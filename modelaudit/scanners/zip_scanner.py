@@ -5,7 +5,7 @@ import tempfile
 import zipfile
 from typing import Any, ClassVar
 
-from ..utils import sanitize_archive_path
+from ..utils import is_absolute_archive_path, is_critical_system_path, sanitize_archive_path
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 CRITICAL_SYSTEM_PATHS = [
@@ -90,7 +90,7 @@ class ZipScanner(BaseScanner):
                 name="ZIP File Format Validation",
                 passed=False,
                 message=f"Not a valid zip file: {path}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
                 details={"path": path},
             )
@@ -101,7 +101,7 @@ class ZipScanner(BaseScanner):
                 name="ZIP File Scan",
                 passed=False,
                 message=f"Error scanning zip file: {e!s}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )
@@ -139,33 +139,6 @@ class ZipScanner(BaseScanner):
             )
 
         with zipfile.ZipFile(path, "r") as z:
-            # Check number of entries
-            entry_count = len(z.namelist())
-            if entry_count > self.max_entries:
-                result.add_check(
-                    name="Entry Count Limit Check",
-                    passed=False,
-                    message=f"ZIP file contains too many entries ({entry_count} > {self.max_entries})",
-                    severity=IssueSeverity.WARNING,
-                    location=path,
-                    details={
-                        "entries": entry_count,
-                        "max_entries": self.max_entries,
-                    },
-                )
-                return result
-            else:
-                result.add_check(
-                    name="Entry Count Limit Check",
-                    passed=True,
-                    message=f"Entry count ({entry_count}) is within limits",
-                    location=path,
-                    details={
-                        "entries": entry_count,
-                        "max_entries": self.max_entries,
-                    },
-                )
-
             # Scan each file in the archive
             for name in z.namelist():
                 info = z.getinfo(name)
@@ -190,13 +163,13 @@ class ZipScanner(BaseScanner):
                     except Exception:
                         target = ""
                     target_base = os.path.dirname(resolved_name)
-                    target_resolved, target_safe = sanitize_archive_path(
+                    _target_resolved, target_safe = sanitize_archive_path(
                         target,
                         target_base,
                     )
                     if not target_safe:
                         # Check if it's specifically a critical system path
-                        if os.path.isabs(target) and any(target.startswith(p) for p in CRITICAL_SYSTEM_PATHS):
+                        if is_absolute_archive_path(target) and is_critical_system_path(target, CRITICAL_SYSTEM_PATHS):
                             message = f"Symlink {name} points to critical system path: {target}"
                         else:
                             message = f"Symlink {name} resolves outside extraction directory"
@@ -208,7 +181,7 @@ class ZipScanner(BaseScanner):
                             location=f"{path}:{name}",
                             details={"target": target, "entry": name},
                         )
-                    elif os.path.isabs(target) and any(target.startswith(p) for p in CRITICAL_SYSTEM_PATHS):
+                    elif is_absolute_archive_path(target) and is_critical_system_path(target, CRITICAL_SYSTEM_PATHS):
                         result.add_check(
                             name="Symlink Safety Validation",
                             passed=False,

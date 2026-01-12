@@ -375,6 +375,9 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
     has_errors: bool = Field(..., description="Whether any critical issues were found")
     scanner_names: list[str] = Field(default_factory=list, description="Names of scanners used")
     file_metadata: dict[str, FileMetadataModel] = Field(default_factory=dict, description="Metadata for each file")
+    content_hash: str | None = Field(
+        default=None, description="Aggregate SHA-256 hash of all scanned files (for deduplication)"
+    )
 
     # Timing and performance
     start_time: float = Field(..., description="Scan start timestamp")
@@ -437,6 +440,10 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
         for scanner in results_dict.get("scanners", []):
             if scanner and scanner not in self.scanner_names and scanner != "unknown":
                 self.scanner_names.append(scanner)
+
+        # Merge content_hash if present (for streaming mode)
+        if "content_hash" in results_dict and results_dict["content_hash"] is not None:
+            self.content_hash = results_dict["content_hash"]
 
     def aggregate_scan_result_direct(self, scan_result: Any) -> None:
         """Directly aggregate a ScanResult object into this model without dict conversion.
@@ -505,12 +512,26 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
     # Dictionary-like access provided by DictCompatMixin
 
     def _finalize_checks(self) -> None:
-        """Calculate check statistics."""
-        from .scanners.base import CheckStatus
+        """Calculate check statistics.
 
-        self.total_checks = len(self.checks)
-        self.passed_checks = sum(1 for c in self.checks if c.status == CheckStatus.PASSED)
-        self.failed_checks = sum(1 for c in self.checks if c.status == CheckStatus.FAILED)
+        Only counts security-relevant checks (excludes failed INFO/DEBUG from total).
+        This ensures the success rate reflects actual security status, not informational notes.
+        """
+        from .scanners.base import CheckStatus, IssueSeverity
+
+        # Exclude only failed INFO/DEBUG checks from success rate calculation
+        # Include: passed checks, skipped checks, and failed WARNING/CRITICAL checks
+        def is_failed_info_or_debug(check):
+            if check.status != CheckStatus.FAILED:
+                return False
+            # Only exclude failed INFO/DEBUG checks
+            return check.severity in (IssueSeverity.INFO, IssueSeverity.DEBUG)
+
+        security_checks = [c for c in self.checks if not is_failed_info_or_debug(c)]
+
+        self.total_checks = len(security_checks)
+        self.passed_checks = sum(1 for c in security_checks if c.status == CheckStatus.PASSED)
+        self.failed_checks = sum(1 for c in security_checks if c.status == CheckStatus.FAILED)
 
     def deduplicate_issues(self) -> None:
         """Remove duplicate issues based on message, severity, and location."""

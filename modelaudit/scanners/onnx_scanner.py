@@ -85,7 +85,7 @@ class OnnxScanner(BaseScanner):
                 name="ONNX Library Check",
                 passed=False,
                 message="onnx package not installed, cannot scan ONNX files.",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.WARNING,
                 location=path,
                 details={"required_package": "onnx"},
             )
@@ -185,13 +185,28 @@ class OnnxScanner(BaseScanner):
             self.check_interrupted()
             if node.domain and node.domain not in ("", "ai.onnx"):
                 custom_domains.add(node.domain)
+
+                # All custom domains are INFO - they're metadata, not executable code
+                # Security risk is in runtime environment (installing malicious operators)
+                # not in the ONNX file itself
                 result.add_check(
                     name="Custom Operator Domain Check",
                     passed=False,
-                    message=f"Model uses custom operator domain '{node.domain}'",
-                    severity=IssueSeverity.WARNING,
+                    message=(
+                        f"Model references custom operator domain '{node.domain}'. "
+                        f"This is metadata only - ensure operators are from trusted sources before installation."
+                    ),
+                    severity=IssueSeverity.INFO,
                     location=f"{path} (node: {node.name})",
-                    details={"op_type": node.op_type, "domain": node.domain},
+                    details={
+                        "op_type": node.op_type,
+                        "domain": node.domain,
+                        "security_note": (
+                            "Custom domains indicate dependencies on external operator implementations. "
+                            "ONNX files cannot execute code - risk is in runtime environment if malicious "
+                            "operators are installed. Verify operator packages before installation."
+                        ),
+                    },
                 )
             elif "python" in node.op_type.lower():
                 python_ops_found = True
@@ -352,7 +367,7 @@ class OnnxScanner(BaseScanner):
                             name="Tensor Size Validation",
                             passed=False,
                             message=f"Tensor '{tensor.name}' data appears truncated",
-                            severity=IssueSeverity.CRITICAL,
+                            severity=IssueSeverity.INFO,
                             location=f"{path} (tensor: {tensor.name})",
                             details={
                                 "expected_size": expected_size,

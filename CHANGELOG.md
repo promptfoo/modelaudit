@@ -5,7 +5,258 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.24](https://github.com/promptfoo/modelaudit/compare/v0.2.23...v0.2.24) (2025-12-23)
+
+### Bug Fixes
+
+- **deps:** update dependency contourpy to &lt;1.3.4 ([#463](https://github.com/promptfoo/modelaudit/issues/463)) ([16fb916](https://github.com/promptfoo/modelaudit/commit/16fb916a88020a7d96455edcbd8bddc0a4c4a58b))
+- **deps:** update dependency fickling to v0.1.6 [security] ([#462](https://github.com/promptfoo/modelaudit/issues/462)) ([9413ddc](https://github.com/promptfoo/modelaudit/commit/9413ddc95cb00fd068fd6ee39a3386a4f4db8016))
+- **deps:** update dependency xgboost to v3 ([#469](https://github.com/promptfoo/modelaudit/issues/469)) ([97adbbc](https://github.com/promptfoo/modelaudit/commit/97adbbc0cfe3699264ade222b9949a98f5e6878d))
+- resolve release-please CHANGELOG formatting race condition ([#457](https://github.com/promptfoo/modelaudit/issues/457)) ([4347b83](https://github.com/promptfoo/modelaudit/commit/4347b83e652fde580437964f22feffdbed7b8731))
+
+## [0.2.23](https://github.com/promptfoo/modelaudit/compare/v0.2.22...v0.2.23) (2025-12-12)
+
+### Documentation
+
+- consolidate agent guidance ([#453](https://github.com/promptfoo/modelaudit/issues/453)) ([a01ceff](https://github.com/promptfoo/modelaudit/commit/a01ceff5daa66750994008e1a9414ce3227115d6))
+- restructure AGENTS.md and CLAUDE.md following 2025 best practices ([#451](https://github.com/promptfoo/modelaudit/issues/451)) ([e87de51](https://github.com/promptfoo/modelaudit/commit/e87de5153c574b9053b507d44f59d5fe85b7204d))
+
 ## [Unreleased]
+
+### Changed
+
+- **deps**: update xgboost to v3.1.2 (from >=1.6.0,<3.0 to >=3.1.2,<3.2) - major version upgrade with no breaking changes affecting ModelAudit's usage
+- **docs**: consolidate agent guidance into a single canonical `AGENTS.md` and align `CLAUDE.md`/`GEMINI.md` to reference it
+- **ci**: add Windows test coverage and introduce a Windows-friendly dependency set for CI usage
+
+### Fixed
+
+- **windows**: normalize Hugging Face cache symlink handling and archive symlink critical-path checks across path separators
+- **windows**: preserve `stream://` paths for streaming scans to avoid path normalization issues
+
+## [0.2.22] - 2025-12-10
+
+### Added
+
+- **feat**: add `modelaudit debug` command for troubleshooting - outputs comprehensive diagnostic information including version, platform, environment variables, authentication status, scanner availability, NumPy compatibility, cache status, and configuration in JSON or pretty-printed format; useful for bug reports and support interactions
+
+## [0.2.21] - 2025-12-09
+
+### Fixed
+
+- **fix**: resolve UnicodeDecodeError when scanning PyTorch .pkl files saved with default ZIP serialization - torch.save() uses ZIP format by default since PyTorch 1.6 (`_use_new_zipfile_serialization=True`), but ModelAudit was incorrectly routing these files to PickleScanner which failed to parse the ZIP header. Now correctly routes ZIP-format .pkl files to PyTorchZipScanner.
+
+## [0.2.20] - 2025-12-01
+
+### Added
+
+- **feat**: detect cloud storage URLs in model configs (AWS S3, GCS, Azure Blob, HuggingFace Hub) - identifies external resource references that could indicate supply chain risks or data exfiltration vectors (Requirement 19)
+- **feat**: add URL allowlist security scanning to manifest scanner - uses 164 trusted domains to flag untrusted URLs in model configs as potential supply chain risks
+- **feat**: detect weak hash algorithms (MD5, SHA1) in model config files - scans manifest files for hash/checksum fields using cryptographically broken algorithms and reports WARNING with CWE-328 reference; SHA256/SHA512 usage is confirmed as strong (addresses Requirement 28: Hash Collisions or Weak Hashes)
+- **feat**: add comprehensive analytics system with Promptfoo integration - opt-out telemetry for usage insights, respects `PROMPTFOO_DISABLE_TELEMETRY` and `NO_ANALYTICS` environment variables
+- **feat**: auto-enable progress display when output goes to file - shows spinner/progress when stdout is redirected to a file
+
+### Fixed
+
+- **fix**: resolve false positives in pickle and TFLite scanners - improved detection accuracy
+- **fix**: clean up tests for CI reliability - removed flaky tests and improved test isolation
+
+## [0.2.19] - 2025-11-24
+
+### Fixed
+
+- **fix**: resolve Jinja2 SSTI false positives from bracket notation - refined obfuscation pattern to only match dunder attributes (`["__class__"]`) instead of legitimate dict access (`["role"]`), and fixed regex bug where `|format\(` matched any pipe character
+- **fix**: remove overly broad secret detection pattern - replaced generic `[A-Za-z0-9]{20,}` pattern with specific well-known token formats (GitHub, OpenAI, AWS, Slack) to eliminate false positives on URLs and model IDs
+- **fix**: resolve msgpack file type validation false positive - unified format name inconsistency where functions returned different values (`"msgpack"` vs `"flax_msgpack"`), causing validation failures on legitimate MessagePack files
+- **fix**: add HuggingFace training utilities to pickle safe globals - added safe Transformers, Accelerate, and TRL classes (HubStrategy, SchedulerType, DistributedType, DeepSpeedPlugin, DPOConfig, etc.) to reduce false positives on training checkpoints
+
+## [0.2.18] - 2025-11-20
+
+### Fixed
+
+- **fix**: exclude INFO/DEBUG checks from success rate calculation - success rate now only includes security-relevant checks (WARNING/CRITICAL), with informational checks (INFO/DEBUG) shown separately in "Failed Checks (non-critical)" section
+- **fix**: missing whitelist logic in validation checks - whitelist downgrading now correctly applies to validation result instantiations
+- **fix**: resolve PyTorch ZIP scanner hang on large models - improved memory-mapped file handling and timeout configuration
+- **fix**: additional severity downgrades - further reduced false positives across multiple scanners
+
+### Changed
+
+- **chore**: standardize on `add_check()` API - migrated all internal code from legacy `add_issue()` method to modern `add_check()` method for structured check reporting with explicit pass/fail status
+
+## [0.2.17] - 2025-11-19
+
+### Fixed
+
+- **fix**: eliminate false positive WARNINGs on sklearn/joblib models (removed overly broad pattern matching)
+  - Removed `b"sklearn"`, `b"NumpyArrayWrapper"`, and `b"numpy_pickle"` from binary pattern detection
+  - These patterns flagged ALL legitimate sklearn/joblib models (100% false positive rate)
+  - Regex CVE patterns still detect actual exploits requiring dangerous combinations
+  - Reduces false positive WARNING rate by 77% (10 out of 13 WARNINGs eliminated)
+- **fix**: NEWOBJ/OBJ/INST opcodes now recognize safe ML classes (eliminates sklearn model false positives)
+  - Applied same safety logic as REDUCE opcode: check if class is in ML_SAFE_GLOBALS allowlist
+  - sklearn models like LogisticRegression now correctly identified as INFO instead of WARNING
+  - Added support for nested sklearn modules (e.g., sklearn.linear_model.\_logistic)
+  - Added joblib.numpy_pickle.NumpyArrayWrapper and dtype.dtype to safe class list
+- **fix**: handle joblib protocol mismatches gracefully (protocol 4 files using protocol 5 opcodes)
+  - joblib files may declare protocol 4 but use protocol 5 opcodes like READONLY_BUFFER (0x0f)
+  - Scanner now parses as much as possible before unknown opcodes, logs INFO instead of failing
+  - Eliminates false positive "Invalid pickle format - unrecognized opcode" WARNING on joblib files
+- **fix**: accept ZIP magic bytes for .npz files (NumPy compressed format is ZIP by design)
+  - .npz files ARE ZIP archives containing multiple .npy files (numpy.savez format)
+  - Now accepts both "zip" and "numpy" header formats for .npz extension
+  - Fixed case-sensitivity bug: MODEL.NPZ, model.Npz now handled correctly
+- **fix**: handle XML namespaces in PMML root element validation
+  - PMML 4.x files with namespaces like `{http://www.dmg.org/PMML-4_4}PMML` now recognized
+  - Strips namespace prefix before comparing tag name
+- **fix**: add validation to prevent TFLite scanner crashes on malformed files
+  - Pre-validates magic bytes ("TFL3") before parsing
+  - Prevents buffer overflow crashes: "unpack_from requires a buffer of at least X bytes"
+  - Added security rationale ("why" field) to magic bytes check
+
+## [0.2.16] - 2025-11-04
+
+### Added
+
+- **feat**: content hash generation for regular scan mode - all scans (not just streaming) now generate `content_hash` field for model deduplication and verification
+
+### Changed
+
+- **refactor**: rename `--scan-and-delete` flag to `--stream` for clarity - streaming mode is now invoked with the more intuitive `--stream` flag
+
+## [0.2.15] - 2025-10-31
+
+### Added
+
+- **feat**: universal streaming scan-and-delete mode for all sources to minimize disk usage
+  - New `--scan-and-delete` CLI flag works with ALL sources (not just HuggingFace):
+    - HuggingFace models (`hf://` or `https://huggingface.co/`)
+    - Cloud storage (S3, GCS: `s3://`, `gs://`)
+    - PyTorch Hub (`https://pytorch.org/hub/`)
+    - Local directories
+  - Files are downloaded/scanned one-by-one, then deleted immediately
+  - Computes SHA256 hash for each file and aggregate content hash for deduplication
+  - Adds `content_hash` field to scan results for identifying identical models
+  - Ideal for CI/CD or constrained disk environments where downloading entire models (100GB+) isn't feasible
+
+### Changed
+
+- **chore**: move cloud storage dependencies (fsspec, s3fs, gcsfs) to default install - S3, GCS, and cloud storage now work without [cloud] extra
+
+### Fixed
+
+- **fix**: centralize MODEL_EXTENSIONS to ensure all scannable formats are downloaded from HuggingFace
+  - Created single source of truth for model extensions (62+ formats including GGUF)
+  - Previously: GGUF files relied on fallback download (inefficient, downloads all files)
+  - Now: GGUF, JAX, Flax, NumPy and other formats are properly detected and selectively downloaded
+  - Dynamically extracts extensions from scanner registry to stay in sync
+- **fix**: restore fallback behavior in streaming downloads to maintain parity with non-streaming mode
+
+## [0.2.14] - 2025-10-23
+
+### Fixed
+
+- **fix**: eliminate false positives across URL detection, CVE checks, GGUF parsing, and secret detection (#412)
+- **fix**: improve shebang detection, fix fsspec usage, and resolve UnboundLocalError (#411)
+
+## [0.2.13] - 2025-10-23
+
+### Added
+
+- **feat**: huggingface model whitelist (#409)
+
+### Fixed
+
+- **fix**: eliminate CVE-2025-32434 false positives for legitimate PyTorch models (#408)
+
+## [0.2.12] - 2025-10-22
+
+### Fixed
+
+- **fix**: remove non-security format validation checks across scanners (#406)
+- **fix**: eliminate false positives in stack depth, GGUF limits, and builtins detection (#405)
+
+## [0.2.11] - 2025-10-22
+
+### Fixed
+
+- **fix**: INFO and DEBUG severity checks no longer count as failures in success rate calculations
+
+## [0.2.10] - 2025-10-22
+
+### Fixed
+
+- **fix**: eliminate false positive REDUCE warnings for safe ML framework operations (#398)
+- **fix**: eliminate ONNX custom domain and PyTorch pickle false positives (#400)
+- **fix**: eliminate false positive JIT/Script warnings on ONNX files (#399)
+
+## [0.2.9] - 2025-10-21
+
+### Added
+
+- **feat**: add context-aware severity for PyTorch pickle models (#395)
+  - Implement SafeTensors detection utility to identify safer format alternatives
+  - Add import analysis to distinguish legitimate vs malicious pickle imports
+  - Consolidate opcode warnings into single check with evidence counts
+  - Add `import_reference` field to pickle scanner GLOBAL checks for analysis
+  - Provide actionable recommendations (use SafeTensors format)
+
+### Changed
+
+- **feat**: rewrite PyTorch pickle severity logic with context-awareness (#395)
+  - CRITICAL: malicious imports detected (os.system, subprocess, eval)
+  - WARNING: legitimate imports + SafeTensors alternative available
+  - INFO: legitimate imports + no SafeTensors alternative
+  - Reduces false positives while maintaining security detection accuracy
+  - Example: sentence-transformers/all-MiniLM-L6-v2 now shows WARNING (was CRITICAL)
+
+## [0.2.8] - 2025-10-21
+
+### Added
+
+- **feat**: add skops scanner for CVE-2025-54412/54413/54886 detection (#392)
+  - Implement dedicated skops scanner for .skops model files
+  - Detect CVE-2025-54412 (OperatorFuncNode RCE vulnerability)
+  - Detect CVE-2025-54413 (MethodNode dangerous attribute access)
+  - Detect CVE-2025-54886 (Card.get_model silent joblib fallback)
+  - Add ZIP format validation and archive bomb detection
+
+### Changed
+
+- **refactor**: remove non-security checks prone to false positives (#391)
+  - Remove blacklist checks from manifest scanner
+  - Remove model name policy checks from manifest scanner
+  - Streamline XGBoost scanner by removing non-security validation checks
+  - Reduce false positives in metadata scanner
+
+### Fixed
+
+- **fix**: resolve XGBoost UBJ crash and network scanner false positives (#392)
+  - Fix UBJ format JSON serialization crash by sanitizing bytes objects to hex strings
+  - Eliminate network scanner false positives for pickle/joblib ML models by adding ML context awareness
+  - Add comprehensive XGBoost testing documentation with 25-model test corpus
+
+## [0.2.7] - 2025-10-20
+
+### Fixed
+
+- **fix**: improve XGBoost scanner severity levels and reduce false positives (#389)
+  - Handle string-encoded numeric values in XGBoost JSON models
+  - Add deterministic JSON validation to prevent claiming non-XGBoost files
+  - Implement tiered file size thresholds (INFO → WARNING) for large models
+  - Downgrade metadata scanner generic secret patterns from WARNING to INFO
+  - Reduce false positives for BibTeX citations and code examples in README files
+- **fix**: prevent ML confidence bypass and hash collision security exploits (#388)
+  - Enable --verbose flag and accurate HuggingFace file sizes
+  - Remove CoreML scanner and coremltools dependency
+- **fix**: enable advanced TorchScript vulnerability detection (#384)
+  - Enable comprehensive detection for serialization injection, module manipulation, and bytecode injection patterns
+
+### Changed
+
+- **refactor**: reorganize codebase into logical module structure (#387)
+  - Create detectors/ module for security detection logic
+  - Improve maintainability and reduce import complexity
+- **chore(deps)**: bump tj-actions/changed-files from v46 to v47 (#386)
 
 ## [0.2.6] - 2025-09-10
 
@@ -371,7 +622,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **style**: improve code formatting and documentation standards (#12, #23)
 - **fix**: improve core scanner functionality and comprehensive test coverage (#11)
 
-[unreleased]: https://github.com/promptfoo/modelaudit/compare/v0.2.6...HEAD
+[unreleased]: https://github.com/promptfoo/modelaudit/compare/v0.2.22...HEAD
+[0.2.22]: https://github.com/promptfoo/modelaudit/compare/v0.2.21...v0.2.22
+[0.2.21]: https://github.com/promptfoo/modelaudit/compare/v0.2.20...v0.2.21
+[0.2.20]: https://github.com/promptfoo/modelaudit/compare/v0.2.19...v0.2.20
+[0.2.19]: https://github.com/promptfoo/modelaudit/compare/v0.2.18...v0.2.19
+[0.2.18]: https://github.com/promptfoo/modelaudit/compare/v0.2.17...v0.2.18
+[0.2.17]: https://github.com/promptfoo/modelaudit/compare/v0.2.16...v0.2.17
+[0.2.16]: https://github.com/promptfoo/modelaudit/compare/v0.2.15...v0.2.16
+[0.2.15]: https://github.com/promptfoo/modelaudit/compare/v0.2.14...v0.2.15
+[0.2.14]: https://github.com/promptfoo/modelaudit/compare/v0.2.13...v0.2.14
+[0.2.13]: https://github.com/promptfoo/modelaudit/compare/v0.2.12...v0.2.13
+[0.2.12]: https://github.com/promptfoo/modelaudit/compare/v0.2.11...v0.2.12
+[0.2.11]: https://github.com/promptfoo/modelaudit/compare/v0.2.10...v0.2.11
+[0.2.10]: https://github.com/promptfoo/modelaudit/compare/v0.2.9...v0.2.10
+[0.2.9]: https://github.com/promptfoo/modelaudit/compare/v0.2.8...v0.2.9
+[0.2.8]: https://github.com/promptfoo/modelaudit/compare/v0.2.7...v0.2.8
+[0.2.7]: https://github.com/promptfoo/modelaudit/compare/v0.2.6...v0.2.7
 [0.2.6]: https://github.com/promptfoo/modelaudit/compare/v0.2.5...v0.2.6
 [0.2.5]: https://github.com/promptfoo/modelaudit/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/promptfoo/modelaudit/compare/v0.2.3...v0.2.4

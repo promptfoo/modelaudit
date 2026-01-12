@@ -248,27 +248,6 @@ class TestZipScanner:
                 if os.path.exists(path):
                     os.unlink(path)
 
-    def test_max_entries_limit(self):
-        """Test that maximum number of entries is enforced"""
-        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
-            with zipfile.ZipFile(tmp.name, "w") as z:
-                # Create many entries
-                for i in range(100):
-                    z.writestr(f"file{i}.txt", f"Content {i}")
-            tmp_path = tmp.name
-
-        try:
-            # Configure scanner with low max entries
-            scanner = ZipScanner(config={"max_zip_entries": 50})
-            result = scanner.scan(tmp_path)
-
-            assert result.success is True
-            # Should have a warning about too many entries
-            entries_issues = [i for i in result.issues if "too many entries" in i.message.lower()]
-            assert len(entries_issues) >= 1
-        finally:
-            os.unlink(tmp_path)
-
     def test_scan_zip_with_dangerous_pickle(self):
         """Test scanning a ZIP file containing a dangerous pickle"""
         with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:

@@ -285,6 +285,40 @@ def verify_file_hash(file_path: str, expected_hash: str) -> bool:
     return hasher.verify_hash(file_path, expected_hash)
 
 
+def compute_aggregate_hash(file_hashes: list[str]) -> str:
+    """
+    Compute an aggregate hash from a list of individual file hashes.
+
+    This creates a deterministic hash representing the entire model content
+    by sorting the hashes alphabetically and computing SHA-256 of the concatenation.
+
+    Args:
+        file_hashes: List of hex-encoded hash strings (one per file)
+
+    Returns:
+        Hex-encoded SHA-256 hash of all file hashes
+
+    Examples:
+        >>> hashes = ["abc123...", "def456...", "ghi789..."]
+        >>> aggregate = compute_aggregate_hash(hashes)
+        >>> # Same files in different order produce same aggregate
+        >>> compute_aggregate_hash(sorted(hashes)) == compute_aggregate_hash(sorted(hashes, reverse=True))
+        True
+    """
+    if not file_hashes:
+        # Return hash of empty string for empty model
+        return hashlib.sha256(b"").hexdigest()
+
+    # Sort hashes for deterministic ordering
+    sorted_hashes = sorted(file_hashes)
+
+    # Concatenate all hashes
+    combined = "".join(sorted_hashes)
+
+    # Compute SHA-256 of the concatenation
+    return hashlib.sha256(combined.encode("utf-8")).hexdigest()
+
+
 # Performance testing function
 def benchmark_hashing_performance(test_file_path: str, iterations: int = 3) -> dict:
     """

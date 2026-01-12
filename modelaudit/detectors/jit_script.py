@@ -858,7 +858,10 @@ class JITScriptDetector:
             findings.extend(self.scan_onnx(data, context))
 
         # Always check for generic dangerous patterns
-        if model_type == "unknown" or not findings:
+        # Only run fallback scanners if model type is truly unknown
+        # Don't run fallback on known types (pytorch, tensorflow, onnx) even if they have no findings
+        # because that causes false positives (e.g. TorchScript patterns matching ONNX metadata)
+        if model_type == "unknown":
             # Check all frameworks if type is unknown
             findings.extend(self.scan_torchscript(data, context))
             # TODO: Fix return type mismatch in scan_advanced_torchscript_vulnerabilities
@@ -904,10 +907,10 @@ def detect_jit_script_risks(file_path: str, max_size: int = 500 * 1024 * 1024) -
         return [
             create_jit_finding(
                 message=f"File too large: {file_size} bytes (max: {max_size})",
-                severity="WARNING",
+                severity="INFO",
                 context=file_path,
                 pattern=None,
-                recommendation="Use a smaller file for analysis",
+                recommendation="Consider increasing the max_size parameter for large model files",
                 confidence=1.0,
                 framework=None,
                 code_snippet=None,

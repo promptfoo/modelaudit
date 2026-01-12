@@ -86,7 +86,8 @@ class TestSevenZipScanner:
         assert len(result.issues) == 1
 
         issue = result.issues[0]
-        assert issue.severity == IssueSeverity.CRITICAL
+        # Missing optional dependency is a WARNING, not CRITICAL
+        assert issue.severity == IssueSeverity.WARNING
         assert "py7zr library not installed" in issue.message
         assert "pip install py7zr" in issue.message
 
@@ -99,7 +100,8 @@ class TestSevenZipScanner:
         assert len(result.issues) == 1
 
         issue = result.issues[0]
-        assert issue.severity == IssueSeverity.CRITICAL
+        # Missing optional dependency is a WARNING, not CRITICAL
+        assert issue.severity == IssueSeverity.WARNING
         assert "py7zr library not installed" in issue.message
 
     @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")

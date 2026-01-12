@@ -32,7 +32,7 @@ python scripts/comprehensive_modelscan_test.py
 
 **Requirements:**
 
-- ModelAudit installed (`rye sync --features all`)
+- ModelAudit installed (`uv sync --extra all`)
 - modelscan installed (`pip install modelscan`)
 - Sufficient disk space for model downloads
 

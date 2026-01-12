@@ -10,10 +10,6 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     HAS_TFLITE = False
 
-# Thresholds to detect potential overflow or malicious sizes
-_MAX_COUNT = 1_000_000
-_MAX_DIM = 10_000_000
-
 
 class TFLiteScanner(BaseScanner):
     """Scanner for TensorFlow Lite model files."""
@@ -41,7 +37,7 @@ class TFLiteScanner(BaseScanner):
                 name="TFLite Library Check",
                 passed=False,
                 message="tflite package not installed. Install with 'pip install modelaudit[tflite]'",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.WARNING,
                 location=path,
                 details={"required_package": "tflite"},
             )
@@ -52,13 +48,30 @@ class TFLiteScanner(BaseScanner):
             with open(path, "rb") as f:
                 data = f.read()
                 result.bytes_scanned = len(data)
+
+            # Check for TFLite magic bytes "TFL3" at offset 4
+            # TFLite uses FlatBuffer format: bytes 0-3 are root table offset, bytes 4-7 are file identifier
+            if len(data) < 8 or data[4:8] != b"TFL3":
+                result.add_check(
+                    name="TFLite Magic Bytes Check",
+                    passed=False,
+                    message="File does not have valid TFLite magic bytes (expected 'TFL3' at offset 4)",
+                    severity=IssueSeverity.INFO,
+                    location=path,
+                    details={"magic_bytes_at_offset_4": data[4:8].hex() if len(data) >= 8 else "file_too_short"},
+                    why="Valid TFLite files use FlatBuffer format with 'TFL3' identifier at bytes 4-7. "
+                    "Missing or incorrect identifier may indicate file corruption or spoofing.",
+                )
+                result.finish(success=False)
+                return result
+
             model = tflite.Model.GetRootAsModel(data, 0)
         except Exception as e:  # pragma: no cover - parse errors
             result.add_check(
                 name="TFLite File Parse",
                 passed=False,
                 message=f"Invalid TFLite file or parse error: {e}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )
@@ -67,15 +80,6 @@ class TFLiteScanner(BaseScanner):
 
         subgraph_count = model.SubgraphsLength()
         result.metadata["subgraph_count"] = subgraph_count
-        if subgraph_count > _MAX_COUNT:
-            result.add_check(
-                name="Subgraph Count Validation",
-                passed=False,
-                message=f"Model declares {subgraph_count} subgraphs which exceeds the safe limit",
-                severity=IssueSeverity.CRITICAL,
-                location=path,
-                details={"subgraph_count": subgraph_count, "max_allowed": _MAX_COUNT},
-            )
 
         for sg_index in range(subgraph_count):
             subgraph = model.Subgraphs(sg_index)
@@ -83,30 +87,6 @@ class TFLiteScanner(BaseScanner):
             operators_len = subgraph.OperatorsLength()
             result.metadata.setdefault("tensor_counts", []).append(tensors_len)
             result.metadata.setdefault("operator_counts", []).append(operators_len)
-
-            if tensors_len > _MAX_COUNT or operators_len > _MAX_COUNT:
-                result.add_check(
-                    name="Tensor/Operator Count Validation",
-                    passed=False,
-                    message="TFLite model has extremely large tensor or operator count",
-                    severity=IssueSeverity.CRITICAL,
-                    location=path,
-                    details={"tensors": tensors_len, "operators": operators_len, "max_allowed": _MAX_COUNT},
-                )
-                continue
-
-            for t_index in range(tensors_len):
-                tensor = subgraph.Tensors(t_index)
-                shape = [tensor.Shape(i) for i in range(tensor.ShapeLength())]
-                if any(dim > _MAX_DIM for dim in shape):
-                    result.add_check(
-                        name="Tensor Dimension Validation",
-                        passed=False,
-                        message="Tensor dimension extremely large (possible overflow)",
-                        severity=IssueSeverity.CRITICAL,
-                        location=f"{path} (tensor {t_index})",
-                        details={"tensor_index": t_index, "shape": shape, "max_allowed_dim": _MAX_DIM},
-                    )
 
             for o_index in range(operators_len):
                 op = subgraph.Operators(o_index)

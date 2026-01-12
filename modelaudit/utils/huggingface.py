@@ -1,5 +1,6 @@
 """Utilities for handling HuggingFace model downloads."""
 
+import json
 import re
 from pathlib import Path
 from typing import Any
@@ -359,3 +360,71 @@ def download_file_from_hf(url: str, cache_dir: Path | None = None) -> Path:
         return Path(local_path)
     except Exception as e:
         raise Exception(f"Failed to download file from {url}: {e!s}") from e
+
+
+def extract_model_id_from_path(path: str) -> tuple[str | None, str | None]:
+    """Extract HuggingFace model ID and source from a path or URL.
+
+    Args:
+        path: File path or URL that might contain model information
+
+    Returns:
+        Tuple of (model_id, source) where:
+        - model_id: The HuggingFace model ID (e.g., "bert-base-uncased") or None
+        - source: The source type ("huggingface", "local", etc.) or None
+    """
+    # Check if it's a HuggingFace URL
+    if is_huggingface_url(path) or is_huggingface_file_url(path):
+        try:
+            namespace, repo_name = parse_huggingface_url(path)
+            model_id = f"{namespace}/{repo_name}" if repo_name else namespace
+            return model_id, "huggingface"
+        except ValueError:
+            pass
+
+    # Check if it's a local path with HuggingFace cache structure
+    # HuggingFace cache typically has structure like: models--namespace--repo-name/...
+    path_obj = Path(path)
+    if "models--" in path:
+        # Extract from HF cache path structure
+        for part in path_obj.parts:
+            if part.startswith("models--"):
+                # Format: models--namespace--repo-name
+                parts = part[len("models--") :].split("--")
+                if len(parts) >= 2:
+                    model_id = f"{parts[0]}/{parts[1]}"
+                    return model_id, "huggingface"
+
+    # Check for config.json or model metadata in parent directories
+    current_path = path_obj if path_obj.is_dir() else path_obj.parent
+    for _ in range(3):  # Check up to 3 levels up
+        config_file = current_path / "config.json"
+        if config_file.exists():
+            try:
+                with open(config_file) as f:
+                    config = json.load(f)
+                    # Look for various model ID fields
+                    model_id = config.get("_name_or_path") or config.get("model_name") or config.get("name")
+                    if model_id and "/" in model_id:
+                        return model_id, "local"
+            except Exception:
+                pass
+
+        # Check model_index.json (Diffusers format)
+        model_index = current_path / "model_index.json"
+        if model_index.exists():
+            try:
+                with open(model_index) as f:
+                    config = json.load(f)
+                    model_id = config.get("_name_or_path") or config.get("name")
+                    if model_id and "/" in model_id:
+                        return model_id, "local"
+            except Exception:
+                pass
+
+        # Move up one directory
+        if current_path.parent == current_path:
+            break
+        current_path = current_path.parent
+
+    return None, None

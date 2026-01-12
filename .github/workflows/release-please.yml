@@ -1,0 +1,136 @@
+name: release-please
+run-name: modelaudit release by @${{ github.actor }}
+
+concurrency:
+  group: release-please-${{ github.ref }}
+  cancel-in-progress: false
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      version: ${{ steps.release.outputs.version }}
+      pr_number: ${{ steps.release.outputs.pr && fromJSON(steps.release.outputs.pr).number || '' }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Format CHANGELOG.md immediately after release-please creates/updates a PR
+      # This runs for BOTH new PRs (prs_created) and existing PRs (pr output exists)
+      - name: Check if PR exists
+        id: check-pr
+        run: |
+          PR_OUTPUT='${{ steps.release.outputs.pr }}'
+          if [ -n "$PR_OUTPUT" ] && [ "$PR_OUTPUT" != "null" ]; then
+            echo "has_pr=true" >> $GITHUB_OUTPUT
+            echo "pr_branch=$(echo '${{ steps.release.outputs.pr }}' | jq -r '.headBranchName')" >> $GITHUB_OUTPUT
+          else
+            echo "has_pr=false" >> $GITHUB_OUTPUT
+          fi
+
+      - uses: actions/checkout@v6
+        if: steps.check-pr.outputs.has_pr == 'true'
+        with:
+          ref: ${{ steps.check-pr.outputs.pr_branch }}
+          # Shallow clone for speed - we only need to format and push
+          fetch-depth: 1
+
+      - name: Format CHANGELOG.md with Prettier
+        if: steps.check-pr.outputs.has_pr == 'true'
+        run: |
+          echo "Formatting CHANGELOG.md on branch: ${{ steps.check-pr.outputs.pr_branch }}"
+          npx --yes prettier@latest --write CHANGELOG.md
+
+          if git diff --quiet CHANGELOG.md; then
+            echo "✓ No formatting changes needed"
+          else
+            echo "→ Formatting changes detected, committing..."
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add CHANGELOG.md
+            git commit -m "chore: format CHANGELOG.md with prettier"
+            git push
+            echo "✓ Formatting committed and pushed"
+          fi
+
+  build:
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    needs: release-please
+    permissions:
+      contents: read
+    outputs:
+      artifact-name: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Sync dependencies
+        run: uv sync --extra all-ci
+
+      - name: Run tests
+        run: |
+          uv run pytest -n auto -m "not slow and not integration and not performance" --tb=short
+
+      - name: Build package
+        run: uv build
+
+      - name: Verify package version matches release
+        run: |
+          EXPECTED_VERSION="${{ needs.release-please.outputs.version }}"
+          # Check wheel filename contains expected version
+          if ls dist/*-${EXPECTED_VERSION}-*.whl 1> /dev/null 2>&1; then
+            echo "Package version ${EXPECTED_VERSION} matches release"
+          else
+            echo "ERROR: Package version mismatch!"
+            echo "Expected version: ${EXPECTED_VERSION}"
+            echo "Built packages:"
+            ls -la dist/
+            exit 1
+          fi
+
+      - name: Upload build artifacts
+        id: upload
+        uses: actions/upload-artifact@v6
+        with:
+          name: dist
+          path: dist/
+
+  publish-pypi:
+    if: needs.release-please.outputs.release_created == 'true'
+    needs: [build, release-please]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/modelaudit/
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v7
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          print-hash: true

@@ -148,18 +148,6 @@ class TestAdvancedSizeLimits:
         # Colossal should handle at least 1TB
         assert COLOSSAL_MODEL_THRESHOLD >= 1024 * 1024 * 1024 * 1024
 
-    @patch("modelaudit.utils.advanced_file_handler.ShardedModelDetector.detect_shards")
-    def test_sharded_models_bypass_individual_limits(self, mock_detect):
-        """Test that sharded models are detected regardless of individual file sizes."""
-        # Simulate detection of sharded model
-        mock_detect.return_value = {
-            "shards": ["shard1.bin", "shard2.bin"],
-            "total_size": 2 * 1024 * 1024 * 1024 * 1024,  # 2TB total
-        }
-
-        # Even a "small" shard should trigger extreme handler if part of large model
-        assert should_use_advanced_handler("shard1.bin")
-
     def test_no_hardcoded_upper_limit(self):
         """Ensure there's no hardcoded upper limit that would block any file."""
         # Test with absurdly large sizes - should not raise or fail

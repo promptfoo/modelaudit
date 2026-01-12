@@ -1,16 +1,13 @@
-FROM python:3.10-slim
+FROM python:3.13-slim
 
 WORKDIR /app
 
-# Copy source code first
-COPY . .
+# Copy only necessary files for installation
+COPY pyproject.toml README.md ./
+COPY modelaudit ./modelaudit
 
-# Install dependencies from requirements.lock
-# The lock file includes the current project as editable, so we need the source first
-RUN pip install --no-cache-dir -r requirements.lock
-
-# Install the application with TensorFlow extras using pip
-RUN pip install --no-cache-dir .[tensorflow]
+# Install the application with TensorFlow extras
+RUN pip install --no-cache-dir ".[tensorflow]"
 
 # Create a non-root user
 ARG UID=10001

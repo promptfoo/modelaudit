@@ -510,6 +510,9 @@ class Jinja2TemplateScanner(BaseScanner):
 
         # Common HuggingFace chat template patterns
         if context.framework == "huggingface":
+            # Normalize quotes for matching (handle both single and double quotes)
+            match_normalized = match_lower.replace('"', "'")
+
             benign_patterns = [
                 "for message in messages",
                 "message['role']",
@@ -518,9 +521,18 @@ class Jinja2TemplateScanner(BaseScanner):
                 "if message['role'] == 'system'",
                 "if message['role'] == 'user'",
                 "if message['role'] == 'assistant'",
+                "if message['role'] == 'tool'",
+                # Bracket notation patterns (non-dunder attributes)
+                "['role']",
+                "['content']",
+                "['tools']",
+                "['name']",
+                # Tool-related patterns
+                "for tool in tools",
+                "if tool is not string",
             ]
 
-            return any(pattern in match_lower for pattern in benign_patterns)
+            return any(pattern in match_normalized for pattern in benign_patterns)
 
         return False
 
@@ -548,7 +560,8 @@ class Jinja2TemplateScanner(BaseScanner):
 
         base_severity = base_severity_map.get(detection.risk_level, IssueSeverity.WARNING)
 
-        # Context-based adjustments
+        # Context-based adjustments: Don't downgrade critical attack patterns
+        # Only downgrade truly benign patterns in legitimate ML contexts
         if (
             context.confidence >= 3
             and context.framework == "huggingface"
@@ -556,6 +569,9 @@ class Jinja2TemplateScanner(BaseScanner):
             and base_severity == IssueSeverity.WARNING
         ):
             return IssueSeverity.INFO
+
+        # Don't downgrade obfuscation patterns in HuggingFace context
+        # The regex fix should prevent false positives, so any remaining matches are suspicious
 
         # Sensitivity level adjustments
         if self.sensitivity_level == "high":

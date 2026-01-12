@@ -139,10 +139,9 @@ test_*.pkl
 # Ruff cache
 .ruff_cache/
 
-# Rye
+# uv / Python environment
 .python-version
 .venv/
-.rye/
 
 # Internal planning files
 TODO.md

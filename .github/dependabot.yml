@@ -1,6 +1,6 @@
 version: 2
 updates:
-  # Python dependencies managed by Rye
+  # Python dependencies managed by uv
   - package-ecosystem: "pip"
     directory: "/"
     schedule:

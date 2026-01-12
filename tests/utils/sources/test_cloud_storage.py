@@ -1,4 +1,5 @@
 import asyncio
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -62,14 +63,14 @@ def test_download_from_cloud(mock_fs, tmp_path):
     assert "model.pt" in call_args[1]
 
     # Result should be a path containing the filename
+    assert isinstance(result, Path)
     assert result.name == "model.pt"
     assert result.exists() or True  # Mock doesn't create actual files
 
-    fs.close.assert_called_once()
-    fs_meta.close.assert_called_once()
+    # Note: fsspec filesystems don't need explicit cleanup according to implementation
 
 
-@patch("modelaudit.utils.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+@patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
 @patch("fsspec.filesystem")
 def test_download_from_cloud_async_context(mock_fs, mock_analyze, tmp_path):
     fs = MagicMock()
@@ -93,7 +94,26 @@ def test_download_from_cloud_async_context(mock_fs, mock_analyze, tmp_path):
 
     # With context managers, fs.get is called but then fs is closed
     # Just verify the result is correct since the mock behavior changes with context managers
+    assert isinstance(result, Path)
     assert result.name == "model.pt"
+
+
+@patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+@patch("modelaudit.utils.file.streaming.get_streaming_preview")
+def test_download_from_cloud_streaming_returns_stream_url(mock_preview, mock_analyze, tmp_path):
+    url = "s3://bucket/model.pt"
+    mock_preview.return_value = None
+    mock_analyze.return_value = {
+        "type": "file",
+        "size": 1024,
+        "name": "model.pt",
+        "human_size": "1.0 KB",
+        "estimated_time": "1 second",
+    }
+
+    result = download_from_cloud(url, cache_dir=tmp_path, use_cache=False, stream_analyze=True)
+
+    assert result == f"stream://{url}"
 
 
 @patch("builtins.__import__")
@@ -111,7 +131,8 @@ def test_download_missing_dependency(mock_import):
 
 
 @patch("fsspec.filesystem")
-def test_analyze_cloud_target_closes_fs(mock_fs):
+def test_analyze_cloud_target_returns_metadata(mock_fs):
+    """Test that analyze_cloud_target returns correct metadata."""
     fs = make_fs_mock()
     fs.info.return_value = {"type": "file", "size": 1024}
     mock_fs.return_value = fs
@@ -119,11 +140,11 @@ def test_analyze_cloud_target_closes_fs(mock_fs):
     metadata = asyncio.run(analyze_cloud_target("s3://bucket/model.pt"))
 
     assert metadata["size"] == 1024
-    fs.close.assert_called_once()
+    # Note: fsspec filesystems don't need explicit cleanup according to implementation
 
 
 @patch("fsspec.filesystem")
-@patch("modelaudit.utils.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+@patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
 def test_download_from_cloud_analysis_failure(mock_analyze, mock_fs):
     mock_analyze.return_value = {"type": "unknown", "error": "boom"}
     with pytest.raises(ValueError, match="Failed to analyze cloud target"):
@@ -176,9 +197,9 @@ class TestDiskSpaceCheckingForCloud:
     """Test disk space checking for cloud downloads."""
 
     @pytest.mark.skip(reason="Context manager behavior needs to be fixed - tracked separately")
-    @patch("modelaudit.utils.cloud_storage.get_cloud_object_size")
-    @patch("modelaudit.utils.cloud_storage.check_disk_space")
-    @patch("modelaudit.utils.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+    @patch("modelaudit.utils.sources.cloud_storage.get_cloud_object_size")
+    @patch("modelaudit.utils.sources.cloud_storage.check_disk_space")
+    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
     @patch("fsspec.filesystem")
     def test_download_insufficient_disk_space(self, mock_fs_class, mock_analyze, mock_check_disk_space, mock_get_size):
         """Test download fails when disk space is insufficient."""
@@ -201,7 +222,7 @@ class TestDiskSpaceCheckingForCloud:
         mock_check_disk_space.return_value = (False, "Insufficient disk space. Required: 12.0 GB, Available: 5.0 GB")
 
         # Test download failure
-        with pytest.raises(Exception, match="Cannot download from.*Insufficient disk space"):
+        with pytest.raises(Exception, match=r"Cannot download from.*Insufficient disk space"):
             download_from_cloud("s3://bucket/large-model.bin", use_cache=False)
 
         # Verify download was not attempted
@@ -214,9 +235,9 @@ class TestDiskSpaceCheckingForCloud:
         # Verify object size check was called
         mock_get_size.assert_called_once()
 
-    @patch("modelaudit.utils.cloud_storage.get_cloud_object_size")
-    @patch("modelaudit.utils.cloud_storage.check_disk_space")
-    @patch("modelaudit.utils.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+    @patch("modelaudit.utils.sources.cloud_storage.get_cloud_object_size")
+    @patch("modelaudit.utils.sources.cloud_storage.check_disk_space")
+    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
     @patch("fsspec.filesystem")
     def test_download_with_disk_space_check(
         self, mock_fs_class, mock_analyze, mock_check_disk_space, mock_get_size, tmp_path
@@ -253,6 +274,7 @@ class TestDiskSpaceCheckingForCloud:
 
         # Verify download proceeded - with context managers, fs.get is called but then fs is closed
         # Just verify the result is correct since the mock behavior changes with context managers
+        assert isinstance(result, Path)
         assert result.name == "model.bin"
         assert str(tmp_path) in str(result)  # Should be within the cache dir
 

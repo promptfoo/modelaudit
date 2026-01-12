@@ -309,7 +309,7 @@ class JaxCheckpointScanner(BaseScanner):
                 name="NumPy Library Check",
                 passed=False,
                 message="NumPy not available for checkpoint analysis",
-                severity=IssueSeverity.INFO,
+                severity=IssueSeverity.WARNING,
                 location=path,
                 details={"required_library": "numpy"},
             )
@@ -324,8 +324,8 @@ class JaxCheckpointScanner(BaseScanner):
                 result.add_check(
                     name="NumPy Array Size Check",
                     passed=False,
-                    message=f"Extremely large NumPy array: {array.size:,} elements",
-                    severity=IssueSeverity.WARNING,
+                    message=f"Large NumPy array detected: {array.size:,} elements",
+                    severity=IssueSeverity.INFO,
                     location=path,
                     details={"size": array.size, "shape": array.shape, "threshold": 100_000_000},
                 )
@@ -336,7 +336,7 @@ class JaxCheckpointScanner(BaseScanner):
                     name="NumPy Array Shape Validation",
                     passed=False,
                     message="Invalid array shape with non-positive dimensions",
-                    severity=IssueSeverity.CRITICAL,
+                    severity=IssueSeverity.INFO,
                     location=path,
                     details={"shape": array.shape},
                 )

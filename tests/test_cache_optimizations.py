@@ -18,7 +18,7 @@ from modelaudit.cache.smart_cache_keys import FileFingerprint, SmartCacheKeyGene
 class TestCacheOptimizationPerformance:
     """Test performance improvements in cache optimizations."""
 
-    def test_smart_cache_key_performance(self):
+    def test_smart_cache_key_performance(self, monkeypatch):
         """Test smart cache key generation vs traditional approach."""
         key_generator = SmartCacheKeyGenerator()
 
@@ -39,6 +39,18 @@ class TestCacheOptimizationPerformance:
             large_file = Path(temp_dir) / "large.bin"
             large_file.write_bytes(b"large content" * 100000)  # ~1.3MB
             test_files.append(str(large_file))
+
+            stat_calls = {"smart": 0, "traditional": 0}
+            current_label: str | None = None
+            original_stat = os.stat
+
+            def counting_stat(path):
+                nonlocal current_label
+                if current_label is not None:
+                    stat_calls[current_label] += 1
+                return original_stat(path)
+
+            monkeypatch.setattr(os, "stat", counting_stat)
 
             def generate_smart_keys():
                 """Generate keys using optimized smart generation."""
@@ -62,16 +74,19 @@ class TestCacheOptimizationPerformance:
 
             # Time smart key generation
             iterations = 100
-            start_time = time.time()
+            current_label = "smart"
+            start_time = time.perf_counter()
             for _ in range(iterations):
                 smart_result = generate_smart_keys()
-            smart_time = time.time() - start_time
+            smart_time = time.perf_counter() - start_time
 
             # Time traditional approach
-            start_time = time.time()
+            current_label = "traditional"
+            start_time = time.perf_counter()
             for _ in range(iterations):
                 traditional_result = generate_traditional_keys()
-            traditional_time = time.time() - start_time
+            traditional_time = time.perf_counter() - start_time
+            current_label = None
 
             # Verify results are equivalent
             assert len(smart_result) == len(traditional_result)
@@ -83,7 +98,9 @@ class TestCacheOptimizationPerformance:
             if smart_time > 0:
                 improvement = traditional_time / smart_time
                 print(f"Performance improvement: {improvement:.1f}x")
-                assert improvement > 1.1  # Should be at least 10% faster
+
+            # Stat reuse should reduce syscalls even when timings are noisy.
+            assert stat_calls["traditional"] >= stat_calls["smart"] * 2
 
     def test_batch_cache_operations_performance(self):
         """Test batch cache operations functionality and basic performance."""
@@ -135,15 +152,15 @@ class TestCacheOptimizationPerformance:
 
             # Basic timing test (reduced iterations)
             iterations = 10
-            start_time = time.time()
+            start_time = time.perf_counter()
             for _ in range(iterations):
                 batch_result = batch_lookup()
-            batch_time = time.time() - start_time
+            batch_time = time.perf_counter() - start_time
 
-            start_time = time.time()
+            start_time = time.perf_counter()
             for _ in range(iterations):
                 individual_result = individual_lookup()
-            individual_time = time.time() - start_time
+            individual_time = time.perf_counter() - start_time
 
             print(f"\nBatch lookup: {batch_time:.4f}s")
             print(f"Individual lookup: {individual_time:.4f}s")
@@ -200,16 +217,16 @@ class TestCacheOptimizationPerformance:
 
         # Time optimized extraction
         iterations = 200
-        start_time = time.time()
+        start_time = time.perf_counter()
         for _ in range(iterations):
             opt_result = optimized_extraction()
-        opt_time = time.time() - start_time
+        opt_time = time.perf_counter() - start_time
 
         # Time traditional approach for comparison
-        start_time = time.time()
+        start_time = time.perf_counter()
         for _ in range(iterations):
             traditional_result = traditional_extraction()
-        traditional_time = time.time() - start_time
+        traditional_time = time.perf_counter() - start_time
 
         # Verify results are equivalent
         assert len(opt_result) == len(traditional_result)
@@ -257,16 +274,16 @@ class TestCacheOptimizationPerformance:
 
             # Time optimized approach
             iterations = 100
-            start_time = time.time()
+            start_time = time.perf_counter()
             for _ in range(iterations):
                 opt_result = optimized_fingerprints()
-            opt_time = time.time() - start_time
+            opt_time = time.perf_counter() - start_time
 
             # Time traditional approach
-            start_time = time.time()
+            start_time = time.perf_counter()
             for _ in range(iterations):
                 traditional_result = traditional_fingerprints()
-            traditional_time = time.time() - start_time
+            traditional_time = time.perf_counter() - start_time
 
             # Verify results are equivalent
             assert len(opt_result) == len(traditional_result)
@@ -310,10 +327,10 @@ class TestCacheOptimizationPerformance:
 
         # Time decision making (benefits from LRU cache)
         iterations = 500
-        start_time = time.time()
+        start_time = time.perf_counter()
         for _ in range(iterations):
             result = make_cache_decisions()
-        decision_time = time.time() - start_time
+        decision_time = time.perf_counter() - start_time
 
         # Verify basic functionality - check the actual thresholds
         print(f"Actual decisions: {result}")
