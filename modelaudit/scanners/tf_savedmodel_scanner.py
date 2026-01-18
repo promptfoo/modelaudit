@@ -32,16 +32,9 @@ def _check_protos() -> bool:
     """Check if TensorFlow protobuf stubs are available (vendored or from TensorFlow)."""
     global HAS_PROTOS
     if HAS_PROTOS is None:
-        try:
-            # Import vendored protos module (sets up sys.path for tensorflow.* imports)
-            # Order matters: modelaudit.protos must be imported first to set up sys.path
-            import modelaudit.protos  # noqa: F401, I001
+        import modelaudit.protos
 
-            from tensorflow.core.protobuf.saved_model_pb2 import SavedModel  # noqa: F401
-
-            HAS_PROTOS = True
-        except ImportError:
-            HAS_PROTOS = False
+        HAS_PROTOS = modelaudit.protos._check_vendored_protos()
     return HAS_PROTOS
 
 
@@ -96,16 +89,16 @@ class TensorFlowSavedModelScanner(BaseScanner):
         # Store the file path for use in issue locations
         self.current_file_path = path
 
-        # Check if TensorFlow is installed
+        # Check if TensorFlow protos are available (vendored or from TensorFlow)
         if not _check_protos():
             result = self._create_result()
             result.add_check(
-                name="TensorFlow Library Check",
+                name="TensorFlow Protos Check",
                 passed=False,
-                message="TensorFlow not installed, cannot scan SavedModel. Install modelaudit[tensorflow].",
+                message="TensorFlow protos unavailable. Vendored protos may be missing or corrupted.",
                 severity=IssueSeverity.WARNING,
                 location=path,
-                details={"path": path, "required_package": "tensorflow"},
+                details={"path": path, "note": "Vendored protos should be bundled; reinstall if missing"},
             )
             result.finish(success=False)
             return result

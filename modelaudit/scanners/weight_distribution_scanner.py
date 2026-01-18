@@ -45,12 +45,13 @@ class WeightDistributionScanner(BaseScanner):
         """Check if this scanner can handle the given path"""
         if os.path.isdir(path):
             try:
-                import tensorflow as tf
+                from modelaudit.utils.tensorflow_compat import get_protobuf_classes
 
-                has_tensorflow = True
+                get_protobuf_classes()
+                has_protos = True
             except ImportError:
-                has_tensorflow = False
-            return has_tensorflow and os.path.exists(os.path.join(path, "saved_model.pb"))
+                has_protos = False
+            return has_protos and os.path.exists(os.path.join(path, "saved_model.pb"))
 
         if not os.path.isfile(path):
             return False
@@ -78,7 +79,9 @@ class WeightDistributionScanner(BaseScanner):
                 return False
         if ext == ".pb":
             try:
-                import tensorflow as tf  # noqa: F401
+                from modelaudit.utils.tensorflow_compat import get_protobuf_classes
+
+                get_protobuf_classes()
             except ImportError:
                 return False
         return True

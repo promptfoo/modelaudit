@@ -27,7 +27,7 @@ ModelAudit uses optional dependencies to keep the base installation lightweight:
 
 ## TensorFlow SavedModel Scanning (No TensorFlow Required)
 
-TensorFlow SavedModel scanning works **without installing TensorFlow** (~2GB). We use vendored
+TensorFlow SavedModel scanning works **without installing TensorFlow** (~2 GB). We use vendored
 protobuf stubs compiled from TensorFlow's `.proto` files.
 
 **How it works:**

@@ -104,4 +104,4 @@ The `test-vendored-protos` job verifies that TensorFlow SavedModel scanning work
 3. Confirms vendored protos load correctly
 4. Tests safe and malicious SavedModel detection
 
-This ensures the ~2GB TensorFlow dependency remains optional for users who only need SavedModel scanning.
+This ensures the ~2 GB TensorFlow dependency remains optional for users who only need SavedModel scanning.

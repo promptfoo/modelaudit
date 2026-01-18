@@ -6,7 +6,7 @@ This plan has been implemented. See the changes below for details.
 
 ## Summary
 
-Replace the full TensorFlow dependency (~2GB) with lightweight protobuf stubs to enable scanning TensorFlow SavedModel files without shipping Keras (and its CVE).
+Replace the full TensorFlow dependency (~2 GB) with lightweight protobuf stubs to enable scanning TensorFlow SavedModel files without shipping Keras (and its CVE).
 
 ## Current TensorFlow Usage Analysis
 
@@ -187,11 +187,11 @@ saved_model.ParseFromString(content)
 
 ## Success Criteria
 
-- [ ] `pip install modelaudit` does not install TensorFlow or Keras
-- [ ] SavedModel scanning works without TensorFlow
-- [ ] No CVE alerts from dependency scanners
-- [ ] All existing tests pass (except checkpoint-specific ones)
-- [ ] Package size reduced by ~2GB
+- [x] `pip install modelaudit` does not install TensorFlow or Keras
+- [x] SavedModel scanning works without TensorFlow
+- [x] No CVE alerts from dependency scanners
+- [x] All existing tests pass (except checkpoint-specific ones)
+- [x] Package size reduced by ~2 GB
 
 ## Timeline
 

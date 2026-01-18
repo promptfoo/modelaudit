@@ -60,10 +60,6 @@ dependencies = [
 tensorflow = [
     "tensorflow>=2.17.0,<3.0; python_version >= '3.11' and python_version < '3.13'",
 ]
-# Full TensorFlow for checkpoint reading (Python 3.11+ only due to Keras CVE)
-tensorflow-full = [
-    "tensorflow>=2.17.0,<3.0; python_version >= '3.11' and python_version < '3.13'",
-]
 h5 = ["h5py>=3.1,<4.0"]
 pytorch = ["torch>=2.6.0,<3.0"]
 yaml = ["pyyaml>=6.0,<7.0"]
