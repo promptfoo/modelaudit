@@ -353,7 +353,8 @@ class WeightDistributionScanner(BaseScanner):
                 data = self._read_file_safely(path)
 
                 # Import vendored protos module (sets up sys.path for tensorflow.* imports)
-                import modelaudit.protos  # noqa: F401
+                # Order matters: modelaudit.protos must be imported first to set up sys.path
+                import modelaudit.protos  # noqa: F401, I001
 
                 from tensorflow.core.framework import graph_pb2
                 from tensorflow.core.protobuf import saved_model_pb2

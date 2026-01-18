@@ -22,13 +22,13 @@ saved_model.ParseFromString(content)
 
 ### 2. `weight_distribution_scanner.py` - Mixed Usage
 
-| Function | Current Code | Replacement Strategy |
-|----------|-------------|---------------------|
-| Protobuf parsing | `saved_model_pb2.SavedModel()` | Standalone protobuf stubs |
-| Protobuf parsing | `graph_pb2.GraphDef()` | Standalone protobuf stubs |
-| Tensor conversion | `tf.make_ndarray(tensor_proto)` | Custom implementation (see below) |
-| Checkpoint reading | `tf.train.list_variables()` | Skip or use tensorflow-io |
-| Checkpoint reading | `tf.train.load_variable()` | Skip or use tensorflow-io |
+| Function           | Current Code                    | Replacement Strategy              |
+| ------------------ | ------------------------------- | --------------------------------- |
+| Protobuf parsing   | `saved_model_pb2.SavedModel()`  | Standalone protobuf stubs         |
+| Protobuf parsing   | `graph_pb2.GraphDef()`          | Standalone protobuf stubs         |
+| Tensor conversion  | `tf.make_ndarray(tensor_proto)` | Custom implementation (see below) |
+| Checkpoint reading | `tf.train.list_variables()`     | Skip or use tensorflow-io         |
+| Checkpoint reading | `tf.train.load_variable()`      | Skip or use tensorflow-io         |
 
 ## Implementation Options
 
@@ -50,6 +50,7 @@ saved_model.ParseFromString(content)
 2. **Vendor the generated `_pb2.py` files** in `modelaudit/protos/tensorflow/`
 
 3. **Implement `make_ndarray` equivalent**:
+
    ```python
    def tensor_proto_to_ndarray(tensor_proto) -> np.ndarray:
        """Convert TensorProto to numpy array without TensorFlow."""
@@ -83,6 +84,7 @@ saved_model.ParseFromString(content)
 3. Still need custom `make_ndarray` implementation
 
 **Concerns**:
+
 - Package is unmaintained (last update: Nov 2022)
 - May not include all required protos
 - Stuck on TensorFlow 2.11 proto definitions
@@ -115,6 +117,7 @@ saved_model.ParseFromString(content)
 ### Phase 1: Protobuf Stubs (Week 1)
 
 1. **Create proto compilation script**:
+
    ```bash
    # scripts/compile_tensorflow_protos.sh
    TF_VERSION="2.18.0"
@@ -129,6 +132,7 @@ saved_model.ParseFromString(content)
 2. **Vendor compiled stubs** in `modelaudit/protos/tensorflow/`
 
 3. **Update imports**:
+
    ```python
    # Before
    from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
@@ -162,24 +166,24 @@ saved_model.ParseFromString(content)
 
 ## Files to Modify
 
-| File | Changes |
-|------|---------|
-| `modelaudit/scanners/tf_savedmodel_scanner.py` | Update imports to use vendored protos |
+| File                                                 | Changes                                   |
+| ---------------------------------------------------- | ----------------------------------------- |
+| `modelaudit/scanners/tf_savedmodel_scanner.py`       | Update imports to use vendored protos     |
 | `modelaudit/scanners/weight_distribution_scanner.py` | Update imports, replace `tf.make_ndarray` |
-| `modelaudit/protos/` | New directory for vendored protobuf stubs |
-| `modelaudit/utils/tensorflow_compat.py` | New file for `tensor_proto_to_ndarray` |
-| `pyproject.toml` | Remove TensorFlow dependency |
-| `scripts/compile_tensorflow_protos.sh` | New script for proto compilation |
-| `tests/` | Update to not require TensorFlow |
+| `modelaudit/protos/`                                 | New directory for vendored protobuf stubs |
+| `modelaudit/utils/tensorflow_compat.py`              | New file for `tensor_proto_to_ndarray`    |
+| `pyproject.toml`                                     | Remove TensorFlow dependency              |
+| `scripts/compile_tensorflow_protos.sh`               | New script for proto compilation          |
+| `tests/`                                             | Update to not require TensorFlow          |
 
 ## Risks and Mitigations
 
-| Risk | Mitigation |
-|------|------------|
-| Proto version drift | Document TF version used; create update automation |
-| Missing dtype support | Comprehensive test coverage for all TensorFlow dtypes |
-| Checkpoint reading loss | Document as limitation; offer full TF as optional |
-| Protobuf compatibility | Pin protobuf version; test across versions |
+| Risk                    | Mitigation                                            |
+| ----------------------- | ----------------------------------------------------- |
+| Proto version drift     | Document TF version used; create update automation    |
+| Missing dtype support   | Comprehensive test coverage for all TensorFlow dtypes |
+| Checkpoint reading loss | Document as limitation; offer full TF as optional     |
+| Protobuf compatibility  | Pin protobuf version; test across versions            |
 
 ## Success Criteria
 

@@ -34,9 +34,9 @@ def _check_protos() -> bool:
     if HAS_PROTOS is None:
         try:
             # Import vendored protos module (sets up sys.path for tensorflow.* imports)
-            import modelaudit.protos  # noqa: F401
+            # Order matters: modelaudit.protos must be imported first to set up sys.path
+            import modelaudit.protos  # noqa: F401, I001
 
-            # Now import using tensorflow.* path (resolves to vendored protos)
             from tensorflow.core.protobuf.saved_model_pb2 import SavedModel  # noqa: F401
 
             HAS_PROTOS = True
@@ -146,7 +146,8 @@ class TensorFlowSavedModelScanner(BaseScanner):
 
         try:
             # Import vendored protos module (sets up sys.path for tensorflow.* imports)
-            import modelaudit.protos  # noqa: F401
+            # Order matters: modelaudit.protos must be imported first to set up sys.path
+            import modelaudit.protos  # noqa: F401, I001
 
             from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
 

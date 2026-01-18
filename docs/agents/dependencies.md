@@ -11,19 +11,19 @@ ModelAudit uses optional dependencies to keep the base installation lightweight:
 
 ## Optional Dependencies
 
-| Feature       | Package        | Purpose                              |
-| ------------- | -------------- | ------------------------------------ |
-| `h5`          | h5py           | Keras H5 model scanning              |
-| `pytorch`     | torch          | PyTorch model scanning               |
-| `yaml`        | pyyaml         | YAML manifest scanning               |
-| `safetensors` | safetensors    | SafeTensors model scanning           |
-| `onnx`        | onnx           | ONNX model scanning                  |
-| `dill`        | dill           | Enhanced pickle support              |
-| `joblib`      | joblib         | Joblib model scanning                |
-| `flax`        | flax           | Flax msgpack scanning                |
-| `tflite`      | tflite-runtime | TensorFlow Lite scanning             |
-| `tensorflow`  | tensorflow     | TF checkpoint reading (rarely needed)|
-| `all`         | All above      | Everything                           |
+| Feature       | Package        | Purpose                               |
+| ------------- | -------------- | ------------------------------------- |
+| `h5`          | h5py           | Keras H5 model scanning               |
+| `pytorch`     | torch          | PyTorch model scanning                |
+| `yaml`        | pyyaml         | YAML manifest scanning                |
+| `safetensors` | safetensors    | SafeTensors model scanning            |
+| `onnx`        | onnx           | ONNX model scanning                   |
+| `dill`        | dill           | Enhanced pickle support               |
+| `joblib`      | joblib         | Joblib model scanning                 |
+| `flax`        | flax           | Flax msgpack scanning                 |
+| `tflite`      | tflite-runtime | TensorFlow Lite scanning              |
+| `tensorflow`  | tensorflow     | TF checkpoint reading (rarely needed) |
+| `all`         | All above      | Everything                            |
 
 ## TensorFlow SavedModel Scanning (No TensorFlow Required)
 
@@ -31,16 +31,19 @@ TensorFlow SavedModel scanning works **without installing TensorFlow** (~2GB). W
 protobuf stubs compiled from TensorFlow's `.proto` files.
 
 **How it works:**
+
 1. If TensorFlow is installed → use its native protos
 2. If TensorFlow is NOT installed → use vendored protos from `modelaudit/protos/`
 
 **What works without TensorFlow:**
+
 - SavedModel structure analysis
 - PyFunc/Lambda layer detection
 - Dangerous operation scanning
 - Keras metadata inspection
 
 **What requires full TensorFlow:**
+
 - Checkpoint reading (`tf.train.list_variables`, `tf.train.load_variable`)
 - Weight distribution analysis on checkpoints
 
@@ -90,6 +93,7 @@ files. They enable SavedModel scanning without the full TensorFlow package.
 ### When to Update
 
 Update protos when:
+
 - TensorFlow releases a new major version with proto changes
 - A new proto field is needed for security scanning
 - Bug reports indicate proto incompatibility
@@ -122,12 +126,12 @@ git commit -m "chore: update vendored TensorFlow protos to v${TF_VERSION}"
 
 ### Files
 
-| Path | Purpose |
-|------|---------|
-| `modelaudit/protos/__init__.py` | Proto loading logic (TF native vs vendored) |
-| `modelaudit/protos/tensorflow/` | 59 vendored `*_pb2.py` files |
-| `modelaudit/utils/tensorflow_compat.py` | `tensor_proto_to_ndarray()` utility |
-| `scripts/compile_tensorflow_protos.sh` | Proto compilation script |
+| Path                                    | Purpose                                     |
+| --------------------------------------- | ------------------------------------------- |
+| `modelaudit/protos/__init__.py`         | Proto loading logic (TF native vs vendored) |
+| `modelaudit/protos/tensorflow/`         | 59 vendored `*_pb2.py` files                |
+| `modelaudit/utils/tensorflow_compat.py` | `tensor_proto_to_ndarray()` utility         |
+| `scripts/compile_tensorflow_protos.sh`  | Proto compilation script                    |
 
 ### Proto Loading Strategy
 

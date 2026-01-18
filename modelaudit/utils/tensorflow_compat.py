@@ -135,7 +135,8 @@ def tensor_proto_to_ndarray(tensor_proto: Any) -> np.ndarray[Any, Any]:
         else:
             arr = np.frombuffer(tensor_proto.tensor_content, dtype=dtype).copy()
 
-        return arr.reshape(shape) if shape else arr
+        result: np.ndarray[Any, Any] = arr.reshape(shape) if shape else arr
+        return result
 
     # Slow path: extract from typed fields
     values: np.ndarray[Any, Any]
@@ -214,8 +215,8 @@ def try_load_vendored_protos() -> tuple[Any, Any] | None:
         Tuple of (SavedModel, GraphDef) classes if available, None otherwise
     """
     try:
-        from modelaudit.protos.tensorflow.core.framework.graph_pb2 import GraphDef
-        from modelaudit.protos.tensorflow.core.protobuf.saved_model_pb2 import SavedModel
+        from modelaudit.protos.tensorflow.core.framework.graph_pb2 import GraphDef  # type: ignore[attr-defined]
+        from modelaudit.protos.tensorflow.core.protobuf.saved_model_pb2 import SavedModel  # type: ignore[attr-defined]
 
         return SavedModel, GraphDef
     except ImportError:

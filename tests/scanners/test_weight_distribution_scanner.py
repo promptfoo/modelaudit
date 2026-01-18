@@ -334,6 +334,10 @@ class TestWeightDistributionScanner:
 
         import tensorflow as tf
 
+        # Skip if tf.keras is not available (newer TensorFlow versions separate Keras)
+        if not hasattr(tf, "keras"):
+            pytest.skip("tf.keras not available (Keras may be a separate package)")
+
         scanner = WeightDistributionScanner()
 
         model = tf.keras.Sequential([tf.keras.layers.Dense(2, input_shape=(3,))])  # type: ignore[call-arg]

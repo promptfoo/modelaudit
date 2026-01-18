@@ -84,16 +84,16 @@ NO_COLOR=1 modelaudit model.pkl
 
 ## CI Job Matrix
 
-| Job | Purpose | When Runs |
-|-----|---------|-----------|
-| `lint` | Ruff format/lint checks | Python files changed |
-| `type-check` | mypy + circular import check | Python files changed |
-| `quick-feedback` | Fast tests (Python 3.12) | Python files changed |
-| `windows-tests` | Windows compatibility | Python files changed |
-| `test` | Full test matrix (Python 3.10-3.13) | Python files changed |
-| `test-numpy-compatibility` | NumPy 1.x/2.x compat | Main branch or deps changed |
-| `test-vendored-protos` | TensorFlow protos without TF | Main branch or python/deps changed |
-| `build` | Package build | Python or deps changed |
+| Job                        | Purpose                             | When Runs                          |
+| -------------------------- | ----------------------------------- | ---------------------------------- |
+| `lint`                     | Ruff format/lint checks             | Python files changed               |
+| `type-check`               | mypy + circular import check        | Python files changed               |
+| `quick-feedback`           | Fast tests (Python 3.12)            | Python files changed               |
+| `windows-tests`            | Windows compatibility               | Python files changed               |
+| `test`                     | Full test matrix (Python 3.10-3.13) | Python files changed               |
+| `test-numpy-compatibility` | NumPy 1.x/2.x compat                | Main branch or deps changed        |
+| `test-vendored-protos`     | TensorFlow protos without TF        | Main branch or python/deps changed |
+| `build`                    | Package build                       | Python or deps changed             |
 
 ## Vendored TensorFlow Protos CI
 
