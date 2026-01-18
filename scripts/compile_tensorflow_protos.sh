@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# Compile TensorFlow protobuf definitions into standalone Python stubs
+# This eliminates the need for the full TensorFlow package (and avoiding Keras CVE exposure)
+#
+# IMPORTANT: The generated protos must keep their original import paths (tensorflow.*)
+# because the protobuf descriptor pool uses file paths internally. We add these to
+# sys.path at import time instead of renaming imports.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+OUTPUT_DIR="$PROJECT_ROOT/modelaudit/protos"
+TEMP_DIR=$(mktemp -d)
+
+# TensorFlow version to extract protos from
+TF_VERSION="${TF_VERSION:-2.18.0}"
+
+echo "=== TensorFlow Protobuf Compiler ==="
+echo "TensorFlow version: $TF_VERSION"
+echo "Output directory: $OUTPUT_DIR"
+echo ""
+
+# Cleanup on exit
+cleanup() {
+    rm -rf "$TEMP_DIR"
+}
+trap cleanup EXIT
+
+cd "$TEMP_DIR"
+
+echo "Downloading TensorFlow proto definitions..."
+git clone --depth 1 --branch "v$TF_VERSION" --filter=blob:none --sparse \
+    https://github.com/tensorflow/tensorflow.git tf
+
+cd tf
+git sparse-checkout set tensorflow/core/protobuf tensorflow/core/framework
+
+echo ""
+echo "Proto files to compile:"
+find tensorflow/core -name "*.proto" | head -20
+echo "..."
+echo ""
+
+# Clean and recreate output directory structure
+rm -rf "$OUTPUT_DIR/tensorflow"
+mkdir -p "$OUTPUT_DIR/tensorflow/core/protobuf"
+mkdir -p "$OUTPUT_DIR/tensorflow/core/framework"
+
+echo "Compiling protobuf files..."
+
+# Compile ALL proto files in the framework directory
+echo "  Compiling framework protos..."
+for proto in tensorflow/core/framework/*.proto; do
+    if [[ -f "$proto" ]]; then
+        protoc --python_out="$OUTPUT_DIR" -I. "$proto" 2>/dev/null || true
+    fi
+done
+
+# Compile ALL proto files in the protobuf directory
+echo "  Compiling protobuf protos..."
+for proto in tensorflow/core/protobuf/*.proto; do
+    if [[ -f "$proto" ]]; then
+        protoc --python_out="$OUTPUT_DIR" -I. "$proto" 2>/dev/null || true
+    fi
+done
+
+# Create __init__.py files for proper Python packaging
+find "$OUTPUT_DIR" -type d -exec touch {}/__init__.py \;
+
+# DON'T patch imports - keep original tensorflow.* imports
+# We'll add modelaudit/protos to sys.path at runtime instead
+
+echo ""
+echo "Creating type stubs..."
+
+# Create a py.typed marker for PEP 561
+touch "$OUTPUT_DIR/py.typed"
+
+echo ""
+echo "=== Compilation Complete ==="
+echo ""
+echo "Generated files:"
+find "$OUTPUT_DIR" -name "*.py" | wc -l
+echo " Python files"
+echo ""
+echo "To use in code:"
+echo "  import sys"
+echo "  sys.path.insert(0, 'path/to/modelaudit/protos')"
+echo "  from tensorflow.core.protobuf.saved_model_pb2 import SavedModel"

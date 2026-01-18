@@ -318,17 +318,24 @@ class WeightDistributionScanner(BaseScanner):
         return weights_info
 
     def _extract_tensorflow_weights(self, path: str) -> dict[str, Any]:
-        """Extract weights from TensorFlow SavedModel files"""
-        try:
-            import numpy as np
-            import tensorflow as tf
-        except ImportError:
-            return {}
+        """Extract weights from TensorFlow SavedModel files.
+
+        Uses vendored protobuf stubs when available, falling back to full TensorFlow.
+        Checkpoint reading (for SavedModel directories) requires full TensorFlow.
+        """
+        import numpy as np
 
         weights_info: dict[str, Any] = {}
 
         try:
             if os.path.isdir(path):
+                # Checkpoint reading requires full TensorFlow - no lightweight alternative
+                try:
+                    import tensorflow as tf
+                except ImportError:
+                    logger.debug(f"Checkpoint reading requires TensorFlow: {path}")
+                    return {}
+
                 ckpt_prefix = os.path.join(path, "variables", "variables")
                 if os.path.exists(ckpt_prefix + ".index"):
                     for name, _shape in tf.train.list_variables(ckpt_prefix):
@@ -342,9 +349,16 @@ class WeightDistributionScanner(BaseScanner):
                         if len(array.shape) >= 2:
                             weights_info[name] = array
             else:
+                # For .pb files, use vendored protos
                 data = self._read_file_safely(path)
+
+                # Import vendored protos module (sets up sys.path for tensorflow.* imports)
+                import modelaudit.protos  # noqa: F401
+
                 from tensorflow.core.framework import graph_pb2
                 from tensorflow.core.protobuf import saved_model_pb2
+
+                from modelaudit.utils.tensorflow_compat import tensor_proto_to_ndarray
 
                 nodes: list[Any] = []
                 saved_model = saved_model_pb2.SavedModel()
@@ -364,7 +378,7 @@ class WeightDistributionScanner(BaseScanner):
                 for node in nodes:
                     if node.op == "Const" and "value" in node.attr:
                         tensor_proto = node.attr["value"].tensor
-                        array = tf.make_ndarray(tensor_proto)
+                        array = tensor_proto_to_ndarray(tensor_proto)
                         if self.max_array_size and self.max_array_size > 0 and array.nbytes > self.max_array_size:
                             continue
                         if ("weight" in node.name.lower() or "kernel" in node.name.lower()) and len(array.shape) >= 2:

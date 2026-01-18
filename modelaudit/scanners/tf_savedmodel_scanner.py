@@ -24,21 +24,25 @@ DANGEROUS_TF_OPERATIONS = {
 # Python operations that require special handling
 PYTHON_OPS = ("PyFunc", "PyCall", "PyFuncStateless", "EagerPyFunc")
 
-# Defer TensorFlow availability check to avoid module-level imports
-HAS_TENSORFLOW: bool | None = None
+# Defer protobuf availability check to avoid module-level imports
+HAS_PROTOS: bool | None = None
 
 
-def _check_tensorflow() -> bool:
-    """Check if TensorFlow is available, with caching."""
-    global HAS_TENSORFLOW
-    if HAS_TENSORFLOW is None:
+def _check_protos() -> bool:
+    """Check if TensorFlow protobuf stubs are available (vendored or from TensorFlow)."""
+    global HAS_PROTOS
+    if HAS_PROTOS is None:
         try:
-            import tensorflow as tf  # noqa: F401
+            # Import vendored protos module (sets up sys.path for tensorflow.* imports)
+            import modelaudit.protos  # noqa: F401
 
-            HAS_TENSORFLOW = True
+            # Now import using tensorflow.* path (resolves to vendored protos)
+            from tensorflow.core.protobuf.saved_model_pb2 import SavedModel  # noqa: F401
+
+            HAS_PROTOS = True
         except ImportError:
-            HAS_TENSORFLOW = False
-    return HAS_TENSORFLOW
+            HAS_PROTOS = False
+    return HAS_PROTOS
 
 
 # Create a placeholder for type hints when TensorFlow is not available
@@ -66,7 +70,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
     @classmethod
     def can_handle(cls, path: str) -> bool:
         """Check if this scanner can handle the given path"""
-        if not _check_tensorflow():
+        if not _check_protos():
             return False
 
         if os.path.isfile(path):
@@ -93,7 +97,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
         self.current_file_path = path
 
         # Check if TensorFlow is installed
-        if not _check_tensorflow():
+        if not _check_protos():
             result = self._create_result()
             result.add_check(
                 name="TensorFlow Library Check",
@@ -141,7 +145,9 @@ class TensorFlowSavedModelScanner(BaseScanner):
             return result
 
         try:
-            # Import the actual SavedModel from TensorFlow
+            # Import vendored protos module (sets up sys.path for tensorflow.* imports)
+            import modelaudit.protos  # noqa: F401
+
             from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
 
             with open(path, "rb") as f:
