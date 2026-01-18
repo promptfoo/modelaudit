@@ -23,6 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **BREAKING (Python 3.10 only)**: Remove TensorFlow/Keras support for Python 3.10 due to Keras CVE (Allocation of Resources Without Limits or Throttling in HDF5 weight loading component, Keras versions 3.0.0-3.13.0). The patched version (Keras 3.13.1) requires Python >=3.11, creating an unsolvable dependency conflict for Python 3.10 users. Python 3.10 users can still scan all other model formats (PyTorch, ONNX, SafeTensors, XGBoost, etc.). **Upgrade to Python 3.11+ for full TensorFlow/Keras scanning support.** See [Dependabot alert #19](https://github.com/promptfoo/modelaudit/security/dependabot/19) for details.
+
 ### Changed
 
 - **deps**: update xgboost to v3.1.2 (from >=1.6.0,<3.0 to >=3.1.2,<3.2) - major version upgrade with no breaking changes affecting ModelAudit's usage

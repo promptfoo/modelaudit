@@ -53,10 +53,11 @@ dependencies = [
 
 [project.optional-dependencies]
 # TensorFlow version depends on Python version:
-# - Python 3.10: TensorFlow 2.13+ (NumPy 1.x compatible)
-# - Python 3.11+: TensorFlow 2.17+ (NumPy 2.x required)
+# - Python 3.10: TensorFlow UNAVAILABLE (Keras 3.13.1+ requires Python >=3.11 for CVE fix)
+#   See: https://github.com/promptfoo/modelaudit/security/dependabot/19
+#   Keras CVE: Allocation of Resources Without Limits or Throttling in HDF5 weight loading
+# - Python 3.11+: TensorFlow 2.17+ (NumPy 2.x required, Keras 3.13.1+ with security fix)
 tensorflow = [
-    "tensorflow>=2.13.0,<3.0; python_version == '3.10'",
     "tensorflow>=2.17.0,<3.0; python_version >= '3.11' and python_version < '3.13'",
 ]
 h5 = ["h5py>=3.1,<4.0"]
@@ -74,12 +75,11 @@ mlflow = ["mlflow>=2.12.0"]
 huggingface = ["huggingface-hub>=0.23.0"]
 sevenzip = ["py7zr>=0.20.0"]
 # Full ML framework bundle with version-appropriate NumPy:
-# - Python 3.10: NumPy 1.x + TensorFlow 2.13+
+# - Python 3.10: NumPy 1.x (TensorFlow unavailable due to Keras CVE)
 # - Python 3.11+: NumPy 2.x + TensorFlow 2.17+
 numpy1 = [
     "numpy>=1.19.0,<2.0; python_version == '3.10'",
     "numpy>=2.4,<2.5; python_version >= '3.11'",
-    "tensorflow>=2.13.0,<3.0; python_version == '3.10'",
     "tensorflow>=2.17.0,<3.0; python_version >= '3.11' and python_version < '3.13'",
     "h5py>=3.1,<4.0",
     "torch>=2.6.0,<3.0",
@@ -96,7 +96,6 @@ numpy1 = [
 # All dependencies except platform-specific ones (for CI)
 # TensorFlow version depends on Python version (see tensorflow extra above)
 all-ci = [
-    "tensorflow>=2.13.0,<3.0; python_version == '3.10'",
     "tensorflow>=2.17.0,<3.0; python_version >= '3.11' and python_version < '3.13'",
     "h5py>=3.1,<4.0",
     "torch>=2.6.0,<3.0",
@@ -121,7 +120,6 @@ all-ci-windows = [
     "safetensors>=0.4.0",
 ]
 all = [
-    "tensorflow>=2.13.0,<3.0; python_version == '3.10'",
     "tensorflow>=2.17.0,<3.0; python_version >= '3.11' and python_version < '3.13'",
     "h5py>=3.1,<4.0",
     "torch>=2.6.0,<3.0",

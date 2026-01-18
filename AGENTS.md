@@ -93,10 +93,10 @@ ModelAudit supports both NumPy 1.x and 2.x using conditional dependencies based 
 
 **Current Strategy (January 2025 → October 2026):**
 
-- **Python 3.10**: NumPy 1.x (1.19.0–1.26.x) + TensorFlow 2.13+
-- **Python 3.11+**: NumPy 2.x (2.4–2.5) + TensorFlow 2.17+
+- **Python 3.10**: NumPy 1.x (1.19.0–1.26.x), **TensorFlow UNAVAILABLE** (Keras CVE requires patched version with Python >=3.11)
+- **Python 3.11+**: NumPy 2.x (2.4–2.5) + TensorFlow 2.17+ (with Keras 3.13.1+ security fix)
 
-**Why:** NumPy 2.4+ requires Python ≥3.11, but Python 3.10 is supported until October 2026. Dropping 3.10 support prematurely would be a breaking change.
+**Why:** NumPy 2.4+ requires Python ≥3.11, but Python 3.10 is supported until October 2026. Dropping 3.10 support prematurely would be a breaking change. **As of January 2025**, TensorFlow/Keras support is unavailable for Python 3.10 due to a security vulnerability in Keras 3.0.0-3.13.0 (CVE pending). The patched version (Keras 3.13.1) requires Python >=3.11, creating an unsolvable dependency conflict for Python 3.10.
 
 **Timeline:**
 
@@ -114,8 +114,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# TensorFlow unavailable for Python 3.10 due to Keras CVE
+# See: https://github.com/promptfoo/modelaudit/security/dependabot/19
 tensorflow = [
-    "tensorflow>=2.13.0,<3.0; python_version == '3.10'",
     "tensorflow>=2.17.0,<3.0; python_version >= '3.11' and python_version < '3.13'",
 ]
 ```
