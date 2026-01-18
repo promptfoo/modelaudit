@@ -196,7 +196,7 @@ ignore = [
 "__init__.py" = ["F401"]
 "tests/**/*.py" = ["S101", "F841"]
 # Auto-generated protobuf files - ignore line length, quotes, and other style issues
-"modelaudit/protos/**/*_pb2.py" = ["E501", "E701", "E711", "E712", "E721", "F401", "F811", "W", "Q", "UP"]
+"modelaudit/protos/**/*_pb2.py" = ["E402", "E501", "E701", "E711", "E712", "E721", "F401", "F811", "I001", "W", "Q", "UP"]
 
 [tool.ruff.lint.flake8-quotes]
 # Standardize on double quotes for consistency with docstrings
@@ -208,6 +208,8 @@ avoid-escape = true
 [tool.ruff.format]
 # Black-compatible formatting
 quote-style = "double"
+# Exclude auto-generated protobuf files from formatting
+exclude = ["modelaudit/protos/**/*_pb2.py"]
 
 [tool.pytest.ini_options]
 minversion = "7.0"
