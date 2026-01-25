@@ -1141,8 +1141,8 @@ def _decode_string_to_bytes(s: str) -> list[tuple[str, bytes]]:
             decoded = binascii.unhexlify(hex_str)
             if len(decoded) >= 8:  # At least 8 bytes
                 candidates.append(("hex", decoded))
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Failed to decode potential hex string: %s", e)
 
     return candidates
 
