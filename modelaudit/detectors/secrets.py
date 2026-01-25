@@ -11,7 +11,7 @@ import math
 import re
 from typing import Any
 
-logger = logging.getLogger(__name__)
+logger: logging.Logger = logging.getLogger(__name__)
 
 # High-priority secret patterns with descriptions
 SECRET_PATTERNS: list[tuple[str, str]] = [
