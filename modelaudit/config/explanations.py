@@ -294,21 +294,21 @@ TF_OP_EXPLANATIONS = {
         "exfiltration vector or to inject malicious data into the inference pipeline."
     ),
     "QueueEnqueueMany": (
-        "QueueEnqueueMany batch enqueues data to TensorFlow queues, which could be used as a high-throughput "
-        "data exfiltration vector to send large amounts of sensitive information."
+        "QueueEnqueueMany batch enqueues data to TensorFlow queues, which attackers could abuse as a "
+        "high-throughput data exfiltration vector to send large amounts of sensitive information."
     ),
     "QueueDequeueMany": (
-        "QueueDequeueMany batch dequeues data from TensorFlow queues, which could be used as a high-throughput "
-        "data exfiltration vector or to inject large amounts of malicious data."
+        "QueueDequeueMany batch dequeues data from TensorFlow queues, which attackers could abuse as a "
+        "high-throughput data exfiltration vector or to inject large amounts of malicious data."
     ),
     # Side-channel operations - MEDIUM RISK
     "Print": (
-        "Print outputs data to stdout, which could be used as a side-channel to leak sensitive information "
-        "such as model parameters, input data, or system information."
+        "Print outputs data to stdout, which attackers could abuse as a side-channel to leak sensitive "
+        "information such as model parameters, input data, or system information."
     ),
     "PrintV2": (
-        "PrintV2 outputs data to stdout (V2 variant), which could be used as a side-channel to leak sensitive "
-        "information such as model parameters, input data, or system information."
+        "PrintV2 outputs data to stdout (V2 variant), which attackers could abuse as a side-channel to leak "
+        "sensitive information such as model parameters, input data, or system information."
     ),
     # Denial of service operations - MEDIUM RISK
     "Assert": (
