@@ -374,7 +374,7 @@ class TestJinja2TemplateScannerEdgeCases:
         }
 
         tokenizer_file = tmp_path / "tokenizer_config.json"
-        tokenizer_file.write_text(json.dumps(config, ensure_ascii=False))
+        tokenizer_file.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
 
         scanner = Jinja2TemplateScanner()
         result = scanner.scan(str(tokenizer_file))
