@@ -1,6 +1,7 @@
 """Tests for code validation utilities."""
 
 from modelaudit.utils.helpers.code_validation import (
+    detect_variadic_lambda,
     extract_dangerous_constructs,
     is_code_potentially_dangerous,
     validate_python_syntax,
@@ -147,6 +148,32 @@ print(result)
         assert not constructs["file_operations"]
         assert not constructs["subprocess_operations"]
         assert not constructs["network_operations"]
+        assert not constructs["variadic_lambdas"]
+
+    def test_detects_lambda_with_args(self):
+        """Test detection of lambda with *args."""
+        code = "f = lambda *args: sum(args)"
+        constructs = extract_dangerous_constructs(code)
+        assert "*args" in constructs["variadic_lambdas"]
+
+    def test_detects_lambda_with_kwargs(self):
+        """Test detection of lambda with **kwargs."""
+        code = "f = lambda **kwargs: kwargs.get('key')"
+        constructs = extract_dangerous_constructs(code)
+        assert "**kwargs" in constructs["variadic_lambdas"]
+
+    def test_detects_lambda_with_both_variadic(self):
+        """Test detection of lambda with both *args and **kwargs."""
+        code = "f = lambda *args, **kwargs: (args, kwargs)"
+        constructs = extract_dangerous_constructs(code)
+        assert "*args" in constructs["variadic_lambdas"]
+        assert "**kwargs" in constructs["variadic_lambdas"]
+
+    def test_allows_simple_lambda(self):
+        """Test that simple lambdas without variadic args are not flagged."""
+        code = "f = lambda x, y: x + y"
+        constructs = extract_dangerous_constructs(code)
+        assert not constructs["variadic_lambdas"]
 
     def test_invalid_code(self):
         """Test handling of invalid code."""
@@ -218,3 +245,56 @@ open("/tmp/test", "w")
         assert "Subprocess operations" in description
         assert "File operations" in description
         assert "Dangerous imports" in description
+
+    def test_variadic_lambda_risk(self):
+        """Test that variadic lambdas are included in risk assessment."""
+        code = "f = lambda *args, **kwargs: sum(args)"
+        _, description = is_code_potentially_dangerous(code, "low")
+        assert "Variadic lambdas" in description
+        assert "*args" in description or "**kwargs" in description
+
+
+class TestDetectVariadicLambda:
+    """Test variadic lambda detection function."""
+
+    def test_detects_args(self):
+        """Test detection of *args in lambda."""
+        code = "f = lambda *args: args[0]"
+        has_variadic, descriptions = detect_variadic_lambda(code)
+        assert has_variadic is True
+        assert any("*args" in d for d in descriptions)
+
+    def test_detects_kwargs(self):
+        """Test detection of **kwargs in lambda."""
+        code = "g = lambda **kwargs: kwargs"
+        has_variadic, descriptions = detect_variadic_lambda(code)
+        assert has_variadic is True
+        assert any("**kwargs" in d for d in descriptions)
+
+    def test_detects_both(self):
+        """Test detection of both *args and **kwargs."""
+        code = "h = lambda *a, **kw: (a, kw)"
+        has_variadic, descriptions = detect_variadic_lambda(code)
+        assert has_variadic is True
+        assert len(descriptions) == 2
+
+    def test_simple_lambda_not_flagged(self):
+        """Test that simple lambdas are not flagged."""
+        code = "f = lambda x, y, z: x + y + z"
+        has_variadic, descriptions = detect_variadic_lambda(code)
+        assert has_variadic is False
+        assert len(descriptions) == 0
+
+    def test_handles_invalid_syntax(self):
+        """Test graceful handling of invalid syntax."""
+        code = "lambda *args: invalid syntax {"
+        has_variadic, descriptions = detect_variadic_lambda(code)
+        assert has_variadic is False
+        assert len(descriptions) == 0
+
+    def test_nested_lambda(self):
+        """Test detection in nested lambdas."""
+        code = "f = lambda x: (lambda *args: sum(args))"
+        has_variadic, descriptions = detect_variadic_lambda(code)
+        assert has_variadic is True
+        assert any("*args" in d for d in descriptions)

@@ -50,6 +50,55 @@ def validate_python_syntax(code: str, filename: str = "<string>") -> tuple[bool,
         return False, f"Validation error: {e!s}"
 
 
+def detect_variadic_lambda(code: str) -> tuple[bool, list[str]]:
+    """
+    Detect if code contains lambda expressions with variadic arguments.
+
+    Variadic arguments (*args, **kwargs) in lambdas can enable tuple unpacking
+    exploits that bypass normal validation by allowing arbitrary argument counts.
+
+    Args:
+        code: Python code string to analyze
+
+    Returns:
+        Tuple of (has_variadic, descriptions)
+        - has_variadic: True if variadic lambda patterns found
+        - descriptions: List of descriptions of found patterns
+    """
+    found_patterns: list[str] = []
+
+    try:
+        tree = ast.parse(code)
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Lambda):
+                args = node.args
+
+                # Check for *args (vararg)
+                if args.vararg is not None:
+                    arg_name = args.vararg.arg
+                    found_patterns.append(f"Lambda with *{arg_name} (variadic positional)")
+
+                # Check for **kwargs (kwarg)
+                if args.kwarg is not None:
+                    arg_name = args.kwarg.arg
+                    found_patterns.append(f"Lambda with **{arg_name} (variadic keyword)")
+
+                # Check for *-only separator (posonlyargs boundary)
+                # This is less dangerous but still worth noting
+                if args.posonlyargs:
+                    found_patterns.append("Lambda with positional-only arguments")
+
+    except SyntaxError:
+        # If code is invalid, we can't parse it
+        pass
+    except Exception:
+        # Handle other parsing errors gracefully
+        pass
+
+    return len(found_patterns) > 0, found_patterns
+
+
 def extract_dangerous_constructs(code: str) -> dict[str, list[str]]:
     """
     Extract potentially dangerous constructs from Python code.
@@ -67,6 +116,7 @@ def extract_dangerous_constructs(code: str) -> dict[str, list[str]]:
         "file_operations": [],
         "network_operations": [],
         "subprocess_operations": [],
+        "variadic_lambdas": [],
     }
 
     try:
@@ -113,6 +163,14 @@ def extract_dangerous_constructs(code: str) -> dict[str, list[str]]:
                         elif module == "socket" and method in ["socket", "connect"]:
                             dangerous["network_operations"].append(f"{module}.{method}")
 
+            # Check for variadic lambdas (can enable tuple unpacking exploits)
+            elif isinstance(node, ast.Lambda):
+                args = node.args
+                if args.vararg is not None:
+                    dangerous["variadic_lambdas"].append(f"*{args.vararg.arg}")
+                if args.kwarg is not None:
+                    dangerous["variadic_lambdas"].append(f"**{args.kwarg.arg}")
+
     except Exception:
         # If parsing fails, we can't analyze the code
         pass
@@ -153,6 +211,12 @@ def is_code_potentially_dangerous(code: str, threshold: str = "medium") -> tuple
     if constructs["network_operations"]:
         risk_score += 5 * len(constructs["network_operations"])
         risks.append(f"Network operations: {', '.join(constructs['network_operations'])}")
+
+    if constructs["variadic_lambdas"]:
+        risk_score += 4 * len(constructs["variadic_lambdas"])
+        risks.append(
+            f"Variadic lambdas (potential tuple unpacking exploit): {', '.join(constructs['variadic_lambdas'])}"
+        )
 
     # Low risk items
     if constructs["imports"]:
