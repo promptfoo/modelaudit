@@ -684,7 +684,7 @@ def scan_model_directory_or_file(
                         continue
 
                     # Skip non-model files early if filtering is enabled
-                    skip_file_types = config.get("skip_file_types", True)
+                    # Note: skip_file_types parameter already contains the correct value
                     if skip_file_types and should_skip_file(
                         file_path, metadata_scanner_available=metadata_scanner_available
                     ):
