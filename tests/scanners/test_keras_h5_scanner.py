@@ -352,3 +352,67 @@ def test_regression_no_false_positives_for_legitimate_files(tmp_path):
         assert len(high_severity_issues) == 0, f"{file_type} should not generate warnings/errors"
 
         # DEBUG messages are OK for non-Keras files
+
+
+def test_keras_h5_scanner_detects_subclassed_model(tmp_path):
+    """Test that scanner detects subclassed models with custom class names."""
+    h5_path = tmp_path / "model.h5"
+
+    with h5py.File(h5_path, "w") as f:
+        # Create a model with a custom (subclassed) class name
+        model_config = {
+            "class_name": "MyCustomModel",  # Subclassed model
+            "config": {
+                "name": "my_custom_model",
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "config": {"units": 10, "activation": "relu"},
+                    },
+                ],
+            },
+        }
+        f.attrs["model_config"] = json.dumps(model_config)
+
+    scanner = KerasH5Scanner()
+    result = scanner.scan(str(h5_path))
+
+    # Should detect subclassed model
+    subclass_issues = [i for i in result.issues if "subclassed" in i.message.lower()]
+    assert len(subclass_issues) > 0
+    assert subclass_issues[0].severity == IssueSeverity.WARNING
+
+
+def test_keras_h5_scanner_allows_known_safe_classes(tmp_path):
+    """Test that scanner passes for known safe model classes."""
+    from modelaudit.scanners.base import CheckStatus
+
+    for model_class in ["Sequential", "Functional", "Model"]:
+        h5_path = tmp_path / f"model_{model_class}.h5"
+
+        with h5py.File(h5_path, "w") as f:
+            model_config = {
+                "class_name": model_class,
+                "config": {
+                    "name": "test_model",
+                    "layers": [
+                        {
+                            "class_name": "Dense",
+                            "config": {"units": 10, "activation": "relu"},
+                        },
+                    ],
+                },
+            }
+            f.attrs["model_config"] = json.dumps(model_config)
+
+        scanner = KerasH5Scanner()
+        result = scanner.scan(str(h5_path))
+
+        # Should not flag known safe classes
+        subclass_issues = [i for i in result.issues if "subclassed" in i.message.lower()]
+        assert len(subclass_issues) == 0, f"{model_class} should not be flagged as subclassed"
+
+        # Check should pass
+        subclass_checks = [c for c in result.checks if "subclassed" in c.name.lower()]
+        assert len(subclass_checks) > 0
+        assert all(c.status == CheckStatus.PASSED for c in subclass_checks)
