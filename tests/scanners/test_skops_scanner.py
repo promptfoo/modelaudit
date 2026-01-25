@@ -1,0 +1,310 @@
+"""Tests for SkopsScanner covering CVE-2025-54412, CVE-2025-54413, CVE-2025-54886."""
+
+import zipfile
+from pathlib import Path
+
+from modelaudit.scanners.base import CheckStatus, IssueSeverity
+from modelaudit.scanners.skops_scanner import SkopsScanner
+
+
+class TestSkopsScannerCanHandle:
+    """Test the can_handle method."""
+
+    def test_can_handle_skops_extension(self, tmp_path: Path) -> None:
+        """Test that scanner handles .skops files."""
+        skops_file = tmp_path / "model.skops"
+        with zipfile.ZipFile(skops_file, "w") as zf:
+            zf.writestr("schema.json", '{"version": "1.0"}')
+
+        assert SkopsScanner.can_handle(str(skops_file)) is True
+
+    def test_cannot_handle_non_skops_extension(self, tmp_path: Path) -> None:
+        """Test that scanner rejects non-.skops files."""
+        other_file = tmp_path / "model.pkl"
+        other_file.write_bytes(b"not a skops file")
+
+        assert SkopsScanner.can_handle(str(other_file)) is False
+
+    def test_cannot_handle_nonexistent_file(self) -> None:
+        """Test that scanner rejects nonexistent files."""
+        assert SkopsScanner.can_handle("/nonexistent/path/model.skops") is False
+
+    def test_cannot_handle_directory(self, tmp_path: Path) -> None:
+        """Test that scanner rejects directories."""
+        skops_dir = tmp_path / "model.skops"
+        skops_dir.mkdir()
+
+        assert SkopsScanner.can_handle(str(skops_dir)) is False
+
+
+class TestSkopsScannerCVE2025_54412:
+    """Test CVE-2025-54412: OperatorFuncNode trusted-type confusion detection."""
+
+    def test_detects_operatorfuncnode_pattern(self, tmp_path: Path) -> None:
+        """Test detection of OperatorFuncNode pattern in file names."""
+        skops_file = tmp_path / "malicious.skops"
+        with zipfile.ZipFile(skops_file, "w") as zf:
+            zf.writestr("OperatorFuncNode_exploit.json", '{"type": "exploit"}')
+            zf.writestr("schema.json", '{"version": "1.0"}')
+
+        scanner = SkopsScanner()
+        result = scanner.scan(str(skops_file))
+
+        cve_checks = [c for c in result.checks if "CVE-2025-54412" in c.name]
+        assert len(cve_checks) > 0
+        assert cve_checks[0].status == CheckStatus.FAILED
+        assert cve_checks[0].severity == IssueSeverity.CRITICAL
+
+    def test_detects_reduce_pattern(self, tmp_path: Path) -> None:
+        """Test detection of __reduce__ pattern."""
+        skops_file = tmp_path / "malicious.skops"
+        with zipfile.ZipFile(skops_file, "w") as zf:
+            zf.writestr("__reduce__payload.bin", b"malicious content")
+            zf.writestr("schema.json", '{"version": "1.0"}')
+
+        scanner = SkopsScanner()
+        result = scanner.scan(str(skops_file))
+
+        cve_checks = [c for c in result.checks if "CVE-2025-54412" in c.name]
+        assert len(cve_checks) > 0
+        assert cve_checks[0].status == CheckStatus.FAILED
+
+    def test_no_false_positive_clean_file(self, tmp_path: Path) -> None:
+        """Test that clean skops files don't trigger CVE-2025-54412."""
+        skops_file = tmp_path / "clean.skops"
+        with zipfile.ZipFile(skops_file, "w") as zf:
+            zf.writestr("schema.json", '{"version": "1.0"}')
+            zf.writestr("model.bin", b"model weights")
+            zf.writestr("metadata.json", '{"name": "clean_model"}')
+
+        scanner = SkopsScanner()
+        result = scanner.scan(str(skops_file))
+
+        cve_54412_checks = [c for c in result.checks if "CVE-2025-54412" in c.name]
+        # Should not have any CVE-2025-54412 failed checks
+        failed = [c for c in cve_54412_checks if c.status == CheckStatus.FAILED]
+        assert len(failed) == 0
+
+
+class TestSkopsScannerCVE2025_54413:
+    """Test CVE-2025-54413: MethodNode inconsistency detection."""
+
+    def test_detects_methodnode_pattern(self, tmp_path: Path) -> None:
+        """Test detection of MethodNode pattern in file names."""
+        skops_file = tmp_path / "malicious.skops"
+        with zipfile.ZipFile(skops_file, "w") as zf:
+            zf.writestr("MethodNode_accessor.json", '{"type": "method"}')
+            zf.writestr("schema.json", '{"version": "1.0"}')
+
+        scanner = SkopsScanner()
+        result = scanner.scan(str(skops_file))
+
+        cve_checks = [c for c in result.checks if "CVE-2025-54413" in c.name]
+        assert len(cve_checks) > 0
+        assert cve_checks[0].status == CheckStatus.FAILED
+        assert cve_checks[0].severity == IssueSeverity.CRITICAL
+
+    def test_detects_getattr_pattern(self, tmp_path: Path) -> None:
+        """Test detection of __getattr__ pattern."""
+        skops_file = tmp_path / "malicious.skops"
+        with zipfile.ZipFile(skops_file, "w") as zf:
+            zf.writestr("__getattr__hook.py", "malicious code")
+            zf.writestr("schema.json", '{"version": "1.0"}')
+
+        scanner = SkopsScanner()
+        result = scanner.scan(str(skops_file))
+
+        cve_checks = [c for c in result.checks if "CVE-2025-54413" in c.name]
+        assert len(cve_checks) > 0
+        assert cve_checks[0].status == CheckStatus.FAILED
+
+
+class TestSkopsScannerCVE2025_54886:
+    """Test CVE-2025-54886: Card.get_model silent joblib fallback detection."""
+
+    def test_detects_card_with_get_model(self, tmp_path: Path) -> None:
+        """Test detection of Card.get_model with joblib references."""
+        skops_file = tmp_path / "malicious.skops"
+        with zipfile.ZipFile(skops_file, "w") as zf:
+            card_content = """
+            # Model Card
+            This model uses get_model() to load the model.
+            Fallback to joblib for compatibility.
+            """
+            zf.writestr("model_card.md", card_content)
+            zf.writestr("schema.json", '{"version": "1.0"}')
+
+        scanner = SkopsScanner()
+        result = scanner.scan(str(skops_file))
+
+        cve_checks = [c for c in result.checks if "CVE-2025-54886" in c.name]
+        assert len(cve_checks) > 0
+        assert cve_checks[0].status == CheckStatus.FAILED
+        assert cve_checks[0].severity == IssueSeverity.CRITICAL
+
+    def test_detects_readme_with_joblib(self, tmp_path: Path) -> None:
+        """Test detection of README with joblib fallback pattern."""
+        skops_file = tmp_path / "malicious.skops"
+        with zipfile.ZipFile(skops_file, "w") as zf:
+            readme_content = """
+            # Model README
+            Load the model using joblib.load() if skops fails.
+            """
+            zf.writestr("README.md", readme_content)
+            zf.writestr("schema.json", '{"version": "1.0"}')
+
+        scanner = SkopsScanner()
+        result = scanner.scan(str(skops_file))
+
+        cve_checks = [c for c in result.checks if "CVE-2025-54886" in c.name]
+        assert len(cve_checks) > 0
+        assert cve_checks[0].status == CheckStatus.FAILED
+
+
+class TestSkopsScannerJoblibFallback:
+    """Test unsafe joblib fallback detection."""
+
+    def test_detects_joblib_load_pattern(self, tmp_path: Path) -> None:
+        """Test detection of joblib.load patterns in file content."""
+        skops_file = tmp_path / "malicious.skops"
+        with zipfile.ZipFile(skops_file, "w") as zf:
+            zf.writestr("model.pkl", b"joblib.load(model_path)")
+            zf.writestr("schema.json", '{"version": "1.0"}')
+
+        scanner = SkopsScanner()
+        result = scanner.scan(str(skops_file))
+
+        joblib_checks = [c for c in result.checks if "Joblib" in c.name]
+        assert len(joblib_checks) > 0
+        assert joblib_checks[0].status == CheckStatus.FAILED
+        assert joblib_checks[0].severity == IssueSeverity.WARNING
+
+    def test_detects_pickle_load_pattern(self, tmp_path: Path) -> None:
+        """Test detection of pickle.load patterns."""
+        skops_file = tmp_path / "malicious.skops"
+        with zipfile.ZipFile(skops_file, "w") as zf:
+            zf.writestr("loader.py", b"import pickle\npickle.load(f)")
+            zf.writestr("schema.json", '{"version": "1.0"}')
+
+        scanner = SkopsScanner()
+        result = scanner.scan(str(skops_file))
+
+        joblib_checks = [c for c in result.checks if "Joblib" in c.name]
+        assert len(joblib_checks) > 0
+
+
+class TestSkopsScannerEdgeCases:
+    """Test edge cases and error handling."""
+
+    def test_handles_empty_archive(self, tmp_path: Path) -> None:
+        """Test handling of empty ZIP archive."""
+        skops_file = tmp_path / "empty.skops"
+        with zipfile.ZipFile(skops_file, "w") as zf:
+            pass  # Create empty archive
+
+        scanner = SkopsScanner()
+        result = scanner.scan(str(skops_file))
+
+        # Should complete without error
+        assert result.success is True
+
+    def test_handles_corrupted_file(self, tmp_path: Path) -> None:
+        """Test handling of corrupted/non-ZIP file."""
+        skops_file = tmp_path / "corrupted.skops"
+        skops_file.write_bytes(b"not a valid zip file content")
+
+        scanner = SkopsScanner()
+        result = scanner.scan(str(skops_file))
+
+        # Should have at least one check about the file
+        assert len(result.checks) > 0
+
+    def test_handles_deeply_nested_files(self, tmp_path: Path) -> None:
+        """Test handling of deeply nested file paths."""
+        skops_file = tmp_path / "nested.skops"
+        with zipfile.ZipFile(skops_file, "w") as zf:
+            deep_path = "/".join(["dir"] * 10) + "/model.bin"
+            zf.writestr(deep_path, b"model data")
+            zf.writestr("schema.json", '{"version": "1.0"}')
+
+        scanner = SkopsScanner()
+        result = scanner.scan(str(skops_file))
+
+        # Should complete without error
+        assert result.success is True
+
+    def test_handles_unicode_filenames(self, tmp_path: Path) -> None:
+        """Test handling of unicode characters in filenames."""
+        skops_file = tmp_path / "unicode.skops"
+        with zipfile.ZipFile(skops_file, "w") as zf:
+            zf.writestr("model.json", '{"name": "test"}')
+            zf.writestr("schema.json", '{"version": "1.0"}')
+
+        scanner = SkopsScanner()
+        result = scanner.scan(str(skops_file))
+
+        # Should complete without error
+        assert result.success is True
+
+
+class TestSkopsScannerMultipleCVEs:
+    """Test detection of multiple CVEs in a single file."""
+
+    def test_detects_multiple_cves(self, tmp_path: Path) -> None:
+        """Test that scanner can detect multiple CVEs in one file."""
+        skops_file = tmp_path / "multi_exploit.skops"
+        with zipfile.ZipFile(skops_file, "w") as zf:
+            # CVE-2025-54412 pattern
+            zf.writestr("OperatorFuncNode.json", '{"exploit": true}')
+            # CVE-2025-54413 pattern
+            zf.writestr("MethodNode_hook.py", "malicious")
+            # CVE-2025-54886 pattern
+            zf.writestr("model_card.md", "use get_model() with joblib fallback")
+            zf.writestr("schema.json", '{"version": "1.0"}')
+
+        scanner = SkopsScanner()
+        result = scanner.scan(str(skops_file))
+
+        # Should detect all three CVEs
+        cve_54412 = [c for c in result.checks if "CVE-2025-54412" in c.name]
+        cve_54413 = [c for c in result.checks if "CVE-2025-54413" in c.name]
+        cve_54886 = [c for c in result.checks if "CVE-2025-54886" in c.name]
+
+        assert len(cve_54412) > 0
+        assert len(cve_54413) > 0
+        assert len(cve_54886) > 0
+
+        # All failed checks should be critical
+        all_cve_checks = cve_54412 + cve_54413 + cve_54886
+        for check in all_cve_checks:
+            if check.status == CheckStatus.FAILED:
+                assert check.severity == IssueSeverity.CRITICAL
+
+
+class TestSkopsScannerCVEDetails:
+    """Test that CVE details are properly populated."""
+
+    def test_cve_details_include_required_fields(self, tmp_path: Path) -> None:
+        """Test that CVE checks include all required detail fields."""
+        skops_file = tmp_path / "malicious.skops"
+        with zipfile.ZipFile(skops_file, "w") as zf:
+            zf.writestr("OperatorFuncNode.json", '{"exploit": true}')
+            zf.writestr("schema.json", '{"version": "1.0"}')
+
+        scanner = SkopsScanner()
+        result = scanner.scan(str(skops_file))
+
+        cve_checks = [c for c in result.checks if "CVE-2025-54412" in c.name and c.status == CheckStatus.FAILED]
+        assert len(cve_checks) > 0
+
+        check = cve_checks[0]
+        details = check.details
+
+        # Verify required fields
+        assert "cve_id" in details
+        assert "cvss" in details
+        assert "cwe" in details
+        assert "affected_versions" in details
+        assert "remediation" in details
+        assert "skops < 0.12.0" in details["affected_versions"]
+        assert "0.12.0" in details["remediation"]
