@@ -345,6 +345,20 @@ BINARY_CODE_PATTERNS: list[bytes] = [
     b"subprocess.call",
     b"subprocess.Popen",
     b"socket.socket",
+    # Native code loading - ctypes
+    b"ctypes.CDLL",
+    b"ctypes.cdll",
+    b"ctypes.windll",
+    b"ctypes.WinDLL",
+    # Native code loading - cffi
+    b"cffi.FFI",
+    b"ffi.dlopen",
+    # Direct dynamic loading
+    b"dlopen(",
+    b"LoadLibrary",
+    # Memory mapping (code injection vector)
+    b"mmap.mmap",
+    b"mmap(",
 ]
 
 # Common executable file signatures found in malicious model data
