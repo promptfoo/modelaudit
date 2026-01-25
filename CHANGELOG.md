@@ -23,6 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **feat**: add Git LFS pointer detection - detects when model files are Git LFS pointers (small text files) instead of actual model content, reports as CRITICAL issue with remediation steps including `git lfs pull` instructions
+
 ### Changed
 
 - **deps**: update xgboost to v3.1.2 (from >=1.6.0,<3.0 to >=3.1.2,<3.2) - major version upgrade with no breaking changes affecting ModelAudit's usage
