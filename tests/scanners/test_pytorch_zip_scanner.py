@@ -318,3 +318,138 @@ def test_pytorch_zip_scanner_detects_malicious_zip_pkl(tmp_path):
     # Should detect the eval function
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
     assert any("eval" in issue.message.lower() for issue in result.issues)
+
+
+def test_pytorch_zip_scanner_entry_limit(tmp_path):
+    """Test that scanner enforces archive entry count limits."""
+    zip_path = tmp_path / "model.pt"
+
+    # Create archive with many entries (exceeding default limit)
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("version", "3")
+        # Create entries exceeding the limit
+        for i in range(15):
+            zipf.writestr(f"entry_{i}.txt", b"data")
+
+    # Use a low limit for testing
+    scanner = PyTorchZipScanner(config={"max_archive_entries": 10})
+    result = scanner.scan(str(zip_path))
+
+    # Should have warning about entry count
+    entry_issues = [
+        i
+        for i in result.issues
+        if "entries" in i.message.lower() and ("max" in i.message.lower() or "limit" in i.message.lower())
+    ]
+    assert len(entry_issues) > 0
+    assert entry_issues[0].severity == IssueSeverity.WARNING
+
+
+def test_pytorch_zip_scanner_entry_limit_passes(tmp_path):
+    """Test that scanner passes when entry count is within limits."""
+    from modelaudit.scanners.base import CheckStatus
+
+    zip_path = tmp_path / "model.pt"
+
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("version", "3")
+        data = pickle.dumps({"weights": [1, 2, 3]})
+        zipf.writestr("data.pkl", data)
+
+    scanner = PyTorchZipScanner()
+    result = scanner.scan(str(zip_path))
+
+    # Should pass entry limit check - look for passed checks about entry count
+    entry_checks = [c for c in result.checks if "entry" in c.name.lower()]
+    assert len(entry_checks) > 0
+    assert all(c.status == CheckStatus.PASSED for c in entry_checks)
+
+
+def test_pytorch_zip_scanner_compression_ratio_check(tmp_path):
+    """Test that scanner detects suspicious compression ratios."""
+
+    zip_path = tmp_path / "model.pt"
+
+    # Create a file with extremely high compression ratio (repetitive data compresses well)
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zipf:
+        zipf.writestr("version", "3")
+        # Create highly compressible data (1MB of zeros will compress to almost nothing)
+        highly_compressible = b"\x00" * (1024 * 1024)
+        zipf.writestr("suspicious_data.bin", highly_compressible)
+
+    # Use a low threshold for testing
+    scanner = PyTorchZipScanner(config={"max_compression_ratio": 50})
+    result = scanner.scan(str(zip_path))
+
+    # Should have warning about compression ratio
+    ratio_issues = [i for i in result.issues if "compression" in i.message.lower() and "ratio" in i.message.lower()]
+    assert len(ratio_issues) > 0
+
+
+def test_pytorch_zip_scanner_compression_ratio_passes(tmp_path):
+    """Test that scanner passes when compression ratio is within limits."""
+    from modelaudit.scanners.base import CheckStatus
+
+    zip_path = tmp_path / "model.pt"
+
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("version", "3")
+        # Random-ish data doesn't compress well
+        data = pickle.dumps({"weights": list(range(1000))})
+        zipf.writestr("data.pkl", data)
+
+    scanner = PyTorchZipScanner()
+    result = scanner.scan(str(zip_path))
+
+    # Should pass compression check - look for passed checks about compression
+    ratio_checks = [c for c in result.checks if "compression" in c.name.lower()]
+    assert len(ratio_checks) > 0
+    assert all(c.status == CheckStatus.PASSED for c in ratio_checks)
+
+
+def test_pytorch_zip_scanner_symlink_detection(tmp_path):
+    """Test that scanner detects symlinks in archives."""
+
+    zip_path = tmp_path / "model.pt"
+
+    # Create a ZIP file with a symlink entry
+    # Symlinks in ZIP files have external_attr with S_IFLNK flag
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("version", "3")
+
+        # Create a symlink entry manually
+        # The external_attr field encodes the Unix file mode
+        # S_IFLNK = 0o120000 (symlink)
+        symlink_info = zipfile.ZipInfo("malicious_link")
+        # Set external attributes to indicate symlink (Unix mode in upper 16 bits)
+        symlink_info.external_attr = 0o120777 << 16  # symlink with full permissions
+        symlink_info.compress_type = zipfile.ZIP_STORED
+        zipf.writestr(symlink_info, "/etc/passwd")
+
+    scanner = PyTorchZipScanner()
+    result = scanner.scan(str(zip_path))
+
+    # Should have warning about symlink
+    symlink_issues = [i for i in result.issues if "symlink" in i.message.lower()]
+    assert len(symlink_issues) > 0
+    assert symlink_issues[0].severity == IssueSeverity.WARNING
+
+
+def test_pytorch_zip_scanner_no_symlinks_passes(tmp_path):
+    """Test that scanner passes when no symlinks are present."""
+    from modelaudit.scanners.base import CheckStatus
+
+    zip_path = tmp_path / "model.pt"
+
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("version", "3")
+        data = pickle.dumps({"weights": [1, 2, 3]})
+        zipf.writestr("data.pkl", data)
+
+    scanner = PyTorchZipScanner()
+    result = scanner.scan(str(zip_path))
+
+    # Should pass symlink check - look for passed checks about symlinks
+    symlink_checks = [c for c in result.checks if "symlink" in c.name.lower()]
+    assert len(symlink_checks) > 0
+    assert all(c.status == CheckStatus.PASSED for c in symlink_checks)
