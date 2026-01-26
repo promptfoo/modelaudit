@@ -84,11 +84,6 @@ def detect_variadic_lambda(code: str) -> tuple[bool, list[str]]:
                     arg_name = args.kwarg.arg
                     found_patterns.append(f"Lambda with **{arg_name} (variadic keyword)")
 
-                # Check for *-only separator (posonlyargs boundary)
-                # This is less dangerous but still worth noting
-                if args.posonlyargs:
-                    found_patterns.append("Lambda with positional-only arguments")
-
     except SyntaxError:
         # If code is invalid, we can't parse it
         pass
