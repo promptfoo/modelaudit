@@ -30,6 +30,9 @@ class KerasH5Scanner(BaseScanner):
     description = "Scans Keras H5 model files for suspicious layer configurations"
     supported_extensions: ClassVar[list[str]] = [".h5", ".hdf5", ".keras"]
 
+    # Known safe Keras model classes that don't contain arbitrary code
+    KNOWN_SAFE_MODEL_CLASSES: ClassVar[set[str]] = {"Sequential", "Functional", "Model"}
+
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
         # Additional scanner-specific configuration
@@ -201,9 +204,6 @@ class KerasH5Scanner(BaseScanner):
 
         result.finish(success=True)
         return result
-
-    # Known safe Keras model classes that don't contain arbitrary code
-    KNOWN_SAFE_MODEL_CLASSES: ClassVar[set[str]] = {"Sequential", "Functional", "Model"}
 
     def _scan_model_config(
         self,
