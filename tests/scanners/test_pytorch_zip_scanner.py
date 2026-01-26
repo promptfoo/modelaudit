@@ -2,7 +2,7 @@ import pickle
 import time
 import zipfile
 
-from modelaudit.scanners.base import IssueSeverity
+from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.pytorch_zip_scanner import PyTorchZipScanner
 from tests.helpers import create_mock_pytorch_zip
 
@@ -347,8 +347,6 @@ def test_pytorch_zip_scanner_entry_limit(tmp_path):
 
 def test_pytorch_zip_scanner_entry_limit_passes(tmp_path):
     """Test that scanner passes when entry count is within limits."""
-    from modelaudit.scanners.base import CheckStatus
-
     zip_path = tmp_path / "model.pt"
 
     with zipfile.ZipFile(zip_path, "w") as zipf:
@@ -384,12 +382,11 @@ def test_pytorch_zip_scanner_compression_ratio_check(tmp_path):
     # Should have warning about compression ratio
     ratio_issues = [i for i in result.issues if "compression" in i.message.lower() and "ratio" in i.message.lower()]
     assert len(ratio_issues) > 0
+    assert ratio_issues[0].severity == IssueSeverity.WARNING
 
 
 def test_pytorch_zip_scanner_compression_ratio_passes(tmp_path):
     """Test that scanner passes when compression ratio is within limits."""
-    from modelaudit.scanners.base import CheckStatus
-
     zip_path = tmp_path / "model.pt"
 
     with zipfile.ZipFile(zip_path, "w") as zipf:
@@ -437,8 +434,6 @@ def test_pytorch_zip_scanner_symlink_detection(tmp_path):
 
 def test_pytorch_zip_scanner_no_symlinks_passes(tmp_path):
     """Test that scanner passes when no symlinks are present."""
-    from modelaudit.scanners.base import CheckStatus
-
     zip_path = tmp_path / "model.pt"
 
     with zipfile.ZipFile(zip_path, "w") as zipf:
