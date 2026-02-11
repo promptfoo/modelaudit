@@ -5,7 +5,7 @@ import logging
 import threading
 import warnings
 from collections.abc import Iterator
-from typing import Any, Optional
+from typing import Any
 
 from .base import BaseScanner, Check, CheckStatus, Issue, IssueSeverity, ScanResult
 
