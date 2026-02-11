@@ -538,9 +538,21 @@ def scan_command(
         1 - Security issues found (scan completed successfully)
         2 - Errors occurred during scanning
     """
-    # Record telemetry for scan command usage
     import time
+    import warnings
 
+    # Warn users on deprecated Python versions
+    if sys.version_info < (3, 10):
+        warnings.warn(
+            f"Python {sys.version_info.major}.{sys.version_info.minor} support is deprecated "
+            "and will be removed in a future release. Some optional dependencies "
+            "(torch, onnx, xgboost, mlflow, py7zr) may be limited to older versions. "
+            "Please upgrade to Python 3.10 or newer.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
+    # Record telemetry for scan command usage
     scan_start_time = time.time()
     # Telemetry options - only include non-sensitive data
     # DO NOT include actual blacklist patterns or file paths - only counts
