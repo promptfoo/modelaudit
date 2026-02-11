@@ -215,6 +215,7 @@ class TestJFrogIntegrationEndToEnd:
         if not jfrog_url or not api_token:
             pytest.skip("JFrog integration test credentials not available")
 
+        assert jfrog_url is not None  # narrowing for mypy
         results = scan_jfrog_artifact(jfrog_url, api_token=api_token)
 
         # Basic validation
@@ -245,6 +246,7 @@ class TestJFrogIntegrationEndToEnd:
         if not jfrog_url or not api_token:
             pytest.skip("JFrog integration test credentials not available")
 
+        assert jfrog_url is not None  # narrowing for mypy
         results = scan_jfrog_artifact(jfrog_url, api_token=api_token)
 
         # Basic validation for folder scanning

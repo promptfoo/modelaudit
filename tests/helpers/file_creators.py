@@ -5,6 +5,8 @@ These utilities create various model file formats for testing purposes.
 All functions accept a Path and create the file at that location.
 """
 
+from __future__ import annotations
+
 import json
 import pickle
 import struct
