@@ -88,6 +88,28 @@ class TestBinaryCodePatterns:
         for pattern in BINARY_CODE_PATTERNS:
             assert isinstance(pattern, bytes)
 
+    def test_detects_ctypes_cdll(self) -> None:
+        """Test that ctypes native code loading patterns are detected."""
+        assert b"ctypes.CDLL" in BINARY_CODE_PATTERNS
+        assert b"ctypes.cdll" in BINARY_CODE_PATTERNS
+        assert b"ctypes.windll" in BINARY_CODE_PATTERNS
+        assert b"ctypes.WinDLL" in BINARY_CODE_PATTERNS
+
+    def test_detects_cffi_ffi(self) -> None:
+        """Test that CFFI patterns are detected."""
+        assert b"cffi.FFI" in BINARY_CODE_PATTERNS
+        assert b"ffi.dlopen" in BINARY_CODE_PATTERNS
+
+    def test_detects_dlopen(self) -> None:
+        """Test that direct dynamic loading patterns are detected."""
+        assert b"dlopen(" in BINARY_CODE_PATTERNS
+        assert b"LoadLibrary" in BINARY_CODE_PATTERNS
+
+    def test_detects_mmap(self) -> None:
+        """Test that memory mapping patterns are detected."""
+        assert b"mmap.mmap" in BINARY_CODE_PATTERNS
+        assert b"mmap(" in BINARY_CODE_PATTERNS
+
 
 class TestExecutableSignatures:
     """Test EXECUTABLE_SIGNATURES mapping."""
