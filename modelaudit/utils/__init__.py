@@ -7,6 +7,8 @@ Organized into subcategories:
 - helpers/ - Generic utilities (retry, caching, types)
 """
 
+from __future__ import annotations
+
 import os
 import re
 from collections.abc import Iterable

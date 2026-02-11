@@ -14,6 +14,8 @@ popular, well-established models. Users can disable this behavior via the
 'use_hf_whitelist' configuration option.
 """
 
+from __future__ import annotations
+
 # Set of model IDs (author/model-name format)
 POPULAR_MODELS: set[str] = {
     "1-800-BAD-CODE/xlm-roberta_punctuation_fullstop_truecase",

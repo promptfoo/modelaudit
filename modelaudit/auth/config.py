@@ -1,8 +1,11 @@
 """Configuration management for ModelAudit authentication."""
 
+# cast() is a runtime call; Optional[str] needed for Python 3.9 compat.
+from __future__ import annotations
+
 import os
 import tempfile
-from typing import Any, cast
+from typing import Any, Optional, cast
 from uuid import uuid4
 
 import yaml
@@ -63,7 +66,7 @@ class CloudConfig:
 
     def get_api_key(self) -> str | None:
         """Get API key."""
-        return cast(str | None, self.config.get("apiKey"))
+        return cast(Optional[str], self.config.get("apiKey"))
 
     def get_api_host(self) -> str:
         """Get API host."""
@@ -185,7 +188,7 @@ def get_user_id() -> str:
 def get_user_email() -> str | None:
     """Get user email from global config."""
     global_config = read_global_config()
-    return cast(str | None, global_config.account.get("email"))
+    return cast(Optional[str], global_config.account.get("email"))
 
 
 def set_user_email(email: str) -> None:

@@ -4,6 +4,8 @@ This module provides efficient cache key generation that avoids redundant
 file system calls and provides intelligent key selection based on file characteristics.
 """
 
+from __future__ import annotations
+
 import hashlib
 import os
 import time
@@ -23,7 +25,7 @@ class FileFingerprint:
     content_hash: str | None = None  # Lazy-loaded for large files
 
     @classmethod
-    def from_stat(cls, file_path: str, stat_result: os.stat_result) -> "FileFingerprint":
+    def from_stat(cls, file_path: str, stat_result: os.stat_result) -> FileFingerprint:
         """Create fingerprint from existing stat result to avoid redundant syscalls."""
         # Use blake2b for fast path hashing (much faster than sha256)
         path_hash = hashlib.blake2b(file_path.encode(), digest_size=8).hexdigest()
@@ -31,7 +33,7 @@ class FileFingerprint:
         return cls(path_hash=path_hash, size=stat_result.st_size, mtime=stat_result.st_mtime, inode=stat_result.st_ino)
 
     @classmethod
-    def from_path(cls, file_path: str) -> "FileFingerprint":
+    def from_path(cls, file_path: str) -> FileFingerprint:
         """Create fingerprint with single stat call."""
         stat_result = os.stat(file_path)
         return cls.from_stat(file_path, stat_result)

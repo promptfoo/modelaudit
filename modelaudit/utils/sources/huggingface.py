@@ -1,5 +1,7 @@
 """Utilities for handling HuggingFace model downloads."""
 
+from __future__ import annotations
+
 import re
 from collections.abc import Iterator
 from pathlib import Path

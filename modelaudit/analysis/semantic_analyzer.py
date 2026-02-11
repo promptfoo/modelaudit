@@ -1,5 +1,7 @@
 """Advanced semantic analysis beyond syntax checking."""
 
+from __future__ import annotations
+
 import ast
 import re
 from dataclasses import dataclass
@@ -171,15 +173,13 @@ class SemanticAnalyzer:
                     current = node.func
                     while isinstance(current, ast.Attribute):
                         parts.append(current.attr)
-                        # Use pattern matching for cleaner type handling
-                        match current.value:
-                            case ast.Attribute() as attr_node:
-                                current = attr_node
-                            case ast.Name() as name_node:
-                                parts.append(name_node.id)
-                                break
-                            case _:
-                                break
+                        if isinstance(current.value, ast.Attribute):
+                            current = current.value
+                        elif isinstance(current.value, ast.Name):
+                            parts.append(current.value.id)
+                            break
+                        else:
+                            break
                     return ".".join(reversed(parts))
                 return None
 

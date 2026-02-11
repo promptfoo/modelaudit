@@ -1,5 +1,7 @@
 """File filtering utilities for ModelAudit."""
 
+from __future__ import annotations
+
 import os
 
 # Default extensions to skip when scanning directories

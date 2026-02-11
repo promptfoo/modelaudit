@@ -1,5 +1,7 @@
 """Authentication client for ModelAudit - mirrors promptfoo's implementation."""
 
+from __future__ import annotations
+
 import logging
 import os
 from typing import Any, cast

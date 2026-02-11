@@ -5,6 +5,8 @@ This module provides advanced utilities for scanning large model files (400B+ pa
 with memory-mapped I/O, sharded model support, and distributed scanning capabilities.
 """
 
+from __future__ import annotations
+
 import logging
 import mmap
 import os

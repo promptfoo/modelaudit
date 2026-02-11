@@ -5,6 +5,8 @@ This module provides advanced utilities for scanning large model files (400B+ pa
 with memory-mapped I/O, sharded model support, and distributed scanning capabilities.
 """
 
+from __future__ import annotations
+
 import logging
 import mmap
 import os
@@ -120,7 +122,7 @@ class MemoryMappedScanner:
         self.scanner = scanner
         self.file_size = os.path.getsize(file_path)
 
-    def scan_with_mmap(self, progress_callback: Callable[[str, float], None] | None = None) -> "ScanResult":
+    def scan_with_mmap(self, progress_callback: Callable[[str, float], None] | None = None) -> ScanResult:
         """
         Scan file using memory mapping.
 
@@ -180,7 +182,7 @@ class MemoryMappedScanner:
 
         return result
 
-    def _analyze_window(self, data: bytes, offset: int) -> "ScanResult":
+    def _analyze_window(self, data: bytes, offset: int) -> ScanResult:
         from ...scanners.base import IssueSeverity, ScanResult
 
         """Analyze a window of data using the actual scanner's checks."""
@@ -248,7 +250,7 @@ class ParallelShardScanner:
         self.shard_info = shard_info
         self.scanner_class = scanner_class
 
-    def scan_shards(self, progress_callback: Callable[[str, float], None] | None = None) -> "ScanResult":
+    def scan_shards(self, progress_callback: Callable[[str, float], None] | None = None) -> ScanResult:
         from ...scanners.base import IssueSeverity, ScanResult
 
         """
@@ -308,9 +310,7 @@ class ParallelShardScanner:
 
         return result
 
-    def _scan_single_shard(self, shard_path: str) -> "ScanResult":
-        from ...scanners.base import ScanResult
-
+    def _scan_single_shard(self, shard_path: str) -> ScanResult:
         """Scan a single shard file."""
         scanner = self.scanner_class()
         result: ScanResult = scanner.scan(shard_path)
@@ -353,7 +353,7 @@ class AdvancedFileHandler:
             self.total_size = os.path.getsize(file_path)
             self.is_sharded = False
 
-    def scan(self) -> "ScanResult":
+    def scan(self) -> ScanResult:
         """
         Scan the large model file.
 
@@ -376,7 +376,7 @@ class AdvancedFileHandler:
             handler = LargeFileHandler(self.file_path, self.scanner, self.progress_callback, self.timeout)
             return handler.scan()
 
-    def _scan_sharded_model(self) -> "ScanResult":
+    def _scan_sharded_model(self) -> ScanResult:
         from ...scanners.base import IssueSeverity, ScanResult
 
         """Scan a sharded model."""
@@ -410,12 +410,12 @@ class AdvancedFileHandler:
 
         return result
 
-    def _scan_with_mmap(self) -> "ScanResult":
+    def _scan_with_mmap(self) -> ScanResult:
         """Scan using memory mapping."""
         mmap_scanner = MemoryMappedScanner(self.file_path, self.scanner)
         return mmap_scanner.scan_with_mmap(self.progress_callback)
 
-    def _scan_large_file_distributed(self) -> "ScanResult":
+    def _scan_large_file_distributed(self) -> ScanResult:
         from ...scanners.base import IssueSeverity, ScanResult
 
         """Scan large files using memory-mapped approach with FULL security checks."""
@@ -517,7 +517,7 @@ def scan_advanced_large_file(
     scanner: Any,
     progress_callback: Callable[[str, float], None] | None = None,
     timeout: int = 7200,
-) -> "ScanResult":
+) -> ScanResult:
     """
     Scan a large file with advanced handler.
 
@@ -569,7 +569,7 @@ def _scan_advanced_large_file_internal(
     scanner: Any,
     progress_callback: Callable[[str, float], None] | None = None,
     timeout: int = 7200,
-) -> "ScanResult":
+) -> ScanResult:
     """
     Internal implementation of advanced large file scanning (cache-agnostic).
 

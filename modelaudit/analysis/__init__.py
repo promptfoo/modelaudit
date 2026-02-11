@@ -12,6 +12,8 @@ This package contains modules for analyzing ML models and detecting framework-sp
 - unified_context.py - Unified ML context for cross-framework analysis
 """
 
+from __future__ import annotations
+
 from typing import Any
 
 from modelaudit.analysis import framework_patterns, unified_context

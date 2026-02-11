@@ -1,5 +1,7 @@
 """Framework-specific pattern knowledge base for reducing false positives."""
 
+from __future__ import annotations
+
 import re
 from dataclasses import dataclass
 from enum import Enum

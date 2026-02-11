@@ -1,5 +1,7 @@
 """Scanner for text-based ML files like README.md and vocab.txt."""
 
+from __future__ import annotations
+
 import os
 from typing import Any, ClassVar
 

@@ -5,6 +5,8 @@ This module provides utilities for scanning large model files efficiently
 with chunked reading, progress reporting, and memory management.
 """
 
+from __future__ import annotations
+
 import logging
 import os
 import time

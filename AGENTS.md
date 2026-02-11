@@ -136,7 +136,7 @@ tensorflow = [
 
 ## Coding & Style Guardrails
 
-- **Python:** 3.10–3.13 supported. Classes PascalCase, functions/vars snake_case, constants UPPER_SNAKE_CASE, always type hints.
+- **Python:** 3.9–3.13 supported. Classes PascalCase, functions/vars snake_case, constants UPPER_SNAKE_CASE, always type hints.
 - **Comments:** Use sparingly to explain intent, not mechanics.
 - **Docs/Markdown:** Keep concise; when formatting markdown/json/yaml, use `npx --yes prettier@latest --write "**/*.{md,yaml,yml,json}"` if instructed or if formatting drifts.
 - **Dependencies:** Do not add new packages without explicit approval and updating `pyproject.toml`/locks.
@@ -147,7 +147,7 @@ tensorflow = [
 - Preserve or strengthen detections; test both benign and malicious samples.
 - Follow existing scanner patterns and update registries, CLI wiring, and docs as needed.
 - Add comprehensive tests, including edge cases and regression coverage.
-- Ensure compatibility across Python 3.10–3.13 and handle missing optional deps gracefully.
+- Ensure compatibility across Python 3.9–3.13 and handle missing optional deps gracefully.
 
 ## Project Map & References
 

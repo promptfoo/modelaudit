@@ -1,5 +1,7 @@
 """Python code validation utilities using py_compile."""
 
+from __future__ import annotations
+
 import ast
 import os
 import py_compile

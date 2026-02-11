@@ -6,6 +6,8 @@ This package contains configuration files and static data used throughout ModelA
 - explanations.py - Human-readable explanations for security issues
 """
 
+from __future__ import annotations
+
 from modelaudit.config import constants, explanations, name_blacklist
 
 __all__ = [

@@ -53,6 +53,8 @@ Version History:
     - v1.1: Added documentation and architecture overview
 """
 
+from __future__ import annotations
+
 from typing import Any
 
 from ..config.explanations import DANGEROUS_OPCODES as _EXPLAIN_OPCODES

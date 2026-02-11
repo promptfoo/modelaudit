@@ -5,6 +5,8 @@ Dynamically extracts all scannable file extensions from the scanner registry
 to ensure we always know what ModelAudit can scan.
 """
 
+from __future__ import annotations
+
 
 def get_all_scannable_extensions() -> set[str]:
     """

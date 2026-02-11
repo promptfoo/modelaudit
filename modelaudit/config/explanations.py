@@ -5,6 +5,8 @@ This module provides centralized, security-team-friendly explanations
 for common security issues found in ML model files.
 """
 
+from __future__ import annotations
+
 # Common explanations for dangerous imports and modules
 DANGEROUS_IMPORTS: dict[str, str] = {
     "os": (
@@ -301,18 +303,16 @@ def get_explanation(category: str, specific_item: str | None = None) -> str | No
     Returns:
         A security-team-friendly explanation, or None if not found
     """
-    # Use pattern matching for cleaner category-based lookups (Python 3.10+)
-    match category:
-        case "import" if specific_item in DANGEROUS_IMPORTS:
-            return DANGEROUS_IMPORTS[specific_item]
-        case "opcode" if specific_item in DANGEROUS_OPCODES:
-            return DANGEROUS_OPCODES[specific_item]
-        case "pattern" if specific_item in PATTERN_EXPLANATIONS:
-            return PATTERN_EXPLANATIONS[specific_item]
-        case "tf_op" if specific_item in TF_OP_EXPLANATIONS:
-            return TF_OP_EXPLANATIONS[specific_item]
-        case _:
-            return None
+    _CATEGORY_MAP: dict[str, dict[str, str]] = {
+        "import": DANGEROUS_IMPORTS,
+        "opcode": DANGEROUS_OPCODES,
+        "pattern": PATTERN_EXPLANATIONS,
+        "tf_op": TF_OP_EXPLANATIONS,
+    }
+    lookup = _CATEGORY_MAP.get(category)
+    if lookup is not None and specific_item is not None:
+        return lookup.get(specific_item)
+    return None
 
 
 # Convenience functions for common use cases

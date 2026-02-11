@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 BLACKLIST_PATTERNS = [
     # Examples of patterns you might want to blacklist
     "malicious",

@@ -436,7 +436,7 @@ class TestCVEPatternValidation:
 
             # Validate CVSS score range
             cvss_score = cve_info["cvss"]
-            assert isinstance(cvss_score, int | float) and 0.0 <= cvss_score <= 10.0, (
+            assert isinstance(cvss_score, (int, float)) and 0.0 <= cvss_score <= 10.0, (
                 f"CVSS score should be 0-10 for {cve_id}"
             )
 

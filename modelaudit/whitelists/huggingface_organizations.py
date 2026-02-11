@@ -35,6 +35,8 @@ models from trusted organizations. Users can disable this behavior via the
 'use_hf_whitelist' configuration option.
 """
 
+from __future__ import annotations
+
 # Set of model IDs from trusted organizations
 ORGANIZATION_MODELS: set[str] = {
     "CompVis/SCFlow",

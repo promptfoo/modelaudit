@@ -5,6 +5,8 @@ attack techniques that use combinations of individually safe opcodes to perform
 malicious operations.
 """
 
+from __future__ import annotations
+
 import logging
 from collections import deque
 from dataclasses import dataclass

@@ -4,6 +4,8 @@ This module detects potential network communication capabilities in model files
 that could be used for data exfiltration or command & control operations.
 """
 
+from __future__ import annotations
+
 import ipaddress
 import re
 from typing import Any, ClassVar

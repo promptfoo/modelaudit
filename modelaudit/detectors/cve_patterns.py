@@ -409,7 +409,7 @@ def _get_cve_cvss(cve_id: str) -> float:
     """Get CVE CVSS score."""
     info = CVE_COMBINED_PATTERNS.get(cve_id, {})
     cvss_value = info.get("cvss", 0.0)
-    if isinstance(cvss_value, int | float):
+    if isinstance(cvss_value, (int, float)):
         return float(cvss_value)
     return 0.0
 

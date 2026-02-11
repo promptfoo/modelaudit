@@ -6,6 +6,8 @@ Detects API keys, passwords, tokens, and other sensitive data embedded in model 
 Part of ModelAudit's critical security validation suite.
 """
 
+from __future__ import annotations
+
 import math
 import re
 from typing import Any
@@ -550,7 +552,7 @@ class SecretsDetector:
                 findings.extend(self.scan_bytes(value, key_context))
             elif isinstance(value, dict):
                 findings.extend(self.scan_dict(value, key_context))
-            elif isinstance(value, list | tuple):
+            elif isinstance(value, (list, tuple)):
                 for i, item in enumerate(value):
                     item_context = f"{key_context}[{i}]"
                     if isinstance(item, str):
@@ -589,7 +591,7 @@ class SecretsDetector:
                 findings.extend(self.scan_bytes(byte_data, f"{context}[array]"))
             except Exception:
                 pass
-        elif isinstance(weights, list | tuple):
+        elif isinstance(weights, (list, tuple)):
             for i, item in enumerate(weights):
                 findings.extend(self.scan_model_weights(item, f"{context}[{i}]"))
 

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import zipfile
 from typing import Any, ClassVar

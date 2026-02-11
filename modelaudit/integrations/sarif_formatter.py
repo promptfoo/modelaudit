@@ -4,6 +4,8 @@ This module converts ModelAudit scan results to SARIF 2.1.0 format for
 integration with security tools and CI/CD pipelines.
 """
 
+from __future__ import annotations
+
 import contextlib
 import json
 from pathlib import Path

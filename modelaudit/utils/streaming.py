@@ -1,5 +1,7 @@
 """Streaming analysis support for cloud-hosted model files."""
 
+from __future__ import annotations
+
 import io
 from pathlib import Path
 from typing import Any

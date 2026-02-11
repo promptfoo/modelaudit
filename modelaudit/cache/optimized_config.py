@@ -1,5 +1,7 @@
 """Optimized configuration handling for cache operations."""
 
+from __future__ import annotations
+
 import functools
 from typing import Any
 

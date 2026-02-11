@@ -9,6 +9,8 @@ arbitrary code execution.
 Part of ModelAudit's critical security validation suite.
 """
 
+from __future__ import annotations
+
 import ast
 import re
 from typing import TYPE_CHECKING, Any
@@ -17,7 +19,7 @@ if TYPE_CHECKING:
     from modelaudit.models import JITScriptFinding
 
 
-def create_jit_finding(**kwargs: Any) -> "JITScriptFinding":
+def create_jit_finding(**kwargs: Any) -> JITScriptFinding:
     """Helper to create JITScriptFinding with proper field handling."""
     from modelaudit.models import JITScriptFinding
 
@@ -164,7 +166,7 @@ class JITScriptDetector:
             if "tf" in custom_ops:
                 self.dangerous_tf_ops.extend(custom_ops["tf"])
 
-    def scan_torchscript(self, data: bytes, context: str = "") -> list["JITScriptFinding"]:
+    def scan_torchscript(self, data: bytes, context: str = "") -> list[JITScriptFinding]:
         """Scan TorchScript model data for dangerous operations.
 
         Args:
@@ -248,7 +250,7 @@ class JITScriptDetector:
 
         return findings
 
-    def scan_tensorflow(self, data: bytes, context: str = "") -> list["JITScriptFinding"]:
+    def scan_tensorflow(self, data: bytes, context: str = "") -> list[JITScriptFinding]:
         """Scan TensorFlow SavedModel for dangerous operations.
 
         Args:
@@ -332,7 +334,7 @@ class JITScriptDetector:
 
         return findings
 
-    def scan_onnx(self, data: bytes, context: str = "") -> list["JITScriptFinding"]:
+    def scan_onnx(self, data: bytes, context: str = "") -> list[JITScriptFinding]:
         """Scan ONNX model for custom operators and dangerous patterns.
 
         Args:
@@ -342,7 +344,6 @@ class JITScriptDetector:
         Returns:
             List of findings with details
         """
-        from modelaudit.models import JITScriptFinding
 
         findings: list[JITScriptFinding] = []
 
@@ -405,7 +406,7 @@ class JITScriptDetector:
 
         return findings
 
-    def _extract_and_check_python_code(self, data: bytes, framework: str, context: str) -> list["JITScriptFinding"]:
+    def _extract_and_check_python_code(self, data: bytes, framework: str, context: str) -> list[JITScriptFinding]:
         """Extract and analyze embedded Python code.
 
         Args:
@@ -416,7 +417,6 @@ class JITScriptDetector:
         Returns:
             List of findings from code analysis
         """
-        from modelaudit.models import JITScriptFinding
 
         findings: list[JITScriptFinding] = []
 
@@ -506,7 +506,7 @@ class JITScriptDetector:
 
         return findings
 
-    def _analyze_ast(self, tree: ast.AST, framework: str, context: str) -> list["JITScriptFinding"]:
+    def _analyze_ast(self, tree: ast.AST, framework: str, context: str) -> list[JITScriptFinding]:
         """Analyze Python AST for dangerous patterns.
 
         Args:
@@ -517,7 +517,6 @@ class JITScriptDetector:
         Returns:
             List of findings from AST analysis
         """
-        from modelaudit.models import JITScriptFinding
 
         findings: list[JITScriptFinding] = []
 
@@ -593,7 +592,7 @@ class JITScriptDetector:
 
         return findings
 
-    def scan_advanced_torchscript_vulnerabilities(self, data: bytes, context: str = "") -> list["JITScriptFinding"]:
+    def scan_advanced_torchscript_vulnerabilities(self, data: bytes, context: str = "") -> list[JITScriptFinding]:
         """Advanced TorchScript vulnerability scanning for sophisticated attacks"""
         findings: list[JITScriptFinding] = []
 
@@ -823,7 +822,7 @@ class JITScriptDetector:
 
         return findings
 
-    def scan_model(self, data: bytes, model_type: str = "unknown", context: str = "") -> list["JITScriptFinding"]:
+    def scan_model(self, data: bytes, model_type: str = "unknown", context: str = "") -> list[JITScriptFinding]:
         """Main entry point to scan a model for JIT/Script code execution risks.
 
         Args:
@@ -872,7 +871,7 @@ class JITScriptDetector:
         return findings
 
 
-def detect_jit_script_risks(file_path: str, max_size: int = 500 * 1024 * 1024) -> list["JITScriptFinding"]:
+def detect_jit_script_risks(file_path: str, max_size: int = 500 * 1024 * 1024) -> list[JITScriptFinding]:
     """Convenience function to scan a file for JIT/Script execution risks.
 
     Args:

@@ -1,5 +1,7 @@
 """Performance benchmarks and tests for cache optimizations."""
 
+from __future__ import annotations
+
 import os
 import tempfile
 import time

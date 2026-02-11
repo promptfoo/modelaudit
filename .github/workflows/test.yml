@@ -220,9 +220,9 @@ jobs:
       matrix:
         # For PRs, only test min and max Python versions to save time
         # For main branch, test all versions
-        # Note: Python 3.10+ supported (see pyproject.toml)
-        # Python 3.10 gets NumPy 1.x, Python 3.11+ gets NumPy 2.x
-        python-version: ${{ github.event_name == 'pull_request' && fromJSON('["3.10", "3.13"]') || fromJSON('["3.10", "3.11", "3.12", "3.13"]') }}
+        # Note: Python 3.9+ supported (see pyproject.toml)
+        # Python 3.9-3.10 gets NumPy 1.x, Python 3.11+ gets NumPy 2.x
+        python-version: ${{ github.event_name == 'pull_request' && fromJSON('["3.9", "3.10", "3.13"]') || fromJSON('["3.9", "3.10", "3.11", "3.12", "3.13"]') }}
     steps:
       - name: Checkout repo
         uses: actions/checkout@v6
@@ -309,10 +309,10 @@ jobs:
     strategy:
       matrix:
         # Test both NumPy versions with appropriate Python versions:
-        # - NumPy 1.x on Python 3.10 (last version supporting NumPy 1.x)
+        # - NumPy 1.x on Python 3.9-3.10 (NumPy 2.x requires Python >=3.11)
         # - NumPy 2.x on Python 3.11+ (requires Python >=3.11)
         # Reduced matrix for PRs, full matrix for main branch
-        include: ${{ github.event_name == 'pull_request' && fromJSON('[{"python-version":"3.10","numpy-mode":"1.x"},{"python-version":"3.11","numpy-mode":"2.x"}]') || fromJSON('[{"python-version":"3.10","numpy-mode":"1.x"},{"python-version":"3.11","numpy-mode":"2.x"},{"python-version":"3.12","numpy-mode":"2.x"},{"python-version":"3.13","numpy-mode":"2.x"}]') }}
+        include: ${{ github.event_name == 'pull_request' && fromJSON('[{"python-version":"3.9","numpy-mode":"1.x"},{"python-version":"3.10","numpy-mode":"1.x"},{"python-version":"3.11","numpy-mode":"2.x"}]') || fromJSON('[{"python-version":"3.9","numpy-mode":"1.x"},{"python-version":"3.10","numpy-mode":"1.x"},{"python-version":"3.11","numpy-mode":"2.x"},{"python-version":"3.12","numpy-mode":"2.x"},{"python-version":"3.13","numpy-mode":"2.x"}]') }}
     steps:
       - name: Checkout repo
         uses: actions/checkout@v6
@@ -342,7 +342,7 @@ jobs:
       - name: Install dependencies
         run: |
           # Dependencies are automatically version-matched based on Python version
-          # Python 3.10: NumPy 1.x + TensorFlow 2.13+
+          # Python 3.9-3.10: NumPy 1.x + TensorFlow 2.13+
           # Python 3.11+: NumPy 2.x + TensorFlow 2.17+
           uv sync --extra all-ci
 

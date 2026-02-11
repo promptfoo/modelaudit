@@ -18,6 +18,8 @@ Security Focus:
 - Known CVE patterns and exploit signatures
 """
 
+from __future__ import annotations
+
 import json
 import os
 import re
@@ -136,7 +138,7 @@ class XGBoostScanner(BaseScanner):
 
             # Validate version is array-like with at least 2 elements
             version = data.get("version")
-            if not isinstance(version, list | tuple) or len(version) < 2:
+            if not isinstance(version, (list, tuple)) or len(version) < 2:
                 return False
 
             # Validate learner is a dict
@@ -350,7 +352,7 @@ class XGBoostScanner(BaseScanner):
 
         # Validate version
         version = data.get("version")
-        if not isinstance(version, list | tuple) or len(version) < 2:
+        if not isinstance(version, (list, tuple)) or len(version) < 2:
             result.add_check(
                 name="XGBoost Version Validation",
                 passed=False,
@@ -475,7 +477,7 @@ class XGBoostScanner(BaseScanner):
             return obj.hex()
         elif isinstance(obj, dict):
             return {k: self._sanitize_for_json(v) for k, v in obj.items()}
-        elif isinstance(obj, list | tuple):
+        elif isinstance(obj, (list, tuple)):
             return [self._sanitize_for_json(item) for item in obj]
         return obj
 

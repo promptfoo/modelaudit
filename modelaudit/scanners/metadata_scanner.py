@@ -1,5 +1,7 @@
 """Scanner for model metadata files (README, model cards, documentation)."""
 
+from __future__ import annotations
+
 import logging
 from pathlib import Path
 

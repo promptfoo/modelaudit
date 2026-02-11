@@ -1,5 +1,7 @@
 """Entropy-based analysis to distinguish code from data."""
 
+from __future__ import annotations
+
 import math
 import struct
 from collections import Counter

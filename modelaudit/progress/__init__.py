@@ -1,5 +1,7 @@
 """Progress tracking system for large model scans."""
 
+from __future__ import annotations
+
 from .base import (
     ProgressCallback,
     ProgressPhase,

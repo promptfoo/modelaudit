@@ -1,5 +1,7 @@
 """Streaming analysis support for cloud-hosted model files."""
 
+from __future__ import annotations
+
 import io
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -12,7 +14,7 @@ if TYPE_CHECKING:
 from modelaudit.utils.sources.cloud_storage import get_fs_protocol
 
 
-def can_stream_analyze(url: str, scanner: "BaseScanner") -> bool:
+def can_stream_analyze(url: str, scanner: BaseScanner) -> bool:
     """Check if a file can be analyzed via streaming."""
     # Currently support streaming for pickle files
     # Can be extended to other formats that support partial reads
@@ -24,9 +26,9 @@ def can_stream_analyze(url: str, scanner: "BaseScanner") -> bool:
 
 def stream_analyze_file(
     url: str,
-    scanner: "BaseScanner",
+    scanner: BaseScanner,
     max_bytes: int = 1024 * 1024 * 1024 * 1024,  # 1TB default
-) -> tuple["ScanResult | None", bool]:
+) -> tuple[ScanResult | None, bool]:
     from modelaudit.scanners.base import Issue, IssueSeverity, ScanResult
 
     """Stream analyze a file from cloud storage.

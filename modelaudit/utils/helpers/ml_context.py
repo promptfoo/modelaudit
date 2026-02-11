@@ -5,6 +5,8 @@ This module provides utilities to detect when binary data appears to be ML model
 or other legitimate ML content, helping to reduce false positives in security scanning.
 """
 
+from __future__ import annotations
+
 import struct
 from typing import Any
 

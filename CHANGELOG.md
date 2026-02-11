@@ -29,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Expanded Python version support to include Python 3.9 (now supports 3.9-3.13)
 - **deps**: update xgboost to v3.1.2 (from >=1.6.0,<3.0 to >=3.1.2,<3.2) - major version upgrade with no breaking changes affecting ModelAudit's usage
 - **docs**: consolidate agent guidance into a single canonical `AGENTS.md` and align `CLAUDE.md`/`GEMINI.md` to reference it
 - **ci**: add Windows test coverage and introduce a Windows-friendly dependency set for CI usage

@@ -20,20 +20,21 @@ classifiers = [
     "Topic :: Security",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
 ]
-requires-python = ">=3.10"
+requires-python = ">=3.9"
 dependencies = [
     "click>=8.1.7",
     "yaspin>=2.5.0",
     # NumPy version depends on Python version for compatibility
-    # Python 3.10: NumPy 1.x (NumPy 2.x requires Python >=3.11)
+    # Python 3.9-3.10: NumPy 1.x (NumPy 2.x requires Python >=3.11)
     # Python 3.11+: NumPy 2.x (better performance, modern ML framework support)
-    "numpy>=1.19.0,<2.0; python_version == '3.10'",
+    "numpy>=1.19.0,<2.0; python_version < '3.11'",
     "numpy>=2.4,<2.5; python_version >= '3.11'",
     "scipy>=1.7.0",
     "cyclonedx-python-lib>=11.0.0",
@@ -48,15 +49,15 @@ dependencies = [
     "fsspec>=2025.5.1",
     "s3fs>=2025.5.1",
     "gcsfs>=2025.5.1",
-    "posthog>=7.0.0",
+    "posthog>=3.7.0",
 ]
 
 [project.optional-dependencies]
 # TensorFlow version depends on Python version:
-# - Python 3.10: TensorFlow 2.13+ (NumPy 1.x compatible)
+# - Python 3.9-3.10: TensorFlow 2.13+ (NumPy 1.x compatible)
 # - Python 3.11+: TensorFlow 2.17+ (NumPy 2.x required)
 tensorflow = [
-    "tensorflow>=2.13.0,<3.0; python_version == '3.10'",
+    "tensorflow>=2.13.0,<3.0; python_version >= '3.9' and python_version < '3.11'",
     "tensorflow>=2.17.0,<3.0; python_version >= '3.11' and python_version < '3.13'",
 ]
 h5 = ["h5py>=3.1,<4.0"]
@@ -69,7 +70,7 @@ joblib = ["joblib>=1.0.0,<2.0", "scikit-learn>=1.0.0,<2.0"]
 flax = ["msgpack>=1.0.0,<2.0"]
 tflite = ["tflite>=2.18.0"]
 tensorrt = ["tensorrt>=8.6.0; sys_platform == 'linux' or sys_platform == 'win32'"]
-xgboost = ["xgboost>=3.1.2,<3.2", "py-ubjson>=0.16.0"]
+xgboost = ["xgboost>=3.1.2,<3.2; python_version >= '3.10'", "py-ubjson>=0.16.0"]
 mlflow = ["mlflow>=2.12.0"]
 huggingface = ["huggingface-hub>=0.23.0"]
 sevenzip = ["py7zr>=0.20.0"]
@@ -77,9 +78,9 @@ sevenzip = ["py7zr>=0.20.0"]
 # - Python 3.10: NumPy 1.x + TensorFlow 2.13+
 # - Python 3.11+: NumPy 2.x + TensorFlow 2.17+
 numpy1 = [
-    "numpy>=1.19.0,<2.0; python_version == '3.10'",
+    "numpy>=1.19.0,<2.0; python_version < '3.11'",
     "numpy>=2.4,<2.5; python_version >= '3.11'",
-    "tensorflow>=2.13.0,<3.0; python_version == '3.10'",
+    "tensorflow>=2.13.0,<3.0; python_version >= '3.9' and python_version < '3.11'",
     "tensorflow>=2.17.0,<3.0; python_version >= '3.11' and python_version < '3.13'",
     "h5py>=3.1,<4.0",
     "torch>=2.6.0,<3.0",
@@ -96,7 +97,7 @@ numpy1 = [
 # All dependencies except platform-specific ones (for CI)
 # TensorFlow version depends on Python version (see tensorflow extra above)
 all-ci = [
-    "tensorflow>=2.13.0,<3.0; python_version == '3.10'",
+    "tensorflow>=2.13.0,<3.0; python_version >= '3.9' and python_version < '3.11'",
     "tensorflow>=2.17.0,<3.0; python_version >= '3.11' and python_version < '3.13'",
     "h5py>=3.1,<4.0",
     "torch>=2.6.0,<3.0",
@@ -108,7 +109,7 @@ all-ci = [
     "scikit-learn>=1.0.0,<2.0",
     "msgpack>=1.0.0,<2.0",
     "tflite>=2.18.0",
-    "xgboost>=3.1.2,<3.2",
+    "xgboost>=3.1.2,<3.2; python_version >= '3.10'",
     "py-ubjson>=0.16.0",
     "mlflow>=2.12.0",
     "huggingface-hub>=0.23.0",
@@ -121,7 +122,7 @@ all-ci-windows = [
     "safetensors>=0.4.0",
 ]
 all = [
-    "tensorflow>=2.13.0,<3.0; python_version == '3.10'",
+    "tensorflow>=2.13.0,<3.0; python_version >= '3.9' and python_version < '3.11'",
     "tensorflow>=2.17.0,<3.0; python_version >= '3.11' and python_version < '3.13'",
     "h5py>=3.1,<4.0",
     "torch>=2.6.0,<3.0",
@@ -133,7 +134,7 @@ all = [
     "scikit-learn>=1.0.0,<2.0",
     "msgpack>=1.0.0,<2.0",
     "tflite>=2.18.0",
-    "xgboost>=3.1.2,<3.2",
+    "xgboost>=3.1.2,<3.2; python_version >= '3.10'",
     "py-ubjson>=0.16.0",
     "mlflow>=2.12.0",
     "huggingface-hub>=0.23.0",
@@ -171,7 +172,7 @@ default-groups = ["dev"]
 
 [tool.ruff]
 line-length = 120
-target-version = "py310"
+target-version = "py39"
 
 [tool.ruff.lint]
 # Extend the default rule set to be more prescriptive
@@ -265,7 +266,7 @@ precision = 2
 output = "coverage.xml"
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.9"
 plugins = ["pydantic.mypy"]
 
 # Phase 1: Immediate improvements to catch real bugs
@@ -315,6 +316,11 @@ module = "modelaudit.suspicious_symbols"
 warn_unreachable = false
 
 [[tool.mypy.overrides]]
+module = ["mlflow.*", "torch.*"]
+# These packages use match/case syntax (Python 3.10+); skip when checking with python_version=3.9
+follow_imports = "skip"
+
+[[tool.mypy.overrides]]
 module = "modelaudit.scanners.oci_layer_scanner"
 # Runtime validation needs to check types even with annotations
 warn_unreachable = false
@@ -324,7 +330,7 @@ warn_unreachable = false
 
 [tool.ty.environment]
 # Use the minimum Python version from requires-python
-python-version = "3.10"
+python-version = "3.9"
 # Include both main source and test directories
 root = [".", "./modelaudit", "./tests"]
 

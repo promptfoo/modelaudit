@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import pickletools
 import struct
@@ -809,7 +811,7 @@ def _detect_ml_context(opcodes: list[tuple]) -> dict[str, Any]:
         if framework_score > 5.0:  # Much lower threshold - any ML module presence
             # Normalize confidence to 0-1 range
             confidence_boost = patterns["confidence_boost"]
-            if isinstance(confidence_boost, int | float):
+            if isinstance(confidence_boost, (int, float)):
                 confidence = min(framework_score / 100.0 * confidence_boost, 1.0)
                 context["frameworks"][framework] = {
                     "confidence": confidence,
@@ -2991,7 +2993,7 @@ class PickleScanner(BaseScanner):
                         )
 
                 # Detect nested pickle bytes
-                if opcode.name in ["BINBYTES", "SHORT_BINBYTES"] and isinstance(arg, bytes | bytearray):
+                if opcode.name in ["BINBYTES", "SHORT_BINBYTES"] and isinstance(arg, (bytes, bytearray)):
                     sample = bytes(arg[:1024])  # limit
                     if _looks_like_pickle(sample):
                         severity = _get_context_aware_severity(IssueSeverity.CRITICAL, ml_context)
@@ -3285,7 +3287,7 @@ class PickleScanner(BaseScanner):
 
             # Check if this is a known benign error in legitimate serialization files
             is_benign_error = (
-                isinstance(e, ValueError | struct.error)
+                isinstance(e, (ValueError, struct.error))
                 and any(
                     msg in str(e).lower()
                     for msg in [

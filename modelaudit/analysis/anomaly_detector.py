@@ -1,5 +1,7 @@
 """Statistical anomaly detection for model files."""
 
+from __future__ import annotations
+
 import math
 from dataclasses import dataclass
 from typing import Any
@@ -20,7 +22,7 @@ class StatisticalProfile:
     zero_ratio: float
     sparsity: float
 
-    def is_anomalous(self, other: "StatisticalProfile", threshold: float = 3.0) -> tuple[bool, float]:
+    def is_anomalous(self, other: StatisticalProfile, threshold: float = 3.0) -> tuple[bool, float]:
         """Check if another profile is anomalous compared to this one."""
         # Calculate z-scores for each metric
         z_scores = []

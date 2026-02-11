@@ -5,6 +5,8 @@ This module provides utilities for scanning large model files efficiently
 with chunked reading, progress reporting, and memory management.
 """
 
+from __future__ import annotations
+
 import logging
 import os
 import time
@@ -82,7 +84,7 @@ class LargeFileHandler:
         if self.progress_callback:
             self.progress_callback(message, percentage)
 
-    def scan(self) -> "ScanResult":
+    def scan(self) -> ScanResult:
         """
         Scan the file using the appropriate strategy.
 
@@ -100,9 +102,7 @@ class LargeFileHandler:
         else:  # optimized
             return self._scan_optimized()
 
-    def _scan_normal(self) -> "ScanResult":
-        from ...scanners.base import ScanResult
-
+    def _scan_normal(self) -> ScanResult:
         """Normal scanning for small files."""
         self._report_progress(f"Scanning {self.file_name}", 0)
 
@@ -112,7 +112,7 @@ class LargeFileHandler:
         self._report_progress(f"Completed {self.file_name}", 100)
         return result
 
-    def _scan_chunked(self) -> "ScanResult":
+    def _scan_chunked(self) -> ScanResult:
         from ...scanners.base import IssueSeverity, ScanResult
 
         """Chunked scanning for medium files."""
@@ -190,12 +190,12 @@ class LargeFileHandler:
         result.finish(success=success and not result.has_errors)
         return result
 
-    def _scan_streaming(self) -> "ScanResult":
+    def _scan_streaming(self) -> ScanResult:
         """Streaming scan for large files - always scans completely for security."""
         # Security requires complete file scanning
         return self._scan_normal()
 
-    def _scan_optimized(self) -> "ScanResult":
+    def _scan_optimized(self) -> ScanResult:
         """Optimized scanning for large files (>8GB) - still scans completely."""
         # Security requires complete file scanning
         return self._scan_normal()
@@ -224,7 +224,7 @@ def scan_large_file(
     scanner: Any,
     progress_callback: Callable[[str, float], None] | None = None,
     timeout: int = 3600,
-) -> "ScanResult":
+) -> ScanResult:
     """
     Scan a large file with appropriate strategy.
 
@@ -276,7 +276,7 @@ def _scan_large_file_internal(
     scanner: Any,
     progress_callback: Callable[[str, float], None] | None = None,
     timeout: int = 3600,
-) -> "ScanResult":
+) -> ScanResult:
     """
     Internal implementation of large file scanning (cache-agnostic).
 

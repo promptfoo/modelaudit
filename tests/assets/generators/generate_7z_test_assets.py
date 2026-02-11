@@ -6,6 +6,8 @@ Generates 7z archive test assets for SevenZipScanner testing.
 Creates both safe and malicious archives to test scanner behavior.
 """
 
+from __future__ import annotations
+
 import os
 import pickle
 import tempfile

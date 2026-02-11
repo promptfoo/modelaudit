@@ -1,5 +1,7 @@
 """Shared constants for ModelAudit."""
 
+from __future__ import annotations
+
 # Core model file extensions that can contain executable code and should be scanned
 SCANNABLE_MODEL_EXTENSIONS: frozenset[str] = frozenset(
     {

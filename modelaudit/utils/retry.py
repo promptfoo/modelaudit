@@ -1,5 +1,7 @@
 """Retry logic utilities for robust cloud operations."""
 
+from __future__ import annotations
+
 import functools
 import logging
 import random

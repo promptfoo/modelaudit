@@ -316,7 +316,10 @@ class TelemetryClient:
             }
 
             # PostHog v7 uses set() instead of identify()
-            self._posthog_client.set(distinct_id=self._user_config.user_id, properties=properties)
+            if hasattr(self._posthog_client, "set"):
+                self._posthog_client.set(distinct_id=self._user_config.user_id, properties=properties)
+            else:
+                self._posthog_client.identify(self._user_config.user_id, properties)
             # Flush immediately (matches Promptfoo's pattern)
             self._posthog_client.flush()
         except Exception as e:

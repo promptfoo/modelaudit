@@ -5,6 +5,8 @@ representations for caching and serialization purposes. It helps break circular
 import dependencies between core.py and scanners/base.py.
 """
 
+from __future__ import annotations
+
 import logging
 import time
 from typing import TYPE_CHECKING, Any
@@ -15,7 +17,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def scan_result_from_dict(result_dict: dict[str, Any]) -> "ScanResult":
+def scan_result_from_dict(result_dict: dict[str, Any]) -> ScanResult:
     """
     Convert a dictionary representation back to a ScanResult object.
 
@@ -131,7 +133,7 @@ def scan_result_from_dict(result_dict: dict[str, Any]) -> "ScanResult":
     return result
 
 
-def scan_result_to_dict(scan_result: "ScanResult") -> dict[str, Any]:
+def scan_result_to_dict(scan_result: ScanResult) -> dict[str, Any]:
     """
     Convert a ScanResult object to a dictionary representation.
 

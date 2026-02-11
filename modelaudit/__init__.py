@@ -5,6 +5,8 @@ Python Packaging Authority (PyPA) as of 2025. The version is defined once in
 pyproject.toml and accessed at runtime via importlib.metadata.
 """
 
+from __future__ import annotations
+
 import sys
 
 # Set high recursion limit for security analysis

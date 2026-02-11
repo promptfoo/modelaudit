@@ -1,5 +1,7 @@
 """Batch cache operations for optimized multi-file scanning."""
 
+from __future__ import annotations
+
 import logging
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed

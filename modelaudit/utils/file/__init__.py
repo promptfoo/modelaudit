@@ -8,6 +8,8 @@ This package contains utilities for file operations:
 - streaming.py - Streaming file processing
 """
 
+from __future__ import annotations
+
 from modelaudit.utils.file import detection, filtering, handlers, large_file_handler, streaming
 
 __all__ = [

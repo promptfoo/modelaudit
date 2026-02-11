@@ -10,6 +10,8 @@ Whitelist sources:
 2. Trusted organizations - Models from verified organizations (Meta, Google, Microsoft, etc.)
 """
 
+from __future__ import annotations
+
 from modelaudit.whitelists.huggingface_organizations import (
     ORGANIZATION_MODELS,
     is_from_trusted_organization,

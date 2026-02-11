@@ -1,5 +1,7 @@
 """Cache manager for integrating with ModelAudit scanners."""
 
+from __future__ import annotations
+
 import logging
 import os
 import time

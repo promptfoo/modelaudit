@@ -25,6 +25,8 @@ Usage:
         # Signal handlers are restored on exit
 """
 
+from __future__ import annotations
+
 import contextlib
 import logging
 import os
@@ -197,7 +199,7 @@ def reset_interrupt() -> None:
 
 
 @contextmanager
-def interruptible_scan() -> Generator["InterruptHandler", None, None]:
+def interruptible_scan() -> Generator[InterruptHandler, None, None]:
     """Context manager for interruptible scanning operations.
 
     This installs signal handlers for SIGINT and SIGTERM, allowing the

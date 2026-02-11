@@ -8,6 +8,8 @@ This package contains specialized detectors for identifying security threats in 
 - Suspicious symbols (dangerous function calls)
 """
 
+from __future__ import annotations
+
 from modelaudit.detectors import cve_patterns, jit_script, network_comm, secrets, suspicious_symbols
 
 __all__ = [

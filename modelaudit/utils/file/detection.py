@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import re
 import struct
 from pathlib import Path
@@ -32,42 +34,30 @@ def read_magic_bytes(path: str, num_bytes: int = 8) -> bytes:
 
 
 def detect_format_from_magic_bytes(magic4: MagicBytes, magic8: MagicBytes, magic16: MagicBytes) -> FileFormat:
-    """Detect file format using Python 3.10+ pattern matching on magic bytes."""
-    # Use pattern matching for cleaner magic byte detection
-    match magic4:
-        case b"GGUF":
-            return "gguf"
-        case magic if magic in GGML_MAGIC_VARIANTS:
-            return "ggml"
-        case magic if magic.startswith(b"PK"):
-            return "zip"
-        case b"\x08\x01\x12\x00":  # ONNX protobuf magic
-            return "onnx"
-        case _:
-            pass
+    """Detect file format from magic bytes."""
+    # Check 4-byte magic sequences
+    if magic4 == b"GGUF":
+        return "gguf"
+    elif magic4 in GGML_MAGIC_VARIANTS:
+        return "ggml"
+    elif magic4.startswith(b"PK"):
+        return "zip"
+    elif magic4 == b"\x08\x01\x12\x00":  # ONNX protobuf magic
+        return "onnx"
 
     # Check longer magic sequences
-    match magic8:
-        case b"\x89HDF\r\n\x1a\n":  # HDF5 magic
-            return "hdf5"
-        case magic if magic.startswith(b"\x93NUMPY"):
-            return "numpy"
-        case _:
-            pass
+    if magic8 == b"\x89HDF\r\n\x1a\n":  # HDF5 magic
+        return "hdf5"
+    elif magic8.startswith(b"\x93NUMPY"):
+        return "numpy"
 
-    # Check pickle magic bytes using pattern matching
-    match magic4[:2]:
-        case b"\x80\x02" | b"\x80\x03" | b"\x80\x04" | b"\x80\x05":
-            return "pickle"
-        case _:
-            pass
+    # Check pickle magic bytes
+    if magic4[:2] in (b"\x80\x02", b"\x80\x03", b"\x80\x04", b"\x80\x05"):
+        return "pickle"
 
     # Check for JSON-like formats (SafeTensors, etc.)
-    match magic4[0:1]:
-        case b"{":
-            return "safetensors"
-        case _:
-            pass
+    if magic4[0:1] == b"{":
+        return "safetensors"
 
     # Check for patterns in first 16 bytes
     if b"onnx" in magic16:
@@ -348,56 +338,51 @@ EXTENSION_FORMAT_MAP = {
 
 
 def detect_format_from_extension_pattern_matching(extension: FileExtension) -> FileFormat:
-    """Detect format using Python 3.10+ pattern matching for file extensions."""
-    # Use pattern matching for more readable extension handling
-    match extension.lower():
+    """Detect format from file extension using dict lookup."""
+    _EXTENSION_FORMAT_LOOKUP: dict[str, FileFormat] = {
         # PyTorch/Pickle formats
-        case ".pt" | ".pth" | ".ckpt" | ".pkl" | ".pickle" | ".dill":
-            return "pickle"
+        ".pt": "pickle",
+        ".pth": "pickle",
+        ".ckpt": "pickle",
+        ".pkl": "pickle",
+        ".pickle": "pickle",
+        ".dill": "pickle",
         # HDF5 formats
-        case ".h5" | ".hdf5" | ".keras":
-            return "hdf5"
+        ".h5": "hdf5",
+        ".hdf5": "hdf5",
+        ".keras": "hdf5",
         # Archive formats
-        case ".zip":
-            return "zip"
-        case ".tar" | ".tar.gz" | ".tgz":
-            return "tar"
+        ".zip": "zip",
+        ".tar": "tar",
+        ".tar.gz": "tar",
+        ".tgz": "tar",
         # ML model formats
-        case ".onnx":
-            return "onnx"
-        case ".safetensors":
-            return "safetensors"
-        case ".bin":
-            return "pytorch_binary"
+        ".onnx": "onnx",
+        ".safetensors": "safetensors",
+        ".bin": "pytorch_binary",
         # GGML/GGUF formats
-        case ".gguf":
-            return "gguf"
-        case ".ggml" | ".ggmf" | ".ggjt" | ".ggla" | ".ggsa":
-            return "ggml"
+        ".gguf": "gguf",
+        ".ggml": "ggml",
+        ".ggmf": "ggml",
+        ".ggjt": "ggml",
+        ".ggla": "ggml",
+        ".ggsa": "ggml",
         # ExecutorTorch formats
-        case ".ptl" | ".pte":
-            return "executorch"
+        ".ptl": "executorch",
+        ".pte": "executorch",
         # Other formats
-        case ".pb":
-            return "protobuf"
-        case ".tflite":
-            return "tflite"
-        case ".engine":
-            return "tensorrt"
-        case ".pdmodel":
-            return "paddle"
-        case ".xml":
-            return "openvino"
-        case ".pmml":
-            return "pmml"
-        case ".npy" | ".npz":
-            return "numpy"
-        case ".msgpack":
-            return "flax_msgpack"
-        case ".7z":
-            return "sevenzip"
-        case _:
-            return "unknown"
+        ".pb": "protobuf",
+        ".tflite": "tflite",
+        ".engine": "tensorrt",
+        ".pdmodel": "paddle",
+        ".xml": "openvino",
+        ".pmml": "pmml",
+        ".npy": "numpy",
+        ".npz": "numpy",
+        ".msgpack": "flax_msgpack",
+        ".7z": "sevenzip",
+    }
+    return _EXTENSION_FORMAT_LOOKUP.get(extension.lower(), "unknown")
 
 
 def detect_format_from_extension(path: FilePath) -> FileFormat:

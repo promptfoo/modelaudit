@@ -1,5 +1,7 @@
 """Secure file hashing for ModelAudit cache system."""
 
+from __future__ import annotations
+
 import hashlib
 import logging
 import mmap

@@ -1,5 +1,7 @@
 """File-based progress reporting for logging and monitoring."""
 
+from __future__ import annotations
+
 import json
 import time
 from pathlib import Path

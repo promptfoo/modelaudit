@@ -14,6 +14,8 @@ This package contains general-purpose utility functions:
 - types.py - Type definitions and aliases
 """
 
+from __future__ import annotations
+
 from modelaudit.utils.helpers import (
     assets,
     cache_decorator,

@@ -4,6 +4,8 @@ This module provides sophisticated pattern detection that goes beyond simple str
 matching to include semantic analysis, obfuscation detection, and ML context awareness.
 """
 
+from __future__ import annotations
+
 import base64
 import logging
 import re

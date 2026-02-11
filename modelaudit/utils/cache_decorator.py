@@ -4,6 +4,8 @@ This module provides a single, consistent caching interface that eliminates
 duplicate caching logic between core.py and scanners/base.py.
 """
 
+from __future__ import annotations
+
 import functools
 import logging
 import os

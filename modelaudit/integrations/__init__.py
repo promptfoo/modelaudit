@@ -8,6 +8,8 @@ This package contains integrations with external systems and output formats:
 - SARIF formatter (security analysis output)
 """
 
+from __future__ import annotations
+
 from modelaudit.integrations import jfrog, license_checker, mlflow, sarif_formatter, sbom_generator
 
 __all__ = [

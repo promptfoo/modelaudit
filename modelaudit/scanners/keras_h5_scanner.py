@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import os
 from typing import Any, ClassVar
@@ -168,7 +170,7 @@ class KerasH5Scanner(BaseScanner):
                     training_config = json.loads(f.attrs["training_config"])
                     if "metrics" in training_config and training_config["metrics"] is not None:
                         metrics_list = training_config["metrics"]
-                        if not isinstance(metrics_list, list | tuple):
+                        if not isinstance(metrics_list, (list, tuple)):
                             metrics_list = []
                         for metric in metrics_list:
                             if isinstance(metric, dict) and metric.get(

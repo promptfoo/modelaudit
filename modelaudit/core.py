@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import builtins
 import hashlib
 import logging
@@ -356,7 +358,7 @@ def _get_consolidated_timestamp(group_checks: list[dict[str, Any]]) -> float:
     Returns:
         Most recent timestamp, or current time if none found
     """
-    timestamps = [c.get("timestamp", 0) for c in group_checks if isinstance(c.get("timestamp"), int | float)]
+    timestamps = [c.get("timestamp", 0) for c in group_checks if isinstance(c.get("timestamp"), (int, float))]
     return max(timestamps) if timestamps else time.time()
 
 
@@ -946,7 +948,7 @@ def scan_model_directory_or_file(
                             def progress_read(size: int = -1) -> Any:
                                 nonlocal file_pos
                                 data = original_read(size)
-                                if isinstance(data, str | bytes):
+                                if isinstance(data, (str, bytes)):
                                     file_pos += len(data)
                                 callback(
                                     f"Reading file: {os.path.basename(file_path)}",

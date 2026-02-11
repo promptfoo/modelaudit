@@ -1,48 +1,54 @@
-"""Common type aliases for ModelAudit using Python 3.10+ features."""
+"""Common type aliases for ModelAudit."""
+
+# ruff: noqa: UP006, UP035, UP045
+# TypeAlias values are runtime expressions, not annotations.
+# Must use typing.Dict/List/Union/Optional for Python 3.9 compat.
 
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any, Literal, Protocol, TypeAlias, TypedDict
+from typing import Any, Dict, List, Literal, Optional, Protocol, Tuple, TypedDict, Union
+
+from typing_extensions import TypeAlias
 
 # Configuration types
-ConfigValue: TypeAlias = str | int | bool | list[str] | dict[str, Any]
-ConfigDict: TypeAlias = dict[str, ConfigValue]
-NestedDict: TypeAlias = dict[str, Any]
+ConfigValue: TypeAlias = Union[str, int, bool, List[str], Dict[str, Any]]
+ConfigDict: TypeAlias = Dict[str, ConfigValue]
+NestedDict: TypeAlias = Dict[str, Any]
 
 # File and path types
 FilePath: TypeAlias = str
 FileSize: TypeAlias = int
-PathList: TypeAlias = list[FilePath]
+PathList: TypeAlias = List[FilePath]
 
 # Model scanning types
-ScanMetadata: TypeAlias = dict[str, Any]
-CheckDetails: TypeAlias = dict[str, Any] | None
-IssueDict: TypeAlias = dict[str, Any]
+ScanMetadata: TypeAlias = Dict[str, Any]
+CheckDetails: TypeAlias = Optional[Dict[str, Any]]
+IssueDict: TypeAlias = Dict[str, Any]
 
 # Tensor and ML types
-TensorShape: TypeAlias = tuple[int, ...]
-LayerInfo: TypeAlias = dict[str, Any]
-ModelWeights: TypeAlias = dict[str, Any]
+TensorShape: TypeAlias = Tuple[int, ...]
+LayerInfo: TypeAlias = Dict[str, Any]
+ModelWeights: TypeAlias = Dict[str, Any]
 
 # Network and URL types
 URLString: TypeAlias = str
-Headers: TypeAlias = dict[str, str]
-QueryParams: TypeAlias = dict[str, str | list[str]]
+Headers: TypeAlias = Dict[str, str]
+QueryParams: TypeAlias = Dict[str, Union[str, List[str]]]
 
 # Progress and callback types
 ProgressValue: TypeAlias = float  # 0.0 to 1.0
 ProgressCallback: TypeAlias = Callable[[str, ProgressValue], None]
 
 # Security and detection types
-PatternMatch: TypeAlias = dict[str, Any]
-SecurityFinding: TypeAlias = dict[str, Any]
+PatternMatch: TypeAlias = Dict[str, Any]
+SecurityFinding: TypeAlias = Dict[str, Any]
 RiskScore: TypeAlias = float  # 0.0 to 1.0
 
 # SARIF and reporting types
-SARIFRule: TypeAlias = dict[str, Any]
-SARIFResult: TypeAlias = dict[str, Any]
-SARIFArtifact: TypeAlias = dict[str, Any]
+SARIFRule: TypeAlias = Dict[str, Any]
+SARIFResult: TypeAlias = Dict[str, Any]
+SARIFArtifact: TypeAlias = Dict[str, Any]
 
 # Hash and caching types
 HashString: TypeAlias = str
@@ -82,7 +88,7 @@ class IssueDataTypedDict(TypedDict):
     message: str
     severity: SeverityLevel
     location: str
-    details: dict[str, Any] | None
+    details: Optional[Dict[str, Any]]
 
 
 class ScanResultMetadataTypedDict(TypedDict, total=False):

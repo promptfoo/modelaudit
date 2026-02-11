@@ -1,5 +1,7 @@
 """Console-based progress reporting with tqdm integration."""
 
+from __future__ import annotations
+
 import sys
 
 from .base import ProgressPhase, ProgressReporter, ProgressStats
@@ -55,7 +57,7 @@ class ConsoleProgressReporter(ProgressReporter):
         self._item_pbar: tqdm | None = None
         self._current_phase = ProgressPhase.INITIALIZING
 
-    def _create_byte_progress_bar(self, stats: ProgressStats) -> "tqdm | None":
+    def _create_byte_progress_bar(self, stats: ProgressStats) -> tqdm | None:
         """Create byte-level progress bar."""
         if not self.use_tqdm or not self.show_bytes or stats.total_bytes <= 0:
             return None
@@ -71,7 +73,7 @@ class ConsoleProgressReporter(ProgressReporter):
             leave=True,
         )
 
-    def _create_item_progress_bar(self, stats: ProgressStats) -> "tqdm | None":
+    def _create_item_progress_bar(self, stats: ProgressStats) -> tqdm | None:
         """Create item-level progress bar."""
         if not self.use_tqdm or not self.show_items or stats.total_items <= 0:
             return None
@@ -86,7 +88,7 @@ class ConsoleProgressReporter(ProgressReporter):
             leave=True,
         )
 
-    def _update_progress_bar_desc(self, pbar: "tqdm", stats: ProgressStats) -> None:
+    def _update_progress_bar_desc(self, pbar: tqdm, stats: ProgressStats) -> None:
         """Update progress bar description with current phase and item."""
         desc_parts = [stats.current_phase.value.capitalize()]
 

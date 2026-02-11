@@ -4,6 +4,8 @@ These models provide type safety and validation while producing the exact same
 JSON structure that ModelAudit currently outputs for backward compatibility.
 """
 
+from __future__ import annotations
+
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -368,8 +370,8 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
 
     # Core scan results
     bytes_scanned: int = Field(..., description="Total bytes scanned")
-    issues: list["Issue"] = Field(default_factory=list, description="List of security issues found")
-    checks: list["Check"] = Field(default_factory=list, description="List of all checks performed")
+    issues: list[Issue] = Field(default_factory=list, description="List of security issues found")
+    checks: list[Check] = Field(default_factory=list, description="List of all checks performed")
     files_scanned: int = Field(..., description="Number of files scanned")
     assets: list[AssetModel] = Field(default_factory=list, description="List of scanned assets")
     has_errors: bool = Field(..., description="Whether any critical issues were found")
@@ -391,7 +393,7 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
     # Legacy compatibility
     success: bool = Field(default=True, description="Whether the scan completed successfully")
 
-    def aggregate_scan_result(self, results: "dict[str, Any] | ModelAuditResultModel") -> None:
+    def aggregate_scan_result(self, results: dict[str, Any] | ModelAuditResultModel) -> None:
         """Efficiently aggregate scan results into this model.
 
         This method updates the current model in-place for performance.
@@ -605,7 +607,7 @@ def create_audit_result_model(aggregated_results: dict[str, Any]) -> ModelAuditR
     )
 
 
-def convert_issues_to_models(issues: list[Any]) -> list["Issue"]:
+def convert_issues_to_models(issues: list[Any]) -> list[Issue]:
     """Convert list of issue dicts or objects to Issue instances."""
     import time
 
@@ -629,7 +631,7 @@ def convert_issues_to_models(issues: list[Any]) -> list["Issue"]:
     return result
 
 
-def convert_checks_to_models(checks: list[Any]) -> list["Check"]:
+def convert_checks_to_models(checks: list[Any]) -> list[Check]:
     """Convert list of check dicts or objects to Check instances."""
     import time
 
@@ -720,7 +722,7 @@ class ScanConfigModel(BaseModel):
         return self.model_dump(exclude_none=True)
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "ScanConfigModel":
+    def from_dict(cls, data: dict[str, Any]) -> ScanConfigModel:
         """Create from dictionary with validation"""
         return cls(**data)
 

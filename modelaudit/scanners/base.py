@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import hashlib
 import json
 import logging
@@ -127,7 +129,7 @@ class Issue(BaseModel):
 class ScanResult:
     """Collects and manages issues found during scanning"""
 
-    def __init__(self, scanner_name: str = "unknown", scanner: "BaseScanner | None" = None):
+    def __init__(self, scanner_name: str = "unknown", scanner: BaseScanner | None = None):
         self.scanner_name = scanner_name
         self.scanner = scanner  # Reference to the scanner for whitelist checks
         self.issues: list[Issue] = []
@@ -234,7 +236,7 @@ class ScanResult:
             why=why,
         )
 
-    def merge(self, other: "ScanResult") -> None:
+    def merge(self, other: ScanResult) -> None:
         """Merge another scan result into this one"""
         self.issues.extend(other.issues)
         self.checks.extend(other.checks)  # Merge checks as well
@@ -457,7 +459,7 @@ class BaseScanner(ABC):
 
         # Create cached version of the scan method
         @cached_scan()
-        def cached_scan_method(scanner_self: "BaseScanner", file_path: str) -> ScanResult:
+        def cached_scan_method(scanner_self: BaseScanner, file_path: str) -> ScanResult:
             return scanner_self.scan(file_path)
 
         return cached_scan_method(self, path)
