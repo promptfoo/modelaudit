@@ -150,7 +150,16 @@ SUSPICIOUS_GLOBALS = {
     "platform": ["system", "popen"],  # System information/execution
     # Low-level system access - CRITICAL RISK
     "ctypes": ["*"],  # C library access
+    "ctypes.util": "*",  # Library finding utilities (find_library, etc.)
     "socket": ["*"],  # Network communication
+    "mmap": "*",  # Memory mapping (can map files, shared memory)
+    # Process and signal control - CRITICAL RISK
+    "multiprocessing": "*",  # Process spawning and pool execution
+    "multiprocessing.pool": "*",  # Process pools
+    "concurrent.futures": ["ProcessPoolExecutor", "ThreadPoolExecutor"],  # Executor pools
+    "signal": "*",  # Signal handling manipulation (can alter program flow)
+    # Async subprocess - CRITICAL RISK
+    "asyncio.subprocess": "*",  # Async subprocess execution
     # Serialization libraries that can execute arbitrary code - HIGH RISK
     "dill": [
         "load",
