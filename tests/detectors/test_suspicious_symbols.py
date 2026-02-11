@@ -151,6 +151,37 @@ class TestSuspiciousStringPatterns:
         # (These are trade-offs between security and usability)
         print(f"Known false positives: {false_positives}")
 
+    def test_detects_getattr_system_evasion(self) -> None:
+        """Test that getattr-based system call evasion is detected."""
+        evasion_patterns = [
+            "getattr(os, 'system')('whoami')",
+            "getattr(os,'popen')('cat /etc/passwd')",
+            "getattr( os , 'spawn' )",
+        ]
+        system_pattern = r"getattr\s*\(\s*\w+\s*,\s*['\"]system['\"]\s*\)"
+        popen_pattern = r"getattr\s*\(\s*\w+\s*,\s*['\"]popen['\"]\s*\)"
+        spawn_pattern = r"getattr\s*\(\s*\w+\s*,\s*['\"]spawn['\"]\s*\)"
+
+        assert re.search(system_pattern, evasion_patterns[0])
+        assert re.search(popen_pattern, evasion_patterns[1])
+        assert re.search(spawn_pattern, evasion_patterns[2])
+
+    def test_detects_getattr_exec_evasion(self) -> None:
+        """Test that getattr-based exec/eval evasion is detected."""
+        exec_pattern = r"getattr\s*\(\s*\w+\s*,\s*['\"]exec['\"]\s*\)"
+        eval_pattern = r"getattr\s*\(\s*\w+\s*,\s*['\"]eval['\"]\s*\)"
+
+        assert re.search(exec_pattern, "getattr(builtins, 'exec')(code)")
+        assert re.search(eval_pattern, "getattr(__builtins__, 'eval')('1+1')")
+
+    def test_detects_nested_getattr_chains(self) -> None:
+        """Test that nested getattr chains are detected."""
+        chain_pattern = r"getattr\s*\(\s*getattr\s*\("
+
+        # Nested getattr used to obfuscate attribute access
+        obfuscated = "getattr(getattr(__import__('os'), 'path'), 'join')"
+        assert re.search(chain_pattern, obfuscated)
+
 
 class TestSuspiciousMetadataPatterns:
     """Test SUSPICIOUS_METADATA_PATTERNS regex patterns."""

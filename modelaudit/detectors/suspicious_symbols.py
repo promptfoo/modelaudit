@@ -222,6 +222,16 @@ SUSPICIOUS_STRING_PATTERNS = [
     r"lambda",  # Anonymous function creation
     # Hex encoding - possible obfuscation
     r"\\x[0-9a-fA-F]{2}",  # Hex-encoded characters
+    # getattr-based evasion patterns - bypass string matching via dynamic attribute access
+    r"getattr\s*\(\s*\w+\s*,\s*['\"]system['\"]\s*\)",  # getattr(os, 'system')
+    r"getattr\s*\(\s*\w+\s*,\s*['\"]exec['\"]\s*\)",  # getattr(builtins, 'exec')
+    r"getattr\s*\(\s*\w+\s*,\s*['\"]eval['\"]\s*\)",  # getattr(builtins, 'eval')
+    r"getattr\s*\(\s*\w+\s*,\s*['\"]popen['\"]\s*\)",  # getattr(os, 'popen')
+    r"getattr\s*\(\s*\w+\s*,\s*['\"]spawn['\"]\s*\)",  # getattr(os, 'spawn*')
+    r"getattr\s*\(\s*\w+\s*,\s*['\"]call['\"]\s*\)",  # getattr(subprocess, 'call')
+    r"getattr\s*\(\s*\w+\s*,\s*['\"]run['\"]\s*\)",  # getattr(subprocess, 'run')
+    r"getattr\s*\(\s*\w+\s*,\s*['\"]Popen['\"]\s*\)",  # getattr(subprocess, 'Popen')
+    r"getattr\s*\(\s*getattr\s*\(",  # Nested getattr chains - obfuscation technique
 ]
 
 # =============================================================================
