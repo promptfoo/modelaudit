@@ -1406,6 +1406,8 @@ def check_opcode_sequence(
 
             # Special handling for REDUCE - check if it's using safe globals
             elif opcode.name == "REDUCE":
+                # Default to dangerous if no associated GLOBAL/STACK_GLOBAL found
+                is_dangerous_opcode = True
                 # Look back to find the associated GLOBAL or STACK_GLOBAL
                 for j in range(i - 1, max(0, i - 10), -1):
                     prev_opcode, prev_arg, _prev_pos = opcodes[j]
@@ -1420,9 +1422,9 @@ def check_opcode_sequence(
                         )
                         if len(parts) == 2:
                             mod, func = parts
-                            # Only count as dangerous if NOT in safe globals
-                            if not _is_safe_ml_global(mod, func):
-                                is_dangerous_opcode = True
+                            # Only skip if in safe globals
+                            if _is_safe_ml_global(mod, func):
+                                is_dangerous_opcode = False
                             break
 
                     elif prev_opcode.name == "STACK_GLOBAL":
@@ -1444,9 +1446,9 @@ def check_opcode_sequence(
 
                         if len(recent_strings) >= 2:
                             mod, func = recent_strings[0], recent_strings[1]
-                            # Only count as dangerous if NOT in safe globals
-                            if not _is_safe_ml_global(mod, func):
-                                is_dangerous_opcode = True
+                            # Only skip if in safe globals
+                            if _is_safe_ml_global(mod, func):
+                                is_dangerous_opcode = False
                             break
 
             # GLOBAL/STACK_GLOBAL: only count when referencing non-safe modules
