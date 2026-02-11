@@ -1,10 +1,13 @@
 """Tests for Python version warnings in __init__.py and cli.py."""
 
+import importlib
 import sys
 import warnings
 from unittest.mock import call, patch
 
 import click
+
+import modelaudit
 
 
 class TestInitVersionWarning:
@@ -15,28 +18,20 @@ class TestInitVersionWarning:
         fake_version = (3, 9, 0, "final", 0)
         with patch.object(sys, "version_info", fake_version), warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            if sys.version_info < (3, 10):  # noqa: UP036
-                warnings.warn(
-                    f"modelaudit requires Python 3.10+, but you are running Python "
-                    f"{sys.version_info[0]}.{sys.version_info[1]}. "
-                    f"Please upgrade: https://www.promptfoo.dev/docs/model-audit/",
-                    stacklevel=2,
-                )
-            assert len(caught) == 1
-            assert "Python 3.10+" in str(caught[0].message)
-            assert "3.9" in str(caught[0].message)
+            importlib.reload(modelaudit)
+
+        warning_messages = [str(w.message) for w in caught]
+        assert any("Python 3.10+" in msg for msg in warning_messages)
+        assert any("3.9" in msg for msg in warning_messages)
 
     def test_no_warning_on_supported_python(self):
         """Should NOT emit a warning when Python >= 3.10."""
-        fake_version = (3, 12, 0, "final", 0)
-        with patch.object(sys, "version_info", fake_version), warnings.catch_warnings(record=True) as caught:
+        with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            if sys.version_info < (3, 10):  # noqa: UP036
-                warnings.warn(
-                    "modelaudit requires Python 3.10+",
-                    stacklevel=2,
-                )
-            assert len(caught) == 0
+            importlib.reload(modelaudit)
+
+        warning_messages = [str(w.message) for w in caught]
+        assert not any("Python 3.10+" in msg for msg in warning_messages)
 
 
 class TestCliVersionWarning:

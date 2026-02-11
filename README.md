@@ -501,12 +501,15 @@ python --version   # Must be 3.10 or higher
 
 1. **Upgrade Python** — install Python 3.10+ from [python.org](https://www.python.org/downloads/) or your package manager.
 2. **Use pyenv** — manage multiple Python versions side-by-side:
+
    ```bash
    pyenv install 3.12
    pyenv shell 3.12
    pip install modelaudit
    ```
+
 3. **Use Docker** — no local Python needed:
+
    ```bash
    docker pull ghcr.io/promptfoo/modelaudit:latest
    docker run --rm -v "$(pwd)":/app ghcr.io/promptfoo/modelaudit:latest model.pkl
