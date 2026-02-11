@@ -6,6 +6,7 @@ import lzma
 import pickle
 import zipfile
 import zlib
+from typing import Any
 
 import numpy as np
 
@@ -343,7 +344,7 @@ class TestNumPyScannerSecurity:
 
         # Create a large 4D array that should trigger version 2.0
         # due to large header size, not structured dtype
-        arr = np.zeros((100, 50, 20, 10), dtype=np.float64)
+        arr: Any = np.zeros((100, 50, 20, 10), dtype=np.float64)
 
         npy_file = tmp_path / "version2.npy"
         np.save(npy_file, arr)
