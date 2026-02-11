@@ -315,7 +315,7 @@ class TelemetryClient:
                 "python_version": f"{sys.version_info.major}.{sys.version_info.minor}",
             }
 
-            # PostHog v7 uses set() instead of identify()
+            # PostHog v6+ uses set() instead of identify()
             if hasattr(self._posthog_client, "set"):
                 self._posthog_client.set(distinct_id=self._user_config.user_id, properties=properties)
             else:

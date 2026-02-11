@@ -45,6 +45,7 @@ dependencies = [
     "platformdirs>=3.0.0",
     "pyyaml>=6.0,<7.0",
     "pydantic>=2.11.0,<3.0",
+    "typing_extensions>=4.0",
     "contourpy<1.3.4",
     "fsspec>=2025.5.1",
     "s3fs>=2025.5.1",
@@ -316,7 +317,7 @@ module = "modelaudit.suspicious_symbols"
 warn_unreachable = false
 
 [[tool.mypy.overrides]]
-module = ["mlflow.*", "torch.*"]
+module = ["mlflow.*", "torch.*", "_pytest.*"]
 # These packages use match/case syntax (Python 3.10+); skip when checking with python_version=3.9
 follow_imports = "skip"
 

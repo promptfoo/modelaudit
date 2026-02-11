@@ -60,14 +60,14 @@ MagicBytes: TypeAlias = bytes
 FileFormat: TypeAlias = str
 FileExtension: TypeAlias = str
 
-# Literal types for Python 3.10+
+# Literal types
 SeverityLevel: TypeAlias = Literal["debug", "info", "warning", "critical"]
 CheckStatusType: TypeAlias = Literal["passed", "failed", "skipped"]
 ScanFormatType: TypeAlias = Literal["text", "json", "sarif", "sbom"]
 LogLevelType: TypeAlias = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 
 
-# TypedDict for structured configurations (Python 3.10+)
+# TypedDict for structured configurations
 class ScanConfigTypedDict(TypedDict, total=False):
     """Typed configuration dictionary for scanning options."""
 
@@ -102,7 +102,7 @@ class ScanResultMetadataTypedDict(TypedDict, total=False):
     custom_domains: list[str]
 
 
-# Protocol classes for better duck typing (Python 3.10+)
+# Protocol classes for better duck typing
 class ScannerProtocol(Protocol):
     """Protocol for scanner implementations."""
 

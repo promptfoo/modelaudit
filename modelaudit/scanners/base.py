@@ -1,3 +1,6 @@
+# ruff: noqa: UP045
+# Pydantic evaluates annotations at runtime via eval().
+# Must use Optional[X] instead of X|None for Python 3.9 compat.
 from __future__ import annotations
 
 import hashlib
@@ -9,7 +12,7 @@ import os
 import time
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_serializer
 
@@ -63,10 +66,10 @@ class Check(BaseModel):
     name: str = Field(..., description="Name of the check performed")
     status: CheckStatus = Field(..., description="Whether the check passed or failed")
     message: str = Field(..., description="Description of what was checked")
-    severity: IssueSeverity | None = Field(None, description="Severity (only for failed checks)")
-    location: str | None = Field(None, description="File position, line number, etc.")
+    severity: Optional[IssueSeverity] = Field(None, description="Severity (only for failed checks)")
+    location: Optional[str] = Field(None, description="File position, line number, etc.")
     details: dict[str, Any] = Field(default_factory=dict, description="Additional check details")
-    why: str | None = Field(None, description="Explanation (mainly for failed checks)")
+    why: Optional[str] = Field(None, description="Explanation (mainly for failed checks)")
     timestamp: float = Field(default_factory=time.time, description="Timestamp when check was performed")
 
     @field_serializer("status")
@@ -75,7 +78,7 @@ class Check(BaseModel):
         return status.value
 
     @field_serializer("severity")
-    def serialize_severity(self, severity: IssueSeverity | None) -> str | None:
+    def serialize_severity(self, severity: Optional[IssueSeverity]) -> Optional[str]:
         """Serialize severity enum to string value"""
         return severity.value if severity else None
 
@@ -102,11 +105,11 @@ class Issue(BaseModel):
 
     message: str = Field(..., description="Description of the issue")
     severity: IssueSeverity = Field(default=IssueSeverity.WARNING, description="Issue severity level")
-    location: str | None = Field(None, description="File position, line number, etc.")
+    location: Optional[str] = Field(None, description="File position, line number, etc.")
     details: dict[str, Any] = Field(default_factory=dict, description="Additional details about the issue")
-    why: str | None = Field(None, description="Explanation of why this is a security concern")
+    why: Optional[str] = Field(None, description="Explanation of why this is a security concern")
     timestamp: float = Field(default_factory=time.time, description="Timestamp when issue was detected")
-    type: str | None = Field(None, description="Type of issue for categorization")
+    type: Optional[str] = Field(None, description="Type of issue for categorization")
 
     @field_serializer("severity")
     def serialize_severity(self, severity: IssueSeverity) -> str:

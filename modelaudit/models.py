@@ -4,10 +4,14 @@ These models provide type safety and validation while producing the exact same
 JSON structure that ModelAudit currently outputs for backward compatibility.
 """
 
+# ruff: noqa: UP007, UP045
+# Pydantic evaluates annotations at runtime via eval().
+# Must use Optional[X]/Union[X,Y] instead of X|Y for Python 3.9 compat.
+
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
 
@@ -25,8 +29,8 @@ class DetectorFinding(BaseModel):
     message: str = Field(..., description="Description of the finding")
     severity: str = Field(..., description="Severity level (CRITICAL, WARNING, INFO, DEBUG)")
     context: str = Field(..., description="Context where finding was detected")
-    pattern: str | None = Field(None, description="Pattern that triggered the finding")
-    recommendation: str | None = Field(None, description="Recommended action")
+    pattern: Optional[str] = Field(None, description="Pattern that triggered the finding")
+    recommendation: Optional[str] = Field(None, description="Recommended action")
     confidence: float = Field(1.0, description="Confidence in the finding", ge=0.0, le=1.0)
     details: dict[str, Any] = Field(default_factory=dict, description="Additional finding details")
 
@@ -38,29 +42,29 @@ class DetectorFinding(BaseModel):
 class JITScriptFinding(DetectorFinding):
     """Pydantic model for JIT/Script detector findings"""
 
-    framework: str | None = Field(None, description="Framework where finding was detected")
-    code_snippet: str | None = Field(None, description="Relevant code snippet")
-    type: str | None = Field(None, description="Type of JIT/Script finding")
-    operation: str | None = Field(None, description="Detected operation or pattern")
-    builtin: str | None = Field(None, description="Detected builtin function")
-    import_: str | None = Field(None, description="Detected import statement", alias="import")
+    framework: Optional[str] = Field(None, description="Framework where finding was detected")
+    code_snippet: Optional[str] = Field(None, description="Relevant code snippet")
+    type: Optional[str] = Field(None, description="Type of JIT/Script finding")
+    operation: Optional[str] = Field(None, description="Detected operation or pattern")
+    builtin: Optional[str] = Field(None, description="Detected builtin function")
+    import_: Optional[str] = Field(None, description="Detected import statement", alias="import")
 
 
 class NetworkCommFinding(DetectorFinding):
     """Pydantic model for network communication detector findings"""
 
-    url: str | None = Field(None, description="Detected URL")
-    ip_address: str | None = Field(None, description="Detected IP address")
-    domain: str | None = Field(None, description="Detected domain")
-    protocol: str | None = Field(None, description="Detected protocol")
+    url: Optional[str] = Field(None, description="Detected URL")
+    ip_address: Optional[str] = Field(None, description="Detected IP address")
+    domain: Optional[str] = Field(None, description="Detected domain")
+    protocol: Optional[str] = Field(None, description="Detected protocol")
 
 
 class SecretsFinding(DetectorFinding):
     """Pydantic model for secrets detector findings"""
 
-    secret_type: str | None = Field(None, description="Type of secret detected")
-    location: str | None = Field(None, description="Location in file/data")
-    masked_value: str | None = Field(None, description="Masked version of detected secret")
+    secret_type: Optional[str] = Field(None, description="Type of secret detected")
+    location: Optional[str] = Field(None, description="Location in file/data")
+    masked_value: Optional[str] = Field(None, description="Masked version of detected secret")
 
 
 class DictCompatMixin:
@@ -88,10 +92,10 @@ class AssetModel(BaseModel, DictCompatMixin):
 
     path: str = Field(..., description="Path to the asset")
     type: str = Field(..., description="Type of asset (e.g., 'pickle')")
-    size: int | None = Field(None, description="Size of the asset in bytes")
-    tensors: list[str] | None = Field(None, description="List of tensor names (for safetensors)")
-    keys: list[str] | None = Field(None, description="List of keys (for JSON manifests)")
-    contents: list[dict[str, Any]] | None = Field(None, description="Contents list (for ZIP files)")
+    size: Optional[int] = Field(None, description="Size of the asset in bytes")
+    tensors: Optional[list[str]] = Field(None, description="List of tensor names (for safetensors)")
+    keys: Optional[list[str]] = Field(None, description="List of keys (for JSON manifests)")
+    contents: Optional[list[dict[str, Any]]] = Field(None, description="Contents list (for ZIP files)")
 
     # Dictionary-like access provided by DictCompatMixin
 
@@ -101,11 +105,11 @@ class MLFrameworkInfo(BaseModel):
 
     model_config = ConfigDict(validate_assignment=True)
 
-    name: str | None = Field(None, description="Framework name (e.g., 'pytorch', 'tensorflow')")
-    version: str | None = Field(None, description="Detected version if available")
+    name: Optional[str] = Field(None, description="Framework name (e.g., 'pytorch', 'tensorflow')")
+    version: Optional[str] = Field(None, description="Detected version if available")
     confidence: float = Field(0.0, description="Confidence in detection (0.0 to 1.0)", ge=0.0, le=1.0)
-    indicators: list[str] | None = Field(default_factory=list, description="Patterns that indicated this framework")
-    file_patterns: list[str] | None = Field(default_factory=list, description="File patterns that matched")
+    indicators: Optional[list[str]] = Field(default_factory=list, description="Patterns that indicated this framework")
+    file_patterns: Optional[list[str]] = Field(default_factory=list, description="File patterns that matched")
 
 
 class WeightAnalysisModel(BaseModel):
@@ -140,25 +144,25 @@ class MLContextModel(BaseModel):
     detected_patterns: list[str] = Field(default_factory=list, description="Detected ML patterns")
 
     # Weight analysis
-    weight_analysis: WeightAnalysisModel | None = Field(None, description="Analysis of potential weight data")
+    weight_analysis: Optional[WeightAnalysisModel] = Field(None, description="Analysis of potential weight data")
 
     # Model architecture hints
-    model_type: str | None = Field(None, description="Detected model type (e.g., 'transformer', 'cnn', 'rnn')")
-    layer_count_estimate: int | None = Field(None, description="Estimated number of layers", ge=0)
-    parameter_count_estimate: int | None = Field(None, description="Estimated parameter count", ge=0)
+    model_type: Optional[str] = Field(None, description="Detected model type (e.g., 'transformer', 'cnn', 'rnn')")
+    layer_count_estimate: Optional[int] = Field(None, description="Estimated number of layers", ge=0)
+    parameter_count_estimate: Optional[int] = Field(None, description="Estimated parameter count", ge=0)
 
     # Training metadata
-    training_framework: str | None = Field(None, description="Framework likely used for training")
-    precision_type: str | None = Field(None, description="Detected precision (fp32, fp16, int8, etc.)")
+    training_framework: Optional[str] = Field(None, description="Framework likely used for training")
+    precision_type: Optional[str] = Field(None, description="Detected precision (fp32, fp16, int8, etc.)")
     optimization_hints: list[str] = Field(default_factory=list, description="Detected optimization techniques")
 
     def add_framework(
         self,
         name: str,
         confidence: float,
-        version: str | None = None,
-        indicators: list[str] | None = None,
-        file_patterns: list[str] | None = None,
+        version: Optional[str] = None,
+        indicators: Optional[list[str]] = None,
+        file_patterns: Optional[list[str]] = None,
     ) -> None:
         """Add framework detection with validation"""
         framework_info = MLFrameworkInfo(
@@ -185,17 +189,17 @@ class LicenseInfoModel(BaseModel):
 
     model_config = ConfigDict(validate_assignment=True)
 
-    spdx_id: str | None = Field(None, description="SPDX license identifier")
-    name: str | None = Field(None, description="License name")
-    url: HttpUrl | None = Field(None, description="License URL")
-    text: str | None = Field(None, description="License text content")
+    spdx_id: Optional[str] = Field(None, description="SPDX license identifier")
+    name: Optional[str] = Field(None, description="License name")
+    url: Optional[HttpUrl] = Field(None, description="License URL")
+    text: Optional[str] = Field(None, description="License text content")
     confidence: float = Field(0.0, description="Confidence in license detection", ge=0.0, le=1.0)
-    source: str | None = Field(None, description="Source of license detection (file, header, etc.)")
-    commercial_allowed: bool | None = Field(None, description="Whether commercial use is allowed")
+    source: Optional[str] = Field(None, description="Source of license detection (file, header, etc.)")
+    commercial_allowed: Optional[bool] = Field(None, description="Whether commercial use is allowed")
 
     @field_validator("spdx_id")
     @classmethod
-    def validate_spdx_id(cls, v: str | None) -> str | None:
+    def validate_spdx_id(cls, v: Optional[str]) -> Optional[str]:
         """Validate SPDX ID format"""
         if v is None:
             return v
@@ -211,13 +215,13 @@ class CopyrightNoticeModel(BaseModel):
     model_config = ConfigDict(validate_assignment=True)
 
     holder: str = Field(..., description="Copyright holder name")
-    year: str | None = Field(None, description="Copyright year(s)")
-    text: str | None = Field(None, description="Full copyright notice text")
+    year: Optional[str] = Field(None, description="Copyright year(s)")
+    text: Optional[str] = Field(None, description="Full copyright notice text")
     confidence: float = Field(0.0, description="Confidence in copyright detection", ge=0.0, le=1.0)
 
     @field_validator("year")
     @classmethod
-    def validate_year(cls, v: str | None) -> str | None:
+    def validate_year(cls, v: Optional[str]) -> Optional[str]:
         """Validate copyright year format (e.g., '2020', '2020-2023')"""
         if v is None:
             return v
@@ -234,16 +238,16 @@ class FileHashesModel(BaseModel):
 
     model_config = ConfigDict(validate_assignment=True)
 
-    md5: str | None = Field(None, description="MD5 hash", pattern=r"^[a-fA-F0-9]{32}$")
-    sha1: str | None = Field(None, description="SHA1 hash", pattern=r"^[a-fA-F0-9]{40}$")
-    sha256: str | None = Field(None, description="SHA256 hash", pattern=r"^[a-fA-F0-9]{64}$")
-    sha512: str | None = Field(None, description="SHA512 hash", pattern=r"^[a-fA-F0-9]{128}$")
+    md5: Optional[str] = Field(None, description="MD5 hash", pattern=r"^[a-fA-F0-9]{32}$")
+    sha1: Optional[str] = Field(None, description="SHA1 hash", pattern=r"^[a-fA-F0-9]{40}$")
+    sha256: Optional[str] = Field(None, description="SHA256 hash", pattern=r"^[a-fA-F0-9]{64}$")
+    sha512: Optional[str] = Field(None, description="SHA512 hash", pattern=r"^[a-fA-F0-9]{128}$")
 
     def has_any_hash(self) -> bool:
         """Check if any hash is present"""
         return any([self.md5, self.sha1, self.sha256, self.sha512])
 
-    def get_strongest_hash(self) -> tuple[str, str] | None:
+    def get_strongest_hash(self) -> Optional[tuple[str, str]]:
         """Get the strongest available hash as (algorithm, hash) tuple"""
         if self.sha512:
             return ("sha512", self.sha512)
@@ -265,19 +269,19 @@ class FileMetadataModel(BaseModel, DictCompatMixin):
     )
 
     # Basic file information
-    file_size: int | None = Field(None, description="File size in bytes", ge=0)
-    file_hashes: FileHashesModel | None = Field(None, description="File hashes with validation")
+    file_size: Optional[int] = Field(None, description="File size in bytes", ge=0)
+    file_hashes: Optional[FileHashesModel] = Field(None, description="File hashes with validation")
 
     # Pickle-specific metadata
-    max_stack_depth: int | None = Field(None, description="Maximum stack depth for pickle files", ge=0)
-    opcode_count: int | None = Field(None, description="Number of opcodes for pickle files", ge=0)
-    suspicious_count: int | None = Field(None, description="Count of suspicious patterns", ge=0)
+    max_stack_depth: Optional[int] = Field(None, description="Maximum stack depth for pickle files", ge=0)
+    opcode_count: Optional[int] = Field(None, description="Number of opcodes for pickle files", ge=0)
+    suspicious_count: Optional[int] = Field(None, description="Count of suspicious patterns", ge=0)
 
     # ML context analysis
-    ml_context: MLContextModel | None = Field(None, description="ML context information")
+    ml_context: Optional[MLContextModel] = Field(None, description="ML context information")
 
     # License and copyright information
-    license: str | None = Field(None, description="Legacy license field for backward compatibility")
+    license: Optional[str] = Field(None, description="Legacy license field for backward compatibility")
     license_info: list[LicenseInfoModel] = Field(default_factory=list, description="Structured license information")
     copyright_notices: list[CopyrightNoticeModel] = Field(
         default_factory=list, description="Structured copyright notices"
@@ -285,8 +289,8 @@ class FileMetadataModel(BaseModel, DictCompatMixin):
     license_files_nearby: list[str] = Field(default_factory=list, description="License files found nearby")
 
     # File classification
-    is_dataset: bool | None = Field(None, description="Whether file appears to be a dataset")
-    is_model: bool | None = Field(None, description="Whether file appears to be a model")
+    is_dataset: Optional[bool] = Field(None, description="Whether file appears to be a dataset")
+    is_model: Optional[bool] = Field(None, description="Whether file appears to be a model")
 
     # Security metadata
     risk_score: float = Field(default=0.0, description="Calculated risk score (0.0 to 1.0)", ge=0.0, le=1.0)
@@ -294,12 +298,12 @@ class FileMetadataModel(BaseModel, DictCompatMixin):
 
     def add_license_info(
         self,
-        spdx_id: str | None = None,
-        name: str | None = None,
-        url: str | None = None,
-        text: str | None = None,
+        spdx_id: Optional[str] = None,
+        name: Optional[str] = None,
+        url: Optional[str] = None,
+        text: Optional[str] = None,
         confidence: float = 0.0,
-        source: str | None = None,
+        source: Optional[str] = None,
     ) -> None:
         """Add license information with validation"""
         from pydantic import HttpUrl
@@ -323,7 +327,7 @@ class FileMetadataModel(BaseModel, DictCompatMixin):
         self.license_info.append(license_info)
 
     def add_copyright_notice(
-        self, holder: str, years: str | None = None, notice_text: str | None = None, confidence: float = 0.0
+        self, holder: str, years: Optional[str] = None, notice_text: Optional[str] = None, confidence: float = 0.0
     ) -> None:
         """Add copyright notice with validation"""
         copyright_notice = CopyrightNoticeModel(holder=holder, year=years, text=notice_text, confidence=confidence)
@@ -377,7 +381,7 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
     has_errors: bool = Field(..., description="Whether any critical issues were found")
     scanner_names: list[str] = Field(default_factory=list, description="Names of scanners used")
     file_metadata: dict[str, FileMetadataModel] = Field(default_factory=dict, description="Metadata for each file")
-    content_hash: str | None = Field(
+    content_hash: Optional[str] = Field(
         default=None, description="Aggregate SHA-256 hash of all scanned files (for deduplication)"
     )
 
@@ -393,7 +397,7 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
     # Legacy compatibility
     success: bool = Field(default=True, description="Whether the scan completed successfully")
 
-    def aggregate_scan_result(self, results: dict[str, Any] | ModelAuditResultModel) -> None:
+    def aggregate_scan_result(self, results: Union[dict[str, Any], ModelAuditResultModel]) -> None:
         """Efficiently aggregate scan results into this model.
 
         This method updates the current model in-place for performance.
@@ -708,7 +712,7 @@ class ScanConfigModel(BaseModel):
     chunk_size: int = Field(default=8192, description="Chunk size for streaming operations", gt=0)
 
     # Advanced options
-    blacklist_patterns: list[str] | None = Field(default=None, description="Patterns to blacklist during scanning")
+    blacklist_patterns: Optional[list[str]] = Field(default=None, description="Patterns to blacklist during scanning")
     enable_large_model_support: bool = Field(True, description="Enable optimizations for large models")
     include_license_scan: bool = Field(True, description="Include license scanning in results")
     enable_network_detection: bool = Field(True, description="Enable network communication detection")
