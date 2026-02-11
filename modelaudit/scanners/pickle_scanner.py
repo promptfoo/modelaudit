@@ -1383,18 +1383,27 @@ def check_opcode_sequence(
     if _should_ignore_opcode_sequence(opcodes, ml_context):
         return suspicious_patterns  # Return empty list for legitimate ML content
 
+    # Memo and framing opcodes are structural (data storage/retrieval, not code
+    # execution).  They appear in every non-trivial pickle stream and counting
+    # them inflates the dangerous-opcode metric for legitimate ML models.
+    _STRUCTURAL_OPCODES = frozenset({"BINPUT", "LONG_BINPUT", "BINGET", "LONG_BINGET", "FRAME"})
+
     # Count dangerous opcodes with ML context awareness
     dangerous_opcode_count = 0
     consecutive_dangerous = 0
     max_consecutive = 0
 
     for i, (opcode, arg, pos) in enumerate(opcodes):
-        # Track dangerous opcodes, but skip REDUCE if it's using safe ML globals
+        # Track dangerous opcodes, skipping safe ML globals and structural opcodes
         is_dangerous_opcode = False
 
         if opcode.name in DANGEROUS_OPCODES:
+            # Skip structural/memo opcodes — they cannot execute code on their own
+            if opcode.name in _STRUCTURAL_OPCODES:
+                pass
+
             # Special handling for REDUCE - check if it's using safe globals
-            if opcode.name == "REDUCE":
+            elif opcode.name == "REDUCE":
                 # Look back to find the associated GLOBAL or STACK_GLOBAL
                 for j in range(i - 1, max(0, i - 10), -1):
                     prev_opcode, prev_arg, _prev_pos = opcodes[j]
@@ -1437,8 +1446,41 @@ def check_opcode_sequence(
                             if not _is_safe_ml_global(mod, func):
                                 is_dangerous_opcode = True
                             break
+
+            # GLOBAL/STACK_GLOBAL: only count when referencing non-safe modules
+            elif opcode.name == "GLOBAL" and isinstance(arg, str):
+                parts = arg.split(" ", 1) if " " in arg else arg.rsplit(".", 1) if "." in arg else [arg, ""]
+                if len(parts) == 2:
+                    mod, func = parts
+                    if not _is_safe_ml_global(mod, func):
+                        is_dangerous_opcode = True
+                else:
+                    is_dangerous_opcode = True
+
+            elif opcode.name == "STACK_GLOBAL":
+                recent_strings = []
+                for k in range(i - 1, max(0, i - 10), -1):
+                    prev_opcode, prev_arg, _prev_pos = opcodes[k]
+                    if prev_opcode.name in [
+                        "SHORT_BINSTRING",
+                        "BINSTRING",
+                        "STRING",
+                        "SHORT_BINUNICODE",
+                        "BINUNICODE",
+                        "UNICODE",
+                    ] and isinstance(prev_arg, str):
+                        recent_strings.insert(0, prev_arg)
+                        if len(recent_strings) >= 2:
+                            break
+                if len(recent_strings) >= 2:
+                    mod, func = recent_strings[0], recent_strings[1]
+                    if not _is_safe_ml_global(mod, func):
+                        is_dangerous_opcode = True
+                else:
+                    is_dangerous_opcode = True
+
             else:
-                # Other dangerous opcodes are always counted
+                # Other dangerous opcodes (INST, OBJ, NEWOBJ, NEWOBJ_EX, BUILD, EXT*)
                 is_dangerous_opcode = True
 
             if is_dangerous_opcode:
@@ -1450,9 +1492,10 @@ def check_opcode_sequence(
         else:
             consecutive_dangerous = 0
 
-        # Fixed threshold for dangerous opcode detection
-        # Removed ML confidence-based adjustments to prevent security bypasses
-        threshold = 50  # Lower threshold for stronger security (may increase false positives on large models)
+        # Fixed threshold for dangerous opcode detection.
+        # Only execution-related opcodes are counted (memo/framing excluded),
+        # and safe ML globals are skipped for REDUCE/GLOBAL/STACK_GLOBAL.
+        threshold = 50
 
         if dangerous_opcode_count > threshold:
             suspicious_patterns.append(
