@@ -26,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **feat**: add Git LFS pointer detection - detects when model files are Git LFS pointers (small text files) instead of actual model content, reports as CRITICAL issue with remediation steps including `git lfs pull` instructions
+- **ux**: add Python version warnings — runtime `warnings.warn()` in `__init__.py` and click-styled stderr warning in CLI for Python < 3.10, plus README troubleshooting section for users stuck on version 0.2.5
 
 ### Changed
 

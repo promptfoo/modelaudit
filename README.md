@@ -13,6 +13,8 @@
 
 ## 🚀 Quick Start
 
+**Requires Python 3.10+** ([troubleshooting](#stuck-on-old-version--cant-upgrade))
+
 **Install and scan in 30 seconds:**
 
 ```bash
@@ -286,10 +288,8 @@ then run redteaming if you need to test how the model responds when invoked.
 
 ## ⚙️ Installation Options
 
-**Requirements:**
-
-- Python 3.10 or higher
-- Compatible with Python 3.10, 3.11, 3.12, and 3.13
+> **Requires Python 3.10+** (3.10, 3.11, 3.12, 3.13, 3.14).
+> If `pip install modelaudit` gives you version 0.2.5, your Python is too old — see [Troubleshooting](#stuck-on-old-version--cant-upgrade).
 
 **Basic installation (recommended for most users):**
 
@@ -486,6 +486,31 @@ modelaudit model.pkl --format sarif --output results.sarif
 ```
 
 ## Troubleshooting
+
+### Stuck on old version / can't upgrade
+
+If `pip install modelaudit` installs version **0.2.5** instead of the latest, your Python version is below 3.10. Pip silently picks the last compatible release instead of showing an error.
+
+**Diagnose:**
+
+```bash
+python --version   # Must be 3.10 or higher
+```
+
+**Fixes:**
+
+1. **Upgrade Python** — install Python 3.10+ from [python.org](https://www.python.org/downloads/) or your package manager.
+2. **Use pyenv** — manage multiple Python versions side-by-side:
+   ```bash
+   pyenv install 3.12
+   pyenv shell 3.12
+   pip install modelaudit
+   ```
+3. **Use Docker** — no local Python needed:
+   ```bash
+   docker pull ghcr.io/promptfoo/modelaudit:latest
+   docker run --rm -v "$(pwd)":/app ghcr.io/promptfoo/modelaudit:latest model.pkl
+   ```
 
 ### Check scanner availability
 
