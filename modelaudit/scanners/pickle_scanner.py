@@ -1095,7 +1095,8 @@ def _looks_like_pickle(data: bytes) -> bool:
             if opcode_count > 20:
                 break
 
-    except Exception:
+    except Exception as e:
+        logger.debug("Error analyzing pickle structure: %s", e)
         return False
 
     return False
@@ -1123,8 +1124,8 @@ def _decode_string_to_bytes(s: str) -> list[tuple[str, bytes]]:
             # Additional validation: decoded should be reasonable binary data
             if len(decoded) >= 8:  # At least 8 bytes for meaningful content
                 candidates.append(("base64", decoded))
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Failed to decode potential base64 string: %s", e)
 
     # More strict hex validation
     try:
@@ -1140,8 +1141,8 @@ def _decode_string_to_bytes(s: str) -> list[tuple[str, bytes]]:
             decoded = binascii.unhexlify(hex_str)
             if len(decoded) >= 8:  # At least 8 bytes
                 candidates.append(("hex", decoded))
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Failed to decode potential hex string: %s", e)
 
     return candidates
 
