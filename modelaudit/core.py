@@ -1444,13 +1444,18 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         else:
             format_ = header_format
             sr = ScanResult(scanner_name="unknown")
-            sr.add_check(
-                name="Format Detection",
-                passed=False,
-                message=f"Unknown or unhandled format: {format_}",
-                severity=IssueSeverity.DEBUG,
-                details={"format": format_, "path": path},
-            )
+            if format_ == "unknown":
+                # Not a recognized model format — skip silently
+                logger.debug(f"Skipping unrecognized format file: {path}")
+            else:
+                # Known format but no scanner available
+                sr.add_check(
+                    name="Format Detection",
+                    passed=False,
+                    message=f"Unknown or unhandled format: {format_}",
+                    severity=IssueSeverity.DEBUG,
+                    details={"format": format_, "path": path},
+                )
             result = sr
 
     if discrepancy_msg:

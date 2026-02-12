@@ -403,9 +403,12 @@ class WeightDistributionScanner(BaseScanner):
         try:
             model = onnx.load(path)  # type: ignore[possibly-unresolved-reference]
 
-            # Extract initializers (weights)
+            # Extract 2D+ initializers — these are weight matrices (conv kernels,
+            # linear layers, embeddings). 1D tensors (biases, batch-norm params)
+            # aren't relevant for weight distribution analysis. This approach is
+            # framework-agnostic since ONNX naming conventions vary by exporter.
             for initializer in model.graph.initializer:
-                if "weight" in initializer.name.lower():
+                if len(initializer.dims) >= 2:
                     weights_info[initializer.name] = onnx.numpy_helper.to_array(  # type: ignore[possibly-unresolved-reference]
                         initializer,
                     )
