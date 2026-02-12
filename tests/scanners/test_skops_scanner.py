@@ -68,6 +68,7 @@ class TestSkopsScannerCVE2025_54412:
         cve_checks = [c for c in result.checks if "CVE-2025-54412" in c.name]
         assert len(cve_checks) > 0
         assert cve_checks[0].status == CheckStatus.FAILED
+        assert cve_checks[0].severity == IssueSeverity.CRITICAL
 
     def test_no_false_positive_clean_file(self, tmp_path: Path) -> None:
         """Test that clean skops files don't trigger CVE-2025-54412."""
@@ -117,6 +118,7 @@ class TestSkopsScannerCVE2025_54413:
         cve_checks = [c for c in result.checks if "CVE-2025-54413" in c.name]
         assert len(cve_checks) > 0
         assert cve_checks[0].status == CheckStatus.FAILED
+        assert cve_checks[0].severity == IssueSeverity.CRITICAL
 
 
 class TestSkopsScannerCVE2025_54886:
@@ -159,6 +161,7 @@ class TestSkopsScannerCVE2025_54886:
         cve_checks = [c for c in result.checks if "CVE-2025-54886" in c.name]
         assert len(cve_checks) > 0
         assert cve_checks[0].status == CheckStatus.FAILED
+        assert cve_checks[0].severity == IssueSeverity.CRITICAL
 
 
 class TestSkopsScannerJoblibFallback:
@@ -191,6 +194,8 @@ class TestSkopsScannerJoblibFallback:
 
         joblib_checks = [c for c in result.checks if "Joblib" in c.name]
         assert len(joblib_checks) > 0
+        assert joblib_checks[0].status == CheckStatus.FAILED
+        assert joblib_checks[0].severity == IssueSeverity.WARNING
 
 
 class TestSkopsScannerEdgeCases:
@@ -237,7 +242,8 @@ class TestSkopsScannerEdgeCases:
         """Test handling of unicode characters in filenames."""
         skops_file = tmp_path / "unicode.skops"
         with zipfile.ZipFile(skops_file, "w") as zf:
-            zf.writestr("model.json", '{"name": "test"}')
+            zf.writestr("模型_data.json", '{"name": "test"}')
+            zf.writestr("données_modèle.bin", b"model data")
             zf.writestr("schema.json", '{"version": "1.0"}')
 
         scanner = SkopsScanner()
@@ -245,6 +251,21 @@ class TestSkopsScannerEdgeCases:
 
         # Should complete without error
         assert result.success is True
+
+    def test_handles_decompression_bomb(self, tmp_path: Path) -> None:
+        """Test that archives exceeding max file count are rejected."""
+        skops_file = tmp_path / "bomb.skops"
+        with zipfile.ZipFile(skops_file, "w") as zf:
+            for i in range(15):
+                zf.writestr(f"file_{i}.bin", b"data")
+
+        scanner = SkopsScanner(config={"max_files_in_archive": 5})
+        result = scanner.scan(str(skops_file))
+
+        assert result.success is False
+        bomb_checks = [c for c in result.checks if "Archive Bomb" in c.name]
+        assert len(bomb_checks) > 0
+        assert bomb_checks[0].status == CheckStatus.FAILED
 
 
 class TestSkopsScannerMultipleCVEs:
