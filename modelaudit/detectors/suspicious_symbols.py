@@ -442,6 +442,10 @@ TENSORFLOW_DANGEROUS_OPS: dict[str, str] = {
     "DecodePng": "Can decode PNG data, potential injection of malicious content",
 }
 
+# Known safe Keras model classes that use declarative layer configurations
+# without custom code execution (Sequential, Functional, Model)
+KNOWN_SAFE_MODEL_CLASSES: set[str] = {"Sequential", "Functional", "Model"}
+
 # Suspicious Keras layer types
 # Layer types that can contain arbitrary code or complex functionality
 SUSPICIOUS_LAYER_TYPES = {
