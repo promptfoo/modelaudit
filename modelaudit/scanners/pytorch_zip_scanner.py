@@ -256,6 +256,8 @@ class PyTorchZipScanner(BaseScanner):
                 continue
 
             # Check compression ratio (decompression bomb detection)
+            # Entries with compress_size == 0 (e.g., empty files or stored entries
+            # where the size field is zero) are skipped since ratio is undefined.
             if info.compress_size > 0:
                 compression_ratio = info.file_size / info.compress_size
                 if compression_ratio > self.max_compression_ratio:
@@ -276,6 +278,7 @@ class PyTorchZipScanner(BaseScanner):
                         why="Decompression bombs use high compression ratios to exhaust system resources",
                     )
                     compression_issues_found = True
+                    continue
 
             safe_entries.append(name)
 

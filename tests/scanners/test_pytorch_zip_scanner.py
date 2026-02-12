@@ -329,7 +329,7 @@ def test_pytorch_zip_scanner_entry_limit(tmp_path):
         zipf.writestr("version", "3")
         # Create entries exceeding the limit
         for i in range(15):
-            zipf.writestr(f"entry_{i}.txt", b"data")
+            zipf.writestr(f"entry_{i}.txt", "data")
 
     # Use a low limit for testing
     scanner = PyTorchZipScanner(config={"max_archive_entries": 10})
@@ -448,3 +448,36 @@ def test_pytorch_zip_scanner_no_symlinks_passes(tmp_path):
     symlink_checks = [c for c in result.checks if "symlink" in c.name.lower()]
     assert len(symlink_checks) > 0
     assert all(c.status == CheckStatus.PASSED for c in symlink_checks)
+
+
+def test_pytorch_zip_scanner_combined_security_controls(tmp_path):
+    """Test that multiple security controls fire together without interfering."""
+    zip_path = tmp_path / "model.pt"
+
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("version", "3")
+        # Generate enough entries to exceed a low limit
+        for i in range(12):
+            zipf.writestr(f"entry_{i}.txt", "data")
+        # Add a symlink entry
+        symlink_info = zipfile.ZipInfo("evil_link")
+        symlink_info.external_attr = 0o120777 << 16
+        symlink_info.compress_type = zipfile.ZIP_STORED
+        zipf.writestr(symlink_info, "/etc/shadow")
+
+    scanner = PyTorchZipScanner(config={"max_archive_entries": 10})
+    result = scanner.scan(str(zip_path))
+
+    # Entry limit should trigger
+    entry_issues = [
+        i
+        for i in result.issues
+        if "entries" in i.message.lower() and ("max" in i.message.lower() or "limit" in i.message.lower())
+    ]
+    assert len(entry_issues) > 0
+    assert entry_issues[0].severity == IssueSeverity.WARNING
+
+    # Symlink should also trigger independently
+    symlink_issues = [i for i in result.issues if "symlink" in i.message.lower()]
+    assert len(symlink_issues) > 0
+    assert symlink_issues[0].severity == IssueSeverity.WARNING
