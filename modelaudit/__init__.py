@@ -7,6 +7,16 @@ pyproject.toml and accessed at runtime via importlib.metadata.
 
 import sys
 
+if sys.version_info < (3, 10):  # noqa: UP036 — intentional safety net for bypassed requires-python
+    import warnings
+
+    warnings.warn(
+        f"modelaudit requires Python 3.10+, but you are running Python "
+        f"{sys.version_info[0]}.{sys.version_info[1]}. "
+        f"Please upgrade: https://www.promptfoo.dev/docs/model-audit/",
+        stacklevel=2,
+    )
+
 # Set high recursion limit for security analysis
 # ModelAudit needs to handle complex file structures and deep analysis
 # This is safe since we're analyzing files, not executing arbitrary code
