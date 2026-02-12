@@ -13,6 +13,7 @@ from modelaudit.utils.helpers.code_validation import (
 
 from ..config.explanations import get_pattern_explanation
 from .base import BaseScanner, IssueSeverity, ScanResult
+from .keras_utils import check_subclassed_model
 
 # Try to import h5py, but handle the case where it's not installed
 try:
@@ -212,6 +213,9 @@ class KerasH5Scanner(BaseScanner):
         # Check model class name
         model_class = model_config.get("class_name", "")
         result.metadata["model_class"] = model_class
+
+        # Check for subclassed models (custom class names)
+        check_subclassed_model(model_class, result, self.current_file_path)
 
         # Collect all layers
         layers = []
