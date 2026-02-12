@@ -317,8 +317,8 @@ TF_OP_EXPLANATIONS = {
         "vector to send sensitive information to external systems."
     ),
     "QueueEnqueueV2": (
-        "QueueEnqueueV2 enqueues data to TensorFlow queues (V2 variant), which could be used as a data "
-        "exfiltration vector to send sensitive information to external systems."
+        "QueueEnqueueV2 enqueues data to TensorFlow queues (V2 variant), which attackers could abuse as a "
+        "data exfiltration vector to send sensitive information to external systems."
     ),
     "QueueDequeue": (
         "QueueDequeue dequeues data from TensorFlow queues, which could be used as a data exfiltration "
