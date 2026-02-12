@@ -367,6 +367,62 @@ jobs:
           uv run pytest tests/scanners/test_numpy_scanner.py -v
           uv run pytest tests/scanners/test_scanner_registry.py -v -k "numpy"
 
+  test-vendored-protos:
+    name: Test Vendored TensorFlow Protos
+    needs: changes
+    # Run on main branch or if Python/dependency files changed
+    if: github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.dependencies == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Pin Python version
+        run: |
+          uv python pin 3.12
+
+      - name: Install WITHOUT TensorFlow
+        run: |
+          # Install only base dependencies - no tensorflow extra
+          uv sync
+
+      - name: Verify TensorFlow is NOT installed
+        run: |
+          uv run python -c "
+          try:
+              import tensorflow
+              print('ERROR: TensorFlow should not be installed!')
+              exit(1)
+          except ImportError:
+              print('✓ TensorFlow is not installed (expected)')
+          "
+
+      - name: Verify vendored protos load correctly
+        run: |
+          uv run python -c "
+          import modelaudit.protos
+          assert modelaudit.protos._check_vendored_protos(), 'Protos should be available'
+          assert modelaudit.protos.is_using_vendored_protos(), 'Should use vendored protos'
+          print('✓ Vendored protos loaded successfully')
+          "
+
+      - name: Test safe SavedModel scanning
+        run: |
+          uv run python -m modelaudit tests/assets/samples/tensorflow/safe_savedmodel/ --format json | \
+            uv run python -c "import sys,json; d=json.load(sys.stdin); assert len(d['issues'])==0, f'Expected 0 issues, got {len(d[\"issues\"])}'; print('✓ Safe model: 0 issues')"
+
+      - name: Test malicious SavedModel scanning
+        run: |
+          # Should detect PyFunc operation
+          uv run python -m modelaudit tests/assets/samples/tensorflow/malicious_pyfunc/ --format json | \
+            uv run python -c "import sys,json; d=json.load(sys.stdin); critical=[i for i in d['issues'] if i['severity']=='critical']; assert len(critical)>=1, f'Expected critical issues, got {len(critical)}'; print(f'✓ Malicious model: {len(critical)} critical issue(s) detected')"
+
   build:
     name: Build and Package
     needs: changes
@@ -424,6 +480,7 @@ jobs:
         windows-tests,
         test,
         test-numpy-compatibility,
+        test-vendored-protos,
         build,
       ]
     if: always()
@@ -439,11 +496,13 @@ jobs:
           WINDOWS_RESULT="${{ needs.windows-tests.result }}"
           TEST_RESULT="${{ needs.test.result }}"
           NUMPY_RESULT="${{ needs.test-numpy-compatibility.result }}"
+          PROTOS_RESULT="${{ needs.test-vendored-protos.result }}"
           BUILD_RESULT="${{ needs.build.result }}"
 
-          # Check if numpy job should have run
+          # Check if conditional jobs should have run
           ON_MAIN_BRANCH="${{ github.ref == 'refs/heads/main' }}"
           DEPENDENCIES_CHANGED="${{ needs.changes.outputs.dependencies == 'true' }}"
+          PYTHON_CHANGED="${{ needs.changes.outputs.python == 'true' }}"
 
           echo "Job results:"
           echo "  quick-feedback: $QUICK_FEEDBACK_RESULT"
@@ -452,6 +511,7 @@ jobs:
           echo "  windows-tests: $WINDOWS_RESULT"
           echo "  test: $TEST_RESULT"
           echo "  test-numpy-compatibility: $NUMPY_RESULT (should run: on_main=$ON_MAIN_BRANCH, deps_changed=$DEPENDENCIES_CHANGED)"
+          echo "  test-vendored-protos: $PROTOS_RESULT (should run: on_main=$ON_MAIN_BRANCH, python_changed=$PYTHON_CHANGED, deps_changed=$DEPENDENCIES_CHANGED)"
           echo "  build: $BUILD_RESULT"
 
           # Check if any job failed or was cancelled
@@ -465,13 +525,19 @@ jobs:
           [[ "$BUILD_RESULT" == "failure" || "$BUILD_RESULT" == "cancelled" ]] && FAILED=true
 
           # NumPy compatibility job only runs on main or when dependencies change
-          # If it should have run, check for failure/cancellation
-          # If it shouldn't have run (skipped), don't fail
           if [[ "$ON_MAIN_BRANCH" == "true" || "$DEPENDENCIES_CHANGED" == "true" ]]; then
             echo "NumPy job should have run - checking for failure"
             [[ "$NUMPY_RESULT" == "failure" || "$NUMPY_RESULT" == "cancelled" ]] && FAILED=true
           else
             echo "NumPy job was not expected to run - treating as OK"
+          fi
+
+          # Vendored protos job runs on main or when python/dependencies change
+          if [[ "$ON_MAIN_BRANCH" == "true" || "$PYTHON_CHANGED" == "true" || "$DEPENDENCIES_CHANGED" == "true" ]]; then
+            echo "Vendored protos job should have run - checking for failure"
+            [[ "$PROTOS_RESULT" == "failure" || "$PROTOS_RESULT" == "cancelled" ]] && FAILED=true
+          else
+            echo "Vendored protos job was not expected to run - treating as OK"
           fi
 
           if [[ "$FAILED" == "true" ]]; then
