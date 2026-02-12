@@ -135,6 +135,41 @@ DANGEROUS_OPCODES = {
         "The GLOBAL opcode imports and accesses module attributes. When referencing dangerous modules, this "
         "indicates potential security risks."
     ),
+    # Memo-based attack opcodes - can reference previously stored dangerous objects
+    "BINGET": (
+        "The BINGET opcode retrieves an object from the pickle memo by index. Attackers can use this to "
+        "reference dangerous objects that were stored earlier in the pickle stream, enabling indirect attacks."
+    ),
+    "LONG_BINGET": (
+        "The LONG_BINGET opcode retrieves an object from the pickle memo using a 4-byte index. Like BINGET, "
+        "it can be used in memo-based attacks to reference dangerous objects stored earlier."
+    ),
+    "BINPUT": (
+        "The BINPUT opcode stores an object in the pickle memo. In attack chains, this allows storing dangerous "
+        "callable objects for later retrieval via BINGET, enabling multi-stage attacks."
+    ),
+    "LONG_BINPUT": (
+        "The LONG_BINPUT opcode stores an object in the pickle memo using a 4-byte index. Used in conjunction "
+        "with LONG_BINGET for memo-based attacks with larger indexes."
+    ),
+    # Extension registry opcodes - can reference external dangerous modules
+    "EXT1": (
+        "The EXT1 opcode references a registered extension by 1-byte code. Extension registry entries can "
+        "map to dangerous callables, enabling code execution via pre-registered malicious extensions."
+    ),
+    "EXT2": (
+        "The EXT2 opcode references a registered extension by 2-byte code. Like EXT1, it can invoke dangerous "
+        "functionality through the pickle extension registry."
+    ),
+    "EXT4": (
+        "The EXT4 opcode references a registered extension by 4-byte code. Extension registry attacks can "
+        "bypass module-based detection by using numeric codes instead of module names."
+    ),
+    # Protocol 4+ framing opcode
+    "FRAME": (
+        "The FRAME opcode (Protocol 4+) introduces a frame boundary for chunked data. While not directly "
+        "dangerous, it can be used to obfuscate payload structure and evade pattern-based detection."
+    ),
 }
 
 # Explanations for specific patterns and behaviors
