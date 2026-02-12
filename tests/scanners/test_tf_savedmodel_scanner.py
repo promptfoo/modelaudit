@@ -16,6 +16,13 @@ def has_tensorflow():
         return False
 
 
+def has_tf_protos():
+    """Check if TensorFlow protobuf stubs are available (vendored or from TensorFlow)."""
+    import modelaudit.protos
+
+    return modelaudit.protos._check_vendored_protos()
+
+
 def test_tf_savedmodel_scanner_can_handle(tmp_path):
     """Test the can_handle method of TensorFlowSavedModelScanner."""
     # Create a directory with saved_model.pb
@@ -31,12 +38,13 @@ def test_tf_savedmodel_scanner_can_handle(tmp_path):
     test_file = tmp_path / "test.pb"
     test_file.write_bytes(b"dummy content")
 
-    if has_tensorflow():
+    if has_tf_protos():
+        # With vendored protos or TensorFlow, can_handle works for valid paths
         assert TensorFlowSavedModelScanner.can_handle(str(tf_dir)) is True
         assert TensorFlowSavedModelScanner.can_handle(str(regular_dir)) is False
         assert TensorFlowSavedModelScanner.can_handle(str(test_file)) is True  # Now accepts any .pb file
     else:
-        # When TensorFlow is not installed, can_handle returns False
+        # Without protos, can_handle returns False
         assert TensorFlowSavedModelScanner.can_handle(str(tf_dir)) is False
         assert TensorFlowSavedModelScanner.can_handle(str(regular_dir)) is False
         assert TensorFlowSavedModelScanner.can_handle(str(test_file)) is False
