@@ -42,6 +42,7 @@ from modelaudit.utils.helpers.types import (
     FilePath,
     ProgressCallback,
 )
+from modelaudit.utils.lfs import check_lfs_pointer, get_lfs_issue_details, get_lfs_remediation_steps
 
 logger = logging.getLogger("modelaudit.core")
 
@@ -1222,6 +1223,39 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             details={"path": path, "reason": "huggingface_cache_file"},
         )
         sr.finish(success=True)
+        return sr
+
+    # Check for Git LFS pointer files (text pointers instead of actual model content)
+    # This is a common issue when cloning repos without `git lfs pull`
+    is_lfs, lfs_info = check_lfs_pointer(path)
+    if is_lfs:
+        sr = ScanResult(scanner_name="lfs_check")
+        details = get_lfs_issue_details(path, lfs_info)
+        details["remediation"] = get_lfs_remediation_steps()
+
+        if lfs_info:
+            message = (
+                f"Git LFS pointer detected - file is {details['actual_size_bytes']} bytes "
+                f"but should be {lfs_info.format_expected_size()}"
+            )
+        else:
+            message = "Git LFS pointer detected - this is a text pointer, not the actual model file"
+
+        # add_check with passed=False automatically creates an Issue as well
+        sr.add_check(
+            name="Git LFS Pointer Detection",
+            passed=False,
+            message=message,
+            severity=IssueSeverity.CRITICAL,
+            location=path,
+            why=(
+                "This file is a Git LFS pointer (a small text file that references the actual content) "
+                "rather than the actual model weights. The model cannot be loaded in its current state. "
+                "Run 'git lfs pull' to download the actual file."
+            ),
+            details=details,
+        )
+        sr.finish(success=False)
         return sr
 
     # Get file size for later checks
