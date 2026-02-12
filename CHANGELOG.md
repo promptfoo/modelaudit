@@ -7,37 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.2.25](https://github.com/promptfoo/modelaudit/compare/v0.2.24...v0.2.25) (2026-02-12)
 
-
 ### Features
 
-* add binary patterns for native code loading ([#499](https://github.com/promptfoo/modelaudit/issues/499)) ([ef638f1](https://github.com/promptfoo/modelaudit/commit/ef638f1470b78f1f34ce7866c4a217f8093092f3))
-* add comprehensive Windows compatibility support ([#474](https://github.com/promptfoo/modelaudit/issues/474)) ([d62574e](https://github.com/promptfoo/modelaudit/commit/d62574e264eb3511a2a48d8b6614ea9152aa2efa))
-* add detection for dangerous TensorFlow operations ([#494](https://github.com/promptfoo/modelaudit/issues/494)) ([6c4c0c9](https://github.com/promptfoo/modelaudit/commit/6c4c0c90441706061e6c0e66f00da3c481962bb2))
-* add detection for memo-based and extension registry pickle opcodes ([#493](https://github.com/promptfoo/modelaudit/issues/493)) ([72509f7](https://github.com/promptfoo/modelaudit/commit/72509f727e3105f0706ad80611a7e110096e1d62))
-* add getattr-based evasion detection patterns ([#500](https://github.com/promptfoo/modelaudit/issues/500)) ([87ba295](https://github.com/promptfoo/modelaudit/commit/87ba2955c96e67b3110578f5e567ef76e7644690))
-* add Git LFS pointer detection ([#488](https://github.com/promptfoo/modelaudit/issues/488)) ([6413ae3](https://github.com/promptfoo/modelaudit/commit/6413ae3a07ec2b2849db954d794038cffdf67e10))
-* add Keras subclassed model detection ([#503](https://github.com/promptfoo/modelaudit/issues/503)) ([d9e5663](https://github.com/promptfoo/modelaudit/commit/d9e566346c46355f5b6bda413a0cb98af051dafb))
-* add lambda variadic argument validation ([#501](https://github.com/promptfoo/modelaudit/issues/501)) ([52a6622](https://github.com/promptfoo/modelaudit/commit/52a6622961c7d63221bc44a74e569ba5a511a2af))
-* add PyTorch ZIP archive security controls ([#502](https://github.com/promptfoo/modelaudit/issues/502)) ([09ab087](https://github.com/promptfoo/modelaudit/commit/09ab0871b7625899447a8b05b991ce9a77b9cc09))
-* eliminate TensorFlow dependency with vendored protobuf stubs ([#485](https://github.com/promptfoo/modelaudit/issues/485)) ([56cec5e](https://github.com/promptfoo/modelaudit/commit/56cec5e1727aae973164ad6f8f0ef85004a0ba25))
-* expand SUSPICIOUS_GLOBALS with process and memory modules ([#495](https://github.com/promptfoo/modelaudit/issues/495)) ([8637d2b](https://github.com/promptfoo/modelaudit/commit/8637d2beb00020a19b285a9c7d043fa88e9213b6))
-
+- add binary patterns for native code loading ([#499](https://github.com/promptfoo/modelaudit/issues/499)) ([ef638f1](https://github.com/promptfoo/modelaudit/commit/ef638f1470b78f1f34ce7866c4a217f8093092f3))
+- add comprehensive Windows compatibility support ([#474](https://github.com/promptfoo/modelaudit/issues/474)) ([d62574e](https://github.com/promptfoo/modelaudit/commit/d62574e264eb3511a2a48d8b6614ea9152aa2efa))
+- add detection for dangerous TensorFlow operations ([#494](https://github.com/promptfoo/modelaudit/issues/494)) ([6c4c0c9](https://github.com/promptfoo/modelaudit/commit/6c4c0c90441706061e6c0e66f00da3c481962bb2))
+- add detection for memo-based and extension registry pickle opcodes ([#493](https://github.com/promptfoo/modelaudit/issues/493)) ([72509f7](https://github.com/promptfoo/modelaudit/commit/72509f727e3105f0706ad80611a7e110096e1d62))
+- add getattr-based evasion detection patterns ([#500](https://github.com/promptfoo/modelaudit/issues/500)) ([87ba295](https://github.com/promptfoo/modelaudit/commit/87ba2955c96e67b3110578f5e567ef76e7644690))
+- add Git LFS pointer detection ([#488](https://github.com/promptfoo/modelaudit/issues/488)) ([6413ae3](https://github.com/promptfoo/modelaudit/commit/6413ae3a07ec2b2849db954d794038cffdf67e10))
+- add Keras subclassed model detection ([#503](https://github.com/promptfoo/modelaudit/issues/503)) ([d9e5663](https://github.com/promptfoo/modelaudit/commit/d9e566346c46355f5b6bda413a0cb98af051dafb))
+- add lambda variadic argument validation ([#501](https://github.com/promptfoo/modelaudit/issues/501)) ([52a6622](https://github.com/promptfoo/modelaudit/commit/52a6622961c7d63221bc44a74e569ba5a511a2af))
+- add PyTorch ZIP archive security controls ([#502](https://github.com/promptfoo/modelaudit/issues/502)) ([09ab087](https://github.com/promptfoo/modelaudit/commit/09ab0871b7625899447a8b05b991ce9a77b9cc09))
+- eliminate TensorFlow dependency with vendored protobuf stubs ([#485](https://github.com/promptfoo/modelaudit/issues/485)) ([56cec5e](https://github.com/promptfoo/modelaudit/commit/56cec5e1727aae973164ad6f8f0ef85004a0ba25))
+- expand SUSPICIOUS_GLOBALS with process and memory modules ([#495](https://github.com/promptfoo/modelaudit/issues/495)) ([8637d2b](https://github.com/promptfoo/modelaudit/commit/8637d2beb00020a19b285a9c7d043fa88e9213b6))
 
 ### Bug Fixes
 
-* add content-based CVE detection to SkopsScanner ([#498](https://github.com/promptfoo/modelaudit/issues/498)) ([89895cb](https://github.com/promptfoo/modelaudit/commit/89895cb611f95c6c3119cdd8adf513e1b0c5a818))
-* add logging to critical exception handlers in pickle scanner ([#492](https://github.com/promptfoo/modelaudit/issues/492)) ([b6b06cb](https://github.com/promptfoo/modelaudit/commit/b6b06cb2b0f6adccfa15e43948e78efad005abb6))
-* add logging to silent exception handlers in secrets detector ([#491](https://github.com/promptfoo/modelaudit/issues/491)) ([b59f8a4](https://github.com/promptfoo/modelaudit/commit/b59f8a4924e2285c72b3f40e2ff6bec5f5815727))
-* add security keywords to QueueEnqueueV2 TF op explanation ([#511](https://github.com/promptfoo/modelaudit/issues/511)) ([1d93483](https://github.com/promptfoo/modelaudit/commit/1d93483b79c76a9fbbbd8bc7aa2239c8aca28ec2))
-* **ci:** ensure numpy compatibility job runs ([#478](https://github.com/promptfoo/modelaudit/issues/478)) ([7266160](https://github.com/promptfoo/modelaudit/commit/72661605482c2883a9f7ae28c32416677d0fcd17))
-* **deps:** bump pillow 12.1.0→12.1.1 and cryptography 46.0.4→46.0.5 ([#513](https://github.com/promptfoo/modelaudit/issues/513)) ([5b18d49](https://github.com/promptfoo/modelaudit/commit/5b18d49cd16bd611bb89b41b341475175bca6922))
-* **deps:** update dependency fickling to v0.1.7 [security] ([#479](https://github.com/promptfoo/modelaudit/issues/479)) ([292eb23](https://github.com/promptfoo/modelaudit/commit/292eb234c5c3379706e51372973078b59b2516f9))
-* improve Python version requirement UX ([#508](https://github.com/promptfoo/modelaudit/issues/508)) ([a44d8bb](https://github.com/promptfoo/modelaudit/commit/a44d8bb67f27f4e8b04d55c04fd28f9d257bfec8))
-* reduce false positive scan warnings for HuggingFace models ([#514](https://github.com/promptfoo/modelaudit/issues/514)) ([b545c11](https://github.com/promptfoo/modelaudit/commit/b545c1102c538b7b907af6e4c949afd9b301c0a5))
-* reduce pickle scanner false positives for BERT and standalone REDUCE opcodes ([#510](https://github.com/promptfoo/modelaudit/issues/510)) ([94c22d6](https://github.com/promptfoo/modelaudit/commit/94c22d6d5237e18aaa47f53cde93b4a1ff9e4b08))
-* remove duplicate whitelist downgrading in add_check() ([#490](https://github.com/promptfoo/modelaudit/issues/490)) ([a8c52bc](https://github.com/promptfoo/modelaudit/commit/a8c52bcb85e160e1d80414aa4767ccebe1794707))
-* remove variable shadowing for skip_file_types parameter ([#489](https://github.com/promptfoo/modelaudit/issues/489)) ([bcf99ea](https://github.com/promptfoo/modelaudit/commit/bcf99ea7d0e62b358c130754c38e7f5be3282e18))
-* use deterministic data patterns in anomaly detector tests ([#477](https://github.com/promptfoo/modelaudit/issues/477)) ([df11759](https://github.com/promptfoo/modelaudit/commit/df11759ee22628aed6ed541f819fd5f26920a38b))
+- add content-based CVE detection to SkopsScanner ([#498](https://github.com/promptfoo/modelaudit/issues/498)) ([89895cb](https://github.com/promptfoo/modelaudit/commit/89895cb611f95c6c3119cdd8adf513e1b0c5a818))
+- add logging to critical exception handlers in pickle scanner ([#492](https://github.com/promptfoo/modelaudit/issues/492)) ([b6b06cb](https://github.com/promptfoo/modelaudit/commit/b6b06cb2b0f6adccfa15e43948e78efad005abb6))
+- add logging to silent exception handlers in secrets detector ([#491](https://github.com/promptfoo/modelaudit/issues/491)) ([b59f8a4](https://github.com/promptfoo/modelaudit/commit/b59f8a4924e2285c72b3f40e2ff6bec5f5815727))
+- add security keywords to QueueEnqueueV2 TF op explanation ([#511](https://github.com/promptfoo/modelaudit/issues/511)) ([1d93483](https://github.com/promptfoo/modelaudit/commit/1d93483b79c76a9fbbbd8bc7aa2239c8aca28ec2))
+- **ci:** ensure numpy compatibility job runs ([#478](https://github.com/promptfoo/modelaudit/issues/478)) ([7266160](https://github.com/promptfoo/modelaudit/commit/72661605482c2883a9f7ae28c32416677d0fcd17))
+- **deps:** bump pillow 12.1.0→12.1.1 and cryptography 46.0.4→46.0.5 ([#513](https://github.com/promptfoo/modelaudit/issues/513)) ([5b18d49](https://github.com/promptfoo/modelaudit/commit/5b18d49cd16bd611bb89b41b341475175bca6922))
+- **deps:** update dependency fickling to v0.1.7 [security] ([#479](https://github.com/promptfoo/modelaudit/issues/479)) ([292eb23](https://github.com/promptfoo/modelaudit/commit/292eb234c5c3379706e51372973078b59b2516f9))
+- improve Python version requirement UX ([#508](https://github.com/promptfoo/modelaudit/issues/508)) ([a44d8bb](https://github.com/promptfoo/modelaudit/commit/a44d8bb67f27f4e8b04d55c04fd28f9d257bfec8))
+- reduce false positive scan warnings for HuggingFace models ([#514](https://github.com/promptfoo/modelaudit/issues/514)) ([b545c11](https://github.com/promptfoo/modelaudit/commit/b545c1102c538b7b907af6e4c949afd9b301c0a5))
+- reduce pickle scanner false positives for BERT and standalone REDUCE opcodes ([#510](https://github.com/promptfoo/modelaudit/issues/510)) ([94c22d6](https://github.com/promptfoo/modelaudit/commit/94c22d6d5237e18aaa47f53cde93b4a1ff9e4b08))
+- remove duplicate whitelist downgrading in add_check() ([#490](https://github.com/promptfoo/modelaudit/issues/490)) ([a8c52bc](https://github.com/promptfoo/modelaudit/commit/a8c52bcb85e160e1d80414aa4767ccebe1794707))
+- remove variable shadowing for skip_file_types parameter ([#489](https://github.com/promptfoo/modelaudit/issues/489)) ([bcf99ea](https://github.com/promptfoo/modelaudit/commit/bcf99ea7d0e62b358c130754c38e7f5be3282e18))
+- use deterministic data patterns in anomaly detector tests ([#477](https://github.com/promptfoo/modelaudit/issues/477)) ([df11759](https://github.com/promptfoo/modelaudit/commit/df11759ee22628aed6ed541f819fd5f26920a38b))
 
 ## [0.2.24](https://github.com/promptfoo/modelaudit/compare/v0.2.23...v0.2.24) (2025-12-23)
 
