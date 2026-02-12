@@ -6,9 +6,12 @@ Detects API keys, passwords, tokens, and other sensitive data embedded in model 
 Part of ModelAudit's critical security validation suite.
 """
 
+import logging
 import math
 import re
 from typing import Any
+
+logger: logging.Logger = logging.getLogger(__name__)
 
 # High-priority secret patterns with descriptions
 SECRET_PATTERNS: list[tuple[str, str]] = [
@@ -326,8 +329,8 @@ class SecretsDetector:
             # This helps filter out false positives from model weights
             text_findings = self.scan_text(text, context, is_binary_source=True)
             findings.extend(text_findings)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Failed to decode binary data as UTF-8 for secrets scanning: %s", e)
 
         # Check for high-entropy regions that might be encrypted/encoded secrets
         # Only check if data is not too large (to avoid flagging compressed model weights)
@@ -367,8 +370,8 @@ class SecretsDetector:
                                 }
                             )
                             break  # Only report first high-entropy region to avoid spam
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("Error analyzing high-entropy region at offset %d: %s", i, e)
                 elif entropy > self.min_entropy:
                     # Moderate entropy - might be a secret or just compressed data
                     # Try to decode as base64 or hex to check for secrets
@@ -383,8 +386,8 @@ class SecretsDetector:
                             decoded_findings = self.scan_text(decoded_text, f"{context} (base64 decoded)")
                             if decoded_findings:
                                 findings.extend(decoded_findings)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("Failed to decode/analyze base64 content: %s", e)
 
         return findings
 
@@ -587,8 +590,8 @@ class SecretsDetector:
             try:
                 byte_data = weights.tobytes()
                 findings.extend(self.scan_bytes(byte_data, f"{context}[array]"))
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to convert model weights to bytes for scanning: %s", e)
         elif isinstance(weights, list | tuple):
             for i, item in enumerate(weights):
                 findings.extend(self.scan_model_weights(item, f"{context}[{i}]"))
