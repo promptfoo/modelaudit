@@ -364,3 +364,61 @@ __import__('pickle').loads(data)
 
         finally:
             os.unlink(temp_path)
+
+    def test_detects_subclassed_model_in_zip(self, tmp_path):
+        """Test that scanner detects subclassed models with custom class names."""
+        scanner = KerasZipScanner()
+        keras_path = tmp_path / "model.keras"
+
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            config = {
+                "class_name": "MyCustomTransformer",  # Subclassed model
+                "config": {
+                    "name": "custom_transformer",
+                    "layers": [
+                        {"class_name": "Dense", "config": {"units": 10}},
+                    ],
+                },
+            }
+            zf.writestr("config.json", json.dumps(config))
+            zf.writestr("metadata.json", json.dumps({"keras_version": "3.0.0"}))
+
+        result = scanner.scan(str(keras_path))
+
+        from modelaudit.scanners.base import CheckStatus
+
+        subclass_checks = [c for c in result.checks if "subclassed" in c.name.lower()]
+        assert len(subclass_checks) > 0
+        assert subclass_checks[0].status != CheckStatus.PASSED
+        assert subclass_checks[0].severity == IssueSeverity.INFO
+
+    def test_allows_known_safe_model_classes_in_zip(self, tmp_path):
+        """Test that scanner passes for known safe model classes."""
+        from modelaudit.scanners.base import CheckStatus
+
+        scanner = KerasZipScanner()
+
+        for model_class in ["Sequential", "Functional", "Model"]:
+            keras_path = tmp_path / f"model_{model_class}.keras"
+
+            with zipfile.ZipFile(keras_path, "w") as zf:
+                config = {
+                    "class_name": model_class,
+                    "config": {
+                        "name": "test_model",
+                        "layers": [
+                            {"class_name": "Dense", "config": {"units": 10}},
+                        ],
+                    },
+                }
+                zf.writestr("config.json", json.dumps(config))
+                zf.writestr("metadata.json", json.dumps({"keras_version": "3.0.0"}))
+
+            result = scanner.scan(str(keras_path))
+
+            subclass_issues = [i for i in result.issues if "subclassed" in i.message.lower()]
+            assert len(subclass_issues) == 0, f"{model_class} should not be flagged as subclassed"
+
+            subclass_checks = [c for c in result.checks if "subclassed" in c.name.lower()]
+            assert len(subclass_checks) > 0
+            assert all(c.status == CheckStatus.PASSED for c in subclass_checks)
