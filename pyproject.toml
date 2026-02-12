@@ -49,14 +49,16 @@ dependencies = [
     "s3fs>=2025.5.1",
     "gcsfs>=2025.5.1",
     "posthog>=7.0.0",
+    "protobuf>=5.29.0",
 ]
 
 [project.optional-dependencies]
-# TensorFlow version depends on Python version:
-# - Python 3.10: TensorFlow 2.13+ (NumPy 1.x compatible)
-# - Python 3.11+: TensorFlow 2.17+ (NumPy 2.x required)
+# TensorFlow is now OPTIONAL - vendored protobuf stubs handle SavedModel scanning
+# without requiring the full TensorFlow package (and avoiding Keras CVE exposure).
+# Only install TensorFlow if you need:
+# - Checkpoint reading from SavedModel directories (variables/*.index files)
+# - Maximum compatibility with edge cases
 tensorflow = [
-    "tensorflow>=2.13.0,<3.0; python_version == '3.10'",
     "tensorflow>=2.17.0,<3.0; python_version >= '3.11' and python_version < '3.13'",
 ]
 h5 = ["h5py>=3.1,<4.0"]
@@ -73,14 +75,11 @@ xgboost = ["xgboost>=3.1.2,<3.2", "py-ubjson>=0.16.0"]
 mlflow = ["mlflow>=2.12.0"]
 huggingface = ["huggingface-hub>=0.23.0"]
 sevenzip = ["py7zr>=0.20.0"]
-# Full ML framework bundle with version-appropriate NumPy:
-# - Python 3.10: NumPy 1.x + TensorFlow 2.13+
-# - Python 3.11+: NumPy 2.x + TensorFlow 2.17+
+# Full ML framework bundle with version-appropriate NumPy
+# Note: TensorFlow is no longer required - vendored protos handle SavedModel scanning
 numpy1 = [
     "numpy>=1.19.0,<2.0; python_version == '3.10'",
     "numpy>=2.4,<2.5; python_version >= '3.11'",
-    "tensorflow>=2.13.0,<3.0; python_version == '3.10'",
-    "tensorflow>=2.17.0,<3.0; python_version >= '3.11' and python_version < '3.13'",
     "h5py>=3.1,<4.0",
     "torch>=2.6.0,<3.0",
     "pyyaml>=6.0,<7.0",
@@ -94,10 +93,8 @@ numpy1 = [
     "huggingface-hub>=0.23.0",
 ]
 # All dependencies except platform-specific ones (for CI)
-# TensorFlow version depends on Python version (see tensorflow extra above)
+# Note: TensorFlow removed - vendored protos handle SavedModel scanning without Keras CVE exposure
 all-ci = [
-    "tensorflow>=2.13.0,<3.0; python_version == '3.10'",
-    "tensorflow>=2.17.0,<3.0; python_version >= '3.11' and python_version < '3.13'",
     "h5py>=3.1,<4.0",
     "torch>=2.6.0,<3.0",
     "pyyaml>=6.0,<7.0",
@@ -120,9 +117,8 @@ all-ci-windows = [
     "msgpack>=1.0.0,<2.0",
     "safetensors>=0.4.0",
 ]
+# All optional dependencies (TensorFlow removed - use vendored protos)
 all = [
-    "tensorflow>=2.13.0,<3.0; python_version == '3.10'",
-    "tensorflow>=2.17.0,<3.0; python_version >= '3.11' and python_version < '3.13'",
     "h5py>=3.1,<4.0",
     "torch>=2.6.0,<3.0",
     "pyyaml>=6.0,<7.0",
@@ -196,6 +192,8 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
 "tests/**/*.py" = ["S101", "F841"]
+# Auto-generated protobuf files - ignore line length, quotes, and other style issues
+"modelaudit/protos/**/*_pb2.py" = ["E402", "E501", "E701", "E711", "E712", "E721", "F401", "F811", "I001", "W", "Q", "UP"]
 
 [tool.ruff.lint.flake8-quotes]
 # Standardize on double quotes for consistency with docstrings
@@ -207,6 +205,8 @@ avoid-escape = true
 [tool.ruff.format]
 # Black-compatible formatting
 quote-style = "double"
+# Exclude auto-generated protobuf files from formatting
+exclude = ["modelaudit/protos/**/*_pb2.py"]
 
 [tool.pytest.ini_options]
 minversion = "7.0"
@@ -303,6 +303,11 @@ module = "modelaudit.tests.*"
 # Tests can be less strict
 disallow_untyped_defs = false
 check_untyped_defs = true
+
+[[tool.mypy.overrides]]
+module = "modelaudit.protos.*"
+# Auto-generated protobuf files lack type annotations
+ignore_errors = true
 
 [[tool.mypy.overrides]]
 module = "modelaudit.scanners.*"
