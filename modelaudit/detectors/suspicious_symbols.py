@@ -150,7 +150,16 @@ SUSPICIOUS_GLOBALS = {
     "platform": ["system", "popen"],  # System information/execution
     # Low-level system access - CRITICAL RISK
     "ctypes": ["*"],  # C library access
+    "ctypes.util": "*",  # Library finding utilities (find_library, etc.)
     "socket": ["*"],  # Network communication
+    "mmap": "*",  # Memory mapping (can map files, shared memory)
+    # Process and signal control - CRITICAL RISK
+    "multiprocessing": "*",  # Process spawning and pool execution
+    "multiprocessing.pool": "*",  # Process pools
+    "concurrent.futures": ["ProcessPoolExecutor", "ThreadPoolExecutor"],  # Executor pools
+    "signal": "*",  # Signal handling manipulation (can alter program flow)
+    # Async subprocess - CRITICAL RISK
+    "asyncio.subprocess": "*",  # Async subprocess execution
     # Serialization libraries that can execute arbitrary code - HIGH RISK
     "dill": [
         "load",
@@ -222,6 +231,16 @@ SUSPICIOUS_STRING_PATTERNS = [
     r"lambda",  # Anonymous function creation
     # Hex encoding - possible obfuscation
     r"\\x[0-9a-fA-F]{2}",  # Hex-encoded characters
+    # getattr-based evasion patterns - bypass string matching via dynamic attribute access
+    r"getattr\s*\(\s*\w+\s*,\s*['\"]system['\"]\s*\)",  # getattr(os, 'system')
+    r"getattr\s*\(\s*\w+\s*,\s*['\"]exec['\"]\s*\)",  # getattr(builtins, 'exec')
+    r"getattr\s*\(\s*\w+\s*,\s*['\"]eval['\"]\s*\)",  # getattr(builtins, 'eval')
+    r"getattr\s*\(\s*\w+\s*,\s*['\"]popen['\"]\s*\)",  # getattr(os, 'popen')
+    r"getattr\s*\(\s*\w+\s*,\s*['\"]spawn['\"]\s*\)",  # getattr(os, 'spawn*')
+    r"getattr\s*\(\s*\w+\s*,\s*['\"]call['\"]\s*\)",  # getattr(subprocess, 'call')
+    r"getattr\s*\(\s*\w+\s*,\s*['\"]run['\"]\s*\)",  # getattr(subprocess, 'run')
+    r"getattr\s*\(\s*\w+\s*,\s*['\"]Popen['\"]\s*\)",  # getattr(subprocess, 'Popen')
+    r"getattr\s*\(\s*getattr\s*\(",  # Nested getattr chains - obfuscation technique
 ]
 
 # =============================================================================
@@ -345,6 +364,20 @@ BINARY_CODE_PATTERNS: list[bytes] = [
     b"subprocess.call",
     b"subprocess.Popen",
     b"socket.socket",
+    # Native code loading - ctypes
+    b"ctypes.CDLL",
+    b"ctypes.cdll",
+    b"ctypes.windll",
+    b"ctypes.WinDLL",
+    # Native code loading - cffi
+    b"cffi.FFI",
+    b"ffi.dlopen",
+    # Direct dynamic loading
+    b"dlopen(",
+    b"LoadLibrary",
+    # Memory mapping (code injection vector)
+    b"mmap.mmap",
+    b"mmap(",
 ]
 
 # Common executable file signatures found in malicious model data
@@ -408,6 +441,10 @@ TENSORFLOW_DANGEROUS_OPS: dict[str, str] = {
     "DecodeJpeg": "Can decode JPEG data, potential injection of malicious content",
     "DecodePng": "Can decode PNG data, potential injection of malicious content",
 }
+
+# Known safe Keras model classes that use declarative layer configurations
+# without custom code execution (Sequential, Functional, Model)
+KNOWN_SAFE_MODEL_CLASSES: set[str] = {"Sequential", "Functional", "Model"}
 
 # Suspicious Keras layer types
 # Layer types that can contain arbitrary code or complex functionality
