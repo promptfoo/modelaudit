@@ -81,3 +81,27 @@ NO_COLOR=1 modelaudit model.pkl
 - **Target specific test files** instead of full suite during development
 - **Use `--maxfail=1`** with pytest to exit on first test failure
 - **Keep branches clean** - merge main regularly to avoid conflicts
+
+## CI Job Matrix
+
+| Job                        | Purpose                             | When Runs                          |
+| -------------------------- | ----------------------------------- | ---------------------------------- |
+| `lint`                     | Ruff format/lint checks             | Python files changed               |
+| `type-check`               | mypy + circular import check        | Python files changed               |
+| `quick-feedback`           | Fast tests (Python 3.12)            | Python files changed               |
+| `windows-tests`            | Windows compatibility               | Python files changed               |
+| `test`                     | Full test matrix (Python 3.10-3.13) | Python files changed               |
+| `test-numpy-compatibility` | NumPy 1.x/2.x compat                | Main branch or deps changed        |
+| `test-vendored-protos`     | TensorFlow protos without TF        | Main branch or python/deps changed |
+| `build`                    | Package build                       | Python or deps changed             |
+
+## Vendored TensorFlow Protos CI
+
+The `test-vendored-protos` job verifies that TensorFlow SavedModel scanning works **without** TensorFlow installed:
+
+1. Installs modelaudit without the `tensorflow` extra
+2. Verifies TensorFlow is NOT installed
+3. Confirms vendored protos load correctly
+4. Tests safe and malicious SavedModel detection
+
+This ensures the ~2 GB TensorFlow dependency remains optional for users who only need SavedModel scanning.
