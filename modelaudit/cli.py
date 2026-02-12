@@ -2607,6 +2607,16 @@ def debug(output_json: bool, verbose: bool) -> None:
 
 
 def main() -> None:
+    if sys.version_info < (3, 10):  # noqa: UP036 — intentional safety net for bypassed requires-python
+        click.echo(
+            click.style(
+                f"WARNING: modelaudit requires Python 3.10+, but you are running "
+                f"Python {sys.version_info[0]}.{sys.version_info[1]}. "
+                f"Please upgrade: https://www.promptfoo.dev/docs/model-audit/",
+                fg="yellow",
+            ),
+            err=True,
+        )
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",

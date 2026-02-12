@@ -17,6 +17,7 @@ from modelaudit.utils.helpers.code_validation import (
 
 from ..config.explanations import get_pattern_explanation
 from .base import BaseScanner, IssueSeverity, ScanResult
+from .keras_utils import check_subclassed_model
 
 
 class KerasZipScanner(BaseScanner):
@@ -170,7 +171,10 @@ class KerasZipScanner(BaseScanner):
         model_class = model_config.get("class_name", "")
         result.metadata["model_class"] = model_class
 
-        # Check for suspicious model types
+        # Check for subclassed models (custom class names)
+        check_subclassed_model(model_class, result, self.current_file_path)
+
+        # Check for suspicious model types (Lambda, etc.)
         if model_class in self.suspicious_layer_types:
             result.add_check(
                 name="Model Type Security Check",
