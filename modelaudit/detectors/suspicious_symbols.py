@@ -405,6 +405,13 @@ SUSPICIOUS_OPS = {
     "MergeV2Checkpoints",  # Checkpoint manipulation
     "Save",  # Save operations (potential overwrite)
     "SaveV2",  # SaveV2 operations
+    "LoadAndRemapMatrix",  # Load matrix from files with arbitrary paths
+    "RestoreV2",  # Restore checkpoint data (file access)
+    # External data loading - HIGH RISK
+    "LookupTableImport",  # Import data from external files
+    "InitializeTable",  # Initialize lookup tables from files
+    "LookupTableImportV2",  # Import data from external files (V2)
+    "InitializeTableV2",  # Initialize lookup tables from files (V2)
     # Code execution - CRITICAL RISK
     "PyFunc",  # Execute Python functions
     "PyFuncStateless",  # Execute Python functions (stateless variant)
@@ -414,6 +421,19 @@ SUSPICIOUS_OPS = {
     "ShellExecute",  # Execute shell commands
     "ExecuteOp",  # Execute arbitrary operations
     "SystemConfig",  # System configuration access
+    # Queue operations - data exfiltration risk
+    "QueueEnqueue",  # Enqueue data (potential exfiltration)
+    "QueueEnqueueV2",  # Enqueue data V2
+    "QueueDequeue",  # Dequeue data (potential exfiltration)
+    "QueueDequeueV2",  # Dequeue data V2
+    "QueueEnqueueMany",  # Batch enqueue (potential exfiltration)
+    "QueueDequeueMany",  # Batch dequeue (potential exfiltration)
+    # Side-channel information leakage
+    "Print",  # Print to stdout (information leakage)
+    "PrintV2",  # Print to stdout V2 (information leakage)
+    # Pipeline disruption
+    "Assert",  # Can crash inference pipelines
+    "Abort",  # Can abort execution
     # Data decoding - CRITICAL (scanner emits CRITICAL for these ops in suspicious-ops path)
     "DecodeRaw",  # Raw data decoding
     "DecodeJpeg",  # JPEG decoding (image processing)
@@ -427,6 +447,13 @@ TENSORFLOW_DANGEROUS_OPS: dict[str, str] = {
     "MergeV2Checkpoints": "Can manipulate checkpoint files",
     "Save": "Can save data to arbitrary locations",
     "SaveV2": "Can save data to arbitrary locations",
+    "LoadAndRemapMatrix": "Can load matrix data from arbitrary file paths",
+    "RestoreV2": "Can restore checkpoint data, enabling file system access",
+    # External data loading - HIGH RISK
+    "LookupTableImport": "Can import data from external files",
+    "InitializeTable": "Can initialize lookup tables from external files",
+    "LookupTableImportV2": "Can import data from external files (V2 variant)",
+    "InitializeTableV2": "Can initialize lookup tables from external files (V2 variant)",
     # Code execution - CRITICAL RISK
     "PyFunc": "Can execute arbitrary Python functions",
     "PyFuncStateless": "Can execute arbitrary Python functions (stateless variant)",
@@ -436,6 +463,19 @@ TENSORFLOW_DANGEROUS_OPS: dict[str, str] = {
     "ShellExecute": "Can execute shell commands",
     "ExecuteOp": "Can execute arbitrary operations",
     "SystemConfig": "Can access system configuration",
+    # Queue operations - data exfiltration risk
+    "QueueEnqueue": "Can enqueue data to queues, potential data exfiltration vector",
+    "QueueEnqueueV2": "Can enqueue data to queues (V2 variant)",
+    "QueueDequeue": "Can dequeue data from queues, potential data exfiltration vector",
+    "QueueDequeueV2": "Can dequeue data from queues (V2 variant)",
+    "QueueEnqueueMany": "Can batch enqueue data, potential data exfiltration vector",
+    "QueueDequeueMany": "Can batch dequeue data, potential data exfiltration vector",
+    # Side-channel information leakage
+    "Print": "Can print to stdout, enabling side-channel information leakage",
+    "PrintV2": "Can print to stdout (V2 variant), enabling side-channel information leakage",
+    # Pipeline disruption
+    "Assert": "Can crash inference pipelines if assertion fails",
+    "Abort": "Can abort execution, enabling denial of service",
     # Data decoding - CRITICAL (scanner emits CRITICAL for these ops in suspicious-ops path)
     "DecodeRaw": "Can decode raw image data, potential injection of malicious content",
     "DecodeJpeg": "Can decode JPEG data, potential injection of malicious content",
