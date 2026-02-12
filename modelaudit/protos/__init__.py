@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import types
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -52,7 +53,7 @@ def _setup_vendored_protos() -> bool:
 
         return True
     except ImportError as e:
-        logger.debug(f"Vendored TensorFlow protos failed to load: {e}")
+        logger.debug("Vendored TensorFlow protos failed to load: %s", e)
         return False
 
 
@@ -93,7 +94,7 @@ def get_graph_def_class() -> type:
     return GraphDef
 
 
-def get_saved_model_pb2() -> object:
+def get_saved_model_pb2() -> types.ModuleType:
     """Get the saved_model_pb2 module (from TensorFlow or vendored protos)."""
     if not _check_vendored_protos():
         raise ImportError("TensorFlow protos not available (neither TensorFlow nor vendored)")
@@ -103,7 +104,7 @@ def get_saved_model_pb2() -> object:
     return saved_model_pb2
 
 
-def get_graph_pb2() -> object:
+def get_graph_pb2() -> types.ModuleType:
     """Get the graph_pb2 module (from TensorFlow or vendored protos)."""
     if not _check_vendored_protos():
         raise ImportError("TensorFlow protos not available (neither TensorFlow nor vendored)")

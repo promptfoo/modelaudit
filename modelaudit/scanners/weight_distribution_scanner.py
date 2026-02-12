@@ -44,14 +44,13 @@ class WeightDistributionScanner(BaseScanner):
     def can_handle(cls, path: str) -> bool:
         """Check if this scanner can handle the given path"""
         if os.path.isdir(path):
+            # Directory-based SavedModel weight extraction requires full TensorFlow
+            # for checkpoint reading (tf.train.list_variables / tf.train.load_variable)
             try:
-                from modelaudit.utils.tensorflow_compat import get_protobuf_classes
-
-                get_protobuf_classes()
-                has_protos = True
+                import tensorflow  # noqa: F401
             except ImportError:
-                has_protos = False
-            return has_protos and os.path.exists(os.path.join(path, "saved_model.pb"))
+                return False
+            return os.path.exists(os.path.join(path, "saved_model.pb"))
 
         if not os.path.isfile(path):
             return False

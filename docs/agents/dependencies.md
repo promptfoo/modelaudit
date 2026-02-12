@@ -135,7 +135,7 @@ git commit -m "chore: update vendored TensorFlow protos to v${TF_VERSION}"
 
 ### Proto Loading Strategy
 
-```
+```text
 1. Import modelaudit.protos
 2. Check if TensorFlow is installed
 3. If YES → use TensorFlow's native protos (no sys.path changes)

@@ -415,13 +415,13 @@ jobs:
       - name: Test safe SavedModel scanning
         run: |
           uv run python -m modelaudit tests/assets/samples/tensorflow/safe_savedmodel/ --format json | \
-            python -c "import sys,json; d=json.load(sys.stdin); assert len(d['issues'])==0, f'Expected 0 issues, got {len(d[\"issues\"])}'; print('✓ Safe model: 0 issues')"
+            uv run python -c "import sys,json; d=json.load(sys.stdin); assert len(d['issues'])==0, f'Expected 0 issues, got {len(d[\"issues\"])}'; print('✓ Safe model: 0 issues')"
 
       - name: Test malicious SavedModel scanning
         run: |
           # Should detect PyFunc operation
-          uv run python -m modelaudit tests/assets/samples/tensorflow/malicious_pyfunc/ --format json 2>/dev/null | \
-            python -c "import sys,json; d=json.load(sys.stdin); critical=[i for i in d['issues'] if i['severity']=='critical']; assert len(critical)>=1, f'Expected critical issues, got {len(critical)}'; print(f'✓ Malicious model: {len(critical)} critical issue(s) detected')"
+          uv run python -m modelaudit tests/assets/samples/tensorflow/malicious_pyfunc/ --format json | \
+            uv run python -c "import sys,json; d=json.load(sys.stdin); critical=[i for i in d['issues'] if i['severity']=='critical']; assert len(critical)>=1, f'Expected critical issues, got {len(critical)}'; print(f'✓ Malicious model: {len(critical)} critical issue(s) detected')"
 
   build:
     name: Build and Package

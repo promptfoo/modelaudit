@@ -49,6 +49,7 @@ dependencies = [
     "s3fs>=2025.5.1",
     "gcsfs>=2025.5.1",
     "posthog>=7.0.0",
+    "protobuf>=5.29.0",
 ]
 
 [project.optional-dependencies]
@@ -302,6 +303,11 @@ module = "modelaudit.tests.*"
 # Tests can be less strict
 disallow_untyped_defs = false
 check_untyped_defs = true
+
+[[tool.mypy.overrides]]
+module = "modelaudit.protos.*"
+# Auto-generated protobuf files lack type annotations
+ignore_errors = true
 
 [[tool.mypy.overrides]]
 module = "modelaudit.scanners.*"

@@ -49,11 +49,19 @@ mkdir -p "$OUTPUT_DIR/tensorflow/core/framework"
 
 echo "Compiling protobuf files..."
 
+COMPILED=0
+FAILED=0
+
 # Compile ALL proto files in the framework directory
 echo "  Compiling framework protos..."
 for proto in tensorflow/core/framework/*.proto; do
     if [[ -f "$proto" ]]; then
-        protoc --python_out="$OUTPUT_DIR" -I. "$proto" 2>/dev/null || true
+        if protoc --python_out="$OUTPUT_DIR" -I. "$proto" 2>&1; then
+            COMPILED=$((COMPILED + 1))
+        else
+            echo "  WARNING: Failed to compile $proto"
+            FAILED=$((FAILED + 1))
+        fi
     fi
 done
 
@@ -61,12 +69,21 @@ done
 echo "  Compiling protobuf protos..."
 for proto in tensorflow/core/protobuf/*.proto; do
     if [[ -f "$proto" ]]; then
-        protoc --python_out="$OUTPUT_DIR" -I. "$proto" 2>/dev/null || true
+        if protoc --python_out="$OUTPUT_DIR" -I. "$proto" 2>&1; then
+            COMPILED=$((COMPILED + 1))
+        else
+            echo "  WARNING: Failed to compile $proto"
+            FAILED=$((FAILED + 1))
+        fi
     fi
 done
 
+echo ""
+echo "Compilation results: $COMPILED succeeded, $FAILED failed"
+
 # Create __init__.py files for proper Python packaging
-find "$OUTPUT_DIR" -type d -exec touch {}/__init__.py \;
+# Only in tensorflow/ subdirectories - do NOT overwrite modelaudit/protos/__init__.py
+find "$OUTPUT_DIR/tensorflow" -type d -exec touch {}/__init__.py \;
 
 # DON'T patch imports - keep original tensorflow.* imports
 # We'll add modelaudit/protos to sys.path at runtime instead
@@ -77,6 +94,35 @@ echo "Creating type stubs..."
 # Create a py.typed marker for PEP 561
 touch "$OUTPUT_DIR/py.typed"
 
+# Verify critical output files exist
+echo ""
+echo "Verifying critical proto files..."
+CRITICAL_FILES=(
+    "$OUTPUT_DIR/tensorflow/core/protobuf/saved_model_pb2.py"
+    "$OUTPUT_DIR/tensorflow/core/framework/graph_pb2.py"
+    "$OUTPUT_DIR/tensorflow/core/framework/tensor_pb2.py"
+    "$OUTPUT_DIR/tensorflow/core/framework/tensor_shape_pb2.py"
+    "$OUTPUT_DIR/tensorflow/core/framework/types_pb2.py"
+    "$OUTPUT_DIR/tensorflow/core/framework/node_def_pb2.py"
+    "$OUTPUT_DIR/tensorflow/core/framework/attr_value_pb2.py"
+)
+
+MISSING=0
+for f in "${CRITICAL_FILES[@]}"; do
+    if [[ -f "$f" ]]; then
+        echo "  OK: $(basename "$f")"
+    else
+        echo "  MISSING: $(basename "$f")"
+        MISSING=$((MISSING + 1))
+    fi
+done
+
+if [[ $MISSING -gt 0 ]]; then
+    echo ""
+    echo "ERROR: $MISSING critical proto file(s) missing! Compilation incomplete."
+    exit 1
+fi
+
 echo ""
 echo "=== Compilation Complete ==="
 echo ""
@@ -85,6 +131,5 @@ find "$OUTPUT_DIR" -name "*.py" | wc -l
 echo " Python files"
 echo ""
 echo "To use in code:"
-echo "  import sys"
-echo "  sys.path.insert(0, 'path/to/modelaudit/protos')"
+echo "  import modelaudit.protos  # sets up sys.path automatically"
 echo "  from tensorflow.core.protobuf.saved_model_pb2 import SavedModel"

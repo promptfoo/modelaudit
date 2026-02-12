@@ -13,12 +13,9 @@ avoiding exposure to Keras CVEs while maintaining full scanning functionality.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import numpy as np
-
-if TYPE_CHECKING:
-    pass
 
 logger = logging.getLogger(__name__)
 
@@ -207,43 +204,12 @@ def tensor_proto_to_ndarray(tensor_proto: Any) -> np.ndarray[Any, Any]:
     return values.reshape(shape) if shape else values
 
 
-def try_load_vendored_protos() -> tuple[Any, Any] | None:
-    """
-    Try to load vendored TensorFlow protobuf stubs.
-
-    Returns:
-        Tuple of (SavedModel, GraphDef) classes if available, None otherwise
-    """
-    try:
-        from modelaudit.protos.tensorflow.core.framework.graph_pb2 import GraphDef  # type: ignore[attr-defined]
-        from modelaudit.protos.tensorflow.core.protobuf.saved_model_pb2 import SavedModel  # type: ignore[attr-defined]
-
-        return SavedModel, GraphDef
-    except ImportError:
-        return None
-
-
-def try_load_tensorflow_protos() -> tuple[Any, Any] | None:
-    """
-    Try to load TensorFlow protobuf classes from the full TensorFlow package.
-
-    Returns:
-        Tuple of (SavedModel, GraphDef) classes if available, None otherwise
-    """
-    try:
-        from tensorflow.core.framework.graph_pb2 import GraphDef
-        from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
-
-        return SavedModel, GraphDef
-    except ImportError:
-        return None
-
-
 def get_protobuf_classes() -> tuple[Any, Any]:
     """
     Get SavedModel and GraphDef protobuf classes.
 
-    Tries vendored protos first, falls back to full TensorFlow.
+    Uses modelaudit.protos to initialize proto loading (TF-native first, vendored fallback),
+    then imports via tensorflow.core.* which resolves to whichever source is available.
 
     Returns:
         Tuple of (SavedModel, GraphDef) classes
@@ -251,23 +217,19 @@ def get_protobuf_classes() -> tuple[Any, Any]:
     Raises:
         ImportError: If neither vendored protos nor TensorFlow are available
     """
-    # Try vendored protos first (lightweight, no CVE exposure)
-    result = try_load_vendored_protos()
-    if result:
-        logger.debug("Using vendored TensorFlow protobuf stubs")
-        return result
+    import modelaudit.protos
 
-    # Fall back to full TensorFlow
-    result = try_load_tensorflow_protos()
-    if result:
-        logger.debug("Using TensorFlow package protobuf classes")
-        return result
+    if not modelaudit.protos._check_vendored_protos():
+        raise ImportError(
+            "TensorFlow protobuf stubs not available. "
+            "Vendored protos may be missing or corrupted. "
+            "Reinstall modelaudit or install TensorFlow with: pip install modelaudit[tensorflow]"
+        )
 
-    raise ImportError(
-        "TensorFlow protobuf stubs not available. "
-        "Either run scripts/compile_tensorflow_protos.sh to generate vendored stubs, "
-        "or install TensorFlow with: pip install modelaudit[tensorflow]"
-    )
+    from tensorflow.core.framework.graph_pb2 import GraphDef
+    from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
+
+    return SavedModel, GraphDef
 
 
 # Checkpoint reading requires full TensorFlow (no lightweight alternative)
