@@ -16,7 +16,7 @@ def has_tensorflow():
         return False
 
 
-def has_tf_protos():
+def has_tf_protos() -> bool:
     """Check if TensorFlow protobuf stubs are available (vendored or from TensorFlow)."""
     import modelaudit.protos
 
