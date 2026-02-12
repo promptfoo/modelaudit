@@ -1,7 +1,6 @@
 """Tests for code validation utilities."""
 
 from modelaudit.utils.helpers.code_validation import (
-    detect_variadic_lambda,
     extract_dangerous_constructs,
     is_code_potentially_dangerous,
     validate_python_syntax,
@@ -253,48 +252,14 @@ open("/tmp/test", "w")
         assert "Variadic lambdas" in description
         assert "*args" in description or "**kwargs" in description
 
-
-class TestDetectVariadicLambda:
-    """Test variadic lambda detection function."""
-
-    def test_detects_args(self):
-        """Test detection of *args in lambda."""
-        code = "f = lambda *args: args[0]"
-        has_variadic, descriptions = detect_variadic_lambda(code)
-        assert has_variadic is True
-        assert any("*args" in d for d in descriptions)
-
-    def test_detects_kwargs(self):
-        """Test detection of **kwargs in lambda."""
-        code = "g = lambda **kwargs: kwargs"
-        has_variadic, descriptions = detect_variadic_lambda(code)
-        assert has_variadic is True
-        assert any("**kwargs" in d for d in descriptions)
-
-    def test_detects_both(self):
-        """Test detection of both *args and **kwargs."""
-        code = "h = lambda *a, **kw: (a, kw)"
-        has_variadic, descriptions = detect_variadic_lambda(code)
-        assert has_variadic is True
-        assert len(descriptions) == 2
-
-    def test_simple_lambda_not_flagged(self):
-        """Test that simple lambdas are not flagged."""
-        code = "f = lambda x, y, z: x + y + z"
-        has_variadic, descriptions = detect_variadic_lambda(code)
-        assert has_variadic is False
-        assert len(descriptions) == 0
-
-    def test_handles_invalid_syntax(self):
-        """Test graceful handling of invalid syntax."""
-        code = "lambda *args: invalid syntax {"
-        has_variadic, descriptions = detect_variadic_lambda(code)
-        assert has_variadic is False
-        assert len(descriptions) == 0
-
-    def test_nested_lambda(self):
-        """Test detection in nested lambdas."""
+    def test_detects_nested_variadic_lambda(self):
+        """Test detection of variadic lambda nested inside another lambda."""
         code = "f = lambda x: (lambda *args: sum(args))"
-        has_variadic, descriptions = detect_variadic_lambda(code)
-        assert has_variadic is True
-        assert any("*args" in d for d in descriptions)
+        constructs = extract_dangerous_constructs(code)
+        assert "*args" in constructs["variadic_lambdas"]
+
+    def test_detects_variadic_lambda_inside_call(self):
+        """Test detection of variadic lambda used as argument in a function call."""
+        code = "result = map(lambda *args: sum(args), data)"
+        constructs = extract_dangerous_constructs(code)
+        assert "*args" in constructs["variadic_lambdas"]
