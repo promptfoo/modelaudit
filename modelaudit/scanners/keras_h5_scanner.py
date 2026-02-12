@@ -45,15 +45,15 @@ class KerasH5Scanner(BaseScanner):
     @classmethod
     def can_handle(cls, path: str) -> bool:
         """Check if this scanner can handle the given path"""
-        if not HAS_H5PY:
-            return False
-
         if not os.path.isfile(path):
             return False
 
         ext = os.path.splitext(path)[1].lower()
         if ext not in cls.supported_extensions:
             return False
+
+        if not HAS_H5PY:
+            return True  # Let scan() handle the missing dep with a proper message
 
         # Try to open as HDF5 file
         try:
@@ -82,12 +82,12 @@ class KerasH5Scanner(BaseScanner):
             result.add_check(
                 name="H5PY Library Check",
                 passed=False,
-                message="h5py not installed, cannot scan Keras H5 files. Install with 'pip install modelaudit[h5]'.",
+                message="h5py is required for Keras H5 scanning. Install with 'pip install modelaudit[h5]'.",
                 severity=IssueSeverity.WARNING,
                 location=path,
                 details={"path": path, "required_package": "h5py"},
             )
-            result.finish(success=False)
+            result.finish(success=True)
             return result
 
         result = self._create_result()
