@@ -1,10 +1,15 @@
 """Tests for SkopsScanner covering CVE-2025-54412, CVE-2025-54413, CVE-2025-54886."""
 
+import os
 import zipfile
 from pathlib import Path
 
+import pytest
+
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.skops_scanner import SkopsScanner
+
+SAMPLES_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets", "samples")
 
 
 class TestSkopsScannerCanHandle:
@@ -329,3 +334,49 @@ class TestSkopsScannerCVEDetails:
         assert "remediation" in details
         assert "skops < 0.12.0" in details["affected_versions"]
         assert "0.12.0" in details["remediation"]
+
+
+class TestSkopsScannerRealModel:
+    """Integration tests using a real .skops model from HuggingFace."""
+
+    REAL_SKOPS = os.path.join(SAMPLES_DIR, "pipeline.skops")
+
+    @pytest.mark.skipif(
+        not os.path.isfile(os.path.join(SAMPLES_DIR, "pipeline.skops")),
+        reason="Real .skops sample not available",
+    )
+    def test_can_handle_real_skops_model(self) -> None:
+        """Test that scanner recognises a real .skops file (scikit-learn/persistence)."""
+        assert SkopsScanner.can_handle(self.REAL_SKOPS) is True
+
+    @pytest.mark.skipif(
+        not os.path.isfile(os.path.join(SAMPLES_DIR, "pipeline.skops")),
+        reason="Real .skops sample not available",
+    )
+    def test_scan_real_skops_model_no_cve_false_positives(self) -> None:
+        """Test that a legitimate model doesn't trigger CVE detections."""
+        scanner = SkopsScanner()
+        result = scanner.scan(self.REAL_SKOPS)
+
+        assert result.success is True
+
+        # No CVE checks should fail on a legitimate model
+        cve_failed = [
+            c
+            for c in result.checks
+            if any(cve in c.name for cve in ["CVE-2025-54412", "CVE-2025-54413", "CVE-2025-54886"])
+            and c.status == CheckStatus.FAILED
+        ]
+        assert len(cve_failed) == 0, f"False positive CVE detections: {[c.name for c in cve_failed]}"
+
+    @pytest.mark.skipif(
+        not os.path.isfile(os.path.join(SAMPLES_DIR, "pipeline.skops")),
+        reason="Real .skops sample not available",
+    )
+    def test_scan_real_skops_model_metadata(self) -> None:
+        """Test that scan metadata is populated for a real model."""
+        scanner = SkopsScanner()
+        result = scanner.scan(self.REAL_SKOPS)
+
+        assert result.metadata.get("file_size", 0) > 0
+        assert result.metadata.get("file_count", 0) > 0
