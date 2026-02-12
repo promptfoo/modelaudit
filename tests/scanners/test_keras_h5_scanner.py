@@ -356,6 +356,8 @@ def test_regression_no_false_positives_for_legitimate_files(tmp_path):
 
 def test_keras_h5_scanner_detects_subclassed_model(tmp_path):
     """Test that scanner detects subclassed models with custom class names."""
+    from modelaudit.scanners.base import CheckStatus
+
     h5_path = tmp_path / "model.h5"
 
     with h5py.File(h5_path, "w") as f:
@@ -377,10 +379,11 @@ def test_keras_h5_scanner_detects_subclassed_model(tmp_path):
     scanner = KerasH5Scanner()
     result = scanner.scan(str(h5_path))
 
-    # Should detect subclassed model
-    subclass_issues = [i for i in result.issues if "subclassed" in i.message.lower()]
-    assert len(subclass_issues) > 0
-    assert subclass_issues[0].severity == IssueSeverity.WARNING
+    # Should detect subclassed model at INFO severity
+    subclass_checks = [c for c in result.checks if "subclassed" in c.name.lower()]
+    assert len(subclass_checks) > 0
+    assert subclass_checks[0].status != CheckStatus.PASSED
+    assert subclass_checks[0].severity == IssueSeverity.INFO
 
 
 def test_keras_h5_scanner_allows_known_safe_classes(tmp_path):

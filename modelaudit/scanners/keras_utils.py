@@ -25,17 +25,18 @@ def check_subclassed_model(
             name="Subclassed Model Detection",
             passed=False,
             message=f"Subclassed Keras model detected: {model_class}",
-            severity=IssueSeverity.WARNING,
+            severity=IssueSeverity.INFO,
             location=location,
             details={
                 "model_class": model_class,
                 "known_safe_classes": sorted(KNOWN_SAFE_MODEL_CLASSES),
-                "risk": "Subclassed models can contain arbitrary Python code in their call() method",
+                "risk": "Subclassed models require external Python code to load, which should be reviewed",
             },
             why=(
-                "Subclassed Keras models (custom class names) may contain arbitrary Python code "
-                "in their call() or other methods. Standard Keras models (Sequential, Functional, Model) "
-                "are safer as they use declarative layer configurations without custom code execution."
+                "Subclassed Keras models (custom class names) require external Python class "
+                "definitions to load. The model file itself does not contain executable code, "
+                "but the loading code should be reviewed. Standard Keras models (Sequential, "
+                "Functional, Model) use declarative layer configurations and load without custom code."
             ),
         )
     elif model_class in KNOWN_SAFE_MODEL_CLASSES:

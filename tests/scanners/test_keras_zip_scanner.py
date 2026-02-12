@@ -385,9 +385,12 @@ __import__('pickle').loads(data)
 
         result = scanner.scan(str(keras_path))
 
-        subclass_issues = [i for i in result.issues if "subclassed" in i.message.lower()]
-        assert len(subclass_issues) > 0
-        assert subclass_issues[0].severity == IssueSeverity.WARNING
+        from modelaudit.scanners.base import CheckStatus
+
+        subclass_checks = [c for c in result.checks if "subclassed" in c.name.lower()]
+        assert len(subclass_checks) > 0
+        assert subclass_checks[0].status != CheckStatus.PASSED
+        assert subclass_checks[0].severity == IssueSeverity.INFO
 
     def test_allows_known_safe_model_classes_in_zip(self, tmp_path):
         """Test that scanner passes for known safe model classes."""
