@@ -231,7 +231,11 @@ class PyTorchZipScanner(BaseScanner):
             is_symlink = (info.external_attr >> 16) & 0o170000 == stat.S_IFLNK
             if is_symlink:
                 try:
-                    target = zip_file.read(name).decode("utf-8", "replace")
+                    # Read only a bounded prefix (4KB) to avoid DoS from a
+                    # symlink entry that hides a large compressed payload.
+                    # Real symlink targets are short filesystem paths.
+                    with zip_file.open(name) as entry:
+                        target = entry.read(4096).decode("utf-8", "replace")
                 except Exception:
                     target = "<unreadable>"
                 result.add_check(
