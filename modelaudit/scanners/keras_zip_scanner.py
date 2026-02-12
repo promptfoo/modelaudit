@@ -17,6 +17,7 @@ from modelaudit.utils.helpers.code_validation import (
 
 from ..config.explanations import get_pattern_explanation
 from .base import BaseScanner, IssueSeverity, ScanResult
+from .keras_utils import check_subclassed_model
 
 
 class KerasZipScanner(BaseScanner):
@@ -25,9 +26,6 @@ class KerasZipScanner(BaseScanner):
     name = "keras_zip"
     description = "Scans ZIP-based Keras model files for suspicious configurations and Lambda layers"
     supported_extensions: ClassVar[list[str]] = [".keras"]
-
-    # Known safe Keras model classes that don't contain arbitrary code
-    KNOWN_SAFE_MODEL_CLASSES: ClassVar[set[str]] = {"Sequential", "Functional", "Model"}
 
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
@@ -174,33 +172,7 @@ class KerasZipScanner(BaseScanner):
         result.metadata["model_class"] = model_class
 
         # Check for subclassed models (custom class names)
-        # Subclassed models can contain arbitrary Python code in their call() method
-        if model_class and model_class not in self.KNOWN_SAFE_MODEL_CLASSES:
-            result.add_check(
-                name="Subclassed Model Detection",
-                passed=False,
-                message=f"Subclassed Keras model detected: {model_class}",
-                severity=IssueSeverity.WARNING,
-                location=self.current_file_path,
-                details={
-                    "model_class": model_class,
-                    "known_safe_classes": list(self.KNOWN_SAFE_MODEL_CLASSES),
-                    "risk": "Subclassed models can contain arbitrary Python code in their call() method",
-                },
-                why=(
-                    "Subclassed Keras models (custom class names) may contain arbitrary Python code "
-                    "in their call() or other methods. Standard Keras models (Sequential, Functional, Model) "
-                    "are safer as they use declarative layer configurations without custom code execution."
-                ),
-            )
-        elif model_class in self.KNOWN_SAFE_MODEL_CLASSES:
-            result.add_check(
-                name="Subclassed Model Detection",
-                passed=True,
-                message=f"Standard Keras model class: {model_class}",
-                location=self.current_file_path,
-                details={"model_class": model_class},
-            )
+        check_subclassed_model(model_class, result, self.current_file_path)
 
         # Check for suspicious model types (Lambda, etc.)
         if model_class in self.suspicious_layer_types:
