@@ -67,6 +67,7 @@ def extract_dangerous_constructs(code: str) -> dict[str, list[str]]:
         "file_operations": [],
         "network_operations": [],
         "subprocess_operations": [],
+        "variadic_lambdas": [],
     }
 
     try:
@@ -113,6 +114,14 @@ def extract_dangerous_constructs(code: str) -> dict[str, list[str]]:
                         elif module == "socket" and method in ["socket", "connect"]:
                             dangerous["network_operations"].append(f"{module}.{method}")
 
+            # Check for variadic lambdas (can enable tuple unpacking exploits)
+            elif isinstance(node, ast.Lambda):
+                args = node.args
+                if args.vararg is not None:
+                    dangerous["variadic_lambdas"].append(f"*{args.vararg.arg}")
+                if args.kwarg is not None:
+                    dangerous["variadic_lambdas"].append(f"**{args.kwarg.arg}")
+
     except Exception:
         # If parsing fails, we can't analyze the code
         pass
@@ -153,6 +162,12 @@ def is_code_potentially_dangerous(code: str, threshold: str = "medium") -> tuple
     if constructs["network_operations"]:
         risk_score += 5 * len(constructs["network_operations"])
         risks.append(f"Network operations: {', '.join(constructs['network_operations'])}")
+
+    if constructs["variadic_lambdas"]:
+        risk_score += 4 * len(constructs["variadic_lambdas"])
+        risks.append(
+            f"Variadic lambdas (potential tuple unpacking exploit): {', '.join(constructs['variadic_lambdas'])}"
+        )
 
     # Low risk items
     if constructs["imports"]:
