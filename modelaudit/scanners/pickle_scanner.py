@@ -248,6 +248,30 @@ ALWAYS_DANGEROUS_FUNCTIONS: set[str] = {
     "shutil.move",
     "shutil.copy",
     "shutil.copytree",
+    # Profiling/debugging modules that execute arbitrary Python code
+    "cProfile.run",
+    "cProfile.runctx",
+    "profile.run",
+    "profile.runctx",
+    "pdb.run",
+    "pdb.runeval",
+    "pdb.runcall",
+    "pdb.runctx",
+    "timeit.timeit",
+    "timeit.repeat",
+    # Native code execution
+    "ctypes.CDLL",
+    "ctypes.WinDLL",
+    "ctypes.OleDLL",
+    "ctypes.PyDLL",
+    "ctypes.cdll",
+    "ctypes.windll",
+    "ctypes.oledll",
+    "ctypes.pydll",
+    "ctypes.pythonapi",
+    "ctypes.cast",
+    "ctypes.CFUNCTYPE",
+    "ctypes.WINFUNCTYPE",
 }
 
 # Module prefixes that are always dangerous (Fickling-based + additional)
@@ -271,6 +295,21 @@ ALWAYS_DANGEROUS_MODULES: set[str] = {
     "shutil",
     "code",
     "torch.hub",
+    # Native code execution (ctypes)
+    "ctypes",
+    "ctypes.util",
+    # Profiling/debugging - can execute arbitrary Python code via run()
+    "cProfile",
+    "profile",
+    "pdb",
+    "timeit",
+    # Thread/process spawning
+    "_thread",
+    "multiprocessing",
+    # Module loading from untrusted sources
+    "zipimport",
+    "importlib",
+    "runpy",
 }
 
 # Safe ML-specific global patterns (SECURITY: NO WILDCARDS - explicit lists only)
@@ -1542,8 +1581,12 @@ def is_suspicious_global(mod: str, func: str) -> bool:
         val = SUSPICIOUS_GLOBALS[mod]
         if val == "*":
             return True
-        if isinstance(val, list) and func in val:
-            return True
+        if isinstance(val, list):
+            # Handle ["*"] wildcard (all functions in module are suspicious)
+            if "*" in val:
+                return True
+            if func in val:
+                return True
 
     # Enhanced detection for builtin eval/exec patterns
     # These are CRITICAL as they allow arbitrary code execution
