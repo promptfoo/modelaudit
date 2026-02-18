@@ -590,17 +590,309 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "Segment",
         "Classify",
     ],
-    # Standard ML libraries
-    "sklearn": [
-        "base",
-        "ensemble",
-        "linear_model",
-        "tree",
-        "svm",
-        "neighbors",
-        "cluster",
-        "decomposition",
-        "preprocessing",
+    # Standard ML libraries - sklearn
+    # SECURITY: Use exact module.function matching (no prefix wildcards)
+    # Each submodule must list specific safe classes/functions to prevent
+    # arbitrary function execution under allowed prefixes.
+    "sklearn.base": [
+        "BaseEstimator",
+        "ClassifierMixin",
+        "RegressorMixin",
+        "TransformerMixin",
+        "ClusterMixin",
+        "BiclusterMixin",
+        "DensityMixin",
+        "OutlierMixin",
+        "MetaEstimatorMixin",
+        "MultiOutputMixin",
+        "_clone_parametrized",
+    ],
+    "sklearn.ensemble": [
+        "RandomForestClassifier",
+        "RandomForestRegressor",
+        "GradientBoostingClassifier",
+        "GradientBoostingRegressor",
+        "AdaBoostClassifier",
+        "AdaBoostRegressor",
+        "BaggingClassifier",
+        "BaggingRegressor",
+        "ExtraTreesClassifier",
+        "ExtraTreesRegressor",
+        "VotingClassifier",
+        "VotingRegressor",
+        "StackingClassifier",
+        "StackingRegressor",
+        "IsolationForest",
+        "HistGradientBoostingClassifier",
+        "HistGradientBoostingRegressor",
+    ],
+    "sklearn.ensemble._forest": [
+        "RandomForestClassifier",
+        "RandomForestRegressor",
+        "ExtraTreesClassifier",
+        "ExtraTreesRegressor",
+    ],
+    "sklearn.ensemble._gb": [
+        "GradientBoostingClassifier",
+        "GradientBoostingRegressor",
+    ],
+    "sklearn.ensemble._weight_boosting": [
+        "AdaBoostClassifier",
+        "AdaBoostRegressor",
+    ],
+    "sklearn.ensemble._bagging": [
+        "BaggingClassifier",
+        "BaggingRegressor",
+    ],
+    "sklearn.ensemble._voting": [
+        "VotingClassifier",
+        "VotingRegressor",
+    ],
+    "sklearn.ensemble._stacking": [
+        "StackingClassifier",
+        "StackingRegressor",
+    ],
+    "sklearn.ensemble._iforest": [
+        "IsolationForest",
+    ],
+    "sklearn.ensemble._hist_gradient_boosting.gradient_boosting": [
+        "HistGradientBoostingClassifier",
+        "HistGradientBoostingRegressor",
+    ],
+    "sklearn.linear_model": [
+        "LinearRegression",
+        "LogisticRegression",
+        "Ridge",
+        "Lasso",
+        "ElasticNet",
+        "SGDClassifier",
+        "SGDRegressor",
+        "Perceptron",
+        "PassiveAggressiveClassifier",
+        "PassiveAggressiveRegressor",
+        "BayesianRidge",
+        "ARDRegression",
+        "Lars",
+        "LassoLars",
+        "OrthogonalMatchingPursuit",
+        "HuberRegressor",
+        "RANSACRegressor",
+        "TheilSenRegressor",
+    ],
+    "sklearn.linear_model._logistic": [
+        "LogisticRegression",
+    ],
+    "sklearn.linear_model._base": [
+        "LinearRegression",
+    ],
+    "sklearn.linear_model._ridge": [
+        "Ridge",
+        "RidgeClassifier",
+    ],
+    "sklearn.linear_model._coordinate_descent": [
+        "Lasso",
+        "ElasticNet",
+    ],
+    "sklearn.linear_model._stochastic_gradient": [
+        "SGDClassifier",
+        "SGDRegressor",
+    ],
+    "sklearn.tree": [
+        "DecisionTreeClassifier",
+        "DecisionTreeRegressor",
+        "ExtraTreeClassifier",
+        "ExtraTreeRegressor",
+    ],
+    "sklearn.tree._classes": [
+        "DecisionTreeClassifier",
+        "DecisionTreeRegressor",
+        "ExtraTreeClassifier",
+        "ExtraTreeRegressor",
+    ],
+    "sklearn.tree._tree": [
+        "Tree",
+    ],
+    "sklearn.svm": [
+        "SVC",
+        "SVR",
+        "LinearSVC",
+        "LinearSVR",
+        "NuSVC",
+        "NuSVR",
+        "OneClassSVM",
+    ],
+    "sklearn.svm._classes": [
+        "SVC",
+        "SVR",
+        "LinearSVC",
+        "LinearSVR",
+        "NuSVC",
+        "NuSVR",
+        "OneClassSVM",
+    ],
+    "sklearn.neighbors": [
+        "KNeighborsClassifier",
+        "KNeighborsRegressor",
+        "RadiusNeighborsClassifier",
+        "RadiusNeighborsRegressor",
+        "NearestNeighbors",
+        "NearestCentroid",
+        "LocalOutlierFactor",
+        "KernelDensity",
+    ],
+    "sklearn.neighbors._classification": [
+        "KNeighborsClassifier",
+        "RadiusNeighborsClassifier",
+    ],
+    "sklearn.neighbors._regression": [
+        "KNeighborsRegressor",
+        "RadiusNeighborsRegressor",
+    ],
+    "sklearn.neighbors._unsupervised": [
+        "NearestNeighbors",
+    ],
+    "sklearn.neighbors._kde": [
+        "KernelDensity",
+    ],
+    "sklearn.neighbors._lof": [
+        "LocalOutlierFactor",
+    ],
+    "sklearn.cluster": [
+        "KMeans",
+        "MiniBatchKMeans",
+        "AgglomerativeClustering",
+        "DBSCAN",
+        "OPTICS",
+        "SpectralClustering",
+        "Birch",
+        "MeanShift",
+        "AffinityPropagation",
+    ],
+    "sklearn.cluster._kmeans": [
+        "KMeans",
+        "MiniBatchKMeans",
+    ],
+    "sklearn.cluster._agglomerative": [
+        "AgglomerativeClustering",
+    ],
+    "sklearn.cluster._dbscan": [
+        "DBSCAN",
+    ],
+    "sklearn.cluster._optics": [
+        "OPTICS",
+    ],
+    "sklearn.decomposition": [
+        "PCA",
+        "IncrementalPCA",
+        "KernelPCA",
+        "TruncatedSVD",
+        "NMF",
+        "LatentDirichletAllocation",
+        "FastICA",
+    ],
+    "sklearn.decomposition._pca": [
+        "PCA",
+    ],
+    "sklearn.decomposition._incremental_pca": [
+        "IncrementalPCA",
+    ],
+    "sklearn.decomposition._truncated_svd": [
+        "TruncatedSVD",
+    ],
+    "sklearn.decomposition._nmf": [
+        "NMF",
+    ],
+    "sklearn.preprocessing": [
+        "StandardScaler",
+        "MinMaxScaler",
+        "MaxAbsScaler",
+        "RobustScaler",
+        "Normalizer",
+        "Binarizer",
+        "LabelEncoder",
+        "LabelBinarizer",
+        "OneHotEncoder",
+        "OrdinalEncoder",
+        "PolynomialFeatures",
+        "PowerTransformer",
+        "QuantileTransformer",
+        "FunctionTransformer",
+        "KBinsDiscretizer",
+        "SplineTransformer",
+    ],
+    "sklearn.preprocessing._data": [
+        "StandardScaler",
+        "MinMaxScaler",
+        "MaxAbsScaler",
+        "RobustScaler",
+        "Normalizer",
+        "Binarizer",
+        "PolynomialFeatures",
+        "PowerTransformer",
+        "QuantileTransformer",
+        "KBinsDiscretizer",
+        "SplineTransformer",
+    ],
+    "sklearn.preprocessing._label": [
+        "LabelEncoder",
+        "LabelBinarizer",
+    ],
+    "sklearn.preprocessing._encoders": [
+        "OneHotEncoder",
+        "OrdinalEncoder",
+    ],
+    "sklearn.preprocessing._function_transformer": [
+        "FunctionTransformer",
+    ],
+    "sklearn.pipeline": [
+        "Pipeline",
+        "FeatureUnion",
+        "make_pipeline",
+        "make_union",
+    ],
+    "sklearn.compose": [
+        "ColumnTransformer",
+        "TransformedTargetRegressor",
+    ],
+    "sklearn.compose._column_transformer": [
+        "ColumnTransformer",
+    ],
+    "sklearn.model_selection": [
+        "GridSearchCV",
+        "RandomizedSearchCV",
+    ],
+    "sklearn.model_selection._search": [
+        "GridSearchCV",
+        "RandomizedSearchCV",
+    ],
+    "sklearn.feature_extraction.text": [
+        "CountVectorizer",
+        "TfidfVectorizer",
+        "TfidfTransformer",
+        "HashingVectorizer",
+    ],
+    "sklearn.feature_extraction._dict_vectorizer": [
+        "DictVectorizer",
+    ],
+    "sklearn.naive_bayes": [
+        "GaussianNB",
+        "MultinomialNB",
+        "BernoulliNB",
+        "ComplementNB",
+    ],
+    "sklearn.metrics": [
+        "make_scorer",
+    ],
+    "sklearn.multiclass": [
+        "OneVsRestClassifier",
+        "OneVsOneClassifier",
+    ],
+    "sklearn.multioutput": [
+        "MultiOutputClassifier",
+        "MultiOutputRegressor",
+    ],
+    "sklearn.utils._tags": [
+        "Tags",
     ],
     "transformers": [
         "AutoModel",
@@ -758,7 +1050,10 @@ def _detect_ml_context(opcodes: list[tuple]) -> dict[str, Any]:
 
             global_refs[module] = global_refs.get(module, 0) + 1
 
-        elif opcode.name in ["SHORT_BINUNICODE", "BINUNICODE", "UNICODE"] and isinstance(arg, str):
+        elif opcode.name in [
+            "STRING", "BINSTRING", "SHORT_BINSTRING",
+            "UNICODE", "SHORT_BINUNICODE", "BINUNICODE", "BINUNICODE8",
+        ] and isinstance(arg, str):
             # Collect strings that might be used for STACK_GLOBAL
             stack_strings.append(arg)
 
@@ -836,32 +1131,16 @@ def _is_safe_ml_global(mod: str, func: str) -> bool:
     """
     Check if a module.function is in the ML_SAFE_GLOBALS allowlist.
 
-    Supports both exact module matches and prefix matching for nested modules
-    (e.g., sklearn.linear_model._logistic matches sklearn.linear_model).
+    Uses strict exact matching on both module path and function/class name.
+    Every allowed module must explicitly list its safe functions/classes.
 
     Returns:
         True if the global is in the safe list, False otherwise
     """
-    # Try exact match first
     if mod in ML_SAFE_GLOBALS:
         safe_funcs = ML_SAFE_GLOBALS[mod]
         if func in safe_funcs:
             return True
-
-    # For sklearn/xgboost: check if module starts with allowed submodule
-    # e.g., sklearn.linear_model._logistic -> check sklearn.linear_model
-    if mod.startswith("sklearn.") or mod.startswith("xgboost."):
-        # Get the base framework (sklearn or xgboost)
-        base = mod.split(".")[0]
-        if base in ML_SAFE_GLOBALS:
-            safe_submodules = ML_SAFE_GLOBALS[base]
-            # Check if any allowed submodule is a prefix of the actual module
-            for allowed_submodule in safe_submodules:
-                # Build full path: sklearn.linear_model
-                full_allowed = f"{base}.{allowed_submodule}"
-                if mod.startswith(full_allowed):
-                    # Module is under an allowed submodule, func is implicitly safe
-                    return True
 
     return False
 
@@ -940,6 +1219,7 @@ def _find_stack_global_strings(opcodes: list, start_index: int, lookback: int = 
         "STRING",
         "SHORT_BINUNICODE",
         "BINUNICODE",
+        "BINUNICODE8",
         "UNICODE",
     }
 
@@ -1330,6 +1610,37 @@ def is_dangerous_reduce_pattern(opcodes: list[tuple]) -> dict[str, Any] | None:
                     "opcode": opcode.name,
                 }
 
+        # Check for STACK_GLOBAL followed by REDUCE - protocol 4+ variant
+        if opcode.name == "STACK_GLOBAL":
+            # Check if next non-structural opcode leads to REDUCE
+            for j in range(i + 1, min(i + 5, len(opcodes))):
+                next_op = opcodes[j][0].name
+                if next_op == "REDUCE":
+                    # Find the strings that were pushed for this STACK_GLOBAL
+                    string_opcodes = {
+                        "SHORT_BINSTRING", "BINSTRING", "STRING",
+                        "SHORT_BINUNICODE", "BINUNICODE", "BINUNICODE8", "UNICODE",
+                    }
+                    recent = []
+                    for k in range(i - 1, max(0, i - 10), -1):
+                        pk = opcodes[k]
+                        if pk[0].name in string_opcodes and isinstance(pk[1], str):
+                            recent.insert(0, pk[1])
+                            if len(recent) >= 2:
+                                break
+                    if len(recent) >= 2:
+                        return {
+                            "pattern": "STACK_GLOBAL+REDUCE",
+                            "module": recent[0],
+                            "function": recent[1],
+                            "position": pos,
+                            "opcode": opcode.name,
+                        }
+                    break
+                elif next_op not in {"TUPLE", "TUPLE1", "TUPLE2", "TUPLE3", "EMPTY_TUPLE",
+                                     "MARK", "BINPUT", "LONG_BINPUT", "MEMOIZE"}:
+                    break
+
         # Check for INST or OBJ opcodes which can also be used for code execution
         if opcode.name in ["INST", "OBJ", "NEWOBJ"] and isinstance(arg, str):
             return {
@@ -1348,12 +1659,15 @@ def is_dangerous_reduce_pattern(opcodes: list[tuple]) -> dict[str, Any] | None:
                 "opcode": opcode.name,
             }
 
-        # Check for suspicious strings in STRING or BINSTRING opcodes
+        # Check for suspicious strings in all string opcodes
         if opcode.name in [
             "STRING",
             "BINSTRING",
             "SHORT_BINSTRING",
             "UNICODE",
+            "SHORT_BINUNICODE",
+            "BINUNICODE",
+            "BINUNICODE8",
         ] and isinstance(arg, str):
             suspicious_pattern = is_suspicious_string(arg)
             if suspicious_pattern:
@@ -1436,6 +1750,7 @@ def check_opcode_sequence(
                                 "STRING",
                                 "SHORT_BINUNICODE",
                                 "BINUNICODE",
+                                "BINUNICODE8",
                                 "UNICODE",
                             ] and isinstance(stack_prev_arg, str):
                                 recent_strings.insert(0, stack_prev_arg)
@@ -1469,6 +1784,7 @@ def check_opcode_sequence(
                         "STRING",
                         "SHORT_BINUNICODE",
                         "BINUNICODE",
+                        "BINUNICODE8",
                         "UNICODE",
                     ] and isinstance(prev_arg, str):
                         recent_strings.insert(0, prev_arg)
@@ -2536,6 +2852,8 @@ class PickleScanner(BaseScanner):
                     "BINSTRING",
                     "SHORT_BINSTRING",
                     "SHORT_BINUNICODE",
+                    "BINUNICODE",
+                    "BINUNICODE8",
                     "UNICODE",
                 ] and isinstance(arg, str):
                     string_stack.append(arg)
@@ -3004,6 +3322,8 @@ class PickleScanner(BaseScanner):
                     "SHORT_BINSTRING",
                     "UNICODE",
                     "SHORT_BINUNICODE",
+                    "BINUNICODE",
+                    "BINUNICODE8",
                 ] and isinstance(arg, str):
                     suspicious_pattern = _is_actually_dangerous_string(arg, ml_context)
                     if suspicious_pattern:
@@ -3061,6 +3381,8 @@ class PickleScanner(BaseScanner):
                     "SHORT_BINSTRING",
                     "UNICODE",
                     "SHORT_BINUNICODE",
+                    "BINUNICODE",
+                    "BINUNICODE8",
                 ] and isinstance(arg, str):
                     for enc, decoded in _decode_string_to_bytes(arg):
                         if _looks_like_pickle(decoded[:1024]):
@@ -3135,6 +3457,8 @@ class PickleScanner(BaseScanner):
                             "BINSTRING",
                             "SHORT_BINSTRING",
                             "SHORT_BINUNICODE",
+                            "BINUNICODE",
+                            "BINUNICODE8",
                             "UNICODE",
                         ] and isinstance(prev_arg, str):
                             recent_strings.insert(
@@ -3217,8 +3541,10 @@ class PickleScanner(BaseScanner):
                             )
 
             # Check for dangerous patterns in the opcodes
+            # SECURITY: Always run reduce pattern analysis regardless of ML context.
+            # ML context must not suppress security-critical pattern detection.
             dangerous_pattern = is_dangerous_reduce_pattern(opcodes)
-            if dangerous_pattern and not ml_context.get("is_ml_content", False):
+            if dangerous_pattern:
                 suspicious_count += 1
                 severity = _get_context_aware_severity(
                     IssueSeverity.CRITICAL,
