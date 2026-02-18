@@ -1633,9 +1633,28 @@ def is_suspicious_string(s: str) -> str | None:
 
 def is_dangerous_reduce_pattern(opcodes: list[tuple]) -> dict[str, Any] | None:
     """
-    Check for patterns that indicate a dangerous __reduce__ method
-    Returns details about the dangerous pattern if found, None otherwise
+    Check for patterns that indicate a dangerous __reduce__ method.
+    Returns details about the dangerous pattern if found, None otherwise.
+
+    Only flags GLOBAL/STACK_GLOBAL+REDUCE patterns where the module/function
+    is actually dangerous or suspicious. Safe ML globals and unknown non-dangerous
+    modules are handled by the individual GLOBAL/REDUCE checks in the main loop.
     """
+
+    def _is_dangerous_ref(mod: str, func: str) -> bool:
+        """Check if a module.function reference is dangerous enough to flag."""
+        # Safe ML globals are never dangerous
+        if _is_safe_ml_global(mod, func):
+            return False
+        full_ref = f"{mod}.{func}"
+        # Check ALWAYS_DANGEROUS lists
+        if full_ref in ALWAYS_DANGEROUS_FUNCTIONS or func in ALWAYS_DANGEROUS_FUNCTIONS:
+            return True
+        if mod in ALWAYS_DANGEROUS_MODULES:
+            return True
+        # Check SUSPICIOUS_GLOBALS (the fallback)
+        return is_suspicious_global(mod, func)
+
     # Look for common patterns in __reduce__ exploits
     for i, (opcode, arg, pos) in enumerate(opcodes):
         # Check for GLOBAL followed by REDUCE - common in exploits
@@ -1645,13 +1664,14 @@ def is_dangerous_reduce_pattern(opcodes: list[tuple]) -> dict[str, Any] | None:
             parts = arg.split(" ", 1) if " " in arg else arg.rsplit(".", 1) if "." in arg else [arg, ""]
             if len(parts) == 2:
                 mod, func = parts
-                return {
-                    "pattern": "GLOBAL+REDUCE",
-                    "module": mod,
-                    "function": func,
-                    "position": pos,
-                    "opcode": opcode.name,
-                }
+                if _is_dangerous_ref(mod, func):
+                    return {
+                        "pattern": "GLOBAL+REDUCE",
+                        "module": mod,
+                        "function": func,
+                        "position": pos,
+                        "opcode": opcode.name,
+                    }
 
         # Check for STACK_GLOBAL followed by REDUCE - protocol 4+ variant
         if opcode.name == "STACK_GLOBAL":
@@ -1672,13 +1692,15 @@ def is_dangerous_reduce_pattern(opcodes: list[tuple]) -> dict[str, Any] | None:
                             if len(recent) >= 2:
                                 break
                     if len(recent) >= 2:
-                        return {
-                            "pattern": "STACK_GLOBAL+REDUCE",
-                            "module": recent[0],
-                            "function": recent[1],
-                            "position": pos,
-                            "opcode": opcode.name,
-                        }
+                        mod, func = recent[0], recent[1]
+                        if _is_dangerous_ref(mod, func):
+                            return {
+                                "pattern": "STACK_GLOBAL+REDUCE",
+                                "module": mod,
+                                "function": func,
+                                "position": pos,
+                                "opcode": opcode.name,
+                            }
                     break
                 elif next_op not in {"TUPLE", "TUPLE1", "TUPLE2", "TUPLE3", "EMPTY_TUPLE",
                                      "MARK", "BINPUT", "LONG_BINPUT", "MEMOIZE"}:
