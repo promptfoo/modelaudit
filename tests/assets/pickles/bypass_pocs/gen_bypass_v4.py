@@ -26,7 +26,7 @@ import struct
 OUTPUT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
-def write_poc(name: str, data: bytes, description: str):
+def write_poc(name: str, data: bytes, description: str) -> None:
     path = os.path.join(OUTPUT_DIR, f"{name}.pkl")
     with open(path, "wb") as f:
         f.write(data)

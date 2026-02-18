@@ -1694,7 +1694,7 @@ def is_dangerous_reduce_pattern(opcodes: list[tuple]) -> dict[str, Any] | None:
                         "BINUNICODE8",
                         "UNICODE",
                     }
-                    recent = []
+                    recent: list[str] = []
                     for k in range(i - 1, max(0, i - 10), -1):
                         pk = opcodes[k]
                         if pk[0].name in string_opcodes and isinstance(pk[1], str):
