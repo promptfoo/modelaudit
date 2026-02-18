@@ -1090,8 +1090,13 @@ def _detect_ml_context(opcodes: list[tuple]) -> dict[str, Any]:
             global_refs[module] = global_refs.get(module, 0) + 1
 
         elif opcode.name in [
-            "STRING", "BINSTRING", "SHORT_BINSTRING",
-            "UNICODE", "SHORT_BINUNICODE", "BINUNICODE", "BINUNICODE8",
+            "STRING",
+            "BINSTRING",
+            "SHORT_BINSTRING",
+            "UNICODE",
+            "SHORT_BINUNICODE",
+            "BINUNICODE",
+            "BINUNICODE8",
         ] and isinstance(arg, str):
             # Collect strings that might be used for STACK_GLOBAL
             stack_strings.append(arg)
@@ -1681,8 +1686,13 @@ def is_dangerous_reduce_pattern(opcodes: list[tuple]) -> dict[str, Any] | None:
                 if next_op == "REDUCE":
                     # Find the strings that were pushed for this STACK_GLOBAL
                     string_opcodes = {
-                        "SHORT_BINSTRING", "BINSTRING", "STRING",
-                        "SHORT_BINUNICODE", "BINUNICODE", "BINUNICODE8", "UNICODE",
+                        "SHORT_BINSTRING",
+                        "BINSTRING",
+                        "STRING",
+                        "SHORT_BINUNICODE",
+                        "BINUNICODE",
+                        "BINUNICODE8",
+                        "UNICODE",
                     }
                     recent = []
                     for k in range(i - 1, max(0, i - 10), -1):
@@ -1702,8 +1712,17 @@ def is_dangerous_reduce_pattern(opcodes: list[tuple]) -> dict[str, Any] | None:
                                 "opcode": opcode.name,
                             }
                     break
-                elif next_op not in {"TUPLE", "TUPLE1", "TUPLE2", "TUPLE3", "EMPTY_TUPLE",
-                                     "MARK", "BINPUT", "LONG_BINPUT", "MEMOIZE"}:
+                elif next_op not in {
+                    "TUPLE",
+                    "TUPLE1",
+                    "TUPLE2",
+                    "TUPLE3",
+                    "EMPTY_TUPLE",
+                    "MARK",
+                    "BINPUT",
+                    "LONG_BINPUT",
+                    "MEMOIZE",
+                }:
                     break
 
         # Check for INST or OBJ opcodes which can also be used for code execution
