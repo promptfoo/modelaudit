@@ -17,6 +17,7 @@ keywords = ["ai", "ml", "security", "model-scanning", "pickle", "tensorflow", "p
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
     "Topic :: Security",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Programming Language :: Python :: 3",
@@ -24,7 +25,6 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
-    "Programming Language :: Python :: 3.14",
 ]
 requires-python = ">=3.10"
 dependencies = [
@@ -141,6 +141,8 @@ modelaudit = "modelaudit.cli:main"
 [project.urls]
 Repository = "https://github.com/promptfoo/modelaudit"
 Homepage = "https://github.com/promptfoo/modelaudit"
+"Bug Tracker" = "https://github.com/promptfoo/modelaudit/issues"
+Changelog = "https://github.com/promptfoo/modelaudit/blob/main/CHANGELOG.md"
 
 [dependency-groups]
 dev = [

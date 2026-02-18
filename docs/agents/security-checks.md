@@ -7,13 +7,11 @@
 Keep these security checks:
 
 - **CVE-documented vulnerabilities**: Any check with a specific CVE number
-  - CVE-2025-32434: PyTorch pickle RCE
-  - CVE-2025-54412/54413/54886: skops RCE
 - **Real-world attacks**: Documented exploits that have compromised systems
-- **Code execution vectors**: eval, exec, os.system, subprocess, \_\_import\_\_, compile
-- **Path traversal**: ../, absolute paths to sensitive files (/etc/passwd, /proc/)
+- **Code execution vectors**: Known dangerous imports and function calls
+- **Path traversal**: Directory traversal and sensitive file access
 - **Compression bombs**: Documented thresholds (compression ratio >100x)
-- **Dangerous opcodes**: Pickle REDUCE, INST, OBJ, NEWOBJ, STACK_GLOBAL
+- **Dangerous opcodes**: Known pickle deserialization attack patterns
 - **Exposed secrets**: API keys, passwords, tokens in model metadata
 
 ## Unacceptable Checks - Remove These
@@ -36,27 +34,12 @@ Keep these security checks:
 
 ## Security Detection Focus
 
-### Dangerous Patterns
+Refer to the source code in `modelaudit/scanners/` for current detection patterns and implementations. Scanners cover:
 
-- Dangerous imports (os, sys, subprocess, eval, exec)
-- Pickle opcodes (REDUCE, INST, OBJ, NEWOBJ, STACK_GLOBAL)
-- Encoded payloads (base64, hex)
-- Unsafe Lambda layers (Keras/TensorFlow)
+- Pickle deserialization attacks (dangerous imports and opcodes)
+- Encoded/obfuscated payloads
+- Unsafe Keras/TensorFlow layer serialization
 - Executable files in archives
+- Weight distribution anomalies
+- Model metadata security issues
 - Blacklisted model names
-- Weight distribution anomalies (outlier neurons, dissimilar weight vectors)
-- Model metadata security issues (exposed secrets, suspicious URLs, dangerous code references)
-
-### Common Suspicious Patterns
-
-```python
-SUSPICIOUS_GLOBALS = {
-    "os": "*",
-    "subprocess": "*",
-    "eval": "*",
-    "exec": "*",
-    "__import__": "*"
-}
-
-DANGEROUS_OPCODES = ["REDUCE", "INST", "OBJ", "NEWOBJ", "STACK_GLOBAL"]
-```

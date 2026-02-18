@@ -349,35 +349,6 @@ For feature requests:
 - Explain why it would benefit users
 - Consider proposing an implementation approach
 
-## Known Issues & False Positives
-
-When contributing scanner improvements, be aware of these known false positive patterns:
-
-### Configuration Pattern False Positives
-
-- **Issue**: Manifest scanner flags `label2id` dictionary keys in HuggingFace `config.json` as security risks
-- **Affected Models**: `openai/clip-vit-base-patch32`, `google/vit-base-patch16-224`
-- **Solution**: Scanner should ignore `label2id` field or add ML context awareness
-
-### Flax Model Structure Warnings
-
-- **Issue**: "Suspicious data structure" warnings on legitimate `flax_model.msgpack` files
-- **Affected Models**: Standard HuggingFace Flax models
-- **Solution**: Improve Flax model structure recognition
-
-### PyTorch Opcode Sensitivity
-
-- **Issue**: "MANY_DANGEROUS_OPCODES" warnings on popular legitimate models
-- **Affected Models**: `ultralytics/yolov5n`, `pytorch/vision` models
-- **Solution**: Adjust opcode thresholds based on ML confidence levels
-
-### Scikit-learn Pickle Opcodes
-
-- **Issue**: `NEWOBJ` and `REDUCE` opcodes flagged in standard scikit-learn models
-- **Solution**: Better context analysis for legitimate ML serialization patterns
-
-When fixing scanner issues, ensure changes don't regress detection of actual malicious models listed in `models.md`.
-
 ## Getting Help
 
 - GitHub Issues: For bugs and feature requests

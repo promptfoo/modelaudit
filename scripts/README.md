@@ -1,54 +1,29 @@
 # Scripts Directory
 
-This directory contains utility scripts for development, testing, and comparison purposes. These scripts are not part of the main ModelAudit package and are not published to PyPI.
+This directory contains utility scripts for development and testing purposes. These scripts are not part of the main ModelAudit package and are not published to PyPI.
 
 ## Files
 
-### `comprehensive_modelscan_test.py`
+### `check_circular_imports.py` / `minimal_circular_check.py`
 
-A comprehensive testing script that compares ModelAudit vs modelscan across various model categories and formats. This script:
+Development utilities for detecting circular import issues in the codebase.
 
-- Tests multiple model categories (ONNX, GGUF, PyTorch, etc.)
-- Runs both tools on the same models for comparison
-- Generates detailed comparison reports
-- Identifies blind spots and detection gaps
+### `compile_tensorflow_protos.sh`
 
-**Usage:**
+Script to regenerate vendored TensorFlow protobuf stubs from `.proto` files.
 
-```bash
-# Test a specific category
-python scripts/comprehensive_modelscan_test.py ONNX_BLIND_SPOTS
+### `fetch_hf_org_models.py` / `fetch_hf_top_models.py`
 
-# Test all categories (shows detailed time estimates)
-python scripts/comprehensive_modelscan_test.py
-```
+Utilities for fetching model metadata from HuggingFace for testing and validation.
 
-**Features:**
+### `jax_flax_scanning_demo.py`
 
-- Detailed time estimates based on model count (≈2 min per model)
-- Progress tracking with category/model counts
-- Intermediate results saved as JSON for recovery
-- Automatic cleanup of temporary files on completion
+Demonstrates JAX/Flax model scanning capabilities including Msgpack-based checkpoints, Orbax format, and JAX-specific threat detection.
 
-**Requirements:**
+### `verify_models.py`
 
-- ModelAudit installed (`uv sync --extra all`)
-- modelscan installed (`pip install modelscan`)
-- Sufficient disk space for model downloads
-
-**Output:**
-
-- Generates `comprehensive_comparison_report.md` with detailed results
-- Console output with real-time comparison results
-- Evidence for security gap analysis
+Model verification and validation utility.
 
 ## Development Use Only
 
-These scripts are intended for:
-
-- Internal testing and validation
-- Competitive analysis and benchmarking
-- Research and development purposes
-- Generating documentation and evidence
-
-They should not be used in production environments.
+These scripts are intended for development, testing, and research purposes. They should not be used in production environments.

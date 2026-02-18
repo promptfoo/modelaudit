@@ -142,6 +142,8 @@ test_*.pkl
 # uv / Python environment
 .python-version
 .venv/
+.vscode/
+.idea/
 
 # Internal planning files
 TODO.md
