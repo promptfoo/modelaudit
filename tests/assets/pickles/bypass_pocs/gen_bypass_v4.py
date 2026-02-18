@@ -20,7 +20,6 @@ itself is caught, not just the string content.
 
 import io
 import os
-import pickle
 import pickletools
 import struct
 
