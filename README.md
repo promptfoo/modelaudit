@@ -101,6 +101,14 @@ modelaudit https://company.jfrog.io/artifactory/repo/models/
 modelaudit model.dvc
 ```
 
+### Authentication Environment Variables
+
+- `HF_TOKEN` for private Hugging Face repositories
+- `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (and optional `AWS_SESSION_TOKEN`) for S3
+- `GOOGLE_APPLICATION_CREDENTIALS` for GCS
+- `MLFLOW_TRACKING_URI` for MLflow registry access
+- `JFROG_API_TOKEN` or `JFROG_ACCESS_TOKEN` for JFrog Artifactory
+
 ## Installation
 
 ```bash
@@ -138,6 +146,24 @@ docker run --rm -v "$(pwd)":/app ghcr.io/promptfoo/modelaudit:latest model.pkl
 ```
 
 Exit codes: `0` clean, `1` issues found, `2` errors.
+
+## Output Examples
+
+```bash
+# JSON for CI/CD pipelines
+modelaudit model.pkl --format json --output results.json
+
+# SARIF for code scanning platforms
+modelaudit model.pkl --format sarif --output results.sarif
+```
+
+## Troubleshooting
+
+- Run `modelaudit doctor --show-failed` to list unavailable scanners and missing optional deps.
+- If `pip` installs an older release, verify Python is `3.10+` (`python --version`).
+- For additional troubleshooting and cloud auth guidance, see:
+  - https://www.promptfoo.dev/docs/model-audit/
+  - https://www.promptfoo.dev/docs/model-audit/usage/
 
 ## Documentation
 

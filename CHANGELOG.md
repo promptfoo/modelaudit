@@ -660,6 +660,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **fix**: improve core scanner functionality and comprehensive test coverage (#11)
 
 [unreleased]: https://github.com/promptfoo/modelaudit/compare/v0.2.25...HEAD
+[0.2.25]: https://github.com/promptfoo/modelaudit/compare/v0.2.24...v0.2.25
+[0.2.24]: https://github.com/promptfoo/modelaudit/compare/v0.2.23...v0.2.24
+[0.2.23]: https://github.com/promptfoo/modelaudit/compare/v0.2.22...v0.2.23
 [0.2.22]: https://github.com/promptfoo/modelaudit/compare/v0.2.21...v0.2.22
 [0.2.21]: https://github.com/promptfoo/modelaudit/compare/v0.2.20...v0.2.21
 [0.2.20]: https://github.com/promptfoo/modelaudit/compare/v0.2.19...v0.2.20

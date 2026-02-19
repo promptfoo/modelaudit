@@ -353,60 +353,6 @@ ModelAudit uses advanced density-based analysis for CVE-2025-32434 detection, dr
 
 This density-based approach eliminates alert fatigue for legitimate large models while maintaining security effectiveness.
 
-## ModelAudit vs modelscan: Comparative Testing
-
-The following models are recommended for demonstrating ModelAudit's superior detection capabilities compared to ProtectAI's modelscan. These models highlight critical blind spots in modelscan where ModelAudit provides comprehensive security analysis.
-
-### Models that Demonstrate ModelAudit's Advantages
-
-**Test context**: modelscan submodule commit 8b8ed4b (as of August 23, 2025). Results reflect this commit and our standard test corpus.
-
-| Category                    | Model                                   | ModelAudit Detection           | modelscan Result          | Impact       |
-| --------------------------- | --------------------------------------- | ------------------------------ | ------------------------- | ------------ |
-| **GGUF Template Injection** | `microsoft/Phi-3-mini-4k-instruct-gguf` | ✅ Chat template analysis      | ❌ No GGUF scanner        | **CRITICAL** |
-| **ONNX Blind Spot**         | `Xenova/clip-vit-base-patch16`          | ✅ Full ONNX graph analysis    | ❌ Skips all .onnx files  | **HIGH**     |
-| **ONNX Blind Spot**         | `onnx-community/mobilenet_v2_1.0_224`   | ✅ Custom operator detection   | ❌ Skips all .onnx files  | **HIGH**     |
-| **Config Exploits**         | `internlm/internlm2-chat-7b`            | ✅ auto_map detection          | ❌ No config analysis     | **HIGH**     |
-| **Config Exploits**         | `chandar-lab/NeoBERT`                   | ✅ trust_remote_code detection | ❌ No config analysis     | **HIGH**     |
-| **Advanced PyTorch**        | `drhyrum/bert-tiny-torch-picklebomb`    | ✅ CVE-2025-32434 patterns     | ⚠️ Basic pickle detection | **MEDIUM**   |
-| **Multi-format**            | `nono31/malicious-models-repo`          | ✅ 12+ distinct issues         | ⚠️ 3 basic issues         | **MEDIUM**   |
-
-### Quick Comparison Commands
-
-```bash
-# Test ONNX blind spot (modelscan skips entirely)
-modelaudit hf://Xenova/clip-vit-base-patch16 --no-large-model-support
-modelscan -p ~/.modelaudit/cache/huggingface/Xenova/clip-vit-base-patch16
-
-# Test GGUF template analysis
-modelaudit hf://microsoft/Phi-3-mini-4k-instruct-gguf --timeout 300
-# modelscan has no GGUF support
-
-# Test configuration analysis
-modelaudit hf://internlm/internlm2-chat-7b
-# modelscan has no config analysis
-
-# Test advanced malicious detection
-modelaudit hf://nono31/malicious-models-repo
-modelscan -p ~/.modelaudit/cache/huggingface/nono31/malicious-models-repo
-```
-
-### Key Findings Summary
-
-1. **ONNX Models**: in our tests (commit 8b8ed4b), modelscan skipped ONNX files (0% coverage on the listed corpus)
-2. **GGUF Models**: as of commit 8b8ed4b, modelscan had no GGUF scanner or template injection checks
-3. **Configuration Files**: as tested, modelscan did not analyze config.json/tokenizer_config.json
-4. **Advanced Frameworks**: missing scanners observed for TensorRT, OpenVINO, PaddlePaddle, CoreML, TFLite in our tests
-
-### Recommended Test Sequence for Demos
-
-1. **Start with ONNX**: `Xenova/clip-vit-base-patch16` - Shows complete modelscan blind spot
-2. **GGUF Templates**: `microsoft/Phi-3-mini-4k-instruct-gguf` - Shows missing GGUF support
-3. **Config Exploits**: `chandar-lab/NeoBERT` - Shows missing configuration analysis
-4. **Advanced Detection**: `nono31/malicious-models-repo` - Shows ModelAudit's deeper analysis
-
-In these tests, ModelAudit detected issues that modelscan (commit 8b8ed4b) missed, indicating material gaps in coverage on the evaluated corpus and date.
-
 ## XGBoost Model Testing Results
 
 Comprehensive testing of 25 XGBoost models across different serialization formats to validate scanner accuracy and severity levels.
