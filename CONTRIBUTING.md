@@ -272,6 +272,8 @@ python -c "import torch; torch.save({'model': 'data'}, 'test.pt')"
 python -c "import pickle; pickle.dump({'test': 'malicious'}, open('malicious.pkl', 'wb'))"
 ```
 
+The curated model regression corpus is documented in `docs/agents/model-test-corpus.md`.
+
 ### Release Process (Maintainers)
 
 #### Version Bump and Release

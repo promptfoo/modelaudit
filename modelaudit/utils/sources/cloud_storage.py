@@ -93,13 +93,7 @@ def _is_within_directory(base_dir: Path, target: Path) -> bool:
             return os.path.commonpath([target_norm, base_norm]) == base_norm
         except ValueError:
             return False
-    try:
-        return target_path.is_relative_to(base_path)
-    except AttributeError:
-        try:
-            return os.path.commonpath([str(target_path), str(base_path)]) == str(base_path)
-        except ValueError:
-            return False
+    return target_path.is_relative_to(base_path)
 
 
 def _resolve_cloud_path(entry_name: str, base_dir: Path) -> tuple[Path, bool]:
@@ -561,15 +555,16 @@ def download_from_cloud(
     try:
         object_size = get_cloud_object_size(fs, url, strict=True)
     except ValueError as exc:
-        # Fall back to metadata-derived size only when available.
+        # Fall back to metadata-derived size when available. If no reliable size is
+        # available, continue without a pre-download disk check (legacy behavior).
         if size > 0:
             object_size = int(size)
             if show_progress:
                 click.echo(f"⚠️  Falling back to metadata size estimate for disk check: {exc}")
         else:
-            if cache_dir is None and download_path.exists():
-                shutil.rmtree(download_path)
-            raise ValueError(f"Cannot safely determine download size for {url}: {exc}") from exc
+            object_size = None
+            if show_progress:
+                click.echo(f"⚠️  Unable to determine download size for {url}; continuing without disk check: {exc}")
 
     if object_size is not None:
         has_space, message = check_disk_space(download_path, object_size)
@@ -727,11 +722,12 @@ def download_from_cloud_streaming(
         total_files = len(files)
         for i, file_info in enumerate(files):
             file_url = file_info["path"]
-            file_name = file_info["name"]
+            file_name = file_info.get("name") or Path(file_url).name
             is_last = i == total_files - 1
 
-            # Download to temp location
-            local_path = temp_dir / f"file_{i}_{file_name}"
+            # Build a safe local path relative to the requested cloud base path.
+            local_path = _build_safe_local_path(url, file_url, temp_dir)
+            local_path.parent.mkdir(parents=True, exist_ok=True)
 
             if show_progress:
                 click.echo(f"⬇️  Downloading {file_name} ({file_info.get('human_size', 'unknown size')})")

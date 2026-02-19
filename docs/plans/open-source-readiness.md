@@ -22,11 +22,12 @@ recommendations for git history rewriting.
 - [x] Delete internal competitive-analysis documentation.
 - [x] Delete internal benchmarking/comparison scripts.
 - [x] Review and remove non-essential context-generation scripts.
+- [x] Move model regression catalog from `docs/models.md` to contributor-facing `docs/agents/model-test-corpus.md`.
 
 ### 1b. Redact detection-pattern details from docs
 
-- [x] Redact exact `SUSPICIOUS_GLOBALS` and `DANGEROUS_OPCODES` from `docs/agents/security-checks.md`
-- [x] Remove internal CVE threshold and attack-vector details from public docs.
+- [x] Keep detection implementation details out user-facing docs/README.
+- [x] Keep actionable security test details in contributor-facing docs (`docs/agents/security-checks.md`).
 - [x] Redact the "KEEP PRIVATE" section in `AGENTS.md` (it paradoxically reveals what's sensitive)
 - [x] Redact "Known Issues & False Positives" evasion details from `CONTRIBUTING.md`
 
