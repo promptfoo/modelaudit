@@ -319,6 +319,99 @@ def gen_poc34_zipimport() -> None:
     )
 
 
+# ============================================================================
+# POC 35: STACK_GLOBAL+REDUCE via SHORT_BINUNICODE (Protocol 4)
+# ============================================================================
+# Tests the STACK_GLOBAL+REDUCE detection path using protocol 4 opcodes.
+# STACK_GLOBAL pops two strings (module, function) from the stack.
+# ============================================================================
+
+
+def gen_poc35_stack_global_os_system() -> None:
+    """os.system via STACK_GLOBAL+REDUCE (protocol 4)."""
+    buf = io.BytesIO()
+    buf.write(b"\x80\x04")  # PROTO 4
+
+    # FRAME header (required for protocol 4)
+    frame_buf = io.BytesIO()
+    # Push module name with SHORT_BINUNICODE
+    mod = b"os"
+    frame_buf.write(b"\x8c")  # SHORT_BINUNICODE
+    frame_buf.write(struct.pack("<B", len(mod)))
+    frame_buf.write(mod)
+    # Push function name with SHORT_BINUNICODE
+    func = b"system"
+    frame_buf.write(b"\x8c")
+    frame_buf.write(struct.pack("<B", len(func)))
+    frame_buf.write(func)
+    # STACK_GLOBAL: pops 'system' and 'os', pushes os.system
+    frame_buf.write(b"\x93")
+    # Push argument with SHORT_BINUNICODE
+    arg = b"echo test"
+    frame_buf.write(b"\x8c")
+    frame_buf.write(struct.pack("<B", len(arg)))
+    frame_buf.write(arg)
+    frame_buf.write(b"\x85")  # TUPLE1
+    frame_buf.write(b"R")  # REDUCE
+    frame_buf.write(b".")  # STOP
+
+    frame_data = frame_buf.getvalue()
+    buf.write(b"\x95")  # FRAME opcode
+    buf.write(struct.pack("<Q", len(frame_data)))
+    buf.write(frame_data)
+
+    write_poc(
+        "poc35_stack_global_os_system",
+        buf.getvalue(),
+        "os.system via STACK_GLOBAL+REDUCE (protocol 4, SHORT_BINUNICODE). Tests STACK_GLOBAL+REDUCE detection path.",
+    )
+
+
+# ============================================================================
+# POC 36: STACK_GLOBAL+REDUCE via BINUNICODE8 (Protocol 4)
+# ============================================================================
+
+
+def gen_poc36_stack_global_binunicode8() -> None:
+    """builtins.exec via STACK_GLOBAL+REDUCE using BINUNICODE8 (protocol 4)."""
+    buf = io.BytesIO()
+    buf.write(b"\x80\x04")  # PROTO 4
+
+    frame_buf = io.BytesIO()
+    # Push module with BINUNICODE8 (0x8d + 8-byte length)
+    mod = b"builtins"
+    frame_buf.write(b"\x8d")  # BINUNICODE8
+    frame_buf.write(struct.pack("<Q", len(mod)))
+    frame_buf.write(mod)
+    # Push function with BINUNICODE8
+    func = b"exec"
+    frame_buf.write(b"\x8d")
+    frame_buf.write(struct.pack("<Q", len(func)))
+    frame_buf.write(func)
+    # STACK_GLOBAL
+    frame_buf.write(b"\x93")
+    # Push argument with BINUNICODE8
+    arg = b"print(1+1)"
+    frame_buf.write(b"\x8d")
+    frame_buf.write(struct.pack("<Q", len(arg)))
+    frame_buf.write(arg)
+    frame_buf.write(b"\x85")  # TUPLE1
+    frame_buf.write(b"R")  # REDUCE
+    frame_buf.write(b".")  # STOP
+
+    frame_data = frame_buf.getvalue()
+    buf.write(b"\x95")  # FRAME
+    buf.write(struct.pack("<Q", len(frame_data)))
+    buf.write(frame_data)
+
+    write_poc(
+        "poc36_stack_global_binunicode8",
+        buf.getvalue(),
+        "builtins.exec via STACK_GLOBAL+REDUCE (protocol 4, BINUNICODE8). "
+        "Tests STACK_GLOBAL+REDUCE detection with BINUNICODE8 string opcode.",
+    )
+
+
 if __name__ == "__main__":
     gen_poc25_ctypes_cdll()
     gen_poc26_cprofile_run()
@@ -330,6 +423,8 @@ if __name__ == "__main__":
     gen_poc32_linecache()
     gen_poc33_logging_listen()
     gen_poc34_zipimport()
+    gen_poc35_stack_global_os_system()
+    gen_poc36_stack_global_binunicode8()
 
     print("\n" + "=" * 70)
     print("V4 POCs generated. Testing missing dangerous modules and ['*'] bug.")

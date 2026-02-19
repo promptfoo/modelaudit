@@ -310,6 +310,10 @@ ALWAYS_DANGEROUS_MODULES: set[str] = {
     "zipimport",
     "importlib",
     "runpy",
+    # NOTE: linecache and logging.config are intentionally NOT in this set.
+    # - linecache.getline: file read (not code execution), flagged as WARNING
+    # - logging.config.listen: network listener (not direct code exec), flagged as WARNING
+    # They are caught by SUSPICIOUS_GLOBALS or general suspicious-string detection.
 }
 
 # String opcodes that push text onto the pickle stack.
