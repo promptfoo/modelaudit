@@ -19,14 +19,14 @@ recommendations for git history rewriting.
 
 ### 1a. Delete competitive analysis and internal scripts
 
-- [x] Delete `docs/modelscan-competitive-analysis.md`
-- [x] Delete `scripts/comprehensive_modelscan_test.py`
-- [x] Review and potentially delete `scripts/generate_llm_context.py`
+- [x] Delete internal competitive-analysis documentation.
+- [x] Delete internal benchmarking/comparison scripts.
+- [x] Review and remove non-essential context-generation scripts.
 
 ### 1b. Redact detection-pattern details from docs
 
 - [x] Redact exact `SUSPICIOUS_GLOBALS` and `DANGEROUS_OPCODES` from `docs/agents/security-checks.md`
-- [x] Redact CVE detection thresholds and attack vector details from `docs/models.md`
+- [x] Remove internal CVE threshold and attack-vector details from public docs.
 - [x] Redact the "KEEP PRIVATE" section in `AGENTS.md` (it paradoxically reveals what's sensitive)
 - [x] Redact "Known Issues & False Positives" evasion details from `CONTRIBUTING.md`
 

@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import os
 import re
 import shutil
 import tempfile
@@ -80,7 +81,37 @@ def format_size(size_bytes: int) -> str:
     return f"{size:.1f} PB"
 
 
-def get_cloud_object_size(fs: Any, url: str) -> int | None:
+def _is_within_directory(base_dir: Path, target: Path) -> bool:
+    """Return True if target resolves within base_dir."""
+    base_path = base_dir.resolve()
+    target_path = target.resolve()
+    if os.name == "nt":
+        base_norm = os.path.normcase(os.path.normpath(str(base_path)))
+        target_norm = os.path.normcase(os.path.normpath(str(target_path)))
+        try:
+            return os.path.commonpath([target_norm, base_norm]) == base_norm
+        except ValueError:
+            return False
+    try:
+        return target_path.is_relative_to(base_path)
+    except AttributeError:
+        try:
+            return os.path.commonpath([str(target_path), str(base_path)]) == str(base_path)
+        except ValueError:
+            return False
+
+
+def _resolve_cloud_path(entry_name: str, base_dir: Path) -> tuple[Path, bool]:
+    """Resolve a cloud object relative path and return whether it is safe."""
+    entry = entry_name.replace("\\", "/")
+    if entry.startswith("/") or (len(entry) > 1 and entry[1] == ":"):
+        return (base_dir / entry.lstrip("/")).resolve(), False
+
+    resolved = (base_dir / entry.lstrip("/")).resolve()
+    return resolved, _is_within_directory(base_dir, resolved)
+
+
+def get_cloud_object_size(fs: Any, url: str, strict: bool = False) -> int | None:
     """Get the size of a cloud storage object or directory.
 
     Args:
@@ -92,48 +123,67 @@ def get_cloud_object_size(fs: Any, url: str) -> int | None:
     """
     try:
         info = fs.info(url)
-        if "size" in info:
-            return int(info["size"])
-
-        total_size = 0
-
-        # Try using fs.walk to traverse directories
-        try:
-            for _, _, files in fs.walk(url):
-                for file_path in files:
-                    try:
-                        file_info = fs.info(file_path)
-                        if "size" in file_info:
-                            total_size += int(file_info["size"])
-                    except Exception:
-                        continue
-            if total_size > 0:
-                return total_size
-        except Exception:
-            pass
-
-        # Fallback to recursive ls if walk is unavailable
-        def _collect(path: str) -> None:
-            nonlocal total_size
-            try:
-                entries = fs.ls(path, detail=True)
-            except Exception:
-                return
-            for entry in entries:
-                if not isinstance(entry, dict):
-                    continue
-                name = entry.get("name") or entry.get("path")
-                if entry.get("type") == "directory" or (name and name.endswith("/")):
-                    if name:
-                        _collect(name)
-                elif "size" in entry:
-                    total_size += int(entry["size"])
-
-        _collect(url)
-
-        return total_size if total_size > 0 else None
-    except Exception:
+    except Exception as exc:
+        if strict:
+            raise ValueError(f"Unable to read cloud object info for {url}: {exc}") from exc
         return None
+
+    if "size" in info:
+        return int(info["size"])
+
+    total_size = 0
+    walk_error: Exception | None = None
+    ls_error: Exception | None = None
+
+    # Try using fs.walk to traverse directories
+    try:
+        for _, _, files in fs.walk(url):
+            for file_path in files:
+                try:
+                    file_info = fs.info(file_path)
+                    if "size" in file_info:
+                        total_size += int(file_info["size"])
+                except Exception:
+                    continue
+        if total_size > 0:
+            return total_size
+    except Exception as exc:
+        walk_error = exc
+
+    # Fallback to recursive ls if walk is unavailable
+    def _collect(path: str) -> None:
+        nonlocal total_size, ls_error
+        try:
+            entries = fs.ls(path, detail=True)
+        except Exception as exc:
+            if ls_error is None:
+                ls_error = exc
+            return
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("name") or entry.get("path")
+            if entry.get("type") == "directory" or (name and name.endswith("/")):
+                if name:
+                    _collect(name)
+            elif "size" in entry:
+                total_size += int(entry["size"])
+
+    _collect(url)
+    if total_size > 0:
+        return total_size
+
+    if strict:
+        error_parts = []
+        if walk_error:
+            error_parts.append(f"walk() failed: {walk_error}")
+        if ls_error:
+            error_parts.append(f"ls() failed: {ls_error}")
+        if not error_parts:
+            error_parts.append("cloud provider did not return file sizes")
+        raise ValueError(f"Unable to determine cloud object size for {url}: {'; '.join(error_parts)}")
+
+    return None
 
 
 async def analyze_cloud_target(url: str) -> dict[str, Any]:
@@ -388,6 +438,32 @@ def filter_scannable_files(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return scannable
 
 
+def _build_safe_local_path(base_url: str, file_url: str, download_path: Path) -> Path:
+    """Build a local path for a cloud object and reject traversal attempts."""
+    normalized_base = base_url.rstrip("/")
+
+    if file_url.startswith(f"{normalized_base}/"):
+        relative_path = file_url[len(normalized_base) + 1 :]
+    elif file_url == normalized_base:
+        relative_path = Path(file_url).name
+    else:
+        # Fallback to basename for unexpected path shapes.
+        relative_path = Path(file_url).name
+
+    if not relative_path:
+        raise ValueError(f"Invalid cloud object path: {file_url}")
+
+    resolved_path, is_safe = _resolve_cloud_path(relative_path, download_path)
+    if not is_safe:
+        raise ValueError(f"Path traversal attempt detected in cloud object path: {file_url}")
+
+    local_path = Path(resolved_path)
+    if not _is_within_directory(download_path, local_path):
+        raise ValueError(f"Cloud object path escaped download directory: {file_url}")
+
+    return local_path
+
+
 def download_from_cloud(
     url: str,
     cache_dir: Path | None = None,
@@ -480,7 +556,20 @@ def download_from_cloud(
     fs = fsspec.filesystem(fs_protocol, **fs_args)
 
     # Check available disk space before downloading
-    object_size = get_cloud_object_size(fs, url)
+    object_size: int | None
+    try:
+        object_size = get_cloud_object_size(fs, url, strict=True)
+    except ValueError as exc:
+        # Fall back to metadata-derived size only when available.
+        if size > 0:
+            object_size = int(size)
+            if show_progress:
+                click.echo(f"⚠️  Falling back to metadata size estimate for disk check: {exc}")
+        else:
+            if cache_dir is None and download_path.exists():
+                shutil.rmtree(download_path)
+            raise ValueError(f"Cannot safely determine download size for {url}: {exc}") from exc
+
     if object_size is not None:
         has_space, message = check_disk_space(download_path, object_size)
         if not has_space:
@@ -516,18 +605,7 @@ def download_from_cloud(
         # Download files
         for file_info in files:
             file_url = file_info["path"]
-            # Calculate relative path more robustly
-            base_url = url.rstrip("/")
-            if file_url.startswith(base_url + "/"):
-                relative_path = file_url[len(base_url) + 1 :]
-            elif file_url.startswith(base_url):
-                # Handle case where file_url might be exactly base_url
-                relative_path = Path(file_url).name
-            else:
-                # Fallback to just the filename
-                relative_path = Path(file_url).name
-
-            local_path = download_path / relative_path
+            local_path = _build_safe_local_path(url, file_url, download_path)
             local_path.parent.mkdir(parents=True, exist_ok=True)
 
             if show_progress:

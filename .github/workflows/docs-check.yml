@@ -37,14 +37,24 @@ jobs:
             **.yml
             **.json
 
+      - name: Setup Node.js
+        if: steps.changed-files.outputs.any_changed == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Node dependencies
+        if: steps.changed-files.outputs.any_changed == 'true'
+        run: npm ci --ignore-scripts
+
       - name: Check markdown formatting with prettier
         if: steps.changed-files.outputs.any_changed == 'true'
         run: |
           echo "Checking formatting for changed files:"
           echo "${{ steps.changed-files.outputs.all_changed_files }}"
-          npx prettier@latest --check ${{ steps.changed-files.outputs.all_changed_files }} || (
+          npx prettier --check ${{ steps.changed-files.outputs.all_changed_files }} || (
             echo "Documentation is not properly formatted. Run:"
-            echo "npx prettier@latest --write '**/*.{md,yaml,yml,json}'"
+            echo "npm ci --ignore-scripts && npx prettier --write '**/*.{md,yaml,yml,json}'"
             exit 1
           )
 

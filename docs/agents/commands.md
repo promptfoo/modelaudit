@@ -48,7 +48,7 @@ uv run ruff format modelaudit/ tests/                # Format code
 uv run ruff check --fix modelaudit/ tests/           # Fix linting issues
 uv run mypy modelaudit/                              # Type checking (mypy)
 uv run ty check                                      # Advanced type checking (ty)
-npx prettier@latest --write "**/*.{md,yaml,yml,json}" # Format docs
+npm ci --ignore-scripts && npx prettier --write "**/*.{md,yaml,yml,json}" # Format docs
 ```
 
 ## CI Pre-Commit Workflow
@@ -75,7 +75,7 @@ uv run ty check
 uv run pytest -n auto -m "not slow and not integration"
 
 # 7. Format docs
-npx prettier@latest --write "**/*.{md,yaml,yml,json}"
+npm ci --ignore-scripts && npx prettier --write "**/*.{md,yaml,yml,json}"
 ```
 
 ## Additional Commands

@@ -279,6 +279,68 @@ class TestDiskSpaceCheckingForCloud:
         assert str(tmp_path) in str(result)  # Should be within the cache dir
 
 
+class TestCloudPathSecurity:
+    """Test path-safety behavior for cloud downloads."""
+
+    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+    @patch("fsspec.filesystem")
+    def test_download_rejects_path_traversal(self, mock_fs_class, mock_analyze, tmp_path):
+        fs = make_fs_mock()
+        fs.info.return_value = {}
+        mock_fs_class.return_value = fs
+
+        mock_analyze.return_value = {
+            "type": "directory",
+            "file_count": 1,
+            "total_size": 1024,
+            "human_size": "1.0 KB",
+            "estimated_time": "instant",
+            "files": [
+                {
+                    "path": "s3://bucket/models/../secrets/evil.pkl",
+                    "name": "evil.pkl",
+                    "size": 1024,
+                    "human_size": "1.0 KB",
+                }
+            ],
+        }
+
+        with pytest.raises(ValueError, match="Path traversal attempt detected"):
+            download_from_cloud(
+                "s3://bucket/models",
+                cache_dir=tmp_path,
+                use_cache=False,
+                selective=False,
+                show_progress=False,
+            )
+
+        fs.get.assert_not_called()
+
+    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+    @patch("fsspec.filesystem")
+    def test_download_fails_when_size_cannot_be_determined(self, mock_fs_class, mock_analyze):
+        fs = make_fs_mock()
+        fs.info.side_effect = RuntimeError("permission denied")
+        mock_fs_class.return_value = fs
+
+        mock_analyze.return_value = {
+            "type": "file",
+            "size": 0,
+            "name": "model.bin",
+            "human_size": "0 B",
+            "estimated_time": "instant",
+        }
+
+        with pytest.raises(ValueError, match="Cannot safely determine download size"):
+            download_from_cloud(
+                "s3://bucket/model.bin",
+                use_cache=False,
+                show_progress=False,
+            )
+
+        fs.get.assert_not_called()
+
+
 def test_filter_scannable_files_recognizes_pdiparams():
     files = [{"path": "model.pdiparams"}]
     assert filter_scannable_files(files) == files

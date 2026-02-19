@@ -23,7 +23,7 @@ jobs:
       version: ${{ steps.release.outputs.version }}
       pr_number: ${{ steps.release.outputs.pr && fromJSON(steps.release.outputs.pr).number || '' }}
     steps:
-      - uses: googleapis/release-please-action@v4
+      - uses: googleapis/release-please-action@16a9c90856f42705d54a6fda1823352bdc62cf38 # v4
         id: release
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -41,18 +41,28 @@ jobs:
             echo "has_pr=false" >> $GITHUB_OUTPUT
           fi
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         if: steps.check-pr.outputs.has_pr == 'true'
         with:
           ref: ${{ steps.check-pr.outputs.pr_branch }}
           # Shallow clone for speed - we only need to format and push
           fetch-depth: 1
 
+      - name: Setup Node.js
+        if: steps.check-pr.outputs.has_pr == 'true'
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+
+      - name: Install Node dependencies
+        if: steps.check-pr.outputs.has_pr == 'true'
+        run: npm ci --ignore-scripts
+
       - name: Format CHANGELOG.md with Prettier
         if: steps.check-pr.outputs.has_pr == 'true'
         run: |
           echo "Formatting CHANGELOG.md on branch: ${{ steps.check-pr.outputs.pr_branch }}"
-          npx --yes prettier@latest --write CHANGELOG.md
+          npx prettier --write CHANGELOG.md
 
           if git diff --quiet CHANGELOG.md; then
             echo "✓ No formatting changes needed"
@@ -84,6 +94,15 @@ jobs:
 
       - name: Sync dependencies
         run: uv sync --extra all-ci
+
+      - name: Lint with Ruff
+        run: uv run ruff check modelaudit/ tests/
+
+      - name: Check formatting with Ruff
+        run: uv run ruff format --check modelaudit/ tests/
+
+      - name: Type check with mypy
+        run: uv run mypy modelaudit/
 
       - name: Run tests
         run: |
@@ -131,6 +150,6 @@ jobs:
           path: dist/
 
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # release/v1
         with:
           print-hash: true
