@@ -23,7 +23,7 @@ import os
 import pickletools
 import struct
 
-OUTPUT_DIR = os.path.dirname(os.path.abspath(__file__))
+OUTPUT_DIR: str = os.path.dirname(os.path.abspath(__file__))
 
 
 def write_poc(name: str, data: bytes, description: str) -> None:
@@ -57,7 +57,7 @@ def write_poc(name: str, data: bytes, description: str) -> None:
 # ============================================================================
 
 
-def gen_poc25_ctypes_cdll():
+def gen_poc25_ctypes_cdll() -> None:
     """ctypes.CDLL - load a malicious shared library."""
     buf = io.BytesIO()
     buf.write(b"\x80\x02")
@@ -95,7 +95,7 @@ def gen_poc25_ctypes_cdll():
 # ============================================================================
 
 
-def gen_poc26_cprofile_run():
+def gen_poc26_cprofile_run() -> None:
     """cProfile.run executes arbitrary Python statements."""
     buf = io.BytesIO()
     buf.write(b"\x80\x02")
@@ -125,7 +125,7 @@ def gen_poc26_cprofile_run():
 # ============================================================================
 
 
-def gen_poc27_pdb_run():
+def gen_poc27_pdb_run() -> None:
     """pdb.run executes arbitrary Python statements."""
     buf = io.BytesIO()
     buf.write(b"\x80\x02")
@@ -153,7 +153,7 @@ def gen_poc27_pdb_run():
 # ============================================================================
 
 
-def gen_poc28_timeit():
+def gen_poc28_timeit() -> None:
     """timeit.timeit executes arbitrary Python statements."""
     buf = io.BytesIO()
     buf.write(b"\x80\x02")
@@ -180,7 +180,7 @@ def gen_poc28_timeit():
 # ============================================================================
 
 
-def gen_poc29_profile_run():
+def gen_poc29_profile_run() -> None:
     """profile.run executes arbitrary Python statements."""
     buf = io.BytesIO()
     buf.write(b"\x80\x02")
@@ -207,7 +207,7 @@ def gen_poc29_profile_run():
 # ============================================================================
 
 
-def gen_poc30_thread():
+def gen_poc30_thread() -> None:
     """_thread.start_new_thread spawns a thread with arbitrary function."""
     buf = io.BytesIO()
     buf.write(b"\x80\x02")
@@ -232,7 +232,7 @@ def gen_poc30_thread():
 # ============================================================================
 
 
-def gen_poc31_ctypes_cast():
+def gen_poc31_ctypes_cast() -> None:
     """ctypes.cast for pointer manipulation."""
     buf = io.BytesIO()
     buf.write(b"\x80\x02")
@@ -253,7 +253,7 @@ def gen_poc31_ctypes_cast():
 # ============================================================================
 
 
-def gen_poc32_linecache():
+def gen_poc32_linecache() -> None:
     """linecache.getline reads arbitrary file contents."""
     buf = io.BytesIO()
     buf.write(b"\x80\x02")
@@ -278,7 +278,7 @@ def gen_poc32_linecache():
 # ============================================================================
 
 
-def gen_poc33_logging_listen():
+def gen_poc33_logging_listen() -> None:
     """logging.config.listen opens a network socket listener."""
     buf = io.BytesIO()
     buf.write(b"\x80\x02")
@@ -300,7 +300,7 @@ def gen_poc33_logging_listen():
 # ============================================================================
 
 
-def gen_poc34_zipimport():
+def gen_poc34_zipimport() -> None:
     """zipimport.zipimporter loads modules from ZIP files."""
     buf = io.BytesIO()
     buf.write(b"\x80\x02")

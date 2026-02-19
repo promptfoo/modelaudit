@@ -312,6 +312,20 @@ ALWAYS_DANGEROUS_MODULES: set[str] = {
     "runpy",
 }
 
+# String opcodes that push text onto the pickle stack.
+# Used for STACK_GLOBAL reconstruction and suspicious string detection.
+STRING_OPCODES: frozenset[str] = frozenset(
+    {
+        "STRING",
+        "BINSTRING",
+        "SHORT_BINSTRING",
+        "UNICODE",
+        "SHORT_BINUNICODE",
+        "BINUNICODE",
+        "BINUNICODE8",
+    }
+)
+
 # Safe ML-specific global patterns (SECURITY: NO WILDCARDS - explicit lists only)
 ML_SAFE_GLOBALS: dict[str, list[str]] = {
     # PyTorch - explicit functions only (no wildcards)
@@ -1089,15 +1103,7 @@ def _detect_ml_context(opcodes: list[tuple]) -> dict[str, Any]:
 
             global_refs[module] = global_refs.get(module, 0) + 1
 
-        elif opcode.name in [
-            "STRING",
-            "BINSTRING",
-            "SHORT_BINSTRING",
-            "UNICODE",
-            "SHORT_BINUNICODE",
-            "BINUNICODE",
-            "BINUNICODE8",
-        ] and isinstance(arg, str):
+        elif opcode.name in STRING_OPCODES and isinstance(arg, str):
             # Collect strings that might be used for STACK_GLOBAL
             stack_strings.append(arg)
 
@@ -1257,20 +1263,10 @@ def _find_stack_global_strings(opcodes: list, start_index: int, lookback: int = 
     Returns:
         Tuple of (module, function/class) or None if not found
     """
-    string_opcodes = {
-        "SHORT_BINSTRING",
-        "BINSTRING",
-        "STRING",
-        "SHORT_BINUNICODE",
-        "BINUNICODE",
-        "BINUNICODE8",
-        "UNICODE",
-    }
-
     recent_strings: list[str] = []
     for k in range(start_index - 1, max(0, start_index - lookback), -1):
         prev_opcode, prev_arg, _prev_pos = opcodes[k]
-        if prev_opcode.name in string_opcodes and isinstance(prev_arg, str):
+        if prev_opcode.name in STRING_OPCODES and isinstance(prev_arg, str):
             recent_strings.insert(0, prev_arg)
             if len(recent_strings) >= 2:
                 return recent_strings[0], recent_strings[1]
@@ -1685,19 +1681,10 @@ def is_dangerous_reduce_pattern(opcodes: list[tuple]) -> dict[str, Any] | None:
                 next_op = opcodes[j][0].name
                 if next_op == "REDUCE":
                     # Find the strings that were pushed for this STACK_GLOBAL
-                    string_opcodes = {
-                        "SHORT_BINSTRING",
-                        "BINSTRING",
-                        "STRING",
-                        "SHORT_BINUNICODE",
-                        "BINUNICODE",
-                        "BINUNICODE8",
-                        "UNICODE",
-                    }
                     recent: list[str] = []
                     for k in range(i - 1, max(0, i - 10), -1):
                         pk = opcodes[k]
-                        if pk[0].name in string_opcodes and isinstance(pk[1], str):
+                        if pk[0].name in STRING_OPCODES and isinstance(pk[1], str):
                             recent.insert(0, pk[1])
                             if len(recent) >= 2:
                                 break
@@ -1744,15 +1731,7 @@ def is_dangerous_reduce_pattern(opcodes: list[tuple]) -> dict[str, Any] | None:
             }
 
         # Check for suspicious strings in all string opcodes
-        if opcode.name in [
-            "STRING",
-            "BINSTRING",
-            "SHORT_BINSTRING",
-            "UNICODE",
-            "SHORT_BINUNICODE",
-            "BINUNICODE",
-            "BINUNICODE8",
-        ] and isinstance(arg, str):
+        if opcode.name in STRING_OPCODES and isinstance(arg, str):
             suspicious_pattern = is_suspicious_string(arg)
             if suspicious_pattern:
                 return {
@@ -1828,15 +1807,7 @@ def check_opcode_sequence(
                         recent_strings: list[str] = []
                         for k in range(j - 1, max(0, j - 10), -1):
                             stack_prev_opcode, stack_prev_arg, _stack_prev_pos = opcodes[k]
-                            if stack_prev_opcode.name in [
-                                "SHORT_BINSTRING",
-                                "BINSTRING",
-                                "STRING",
-                                "SHORT_BINUNICODE",
-                                "BINUNICODE",
-                                "BINUNICODE8",
-                                "UNICODE",
-                            ] and isinstance(stack_prev_arg, str):
+                            if stack_prev_opcode.name in STRING_OPCODES and isinstance(stack_prev_arg, str):
                                 recent_strings.insert(0, stack_prev_arg)
                                 if len(recent_strings) >= 2:
                                     break
@@ -1862,15 +1833,7 @@ def check_opcode_sequence(
                 recent_strings = []
                 for k in range(i - 1, max(0, i - 10), -1):
                     prev_opcode, prev_arg, _prev_pos = opcodes[k]
-                    if prev_opcode.name in [
-                        "SHORT_BINSTRING",
-                        "BINSTRING",
-                        "STRING",
-                        "SHORT_BINUNICODE",
-                        "BINUNICODE",
-                        "BINUNICODE8",
-                        "UNICODE",
-                    ] and isinstance(prev_arg, str):
+                    if prev_opcode.name in STRING_OPCODES and isinstance(prev_arg, str):
                         recent_strings.insert(0, prev_arg)
                         if len(recent_strings) >= 2:
                             break
@@ -2749,7 +2712,7 @@ class PickleScanner(BaseScanner):
                 continue
             if op_name in {"GET", "BINGET", "LONG_BINGET"}:
                 values.append(memo.get(op_value, "unknown"))
-            elif op_name in {"SHORT_BINUNICODE", "UNICODE", "BINUNICODE", "BINUNICODE8"}:
+            elif op_name in STRING_OPCODES:
                 values.append(str(op_value))
             else:
                 logger.debug(f"Non-string opcode {op_name} in STACK_GLOBAL analysis")
@@ -2931,15 +2894,7 @@ class PickleScanner(BaseScanner):
                         break
 
                 # Track strings for STACK_GLOBAL analysis
-                if opcode.name in [
-                    "STRING",
-                    "BINSTRING",
-                    "SHORT_BINSTRING",
-                    "SHORT_BINUNICODE",
-                    "BINUNICODE",
-                    "BINUNICODE8",
-                    "UNICODE",
-                ] and isinstance(arg, str):
+                if opcode.name in STRING_OPCODES and isinstance(arg, str):
                     string_stack.append(arg)
                     # Keep only the last 10 strings to avoid memory issues
                     if len(string_stack) > 10:
@@ -3400,15 +3355,7 @@ class PickleScanner(BaseScanner):
                             )
 
                 # Check for suspicious strings
-                if opcode.name in [
-                    "STRING",
-                    "BINSTRING",
-                    "SHORT_BINSTRING",
-                    "UNICODE",
-                    "SHORT_BINUNICODE",
-                    "BINUNICODE",
-                    "BINUNICODE8",
-                ] and isinstance(arg, str):
+                if opcode.name in STRING_OPCODES and isinstance(arg, str):
                     suspicious_pattern = _is_actually_dangerous_string(arg, ml_context)
                     if suspicious_pattern:
                         severity = _get_context_aware_severity(
@@ -3459,15 +3406,7 @@ class PickleScanner(BaseScanner):
                         )
 
                 # Detect encoded nested pickle strings
-                if opcode.name in [
-                    "STRING",
-                    "BINSTRING",
-                    "SHORT_BINSTRING",
-                    "UNICODE",
-                    "SHORT_BINUNICODE",
-                    "BINUNICODE",
-                    "BINUNICODE8",
-                ] and isinstance(arg, str):
+                if opcode.name in STRING_OPCODES and isinstance(arg, str):
                     for enc, decoded in _decode_string_to_bytes(arg):
                         if _looks_like_pickle(decoded[:1024]):
                             severity = _get_context_aware_severity(IssueSeverity.CRITICAL, ml_context)
@@ -3536,15 +3475,7 @@ class PickleScanner(BaseScanner):
                         -1,
                     ):  # Look back at most 10 opcodes
                         prev_opcode, prev_arg, _prev_pos = opcodes[j]
-                        if prev_opcode.name in [
-                            "STRING",
-                            "BINSTRING",
-                            "SHORT_BINSTRING",
-                            "SHORT_BINUNICODE",
-                            "BINUNICODE",
-                            "BINUNICODE8",
-                            "UNICODE",
-                        ] and isinstance(prev_arg, str):
+                        if prev_opcode.name in STRING_OPCODES and isinstance(prev_arg, str):
                             recent_strings.insert(
                                 0,
                                 prev_arg,
