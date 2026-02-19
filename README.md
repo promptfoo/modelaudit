@@ -288,7 +288,7 @@ then run redteaming if you need to test how the model responds when invoked.
 
 ## ⚙️ Installation Options
 
-> **Requires Python 3.10+** (3.10, 3.11, 3.12, 3.13, 3.14).
+> **Requires Python 3.10+**.
 > If `pip install modelaudit` gives you version 0.2.5, your Python is too old — see [Troubleshooting](#stuck-on-old-version--cant-upgrade).
 
 **Basic installation (recommended for most users):**

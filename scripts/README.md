@@ -20,10 +20,6 @@ Utilities for fetching model metadata from HuggingFace for testing and validatio
 
 Demonstrates JAX/Flax model scanning capabilities including Msgpack-based checkpoints, Orbax format, and JAX-specific threat detection.
 
-### `verify_models.py`
-
-Model verification and validation utility.
-
 ## Development Use Only
 
 These scripts are intended for development, testing, and research purposes. They should not be used in production environments.

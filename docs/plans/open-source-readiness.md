@@ -50,7 +50,7 @@ recommendations for git history rewriting.
 
 ## 4. Metadata & Config Improvements
 
-- [x] Remove Python 3.14 classifier from pyproject.toml (not released, not in CI)
+- [x] Remove Python 3.14 classifier from pyproject.toml (not part of current CI support policy)
 - [x] Add `.vscode/` and `.idea/` to `.gitignore`
 - [x] Add `.editorconfig`
 - [x] Add `.gitattributes`
