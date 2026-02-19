@@ -8,7 +8,7 @@ from urllib.parse import urlparse
 import click
 
 from modelaudit.scanners.base import BaseScanner, Issue, IssueSeverity, ScanResult
-from modelaudit.utils.cloud_storage import get_fs_protocol
+from modelaudit.utils.sources.cloud_storage import get_fs_protocol
 
 
 def can_stream_analyze(url: str, scanner: BaseScanner) -> bool:
