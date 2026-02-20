@@ -1,0 +1,65 @@
+name: Bug report
+description: Report a reproducible problem with ModelAudit.
+title: "bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug report.
+        Please include enough detail for us to reproduce and verify the issue quickly.
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight checklist
+      options:
+        - label: I searched existing issues and did not find a duplicate.
+          required: true
+        - label: I am using the latest released version of ModelAudit.
+          required: true
+  - type: input
+    id: version
+    attributes:
+      label: ModelAudit version
+      placeholder: "e.g. 0.2.25"
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      placeholder: "e.g. 3.12.7"
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command(s) run
+      description: Include the exact command and flags used.
+      placeholder: "modelaudit path/to/model --format json"
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include relevant logs or error output.
+    validations:
+      required: true
+  - type: textarea
+    id: sample
+    attributes:
+      label: Reproducible sample details
+      description: Provide a minimal file/sample or describe how to reproduce safely.
+  - type: markdown
+    attributes:
+      value: |
+        For security vulnerabilities, do not open a public issue.
+        Please follow `SECURITY.md` and report privately via `security@promptfoo.dev`.

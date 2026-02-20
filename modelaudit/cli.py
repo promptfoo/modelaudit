@@ -2517,7 +2517,7 @@ def _format_debug_output(debug_info: dict[str, Any], verbose: bool) -> str:
             fg="yellow",
         )
     )
-    lines.append(style_text("https://github.com/promptfoo/promptfoo/issues", fg="cyan"))
+    lines.append(style_text("https://github.com/promptfoo/modelaudit/issues", fg="cyan"))
     lines.append("")
 
     # Quick diagnosis section

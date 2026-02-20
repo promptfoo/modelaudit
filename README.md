@@ -5,7 +5,7 @@
 [![PyPI version](https://badge.fury.io/py/modelaudit.svg)](https://pypi.org/project/modelaudit/)
 [![Python versions](https://img.shields.io/pypi/pyversions/modelaudit.svg)](https://pypi.org/project/modelaudit/)
 [![Code Style: ruff](https://img.shields.io/badge/code%20style-ruff-005cd7.svg)](https://github.com/astral-sh/ruff)
-[![License](https://img.shields.io/github/license/promptfoo/promptfoo)](https://github.com/promptfoo/promptfoo/blob/main/LICENSE)
+[![License](https://img.shields.io/github/license/promptfoo/modelaudit)](https://github.com/promptfoo/modelaudit/blob/main/LICENSE)
 
 <img width="989" alt="ModelAudit scan results" src="https://www.promptfoo.dev/img/docs/modelaudit/modelaudit-result.png" />
 
@@ -101,6 +101,15 @@ modelaudit https://company.jfrog.io/artifactory/repo/models/
 modelaudit model.dvc
 ```
 
+### Authentication Environment Variables
+
+- `HF_TOKEN` for private Hugging Face repositories
+- `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (and optional `AWS_SESSION_TOKEN`) for S3
+- `GOOGLE_APPLICATION_CREDENTIALS` for GCS
+- `MLFLOW_TRACKING_URI` for MLflow registry access
+- `JFROG_API_TOKEN` or `JFROG_ACCESS_TOKEN` for JFrog Artifactory
+- Store credentials in environment variables or a secrets manager, and never commit tokens/keys.
+
 ## Installation
 
 ```bash
@@ -138,6 +147,24 @@ docker run --rm -v "$(pwd)":/app ghcr.io/promptfoo/modelaudit:latest model.pkl
 ```
 
 Exit codes: `0` clean, `1` issues found, `2` errors.
+
+## Output Examples
+
+```bash
+# JSON for CI/CD pipelines
+modelaudit model.pkl --format json --output results.json
+
+# SARIF for code scanning platforms
+modelaudit model.pkl --format sarif --output results.sarif
+```
+
+## Troubleshooting
+
+- Run `modelaudit doctor --show-failed` to list unavailable scanners and missing optional deps.
+- If `pip` installs an older release, verify Python is `3.10+` (`python --version`).
+- For additional troubleshooting and cloud auth guidance, see:
+  - https://www.promptfoo.dev/docs/model-audit/
+  - https://www.promptfoo.dev/docs/model-audit/usage/
 
 ## Documentation
 

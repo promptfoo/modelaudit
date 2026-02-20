@@ -23,7 +23,7 @@ uv run mypy modelaudit/ || exit 1
 uv run pytest -n auto -m "not slow and not integration" --maxfail=1
 
 # 5. Documentation formatting (if changed)
-npx prettier@latest --write "**/*.{md,yaml,yml,json}"
+npm ci --ignore-scripts && npx prettier --write "**/*.{md,yaml,yml,json}"
 ```
 
 ## Branch Hygiene
