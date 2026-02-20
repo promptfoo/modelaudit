@@ -7,7 +7,7 @@ import pytest
 from click.testing import CliRunner
 
 from modelaudit import __version__
-from modelaudit.cli import cli, format_text_output
+from modelaudit.cli import cli, expand_paths, format_text_output
 from modelaudit.models import create_initial_audit_result
 
 
@@ -1253,3 +1253,114 @@ def test_doctor_command_numpy_status():
     # Should provide either success message or recommendations
     success_indicators = ["All scanners loaded successfully!", "Recommendations:"]
     assert any(indicator in result.output for indicator in success_indicators)
+
+
+# --- expand_paths and glob-empty-scan-paths tests ---
+
+
+class TestExpandPaths:
+    """Tests for the expand_paths function."""
+
+    def test_expand_paths_literal_file(self, tmp_path):
+        """Literal file path is resolved and returned."""
+        f = tmp_path / "model.pkl"
+        f.write_bytes(b"data")
+        expanded, missing = expand_paths((str(f),))
+        assert len(expanded) == 1
+        assert str(f.resolve()) in expanded[0]
+        assert missing == []
+
+    def test_expand_paths_nonexistent_literal(self):
+        """Non-existent literal path is kept as-is (no glob)."""
+        expanded, missing = expand_paths(("/no/such/file.pkl",))
+        assert expanded == ["/no/such/file.pkl"]
+        assert missing == []
+
+    def test_expand_paths_glob_matches(self, tmp_path):
+        """Glob pattern that matches files returns them."""
+        (tmp_path / "a.pkl").write_bytes(b"a")
+        (tmp_path / "b.pkl").write_bytes(b"b")
+        pattern = str(tmp_path / "*.pkl")
+        expanded, missing = expand_paths((pattern,))
+        assert len(expanded) == 2
+        assert missing == []
+
+    def test_expand_paths_glob_no_match(self, tmp_path):
+        """Glob pattern matching nothing is reported in missing_globs."""
+        pattern = str(tmp_path / "*.nonexistent")
+        expanded, missing = expand_paths((pattern,))
+        assert expanded == []
+        assert missing == [pattern]
+
+    def test_expand_paths_mixed_globs(self, tmp_path):
+        """Mix of matching and non-matching globs."""
+        (tmp_path / "model.h5").write_bytes(b"data")
+        good = str(tmp_path / "*.h5")
+        bad = str(tmp_path / "*.zzz")
+        expanded, missing = expand_paths((good, bad))
+        assert len(expanded) == 1
+        assert missing == [bad]
+
+    def test_expand_paths_recursive_glob(self, tmp_path):
+        """Recursive glob (**) works."""
+        sub = tmp_path / "subdir"
+        sub.mkdir()
+        (sub / "deep.bin").write_bytes(b"x")
+        pattern = str(tmp_path / "**" / "*.bin")
+        expanded, missing = expand_paths((pattern,))
+        assert len(expanded) >= 1
+        assert missing == []
+
+    def test_expand_paths_question_mark_glob(self, tmp_path):
+        """Single-char wildcard (?) is treated as a glob."""
+        (tmp_path / "a.pt").write_bytes(b"x")
+        pattern = str(tmp_path / "?.pt")
+        expanded, missing = expand_paths((pattern,))
+        assert len(expanded) == 1
+        assert missing == []
+
+    def test_expand_paths_empty_input(self):
+        """Empty tuple returns empty results."""
+        expanded, missing = expand_paths(())
+        assert expanded == []
+        assert missing == []
+
+
+class TestScanGlobFailFast:
+    """Tests for scan command behavior with unmatched globs."""
+
+    def test_scan_unmatched_glob_exits_2(self, tmp_path):
+        """Scan with only unmatched globs exits with code 2."""
+        runner = CliRunner()
+        pattern = str(tmp_path / "*.nonexistent_extension")
+        result = runner.invoke(cli, ["scan", pattern])
+        assert result.exit_code == 2
+        assert "No matching paths found" in strip_ansi(result.output + (result.stderr or ""))
+
+    def test_scan_unmatched_glob_warns(self, tmp_path):
+        """Scan with a mix of valid file + unmatched glob warns but continues."""
+        f = tmp_path / "real.dat"
+        f.write_bytes(b"content")
+        bad_glob = str(tmp_path / "*.zzzzz")
+        runner = CliRunner()
+        result = runner.invoke(cli, ["scan", str(f), bad_glob], catch_exceptions=True)
+        # Should NOT exit 2 since there's a valid path
+        assert result.exit_code != 2
+        # Warning should appear in stderr
+        combined = strip_ansi(result.output + (result.stderr or ""))
+        assert "did not match any files" in combined or "Warning" in combined
+
+    @patch("modelaudit.cli.record_scan_failed")
+    @patch("modelaudit.cli.flush_telemetry")
+    def test_scan_unmatched_glob_records_telemetry(self, mock_flush, mock_record_failed, tmp_path):
+        """Telemetry is recorded and flushed on early exit."""
+        runner = CliRunner()
+        pattern = str(tmp_path / "*.nonexistent_extension")
+        runner.invoke(cli, ["scan", pattern])
+        mock_record_failed.assert_called_once()
+        # Duration should be a positive float, not hardcoded 0.0
+        duration_arg = mock_record_failed.call_args[0][0]
+        assert isinstance(duration_arg, float)
+        assert duration_arg >= 0.0
+        assert mock_record_failed.call_args[0][1] == "No matching paths"
+        mock_flush.assert_called_once()
