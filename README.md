@@ -255,6 +255,7 @@ ModelAudit uses **smart detection** to automatically configure optimal settings 
 - `--dry-run` – preview what would be scanned/downloaded
 - `--progress` – force enable progress reporting
 - `--no-cache` – disable caching (overrides smart detection)
+- `--cache-dir PATH` – set cache directory (helpful for low disk or Windows symlink limits)
 - `--format json` / `--output file.json` – structured output for CI/CD
 - `--sbom file.json` – generate CycloneDX v1.6 SBOM with enhanced ML-BOM support
 - `--verbose` / `--quiet` – control output detail level
@@ -506,6 +507,19 @@ pip install modelaudit[numpy1]
 # ModelAudit shows exactly what to install
 modelaudit your-model.onnx
 # Output: "Install with 'pip install modelaudit[onnx]'"
+```
+
+### Manage the scan cache
+
+```bash
+# See cache size and hit rate
+modelaudit cache stats
+
+# Remove old entries (default: older than 30 days)
+modelaudit cache cleanup --max-age 14
+
+# Clear everything (use --dry-run to preview)
+modelaudit cache clear --dry-run
 ```
 
 ### Exit Codes
