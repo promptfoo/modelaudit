@@ -98,6 +98,33 @@ jobs:
         run: |
           uv run ruff format --check modelaudit/ tests/
 
+  dependency-audit:
+    name: Dependency Audit
+    needs: changes
+    if: github.ref == 'refs/heads/main' || needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@eac588ad8def6316056a12d4907a9d4d84ff7a3b # v7
+        with:
+          enable-cache: true
+
+      - name: Pin Python version
+        run: |
+          uv python pin 3.12
+
+      - name: Sync dependencies
+        run: |
+          uv sync --extra all-ci
+
+      - name: Audit dependencies for vulnerabilities
+        run: |
+          uvx pip-audit --strict --desc -r <(uv export --no-hashes)
+
   type-check:
     name: Type Check
     needs: changes
@@ -463,6 +490,10 @@ jobs:
         run: |
           uv build
 
+      - name: Validate package metadata
+        run: |
+          uvx twine check dist/*
+
       - name: Upload artifacts
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
@@ -476,6 +507,7 @@ jobs:
       [
         quick-feedback,
         lint,
+        dependency-audit,
         type-check,
         windows-tests,
         test,
@@ -492,6 +524,7 @@ jobs:
           # (skipped means the job's conditions weren't met, which is fine)
           QUICK_FEEDBACK_RESULT="${{ needs.quick-feedback.result }}"
           LINT_RESULT="${{ needs.lint.result }}"
+          AUDIT_RESULT="${{ needs.dependency-audit.result }}"
           TYPE_CHECK_RESULT="${{ needs.type-check.result }}"
           WINDOWS_RESULT="${{ needs.windows-tests.result }}"
           TEST_RESULT="${{ needs.test.result }}"
@@ -507,6 +540,7 @@ jobs:
           echo "Job results:"
           echo "  quick-feedback: $QUICK_FEEDBACK_RESULT"
           echo "  lint: $LINT_RESULT"
+          echo "  dependency-audit: $AUDIT_RESULT"
           echo "  type-check: $TYPE_CHECK_RESULT"
           echo "  windows-tests: $WINDOWS_RESULT"
           echo "  test: $TEST_RESULT"
@@ -519,6 +553,7 @@ jobs:
 
           [[ "$QUICK_FEEDBACK_RESULT" == "failure" || "$QUICK_FEEDBACK_RESULT" == "cancelled" ]] && FAILED=true
           [[ "$LINT_RESULT" == "failure" || "$LINT_RESULT" == "cancelled" ]] && FAILED=true
+          [[ "$AUDIT_RESULT" == "failure" || "$AUDIT_RESULT" == "cancelled" ]] && FAILED=true
           [[ "$TYPE_CHECK_RESULT" == "failure" || "$TYPE_CHECK_RESULT" == "cancelled" ]] && FAILED=true
           [[ "$WINDOWS_RESULT" == "failure" || "$WINDOWS_RESULT" == "cancelled" ]] && FAILED=true
           [[ "$TEST_RESULT" == "failure" || "$TEST_RESULT" == "cancelled" ]] && FAILED=true
