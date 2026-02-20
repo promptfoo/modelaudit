@@ -602,7 +602,7 @@ def scan_command(
             ),
             err=True,
         )
-        record_scan_failed(0.0, "No matching paths")
+        record_scan_failed(time.time() - scan_start_time, "No matching paths")
         flush_telemetry()
         sys.exit(2)
 
