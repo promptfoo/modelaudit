@@ -44,13 +44,13 @@ class WeightDistributionScanner(BaseScanner):
     def can_handle(cls, path: str) -> bool:
         """Check if this scanner can handle the given path"""
         if os.path.isdir(path):
+            # Directory-based SavedModel weight extraction requires full TensorFlow
+            # for checkpoint reading (tf.train.list_variables / tf.train.load_variable)
             try:
-                import tensorflow as tf
-
-                has_tensorflow = True
+                import tensorflow  # noqa: F401
             except ImportError:
-                has_tensorflow = False
-            return has_tensorflow and os.path.exists(os.path.join(path, "saved_model.pb"))
+                return False
+            return os.path.exists(os.path.join(path, "saved_model.pb"))
 
         if not os.path.isfile(path):
             return False
@@ -78,7 +78,9 @@ class WeightDistributionScanner(BaseScanner):
                 return False
         if ext == ".pb":
             try:
-                import tensorflow as tf  # noqa: F401
+                from modelaudit.utils.tensorflow_compat import get_protobuf_classes
+
+                get_protobuf_classes()
             except ImportError:
                 return False
         return True
@@ -318,17 +320,24 @@ class WeightDistributionScanner(BaseScanner):
         return weights_info
 
     def _extract_tensorflow_weights(self, path: str) -> dict[str, Any]:
-        """Extract weights from TensorFlow SavedModel files"""
-        try:
-            import numpy as np
-            import tensorflow as tf
-        except ImportError:
-            return {}
+        """Extract weights from TensorFlow SavedModel files.
+
+        Uses vendored protobuf stubs when available, falling back to full TensorFlow.
+        Checkpoint reading (for SavedModel directories) requires full TensorFlow.
+        """
+        import numpy as np
 
         weights_info: dict[str, Any] = {}
 
         try:
             if os.path.isdir(path):
+                # Checkpoint reading requires full TensorFlow - no lightweight alternative
+                try:
+                    import tensorflow as tf
+                except ImportError:
+                    logger.debug(f"Checkpoint reading requires TensorFlow: {path}")
+                    return {}
+
                 ckpt_prefix = os.path.join(path, "variables", "variables")
                 if os.path.exists(ckpt_prefix + ".index"):
                     for name, _shape in tf.train.list_variables(ckpt_prefix):
@@ -342,9 +351,17 @@ class WeightDistributionScanner(BaseScanner):
                         if len(array.shape) >= 2:
                             weights_info[name] = array
             else:
+                # For .pb files, use vendored protos
                 data = self._read_file_safely(path)
+
+                # Import vendored protos module (sets up sys.path for tensorflow.* imports)
+                # Order matters: modelaudit.protos must be imported first to set up sys.path
+                import modelaudit.protos  # noqa: F401, I001
+
                 from tensorflow.core.framework import graph_pb2
                 from tensorflow.core.protobuf import saved_model_pb2
+
+                from modelaudit.utils.tensorflow_compat import tensor_proto_to_ndarray
 
                 nodes: list[Any] = []
                 saved_model = saved_model_pb2.SavedModel()
@@ -364,7 +381,7 @@ class WeightDistributionScanner(BaseScanner):
                 for node in nodes:
                     if node.op == "Const" and "value" in node.attr:
                         tensor_proto = node.attr["value"].tensor
-                        array = tf.make_ndarray(tensor_proto)
+                        array = tensor_proto_to_ndarray(tensor_proto)
                         if self.max_array_size and self.max_array_size > 0 and array.nbytes > self.max_array_size:
                             continue
                         if ("weight" in node.name.lower() or "kernel" in node.name.lower()) and len(array.shape) >= 2:
@@ -386,9 +403,12 @@ class WeightDistributionScanner(BaseScanner):
         try:
             model = onnx.load(path)  # type: ignore[possibly-unresolved-reference]
 
-            # Extract initializers (weights)
+            # Extract 2D+ initializers — these are weight matrices (conv kernels,
+            # linear layers, embeddings). 1D tensors (biases, batch-norm params)
+            # aren't relevant for weight distribution analysis. This approach is
+            # framework-agnostic since ONNX naming conventions vary by exporter.
             for initializer in model.graph.initializer:
-                if "weight" in initializer.name.lower():
+                if len(initializer.dims) >= 2:
                     weights_info[initializer.name] = onnx.numpy_helper.to_array(  # type: ignore[possibly-unresolved-reference]
                         initializer,
                     )

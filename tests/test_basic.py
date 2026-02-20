@@ -16,12 +16,10 @@ def test_unknown_file(tmp_path):
 
     assert hasattr(results, "issues")
     assert results.files_scanned == 1
-    # The bytes_scanned might be 0 for unknown formats, so we'll skip this check
-    # assert results.bytes_scanned > 0
 
-    # Should have an issue about unknown format
+    # Truly unknown format files are silently skipped (no false positive warnings)
     unknown_format_issues = [issue for issue in results.issues if "Unknown or unhandled format" in issue.message]
-    assert len(unknown_format_issues) > 0
+    assert len(unknown_format_issues) == 0
 
 
 def test_nonexistent_file():
@@ -57,9 +55,9 @@ def test_directory_scan(tmp_path):
     # The bytes_scanned might be 0 for unknown formats, so we'll skip this check
     # assert results.bytes_scanned > 0
 
-    # Check for unknown format issues (only .dat should be unknown)
+    # Truly unknown format files (like .dat) are silently skipped — no false positive warnings
     unknown_format_issues = [issue for issue in results.issues if "Unknown or unhandled format" in issue.message]
-    assert len(unknown_format_issues) == 1  # .dat file
+    assert len(unknown_format_issues) == 0
 
     # Scanner tracking is in scan_metadata in core, but scanner_names is in results
     # For now, let's check scanner_names instead

@@ -74,9 +74,10 @@ def style_text(text: str, **kwargs: Any) -> str:
     return text
 
 
-def expand_paths(paths: tuple[str, ...]) -> list[str]:
+def expand_paths(paths: tuple[str, ...]) -> tuple[list[str], list[str]]:
     """Expand and validate input paths with type safety."""
     expanded: list[str] = []
+    missing_globs: list[str] = []
     for path_str in paths:
         # Handle glob patterns and resolve paths
         path = Path(path_str)
@@ -85,10 +86,13 @@ def expand_paths(paths: tuple[str, ...]) -> list[str]:
             import glob
 
             matches = glob.glob(path_str, recursive=True)
-            expanded.extend(matches)
+            if matches:
+                expanded.extend(matches)
+            else:
+                missing_globs.append(path_str)
         else:
             expanded.append(str(path.resolve()) if path.exists() else path_str)
-    return expanded
+    return expanded, missing_globs
 
 
 def create_progress_callback_wrapper(progress_callback: Any | None, spinner: Any | None) -> Any | None:
@@ -562,7 +566,7 @@ def scan_command(
     record_scan_started(list(paths), telemetry_options)
 
     # Expand and validate paths with type safety
-    expanded_paths: list[str] = expand_paths(paths)
+    expanded_paths, missing_globs = expand_paths(paths)
 
     # Process DVC pointer files
     dvc_expanded_paths: list[str] = []
@@ -578,6 +582,29 @@ def scan_command(
 
     # Use the DVC-expanded paths as the final list
     expanded_paths = dvc_expanded_paths
+
+    if missing_globs:
+        click.echo(
+            style_text(
+                f"Warning: glob pattern(s) did not match any files: {', '.join(missing_globs)}",
+                fg="yellow",
+            ),
+            err=True,
+        )
+        click.echo("Note: glob expansion is only applied to local paths.", err=True)
+
+    if not expanded_paths:
+        click.echo(
+            style_text(
+                "No matching paths found. Check your paths or glob patterns.",
+                fg="red",
+                bold=True,
+            ),
+            err=True,
+        )
+        record_scan_failed(time.time() - scan_start_time, "No matching paths")
+        flush_telemetry()
+        sys.exit(2)
 
     # Generate smart defaults based on input analysis
     smart_defaults = generate_smart_defaults(expanded_paths)
@@ -2490,7 +2517,7 @@ def _format_debug_output(debug_info: dict[str, Any], verbose: bool) -> str:
             fg="yellow",
         )
     )
-    lines.append(style_text("https://github.com/promptfoo/promptfoo/issues", fg="cyan"))
+    lines.append(style_text("https://github.com/promptfoo/modelaudit/issues", fg="cyan"))
     lines.append("")
 
     # Quick diagnosis section
@@ -2607,6 +2634,16 @@ def debug(output_json: bool, verbose: bool) -> None:
 
 
 def main() -> None:
+    if sys.version_info < (3, 10):  # noqa: UP036 — intentional safety net for bypassed requires-python
+        click.echo(
+            click.style(
+                f"WARNING: modelaudit requires Python 3.10+, but you are running "
+                f"Python {sys.version_info[0]}.{sys.version_info[1]}. "
+                f"Please upgrade: https://www.promptfoo.dev/docs/model-audit/",
+                fg="yellow",
+            ),
+            err=True,
+        )
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",

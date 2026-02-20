@@ -24,21 +24,18 @@ DANGEROUS_TF_OPERATIONS = {
 # Python operations that require special handling
 PYTHON_OPS = ("PyFunc", "PyCall", "PyFuncStateless", "EagerPyFunc")
 
-# Defer TensorFlow availability check to avoid module-level imports
-HAS_TENSORFLOW: bool | None = None
+# Defer protobuf availability check to avoid module-level imports
+HAS_PROTOS: bool | None = None
 
 
-def _check_tensorflow() -> bool:
-    """Check if TensorFlow is available, with caching."""
-    global HAS_TENSORFLOW
-    if HAS_TENSORFLOW is None:
-        try:
-            import tensorflow as tf  # noqa: F401
+def _check_protos() -> bool:
+    """Check if TensorFlow protobuf stubs are available (vendored or from TensorFlow)."""
+    global HAS_PROTOS
+    if HAS_PROTOS is None:
+        import modelaudit.protos
 
-            HAS_TENSORFLOW = True
-        except ImportError:
-            HAS_TENSORFLOW = False
-    return HAS_TENSORFLOW
+        HAS_PROTOS = modelaudit.protos._check_vendored_protos()
+    return HAS_PROTOS
 
 
 # Create a placeholder for type hints when TensorFlow is not available
@@ -66,7 +63,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
     @classmethod
     def can_handle(cls, path: str) -> bool:
         """Check if this scanner can handle the given path"""
-        if not _check_tensorflow():
+        if not _check_protos():
             return False
 
         if os.path.isfile(path):
@@ -92,16 +89,16 @@ class TensorFlowSavedModelScanner(BaseScanner):
         # Store the file path for use in issue locations
         self.current_file_path = path
 
-        # Check if TensorFlow is installed
-        if not _check_tensorflow():
+        # Check if TensorFlow protos are available (vendored or from TensorFlow)
+        if not _check_protos():
             result = self._create_result()
             result.add_check(
-                name="TensorFlow Library Check",
+                name="TensorFlow Protos Check",
                 passed=False,
-                message="TensorFlow not installed, cannot scan SavedModel. Install modelaudit[tensorflow].",
+                message="TensorFlow protos unavailable. Vendored protos may be missing or corrupted.",
                 severity=IssueSeverity.WARNING,
                 location=path,
-                details={"path": path, "required_package": "tensorflow"},
+                details={"path": path, "note": "Vendored protos should be bundled; reinstall if missing"},
             )
             result.finish(success=False)
             return result
@@ -141,7 +138,10 @@ class TensorFlowSavedModelScanner(BaseScanner):
             return result
 
         try:
-            # Import the actual SavedModel from TensorFlow
+            # Import vendored protos module (sets up sys.path for tensorflow.* imports)
+            # Order matters: modelaudit.protos must be imported first to set up sys.path
+            import modelaudit.protos  # noqa: F401, I001
+
             from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
 
             with open(path, "rb") as f:
