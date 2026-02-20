@@ -509,19 +509,6 @@ modelaudit your-model.onnx
 # Output: "Install with 'pip install modelaudit[onnx]'"
 ```
 
-### Manage the scan cache
-
-```bash
-# See cache size and hit rate
-modelaudit cache stats
-
-# Remove old entries (default: older than 30 days)
-modelaudit cache cleanup --max-age 14
-
-# Clear everything (use --dry-run to preview)
-modelaudit cache clear --dry-run
-```
-
 ### Exit Codes
 
 - `0` - No security issues found
