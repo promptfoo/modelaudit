@@ -1,3 +1,5 @@
+"""Scanner for detecting anomalous weight distributions in model files."""
+
 import os
 import zipfile
 from typing import Any, ClassVar

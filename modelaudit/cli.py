@@ -1,3 +1,5 @@
+"""Command-line interface for ModelAudit security scanner."""
+
 import json
 import logging
 import os
