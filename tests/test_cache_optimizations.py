@@ -293,13 +293,12 @@ class TestCacheOptimizationPerformance:
 
             print(f"\nOptimized fingerprints: {opt_time:.4f}s ({len(opt_result)} fingerprints)")
             print(f"Traditional fingerprints: {traditional_time:.4f}s")
-
-        if opt_time > 0:
-            improvement = traditional_time / opt_time
-            print(f"Performance improvement: {improvement:.1f}x")
-            # Micro-benchmarks are noisy in shared CI/dev environments.
-            # Guard against major regressions without requiring a strict speedup.
-            assert opt_time <= traditional_time * 1.5
+            if opt_time > 0:
+                improvement = traditional_time / opt_time
+                print(f"Performance improvement: {improvement:.1f}x")
+                # Micro-benchmarks are noisy in shared CI/dev environments.
+                # Guard against major regressions without requiring a strict speedup.
+                assert opt_time <= traditional_time * 1.5
 
     def test_cache_configuration_decisions(self):
         """Test cache configuration decision making performance."""

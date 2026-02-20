@@ -1,4 +1,4 @@
-# Open Source Readiness Plan
+# Open-Source Readiness Plan
 
 **Status:** HEAD CHANGES COMPLETE (HISTORY REWRITE PENDING)
 **Created:** 2026-02-18
@@ -6,7 +6,7 @@
 
 ## Overview
 
-This plan prepares the ModelAudit repository for public open source release. It covers
+This plan prepares the ModelAudit repository for public open-source release. It covers
 license compliance, sensitive content redaction, community files, metadata fixes, and
 recommendations for git history rewriting.
 
@@ -26,7 +26,7 @@ recommendations for git history rewriting.
 
 ### 1b. Redact detection-pattern details from docs
 
-- [x] Keep detection implementation details out user-facing docs/README.
+- [x] Keep detection implementation details out of user-facing docs/README.
 - [x] Keep actionable security test details in contributor-facing docs (`docs/agents/security-checks.md`).
 - [x] Redact the "KEEP PRIVATE" section in `AGENTS.md` (it paradoxically reveals what's sensitive)
 - [x] Redact "Known Issues & False Positives" evasion details from `CONTRIBUTING.md`

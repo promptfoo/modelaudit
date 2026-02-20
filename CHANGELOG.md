@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.25](https://github.com/promptfoo/modelaudit/compare/v0.2.24...v0.2.25) (2026-02-12)
+## [0.2.25] - 2026-02-12
 
 ### Features
 
@@ -37,7 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - remove variable shadowing for skip_file_types parameter ([#489](https://github.com/promptfoo/modelaudit/issues/489)) ([bcf99ea](https://github.com/promptfoo/modelaudit/commit/bcf99ea7d0e62b358c130754c38e7f5be3282e18))
 - use deterministic data patterns in anomaly detector tests ([#477](https://github.com/promptfoo/modelaudit/issues/477)) ([df11759](https://github.com/promptfoo/modelaudit/commit/df11759ee22628aed6ed541f819fd5f26920a38b))
 
-## [0.2.24](https://github.com/promptfoo/modelaudit/compare/v0.2.23...v0.2.24) (2025-12-23)
+## [0.2.24] - 2025-12-23
 
 ### Bug Fixes
 
@@ -46,7 +46,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps:** update dependency xgboost to v3 ([#469](https://github.com/promptfoo/modelaudit/issues/469)) ([97adbbc](https://github.com/promptfoo/modelaudit/commit/97adbbc0cfe3699264ade222b9949a98f5e6878d))
 - resolve release-please CHANGELOG formatting race condition ([#457](https://github.com/promptfoo/modelaudit/issues/457)) ([4347b83](https://github.com/promptfoo/modelaudit/commit/4347b83e652fde580437964f22feffdbed7b8731))
 
-## [0.2.23](https://github.com/promptfoo/modelaudit/compare/v0.2.22...v0.2.23) (2025-12-12)
+## [0.2.23] - 2025-12-12
 
 ### Documentation
 
@@ -59,6 +59,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **feat**: add Git LFS pointer detection - detects when model files are Git LFS pointers (small text files) instead of actual model content, reports as CRITICAL issue with remediation steps including `git lfs pull` instructions
 - **ux**: add Python version warnings — runtime `warnings.warn()` in `__init__.py` and click-styled stderr warning in CLI for Python < 3.10, plus README troubleshooting section for users stuck on version 0.2.5
+- **docs**: add `SECURITY.md` vulnerability disclosure policy and contributor community scaffolding (`CODE_OF_CONDUCT.md`, issue/PR templates, `CODEOWNERS`)
 
 ### Changed
 

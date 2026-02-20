@@ -106,6 +106,14 @@ def _resolve_cloud_path(entry_name: str, base_dir: Path) -> tuple[Path, bool]:
     return resolved, _is_within_directory(base_dir, resolved)
 
 
+def _parse_size_value(size_value: Any) -> int:
+    """Parse a cloud-reported size value to a non-negative integer."""
+    parsed_size = int(size_value)
+    if parsed_size < 0:
+        raise ValueError(f"size must be non-negative, got {parsed_size}")
+    return parsed_size
+
+
 def get_cloud_object_size(fs: Any, url: str, strict: bool = False) -> int | None:
     """Get the size of a cloud storage object or directory.
 
@@ -123,8 +131,12 @@ def get_cloud_object_size(fs: Any, url: str, strict: bool = False) -> int | None
             raise ValueError(f"Unable to read cloud object info for {url}: {exc}") from exc
         return None
 
+    top_level_size_error: Exception | None = None
     if "size" in info:
-        return int(info["size"])
+        try:
+            return _parse_size_value(info["size"])
+        except (TypeError, ValueError) as exc:
+            top_level_size_error = exc
 
     total_size = 0
     walk_error: Exception | None = None
@@ -137,7 +149,7 @@ def get_cloud_object_size(fs: Any, url: str, strict: bool = False) -> int | None
                 try:
                     file_info = fs.info(file_path)
                     if "size" in file_info:
-                        total_size += int(file_info["size"])
+                        total_size += _parse_size_value(file_info["size"])
                 except Exception:
                     continue
         if total_size > 0:
@@ -162,7 +174,10 @@ def get_cloud_object_size(fs: Any, url: str, strict: bool = False) -> int | None
                 if name:
                     _collect(name)
             elif "size" in entry:
-                total_size += int(entry["size"])
+                try:
+                    total_size += _parse_size_value(entry["size"])
+                except Exception:
+                    continue
 
     _collect(url)
     if total_size > 0:
@@ -170,6 +185,8 @@ def get_cloud_object_size(fs: Any, url: str, strict: bool = False) -> int | None
 
     if strict:
         error_parts = []
+        if top_level_size_error is not None:
+            error_parts.append(f"invalid size from info(): {top_level_size_error}")
         if walk_error:
             error_parts.append(f"walk() failed: {walk_error}")
         if ls_error:

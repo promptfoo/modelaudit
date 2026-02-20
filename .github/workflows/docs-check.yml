@@ -41,7 +41,7 @@ jobs:
         if: steps.changed-files.outputs.any_changed == 'true'
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: "22"
+          node-version: "24"
 
       - name: Install Node dependencies
         if: steps.changed-files.outputs.any_changed == 'true'
@@ -63,6 +63,7 @@ jobs:
         run: echo "No documentation files changed, skipping formatting check"
 
       - name: Check for broken links in markdown
+        if: steps.changed-files.outputs.any_changed == 'true'
         uses: gaurav-nelson/github-action-markdown-link-check@5c5dfc0ac2e225883c0e5f03a85311ec2830d368 # v1
         with:
           use-quiet-mode: "yes"

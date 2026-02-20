@@ -38,6 +38,9 @@ This policy does **not** cover:
 - The promptfoo.dev documentation website
 - Models scanned by ModelAudit (report those to the model publisher)
 
+If you discover a malicious or vulnerable third-party model artifact, please report it to the model publisher.
+Only report privately to us when the issue is in ModelAudit itself (for example, a detection bypass or scanner vulnerability).
+
 ## Supported Versions
 
 | Version | Supported |

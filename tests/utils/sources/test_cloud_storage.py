@@ -156,7 +156,7 @@ def test_download_from_cloud_analysis_failure(mock_analyze, mock_fs):
 class TestCloudObjectSize:
     """Test cloud object size retrieval."""
 
-    def test_get_cloud_object_size_single_file(self):
+    def test_get_cloud_object_size_single_file(self) -> None:
         """Test getting size of a single file."""
         fs = MagicMock()
         fs.info.return_value = {"size": 1024 * 1024}  # 1 MB
@@ -164,7 +164,7 @@ class TestCloudObjectSize:
         size = get_cloud_object_size(fs, "s3://bucket/file.bin")
         assert size == 1024 * 1024
 
-    def test_get_cloud_object_size_directory(self):
+    def test_get_cloud_object_size_directory(self) -> None:
         """Test getting total size of a directory."""
         fs = MagicMock()
         fs.info.return_value = {}  # No size means it's a directory
@@ -185,13 +185,31 @@ class TestCloudObjectSize:
         size = get_cloud_object_size(fs, "s3://bucket/dir/")
         assert size == (1024 + 2048 + 512) * 1024  # 3.5 MB
 
-    def test_get_cloud_object_size_error(self):
+    def test_get_cloud_object_size_error(self) -> None:
         """Test size retrieval returns None on error."""
         fs = MagicMock()
         fs.info.side_effect = Exception("Access denied")
 
         size = get_cloud_object_size(fs, "s3://bucket/file.bin")
         assert size is None
+
+    def test_get_cloud_object_size_invalid_top_level_size_non_strict(self) -> None:
+        """Test invalid top-level size values are ignored in non-strict mode."""
+        fs = MagicMock()
+        fs.info.return_value = {"size": None}
+
+        size = get_cloud_object_size(fs, "s3://bucket/file.bin")
+        assert size is None
+
+    def test_get_cloud_object_size_invalid_top_level_size_strict(self) -> None:
+        """Test invalid top-level size values raise ValueError in strict mode."""
+        fs = MagicMock()
+        fs.info.return_value = {"size": None}
+        fs.walk.side_effect = RuntimeError("walk unavailable")
+        fs.ls.side_effect = RuntimeError("ls unavailable")
+
+        with pytest.raises(ValueError, match="invalid size from info\\(\\)"):
+            get_cloud_object_size(fs, "s3://bucket/file.bin", strict=True)
 
 
 class TestDiskSpaceCheckingForCloud:
@@ -285,7 +303,12 @@ class TestCloudPathSecurity:
 
     @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
     @patch("fsspec.filesystem")
-    def test_download_rejects_path_traversal(self, mock_fs_class, mock_analyze, tmp_path):
+    def test_download_rejects_path_traversal(
+        self,
+        mock_fs_class: MagicMock,
+        mock_analyze: AsyncMock,
+        tmp_path: Path,
+    ) -> None:
         fs = make_fs_mock()
         fs.info.return_value = {}
         mock_fs_class.return_value = fs
@@ -319,7 +342,11 @@ class TestCloudPathSecurity:
 
     @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
     @patch("fsspec.filesystem")
-    def test_download_continues_when_size_cannot_be_determined(self, mock_fs_class, mock_analyze):
+    def test_download_continues_when_size_cannot_be_determined(
+        self,
+        mock_fs_class: MagicMock,
+        mock_analyze: AsyncMock,
+    ) -> None:
         fs = make_fs_mock()
         fs.info.side_effect = RuntimeError("permission denied")
         mock_fs_class.return_value = fs
@@ -344,7 +371,11 @@ class TestCloudPathSecurity:
 
     @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
     @patch("fsspec.filesystem")
-    def test_streaming_download_rejects_path_traversal(self, mock_fs_class, mock_analyze):
+    def test_streaming_download_rejects_path_traversal(
+        self,
+        mock_fs_class: MagicMock,
+        mock_analyze: AsyncMock,
+    ) -> None:
         fs = make_fs_mock()
         mock_fs_class.return_value = fs
 

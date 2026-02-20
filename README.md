@@ -108,6 +108,7 @@ modelaudit model.dvc
 - `GOOGLE_APPLICATION_CREDENTIALS` for GCS
 - `MLFLOW_TRACKING_URI` for MLflow registry access
 - `JFROG_API_TOKEN` or `JFROG_ACCESS_TOKEN` for JFrog Artifactory
+- Store credentials in environment variables or a secrets manager, and never commit tokens/keys.
 
 ## Installation
 
