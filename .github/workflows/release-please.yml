@@ -202,11 +202,20 @@ jobs:
           set -euo pipefail
           EXPECTED_VERSION="${{ needs.release-please.outputs.version }}"
 
+          shopt -s nullglob
+          wheel_artifacts=(dist/modelaudit-*.whl)
+          if [[ ${#wheel_artifacts[@]} -ne 1 ]]; then
+            echo "ERROR: Expected exactly 1 wheel artifact for install smoke test, found ${#wheel_artifacts[@]}"
+            ls -la dist/
+            exit 1
+          fi
+          WHEEL_ARTIFACT="${wheel_artifacts[0]}"
+
           python -m venv /tmp/modelaudit-wheel-smoke
           source /tmp/modelaudit-wheel-smoke/bin/activate
 
           python -m pip install --upgrade pip
-          python -m pip install "dist/modelaudit-${EXPECTED_VERSION}-py3-none-any.whl"
+          python -m pip install "${WHEEL_ARTIFACT}"
 
           INSTALLED_VERSION="$(python -c "import importlib.metadata as m; print(m.version('modelaudit'))")"
           if [[ "$INSTALLED_VERSION" != "$EXPECTED_VERSION" ]]; then
@@ -218,6 +227,7 @@ jobs:
           python - <<'PY'
           import importlib.metadata as md
 
+          # Keep these expected URLs in sync with [project.urls] in pyproject.toml.
           required = {
               "Bug Tracker": "https://github.com/promptfoo/modelaudit/issues",
               "Changelog": "https://github.com/promptfoo/modelaudit/blob/main/CHANGELOG.md",
@@ -248,20 +258,21 @@ jobs:
           import subprocess
           import tempfile
 
-          test_dir = pathlib.Path(tempfile.mkdtemp(prefix="modelaudit-wheel-smoke-"))
-          test_file = test_dir / "smoke.pkl"
-          with test_file.open("wb") as f:
-              pickle.dump({"smoke": True}, f)
+          with tempfile.TemporaryDirectory(prefix="modelaudit-wheel-smoke-") as tmpdir:
+              test_dir = pathlib.Path(tmpdir)
+              test_file = test_dir / "smoke.pkl"
+              with test_file.open("wb") as f:
+                  pickle.dump({"smoke": True}, f)
 
-          completed = subprocess.run(
-              ["modelaudit", str(test_file), "--format", "json"],
-              capture_output=True,
-              text=True,
-              check=False,
-          )
-          print(completed.stdout)
-          if completed.returncode not in (0, 1):
-              raise SystemExit(f"Unexpected modelaudit exit code during wheel smoke test: {completed.returncode}")
+              completed = subprocess.run(
+                  ["modelaudit", str(test_file), "--format", "json"],
+                  capture_output=True,
+                  text=True,
+                  check=False,
+              )
+              print(completed.stdout)
+              if completed.returncode not in (0, 1):
+                  raise SystemExit(f"Unexpected modelaudit exit code during wheel smoke test: {completed.returncode}")
           PY
 
       - name: Smoke test sdist install in clean environment
@@ -269,11 +280,20 @@ jobs:
           set -euo pipefail
           EXPECTED_VERSION="${{ needs.release-please.outputs.version }}"
 
+          shopt -s nullglob
+          sdist_artifacts=(dist/modelaudit-*.tar.gz)
+          if [[ ${#sdist_artifacts[@]} -ne 1 ]]; then
+            echo "ERROR: Expected exactly 1 sdist artifact for install smoke test, found ${#sdist_artifacts[@]}"
+            ls -la dist/
+            exit 1
+          fi
+          SDIST_ARTIFACT="${sdist_artifacts[0]}"
+
           python -m venv /tmp/modelaudit-sdist-smoke
           source /tmp/modelaudit-sdist-smoke/bin/activate
 
           python -m pip install --upgrade pip
-          python -m pip install "dist/modelaudit-${EXPECTED_VERSION}.tar.gz"
+          python -m pip install "${SDIST_ARTIFACT}"
 
           INSTALLED_VERSION="$(python -c "import importlib.metadata as m; print(m.version('modelaudit'))")"
           if [[ "$INSTALLED_VERSION" != "$EXPECTED_VERSION" ]]; then
@@ -290,20 +310,21 @@ jobs:
           import subprocess
           import tempfile
 
-          test_dir = pathlib.Path(tempfile.mkdtemp(prefix="modelaudit-sdist-smoke-"))
-          test_file = test_dir / "smoke.pkl"
-          with test_file.open("wb") as f:
-              pickle.dump({"smoke": True}, f)
+          with tempfile.TemporaryDirectory(prefix="modelaudit-sdist-smoke-") as tmpdir:
+              test_dir = pathlib.Path(tmpdir)
+              test_file = test_dir / "smoke.pkl"
+              with test_file.open("wb") as f:
+                  pickle.dump({"smoke": True}, f)
 
-          completed = subprocess.run(
-              ["modelaudit", str(test_file), "--format", "json"],
-              capture_output=True,
-              text=True,
-              check=False,
-          )
-          print(completed.stdout)
-          if completed.returncode not in (0, 1):
-              raise SystemExit(f"Unexpected modelaudit exit code during sdist smoke test: {completed.returncode}")
+              completed = subprocess.run(
+                  ["modelaudit", str(test_file), "--format", "json"],
+                  capture_output=True,
+                  text=True,
+                  check=False,
+              )
+              print(completed.stdout)
+              if completed.returncode not in (0, 1):
+                  raise SystemExit(f"Unexpected modelaudit exit code during sdist smoke test: {completed.returncode}")
           PY
 
       - name: Upload build artifacts
