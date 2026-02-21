@@ -50,7 +50,7 @@ jobs:
 
       - name: Setup Node.js
         if: steps.check-pr.outputs.has_pr == 'true'
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238 # v6.2.0
         with:
           node-version: "24"
 
@@ -124,6 +124,9 @@ jobs:
             ls -la dist/
             exit 1
           fi
+
+      - name: Validate package metadata
+        run: uvx twine check dist/*
 
       - name: Upload build artifacts
         id: upload

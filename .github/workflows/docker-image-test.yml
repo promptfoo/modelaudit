@@ -84,6 +84,15 @@ jobs:
           # This should fail gracefully
           docker run --rm modelaudit:lightweight invalid-command && exit 1 || echo "Command properly rejected invalid input"
 
+      - name: Scan image for vulnerabilities
+        uses: aquasecurity/trivy-action@c1824fd6edce30d7ab345a9989de00bbd46ef284 # 0.34.0
+        with:
+          image-ref: modelaudit:lightweight
+          format: table
+          exit-code: "1"
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+
       - name: Test lightweight container with actual scan
         run: |
           # Create a test model file using Docker to ensure Python is available
@@ -132,6 +141,15 @@ jobs:
         run: |
           # Test that the package is properly installed
           docker run --rm modelaudit:full --version
+
+      - name: Scan image for vulnerabilities
+        uses: aquasecurity/trivy-action@c1824fd6edce30d7ab345a9989de00bbd46ef284 # 0.34.0
+        with:
+          image-ref: modelaudit:full
+          format: table
+          exit-code: "1"
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
 
       - name: Verify ML dependencies in full image
         run: |
