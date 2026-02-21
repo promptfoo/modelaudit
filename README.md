@@ -148,6 +148,28 @@ docker run --rm -v "$(pwd)":/app ghcr.io/promptfoo/modelaudit:latest model.pkl
 
 Exit codes: `0` clean, `1` issues found, `2` errors.
 
+## Telemetry and Privacy
+
+ModelAudit includes telemetry for product reliability and usage analytics.
+
+- Collected metadata can include command usage, scan timing, scanner/file-type usage, issue severity/type aggregates, and model path or URL identifiers.
+- Model files are scanned locally and ModelAudit does not upload model binary contents as telemetry events.
+- Telemetry is disabled automatically in CI/test environments and in editable development installs by default.
+
+Opt out explicitly with either environment variable:
+
+```bash
+export PROMPTFOO_DISABLE_TELEMETRY=1
+# or
+export NO_ANALYTICS=1
+```
+
+To opt in during editable/development installs:
+
+```bash
+export MODELAUDIT_TELEMETRY_DEV=1
+```
+
 ## Output Examples
 
 ```bash
@@ -171,6 +193,7 @@ modelaudit model.pkl --format sarif --output results.sarif
 - **[Full docs](https://www.promptfoo.dev/docs/model-audit/)** — setup, configuration, and advanced usage
 - **[Usage examples](https://www.promptfoo.dev/docs/model-audit/usage/)** — CI/CD integration, remote scanning, SBOM generation
 - **[Supported formats](https://www.promptfoo.dev/docs/model-audit/scanners/)** — detailed scanner documentation
+- **[Support policy](SUPPORT.md)** — supported Python/OS versions and maintenance policy
 - **Troubleshooting** — run `modelaudit doctor --show-failed` to check scanner availability
 
 ## License
