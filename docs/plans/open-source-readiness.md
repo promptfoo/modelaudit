@@ -135,11 +135,11 @@ This section tracks high-value work after the initial hardening pass. Use `[P0]`
 
 - [x] [P0] Add README section explaining telemetry behavior and explicit opt-out controls.
 - [x] [P0] Add clear support policy (supported versions and maintenance window).
-- [ ] [P1] Add "security model and limitations" page for users.
+- [x] [P1] Add "security model and limitations" page for users.
 - [x] [P1] Add "false positives/false negatives" reporting guidelines.
-- [ ] [P1] Add contributor quickstart focused on adding a new scanner safely.
-- [ ] [P1] Add compatibility matrix page for file formats vs optional dependencies.
-- [ ] [P1] Add offline/air-gapped usage guidance.
+- [x] [P1] Add contributor quickstart focused on adding a new scanner safely.
+- [x] [P1] Add compatibility matrix page for file formats vs optional dependencies.
+- [x] [P1] Add offline/air-gapped usage guidance.
 - [ ] [P2] Add architecture diagram for scanner pipeline.
 - [ ] [P2] Add docs on cache behavior, data retention, and local file handling.
 - [ ] [P2] Add troubleshooting decision tree for common scan failures.
