@@ -85,17 +85,17 @@ This section tracks high-value work after the initial hardening pass. Use `[P0]`
 - [ ] [P1] Prevent branch deletions and force-pushes on protected branches.
 - [ ] [P1] Restrict who can create/modify tags matching `v*`.
 - [ ] [P1] Add at least one backup maintainer to reduce single-maintainer risk.
-- [ ] [P1] Expand `.github/CODEOWNERS` with per-area ownership (scanners, docs, CI, release).
-- [ ] [P2] Add `MAINTAINERS.md` with roles (maintainer, reviewer, triage).
+- [x] [P1] Expand `.github/CODEOWNERS` with per-area ownership (scanners, docs, CI, release).
+- [x] [P2] Add `MAINTAINERS.md` with roles (maintainer, reviewer, triage).
 - [ ] [P2] Define maintainer response expectations (issues/PR triage SLO).
 
 ### 7b. Security Program & Supply Chain
 
 - [ ] [P0] Enable GitHub security features: dependency graph, Dependabot alerts, secret scanning, push protection.
 - [ ] [P0] Enable and monitor private vulnerability reporting (via `SECURITY.md` workflow).
-- [ ] [P0] Add CodeQL workflow for Python and GitHub Actions analysis.
-- [ ] [P0] Add dependency vulnerability scanning in CI (`pip-audit` or equivalent).
-- [ ] [P0] Add container vulnerability scanning for Docker images (e.g., Trivy/Grype).
+- [x] [P0] Add CodeQL workflow for Python and GitHub Actions analysis.
+- [x] [P0] Add dependency vulnerability scanning in CI (`pip-audit` or equivalent).
+- [x] [P0] Add container vulnerability scanning for Docker images (e.g., Trivy/Grype).
 - [ ] [P1] Add provenance attestations for release artifacts (SLSA/Sigstore).
 - [ ] [P1] Add artifact signing strategy for wheels/sdists and release tags.
 - [ ] [P1] Add SBOM generation to release workflow and attach SBOM to releases.
@@ -120,7 +120,7 @@ This section tracks high-value work after the initial hardening pass. Use `[P0]`
 
 ### 7d. CI/CD Quality Gates
 
-- [ ] [P0] Add scheduled nightly CI run for full matrix (including slow/integration/performance tests).
+- [x] [P0] Add scheduled nightly CI run for full matrix (including slow/integration/performance tests).
 - [ ] [P1] Add compatibility smoke tests for all optional extras bundles.
 - [ ] [P1] Add reproducibility checks for generated protobuf artifacts.
 - [ ] [P1] Add CI checks for minimum supported Python/NumPy combinations as explicit gates.
@@ -133,10 +133,10 @@ This section tracks high-value work after the initial hardening pass. Use `[P0]`
 
 ### 7e. Documentation & User Trust
 
-- [ ] [P0] Add README section explaining telemetry behavior and explicit opt-out controls.
-- [ ] [P0] Add clear support policy (supported versions and maintenance window).
+- [x] [P0] Add README section explaining telemetry behavior and explicit opt-out controls.
+- [x] [P0] Add clear support policy (supported versions and maintenance window).
 - [ ] [P1] Add "security model and limitations" page for users.
-- [ ] [P1] Add "false positives/false negatives" reporting guidelines.
+- [x] [P1] Add "false positives/false negatives" reporting guidelines.
 - [ ] [P1] Add contributor quickstart focused on adding a new scanner safely.
 - [ ] [P1] Add compatibility matrix page for file formats vs optional dependencies.
 - [ ] [P1] Add offline/air-gapped usage guidance.
@@ -157,9 +157,9 @@ This section tracks high-value work after the initial hardening pass. Use `[P0]`
 ### 7g. Community & Project Operations
 
 - [ ] [P1] Enable GitHub Discussions with categories (Q&A, Ideas, Show and Tell).
-- [ ] [P1] Define label taxonomy (`good first issue`, `help wanted`, `security`, `needs-repro`).
+- [x] [P1] Define label taxonomy (`good first issue`, `help wanted`, `security`, `needs-repro`).
 - [ ] [P1] Seed onboarding issues for first-time external contributors.
-- [ ] [P1] Add issue triage playbook for maintainers.
+- [x] [P1] Add issue triage playbook for maintainers.
 - [ ] [P2] Add stale-issue policy and automation.
 - [ ] [P2] Publish roadmap/milestones for upcoming releases.
 - [ ] [P2] Add community acknowledgements/contributors section.
