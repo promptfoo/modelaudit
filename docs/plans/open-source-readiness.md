@@ -2,8 +2,8 @@
 
 **Status:** HEAD CHANGES COMPLETE; NEXT-PHASE CHECKLIST ACTIVE
 **Created:** 2026-02-18
-**Updated:** 2026-02-21
-**Branch:** `chore/open-source-readiness`
+**Updated:** 2026-02-20
+**Branch:** `chore/open-source-next-phase-batch4`
 
 ## Overview
 
@@ -96,12 +96,12 @@ This section tracks high-value work after the initial hardening pass. Use `[P0]`
 - [x] [P0] Add CodeQL workflow for Python and GitHub Actions analysis.
 - [x] [P0] Add dependency vulnerability scanning in CI (`pip-audit` or equivalent).
 - [x] [P0] Add container vulnerability scanning for Docker images (e.g., Trivy/Grype).
-- [ ] [P1] Add provenance attestations for release artifacts (SLSA/Sigstore).
-- [ ] [P1] Add artifact signing strategy for wheels/sdists and release tags.
+- [x] [P1] Add provenance attestations for release artifacts (SLSA/Sigstore).
+- [x] [P1] Add artifact signing strategy for wheels/sdists and release tags.
 - [ ] [P1] Add SBOM generation to release workflow and attach SBOM to releases.
-- [ ] [P1] Add CVE handling process (triage, fix, advisory publication flow).
+- [x] [P1] Add CVE handling process (triage, fix, advisory publication flow).
 - [ ] [P1] Add security advisory templates for maintainers.
-- [ ] [P1] Add a lightweight public threat model document.
+- [x] [P1] Add a lightweight public threat model document.
 - [ ] [P2] Add fuzzing strategy for binary/model parsers.
 - [ ] [P2] Add periodic external security review cadence (quarterly/biannual).
 
@@ -110,8 +110,8 @@ This section tracks high-value work after the initial hardening pass. Use `[P0]`
 - [x] [P0] Add `twine check dist/*` to release workflow.
 - [x] [P0] Add clean-room install smoke tests from built wheel/sdist.
 - [x] [P0] Ensure release workflow validates exactly one version in `dist/` artifacts.
-- [ ] [P1] Publish Docker images in CI (if advertised in README), with semver tags and digests.
-- [ ] [P1] Add GHCR publish workflow (or remove GHCR usage docs if not publishing).
+- [x] [P1] Publish Docker images in CI (if advertised in README), with semver tags and digests.
+- [x] [P1] Add GHCR publish workflow (or remove GHCR usage docs if not publishing).
 - [x] [P1] Document release rollback procedure.
 - [x] [P1] Add explicit pre-release checklist (version, changelog, smoke test, publish, verify).
 - [x] [P1] Validate PyPI metadata and project URLs on every release.
@@ -121,11 +121,11 @@ This section tracks high-value work after the initial hardening pass. Use `[P0]`
 ### 7d. CI/CD Quality Gates
 
 - [x] [P0] Add scheduled nightly CI run for full matrix (including slow/integration/performance tests).
-- [ ] [P1] Add compatibility smoke tests for all optional extras bundles.
-- [ ] [P1] Add reproducibility checks for generated protobuf artifacts.
-- [ ] [P1] Add CI checks for minimum supported Python/NumPy combinations as explicit gates.
+- [x] [P1] Add compatibility smoke tests for all optional extras bundles.
+- [x] [P1] Add reproducibility checks for generated protobuf artifacts.
+- [x] [P1] Add CI checks for minimum supported Python/NumPy combinations as explicit gates.
 - [ ] [P1] Add regression corpus validation for malicious and benign fixtures.
-- [ ] [P1] Add `uv lock` consistency check in CI.
+- [x] [P1] Add `uv lock` consistency check in CI.
 - [ ] [P2] Add performance budget checks to catch scanner regressions.
 - [ ] [P2] Add mutation/property-based tests for high-risk scanners.
 - [ ] [P2] Add flaky-test detector/reporting.
@@ -146,11 +146,11 @@ This section tracks high-value work after the initial hardening pass. Use `[P0]`
 
 ### 7f. Legal, Licensing, and Compliance
 
-- [ ] [P0] Generate and review third-party license inventory for runtime + dev dependencies.
-- [ ] [P0] Confirm all bundled third-party files include required notices in distributions.
-- [ ] [P1] Add `THIRD_PARTY_NOTICES.md` if legal review requires consolidated notices.
-- [ ] [P1] Add explicit policy for adding new dependencies (security + license review gate).
-- [ ] [P1] Add license compliance check to CI for dependency updates.
+- [x] [P0] Generate and review third-party license inventory for runtime + dev dependencies.
+- [x] [P0] Confirm all bundled third-party files include required notices in distributions.
+- [x] [P1] Add `THIRD_PARTY_NOTICES.md` if legal review requires consolidated notices.
+- [x] [P1] Add explicit policy for adding new dependencies (security + license review gate).
+- [x] [P1] Add license compliance check to CI for dependency updates.
 - [ ] [P2] Add trademark/branding usage guidance for external forks.
 - [ ] [P2] Add policy for test corpus licensing provenance documentation.
 
@@ -158,9 +158,8 @@ This section tracks high-value work after the initial hardening pass. Use `[P0]`
 
 - [ ] [P1] Enable GitHub Discussions with categories (Q&A, Ideas, Show and Tell).
 - [x] [P1] Define label taxonomy (`good first issue`, `help wanted`, `security`, `needs-repro`).
-- [ ] [P1] Seed onboarding issues for first-time external contributors.
+- [x] [P1] Seed onboarding issues for first-time external contributors.
 - [x] [P1] Add issue triage playbook for maintainers.
-- [ ] [P2] Add stale-issue policy and automation.
 - [ ] [P2] Publish roadmap/milestones for upcoming releases.
 - [ ] [P2] Add community acknowledgements/contributors section.
 - [ ] [P2] Define escalation path for abuse/moderation beyond CODE_OF_CONDUCT contact.
