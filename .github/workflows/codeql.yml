@@ -40,6 +40,7 @@ jobs:
         uses: github/codeql-action/analyze@45580472a5bb82c4681c4ac726cfdb60060c2ee1 # v3
         with:
           category: "/language:python"
+          upload: never
 
   analyze-actions:
     name: Analyze GitHub Actions
@@ -59,3 +60,4 @@ jobs:
         uses: github/codeql-action/analyze@45580472a5bb82c4681c4ac726cfdb60060c2ee1 # v3
         with:
           category: "/language:actions"
+          upload: never
