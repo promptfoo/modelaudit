@@ -50,3 +50,38 @@ def ensure_high_recursion_limit(minimum_limit: int = 10000) -> int:
     if current_limit < minimum_limit:
         sys.setrecursionlimit(minimum_limit)
     return current_limit
+
+
+# Public API — lazy-loaded to avoid circular imports at package init time.
+_LAZY_IMPORTS: dict[str, tuple[str, str]] = {
+    "scan_file": ("modelaudit.core", "scan_file"),
+    "scan_model_directory_or_file": ("modelaudit.core", "scan_model_directory_or_file"),
+    "ScanResult": ("modelaudit.scanners.base", "ScanResult"),
+    "IssueSeverity": ("modelaudit.scanners.base", "IssueSeverity"),
+    "Issue": ("modelaudit.scanners.base", "Issue"),
+    "BaseScanner": ("modelaudit.scanners.base", "BaseScanner"),
+}
+
+
+def __getattr__(name: str) -> object:
+    if name in _LAZY_IMPORTS:
+        module_path, attr = _LAZY_IMPORTS[name]
+        import importlib
+
+        mod = importlib.import_module(module_path)
+        val = getattr(mod, attr)
+        # Cache on the module so __getattr__ is not called again
+        globals()[name] = val
+        return val
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+__all__ = [
+    "BaseScanner",
+    "Issue",
+    "IssueSeverity",
+    "ScanResult",
+    "__version__",
+    "scan_file",
+    "scan_model_directory_or_file",
+]
