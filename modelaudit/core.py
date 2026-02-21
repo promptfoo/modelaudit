@@ -1,3 +1,5 @@
+"""Core scanning engine for orchestrating model file security analysis."""
+
 import builtins
 import hashlib
 import logging

@@ -1,3 +1,5 @@
+"""Scanner for tar-archived model files (.tar, .tar.gz, .tgz)."""
+
 from __future__ import annotations
 
 import os

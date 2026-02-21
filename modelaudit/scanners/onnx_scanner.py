@@ -1,3 +1,5 @@
+"""Scanner for ONNX model files (.onnx)."""
+
 import os
 from pathlib import Path
 from typing import Any, ClassVar
