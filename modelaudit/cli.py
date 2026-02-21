@@ -2451,6 +2451,9 @@ def _get_cache_info() -> dict[str, Any]:
             home = str(Path.home())
             if cache_dir_path.startswith(home):
                 cache_dir_path = "~" + cache_dir_path[len(home) :]
+            elif os.path.isabs(cache_dir_path):
+                # Redact absolute paths in debug output while preserving a readable structure.
+                cache_dir_path = "~" + cache_dir_path
 
         return {
             "enabled": True,
