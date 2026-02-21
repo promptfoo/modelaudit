@@ -183,6 +183,26 @@ git push origin feature/your-feature-name
 - Add tests for new functionality
 - Update documentation as needed
 
+### Reporting False Positives / False Negatives
+
+Detection quality reports are high priority and should be reproducible.
+
+Include the following:
+
+- ModelAudit version and Python version
+- Exact command used (including flags)
+- Expected result vs actual result
+- Minimal reproducible sample (or a redacted/synthetic equivalent)
+- Why the behavior is a false positive or false negative
+
+If sharing a model artifact is not possible, include:
+
+- File format and extension
+- Relevant metadata/layout details
+- Representative snippets (redacted) that trigger or evade detection
+
+For sensitive security bypass details, use the private disclosure process in `SECURITY.md` instead of a public issue.
+
 ### Commit Message Format
 
 We use [Conventional Commits](https://www.conventionalcommits.org/) format:
