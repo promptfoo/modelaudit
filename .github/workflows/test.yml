@@ -159,7 +159,7 @@ jobs:
           APPROVED_KEYWORDS = [
               'mit', 'bsd', 'apache', 'isc', 'psf', 'python software foundation',
               'mpl', 'mozilla public', 'lgpl',
-              'public domain', 'unlicense', 'cc0',
+              'public domain', 'unlicense', 'cc0', '0bsd', 'zlib',
               '3-clause bsd',
           ]
 
@@ -179,7 +179,17 @@ jobs:
           # under NVIDIA's EULA and cannot be avoided when using CUDA-enabled torch.
           NVIDIA_PREFIXES = ('nvidia-', 'cuda-')
 
+          # Packages that ship no license metadata at all but are known-good.
+          # Verify manually on PyPI before adding here.
+          KNOWN_GOOD_NO_METADATA = {
+              'google-crc32c',  # Apache-2.0 (https://pypi.org/project/google-crc32c/)
+          }
+
           def is_approved(name: str, lic: str, classifiers: list[str]) -> bool:
+              # Known-good packages with broken/missing metadata
+              if name in KNOWN_GOOD_NO_METADATA:
+                  return True
+
               # NVIDIA CUDA transitive deps from PyTorch optional extra
               if any(name.lower().startswith(p) for p in NVIDIA_PREFIXES):
                   return True
@@ -206,12 +216,16 @@ jobs:
               if name == 'modelaudit':
                   continue
 
+              # Check both License (legacy) and License-Expression (PEP 639)
               lic = dist.metadata.get('License', '') or ''
+              lic_expr = dist.metadata.get('License-Expression', '') or ''
+              # Combine both fields for checking
+              combined_lic = f'{lic} {lic_expr}'.strip()
               classifiers = dist.metadata.get_all('Classifier') or []
 
-              if not is_approved(name, lic, classifiers):
+              if not is_approved(name, combined_lic, classifiers):
                   # Build a readable label for the failure message
-                  lic_display = lic.strip()[:80] if lic.strip() else '(empty)'
+                  lic_display = combined_lic[:80] if combined_lic else '(empty)'
                   lic_cls = [c.split(' :: ')[-1] for c in classifiers if 'License' in c]
                   if lic_cls:
                       lic_display += f' classifiers={lic_cls}'
