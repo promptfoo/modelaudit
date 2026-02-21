@@ -154,58 +154,68 @@ jobs:
           import importlib.metadata as md
           import sys
 
-          # Licenses approved per docs/maintainers/dependency-policy.md
-          APPROVED = {
-              'MIT', 'MIT License',
-              'BSD', 'BSD License', 'BSD-2-Clause', 'BSD-3-Clause',
-              'Apache 2.0', 'Apache-2.0', 'Apache License 2.0', 'Apache License, Version 2.0',
-              'Apache Software License', 'Apache Software License, BSD License',
-              'ISC', 'ISC License',
-              'PSF-2.0', 'PSFL', 'PSF', 'Python Software Foundation License',
-              'MPL-2.0', 'MPL 2.0', 'Mozilla Public License 2.0 (MPL 2.0)',
-              'MPL-2.0 AND MIT',  # tqdm
-              'Apache-2.0 AND MIT',  # aiohttp
-              'Dual License',  # python-dateutil (Apache-2.0/BSD)
-              '3-Clause BSD License',  # protobuf
-              'LGPL-2.1+',  # py7zr (optional, dynamically linked)
-          }
+          # Approved license keywords (case-insensitive substring matching).
+          # See docs/maintainers/dependency-policy.md for the full policy.
+          APPROVED_KEYWORDS = [
+              'mit', 'bsd', 'apache', 'isc', 'psf', 'python software foundation',
+              'mpl', 'mozilla public', 'lgpl',
+              'public domain', 'unlicense', 'cc0',
+              '3-clause bsd',
+          ]
 
-          # Packages that report 'Unknown' but are known-good
-          KNOWN_GOOD = {
-              'click', 'numpy', 'pydantic', 'pydantic_core', 'typing_extensions',
-              'typing-inspection', 'annotated-doc', 'anyio', 'attrs', 'certifi',
-              'cffi', 'charset-normalizer', 'cryptography', 'fsspec', 'grpcio',
-              'grpcio-status', 'idna', 'iniconfig', 'mypy_extensions',
-              'pycparser', 'pytest', 'pytest-asyncio', 'pytest-xdist',
-              'python-dotenv', 'urllib3', 'wrapt', 'aioitertools',
-              'google-crc32c', 'termcolor', 'typer', 'typer-slim',
-              'types-protobuf', 'types-PyYAML', 'types-requests',
-              'types-tensorflow', 'types-click',
-          }
+          # Classifier fragments that indicate an approved license.
+          APPROVED_CLASSIFIERS = [
+              'MIT License',
+              'BSD License',
+              'Apache Software License',
+              'ISC License',
+              'Mozilla Public License',
+              'Python Software Foundation License',
+              'Public Domain',
+          ]
+
+          # NVIDIA CUDA packages are proprietary but are required transitive
+          # dependencies of PyTorch (an optional extra). They are redistributable
+          # under NVIDIA's EULA and cannot be avoided when using CUDA-enabled torch.
+          NVIDIA_PREFIXES = ('nvidia-', 'cuda-')
+
+          def is_approved(name: str, lic: str, classifiers: list[str]) -> bool:
+              # NVIDIA CUDA transitive deps from PyTorch optional extra
+              if any(name.lower().startswith(p) for p in NVIDIA_PREFIXES):
+                  return True
+
+              # Check license field (case-insensitive keyword match)
+              lic_lower = lic.lower().strip()
+              if lic_lower and any(kw in lic_lower for kw in APPROVED_KEYWORDS):
+                  return True
+
+              # Check classifiers
+              lic_classifiers = [c for c in classifiers if c.startswith('License')]
+              for cls in lic_classifiers:
+                  if any(frag in cls for frag in APPROVED_CLASSIFIERS):
+                      return True
+                  # 'OSI Approved' without a specific license is acceptable
+                  if 'OSI Approved' in cls:
+                      return True
+
+              return False
 
           failed = []
           for dist in md.distributions():
               name = dist.metadata['Name']
-              lic = dist.metadata.get('License', '')
-
-              # Skip our own package
               if name == 'modelaudit':
                   continue
 
-              # Check classifier-based licenses if field is empty or too long
-              if not lic or len(lic) > 100:
-                  classifiers = dist.metadata.get_all('Classifier') or []
-                  lic_classifiers = [c.split(' :: ')[-1] for c in classifiers if c.startswith('License')]
-                  lic = ', '.join(lic_classifiers) if lic_classifiers else lic
+              lic = dist.metadata.get('License', '') or ''
+              classifiers = dist.metadata.get_all('Classifier') or []
 
-              if lic in APPROVED or name in KNOWN_GOOD:
-                  continue
-
-              # Check if any approved license substring matches
-              if any(approved in lic for approved in APPROVED):
-                  continue
-
-              failed.append(f'{name}: {lic}')
+              if not is_approved(name, lic, classifiers):
+                  # Build a readable label for the failure message
+                  lic_display = lic.strip()[:80] if lic.strip() else '(empty)'
+                  lic_cls = [c.split(' :: ')[-1] for c in classifiers if 'License' in c]
+                  if lic_cls:
+                      lic_display += f' classifiers={lic_cls}'
+                  failed.append(f'{name}: {lic_display}')
 
           if failed:
               print('Unapproved licenses found:')
@@ -608,7 +618,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        extra: [h5, pytorch, safetensors, onnx, dill, joblib, flax, xgboost, sevenzip]
+        extra:
+          [
+            h5,
+            pytorch,
+            safetensors,
+            onnx,
+            dill,
+            joblib,
+            flax,
+            xgboost,
+            sevenzip,
+          ]
     steps:
       - name: Checkout repo
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6

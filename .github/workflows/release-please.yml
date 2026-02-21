@@ -377,7 +377,9 @@ jobs:
         with:
           subject-path: "dist/*"
 
-      - name: Upload attestations to GitHub Release
+      # Upload wheel/sdist to the GitHub Release as an alternative download
+      # location alongside PyPI. --clobber ensures idempotency on re-runs.
+      - name: Upload build artifacts to GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
