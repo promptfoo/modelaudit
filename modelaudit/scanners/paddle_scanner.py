@@ -1,3 +1,5 @@
+"""Scanner for PaddlePaddle model files (.pdparams, .pdiparams, .pdmodel)."""
+
 import os
 import re
 from typing import ClassVar

@@ -1,3 +1,5 @@
+"""Scanner for PyTorch zip-archived model files (.pt, .pth)."""
+
 import io
 import logging
 import os

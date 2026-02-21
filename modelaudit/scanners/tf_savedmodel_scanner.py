@@ -1,3 +1,5 @@
+"""Scanner for TensorFlow SavedModel directories and files."""
+
 import logging
 import os
 from pathlib import Path

@@ -1,3 +1,5 @@
+"""Scanner for 7-Zip compressed model archives (.7z)."""
+
 import os
 import tempfile
 from typing import TYPE_CHECKING, Any, ClassVar

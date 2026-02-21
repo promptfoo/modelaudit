@@ -1,3 +1,5 @@
+"""Scanner for Keras HDF5 model files (.h5, .keras, .hdf5)."""
+
 import json
 import os
 from typing import Any, ClassVar
