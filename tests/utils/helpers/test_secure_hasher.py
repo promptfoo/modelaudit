@@ -6,7 +6,7 @@ import os
 
 import pytest
 
-from modelaudit.utils.secure_hasher import (
+from modelaudit.utils.helpers.secure_hasher import (
     SecureFileHasher,
     benchmark_hashing_performance,
     hash_file_secure,

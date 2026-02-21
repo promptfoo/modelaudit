@@ -140,7 +140,7 @@ class TestMemoryMappedScanner:
 class TestAdvancedFileHandler:
     """Test extreme large file handler."""
 
-    @patch("modelaudit.utils.advanced_file_handler.os.path.getsize")
+    @patch("modelaudit.utils.file.handlers.os.path.getsize")
     def test_extreme_file_detection(self, mock_getsize: Any) -> None:
         """Test detection of extreme large files."""
         # Test file over 200GB threshold
@@ -153,8 +153,8 @@ class TestAdvancedFileHandler:
 
         assert not should_use_advanced_handler("small_model.bin")
 
-    @patch("modelaudit.utils.advanced_file_handler.os.path.getsize")
-    @patch("modelaudit.utils.advanced_file_handler.ShardedModelDetector.detect_shards")
+    @patch("modelaudit.utils.file.handlers.os.path.getsize")
+    @patch("modelaudit.utils.file.handlers.ShardedModelDetector.detect_shards")
     def test_massive_file_handling(self, mock_detect: Any, mock_getsize: Any) -> None:
         """Test handling of massive files (>200GB)."""
         mock_detect.return_value = None  # Not sharded

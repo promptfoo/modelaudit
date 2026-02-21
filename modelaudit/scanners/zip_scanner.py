@@ -289,7 +289,7 @@ class ZipScanner(BaseScanner):
                                         1,
                                     )
                             result.merge(nested_result)
-                            from ..utils.assets import asset_from_scan_result
+                            from ..utils.helpers.assets import asset_from_scan_result
 
                             asset_entry = asset_from_scan_result(
                                 f"{path}:{name}",
@@ -333,7 +333,7 @@ class ZipScanner(BaseScanner):
 
                             result.merge(file_result)
 
-                            from ..utils.assets import asset_from_scan_result
+                            from ..utils.helpers.assets import asset_from_scan_result
 
                             asset_entry = asset_from_scan_result(
                                 f"{path}:{name}",
