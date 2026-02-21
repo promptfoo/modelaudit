@@ -111,22 +111,134 @@ jobs:
       - name: Build package
         run: uv build
 
-      - name: Verify package version matches release
+      - name: Verify distribution artifacts and version consistency
         run: |
+          set -euo pipefail
           EXPECTED_VERSION="${{ needs.release-please.outputs.version }}"
-          # Check wheel filename contains expected version
-          if ls dist/*-${EXPECTED_VERSION}-*.whl 1> /dev/null 2>&1; then
-            echo "Package version ${EXPECTED_VERSION} matches release"
-          else
-            echo "ERROR: Package version mismatch!"
-            echo "Expected version: ${EXPECTED_VERSION}"
-            echo "Built packages:"
-            ls -la dist/
+
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          sdists=(dist/*.tar.gz)
+
+          echo "Built artifacts:"
+          ls -la dist/
+
+          if [[ ${#wheels[@]} -ne 1 ]]; then
+            echo "ERROR: Expected exactly 1 wheel artifact, found ${#wheels[@]}"
             exit 1
           fi
 
+          if [[ ${#sdists[@]} -ne 1 ]]; then
+            echo "ERROR: Expected exactly 1 sdist artifact, found ${#sdists[@]}"
+            exit 1
+          fi
+
+          WHEEL_FILE="$(basename "${wheels[0]}")"
+          SDIST_FILE="$(basename "${sdists[0]}")"
+
+          WHEEL_VERSION="${WHEEL_FILE#modelaudit-}"
+          WHEEL_VERSION="${WHEEL_VERSION%%-*}"
+          SDIST_VERSION="${SDIST_FILE#modelaudit-}"
+          SDIST_VERSION="${SDIST_VERSION%.tar.gz}"
+
+          if [[ "$WHEEL_VERSION" != "$EXPECTED_VERSION" || "$SDIST_VERSION" != "$EXPECTED_VERSION" ]]; then
+            echo "ERROR: Artifact versions do not match expected release version"
+            echo "Expected version: $EXPECTED_VERSION"
+            echo "Wheel version: $WHEEL_VERSION ($WHEEL_FILE)"
+            echo "sdist version: $SDIST_VERSION ($SDIST_FILE)"
+            exit 1
+          fi
+
+          echo "Artifact validation passed for version ${EXPECTED_VERSION}"
+
       - name: Validate package metadata
         run: uvx twine check dist/*
+
+      - name: Smoke test wheel install in clean environment
+        run: |
+          set -euo pipefail
+          EXPECTED_VERSION="${{ needs.release-please.outputs.version }}"
+
+          python -m venv /tmp/modelaudit-wheel-smoke
+          source /tmp/modelaudit-wheel-smoke/bin/activate
+
+          python -m pip install --upgrade pip
+          python -m pip install "dist/modelaudit-${EXPECTED_VERSION}-py3-none-any.whl"
+
+          INSTALLED_VERSION="$(python -c "import importlib.metadata as m; print(m.version('modelaudit'))")"
+          if [[ "$INSTALLED_VERSION" != "$EXPECTED_VERSION" ]]; then
+            echo "ERROR: Wheel install version mismatch: expected $EXPECTED_VERSION, got $INSTALLED_VERSION"
+            exit 1
+          fi
+
+          # Validate required project URLs in installed metadata.
+          python - <<'PY'
+          import importlib.metadata as md
+
+          required = {
+              "Bug Tracker": "https://github.com/promptfoo/modelaudit/issues",
+              "Changelog": "https://github.com/promptfoo/modelaudit/blob/main/CHANGELOG.md",
+          }
+
+          project_urls = md.metadata("modelaudit").get_all("Project-URL") or []
+          parsed = {}
+          for entry in project_urls:
+              if "," in entry:
+                  label, url = entry.split(",", 1)
+                  parsed[label.strip()] = url.strip()
+
+          missing = [label for label in required if label not in parsed]
+          mismatched = [label for label, expected in required.items() if parsed.get(label) != expected]
+          if missing or mismatched:
+              raise SystemExit(
+                  f"Project URL metadata invalid. missing={missing}, mismatched={mismatched}, parsed={parsed}"
+              )
+          print("Project URL metadata validated.")
+          PY
+
+          modelaudit --version
+
+          # Basic CLI smoke run from the installed wheel.
+          python - <<'PY'
+          import pathlib
+          import pickle
+          import subprocess
+          import tempfile
+
+          test_dir = pathlib.Path(tempfile.mkdtemp(prefix="modelaudit-wheel-smoke-"))
+          test_file = test_dir / "smoke.pkl"
+          with test_file.open("wb") as f:
+              pickle.dump({"smoke": True}, f)
+
+          completed = subprocess.run(
+              ["modelaudit", str(test_file), "--format", "json"],
+              capture_output=True,
+              text=True,
+              check=False,
+          )
+          print(completed.stdout)
+          if completed.returncode not in (0, 1):
+              raise SystemExit(f"Unexpected modelaudit exit code during wheel smoke test: {completed.returncode}")
+          PY
+
+      - name: Smoke test sdist install in clean environment
+        run: |
+          set -euo pipefail
+          EXPECTED_VERSION="${{ needs.release-please.outputs.version }}"
+
+          python -m venv /tmp/modelaudit-sdist-smoke
+          source /tmp/modelaudit-sdist-smoke/bin/activate
+
+          python -m pip install --upgrade pip
+          python -m pip install "dist/modelaudit-${EXPECTED_VERSION}.tar.gz"
+
+          INSTALLED_VERSION="$(python -c "import importlib.metadata as m; print(m.version('modelaudit'))")"
+          if [[ "$INSTALLED_VERSION" != "$EXPECTED_VERSION" ]]; then
+            echo "ERROR: sdist install version mismatch: expected $EXPECTED_VERSION, got $INSTALLED_VERSION"
+            exit 1
+          fi
+
+          modelaudit --version
 
       - name: Upload build artifacts
         id: upload

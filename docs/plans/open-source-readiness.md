@@ -2,7 +2,7 @@
 
 **Status:** HEAD CHANGES COMPLETE; NEXT-PHASE CHECKLIST ACTIVE
 **Created:** 2026-02-18
-**Updated:** 2026-02-20
+**Updated:** 2026-02-21
 **Branch:** `chore/open-source-readiness`
 
 ## Overview
@@ -107,14 +107,14 @@ This section tracks high-value work after the initial hardening pass. Use `[P0]`
 
 ### 7c. Release Engineering & Distribution
 
-- [ ] [P0] Add `twine check dist/*` to release workflow.
-- [ ] [P0] Add clean-room install smoke tests from built wheel/sdist.
-- [ ] [P0] Ensure release workflow validates exactly one version in `dist/` artifacts.
+- [x] [P0] Add `twine check dist/*` to release workflow.
+- [x] [P0] Add clean-room install smoke tests from built wheel/sdist.
+- [x] [P0] Ensure release workflow validates exactly one version in `dist/` artifacts.
 - [ ] [P1] Publish Docker images in CI (if advertised in README), with semver tags and digests.
 - [ ] [P1] Add GHCR publish workflow (or remove GHCR usage docs if not publishing).
-- [ ] [P1] Document release rollback procedure.
-- [ ] [P1] Add explicit pre-release checklist (version, changelog, smoke test, publish, verify).
-- [ ] [P1] Validate PyPI metadata and project URLs on every release.
+- [x] [P1] Document release rollback procedure.
+- [x] [P1] Add explicit pre-release checklist (version, changelog, smoke test, publish, verify).
+- [x] [P1] Validate PyPI metadata and project URLs on every release.
 - [ ] [P2] Add post-release verification checklist (pip install, Docker pull, CLI smoke runs).
 - [ ] [P2] Add release health dashboard (failed publishes, release timing, package integrity checks).
 
