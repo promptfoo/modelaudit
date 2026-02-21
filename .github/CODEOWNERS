@@ -1,3 +1,27 @@
 # Default ownership for all repository files.
-# Replace with an org team if/when one is created.
 * @mdangelo
+
+# Scanner engine and detection logic
+/modelaudit/scanners/ @mdangelo
+/modelaudit/detectors/ @mdangelo
+/modelaudit/analysis/ @mdangelo
+
+# CLI, core orchestration, and package metadata
+/modelaudit/cli.py @mdangelo
+/modelaudit/core.py @mdangelo
+/pyproject.toml @mdangelo
+/uv.lock @mdangelo
+
+# CI/CD, release automation, and repo governance
+/.github/workflows/ @mdangelo
+/.github/CODEOWNERS @mdangelo
+/.github/PULL_REQUEST_TEMPLATE.md @mdangelo
+/.github/ISSUE_TEMPLATE/ @mdangelo
+
+# Documentation and contributor guidance
+/README.md @mdangelo
+/CONTRIBUTING.md @mdangelo
+/SECURITY.md @mdangelo
+/SUPPORT.md @mdangelo
+/MAINTAINERS.md @mdangelo
+/docs/ @mdangelo
