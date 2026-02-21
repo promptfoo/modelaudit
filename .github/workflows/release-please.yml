@@ -133,13 +133,56 @@ jobs:
             exit 1
           fi
 
-          WHEEL_FILE="$(basename "${wheels[0]}")"
-          SDIST_FILE="$(basename "${sdists[0]}")"
+          WHEEL_PATH="${wheels[0]}"
+          SDIST_PATH="${sdists[0]}"
+          WHEEL_FILE="$(basename "${WHEEL_PATH}")"
+          SDIST_FILE="$(basename "${SDIST_PATH}")"
 
-          WHEEL_VERSION="${WHEEL_FILE#modelaudit-}"
-          WHEEL_VERSION="${WHEEL_VERSION%%-*}"
-          SDIST_VERSION="${SDIST_FILE#modelaudit-}"
-          SDIST_VERSION="${SDIST_VERSION%.tar.gz}"
+          # Extract versions from package metadata, not filenames.
+          WHEEL_VERSION="$(
+            python - "${WHEEL_PATH}" <<'PY'
+          import sys
+          import zipfile
+
+          wheel_path = sys.argv[1]
+          with zipfile.ZipFile(wheel_path) as zf:
+              metadata_files = [name for name in zf.namelist() if name.endswith(".dist-info/METADATA")]
+              if len(metadata_files) != 1:
+                  raise SystemExit(f"Expected exactly one wheel METADATA file, found {len(metadata_files)}")
+              metadata_text = zf.read(metadata_files[0]).decode("utf-8", errors="replace")
+
+          for line in metadata_text.splitlines():
+              if line.startswith("Version: "):
+                  print(line.split(":", 1)[1].strip())
+                  break
+          else:
+              raise SystemExit("Could not find Version header in wheel METADATA")
+          PY
+          )"
+
+          SDIST_VERSION="$(
+            python - "${SDIST_PATH}" <<'PY'
+          import sys
+          import tarfile
+
+          sdist_path = sys.argv[1]
+          with tarfile.open(sdist_path, "r:gz") as tf:
+              pkg_info_files = [m for m in tf.getmembers() if m.name.endswith("/PKG-INFO")]
+              if len(pkg_info_files) != 1:
+                  raise SystemExit(f"Expected exactly one PKG-INFO file in sdist, found {len(pkg_info_files)}")
+              file_obj = tf.extractfile(pkg_info_files[0])
+              if file_obj is None:
+                  raise SystemExit("Failed to read PKG-INFO from sdist")
+              pkg_info_text = file_obj.read().decode("utf-8", errors="replace")
+
+          for line in pkg_info_text.splitlines():
+              if line.startswith("Version: "):
+                  print(line.split(":", 1)[1].strip())
+                  break
+          else:
+              raise SystemExit("Could not find Version header in sdist PKG-INFO")
+          PY
+          )"
 
           if [[ "$WHEEL_VERSION" != "$EXPECTED_VERSION" || "$SDIST_VERSION" != "$EXPECTED_VERSION" ]]; then
             echo "ERROR: Artifact versions do not match expected release version"
@@ -239,6 +282,29 @@ jobs:
           fi
 
           modelaudit --version
+
+          # Basic CLI smoke run from the installed sdist.
+          python - <<'PY'
+          import pathlib
+          import pickle
+          import subprocess
+          import tempfile
+
+          test_dir = pathlib.Path(tempfile.mkdtemp(prefix="modelaudit-sdist-smoke-"))
+          test_file = test_dir / "smoke.pkl"
+          with test_file.open("wb") as f:
+              pickle.dump({"smoke": True}, f)
+
+          completed = subprocess.run(
+              ["modelaudit", str(test_file), "--format", "json"],
+              capture_output=True,
+              text=True,
+              check=False,
+          )
+          print(completed.stdout)
+          if completed.returncode not in (0, 1):
+              raise SystemExit(f"Unexpected modelaudit exit code during sdist smoke test: {completed.returncode}")
+          PY
 
       - name: Upload build artifacts
         id: upload
