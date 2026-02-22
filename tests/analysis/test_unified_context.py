@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from modelaudit.context.unified_context import (
+from modelaudit.analysis.unified_context import (
     LayerPattern,
     ModelArchitecture,
     TensorInfo,
