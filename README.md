@@ -200,7 +200,7 @@ modelaudit https://company.jfrog.io/artifactory/repo/models/  # Scan entire fold
 modelaudit model_package.zip --sbom compliance_report.json --strict --verbose
 ```
 
-### 🧠 Smart Detection Examples
+### Automatic Defaults Examples
 
 ModelAudit automatically adapts to your input - **no configuration needed for most cases:**
 
@@ -221,7 +221,7 @@ modelaudit 15GB-model.bin
 CI=true modelaudit model.pkl
 ```
 
-**Override smart detection when needed:**
+**Override defaults when needed:**
 
 ```bash
 # Force strict mode for security-critical scans
@@ -236,11 +236,11 @@ modelaudit s3://bucket/model.pt --dry-run
 
 [View advanced usage examples →](https://www.promptfoo.dev/docs/model-audit/usage/)
 
-### ⚙️ Smart Detection & CLI Options
+### Defaults & CLI Options
 
-ModelAudit uses **smart detection** to automatically configure optimal settings based on your input:
+ModelAudit uses defaults to configure settings based on your input:
 
-**✨ Smart Detection Features:**
+**Default behavior:**
 
 - **Input type** (local/cloud/registry) → optimal download & caching strategies
 - **File size** (>1GB) → large model optimizations + progress bars
@@ -254,7 +254,7 @@ ModelAudit uses **smart detection** to automatically configure optimal settings 
 - `--timeout SECONDS` – override auto-detected timeout
 - `--dry-run` – preview what would be scanned/downloaded
 - `--progress` – force enable progress reporting
-- `--no-cache` – disable caching (overrides smart detection)
+- `--no-cache` – disable caching (overrides defaults)
 - `--format json` / `--output file.json` – structured output for CI/CD
 - `--sbom file.json` – generate CycloneDX v1.6 SBOM with enhanced ML-BOM support
 - `--verbose` / `--quiet` – control output detail level
@@ -420,6 +420,7 @@ modelaudit https://company.jfrog.io/artifactory/repo/models/       # Entire fold
 - **`--sbom`** - Generate CycloneDX SBOM
 - **`--blacklist`** - Additional patterns to flag
 - **`--no-cache`** - Disable result caching
+- **`--cache-dir`** - Set cache directory for downloads and scan results
 - **`--stream`** - Stream scan: download files one-by-one, scan immediately, then delete to save disk space
 
 [Advanced usage examples →](https://www.promptfoo.dev/docs/model-audit/usage/)
