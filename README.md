@@ -143,6 +143,7 @@ docker run --rm -v "$(pwd)":/app ghcr.io/promptfoo/modelaudit:latest model.pkl
 --verbose / --quiet          Control output detail
 --blacklist PATTERN          Additional patterns to flag
 --no-cache                   Disable result caching
+--cache-dir DIR              Set cache directory for downloads and scan results
 --progress                   Force progress display
 ```
 
