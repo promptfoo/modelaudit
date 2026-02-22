@@ -738,6 +738,7 @@ jobs:
     name: CI Success
     needs:
       [
+        changes,
         quick-feedback,
         lint,
         dependency-audit,
