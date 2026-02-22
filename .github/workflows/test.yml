@@ -158,7 +158,7 @@ jobs:
           # See docs/maintainers/dependency-policy.md for the full policy.
           APPROVED_KEYWORDS = [
               'mit', 'bsd', 'apache', 'isc', 'psf', 'python software foundation',
-              'mpl', 'mozilla public', 'lgpl',
+              'mpl', 'mozilla public',
               'public domain', 'unlicense', 'cc0', '0bsd', 'zlib',
               '3-clause bsd',
           ]
@@ -174,10 +174,22 @@ jobs:
               'Public Domain',
           ]
 
+          # Classifiers that must NOT pass the OSI Approved catch-all.
+          BLOCKED_CLASSIFIERS = [
+              'GNU General Public License',
+              'GNU Affero General Public License',
+          ]
+
           # NVIDIA CUDA packages are proprietary but are required transitive
           # dependencies of PyTorch (an optional extra). They are redistributable
           # under NVIDIA's EULA and cannot be avoided when using CUDA-enabled torch.
+          # See docs/maintainers/dependency-policy.md for the full exception rationale.
           NVIDIA_PREFIXES = ('nvidia-', 'cuda-')
+
+          # LGPL packages that have received explicit maintainer approval.
+          # Per policy, LGPL requires case-by-case approval. Each entry here
+          # must have a corresponding note in THIRD_PARTY_NOTICES.md.
+          APPROVED_LGPL_PACKAGES = {'py7zr'}
 
           # Packages that ship no license metadata at all but are known-good.
           # Verify manually on PyPI before adding here.
@@ -194,6 +206,10 @@ jobs:
               if any(name.lower().startswith(p) for p in NVIDIA_PREFIXES):
                   return True
 
+              # LGPL packages with explicit maintainer approval
+              if name in APPROVED_LGPL_PACKAGES:
+                  return True
+
               # Check license field (case-insensitive keyword match)
               lic_lower = lic.lower().strip()
               if lic_lower and any(kw in lic_lower for kw in APPROVED_KEYWORDS):
@@ -201,10 +217,15 @@ jobs:
 
               # Check classifiers
               lic_classifiers = [c for c in classifiers if c.startswith('License')]
+
+              # Reject blocked license families before checking approvals
+              for cls in lic_classifiers:
+                  if any(blocked in cls for blocked in BLOCKED_CLASSIFIERS):
+                      return False
+
               for cls in lic_classifiers:
                   if any(frag in cls for frag in APPROVED_CLASSIFIERS):
                       return True
-                  # 'OSI Approved' without a specific license is acceptable
                   if 'OSI Approved' in cls:
                       return True
 

@@ -10,6 +10,19 @@ This document governs how new dependencies are added to ModelAudit.
 | Requires maintainer approval | LGPL (any version), other weak copyleft                            |
 | Blocked                      | GPL, AGPL, proprietary, unlicensed                                 |
 
+### Approved Exceptions
+
+| Package   | License      | Rationale                                                             |
+| --------- | ------------ | --------------------------------------------------------------------- |
+| py7zr     | LGPL-2.1+    | Optional `sevenzip` extra; dynamically linked; user-initiated install |
+| nvidia-\* | NVIDIA EULA  | Transitive deps of PyTorch CUDA; redistributable under NVIDIA's EULA  |
+| tensorrt  | NVIDIA Prop. | Optional `tensorrt` extra; Linux/Windows only; user-initiated install |
+
+Exceptions are enforced in CI via `APPROVED_LGPL_PACKAGES` and `NVIDIA_PREFIXES` in
+`.github/workflows/test.yml`. Any new LGPL or proprietary dependency requires a PR
+adding it to the exception list with maintainer approval and a corresponding entry in
+`THIRD_PARTY_NOTICES.md`.
+
 When in doubt, check with `pip-licenses` or inspect the package metadata on PyPI before merging.
 
 ## Core vs. Optional
