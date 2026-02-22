@@ -81,7 +81,6 @@ This section tracks high-value work after the initial hardening pass. Use `[P0]`
 - [x] [P0] Enforce branch protection on `main` (PR-only, 1 approval required, CODEOWNERS review enforced).
 - [x] [P0] Require all critical checks before merge (`CI Success`, `Check Documentation Formatting`, `Validate PR Title`).
 - [x] [P0] Require up-to-date branches before merge (`strict: true`).
-- [ ] [P1] Enable merge queue for serialized safe merges (currently using required linear history instead).
 - [x] [P1] Prevent branch deletions and force-pushes on protected branches.
 - [ ] [P1] Restrict who can create/modify tags matching `v*` (no rulesets configured).
 - [x] [P1] Add at least one backup maintainer to reduce single-maintainer risk (16 admins on repo).
@@ -160,7 +159,6 @@ This section tracks high-value work after the initial hardening pass. Use `[P0]`
 - [x] [P1] Define label taxonomy (`good first issue`, `help wanted` present; `security` and `needs-repro` still need to be created).
 - [x] [P1] Seed onboarding issues for first-time external contributors.
 - [x] [P1] Add issue triage playbook for maintainers.
-- [ ] [P2] Publish roadmap/milestones for upcoming releases.
 - [ ] [P2] Add community acknowledgements/contributors section.
 - [ ] [P2] Define escalation path for abuse/moderation beyond CODE_OF_CONDUCT contact.
 
