@@ -729,7 +729,7 @@ def scan_command(
         # Suppress INFO logs from technical modules in normal mode to reduce noise
         # Users can still see these with --verbose if needed
         logging.getLogger("modelaudit.core").setLevel(logging.WARNING)
-        logging.getLogger("modelaudit.utils.secure_hasher").setLevel(logging.WARNING)
+        logging.getLogger("modelaudit.utils.helpers.secure_hasher").setLevel(logging.WARNING)
         logging.getLogger("modelaudit.cache.cache_manager").setLevel(logging.WARNING)
 
     # Setup progress tracking
