@@ -6,6 +6,15 @@ pyproject.toml and accessed at runtime via importlib.metadata.
 """
 
 import sys
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from modelaudit.core import scan_file as scan_file
+    from modelaudit.core import scan_model_directory_or_file as scan_model_directory_or_file
+    from modelaudit.scanners.base import BaseScanner as BaseScanner
+    from modelaudit.scanners.base import Issue as Issue
+    from modelaudit.scanners.base import IssueSeverity as IssueSeverity
+    from modelaudit.scanners.base import ScanResult as ScanResult
 
 if sys.version_info < (3, 10):  # noqa: UP036 — intentional safety net for bypassed requires-python
     import warnings
