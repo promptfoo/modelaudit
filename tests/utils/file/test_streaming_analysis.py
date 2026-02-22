@@ -3,7 +3,7 @@ from fsspec.implementations.local import LocalFileSystem
 
 from modelaudit.scanners.base import IssueSeverity, ScanResult
 from modelaudit.scanners.pickle_scanner import PickleScanner
-from modelaudit.utils import streaming
+from modelaudit.utils.file import streaming
 
 
 def test_stream_analyze_file_uses_scanner(tmp_path, monkeypatch):
