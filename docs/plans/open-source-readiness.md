@@ -2,8 +2,8 @@
 
 **Status:** HEAD CHANGES COMPLETE; NEXT-PHASE CHECKLIST ACTIVE
 **Created:** 2026-02-18
-**Updated:** 2026-02-20
-**Branch:** `chore/open-source-next-phase-batch4`
+**Updated:** 2026-02-22
+**Last audit:** 2026-02-22 (via `gh api` against live repo settings)
 
 ## Overview
 
@@ -78,21 +78,20 @@ This section tracks high-value work after the initial hardening pass. Use `[P0]`
 
 ### 7a. GitHub Repository Settings & Governance
 
-- [ ] [P0] Enforce branch protection on `main` (PR-only, no direct pushes).
-- [ ] [P0] Require all critical checks before merge (`CI Success`, `Docker CI Success`, docs checks).
-- [ ] [P0] Require up-to-date branches before merge.
-- [ ] [P1] Enable merge queue for serialized safe merges.
-- [ ] [P1] Prevent branch deletions and force-pushes on protected branches.
-- [ ] [P1] Restrict who can create/modify tags matching `v*`.
-- [ ] [P1] Add at least one backup maintainer to reduce single-maintainer risk.
+- [x] [P0] Enforce branch protection on `main` (PR-only, 1 approval required, CODEOWNERS review enforced).
+- [x] [P0] Require all critical checks before merge (`CI Success`, `Check Documentation Formatting`, `Validate PR Title`).
+- [x] [P0] Require up-to-date branches before merge (`strict: true`).
+- [x] [P1] Prevent branch deletions and force-pushes on protected branches.
+- [ ] [P1] Restrict who can create/modify tags matching `v*` (no rulesets configured).
+- [x] [P1] Add at least one backup maintainer to reduce single-maintainer risk (16 admins on repo).
 - [x] [P1] Expand `.github/CODEOWNERS` with per-area ownership (scanners, docs, CI, release).
 - [x] [P2] Add `MAINTAINERS.md` with roles (maintainer, reviewer, triage).
 - [ ] [P2] Define maintainer response expectations (issues/PR triage SLO).
 
 ### 7b. Security Program & Supply Chain
 
-- [ ] [P0] Enable GitHub security features: dependency graph, Dependabot alerts, secret scanning, push protection.
-- [ ] [P0] Enable and monitor private vulnerability reporting (via `SECURITY.md` workflow).
+- [x] [P0] Enable GitHub security features: Dependabot security updates enabled, secret scanning enabled, push protection enabled. **Note:** `code_security` is disabled at repo level — CodeQL runs via workflow but GitHub Advanced Security code scanning API is inaccessible. 1 open secret scanning alert to triage.
+- [ ] [P0] Enable and monitor private vulnerability reporting (not yet enabled — returns 404).
 - [x] [P0] Add CodeQL workflow for Python and GitHub Actions analysis.
 - [x] [P0] Add dependency vulnerability scanning in CI (`pip-audit` or equivalent).
 - [x] [P0] Add container vulnerability scanning for Docker images (e.g., Trivy/Grype).
@@ -157,10 +156,9 @@ This section tracks high-value work after the initial hardening pass. Use `[P0]`
 ### 7g. Community & Project Operations
 
 - [ ] [P1] Enable GitHub Discussions with categories (Q&A, Ideas, Show and Tell).
-- [x] [P1] Define label taxonomy (`good first issue`, `help wanted`, `security`, `needs-repro`).
+- [x] [P1] Define label taxonomy (`good first issue`, `help wanted` present; `security` and `needs-repro` still need to be created).
 - [x] [P1] Seed onboarding issues for first-time external contributors.
 - [x] [P1] Add issue triage playbook for maintainers.
-- [ ] [P2] Publish roadmap/milestones for upcoming releases.
 - [ ] [P2] Add community acknowledgements/contributors section.
 - [ ] [P2] Define escalation path for abuse/moderation beyond CODE_OF_CONDUCT contact.
 
@@ -172,6 +170,38 @@ This section tracks high-value work after the initial hardening pass. Use `[P0]`
 - [ ] [P0] Confirm security contact and reporting workflow end-to-end.
 - [ ] [P0] Confirm README commands match actual released behavior.
 - [ ] [P1] Announce launch with known limitations and support boundaries.
+
+---
+
+## Audit Summary (2026-02-22)
+
+Automated audit via `gh api` against live repository settings.
+
+### Confirmed active
+
+- Branch protection on `main`: PR-only, 1 approval, CODEOWNERS review, linear history required
+- Required status checks: `CI Success`, `Check Documentation Formatting`, `Validate PR Title` (strict mode)
+- Force-push and branch deletion: blocked on `main`
+- Secret scanning: enabled with push protection
+- Dependabot security updates: enabled (20 alerts, all fixed)
+- Collaborators: 17 total (16 admin, 1 read)
+- Workflows: CodeQL, Docker CI, Docker Publish, Docs Check, Nightly CI, release-please, Python CI, PR title validation
+- Labels: `good first issue`, `help wanted`, `bug`, `enhancement`, `documentation`, `dependencies`, `question`
+
+### Needs attention
+
+| Item                            | Status                                | Action needed                              |
+| ------------------------------- | ------------------------------------- | ------------------------------------------ |
+| Code Security (GHAS)            | `disabled` at repo level              | Enable in Settings > Code security         |
+| Private vulnerability reporting | Not enabled (404)                     | Enable in Settings > Code security         |
+| Secret scanning alert           | 1 open alert                          | Triage and resolve                         |
+| Missing labels                  | `security`, `needs-repro` not created | Create via GitHub Labels UI                |
+| Tag protection                  | No rulesets for `v*` tags             | Add ruleset in Settings > Rules > Rulesets |
+| Merge queue                     | Not enabled (using linear history)    | Optional — evaluate if needed              |
+| GitHub Discussions              | Disabled                              | Enable if desired for community Q&A        |
+| SBOM generation                 | Not in release workflow               | Add `syft` or `cyclonedx-bom` step         |
+| Repo topics                     | Empty                                 | Add topics for discoverability             |
+| Repo visibility                 | `internal` (not yet public)           | Change to `public` at launch               |
 
 ---
 
