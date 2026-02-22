@@ -251,6 +251,8 @@ When adding a new scanner for a model format:
 4. Update documentation
 5. Add any new dependencies to `pyproject.toml`
 
+For the security-focused implementation checklist, see `docs/agents/new-scanner-quickstart.md`.
+
 ### Code Style
 
 - Follow PEP 8 style guidelines
