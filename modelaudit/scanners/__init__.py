@@ -682,6 +682,9 @@ def __getattr__(name: str) -> Any:
         "TarScanner": "tar",
         "Jinja2TemplateScanner": "jinja2_template",
         "MetadataScanner": "metadata",
+        "KerasZipScanner": "keras_zip",
+        "SevenZipScanner": "sevenzip",
+        "TextScanner": "text",
         "XGBoostScanner": "xgboost",
         "ZipScanner": "zip",
     }
@@ -718,7 +721,6 @@ __all__ = [
     "Issue",
     "IssueSeverity",
     "ScanResult",
-    "_registry",
     "get_scanner_for_file",
     # Scanner classes will be lazy loaded via __getattr__
 ]
