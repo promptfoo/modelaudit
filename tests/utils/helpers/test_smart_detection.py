@@ -2,7 +2,7 @@
 
 import tempfile
 
-from modelaudit.utils.smart_detection import (
+from modelaudit.utils.helpers.smart_detection import (
     detect_file_size,
     detect_input_type,
     generate_smart_defaults,

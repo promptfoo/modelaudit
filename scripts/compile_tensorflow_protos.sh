@@ -16,9 +16,28 @@ TEMP_DIR=$(mktemp -d)
 # TensorFlow version to extract protos from
 TF_VERSION="${TF_VERSION:-2.18.0}"
 
+# Required protoc version — must match the version used to generate vendored protos.
+# Install from: https://github.com/protocolbuffers/protobuf/releases/tag/v33.4
+REQUIRED_PROTOC="33.5"
+
 echo "=== TensorFlow Protobuf Compiler ==="
 echo "TensorFlow version: $TF_VERSION"
 echo "Output directory: $OUTPUT_DIR"
+
+# Verify protoc version
+PROTOC_VERSION=$(protoc --version 2>/dev/null | sed 's/.*libprotoc //' || true)
+if [[ -z "$PROTOC_VERSION" ]]; then
+    echo "ERROR: protoc not found. Install libprotoc $REQUIRED_PROTOC from:"
+    echo "  https://github.com/protocolbuffers/protobuf/releases/tag/v$REQUIRED_PROTOC"
+    exit 1
+fi
+if [[ "$PROTOC_VERSION" != "$REQUIRED_PROTOC" ]]; then
+    echo "ERROR: protoc version mismatch: found $PROTOC_VERSION, need $REQUIRED_PROTOC"
+    echo "Install the correct version from:"
+    echo "  https://github.com/protocolbuffers/protobuf/releases/tag/v$REQUIRED_PROTOC"
+    exit 1
+fi
+echo "protoc version: $PROTOC_VERSION (OK)"
 echo ""
 
 # Cleanup on exit

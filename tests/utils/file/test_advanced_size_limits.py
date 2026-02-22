@@ -17,7 +17,7 @@ from modelaudit.utils.file.handlers import (
 class TestAdvancedSizeLimits:
     """Test that size limits don't prevent scanning huge models."""
 
-    @patch("modelaudit.utils.advanced_file_handler.os.path.getsize")
+    @patch("modelaudit.utils.file.handlers.os.path.getsize")
     @patch("modelaudit.core.os.path.getsize")
     @patch("modelaudit.core.should_use_advanced_handler")
     def test_advanced_files_bypass_size_limit(self, mock_should_use, mock_core_size, mock_extreme_size):
@@ -55,7 +55,7 @@ class TestAdvancedSizeLimits:
                                 # but using the normal large file handler
                                 assert result is not None
 
-    @patch("modelaudit.utils.advanced_file_handler.os.path.getsize")
+    @patch("modelaudit.utils.file.handlers.os.path.getsize")
     def test_normal_files_respect_size_limit(self, mock_size):
         """Test that normal files still respect max_file_size."""
         # Simulate a 5GB file (below extreme threshold)
@@ -88,7 +88,7 @@ class TestAdvancedSizeLimits:
             assert not result.success
             assert result.end_time is not None
 
-    @patch("modelaudit.utils.advanced_file_handler.os.path.getsize")
+    @patch("modelaudit.utils.file.handlers.os.path.getsize")
     def test_colossal_files_handled(self, mock_size):
         """Test that even 10TB+ files can be handled."""
         # Simulate a 10TB file
@@ -98,7 +98,7 @@ class TestAdvancedSizeLimits:
         # Should be detected as needing extreme handler
         assert should_use_advanced_handler("massive_model.bin")
 
-    @patch("modelaudit.utils.advanced_file_handler.os.path.getsize")
+    @patch("modelaudit.utils.file.handlers.os.path.getsize")
     @patch("modelaudit.core.should_use_advanced_handler")
     def test_unlimited_size_default(self, mock_should_use, mock_size):
         """Test that default config has no size limit."""
@@ -154,7 +154,7 @@ class TestAdvancedSizeLimits:
         petabyte = 1024 * 1024 * 1024 * 1024 * 1024  # 1PB
         exabyte = petabyte * 1024  # 1EB
 
-        with patch("modelaudit.utils.advanced_file_handler.os.path.getsize") as mock_size:
+        with patch("modelaudit.utils.file.handlers.os.path.getsize") as mock_size:
             # Test petabyte file
             mock_size.return_value = petabyte
             assert should_use_advanced_handler("petabyte_model.bin")
