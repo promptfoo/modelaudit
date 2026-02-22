@@ -217,13 +217,16 @@ jobs:
 
               # Check classifiers
               lic_classifiers = [c for c in classifiers if c.startswith('License')]
+
+              # Reject blocked license families before checking approvals
+              for cls in lic_classifiers:
+                  if any(blocked in cls for blocked in BLOCKED_CLASSIFIERS):
+                      return False
+
               for cls in lic_classifiers:
                   if any(frag in cls for frag in APPROVED_CLASSIFIERS):
                       return True
-                  # OSI Approved is acceptable unless it's a blocked license family
                   if 'OSI Approved' in cls:
-                      if any(blocked in cls for blocked in BLOCKED_CLASSIFIERS):
-                          return False
                       return True
 
               return False

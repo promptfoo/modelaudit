@@ -115,11 +115,11 @@ On `main` this works correctly because `ON_MAIN_BRANCH == "true"` short-circuits
 
 **Files and claims:**
 
-| Claim | File | Reality |
-| --- | --- | --- |
-| "ModelAudit does not make outbound network requests during scanning" | `docs/security/threat-model.md:33` | Technically accurate (downloads happen in CLI before scanning), but misleading. CLI at `cli.py:819` and `cli.py:904` downloads from HuggingFace Hub. |
-| "ModelAudit never calls `pickle.loads`, `torch.load`, or any deserializer on untrusted input" | `docs/security/threat-model.md:63` | **Directly contradicted.** `weight_distribution_scanner.py:202` calls `torch.load`. |
-| "Path traversal checks are applied to member names before any extraction occurs" | `docs/security/threat-model.md:67` | **Misleading.** True for ZIP scanner, but 7z scanner extracts files to temp dir for sub-scanning (finding #3). |
+| Claim                                                                                         | File                               | Reality                                                                                                                                              |
+| --------------------------------------------------------------------------------------------- | ---------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| "ModelAudit does not make outbound network requests during scanning"                          | `docs/security/threat-model.md:33` | Technically accurate (downloads happen in CLI before scanning), but misleading. CLI at `cli.py:819` and `cli.py:904` downloads from HuggingFace Hub. |
+| "ModelAudit never calls `pickle.loads`, `torch.load`, or any deserializer on untrusted input" | `docs/security/threat-model.md:63` | **Directly contradicted.** `weight_distribution_scanner.py:202` calls `torch.load`.                                                                  |
+| "Path traversal checks are applied to member names before any extraction occurs"              | `docs/security/threat-model.md:67` | **Misleading.** True for ZIP scanner, but 7z scanner extracts files to temp dir for sub-scanning (finding #3).                                       |
 
 **Fix:**
 

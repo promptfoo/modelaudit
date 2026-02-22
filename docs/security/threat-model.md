@@ -60,7 +60,7 @@ The scanning engine makes no outbound network requests. The CLI may download mod
 
 ## Mitigations
 
-**Static-only analysis.** Core scanners use byte-level parsing and never call `pickle.loads` or other deserializers on untrusted input. The optional weight distribution scanner calls `torch.load` with `map_location='cpu'` for statistical analysis of PyTorch weight tensors. This eliminates the largest class of risk.
+**Static-only analysis.** Core scanners avoid Python object deserialization (`pickle.loads`, `joblib.load`, etc.) on untrusted input, relying on byte-level parsing and format-specific readers instead. ONNX scanning uses `onnx.load` (protobuf deserialization, not arbitrary code execution). The optional weight distribution scanner calls `torch.load` with `map_location='cpu'` for statistical analysis of PyTorch weight tensors. This eliminates the largest class of risk.
 
 **defusedxml for XML parsing.** All XML-based formats (ONNX, some TensorFlow variants) use `defusedxml` to prevent XML External Entity (XXE) and billion-laughs attacks.
 
