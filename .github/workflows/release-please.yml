@@ -377,8 +377,27 @@ jobs:
         with:
           subject-path: "dist/*"
 
-      # Upload wheel/sdist to the GitHub Release as an alternative download
-      # location alongside PyPI. --clobber ensures idempotency on re-runs.
+      - name: Install uv
+        uses: astral-sh/setup-uv@eac588ad8def6316056a12d4907a9d4d84ff7a3b # v7
+        with:
+          enable-cache: true
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          sparse-checkout: pyproject.toml
+
+      - name: Generate SBOM
+        run: |
+          uv tool install cyclonedx-bom
+          uv tool run cyclonedx-py requirements \
+            --pyproject pyproject.toml \
+            --output-format json \
+            --outfile dist/modelaudit-${{ needs.release-please.outputs.version }}.cdx.json
+          echo "SBOM generated:"
+          ls -la dist/*.cdx.json
+
+      # Upload wheel/sdist and SBOM to the GitHub Release as an alternative
+      # download location alongside PyPI. --clobber ensures idempotency on re-runs.
       - name: Upload build artifacts to GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
