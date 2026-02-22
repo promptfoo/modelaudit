@@ -1,3 +1,5 @@
+"""Core scanning engine for orchestrating model file security analysis."""
+
 import builtins
 import hashlib
 import logging
@@ -42,6 +44,7 @@ from modelaudit.utils.helpers.types import (
     FilePath,
     ProgressCallback,
 )
+from modelaudit.utils.lfs import check_lfs_pointer, get_lfs_issue_details, get_lfs_remediation_steps
 
 logger = logging.getLogger("modelaudit.core")
 
@@ -684,7 +687,7 @@ def scan_model_directory_or_file(
                         continue
 
                     # Skip non-model files early if filtering is enabled
-                    skip_file_types = config.get("skip_file_types", True)
+                    # Note: skip_file_types parameter already contains the correct value
                     if skip_file_types and should_skip_file(
                         file_path, metadata_scanner_available=metadata_scanner_available
                     ):
@@ -1224,6 +1227,39 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         sr.finish(success=True)
         return sr
 
+    # Check for Git LFS pointer files (text pointers instead of actual model content)
+    # This is a common issue when cloning repos without `git lfs pull`
+    is_lfs, lfs_info = check_lfs_pointer(path)
+    if is_lfs:
+        sr = ScanResult(scanner_name="lfs_check")
+        details = get_lfs_issue_details(path, lfs_info)
+        details["remediation"] = get_lfs_remediation_steps()
+
+        if lfs_info:
+            message = (
+                f"Git LFS pointer detected - file is {details['actual_size_bytes']} bytes "
+                f"but should be {lfs_info.format_expected_size()}"
+            )
+        else:
+            message = "Git LFS pointer detected - this is a text pointer, not the actual model file"
+
+        # add_check with passed=False automatically creates an Issue as well
+        sr.add_check(
+            name="Git LFS Pointer Detection",
+            passed=False,
+            message=message,
+            severity=IssueSeverity.CRITICAL,
+            location=path,
+            why=(
+                "This file is a Git LFS pointer (a small text file that references the actual content) "
+                "rather than the actual model weights. The model cannot be loaded in its current state. "
+                "Run 'git lfs pull' to download the actual file."
+            ),
+            details=details,
+        )
+        sr.finish(success=False)
+        return sr
+
     # Get file size for later checks
     try:
         file_size = os.path.getsize(path)
@@ -1410,13 +1446,18 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         else:
             format_ = header_format
             sr = ScanResult(scanner_name="unknown")
-            sr.add_check(
-                name="Format Detection",
-                passed=False,
-                message=f"Unknown or unhandled format: {format_}",
-                severity=IssueSeverity.DEBUG,
-                details={"format": format_, "path": path},
-            )
+            if format_ == "unknown":
+                # Not a recognized model format — skip silently
+                logger.debug(f"Skipping unrecognized format file: {path}")
+            else:
+                # Known format but no scanner available
+                sr.add_check(
+                    name="Format Detection",
+                    passed=False,
+                    message=f"Unknown or unhandled format: {format_}",
+                    severity=IssueSeverity.DEBUG,
+                    details={"format": format_, "path": path},
+                )
             result = sr
 
     if discrepancy_msg:

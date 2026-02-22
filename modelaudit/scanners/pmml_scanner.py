@@ -1,3 +1,5 @@
+"""Scanner for PMML model definition files (.pmml)."""
+
 import os
 import re
 from typing import TYPE_CHECKING, Any, ClassVar

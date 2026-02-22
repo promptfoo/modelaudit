@@ -5,22 +5,32 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
-    open-pull-requests-limit: 10
     labels:
       - "dependencies"
       - "python"
+    open-pull-requests-limit: 10
     versioning-strategy: "lockfile-only"
 
-  # GitHub Actions
+  # GitHub Actions (includes pinned SHA updates)
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      interval: "monthly"
-    open-pull-requests-limit: 10
+      interval: "weekly"
     labels:
       - "dependencies"
       - "github-actions"
+    open-pull-requests-limit: 10
     groups:
       github-actions:
         patterns:
           - "*"
+
+  # Docker base image digests
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+      - "docker"
+    open-pull-requests-limit: 10

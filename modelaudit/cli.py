@@ -1,3 +1,5 @@
+"""Command-line interface for ModelAudit security scanner."""
+
 import json
 import logging
 import os
@@ -74,9 +76,10 @@ def style_text(text: str, **kwargs: Any) -> str:
     return text
 
 
-def expand_paths(paths: tuple[str, ...]) -> list[str]:
+def expand_paths(paths: tuple[str, ...]) -> tuple[list[str], list[str]]:
     """Expand and validate input paths with type safety."""
     expanded: list[str] = []
+    missing_globs: list[str] = []
     for path_str in paths:
         # Handle glob patterns and resolve paths
         path = Path(path_str)
@@ -85,10 +88,13 @@ def expand_paths(paths: tuple[str, ...]) -> list[str]:
             import glob
 
             matches = glob.glob(path_str, recursive=True)
-            expanded.extend(matches)
+            if matches:
+                expanded.extend(matches)
+            else:
+                missing_globs.append(path_str)
         else:
             expanded.append(str(path.resolve()) if path.exists() else path_str)
-    return expanded
+    return expanded, missing_globs
 
 
 def create_progress_callback_wrapper(progress_callback: Any | None, spinner: Any | None) -> Any | None:
@@ -525,7 +531,7 @@ def scan_command(
         modelaudit scan model.pkl --strict --format json --output report.json
 
     \b
-    Automatic defaults:
+    Defaults:
         • Input type (local/cloud/registry) → optimal download & caching
         • File size (>1GB) → large model optimizations + progress bars
         • Terminal type (TTY/CI) → appropriate UI (progress vs quiet)
@@ -568,7 +574,7 @@ def scan_command(
     record_scan_started(list(paths), telemetry_options)
 
     # Expand and validate paths with type safety
-    expanded_paths: list[str] = expand_paths(paths)
+    expanded_paths, missing_globs = expand_paths(paths)
 
     # Process DVC pointer files
     dvc_expanded_paths: list[str] = []
@@ -584,6 +590,29 @@ def scan_command(
 
     # Use the DVC-expanded paths as the final list
     expanded_paths = dvc_expanded_paths
+
+    if missing_globs:
+        click.echo(
+            style_text(
+                f"Warning: glob pattern(s) did not match any files: {', '.join(missing_globs)}",
+                fg="yellow",
+            ),
+            err=True,
+        )
+        click.echo("Note: glob expansion is only applied to local paths.", err=True)
+
+    if not expanded_paths:
+        click.echo(
+            style_text(
+                "No matching paths found. Check your paths or glob patterns.",
+                fg="red",
+                bold=True,
+            ),
+            err=True,
+        )
+        record_scan_failed(time.time() - scan_start_time, "No matching paths")
+        flush_telemetry()
+        sys.exit(2)
 
     # Generate defaults based on input analysis
     smart_defaults = generate_smart_defaults(expanded_paths)
@@ -603,6 +632,7 @@ def scan_command(
             import sys as sys_module
 
             sys_module.exit(2)
+
     if cache_dir is not None:
         user_overrides["cache_dir"] = str(Path(cache_dir).expanduser())
         user_overrides["use_cache"] = True
@@ -648,7 +678,7 @@ def scan_command(
     final_skip_files = config.get("skip_non_model_files", True)
     final_strict_license = config.get("strict_license", False)
 
-    # Handle max download size from defaults or max_size override
+    # Handle max download size from smart defaults or max_size override
     max_download_bytes = None
     if max_size is not None:
         import contextlib
@@ -656,15 +686,15 @@ def scan_command(
         with contextlib.suppress(ValueError):
             max_download_bytes = parse_size_string(max_size)
 
-    # Show auto-configuration info if not quiet
+    # Show defaults info if not quiet
     if not quiet and show_styled_output:
         if verbose:
-            click.echo(f"Automatic defaults: {len(expanded_paths)} path(s) analyzed")
+            click.echo(f"Defaults: {len(expanded_paths)} path(s) analyzed")
             for key, value in config.items():
                 if key != "cache_dir":  # Skip showing long paths
                     click.echo(f"   • {key}: {value}")
         elif not config.get("colors", True):  # In CI mode
-            pass  # No auto-configuration message needed
+            pass  # No defaults message needed
 
     # Print a nice header if not in structured format mode
     if show_styled_output and not quiet:
@@ -723,7 +753,7 @@ def scan_command(
             # Only enable ProgressTracker for text format without output file
             # (ProgressTracker has threading issues that cause segfaults)
             if progress_tracker and final_format == "text" and not output:
-                if True:  # Always use tqdm format (default)
+                if True:  # Always use tqdm format (smart default)
                     # Use tqdm progress bars if available and appropriate
                     console_reporter = ConsoleProgressReporter(  # type: ignore[possibly-unresolved-reference]
                         update_interval=2.0,  # Smart default
@@ -735,7 +765,7 @@ def scan_command(
                 progress_reporters.append(console_reporter)
                 progress_tracker.add_reporter(console_reporter)
 
-            # File logging removed - use defaults only
+            # File logging removed - use smart defaults only
 
         except (ImportError, RecursionError) as e:
             if verbose:
@@ -1080,8 +1110,8 @@ def scan_command(
                 # Check if this is a cloud storage URL
                 elif is_cloud_url(path):
                     # Max download size already handled above
-                    # max_download_bytes is already set from defaults
-                    # Max download size parsing removed - handled by defaults
+                    # max_download_bytes is already set from smart defaults
+                    # Max download size parsing removed - handled by smart defaults
 
                     # Handle dry-run mode (replaces preview)
                     if dry_run:
@@ -1457,7 +1487,7 @@ def scan_command(
                         "cache_dir": final_cache_dir,
                     }
 
-                    # Record feature usage for large model support (based on defaults)
+                    # Record feature usage for large model support (based on smart detection)
                     # Note: DO NOT send actual path - only track that the feature was used
                     if final_max_file_size > 0 or final_max_total_size > 0:
                         record_feature_used(
@@ -2431,6 +2461,9 @@ def _get_cache_info() -> dict[str, Any]:
             home = str(Path.home())
             if cache_dir_path.startswith(home):
                 cache_dir_path = "~" + cache_dir_path[len(home) :]
+            elif os.path.isabs(cache_dir_path):
+                # Redact absolute paths in debug output while preserving a readable structure.
+                cache_dir_path = "~" + cache_dir_path
 
         return {
             "enabled": True,
@@ -2499,7 +2532,7 @@ def _format_debug_output(debug_info: dict[str, Any], verbose: bool) -> str:
             fg="yellow",
         )
     )
-    lines.append(style_text("https://github.com/promptfoo/promptfoo/issues", fg="cyan"))
+    lines.append(style_text("https://github.com/promptfoo/modelaudit/issues", fg="cyan"))
     lines.append("")
 
     # Quick diagnosis section
@@ -2616,6 +2649,16 @@ def debug(output_json: bool, verbose: bool) -> None:
 
 
 def main() -> None:
+    if sys.version_info < (3, 10):  # noqa: UP036 — intentional safety net for bypassed requires-python
+        click.echo(
+            click.style(
+                f"WARNING: modelaudit requires Python 3.10+, but you are running "
+                f"Python {sys.version_info[0]}.{sys.version_info[1]}. "
+                f"Please upgrade: https://www.promptfoo.dev/docs/model-audit/",
+                fg="yellow",
+            ),
+            err=True,
+        )
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
