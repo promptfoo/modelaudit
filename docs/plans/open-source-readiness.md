@@ -97,9 +97,9 @@ This section tracks high-value work after the initial hardening pass. Use `[P0]`
 - [x] [P0] Add container vulnerability scanning for Docker images (e.g., Trivy/Grype).
 - [x] [P1] Add provenance attestations for release artifacts (SLSA/Sigstore).
 - [x] [P1] Add artifact signing strategy for wheels/sdists and release tags.
-- [ ] [P1] Add SBOM generation to release workflow and attach SBOM to releases.
+- [x] [P1] Add SBOM generation to release workflow and attach SBOM to releases.
 - [x] [P1] Add CVE handling process (triage, fix, advisory publication flow).
-- [ ] [P1] Add security advisory templates for maintainers.
+- [x] [P1] Add security advisory templates for maintainers.
 - [x] [P1] Add a lightweight public threat model document.
 - [ ] [P2] Add fuzzing strategy for binary/model parsers.
 - [ ] [P2] Add periodic external security review cadence (quarterly/biannual).
@@ -123,7 +123,7 @@ This section tracks high-value work after the initial hardening pass. Use `[P0]`
 - [x] [P1] Add compatibility smoke tests for all optional extras bundles.
 - [x] [P1] Add reproducibility checks for generated protobuf artifacts.
 - [x] [P1] Add CI checks for minimum supported Python/NumPy combinations as explicit gates.
-- [ ] [P1] Add regression corpus validation for malicious and benign fixtures.
+- [x] [P1] Add regression corpus validation for malicious and benign fixtures.
 - [x] [P1] Add `uv lock` consistency check in CI.
 - [ ] [P2] Add performance budget checks to catch scanner regressions.
 - [ ] [P2] Add mutation/property-based tests for high-risk scanners.

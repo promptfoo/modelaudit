@@ -237,6 +237,7 @@ markers = [
     "safetensors: marks tests as requiring safetensors",
     "joblib: marks tests as requiring joblib",
     "dill: marks tests as requiring dill",
+    "regression: marks tests as regression corpus validation",
 ]
 filterwarnings = [
     "ignore::DeprecationWarning",
