@@ -595,9 +595,19 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
-      - name: Install protoc
+      - name: Install protoc 33.5
         run: |
-          sudo apt-get update && sudo apt-get install -y protobuf-compiler
+          # Pin protoc to the exact version used to generate vendored protos.
+          # The vendored files contain "Protobuf Python Version: 6.33.5"
+          # which corresponds to libprotoc 33.5.
+          PROTOC_VERSION="33.5"
+          PROTOC_ZIP="protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+          curl -fsSL -o /tmp/protoc.zip \
+            "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/${PROTOC_ZIP}"
+          sudo unzip -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'
+          sudo chmod +x /usr/local/bin/protoc
+          rm /tmp/protoc.zip
+          protoc --version
 
       - name: Regenerate protos and compare
         run: |
