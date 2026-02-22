@@ -524,7 +524,7 @@ def extract_model_id_from_path(path: str) -> tuple[str | None, str | None]:
         config_file = current_path / "config.json"
         if config_file.exists():
             try:
-                with open(config_file) as f:
+                with open(config_file, encoding="utf-8") as f:
                     config = json.load(f)
                     # Look for various model ID fields
                     model_id = config.get("_name_or_path") or config.get("model_name") or config.get("name")
@@ -537,7 +537,7 @@ def extract_model_id_from_path(path: str) -> tuple[str | None, str | None]:
         model_index = current_path / "model_index.json"
         if model_index.exists():
             try:
-                with open(model_index) as f:
+                with open(model_index, encoding="utf-8") as f:
                     config = json.load(f)
                     model_id = config.get("_name_or_path") or config.get("name")
                     if model_id and "/" in model_id:

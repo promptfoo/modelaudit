@@ -6,6 +6,7 @@ import zipfile
 from typing import Any, ClassVar
 
 from ..utils import is_absolute_archive_path, is_critical_system_path, sanitize_archive_path
+from ..utils.helpers.assets import asset_from_scan_result
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 CRITICAL_SYSTEM_PATHS = [
@@ -289,7 +290,6 @@ class ZipScanner(BaseScanner):
                                         1,
                                     )
                             result.merge(nested_result)
-                            from ..utils.helpers.assets import asset_from_scan_result
 
                             asset_entry = asset_from_scan_result(
                                 f"{path}:{name}",
@@ -332,8 +332,6 @@ class ZipScanner(BaseScanner):
                                     issue.details = {"zip_entry": name}
 
                             result.merge(file_result)
-
-                            from ..utils.helpers.assets import asset_from_scan_result
 
                             asset_entry = asset_from_scan_result(
                                 f"{path}:{name}",
