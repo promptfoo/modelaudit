@@ -135,6 +135,41 @@ DANGEROUS_OPCODES = {
         "The GLOBAL opcode imports and accesses module attributes. When referencing dangerous modules, this "
         "indicates potential security risks."
     ),
+    # Memo-based attack opcodes - can reference previously stored dangerous objects
+    "BINGET": (
+        "The BINGET opcode retrieves an object from the pickle memo by index. Attackers can use this to "
+        "reference dangerous objects that were stored earlier in the pickle stream, enabling indirect attacks."
+    ),
+    "LONG_BINGET": (
+        "The LONG_BINGET opcode retrieves an object from the pickle memo using a 4-byte index. Like BINGET, "
+        "it can be used in memo-based attacks to reference dangerous objects stored earlier."
+    ),
+    "BINPUT": (
+        "The BINPUT opcode stores an object in the pickle memo. In attack chains, this allows storing dangerous "
+        "callable objects for later retrieval via BINGET, enabling multi-stage attacks."
+    ),
+    "LONG_BINPUT": (
+        "The LONG_BINPUT opcode stores an object in the pickle memo using a 4-byte index. Used in conjunction "
+        "with LONG_BINGET for memo-based attacks with larger indexes."
+    ),
+    # Extension registry opcodes - can reference external dangerous modules
+    "EXT1": (
+        "The EXT1 opcode references a registered extension by 1-byte code. Extension registry entries can "
+        "map to dangerous callables, enabling code execution via pre-registered malicious extensions."
+    ),
+    "EXT2": (
+        "The EXT2 opcode references a registered extension by 2-byte code. Like EXT1, it can invoke dangerous "
+        "functionality through the pickle extension registry."
+    ),
+    "EXT4": (
+        "The EXT4 opcode references a registered extension by 4-byte code. Extension registry attacks can "
+        "bypass module-based detection by using numeric codes instead of module names."
+    ),
+    # Protocol 4+ framing opcode
+    "FRAME": (
+        "The FRAME opcode (Protocol 4+) introduces a frame boundary for chunked data. While not directly "
+        "dangerous, it can be used to obfuscate payload structure and evade pattern-based detection."
+    ),
 }
 
 # Explanations for specific patterns and behaviors
@@ -251,6 +286,74 @@ TF_OP_EXPLANATIONS = {
         "DecodeJpeg decodes JPEG images; crafted images may exploit vulnerabilities or consume excessive resources."
     ),
     "DecodePng": ("DecodePng decodes PNG data, which could be abused with malformed inputs."),
+    # Checkpoint and table operations - HIGH RISK
+    "LoadAndRemapMatrix": (
+        "LoadAndRemapMatrix loads matrix data from arbitrary file paths, which could be used to read "
+        "sensitive files or load malicious data into the model."
+    ),
+    "RestoreV2": (
+        "RestoreV2 restores checkpoint data from files, enabling file system access that could be used "
+        "to read sensitive data or load malicious parameters."
+    ),
+    "LookupTableImport": (
+        "LookupTableImport imports data from external files into lookup tables, which could be used to "
+        "read sensitive files or inject malicious data."
+    ),
+    "InitializeTable": (
+        "InitializeTable initializes lookup tables from external files, which could be used to read "
+        "sensitive files or inject malicious data during model initialization."
+    ),
+    "LookupTableImportV2": (
+        "LookupTableImportV2 imports data from external files into lookup tables (V2 variant), which could "
+        "be used to read sensitive files or inject malicious data."
+    ),
+    "InitializeTableV2": (
+        "InitializeTableV2 initializes lookup tables from external files (V2 variant), which could be used "
+        "to read sensitive files or inject malicious data during model initialization."
+    ),
+    # Queue operations - MEDIUM RISK (data exfiltration)
+    "QueueEnqueue": (
+        "QueueEnqueue enqueues data to TensorFlow queues, which could be used as a data exfiltration "
+        "vector to send sensitive information to external systems."
+    ),
+    "QueueEnqueueV2": (
+        "QueueEnqueueV2 enqueues data to TensorFlow queues (V2 variant), which attackers could abuse as a "
+        "data exfiltration vector to send sensitive information to external systems."
+    ),
+    "QueueDequeue": (
+        "QueueDequeue dequeues data from TensorFlow queues, which could be used as a data exfiltration "
+        "vector or to inject malicious data into the inference pipeline."
+    ),
+    "QueueDequeueV2": (
+        "QueueDequeueV2 dequeues data from TensorFlow queues (V2 variant), which could be used as a data "
+        "exfiltration vector or to inject malicious data into the inference pipeline."
+    ),
+    "QueueEnqueueMany": (
+        "QueueEnqueueMany batch enqueues data to TensorFlow queues, which attackers could abuse as a "
+        "high-throughput data exfiltration vector to send large amounts of sensitive information."
+    ),
+    "QueueDequeueMany": (
+        "QueueDequeueMany batch dequeues data from TensorFlow queues, which attackers could abuse as a "
+        "high-throughput data exfiltration vector or to inject large amounts of malicious data."
+    ),
+    # Side-channel operations - MEDIUM RISK
+    "Print": (
+        "Print outputs data to stdout, which attackers could abuse as a side-channel to leak sensitive "
+        "information such as model parameters, input data, or system information."
+    ),
+    "PrintV2": (
+        "PrintV2 outputs data to stdout (V2 variant), which attackers could abuse as a side-channel to leak "
+        "sensitive information such as model parameters, input data, or system information."
+    ),
+    # Denial of service operations - MEDIUM RISK
+    "Assert": (
+        "Assert can crash inference pipelines if assertions fail, which could be used for denial of service "
+        "attacks or to cause unexpected behavior in production systems."
+    ),
+    "Abort": (
+        "Abort immediately terminates execution, which could be used for denial of service attacks "
+        "to crash inference pipelines or disrupt production systems."
+    ),
 }
 
 

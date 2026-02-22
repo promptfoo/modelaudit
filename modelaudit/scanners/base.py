@@ -180,9 +180,8 @@ class ScanResult:
             # Severity should never be None here due to check above, but add assertion for type checker
             assert severity is not None
 
-            # Apply whitelist downgrading logic if scanner is available
-            if self.scanner:
-                severity, details = self.scanner._apply_whitelist_downgrade(severity, details)
+            # Note: whitelist downgrading was already applied above (lines 160-163)
+            # before creating the Check, so we use the same downgraded severity here
 
             issue = Issue(
                 message=message,
@@ -466,7 +465,7 @@ class BaseScanner(ABC):
         """Initialize the unified context for the current file."""
         from pathlib import Path as PathlibPath
 
-        from modelaudit.utils.huggingface import extract_model_id_from_path
+        from modelaudit.utils.sources.huggingface import extract_model_id_from_path
 
         path_obj = PathlibPath(path)
         file_size = self.get_file_size(path)

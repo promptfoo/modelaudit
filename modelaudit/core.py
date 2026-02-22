@@ -1,14 +1,16 @@
+"""Core scanning engine for orchestrating model file security analysis."""
+
 import builtins
+import contextlib
 import hashlib
 import logging
 import os
 import time
 from collections import defaultdict
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator, Iterator
 from pathlib import Path
 from threading import Lock
 from typing import IO, Any
-from unittest.mock import patch
 
 from modelaudit.integrations.license_checker import (
     LICENSE_FILES,
@@ -42,11 +44,23 @@ from modelaudit.utils.helpers.types import (
     FilePath,
     ProgressCallback,
 )
+from modelaudit.utils.lfs import check_lfs_pointer, get_lfs_issue_details, get_lfs_remediation_steps
 
 logger = logging.getLogger("modelaudit.core")
 
 # Lock to ensure thread-safe monkey patching of builtins.open
 _OPEN_PATCH_LOCK = Lock()
+
+
+@contextlib.contextmanager
+def _patched_open(replacement: Callable[..., IO[Any]]) -> Generator[None, None, None]:
+    """Temporarily replace builtins.open with *replacement*, then restore it."""
+    original: Callable[..., IO[Any]] = builtins.open
+    builtins.open = replacement  # type: ignore[assignment]
+    try:
+        yield
+    finally:
+        builtins.open = original  # type: ignore[assignment]
 
 
 def _add_asset_to_results(
@@ -684,7 +698,7 @@ def scan_model_directory_or_file(
                         continue
 
                     # Skip non-model files early if filtering is enabled
-                    skip_file_types = config.get("skip_file_types", True)
+                    # Note: skip_file_types parameter already contains the correct value
                     if skip_file_types and should_skip_file(
                         file_path, metadata_scanner_available=metadata_scanner_available
                     ):
@@ -929,7 +943,9 @@ def scan_model_directory_or_file(
                 if progress_callback is not None and file_size > 0:
 
                     def create_progress_open(
-                        callback: Callable[[str, float], None], current_file_size: int
+                        callback: Callable[[str, float], None],
+                        current_file_size: int,
+                        original_open: Callable[..., IO[Any]],
                     ) -> Callable[..., IO[Any]]:
                         """Create a progress-aware file opener with properly bound variables."""
 
@@ -937,7 +953,7 @@ def scan_model_directory_or_file(
                             # Note: We intentionally don't use a context manager here because we need to
                             # return the file object for further processing. The SIM115 warning is
                             # suppressed because this is a legitimate use case.
-                            file = builtins.open(file_path, mode, *args, **kwargs)  # noqa: SIM115
+                            file = original_open(file_path, mode, *args, **kwargs)
                             file_pos = 0
 
                             original_read = file.read
@@ -958,8 +974,8 @@ def scan_model_directory_or_file(
 
                         return progress_open
 
-                    progress_opener = create_progress_open(progress_callback, file_size)
-                    with _OPEN_PATCH_LOCK, patch("builtins.open", progress_opener):
+                    progress_opener = create_progress_open(progress_callback, file_size, builtins.open)
+                    with _OPEN_PATCH_LOCK, _patched_open(progress_opener):
                         file_result = scan_file(target, config)
                 else:
                     file_result = scan_file(target, config)
@@ -1224,6 +1240,39 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         sr.finish(success=True)
         return sr
 
+    # Check for Git LFS pointer files (text pointers instead of actual model content)
+    # This is a common issue when cloning repos without `git lfs pull`
+    is_lfs, lfs_info = check_lfs_pointer(path)
+    if is_lfs:
+        sr = ScanResult(scanner_name="lfs_check")
+        details = get_lfs_issue_details(path, lfs_info)
+        details["remediation"] = get_lfs_remediation_steps()
+
+        if lfs_info:
+            message = (
+                f"Git LFS pointer detected - file is {details['actual_size_bytes']} bytes "
+                f"but should be {lfs_info.format_expected_size()}"
+            )
+        else:
+            message = "Git LFS pointer detected - this is a text pointer, not the actual model file"
+
+        # add_check with passed=False automatically creates an Issue as well
+        sr.add_check(
+            name="Git LFS Pointer Detection",
+            passed=False,
+            message=message,
+            severity=IssueSeverity.CRITICAL,
+            location=path,
+            why=(
+                "This file is a Git LFS pointer (a small text file that references the actual content) "
+                "rather than the actual model weights. The model cannot be loaded in its current state. "
+                "Run 'git lfs pull' to download the actual file."
+            ),
+            details=details,
+        )
+        sr.finish(success=False)
+        return sr
+
     # Get file size for later checks
     try:
         file_size = os.path.getsize(path)
@@ -1410,13 +1459,18 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         else:
             format_ = header_format
             sr = ScanResult(scanner_name="unknown")
-            sr.add_check(
-                name="Format Detection",
-                passed=False,
-                message=f"Unknown or unhandled format: {format_}",
-                severity=IssueSeverity.DEBUG,
-                details={"format": format_, "path": path},
-            )
+            if format_ == "unknown":
+                # Not a recognized model format — skip silently
+                logger.debug(f"Skipping unrecognized format file: {path}")
+            else:
+                # Known format but no scanner available
+                sr.add_check(
+                    name="Format Detection",
+                    passed=False,
+                    message=f"Unknown or unhandled format: {format_}",
+                    severity=IssueSeverity.DEBUG,
+                    details={"format": format_, "path": path},
+                )
             result = sr
 
     if discrepancy_msg:

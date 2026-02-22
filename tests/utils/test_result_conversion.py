@@ -3,7 +3,7 @@
 import time
 
 from modelaudit.scanners.base import Check, CheckStatus, Issue, IssueSeverity, ScanResult
-from modelaudit.utils.result_conversion import scan_result_from_dict, scan_result_to_dict
+from modelaudit.utils.helpers.result_conversion import scan_result_from_dict, scan_result_to_dict
 
 
 class TestScanResultToDict:

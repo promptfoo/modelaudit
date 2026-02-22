@@ -1,3 +1,5 @@
+"""Scanner for model manifest and configuration files."""
+
 import json
 import os
 import re

@@ -848,7 +848,6 @@ class JITScriptDetector:
         # Scan based on model type
         if model_type in ["pytorch", "torchscript"]:
             findings.extend(self.scan_torchscript(data, context))
-            # TODO: Fix return type mismatch in scan_advanced_torchscript_vulnerabilities
             findings.extend(self.scan_advanced_torchscript_vulnerabilities(data, context))
 
         if model_type in ["tensorflow", "tf", "keras"]:
@@ -864,7 +863,6 @@ class JITScriptDetector:
         if model_type == "unknown":
             # Check all frameworks if type is unknown
             findings.extend(self.scan_torchscript(data, context))
-            # TODO: Fix return type mismatch in scan_advanced_torchscript_vulnerabilities
             findings.extend(self.scan_advanced_torchscript_vulnerabilities(data, context))
             findings.extend(self.scan_tensorflow(data, context))
             findings.extend(self.scan_onnx(data, context))

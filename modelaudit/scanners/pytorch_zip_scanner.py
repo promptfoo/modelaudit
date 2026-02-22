@@ -1,7 +1,10 @@
+"""Scanner for PyTorch zip-archived model files (.pt, .pth)."""
+
 import io
 import logging
 import os
 import re
+import stat
 import tempfile
 import zipfile
 from typing import Any, ClassVar
@@ -26,11 +29,18 @@ class PyTorchZipScanner(BaseScanner):
     CVE_2025_32434_FIX_VERSION: ClassVar[str] = "2.6.0"
     CVE_2025_32434_DESCRIPTION: ClassVar[str] = "RCE when loading models with torch.load(weights_only=True)"
 
+    # Security limits for archive manipulation protection
+    MAX_COMPRESSION_RATIO: ClassVar[int] = 100  # 100:1 compression ratio threshold
+    MAX_ARCHIVE_ENTRIES: ClassVar[int] = 10000  # Maximum number of entries in archive
+
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
         # Initialize a pickle scanner for embedded pickles
         self.pickle_scanner: PickleScanner = PickleScanner(config)
         self.current_file_path = ""  # Will be set when scanning files
+        # Configurable limits (can override class defaults via config)
+        self.max_compression_ratio = self.config.get("max_compression_ratio", self.MAX_COMPRESSION_RATIO)
+        self.max_archive_entries = self.config.get("max_archive_entries", self.MAX_ARCHIVE_ENTRIES)
 
     @staticmethod
     def _read_header(path: str, length: int = 4) -> bytes:
@@ -170,11 +180,42 @@ class PyTorchZipScanner(BaseScanner):
         return result
 
     def _validate_zip_entries(self, zip_file: zipfile.ZipFile, result: ScanResult, path: str) -> list[str]:
-        """Validate ZIP entries and check for path traversal attacks"""
+        """Validate ZIP entries and check for path traversal, symlinks, and archive manipulation attacks"""
         safe_entries: list[str] = []
         path_traversal_found = False
+        symlink_issues_found = False
+        compression_issues_found = False
         temp_base = os.path.join(tempfile.gettempdir(), "extract")
+
+        # Check entry count limit (decompression bomb indicator)
+        entry_count = len(zip_file.namelist())
+        if entry_count > self.max_archive_entries:
+            result.add_check(
+                name="Archive Entry Limit",
+                passed=False,
+                message=f"Archive contains {entry_count} entries (max: {self.max_archive_entries})",
+                severity=IssueSeverity.WARNING,
+                location=path,
+                details={
+                    "entry_count": entry_count,
+                    "max_entries": self.max_archive_entries,
+                    "risk": "Excessive entries may indicate a decompression bomb attack",
+                },
+                why="Archives with excessive entries can exhaust system resources during extraction",
+            )
+        else:
+            result.add_check(
+                name="Archive Entry Limit",
+                passed=True,
+                message=f"Archive entry count ({entry_count}) is within limits",
+                location=path,
+                details={"entry_count": entry_count, "max_entries": self.max_archive_entries},
+            )
+
         for name in zip_file.namelist():
+            info = zip_file.getinfo(name)
+
+            # Check for path traversal
             _, is_safe = sanitize_archive_path(name, temp_base)
             if not is_safe:
                 result.add_check(
@@ -187,8 +228,67 @@ class PyTorchZipScanner(BaseScanner):
                 )
                 path_traversal_found = True
                 continue
+
+            # Check for symlinks (ZIP slip variant attack)
+            is_symlink = (info.external_attr >> 16) & 0o170000 == stat.S_IFLNK
+            if is_symlink:
+                try:
+                    # Read only a bounded prefix (4KB) to avoid DoS from a
+                    # symlink entry that hides a large compressed payload.
+                    # Real symlink targets are short filesystem paths.
+                    with zip_file.open(name) as entry:
+                        target = entry.read(4096).decode("utf-8", "replace")
+                except Exception:
+                    target = "<unreadable>"
+                result.add_check(
+                    name="Symlink Safety Validation",
+                    passed=False,
+                    message=f"Symlink entry detected: {name} -> {target}",
+                    severity=IssueSeverity.WARNING,
+                    location=f"{path}:{name}",
+                    details={
+                        "entry": name,
+                        "target": target,
+                        "risk": "Symlinks in PyTorch models can be used for path traversal attacks",
+                    },
+                    why="Symlinks in model archives are unusual and may indicate an attack attempt",
+                )
+                symlink_issues_found = True
+                continue
+
+            # Skip directories for content checks
+            if name.endswith("/"):
+                safe_entries.append(name)
+                continue
+
+            # Check compression ratio (decompression bomb detection)
+            # Entries with compress_size == 0 (e.g., empty files or stored entries
+            # where the size field is zero) are skipped since ratio is undefined.
+            if info.compress_size > 0:
+                compression_ratio = info.file_size / info.compress_size
+                if compression_ratio > self.max_compression_ratio:
+                    result.add_check(
+                        name="Compression Ratio Check",
+                        passed=False,
+                        message=f"Suspicious compression ratio ({compression_ratio:.1f}x) in entry: {name}",
+                        severity=IssueSeverity.WARNING,
+                        location=f"{path}:{name}",
+                        details={
+                            "entry": name,
+                            "compressed_size": info.compress_size,
+                            "uncompressed_size": info.file_size,
+                            "ratio": compression_ratio,
+                            "threshold": self.max_compression_ratio,
+                            "risk": "High compression ratio may indicate a decompression bomb",
+                        },
+                        why="Decompression bombs use high compression ratios to exhaust system resources",
+                    )
+                    compression_issues_found = True
+                    continue
+
             safe_entries.append(name)
 
+        # Summary checks for clean archives
         if not path_traversal_found and zip_file.namelist():
             result.add_check(
                 name="Path Traversal Protection",
@@ -196,6 +296,23 @@ class PyTorchZipScanner(BaseScanner):
                 message="All archive entries have safe paths",
                 location=path,
                 details={"entries_checked": len(zip_file.namelist())},
+            )
+
+        if not symlink_issues_found and zip_file.namelist():
+            result.add_check(
+                name="Symlink Safety Validation",
+                passed=True,
+                message="No symlinks detected in archive",
+                location=path,
+            )
+
+        if not compression_issues_found and zip_file.namelist():
+            result.add_check(
+                name="Compression Ratio Check",
+                passed=True,
+                message="All entries have safe compression ratios",
+                location=path,
+                details={"threshold": self.max_compression_ratio},
             )
 
         return safe_entries

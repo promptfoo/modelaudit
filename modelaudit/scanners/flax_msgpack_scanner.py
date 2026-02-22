@@ -1,3 +1,5 @@
+"""Scanner for Flax/JAX MessagePack serialized model files (.msgpack)."""
+
 from __future__ import annotations
 
 import os
