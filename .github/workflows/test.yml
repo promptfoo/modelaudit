@@ -738,6 +738,7 @@ jobs:
     name: CI Success
     needs:
       [
+        changes,
         quick-feedback,
         lint,
         dependency-audit,
@@ -772,6 +773,7 @@ jobs:
           PROTO_REPRO_RESULT="${{ needs.test-proto-reproducibility.result }}"
           EXTRAS_RESULT="${{ needs.test-extras-smoke.result }}"
           BUILD_RESULT="${{ needs.build.result }}"
+          CHANGES_RESULT="${{ needs.changes.result }}"
 
           # Check if conditional jobs should have run
           ON_MAIN_BRANCH="${{ github.ref == 'refs/heads/main' }}"
@@ -792,10 +794,12 @@ jobs:
           echo "  test-proto-reproducibility: $PROTO_REPRO_RESULT"
           echo "  test-extras-smoke: $EXTRAS_RESULT"
           echo "  build: $BUILD_RESULT"
+          echo "  changes: $CHANGES_RESULT"
 
           # Check if any job failed or was cancelled
           FAILED=false
 
+          [[ "$CHANGES_RESULT" == "failure" || "$CHANGES_RESULT" == "cancelled" ]] && FAILED=true
           [[ "$QUICK_FEEDBACK_RESULT" == "failure" || "$QUICK_FEEDBACK_RESULT" == "cancelled" ]] && FAILED=true
           [[ "$LINT_RESULT" == "failure" || "$LINT_RESULT" == "cancelled" ]] && FAILED=true
           [[ "$AUDIT_RESULT" == "failure" || "$AUDIT_RESULT" == "cancelled" ]] && FAILED=true

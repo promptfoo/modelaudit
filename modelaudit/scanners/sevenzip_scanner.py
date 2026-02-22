@@ -118,12 +118,13 @@ class SevenZipScanner(BaseScanner):
                     result.finish(success=False)
                     return result
 
-                # Check for path traversal vulnerabilities
-                self._check_path_traversal(file_names, path, result)
+                # Check for path traversal vulnerabilities and only keep safe entries
+                safe_file_names = self._check_path_traversal(file_names, path, result)
 
-                # Filter for scannable model files
-                scannable_files = self._identify_scannable_files(file_names)
+                # Filter for scannable model files from safe entries only
+                scannable_files = self._identify_scannable_files(safe_file_names)
                 result.metadata["scannable_files"] = len(scannable_files)
+                result.metadata["unsafe_entries"] = len(file_names) - len(safe_file_names)
 
                 if not scannable_files:
                     result.add_check(
@@ -190,14 +191,17 @@ class SevenZipScanner(BaseScanner):
 
         return scannable_files
 
-    def _check_path_traversal(self, file_names: list[str], archive_path: str, result: ScanResult) -> None:
-        """Check for path traversal vulnerabilities in archive entries"""
+    def _check_path_traversal(self, file_names: list[str], archive_path: str, result: ScanResult) -> list[str]:
+        """Check for path traversal vulnerabilities and return only safe entries."""
+        safe_entries: list[str] = []
         for file_name in file_names:
             # Use temporary directory as base for sanitization check
             temp_base = os.path.join(tempfile.gettempdir(), "modelaudit_7z")  # Placeholder base directory
             sanitized_path, is_safe = sanitize_archive_path(file_name, temp_base)
             if not is_safe:
-                result._add_issue(
+                result.add_check(
+                    name="7z Path Traversal Protection",
+                    passed=False,
                     message=f"Potential path traversal attempt in archive entry: {file_name}",
                     severity=IssueSeverity.CRITICAL,
                     location=f"{archive_path}:{file_name}",
@@ -207,6 +211,11 @@ class SevenZipScanner(BaseScanner):
                         "threat_type": "path_traversal",
                     },
                 )
+                continue
+
+            safe_entries.append(file_name)
+
+        return safe_entries
 
     def _extract_and_scan_files(
         self, archive: Any, scannable_files: list[str], archive_path: str, result: ScanResult

@@ -59,8 +59,6 @@ class OnnxScanner(BaseScanner):
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
-        if not _check_onnx():
-            return False
         if not os.path.isfile(path):
             return False
         return os.path.splitext(path)[1].lower() in cls.supported_extensions
