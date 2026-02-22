@@ -465,7 +465,7 @@ class BaseScanner(ABC):
         """Initialize the unified context for the current file."""
         from pathlib import Path as PathlibPath
 
-        from modelaudit.utils.huggingface import extract_model_id_from_path
+        from modelaudit.utils.sources.huggingface import extract_model_id_from_path
 
         path_obj = PathlibPath(path)
         file_size = self.get_file_size(path)

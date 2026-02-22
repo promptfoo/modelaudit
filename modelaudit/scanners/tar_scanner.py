@@ -10,7 +10,7 @@ from typing import Any, ClassVar
 
 from .. import core
 from ..utils import is_absolute_archive_path, is_critical_system_path, sanitize_archive_path
-from ..utils.assets import asset_from_scan_result
+from ..utils.helpers.assets import asset_from_scan_result
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 CRITICAL_SYSTEM_PATHS = [
