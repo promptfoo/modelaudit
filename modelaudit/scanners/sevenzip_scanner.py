@@ -199,7 +199,9 @@ class SevenZipScanner(BaseScanner):
             temp_base = os.path.join(tempfile.gettempdir(), "modelaudit_7z")  # Placeholder base directory
             sanitized_path, is_safe = sanitize_archive_path(file_name, temp_base)
             if not is_safe:
-                result._add_issue(
+                result.add_check(
+                    name="7z Path Traversal Protection",
+                    passed=False,
                     message=f"Potential path traversal attempt in archive entry: {file_name}",
                     severity=IssueSeverity.CRITICAL,
                     location=f"{archive_path}:{file_name}",
