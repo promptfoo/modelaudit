@@ -245,7 +245,7 @@ def test_merge_scan_results():
 
 def test_blacklist_patterns(tmp_path):
     """Test blacklist patterns parameter."""
-    test_file = tmp_path / "manifest.json"
+    test_file = tmp_path / "config.json"
     test_file.write_text('{"notes": "contains malicious_pattern for testing"}', encoding="utf-8")
 
     # Scan with blacklist patterns
@@ -256,7 +256,10 @@ def test_blacklist_patterns(tmp_path):
 
     blacklist_checks = [check for check in results.checks if check.name == "Blacklist Pattern Check"]
     assert blacklist_checks, "Expected blacklist checks to be recorded"
-    assert any(check.status.value == "failed" for check in blacklist_checks)
+    assert any(check.status.value == "failed" for check in blacklist_checks), (
+        f"Expected at least one failed blacklist check, got statuses: "
+        f"{[check.status.value for check in blacklist_checks]}"
+    )
 
 
 def test_invalid_config_values(tmp_path):
