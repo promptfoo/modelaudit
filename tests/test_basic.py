@@ -245,10 +245,8 @@ def test_merge_scan_results():
 
 def test_blacklist_patterns(tmp_path):
     """Test blacklist patterns parameter."""
-    # This test is a placeholder since we don't have the actual implementation
-    # of how blacklist patterns are used in the scanners
-    test_file = tmp_path / "test_file.dat"
-    test_file.write_bytes(b"test content")
+    test_file = tmp_path / "config.json"
+    test_file.write_text('{"notes": "contains malicious_pattern for testing"}', encoding="utf-8")
 
     # Scan with blacklist patterns
     results = scan_model_directory_or_file(
@@ -256,8 +254,12 @@ def test_blacklist_patterns(tmp_path):
         blacklist_patterns=["malicious_pattern", "evil_function"],
     )
 
-    # Just verify the scan completes successfully
-    assert results.success is True
+    blacklist_checks = [check for check in results.checks if check.name == "Blacklist Pattern Check"]
+    assert blacklist_checks, "Expected blacklist checks to be recorded"
+    assert any(check.status.value == "failed" for check in blacklist_checks), (
+        f"Expected at least one failed blacklist check, got statuses: "
+        f"{[check.status.value for check in blacklist_checks]}"
+    )
 
 
 def test_invalid_config_values(tmp_path):
