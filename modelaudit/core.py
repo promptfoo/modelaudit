@@ -1,16 +1,16 @@
 """Core scanning engine for orchestrating model file security analysis."""
 
 import builtins
+import contextlib
 import hashlib
 import logging
 import os
 import time
 from collections import defaultdict
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator, Iterator
 from pathlib import Path
 from threading import Lock
 from typing import IO, Any
-from unittest.mock import patch
 
 from modelaudit.integrations.license_checker import (
     LICENSE_FILES,
@@ -50,6 +50,17 @@ logger = logging.getLogger("modelaudit.core")
 
 # Lock to ensure thread-safe monkey patching of builtins.open
 _OPEN_PATCH_LOCK = Lock()
+
+
+@contextlib.contextmanager
+def _patched_open(replacement: Callable[..., IO[Any]]) -> Generator[None, None, None]:
+    """Temporarily replace builtins.open with *replacement*, then restore it."""
+    original: Callable[..., IO[Any]] = builtins.open
+    builtins.open = replacement  # type: ignore[assignment]
+    try:
+        yield
+    finally:
+        builtins.open = original  # type: ignore[assignment]
 
 
 def _add_asset_to_results(
@@ -932,7 +943,9 @@ def scan_model_directory_or_file(
                 if progress_callback is not None and file_size > 0:
 
                     def create_progress_open(
-                        callback: Callable[[str, float], None], current_file_size: int
+                        callback: Callable[[str, float], None],
+                        current_file_size: int,
+                        original_open: Callable[..., IO[Any]],
                     ) -> Callable[..., IO[Any]]:
                         """Create a progress-aware file opener with properly bound variables."""
 
@@ -940,7 +953,7 @@ def scan_model_directory_or_file(
                             # Note: We intentionally don't use a context manager here because we need to
                             # return the file object for further processing. The SIM115 warning is
                             # suppressed because this is a legitimate use case.
-                            file = builtins.open(file_path, mode, *args, **kwargs)  # noqa: SIM115
+                            file = original_open(file_path, mode, *args, **kwargs)
                             file_pos = 0
 
                             original_read = file.read
@@ -961,8 +974,8 @@ def scan_model_directory_or_file(
 
                         return progress_open
 
-                    progress_opener = create_progress_open(progress_callback, file_size)
-                    with _OPEN_PATCH_LOCK, patch("builtins.open", progress_opener):
+                    progress_opener = create_progress_open(progress_callback, file_size, builtins.open)
+                    with _OPEN_PATCH_LOCK, _patched_open(progress_opener):
                         file_result = scan_file(target, config)
                 else:
                     file_result = scan_file(target, config)
