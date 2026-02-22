@@ -70,13 +70,12 @@ def __getattr__(name: str) -> object:
 
         mod = importlib.import_module(module_path)
         val = getattr(mod, attr)
-        # Cache on the module so __getattr__ is not called again
         globals()[name] = val
         return val
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-__all__ = [
+__all__: list[str] = [
     "BaseScanner",
     "Issue",
     "IssueSeverity",
