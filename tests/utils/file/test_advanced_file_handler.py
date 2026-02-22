@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 
 from modelaudit.utils.file.handlers import (
     AdvancedFileHandler,
-    MemoryMappedScanner,
+    MemoryMappedHandler,
     ShardedModelDetector,
     should_use_advanced_handler,
 )
@@ -82,7 +82,7 @@ class TestShardedModelDetector:
             assert found_config == str(config_path)
 
 
-class TestMemoryMappedScanner:
+class TestMemoryMappedHandler:
     """Test memory-mapped scanning."""
 
     def test_mmap_scanning(self) -> None:
@@ -100,7 +100,7 @@ class TestMemoryMappedScanner:
             mock_scanner = MagicMock()
             mock_scanner.name = "test_scanner"
 
-            mmap_scanner = MemoryMappedScanner(temp_path, mock_scanner)
+            mmap_scanner = MemoryMappedHandler(temp_path, mock_scanner)
             result = mmap_scanner.scan_with_mmap()
 
             # With full scanning, we might not detect patterns in mmap test
@@ -127,7 +127,7 @@ class TestMemoryMappedScanner:
             mock_scanner = MagicMock()
             mock_scanner.name = "test_scanner"
 
-            mmap_scanner = MemoryMappedScanner(temp_path, mock_scanner)
+            mmap_scanner = MemoryMappedHandler(temp_path, mock_scanner)
             result = mmap_scanner.scan_with_mmap()
 
             # With full scanning, mmap test focuses on completion without errors
