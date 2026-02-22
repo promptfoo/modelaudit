@@ -195,6 +195,10 @@ modelaudit model.pkl --format sarif --output results.sarif
 - **[Usage examples](https://www.promptfoo.dev/docs/model-audit/usage/)** — CI/CD integration, remote scanning, SBOM generation
 - **[Supported formats](https://www.promptfoo.dev/docs/model-audit/scanners/)** — detailed scanner documentation
 - **[Support policy](SUPPORT.md)** — supported Python/OS versions and maintenance policy
+- **[Security model and limitations](docs/user/security-model.md)** — what ModelAudit does and does not guarantee
+- **[Compatibility matrix](docs/user/compatibility-matrix.md)** — file formats vs optional dependencies
+- **[Offline/air-gapped guide](docs/user/offline-air-gapped.md)** — secure operation without internet access
+- **[Scanner contributor quickstart](docs/agents/new-scanner-quickstart.md)** — safe workflow for new scanner development
 - **Troubleshooting** — run `modelaudit doctor --show-failed` to check scanner availability
 
 ## License
