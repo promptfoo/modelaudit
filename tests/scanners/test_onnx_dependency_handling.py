@@ -7,13 +7,12 @@ from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.onnx_scanner import OnnxScanner
 
 
-def test_onnx_file_routes_to_onnx_scanner_when_dependency_check_fails(tmp_path):
-    """ONNX files should still route to OnnxScanner for explicit missing-dep reporting."""
+def test_onnx_file_routes_to_onnx_scanner_by_extension(tmp_path):
+    """ONNX files should route to OnnxScanner regardless of optional deps."""
     model_path = tmp_path / "model.onnx"
     model_path.write_bytes(b"not-a-real-onnx-model")
 
-    with patch("modelaudit.scanners.onnx_scanner._check_onnx", return_value=False):
-        scanner = get_scanner_for_file(str(model_path))
+    scanner = get_scanner_for_file(str(model_path))
 
     assert scanner is not None
     assert isinstance(scanner, OnnxScanner)
