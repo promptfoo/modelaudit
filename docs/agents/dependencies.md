@@ -11,19 +11,19 @@ ModelAudit uses optional dependencies to keep the base installation lightweight:
 
 ## Optional Dependencies
 
-| Feature       | Package        | Purpose                               |
-| ------------- | -------------- | ------------------------------------- |
-| `h5`          | h5py           | Keras H5 model scanning               |
-| `pytorch`     | torch          | PyTorch model scanning                |
-| `yaml`        | pyyaml         | YAML manifest scanning                |
-| `safetensors` | safetensors    | SafeTensors model scanning            |
-| `onnx`        | onnx           | ONNX model scanning                   |
-| `dill`        | dill           | Enhanced pickle support               |
-| `joblib`      | joblib         | Joblib model scanning                 |
-| `flax`        | flax           | Flax msgpack scanning                 |
-| `tflite`      | tflite-runtime | TensorFlow Lite scanning              |
-| `tensorflow`  | tensorflow     | TF checkpoint reading (rarely needed) |
-| `all`         | All above      | Everything                            |
+| Feature       | Package     | Purpose                               |
+| ------------- | ----------- | ------------------------------------- |
+| `h5`          | h5py        | Keras H5 model scanning               |
+| `pytorch`     | torch       | PyTorch model scanning                |
+| `yaml`        | pyyaml      | YAML manifest scanning                |
+| `safetensors` | safetensors | SafeTensors model scanning            |
+| `onnx`        | onnx        | ONNX model scanning                   |
+| `dill`        | dill        | Enhanced pickle support               |
+| `joblib`      | joblib      | Joblib model scanning                 |
+| `flax`        | flax        | Flax msgpack scanning                 |
+| `tflite`      | tflite      | TensorFlow Lite scanning              |
+| `tensorflow`  | tensorflow  | TF checkpoint reading (rarely needed) |
+| `all`         | All above   | Everything                            |
 
 ## TensorFlow SavedModel Scanning (No TensorFlow Required)
 
