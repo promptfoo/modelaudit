@@ -272,5 +272,5 @@ class TestDetectSecretsInFile:
         # Test with very small max_size
         findings = detect_secrets_in_file(str(large_file), max_size=50)
         assert len(findings) == 1
-        assert findings[0]["type"] == "error"
+        assert findings[0]["type"] == "info"
         assert "too large" in findings[0]["message"]
