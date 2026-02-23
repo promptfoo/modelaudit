@@ -1,9 +1,12 @@
 """Python code validation utilities using py_compile."""
 
 import ast
+import logging
 import os
 import py_compile
 import tempfile
+
+logger = logging.getLogger(__name__)
 
 
 def validate_python_syntax(code: str, filename: str = "<string>") -> tuple[bool, str | None]:
@@ -123,8 +126,7 @@ def extract_dangerous_constructs(code: str) -> dict[str, list[str]]:
                     dangerous["variadic_lambdas"].append(f"**{args.kwarg.arg}")
 
     except Exception:
-        # If parsing fails, we can't analyze the code
-        pass
+        logger.debug("Failed to parse code for dangerous construct analysis")
 
     return dangerous
 
