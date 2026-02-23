@@ -219,26 +219,14 @@ We use [Conventional Commits](https://www.conventionalcommits.org/) format:
 
 ```
 modelaudit/
-├── modelaudit/
-│   ├── scanners/          # Model format scanners
-│   │   ├── base.py                    # Base scanner class
-│   │   ├── pickle_scanner.py          # Pickle/joblib security scanner
-│   │   ├── tf_savedmodel_scanner.py   # TensorFlow SavedModel scanner
-│   │   ├── keras_h5_scanner.py        # Keras H5 model scanner
-│   │   ├── pytorch_zip_scanner.py     # PyTorch ZIP format scanner
-│   │   ├── pytorch_binary_scanner.py  # PyTorch binary format scanner
-│   │   ├── safetensors_scanner.py     # SafeTensors format scanner
-│   │   ├── weight_distribution_scanner.py # Weight analysis scanner
-│   │   ├── zip_scanner.py             # ZIP archive scanner
-│   │   └── manifest_scanner.py        # Config/manifest scanner
-│   ├── utils/             # Utility modules
-│   ├── auth/              # Authentication modules
-│   ├── name_policies/     # Name policy modules
-│   ├── cli.py            # Command-line interface
+├── modelaudit/           # Main package
+│   ├── scanners/         # Scanner implementations (one per format)
+│   ├── utils/            # Utility modules
+│   ├── cli.py            # CLI interface
 │   └── core.py           # Core scanning logic
 ├── tests/                # Test suite
-├── .github/              # GitHub Actions workflows
-└── README.md             # User documentation
+├── docs/                 # Contributor and security documentation
+└── .github/              # GitHub Actions workflows
 ```
 
 ### Adding New Scanners
@@ -285,9 +273,6 @@ uv run ruff check --fix .
 
 # Quick development test cycle
 uv run pytest -n auto -m "not slow and not integration" -x
-
-# Build documentation (if applicable)
-# Add documentation build commands here
 
 # Create test models for specific formats
 python -c "import torch; torch.save({'model': 'data'}, 'test.pt')"

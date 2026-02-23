@@ -21,7 +21,6 @@ uv run modelaudit scan model.pkl  # Explicit scan command
 # Large Model Support (8 GB+)
 uv run modelaudit large_model.bin --timeout 1800  # 30 min timeout
 uv run modelaudit huge_model.bin --verbose        # Show progress
-uv run modelaudit model.bin --no-large-model-support  # Disable optimizations
 ```
 
 ## Testing Commands
