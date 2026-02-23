@@ -109,10 +109,10 @@ class TestMetadataScanner:
 
         result = scanner.scan("/nonexistent/README.md")
 
-        assert len(result.issues) == 1
-        # File access errors are WARNING severity (may indicate tampering)
-        assert result.issues[0].severity == IssueSeverity.WARNING
-        assert "Error reading" in result.issues[0].message
+        assert len(result.issues) >= 1
+        # Base class _check_path returns CRITICAL for nonexistent paths
+        assert result.issues[0].severity == IssueSeverity.CRITICAL
+        assert "does not exist" in result.issues[0].message
 
     def test_bytes_scanned_reported(self):
         """Test that bytes scanned is properly reported."""

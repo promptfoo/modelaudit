@@ -142,6 +142,8 @@ test_*.pkl
 # uv / Python environment
 .python-version
 .venv/
+.vscode/
+.idea/
 
 # Internal planning files
 TODO.md
@@ -149,15 +151,8 @@ TODO.md
 # Temporary analysis artifacts should never be committed
 _temp_files/
 
-# External repository directories (for research/comparison)
-modelscan/
-picklescan/
-
 # MLflow experiment tracking (temporary data)
 mlruns/
 
 # Scan results output (temporary data)
 scan_results/
-
-# This comment forces a new CI run
-# CI status check

@@ -77,6 +77,7 @@ def pytest_runtest_setup(item):
             "test_manifest_scanner.py",  # Manifest scanner tests
             "test_weak_hash_detection.py",  # Weak hash detection tests
             "test_cloud_url_detection.py",  # Cloud storage URL detection tests
+            "test_skops_scanner.py",  # Skops scanner CVE detection tests
         ]
 
         # Check if this is an allowed test file
@@ -296,19 +297,22 @@ def pytest_configure(config):
 
 
 def pytest_collection_modifyitems(config, items):
-    """Auto-mark tests based on their names."""
+    """Auto-mark tests based on their file names (not test function names).
+
+    Using file names instead of test function names avoids false positives
+    like marking test_multiple_issues as slow just because 'multiple' appears
+    in the name.
+    """
     for item in items:
-        # Mark performance tests
-        if "performance" in item.name.lower() or "benchmark" in item.name.lower():
+        test_file = str(item.fspath).lower()
+
+        # Mark performance tests by file name
+        if "performance" in test_file or "benchmark" in test_file:
             item.add_marker(pytest.mark.performance)
 
-        # Mark integration tests
-        if "integration" in item.name.lower() or "real_world" in item.name.lower():
+        # Mark integration tests by file name
+        if "integration" in test_file:
             item.add_marker(pytest.mark.integration)
-
-        # Mark slow tests
-        if "large" in item.name.lower() or "multiple" in item.name.lower():
-            item.add_marker(pytest.mark.slow)
 
 
 @pytest.fixture
@@ -395,18 +399,12 @@ def mock_cli_scan_command():
 
 @pytest.fixture(autouse=True)
 def cleanup_test_files():
-    """Ensure test files are cleaned up after each test."""
+    """Ensure test temp files are cleaned up after each test.
+
+    Tests should use tmp_path for any temporary files;
+    pytest handles tmp_path cleanup automatically.
+    """
     yield
-    # Cleanup any test files that might have been left behind
-    for pattern in ["*.test_*", "test_*", "*.tmp"]:
-        for file in Path.cwd().glob(pattern):
-            try:
-                if file.is_file():
-                    file.unlink()
-                elif file.is_dir():
-                    shutil.rmtree(file)
-            except (OSError, PermissionError):
-                pass  # Ignore cleanup errors
 
 
 # =============================================================================

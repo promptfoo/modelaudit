@@ -1,5 +1,7 @@
 """Progress tracking system for large model scans."""
 
+from modelaudit.progress import hooks
+
 from .base import (
     ProgressCallback,
     ProgressPhase,
@@ -21,4 +23,5 @@ __all__ = [
     "ProgressStats",
     "ProgressTracker",
     "SimpleConsoleReporter",
+    "hooks",
 ]

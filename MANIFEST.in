@@ -5,10 +5,8 @@ prune docs
 prune scripts
 exclude Dockerfile*
 exclude docker-compose.yml
-exclude setup-poetry.sh
 exclude AGENTS.md
 exclude CLAUDE.md
-exclude GEMINI.md
 exclude CONTRIBUTING.md
 exclude evil.pickle
 exclude package.json
