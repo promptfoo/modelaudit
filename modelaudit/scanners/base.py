@@ -576,7 +576,6 @@ class BaseScanner(ABC):
             message="File integrity hashes calculated",
             location=path,
             details={
-                "md5": hashes["md5"],
                 "sha256": hashes["sha256"],
                 "sha512": hashes["sha512"],
                 "file_size": file_size,
@@ -1155,36 +1154,30 @@ class BaseScanner(ABC):
             return 0
 
     def calculate_file_hashes(self, path: str) -> dict[str, str | None]:
-        """Calculate MD5, SHA256, and SHA512 hashes of a file.
+        """Calculate SHA256 and SHA512 hashes of a file.
 
         Returns a dictionary with hash values or None if calculation fails.
         Uses None instead of empty strings to satisfy Pydantic validation.
         """
-        hashes: dict[str, str | None] = {"md5": None, "sha256": None, "sha512": None}
+        hashes: dict[str, str | None] = {"sha256": None, "sha512": None}
 
         if not os.path.isfile(path):
             return hashes
 
         try:
-            # Calculate all hashes in a single pass for efficiency
-            md5_hash = hashlib.md5()
             sha256_hash = hashlib.sha256()
             sha512_hash = hashlib.sha512()
 
             with open(path, "rb") as f:
-                # Read file in chunks to handle large files
                 for chunk in iter(lambda: f.read(8192), b""):
-                    md5_hash.update(chunk)
                     sha256_hash.update(chunk)
                     sha512_hash.update(chunk)
 
-            hashes["md5"] = md5_hash.hexdigest()
             hashes["sha256"] = sha256_hash.hexdigest()
             hashes["sha512"] = sha512_hash.hexdigest()
 
         except Exception as e:
             logger.warning(f"Failed to calculate hashes for {path}: {e}")
-            # Return None hashes on error - Pydantic will accept None but not empty strings
 
         return hashes
 

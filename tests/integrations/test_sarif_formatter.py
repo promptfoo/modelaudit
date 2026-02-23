@@ -268,14 +268,13 @@ class TestCreateArtifacts:
         result = create_initial_audit_result()
         result.assets = [AssetModel(path="/test/model.pkl", type="pickle")]
         result.file_metadata["/test/model.pkl"] = FileMetadataModel(
-            file_hashes=FileHashesModel(sha256="a" * 64, md5="b" * 32)
+            file_hashes=FileHashesModel(sha256="a" * 64)
         )
 
         artifacts = _create_artifacts(result)
 
         assert "hashes" in artifacts[0]
         assert "sha-256" in artifacts[0]["hashes"]
-        assert "md5" in artifacts[0]["hashes"]
 
 
 class TestHelperFunctions:

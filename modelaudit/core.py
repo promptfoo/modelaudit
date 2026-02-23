@@ -1,16 +1,13 @@
 """Core scanning engine for orchestrating model file security analysis."""
 
-import builtins
-import contextlib
 import hashlib
 import logging
 import os
 import time
 from collections import defaultdict
-from collections.abc import Callable, Generator, Iterator
+from collections.abc import Iterator
 from pathlib import Path
-from threading import Lock
-from typing import IO, Any
+from typing import Any
 
 from modelaudit.integrations.license_checker import (
     LICENSE_FILES,
@@ -47,20 +44,6 @@ from modelaudit.utils.helpers.types import (
 from modelaudit.utils.lfs import check_lfs_pointer, get_lfs_issue_details, get_lfs_remediation_steps
 
 logger = logging.getLogger("modelaudit.core")
-
-# Lock to ensure thread-safe monkey patching of builtins.open
-_OPEN_PATCH_LOCK = Lock()
-
-
-@contextlib.contextmanager
-def _patched_open(replacement: Callable[..., IO[Any]]) -> Generator[None, None, None]:
-    """Temporarily replace builtins.open with *replacement*, then restore it."""
-    original: Callable[..., IO[Any]] = builtins.open
-    builtins.open = replacement  # type: ignore[assignment]
-    try:
-        yield
-    finally:
-        builtins.open = original  # type: ignore[assignment]
 
 
 def _add_asset_to_results(
@@ -940,45 +923,14 @@ def scan_model_directory_or_file(
                     logger.debug(f"Failed to hash file {target}: {e}")
                     # Continue without hash - not a critical error
 
+                file_result = scan_file(target, config)
+
+                # Report progress after scanning completes
                 if progress_callback is not None and file_size > 0:
-
-                    def create_progress_open(
-                        callback: Callable[[str, float], None],
-                        current_file_size: int,
-                        original_open: Callable[..., IO[Any]],
-                    ) -> Callable[..., IO[Any]]:
-                        """Create a progress-aware file opener with properly bound variables."""
-
-                        def progress_open(file_path: str, mode: str = "r", *args: Any, **kwargs: Any) -> IO[Any]:
-                            # Note: We intentionally don't use a context manager here because we need to
-                            # return the file object for further processing. The SIM115 warning is
-                            # suppressed because this is a legitimate use case.
-                            file = original_open(file_path, mode, *args, **kwargs)
-                            file_pos = 0
-
-                            original_read = file.read
-
-                            def progress_read(size: int = -1) -> Any:
-                                nonlocal file_pos
-                                data = original_read(size)
-                                if isinstance(data, str | bytes):
-                                    file_pos += len(data)
-                                callback(
-                                    f"Reading file: {os.path.basename(file_path)}",
-                                    min(file_pos / current_file_size * 100, 100),
-                                )
-                                return data
-
-                            file.read = progress_read  # type: ignore[method-assign]
-                            return file
-
-                        return progress_open
-
-                    progress_opener = create_progress_open(progress_callback, file_size, builtins.open)
-                    with _OPEN_PATCH_LOCK, _patched_open(progress_opener):
-                        file_result = scan_file(target, config)
-                else:
-                    file_result = scan_file(target, config)
+                    progress_callback(
+                        f"Scanned: {os.path.basename(target)}",
+                        100.0,
+                    )
 
                 # Use helper function to add scan result to Pydantic model
                 _add_scan_result_to_model(results, scan_metadata, file_result, target)
