@@ -267,9 +267,7 @@ class TestCreateArtifacts:
         """Test artifact includes hashes from metadata."""
         result = create_initial_audit_result()
         result.assets = [AssetModel(path="/test/model.pkl", type="pickle")]
-        result.file_metadata["/test/model.pkl"] = FileMetadataModel(
-            file_hashes=FileHashesModel(sha256="a" * 64)
-        )
+        result.file_metadata["/test/model.pkl"] = FileMetadataModel(file_hashes=FileHashesModel(sha256="a" * 64))
 
         artifacts = _create_artifacts(result)
 
