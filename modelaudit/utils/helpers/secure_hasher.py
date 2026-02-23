@@ -355,7 +355,7 @@ def benchmark_hashing_performance(test_file_path: str, iterations: int = 3) -> d
             assert hash_result == first_hash, "Hash inconsistency detected!"
 
     avg_time = sum(times) / len(times)
-    throughput_mbps = (file_size / (1024 * 1024)) / avg_time
+    throughput_mbps = (file_size / (1024 * 1024)) / avg_time if avg_time > 0 else float("inf")
 
     # At this point first_hash is guaranteed to be set since iterations > 0
     assert first_hash is not None, "Internal error: first_hash should be set"

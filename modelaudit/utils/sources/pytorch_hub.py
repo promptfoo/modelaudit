@@ -119,7 +119,7 @@ def download_pytorch_hub_model_streaming(url: str, show_progress: bool = True) -
             dest_file = temp_dir / filename
 
             if show_progress:
-                print(f"⬇️  Downloading {filename}")
+                click.echo(f"⬇️  Downloading {filename}")
 
             try:
                 with requests.get(weight_url, stream=True, timeout=30) as resp:

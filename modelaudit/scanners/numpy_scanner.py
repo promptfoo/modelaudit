@@ -1,3 +1,5 @@
+"""Scanner for NumPy serialized array files (.npy, .npz)."""
+
 from __future__ import annotations
 
 import sys

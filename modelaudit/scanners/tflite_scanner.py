@@ -1,3 +1,5 @@
+"""Scanner for TensorFlow Lite model files (.tflite)."""
+
 import os
 from typing import Any, ClassVar
 

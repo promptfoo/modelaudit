@@ -1,3 +1,5 @@
+"""Scanner for raw PyTorch binary model files (.bin, .pt)."""
+
 import os
 import struct
 from typing import Any, ClassVar

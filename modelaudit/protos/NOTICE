@@ -1,0 +1,13 @@
+TensorFlow Protobuf Stubs
+=========================
+
+The protobuf Python files in this directory are generated from TensorFlow's
+.proto definition files. They are used to parse TensorFlow SavedModel files
+without requiring the full TensorFlow package.
+
+Original source: https://github.com/tensorflow/tensorflow
+Copyright 2015 The TensorFlow Authors. All rights reserved.
+Licensed under the Apache License, Version 2.0.
+
+These files were generated using protoc from TensorFlow's .proto files
+located at tensorflow/core/framework/ and tensorflow/core/protobuf/.
