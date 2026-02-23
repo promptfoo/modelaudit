@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 from typing import Any
 
 from .scanners import SCANNER_REGISTRY
+
+logger = logging.getLogger("modelaudit.metadata_extractor")
 
 
 class ModelMetadataExtractor:
@@ -43,23 +46,19 @@ class ModelMetadataExtractor:
         # Create scanner instance and extract metadata
         scanner = scanner_class({"allow_metadata_deserialization": allow_deserialization})
 
-        # Get basic metadata
-        metadata = {
-            "file": os.path.basename(file_path),
-            "path": file_path,
-            "format": getattr(scanner_class, "name", "unknown"),
-            "file_size": scanner.get_file_size(file_path)
-            if hasattr(scanner, "get_file_size")
-            else os.path.getsize(file_path),
-        }
+        # Start with file-level fields, then layer scanner metadata on top.
+        # Scanner extract_metadata() provides format, description, file_size
+        # which we augment with file/path identifiers.
+        try:
+            metadata = scanner.extract_metadata(file_path)
+        except Exception as e:
+            logger.debug("extract_metadata failed for %s: %s", file_path, e, exc_info=True)
+            metadata = {"extraction_error": str(e)}
 
-        # Try to extract format-specific metadata if scanner supports it
-        if hasattr(scanner, "extract_metadata"):
-            try:
-                format_metadata = scanner.extract_metadata(file_path)
-                metadata.update(format_metadata)
-            except Exception as e:
-                metadata["extraction_error"] = str(e)
+        # Always ensure file identifiers are present
+        metadata.setdefault("file", os.path.basename(file_path))
+        metadata.setdefault("path", file_path)
+        metadata.setdefault("format", getattr(scanner_class, "name", "unknown"))
 
         # Filter for security-only if requested
         if security_only:
@@ -89,6 +88,7 @@ class ModelMetadataExtractor:
                         )
 
                 except Exception as e:
+                    logger.debug("Metadata extraction failed for %s: %s", file_path, e, exc_info=True)
                     results["files"].append({"file": file, "path": file_path, "error": str(e)})
 
         return results
@@ -119,6 +119,11 @@ class ModelMetadataExtractor:
             # Common security indicators
             "has_custom_operators",
             "has_external_data",
+            # Deserialization status
+            "deserialization_skipped",
+            "reason",
+            "dangerous_opcodes",
+            "has_dangerous_opcodes",
         ]
 
         filtered = {}
