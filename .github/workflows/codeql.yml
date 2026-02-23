@@ -40,7 +40,7 @@ jobs:
         uses: github/codeql-action/analyze@89a39a4e59826350b863aa6b6252a07ad50cf83e # v4
         with:
           category: "/language:python"
-          upload: always
+          upload: ${{ github.event.pull_request.head.repo.fork == true && 'never' || 'always' }}
 
   analyze-actions:
     name: Analyze GitHub Actions
@@ -60,4 +60,4 @@ jobs:
         uses: github/codeql-action/analyze@89a39a4e59826350b863aa6b6252a07ad50cf83e # v4
         with:
           category: "/language:actions"
-          upload: always
+          upload: ${{ github.event.pull_request.head.repo.fork == true && 'never' || 'always' }}

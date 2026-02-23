@@ -925,13 +925,6 @@ def scan_model_directory_or_file(
 
                 file_result = scan_file(target, config)
 
-                # Report progress after scanning completes
-                if progress_callback is not None and file_size > 0:
-                    progress_callback(
-                        f"Scanned: {os.path.basename(target)}",
-                        100.0,
-                    )
-
                 # Use helper function to add scan result to Pydantic model
                 _add_scan_result_to_model(results, scan_metadata, file_result, target)
 
