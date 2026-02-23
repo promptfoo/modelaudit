@@ -4195,3 +4195,130 @@ class PickleScanner(BaseScanner):
                 why="JIT/Script detection encountered an unexpected error",
             )
             return 0
+
+    def extract_metadata(self, file_path: str) -> dict[str, Any]:
+        """Extract pickle file metadata."""
+        metadata = super().extract_metadata(file_path)
+
+        allow_deserialization = bool(self.config.get("allow_metadata_deserialization"))
+
+        try:
+            import pickle
+            import pickletools
+            from io import BytesIO
+
+            with open(file_path, "rb") as f:
+                pickle_data = f.read()
+
+            # Analyze pickle structure
+            metadata.update(
+                {
+                    "pickle_size": len(pickle_data),
+                    "pickle_protocol": self._detect_pickle_protocol(pickle_data),
+                }
+            )
+
+            # Analyze opcodes
+            try:
+                # Count different opcode types
+                opcode_counts: dict[str, int] = {}
+                dangerous_opcodes = []
+
+                # Use pickletools to analyze opcodes
+                bio = BytesIO(pickle_data)
+                opcodes_info = []
+                for opcode, _arg, _pos in pickletools.genops(bio):
+                    opcode_name = opcode.name
+                    opcode_counts[opcode_name] = opcode_counts.get(opcode_name, 0) + 1
+                    opcodes_info.append(opcode_name)
+
+                    # Check for dangerous opcodes (any opcode that can trigger code execution)
+                    if opcode_name in [
+                        "REDUCE",
+                        "INST",
+                        "OBJ",
+                        "NEWOBJ",
+                        "NEWOBJ_EX",
+                        "STACK_GLOBAL",
+                        "GLOBAL",
+                        "BUILD",
+                    ]:
+                        dangerous_opcodes.append(opcode_name)
+
+                metadata.update(
+                    {
+                        "opcode_counts": opcode_counts,
+                        "dangerous_opcodes": list(set(dangerous_opcodes)),
+                        "total_opcodes": len(opcodes_info),
+                        "has_dangerous_opcodes": len(dangerous_opcodes) > 0,
+                    }
+                )
+
+            except Exception:
+                pass
+
+            # Try to load and analyze content (safely) only if explicitly allowed
+            if allow_deserialization:
+                try:
+                    # Only try to load if it looks safe (no dangerous opcodes)
+                    if not metadata.get("dangerous_opcodes"):
+                        with open(file_path, "rb") as f:
+                            try:
+                                obj = pickle.load(f)
+                                metadata.update(
+                                    {
+                                        "object_type": type(obj).__name__,
+                                        "object_module": getattr(type(obj), "__module__", "unknown"),
+                                    }
+                                )
+
+                                # Analyze object structure
+                                if isinstance(obj, dict):
+                                    metadata.update(
+                                        {
+                                            "dict_keys": list(obj.keys())[:10],  # First 10 keys
+                                            "dict_size": len(obj),
+                                        }
+                                    )
+                                elif hasattr(obj, "__dict__"):
+                                    attrs = list(obj.__dict__.keys())[:10]
+                                    metadata.update(
+                                        {
+                                            "object_attributes": attrs,
+                                            "attribute_count": len(obj.__dict__),
+                                        }
+                                    )
+
+                            except Exception:
+                                metadata["safe_loading"] = False
+                    else:
+                        metadata["safe_loading"] = False
+
+                except Exception:
+                    metadata["safe_loading"] = False
+            else:
+                metadata["safe_loading"] = False
+                metadata["deserialization_skipped"] = True
+                metadata["reason"] = "Deserialization disabled for metadata extraction"
+
+        except Exception as e:
+            metadata["extraction_error"] = str(e)
+
+        return metadata
+
+    def _detect_pickle_protocol(self, data: bytes) -> int:
+        """Detect pickle protocol version."""
+        if len(data) < 2:
+            return 0
+
+        # Protocol is usually indicated in the first few bytes
+        first_byte = data[0]
+
+        # Protocol 0: ASCII
+        if first_byte in [ord(b"("), ord(b"c"), ord(b"N"), ord(b"S")]:
+            return 0
+        # Protocol 2+: Binary
+        elif first_byte == 0x80 and len(data) > 1:
+            return data[1]
+
+        return -1  # Unknown protocol

@@ -284,3 +284,88 @@ class JoblibScanner(BaseScanner):
 
         result.finish(success=True)
         return result
+
+    def extract_metadata(self, file_path: str) -> dict[str, Any]:
+        """Extract joblib metadata."""
+        metadata = super().extract_metadata(file_path)
+
+        allow_deserialization = bool(self.config.get("allow_metadata_deserialization"))
+
+        if not allow_deserialization:
+            metadata["deserialization_skipped"] = True
+            metadata["reason"] = "Deserialization disabled for metadata extraction"
+            return metadata
+
+        try:
+            import joblib
+
+            # Try to load the joblib file
+            obj = joblib.load(file_path)
+
+            metadata.update(
+                {
+                    "joblib_version": joblib.__version__,
+                    "object_type": type(obj).__name__,
+                    "object_module": getattr(type(obj), "__module__", "unknown"),
+                }
+            )
+
+            # Analyze sklearn models specifically
+            if hasattr(obj, "_sklearn_version"):
+                metadata["sklearn_version"] = obj._sklearn_version
+
+            if hasattr(obj, "get_params"):
+                try:
+                    params = obj.get_params()
+                    metadata.update(
+                        {
+                            "model_parameters": len(params),
+                            "key_parameters": list(params.keys())[:10],  # First 10 parameters
+                        }
+                    )
+                except Exception:
+                    pass
+
+            # Check for common sklearn model attributes
+            if hasattr(obj, "n_features_in_"):
+                metadata["n_features_in"] = obj.n_features_in_
+
+            if hasattr(obj, "classes_"):
+                metadata.update(
+                    {
+                        "n_classes": len(obj.classes_),
+                        "classes": list(obj.classes_)[:10]
+                        if len(obj.classes_) <= 10
+                        else f"{len(obj.classes_)} classes",
+                    }
+                )
+
+            if hasattr(obj, "feature_importances_"):
+                metadata["has_feature_importances"] = True
+                try:
+                    importances = obj.feature_importances_
+                    metadata["feature_importance_stats"] = {
+                        "min": float(min(importances)),
+                        "max": float(max(importances)),
+                        "mean": float(sum(importances) / len(importances)),
+                    }
+                except Exception:
+                    pass
+            else:
+                metadata["has_feature_importances"] = False
+
+            # Check for ensemble models
+            if hasattr(obj, "estimators_"):
+                metadata.update(
+                    {
+                        "is_ensemble": True,
+                        "n_estimators": len(obj.estimators_),
+                    }
+                )
+            else:
+                metadata["is_ensemble"] = False
+
+        except Exception as e:
+            metadata["extraction_error"] = str(e)
+
+        return metadata

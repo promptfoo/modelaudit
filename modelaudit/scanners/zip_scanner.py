@@ -360,3 +360,89 @@ class ZipScanner(BaseScanner):
         result.metadata["file_size"] = os.path.getsize(path)
         result.finish(success=not result.has_errors)
         return result
+
+    def extract_metadata(self, file_path: str) -> dict[str, Any]:
+        """Extract ZIP archive metadata."""
+        metadata = super().extract_metadata(file_path)
+
+        try:
+            import zipfile
+
+            with zipfile.ZipFile(file_path, "r") as zip_file:
+                file_list = zip_file.namelist()
+
+                # Basic ZIP info
+                metadata.update(
+                    {
+                        "total_files": len(file_list),
+                        "compressed_size": sum(info.compress_size for info in zip_file.filelist),
+                        "uncompressed_size": sum(info.file_size for info in zip_file.filelist),
+                    }
+                )
+
+                # Calculate compression ratio
+                if metadata["uncompressed_size"] > 0:
+                    metadata["compression_ratio"] = metadata["compressed_size"] / metadata["uncompressed_size"]
+
+                # Analyze file types and structure
+                file_extensions: dict[str, int] = {}
+                directories = set()
+                executable_files = []
+
+                for name in file_list:
+                    if name.endswith("/"):
+                        directories.add(name)
+                        continue
+
+                    # Track file extensions
+                    if "." in name:
+                        ext = name.split(".")[-1].lower()
+                        file_extensions[ext] = file_extensions.get(ext, 0) + 1
+
+                    # Check for executable files
+                    if any(name.endswith(ext) for ext in [".exe", ".bat", ".sh", ".py", ".js"]):
+                        executable_files.append(name)
+
+                metadata.update(
+                    {
+                        "file_extensions": file_extensions,
+                        "directory_count": len(directories),
+                        "executable_files": executable_files,
+                        "has_executables": len(executable_files) > 0,
+                    }
+                )
+
+                # Look for common model patterns
+                model_indicators = {
+                    "pytorch": any(name.endswith((".pt", ".pth")) for name in file_list),
+                    "tensorflow": any("saved_model.pb" in name for name in file_list),
+                    "onnx": any(name.endswith(".onnx") for name in file_list),
+                    "pickle": any(name.endswith(".pkl") for name in file_list),
+                    "keras": any(name.endswith(".h5") for name in file_list),
+                }
+
+                detected_formats = [k for k, v in model_indicators.items() if v]
+                if detected_formats:
+                    metadata["detected_model_formats"] = detected_formats
+
+                # Check for configuration files
+                config_files = [
+                    name
+                    for name in file_list
+                    if any(pattern in name.lower() for pattern in ["config", "manifest", "metadata", "readme"])
+                ]
+                if config_files:
+                    metadata["config_files"] = config_files
+
+                # Security analysis
+                metadata["security_notes"] = []
+                if executable_files:
+                    metadata["security_notes"].append(f"Contains {len(executable_files)} executable files")
+
+                if any(".." in name for name in file_list):
+                    metadata["security_notes"].append("Contains path traversal patterns")
+
+        except Exception as e:
+            metadata["extraction_error"] = str(e)
+
+        return metadata

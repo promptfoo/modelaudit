@@ -48,7 +48,7 @@ class NumPyScanner(BaseScanner):
     description = f"Scans NumPy .npy files for integrity issues (NumPy {NUMPY_VERSION})"
     supported_extensions: ClassVar[list[str]] = [".npy"]
 
-    def __init__(self, config=None):
+    def __init__(self, config: dict[str, Any] | None = None) -> None:
         super().__init__(config)
         # Security limits
         self.max_array_bytes = self.config.get(
@@ -66,7 +66,7 @@ class NumPyScanner(BaseScanner):
             return False
         return super().can_handle(path)
 
-    def _validate_array_dimensions(self, shape: tuple) -> None:
+    def _validate_array_dimensions(self, shape: tuple[int, ...]) -> None:
         """Validate array dimensions for security"""
         # Check number of dimensions
         if len(shape) > self.max_dimensions:
@@ -86,10 +86,10 @@ class NumPyScanner(BaseScanner):
     def _validate_dtype(self, dtype: Any) -> None:
         """Validate numpy dtype for security"""
         # Check for problematic data types
-        dangerous_names = ["object"]
-        dangerous_kinds = ["O", "V"]  # Object and Void kinds
+        dangerous_names = ["object", "void"]
+        dangerous_kinds = ["O", "V"]  # Python object and raw void kinds
 
-        if dtype.name in dangerous_names or dtype.kind in dangerous_kinds:
+        if dtype.name in dangerous_names or dtype.kind in dangerous_kinds or getattr(dtype, "hasobject", False):
             raise ValueError(
                 f"Dangerous dtype not allowed: {dtype.name} (kind: {dtype.kind})",
             )
@@ -100,7 +100,7 @@ class NumPyScanner(BaseScanner):
                 f"Itemsize too large: {dtype.itemsize} bytes (max: {self.max_itemsize})",
             )
 
-    def _calculate_safe_array_size(self, shape: tuple, dtype: Any) -> int:
+    def _calculate_safe_array_size(self, shape: tuple[int, ...], dtype: Any) -> int:
         """Calculate array size with overflow protection"""
         total_elements = 1
         max_elements = sys.maxsize // max(dtype.itemsize, 1)
@@ -306,6 +306,8 @@ class NumPyScanner(BaseScanner):
                                 "dtype": str(dtype),
                             },
                         )
+                        result.finish(success=False)
+                        return result
                     else:
                         result.add_check(
                             name="File Integrity Check",
@@ -337,3 +339,67 @@ class NumPyScanner(BaseScanner):
 
         result.finish(success=True)
         return result
+
+    def extract_metadata(self, file_path: str) -> dict[str, Any]:
+        """Extract NumPy array metadata without deserializing object arrays."""
+        metadata = super().extract_metadata(file_path)
+        allow_deserialization = self.config.get("allow_metadata_deserialization", False)
+
+        try:
+            import numpy as np
+
+            # SECURITY: always pass allow_pickle=False to prevent code execution
+            # via crafted object-dtype .npy files or .npz containing pickled data.
+            try:
+                array = np.load(file_path, mmap_mode="r", allow_pickle=False)
+            except ValueError:
+                # File contains object arrays that require pickle deserialization
+                if not allow_deserialization:
+                    metadata["deserialization_skipped"] = True
+                    metadata["reason"] = "File contains object arrays requiring pickle deserialization"
+                    return metadata
+                array = np.load(file_path, allow_pickle=True)
+
+            metadata.update(
+                {
+                    "numpy_version": np.__version__,
+                    "array_shape": list(array.shape),
+                    "array_dtype": str(array.dtype),
+                    "array_size": array.size,
+                    "array_nbytes": array.nbytes,
+                    "array_ndim": array.ndim,
+                    "memory_usage_mb": array.nbytes / (1024 * 1024),
+                }
+            )
+
+            # Analyze array properties
+            if array.size > 0:
+                try:
+                    # For small arrays, get some statistics
+                    if array.nbytes < 10 * 1024 * 1024:  # Less than 10MB
+                        if np.issubdtype(array.dtype, np.number):
+                            metadata.update(
+                                {
+                                    "min_value": float(np.min(array)),
+                                    "max_value": float(np.max(array)),
+                                    "mean_value": float(np.mean(array)),
+                                    "std_value": float(np.std(array)),
+                                }
+                            )
+                    else:
+                        metadata["large_array_stats"] = "Skipped statistics for large array"
+
+                except Exception:
+                    pass  # Skip stats if not numeric
+
+            # Check for unusual patterns
+            if array.dtype.kind in ["U", "S", "O"]:  # String or object arrays
+                metadata["contains_objects"] = True
+                metadata["security_note"] = "Object arrays may contain arbitrary Python objects"
+            else:
+                metadata["contains_objects"] = False
+
+        except Exception as e:
+            metadata["extraction_error"] = str(e)
+
+        return metadata

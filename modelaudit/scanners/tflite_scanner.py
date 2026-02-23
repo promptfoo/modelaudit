@@ -1,7 +1,7 @@
 """Scanner for TensorFlow Lite model files (.tflite)."""
 
 import os
-from typing import ClassVar
+from typing import Any, ClassVar
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -108,3 +108,111 @@ class TFLiteScanner(BaseScanner):
 
         result.finish(success=not result.has_errors)
         return result
+
+    def extract_metadata(self, file_path: str) -> dict[str, Any]:
+        """Extract TensorFlow Lite metadata."""
+        metadata = super().extract_metadata(file_path)
+
+        if not HAS_TFLITE:
+            metadata["error"] = "TensorFlow Lite library not available"
+            return metadata
+
+        try:
+            import tflite
+
+            # Limit file read to avoid OOM on very large files
+            max_size = 2 * 1024 * 1024 * 1024  # 2GB
+            file_size = os.path.getsize(file_path)
+            if file_size > max_size:
+                metadata["error"] = f"File too large for metadata extraction ({file_size} bytes)"
+                return metadata
+
+            with open(file_path, "rb") as f:
+                model_data = f.read()
+
+            model = tflite.Model.GetRootAsModel(model_data, 0)
+
+            # Basic model info
+            metadata.update(
+                {
+                    "tflite_version": model.Version(),
+                    "model_description": model.Description().decode("utf-8") if model.Description() else None,
+                    "subgraph_count": model.SubgraphsLength(),
+                    "operator_codes_count": model.OperatorCodesLength(),
+                }
+            )
+
+            # Analyze subgraphs
+            if model.SubgraphsLength() > 0:
+                subgraph = model.Subgraphs(0)  # Main subgraph
+
+                metadata.update(
+                    {
+                        "tensors_count": subgraph.TensorsLength(),
+                        "operators_count": subgraph.OperatorsLength(),
+                        "inputs_count": subgraph.InputsLength(),
+                        "outputs_count": subgraph.OutputsLength(),
+                    }
+                )
+
+                # Get input/output tensor info
+                inputs = []
+                outputs = []
+
+                for i in range(subgraph.InputsLength()):
+                    tensor_idx = subgraph.Inputs(i)
+                    tensor = subgraph.Tensors(tensor_idx)
+                    inputs.append(
+                        {
+                            "name": tensor.Name().decode("utf-8") if tensor.Name() else f"input_{i}",
+                            "shape": [tensor.Shape(j) for j in range(tensor.ShapeLength())],
+                            "type": tensor.Type(),
+                        }
+                    )
+
+                for i in range(subgraph.OutputsLength()):
+                    tensor_idx = subgraph.Outputs(i)
+                    tensor = subgraph.Tensors(tensor_idx)
+                    outputs.append(
+                        {
+                            "name": tensor.Name().decode("utf-8") if tensor.Name() else f"output_{i}",
+                            "shape": [tensor.Shape(j) for j in range(tensor.ShapeLength())],
+                            "type": tensor.Type(),
+                        }
+                    )
+
+                metadata.update(
+                    {
+                        "inputs": inputs,
+                        "outputs": outputs,
+                    }
+                )
+
+                # Analyze operators
+                operator_types = []
+                custom_operators = []
+
+                for i in range(subgraph.OperatorsLength()):
+                    op = subgraph.Operators(i)
+                    opcode = model.OperatorCodes(op.OpcodeIndex())
+                    builtin = opcode.BuiltinCode()
+
+                    if builtin == tflite.BuiltinOperator.CUSTOM:
+                        custom = opcode.CustomCode()
+                        name = custom.decode("utf-8", "ignore") if custom else "unknown"
+                        custom_operators.append(name)
+                    else:
+                        operator_types.append(builtin)
+
+                metadata.update(
+                    {
+                        "operator_types": list(set(operator_types)),
+                        "custom_operators": custom_operators,
+                        "has_custom_operators": len(custom_operators) > 0,
+                    }
+                )
+
+        except Exception as e:
+            metadata["extraction_error"] = str(e)
+
+        return metadata

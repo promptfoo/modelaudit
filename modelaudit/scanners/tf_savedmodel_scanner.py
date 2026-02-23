@@ -540,7 +540,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
 
                         try:
                             # Clean the base64 string (remove newlines and spaces)
-                            base64_code = base64_code.replace("\\n", "").replace(" ", "").strip()
+                            base64_code = base64_code.replace("\n", "").replace(" ", "").strip()
 
                             # Try to decode the base64
                             decoded = base64.b64decode(base64_code)
@@ -682,6 +682,12 @@ class TensorFlowSavedModelScanner(BaseScanner):
         # Check for malicious string data in protobuf fields
         self._check_protobuf_string_injection(saved_model, result)
 
+        # Check for buffer overflow patterns
+        self._check_protobuf_buffer_overflow(saved_model, result)
+
+        # Check for field bombs
+        self._check_protobuf_field_bomb(saved_model, result)
+
     def _check_protobuf_string_injection(self, saved_model: Any, result: ScanResult) -> None:
         """Check for string injection attacks in protobuf fields"""
 
@@ -696,7 +702,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
             (r"subprocess\.[a-zA-Z_]+\s*\(", "system_command", "subprocess call"),
             # Path traversal patterns
             (r"\.\./+", "path_traversal", "directory traversal"),
-            (r"\.\.\\+", "path_traversal", "Windows directory traversal"),
+            (r"\.\\.+", "path_traversal", "Windows directory traversal"),
             (r"/etc/passwd", "path_traversal", "system file access"),
             (r"/proc/", "path_traversal", "proc filesystem access"),
             # Encoding bypass attempts
@@ -776,3 +782,158 @@ class TensorFlowSavedModelScanner(BaseScanner):
                                         },
                                     )
                                     break  # Only report first match per string to avoid spam
+
+    def _check_protobuf_buffer_overflow(self, saved_model: Any, result: ScanResult) -> None:
+        """Check for potential buffer overflow patterns in protobuf data"""
+
+        for meta_graph in saved_model.meta_graphs:
+            graph_def = meta_graph.graph_def
+
+            # Check for nodes with extremely long names (potential buffer overflow)
+            for node in graph_def.node:
+                if len(node.name) > 2048:  # 2KB threshold for node names
+                    result.add_check(
+                        name="Protobuf Node Name Length Check",
+                        passed=False,
+                        message=(
+                            f"Abnormally long node name (length: {len(node.name)}) may indicate buffer overflow attempt"
+                        ),
+                        severity=IssueSeverity.WARNING,
+                        location=f"{self.current_file_path} (node: {node.name[:100]}...)",
+                        details={
+                            "node_name_length": len(node.name),
+                            "name_threshold": 2048,
+                            "attack_type": "protobuf_buffer_overflow",
+                            "node_name_preview": node.name[:200],  # First 200 chars
+                        },
+                    )
+
+                # Check input names for excessive length
+                for input_name in node.input:
+                    if len(input_name) > 2048:
+                        result.add_check(
+                            name="Protobuf Input Name Length Check",
+                            passed=False,
+                            message=f"Abnormally long input name (length: {len(input_name)}) in node {node.name}",
+                            severity=IssueSeverity.WARNING,
+                            location=f"{self.current_file_path} (node: {node.name})",
+                            details={
+                                "node_name": node.name,
+                                "input_name_length": len(input_name),
+                                "name_threshold": 2048,
+                                "attack_type": "protobuf_buffer_overflow",
+                            },
+                        )
+
+    def _check_protobuf_field_bomb(self, saved_model: Any, result: ScanResult) -> None:
+        """Check for protobuf field bombs (DoS via excessive fields)"""
+
+        total_nodes = 0
+        total_attrs = 0
+
+        for meta_graph in saved_model.meta_graphs:
+            graph_def = meta_graph.graph_def
+            meta_graph_nodes = len(graph_def.node)
+            total_nodes += meta_graph_nodes
+
+            # Count total attributes across all nodes
+            meta_graph_attrs = sum(len(node.attr) if hasattr(node, "attr") else 0 for node in graph_def.node)
+            total_attrs += meta_graph_attrs
+
+            # Check for excessive nodes in single meta graph
+            if meta_graph_nodes > 50000:  # 50k nodes threshold
+                result.add_check(
+                    name="Protobuf Node Count Bomb Check",
+                    passed=False,
+                    message=f"Meta graph contains excessive nodes ({meta_graph_nodes:,}) - potential DoS attack",
+                    severity=IssueSeverity.WARNING,
+                    location=self.current_file_path,
+                    details={
+                        "node_count": meta_graph_nodes,
+                        "node_threshold": 50000,
+                        "attack_type": "protobuf_node_bomb",
+                    },
+                )
+
+        # Check total model complexity
+        if total_nodes > 100000:  # 100k total nodes
+            result.add_check(
+                name="Protobuf Total Complexity Check",
+                passed=False,
+                message=f"Model has excessive total complexity ({total_nodes:,} nodes, {total_attrs:,} attributes)",
+                severity=IssueSeverity.WARNING,
+                location=self.current_file_path,
+                details={
+                    "total_nodes": total_nodes,
+                    "total_attributes": total_attrs,
+                    "node_threshold": 100000,
+                    "attack_type": "protobuf_complexity_bomb",
+                },
+            )
+
+    def extract_metadata(self, file_path: str) -> dict[str, Any]:
+        """Extract TensorFlow SavedModel metadata."""
+        metadata = super().extract_metadata(file_path)
+
+        allow_deserialization = bool(self.config.get("allow_metadata_deserialization"))
+
+        if not allow_deserialization:
+            metadata["deserialization_skipped"] = True
+            metadata["reason"] = "Deserialization disabled for metadata extraction"
+            return metadata
+
+        try:
+            import tensorflow as tf
+
+            # Load the SavedModel
+            model = tf.saved_model.load(file_path)
+
+            # Basic model info
+            metadata.update(
+                {
+                    "tensorflow_version": tf.__version__,
+                    "signatures": list(model.signatures.keys()) if hasattr(model, "signatures") else [],
+                    "trackable_objects": len(model._list_all_trackable_objects())
+                    if hasattr(model, "_list_all_trackable_objects")
+                    else 0,
+                }
+            )
+
+            # Try to get more detailed signature info
+            if hasattr(model, "signatures"):
+                signature_details = {}
+                for sig_name, signature in model.signatures.items():
+                    sig_info = {
+                        "inputs": list(signature.inputs.keys()) if hasattr(signature, "inputs") else [],
+                        "outputs": list(signature.outputs.keys()) if hasattr(signature, "outputs") else [],
+                    }
+                    signature_details[sig_name] = sig_info
+
+                if signature_details:
+                    metadata["signature_details"] = signature_details
+
+            # Check for variables
+            try:
+                variables = model.variables if hasattr(model, "variables") else []
+                if variables:
+                    metadata.update(
+                        {
+                            "variable_count": len(variables),
+                            "trainable_variables": sum(1 for v in variables if getattr(v, "trainable", True)),
+                        }
+                    )
+
+                    # Calculate total parameters
+                    total_params = sum(
+                        v.shape.num_elements() if hasattr(v.shape, "num_elements") else 0 for v in variables
+                    )
+                    if total_params > 0:
+                        metadata["total_parameters"] = total_params
+
+            except Exception:
+                pass  # Variables might not be accessible
+
+        except Exception as e:
+            metadata["extraction_error"] = str(e)
+
+        return metadata

@@ -392,3 +392,55 @@ class OnnxScanner(BaseScanner):
                         severity=IssueSeverity.DEBUG,
                         location=path,
                     )
+
+    def extract_metadata(self, file_path: str) -> dict[str, Any]:
+        """Extract ONNX model metadata."""
+        metadata = super().extract_metadata(file_path)
+
+        if not _check_onnx():
+            metadata["error"] = "ONNX library not available"
+            return metadata
+
+        try:
+            import onnx
+
+            model = onnx.load(file_path, load_external_data=False)
+
+            # Basic model info
+            metadata.update(
+                {
+                    "ir_version": model.ir_version,
+                    "producer_name": model.producer_name,
+                    "producer_version": model.producer_version,
+                    "model_version": model.model_version,
+                    "domain": model.domain,
+                    "node_count": len(model.graph.node),
+                }
+            )
+
+            # Opsets
+            metadata["opset_imports"] = [
+                {"domain": op.domain or "ai.onnx", "version": op.version} for op in model.opset_import
+            ]
+
+            # Inputs/outputs
+            metadata["inputs"] = [
+                {"name": inp.name, "type": str(inp.type.tensor_type.elem_type)} for inp in model.graph.input
+            ]
+            metadata["outputs"] = [
+                {"name": out.name, "type": str(out.type.tensor_type.elem_type)} for out in model.graph.output
+            ]
+
+            # Operators used
+            operators = list({node.op_type for node in model.graph.node})
+            metadata["operators"] = operators
+
+            # Custom domains
+            custom_domains = [node.domain for node in model.graph.node if node.domain and node.domain != ""]
+            if custom_domains:
+                metadata["custom_domains"] = list(set(custom_domains))
+
+        except Exception as e:
+            metadata["extraction_error"] = str(e)
+
+        return metadata
