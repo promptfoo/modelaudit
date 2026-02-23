@@ -120,6 +120,13 @@ class TFLiteScanner(BaseScanner):
         try:
             import tflite
 
+            # Limit file read to avoid OOM on very large files
+            max_size = 2 * 1024 * 1024 * 1024  # 2GB
+            file_size = os.path.getsize(file_path)
+            if file_size > max_size:
+                metadata["error"] = f"File too large for metadata extraction ({file_size} bytes)"
+                return metadata
+
             with open(file_path, "rb") as f:
                 model_data = f.read()
 

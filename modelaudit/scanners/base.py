@@ -1382,7 +1382,5 @@ class BaseScanner(ABC):
         return {
             "format": getattr(self, "name", "unknown"),
             "description": getattr(self, "description", ""),
-            "file_size": self.get_file_size(file_path)
-            if hasattr(self, "get_file_size")
-            else os.path.getsize(file_path),
+            "file_size": self.get_file_size(file_path),
         }

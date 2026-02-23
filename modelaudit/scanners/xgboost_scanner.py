@@ -660,11 +660,18 @@ except Exception as e:
     def extract_metadata(self, file_path: str) -> dict[str, Any]:
         """Extract XGBoost model metadata."""
         metadata = super().extract_metadata(file_path)
+        allow_deserialization = self.config.get("allow_metadata_deserialization", False)
+
+        if not allow_deserialization:
+            metadata["deserialization_skipped"] = True
+            metadata["reason"] = "Deserialization disabled for metadata extraction"
+            return metadata
 
         try:
             import xgboost as xgb
 
-            # Load the model
+            # SECURITY: xgb.Booster().load_model() deserializes the model in-process.
+            # Only reached when allow_metadata_deserialization is explicitly True.
             model = xgb.Booster()
             model.load_model(file_path)
 
