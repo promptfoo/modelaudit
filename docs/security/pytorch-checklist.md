@@ -219,7 +219,5 @@ Comprehensive security checklist for PyTorch model development and deployment.
 
 ### Emergency Contacts
 
-- **Security Team**: [Your security team contact]
-- **DevOps Team**: [Your DevOps team contact]
-- **Management**: [Incident escalation contact]
-- **External Support**: [External security support if needed]
+- **Security Reports**: See [SECURITY.md](../../SECURITY.md) for vulnerability disclosure
+- **Maintainers**: Open an issue at <https://github.com/promptfoo/modelaudit/issues>

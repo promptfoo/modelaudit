@@ -53,25 +53,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - consolidate agent guidance ([#453](https://github.com/promptfoo/modelaudit/issues/453)) ([a01ceff](https://github.com/promptfoo/modelaudit/commit/a01ceff5daa66750994008e1a9414ce3227115d6))
 - restructure AGENTS.md and CLAUDE.md following 2025 best practices ([#451](https://github.com/promptfoo/modelaudit/issues/451)) ([e87de51](https://github.com/promptfoo/modelaudit/commit/e87de5153c574b9053b507d44f59d5fe85b7204d))
 
-## [Unreleased]
-
-### Added
-
-- **feat**: add Git LFS pointer detection - detects when model files are Git LFS pointers (small text files) instead of actual model content, reports as CRITICAL issue with remediation steps including `git lfs pull` instructions
-- **ux**: add Python version warnings — runtime `warnings.warn()` in `__init__.py` and click-styled stderr warning in CLI for Python < 3.10, plus README troubleshooting section for users stuck on version 0.2.5
-- **docs**: add `SECURITY.md` vulnerability disclosure policy and contributor community scaffolding (`CODE_OF_CONDUCT.md`, issue/PR templates, `CODEOWNERS`)
-
-### Changed
-
-- **deps**: update xgboost to v3.1.2 (from >=1.6.0,<3.0 to >=3.1.2,<3.2) - major version upgrade with no breaking changes affecting ModelAudit's usage
-- **docs**: consolidate agent guidance into a single canonical `AGENTS.md` and align `CLAUDE.md`/`GEMINI.md` to reference it
-- **ci**: add Windows test coverage and introduce a Windows-friendly dependency set for CI usage
-
-### Fixed
-
-- **windows**: normalize Hugging Face cache symlink handling and archive symlink critical-path checks across path separators
-- **windows**: preserve `stream://` paths for streaming scans to avoid path normalization issues
-
 ## [0.2.22] - 2025-12-10
 
 ### Added
