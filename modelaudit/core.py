@@ -923,7 +923,7 @@ def scan_model_directory_or_file(
                     logger.debug(f"Failed to hash file {target}: {e}")
                     # Continue without hash - not a critical error
 
-                file_result = scan_file(target, config)
+                file_result: ScanResult = scan_file(target, config)
 
                 # Use helper function to add scan result to Pydantic model
                 _add_scan_result_to_model(results, scan_metadata, file_result, target)
