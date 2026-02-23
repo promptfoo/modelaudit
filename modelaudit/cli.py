@@ -669,7 +669,6 @@ def scan_command(
     # Determine if we should show styled console output (spinners, colors, headers)
     # Show styled output when: text format OR output goes to file (stdout is free)
     show_styled_output = final_format == "text" or bool(output)
-    # final_large_model_support = config.get("large_model_support", True)  # Unused in new implementation
     final_selective = config.get("selective_download", True)
     final_stream = config.get("stream_analysis", False)
     final_scan_and_delete = config.get("scan_and_delete", False)
