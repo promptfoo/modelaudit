@@ -295,7 +295,9 @@ class KerasZipScanner(BaseScanner):
                             found_patterns.append(pattern)
 
                     if found_patterns:
-                        result._add_issue(
+                        result.add_check(
+                            name="Dangerous Lambda Layer",
+                            passed=False,
                             message=f"Lambda layer '{layer_name}' contains dangerous code: {', '.join(found_patterns)}",
                             severity=IssueSeverity.CRITICAL,
                             location=f"{self.current_file_path} (layer: {layer_name})",
