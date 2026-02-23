@@ -398,14 +398,13 @@ def mock_cli_scan_command():
 
 
 @pytest.fixture(autouse=True)
-def cleanup_test_files(tmp_path):
+def cleanup_test_files():
     """Ensure test temp files are cleaned up after each test.
 
-    Only cleans files inside tmp_path to avoid accidentally deleting
-    project files. Tests should use tmp_path for any temporary files.
+    Tests should use tmp_path for any temporary files;
+    pytest handles tmp_path cleanup automatically.
     """
     yield
-    # tmp_path cleanup is handled automatically by pytest
 
 
 # =============================================================================
