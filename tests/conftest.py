@@ -297,19 +297,22 @@ def pytest_configure(config):
 
 
 def pytest_collection_modifyitems(config, items):
-    """Auto-mark tests based on their names."""
+    """Auto-mark tests based on their file names (not test function names).
+
+    Using file names instead of test function names avoids false positives
+    like marking test_multiple_issues as slow just because 'multiple' appears
+    in the name.
+    """
     for item in items:
-        # Mark performance tests
-        if "performance" in item.name.lower() or "benchmark" in item.name.lower():
+        test_file = str(item.fspath).lower()
+
+        # Mark performance tests by file name
+        if "performance" in test_file or "benchmark" in test_file:
             item.add_marker(pytest.mark.performance)
 
-        # Mark integration tests
-        if "integration" in item.name.lower() or "real_world" in item.name.lower():
+        # Mark integration tests by file name
+        if "integration" in test_file:
             item.add_marker(pytest.mark.integration)
-
-        # Mark slow tests
-        if "large" in item.name.lower() or "multiple" in item.name.lower():
-            item.add_marker(pytest.mark.slow)
 
 
 @pytest.fixture
@@ -395,19 +398,14 @@ def mock_cli_scan_command():
 
 
 @pytest.fixture(autouse=True)
-def cleanup_test_files():
-    """Ensure test files are cleaned up after each test."""
+def cleanup_test_files(tmp_path):
+    """Ensure test temp files are cleaned up after each test.
+
+    Only cleans files inside tmp_path to avoid accidentally deleting
+    project files. Tests should use tmp_path for any temporary files.
+    """
     yield
-    # Cleanup any test files that might have been left behind
-    for pattern in ["*.test_*", "test_*", "*.tmp"]:
-        for file in Path.cwd().glob(pattern):
-            try:
-                if file.is_file():
-                    file.unlink()
-                elif file.is_dir():
-                    shutil.rmtree(file)
-            except (OSError, PermissionError):
-                pass  # Ignore cleanup errors
+    # tmp_path cleanup is handled automatically by pytest
 
 
 # =============================================================================
