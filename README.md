@@ -70,6 +70,7 @@ ModelAudit includes **30 specialized scanners** covering model, archive, and con
 | **TensorRT**     | `.engine`, `.plan`                    | LOW    |
 | **PaddlePaddle** | `.pdmodel`, `.pdiparams`              | LOW    |
 | **OpenVINO**     | `.xml`                                | LOW    |
+| **Skops**        | `.skops`                              | HIGH   |
 | **PMML**         | `.pmml`                               | LOW    |
 
 Plus scanners for ZIP, TAR, 7-Zip, OCI layers, Jinja2 templates, JSON/YAML metadata, manifests, and text files.

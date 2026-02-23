@@ -110,12 +110,25 @@ uv run pytest -n auto -m "not slow and not integration" --maxfail=1
 ```bash
 modelaudit/
 ├── modelaudit/           # Main package
-│   ├── scanners/         # Scanner implementations
-│   ├── utils/            # Utility modules
+│   ├── analysis/         # Semantic and integrated analysis
+│   ├── auth/             # API authentication and config
+│   ├── cache/            # Scan result caching
+│   ├── config/           # Blocklists and configuration
+│   ├── detectors/        # Security detectors (secrets, JIT, network)
+│   ├── integrations/     # SARIF, JFrog, license checking
+│   ├── progress/         # Progress tracking subsystem
+│   ├── protos/           # Vendored TensorFlow protobuf stubs
+│   ├── scanners/         # Scanner implementations (30+)
+│   ├── utils/            # File detection, helpers, streaming
+│   ├── whitelists/       # HuggingFace/model whitelists
 │   ├── cli.py            # CLI interface
-│   └── core.py           # Core scanning logic
+│   ├── core.py           # Core scanning orchestration
+│   ├── models.py         # Pydantic result models
+│   └── telemetry.py      # Anonymous usage telemetry
 ├── tests/                # Test suite
-├── docs/agents/          # Detailed documentation
+├── docs/agents/          # Agent documentation
+├── docs/maintainers/     # Release, CVE, dependency docs
+├── docs/user/            # User-facing guides
 └── CHANGELOG.md          # Keep a Changelog format
 ```
 
