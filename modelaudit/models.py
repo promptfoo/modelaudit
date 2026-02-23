@@ -232,7 +232,7 @@ class FileHashesModel(BaseModel):
 
     model_config = ConfigDict(validate_assignment=True)
 
-    md5: str | None = Field(None, description="MD5 hash (deprecated, no longer computed)", pattern=r"^[a-fA-F0-9]{32}$")
+    md5: str | None = Field(None, description="MD5 hash", pattern=r"^[a-fA-F0-9]{32}$")
     sha1: str | None = Field(None, description="SHA1 hash", pattern=r"^[a-fA-F0-9]{40}$")
     sha256: str | None = Field(None, description="SHA256 hash", pattern=r"^[a-fA-F0-9]{64}$")
     sha512: str | None = Field(None, description="SHA512 hash", pattern=r"^[a-fA-F0-9]{128}$")

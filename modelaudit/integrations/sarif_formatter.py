@@ -242,6 +242,8 @@ def _create_artifacts(audit_result: ModelAuditResultModel) -> list[dict[str, Any
                     hashes["sha-256"] = metadata.file_hashes.sha256
                 if metadata.file_hashes.sha1:
                     hashes["sha-1"] = metadata.file_hashes.sha1
+                if metadata.file_hashes.md5:
+                    hashes["md5"] = metadata.file_hashes.md5
 
                 if hashes:
                     artifact["hashes"] = hashes
