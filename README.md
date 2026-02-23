@@ -146,7 +146,11 @@ docker run --rm -v "$(pwd)":/app ghcr.io/promptfoo/modelaudit:latest model.pkl
 --progress                   Force progress display
 ```
 
-Exit codes: `0` clean, `1` issues found, `2` errors.
+## Exit Codes
+
+- `0`: No security issues detected
+- `1`: Security issues detected
+- `2`: Scan errors
 
 ## Telemetry and Privacy
 
