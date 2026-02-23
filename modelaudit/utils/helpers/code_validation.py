@@ -6,7 +6,7 @@ import os
 import py_compile
 import tempfile
 
-logger = logging.getLogger(__name__)
+logger: logging.Logger = logging.getLogger(__name__)
 
 
 def validate_python_syntax(code: str, filename: str = "<string>") -> tuple[bool, str | None]:
@@ -126,7 +126,7 @@ def extract_dangerous_constructs(code: str) -> dict[str, list[str]]:
                     dangerous["variadic_lambdas"].append(f"**{args.kwarg.arg}")
 
     except Exception:
-        logger.debug("Failed to parse code for dangerous construct analysis")
+        logger.debug("Failed to parse code for dangerous construct analysis", exc_info=True)
 
     return dangerous
 
