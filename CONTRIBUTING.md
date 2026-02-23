@@ -35,17 +35,17 @@ pip install -e .[all]
 # Option 1: Install in development mode with pip
 pip install -e .[all]
 
-# Then test the CLI directly
-modelaudit scan test_model.pkl
+# Then test the CLI directly (both forms work: "modelaudit <path>" or "modelaudit scan <path>")
+modelaudit test_model.pkl
 
 # Option 2: Use uv (recommended)
 uv sync --extra all
 
 # Test with uv run (no shell activation needed)
-uv run modelaudit scan test_model.pkl
+uv run modelaudit test_model.pkl
 
 # Test with Python import
-uv run python -c "from modelaudit.core import scan_file; print(scan_file('test_model.pkl'))"
+uv run python -c "from modelaudit import scan_file; print(scan_file('test_model.pkl'))"
 ```
 
 **Create test models for development:**
@@ -55,7 +55,7 @@ uv run python -c "from modelaudit.core import scan_file; print(scan_file('test_m
 python -c "import pickle; pickle.dump({'test': 'data'}, open('test_model.pkl', 'wb'))"
 
 # Test scanning it
-modelaudit scan test_model.pkl
+modelaudit test_model.pkl
 ```
 
 ### Running Tests - Fast & Efficient
@@ -133,7 +133,7 @@ npx prettier --check .
 git checkout -b feature/your-feature-name
 
 # Make your changes...
-git add .
+git add <specific-files>
 git commit -m "feat: description"
 git push origin feature/your-feature-name
 ```
