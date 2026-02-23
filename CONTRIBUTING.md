@@ -91,55 +91,19 @@ uv run pytest -k "test_scanner" -n auto
 uv run pytest --durations=10 --tb=no
 ```
 
-#### Speed Optimizations Implemented
-
-**Parallel Execution:**
-
-- **37% faster** execution using `pytest-xdist`
-- Automatically detects CPU cores with `-n auto`
-- Uses 240%+ CPU utilization
-
-**Smart Test Selection:**
-
-- Exclude slow tests during development: `-m "not slow and not integration"`
-- Run only unit tests: `-m "unit"`
-- Test specific files: `pytest tests/test_specific.py -n auto`
-
-**Performance Comparison:**
-| Configuration | Time | Speedup |
-|--------------|------|---------|
-| Original (sequential) | 68.5s | Baseline |
-| **Parallel (all tests)** | **43.3s** | **37% faster** |
-| **Fast tests only** | **~45s** | **34% faster** |
-| **Specific file/pattern** | **~5-15s** | **80-90% faster** |
-
-**Test Markers Available:**
-
-- `@pytest.mark.slow` - Skip with `-m "not slow"`
-- `@pytest.mark.integration` - Skip with `-m "not integration"`
-- `@pytest.mark.unit` - Run only with `-m "unit"`
-- `@pytest.mark.performance` - Benchmark tests
-
 ### Development Workflow
 
 ```bash
 # Run linting and formatting with Ruff
-uv run ruff check .          # Check entire codebase (including tests)
-uv run ruff check --fix .    # Automatically fix lint issues
-uv run ruff format .         # Format code
+uv run ruff check modelaudit/ tests/           # Check code
+uv run ruff check --fix modelaudit/ tests/     # Automatically fix lint issues
+uv run ruff format modelaudit/ tests/          # Format code
 
 # Type checking
 uv run mypy modelaudit/
 
 # Build package
 uv build
-
-# The generated distribution contains only the `modelaudit` code and metadata.
-# Unnecessary files like tests and Docker configurations are excluded via
-# `MANIFEST.in`.
-
-# Publish (maintainers only)
-uv publish
 ```
 
 **Code Quality Tools:**
@@ -268,8 +232,8 @@ uv run pytest -n auto --cov=modelaudit --cov-report=html
 uv run mypy modelaudit/
 
 # Format and lint code
-uv run ruff format .
-uv run ruff check --fix .
+uv run ruff format modelaudit/ tests/
+uv run ruff check --fix modelaudit/ tests/
 
 # Quick development test cycle
 uv run pytest -n auto -m "not slow and not integration" -x
@@ -278,8 +242,6 @@ uv run pytest -n auto -m "not slow and not integration" -x
 python -c "import torch; torch.save({'model': 'data'}, 'test.pt')"
 python -c "import pickle; pickle.dump({'test': 'malicious'}, open('malicious.pkl', 'wb'))"
 ```
-
-The curated model regression corpus is documented in `docs/agents/model-test-corpus.md`.
 
 ### Release Process (Maintainers)
 

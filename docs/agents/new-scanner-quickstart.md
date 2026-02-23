@@ -8,11 +8,7 @@ Use this checklist to add a new scanner safely and consistently.
 - Document the concrete security risks you are detecting (CVE, known exploit class, or clearly documented abuse pattern).
 - Decide whether dependencies are optional and how scanner behavior degrades when missing.
 
-Reference:
-
-- `docs/agents/architecture.md`
-- `docs/agents/security-checks.md`
-- `docs/agents/testing.md`
+Reference: `docs/agents/architecture.md`
 
 ## 2. Implement scanner class
 
