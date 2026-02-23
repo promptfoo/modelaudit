@@ -930,10 +930,6 @@ class TensorFlowSavedModelScanner(BaseScanner):
             metadata["reason"] = "Deserialization disabled for metadata extraction"
             return metadata
 
-        if not _check_tensorflow():
-            metadata["error"] = "TensorFlow library not available"
-            return metadata
-
         try:
             import tensorflow as tf
 
