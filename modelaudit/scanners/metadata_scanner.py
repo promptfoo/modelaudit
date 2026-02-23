@@ -11,16 +11,19 @@ logger = logging.getLogger(__name__)
 class MetadataScanner(BaseScanner):
     """Scanner for model documentation files looking for security issues."""
 
-    @staticmethod
-    def can_handle(file_path: str) -> bool:
+    name = "metadata"
+    description = "Scans model documentation files for security issues"
+
+    @classmethod
+    def can_handle(cls, path: str) -> bool:
         """Check if this scanner can handle the file."""
-        path = Path(file_path)
+        p = Path(path)
 
         # MetadataScanner focuses on documentation files only
         # JSON config files are handled by ManifestScanner
 
         # Handle README/model card files (including extensionless README files)
-        filename_lower = path.name.lower()
+        filename_lower = p.name.lower()
         return filename_lower in [
             "readme",
             "readme.md",
@@ -34,31 +37,42 @@ class MetadataScanner(BaseScanner):
             "model-index.yaml",
         ] or filename_lower.startswith("readme.")
 
-    def scan(self, file_path: str, timeout: int = 300) -> ScanResult:
+    def scan(self, path: str) -> ScanResult:
         """Scan metadata file for security issues."""
-        issues: list[Issue] = []
-        path = Path(file_path)
+        path_check_result = self._check_path(path)
+        if path_check_result:
+            return path_check_result
+
+        result = self._create_result()
+        p = Path(path)
 
         try:
             # MetadataScanner only handles text/documentation files
-            issues.extend(self._scan_text_metadata(file_path))
+            issues = self._scan_text_metadata(path)
+            for issue in issues:
+                result.add_check(
+                    name=issue.type or "Metadata Security Check",
+                    passed=False,
+                    message=issue.message,
+                    severity=issue.severity,
+                    location=issue.location,
+                    details=issue.details,
+                    why=issue.why,
+                )
 
         except Exception as e:
-            logger.warning(f"Error scanning metadata file {file_path}: {e}")
-            issues.append(
-                Issue(
-                    message=f"Failed to scan metadata file: {e}",
-                    severity=IssueSeverity.WARNING,
-                    location=file_path,
-                    details={"error": str(e)},
-                    why="Failed to process metadata file during scanning",
-                    type="scan_error",
-                )
+            logger.warning(f"Error scanning metadata file {path}: {e}")
+            result.add_check(
+                name="Metadata Scan Error",
+                passed=False,
+                message=f"Failed to scan metadata file: {e}",
+                severity=IssueSeverity.WARNING,
+                location=path,
+                details={"error": str(e)},
+                why="Failed to process metadata file during scanning",
             )
 
-        result = ScanResult("metadata")
-        result.issues = issues
-        result.bytes_scanned = path.stat().st_size if path.exists() else 0
+        result.bytes_scanned = p.stat().st_size if p.exists() else 0
         result.finish(success=True)
         return result
 
