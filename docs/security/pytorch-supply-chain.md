@@ -11,7 +11,7 @@ TRUSTED_SOURCES = [
     'huggingface.co',
     'pytorch.org',
     'github.com/pytorch',
-    'your-internal-repo.com'
+    'models.example.com'
 ]
 
 def validate_model_source(url):
