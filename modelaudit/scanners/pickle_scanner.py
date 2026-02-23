@@ -4232,8 +4232,17 @@ class PickleScanner(BaseScanner):
                     opcode_counts[opcode_name] = opcode_counts.get(opcode_name, 0) + 1
                     opcodes_info.append(opcode_name)
 
-                    # Check for dangerous opcodes
-                    if opcode_name in ["REDUCE", "INST", "OBJ", "NEWOBJ", "STACK_GLOBAL", "GLOBAL"]:
+                    # Check for dangerous opcodes (any opcode that can trigger code execution)
+                    if opcode_name in [
+                        "REDUCE",
+                        "INST",
+                        "OBJ",
+                        "NEWOBJ",
+                        "NEWOBJ_EX",
+                        "STACK_GLOBAL",
+                        "GLOBAL",
+                        "BUILD",
+                    ]:
                         dangerous_opcodes.append(opcode_name)
 
                 metadata.update(

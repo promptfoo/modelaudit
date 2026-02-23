@@ -341,14 +341,24 @@ class NumPyScanner(BaseScanner):
         return result
 
     def extract_metadata(self, file_path: str) -> dict[str, Any]:
-        """Extract NumPy array metadata."""
+        """Extract NumPy array metadata without deserializing object arrays."""
         metadata = super().extract_metadata(file_path)
+        allow_deserialization = self.config.get("allow_metadata_deserialization", False)
 
         try:
             import numpy as np
 
-            # Load the numpy array
-            array = np.load(file_path, mmap_mode="r")  # Memory-map to avoid loading large arrays
+            # SECURITY: always pass allow_pickle=False to prevent code execution
+            # via crafted object-dtype .npy files or .npz containing pickled data.
+            try:
+                array = np.load(file_path, mmap_mode="r", allow_pickle=False)
+            except ValueError:
+                # File contains object arrays that require pickle deserialization
+                if not allow_deserialization:
+                    metadata["deserialization_skipped"] = True
+                    metadata["reason"] = "File contains object arrays requiring pickle deserialization"
+                    return metadata
+                array = np.load(file_path, allow_pickle=True)
 
             metadata.update(
                 {
