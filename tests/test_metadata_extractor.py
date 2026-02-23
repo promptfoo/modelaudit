@@ -30,7 +30,7 @@ class TestModelMetadataExtractor:
             assert "error" in metadata
             assert metadata["file"] == Path(tmp.name).name
 
-    def test_extract_metadata_basic(self):
+    def test_extract_metadata_basic(self, tmp_path):
         """Test basic metadata extraction functionality."""
         extractor = ModelMetadataExtractor()
 
@@ -39,23 +39,19 @@ class TestModelMetadataExtractor:
         header_json = json.dumps(header).encode("utf-8")
         header_len = len(header_json)
 
-        with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as tmp:
-            tmp.write(struct.pack("<Q", header_len))
-            tmp.write(header_json)
-            tmp.write(b"\x00" * 16)  # Dummy tensor data
-            tmp.flush()
+        st_file = tmp_path / "model.safetensors"
+        with open(st_file, "wb") as f:
+            f.write(struct.pack("<Q", header_len))
+            f.write(header_json)
+            f.write(b"\x00" * 16)  # Dummy tensor data
 
-            try:
-                metadata = extractor.extract(tmp.name)
+        metadata = extractor.extract(str(st_file))
 
-                assert metadata["format"] == "safetensors"
-                assert metadata["file_size"] > 0
-                assert metadata["tensor_count"] == 1
-                assert metadata["total_parameters"] == 4
-                assert "tensors" in metadata
-
-            finally:
-                os.unlink(tmp.name)
+        assert metadata["format"] == "safetensors"
+        assert metadata["file_size"] > 0
+        assert metadata["tensor_count"] == 1
+        assert metadata["total_parameters"] == 4
+        assert "tensors" in metadata
 
     def test_extract_directory_metadata(self):
         """Test directory metadata extraction."""
@@ -88,36 +84,33 @@ class TestModelMetadataExtractor:
             assert "safetensors" in metadata["summary"]["formats"]
             assert "pickle" in metadata["summary"]["formats"]
 
-    def test_security_only_filter(self):
+    def test_security_only_filter(self, tmp_path):
         """Test security-only metadata filtering."""
         extractor = ModelMetadataExtractor()
 
-        with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as tmp:
-            header = {
-                "tensor1": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
-                "__metadata__": {"framework": "test", "version": "1.0"},
-            }
-            header_json = json.dumps(header).encode("utf-8")
-            tmp.write(struct.pack("<Q", len(header_json)))
-            tmp.write(header_json)
-            tmp.write(b"\x00\x00\x00\x00")
-            tmp.flush()
+        header = {
+            "tensor1": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+            "__metadata__": {"framework": "test", "version": "1.0"},
+        }
+        header_json = json.dumps(header).encode("utf-8")
 
-            try:
-                # Test with security_only=True
-                metadata = extractor.extract(tmp.name, security_only=True)
+        st_file = tmp_path / "model.safetensors"
+        with open(st_file, "wb") as f:
+            f.write(struct.pack("<Q", len(header_json)))
+            f.write(header_json)
+            f.write(b"\x00\x00\x00\x00")
 
-                # Should contain basic info
-                assert "file" in metadata
-                assert "format" in metadata
-                assert "file_size" in metadata
+        # Test with security_only=True
+        metadata = extractor.extract(str(st_file), security_only=True)
 
-                # Should contain custom metadata (potentially security relevant)
-                if "custom_metadata" in metadata:
-                    assert metadata["custom_metadata"]["framework"] == "test"
+        # Should contain basic info
+        assert "file" in metadata
+        assert "format" in metadata
+        assert "file_size" in metadata
 
-            finally:
-                os.unlink(tmp.name)
+        # Should contain custom metadata (potentially security relevant)
+        if "custom_metadata" in metadata:
+            assert metadata["custom_metadata"]["framework"] == "test"
 
     def test_format_table_single_file(self):
         """Test table formatting for single file."""
@@ -185,18 +178,16 @@ class TestModelMetadataExtractor:
 
     def test_joblib_metadata_no_deserialization(self, monkeypatch, tmp_path):
         """Ensure joblib metadata extraction does not deserialize by default."""
-        joblib = pytest.importorskip("joblib")
+        joblib_mod = pytest.importorskip("joblib")
         extractor = ModelMetadataExtractor()
 
         joblib_file = tmp_path / "model.joblib"
-        joblib.dump({"x": 1}, joblib_file)
-
-        import joblib
+        joblib_mod.dump({"x": 1}, joblib_file)
 
         def fail_load(*_args, **_kwargs):
             raise AssertionError("joblib.load should not be called during metadata extraction")
 
-        monkeypatch.setattr(joblib, "load", fail_load, raising=True)
+        monkeypatch.setattr(joblib_mod, "load", fail_load, raising=True)
 
         metadata = extractor.extract(str(joblib_file))
 
