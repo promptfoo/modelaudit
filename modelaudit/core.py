@@ -912,7 +912,6 @@ def scan_model_directory_or_file(
                 if progress_callback:
                     progress_callback(f"Scanning file: {target}", 0.0)
 
-                file_size = os.path.getsize(target)
                 results.files_scanned += 1
 
                 # Compute hash for single file to enable aggregate hash
@@ -923,7 +922,7 @@ def scan_model_directory_or_file(
                     logger.debug(f"Failed to hash file {target}: {e}")
                     # Continue without hash - not a critical error
 
-                file_result: ScanResult = scan_file(target, config)
+                file_result = scan_file(target, config)
 
                 # Use helper function to add scan result to Pydantic model
                 _add_scan_result_to_model(results, scan_metadata, file_result, target)
