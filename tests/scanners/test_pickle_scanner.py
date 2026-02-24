@@ -225,7 +225,7 @@ class TestPickleScannerAdvanced(unittest.TestCase):
 
     def test_stack_global_detection(self) -> None:
         scanner = PickleScanner()
-        result = scanner.scan("tests/assets/pickles/stack_global_attack.pkl")
+        result = scanner.scan(str(Path(__file__).parent.parent / "assets" / "pickles" / "stack_global_attack.pkl"))
 
         assert len(result.issues) > 0, "Expected issues to be detected for STACK_GLOBAL attack"
         os_issues = [
@@ -237,7 +237,7 @@ class TestPickleScannerAdvanced(unittest.TestCase):
 
     def test_memo_object_tracking(self) -> None:
         scanner = PickleScanner()
-        result = scanner.scan("tests/assets/pickles/memo_attack.pkl")
+        result = scanner.scan(str(Path(__file__).parent.parent / "assets" / "pickles" / "memo_attack.pkl"))
 
         assert len(result.issues) > 0, "Expected issues to be detected for memo-based attack"
         subprocess_issues = [i for i in result.issues if "subprocess" in i.message.lower()]
@@ -247,7 +247,7 @@ class TestPickleScannerAdvanced(unittest.TestCase):
 
     def test_multiple_pickle_streams(self) -> None:
         scanner = PickleScanner()
-        result = scanner.scan("tests/assets/pickles/multiple_stream_attack.pkl")
+        result = scanner.scan(str(Path(__file__).parent.parent / "assets" / "pickles" / "multiple_stream_attack.pkl"))
 
         assert len(result.issues) > 0, "Expected issues to be detected for multiple pickle streams"
         eval_issues = [i for i in result.issues if "eval" in i.message.lower()]

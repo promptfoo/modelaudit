@@ -5,7 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.25](https://github.com/promptfoo/modelaudit/compare/v0.2.24...v0.2.25) (2026-02-12)
+## [Unreleased]
+
+### Fixed
+
+- **security**: harden pickle scanner stack resolution to correctly track `STACK_GLOBAL` and memoized `REDUCE` call targets, preventing decoy-string and `BINGET` bypasses
+- **security**: tighten manifest trusted-domain matching to validate URL hostnames instead of substring matches
+- **security**: make `.keras` suspicious file extension checks case-insensitive to catch uppercase executable/script payloads
+- **security**: block unsafe in-process `torch.load` in `WeightDistributionScanner` by default unless explicitly opted in
+
+## [0.2.25] - 2026-02-12
 
 ### Features
 
@@ -37,7 +46,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - remove variable shadowing for skip_file_types parameter ([#489](https://github.com/promptfoo/modelaudit/issues/489)) ([bcf99ea](https://github.com/promptfoo/modelaudit/commit/bcf99ea7d0e62b358c130754c38e7f5be3282e18))
 - use deterministic data patterns in anomaly detector tests ([#477](https://github.com/promptfoo/modelaudit/issues/477)) ([df11759](https://github.com/promptfoo/modelaudit/commit/df11759ee22628aed6ed541f819fd5f26920a38b))
 
-## [0.2.24](https://github.com/promptfoo/modelaudit/compare/v0.2.23...v0.2.24) (2025-12-23)
+## [0.2.24] - 2025-12-23
 
 ### Bug Fixes
 
@@ -46,35 +55,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps:** update dependency xgboost to v3 ([#469](https://github.com/promptfoo/modelaudit/issues/469)) ([97adbbc](https://github.com/promptfoo/modelaudit/commit/97adbbc0cfe3699264ade222b9949a98f5e6878d))
 - resolve release-please CHANGELOG formatting race condition ([#457](https://github.com/promptfoo/modelaudit/issues/457)) ([4347b83](https://github.com/promptfoo/modelaudit/commit/4347b83e652fde580437964f22feffdbed7b8731))
 
-## [0.2.23](https://github.com/promptfoo/modelaudit/compare/v0.2.22...v0.2.23) (2025-12-12)
+## [0.2.23] - 2025-12-12
 
 ### Documentation
 
 - consolidate agent guidance ([#453](https://github.com/promptfoo/modelaudit/issues/453)) ([a01ceff](https://github.com/promptfoo/modelaudit/commit/a01ceff5daa66750994008e1a9414ce3227115d6))
 - restructure AGENTS.md and CLAUDE.md following 2025 best practices ([#451](https://github.com/promptfoo/modelaudit/issues/451)) ([e87de51](https://github.com/promptfoo/modelaudit/commit/e87de5153c574b9053b507d44f59d5fe85b7204d))
-
-## [Unreleased]
-
-### Added
-
-- **feat**: add Git LFS pointer detection - detects when model files are Git LFS pointers (small text files) instead of actual model content, reports as CRITICAL issue with remediation steps including `git lfs pull` instructions
-- **ux**: add Python version warnings — runtime `warnings.warn()` in `__init__.py` and click-styled stderr warning in CLI for Python < 3.10, plus README troubleshooting section for users stuck on version 0.2.5
-
-### Changed
-
-- **deps**: update xgboost to v3.1.2 (from >=1.6.0,<3.0 to >=3.1.2,<3.2) - major version upgrade with no breaking changes affecting ModelAudit's usage
-- **docs**: consolidate agent guidance into a single canonical `AGENTS.md` and align `CLAUDE.md`/`GEMINI.md` to reference it
-- **ci**: add Windows test coverage and introduce a Windows-friendly dependency set for CI usage
-
-### Fixed
-
-- **windows**: normalize Hugging Face cache symlink handling and archive symlink critical-path checks across path separators
-- **windows**: preserve `stream://` paths for streaming scans to avoid path normalization issues
-- **security**: harden pickle scanner stack resolution to correctly track `STACK_GLOBAL` and memoized `REDUCE` call targets, preventing decoy-string and `BINGET` bypasses
-- **security**: tighten manifest trusted-domain matching to validate URL hostnames instead of substring matches
-- **security**: make `.keras` suspicious file extension checks case-insensitive to catch uppercase executable/script payloads
-- **security**: block unsafe in-process `torch.load` in `WeightDistributionScanner` by default unless explicitly opted in
-
 ## [0.2.22] - 2025-12-10
 
 ### Added
@@ -91,9 +77,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **feat**: detect cloud storage URLs in model configs (AWS S3, GCS, Azure Blob, HuggingFace Hub) - identifies external resource references that could indicate supply chain risks or data exfiltration vectors (Requirement 19)
+- **feat**: detect cloud storage URLs in model configs (AWS S3, GCS, Azure Blob, HuggingFace Hub) - identifies external resource references that could indicate supply chain risks or data exfiltration vectors
 - **feat**: add URL allowlist security scanning to manifest scanner - uses 164 trusted domains to flag untrusted URLs in model configs as potential supply chain risks
-- **feat**: detect weak hash algorithms (MD5, SHA1) in model config files - scans manifest files for hash/checksum fields using cryptographically broken algorithms and reports WARNING with CWE-328 reference; SHA256/SHA512 usage is confirmed as strong (addresses Requirement 28: Hash Collisions or Weak Hashes)
+- **feat**: detect weak hash algorithms (MD5, SHA1) in model config files - scans manifest files for hash/checksum fields using cryptographically broken algorithms and reports WARNING with CWE-328 reference; SHA256/SHA512 usage is confirmed as strong
 - **feat**: add comprehensive analytics system with Promptfoo integration - opt-out telemetry for usage insights, respects `PROMPTFOO_DISABLE_TELEMETRY` and `NO_ANALYTICS` environment variables
 - **feat**: auto-enable progress display when output goes to file - shows spinner/progress when stdout is redirected to a file
 
@@ -663,7 +649,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **style**: improve code formatting and documentation standards (#12, #23)
 - **fix**: improve core scanner functionality and comprehensive test coverage (#11)
 
-[unreleased]: https://github.com/promptfoo/modelaudit/compare/v0.2.22...HEAD
+[unreleased]: https://github.com/promptfoo/modelaudit/compare/v0.2.25...HEAD
+[0.2.25]: https://github.com/promptfoo/modelaudit/compare/v0.2.24...v0.2.25
+[0.2.24]: https://github.com/promptfoo/modelaudit/compare/v0.2.23...v0.2.24
+[0.2.23]: https://github.com/promptfoo/modelaudit/compare/v0.2.22...v0.2.23
 [0.2.22]: https://github.com/promptfoo/modelaudit/compare/v0.2.21...v0.2.22
 [0.2.21]: https://github.com/promptfoo/modelaudit/compare/v0.2.20...v0.2.21
 [0.2.20]: https://github.com/promptfoo/modelaudit/compare/v0.2.19...v0.2.20

@@ -17,6 +17,7 @@ keywords = ["ai", "ml", "security", "model-scanning", "pickle", "tensorflow", "p
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
     "Topic :: Security",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Programming Language :: Python :: 3",
@@ -24,7 +25,6 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
-    "Programming Language :: Python :: 3.14",
 ]
 requires-python = ">=3.10"
 dependencies = [
@@ -44,7 +44,6 @@ dependencies = [
     "platformdirs>=3.0.0",
     "pyyaml>=6.0,<7.0",
     "pydantic>=2.11.0,<3.0",
-    "contourpy<1.3.4",
     "fsspec>=2025.5.1",
     "s3fs>=2025.5.1",
     "gcsfs>=2025.5.1",
@@ -63,7 +62,6 @@ tensorflow = [
 ]
 h5 = ["h5py>=3.1,<4.0"]
 pytorch = ["torch>=2.6.0,<3.0"]
-yaml = ["pyyaml>=6.0,<7.0"]
 safetensors = ["safetensors>=0.4.0"]
 onnx = ["onnx>=1.12.0,<2.0; python_version < '3.13'"]
 dill = ["dill>=0.3.0,<1.0"]
@@ -73,7 +71,6 @@ tflite = ["tflite>=2.18.0"]
 tensorrt = ["tensorrt>=8.6.0; sys_platform == 'linux' or sys_platform == 'win32'"]
 xgboost = ["xgboost>=3.2,<3.3", "py-ubjson>=0.16.0"]
 mlflow = ["mlflow>=2.12.0"]
-huggingface = ["huggingface-hub>=0.23.0"]
 sevenzip = ["py7zr>=0.20.0"]
 # Full ML framework bundle with version-appropriate NumPy
 # Note: TensorFlow is no longer required - vendored protos handle SavedModel scanning
@@ -141,6 +138,8 @@ modelaudit = "modelaudit.cli:main"
 [project.urls]
 Repository = "https://github.com/promptfoo/modelaudit"
 Homepage = "https://github.com/promptfoo/modelaudit"
+"Bug Tracker" = "https://github.com/promptfoo/modelaudit/issues"
+Changelog = "https://github.com/promptfoo/modelaudit/blob/main/CHANGELOG.md"
 
 [dependency-groups]
 dev = [
@@ -235,6 +234,7 @@ markers = [
     "safetensors: marks tests as requiring safetensors",
     "joblib: marks tests as requiring joblib",
     "dill: marks tests as requiring dill",
+    "regression: marks tests as regression corpus validation",
 ]
 filterwarnings = [
     "ignore::DeprecationWarning",
@@ -299,7 +299,7 @@ follow_imports = "silent"
 
 # Per-module overrides for gradual adoption
 [[tool.mypy.overrides]]
-module = "modelaudit.tests.*"
+module = "tests.*"
 # Tests can be less strict
 disallow_untyped_defs = false
 check_untyped_defs = true
@@ -343,8 +343,6 @@ exclude = [
     "**/.pytest_cache/**", 
     "**/build/**",
     "**/dist/**",
-    "picklescan/**",      # Legacy code that might be removed
-    "modelscan/**",       # Legacy code that might be removed
 ]
 
 [tool.ty.rules]

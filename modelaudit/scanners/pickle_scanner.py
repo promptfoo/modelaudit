@@ -1,3 +1,5 @@
+"""Scanner for Python pickle serialized files (.pkl, .pickle)."""
+
 import os
 import pickletools
 import struct

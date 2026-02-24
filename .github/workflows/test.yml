@@ -32,8 +32,8 @@ jobs:
       workflows: ${{ steps.filter.outputs.workflows }}
       dependencies: ${{ steps.filter.outputs.dependencies }}
     steps:
-      - uses: actions/checkout@v6
-      - uses: dorny/paths-filter@v3
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3
         id: filter
         with:
           filters: |
@@ -59,10 +59,10 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@eac588ad8def6316056a12d4907a9d4d84ff7a3b # v7
         with:
           enable-cache: true
 
@@ -71,7 +71,7 @@ jobs:
           uv python pin 3.12
 
       - name: Cache Python dependencies
-        uses: actions/cache@v5
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5
         with:
           path: |
             .venv
@@ -98,6 +98,188 @@ jobs:
         run: |
           uv run ruff format --check modelaudit/ tests/
 
+  dependency-audit:
+    name: Dependency Audit
+    needs: changes
+    if: github.ref == 'refs/heads/main' || needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@eac588ad8def6316056a12d4907a9d4d84ff7a3b # v7
+        with:
+          enable-cache: true
+
+      - name: Pin Python version
+        run: |
+          uv python pin 3.12
+
+      - name: Sync dependencies
+        run: |
+          uv sync --extra all-ci
+
+      - name: Audit dependencies for vulnerabilities
+        run: |
+          uvx pip-audit --strict --desc -r <(uv export --no-hashes)
+
+  license-check:
+    name: License Compliance
+    needs: changes
+    if: github.ref == 'refs/heads/main' || needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@eac588ad8def6316056a12d4907a9d4d84ff7a3b # v7
+        with:
+          enable-cache: true
+
+      - name: Pin Python version
+        run: |
+          uv python pin 3.12
+
+      - name: Sync dependencies
+        run: |
+          uv sync --extra all-ci
+
+      - name: Check dependency licenses
+        run: |
+          uv run python -c "
+          import importlib.metadata as md
+          import sys
+
+          # Approved license keywords (case-insensitive substring matching).
+          # See docs/maintainers/dependency-policy.md for the full policy.
+          APPROVED_KEYWORDS = [
+              'mit', 'bsd', 'apache', 'isc', 'psf', 'python software foundation',
+              'mpl', 'mozilla public',
+              'public domain', 'unlicense', 'cc0', '0bsd', 'zlib',
+              '3-clause bsd',
+          ]
+
+          # Classifier fragments that indicate an approved license.
+          APPROVED_CLASSIFIERS = [
+              'MIT License',
+              'BSD License',
+              'Apache Software License',
+              'ISC License',
+              'Mozilla Public License',
+              'Python Software Foundation License',
+              'Public Domain',
+          ]
+
+          # Classifiers that must NOT pass the OSI Approved catch-all.
+          BLOCKED_CLASSIFIERS = [
+              'GNU General Public License',
+              'GNU Affero General Public License',
+          ]
+
+          # NVIDIA CUDA packages are proprietary but are required transitive
+          # dependencies of PyTorch (an optional extra). They are redistributable
+          # under NVIDIA's EULA and cannot be avoided when using CUDA-enabled torch.
+          # See docs/maintainers/dependency-policy.md for the full exception rationale.
+          NVIDIA_PREFIXES = ('nvidia-', 'cuda-')
+
+          # LGPL packages that have received explicit maintainer approval.
+          # Per policy, LGPL requires case-by-case approval. Each entry here
+          # must have a corresponding note in THIRD_PARTY_NOTICES.md.
+          APPROVED_LGPL_PACKAGES = {'py7zr'}
+
+          # Packages that ship no license metadata at all but are known-good.
+          # Verify manually on PyPI before adding here.
+          KNOWN_GOOD_NO_METADATA = {
+              'google-crc32c',  # Apache-2.0 (https://pypi.org/project/google-crc32c/)
+          }
+
+          def is_approved(name: str, lic: str, classifiers: list[str]) -> bool:
+              # Known-good packages with broken/missing metadata
+              if name in KNOWN_GOOD_NO_METADATA:
+                  return True
+
+              # NVIDIA CUDA transitive deps from PyTorch optional extra
+              if any(name.lower().startswith(p) for p in NVIDIA_PREFIXES):
+                  return True
+
+              # LGPL packages with explicit maintainer approval
+              if name in APPROVED_LGPL_PACKAGES:
+                  return True
+
+              # Check license field (case-insensitive keyword match)
+              lic_lower = lic.lower().strip()
+              if lic_lower and any(kw in lic_lower for kw in APPROVED_KEYWORDS):
+                  return True
+
+              # Check classifiers
+              lic_classifiers = [c for c in classifiers if c.startswith('License')]
+
+              # Reject blocked license families before checking approvals
+              for cls in lic_classifiers:
+                  if any(blocked in cls for blocked in BLOCKED_CLASSIFIERS):
+                      return False
+
+              for cls in lic_classifiers:
+                  if any(frag in cls for frag in APPROVED_CLASSIFIERS):
+                      return True
+                  if 'OSI Approved' in cls:
+                      return True
+
+              return False
+
+          failed = []
+          for dist in md.distributions():
+              name = dist.metadata['Name']
+              if name == 'modelaudit':
+                  continue
+
+              # Check both License (legacy) and License-Expression (PEP 639)
+              lic = dist.metadata.get('License', '') or ''
+              lic_expr = dist.metadata.get('License-Expression', '') or ''
+              # Combine both fields for checking
+              combined_lic = f'{lic} {lic_expr}'.strip()
+              classifiers = dist.metadata.get_all('Classifier') or []
+
+              if not is_approved(name, combined_lic, classifiers):
+                  # Build a readable label for the failure message
+                  lic_display = combined_lic[:80] if combined_lic else '(empty)'
+                  lic_cls = [c.split(' :: ')[-1] for c in classifiers if 'License' in c]
+                  if lic_cls:
+                      lic_display += f' classifiers={lic_cls}'
+                  failed.append(f'{name}: {lic_display}')
+
+          if failed:
+              print('Unapproved licenses found:')
+              for f in sorted(failed):
+                  print(f'  {f}')
+              sys.exit(1)
+          else:
+              print('All dependency licenses are approved.')
+          "
+
+  uv-lock-check:
+    name: Lock File Consistency
+    needs: changes
+    if: github.ref == 'refs/heads/main' || needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@eac588ad8def6316056a12d4907a9d4d84ff7a3b # v7
+        with:
+          enable-cache: true
+
+      - name: Check uv.lock is in sync with pyproject.toml
+        run: |
+          uv lock --check
+
   type-check:
     name: Type Check
     needs: changes
@@ -107,10 +289,10 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@eac588ad8def6316056a12d4907a9d4d84ff7a3b # v7
         with:
           enable-cache: true
 
@@ -119,7 +301,7 @@ jobs:
           uv python pin 3.12
 
       - name: Cache Python dependencies
-        uses: actions/cache@v5
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5
         with:
           path: |
             .venv
@@ -153,10 +335,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@eac588ad8def6316056a12d4907a9d4d84ff7a3b # v7
         with:
           enable-cache: true
 
@@ -165,7 +347,7 @@ jobs:
           uv python pin 3.12
 
       - name: Cache Python dependencies
-        uses: actions/cache@v5
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5
         with:
           path: |
             .venv
@@ -192,10 +374,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@eac588ad8def6316056a12d4907a9d4d84ff7a3b # v7
 
       - name: Pin Python version
         run: |
@@ -225,10 +407,10 @@ jobs:
         python-version: ${{ github.event_name == 'pull_request' && fromJSON('["3.10", "3.13"]') || fromJSON('["3.10", "3.11", "3.12", "3.13"]') }}
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@eac588ad8def6316056a12d4907a9d4d84ff7a3b # v7
         with:
           enable-cache: true
 
@@ -237,7 +419,7 @@ jobs:
           uv python pin ${{ matrix.python-version }}
 
       - name: Cache Python dependencies
-        uses: actions/cache@v5
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5
         with:
           path: |
             .venv
@@ -293,7 +475,7 @@ jobs:
 
       - name: Upload coverage to Codecov
         if: matrix.python-version == '3.12'
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@671740ac38dd9b0130fbe1cec585b89eea48d3de # v5
         with:
           files: ./coverage.xml
           fail_ci_if_error: false
@@ -315,10 +497,10 @@ jobs:
         include: ${{ github.event_name == 'pull_request' && fromJSON('[{"python-version":"3.10","numpy-mode":"1.x"},{"python-version":"3.11","numpy-mode":"2.x"}]') || fromJSON('[{"python-version":"3.10","numpy-mode":"1.x"},{"python-version":"3.11","numpy-mode":"2.x"},{"python-version":"3.12","numpy-mode":"2.x"},{"python-version":"3.13","numpy-mode":"2.x"}]') }}
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@eac588ad8def6316056a12d4907a9d4d84ff7a3b # v7
         with:
           enable-cache: true
 
@@ -327,7 +509,7 @@ jobs:
           uv python pin ${{ matrix.python-version }}
 
       - name: Cache Python dependencies
-        uses: actions/cache@v5
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5
         with:
           path: |
             .venv
@@ -376,10 +558,10 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@eac588ad8def6316056a12d4907a9d4d84ff7a3b # v7
         with:
           enable-cache: true
 
@@ -423,6 +605,105 @@ jobs:
           uv run python -m modelaudit tests/assets/samples/tensorflow/malicious_pyfunc/ --format json | \
             uv run python -c "import sys,json; d=json.load(sys.stdin); critical=[i for i in d['issues'] if i['severity']=='critical']; assert len(critical)>=1, f'Expected critical issues, got {len(critical)}'; print(f'✓ Malicious model: {len(critical)} critical issue(s) detected')"
 
+  test-proto-reproducibility:
+    name: Verify Vendored Proto Reproducibility
+    needs: changes
+    # Only run on main or when proto-related files change
+    if: github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.dependencies == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install protoc 33.5
+        run: |
+          # Pin protoc to the exact version used to generate vendored protos.
+          # The vendored files contain "Protobuf Python Version: 6.33.5"
+          # which corresponds to libprotoc 33.5.
+          PROTOC_VERSION="33.5"
+          PROTOC_ZIP="protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+          curl -fsSL -o /tmp/protoc.zip \
+            "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/${PROTOC_ZIP}"
+          sudo unzip -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'
+          sudo chmod +x /usr/local/bin/protoc
+          rm /tmp/protoc.zip
+          protoc --version
+
+      - name: Regenerate protos and compare
+        run: |
+          set -euo pipefail
+
+          # Save checksums of current vendored protos
+          find modelaudit/protos/tensorflow -name "*.py" -exec md5sum {} \; | sort > /tmp/before.md5
+
+          # Regenerate using the same script
+          bash scripts/compile_tensorflow_protos.sh
+
+          # Save checksums of regenerated protos
+          find modelaudit/protos/tensorflow -name "*.py" -exec md5sum {} \; | sort > /tmp/after.md5
+
+          # Compare
+          if ! diff /tmp/before.md5 /tmp/after.md5; then
+            echo "ERROR: Vendored protos differ from regenerated output!"
+            echo "Run 'bash scripts/compile_tensorflow_protos.sh' locally and commit the results."
+            diff /tmp/before.md5 /tmp/after.md5 || true
+            exit 1
+          fi
+
+          echo "Vendored protos match regenerated output."
+
+  test-extras-smoke:
+    name: Extras Smoke Test (${{ matrix.extra }})
+    needs: changes
+    # Only run on main or when dependencies change
+    if: github.ref == 'refs/heads/main' || needs.changes.outputs.dependencies == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        extra:
+          [
+            h5,
+            pytorch,
+            safetensors,
+            onnx,
+            dill,
+            joblib,
+            flax,
+            xgboost,
+            sevenzip,
+          ]
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@eac588ad8def6316056a12d4907a9d4d84ff7a3b # v7
+        with:
+          enable-cache: true
+
+      - name: Pin Python version
+        run: |
+          uv python pin 3.12
+
+      - name: Install with ${{ matrix.extra }} extra
+        run: |
+          uv sync --extra ${{ matrix.extra }}
+
+      - name: Verify import and basic scan
+        run: |
+          # Verify modelaudit loads without import errors
+          uv run python -c "import modelaudit; print(f'modelaudit {modelaudit.__version__} loaded')"
+
+          # Run scanner diagnostics
+          uv run modelaudit doctor --show-failed
+
+          # Create a test file and scan it
+          uv run python -c "import pickle; pickle.dump({'test': True}, open('smoke_test.pkl', 'wb'))"
+          uv run modelaudit scan smoke_test.pkl --format json
+
   build:
     name: Build and Package
     needs: changes
@@ -432,10 +713,10 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@eac588ad8def6316056a12d4907a9d4d84ff7a3b # v7
         with:
           enable-cache: true
 
@@ -444,7 +725,7 @@ jobs:
           uv python pin 3.12
 
       - name: Cache Python dependencies
-        uses: actions/cache@v5
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5
         with:
           path: |
             .venv
@@ -463,8 +744,12 @@ jobs:
         run: |
           uv build
 
+      - name: Validate package metadata
+        run: |
+          uvx twine check dist/*
+
       - name: Upload artifacts
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: dist
           path: dist/
@@ -474,13 +759,19 @@ jobs:
     name: CI Success
     needs:
       [
+        changes,
         quick-feedback,
         lint,
+        dependency-audit,
+        license-check,
+        uv-lock-check,
         type-check,
         windows-tests,
         test,
         test-numpy-compatibility,
         test-vendored-protos,
+        test-proto-reproducibility,
+        test-extras-smoke,
         build,
       ]
     if: always()
@@ -492,12 +783,18 @@ jobs:
           # (skipped means the job's conditions weren't met, which is fine)
           QUICK_FEEDBACK_RESULT="${{ needs.quick-feedback.result }}"
           LINT_RESULT="${{ needs.lint.result }}"
+          AUDIT_RESULT="${{ needs.dependency-audit.result }}"
+          LICENSE_RESULT="${{ needs.license-check.result }}"
+          UV_LOCK_RESULT="${{ needs.uv-lock-check.result }}"
           TYPE_CHECK_RESULT="${{ needs.type-check.result }}"
           WINDOWS_RESULT="${{ needs.windows-tests.result }}"
           TEST_RESULT="${{ needs.test.result }}"
           NUMPY_RESULT="${{ needs.test-numpy-compatibility.result }}"
           PROTOS_RESULT="${{ needs.test-vendored-protos.result }}"
+          PROTO_REPRO_RESULT="${{ needs.test-proto-reproducibility.result }}"
+          EXTRAS_RESULT="${{ needs.test-extras-smoke.result }}"
           BUILD_RESULT="${{ needs.build.result }}"
+          CHANGES_RESULT="${{ needs.changes.result }}"
 
           # Check if conditional jobs should have run
           ON_MAIN_BRANCH="${{ github.ref == 'refs/heads/main' }}"
@@ -507,37 +804,44 @@ jobs:
           echo "Job results:"
           echo "  quick-feedback: $QUICK_FEEDBACK_RESULT"
           echo "  lint: $LINT_RESULT"
+          echo "  dependency-audit: $AUDIT_RESULT"
+          echo "  license-check: $LICENSE_RESULT"
+          echo "  uv-lock-check: $UV_LOCK_RESULT"
           echo "  type-check: $TYPE_CHECK_RESULT"
           echo "  windows-tests: $WINDOWS_RESULT"
           echo "  test: $TEST_RESULT"
-          echo "  test-numpy-compatibility: $NUMPY_RESULT (should run: on_main=$ON_MAIN_BRANCH, deps_changed=$DEPENDENCIES_CHANGED)"
-          echo "  test-vendored-protos: $PROTOS_RESULT (should run: on_main=$ON_MAIN_BRANCH, python_changed=$PYTHON_CHANGED, deps_changed=$DEPENDENCIES_CHANGED)"
+          echo "  test-numpy-compatibility: $NUMPY_RESULT"
+          echo "  test-vendored-protos: $PROTOS_RESULT"
+          echo "  test-proto-reproducibility: $PROTO_REPRO_RESULT"
+          echo "  test-extras-smoke: $EXTRAS_RESULT"
           echo "  build: $BUILD_RESULT"
+          echo "  changes: $CHANGES_RESULT"
 
           # Check if any job failed or was cancelled
           FAILED=false
 
+          [[ "$CHANGES_RESULT" == "failure" || "$CHANGES_RESULT" == "cancelled" ]] && FAILED=true
           [[ "$QUICK_FEEDBACK_RESULT" == "failure" || "$QUICK_FEEDBACK_RESULT" == "cancelled" ]] && FAILED=true
           [[ "$LINT_RESULT" == "failure" || "$LINT_RESULT" == "cancelled" ]] && FAILED=true
+          [[ "$AUDIT_RESULT" == "failure" || "$AUDIT_RESULT" == "cancelled" ]] && FAILED=true
           [[ "$TYPE_CHECK_RESULT" == "failure" || "$TYPE_CHECK_RESULT" == "cancelled" ]] && FAILED=true
           [[ "$WINDOWS_RESULT" == "failure" || "$WINDOWS_RESULT" == "cancelled" ]] && FAILED=true
           [[ "$TEST_RESULT" == "failure" || "$TEST_RESULT" == "cancelled" ]] && FAILED=true
           [[ "$BUILD_RESULT" == "failure" || "$BUILD_RESULT" == "cancelled" ]] && FAILED=true
 
-          # NumPy compatibility job only runs on main or when dependencies change
+          # Conditional jobs: only fail if they should have run
+          # License/lock checks run on main or when dependencies change
           if [[ "$ON_MAIN_BRANCH" == "true" || "$DEPENDENCIES_CHANGED" == "true" ]]; then
-            echo "NumPy job should have run - checking for failure"
+            [[ "$LICENSE_RESULT" == "failure" || "$LICENSE_RESULT" == "cancelled" ]] && FAILED=true
+            [[ "$UV_LOCK_RESULT" == "failure" || "$UV_LOCK_RESULT" == "cancelled" ]] && FAILED=true
             [[ "$NUMPY_RESULT" == "failure" || "$NUMPY_RESULT" == "cancelled" ]] && FAILED=true
-          else
-            echo "NumPy job was not expected to run - treating as OK"
+            [[ "$EXTRAS_RESULT" == "failure" || "$EXTRAS_RESULT" == "cancelled" ]] && FAILED=true
           fi
 
-          # Vendored protos job runs on main or when python/dependencies change
+          # Vendored protos jobs run on main or when python/dependencies change
           if [[ "$ON_MAIN_BRANCH" == "true" || "$PYTHON_CHANGED" == "true" || "$DEPENDENCIES_CHANGED" == "true" ]]; then
-            echo "Vendored protos job should have run - checking for failure"
             [[ "$PROTOS_RESULT" == "failure" || "$PROTOS_RESULT" == "cancelled" ]] && FAILED=true
-          else
-            echo "Vendored protos job was not expected to run - treating as OK"
+            [[ "$PROTO_REPRO_RESULT" == "failure" || "$PROTO_REPRO_RESULT" == "cancelled" ]] && FAILED=true
           fi
 
           if [[ "$FAILED" == "true" ]]; then

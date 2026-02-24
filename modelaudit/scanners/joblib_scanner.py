@@ -1,3 +1,5 @@
+"""Scanner for Joblib serialized model files (.joblib)."""
+
 from __future__ import annotations
 
 import io

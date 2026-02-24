@@ -105,7 +105,7 @@ class ShardedModelDetector:
         return None
 
 
-class MemoryMappedScanner:
+class MemoryMappedHandler:
     """Scanner using memory-mapped I/O for large file sizes."""
 
     def __init__(self, file_path: str, scanner: Any):
@@ -234,7 +234,7 @@ class MemoryMappedScanner:
         return result
 
 
-class ParallelShardScanner:
+class ParallelShardHandler:
     """Scan multiple model shards in parallel."""
 
     def __init__(self, shard_info: dict[str, Any], scanner_class: type):
@@ -404,7 +404,7 @@ class AdvancedFileHandler:
 
         # Scan shards in parallel
         if self.shard_info:
-            parallel_scanner = ParallelShardScanner(self.shard_info, self.scanner.__class__)
+            parallel_scanner = ParallelShardHandler(self.shard_info, self.scanner.__class__)
             shard_results = parallel_scanner.scan_shards(self.progress_callback)
             result.merge(shard_results)
 
@@ -412,7 +412,7 @@ class AdvancedFileHandler:
 
     def _scan_with_mmap(self) -> "ScanResult":
         """Scan using memory mapping."""
-        mmap_scanner = MemoryMappedScanner(self.file_path, self.scanner)
+        mmap_scanner = MemoryMappedHandler(self.file_path, self.scanner)
         return mmap_scanner.scan_with_mmap(self.progress_callback)
 
     def _scan_large_file_distributed(self) -> "ScanResult":
@@ -437,7 +437,7 @@ class AdvancedFileHandler:
 
         # Use memory-mapped scanner to run ALL checks
         # This ensures we don't skip any security validations
-        mmap_scanner = MemoryMappedScanner(self.file_path, self.scanner)
+        mmap_scanner = MemoryMappedHandler(self.file_path, self.scanner)
 
         # If the scanner has its own scanning method, try to use it with memory mapping
         if hasattr(self.scanner, "_scan_with_mmap"):

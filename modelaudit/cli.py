@@ -1,3 +1,5 @@
+"""Command-line interface for ModelAudit security scanner."""
+
 import json
 import logging
 import os
@@ -74,9 +76,10 @@ def style_text(text: str, **kwargs: Any) -> str:
     return text
 
 
-def expand_paths(paths: tuple[str, ...]) -> list[str]:
+def expand_paths(paths: tuple[str, ...]) -> tuple[list[str], list[str]]:
     """Expand and validate input paths with type safety."""
     expanded: list[str] = []
+    missing_globs: list[str] = []
     for path_str in paths:
         # Handle glob patterns and resolve paths
         path = Path(path_str)
@@ -85,10 +88,13 @@ def expand_paths(paths: tuple[str, ...]) -> list[str]:
             import glob
 
             matches = glob.glob(path_str, recursive=True)
-            expanded.extend(matches)
+            if matches:
+                expanded.extend(matches)
+            else:
+                missing_globs.append(path_str)
         else:
             expanded.append(str(path.resolve()) if path.exists() else path_str)
-    return expanded
+    return expanded, missing_globs
 
 
 def create_progress_callback_wrapper(progress_callback: Any | None, spinner: Any | None) -> Any | None:
@@ -456,7 +462,7 @@ def delegate_info() -> None:
     type=click.Path(),
     help="Write CycloneDX SBOM to the specified file",
 )
-# Override smart detection (2 flags)
+# Override defaults (2 flags)
 @click.option(
     "--timeout",
     "-t",
@@ -477,7 +483,12 @@ def delegate_info() -> None:
 @click.option(
     "--no-cache",
     is_flag=True,
-    help="Force disable caching (overrides smart detection)",
+    help="Force disable caching (overrides defaults)",
+)
+@click.option(
+    "--cache-dir",
+    type=click.Path(),
+    help="Cache directory path (overrides default cache location)",
 )
 @click.option(
     "--stream",
@@ -498,12 +509,13 @@ def scan_command(
     max_size: str | None,
     dry_run: bool,
     no_cache: bool,
+    cache_dir: str | None,
     stream: bool,
 ) -> None:
     """Scan files, directories, HuggingFace models, MLflow models, cloud storage,
     or JFrog artifacts for security issues.
 
-    Uses smart detection to automatically configure optimal settings based on input type.
+    Uses defaults based on input type.
 
     \b
     Examples:
@@ -512,14 +524,14 @@ def scan_command(
         modelaudit scan hf://user/llama              # HuggingFace - selective download
         modelaudit scan models:/model/v1             # MLflow - registry integration
 
-        # Override smart detection when needed
+        # Override defaults when needed
         modelaudit scan large-model.pt --max-size 20GB --timeout 7200
 
         # Strict mode for security-critical scans
         modelaudit scan model.pkl --strict --format json --output report.json
 
     \b
-    Smart Detection:
+    Defaults:
         • Input type (local/cloud/registry) → optimal download & caching
         • File size (>1GB) → large model optimizations + progress bars
         • Terminal type (TTY/CI) → appropriate UI (progress vs quiet)
@@ -562,7 +574,7 @@ def scan_command(
     record_scan_started(list(paths), telemetry_options)
 
     # Expand and validate paths with type safety
-    expanded_paths: list[str] = expand_paths(paths)
+    expanded_paths, missing_globs = expand_paths(paths)
 
     # Process DVC pointer files
     dvc_expanded_paths: list[str] = []
@@ -579,7 +591,30 @@ def scan_command(
     # Use the DVC-expanded paths as the final list
     expanded_paths = dvc_expanded_paths
 
-    # Generate smart defaults based on input analysis
+    if missing_globs:
+        click.echo(
+            style_text(
+                f"Warning: glob pattern(s) did not match any files: {', '.join(missing_globs)}",
+                fg="yellow",
+            ),
+            err=True,
+        )
+        click.echo("Note: glob expansion is only applied to local paths.", err=True)
+
+    if not expanded_paths:
+        click.echo(
+            style_text(
+                "No matching paths found. Check your paths or glob patterns.",
+                fg="red",
+                bold=True,
+            ),
+            err=True,
+        )
+        record_scan_failed(time.time() - scan_start_time, "No matching paths")
+        flush_telemetry()
+        sys.exit(2)
+
+    # Generate defaults based on input analysis
     smart_defaults = generate_smart_defaults(expanded_paths)
 
     # Prepare user overrides (only non-None values)
@@ -598,7 +633,11 @@ def scan_command(
 
             sys_module.exit(2)
 
-    # Override smart detection with explicit user flags
+    if cache_dir is not None:
+        user_overrides["cache_dir"] = str(Path(cache_dir).expanduser())
+        user_overrides["use_cache"] = True
+
+    # Override defaults with explicit user flags
     if progress:
         user_overrides["show_progress"] = True
     if no_cache:
@@ -613,7 +652,7 @@ def scan_command(
     if quiet:
         user_overrides["verbose"] = False
 
-    # Apply smart defaults + user overrides
+    # Apply defaults + user overrides
     config = apply_smart_overrides(user_overrides, smart_defaults)
 
     # Handle environment variables for removed flags
@@ -630,7 +669,6 @@ def scan_command(
     # Determine if we should show styled console output (spinners, colors, headers)
     # Show styled output when: text format OR output goes to file (stdout is free)
     show_styled_output = final_format == "text" or bool(output)
-    # final_large_model_support = config.get("large_model_support", True)  # Unused in new implementation
     final_selective = config.get("selective_download", True)
     final_stream = config.get("stream_analysis", False)
     final_scan_and_delete = config.get("scan_and_delete", False)
@@ -647,15 +685,15 @@ def scan_command(
         with contextlib.suppress(ValueError):
             max_download_bytes = parse_size_string(max_size)
 
-    # Show smart detection info if not quiet
+    # Show defaults info if not quiet
     if not quiet and show_styled_output:
         if verbose:
-            click.echo(f"🧠 Smart detection: {len(expanded_paths)} path(s) analyzed")
+            click.echo(f"Defaults: {len(expanded_paths)} path(s) analyzed")
             for key, value in config.items():
                 if key != "cache_dir":  # Skip showing long paths
                     click.echo(f"   • {key}: {value}")
         elif not config.get("colors", True):  # In CI mode
-            pass  # No smart detection message needed
+            pass  # No defaults message needed
 
     # Print a nice header if not in structured format mode
     if show_styled_output and not quiet:
@@ -690,7 +728,7 @@ def scan_command(
         # Suppress INFO logs from technical modules in normal mode to reduce noise
         # Users can still see these with --verbose if needed
         logging.getLogger("modelaudit.core").setLevel(logging.WARNING)
-        logging.getLogger("modelaudit.utils.secure_hasher").setLevel(logging.WARNING)
+        logging.getLogger("modelaudit.utils.helpers.secure_hasher").setLevel(logging.WARNING)
         logging.getLogger("modelaudit.cache.cache_manager").setLevel(logging.WARNING)
 
     # Setup progress tracking
@@ -2422,6 +2460,9 @@ def _get_cache_info() -> dict[str, Any]:
             home = str(Path.home())
             if cache_dir_path.startswith(home):
                 cache_dir_path = "~" + cache_dir_path[len(home) :]
+            elif os.path.isabs(cache_dir_path):
+                # Redact absolute paths in debug output while preserving a readable structure.
+                cache_dir_path = "~" + cache_dir_path
 
         return {
             "enabled": True,
@@ -2490,7 +2531,7 @@ def _format_debug_output(debug_info: dict[str, Any], verbose: bool) -> str:
             fg="yellow",
         )
     )
-    lines.append(style_text("https://github.com/promptfoo/promptfoo/issues", fg="cyan"))
+    lines.append(style_text("https://github.com/promptfoo/modelaudit/issues", fg="cyan"))
     lines.append("")
 
     # Quick diagnosis section

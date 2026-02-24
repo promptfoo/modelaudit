@@ -5,7 +5,7 @@
 [![PyPI version](https://badge.fury.io/py/modelaudit.svg)](https://pypi.org/project/modelaudit/)
 [![Python versions](https://img.shields.io/pypi/pyversions/modelaudit.svg)](https://pypi.org/project/modelaudit/)
 [![Code Style: ruff](https://img.shields.io/badge/code%20style-ruff-005cd7.svg)](https://github.com/astral-sh/ruff)
-[![License](https://img.shields.io/github/license/promptfoo/promptfoo)](https://github.com/promptfoo/promptfoo/blob/main/LICENSE)
+[![License](https://img.shields.io/github/license/promptfoo/modelaudit)](https://github.com/promptfoo/modelaudit/blob/main/LICENSE)
 
 <img width="989" alt="ModelAudit scan results" src="https://www.promptfoo.dev/img/docs/modelaudit/modelaudit-result.png" />
 
@@ -70,6 +70,7 @@ ModelAudit includes **30 specialized scanners** covering model, archive, and con
 | **TensorRT**     | `.engine`, `.plan`                    | LOW    |
 | **PaddlePaddle** | `.pdmodel`, `.pdiparams`              | LOW    |
 | **OpenVINO**     | `.xml`                                | LOW    |
+| **Skops**        | `.skops`                              | HIGH   |
 | **PMML**         | `.pmml`                               | LOW    |
 
 Plus scanners for ZIP, TAR, 7-Zip, OCI layers, Jinja2 templates, JSON/YAML metadata, manifests, and text files.
@@ -100,6 +101,15 @@ modelaudit https://company.jfrog.io/artifactory/repo/models/
 # DVC-tracked models
 modelaudit model.dvc
 ```
+
+### Authentication Environment Variables
+
+- `HF_TOKEN` for private Hugging Face repositories
+- `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (and optional `AWS_SESSION_TOKEN`) for S3
+- `GOOGLE_APPLICATION_CREDENTIALS` for GCS
+- `MLFLOW_TRACKING_URI` for MLflow registry access
+- `JFROG_API_TOKEN` or `JFROG_ACCESS_TOKEN` for JFrog Artifactory
+- Store credentials in environment variables or a secrets manager, and never commit tokens/keys.
 
 ## Installation
 
@@ -134,16 +144,66 @@ docker run --rm -v "$(pwd)":/app ghcr.io/promptfoo/modelaudit:latest model.pkl
 --verbose / --quiet          Control output detail
 --blacklist PATTERN          Additional patterns to flag
 --no-cache                   Disable result caching
+--cache-dir DIR              Set cache directory for downloads and scan results
 --progress                   Force progress display
 ```
 
-Exit codes: `0` clean, `1` issues found, `2` errors.
+## Exit Codes
+
+- `0`: No security issues detected
+- `1`: Security issues detected
+- `2`: Scan errors
+
+## Telemetry and Privacy
+
+ModelAudit includes telemetry for product reliability and usage analytics.
+
+- Collected metadata can include command usage, scan timing, scanner/file-type usage, issue severity/type aggregates, and model path or URL identifiers.
+- Model files are scanned locally and ModelAudit does not upload model binary contents as telemetry events.
+- Telemetry is disabled automatically in CI/test environments and in editable development installs by default.
+
+Opt out explicitly with either environment variable:
+
+```bash
+export PROMPTFOO_DISABLE_TELEMETRY=1
+# or
+export NO_ANALYTICS=1
+```
+
+To opt in during editable/development installs:
+
+```bash
+export MODELAUDIT_TELEMETRY_DEV=1
+```
+
+## Output Examples
+
+```bash
+# JSON for CI/CD pipelines
+modelaudit model.pkl --format json --output results.json
+
+# SARIF for code scanning platforms
+modelaudit model.pkl --format sarif --output results.sarif
+```
+
+## Troubleshooting
+
+- Run `modelaudit doctor --show-failed` to list unavailable scanners and missing optional deps.
+- If `pip` installs an older release, verify Python is `3.10+` (`python --version`).
+- For additional troubleshooting and cloud auth guidance, see:
+  - https://www.promptfoo.dev/docs/model-audit/
+  - https://www.promptfoo.dev/docs/model-audit/usage/
 
 ## Documentation
 
 - **[Full docs](https://www.promptfoo.dev/docs/model-audit/)** — setup, configuration, and advanced usage
 - **[Usage examples](https://www.promptfoo.dev/docs/model-audit/usage/)** — CI/CD integration, remote scanning, SBOM generation
 - **[Supported formats](https://www.promptfoo.dev/docs/model-audit/scanners/)** — detailed scanner documentation
+- **[Support policy](SUPPORT.md)** — supported Python/OS versions and maintenance policy
+- **[Security model and limitations](docs/user/security-model.md)** — what ModelAudit does and does not guarantee
+- **[Compatibility matrix](docs/user/compatibility-matrix.md)** — file formats vs optional dependencies
+- **[Offline/air-gapped guide](docs/user/offline-air-gapped.md)** — secure operation without internet access
+- **[Scanner contributor quickstart](docs/agents/new-scanner-quickstart.md)** — safe workflow for new scanner development
 - **Troubleshooting** — run `modelaudit doctor --show-failed` to check scanner availability
 
 ## License

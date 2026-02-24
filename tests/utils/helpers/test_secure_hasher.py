@@ -6,7 +6,7 @@ import os
 
 import pytest
 
-from modelaudit.utils.secure_hasher import (
+from modelaudit.utils.helpers.secure_hasher import (
     SecureFileHasher,
     benchmark_hashing_performance,
     hash_file_secure,
@@ -235,9 +235,10 @@ class TestBenchmarking:
         assert "hash_result" in results
 
         # Verify reasonable values
+        # Timing values may be 0.0 on fast CI runners (Windows timer resolution ~15.6ms)
         assert results["file_size_mb"] > 0
-        assert results["avg_time_seconds"] > 0
-        assert results["throughput_mbps"] > 0
+        assert results["avg_time_seconds"] >= 0
+        assert results["throughput_mbps"] > 0 or results["avg_time_seconds"] == 0
         assert results["hash_method"] in ["full_hash", "enhanced_fingerprint"]
         assert results["hash_result"].startswith(("secure:", "fingerprint:"))
 

@@ -57,3 +57,31 @@ chore: update dependencies to latest versions
 uv run pytest tests/test_affected_component.py
 uv run modelaudit test-file.pkl
 ```
+
+## Pre-Release Checklist (Maintainers)
+
+Before merging a release PR:
+
+1. Confirm release PR version/changelog content looks correct.
+2. Confirm required checks are green (`CI Success`, `Docker CI Success`, docs checks, CodeQL).
+3. Confirm release build validation passed:
+   - `twine check dist/*`
+   - exactly one wheel + one sdist, both matching the release version
+   - clean-room install smoke tests from wheel and sdist
+   - project URL metadata checks (`Bug Tracker`, `Changelog`)
+4. Confirm no unreviewed high-severity security findings are outstanding.
+5. Merge release PR, then verify GitHub Release and PyPI publish completed.
+
+## Rollback Procedure
+
+If a release goes wrong, use the least disruptive rollback path:
+
+1. If the release PR is not merged yet:
+   - close or update the release PR and regenerate with new commits.
+2. If GitHub release exists but PyPI publish failed:
+   - fix workflow/secrets issues and rerun the failed publish job.
+3. If a bad package version was published:
+   - yank the affected version on PyPI,
+   - ship a follow-up patch release with a clear changelog note.
+4. If release metadata/tagging is incorrect:
+   - prefer a corrective follow-up release over rewriting public history.

@@ -1,0 +1,88 @@
+name: Nightly CI
+
+on:
+  schedule:
+    # Run daily at 04:00 UTC
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  full-matrix:
+    name: Full Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@eac588ad8def6316056a12d4907a9d4d84ff7a3b # v7
+        with:
+          enable-cache: true
+
+      - name: Pin Python version
+        run: |
+          uv python pin ${{ matrix.python-version }}
+
+      - name: Sync dependencies
+        run: |
+          uv sync --extra all-ci
+
+      - name: Run all tests (fast + slow + integration + performance)
+        run: |
+          uv run pytest -n auto --tb=short --durations=20
+
+  windows-full:
+    name: Windows Full Tests (Python 3.11)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@eac588ad8def6316056a12d4907a9d4d84ff7a3b # v7
+
+      - name: Pin Python version
+        run: |
+          uv python pin 3.11
+
+      - name: Sync dependencies
+        run: |
+          uv sync --extra all-ci-windows
+
+      - name: Run all tests
+        run: |
+          uv run pytest -n auto --tb=short --durations=20
+
+  dependency-audit:
+    name: Dependency Vulnerability Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@eac588ad8def6316056a12d4907a9d4d84ff7a3b # v7
+        with:
+          enable-cache: true
+
+      - name: Pin Python version
+        run: |
+          uv python pin 3.12
+
+      - name: Sync dependencies
+        run: |
+          uv sync --extra all-ci
+
+      - name: Audit dependencies for vulnerabilities
+        run: |
+          uvx pip-audit --strict --desc -r <(uv export --no-hashes)

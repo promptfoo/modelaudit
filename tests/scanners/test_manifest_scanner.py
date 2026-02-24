@@ -1,8 +1,6 @@
 import json
 import logging
 
-import pytest
-
 from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.manifest_scanner import ManifestScanner
 
@@ -174,10 +172,22 @@ def test_parse_file_logs_warning(caplog, capsys):
     assert any(issue.severity == IssueSeverity.DEBUG for issue in result.issues)
 
 
-def test_manifest_scanner_yaml():
-    """Test the manifest scanner with a YAML file."""
-    # Skip this test - YAML files are no longer supported after whitelist changes
-    pytest.skip("YAML files are no longer supported by manifest scanner whitelist")
+def test_manifest_scanner_yaml_not_handled(tmp_path):
+    """Test that YAML files are not handled by the manifest scanner."""
+    yaml_file = tmp_path / "config.yaml"
+    yaml_file.write_text("model_type: bert\nhidden_size: 768\n")
+
+    scanner = ManifestScanner()
+    assert scanner.can_handle(str(yaml_file)) is False
+
+
+def test_manifest_scanner_yml_not_handled(tmp_path):
+    """Test that .yml files are not handled by the manifest scanner."""
+    yml_file = tmp_path / "config.yml"
+    yml_file.write_text("model_type: gpt2\nhidden_size: 768\n")
+
+    scanner = ManifestScanner()
+    assert scanner.can_handle(str(yml_file)) is False
 
 
 def test_manifest_scanner_can_handle(tmp_path):
