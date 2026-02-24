@@ -2,6 +2,7 @@ import json
 import os
 import re
 from typing import Any
+from urllib.parse import urlparse
 
 from .base import BaseScanner, IssueSeverity, ScanResult, logger
 
@@ -782,9 +783,18 @@ class ManifestScanner(BaseScanner):
         """
         seen_urls: set[str] = set()
 
-        def is_trusted_domain(url_lower: str) -> bool:
-            """Check if URL is from a trusted domain in the allowlist."""
-            return any(domain in url_lower for domain in TRUSTED_URL_DOMAINS)
+        def is_trusted_domain(url: str) -> bool:
+            """Check if URL host is in the trusted domain allowlist."""
+            parsed = urlparse(url)
+            host = (parsed.hostname or "").lower().rstrip(".")
+            if not host:
+                return False
+
+            for domain in TRUSTED_URL_DOMAINS:
+                trusted = domain.lower().rstrip(".")
+                if host == trusted or host.endswith(f".{trusted}"):
+                    return True
+            return False
 
         def extract_urls_from_value(value: Any, key_path: str) -> None:
             """Recursively extract and check URLs from any value type."""
@@ -794,10 +804,8 @@ class ManifestScanner(BaseScanner):
                     if url in seen_urls:
                         continue
                     seen_urls.add(url)
-                    url_lower = url.lower()
-
                     # Flag any URL not from a trusted domain
-                    if not is_trusted_domain(url_lower):
+                    if not is_trusted_domain(url):
                         result.add_check(
                             name="Untrusted URL Check",
                             passed=False,

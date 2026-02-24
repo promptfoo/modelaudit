@@ -1,4 +1,6 @@
+import inspect
 import os
+import re
 import zipfile
 from typing import Any, ClassVar
 
@@ -37,8 +39,11 @@ class WeightDistributionScanner(BaseScanner):
         self.enable_llm_checks = self.config.get("enable_llm_checks", False)
         # Use max_array_size for in-memory array size limits (default 100MB)
         self.max_array_size = self.config.get("max_array_size", 100 * 1024 * 1024)
+        # Direct torch.load on untrusted files can trigger pickle RCE. Keep opt-in.
+        self.enable_unsafe_torch_load = self.config.get("enable_unsafe_torch_load", False)
         # Flag set when weight extraction would be unsafe
         self.extraction_unsafe = False
+        self.extraction_unsafe_reason: str | None = None
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -100,6 +105,7 @@ class WeightDistributionScanner(BaseScanner):
         result.metadata["file_size"] = file_size
         # Reset flag before extraction
         self.extraction_unsafe = False
+        self.extraction_unsafe_reason = None
 
         try:
             # Extract weights based on file format
@@ -134,7 +140,7 @@ class WeightDistributionScanner(BaseScanner):
                 message = "Failed to extract weights from model"
                 severity = IssueSeverity.DEBUG
                 if self.extraction_unsafe:
-                    message = "Unsafe to extract weights from data.pkl in PyTorch archive"
+                    message = self.extraction_unsafe_reason or "Unsafe to extract weights from model"
                     severity = IssueSeverity.WARNING
                 result.add_check(
                     name="Weight Extraction",
@@ -192,12 +198,48 @@ class WeightDistributionScanner(BaseScanner):
 
         # Reset safety flag for each extraction
         self.extraction_unsafe = False
+        self.extraction_unsafe_reason = None
 
         weights_info: dict[str, Any] = {}
 
         try:
+            # SECURITY: avoid unsafe torch.load on untrusted files unless explicitly allowed.
+            # Use weights_only=True on patched versions, and block unsafe fallbacks by default.
+            load_kwargs: dict[str, Any] = {"map_location": torch.device("cpu")}
+            torch_version = getattr(torch, "__version__", "unknown")
+            supports_weights_only = False
+            try:
+                load_sig = inspect.signature(torch.load)
+                supports_weights_only = "weights_only" in load_sig.parameters
+            except (TypeError, ValueError):  # pragma: no cover - defensive
+                supports_weights_only = False
+
+            if supports_weights_only:
+                load_kwargs["weights_only"] = True
+                version_match = re.match(r"^(\d+)\.(\d+)", str(torch_version))
+                is_patched_version = False
+                if version_match:
+                    major = int(version_match.group(1))
+                    minor = int(version_match.group(2))
+                    is_patched_version = (major, minor) >= (2, 6)
+
+                if not is_patched_version and not self.enable_unsafe_torch_load:
+                    self.extraction_unsafe = True
+                    self.extraction_unsafe_reason = (
+                        "Blocked torch.load: weights_only=True on PyTorch versions below 2.6 "
+                        "is vulnerable to RCE. Set enable_unsafe_torch_load=true to override."
+                    )
+                    raise RuntimeError(self.extraction_unsafe_reason)
+            elif not self.enable_unsafe_torch_load:
+                self.extraction_unsafe = True
+                self.extraction_unsafe_reason = (
+                    "Blocked torch.load: this PyTorch version does not support weights_only=True. "
+                    "Set enable_unsafe_torch_load=true to override."
+                )
+                raise RuntimeError(self.extraction_unsafe_reason)
+
             # Load model with map_location to CPU to avoid GPU requirements
-            model_data = torch.load(path, map_location=torch.device("cpu"))
+            model_data = torch.load(path, **load_kwargs)
 
             # Handle different PyTorch save formats
             if isinstance(model_data, dict):
@@ -268,6 +310,10 @@ class WeightDistributionScanner(BaseScanner):
 
                         if unsafe:
                             self.extraction_unsafe = True
+                            if self.extraction_unsafe_reason is None:
+                                self.extraction_unsafe_reason = (
+                                    "Unsafe to extract weights from data.pkl in PyTorch archive"
+                                )
                         else:
                             try:
 
@@ -285,13 +331,25 @@ class WeightDistributionScanner(BaseScanner):
                                             weights_info[key] = array
                                 else:
                                     self.extraction_unsafe = True
+                                    if self.extraction_unsafe_reason is None:
+                                        self.extraction_unsafe_reason = (
+                                            "Restricted unpickler could not parse PyTorch archive safely"
+                                        )
                             except Exception as e2:  # pragma: no cover - defensive
                                 logger.debug(
                                     f"Failed restricted unpickle for {path}: {e2}",
                                 )
                                 self.extraction_unsafe = True
+                                if self.extraction_unsafe_reason is None:
+                                    self.extraction_unsafe_reason = (
+                                        "Restricted unpickler failed while extracting PyTorch archive"
+                                    )
             except Exception as e2:  # pragma: no cover - defensive
                 logger.debug(f"Failed to extract weights from {path}: {e2}")
+
+        if weights_info:
+            self.extraction_unsafe = False
+            self.extraction_unsafe_reason = None
 
         return weights_info
 

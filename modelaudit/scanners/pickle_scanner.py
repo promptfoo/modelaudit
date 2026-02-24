@@ -2,7 +2,7 @@ import os
 import pickletools
 import struct
 import time
-from typing import IO, Any, BinaryIO, ClassVar
+from typing import IO, Any, BinaryIO, ClassVar, TypeGuard
 
 from modelaudit.analysis.enhanced_pattern_detector import EnhancedPatternDetector, PatternMatch
 from modelaudit.analysis.entropy_analyzer import EntropyAnalyzer
@@ -1252,34 +1252,235 @@ def _parse_module_function(arg: str) -> tuple[str, str] | None:
     return None
 
 
-def _find_stack_global_strings(opcodes: list, start_index: int, lookback: int = 10) -> tuple[str, str] | None:
+def _build_symbolic_reference_maps(
+    opcodes: list[tuple],
+) -> tuple[dict[int, tuple[str, str]], dict[int, tuple[str, str]]]:
     """
-    Find the two most recent string opcodes before a STACK_GLOBAL.
+    Build symbolic maps of callable references in an opcode stream.
 
-    STACK_GLOBAL uses two strings from the stack (module and function/class name).
-    This searches backwards to find them.
+    Returns:
+        Tuple of:
+        - stack_global_refs: opcode index -> (module, function) for STACK_GLOBAL
+        - callable_refs: opcode index -> (module, function) for REDUCE/NEWOBJ/OBJ/INST call targets
+    """
+    stack_global_refs: dict[int, tuple[str, str]] = {}
+    callable_refs: dict[int, tuple[str, str]] = {}
+
+    marker = object()
+    unknown = object()
+    stack: list[Any] = []
+    memo: dict[int | str, Any] = {}
+    next_memo_index = 0
+
+    def _pop(default: Any = unknown) -> Any:
+        return stack.pop() if stack else default
+
+    def _peek(default: Any = unknown) -> Any:
+        return stack[-1] if stack else default
+
+    def _pop_to_mark() -> list[Any]:
+        popped: list[Any] = []
+        while stack:
+            item = stack.pop()
+            if item is marker:
+                break
+            popped.append(item)
+        return popped
+
+    def _is_ref(value: Any) -> TypeGuard[tuple[str, str]]:
+        return isinstance(value, tuple) and len(value) == 2 and isinstance(value[0], str) and isinstance(value[1], str)
+
+    for i, (opcode, arg, _pos) in enumerate(opcodes):
+        name = opcode.name
+
+        if name in STRING_OPCODES and isinstance(arg, str):
+            stack.append(arg)
+            continue
+
+        if name == "GLOBAL" and isinstance(arg, str):
+            parsed = _parse_module_function(arg)
+            stack.append(parsed if parsed else unknown)
+            continue
+
+        if name == "STACK_GLOBAL":
+            func_name = _pop()
+            mod_name = _pop()
+            if isinstance(mod_name, str) and isinstance(func_name, str):
+                ref = (mod_name, func_name)
+                stack_global_refs[i] = ref
+                stack.append(ref)
+            else:
+                stack.append(unknown)
+            continue
+
+        if name == "INST" and isinstance(arg, str):
+            parsed = _parse_module_function(arg)
+            if parsed:
+                callable_refs[i] = parsed
+            stack.append(unknown)
+            continue
+
+        if name in {"PUT", "BINPUT", "LONG_BINPUT"}:
+            memo[arg] = _peek()
+            if isinstance(arg, int):
+                next_memo_index = max(next_memo_index, arg + 1)
+            continue
+
+        if name == "MEMOIZE":
+            memo[next_memo_index] = _peek()
+            next_memo_index += 1
+            continue
+
+        if name in {"GET", "BINGET", "LONG_BINGET"}:
+            stack.append(memo.get(arg, unknown))
+            continue
+
+        if name == "MARK":
+            stack.append(marker)
+            continue
+
+        if name == "POP":
+            _pop()
+            continue
+
+        if name == "DUP":
+            stack.append(_peek())
+            continue
+
+        if name == "POP_MARK":
+            _pop_to_mark()
+            continue
+
+        if name in {"TUPLE", "LIST", "DICT", "SET", "FROZENSET"}:
+            _pop_to_mark()
+            stack.append(unknown)
+            continue
+
+        if name in {"TUPLE1", "TUPLE2", "TUPLE3"}:
+            size = {"TUPLE1": 1, "TUPLE2": 2, "TUPLE3": 3}[name]
+            for _ in range(size):
+                _pop()
+            stack.append(unknown)
+            continue
+
+        if name in {"EMPTY_TUPLE", "EMPTY_LIST", "EMPTY_DICT", "EMPTY_SET"}:
+            stack.append(unknown)
+            continue
+
+        if name in {"APPEND", "SETITEM"}:
+            # Pop appended item / key-value while keeping container on stack
+            _pop()
+            if name == "SETITEM":
+                _pop()
+            continue
+
+        if name in {"APPENDS", "SETITEMS", "ADDITEMS"}:
+            _pop_to_mark()
+            continue
+
+        if name == "BUILD":
+            # BUILD consumes state and mutates object in-place
+            _pop()
+            continue
+
+        if name == "REDUCE":
+            reduce_args = _pop()
+            callable_item = _pop()
+            del reduce_args
+            if _is_ref(callable_item):
+                callable_refs[i] = callable_item
+            stack.append(unknown)
+            continue
+
+        if name == "NEWOBJ":
+            newobj_args = _pop()
+            class_item = _pop()
+            del newobj_args
+            if _is_ref(class_item):
+                callable_refs[i] = class_item
+            stack.append(unknown)
+            continue
+
+        if name == "NEWOBJ_EX":
+            kwargs = _pop()
+            args = _pop()
+            class_item = _pop()
+            del kwargs, args
+            if _is_ref(class_item):
+                callable_refs[i] = class_item
+            stack.append(unknown)
+            continue
+
+        if name == "OBJ":
+            items = _pop_to_mark()
+            class_item = items[-1] if items else unknown
+            if _is_ref(class_item):
+                callable_refs[i] = class_item
+            stack.append(unknown)
+            continue
+
+        if name in {"BINPERSID"}:
+            _pop()
+            stack.append(unknown)
+            continue
+
+        if name in {
+            "PERSID",
+            "NONE",
+            "NEWTRUE",
+            "NEWFALSE",
+            "INT",
+            "BININT",
+            "BININT1",
+            "BININT2",
+            "LONG",
+            "LONG1",
+            "LONG4",
+            "FLOAT",
+            "BINFLOAT",
+            "BINBYTES",
+            "SHORT_BINBYTES",
+            "BINBYTES8",
+            "BYTEARRAY8",
+            "UNICODE",
+            "SHORT_BINUNICODE",
+            "BINUNICODE",
+            "BINUNICODE8",
+        }:
+            stack.append(unknown)
+
+    return stack_global_refs, callable_refs
+
+
+def _find_stack_global_strings(
+    opcodes: list,
+    start_index: int,
+    lookback: int = 10,
+    stack_global_refs: dict[int, tuple[str, str]] | None = None,
+) -> tuple[str, str] | None:
+    """
+    Resolve module/function used by STACK_GLOBAL from symbolic stack state.
 
     Args:
         opcodes: List of (opcode, arg, pos) tuples
-        start_index: Index to start searching backwards from
-        lookback: Maximum number of opcodes to search back
+        start_index: Index of the STACK_GLOBAL opcode
+        lookback: Unused (kept for backward compatibility)
+        stack_global_refs: Optional precomputed STACK_GLOBAL map
 
     Returns:
-        Tuple of (module, function/class) or None if not found
+        Tuple of (module, function/class) or None if not resolved
     """
-    recent_strings: list[str] = []
-    for k in range(start_index - 1, max(0, start_index - lookback), -1):
-        prev_opcode, prev_arg, _prev_pos = opcodes[k]
-        if prev_opcode.name in STRING_OPCODES and isinstance(prev_arg, str):
-            recent_strings.insert(0, prev_arg)
-            if len(recent_strings) >= 2:
-                return recent_strings[0], recent_strings[1]
-
-    return None
+    del lookback
+    refs = stack_global_refs if stack_global_refs is not None else _build_symbolic_reference_maps(opcodes)[0]
+    return refs.get(start_index)
 
 
 def _find_associated_global_or_class(
-    opcodes: list, current_index: int, lookback: int = 10
+    opcodes: list,
+    current_index: int,
+    lookback: int = 10,
+    stack_global_refs: dict[int, tuple[str, str]] | None = None,
+    callable_refs: dict[int, tuple[str, str]] | None = None,
 ) -> tuple[str | None, str | None, str | None]:
     """
     Look backward to find the associated GLOBAL or STACK_GLOBAL for an opcode.
@@ -1291,10 +1492,18 @@ def _find_associated_global_or_class(
         opcodes: List of (opcode, arg, pos) tuples
         current_index: Current opcode index
         lookback: Maximum number of opcodes to search back
+        stack_global_refs: Optional precomputed STACK_GLOBAL map
+        callable_refs: Optional precomputed callable map (for REDUCE/NEWOBJ/OBJ/INST)
 
     Returns:
         Tuple of (module, function/class, full_name) or (None, None, None)
     """
+    callable_map = callable_refs if callable_refs is not None else _build_symbolic_reference_maps(opcodes)[1]
+    direct_ref = callable_map.get(current_index)
+    if direct_ref:
+        mod, func = direct_ref
+        return mod, func, f"{mod}.{func}"
+
     for j in range(current_index - 1, max(0, current_index - lookback), -1):
         prev_opcode, prev_arg, _prev_pos = opcodes[j]
 
@@ -1307,7 +1516,12 @@ def _find_associated_global_or_class(
 
         elif prev_opcode.name == "STACK_GLOBAL":
             # Find two strings before STACK_GLOBAL
-            strings = _find_stack_global_strings(opcodes, j, lookback)
+            strings = _find_stack_global_strings(
+                opcodes,
+                j,
+                lookback=lookback,
+                stack_global_refs=stack_global_refs,
+            )
             if strings:
                 mod, func = strings
                 return mod, func, f"{mod}.{func}"
@@ -1636,7 +1850,11 @@ def is_suspicious_string(s: str) -> str | None:
     return None
 
 
-def is_dangerous_reduce_pattern(opcodes: list[tuple]) -> dict[str, Any] | None:
+def is_dangerous_reduce_pattern(
+    opcodes: list[tuple],
+    stack_global_refs: dict[int, tuple[str, str]] | None = None,
+    callable_refs: dict[int, tuple[str, str]] | None = None,
+) -> dict[str, Any] | None:
     """
     Check for patterns that indicate a dangerous __reduce__ method.
     Returns details about the dangerous pattern if found, None otherwise.
@@ -1660,8 +1878,30 @@ def is_dangerous_reduce_pattern(opcodes: list[tuple]) -> dict[str, Any] | None:
         # Check SUSPICIOUS_GLOBALS (the fallback)
         return is_suspicious_global(mod, func)
 
+    if stack_global_refs is None or callable_refs is None:
+        computed_stack_refs, computed_callable_refs = _build_symbolic_reference_maps(opcodes)
+    else:
+        computed_stack_refs, computed_callable_refs = stack_global_refs, callable_refs
+
+    resolved_stack_globals = stack_global_refs if stack_global_refs is not None else computed_stack_refs
+    resolved_callables = callable_refs if callable_refs is not None else computed_callable_refs
+
     # Look for common patterns in __reduce__ exploits
     for i, (opcode, arg, pos) in enumerate(opcodes):
+        # Resolve REDUCE targets from symbolic stack state (handles BINGET/MEMOIZE indirection)
+        if opcode.name == "REDUCE":
+            reduce_ref = resolved_callables.get(i)
+            if reduce_ref:
+                mod, func = reduce_ref
+                if _is_dangerous_ref(mod, func):
+                    return {
+                        "pattern": "RESOLVED_REDUCE_CALL_TARGET",
+                        "module": mod,
+                        "function": func,
+                        "position": pos,
+                        "opcode": opcode.name,
+                    }
+
         # Check for GLOBAL followed by REDUCE - common in exploits
         if (opcode.name == "GLOBAL" and i + 1 < len(opcodes) and opcodes[i + 1][0].name == "REDUCE") and isinstance(
             arg, str
@@ -1684,16 +1924,9 @@ def is_dangerous_reduce_pattern(opcodes: list[tuple]) -> dict[str, Any] | None:
             for j in range(i + 1, min(i + 5, len(opcodes))):
                 next_op = opcodes[j][0].name
                 if next_op == "REDUCE":
-                    # Find the strings that were pushed for this STACK_GLOBAL
-                    recent: list[str] = []
-                    for k in range(i - 1, max(0, i - 10), -1):
-                        pk = opcodes[k]
-                        if pk[0].name in STRING_OPCODES and isinstance(pk[1], str):
-                            recent.insert(0, pk[1])
-                            if len(recent) >= 2:
-                                break
-                    if len(recent) >= 2:
-                        mod, func = recent[0], recent[1]
+                    resolved = resolved_stack_globals.get(i)
+                    if resolved:
+                        mod, func = resolved
                         if _is_dangerous_ref(mod, func):
                             return {
                                 "pattern": "STACK_GLOBAL+REDUCE",
@@ -1752,6 +1985,8 @@ def is_dangerous_reduce_pattern(opcodes: list[tuple]) -> dict[str, Any] | None:
 def check_opcode_sequence(
     opcodes: list[tuple],
     ml_context: dict,
+    stack_global_refs: dict[int, tuple[str, str]] | None = None,
+    callable_refs: dict[int, tuple[str, str]] | None = None,
 ) -> list[dict[str, Any]]:
     """
     Analyze the full sequence of opcodes for suspicious patterns
@@ -1763,6 +1998,14 @@ def check_opcode_sequence(
     # SMART DETECTION: Check if we should ignore this sequence based on ML context
     if _should_ignore_opcode_sequence(opcodes, ml_context):
         return suspicious_patterns  # Return empty list for legitimate ML content
+
+    if stack_global_refs is None or callable_refs is None:
+        computed_stack_refs, computed_callable_refs = _build_symbolic_reference_maps(opcodes)
+    else:
+        computed_stack_refs, computed_callable_refs = stack_global_refs, callable_refs
+
+    resolved_stack_globals = stack_global_refs if stack_global_refs is not None else computed_stack_refs
+    resolved_callables = callable_refs if callable_refs is not None else computed_callable_refs
 
     # Memo and framing opcodes are structural (data storage/retrieval, not code
     # execution).  They appear in every non-trivial pickle stream and counting
@@ -1787,41 +2030,12 @@ def check_opcode_sequence(
             elif opcode.name == "REDUCE":
                 # Default to dangerous if no associated GLOBAL/STACK_GLOBAL found
                 is_dangerous_opcode = True
-                # Look back to find the associated GLOBAL or STACK_GLOBAL
-                for j in range(i - 1, max(0, i - 10), -1):
-                    prev_opcode, prev_arg, _prev_pos = opcodes[j]
-
-                    if prev_opcode.name == "GLOBAL" and isinstance(prev_arg, str):
-                        parts = (
-                            prev_arg.split(" ", 1)
-                            if " " in prev_arg
-                            else prev_arg.rsplit(".", 1)
-                            if "." in prev_arg
-                            else [prev_arg, ""]
-                        )
-                        if len(parts) == 2:
-                            mod, func = parts
-                            # Only skip if in safe globals
-                            if _is_safe_ml_global(mod, func):
-                                is_dangerous_opcode = False
-                            break
-
-                    elif prev_opcode.name == "STACK_GLOBAL":
-                        # Look for the two most recent string opcodes
-                        recent_strings: list[str] = []
-                        for k in range(j - 1, max(0, j - 10), -1):
-                            stack_prev_opcode, stack_prev_arg, _stack_prev_pos = opcodes[k]
-                            if stack_prev_opcode.name in STRING_OPCODES and isinstance(stack_prev_arg, str):
-                                recent_strings.insert(0, stack_prev_arg)
-                                if len(recent_strings) >= 2:
-                                    break
-
-                        if len(recent_strings) >= 2:
-                            mod, func = recent_strings[0], recent_strings[1]
-                            # Only skip if in safe globals
-                            if _is_safe_ml_global(mod, func):
-                                is_dangerous_opcode = False
-                            break
+                associated_ref = resolved_callables.get(i)
+                if associated_ref:
+                    mod, func = associated_ref
+                    # Only skip if in safe globals
+                    if _is_safe_ml_global(mod, func):
+                        is_dangerous_opcode = False
 
             # GLOBAL/STACK_GLOBAL: only count when referencing non-safe modules
             elif opcode.name == "GLOBAL" and isinstance(arg, str):
@@ -1834,15 +2048,9 @@ def check_opcode_sequence(
                     is_dangerous_opcode = True
 
             elif opcode.name == "STACK_GLOBAL":
-                recent_strings = []
-                for k in range(i - 1, max(0, i - 10), -1):
-                    prev_opcode, prev_arg, _prev_pos = opcodes[k]
-                    if prev_opcode.name in STRING_OPCODES and isinstance(prev_arg, str):
-                        recent_strings.insert(0, prev_arg)
-                        if len(recent_strings) >= 2:
-                            break
-                if len(recent_strings) >= 2:
-                    mod, func = recent_strings[0], recent_strings[1]
+                stack_ref = resolved_stack_globals.get(i)
+                if stack_ref:
+                    mod, func = stack_ref
                     if not _is_safe_ml_global(mod, func):
                         is_dangerous_opcode = True
                 else:
@@ -2673,6 +2881,8 @@ class PickleScanner(BaseScanner):
                 logger.debug(f"Pickle parsing failed with no globals found: {e}")
                 return set()
 
+            stack_global_refs, _callable_refs = _build_symbolic_reference_maps(ops)
+
             last_byte = data.read(1)
             if last_byte:
                 data.seek(-1, 1)
@@ -2690,11 +2900,11 @@ class PickleScanner(BaseScanner):
                     elif parts:
                         globals_found.add((parts[0], ""))
                 elif op_name == "STACK_GLOBAL":
-                    values = self._extract_stack_global_values(ops, n, memo)
-                    if len(values) == 2:
-                        globals_found.add((values[1], values[0]))
+                    resolved = stack_global_refs.get(n)
+                    if resolved:
+                        globals_found.add(resolved)
                     else:
-                        logger.debug(f"STACK_GLOBAL parsing failed at position {n}, found {len(values)} values")
+                        logger.debug(f"STACK_GLOBAL parsing failed at position {n}")
                         globals_found.add(("unknown", "unknown"))
 
             if not multiple_pickles:
@@ -2951,6 +3161,7 @@ class PickleScanner(BaseScanner):
 
             # SMART DETECTION: Analyze ML context once for the entire pickle
             ml_context = _detect_ml_context(opcodes)
+            stack_global_refs, callable_refs = _build_symbolic_reference_maps(opcodes)
 
             # CVE-2025-32434 specific opcode sequence analysis - REMOVED
             # Now only show CVE info in REDUCE opcode detection messages
@@ -3154,7 +3365,12 @@ class PickleScanner(BaseScanner):
                 # Flag as WARNING if not in safe globals, INFO if in safe globals
                 if opcode.name == "REDUCE":
                     # Look back to find the associated GLOBAL or STACK_GLOBAL
-                    reduce_mod, reduce_func, associated_global = _find_associated_global_or_class(opcodes, i)
+                    reduce_mod, reduce_func, associated_global = _find_associated_global_or_class(
+                        opcodes,
+                        i,
+                        stack_global_refs=stack_global_refs,
+                        callable_refs=callable_refs,
+                    )
                     is_safe_global = (
                         _is_safe_ml_global(reduce_mod, reduce_func) if reduce_mod and reduce_func else False
                     )
@@ -3232,7 +3448,12 @@ class PickleScanner(BaseScanner):
                 # Apply same logic as REDUCE: check if class is in ML_SAFE_GLOBALS
                 if opcode.name in ["INST", "OBJ", "NEWOBJ"]:
                     # Look back to find the associated class (GLOBAL or STACK_GLOBAL)
-                    class_mod, class_name, associated_class = _find_associated_global_or_class(opcodes, i)
+                    class_mod, class_name, associated_class = _find_associated_global_or_class(
+                        opcodes,
+                        i,
+                        stack_global_refs=stack_global_refs,
+                        callable_refs=callable_refs,
+                    )
                     is_safe_class = _is_safe_ml_global(class_mod, class_name) if class_mod and class_name else False
 
                     # Report based on safe class check (same logic as REDUCE)
@@ -3469,28 +3690,9 @@ class PickleScanner(BaseScanner):
             # (rebuild from opcodes to get proper context)
             for i, (opcode, _arg, pos) in enumerate(opcodes):
                 if opcode.name == "STACK_GLOBAL":
-                    # Find the two immediately preceding STRING-like opcodes
-                    # STACK_GLOBAL expects exactly two strings on the stack:
-                    # module and function
-                    recent_strings: list[str] = []
-                    for j in range(
-                        i - 1,
-                        max(0, i - 10),
-                        -1,
-                    ):  # Look back at most 10 opcodes
-                        prev_opcode, prev_arg, _prev_pos = opcodes[j]
-                        if prev_opcode.name in STRING_OPCODES and isinstance(prev_arg, str):
-                            recent_strings.insert(
-                                0,
-                                prev_arg,
-                            )  # Insert at beginning to maintain order
-                            if len(recent_strings) >= 2:
-                                break
-
-                    if len(recent_strings) >= 2:
-                        # The two strings are module and function in that order
-                        mod = recent_strings[0]  # First string pushed (module)
-                        func = recent_strings[1]  # Second string pushed (function)
+                    resolved = stack_global_refs.get(i)
+                    if resolved:
+                        mod, func = resolved
                         if _is_actually_dangerous_global(mod, func, ml_context):
                             suspicious_count += 1
                             severity = _get_context_aware_severity(
@@ -3546,7 +3748,7 @@ class PickleScanner(BaseScanner):
                                 details={
                                     "position": pos,
                                     "opcode": opcode.name,
-                                    "stack_size": len(recent_strings),
+                                    "stack_size": "unknown",
                                     "ml_context_confidence": ml_context.get(
                                         "overall_confidence",
                                         0,
@@ -3562,7 +3764,11 @@ class PickleScanner(BaseScanner):
             # Check for dangerous patterns in the opcodes
             # SECURITY: Always run reduce pattern analysis regardless of ML context.
             # ML context must not suppress security-critical pattern detection.
-            dangerous_pattern = is_dangerous_reduce_pattern(opcodes)
+            dangerous_pattern = is_dangerous_reduce_pattern(
+                opcodes,
+                stack_global_refs=stack_global_refs,
+                callable_refs=callable_refs,
+            )
             if dangerous_pattern:
                 suspicious_count += 1
                 severity = _get_context_aware_severity(
@@ -3603,7 +3809,12 @@ class PickleScanner(BaseScanner):
                 )
 
             # Check for suspicious opcode sequences with ML context
-            suspicious_sequences = check_opcode_sequence(opcodes, ml_context)
+            suspicious_sequences = check_opcode_sequence(
+                opcodes,
+                ml_context,
+                stack_global_refs=stack_global_refs,
+                callable_refs=callable_refs,
+            )
             if suspicious_sequences:
                 for sequence in suspicious_sequences:
                     suspicious_count += 1

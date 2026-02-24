@@ -305,6 +305,30 @@ def test_manifest_scanner_untrusted_domain_flagged(tmp_path):
     assert any("unknown-server.net" in url for url in detected_urls)
 
 
+def test_manifest_scanner_domain_substring_bypass_flagged(tmp_path):
+    """URLs with trusted-domain substrings in the path/host should still be flagged."""
+    test_file = tmp_path / "config.json"
+    config_with_spoofed_url = {
+        "model_type": "bert",
+        "download_url": "https://evil.example/huggingface.co/backdoor.bin",
+        "mirror_url": "https://huggingface.co.evil.example/model.bin",
+    }
+
+    test_file.write_text(json.dumps(config_with_spoofed_url))
+
+    scanner = ManifestScanner()
+    result = scanner.scan(str(test_file))
+
+    assert result.success is True
+
+    failed_url_checks = [c for c in result.checks if c.name == "Untrusted URL Check" and c.status == CheckStatus.FAILED]
+    assert len(failed_url_checks) == 2, f"Expected 2 untrusted URLs, got {len(failed_url_checks)}"
+
+    detected_urls = {c.details.get("url", "") for c in failed_url_checks}
+    assert any("evil.example/huggingface.co" in url for url in detected_urls)
+    assert any("huggingface.co.evil.example" in url for url in detected_urls)
+
+
 def test_manifest_scanner_nested_untrusted_url(tmp_path):
     """Test that untrusted URLs in nested config structures are detected."""
     test_file = tmp_path / "config.json"
