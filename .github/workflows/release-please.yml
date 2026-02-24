@@ -48,6 +48,26 @@ jobs:
           # Shallow clone for speed - we only need to format and push
           fetch-depth: 1
 
+      - name: Install uv
+        if: steps.check-pr.outputs.has_pr == 'true'
+        uses: astral-sh/setup-uv@eac588ad8def6316056a12d4907a9d4d84ff7a3b # v7
+
+      - name: Sync uv.lock with pyproject.toml
+        if: steps.check-pr.outputs.has_pr == 'true'
+        run: |
+          uv lock
+          if git diff --quiet uv.lock; then
+            echo "✓ uv.lock already in sync"
+          else
+            echo "→ uv.lock updated to match pyproject.toml version bump"
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add uv.lock
+            git commit -m "chore: sync uv.lock with pyproject.toml version bump"
+            git push
+            echo "✓ uv.lock committed and pushed"
+          fi
+
       - name: Setup Node.js
         if: steps.check-pr.outputs.has_pr == 'true'
         uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238 # v6.2.0
@@ -392,7 +412,7 @@ jobs:
           uv tool run cyclonedx-py requirements \
             --pyproject pyproject.toml \
             --output-format json \
-            --outfile dist/modelaudit-${{ needs.release-please.outputs.version }}.cdx.json
+            --output-file dist/modelaudit-${{ needs.release-please.outputs.version }}.cdx.json
           echo "SBOM generated:"
           ls -la dist/*.cdx.json
 
