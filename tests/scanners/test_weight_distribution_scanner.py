@@ -4,6 +4,7 @@ import sys
 import tempfile
 import types
 import zipfile
+from typing import Any
 
 import pytest
 
@@ -418,7 +419,7 @@ class TestWeightDistributionScanner:
 
         load_called = False
 
-        fake_torch = types.ModuleType("torch")
+        fake_torch: Any = types.ModuleType("torch")
         fake_torch.__version__ = "2.5.1"
 
         class FakeTensor:  # pragma: no cover - simple test double
