@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.26](https://github.com/promptfoo/modelaudit/compare/v0.2.25...v0.2.26) (2026-02-24)
+
+### Bug Fixes
+
+- **ci:** pin protoc version for vendored proto reproducibility ([#548](https://github.com/promptfoo/modelaudit/issues/548)) ([03e9d35](https://github.com/promptfoo/modelaudit/commit/03e9d356dd87edbeff37658a81595abe07345b54))
+- **cli:** add --cache-dir and simplify defaults wording ([#550](https://github.com/promptfoo/modelaudit/issues/550)) ([b8701dd](https://github.com/promptfoo/modelaudit/commit/b8701dda1fb9cd71385ff6bdbb1accae531b5ea3))
+- **cli:** fail fast when glob patterns match nothing ([#519](https://github.com/promptfoo/modelaudit/issues/519)) ([404104b](https://github.com/promptfoo/modelaudit/commit/404104b8120e4e4cbcfdb8b456532221da6b3698))
+- **deps:** update dependency xgboost to &gt;=3.2,&lt;3.3 ([#507](https://github.com/promptfoo/modelaudit/issues/507)) ([4489e97](https://github.com/promptfoo/modelaudit/commit/4489e97aa1eb1d4d9b2a56d925648d2f2f9403a4))
+- enforce consistent scanner patterns across all scanners ([#564](https://github.com/promptfoo/modelaudit/issues/564)) ([dd6b8d2](https://github.com/promptfoo/modelaudit/commit/dd6b8d22b35ae85c5e6f3862ed026a47a4444d4b))
+- improve test suite reliability and safety ([#565](https://github.com/promptfoo/modelaudit/issues/565)) ([4bd04a7](https://github.com/promptfoo/modelaudit/commit/4bd04a792a6fd6104b9aec3172bbf934699872e0))
+- remove security anti-patterns from scanning infrastructure ([#562](https://github.com/promptfoo/modelaudit/issues/562)) ([d02cd0b](https://github.com/promptfoo/modelaudit/commit/d02cd0b345e68fb003a4d812058489a7657dc50f))
+- **security:** close critical scanner and CI gating gaps ([#553](https://github.com/promptfoo/modelaudit/issues/553)) ([807a8aa](https://github.com/promptfoo/modelaudit/commit/807a8aa05a69761fc2fcce9267f68ded5e3f6efc))
+- **security:** resolve CodeQL alerts for workflow permissions and sensitive logging ([#570](https://github.com/promptfoo/modelaudit/issues/570)) ([d2dfc79](https://github.com/promptfoo/modelaudit/commit/d2dfc799fe6267d65fb7646eca68d175449d8802))
+- **security:** resolve remaining audit findings ([#4](https://github.com/promptfoo/modelaudit/issues/4)-[#8](https://github.com/promptfoo/modelaudit/issues/8)) ([#556](https://github.com/promptfoo/modelaudit/issues/556)) ([7430436](https://github.com/promptfoo/modelaudit/commit/74304368946e6bc9ea170a23630388e92f8014b0))
+- **security:** use URL hostname parsing instead of substring matching ([#571](https://github.com/promptfoo/modelaudit/issues/571)) ([b4d3696](https://github.com/promptfoo/modelaudit/commit/b4d3696894c0bc3affe56ee77130056ee31c7926))
+- **test:** relax benchmark timing assertions for Windows CI ([#569](https://github.com/promptfoo/modelaudit/issues/569)) ([b06faac](https://github.com/promptfoo/modelaudit/commit/b06faac20c75a8df5d208eb9cb0ed834cb8e22f3))
+
+### Documentation
+
+- clarify README exit codes ([#568](https://github.com/promptfoo/modelaudit/issues/568)) ([e57a0de](https://github.com/promptfoo/modelaudit/commit/e57a0dec6778fa8aab747bf8ef51c5043d9f6c2e))
+- fix accuracy issues across AGENTS.md, README, and CONTRIBUTING ([#566](https://github.com/promptfoo/modelaudit/issues/566)) ([880e7a4](https://github.com/promptfoo/modelaudit/commit/880e7a4455ba7c40e581cc144b25d2bd0a8522dd))
+- **open-source:** add user trust docs batch ([#534](https://github.com/promptfoo/modelaudit/issues/534)) ([dd5e676](https://github.com/promptfoo/modelaudit/commit/dd5e676eac59533212bcea8b5ab9d484eacfd4b8))
+- **readme:** add cache management flag ([#521](https://github.com/promptfoo/modelaudit/issues/521)) ([33d74bd](https://github.com/promptfoo/modelaudit/commit/33d74bd9135f667ef3dd002889bae14031e4dd79))
+- ship next-phase open-source readiness docs ([#532](https://github.com/promptfoo/modelaudit/issues/532)) ([c88035d](https://github.com/promptfoo/modelaudit/commit/c88035d705dda3b9d2cba8f9f03a1b70b4ed41f7))
+- trim README to essentials, fix inaccuracies ([#517](https://github.com/promptfoo/modelaudit/issues/517)) ([59c056c](https://github.com/promptfoo/modelaudit/commit/59c056c5a0414b7700d0c3afc3bcc79f3679edcd))
+
 ## [Unreleased]
 
 ## [0.2.25] - 2026-02-12
