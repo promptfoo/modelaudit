@@ -105,7 +105,7 @@ class AuthClient:
             return {"user": CloudUser(user), "organization": CloudOrganization(organization), "app": CloudApp(app)}
 
         except requests.RequestException as error:
-            logger.error(f"[Cloud] Failed to validate API token with host {host}: {type(error).__name__}")
+            logger.error(f"[Cloud] Failed to validate API token: {type(error).__name__}")
             raise
 
     def get_user_info(self) -> dict[str, Any]:
