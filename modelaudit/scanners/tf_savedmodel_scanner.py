@@ -344,9 +344,15 @@ class TensorFlowSavedModelScanner(BaseScanner):
                     if hasattr(func_attr, "func") and hasattr(func_attr.func, "name"):
                         func_name = func_attr.func.name
 
-                        # Check for suspicious function names
+                        # Check for suspicious function names.
+                        # NOTE: "lambda" is intentionally excluded because
+                        # standard Keras preprocessing layers generate
+                        # StatefulPartitionedCall nodes whose function names
+                        # contain "lambda" as part of normal TF internal
+                        # naming (e.g. "__inference_lambda_layer_call_fn_123").
+                        # Lambda layers are already detected separately via
+                        # _scan_keras_metadata.
                         suspicious_func_patterns = [
-                            "lambda",
                             "eval",
                             "exec",
                             "compile",
@@ -707,8 +713,11 @@ class TensorFlowSavedModelScanner(BaseScanner):
             (r"<script[^>]*>", "script_injection", "HTML script tag"),
             (r"javascript:", "script_injection", "JavaScript URI"),
             (r"vbscript:", "script_injection", "VBScript URI"),
-            # Base64 encoded payloads
-            (r"[A-Za-z0-9+/]{20,}={0,2}", "encoded_payload", "potential base64 payload"),
+            # Base64 encoded payloads — require at least one trailing '=' pad
+            # character to avoid matching normal TF node names that use '/'
+            # as a hierarchical separator (e.g. "bidirectional/forward_lstm",
+            # "Adam/embedding/embeddings").
+            (r"[A-Za-z0-9+/]{20,}={1,2}", "encoded_payload", "potential base64 payload"),
         ]
 
         import re
