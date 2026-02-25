@@ -83,7 +83,7 @@ def _compute_pickle_length(path: str) -> int:
 
 
 # ============================================================================
-# SMART DETECTION SYSTEM - ML Context Awareness
+# ML CONTEXT FILTERING SYSTEM
 # ============================================================================
 
 # ML Framework Detection Patterns
@@ -1203,7 +1203,7 @@ def _is_safe_ml_global(mod: str, func: str) -> bool:
 
 def _is_actually_dangerous_global(mod: str, func: str, ml_context: dict) -> bool:
     """
-    Smart global reference analysis - distinguishes between legitimate ML operations
+    Context-aware global reference analysis - distinguishes between legitimate ML operations
     and actual dangerous operations.
 
     Security-first approach: Always flag dangerous functions, then check ML context
@@ -1533,7 +1533,7 @@ def _find_associated_global_or_class(
 
 def _is_actually_dangerous_string(s: str, ml_context: dict) -> str | None:
     """
-    Smart string analysis - looks for actual executable code rather than ML patterns.
+    Context-aware string analysis - looks for actual executable code rather than ML patterns.
     Now includes py_compile validation to reduce false positives.
     """
     import re
@@ -1714,7 +1714,7 @@ def _get_context_aware_severity(
 
 
 # ============================================================================
-# END SMART DETECTION SYSTEM
+# END ML CONTEXT FILTERING SYSTEM
 # ============================================================================
 
 
@@ -1997,7 +1997,7 @@ def check_opcode_sequence(
     """
     suspicious_patterns: list[dict[str, Any]] = []
 
-    # SMART DETECTION: Check if we should ignore this sequence based on ML context
+    # ML CONTEXT FILTERING: Check if we should ignore this sequence based on ML context
     if _should_ignore_opcode_sequence(opcodes, ml_context):
         return suspicious_patterns  # Return empty list for legitimate ML content
 
@@ -3161,7 +3161,7 @@ class PickleScanner(BaseScanner):
                     },
                 )
 
-            # SMART DETECTION: Analyze ML context once for the entire pickle
+            # ML CONTEXT FILTERING: Analyze ML context once for the entire pickle
             ml_context = _detect_ml_context(opcodes)
             stack_global_refs, callable_refs = _build_symbolic_reference_maps(opcodes)
 

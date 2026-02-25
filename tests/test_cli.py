@@ -126,7 +126,7 @@ def test_scan_file(tmp_path):
 
     # Just check that the command ran and produced some output
     assert result.output  # Should have some output
-    # With smart detection, non-model files may be skipped or shown differently
+    # With automatic defaults, non-model files may be skipped or shown differently
     # Just check that it completed successfully
     assert result.exit_code == 0
 
@@ -191,7 +191,7 @@ def test_scan_with_blacklist(tmp_path):
     # Just check that the command ran and produced some output
     assert result.output  # Should have some output
     assert result.exit_code == 0  # Command should complete successfully
-    # With smart detection, the specific output format may vary
+    # With automatic defaults, the specific output format may vary
 
 
 def test_scan_json_output(tmp_path):
@@ -341,7 +341,7 @@ def test_scan_verbose_mode(tmp_path):
     )
 
     # In verbose mode, we should see more output
-    # With smart detection and new output format, check for successful completion
+    # With automatic defaults and new output format, check for successful completion
     assert result.output  # Should have some output
     assert result.exit_code == 0  # Should complete successfully
     # New output format may not contain "Scanning" text
@@ -422,6 +422,22 @@ def test_format_text_output_only_debug_issues():
     clean_output = strip_ansi(output)
     assert "No security issues detected" in clean_output
     assert "NO ISSUES FOUND" in clean_output
+
+
+def test_format_text_output_operational_errors_status():
+    """Ensure operational errors are surfaced in final text status."""
+    results = {
+        "files_scanned": 1,
+        "bytes_scanned": 10,
+        "duration": 0.1,
+        "issues": [],
+        "has_errors": True,
+    }
+
+    output = format_text_output(results, verbose=False)
+    clean_output = strip_ansi(output)
+    assert "SCAN COMPLETED WITH OPERATIONAL ERRORS" in clean_output
+    assert "NO ISSUES FOUND" not in clean_output
 
 
 def test_format_text_output_only_info_issues():
@@ -535,7 +551,7 @@ def test_scan_huggingface_url_success(mock_rmtree, mock_scan, mock_download, moc
 
     # Should succeed
     assert result.exit_code == 0
-    # With smart detection and new output format, check for successful completion
+    # With automatic defaults and new output format, check for successful completion
     assert (
         "SCAN SUMMARY" in result.output
         or "Files:" in result.output
@@ -656,7 +672,7 @@ def test_scan_pytorchhub_url_success(mock_rmtree, mock_scan, mock_download, mock
     assert result.exit_code == 0
     mock_download.assert_called_once()
     mock_scan.assert_called_once()
-    # With smart detection, PyTorch Hub URLs enable caching by default, so no cleanup
+    # With automatic defaults, PyTorch Hub URLs enable caching by default, so no cleanup
     mock_rmtree.assert_not_called()
 
 

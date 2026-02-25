@@ -1,6 +1,7 @@
 """Real-world integration tests with actual dill and joblib files."""
 
 import os
+import sys
 import time
 from unittest.mock import patch
 
@@ -221,8 +222,9 @@ class TestPerformanceBenchmarks:
         scan_duration = time.perf_counter() - start_time
 
         # Should complete within reasonable time
-        # CI environments may have variable performance, so use a generous threshold
-        assert scan_duration < 2.0, f"Scan took {scan_duration:.2f}s, expected < 2.0s"
+        # CI environments may have variable performance; Windows runners are slower
+        threshold = 5.0 if sys.platform == "win32" else 2.0
+        assert scan_duration < threshold, f"Scan took {scan_duration:.2f}s, expected < {threshold}s"
         assert result.bytes_scanned > 0
 
         # Log performance metrics

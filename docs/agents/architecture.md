@@ -23,7 +23,7 @@ class MyScanner(BaseScanner):
     @classmethod
     def can_handle(cls, path: str) -> bool:
         """Return True if this scanner can handle the file."""
-        pass
+        return path.lower().endswith(tuple(cls.supported_extensions))
 
     def scan(self, path: str) -> ScanResult:
         """Scan the file and return results."""

@@ -1,11 +1,11 @@
-"""Tests for CLI smart detection functionality."""
+"""Tests for CLI automatic-default configuration."""
 
 import tempfile
 
-from modelaudit.utils.helpers.smart_detection import (
+from modelaudit.utils.auto_defaults import (
     detect_file_size,
     detect_input_type,
-    generate_smart_defaults,
+    generate_auto_defaults,
     parse_size_string,
 )
 
@@ -45,13 +45,13 @@ def test_detect_file_size():
         assert size == 400
 
 
-def test_generate_smart_defaults_local():
-    """Test smart defaults for local files."""
+def test_generate_auto_defaults_local():
+    """Test automatic defaults for local files."""
     with tempfile.NamedTemporaryFile() as tmp:
         tmp.write(b"x" * 1000)  # Small file
         tmp.flush()
 
-        defaults = generate_smart_defaults([tmp.name])
+        defaults = generate_auto_defaults([tmp.name])
 
         assert defaults["show_progress"] is False  # Small local file
         assert defaults["use_cache"] is False  # Local files don't need caching
@@ -60,10 +60,10 @@ def test_generate_smart_defaults_local():
         assert defaults["skip_non_model_files"] is True  # Default behavior
 
 
-def test_generate_smart_defaults_cloud():
-    """Test smart defaults for cloud paths."""
+def test_generate_auto_defaults_cloud():
+    """Test automatic defaults for cloud paths."""
     paths = ["s3://bucket/models/"]
-    defaults = generate_smart_defaults(paths)
+    defaults = generate_auto_defaults(paths)
 
     assert defaults["use_cache"] is True  # Cloud operations should cache
     assert defaults["selective_download"] is True  # Cloud directories
@@ -90,10 +90,10 @@ def test_parse_size_string():
         pass
 
 
-def test_smart_defaults_huggingface():
-    """Test smart defaults for HuggingFace models."""
+def test_auto_defaults_huggingface():
+    """Test automatic defaults for HuggingFace models."""
     paths = ["hf://user/model"]
-    defaults = generate_smart_defaults(paths)
+    defaults = generate_auto_defaults(paths)
 
     assert defaults["use_cache"] is True  # Remote operations should cache
     assert defaults["selective_download"] is True  # HuggingFace models
