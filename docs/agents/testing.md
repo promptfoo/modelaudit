@@ -72,7 +72,7 @@ uv run pytest --lf -v
 uv run pytest -x --maxfail=1 -n auto
 ```
 
-## Smart Test Targeting
+## Targeted Test Selection
 
 Target tests related to your changes:
 

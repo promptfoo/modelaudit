@@ -39,8 +39,8 @@ from .telemetry import (
     record_scan_started,
 )
 from .utils import resolve_dvc_file
+from .utils.helpers.auto_defaults import apply_auto_overrides, generate_auto_defaults, parse_size_string
 from .utils.helpers.interrupt_handler import interruptible_scan
-from .utils.helpers.smart_detection import apply_smart_overrides, generate_smart_defaults, parse_size_string
 from .utils.sources.cloud_storage import download_from_cloud, is_cloud_url
 from .utils.sources.huggingface import (
     download_file_from_hf,
@@ -462,7 +462,7 @@ def delegate_info() -> None:
     type=click.Path(),
     help="Write CycloneDX SBOM to the specified file",
 )
-# Override smart detection (2 flags)
+# Override automatic defaults (2 flags)
 @click.option(
     "--timeout",
     "-t",
@@ -483,7 +483,7 @@ def delegate_info() -> None:
 @click.option(
     "--no-cache",
     is_flag=True,
-    help="Force disable caching (overrides smart detection)",
+    help="Force disable caching (overrides automatic defaults)",
 )
 @click.option(
     "--stream",
@@ -509,7 +509,7 @@ def scan_command(
     """Scan files, directories, HuggingFace models, MLflow models, cloud storage,
     or JFrog artifacts for security issues.
 
-    Uses smart detection to automatically configure optimal settings based on input type.
+    Uses automatic defaults to configure settings based on input type.
 
     \b
     Examples:
@@ -518,14 +518,14 @@ def scan_command(
         modelaudit scan hf://user/llama              # HuggingFace - selective download
         modelaudit scan models:/model/v1             # MLflow - registry integration
 
-        # Override smart detection when needed
+        # Override automatic defaults when needed
         modelaudit scan large-model.pt --max-size 20GB --timeout 7200
 
         # Strict mode for security-critical scans
         modelaudit scan model.pkl --strict --format json --output report.json
 
     \b
-    Smart Detection:
+    Automatic Defaults:
         • Input type (local/cloud/registry) → optimal download & caching
         • File size (>1GB) → large model optimizations + progress bars
         • Terminal type (TTY/CI) → appropriate UI (progress vs quiet)
@@ -608,8 +608,8 @@ def scan_command(
         flush_telemetry()
         sys.exit(2)
 
-    # Generate smart defaults based on input analysis
-    smart_defaults = generate_smart_defaults(expanded_paths)
+    # Generate automatic defaults based on input analysis
+    auto_defaults = generate_auto_defaults(expanded_paths)
 
     # Prepare user overrides (only non-None values)
     user_overrides: dict[str, Any] = {}
@@ -627,7 +627,7 @@ def scan_command(
 
             sys_module.exit(2)
 
-    # Override smart detection with explicit user flags
+    # Override automatic defaults with explicit user flags
     if progress:
         user_overrides["show_progress"] = True
     if no_cache:
@@ -642,8 +642,8 @@ def scan_command(
     if quiet:
         user_overrides["verbose"] = False
 
-    # Apply smart defaults + user overrides
-    config = apply_smart_overrides(user_overrides, smart_defaults)
+    # Apply automatic defaults + user overrides
+    config = apply_auto_overrides(user_overrides, auto_defaults)
 
     # Handle environment variables for removed flags
     jfrog_api_token = os.getenv("JFROG_API_TOKEN")
@@ -668,7 +668,7 @@ def scan_command(
     final_skip_files = config.get("skip_non_model_files", True)
     final_strict_license = config.get("strict_license", False)
 
-    # Handle max download size from smart defaults or max_size override
+    # Handle max download size from automatic defaults or max_size override
     max_download_bytes = None
     if max_size is not None:
         import contextlib
@@ -676,15 +676,15 @@ def scan_command(
         with contextlib.suppress(ValueError):
             max_download_bytes = parse_size_string(max_size)
 
-    # Show smart detection info if not quiet
+    # Show automatic-defaults info if not quiet
     if not quiet and show_styled_output:
         if verbose:
-            click.echo(f"🧠 Smart detection: {len(expanded_paths)} path(s) analyzed")
+            click.echo(f"Automatic defaults: {len(expanded_paths)} path(s) analyzed")
             for key, value in config.items():
                 if key != "cache_dir":  # Skip showing long paths
                     click.echo(f"   • {key}: {value}")
         elif not config.get("colors", True):  # In CI mode
-            pass  # No smart detection message needed
+            pass  # No automatic-defaults message needed
 
     # Print a nice header if not in structured format mode
     if show_styled_output and not quiet:
@@ -736,17 +736,17 @@ def scan_command(
 
             # Create progress tracker
             progress_tracker = ProgressTracker(
-                update_interval=2.0,  # Smart default
+                update_interval=2.0,  # Default interval
             )
 
             # Add console reporter based on format preference
             # Only enable ProgressTracker for text format without output file
             # (ProgressTracker has threading issues that cause segfaults)
             if progress_tracker and final_format == "text" and not output:
-                if True:  # Always use tqdm format (smart default)
+                if True:  # Always use tqdm format (default)
                     # Use tqdm progress bars if available and appropriate
                     console_reporter = ConsoleProgressReporter(  # type: ignore[possibly-unresolved-reference]
-                        update_interval=2.0,  # Smart default
+                        update_interval=2.0,  # Default interval
                         disable_on_non_tty=True,
                         show_bytes=True,
                         show_items=True,
@@ -755,7 +755,7 @@ def scan_command(
                 progress_reporters.append(console_reporter)
                 progress_tracker.add_reporter(console_reporter)
 
-            # File logging removed - use smart defaults only
+            # File logging removed - use automatic defaults only
 
         except (ImportError, RecursionError) as e:
             if verbose:
@@ -1100,8 +1100,8 @@ def scan_command(
                 # Check if this is a cloud storage URL
                 elif is_cloud_url(path):
                     # Max download size already handled above
-                    # max_download_bytes is already set from smart defaults
-                    # Max download size parsing removed - handled by smart defaults
+                    # max_download_bytes is already set from automatic defaults
+                    # Max download size parsing removed - handled by automatic defaults
 
                     # Handle dry-run mode (replaces preview)
                     if dry_run:
@@ -1472,12 +1472,12 @@ def scan_command(
                     # Run the scan with progress reporting (NORMAL MODE)
                     config_overrides = {
                         "enable_progress": bool(progress_tracker),
-                        "progress_update_interval": 2.0,  # Smart default
+                        "progress_update_interval": 2.0,  # Default interval
                         "cache_enabled": final_cache,
                         "cache_dir": final_cache_dir,
                     }
 
-                    # Record feature usage for large model support (based on smart detection)
+                    # Record feature usage for large model support (based on automatic defaults)
                     # Note: DO NOT send actual path - only track that the feature was used
                     if final_max_file_size > 0 or final_max_total_size > 0:
                         record_feature_used(

@@ -68,8 +68,8 @@ class MixedContent:
         self.metadata = {"__version__": "1.0"}
 
 
-class TestPickleSmartDetection(unittest.TestCase):
-    """Test smart detection capabilities for PickleScanner"""
+class TestPickleContextFiltering(unittest.TestCase):
+    """Test ML-context filtering behavior for PickleScanner."""
 
     def setUp(self):
         self.scanner = PickleScanner()
@@ -92,7 +92,7 @@ class TestPickleSmartDetection(unittest.TestCase):
             # collections.OrderedDict alone may not trigger high ML confidence)
             ml_context = result.metadata.get("ml_context", {})
             # Check if it's detected as ML content OR has very few issues
-            # (indicating smart filtering worked)
+            # (indicating context filtering worked)
             self.assertTrue(
                 ml_context.get("is_ml_content", False) or len(result.issues) < 5,
                 f"Expected ML detection or low issue count, got {len(result.issues)} issues",
@@ -115,7 +115,7 @@ class TestPickleSmartDetection(unittest.TestCase):
             # Should complete successfully
             self.assertTrue(result.success)
 
-            # Should have fewer issues than without smart detection
+            # Should have fewer issues than without context filtering
             self.assertLess(
                 len(result.issues),
                 50,
@@ -210,11 +210,11 @@ class TestPickleSmartDetection(unittest.TestCase):
                 f"Expected < 50 issues, got {len(result.issues)}. Issues: {[i.message for i in result.issues]}",
             )
 
-            # Check ML context was detected or smart filtering worked
+            # Check ML context was detected or context filtering worked
             ml_context = result.metadata.get("ml_context", {})
             self.assertTrue(
                 ml_context.get("is_ml_content", False) or len(result.issues) < 50,
-                "Should detect ML content or have smart filtering",
+                "Should detect ML content or apply context filtering",
             )
 
         finally:

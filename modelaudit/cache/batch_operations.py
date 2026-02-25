@@ -6,8 +6,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
+from .adaptive_cache_keys import AdaptiveCacheKeyGenerator
 from .cache_manager import CacheManager
-from .smart_cache_keys import SmartCacheKeyGenerator
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +17,7 @@ class BatchCacheOperations:
 
     def __init__(self, cache_manager: CacheManager):
         self.cache_manager = cache_manager
-        self.key_generator = cache_manager.key_generator or SmartCacheKeyGenerator()
+        self.key_generator = cache_manager.key_generator or AdaptiveCacheKeyGenerator()
 
     def batch_lookup(self, file_paths: list[str], max_workers: int = 4) -> dict[str, dict[str, Any] | None]:
         """

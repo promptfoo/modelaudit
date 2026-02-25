@@ -60,7 +60,7 @@ Comprehensive security checklist for PyTorch model development and deployment.
 - [ ] **Migration Plan**: Moving to SafeTensors format?
 - [ ] **Security Updates**: Process for patching vulnerabilities?
 - [ ] **Regular Reviews**: Scheduled security reviews in place?
-- [ ] **Threat Intelligence**: Staying informed about new threats?
+- [ ] **Threat Monitoring**: Staying informed about new threats?
 
 ## For TorchScript Models
 

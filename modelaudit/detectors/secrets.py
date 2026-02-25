@@ -266,7 +266,7 @@ class SecretsDetector:
         if any(ctx in context.lower() for ctx in secret_contexts):
             confidence += 0.2
 
-        # Smart handling of test/example indicators
+        # Heuristic handling of test/example indicators
         test_indicators = ["test", "example", "sample", "demo", "fake", "dummy", "placeholder"]
         text_lower = text.lower()
 

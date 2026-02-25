@@ -102,7 +102,7 @@ def test_scan_command_help():
     assert "--max-size" in result.output  # Updated from --max-file-size
     assert "--strict" in result.output  # New consolidated flag
     assert "--dry-run" in result.output  # New flag
-    assert "Smart Detection:" in result.output  # New feature documentation
+    assert "Automatic Defaults:" in result.output  # New feature documentation
 
 
 def test_scan_nonexistent_file():
@@ -126,7 +126,7 @@ def test_scan_file(tmp_path):
 
     # Just check that the command ran and produced some output
     assert result.output  # Should have some output
-    # With smart detection, non-model files may be skipped or shown differently
+    # With automatic defaults, non-model files may be skipped or shown differently
     # Just check that it completed successfully
     assert result.exit_code == 0
 
@@ -191,7 +191,7 @@ def test_scan_with_blacklist(tmp_path):
     # Just check that the command ran and produced some output
     assert result.output  # Should have some output
     assert result.exit_code == 0  # Command should complete successfully
-    # With smart detection, the specific output format may vary
+    # With automatic defaults, the specific output format may vary
 
 
 def test_scan_json_output(tmp_path):
@@ -341,7 +341,7 @@ def test_scan_verbose_mode(tmp_path):
     )
 
     # In verbose mode, we should see more output
-    # With smart detection and new output format, check for successful completion
+    # With automatic defaults and new output format, check for successful completion
     assert result.output  # Should have some output
     assert result.exit_code == 0  # Should complete successfully
     # New output format may not contain "Scanning" text
@@ -535,7 +535,7 @@ def test_scan_huggingface_url_success(mock_rmtree, mock_scan, mock_download, moc
 
     # Should succeed
     assert result.exit_code == 0
-    # With smart detection and new output format, check for successful completion
+    # With automatic defaults and new output format, check for successful completion
     assert (
         "SCAN SUMMARY" in result.output
         or "Files:" in result.output
@@ -656,7 +656,7 @@ def test_scan_pytorchhub_url_success(mock_rmtree, mock_scan, mock_download, mock
     assert result.exit_code == 0
     mock_download.assert_called_once()
     mock_scan.assert_called_once()
-    # With smart detection, PyTorch Hub URLs enable caching by default, so no cleanup
+    # With automatic defaults, PyTorch Hub URLs enable caching by default, so no cleanup
     mock_rmtree.assert_not_called()
 
 

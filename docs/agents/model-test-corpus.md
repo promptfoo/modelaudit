@@ -273,7 +273,7 @@ Keras configuration files with dynamic module references flagged by security sca
 | 113 | `keras/siglip2_large_patch16_256` | Keras config  | Hugging Face | `tokenizer.json`    | Protect AI marks file **Unsafe** with `PAIT-KERAS-301` due to dynamic module references. Useful to test config‑parsing allowlists. |
 | 114 | `yuto-urushima/my_gemma2_pt`      | Keras config  | Hugging Face | `preprocessor.json` | Protect AI flags **PAIT-KERAS-301**. Tests resilience to KerasHub JSON with module paths.                                          |
 
-## Model Discovery & Intelligence
+## Model Discovery & Analysis
 
 ### Automated Discovery Queries
 

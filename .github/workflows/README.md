@@ -16,7 +16,7 @@ Main testing workflow for Python code.
 
 **Features:**
 
-- **Smart path filtering**: Only runs when Python files, dependencies, or workflows change
+- **Selective path filtering**: Only runs when Python files, dependencies, or workflows change
 - **Conditional job execution**: Jobs depend on what files changed
 - **Optimized matrix testing**:
   - PRs: Test on Python 3.10 and 3.13 only (min/max versions)
@@ -36,7 +36,7 @@ Lightweight workflow for documentation-only changes.
 
 - Fast execution (5-minute timeout)
 - Prettier formatting check
-- Markdown link validation (with smart ignore patterns)
+- Markdown link validation (with targeted ignore patterns)
 - No Python environment setup needed
 
 ### 3. **Docker Image CI** (`docker-image-test.yml`)
@@ -55,7 +55,7 @@ Tests Docker image builds.
   - Full image only builds if explicitly requested or Dockerfile.full changes
   - Saves significant CI time on most PRs
 - **Increased timeouts**: 60 minutes for full image (was 45)
-- **Smart caching**: Uses GitHub Actions cache for faster builds
+- **Workflow caching**: Uses GitHub Actions cache for faster builds
 - **Comprehensive testing**: Validates actual scanning functionality
 
 ### 4. **Validate PR Title** (`validate-pr-title.yml`)
@@ -96,7 +96,7 @@ Ensures PR titles follow conventional commit format.
 - Docker lightweight: 20 minutes
 - Docker full image: 60 minutes
 
-### 5. Smart Caching
+### 5. Workflow Caching
 
 - Python dependencies cached by OS and Python version
 - Docker layers cached using GitHub Actions cache

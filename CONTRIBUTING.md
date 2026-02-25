@@ -99,7 +99,7 @@ uv run pytest --durations=10 --tb=no
 - Automatically detects CPU cores with `-n auto`
 - Uses 240%+ CPU utilization
 
-**Smart Test Selection:**
+**Targeted Test Selection:**
 
 - Exclude slow tests during development: `-m "not slow and not integration"`
 - Run only unit tests: `-m "unit"`

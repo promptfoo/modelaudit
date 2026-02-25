@@ -280,7 +280,7 @@ def prompt_for_large_download(metadata: dict[str, Any]) -> bool:
 
 
 class GCSCache:
-    """Smart caching system for cloud downloads."""
+    """Cache-aware download handling for cloud sources."""
 
     def __init__(self, cache_dir: Path | None = None):
         if cache_dir is None:
