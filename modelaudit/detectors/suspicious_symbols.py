@@ -316,13 +316,12 @@ CVE_COMBINED_PATTERNS = {
 # The regex CVE patterns (CVE_2020_13092_PATTERNS, CVE_2024_34997_PATTERNS) correctly detect
 # actual exploits by requiring COMBINATIONS (e.g., "sklearn.*joblib.*os.system"), not individual keywords.
 CVE_BINARY_PATTERNS = [
-    # CVE-2020-13092 binary signatures
-    b"joblib.load",
-    b"__reduce__",
+    # Only patterns that are genuine indicators of exploitation.
+    # Removed overly broad patterns (b"Pipeline", b"__reduce__", b"joblib.load",
+    # b"read_array") that match ALL legitimate sklearn/numpy pickle files.
+    # The regex CVE patterns (CVE_2020_13092_PATTERNS, CVE_2024_34997_PATTERNS)
+    # correctly detect actual exploits by requiring dangerous COMBINATIONS.
     b"os.system",
-    b"Pipeline",
-    # CVE-2024-34997 binary signatures
-    b"read_array",
     b"pickle.load",
     b"joblib.cache",
 ]
@@ -491,7 +490,6 @@ KNOWN_SAFE_MODEL_CLASSES: set[str] = {"Sequential", "Functional", "Model"}
 SUSPICIOUS_LAYER_TYPES = {
     "Lambda": "Can contain arbitrary Python code",
     "TFOpLambda": "Can call TensorFlow operations",
-    "Functional": "Complex layer that might hide malicious components",
     "PyFunc": "Can execute Python code",
     "CallbackLambda": "Can execute callbacks at runtime",
 }

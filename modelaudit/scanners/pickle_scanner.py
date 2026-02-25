@@ -662,6 +662,22 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "pi",
         "e",
     ],
+    # Truncated numpy module references from pickle opcode resolution.
+    # The pickle scanner sometimes resolves module names incompletely
+    # (e.g., "_reconstruct" instead of "numpy.core.multiarray._reconstruct").
+    "_reconstruct": ["ndarray", "scalar"],
+    "C": ["dtype", "ndarray", "scalar"],
+    "multiarray": ["_reconstruct", "scalar"],
+    "brilliant": ["scalar"],  # misparsed numpy.core.multiarray.scalar
+    "numpy_pickle": ["NumpyArrayWrapper", "NDArrayWrapper"],
+    # Numpy random bit generators (used by sklearn for random state)
+    "numpy.random._mt19937": ["MT19937"],
+    "numpy.random._philox": ["Philox"],
+    "numpy.random._pcg64": ["PCG64"],
+    "numpy.random._sfc64": ["SFC64"],
+    "numpy.random._generator": ["Generator"],
+    "numpy.random._common": ["BitGenerator"],
+    "MT19937": ["__bit_generator_ctor"],
     # YOLO/Ultralytics safe patterns
     "ultralytics": [
         "YOLO",
@@ -1012,6 +1028,41 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
     ],
     "sklearn.utils._tags": [
         "Tags",
+    ],
+    "sklearn.neural_network": [
+        "MLPClassifier",
+        "MLPRegressor",
+        "BernoulliRBM",
+    ],
+    "sklearn.neural_network._multilayer_perceptron": [
+        "MLPClassifier",
+        "MLPRegressor",
+    ],
+    "sklearn.calibration": [
+        "CalibratedClassifierCV",
+    ],
+    "sklearn.discriminant_analysis": [
+        "LinearDiscriminantAnalysis",
+        "QuadraticDiscriminantAnalysis",
+    ],
+    "sklearn.gaussian_process": [
+        "GaussianProcessClassifier",
+        "GaussianProcessRegressor",
+    ],
+    "sklearn.isotonic": [
+        "IsotonicRegression",
+    ],
+    "sklearn.kernel_ridge": [
+        "KernelRidge",
+    ],
+    "sklearn.mixture": [
+        "GaussianMixture",
+        "BayesianGaussianMixture",
+    ],
+    "sklearn.semi_supervised": [
+        "LabelPropagation",
+        "LabelSpreading",
+        "SelfTrainingClassifier",
     ],
     "transformers": [
         "AutoModel",
