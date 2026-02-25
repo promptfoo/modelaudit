@@ -431,15 +431,21 @@ class OnnxScanner(BaseScanner):
                 if len(initializer.dims) < 2:
                     continue
 
-                array = onnx.numpy_helper.to_array(initializer)
+                # Pre-check estimated size before materializing the array.
+                import numpy as np
 
-                # Guard against very large arrays blowing up memory.
-                if max_array_size and max_array_size > 0 and array.nbytes > max_array_size:
+                estimated_bytes = (
+                    np.prod(initializer.dims)
+                    * np.dtype(onnx.helper.tensor_dtype_to_np_dtype(initializer.data_type)).itemsize
+                )
+                if max_array_size and max_array_size > 0 and estimated_bytes > max_array_size:
                     continue
+
+                array = onnx.numpy_helper.to_array(initializer)
 
                 weights_info[initializer.name] = array
         except Exception as e:
-            logger.debug(f"Failed to extract ONNX weights for distribution analysis: {e}")
+            logger.warning(f"Failed to extract ONNX weights for distribution analysis: {e}")
 
         if not weights_info:
             # Nothing to analyse (external-only model, or all tensors too small / too large).
@@ -464,4 +470,4 @@ class OnnxScanner(BaseScanner):
             result.metadata["layers_analyzed"] = len(weights_info)
             result.metadata["anomalies_found"] = len(anomalies)
         except Exception as e:
-            logger.debug(f"Weight distribution analysis failed: {e}")
+            logger.warning(f"Weight distribution analysis failed: {e}")
