@@ -56,13 +56,15 @@ class SkopsScanner(BaseScanner):
         This CVE allows arbitrary code execution through malicious OperatorFuncNode
         objects that bypass trusted type validation.
         """
-        # Check for OperatorFuncNode patterns in file structure and content
+        # Check for OperatorFuncNode patterns in file structure and content.
+        # NOTE: __reduce__ and get_state were removed because they are standard
+        # Python serialization methods used by ALL sklearn Cython types
+        # (e.g., sklearn.tree._tree.Tree). Only flag patterns specific to the
+        # actual CVE-2025-54412 exploit (OperatorFuncNode abuse).
         suspicious_patterns = [
             "OperatorFuncNode",
             "operator.func",
             "trusted_types",
-            "__reduce__",
-            "get_state",
         ]
 
         # Binary patterns for content scanning
@@ -70,8 +72,6 @@ class SkopsScanner(BaseScanner):
             b"OperatorFuncNode",
             b"operator.func",
             b"trusted_types",
-            b"__reduce__",
-            b"get_state",
         ]
 
         # Look for suspicious patterns in ZIP file names
