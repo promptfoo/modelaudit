@@ -1,10 +1,13 @@
 """Scanner for ONNX model files (.onnx)."""
 
+import logging
 import os
 from pathlib import Path
 from typing import Any, ClassVar
 
 from .base import BaseScanner, IssueSeverity, ScanResult
+
+logger = logging.getLogger("modelaudit.scanners")
 
 
 def _get_onnx_mapping() -> Any:
@@ -171,6 +174,7 @@ class OnnxScanner(BaseScanner):
         self._check_custom_ops(model, path, result)
         self._check_external_data(model, path, result)
         self._check_tensor_sizes(model, path, result)
+        self._check_weight_distribution(model, path, result)
 
         result.finish(success=True)
         return result
@@ -392,3 +396,72 @@ class OnnxScanner(BaseScanner):
                         severity=IssueSeverity.DEBUG,
                         location=path,
                     )
+
+    def _check_weight_distribution(self, model: Any, path: str, result: ScanResult) -> None:
+        """Extract weights from ONNX initializers and run weight distribution analysis.
+
+        The model is already loaded with load_external_data=False, so external-data
+        tensors have no raw bytes and must be skipped.  Only inline 2-D+ tensors
+        (conv kernels, linear layers, embeddings) are relevant for distribution
+        analysis; 1-D tensors (biases, batch-norm params) are excluded.
+        """
+        try:
+            import onnx
+
+            # Lazy-import the weight distribution scanner to avoid circular deps
+            # and heavy library loads when the scanner is not needed.
+            from modelaudit.scanners.weight_distribution_scanner import WeightDistributionScanner
+        except ImportError:
+            # numpy / scipy / onnx not available — silently skip
+            return
+
+        # Max in-memory array size (default 100 MB)
+        max_array_size = self.config.get("max_array_size", 100 * 1024 * 1024)
+
+        weights_info: dict[str, Any] = {}
+        try:
+            for initializer in model.graph.initializer:
+                self.check_interrupted()
+
+                # Skip external-data tensors — their bytes were not loaded.
+                if initializer.data_location == onnx.TensorProto.EXTERNAL:
+                    continue
+
+                # Only 2-D+ tensors are interesting for distribution analysis.
+                if len(initializer.dims) < 2:
+                    continue
+
+                array = onnx.numpy_helper.to_array(initializer)
+
+                # Guard against very large arrays blowing up memory.
+                if max_array_size and max_array_size > 0 and array.nbytes > max_array_size:
+                    continue
+
+                weights_info[initializer.name] = array
+        except Exception as e:
+            logger.debug(f"Failed to extract ONNX weights for distribution analysis: {e}")
+
+        if not weights_info:
+            # Nothing to analyse (external-only model, or all tensors too small / too large).
+            return
+
+        # Delegate the actual statistical analysis to WeightDistributionScanner.
+        try:
+            wd_scanner = WeightDistributionScanner(self.config)
+            anomalies = wd_scanner._analyze_weight_distributions(weights_info)
+
+            for anomaly in anomalies:
+                result.add_check(
+                    name="Weight Distribution Anomaly Detection",
+                    passed=False,
+                    message=anomaly["description"],
+                    severity=anomaly["severity"],
+                    location=path,
+                    details=anomaly["details"],
+                    why=anomaly.get("why"),
+                )
+
+            result.metadata["layers_analyzed"] = len(weights_info)
+            result.metadata["anomalies_found"] = len(anomalies)
+        except Exception as e:
+            logger.debug(f"Weight distribution analysis failed: {e}")

@@ -85,6 +85,11 @@ class WeightDistributionScanner(BaseScanner):
                 get_protobuf_classes()
             except ImportError:
                 return False
+        if ext == ".onnx":
+            try:
+                import onnx  # noqa: F401
+            except ImportError:
+                return False
         return True
 
     def scan(self, path: str) -> ScanResult:
@@ -394,7 +399,12 @@ class WeightDistributionScanner(BaseScanner):
         return weights_info
 
     def _extract_onnx_weights(self, path: str) -> dict[str, Any]:
-        """Extract weights from ONNX model files"""
+        """Extract weights from ONNX model files.
+
+        Uses load_external_data=False to avoid failures when external data files
+        are missing (common with HuggingFace downloads or standalone .onnx files).
+        External-data tensors are skipped since their data is not available inline.
+        """
         try:
             import onnx
         except ImportError:
@@ -403,17 +413,29 @@ class WeightDistributionScanner(BaseScanner):
         weights_info: dict[str, Any] = {}
 
         try:
-            model = onnx.load(path)  # type: ignore[possibly-unresolved-reference]
+            # Use load_external_data=False to prevent ValidationError when
+            # external data files (e.g. weights.pb) are missing. This is the
+            # common case for models downloaded from HuggingFace or distributed
+            # as standalone .onnx files without their companion data files.
+            model = onnx.load(path, load_external_data=False)  # type: ignore[possibly-unresolved-reference]
 
             # Extract 2D+ initializers — these are weight matrices (conv kernels,
             # linear layers, embeddings). 1D tensors (biases, batch-norm params)
             # aren't relevant for weight distribution analysis. This approach is
             # framework-agnostic since ONNX naming conventions vary by exporter.
             for initializer in model.graph.initializer:
+                # Skip external-data tensors — their raw bytes are not available
+                # when loaded with load_external_data=False and calling to_array
+                # on them would raise a ValidationError.
+                if initializer.data_location == onnx.TensorProto.EXTERNAL:
+                    continue
                 if len(initializer.dims) >= 2:
-                    weights_info[initializer.name] = onnx.numpy_helper.to_array(  # type: ignore[possibly-unresolved-reference]
+                    array = onnx.numpy_helper.to_array(  # type: ignore[possibly-unresolved-reference]
                         initializer,
                     )
+                    if self.max_array_size and self.max_array_size > 0 and array.nbytes > self.max_array_size:
+                        continue
+                    weights_info[initializer.name] = array
 
         except Exception as e:
             logger.debug(f"Failed to extract weights from {path}: {e}")
