@@ -621,6 +621,16 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "_reconstruct",
         "scalar",
     ],
+    # numpy 1.26+ moved core → _core; both paths appear in pickle streams
+    "numpy._core": [
+        "multiarray",
+        "numeric",
+        "_internal",
+    ],
+    "numpy._core.multiarray": [
+        "_reconstruct",
+        "scalar",
+    ],
     "numpy.random._pickle": [
         "__randomstate_ctor",
         "__generator_ctor",
@@ -662,6 +672,14 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "pi",
         "e",
     ],
+    # operator module functions used by sklearn (e.g., FunctionTransformer with methodcaller).
+    # In ML contexts these are safe; non-ML contexts still flag via ALWAYS_DANGEROUS_FUNCTIONS.
+    "operator": [
+        "methodcaller",
+        "itemgetter",
+        "attrgetter",
+        "getitem",
+    ],
     # Truncated numpy module references from pickle opcode resolution.
     # The pickle scanner sometimes resolves module names incompletely
     # (e.g., "_reconstruct" instead of "numpy.core.multiarray._reconstruct").
@@ -670,13 +688,6 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
     "multiarray": ["_reconstruct", "scalar"],
     "brilliant": ["scalar"],  # misparsed numpy.core.multiarray.scalar
     "numpy_pickle": ["NumpyArrayWrapper", "NDArrayWrapper"],
-    # Numpy random bit generators (used by sklearn for random state)
-    "numpy.random._mt19937": ["MT19937"],
-    "numpy.random._philox": ["Philox"],
-    "numpy.random._pcg64": ["PCG64"],
-    "numpy.random._sfc64": ["SFC64"],
-    "numpy.random._generator": ["Generator"],
-    "numpy.random._common": ["BitGenerator"],
     "MT19937": ["__bit_generator_ctor"],
     # YOLO/Ultralytics safe patterns
     "ultralytics": [
@@ -763,6 +774,31 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
     "sklearn.ensemble._hist_gradient_boosting.gradient_boosting": [
         "HistGradientBoostingClassifier",
         "HistGradientBoostingRegressor",
+    ],
+    "sklearn.ensemble._hist_gradient_boosting.binning": [
+        "_BinMapper",
+    ],
+    "sklearn.ensemble._hist_gradient_boosting.predictor": [
+        "TreePredictor",
+    ],
+    "sklearn.ensemble._hist_gradient_boosting._predictor": [
+        "TreePredictor",
+    ],
+    "sklearn.ensemble._hist_gradient_boosting.grower": [
+        "TreeGrower",
+        "TreeNode",
+    ],
+    "sklearn.ensemble._hist_gradient_boosting.splitting": [
+        "Splitter",
+        "SplitInfo",
+    ],
+    "sklearn.ensemble._hist_gradient_boosting.common": [
+        "MonotonicConstraint",
+        "X_DTYPE",
+        "X_BINNED_DTYPE",
+        "Y_DTYPE",
+        "G_H_DTYPE",
+        "X_BITSET_INNER_DTYPE",
     ],
     "sklearn.linear_model": [
         "LinearRegression",

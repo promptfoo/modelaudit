@@ -209,8 +209,6 @@ DANGEROUS_BUILTINS = [
 # Suspicious string patterns used by PickleScanner
 # Regex patterns that match potentially malicious code in string literals
 SUSPICIOUS_STRING_PATTERNS = [
-    # Python magic methods - can hide malicious code
-    r"__[\w]+__",  # Magic methods like __reduce__, __setstate__
     # Encoding/decoding operations - often used for obfuscation
     r"base64\.b64decode",  # Base64 decoding
     # Dynamic code execution - CRITICAL
@@ -228,7 +226,7 @@ SUSPICIOUS_STRING_PATTERNS = [
     r"importlib",  # Dynamic import library
     r"__import__",  # Built-in import function
     # Code construction - MEDIUM RISK
-    r"lambda",  # Anonymous function creation
+    r"\blambda\b",  # Anonymous function creation (word boundary to avoid matching e.g. "reg_lambda")
     # Hex encoding - possible obfuscation
     r"\\x[0-9a-fA-F]{2}",  # Hex-encoded characters
     # getattr-based evasion patterns - bypass string matching via dynamic attribute access
