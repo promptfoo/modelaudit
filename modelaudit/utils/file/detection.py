@@ -489,6 +489,13 @@ def validate_file_type(path: str) -> bool:
                 return header_format in {"zip", "numpy"}
             return header_format == "numpy"
 
+        # PaddlePaddle files: .pdmodel files are protobuf serialised program
+        # descriptors and .pdiparams files are raw binary weight tensors.
+        # Neither format has distinctive magic bytes, so magic-based
+        # detection legitimately returns "unknown".  Accept that.
+        if ext_format == "paddle":
+            return True
+
         # Flax msgpack files (less strict validation)
         if ext_format == "flax_msgpack":
             return True  # Hard to validate msgpack format reliably
