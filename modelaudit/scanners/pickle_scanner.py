@@ -705,6 +705,65 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "_reconstruct",
         "scalar",
     ],
+    # NumPy random module - bit generators and random state used in sklearn models
+    "numpy.random": [
+        "MT19937",
+        "PCG64",
+        "PCG64DXSM",
+        "Philox",
+        "SFC64",
+        "RandomState",
+        "Generator",
+        "__RandomState_ctor",
+        "_pickle_bitgen",
+    ],
+    "numpy.random._mt19937": [
+        "MT19937",
+    ],
+    "numpy.random._pcg64": [
+        "PCG64",
+        "PCG64DXSM",
+    ],
+    "numpy.random._philox": [
+        "Philox",
+    ],
+    "numpy.random._sfc64": [
+        "SFC64",
+    ],
+    "numpy.random._pickle": [
+        "__bit_generator_ctor",
+        "__generator_ctor",
+        "__randomstate_ctor",
+    ],
+    # copy_reg is used by Python 2 pickles for __reduce_ex__ support
+    "copy_reg": [
+        "_reconstructor",
+    ],
+    "copyreg": [
+        "_reconstructor",
+    ],
+    # scipy sparse matrices (common in sklearn pipelines)
+    "scipy.sparse": [
+        "csr_matrix",
+        "csc_matrix",
+        "coo_matrix",
+        "lil_matrix",
+        "bsr_matrix",
+        "dia_matrix",
+        "dok_matrix",
+    ],
+    "scipy.sparse._csr": [
+        "csr_matrix",
+        "csr_array",
+    ],
+    "scipy.sparse._csc": [
+        "csc_matrix",
+        "csc_array",
+    ],
+    "scipy.sparse._coo": [
+        "coo_matrix",
+        "coo_array",
+    ],
     "math": [
         "sqrt",
         "pow",
@@ -734,6 +793,10 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "Classify",
     ],
     # Standard ML libraries
+    # NOTE: sklearn internal modules use private subpaths like
+    # sklearn.ensemble._forest, sklearn.impute._base, etc.
+    # The _is_safe_ml_global prefix matching handles these automatically
+    # as long as the parent submodule (e.g. "ensemble") is listed here.
     "sklearn": [
         "base",
         "ensemble",
@@ -744,6 +807,32 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "cluster",
         "decomposition",
         "preprocessing",
+        "pipeline",
+        "compose",
+        "impute",
+        "model_selection",
+        "metrics",
+        "feature_extraction",
+        "feature_selection",
+        "utils",
+        "calibration",
+        "discriminant_analysis",
+        "gaussian_process",
+        "isotonic",
+        "kernel_approximation",
+        "kernel_ridge",
+        "manifold",
+        "mixture",
+        "multiclass",
+        "multioutput",
+        "naive_bayes",
+        "neural_network",
+        "random_projection",
+        "semi_supervised",
+        "covariance",
+        "cross_decomposition",
+        "datasets",
+        "exceptions",
     ],
     "transformers": [
         "AutoModel",
@@ -920,6 +1009,12 @@ def _detect_ml_context(opcodes: list[tuple]) -> dict[str, Any]:
                 # Also track the full reference for pattern matching
                 global_refs[full_ref] = global_refs.get(full_ref, 0) + 1
 
+                # Also track top-level module (e.g., "sklearn" from "sklearn.pipeline")
+                # This ensures framework detection works for STACK_GLOBAL the same as GLOBAL
+                if "." in module:
+                    top_level = module.split(".")[0]
+                    global_refs[top_level] = global_refs.get(top_level, 0) + 1
+
     # Check each framework with improved scoring
     for framework, patterns in ML_FRAMEWORK_PATTERNS.items():
         framework_score = 0.0
@@ -1067,7 +1162,9 @@ def _find_stack_global_strings(opcodes: list, start_index: int, lookback: int = 
     Find the two most recent string opcodes before a STACK_GLOBAL.
 
     STACK_GLOBAL uses two strings from the stack (module and function/class name).
-    This searches backwards to find them.
+    This searches backwards to find them.  If a BINGET/LONG_BINGET is encountered
+    before two strings are found, we return None since the operand came from a
+    memo reference that we cannot resolve here (callers should check the memo map).
 
     Args:
         opcodes: List of (opcode, arg, pos) tuples
@@ -1093,6 +1190,10 @@ def _find_stack_global_strings(opcodes: list, start_index: int, lookback: int = 
             recent_strings.insert(0, prev_arg)
             if len(recent_strings) >= 2:
                 return recent_strings[0], recent_strings[1]
+        elif prev_opcode.name in ("BINGET", "LONG_BINGET"):
+            # One of the STACK_GLOBAL operands is from a memo reference.
+            # We can't resolve it here, so return None to avoid misattribution.
+            return None
 
     return None
 
@@ -1540,6 +1641,8 @@ def check_opcode_sequence(
     # ML global.  This lets us recognise BINGET → REDUCE patterns where the
     # callable was stored once via GLOBAL + BINPUT and then recalled many times.
     _safe_memo: dict[int, bool] = {}
+    # MEMOIZE (protocol 4+) auto-assigns indices starting at 0
+    _memoize_counter = 0
 
     for i, (opcode, arg, pos) in enumerate(opcodes):
         # Reset counters at stream boundaries (STOP) so that multi-stream
@@ -1552,11 +1655,22 @@ def check_opcode_sequence(
             max_consecutive = 0
             continue
 
-        # Maintain memo safety map: when BINPUT/LONG_BINPUT stores a value
+        # Maintain memo safety map: when BINPUT/LONG_BINPUT/MEMOIZE stores a value
         # right after a safe GLOBAL/STACK_GLOBAL, mark that memo slot as safe.
+        # This lets us recognise BINGET -> REDUCE/NEWOBJ patterns where the
+        # callable was stored once and then recalled many times.
+        _memo_idx: int | None = None
         if opcode.name in ("BINPUT", "LONG_BINPUT") and isinstance(arg, int):
+            _memo_idx = arg
+        elif opcode.name == "MEMOIZE":
+            _memo_idx = _memoize_counter
+            _memoize_counter += 1
+
+        if _memo_idx is not None:
             # Look back for the most recent GLOBAL/STACK_GLOBAL to see if it
-            # was safe.  Typical pattern: GLOBAL mod func → BINPUT idx.
+            # was safe.  Typical patterns:
+            #   GLOBAL mod func -> BINPUT idx
+            #   STACK_GLOBAL -> MEMOIZE  (protocol 4+)
             for j in range(i - 1, max(0, i - 4), -1):
                 prev_opcode, prev_arg, _prev_pos = opcodes[j]
                 if prev_opcode.name == "GLOBAL" and isinstance(prev_arg, str):
@@ -1568,7 +1682,7 @@ def check_opcode_sequence(
                         else [prev_arg, ""]
                     )
                     if len(parts) == 2:
-                        _safe_memo[arg] = _is_safe_ml_global(parts[0], parts[1])
+                        _safe_memo[_memo_idx] = _is_safe_ml_global(parts[0], parts[1])
                     break
                 if prev_opcode.name == "STACK_GLOBAL":
                     strs: list[str] = []
@@ -1585,8 +1699,20 @@ def check_opcode_sequence(
                             strs.insert(0, pk_arg)
                             if len(strs) >= 2:
                                 break
+                        # BINGET resolves a previously memo'd value — if that
+                        # memo slot is known safe, propagate safety to the
+                        # STACK_GLOBAL result.
+                        if pk_op.name in ("BINGET", "LONG_BINGET") and isinstance(pk_arg, int):
+                            if _safe_memo.get(pk_arg, False):
+                                strs.insert(0, "__safe_memo__")  # placeholder
+                                if len(strs) >= 2:
+                                    break
                     if len(strs) >= 2:
-                        _safe_memo[arg] = _is_safe_ml_global(strs[0], strs[1])
+                        if "__safe_memo__" in strs:
+                            # One of the STACK_GLOBAL's operands was a safe memo ref
+                            _safe_memo[_memo_idx] = True
+                        else:
+                            _safe_memo[_memo_idx] = _is_safe_ml_global(strs[0], strs[1])
                     break
 
         # Track dangerous opcodes, skipping safe ML globals and structural opcodes
@@ -1621,8 +1747,9 @@ def check_opcode_sequence(
                             break
 
                     elif prev_opcode.name == "STACK_GLOBAL":
-                        # Look for the two most recent string opcodes
+                        # Look for the two most recent string/memo-ref opcodes
                         recent_strings: list[str] = []
+                        _reduce_has_safe_binget = False
                         for k in range(j - 1, max(0, j - 10), -1):
                             stack_prev_opcode, stack_prev_arg, _stack_prev_pos = opcodes[k]
                             if stack_prev_opcode.name in [
@@ -1636,13 +1763,23 @@ def check_opcode_sequence(
                                 recent_strings.insert(0, stack_prev_arg)
                                 if len(recent_strings) >= 2:
                                     break
+                            elif stack_prev_opcode.name in ("BINGET", "LONG_BINGET") and isinstance(
+                                stack_prev_arg, int
+                            ):
+                                if _safe_memo.get(stack_prev_arg, False):
+                                    _reduce_has_safe_binget = True
+                                    recent_strings.insert(0, "__safe_memo__")
+                                    if len(recent_strings) >= 2:
+                                        break
 
-                        if len(recent_strings) >= 2:
+                        if _reduce_has_safe_binget:
+                            is_dangerous_opcode = False
+                        elif len(recent_strings) >= 2:
                             mod, func = recent_strings[0], recent_strings[1]
                             # Only skip if in safe globals
                             if _is_safe_ml_global(mod, func):
                                 is_dangerous_opcode = False
-                            break
+                        break
 
                     # Handle memo pattern: BINGET retrieves a previously stored
                     # callable.  If that memo slot was marked safe, treat this
@@ -1664,6 +1801,7 @@ def check_opcode_sequence(
 
             elif opcode.name == "STACK_GLOBAL":
                 recent_strings = []
+                _sg_has_safe_binget = False
                 for k in range(i - 1, max(0, i - 10), -1):
                     prev_opcode, prev_arg, _prev_pos = opcodes[k]
                     if prev_opcode.name in [
@@ -1677,15 +1815,105 @@ def check_opcode_sequence(
                         recent_strings.insert(0, prev_arg)
                         if len(recent_strings) >= 2:
                             break
-                if len(recent_strings) >= 2:
+                    elif prev_opcode.name in ("BINGET", "LONG_BINGET") and isinstance(prev_arg, int):
+                        if _safe_memo.get(prev_arg, False):
+                            _sg_has_safe_binget = True
+                            recent_strings.insert(0, "__safe_memo__")
+                            if len(recent_strings) >= 2:
+                                break
+                if _sg_has_safe_binget:
+                    pass  # Safe: one operand from safe memo
+                elif len(recent_strings) >= 2:
                     mod, func = recent_strings[0], recent_strings[1]
                     if not _is_safe_ml_global(mod, func):
                         is_dangerous_opcode = True
                 else:
                     is_dangerous_opcode = True
 
+            # NEWOBJ/NEWOBJ_EX: check if the class being instantiated is safe
+            elif opcode.name in ("NEWOBJ", "NEWOBJ_EX"):
+                is_dangerous_opcode = True
+                # Look back for associated GLOBAL/STACK_GLOBAL (same logic as REDUCE)
+                for j in range(i - 1, max(0, i - 10), -1):
+                    prev_opcode, prev_arg, _prev_pos = opcodes[j]
+                    if prev_opcode.name == "GLOBAL" and isinstance(prev_arg, str):
+                        parts = (
+                            prev_arg.split(" ", 1)
+                            if " " in prev_arg
+                            else prev_arg.rsplit(".", 1)
+                            if "." in prev_arg
+                            else [prev_arg, ""]
+                        )
+                        if len(parts) == 2:
+                            mod, func = parts
+                            if _is_safe_ml_global(mod, func):
+                                is_dangerous_opcode = False
+                        break
+                    elif prev_opcode.name == "STACK_GLOBAL":
+                        _newobj_strings: list[str] = []
+                        _has_safe_binget = False
+                        for k in range(j - 1, max(0, j - 10), -1):
+                            _no_op, _no_arg, _ = opcodes[k]
+                            if _no_op.name in (
+                                "SHORT_BINSTRING",
+                                "BINSTRING",
+                                "STRING",
+                                "SHORT_BINUNICODE",
+                                "BINUNICODE",
+                                "UNICODE",
+                            ) and isinstance(_no_arg, str):
+                                _newobj_strings.insert(0, _no_arg)
+                                if len(_newobj_strings) >= 2:
+                                    break
+                            elif _no_op.name in ("BINGET", "LONG_BINGET") and isinstance(_no_arg, int):
+                                if _safe_memo.get(_no_arg, False):
+                                    _has_safe_binget = True
+                                    _newobj_strings.insert(0, "__safe_memo__")
+                                    if len(_newobj_strings) >= 2:
+                                        break
+                        if _has_safe_binget:
+                            # One of the STACK_GLOBAL operands was a safe memo ref
+                            is_dangerous_opcode = False
+                        elif len(_newobj_strings) >= 2:
+                            mod, func = _newobj_strings[0], _newobj_strings[1]
+                            if _is_safe_ml_global(mod, func):
+                                is_dangerous_opcode = False
+                        break
+                    elif prev_opcode.name in ("BINGET", "LONG_BINGET") and isinstance(prev_arg, int):
+                        if _safe_memo.get(prev_arg, False):
+                            is_dangerous_opcode = False
+                        break
+
+            # BUILD: only dangerous if not preceded by a safe class instantiation
+            elif opcode.name == "BUILD":
+                is_dangerous_opcode = True
+                # BUILD applies __setstate__ to the object on the stack.
+                # If the preceding constructor was for a safe ML class,
+                # this BUILD is part of normal deserialization.
+                for j in range(i - 1, max(0, i - 15), -1):
+                    prev_opcode, prev_arg, _prev_pos = opcodes[j]
+                    if prev_opcode.name in ("REDUCE", "NEWOBJ", "NEWOBJ_EX", "OBJ", "INST"):
+                        # Try direct GLOBAL resolution first
+                        _build_mod, _build_func, _ = _find_associated_global_or_class(opcodes, j)
+                        if _build_mod and _build_func and _is_safe_ml_global(_build_mod, _build_func):
+                            is_dangerous_opcode = False
+                            break
+                        # Fallback: check if constructor used a safe memo ref (BINGET)
+                        for k in range(j - 1, max(0, j - 10), -1):
+                            _bld_op, _bld_arg, _ = opcodes[k]
+                            if _bld_op.name in ("BINGET", "LONG_BINGET") and isinstance(_bld_arg, int):
+                                if _safe_memo.get(_bld_arg, False):
+                                    is_dangerous_opcode = False
+                                break
+                            if _bld_op.name in ("GLOBAL", "STACK_GLOBAL"):
+                                break
+                        break
+                    # If we hit another BUILD or GLOBAL first, stop looking
+                    if prev_opcode.name in ("BUILD", "GLOBAL", "STACK_GLOBAL"):
+                        break
+
             else:
-                # Other dangerous opcodes (INST, OBJ, NEWOBJ, NEWOBJ_EX, BUILD, EXT*)
+                # Other dangerous opcodes (INST, OBJ, EXT*)
                 is_dangerous_opcode = True
 
             if is_dangerous_opcode:
@@ -1697,10 +1925,23 @@ def check_opcode_sequence(
         else:
             consecutive_dangerous = 0
 
-        # Fixed threshold for dangerous opcode detection.
+        # Threshold for dangerous opcode detection.
         # Only execution-related opcodes are counted (memo/framing excluded),
-        # and safe ML globals are skipped for REDUCE/GLOBAL/STACK_GLOBAL.
-        threshold = 50
+        # and safe ML globals are skipped for REDUCE/GLOBAL/STACK_GLOBAL/NEWOBJ/BUILD.
+        # In a legitimate sklearn/numpy ML context, many REDUCE/BUILD opcodes
+        # are expected due to chained numpy reconstruction patterns
+        # (e.g., numpy.dtype -> BUILD -> numpy.core.multiarray.scalar -> REDUCE)
+        # that can't always be resolved through simple backward lookback.
+        # When ML confidence is high, individual REDUCE/NEWOBJ checks already
+        # flag specific dangerous globals, so the aggregate count adds no value
+        # and causes massive false positives on legitimate tree ensembles.
+        _ml_confidence = ml_context.get("overall_confidence", 0)
+        if _ml_confidence > 0.4:
+            # Suppress aggregate count in high-confidence ML context.
+            # Individual per-opcode checks still flag dangerous globals.
+            threshold = float("inf")
+        else:
+            threshold = 50
 
         if dangerous_opcode_count > threshold:
             suspicious_patterns.append(
@@ -3059,20 +3300,35 @@ class PickleScanner(BaseScanner):
                                         ml_context,
                                     )
 
+                                # CVE-2025-32434 is PyTorch-specific (torch.load RCE).
+                                # Only attribute to this CVE when PyTorch context is detected.
+                                _is_pytorch_context = "pytorch" in ml_context.get("frameworks", {})
+                                if _is_pytorch_context:
+                                    _cve_msg = (
+                                        f"Found REDUCE opcode with non-allowlisted global: {associated_global}. "
+                                        f"This may indicate CVE-2025-32434 exploitation (RCE via torch.load)"
+                                    )
+                                    _cve_details: dict[str, Any] = {
+                                        "cve_id": "CVE-2025-32434",
+                                    }
+                                else:
+                                    _cve_msg = (
+                                        f"Found REDUCE opcode with non-allowlisted global: {associated_global}. "
+                                        f"This callable may execute arbitrary code during unpickling"
+                                    )
+                                    _cve_details = {}
+
                                 result.add_check(
                                     name="REDUCE Opcode Safety Check",
                                     passed=False,
-                                    message=(
-                                        f"Found REDUCE opcode with non-allowlisted global: {associated_global}. "
-                                        f"This may indicate CVE-2025-32434 exploitation (RCE via torch.load)"
-                                    ),
+                                    message=_cve_msg,
                                     severity=severity,
                                     location=f"{self.current_file_path} (pos {pos})",
                                     details={
                                         "position": pos,
                                         "opcode": opcode.name,
                                         "associated_global": associated_global,
-                                        "cve_id": "CVE-2025-32434",
+                                        **_cve_details,
                                         "ml_context_confidence": ml_context.get(
                                             "overall_confidence",
                                             0,

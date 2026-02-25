@@ -380,16 +380,13 @@ CVE_COMBINED_PATTERNS = {
 # because they flagged ALL legitimate sklearn/joblib models (100% false positive rate).
 # The regex CVE patterns (CVE_2020_13092_PATTERNS, CVE_2024_34997_PATTERNS) correctly detect
 # actual exploits by requiring COMBINATIONS (e.g., "sklearn.*joblib.*os.system"), not individual keywords.
+# NOTE: Single-keyword patterns (Pipeline, __reduce__, joblib.load, read_array, pickle.load) were
+# removed because they appear in EVERY legitimate sklearn/joblib/pickle model file and have
+# a 100% false positive rate.  The actual CVE detection uses multi-line regex patterns in
+# cve_patterns.py that require dangerous *combinations* of indicators.
 CVE_BINARY_PATTERNS = [
-    # CVE-2020-13092 binary signatures
-    b"joblib.load",
-    b"__reduce__",
+    # Only patterns that are genuinely dangerous when found as raw binary strings
     b"os.system",
-    b"Pipeline",
-    # CVE-2024-34997 binary signatures
-    b"read_array",
-    b"pickle.load",
-    b"joblib.cache",
 ]
 
 # Suspicious metadata patterns used by SafeTensorsScanner and others
