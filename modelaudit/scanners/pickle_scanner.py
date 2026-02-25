@@ -58,25 +58,49 @@ def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> 
     while True:
         stream_start = file_obj.tell()
         had_opcodes = False
-        try:
-            for item in pickletools.genops(file_obj):
-                had_opcodes = True
-                yield item
-        except ValueError as e:
-            error_str = str(e).lower()
-            if "opcode" in error_str and "unknown" in error_str:
-                logger.info(f"Protocol mismatch in pickle (joblib may use protocol 5 opcodes in protocol 4 files): {e}")
-            elif multi_stream and parsed_any_stream:
-                # In multi-stream mode, a ValueError on a subsequent stream means
-                # we hit non-pickle data (e.g. binary tensor data). Stop gracefully.
+        stream_error = False
+
+        if not parsed_any_stream:
+            # First stream: yield opcodes directly (no buffering needed)
+            try:
+                for item in pickletools.genops(file_obj):
+                    had_opcodes = True
+                    yield item
+            except ValueError as e:
+                error_str = str(e).lower()
+                if "opcode" in error_str and "unknown" in error_str:
+                    logger.info(
+                        f"Protocol mismatch in pickle (joblib may use protocol 5 opcodes in protocol 4 files): {e}"
+                    )
+                else:
+                    raise
+        else:
+            # Subsequent streams: buffer opcodes so that partial streams
+            # (e.g. binary tensor data misinterpreted as opcodes) don't
+            # produce false positives.
+            buffered: list[Any] = []
+            try:
+                for item in pickletools.genops(file_obj):
+                    had_opcodes = True
+                    buffered.append(item)
+            except ValueError:
+                # Any ValueError on a subsequent stream means we hit
+                # non-pickle data or a junk separator byte.
+                stream_error = True
+
+            if stream_error and had_opcodes:
+                # Partial stream: binary data was misinterpreted as opcodes.
+                # Discard the buffer and stop — no more valid streams.
                 return
-            else:
-                raise
+
+            if not stream_error:
+                # Stream completed successfully — yield buffered opcodes
+                yield from buffered
 
         if not multi_stream:
             return
 
-        if had_opcodes:
+        if had_opcodes and not stream_error:
             parsed_any_stream = True
 
         if not had_opcodes:
@@ -1512,7 +1536,59 @@ def check_opcode_sequence(
     consecutive_dangerous = 0
     max_consecutive = 0
 
+    # Track pickle memo: maps memo index -> True if the stored value is a safe
+    # ML global.  This lets us recognise BINGET → REDUCE patterns where the
+    # callable was stored once via GLOBAL + BINPUT and then recalled many times.
+    _safe_memo: dict[int, bool] = {}
+
     for i, (opcode, arg, pos) in enumerate(opcodes):
+        # Reset counters at stream boundaries (STOP) so that multi-stream
+        # analysis evaluates each pickle stream independently.  Without this,
+        # legitimate ML models with many REDUCE calls spread across multiple
+        # streams would accumulate past the threshold.
+        if opcode.name == "STOP":
+            dangerous_opcode_count = 0
+            consecutive_dangerous = 0
+            max_consecutive = 0
+            continue
+
+        # Maintain memo safety map: when BINPUT/LONG_BINPUT stores a value
+        # right after a safe GLOBAL/STACK_GLOBAL, mark that memo slot as safe.
+        if opcode.name in ("BINPUT", "LONG_BINPUT") and isinstance(arg, int):
+            # Look back for the most recent GLOBAL/STACK_GLOBAL to see if it
+            # was safe.  Typical pattern: GLOBAL mod func → BINPUT idx.
+            for j in range(i - 1, max(0, i - 4), -1):
+                prev_opcode, prev_arg, _prev_pos = opcodes[j]
+                if prev_opcode.name == "GLOBAL" and isinstance(prev_arg, str):
+                    parts = (
+                        prev_arg.split(" ", 1)
+                        if " " in prev_arg
+                        else prev_arg.rsplit(".", 1)
+                        if "." in prev_arg
+                        else [prev_arg, ""]
+                    )
+                    if len(parts) == 2:
+                        _safe_memo[arg] = _is_safe_ml_global(parts[0], parts[1])
+                    break
+                if prev_opcode.name == "STACK_GLOBAL":
+                    strs: list[str] = []
+                    for k in range(j - 1, max(0, j - 10), -1):
+                        pk_op, pk_arg, _ = opcodes[k]
+                        if pk_op.name in (
+                            "SHORT_BINSTRING",
+                            "BINSTRING",
+                            "STRING",
+                            "SHORT_BINUNICODE",
+                            "BINUNICODE",
+                            "UNICODE",
+                        ) and isinstance(pk_arg, str):
+                            strs.insert(0, pk_arg)
+                            if len(strs) >= 2:
+                                break
+                    if len(strs) >= 2:
+                        _safe_memo[arg] = _is_safe_ml_global(strs[0], strs[1])
+                    break
+
         # Track dangerous opcodes, skipping safe ML globals and structural opcodes
         is_dangerous_opcode = False
 
@@ -1525,7 +1601,7 @@ def check_opcode_sequence(
             elif opcode.name == "REDUCE":
                 # Default to dangerous if no associated GLOBAL/STACK_GLOBAL found
                 is_dangerous_opcode = True
-                # Look back to find the associated GLOBAL or STACK_GLOBAL
+                # Look back to find the associated GLOBAL, STACK_GLOBAL, or BINGET (memo)
                 for j in range(i - 1, max(0, i - 10), -1):
                     prev_opcode, prev_arg, _prev_pos = opcodes[j]
 
@@ -1567,6 +1643,14 @@ def check_opcode_sequence(
                             if _is_safe_ml_global(mod, func):
                                 is_dangerous_opcode = False
                             break
+
+                    # Handle memo pattern: BINGET retrieves a previously stored
+                    # callable.  If that memo slot was marked safe, treat this
+                    # REDUCE as safe too.
+                    elif prev_opcode.name in ("BINGET", "LONG_BINGET") and isinstance(prev_arg, int):
+                        if _safe_memo.get(prev_arg, False):
+                            is_dangerous_opcode = False
+                        break
 
             # GLOBAL/STACK_GLOBAL: only count when referencing non-safe modules
             elif opcode.name == "GLOBAL" and isinstance(arg, str):
