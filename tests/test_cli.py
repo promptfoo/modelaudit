@@ -424,6 +424,22 @@ def test_format_text_output_only_debug_issues():
     assert "NO ISSUES FOUND" in clean_output
 
 
+def test_format_text_output_operational_errors_status():
+    """Ensure operational errors are surfaced in final text status."""
+    results = {
+        "files_scanned": 1,
+        "bytes_scanned": 10,
+        "duration": 0.1,
+        "issues": [],
+        "has_errors": True,
+    }
+
+    output = format_text_output(results, verbose=False)
+    clean_output = strip_ansi(output)
+    assert "SCAN COMPLETED WITH OPERATIONAL ERRORS" in clean_output
+    assert "NO ISSUES FOUND" not in clean_output
+
+
 def test_format_text_output_only_info_issues():
     """Ensure info-only issues result in a success status."""
     results = {

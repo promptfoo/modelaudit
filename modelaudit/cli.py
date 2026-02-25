@@ -2029,9 +2029,19 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
     output_lines.append("")
     output_lines.append("═" * 80)
 
-    # Check if no files were scanned
+    # Check if scan had operational errors first (highest priority in exit code)
+    has_operational_errors = bool(results.get("has_errors"))
     files_scanned = results.get("files_scanned", 0)
-    if files_scanned == 0:
+    if has_operational_errors:
+        status_icon = "❌"
+        status_msg = "SCAN COMPLETED WITH OPERATIONAL ERRORS"
+        status_color = "red"
+        output_lines.append(f"  {style_text(f'{status_icon} {status_msg}', fg=status_color, bold=True)}")
+        output_lines.append(
+            f"  {style_text('Review warnings above and use --verbose for troubleshooting details.', fg='yellow')}"
+        )
+    # Check if no files were scanned
+    elif files_scanned == 0:
         status_icon = "❌"
         status_msg = "NO FILES SCANNED"
         status_color = "red"
