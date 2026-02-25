@@ -49,6 +49,7 @@ dependencies = [
     "gcsfs>=2025.5.1",
     "posthog>=7.0.0",
     "protobuf>=5.29.0",
+    "msgpack>=1.0.0,<2.0",
 ]
 
 [project.optional-dependencies]
