@@ -1194,14 +1194,21 @@ def _detect_ml_context(opcodes: list[tuple]) -> dict[str, Any]:
         matches: list[str] = []
 
         # Check module matches with improved scoring
+        # Uses prefix matching so that e.g. module pattern "sklearn" matches
+        # global refs like "sklearn.pipeline", "sklearn.ensemble._iforest", etc.
         modules = patterns["modules"]
         if isinstance(modules, list):
             for module in modules:
-                if module in global_refs:
+                # Aggregate counts from all global_refs that match this module
+                # either exactly or as a prefix (e.g. "sklearn" matches "sklearn.pipeline")
+                ref_count = 0
+                for ref_key, ref_cnt in global_refs.items():
+                    if ref_key == module or ref_key.startswith(module + "."):
+                        ref_count += ref_cnt
+
+                if ref_count > 0:
                     # Score based on presence and frequency,
                     # not proportion of total opcodes
-                    ref_count = global_refs[module]
-
                     # Base score for presence
                     module_score = 10.0  # Base score for any ML module presence
 
@@ -2146,8 +2153,10 @@ def check_opcode_sequence(
         threshold = 50
 
         # In high-confidence ML contexts (e.g. sklearn tree ensembles, xgboost),
-        # tree-based models legitimately produce hundreds of REDUCE/NEWOBJ opcodes
-        # for each estimator node.  Raise the threshold to suppress false positives.
+        # tree-based models legitimately produce hundreds of REDUCE/NEWOBJ/BUILD opcodes
+        # for each estimator node.  A Random Forest with 100 trees can easily produce
+        # 5000+ BUILD opcodes from __setstate__ calls on tree nodes.
+        # Raise the threshold significantly to suppress false positives.
         _ml_frameworks = ml_context.get("frameworks", {})
         _tree_ensemble_frameworks = {"sklearn", "xgboost"}
         if (
@@ -2155,7 +2164,7 @@ def check_opcode_sequence(
             and ml_context.get("overall_confidence", 0) >= 0.5
             and _tree_ensemble_frameworks & set(_ml_frameworks.keys())
         ):
-            threshold = 500
+            threshold = 5000
 
         if dangerous_opcode_count > threshold:
             suspicious_patterns.append(
