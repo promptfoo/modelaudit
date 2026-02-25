@@ -44,10 +44,19 @@ def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> 
 
     When *multi_stream* is True the generator continues parsing after the first STOP
     opcode so that malicious payloads hidden in a second pickle stream are not missed.
+    Non-pickle separator bytes between streams are skipped (up to a limit) so that a
+    single junk byte cannot bypass detection.
 
     Yields: (opcode, arg, pos) tuples from pickletools.genops
     """
+    # Maximum number of consecutive non-pickle bytes to skip when resyncing
+    _MAX_RESYNC_BYTES = 256
+    resync_skipped = 0
+    # Track whether we've successfully parsed at least one complete stream
+    parsed_any_stream = False
+
     while True:
+        stream_start = file_obj.tell()
         had_opcodes = False
         try:
             for item in pickletools.genops(file_obj):
@@ -57,15 +66,33 @@ def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> 
             error_str = str(e).lower()
             if "opcode" in error_str and "unknown" in error_str:
                 logger.info(f"Protocol mismatch in pickle (joblib may use protocol 5 opcodes in protocol 4 files): {e}")
+            elif multi_stream and parsed_any_stream:
+                # In multi-stream mode, a ValueError on a subsequent stream means
+                # we hit non-pickle data (e.g. binary tensor data). Stop gracefully.
+                return
             else:
                 raise
 
         if not multi_stream:
             return
 
-        # Check if there is another pickle stream after STOP
+        if had_opcodes:
+            parsed_any_stream = True
+
         if not had_opcodes:
-            return
+            # Resync: the current byte was not a valid pickle start.
+            # Skip one byte and keep searching for the next stream, up to a limit.
+            file_obj.seek(stream_start, 0)
+            if not file_obj.read(1):
+                return  # EOF
+            resync_skipped += 1
+            if resync_skipped >= _MAX_RESYNC_BYTES:
+                return
+            continue
+
+        # Found a valid stream — reset resync counter
+        resync_skipped = 0
+        # Check if there is another pickle stream after STOP
         next_byte = file_obj.read(1)
         if not next_byte:
             return  # EOF
@@ -1821,10 +1848,15 @@ class PickleScanner(BaseScanner):
                 # For .bin files, also scan the remaining binary content
                 # PyTorch files have pickle header followed by tensor data
                 if is_bin_file and scan_result.success:
-                    pickle_end_pos = f.tell()
+                    # Use the first pickle stream end position (before multi-stream
+                    # scanning consumed additional bytes) for binary content scanning.
+                    pickle_end_pos = scan_result.metadata.get("first_pickle_end_pos", f.tell())
                     remaining_bytes = file_size - pickle_end_pos
 
                     if remaining_bytes > 0:
+                        # Seek to the pickle end position (multi-stream scanning may
+                        # have advanced the file pointer beyond this point).
+                        f.seek(pickle_end_pos)
                         # Always scan binary content after pickle
                         # Removed ML confidence-based skipping to prevent security bypasses
                         binary_result = self._scan_binary_content(
@@ -2551,6 +2583,8 @@ class PickleScanner(BaseScanner):
             opcodes = []
             # Track strings on the stack for STACK_GLOBAL opcode analysis
             string_stack = []
+            # Track end position of the first pickle stream for binary scanning
+            first_pickle_end_pos: int | None = None
 
             # Track stack depth for complexity analysis
             current_stack_depth = 0
@@ -2589,6 +2623,8 @@ class PickleScanner(BaseScanner):
                 # STOP resets the stack
                 elif opcode.name == "STOP":
                     current_stack_depth = 0
+                    if first_pickle_end_pos is None:
+                        first_pickle_end_pos = start_pos + pos + 1
 
                 # Store stack depth warnings for ML-context-aware processing later
                 if current_stack_depth > base_stack_depth_limit:
@@ -2784,6 +2820,8 @@ class PickleScanner(BaseScanner):
                     "suspicious_count": suspicious_count,
                 },
             )
+            if first_pickle_end_pos is not None:
+                result.metadata["first_pickle_end_pos"] = first_pickle_end_pos
 
             # Analyze globals extracted from all pickle streams
             for mod, func in advanced_globals:

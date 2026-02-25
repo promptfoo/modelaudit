@@ -14,7 +14,7 @@ from modelaudit.detectors.suspicious_symbols import (
     BINARY_CODE_PATTERNS,
     EXECUTABLE_SIGNATURES,
 )
-from modelaudit.scanners.base import IssueSeverity
+from modelaudit.scanners.base import IssueSeverity, ScanResult
 from modelaudit.scanners.pickle_scanner import PickleScanner
 from tests.assets.generators.generate_advanced_pickle_tests import (
     generate_memo_based_attack,
@@ -535,7 +535,7 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
         call_ops = b"(" + b"t" + b"R" + b"."
         return proto + global_op + call_ops
 
-    def _scan_bytes(self, data: bytes):
+    def _scan_bytes(self, data: bytes) -> ScanResult:
         import os
         import tempfile
 
@@ -552,7 +552,7 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
     # ------------------------------------------------------------------
     # Fix 1: pkgutil trampoline — must be CRITICAL
     # ------------------------------------------------------------------
-    def test_pkgutil_resolve_name_critical(self):
+    def test_pkgutil_resolve_name_critical(self) -> None:
         """pkgutil.resolve_name is a dynamic resolution trampoline to arbitrary callables."""
         result = self._scan_bytes(self._craft_global_reduce_pickle("pkgutil", "resolve_name"))
         assert result.success
@@ -564,7 +564,7 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
     # ------------------------------------------------------------------
     # Fix 1: uuid RCE — must be CRITICAL
     # ------------------------------------------------------------------
-    def test_uuid_get_command_stdout_critical(self):
+    def test_uuid_get_command_stdout_critical(self) -> None:
         """uuid._get_command_stdout internally calls subprocess.Popen."""
         result = self._scan_bytes(self._craft_global_reduce_pickle("uuid", "_get_command_stdout"))
         assert result.success
@@ -576,7 +576,7 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
     # ------------------------------------------------------------------
     # Fix 2: Multi-stream exploit (benign stream 1 + malicious stream 2)
     # ------------------------------------------------------------------
-    def test_multi_stream_benign_then_malicious(self):
+    def test_multi_stream_benign_then_malicious(self) -> None:
         """Scanner must detect malicious globals in stream 2 even if stream 1 is benign."""
         import io
 
@@ -597,10 +597,33 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
         ]
         assert os_issues, f"Expected CRITICAL os issue in stream 2, got: {[i.message for i in result.issues]}"
 
+    def test_multi_stream_separator_byte_resync(self) -> None:
+        """Scanner must detect malicious stream even with junk separator bytes between streams."""
+        import io
+
+        buf = io.BytesIO()
+        # Stream 1: benign
+        pickle.dump({"safe": True}, buf, protocol=2)
+        # Junk separator byte (non-pickle byte between streams)
+        buf.write(b"\x00")
+        # Stream 2: malicious — os.system via GLOBAL+REDUCE
+        buf.write(self._craft_global_reduce_pickle("os", "system"))
+        data = buf.getvalue()
+
+        result = self._scan_bytes(data)
+        assert result.success
+        assert result.has_errors
+        os_issues = [
+            i
+            for i in result.issues
+            if i.severity == IssueSeverity.CRITICAL and ("os" in i.message.lower() or "posix" in i.message.lower())
+        ]
+        assert os_issues, f"Expected CRITICAL os issue after separator byte, got: {[i.message for i in result.issues]}"
+
     # ------------------------------------------------------------------
     # Fix 4: NEWOBJ_EX with dangerous class
     # ------------------------------------------------------------------
-    def test_newobj_ex_dangerous_class(self):
+    def test_newobj_ex_dangerous_class(self) -> None:
         """NEWOBJ_EX opcode with a dangerous class should be flagged."""
         # Craft pickle: PROTO 4 | GLOBAL 'os _wrap_close' | EMPTY_TUPLE | EMPTY_DICT | NEWOBJ_EX | STOP
         # Protocol 4 is needed for NEWOBJ_EX (opcode 0x92)
@@ -621,7 +644,7 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
     # ------------------------------------------------------------------
     # Fix 1: Spot-check newly-added modules
     # ------------------------------------------------------------------
-    def test_smtplib_blocked(self):
+    def test_smtplib_blocked(self) -> None:
         """smtplib module should be flagged as dangerous."""
         result = self._scan_bytes(self._craft_global_reduce_pickle("smtplib", "SMTP"))
         assert result.has_errors
@@ -629,7 +652,7 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
             f"Expected CRITICAL smtplib issue, got: {[i.message for i in result.issues]}"
         )
 
-    def test_sqlite3_blocked(self):
+    def test_sqlite3_blocked(self) -> None:
         """sqlite3 module should be flagged as dangerous."""
         result = self._scan_bytes(self._craft_global_reduce_pickle("sqlite3", "connect"))
         assert result.has_errors
@@ -637,7 +660,7 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
             f"Expected CRITICAL sqlite3 issue, got: {[i.message for i in result.issues]}"
         )
 
-    def test_tarfile_blocked(self):
+    def test_tarfile_blocked(self) -> None:
         """tarfile module should be flagged as dangerous."""
         result = self._scan_bytes(self._craft_global_reduce_pickle("tarfile", "open"))
         assert result.has_errors
@@ -647,7 +670,7 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
 
     # NOTE: ctypes test omitted — ctypes added to ALWAYS_DANGEROUS_MODULES in PR #518
 
-    def test_marshal_blocked(self):
+    def test_marshal_blocked(self) -> None:
         """marshal module should be flagged as dangerous."""
         result = self._scan_bytes(self._craft_global_reduce_pickle("marshal", "loads"))
         assert result.has_errors
@@ -655,7 +678,7 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
             f"Expected CRITICAL marshal issue, got: {[i.message for i in result.issues]}"
         )
 
-    def test_cloudpickle_blocked(self):
+    def test_cloudpickle_blocked(self) -> None:
         """cloudpickle module should be flagged as dangerous."""
         result = self._scan_bytes(self._craft_global_reduce_pickle("cloudpickle", "loads"))
         assert result.has_errors
@@ -663,7 +686,7 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
             f"Expected CRITICAL cloudpickle issue, got: {[i.message for i in result.issues]}"
         )
 
-    def test_webbrowser_blocked(self):
+    def test_webbrowser_blocked(self) -> None:
         """webbrowser module should be flagged as dangerous."""
         result = self._scan_bytes(self._craft_global_reduce_pickle("webbrowser", "open"))
         assert result.has_errors
