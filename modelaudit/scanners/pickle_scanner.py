@@ -3517,9 +3517,8 @@ class PickleScanner(BaseScanner):
                                 # CVE-2025-32434 is specific to torch.load() and
                                 # should only be referenced for PyTorch file formats
                                 _ext = os.path.splitext(self.current_file_path)[1].lower()
-                                _is_pytorch_file = (
-                                    _ext in {".pt", ".pth"}
-                                    or (_ext == ".bin" and "pytorch" in ml_context.get("frameworks", {}))
+                                _is_pytorch_file = _ext in {".pt", ".pth"} or (
+                                    _ext == ".bin" and "pytorch" in ml_context.get("frameworks", {})
                                 )
                                 if _is_pytorch_file:
                                     _reduce_msg = (
