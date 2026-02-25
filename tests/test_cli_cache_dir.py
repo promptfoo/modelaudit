@@ -44,12 +44,11 @@ class TestCacheDirOption:
     """Test the --cache-dir option functionality."""
 
     def test_cache_dir_option_exists(self):
-        """Test that cache directory is handled via automatic defaults."""
+        """Test that cache directory option is available."""
         runner = CliRunner()
         result = runner.invoke(cli, ["scan", "--help"])
         assert result.exit_code == 0
-        # --cache-dir is now handled by automatic defaults, not a CLI flag
-        assert "automatic defaults" in result.output.lower()
+        assert "--cache-dir" in result.output
         assert "--no-cache" in result.output
 
     @patch("modelaudit.cli.should_show_spinner", return_value=False)
@@ -169,3 +168,46 @@ class TestCacheDirOption:
         # The actual message is "Tip: Use --stream to minimize disk usage, or use --cache-dir..."
         assert "disk" in result.output.lower()
         assert result.exit_code != 0
+
+    @patch("modelaudit.cli.should_show_spinner", return_value=False)
+    @patch("modelaudit.cli.download_model")
+    @patch("modelaudit.cli.is_huggingface_url")
+    @patch("modelaudit.cli.scan_model_directory_or_file")
+    def test_explicit_cache_dir_flag(self, mock_scan, mock_is_hf_url, mock_download_model, mock_spinner, tmp_path):
+        """Test that --cache-dir flag sets cache_dir and enables caching."""
+        mock_is_hf_url.return_value = True
+        mock_download_path = tmp_path / "downloaded_model"
+        mock_download_path.mkdir()
+        mock_download_model.return_value = mock_download_path
+        mock_scan.return_value = create_mock_scan_result(success=True, issues=[])
+
+        cache_path = tmp_path / "my_cache"
+        cache_path.mkdir()
+
+        runner = CliRunner()
+        result = runner.invoke(cli, ["scan", "--cache-dir", str(cache_path), "hf://test/model"])
+
+        assert result.exit_code == 0
+        mock_download_model.assert_called_once()
+        call_kwargs = mock_download_model.call_args.kwargs
+        assert "cache_dir" in call_kwargs
+
+    @patch("modelaudit.cli.should_show_spinner", return_value=False)
+    @patch("modelaudit.cli.download_model")
+    @patch("modelaudit.cli.is_huggingface_url")
+    @patch("modelaudit.cli.scan_model_directory_or_file")
+    def test_no_cache_overrides_cache_dir(self, mock_scan, mock_is_hf_url, mock_download_model, mock_spinner, tmp_path):
+        """Test that --no-cache takes precedence over --cache-dir."""
+        mock_is_hf_url.return_value = True
+        mock_download_path = tmp_path / "downloaded_model"
+        mock_download_path.mkdir()
+        mock_download_model.return_value = mock_download_path
+        mock_scan.return_value = create_mock_scan_result(success=True, issues=[])
+
+        cache_path = tmp_path / "my_cache"
+        cache_path.mkdir()
+
+        runner = CliRunner()
+        result = runner.invoke(cli, ["scan", "--cache-dir", str(cache_path), "--no-cache", "hf://test/model"])
+
+        assert result.exit_code == 0

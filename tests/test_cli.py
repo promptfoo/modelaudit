@@ -102,7 +102,7 @@ def test_scan_command_help():
     assert "--max-size" in result.output  # Updated from --max-file-size
     assert "--strict" in result.output  # New consolidated flag
     assert "--dry-run" in result.output  # New flag
-    assert "Automatic Defaults:" in result.output  # New feature documentation
+    assert "Defaults:" in result.output or "Automatic defaults:" in result.output
 
 
 def test_scan_nonexistent_file():

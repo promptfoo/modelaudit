@@ -30,7 +30,7 @@ ModelAudit performs static analysis on model files before they are loaded into a
 | ModelAudit process itself            | Trusted               | Runs with the invoking user's privileges                             |
 | ModelAudit dependencies              | Conditionally trusted | Audited via pip-audit and Trivy; see Mitigations                     |
 
-ModelAudit does not make outbound network requests during scanning. Any model file retrieval is performed by the caller before invoking ModelAudit.
+The scanning engine makes no outbound network requests. The CLI may download model files from remote sources (e.g., HuggingFace Hub) before invoking the scanner.
 
 ---
 
@@ -38,7 +38,7 @@ ModelAudit does not make outbound network requests during scanning. Any model fi
 
 **Malicious model files targeting parser bugs.** ModelAudit parses binary formats (pickle, protobuf, ZIP, GGUF) written by an attacker. A crafted file could exploit a vulnerability in Python's `pickle`, `zipfile`, `struct`, or the vendored protobuf stubs.
 
-**Path traversal via archive extraction.** ZIP-based formats (`.keras`, `.zip`) may contain members with `../` or absolute paths. ModelAudit inspects archive members without extracting to disk, but logic errors in path checking could be bypassed.
+**Path traversal via archive extraction.** ZIP-based formats (`.keras`, `.zip`) and 7z archives may contain members with `../` or absolute paths. ZIP-based formats are inspected without extraction; 7z archives are extracted to a temp directory after filtering unsafe entries. Logic errors in path checking could still be bypassed.
 
 **Compression bombs.** Highly compressed archives could exhaust memory or disk during size-ratio checks. ModelAudit enforces documented limits based on the >100x ratio threshold.
 
@@ -60,11 +60,11 @@ ModelAudit does not make outbound network requests during scanning. Any model fi
 
 ## Mitigations
 
-**Static-only analysis.** ModelAudit never calls `pickle.loads`, `torch.load`, or any deserializer on untrusted input. Parsing uses format-specific byte-level readers. This eliminates the largest class of risk.
+**Static-only analysis.** Core scanners avoid Python object deserialization (`pickle.loads`, `joblib.load`, etc.) on untrusted input, relying on byte-level parsing and format-specific readers instead. ONNX scanning uses `onnx.load` (protobuf deserialization, not arbitrary code execution). The optional weight distribution scanner calls `torch.load` with `map_location='cpu'` for statistical analysis of PyTorch weight tensors. This eliminates the largest class of risk.
 
 **defusedxml for XML parsing.** All XML-based formats (ONNX, some TensorFlow variants) use `defusedxml` to prevent XML External Entity (XXE) and billion-laughs attacks.
 
-**Archive member inspection without extraction.** Path traversal checks are applied to member names before any extraction occurs. Archive size ratios are checked against documented bomb thresholds.
+**Archive member inspection.** ZIP-based formats are inspected without extraction to disk. 7z archives are extracted to an ephemeral temp directory for sub-scanning; path traversal checks filter unsafe entries before extraction. Archive size ratios are checked against documented bomb thresholds.
 
 **Vendored protobuf stubs.** TensorFlow SavedModel scanning uses vendored `.proto` stubs rather than requiring the ~2 GB TensorFlow package. This reduces the dependency surface and eliminates the TF runtime as an attack vector.
 

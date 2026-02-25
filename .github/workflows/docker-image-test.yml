@@ -7,7 +7,7 @@ on:
       - ".dockerignore"
       - "modelaudit/**"
       - "pyproject.toml"
-      - "requirements*.lock"
+      - "uv.lock"
       - ".github/workflows/docker-image-test.yml"
   push:
     branches:
@@ -37,7 +37,7 @@ jobs:
               - '.dockerignore'
               - 'modelaudit/**'
               - 'pyproject.toml'
-              - 'requirements*.lock'
+              - 'uv.lock'
             full-image:
               - 'Dockerfile.full'
 

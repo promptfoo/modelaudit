@@ -550,9 +550,7 @@ class PyTorchZipScanner(BaseScanner):
 
     def _check_blacklist_patterns(self, zip_file: zipfile.ZipFile, safe_entries: list[str], result: ScanResult) -> None:
         """Check for blacklisted patterns in all files"""
-        blacklist_patterns = None
-        if not blacklist_patterns:
-            blacklist_patterns = self.config.get("blacklist_patterns") if self.config else None
+        blacklist_patterns = self.config.get("blacklist_patterns") if self.config else None
 
         if blacklist_patterns:
             self._scan_blacklist_patterns(zip_file, safe_entries, blacklist_patterns, result)

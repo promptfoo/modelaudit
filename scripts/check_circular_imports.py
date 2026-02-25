@@ -53,9 +53,9 @@ def detect_circular_imports() -> list[str]:
     key_modules = {
         "modelaudit.scanners.base": "scanners/base.py",
         "modelaudit.core": "core.py",
-        "modelaudit.utils.result_conversion": "utils/result_conversion.py",
-        "modelaudit.utils.advanced_file_handler": "utils/advanced_file_handler.py",
-        "modelaudit.utils.large_file_handler": "utils/large_file_handler.py",
+        "modelaudit.utils.helpers.result_conversion": "utils/helpers/result_conversion.py",
+        "modelaudit.utils.file.handlers": "utils/file/handlers.py",
+        "modelaudit.utils.file.large_file_handler": "utils/file/large_file_handler.py",
     }
 
     # Define prohibited circular patterns
@@ -64,17 +64,17 @@ def detect_circular_imports() -> list[str]:
         ("modelaudit.scanners.base", "modelaudit.core", "Base scanner importing core creates circular dependency"),
         # Utilities should not import from core (would create cycles through scanners)
         (
-            "modelaudit.utils.result_conversion",
+            "modelaudit.utils.helpers.result_conversion",
             "modelaudit.core",
             "Result conversion utility importing core creates cycles",
         ),
         (
-            "modelaudit.utils.advanced_file_handler",
+            "modelaudit.utils.file.handlers",
             "modelaudit.core",
             "Advanced file handler importing core creates cycles",
         ),
         (
-            "modelaudit.utils.large_file_handler",
+            "modelaudit.utils.file.large_file_handler",
             "modelaudit.core",
             "Large file handler importing core creates cycles",
         ),

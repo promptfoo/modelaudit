@@ -462,7 +462,7 @@ def delegate_info() -> None:
     type=click.Path(),
     help="Write CycloneDX SBOM to the specified file",
 )
-# Override automatic defaults (2 flags)
+# Override defaults (2 flags)
 @click.option(
     "--timeout",
     "-t",
@@ -483,7 +483,12 @@ def delegate_info() -> None:
 @click.option(
     "--no-cache",
     is_flag=True,
-    help="Force disable caching (overrides automatic defaults)",
+    help="Force disable caching (overrides defaults)",
+)
+@click.option(
+    "--cache-dir",
+    type=click.Path(),
+    help="Cache directory path (overrides default cache location)",
 )
 @click.option(
     "--stream",
@@ -504,12 +509,13 @@ def scan_command(
     max_size: str | None,
     dry_run: bool,
     no_cache: bool,
+    cache_dir: str | None,
     stream: bool,
 ) -> None:
     """Scan files, directories, HuggingFace models, MLflow models, cloud storage,
     or JFrog artifacts for security issues.
 
-    Uses automatic defaults to configure settings based on input type.
+    Uses defaults based on input type.
 
     \b
     Examples:
@@ -518,14 +524,14 @@ def scan_command(
         modelaudit scan hf://user/llama              # HuggingFace - selective download
         modelaudit scan models:/model/v1             # MLflow - registry integration
 
-        # Override automatic defaults when needed
+        # Override defaults when needed
         modelaudit scan large-model.pt --max-size 20GB --timeout 7200
 
         # Strict mode for security-critical scans
         modelaudit scan model.pkl --strict --format json --output report.json
 
     \b
-    Automatic Defaults:
+    Defaults:
         • Input type (local/cloud/registry) → optimal download & caching
         • File size (>1GB) → large model optimizations + progress bars
         • Terminal type (TTY/CI) → appropriate UI (progress vs quiet)
@@ -608,7 +614,7 @@ def scan_command(
         flush_telemetry()
         sys.exit(2)
 
-    # Generate automatic defaults based on input analysis
+    # Generate defaults based on input analysis
     auto_defaults = generate_auto_defaults(expanded_paths)
 
     # Prepare user overrides (only non-None values)
@@ -627,7 +633,11 @@ def scan_command(
 
             sys_module.exit(2)
 
-    # Override automatic defaults with explicit user flags
+    if cache_dir is not None:
+        user_overrides["cache_dir"] = str(Path(cache_dir).expanduser())
+        user_overrides["use_cache"] = True
+
+    # Override defaults with explicit user flags
     if progress:
         user_overrides["show_progress"] = True
     if no_cache:
@@ -642,7 +652,7 @@ def scan_command(
     if quiet:
         user_overrides["verbose"] = False
 
-    # Apply automatic defaults + user overrides
+    # Apply defaults + user overrides
     config = apply_auto_overrides(user_overrides, auto_defaults)
 
     # Handle environment variables for removed flags
@@ -659,7 +669,6 @@ def scan_command(
     # Determine if we should show styled console output (spinners, colors, headers)
     # Show styled output when: text format OR output goes to file (stdout is free)
     show_styled_output = final_format == "text" or bool(output)
-    # final_large_model_support = config.get("large_model_support", True)  # Unused in new implementation
     final_selective = config.get("selective_download", True)
     final_stream = config.get("stream_analysis", False)
     final_scan_and_delete = config.get("scan_and_delete", False)
@@ -676,15 +685,15 @@ def scan_command(
         with contextlib.suppress(ValueError):
             max_download_bytes = parse_size_string(max_size)
 
-    # Show automatic-defaults info if not quiet
+    # Show defaults info if not quiet
     if not quiet and show_styled_output:
         if verbose:
-            click.echo(f"Automatic defaults: {len(expanded_paths)} path(s) analyzed")
+            click.echo(f"Defaults: {len(expanded_paths)} path(s) analyzed")
             for key, value in config.items():
                 if key != "cache_dir":  # Skip showing long paths
                     click.echo(f"   • {key}: {value}")
         elif not config.get("colors", True):  # In CI mode
-            pass  # No automatic-defaults message needed
+            pass  # No defaults message needed
 
     # Print a nice header if not in structured format mode
     if show_styled_output and not quiet:
@@ -719,7 +728,7 @@ def scan_command(
         # Suppress INFO logs from technical modules in normal mode to reduce noise
         # Users can still see these with --verbose if needed
         logging.getLogger("modelaudit.core").setLevel(logging.WARNING)
-        logging.getLogger("modelaudit.utils.secure_hasher").setLevel(logging.WARNING)
+        logging.getLogger("modelaudit.utils.helpers.secure_hasher").setLevel(logging.WARNING)
         logging.getLogger("modelaudit.cache.cache_manager").setLevel(logging.WARNING)
 
     # Setup progress tracking

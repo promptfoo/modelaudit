@@ -172,5 +172,5 @@ def test_scan_command_has_cache_options():
 
     assert result.exit_code == 0
     assert "--no-cache" in result.output
-    # --cache-dir is now handled by automatic defaults, not a CLI flag
-    assert "automatic defaults" in result.output.lower()
+    assert "--cache-dir" in result.output
+    assert "defaults" in result.output.lower()

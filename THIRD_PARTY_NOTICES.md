@@ -54,6 +54,7 @@ These are installed only when the corresponding extra is requested.
 | safetensors  | `safetensors` | Apache-2.0   | <https://github.com/huggingface/safetensors> |
 | scikit-learn | `joblib`      | BSD-3-Clause | <https://scikit-learn.org/>                  |
 | tensorflow   | `tensorflow`  | Apache-2.0   | <https://www.tensorflow.org/>                |
+| tensorrt     | `tensorrt`    | NVIDIA Prop. | <https://developer.nvidia.com/tensorrt>      |
 | tflite       | `tflite`      | Apache-2.0   | <https://www.tensorflow.org/lite>            |
 | torch        | `pytorch`     | BSD-3-Clause | <https://pytorch.org/>                       |
 | xgboost      | `xgboost`     | Apache-2.0   | <https://xgboost.readthedocs.io/>            |
@@ -61,12 +62,17 @@ These are installed only when the corresponding extra is requested.
 ## License Compatibility
 
 All runtime dependencies use permissive licenses (MIT, BSD, Apache-2.0, PSF-2.0)
-compatible with ModelAudit's MIT license. The one optional dependency using a
-copyleft license (py7zr, LGPL-2.1+) is dynamically linked and only installed on
-explicit user request via the `sevenzip` extra.
+compatible with ModelAudit's MIT license. Optional dependencies with non-permissive
+licenses are only installed on explicit user request:
+
+- **py7zr** (LGPL-2.1+): Copyleft; dynamically linked via the `sevenzip` extra.
+- **tensorrt** (NVIDIA Proprietary): Proprietary; installed via the `tensorrt` extra. Linux/Windows only. Used as a transitive dependency for PyTorch TensorRT support.
+
+Dev-only dependencies (ruff, mypy, pytest, etc.) are not distributed to users and
+are excluded from this notice.
 
 ---
 
-_This file was last reviewed on 2026-02-20. Run
+_This file was last reviewed on 2026-02-22. Run
 `uv run python -c "import importlib.metadata as md; [print(f'{d.metadata[\"Name\"]} {d.metadata[\"Version\"]} {d.metadata.get(\"License\",\"\")}') for d in md.distributions()]"`
 to regenerate the installed package list._

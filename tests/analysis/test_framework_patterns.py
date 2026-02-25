@@ -2,7 +2,7 @@
 
 import pytest
 
-from modelaudit.knowledge.framework_patterns import (
+from modelaudit.analysis.framework_patterns import (
     FrameworkKnowledgeBase,
     FrameworkPattern,
     FrameworkType,

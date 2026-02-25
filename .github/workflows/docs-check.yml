@@ -18,6 +18,9 @@ on:
       - "LICENSE*"
       - ".github/workflows/docs-check.yml"
 
+permissions:
+  contents: read
+
 jobs:
   format-check:
     name: Check Documentation Formatting

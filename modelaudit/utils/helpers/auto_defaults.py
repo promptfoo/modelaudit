@@ -4,6 +4,15 @@ import os
 import sys
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
+
+
+def _get_hostname(url: str) -> str:
+    """Extract and normalize the hostname from a URL."""
+    try:
+        return (urlparse(url).hostname or "").lower()
+    except Exception:
+        return ""
 
 
 def detect_input_type(path: str) -> str:
@@ -14,7 +23,8 @@ def detect_input_type(path: str) -> str:
                 'mlflow', 'jfrog', 'local_file', 'local_directory'
     """
     # Cloud storage detection
-    if path.startswith(("s3://", "gs://", "az://")) or ".blob.core.windows.net" in path:
+    hostname = _get_hostname(path)
+    if path.startswith(("s3://", "gs://", "az://")) or hostname.endswith(".blob.core.windows.net"):
         if path.startswith("s3://"):
             return "cloud_s3"
         elif path.startswith("gs://"):
@@ -27,7 +37,7 @@ def detect_input_type(path: str) -> str:
         return "huggingface"
 
     # PyTorch Hub detection
-    if "pytorch.org/hub/" in path:
+    if (hostname == "pytorch.org" and "/hub/" in path) or path.startswith("pytorch.org/hub/"):
         return "pytorch_hub"
 
     # MLflow detection
@@ -35,7 +45,7 @@ def detect_input_type(path: str) -> str:
         return "mlflow"
 
     # JFrog detection
-    if ".jfrog.io/" in path or "/artifactory/" in path:
+    if hostname.endswith(".jfrog.io") or hostname == "jfrog.io" or "/artifactory/" in path:
         return "jfrog"
 
     # Local path detection

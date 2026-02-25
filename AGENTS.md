@@ -85,54 +85,10 @@ uv run pytest -n auto -m "not slow and not integration" --maxfail=1
 | Type errors         | Fix manually, re-run `mypy`                             |
 | Test failures       | Check output, fix issues, re-run tests                  |
 
-## Dependency Management & NumPy Strategy
+## Dependency Management
 
-### NumPy Version Strategy (2025–2026)
-
-ModelAudit supports both NumPy 1.x and 2.x using conditional dependencies based on Python version:
-
-**Current Strategy (January 2025 → October 2026):**
-
-- **Python 3.10**: NumPy 1.x (1.19.0–1.26.x) + TensorFlow 2.13+
-- **Python 3.11+**: NumPy 2.x (2.4–2.5) + TensorFlow 2.17+
-
-**Why:** NumPy 2.4+ requires Python ≥3.11, but Python 3.10 is supported until October 2026. Dropping 3.10 support prematurely would be a breaking change.
-
-**Timeline:**
-
-- **Now → October 2026**: Support both configurations with automatic version selection via environment markers
-- **October 2026**: Python 3.10 reaches EOL, can drop 3.10 support and standardize on NumPy 2.x only
-- **Post-October 2026**: Simplify to single NumPy 2.x dependency with `requires-python = ">=3.11"`
-
-**Implementation Details:**
-
-```toml
-# pyproject.toml - Conditional dependencies
-dependencies = [
-    "numpy>=1.19.0,<2.0; python_version == '3.10'",
-    "numpy>=2.4,<2.5; python_version >= '3.11'",
-]
-
-[project.optional-dependencies]
-tensorflow = [
-    "tensorflow>=2.13.0,<3.0; python_version == '3.10'",
-    "tensorflow>=2.17.0,<3.0; python_version >= '3.11' and python_version < '3.13'",
-]
-```
-
-**CI Testing:** Both NumPy versions are tested in CI via matrix strategy (see `.github/workflows/test.yml`):
-
-- NumPy 1.x on Python 3.10
-- NumPy 2.x on Python 3.11, 3.12, 3.13
-
-**User Impact:** No code changes needed. Users get appropriate versions automatically based on their Python version. Natural migration path as users upgrade Python.
-
-**When Adding Dependencies:**
-
-- Check compatibility with both NumPy 1.x and 2.x
-- Add environment markers if dependency requires specific Python/NumPy versions
-- Update CI matrix if testing both versions is needed
-- Document any version-specific behavior
+- ModelAudit supports both NumPy 1.x (Python 3.10) and 2.x (Python 3.11+) via environment markers in `pyproject.toml`. See `docs/agents/dependencies.md` for the full strategy, vendored proto guide, and rules for adding dependencies.
+- When adding dependencies, check compatibility with both NumPy versions and add environment markers if needed.
 
 ## Coding & Style Guardrails
 
@@ -154,16 +110,29 @@ tensorflow = [
 ```bash
 modelaudit/
 ├── modelaudit/           # Main package
-│   ├── scanners/         # Scanner implementations
-│   ├── utils/            # Utility modules
+│   ├── analysis/         # Semantic and integrated analysis
+│   ├── auth/             # API authentication and config
+│   ├── cache/            # Scan result caching
+│   ├── config/           # Blocklists and configuration
+│   ├── detectors/        # Security detectors (secrets, JIT, network)
+│   ├── integrations/     # SARIF, JFrog, license checking
+│   ├── progress/         # Progress tracking subsystem
+│   ├── protos/           # Vendored TensorFlow protobuf stubs
+│   ├── scanners/         # Scanner implementations (30+)
+│   ├── utils/            # File detection, helpers, streaming
+│   ├── whitelists/       # HuggingFace/model whitelists
 │   ├── cli.py            # CLI interface
-│   └── core.py           # Core scanning logic
+│   ├── core.py           # Core scanning orchestration
+│   ├── models.py         # Pydantic result models
+│   └── telemetry.py      # Anonymous usage telemetry
 ├── tests/                # Test suite
-├── docs/agents/          # Detailed documentation
+├── docs/agents/          # Agent documentation
+├── docs/maintainers/     # Release, CVE, dependency docs
+├── docs/user/            # User-facing guides
 └── CHANGELOG.md          # Keep a Changelog format
 ```
 
-Key docs: `docs/agents/commands.md`, `docs/agents/testing.md`, `docs/agents/security-checks.md`, `docs/agents/architecture.md`, `docs/agents/ci-workflow.md`, `docs/agents/release-process.md`, `docs/agents/dependencies.md`.
+Key docs: `docs/agents/architecture.md`, `docs/agents/dependencies.md`, `docs/agents/release-process.md`, `docs/agents/new-scanner-quickstart.md`.
 
 ## README.md Content Guidelines
 

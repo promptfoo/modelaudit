@@ -70,6 +70,7 @@ ModelAudit includes **30 specialized scanners** covering model, archive, and con
 | **TensorRT**     | `.engine`, `.plan`                    | LOW    |
 | **PaddlePaddle** | `.pdmodel`, `.pdiparams`              | LOW    |
 | **OpenVINO**     | `.xml`                                | LOW    |
+| **Skops**        | `.skops`                              | HIGH   |
 | **PMML**         | `.pmml`                               | LOW    |
 
 Plus scanners for ZIP, TAR, 7-Zip, OCI layers, Jinja2 templates, JSON/YAML metadata, manifests, and text files.
@@ -143,10 +144,15 @@ docker run --rm -v "$(pwd)":/app ghcr.io/promptfoo/modelaudit:latest model.pkl
 --verbose / --quiet          Control output detail
 --blacklist PATTERN          Additional patterns to flag
 --no-cache                   Disable result caching
+--cache-dir DIR              Set cache directory for downloads and scan results
 --progress                   Force progress display
 ```
 
-Exit codes: `0` clean, `1` issues found, `2` errors.
+## Exit Codes
+
+- `0`: No security issues detected
+- `1`: Security issues detected
+- `2`: Scan errors
 
 ## Telemetry and Privacy
 
@@ -194,6 +200,10 @@ modelaudit model.pkl --format sarif --output results.sarif
 - **[Usage examples](https://www.promptfoo.dev/docs/model-audit/usage/)** — CI/CD integration, remote scanning, SBOM generation
 - **[Supported formats](https://www.promptfoo.dev/docs/model-audit/scanners/)** — detailed scanner documentation
 - **[Support policy](SUPPORT.md)** — supported Python/OS versions and maintenance policy
+- **[Security model and limitations](docs/user/security-model.md)** — what ModelAudit does and does not guarantee
+- **[Compatibility matrix](docs/user/compatibility-matrix.md)** — file formats vs optional dependencies
+- **[Offline/air-gapped guide](docs/user/offline-air-gapped.md)** — secure operation without internet access
+- **[Scanner contributor quickstart](docs/agents/new-scanner-quickstart.md)** — safe workflow for new scanner development
 - **Troubleshooting** — run `modelaudit doctor --show-failed` to check scanner availability
 
 ## License
