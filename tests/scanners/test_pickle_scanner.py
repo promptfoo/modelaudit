@@ -1,4 +1,5 @@
 import pickle
+import struct
 import sys
 import unittest
 from pathlib import Path
@@ -251,6 +252,102 @@ class TestPickleScannerAdvanced(unittest.TestCase):
         assert len(result.issues) > 0, "Expected issues to be detected for multiple pickle streams"
         eval_issues = [i for i in result.issues if "eval" in i.message.lower()]
         assert len(eval_issues) > 0, f"Expected eval issues, but found: {[i.message for i in result.issues]}"
+
+    def test_reduce_pattern_detects_memoized_callable(self) -> None:
+        """REDUCE analysis should resolve memoized call targets (BINGET/LONG_BINGET)."""
+        scanner = PickleScanner()
+
+        import os
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
+            try:
+                payload = bytearray(b"\x80\x02")
+                payload += b"cposix\nsystem\n"  # GLOBAL posix.system
+                payload += b"q\x01"  # BINPUT 1 (memoize callable)
+                payload += b"0"  # POP original callable from stack
+                # Add filler opcodes so target isn't adjacent to REDUCE
+                for i in range(12):
+                    filler = f"f{i}".encode()
+                    payload += b"X" + struct.pack("<I", len(filler)) + filler
+                    payload += b"0"
+                payload += b"h\x01"  # BINGET 1
+                arg = b"echo test"
+                payload += b"X" + struct.pack("<I", len(arg)) + arg
+                payload += b"\x85R."  # TUPLE1 + REDUCE + STOP
+
+                f.write(payload)
+                f.flush()
+                f.close()
+
+                result = scanner.scan(f.name)
+
+                reduce_pattern_checks = [c for c in result.checks if c.name == "Reduce Pattern Analysis"]
+                assert reduce_pattern_checks, "Expected Reduce Pattern Analysis check"
+                assert any(c.status.value == "failed" for c in reduce_pattern_checks), (
+                    "Reduce Pattern Analysis should fail for memoized posix.system REDUCE target"
+                )
+                assert any("posix.system" in c.message for c in reduce_pattern_checks), (
+                    "Expected posix.system in Reduce Pattern Analysis message: "
+                    f"{[c.message for c in reduce_pattern_checks]}"
+                )
+
+            finally:
+                os.unlink(f.name)
+
+    def test_stack_global_uses_actual_stack_not_popped_decoys(self) -> None:
+        """STACK_GLOBAL resolution should follow stack semantics, not nearby popped strings."""
+        scanner = PickleScanner()
+
+        import os
+        import tempfile
+
+        def short_binunicode(value: bytes) -> bytes:
+            return b"\x8c" + bytes([len(value)]) + value
+
+        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
+            try:
+                payload = bytearray(b"\x80\x04")
+                payload += short_binunicode(b"os")
+                payload += short_binunicode(b"system")
+
+                # Push/pop decoys that should NOT affect STACK_GLOBAL target.
+                for i in range(6):
+                    junk = f"junk{i}".encode()
+                    payload += short_binunicode(junk)
+                    payload += b"0"  # POP
+
+                # Safe-looking decoys near STACK_GLOBAL that are immediately popped.
+                payload += short_binunicode(b"torch._utils")
+                payload += b"0"
+                payload += short_binunicode(b"_rebuild_tensor_v2")
+                payload += b"0"
+
+                payload += b"\x93"  # STACK_GLOBAL (should still resolve to os.system)
+                payload += short_binunicode(b"echo test")
+                payload += b"\x85R."
+
+                f.write(payload)
+                f.flush()
+                f.close()
+
+                result = scanner.scan(f.name)
+
+                stack_checks = [c for c in result.checks if c.name == "STACK_GLOBAL Module Check"]
+                assert stack_checks, "Expected STACK_GLOBAL Module Check"
+                assert any(
+                    c.status.value == "failed" and ("posix.system" in c.message or "os.system" in c.message)
+                    for c in stack_checks
+                ), f"Expected failed STACK_GLOBAL check for os/posix.system, got: {[c.message for c in stack_checks]}"
+
+                reduce_checks = [c for c in result.checks if c.name == "REDUCE Opcode Safety Check"]
+                assert any(
+                    c.status.value == "failed" and ("posix.system" in c.message or "os.system" in c.message)
+                    for c in reduce_checks
+                ), f"Expected REDUCE check to resolve os/posix.system, got: {[c.message for c in reduce_checks]}"
+
+            finally:
+                os.unlink(f.name)
 
     def test_scan_regular_pickle_file(self):
         """Test that regular .pkl files don't trigger binary content scanning"""

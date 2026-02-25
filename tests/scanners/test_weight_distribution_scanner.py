@@ -1,7 +1,10 @@
 import os
 import pickle
+import sys
 import tempfile
+import types
 import zipfile
+from typing import Any
 
 import pytest
 
@@ -410,6 +413,40 @@ class TestWeightDistributionScanner:
         weights = scanner._extract_pytorch_weights(str(zip_path))
         assert weights == {}
         assert scanner.extraction_unsafe
+
+    def test_blocks_unsafe_torch_load_by_default(self, monkeypatch, tmp_path):
+        """_extract_pytorch_weights should not call torch.load in unsafe mode by default."""
+
+        load_called = False
+
+        fake_torch: Any = types.ModuleType("torch")
+        fake_torch.__version__ = "2.5.1"
+
+        class FakeTensor:  # pragma: no cover - simple test double
+            pass
+
+        fake_torch.Tensor = FakeTensor
+        fake_torch.device = lambda value: value
+
+        def fake_load(*_args, **_kwargs):
+            nonlocal load_called
+            load_called = True
+            return {}
+
+        fake_torch.load = fake_load
+        monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+        model_path = tmp_path / "blocked.pt"
+        model_path.write_bytes(b"not-a-valid-pytorch-model")
+
+        scanner = WeightDistributionScanner()
+        weights = scanner._extract_pytorch_weights(str(model_path))
+
+        assert weights == {}
+        assert scanner.extraction_unsafe
+        assert scanner.extraction_unsafe_reason is not None
+        assert "Blocked torch.load" in scanner.extraction_unsafe_reason
+        assert load_called is False
 
     def test_multiple_anomalies(self):
         """Test detection of multiple types of anomalies in one layer"""
