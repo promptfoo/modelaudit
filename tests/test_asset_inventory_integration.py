@@ -119,7 +119,7 @@ class TestAssetInventoryIntegration:
         assert hasattr(st_asset, "size") and st_asset.size is not None
 
         # Check for main JSON config with keys metadata
-        main_config_assets = [a for a in assets if a.path.endswith("/config.json")]
+        main_config_assets = [a for a in assets if a.path.endswith(os.sep + "config.json")]
         assert len(main_config_assets) == 1
         config_asset = main_config_assets[0]
         assert config_asset.type == "manifest"
