@@ -624,12 +624,32 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
     "numpy.random._pickle": [
         "__randomstate_ctor",
         "__generator_ctor",
+        "__bit_generator_ctor",
     ],
     "numpy.random.mtrand": [
         "RandomState",
     ],
+    "numpy.random._common": [
+        "BitGenerator",
+    ],
+    "numpy.random._generator": [
+        "Generator",
+    ],
+    "numpy.random._bounded_integers": [
+        "_bounded_integers",
+    ],
     "numpy.random._mt19937": [
         "MT19937",
+    ],
+    "numpy.random._pcg64": [
+        "PCG64",
+        "PCG64DXSM",
+    ],
+    "numpy.random._philox": [
+        "Philox",
+    ],
+    "numpy.random._sfc64": [
+        "SFC64",
     ],
     "math": [
         "sqrt",
@@ -2098,8 +2118,17 @@ def check_opcode_sequence(
                 else:
                     is_dangerous_opcode = True
 
+            elif opcode.name in ("NEWOBJ", "NEWOBJ_EX"):
+                # NEWOBJ/NEWOBJ_EX: check associated class via resolved_callables
+                is_dangerous_opcode = True
+                associated_ref = resolved_callables.get(i)
+                if associated_ref:
+                    mod, func = associated_ref
+                    if _is_safe_ml_global(mod, func):
+                        is_dangerous_opcode = False
+
             else:
-                # Other dangerous opcodes (INST, OBJ, NEWOBJ, NEWOBJ_EX, BUILD, EXT*)
+                # Other dangerous opcodes (INST, OBJ, BUILD, EXT*)
                 is_dangerous_opcode = True
 
             if is_dangerous_opcode:
@@ -2113,8 +2142,20 @@ def check_opcode_sequence(
 
         # Fixed threshold for dangerous opcode detection.
         # Only execution-related opcodes are counted (memo/framing excluded),
-        # and safe ML globals are skipped for REDUCE/GLOBAL/STACK_GLOBAL.
+        # and safe ML globals are skipped for REDUCE/GLOBAL/STACK_GLOBAL/NEWOBJ.
         threshold = 50
+
+        # In high-confidence ML contexts (e.g. sklearn tree ensembles, xgboost),
+        # tree-based models legitimately produce hundreds of REDUCE/NEWOBJ opcodes
+        # for each estimator node.  Raise the threshold to suppress false positives.
+        _ml_frameworks = ml_context.get("frameworks", {})
+        _tree_ensemble_frameworks = {"sklearn", "xgboost"}
+        if (
+            ml_context.get("is_ml_content", False)
+            and ml_context.get("overall_confidence", 0) >= 0.5
+            and _tree_ensemble_frameworks & set(_ml_frameworks.keys())
+        ):
+            threshold = 500
 
         if dangerous_opcode_count > threshold:
             suspicious_patterns.append(
@@ -3464,16 +3505,19 @@ class PickleScanner(BaseScanner):
                                         ml_context,
                                     )
 
-                                result.add_check(
-                                    name="REDUCE Opcode Safety Check",
-                                    passed=False,
-                                    message=(
+                                # CVE-2025-32434 is specific to torch.load() and
+                                # should only be referenced for PyTorch file formats
+                                _ext = os.path.splitext(self.current_file_path)[1].lower()
+                                _is_pytorch_file = (
+                                    _ext in {".pt", ".pth"}
+                                    or (_ext == ".bin" and "pytorch" in ml_context.get("frameworks", {}))
+                                )
+                                if _is_pytorch_file:
+                                    _reduce_msg = (
                                         f"Found REDUCE opcode with non-allowlisted global: {associated_global}. "
                                         f"This may indicate CVE-2025-32434 exploitation (RCE via torch.load)"
-                                    ),
-                                    severity=severity,
-                                    location=f"{self.current_file_path} (pos {pos})",
-                                    details={
+                                    )
+                                    _reduce_details: dict[str, Any] = {
                                         "position": pos,
                                         "opcode": opcode.name,
                                         "associated_global": associated_global,
@@ -3482,7 +3526,28 @@ class PickleScanner(BaseScanner):
                                             "overall_confidence",
                                             0,
                                         ),
-                                    },
+                                    }
+                                else:
+                                    _reduce_msg = (
+                                        f"Found REDUCE opcode with non-allowlisted global: {associated_global}"
+                                    )
+                                    _reduce_details = {
+                                        "position": pos,
+                                        "opcode": opcode.name,
+                                        "associated_global": associated_global,
+                                        "ml_context_confidence": ml_context.get(
+                                            "overall_confidence",
+                                            0,
+                                        ),
+                                    }
+
+                                result.add_check(
+                                    name="REDUCE Opcode Safety Check",
+                                    passed=False,
+                                    message=_reduce_msg,
+                                    severity=severity,
+                                    location=f"{self.current_file_path} (pos {pos})",
+                                    details=_reduce_details,
                                     why=get_opcode_explanation("REDUCE"),
                                 )
 
