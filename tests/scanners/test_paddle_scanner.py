@@ -1,5 +1,5 @@
 import struct
-
+from pathlib import Path
 from unittest.mock import patch
 
 from modelaudit.scanners.base import IssueSeverity
@@ -7,21 +7,21 @@ from modelaudit.scanners.paddle_scanner import PaddleScanner
 from modelaudit.utils.file.detection import validate_file_type
 
 
-def test_paddle_scanner_can_handle(tmp_path):
+def test_paddle_scanner_can_handle(tmp_path: Path) -> None:
     path = tmp_path / "model.pdmodel"
     path.write_bytes(b"dummy")
     with patch("modelaudit.scanners.paddle_scanner.HAS_PADDLE", True):
         assert PaddleScanner.can_handle(str(path))
 
 
-def test_paddle_scanner_cannot_handle_without_paddle(tmp_path):
+def test_paddle_scanner_cannot_handle_without_paddle(tmp_path: Path) -> None:
     path = tmp_path / "model.pdmodel"
     path.write_bytes(b"dummy")
     with patch("modelaudit.scanners.paddle_scanner.HAS_PADDLE", False):
         assert not PaddleScanner.can_handle(str(path))
 
 
-def test_paddle_scanner_detects_suspicious_pattern(tmp_path):
+def test_paddle_scanner_detects_suspicious_pattern(tmp_path: Path) -> None:
     content = b"os.system('ls')"
     path = tmp_path / "model.pdmodel"
     path.write_bytes(content)
@@ -31,7 +31,7 @@ def test_paddle_scanner_detects_suspicious_pattern(tmp_path):
         assert any("suspicious" in i.message.lower() for i in result.issues)
 
 
-def test_paddle_scanner_missing_dependency(tmp_path):
+def test_paddle_scanner_missing_dependency(tmp_path: Path) -> None:
     path = tmp_path / "model.pdmodel"
     path.write_bytes(b"dummy")
     with patch("modelaudit.scanners.paddle_scanner.HAS_PADDLE", False):
@@ -49,7 +49,7 @@ def test_paddle_scanner_missing_dependency(tmp_path):
 # ---- Tests for false-positive fixes ----
 
 
-def test_pdiparams_hex_escape_not_flagged(tmp_path):
+def test_pdiparams_hex_escape_not_flagged(tmp_path: Path) -> None:
     """Raw float32 tensor data in .pdiparams should NOT trigger the hex-escape
     pattern (\\x[0-9a-fA-F]{2}).  Before the fix every .pdiparams file was
     flagged because lossy UTF-8 decoding of float bytes produces \\xNN runs."""
@@ -77,7 +77,7 @@ def test_pdiparams_hex_escape_not_flagged(tmp_path):
     )
 
 
-def test_pdiparams_dunder_pattern_not_flagged(tmp_path):
+def test_pdiparams_dunder_pattern_not_flagged(tmp_path: Path) -> None:
     """The __[\\w]+__ (magic-method) regex should be suppressed for .pdiparams
     files because random binary data decoded as UTF-8 can coincidentally match."""
     raw = b"\x00__fake__\x00" + b"\xff" * 200
@@ -96,7 +96,7 @@ def test_pdiparams_dunder_pattern_not_flagged(tmp_path):
     )
 
 
-def test_pdiparams_real_threats_still_detected(tmp_path):
+def test_pdiparams_real_threats_still_detected(tmp_path: Path) -> None:
     """Even with FP suppression, genuinely suspicious content in a .pdiparams
     file (e.g. 'import os', 'eval(') must still be reported."""
     content = b"padding " + b"import os" + b" eval(payload) " + b"os.system('rm -rf /')"
@@ -114,7 +114,7 @@ def test_pdiparams_real_threats_still_detected(tmp_path):
     assert any("os.system" in p for p in patterns_found), "os.system should be detected"
 
 
-def test_pdmodel_hex_escape_still_flagged(tmp_path):
+def test_pdmodel_hex_escape_still_flagged(tmp_path: Path) -> None:
     """For .pdmodel files (protobuf model descriptors), the hex-escape pattern
     should NOT be suppressed -- only .pdiparams gets the suppression."""
     # Craft content that contains a literal hex escape sequence in text form
@@ -132,7 +132,7 @@ def test_pdmodel_hex_escape_still_flagged(tmp_path):
     assert len(hex_issues) > 0, "Hex-escape pattern should still fire for .pdmodel files"
 
 
-def test_pdmodel_magic_bytes_validation_passes(tmp_path):
+def test_pdmodel_magic_bytes_validation_passes(tmp_path: Path) -> None:
     """A .pdmodel file should pass file-type validation even though it has no
     distinctive magic bytes (protobuf files start with arbitrary field tags)."""
     # Write some plausible protobuf-like bytes
@@ -144,7 +144,7 @@ def test_pdmodel_magic_bytes_validation_passes(tmp_path):
     )
 
 
-def test_pdiparams_magic_bytes_validation_passes(tmp_path):
+def test_pdiparams_magic_bytes_validation_passes(tmp_path: Path) -> None:
     """A .pdiparams file should pass file-type validation even though its raw
     tensor data has no recognisable magic bytes."""
     path = tmp_path / "weights.pdiparams"

@@ -384,7 +384,7 @@ def detect_format_from_extension_pattern_matching(extension: FileExtension) -> F
             return "tflite"
         case ".engine":
             return "tensorrt"
-        case ".pdmodel":
+        case ".pdmodel" | ".pdiparams":
             return "paddle"
         case ".xml":
             return "openvino"
