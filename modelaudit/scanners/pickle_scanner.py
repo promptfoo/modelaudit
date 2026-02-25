@@ -621,6 +621,16 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "_reconstruct",
         "scalar",
     ],
+    "numpy.random._pickle": [
+        "__randomstate_ctor",
+        "__generator_ctor",
+    ],
+    "numpy.random.mtrand": [
+        "RandomState",
+    ],
+    "numpy.random._mt19937": [
+        "MT19937",
+    ],
     "math": [
         "sqrt",
         "pow",
@@ -915,6 +925,7 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
     ],
     "sklearn.compose._column_transformer": [
         "ColumnTransformer",
+        "make_column_selector",
     ],
     "sklearn.model_selection": [
         "GridSearchCV",
@@ -949,6 +960,35 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
     "sklearn.multioutput": [
         "MultiOutputClassifier",
         "MultiOutputRegressor",
+    ],
+    "sklearn.impute": [
+        "SimpleImputer",
+        "IterativeImputer",
+        "KNNImputer",
+        "MissingIndicator",
+    ],
+    "sklearn.impute._base": [
+        "SimpleImputer",
+        "MissingIndicator",
+    ],
+    "sklearn.impute._iterative": [
+        "IterativeImputer",
+    ],
+    "sklearn.impute._knn": [
+        "KNNImputer",
+    ],
+    "sklearn.dummy": [
+        "DummyClassifier",
+        "DummyRegressor",
+    ],
+    "sklearn.ensemble._gb_losses": [
+        "LeastSquaresError",
+        "BinomialDeviance",
+        "MultinomialDeviance",
+        "ExponentialLoss",
+        "HuberLossFunction",
+        "QuantileLossFunction",
+        "LeastAbsoluteError",
     ],
     "sklearn.utils._tags": [
         "Tags",
