@@ -39,8 +39,8 @@ from .telemetry import (
     record_scan_started,
 )
 from .utils import resolve_dvc_file
+from .utils.helpers.auto_defaults import apply_auto_overrides, generate_auto_defaults, parse_size_string
 from .utils.helpers.interrupt_handler import interruptible_scan
-from .utils.helpers.smart_detection import apply_smart_overrides, generate_smart_defaults, parse_size_string
 from .utils.sources.cloud_storage import download_from_cloud, is_cloud_url
 from .utils.sources.huggingface import (
     download_file_from_hf,
@@ -615,7 +615,7 @@ def scan_command(
         sys.exit(2)
 
     # Generate defaults based on input analysis
-    smart_defaults = generate_smart_defaults(expanded_paths)
+    auto_defaults = generate_auto_defaults(expanded_paths)
 
     # Prepare user overrides (only non-None values)
     user_overrides: dict[str, Any] = {}
@@ -653,7 +653,7 @@ def scan_command(
         user_overrides["verbose"] = False
 
     # Apply defaults + user overrides
-    config = apply_smart_overrides(user_overrides, smart_defaults)
+    config = apply_auto_overrides(user_overrides, auto_defaults)
 
     # Handle environment variables for removed flags
     jfrog_api_token = os.getenv("JFROG_API_TOKEN")
@@ -677,7 +677,7 @@ def scan_command(
     final_skip_files = config.get("skip_non_model_files", True)
     final_strict_license = config.get("strict_license", False)
 
-    # Handle max download size from smart defaults or max_size override
+    # Handle max download size from automatic defaults or max_size override
     max_download_bytes = None
     if max_size is not None:
         import contextlib
@@ -745,17 +745,17 @@ def scan_command(
 
             # Create progress tracker
             progress_tracker = ProgressTracker(
-                update_interval=2.0,  # Smart default
+                update_interval=2.0,  # Default interval
             )
 
             # Add console reporter based on format preference
             # Only enable ProgressTracker for text format without output file
             # (ProgressTracker has threading issues that cause segfaults)
             if progress_tracker and final_format == "text" and not output:
-                if True:  # Always use tqdm format (smart default)
+                if True:  # Always use tqdm format (default)
                     # Use tqdm progress bars if available and appropriate
                     console_reporter = ConsoleProgressReporter(  # type: ignore[possibly-unresolved-reference]
-                        update_interval=2.0,  # Smart default
+                        update_interval=2.0,  # Default interval
                         disable_on_non_tty=True,
                         show_bytes=True,
                         show_items=True,
@@ -764,7 +764,7 @@ def scan_command(
                 progress_reporters.append(console_reporter)
                 progress_tracker.add_reporter(console_reporter)
 
-            # File logging removed - use smart defaults only
+            # File logging removed - use automatic defaults only
 
         except (ImportError, RecursionError) as e:
             if verbose:
@@ -1109,8 +1109,8 @@ def scan_command(
                 # Check if this is a cloud storage URL
                 elif is_cloud_url(path):
                     # Max download size already handled above
-                    # max_download_bytes is already set from smart defaults
-                    # Max download size parsing removed - handled by smart defaults
+                    # max_download_bytes is already set from automatic defaults
+                    # Max download size parsing removed - handled by automatic defaults
 
                     # Handle dry-run mode (replaces preview)
                     if dry_run:
@@ -1481,12 +1481,12 @@ def scan_command(
                     # Run the scan with progress reporting (NORMAL MODE)
                     config_overrides = {
                         "enable_progress": bool(progress_tracker),
-                        "progress_update_interval": 2.0,  # Smart default
+                        "progress_update_interval": 2.0,  # Default interval
                         "cache_enabled": final_cache,
                         "cache_dir": final_cache_dir,
                     }
 
-                    # Record feature usage for large model support (based on smart detection)
+                    # Record feature usage for large model support (based on automatic defaults)
                     # Note: DO NOT send actual path - only track that the feature was used
                     if final_max_file_size > 0 or final_max_total_size > 0:
                         record_feature_used(

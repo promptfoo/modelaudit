@@ -1,4 +1,4 @@
-"""Smart detection utilities for CLI flag consolidation."""
+"""Automatic default configuration utilities for CLI behavior."""
 
 import os
 import sys
@@ -102,14 +102,14 @@ def detect_ci_environment() -> bool:
     return any(os.getenv(var) for var in ci_indicators)
 
 
-def generate_smart_defaults(paths: list[str]) -> dict[str, Any]:
-    """Generate smart defaults based on input analysis.
+def generate_auto_defaults(paths: list[str]) -> dict[str, Any]:
+    """Generate automatic defaults based on input analysis.
 
     Args:
         paths: List of input paths to analyze
 
     Returns:
-        Dictionary of smart default settings
+        Dictionary of automatic default settings
     """
     if not paths:
         return {}
@@ -136,9 +136,9 @@ def generate_smart_defaults(paths: list[str]) -> dict[str, Any]:
         # File processing settings
         "skip_non_model_files": not _has_strict_mode_inputs(input_types),
         # Timeout settings
-        "timeout": _calculate_smart_timeout(input_types, max_file_size),
+        "timeout": _calculate_auto_timeout(input_types, max_file_size),
         # Size limits
-        "max_file_size": _calculate_smart_size_limit(input_types),
+        "max_file_size": _calculate_auto_size_limit(input_types),
         # Output settings
         "format": "json" if is_ci else "text",
         "colors": tty_caps["colors_supported"] and not is_ci,
@@ -189,8 +189,8 @@ def _has_strict_mode_inputs(input_types: list[str]) -> bool:
     return any(t == "local_directory" for t in input_types)
 
 
-def _calculate_smart_timeout(input_types: list[str], max_size: int) -> int:
-    """Calculate smart timeout based on input characteristics."""
+def _calculate_auto_timeout(input_types: list[str], max_size: int) -> int:
+    """Calculate timeout based on input characteristics."""
     base_timeout = 3600  # 1 hour default
 
     # Increase timeout for cloud operations
@@ -206,8 +206,8 @@ def _calculate_smart_timeout(input_types: list[str], max_size: int) -> int:
     return base_timeout
 
 
-def _calculate_smart_size_limit(input_types: list[str]) -> int:
-    """Calculate smart size limits based on input type."""
+def _calculate_auto_size_limit(input_types: list[str]) -> int:
+    """Calculate size limits based on input type."""
     # No limit by default (0 = unlimited)
     if any(t.startswith("cloud_") for t in input_types):
         # 50GB limit for cloud to prevent runaway downloads
@@ -217,17 +217,17 @@ def _calculate_smart_size_limit(input_types: list[str]) -> int:
     return 0
 
 
-def apply_smart_overrides(user_args: dict[str, Any], smart_defaults: dict[str, Any]) -> dict[str, Any]:
-    """Apply smart defaults while respecting user overrides.
+def apply_auto_overrides(user_args: dict[str, Any], auto_defaults: dict[str, Any]) -> dict[str, Any]:
+    """Apply automatic defaults while respecting user overrides.
 
     Args:
         user_args: User-provided arguments (non-None values)
-        smart_defaults: Smart defaults from detection
+        auto_defaults: Automatic defaults from detection
 
     Returns:
-        Final configuration with smart defaults + user overrides
+        Final configuration with automatic defaults + user overrides
     """
-    config = smart_defaults.copy()
+    config = auto_defaults.copy()
 
     # Apply user overrides for any non-None values
     for key, value in user_args.items():

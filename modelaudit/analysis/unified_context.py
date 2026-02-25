@@ -1,4 +1,4 @@
-"""Unified context system for sharing intelligence across scanners."""
+"""Unified context system for sharing analysis data across scanners."""
 
 from dataclasses import dataclass, field
 from enum import Enum

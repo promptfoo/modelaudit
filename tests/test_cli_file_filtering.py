@@ -44,7 +44,7 @@ def test_cli_skip_files_default(mock_cli_scan_command):
         json_text = output_text[start_idx:end_idx]
         output = json.loads(json_text)
 
-        # Smart defaults scan all files that could contain security issues
+        # Automatic defaults scan all files that could contain security issues
         assert output["files_scanned"] >= 1  # At least the model file should be scanned
 
 
@@ -87,8 +87,8 @@ def test_cli_strict_mode(mock_cli_scan_command):
 
 
 @pytest.mark.unit
-def test_cli_smart_default_skip_files(mock_cli_scan_command):
-    """Test smart default file filtering (replaces explicit --skip-files)."""
+def test_cli_auto_default_skip_files(mock_cli_scan_command):
+    """Test automatic-default file filtering (replaces explicit --skip-files)."""
     runner = CliRunner()
 
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -96,7 +96,7 @@ def test_cli_smart_default_skip_files(mock_cli_scan_command):
         (Path(tmp_dir) / "data.log").write_text("log data")
         (Path(tmp_dir) / "model.h5").write_bytes(b"model data")
 
-        # Run scan with smart defaults (should skip .log files)
+        # Run scan with automatic defaults (should skip .log files)
         result = runner.invoke(cli, ["scan", "--format", "json", tmp_dir])
 
         # Extract complete JSON from output (spans multiple lines)
@@ -119,7 +119,7 @@ def test_cli_smart_default_skip_files(mock_cli_scan_command):
         json_text = output_text[start_idx:end_idx]
         output = json.loads(json_text)
 
-        # Should scan model files (smart defaults may skip log files)
+        # Should scan model files (automatic defaults may skip log files)
         assert output["files_scanned"] >= 1  # At least the model file
 
         # Verify the mock was called (proves we avoided heavy imports)

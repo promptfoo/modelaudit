@@ -1,7 +1,7 @@
-"""Smart cache key generation with optimized performance.
+"""Adaptive cache key generation with optimized performance.
 
 This module provides efficient cache key generation that avoids redundant
-file system calls and provides intelligent key selection based on file characteristics.
+file system calls and uses size-aware key selection based on file characteristics.
 """
 
 import hashlib
@@ -50,8 +50,8 @@ class FileFingerprint:
         return f"{self.quick_key()}_{self.content_hash}"
 
 
-class SmartCacheKeyGenerator:
-    """Optimized cache key generation with intelligent key selection."""
+class AdaptiveCacheKeyGenerator:
+    """Optimized cache key generation with size-aware key selection."""
 
     # Thresholds for cache key strategy
     CONTENT_HASH_THRESHOLD = 10 * 1024 * 1024  # 10MB - use content hash for larger files
@@ -75,7 +75,7 @@ class SmartCacheKeyGenerator:
             return str(quick_key)
 
     def generate_key(self, file_path: str) -> str:
-        """Generate cache key with smart strategy selection."""
+        """Generate cache key using an adaptive strategy."""
         # Check if we have a recent fingerprint cached
         cache_key = f"fp_{file_path}"
         current_time = time.time()

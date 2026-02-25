@@ -8,19 +8,19 @@ from typing import Any
 
 import pytest
 
+from modelaudit.cache.adaptive_cache_keys import AdaptiveCacheKeyGenerator, FileFingerprint
 from modelaudit.cache.batch_operations import BatchCacheOperations
 from modelaudit.cache.cache_manager import CacheManager
 from modelaudit.cache.optimized_config import CacheConfiguration, ConfigurationExtractor
-from modelaudit.cache.smart_cache_keys import FileFingerprint, SmartCacheKeyGenerator
 
 
 @pytest.mark.performance
 class TestCacheOptimizationPerformance:
     """Test performance improvements in cache optimizations."""
 
-    def test_smart_cache_key_performance(self, monkeypatch):
-        """Test smart cache key generation vs traditional approach."""
-        key_generator = SmartCacheKeyGenerator()
+    def test_adaptive_cache_key_performance(self, monkeypatch):
+        """Test adaptive cache key generation vs traditional approach."""
+        key_generator = AdaptiveCacheKeyGenerator()
 
         # Create test files of various sizes
         test_files = []
@@ -40,7 +40,7 @@ class TestCacheOptimizationPerformance:
             large_file.write_bytes(b"large content" * 100000)  # ~1.3MB
             test_files.append(str(large_file))
 
-            stat_calls = {"smart": 0, "traditional": 0}
+            stat_calls = {"adaptive": 0, "traditional": 0}
             current_label: str | None = None
             original_stat = os.stat
 
@@ -52,8 +52,8 @@ class TestCacheOptimizationPerformance:
 
             monkeypatch.setattr(os, "stat", counting_stat)
 
-            def generate_smart_keys():
-                """Generate keys using optimized smart generation."""
+            def generate_adaptive_keys():
+                """Generate keys using optimized adaptive generation."""
                 keys = []
                 for file_path in test_files:
                     stat_result = os.stat(file_path)
@@ -72,13 +72,13 @@ class TestCacheOptimizationPerformance:
                     keys.append(key)
                 return keys
 
-            # Time smart key generation
+            # Time adaptive key generation
             iterations = 100
-            current_label = "smart"
+            current_label = "adaptive"
             start_time = time.perf_counter()
             for _ in range(iterations):
-                smart_result = generate_smart_keys()
-            smart_time = time.perf_counter() - start_time
+                adaptive_result = generate_adaptive_keys()
+            adaptive_time = time.perf_counter() - start_time
 
             # Time traditional approach
             current_label = "traditional"
@@ -89,18 +89,18 @@ class TestCacheOptimizationPerformance:
             current_label = None
 
             # Verify results are equivalent
-            assert len(smart_result) == len(traditional_result)
-            assert smart_result == traditional_result
+            assert len(adaptive_result) == len(traditional_result)
+            assert adaptive_result == traditional_result
 
-            print(f"\nSmart key generation: {smart_time:.4f}s ({len(smart_result)} keys)")
+            print(f"\nAdaptive key generation: {adaptive_time:.4f}s ({len(adaptive_result)} keys)")
             print(f"Traditional approach: {traditional_time:.4f}s")
 
-            if smart_time > 0:
-                improvement = traditional_time / smart_time
+            if adaptive_time > 0:
+                improvement = traditional_time / adaptive_time
                 print(f"Performance improvement: {improvement:.1f}x")
 
             # Stat reuse should reduce syscalls even when timings are noisy.
-            assert stat_calls["traditional"] >= stat_calls["smart"] * 2
+            assert stat_calls["traditional"] >= stat_calls["adaptive"] * 2
 
     def test_batch_cache_operations_performance(self):
         """Test batch cache operations functionality and basic performance."""
@@ -388,9 +388,9 @@ def _extract_config_and_path_slow(args, kwargs):
 class TestCacheOptimizationCorrectness:
     """Test correctness of cache optimizations."""
 
-    def test_smart_key_generator_consistency(self):
-        """Test that smart key generator produces consistent results."""
-        key_generator = SmartCacheKeyGenerator()
+    def test_adaptive_key_generator_consistency(self):
+        """Test that adaptive key generator produces consistent results."""
+        key_generator = AdaptiveCacheKeyGenerator()
 
         with tempfile.TemporaryDirectory() as temp_dir:
             test_file = Path(temp_dir) / "test.bin"
