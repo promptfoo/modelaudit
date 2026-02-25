@@ -1435,6 +1435,14 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             },
         )
 
+    # Ensure bytes_scanned reflects the actual file size even when a scanner
+    # returns early (e.g. missing optional dependency, parse error).  The file
+    # size was already computed above via os.path.getsize and is guaranteed to
+    # be accurate.  Without this fallback the scan summary reports "Size: 0
+    # bytes" for every file whose scanner didn't explicitly set the field.
+    if result.bytes_scanned == 0 and file_size > 0:
+        result.bytes_scanned = file_size
+
     return result
 
 
