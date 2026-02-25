@@ -689,6 +689,26 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
     "brilliant": ["scalar"],  # misparsed numpy.core.multiarray.scalar
     "numpy_pickle": ["NumpyArrayWrapper", "NDArrayWrapper"],
     "MT19937": ["__bit_generator_ctor"],
+    # scipy sparse matrices (used by sklearn SVM, text classifiers, etc.)
+    "scipy.sparse._csr": ["csr_matrix", "csr_array"],
+    "scipy.sparse._csc": ["csc_matrix", "csc_array"],
+    "scipy.sparse._coo": ["coo_matrix", "coo_array"],
+    "scipy.sparse._bsr": ["bsr_matrix", "bsr_array"],
+    "scipy.sparse._dia": ["dia_matrix", "dia_array"],
+    "scipy.sparse._lil": ["lil_matrix", "lil_array"],
+    "scipy.sparse._dok": ["dok_matrix", "dok_array"],
+    "scipy.sparse": [
+        "csr_matrix",
+        "csc_matrix",
+        "coo_matrix",
+        "bsr_matrix",
+        "dia_matrix",
+        "lil_matrix",
+        "dok_matrix",
+        "csr_array",
+        "csc_array",
+        "coo_array",
+    ],
     # YOLO/Ultralytics safe patterns
     "ultralytics": [
         "YOLO",
@@ -2248,7 +2268,7 @@ def check_opcode_sequence(
         _tree_ensemble_frameworks = {"sklearn", "xgboost"}
         if (
             ml_context.get("is_ml_content", False)
-            and ml_context.get("overall_confidence", 0) >= 0.5
+            and ml_context.get("overall_confidence", 0) >= 0.4
             and _tree_ensemble_frameworks & set(_ml_frameworks.keys())
         ):
             threshold = 5000
