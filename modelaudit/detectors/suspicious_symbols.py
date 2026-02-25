@@ -170,6 +170,71 @@ SUSPICIOUS_GLOBALS = {
     ],  # dill's load helpers can execute arbitrary code when unpickling
     # References to the private dill._dill module are also suspicious
     "dill._dill": "*",
+    # Dynamic resolution / import trampolines
+    "pkgutil": ["resolve_name", "get_importer", "walk_packages"],
+    "zipimport": "*",
+    # uuid — _get_command_stdout/_popen internally call subprocess.Popen
+    "uuid": ["_get_command_stdout", "_popen"],
+    # Network / exfiltration
+    "smtplib": "*",
+    "xmlrpc": "*",
+    "xmlrpc.client": "*",
+    "xmlrpc.server": "*",
+    "poplib": "*",
+    "imaplib": "*",
+    "nntplib": "*",
+    "ssl": "*",
+    "socketserver": "*",
+    "requests": "*",
+    "aiohttp": "*",
+    # Code execution / compilation
+    "codeop": "*",
+    "marshal": ["loads", "load", "dumps", "dump"],
+    "compileall": "*",
+    "py_compile": "*",
+    # FFI / native code
+    "_ctypes": "*",
+    # Profiling / debugging (can execute code)
+    "cProfile": "*",
+    "profile": "*",
+    "pdb": "*",
+    "timeit": ["timeit", "repeat"],
+    "trace": "*",
+    # Operator / functools bypasses
+    "functools": ["reduce", "partial"],
+    "_operator": "*",
+    # Pickle recursion
+    "cloudpickle": "*",
+    "joblib": "*",
+    # Filesystem / shell
+    "filecmp": "*",
+    "distutils": "*",
+    "pydoc": "*",
+    "pexpect": "*",
+    "fileinput": "*",
+    "glob": "*",
+    # Virtual environments / package install
+    "venv": "*",
+    "ensurepip": "*",
+    "pip": "*",
+    # Threading / process / signal
+    "_signal": "*",
+    "threading": "*",
+    "_thread": "*",
+    # Database / archive / other
+    "sqlite3": "*",
+    "_sqlite3": "*",
+    "select": "*",
+    "selectors": "*",
+    "logging": ["config"],
+    "syslog": "*",
+    "tarfile": "*",
+    "zipfile": "*",
+    "shelve": "*",
+    # Documentation / tooling (can execute code)
+    "doctest": "*",
+    "idlelib": "*",
+    "lib2to3": "*",
 }
 
 # Advanced pickle patterns targeting sophisticated exploitation techniques
