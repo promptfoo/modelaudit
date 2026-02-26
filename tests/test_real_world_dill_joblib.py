@@ -159,10 +159,7 @@ class TestRealJoblibFiles:
             format_issues = [
                 i
                 for i in result.issues
-                if any(
-                    kw in str(i.message).lower()
-                    for kw in ("opcode", "format", "parse", "memory", "unable")
-                )
+                if any(kw in str(i.message).lower() for kw in ("opcode", "format", "parse", "memory", "unable"))
             ]
             assert len(format_issues) > 0, (
                 "Should report format/parse issues for compressed files. "
