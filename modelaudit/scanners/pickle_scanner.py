@@ -525,6 +525,18 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "any",
         "iter",
         "next",
+        # Python 2 type names used by frameworks like fastai during serialization
+        "long",
+        "unicode",
+        "print",
+        "basestring",
+        "xrange",
+        "complex",
+        "memoryview",
+        "property",
+        "staticmethod",
+        "classmethod",
+        "super",
     ],
     "builtins": [  # Python 3 builtins
         "set",
