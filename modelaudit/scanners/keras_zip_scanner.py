@@ -131,7 +131,8 @@ class KerasZipScanner(BaseScanner):
 
                 # Check for suspicious files in the ZIP
                 for filename in zf.namelist():
-                    if filename.endswith((".py", ".pyc", ".pyo")):
+                    normalized_name = filename.lower()
+                    if normalized_name.endswith((".py", ".pyc", ".pyo")):
                         result.add_check(
                             name="Python File Detection",
                             passed=False,
@@ -140,7 +141,7 @@ class KerasZipScanner(BaseScanner):
                             location=f"{path}/{filename}",
                             details={"filename": filename},
                         )
-                    elif filename.endswith((".sh", ".bat", ".exe", ".dll")):
+                    elif normalized_name.endswith((".sh", ".bat", ".exe", ".dll")):
                         result.add_check(
                             name="Executable File Detection",
                             passed=False,
