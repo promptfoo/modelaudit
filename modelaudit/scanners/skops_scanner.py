@@ -260,7 +260,7 @@ class SkopsScanner(BaseScanner):
     # Metadata files that are part of the skops format and should be excluded
     # from joblib fallback pattern matching. These files legitimately contain
     # strings like "sklearn" as type references, not as pickle/joblib code.
-    _SKOPS_METADATA_FILES = frozenset(
+    _SKOPS_METADATA_FILES: ClassVar[frozenset[str]] = frozenset(
         {
             "schema.json",
             "schema",
@@ -290,15 +290,16 @@ class SkopsScanner(BaseScanner):
         files_with_joblib = []
 
         for file_info in zip_file.filelist:
-            # Skip known skops metadata files -- they legitimately reference
-            # module paths like "sklearn.linear_model.LogisticRegression" as
-            # part of the schema, not as pickle/joblib deserialization code.
-            if self._is_skops_metadata(file_info.filename):
-                continue
+            is_metadata = self._is_skops_metadata(file_info.filename)
 
             try:
                 content = zip_file.read(file_info)
                 for pattern in joblib_patterns:
+                    # Only suppress the broad `sklearn` heuristic for metadata
+                    # files; explicit signals like `joblib.load` / `pickle.load`
+                    # must still be reported even inside schema.json.
+                    if is_metadata and pattern == b"sklearn":
+                        continue
                     if pattern in content:
                         files_with_joblib.append(
                             {

@@ -227,6 +227,7 @@ SUSPICIOUS_GLOBALS = {
     "select": "*",
     "selectors": "*",
     "logging": ["config"],
+    "logging.config": ["dictConfig", "fileConfig", "listen"],
     "syslog": "*",
     "tarfile": "*",
     "zipfile": "*",

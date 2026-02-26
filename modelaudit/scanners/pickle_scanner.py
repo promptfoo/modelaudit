@@ -50,7 +50,7 @@ def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> 
     Yields: (opcode, arg, pos) tuples from pickletools.genops
     """
     # Maximum number of consecutive non-pickle bytes to skip when resyncing
-    _MAX_RESYNC_BYTES = 256
+    _MAX_RESYNC_BYTES = 4096
     resync_skipped = 0
     # Track whether we've successfully parsed at least one complete stream
     parsed_any_stream = False
@@ -90,8 +90,10 @@ def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> 
 
             if stream_error and had_opcodes:
                 # Partial stream: binary data was misinterpreted as opcodes.
-                # Discard the buffer and stop — no more valid streams.
-                return
+                # Discard the buffer but keep scanning — a valid stream may
+                # follow after binary tensor data (e.g. appended payloads).
+                resync_skipped = 0
+                continue
 
             if not stream_error:
                 # Stream completed successfully — yield buffered opcodes
@@ -1585,6 +1587,15 @@ def _build_symbolic_reference_maps(
             if _is_ref(class_item):
                 callable_refs[i] = class_item
             stack.append(unknown)
+            continue
+
+        if name == "STOP":
+            # Reset stack and memo at pickle stream boundaries so that
+            # references from a previous stream cannot leak into the next
+            # one (multi-stream / appended-pickle scenarios).
+            stack.clear()
+            memo.clear()
+            next_memo_index = 0
             continue
 
         if name in {"BINPERSID"}:
