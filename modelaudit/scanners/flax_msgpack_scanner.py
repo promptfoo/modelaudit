@@ -233,7 +233,8 @@ class FlaxMsgpackScanner(BaseScanner):
             return metadata
 
         # Check for Orbax format indicators
-        if any(key.startswith("__orbax") for key in obj):
+        # Guard against non-string keys (msgpack allows int/bytes keys)
+        if any(isinstance(key, str) and key.startswith("__orbax") for key in obj):
             metadata["orbax_format"] = True
             result.add_check(
                 name="Checkpoint Format Detection",
