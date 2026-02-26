@@ -386,7 +386,11 @@ CVE_BINARY_PATTERNS = [
     b"joblib.load",
     b"__reduce__",
     b"os.system",
-    b"Pipeline",
+    # NOTE: b"Pipeline" was removed because it matches the class name
+    # "sklearn.pipeline.Pipeline" present in ALL legitimate sklearn Pipeline
+    # models serialized via pickle/joblib (100% false positive rate).
+    # The regex CVE patterns (CVE_2020_13092_PATTERNS) correctly detect actual
+    # exploits by requiring COMBINATIONS (e.g., "Pipeline.*__reduce__.*system").
     # CVE-2024-34997 binary signatures
     b"read_array",
     b"pickle.load",
