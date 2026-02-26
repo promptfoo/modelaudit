@@ -481,7 +481,9 @@ class SecretsDetector:
                 # Skip patterns that commonly match random binary model weight data.
                 # Tensor weights are arbitrary byte sequences that frequently trigger
                 # regex patterns designed for structured text.
-                binary_false_positive_types = [
+                # NOTE: Use exact matching to avoid "AWS Access Key" also suppressing
+                # "AWS Access Key ID" (which is a structured key=value pattern).
+                binary_false_positive_types = {
                     "Hardcoded Password",
                     "Bitcoin Address",
                     "Ethereum Address",
@@ -491,8 +493,8 @@ class SecretsDetector:
                     "Basic Auth Credentials",  # "Basic " + base64 matches binary data
                     "Bearer Token",  # "Bearer " + alphanums matches binary data
                     "UUID (potential secret)",  # Random bytes form valid UUID patterns
-                ]
-                if any(fp_type in description for fp_type in binary_false_positive_types) and (
+                }
+                if (description in binary_false_positive_types) and (
                     is_binary_source or self._is_likely_binary_context(text, position)
                 ):
                     continue
