@@ -49,8 +49,12 @@ def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> 
 
     Yields: (opcode, arg, pos) tuples from pickletools.genops
     """
-    # Maximum number of consecutive non-pickle bytes to skip when resyncing
-    _MAX_RESYNC_BYTES = 256
+    # Maximum number of consecutive non-pickle bytes to skip when resyncing.
+    # Set high enough that an attacker cannot trivially bypass multi-stream
+    # scanning by inserting separator bytes, but low enough to avoid scanning
+    # megabytes of binary tensor data byte-by-byte.  4096 covers typical
+    # alignment padding and header gaps in PyTorch ZIP entries.
+    _MAX_RESYNC_BYTES = 4096
     resync_skipped = 0
     # Track whether we've successfully parsed at least one complete stream
     parsed_any_stream = False

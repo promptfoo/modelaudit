@@ -476,12 +476,16 @@ class WeightDistributionScanner(BaseScanner):
             # common case for models downloaded from HuggingFace or distributed
             # as standalone .onnx files without their companion data files.
             model = onnx.load(path, load_external_data=False)  # type: ignore[possibly-unresolved-reference]
+        except Exception as e:
+            logger.debug(f"Failed to load ONNX model from {path}: {e}")
+            return weights_info
 
-            # Extract 2D+ initializers — these are weight matrices (conv kernels,
-            # linear layers, embeddings). 1D tensors (biases, batch-norm params)
-            # aren't relevant for weight distribution analysis. This approach is
-            # framework-agnostic since ONNX naming conventions vary by exporter.
-            for initializer in model.graph.initializer:
+        # Extract 2D+ initializers — these are weight matrices (conv kernels,
+        # linear layers, embeddings). 1D tensors (biases, batch-norm params)
+        # aren't relevant for weight distribution analysis. This approach is
+        # framework-agnostic since ONNX naming conventions vary by exporter.
+        for initializer in model.graph.initializer:
+            try:
                 # Skip external-data tensors — their raw bytes are not available
                 # when loaded with load_external_data=False and calling to_array
                 # on them would raise a ValidationError.
@@ -504,9 +508,14 @@ class WeightDistributionScanner(BaseScanner):
                         initializer,
                     )
                     weights_info[initializer.name] = array
-
-        except Exception as e:
-            logger.debug(f"Failed to extract weights from {path}: {e}")
+            except Exception as e:
+                logger.warning(
+                    "Failed to extract ONNX initializer '%s' from %s: %s",
+                    initializer.name,
+                    path,
+                    e,
+                )
+                continue
 
         return weights_info
 

@@ -419,6 +419,9 @@ class OnnxScanner(BaseScanner):
         # Max in-memory array size (default 100 MB)
         max_array_size = self.config.get("max_array_size", 100 * 1024 * 1024)
 
+        import numpy as np
+
+        extraction_failures = 0
         weights_info: dict[str, Any] = {}
         for initializer in model.graph.initializer:
             try:
@@ -435,8 +438,6 @@ class OnnxScanner(BaseScanner):
                 # Pre-check estimated size before materializing the array.
                 # Use math.prod for arbitrary-precision arithmetic (np.prod
                 # can silently overflow for very large dimension products).
-                import numpy as np
-
                 numel = math.prod(int(dim) for dim in initializer.dims)
                 itemsize = int(np.dtype(onnx.helper.tensor_dtype_to_np_dtype(initializer.data_type)).itemsize)
                 estimated_bytes = numel * itemsize
@@ -447,6 +448,7 @@ class OnnxScanner(BaseScanner):
 
                 weights_info[initializer.name] = array
             except Exception as e:
+                extraction_failures += 1
                 logger.warning(
                     "Failed to extract ONNX initializer '%s' for distribution analysis: %s",
                     initializer.name,
@@ -476,6 +478,8 @@ class OnnxScanner(BaseScanner):
 
             result.metadata["layers_analyzed"] = len(weights_info)
             result.metadata["anomalies_found"] = len(anomalies)
+            if extraction_failures > 0:
+                result.metadata["weight_extraction_failures"] = extraction_failures
         except Exception as e:
             logger.warning(f"Weight distribution analysis failed: {e}")
             result.add_check(
