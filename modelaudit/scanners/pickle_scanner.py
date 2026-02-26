@@ -2274,9 +2274,12 @@ def check_opcode_sequence(
                     # treat this REDUCE as safe too.
                     if i > 0:
                         prev_opcode, prev_arg, _prev_pos = opcodes[i - 1]
-                        if prev_opcode.name in ("BINGET", "LONG_BINGET") and isinstance(prev_arg, int):
-                            if _safe_memo.get(prev_arg, False):
-                                is_dangerous_opcode = False
+                        if (
+                            prev_opcode.name in ("BINGET", "LONG_BINGET")
+                            and isinstance(prev_arg, int)
+                            and _safe_memo.get(prev_arg, False)
+                        ):
+                            is_dangerous_opcode = False
 
             # GLOBAL/STACK_GLOBAL: only count when referencing non-safe modules
             elif opcode.name == "GLOBAL" and isinstance(arg, str):
