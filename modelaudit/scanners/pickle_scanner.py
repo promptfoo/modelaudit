@@ -33,6 +33,8 @@ from ..detectors.cve_patterns import analyze_cve_patterns, enhance_scan_result_w
 from ..detectors.suspicious_symbols import DANGEROUS_OPCODES
 from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult, logger
 
+_RESYNC_BUDGET = 8192  # Max bytes to scan forward when resyncing after an unknown opcode
+
 
 def _genops_with_fallback(file_obj):
     """
@@ -40,23 +42,40 @@ def _genops_with_fallback(file_obj):
 
     Some files (especially joblib) may declare protocol 4 but use protocol 5 opcodes
     like READONLY_BUFFER (0x0f). This function attempts to parse as much as possible
-    before hitting unknown opcodes.
+    before hitting unknown opcodes, then tries to resync and continue scanning
+    rather than terminating on partial stream errors.
 
     Yields: (opcode, arg, pos) tuples from pickletools.genops
     """
-    try:
-        yield from pickletools.genops(file_obj)
-    except ValueError as e:
-        error_str = str(e).lower()
-        # Check if it's an unknown opcode error (protocol mismatch)
-        if "opcode" in error_str and "unknown" in error_str:
-            # Log that we hit a protocol mismatch - this is expected for joblib files
-            logger.info(f"Protocol mismatch in pickle (joblib may use protocol 5 opcodes in protocol 4 files): {e}")
-            # Don't re-raise - we've already yielded all valid opcodes before the unknown one
+    while True:
+        try:
+            yield from pickletools.genops(file_obj)
+            # Completed successfully -- no more data
             return
-        else:
-            # Re-raise other ValueError types
-            raise
+        except ValueError as e:
+            error_str = str(e).lower()
+            # Check if it's an unknown opcode error (protocol mismatch)
+            if "opcode" in error_str and "unknown" in error_str:
+                # Log that we hit a protocol mismatch - this is expected for joblib files
+                logger.info(f"Protocol mismatch in pickle (joblib may use protocol 5 opcodes in protocol 4 files): {e}")
+                # Try to resync: scan forward up to _RESYNC_BUDGET bytes looking
+                # for a valid pickle opcode (protocol header 0x80 or STOP 0x2e)
+                # so we can continue scanning the rest of the stream.
+                resync_start = file_obj.tell()
+                chunk = file_obj.read(_RESYNC_BUDGET)
+                if not chunk:
+                    return  # EOF -- nothing more to scan
+                # Look for the next pickle protocol header (0x80) in the chunk
+                idx = chunk.find(b"\x80")
+                if idx >= 0:
+                    file_obj.seek(resync_start + idx)
+                    logger.info(f"Resynced {idx} bytes forward after unknown opcode")
+                    continue  # Try parsing again from the new position
+                # No resync point found within budget -- stop scanning
+                return
+            else:
+                # Re-raise other ValueError types
+                raise
 
 
 def _compute_pickle_length(path: str) -> int:
@@ -1408,14 +1427,23 @@ def _detect_ml_context(opcodes: list[tuple]) -> dict[str, Any]:
         # Uses prefix matching so that e.g. module pattern "sklearn" matches
         # global refs like "sklearn.pipeline", "sklearn.ensemble._iforest", etc.
         modules = patterns["modules"]
+        counted_modules: set[str] = set()
         if isinstance(modules, list):
             for module in modules:
                 # Aggregate counts from all global_refs that match this module
-                # either exactly or as a prefix (e.g. "sklearn" matches "sklearn.pipeline")
+                # either exactly or as a prefix (e.g. "sklearn" matches "sklearn.pipeline").
+                # Use counted_modules to prevent double-counting: for STACK_GLOBAL flows
+                # both the module key (e.g. "sklearn") and the full ref
+                # (e.g. "sklearn.ensemble") are stored in global_refs, so a prefix
+                # match could count one logical reference more than once.
                 ref_count = 0
                 for ref_key, ref_cnt in global_refs.items():
+                    base_module = ref_key.split(".")[0] if "." in ref_key else ref_key
+                    if base_module in counted_modules:
+                        continue
                     if ref_key == module or ref_key.startswith(module + "."):
                         ref_count += ref_cnt
+                        counted_modules.add(base_module)
 
                 if ref_count > 0:
                     # Score based on presence and frequency,
@@ -1728,6 +1756,14 @@ def _build_symbolic_reference_maps(
             "BINUNICODE8",
         }:
             stack.append(unknown)
+
+        if name == "STOP":
+            # Reset memo and stack at pickle stream boundaries so that
+            # references from one stream don't leak into the next in
+            # multi-pickle files (e.g. PyTorch .pt containers).
+            memo.clear()
+            stack.clear()
+            next_memo_index = 0
 
     return stack_global_refs, callable_refs
 
@@ -2369,17 +2405,43 @@ def check_opcode_sequence(
         # and safe ML globals are skipped for REDUCE/GLOBAL/STACK_GLOBAL/NEWOBJ.
         threshold = 50
 
-        # In high-confidence ML contexts (e.g. sklearn tree ensembles, xgboost),
-        # tree-based models legitimately produce hundreds of REDUCE/NEWOBJ/BUILD opcodes
-        # for each estimator node.  A Random Forest with 100 trees can easily produce
-        # 5000+ BUILD opcodes from __setstate__ calls on tree nodes.
-        # Raise the threshold significantly to suppress false positives.
+        # In high-confidence ML contexts with tree-ensemble models (e.g. sklearn
+        # RandomForest, xgboost, lightgbm), tree-based models legitimately produce
+        # hundreds of REDUCE/NEWOBJ/BUILD opcodes for each estimator node.  A Random
+        # Forest with 100 trees can easily produce 5000+ BUILD opcodes from
+        # __setstate__ calls on tree nodes.
+        # Raise the threshold significantly to suppress false positives, but ONLY
+        # when tree-ensemble markers are present -- not for all sklearn/xgboost refs.
         _ml_frameworks = ml_context.get("frameworks", {})
         _tree_ensemble_frameworks = {"sklearn", "xgboost", "lightgbm"}
+        _tree_ensemble_markers = {
+            "RandomForest",
+            "ExtraTrees",
+            "GradientBoosting",
+            "DecisionTree",
+            "XGB",
+            "LGBM",
+            "CatBoost",
+            "IsolationForest",
+            "AdaBoost",
+            "BaggingClassifier",
+            "BaggingRegressor",
+        }
+        # Collect all class/function names referenced in the opcode stream so we
+        # can check for tree-ensemble markers.
+        _all_refs_str = (
+            " ".join(f"{mod}.{func}" for mod, func in resolved_stack_globals.values())
+            + " "
+            + " ".join(f"{mod}.{func}" for mod, func in resolved_callables.values())
+            + " "
+            + " ".join(str(arg) for op, arg, _p in opcodes if op.name == "GLOBAL" and isinstance(arg, str))
+        )
+        has_tree_markers = any(marker in _all_refs_str for marker in _tree_ensemble_markers)
         if (
             ml_context.get("is_ml_content", False)
             and ml_context.get("overall_confidence", 0) >= 0.4
             and _tree_ensemble_frameworks & set(_ml_frameworks.keys())
+            and has_tree_markers
         ):
             # Scale threshold with total opcodes: large tree ensembles can have
             # 200K+ opcodes where most are legitimate BUILD/REDUCE for tree nodes.
@@ -3779,9 +3841,9 @@ class PickleScanner(BaseScanner):
                                     why=get_opcode_explanation("REDUCE"),
                                 )
 
-                # Check NEWOBJ/OBJ/INST opcodes for potential security issues
+                # Check NEWOBJ/NEWOBJ_EX/OBJ/INST opcodes for potential security issues
                 # Apply same logic as REDUCE: check if class is in ML_SAFE_GLOBALS
-                if opcode.name in ["INST", "OBJ", "NEWOBJ"]:
+                if opcode.name in ["INST", "OBJ", "NEWOBJ", "NEWOBJ_EX"]:
                     # Look back to find the associated class (GLOBAL or STACK_GLOBAL)
                     class_mod, class_name, associated_class = _find_associated_global_or_class(
                         opcodes,
@@ -3796,7 +3858,7 @@ class PickleScanner(BaseScanner):
                         if is_safe_class:
                             # Safe class (in ML_SAFE_GLOBALS) - show as INFO
                             result.add_check(
-                                name="INST/OBJ/NEWOBJ Opcode Safety Check",
+                                name="INST/OBJ/NEWOBJ/NEWOBJ_EX Opcode Safety Check",
                                 passed=True,
                                 message=f"{opcode.name} opcode with safe ML class: {associated_class}",
                                 severity=IssueSeverity.INFO,
@@ -3834,7 +3896,7 @@ class PickleScanner(BaseScanner):
                                     )
 
                                 result.add_check(
-                                    name="INST/OBJ/NEWOBJ Opcode Safety Check",
+                                    name="INST/OBJ/NEWOBJ/NEWOBJ_EX Opcode Safety Check",
                                     passed=False,
                                     message=(
                                         f"Found {opcode.name} opcode with non-allowlisted class: {associated_class}"
@@ -3866,7 +3928,7 @@ class PickleScanner(BaseScanner):
                                 if is_safe_class:
                                     # Safe class found via arg parsing - INFO
                                     result.add_check(
-                                        name="INST/OBJ/NEWOBJ Opcode Safety Check",
+                                        name="INST/OBJ/NEWOBJ/NEWOBJ_EX Opcode Safety Check",
                                         passed=True,
                                         message=f"{opcode.name} opcode with safe ML class: {associated_class}",
                                         severity=IssueSeverity.INFO,
@@ -3900,7 +3962,7 @@ class PickleScanner(BaseScanner):
                                 ml_context,
                             )
                             result.add_check(
-                                name="INST/OBJ/NEWOBJ Opcode Safety Check",
+                                name="INST/OBJ/NEWOBJ/NEWOBJ_EX Opcode Safety Check",
                                 passed=False,
                                 message=f"Found {opcode.name} opcode - potential code execution (class unknown)",
                                 severity=severity,
@@ -4172,7 +4234,8 @@ class PickleScanner(BaseScanner):
                         },
                         why=(
                             "This pickle contains an unusually high concentration of opcodes that can execute code "
-                            "(REDUCE, INST, OBJ, NEWOBJ). Such patterns are uncommon in legitimate model files."
+                            "(REDUCE, INST, OBJ, NEWOBJ, NEWOBJ_EX). "
+                            "Such patterns are uncommon in legitimate model files."
                         ),
                     )
             else:
