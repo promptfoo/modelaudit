@@ -250,10 +250,16 @@ class OnnxScanner(BaseScanner):
 
     def _check_external_data(self, model: Any, path: str, result: ScanResult) -> None:
         model_dir = Path(path).resolve().parent
+        import onnx
+
+        # Track per-file status to avoid flooding the result with one check
+        # per tensor when many tensors share the same external data file.
+        missing_files: dict[str, list[str]] = {}  # file -> [tensor_names]
+        traversal_files: dict[str, list[str]] = {}  # file -> [tensor_names]
+        safe_files: set[str] = set()
+
         for tensor in model.graph.initializer:
-            # Check for interrupts during external data processing
             self.check_interrupted()
-            import onnx
 
             if tensor.data_location == onnx.TensorProto.EXTERNAL:
                 info = {entry.key: entry.value for entry in tensor.external_data}
@@ -270,32 +276,59 @@ class OnnxScanner(BaseScanner):
                     continue
                 external_path = (model_dir / location).resolve()
                 if not external_path.exists():
-                    result.add_check(
-                        name="External Data File Existence",
-                        passed=False,
-                        message=f"External data file not found for tensor '{tensor.name}'",
-                        severity=IssueSeverity.CRITICAL,
-                        location=str(external_path),
-                        details={"tensor": tensor.name, "file": location},
-                    )
+                    missing_files.setdefault(location, []).append(tensor.name)
                 elif not str(external_path).startswith(str(model_dir)):
-                    result.add_check(
-                        name="External Data Path Traversal Check",
-                        passed=False,
-                        message=f"External data file outside model directory for tensor '{tensor.name}'",
-                        severity=IssueSeverity.CRITICAL,
-                        location=str(external_path),
-                        details={"tensor": tensor.name, "file": location},
-                    )
+                    traversal_files.setdefault(location, []).append(tensor.name)
                 else:
-                    result.add_check(
-                        name="External Data Path Traversal Check",
-                        passed=True,
-                        message=f"External data file path is safe for tensor '{tensor.name}'",
-                        location=str(external_path),
-                        details={"tensor": tensor.name, "file": location},
-                    )
+                    if location not in safe_files:
+                        safe_files.add(location)
+                        result.add_check(
+                            name="External Data Path Traversal Check",
+                            passed=True,
+                            message=f"External data file path is safe: {location}",
+                            location=str(external_path),
+                            details={"file": location},
+                        )
                     self._validate_external_size(tensor, external_path, result)
+
+        # Report missing files once per file (not per tensor)
+        for location, tensors in missing_files.items():
+            external_path = (model_dir / location).resolve()
+            result.add_check(
+                name="External Data File Existence",
+                passed=False,
+                message=(
+                    f"External data file '{location}' not found "
+                    f"({len(tensors)} tensor{'s' if len(tensors) != 1 else ''} affected). "
+                    "This is common for HuggingFace models downloaded without companion data files."
+                ),
+                severity=IssueSeverity.WARNING,
+                location=str(external_path),
+                details={
+                    "file": location,
+                    "affected_tensor_count": len(tensors),
+                    "sample_tensors": tensors[:5],
+                },
+            )
+
+        # Path traversal is a genuine security issue -- keep CRITICAL
+        for location, tensors in traversal_files.items():
+            external_path = (model_dir / location).resolve()
+            result.add_check(
+                name="External Data Path Traversal Check",
+                passed=False,
+                message=(
+                    f"External data file outside model directory: {location} "
+                    f"({len(tensors)} tensor{'s' if len(tensors) != 1 else ''} affected)"
+                ),
+                severity=IssueSeverity.CRITICAL,
+                location=str(external_path),
+                details={
+                    "file": location,
+                    "affected_tensor_count": len(tensors),
+                    "sample_tensors": tensors[:5],
+                },
+            )
 
     def _validate_external_size(
         self,
