@@ -49,8 +49,13 @@ def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> 
 
     Yields: (opcode, arg, pos) tuples from pickletools.genops
     """
-    # Maximum number of consecutive non-pickle bytes to skip when resyncing
-    _MAX_RESYNC_BYTES = 256
+    # Maximum number of consecutive non-pickle bytes to skip when resyncing.
+    # Security trade-off: a larger budget makes it harder for an attacker to
+    # hide a malicious stream behind a junk separator that exceeds the limit,
+    # but increases the cost of scanning non-pickle data.  4096 bytes is a
+    # reasonable upper bound — well above typical inter-stream padding while
+    # still limiting scan overhead on garbage data.
+    _MAX_RESYNC_BYTES = 4096
     resync_skipped = 0
     # Track whether we've successfully parsed at least one complete stream
     parsed_any_stream = False
@@ -90,8 +95,9 @@ def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> 
 
             if stream_error and had_opcodes:
                 # Partial stream: binary data was misinterpreted as opcodes.
-                # Discard the buffer and stop — no more valid streams.
-                return
+                # Discard the buffer but continue scanning — an attacker could
+                # hide a malicious stream behind a broken intermediate segment.
+                continue
 
             if not stream_error:
                 # Stream completed successfully — yield buffered opcodes
@@ -406,9 +412,8 @@ ALWAYS_DANGEROUS_MODULES: set[str] = {
     # Profiling / debugging (additional)
     "bdb",
     "trace",
-    # Operator / functools bypasses
+    # Operator bypasses
     "_operator",
-    "functools",
     # Pickle recursion
     "pickle",
     "_pickle",
@@ -419,7 +424,6 @@ ALWAYS_DANGEROUS_MODULES: set[str] = {
     "tempfile",
     "filecmp",
     "fileinput",
-    "glob",
     "distutils",
     "pydoc",
     "pexpect",
@@ -453,6 +457,18 @@ ALWAYS_DANGEROUS_MODULES: set[str] = {
     # - linecache.getline: file read (not code execution), flagged as WARNING
     # - logging.config.listen: network listener (not direct code exec), flagged as WARNING
     # They are caught by SUSPICIOUS_GLOBALS or general suspicious-string detection.
+}
+
+# Modules that are suspicious but should only be flagged at WARNING severity.
+# These modules appear frequently in legitimate ML pipelines and cannot directly
+# execute arbitrary code, so CRITICAL would cause too many false positives.
+WARNING_SEVERITY_MODULES: set[str] = {
+    # functools.partial is heavily used in PyTorch models; functools.reduce is
+    # the only genuinely dangerous entry and is still in SUSPICIOUS_GLOBALS.
+    "functools",
+    # glob.glob / glob.iglob are common in dataset loading pipelines and
+    # cannot directly execute code.
+    "glob",
 }
 
 # String opcodes that push text onto the pickle stack.
@@ -1601,6 +1617,15 @@ def _build_symbolic_reference_maps(
         if name in {"BINPERSID"}:
             _pop()
             stack.append(unknown)
+            continue
+
+        if name == "STOP":
+            # Clear memo at stream boundaries so that a safe memo entry from
+            # stream 1 cannot be inherited by a dangerous callable in stream 2
+            # (cross-stream memo contamination).
+            memo.clear()
+            next_memo_index = 0
+            stack.clear()
             continue
 
         if name in {
@@ -3469,8 +3494,9 @@ class PickleScanner(BaseScanner):
             for mod, func in advanced_globals:
                 if _is_actually_dangerous_global(mod, func, ml_context):
                     suspicious_count += 1
+                    base_sev = IssueSeverity.WARNING if mod in WARNING_SEVERITY_MODULES else IssueSeverity.CRITICAL
                     severity = _get_context_aware_severity(
-                        IssueSeverity.CRITICAL,
+                        base_sev,
                         ml_context,
                         issue_type="dangerous_global",
                     )
@@ -3517,8 +3543,11 @@ class PickleScanner(BaseScanner):
                         mod, func = parts
                         if _is_actually_dangerous_global(mod, func, ml_context):
                             suspicious_count += 1
+                            base_sev = (
+                                IssueSeverity.WARNING if mod in WARNING_SEVERITY_MODULES else IssueSeverity.CRITICAL
+                            )
                             severity = _get_context_aware_severity(
-                                IssueSeverity.CRITICAL,
+                                base_sev,
                                 ml_context,
                                 issue_type="dangerous_global",
                             )
@@ -3895,8 +3924,11 @@ class PickleScanner(BaseScanner):
                         mod, func = resolved
                         if _is_actually_dangerous_global(mod, func, ml_context):
                             suspicious_count += 1
+                            base_sev = (
+                                IssueSeverity.WARNING if mod in WARNING_SEVERITY_MODULES else IssueSeverity.CRITICAL
+                            )
                             severity = _get_context_aware_severity(
-                                IssueSeverity.CRITICAL,
+                                base_sev,
                                 ml_context,
                                 issue_type="dangerous_global",
                             )

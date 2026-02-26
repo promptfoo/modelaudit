@@ -201,7 +201,11 @@ SUSPICIOUS_GLOBALS = {
     "timeit": ["timeit", "repeat"],
     "trace": "*",
     # Operator / functools bypasses
-    "functools": ["reduce", "partial"],
+    # NOTE: functools.partial is excluded — it is heavily used in legitimate
+    # PyTorch models (e.g. torch.nn modules) and cannot execute arbitrary code
+    # on its own.  Only functools.reduce is flagged because it accepts a
+    # callable and iterates, which can be abused.
+    "functools": ["reduce"],
     "_operator": "*",
     # Pickle recursion
     "cloudpickle": "*",
@@ -212,7 +216,10 @@ SUSPICIOUS_GLOBALS = {
     "pydoc": "*",
     "pexpect": "*",
     "fileinput": "*",
-    "glob": "*",
+    # NOTE: glob.glob / glob.iglob are common in dataset loading pipelines and
+    # cannot directly execute code.  Only flagged at WARNING severity via
+    # WARNING_SEVERITY_MODULES in pickle_scanner.py.
+    "glob": ["glob", "iglob"],
     # Virtual environments / package install
     "venv": "*",
     "ensurepip": "*",
