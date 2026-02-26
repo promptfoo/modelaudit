@@ -694,11 +694,32 @@ class FlaxMsgpackScanner(BaseScanner):
         transformer_keys = {"embeddings", "encoder", "decoder", "pooler", "lm_head", "transformer", "model"}
         # Common HuggingFace model name keys that wrap transformer substructure
         model_name_keys = {
-            "bert", "roberta", "distilbert", "albert", "electra", "xlm",
-            "gpt2", "gpt_neo", "gpt_neox", "gptj", "opt", "llama",
-            "t5", "bart", "pegasus", "mbart", "blenderbot",
-            "vit", "clip", "whisper", "wav2vec2", "flax_model",
-            "classifier", "qa_outputs", "lm_head", "score",
+            "bert",
+            "roberta",
+            "distilbert",
+            "albert",
+            "electra",
+            "xlm",
+            "gpt2",
+            "gpt_neo",
+            "gpt_neox",
+            "gptj",
+            "opt",
+            "llama",
+            "t5",
+            "bart",
+            "pegasus",
+            "mbart",
+            "blenderbot",
+            "vit",
+            "clip",
+            "whisper",
+            "wav2vec2",
+            "flax_model",
+            "classifier",
+            "qa_outputs",
+            "lm_head",
+            "score",
         }
         has_transformer_keys = any(key in found_keys for key in transformer_keys)
 
