@@ -49,8 +49,13 @@ def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> 
 
     Yields: (opcode, arg, pos) tuples from pickletools.genops
     """
-    # Maximum number of consecutive non-pickle bytes to skip when resyncing
-    _MAX_RESYNC_BYTES = 256
+    # Maximum number of consecutive non-pickle bytes to skip when resyncing.
+    # Security trade-off: a larger budget tolerates longer non-pickle gaps
+    # (e.g. Paddle's binary tensor data between pickle streams) but increases
+    # the window in which an attacker could hide a second malicious pickle
+    # stream after a large block of junk bytes.  4096 bytes is large enough
+    # to cover observed framework padding while still bounding the search.
+    _MAX_RESYNC_BYTES = 4096
     resync_skipped = 0
     # Track whether we've successfully parsed at least one complete stream
     parsed_any_stream = False
@@ -90,8 +95,10 @@ def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> 
 
             if stream_error and had_opcodes:
                 # Partial stream: binary data was misinterpreted as opcodes.
-                # Discard the buffer and stop — no more valid streams.
-                return
+                # Discard the buffer but keep scanning — there may be a real
+                # malicious pickle stream further into the file that we must
+                # not miss.
+                continue
 
             if not stream_error:
                 # Stream completed successfully — yield buffered opcodes
@@ -2210,6 +2217,7 @@ def check_opcode_sequence(
             dangerous_opcode_count = 0
             consecutive_dangerous = 0
             max_consecutive = 0
+            _safe_memo.clear()
             continue
 
         # Maintain memo safety map: when BINPUT/LONG_BINPUT stores a value
