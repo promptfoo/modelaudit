@@ -662,6 +662,12 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "_reconstruct",
         "scalar",
     ],
+    "numpy._core.numeric": [
+        "_frombuffer",
+    ],
+    "numpy.core.numeric": [
+        "_frombuffer",
+    ],
     "numpy.random._pickle": [
         "__randomstate_ctor",
         "__generator_ctor",
@@ -723,6 +729,13 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
     "C": ["dtype", "ndarray", "scalar"],
     "multiarray": ["_reconstruct", "scalar"],
     "numpy_pickle": ["NumpyArrayWrapper", "NDArrayWrapper"],
+    # Truncated sklearn class names from joblib opcode resolution.
+    # When joblib serializes sklearn objects it sometimes resolves class names
+    # without the full module path, e.g. "LabelEncoder" instead of
+    # "sklearn.preprocessing._label.LabelEncoder".
+    "LabelEncoder": ["dtype"],
+    "OrdinalEncoder": ["dtype"],
+    "OneHotEncoder": ["dtype"],
     "MT19937": ["__bit_generator_ctor"],
     # scipy sparse matrices (used by sklearn SVM, text classifiers, etc.)
     "scipy.sparse._csr": ["csr_matrix", "csr_array"],
