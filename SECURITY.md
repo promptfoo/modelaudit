@@ -6,13 +6,13 @@ A security vulnerability is any bug that threatens the safety of ModelAudit user
 
 **Vulnerability categories:**
 
-| Category | Examples |
-| --- | --- |
-| Code execution in the scanner | A crafted model file causes ModelAudit itself to execute arbitrary code during scanning |
-| Detection bypass | Security-relevant malicious behavior goes undetected within a format or attack class that ModelAudit claims to cover, even if unrelated detectors still produce other findings |
-| Denial of service | A crafted file causes an out-of-memory condition, infinite loop, or crash in ModelAudit |
-| Information disclosure | Scan results or error output leak host filesystem paths, environment variables, or API keys |
-| Supply chain compromise | Malicious code introduced through the PyPI package, Docker images, or GitHub Actions workflows |
+| Category                      | Examples                                                                                                                                                                       |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Code execution in the scanner | A crafted model file causes ModelAudit itself to execute arbitrary code during scanning                                                                                        |
+| Detection bypass              | Security-relevant malicious behavior goes undetected within a format or attack class that ModelAudit claims to cover, even if unrelated detectors still produce other findings |
+| Denial of service             | A crafted file causes an out-of-memory condition, infinite loop, or crash in ModelAudit                                                                                        |
+| Information disclosure        | Scan results or error output leak host filesystem paths, environment variables, or API keys                                                                                    |
+| Supply chain compromise       | Malicious code introduced through the PyPI package, Docker images, or GitHub Actions workflows                                                                                 |
 
 **Not considered a vulnerability:**
 
@@ -48,30 +48,30 @@ A good report helps us confirm and fix the issue quickly. Include as much of the
 - **Python version** (`python --version`).
 - **Operating system and architecture** (e.g., Ubuntu 22.04 x86_64, macOS 15 arm64).
 - **Installation method** (pip, uv, Docker, source).
-- **Verbose scan output** (`modelaudit scan <file> --verbose`), with any sensitive paths redacted.
+- **Verbose scan output** (`modelaudit scan <file> --verbose`), with sensitive data redacted (paths, usernames, hostnames, tokens, credentials, keys).
 - **Fuzzer details**, if the issue was found through fuzzing — include the fuzzer name, configuration, and corpus entry.
 
 If you cannot share the triggering file, describe how to generate a file that reproduces the issue.
 
 ## Response timeline
 
-| Milestone | Target |
-| --- | --- |
-| Acknowledgment | Within 48 hours of receipt |
-| Initial severity assessment | Within 5 business days |
-| Fix developed and tested | See fix windows below |
-| Coordinated disclosure | Simultaneously with patch release |
+| Milestone                   | Target                            |
+| --------------------------- | --------------------------------- |
+| Acknowledgment              | Within 48 hours of receipt        |
+| Initial severity assessment | Within 5 business days            |
+| Fix developed and tested    | See fix windows below             |
+| Coordinated disclosure      | Simultaneously with patch release |
 
 ### Fix windows by severity
 
 We assess severity using [CVSS v3.1](https://www.first.org/cvss/v3.1/specification-document). Fix windows are targets, not guarantees — we will communicate proactively if a fix requires more time.
 
-| CVSS score | Severity | Target fix window |
-| --- | --- | --- |
-| 9.0–10.0 | Critical | 30 days |
-| 7.0–8.9 | High | 30–60 days |
-| 4.0–6.9 | Medium | Next release cycle |
-| 0.1–3.9 | Low | Best effort |
+| CVSS score | Severity | Target fix window  |
+| ---------- | -------- | ------------------ |
+| 9.0–10.0   | Critical | 30 days            |
+| 7.0–8.9    | High     | 30–60 days         |
+| 4.0–6.9    | Medium   | Next release cycle |
+| 0.1–3.9    | Low      | Best effort        |
 
 **ModelAudit-specific severity factors:**
 
@@ -84,11 +84,11 @@ We assess severity using [CVSS v3.1](https://www.first.org/cvss/v3.1/specificati
 
 We ask reporters to keep vulnerability details confidential until a patch is released. The embargo window depends on severity:
 
-| Severity | Embargo window |
-| --- | --- |
-| Critical or High | 90 days from acknowledgment |
-| Medium | Until the next scheduled release (typically shorter than 90 days) |
-| Low | No formal embargo |
+| Severity         | Embargo window                                                    |
+| ---------------- | ----------------------------------------------------------------- |
+| Critical or High | 90 days from acknowledgment                                       |
+| Medium           | Until the next scheduled release (typically shorter than 90 days) |
+| Low              | No formal embargo                                                 |
 
 If a fix requires longer than the default window, we will negotiate an extension with you before the deadline. If we fail to ship a fix within the agreed window, you are free to disclose.
 
@@ -99,7 +99,7 @@ We request CVE IDs through [GitHub's CVE Numbering Authority (CNA)](https://docs
 **CVE issued:**
 
 - Remote code execution in ModelAudit when scanning untrusted input.
-- Detection bypass where security-relevant malicious behavior goes undetected within a format or attack class that ModelAudit covers (see [claimed coverage](#claimed-coverage)).
+- Detection bypass with broad or material security impact — security-relevant malicious behavior goes undetected within a format or attack class that ModelAudit covers (see [claimed coverage](#claimed-coverage)).
 - Supply chain compromise of the PyPI package, Docker images, or release pipeline.
 - Information disclosure of sensitive host data during a scan.
 
@@ -136,10 +136,10 @@ When in doubt, we err toward issuing a CVE.
 
 We support the latest release only. We do not backport security fixes to older release lines.
 
-| Version | Supported |
-| --- | --- |
-| Latest release | Yes |
-| Older releases | No |
+| Version        | Supported |
+| -------------- | --------- |
+| Latest release | Yes       |
+| Older releases | No        |
 
 We recommend always upgrading to the latest version. See the [CHANGELOG](CHANGELOG.md) for release history.
 
@@ -169,7 +169,7 @@ References to what ModelAudit "claims to cover" throughout this policy mean the 
 - [Security model and limitations](docs/user/security-model.md) — what ModelAudit is designed to catch and what it does not guarantee.
 - [Compatibility matrix](docs/user/compatibility-matrix.md) — supported file formats and the detectors applied to each.
 
-If a format or attack class is listed in these documents, bypasses against it are treated as security-relevant under this policy.
+If a format or attack class is listed in these documents, bypasses against it are treated as security-relevant under this policy. If documentation is stale or ambiguous relative to implemented scanner behavior, we triage in favor of security handling.
 
 ## Related documentation
 
