@@ -1588,8 +1588,17 @@ def _is_actually_dangerous_global(mod: str, func: str, ml_context: dict) -> bool
         )
         return True
 
-    # STEP 2: ALWAYS flag dangerous modules (no exceptions)
+    # STEP 2: Flag dangerous modules, but allow explicitly safe-listed functions.
+    # The truly dangerous functions from these modules (eval, exec, open, getattr,
+    # setattr, delattr, __import__, compile, etc.) are already caught in STEP 1 via
+    # ALWAYS_DANGEROUS_FUNCTIONS, so any function reaching this point that is in the
+    # ML_SAFE_GLOBALS allowlist (e.g., builtins.slice, builtins.set) is genuinely safe.
     if mod in ALWAYS_DANGEROUS_MODULES:
+        if _is_safe_ml_global(mod, func):
+            logger.debug(
+                f"Safe function from dangerous module: {mod}.{func} (explicitly allowlisted in ML_SAFE_GLOBALS)"
+            )
+            return False
         logger.warning(f"Always-dangerous module detected: {mod}.{func} (flagged regardless of ML context)")
         return True
 
@@ -2254,11 +2263,13 @@ def is_dangerous_reduce_pattern(
     def _is_dangerous_ref(mod: str, func: str) -> bool:
         """Check if a module.function reference is dangerous enough to flag."""
         full_ref = f"{mod}.{func}"
-        # Check ALWAYS_DANGEROUS lists FIRST (before allowlist to prevent bypass)
+        # Check ALWAYS_DANGEROUS functions FIRST (before allowlist to prevent bypass)
         if full_ref in ALWAYS_DANGEROUS_FUNCTIONS or func in ALWAYS_DANGEROUS_FUNCTIONS:
             return True
+        # Check dangerous modules, but allow explicitly safe-listed functions
+        # (truly dangerous functions like eval/exec/open are caught above)
         if mod in ALWAYS_DANGEROUS_MODULES:
-            return True
+            return not _is_safe_ml_global(mod, func)
         # Safe ML globals (checked after dangerous lists)
         if _is_safe_ml_global(mod, func):
             return False
