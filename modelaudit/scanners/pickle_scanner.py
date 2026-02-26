@@ -2158,12 +2158,13 @@ def is_dangerous_reduce_pattern(
             ref = resolved_callables.get(i)
             if ref:
                 mod, func = ref
-                return {
-                    "pattern": f"{opcode.name}_EXECUTION",
-                    "argument": f"{mod}.{func}",
-                    "position": pos,
-                    "opcode": opcode.name,
-                }
+                if _is_dangerous_ref(mod, func):
+                    return {
+                        "pattern": f"{opcode.name}_EXECUTION",
+                        "argument": f"{mod}.{func}",
+                        "position": pos,
+                        "opcode": opcode.name,
+                    }
 
         # Check for suspicious attribute access patterns (GETATTR followed by CALL)
         if opcode.name == "GETATTR" and i + 1 < len(opcodes) and opcodes[i + 1][0].name == "CALL":
