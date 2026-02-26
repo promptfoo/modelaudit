@@ -2271,6 +2271,10 @@ def check_opcode_sequence(
     dangerous_opcode_count = 0
     consecutive_dangerous = 0
     max_consecutive = 0
+    # Track whether the last object construction used a safe ML global.
+    # BUILD opcodes restore state on the previously-constructed object via
+    # __setstate__ and are benign when the object comes from a safe ML class.
+    last_construction_safe = False
 
     for i, (opcode, arg, pos) in enumerate(opcodes):
         # Reset counters at stream boundaries (STOP) so that multi-stream
@@ -2281,6 +2285,7 @@ def check_opcode_sequence(
             dangerous_opcode_count = 0
             consecutive_dangerous = 0
             max_consecutive = 0
+            last_construction_safe = False
             continue
 
         # Track dangerous opcodes, skipping safe ML globals and structural opcodes
@@ -2295,12 +2300,35 @@ def check_opcode_sequence(
             elif opcode.name == "REDUCE":
                 # Default to dangerous if no associated GLOBAL/STACK_GLOBAL found
                 is_dangerous_opcode = True
+                last_construction_safe = False
                 associated_ref = resolved_callables.get(i)
                 if associated_ref:
                     mod, func = associated_ref
                     # Only skip if in safe globals
                     if _is_safe_ml_global(mod, func):
                         is_dangerous_opcode = False
+                        last_construction_safe = True
+
+            # NEWOBJ/NEWOBJ_EX: check callable refs like REDUCE
+            elif opcode.name in ("NEWOBJ", "NEWOBJ_EX"):
+                is_dangerous_opcode = True
+                last_construction_safe = False
+                associated_ref = resolved_callables.get(i)
+                if associated_ref:
+                    mod, func = associated_ref
+                    if _is_safe_ml_global(mod, func):
+                        is_dangerous_opcode = False
+                        last_construction_safe = True
+
+            # BUILD: restores object state via __setstate__.  When the
+            # preceding construction used a safe ML global the BUILD is
+            # benign — it just sets attributes on a known-safe object.
+            elif opcode.name == "BUILD":
+                if not last_construction_safe:
+                    is_dangerous_opcode = True
+                # BUILD does not reset last_construction_safe because
+                # multiple BUILD opcodes can follow a single construction
+                # (e.g. nested __setstate__ calls in sklearn trees).
 
             # GLOBAL/STACK_GLOBAL: only count when referencing non-safe modules
             elif opcode.name == "GLOBAL" and isinstance(arg, str):
@@ -2322,8 +2350,9 @@ def check_opcode_sequence(
                     is_dangerous_opcode = True
 
             else:
-                # Other dangerous opcodes (INST, OBJ, NEWOBJ, NEWOBJ_EX, BUILD, EXT*)
+                # Other dangerous opcodes (INST, OBJ, EXT*)
                 is_dangerous_opcode = True
+                last_construction_safe = False
 
             if is_dangerous_opcode:
                 dangerous_opcode_count += 1
