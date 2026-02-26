@@ -149,9 +149,9 @@ SUSPICIOUS_GLOBALS = {
     "pty": ["spawn"],  # Pseudo-terminal spawning
     "platform": ["system", "popen"],  # System information/execution
     # Low-level system access - CRITICAL RISK
-    "ctypes": ["*"],  # C library access
+    "ctypes": "*",  # C library access (FIXED: was ["*"] which bypassed wildcard check)
     "ctypes.util": "*",  # Library finding utilities (find_library, etc.)
-    "socket": ["*"],  # Network communication
+    "socket": "*",  # Network communication (FIXED: was ["*"] which bypassed wildcard check)
     "mmap": "*",  # Memory mapping (can map files, shared memory)
     # Process and signal control - CRITICAL RISK
     "multiprocessing": "*",  # Process spawning and pool execution

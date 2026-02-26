@@ -33,6 +33,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **security**: harden pickle scanner stack resolution to correctly track `STACK_GLOBAL` and memoized `REDUCE` call targets, preventing decoy-string and `BINGET` bypasses
+- **security**: tighten manifest trusted-domain matching to validate URL hostnames instead of substring matches
+- **security**: make `.keras` suspicious file extension checks case-insensitive to catch uppercase executable/script payloads
+- **security**: block unsafe in-process `torch.load` in `WeightDistributionScanner` by default unless explicitly opted in
+
 ## [0.2.25] - 2026-02-12
 
 ### Features
