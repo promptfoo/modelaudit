@@ -60,9 +60,15 @@ class TestSkopsScannerCVE2025_54412:
         assert cve_checks[0].status == CheckStatus.FAILED
         assert cve_checks[0].severity == IssueSeverity.CRITICAL
 
-    def test_detects_reduce_pattern(self, tmp_path: Path) -> None:
-        """Test detection of __reduce__ pattern."""
-        skops_file = tmp_path / "malicious.skops"
+    def test_reduce_pattern_no_false_positive(self, tmp_path: Path) -> None:
+        """Test that __reduce__ filenames do NOT trigger CVE-2025-54412.
+
+        __reduce__ is a standard Python serialization method used by ALL
+        sklearn Cython types (e.g. sklearn.tree._tree.Tree).  It was
+        intentionally removed from CVE-2025-54412 pattern matching to
+        prevent false positives on legitimate models.
+        """
+        skops_file = tmp_path / "legitimate.skops"
         with zipfile.ZipFile(skops_file, "w") as zf:
             zf.writestr("__reduce__payload.bin", b"malicious content")
             zf.writestr("schema.json", '{"version": "1.0"}')
@@ -71,9 +77,9 @@ class TestSkopsScannerCVE2025_54412:
         result = scanner.scan(str(skops_file))
 
         cve_checks = [c for c in result.checks if "CVE-2025-54412" in c.name]
-        assert len(cve_checks) > 0
-        assert cve_checks[0].status == CheckStatus.FAILED
-        assert cve_checks[0].severity == IssueSeverity.CRITICAL
+        # __reduce__ alone should NOT trigger CVE-2025-54412
+        failed = [c for c in cve_checks if c.status == CheckStatus.FAILED]
+        assert len(failed) == 0
 
     def test_no_false_positive_clean_file(self, tmp_path: Path) -> None:
         """Test that clean skops files don't trigger CVE-2025-54412."""
