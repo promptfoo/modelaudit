@@ -75,10 +75,11 @@ def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> 
                     logger.info(
                         f"Protocol mismatch in pickle (joblib may use protocol 5 opcodes in protocol 4 files): {e}"
                     )
-                elif multi_stream:
+                elif multi_stream and had_opcodes:
                     # In multi-stream mode, don't abort on first-stream parse
-                    # errors -- a corrupted first stream should not prevent
-                    # scanning subsequent (potentially malicious) streams.
+                    # errors when we already yielded some opcodes -- a partially
+                    # corrupted first stream should not prevent scanning
+                    # subsequent (potentially malicious) streams.
                     logger.info(f"First pickle stream parse error (continuing multi-stream scan): {e}")
                     stream_error = True
                 else:
