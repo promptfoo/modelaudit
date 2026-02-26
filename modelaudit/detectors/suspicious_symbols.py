@@ -225,8 +225,10 @@ SUSPICIOUS_STRING_PATTERNS = [
     r"\bimport\s+[\w\.]+",  # Import statements referencing modules
     r"importlib",  # Dynamic import library
     r"__import__",  # Built-in import function
-    # Code construction - MEDIUM RISK
-    r"\blambda\b",  # Anonymous function creation (word boundary to avoid matching e.g. "reg_lambda")
+    # NOTE: "lambda" was removed from this list because it matches vocabulary entries
+    # in text classifiers (e.g., TF-IDF vectorizers). Lambda exploitation is detected
+    # by the dedicated Pattern 5 check in check_opcode_sequence() which looks for
+    # lambda strings followed by REDUCE opcodes (the actual attack vector).
     # Hex encoding - possible obfuscation
     r"\\x[0-9a-fA-F]{2}",  # Hex-encoded characters
     # getattr-based evasion patterns - bypass string matching via dynamic attribute access

@@ -709,6 +709,14 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "csc_array",
         "coo_array",
     ],
+    # Old-style scipy paths (without underscore, used in older scipy versions)
+    "scipy.sparse.csr": ["csr_matrix", "csr_array"],
+    "scipy.sparse.csc": ["csc_matrix", "csc_array"],
+    "scipy.sparse.coo": ["coo_matrix", "coo_array"],
+    "scipy.sparse.bsr": ["bsr_matrix", "bsr_array"],
+    "scipy.sparse.dia": ["dia_matrix", "dia_array"],
+    "scipy.sparse.lil": ["lil_matrix", "lil_array"],
+    "scipy.sparse.dok": ["dok_matrix", "dok_array"],
     # YOLO/Ultralytics safe patterns
     "ultralytics": [
         "YOLO",
@@ -1153,7 +1161,7 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "MultinomialLogit",
         "Interval",
     ],
-    # Truncated _loss module name (joblib opcode resolution)
+    # Truncated _loss module name (joblib opcode resolution) + Cython unpickle functions
     "_loss": [
         "CyHalfSquaredError",
         "CyHalfBinomialLoss",
@@ -1164,11 +1172,45 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "CyPinballLoss",
         "CyHuberLoss",
         "CyExponentialLoss",
+        "CyHalfTweedieLoss",
+        "CyHalfTweedieLossIdentity",
+        # Cython __pyx_unpickle_* reconstruction functions
+        "__pyx_unpickle_CyHalfSquaredError",
+        "__pyx_unpickle_CyHalfBinomialLoss",
+        "__pyx_unpickle_CyHalfMultinomialLoss",
+        "__pyx_unpickle_CyHalfPoissonLoss",
+        "__pyx_unpickle_CyHalfGammaLoss",
+        "__pyx_unpickle_CyAbsoluteError",
+        "__pyx_unpickle_CyPinballLoss",
+        "__pyx_unpickle_CyHuberLoss",
+        "__pyx_unpickle_CyExponentialLoss",
+        "__pyx_unpickle_CyHalfTweedieLoss",
+        "__pyx_unpickle_CyHalfTweedieLossIdentity",
     ],
     # Old sklearn module paths (pre-underscore convention, used in older models)
     "sklearn.linear_model.stochastic_gradient": [
         "SGDClassifier",
         "SGDRegressor",
+    ],
+    # LightGBM
+    "lightgbm.sklearn": [
+        "LGBMClassifier",
+        "LGBMRegressor",
+        "LGBMRanker",
+    ],
+    "lightgbm.basic": [
+        "Booster",
+        "Dataset",
+    ],
+    # numpy masked arrays (used by older sklearn models)
+    "numpy.ma.core": [
+        "_mareconstruct",
+        "MaskedArray",
+        "MaskedConstant",
+    ],
+    "numpy.ma": [
+        "core",
+        "MaskedArray",
     ],
     "transformers": [
         "AutoModel",
@@ -2065,11 +2107,17 @@ def is_suspicious_string(s: str) -> str | None:
             return pattern
 
     # Check for base64-like strings (long strings with base64 charset), but avoid repeating patterns
+    # and TF-IDF vocabulary strings (which are long alphanumeric but all lowercase words)
     if (
         len(s) > 40
         and re.match(r"^[A-Za-z0-9+/=]+$", s)
         and not re.match(r"^(.)\1*$", s)  # Not all same character
         and len(set(s)) > 4  # Must have some character diversity
+        # Require characteristics of actual base64: mixed case AND digits present
+        # This avoids matching TF-IDF vocabulary (all lowercase concatenated words)
+        and re.search(r"[A-Z]", s)
+        and re.search(r"[a-z]", s)
+        and re.search(r"[0-9]", s)
     ):
         return "potential_base64"
 
@@ -2315,13 +2363,16 @@ def check_opcode_sequence(
         # 5000+ BUILD opcodes from __setstate__ calls on tree nodes.
         # Raise the threshold significantly to suppress false positives.
         _ml_frameworks = ml_context.get("frameworks", {})
-        _tree_ensemble_frameworks = {"sklearn", "xgboost"}
+        _tree_ensemble_frameworks = {"sklearn", "xgboost", "lightgbm"}
         if (
             ml_context.get("is_ml_content", False)
             and ml_context.get("overall_confidence", 0) >= 0.4
             and _tree_ensemble_frameworks & set(_ml_frameworks.keys())
         ):
-            threshold = 5000
+            # Scale threshold with total opcodes: large tree ensembles can have
+            # 200K+ opcodes where most are legitimate BUILD/REDUCE for tree nodes.
+            # Use max(5000, total_opcodes // 2) to avoid FPs on large models.
+            threshold = max(5000, len(opcodes) // 2)
 
         if dangerous_opcode_count > threshold:
             suspicious_patterns.append(
