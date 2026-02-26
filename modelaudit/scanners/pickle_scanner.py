@@ -95,8 +95,14 @@ def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> 
             if stream_error and had_opcodes:
                 # Partial stream: binary data was misinterpreted as opcodes.
                 # Discard the buffer but keep scanning — a malicious payload
-                # could be hiding after the binary blob.  Resync from the
-                # current file position to find the next valid stream.
+                # could be hiding after the binary blob.  Charge the bytes
+                # consumed by this partial stream against the resync budget
+                # so that an attacker cannot use repeated partial streams to
+                # bypass the _MAX_RESYNC_BYTES limit.
+                partial_bytes = file_obj.tell() - stream_start
+                resync_skipped += max(partial_bytes, 1)
+                if resync_skipped >= _MAX_RESYNC_BYTES:
+                    return
                 continue
 
             if not stream_error:
