@@ -421,9 +421,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                                 "op_type": node.op,
                                 "layer_prefix": layer_prefix,
                                 "meta_graph": (
-                                    meta_graph.meta_info_def.tags[0]
-                                    if meta_graph.meta_info_def.tags
-                                    else "unknown"
+                                    meta_graph.meta_info_def.tags[0] if meta_graph.meta_info_def.tags else "unknown"
                                 ),
                             },
                             why=(
