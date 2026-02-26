@@ -50,7 +50,7 @@ def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> 
     Yields: (opcode, arg, pos) tuples from pickletools.genops
     """
     # Maximum number of consecutive non-pickle bytes to skip when resyncing
-    _MAX_RESYNC_BYTES = 256
+    _MAX_RESYNC_BYTES = 4096
     resync_skipped = 0
     # Track whether we've successfully parsed at least one complete stream
     parsed_any_stream = False
@@ -90,8 +90,9 @@ def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> 
 
             if stream_error and had_opcodes:
                 # Partial stream: binary data was misinterpreted as opcodes.
-                # Discard the buffer and stop — no more valid streams.
-                return
+                # Discard the buffer but continue scanning — there may be a
+                # valid malicious stream hidden after the binary blob.
+                pass
 
             if not stream_error:
                 # Stream completed successfully — yield buffered opcodes
@@ -449,10 +450,13 @@ ALWAYS_DANGEROUS_MODULES: set[str] = {
     "lib2to3",
     # uuid — _get_command_stdout internally calls subprocess.Popen (VULN-6)
     "uuid",
-    # NOTE: linecache and logging.config are intentionally NOT in this set.
+    # NOTE: `logging` the top-level module IS in this set because instantiating
+    # arbitrary handlers (e.g. logging.FileHandler, logging.StreamHandler) can be
+    # abused for file writes and other side-effects.  The specific dangerous
+    # sub-module functions (e.g. logging.config.listen) are caught separately in
+    # SUSPICIOUS_GLOBALS / suspicious_symbols.py.
+    # linecache is intentionally NOT in this set:
     # - linecache.getline: file read (not code execution), flagged as WARNING
-    # - logging.config.listen: network listener (not direct code exec), flagged as WARNING
-    # They are caught by SUSPICIOUS_GLOBALS or general suspicious-string detection.
 }
 
 # String opcodes that push text onto the pickle stack.
@@ -2128,14 +2132,27 @@ def is_dangerous_reduce_pattern(
                 }:
                     break
 
-        # Check for INST or OBJ opcodes which can also be used for code execution
-        if opcode.name in ["INST", "OBJ", "NEWOBJ", "NEWOBJ_EX"] and isinstance(arg, str):
+        # Check for INST opcode (carries class info as a string arg)
+        if opcode.name == "INST" and isinstance(arg, str):
             return {
                 "pattern": f"{opcode.name}_EXECUTION",
                 "argument": arg,
                 "position": pos,
                 "opcode": opcode.name,
             }
+
+        # Check for OBJ/NEWOBJ/NEWOBJ_EX opcodes which produce arg=None;
+        # use the resolved callable map to get the associated class reference.
+        if opcode.name in {"OBJ", "NEWOBJ", "NEWOBJ_EX"}:
+            ref = resolved_callables.get(i)
+            if ref:
+                mod, func = ref
+                return {
+                    "pattern": f"{opcode.name}_EXECUTION",
+                    "argument": f"{mod}.{func}",
+                    "position": pos,
+                    "opcode": opcode.name,
+                }
 
         # Check for suspicious attribute access patterns (GETATTR followed by CALL)
         if opcode.name == "GETATTR" and i + 1 < len(opcodes) and opcodes[i + 1][0].name == "CALL":
@@ -2210,6 +2227,7 @@ def check_opcode_sequence(
             dangerous_opcode_count = 0
             consecutive_dangerous = 0
             max_consecutive = 0
+            _safe_memo.clear()
             continue
 
         # Maintain memo safety map: when BINPUT/LONG_BINPUT stores a value
