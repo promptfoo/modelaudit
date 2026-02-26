@@ -1506,6 +1506,49 @@ def _detect_ml_context(opcodes: list[tuple]) -> dict[str, Any]:
     return context
 
 
+def _is_plausible_python_module(name: str) -> bool:
+    """
+    Check whether *name* looks like a real Python module/package path.
+
+    Legitimate module names follow Python identifier rules:
+    - Each dotted segment is a valid Python identifier (letters, digits,
+      underscores; cannot start with a digit).
+    - Conventionally all-lowercase, though private/internal modules may use
+      a leading underscore.
+
+    Names that contain uppercase letters, start with digits, or include
+    characters outside ``[a-z0-9_.]`` are almost certainly **not** real
+    modules -- they are more likely DataFrame column names, user labels,
+    or other data strings that ended up as pickle GLOBAL arguments
+    (e.g. ``PEDRA_2020``).
+
+    The check is intentionally conservative: a handful of legitimate but
+    unusual module names (e.g. ``PIL``, ``Cython``) are covered by
+    ``ML_SAFE_GLOBALS`` and will pass the allowlist before this function
+    is ever consulted.
+
+    Returns:
+        True if *name* plausibly refers to a real Python module.
+    """
+    import re
+
+    if not name:
+        return False
+
+    # Fast reject: real module paths never contain whitespace.
+    if " " in name or "\t" in name:
+        return False
+
+    # Split on dots; each segment must be a valid Python identifier that
+    # looks like a conventional module name (lowercase + digits + _).
+    segments = name.split(".")
+    if not segments or any(s == "" for s in segments):
+        return False
+
+    _MODULE_SEGMENT_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
+    return all(_MODULE_SEGMENT_RE.match(seg) for seg in segments)
+
+
 def _is_safe_ml_global(mod: str, func: str) -> bool:
     """
     Check if a module.function is in the ML_SAFE_GLOBALS allowlist.
@@ -2382,11 +2425,13 @@ def check_opcode_sequence(
                         is_dangerous_opcode = False
 
             # GLOBAL/STACK_GLOBAL: only count when referencing non-safe modules
+            # Also skip counting when the "module" name is not a plausible
+            # Python module (e.g. DataFrame column names like "PEDRA_2020").
             elif opcode.name == "GLOBAL" and isinstance(arg, str):
                 parts = arg.split(" ", 1) if " " in arg else arg.rsplit(".", 1) if "." in arg else [arg, ""]
                 if len(parts) == 2:
                     mod, func = parts
-                    if not _is_safe_ml_global(mod, func):
+                    if not _is_safe_ml_global(mod, func) and _is_plausible_python_module(mod):
                         is_dangerous_opcode = True
                 else:
                     is_dangerous_opcode = True
@@ -2395,7 +2440,7 @@ def check_opcode_sequence(
                 stack_ref = resolved_stack_globals.get(i)
                 if stack_ref:
                     mod, func = stack_ref
-                    if not _is_safe_ml_global(mod, func):
+                    if not _is_safe_ml_global(mod, func) and _is_plausible_python_module(mod):
                         is_dangerous_opcode = True
                 else:
                     is_dangerous_opcode = True
@@ -2464,14 +2509,25 @@ def check_opcode_sequence(
         has_tree_markers = any(marker in _all_refs_str for marker in _tree_ensemble_markers)
         if (
             ml_context.get("is_ml_content", False)
-            and ml_context.get("overall_confidence", 0) >= 0.4
             and _tree_ensemble_frameworks & set(_ml_frameworks.keys())
             and has_tree_markers
         ):
-            # Scale threshold with total opcodes: large tree ensembles can have
-            # 200K+ opcodes where most are legitimate BUILD/REDUCE for tree nodes.
-            # Use max(5000, total_opcodes // 2) to avoid FPs on large models.
-            threshold = max(5000, len(opcodes) // 2)
+            # Tree-ensemble markers in the opcode stream (e.g. RandomForest,
+            # DecisionTree class references) are themselves strong evidence of
+            # a legitimate model.  A low confidence threshold (0.15) is enough
+            # because the structural markers already confirm the file's nature;
+            # the previous 0.4 threshold caused false positives on real sklearn
+            # tree ensemble .pkl files with ml_context_confidence ~0.27.
+            ml_confidence_val = ml_context.get("overall_confidence", 0)
+            if ml_confidence_val >= 0.15:
+                # Scale threshold with total opcodes: large tree ensembles can have
+                # 200K+ opcodes where most are legitimate BUILD/REDUCE for tree nodes.
+                # Use max(5000, total_opcodes // 2) to avoid FPs on large models.
+                threshold = max(5000, len(opcodes) // 2)
+            elif ml_confidence_val < 0.15 and has_tree_markers:
+                # Even with very low confidence, tree markers warrant a
+                # moderately raised threshold to avoid flooding with warnings.
+                threshold = max(500, len(opcodes) // 10)
 
         if dangerous_opcode_count > threshold:
             suspicious_patterns.append(
@@ -3815,6 +3871,36 @@ class PickleScanner(BaseScanner):
                                         issue_type="dangerous_global",
                                     )
                                 else:
+                                    # Non-allowlisted but not explicitly dangerous.
+                                    # Before flagging, check if the "module" name
+                                    # actually looks like a real Python module.
+                                    # Pickle GLOBAL args can contain arbitrary data
+                                    # strings (e.g. DataFrame column names like
+                                    # "PEDRA_2020") that are not real modules.
+                                    if not _is_plausible_python_module(reduce_mod):
+                                        # Not a real module -- record as safe (INFO)
+                                        result.add_check(
+                                            name="REDUCE Opcode Safety Check",
+                                            passed=True,
+                                            message=(
+                                                f"REDUCE opcode with implausible module name "
+                                                f"'{reduce_mod}' (likely data, not a real import): "
+                                                f"{associated_global}"
+                                            ),
+                                            severity=IssueSeverity.INFO,
+                                            location=f"{self.current_file_path} (pos {pos})",
+                                            details={
+                                                "position": pos,
+                                                "opcode": opcode.name,
+                                                "associated_global": associated_global,
+                                                "implausible_module": True,
+                                                "ml_context_confidence": ml_context.get(
+                                                    "overall_confidence",
+                                                    0,
+                                                ),
+                                            },
+                                        )
+                                        continue
                                     # Non-allowlisted but not explicitly dangerous - WARNING
                                     severity = _get_context_aware_severity(
                                         IssueSeverity.WARNING,
@@ -3914,6 +4000,31 @@ class PickleScanner(BaseScanner):
                                         issue_type="dangerous_global",
                                     )
                                 else:
+                                    # Skip if module name is not a plausible Python module
+                                    # (e.g. DataFrame column names like "PEDRA_2020")
+                                    if not _is_plausible_python_module(class_mod):
+                                        result.add_check(
+                                            name="INST/OBJ/NEWOBJ/NEWOBJ_EX Opcode Safety Check",
+                                            passed=True,
+                                            message=(
+                                                f"{opcode.name} opcode with implausible module name "
+                                                f"'{class_mod}' (likely data, not a real import): "
+                                                f"{associated_class}"
+                                            ),
+                                            severity=IssueSeverity.INFO,
+                                            location=f"{self.current_file_path} (pos {pos})",
+                                            details={
+                                                "position": pos,
+                                                "opcode": opcode.name,
+                                                "associated_class": associated_class,
+                                                "implausible_module": True,
+                                                "ml_context_confidence": ml_context.get(
+                                                    "overall_confidence",
+                                                    0,
+                                                ),
+                                            },
+                                        )
+                                        continue
                                     # Non-allowlisted but not explicitly dangerous - WARNING
                                     severity = _get_context_aware_severity(
                                         IssueSeverity.WARNING,
