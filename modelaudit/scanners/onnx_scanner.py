@@ -1,6 +1,7 @@
 """Scanner for ONNX model files (.onnx)."""
 
 import logging
+import math
 import os
 from pathlib import Path
 from typing import Any, ClassVar
@@ -419,8 +420,8 @@ class OnnxScanner(BaseScanner):
         max_array_size = self.config.get("max_array_size", 100 * 1024 * 1024)
 
         weights_info: dict[str, Any] = {}
-        try:
-            for initializer in model.graph.initializer:
+        for initializer in model.graph.initializer:
+            try:
                 self.check_interrupted()
 
                 # Skip external-data tensors — their bytes were not loaded.
@@ -432,20 +433,26 @@ class OnnxScanner(BaseScanner):
                     continue
 
                 # Pre-check estimated size before materializing the array.
+                # Use math.prod for arbitrary-precision arithmetic (np.prod
+                # can silently overflow for very large dimension products).
                 import numpy as np
 
-                estimated_bytes = (
-                    np.prod(initializer.dims)
-                    * np.dtype(onnx.helper.tensor_dtype_to_np_dtype(initializer.data_type)).itemsize
-                )
+                numel = math.prod(int(dim) for dim in initializer.dims)
+                itemsize = int(np.dtype(onnx.helper.tensor_dtype_to_np_dtype(initializer.data_type)).itemsize)
+                estimated_bytes = numel * itemsize
                 if max_array_size and max_array_size > 0 and estimated_bytes > max_array_size:
                     continue
 
                 array = onnx.numpy_helper.to_array(initializer)
 
                 weights_info[initializer.name] = array
-        except Exception as e:
-            logger.warning(f"Failed to extract ONNX weights for distribution analysis: {e}")
+            except Exception as e:
+                logger.warning(
+                    "Failed to extract ONNX initializer '%s' for distribution analysis: %s",
+                    initializer.name,
+                    e,
+                )
+                continue
 
         if not weights_info:
             # Nothing to analyse (external-only model, or all tensors too small / too large).
@@ -471,3 +478,11 @@ class OnnxScanner(BaseScanner):
             result.metadata["anomalies_found"] = len(anomalies)
         except Exception as e:
             logger.warning(f"Weight distribution analysis failed: {e}")
+            result.add_check(
+                name="Weight Distribution Analysis",
+                passed=False,
+                message=f"Weight distribution analysis failed: {e!s}",
+                severity=IssueSeverity.DEBUG,
+                location=path,
+                details={"exception": str(e), "exception_type": type(e).__name__},
+            )

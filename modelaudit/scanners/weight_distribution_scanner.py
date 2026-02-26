@@ -488,11 +488,21 @@ class WeightDistributionScanner(BaseScanner):
                 if initializer.data_location == onnx.TensorProto.EXTERNAL:
                     continue
                 if len(initializer.dims) >= 2:
+                    # Pre-check estimated size before materializing the tensor
+                    # to avoid memory spikes from oversized arrays.
+                    if self.max_array_size and self.max_array_size > 0:
+                        import math
+
+                        import numpy as np
+
+                        numel = math.prod(int(dim) for dim in initializer.dims)
+                        np_dtype = onnx.helper.tensor_dtype_to_np_dtype(initializer.data_type)
+                        estimated_nbytes = numel * int(np.dtype(np_dtype).itemsize)
+                        if estimated_nbytes > self.max_array_size:
+                            continue
                     array = onnx.numpy_helper.to_array(  # type: ignore[possibly-unresolved-reference]
                         initializer,
                     )
-                    if self.max_array_size and self.max_array_size > 0 and array.nbytes > self.max_array_size:
-                        continue
                     weights_info[initializer.name] = array
 
         except Exception as e:

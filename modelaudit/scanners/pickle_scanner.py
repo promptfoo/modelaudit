@@ -90,8 +90,9 @@ def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> 
 
             if stream_error and had_opcodes:
                 # Partial stream: binary data was misinterpreted as opcodes.
-                # Discard the buffer and stop — no more valid streams.
-                return
+                # Discard the buffer but continue scanning — a malicious
+                # payload could be hidden after the partial stream.
+                continue
 
             if not stream_error:
                 # Stream completed successfully — yield buffered opcodes
@@ -2210,11 +2211,14 @@ def check_opcode_sequence(
             dangerous_opcode_count = 0
             consecutive_dangerous = 0
             max_consecutive = 0
+            _safe_memo.clear()
             continue
 
         # Maintain memo safety map: when BINPUT/LONG_BINPUT stores a value
         # right after a safe GLOBAL/STACK_GLOBAL, mark that memo slot as safe.
         if opcode.name in ("BINPUT", "LONG_BINPUT") and isinstance(arg, int):
+            # Default to unsafe; only mark safe when proven below.
+            _safe_memo[arg] = False
             # Look back for the most recent GLOBAL/STACK_GLOBAL to see if it
             # was safe.  Typical pattern: GLOBAL mod func → BINPUT idx.
             for j in range(i - 1, max(0, i - 4), -1):
