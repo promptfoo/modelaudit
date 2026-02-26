@@ -25,7 +25,7 @@ A security vulnerability is any bug that threatens the safety of ModelAudit user
 
 ## How to report a vulnerability
 
-**Do not open a public GitHub issue.** Public disclosure of unpatched vulnerabilities puts all ModelAudit users at risk. If you do, the issue will be removed promptly.
+**Do not open a public GitHub issue.** Public disclosure of unpatched vulnerabilities puts all ModelAudit users at risk. If this happens, maintainers may close the issue, redact sensitive details when possible, and redirect you to private reporting channels.
 
 ### Primary: GitHub Private Vulnerability Reporting
 
