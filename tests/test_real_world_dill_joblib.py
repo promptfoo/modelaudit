@@ -153,8 +153,19 @@ class TestRealJoblibFiles:
         if result.bytes_scanned == 0:
             # Should have reported format issues
             assert len(result.issues) > 0
-            format_issues = [i for i in result.issues if "opcode" in str(i.message).lower()]
-            assert len(format_issues) > 0, "Should report format/opcode issues for compressed files"
+            # Compressed joblib files produce different errors on different
+            # platforms: "opcode" errors on some, "MemoryError" or other parse
+            # failures on others (notably Windows).  Accept any issue that
+            # indicates the file could not be parsed as valid pickle.
+            format_keywords = ("opcode", "format", "unable to parse", "invalid", "memoryerror", "corrupted")
+            format_issues = [
+                i for i in result.issues
+                if any(kw in str(i.message).lower() for kw in format_keywords)
+            ]
+            assert len(format_issues) > 0, (
+                f"Should report format/parse issues for compressed files. "
+                f"Got: {[str(i.message) for i in result.issues]}"
+            )
 
     @pytest.mark.skipif(not HAS_JOBLIB, reason="joblib not available")
     def test_joblib_with_numpy_arrays(self, tmp_path):
