@@ -260,10 +260,12 @@ class SkopsScanner(BaseScanner):
     # Metadata files that are part of the skops format and should be excluded
     # from joblib fallback pattern matching. These files legitimately contain
     # strings like "sklearn" as type references, not as pickle/joblib code.
-    _SKOPS_METADATA_FILES = frozenset({
-        "schema.json",
-        "schema",
-    })
+    _SKOPS_METADATA_FILES = frozenset(
+        {
+            "schema.json",
+            "schema",
+        }
+    )
 
     @classmethod
     def _is_skops_metadata(cls, filename: str) -> bool:
