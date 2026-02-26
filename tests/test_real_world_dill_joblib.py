@@ -156,11 +156,7 @@ class TestRealJoblibFiles:
             # "truncated", "corrupted", etc.)
             assert len(result.issues) > 0, "Should report issues for compressed files that can't be parsed"
             format_keywords = ["opcode", "format", "pickle", "parse", "truncated", "corrupted"]
-            format_issues = [
-                i
-                for i in result.issues
-                if any(kw in str(i.message).lower() for kw in format_keywords)
-            ]
+            format_issues = [i for i in result.issues if any(kw in str(i.message).lower() for kw in format_keywords)]
             assert len(format_issues) > 0, (
                 f"Should report format/opcode issues for compressed files. "
                 f"Got: {[str(i.message) for i in result.issues]}"

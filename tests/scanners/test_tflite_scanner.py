@@ -23,6 +23,11 @@ def test_tflite_scanner_can_handle(tmp_path):
     assert TFLiteScanner.can_handle(str(path)) is True
 
 
+def test_tflite_scanner_can_handle_missing_path():
+    """Regression: can_handle returns False for non-existent .tflite paths."""
+    assert TFLiteScanner.can_handle("/nonexistent/path/model.tflite") is False
+
+
 def test_tflite_scanner_cannot_handle_wrong_extension(tmp_path):
     """Test the can_handle method with wrong file extension."""
     path = tmp_path / "model.pb"

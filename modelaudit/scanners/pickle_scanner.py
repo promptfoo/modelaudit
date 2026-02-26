@@ -49,9 +49,12 @@ def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> 
 
     Yields: (opcode, arg, pos) tuples from pickletools.genops
     """
-    # Maximum number of consecutive non-pickle bytes to skip when resyncing
+    # Maximum number of consecutive non-pickle bytes to skip when resyncing.
+    # Also serves as the total cumulative limit across the entire file to prevent
+    # attackers from distributing padding across multiple inter-stream gaps.
     _MAX_RESYNC_BYTES = 4096
     resync_skipped = 0
+    total_resync_skipped = 0
     # Track whether we've successfully parsed at least one complete stream
     parsed_any_stream = False
 
@@ -72,6 +75,12 @@ def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> 
                     logger.info(
                         f"Protocol mismatch in pickle (joblib may use protocol 5 opcodes in protocol 4 files): {e}"
                     )
+                elif multi_stream:
+                    # In multi-stream mode, don't abort on first-stream parse
+                    # errors -- a corrupted first stream should not prevent
+                    # scanning subsequent (potentially malicious) streams.
+                    logger.info(f"First pickle stream parse error (continuing multi-stream scan): {e}")
+                    stream_error = True
                 else:
                     raise
         else:
@@ -111,11 +120,12 @@ def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> 
             if not file_obj.read(1):
                 return  # EOF
             resync_skipped += 1
-            if resync_skipped >= _MAX_RESYNC_BYTES:
+            total_resync_skipped += 1
+            if resync_skipped >= _MAX_RESYNC_BYTES or total_resync_skipped >= _MAX_RESYNC_BYTES:
                 return
             continue
 
-        # Found a valid stream — reset resync counter
+        # Found a valid stream — reset per-gap resync counter (cumulative total persists)
         resync_skipped = 0
         # Check if there is another pickle stream after STOP
         next_byte = file_obj.read(1)
