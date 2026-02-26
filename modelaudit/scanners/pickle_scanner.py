@@ -111,7 +111,18 @@ def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> 
                 return  # EOF
             resync_skipped += 1
             if resync_skipped >= _MAX_RESYNC_BYTES:
-                return
+                # Bounded fast-forward search for the next likely protocol header
+                # so simple padding cannot terminate multi-stream scanning.
+                probe_start = file_obj.tell()
+                probe = file_obj.read(64 * 1024)
+                candidate = next(
+                    (idx for idx in range(len(probe) - 1) if probe[idx] == 0x80 and probe[idx + 1] in (2, 3, 4, 5)),
+                    -1,
+                )
+                if candidate < 0:
+                    return
+                file_obj.seek(probe_start + candidate, 0)
+                resync_skipped = 0
             continue
 
         # Found a valid stream — reset resync counter
@@ -198,7 +209,7 @@ ML_FRAMEWORK_PATTERNS: dict[str, dict[str, list[str] | float]] = {
         "confidence_boost": 0.8,
     },
     "sklearn": {
-        "modules": ["sklearn", "joblib", "numpy", "numpy.core", "numpy.dtype"],
+        "modules": ["sklearn", "joblib", "numpy", "numpy.core", "numpy._core", "numpy.dtype", "scipy.sparse"],
         "classes": [
             "Pipeline",
             "StandardScaler",
@@ -214,7 +225,14 @@ ML_FRAMEWORK_PATTERNS: dict[str, dict[str, list[str] | float]] = {
             "Ridge",
             "Lasso",
         ],
-        "patterns": [r"sklearn\..*", r"joblib\..*", r"numpy\..*", r"numpy\.core\..*"],
+        "patterns": [
+            r"sklearn\..*",
+            r"joblib\..*",
+            r"numpy\..*",
+            r"numpy\.core\..*",
+            r"numpy\._core\..*",
+            r"scipy\.sparse\..*",
+        ],
         "confidence_boost": 0.9,
     },
     "huggingface": {
@@ -756,6 +774,22 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "_reconstruct",
         "scalar",
     ],
+    "numpy.core.numeric": [
+        "_frombuffer",
+    ],
+    # numpy._core is the internal path used in NumPy 2.x+
+    "numpy._core": [
+        "multiarray",
+        "numeric",
+        "_internal",
+    ],
+    "numpy._core.multiarray": [
+        "_reconstruct",
+        "scalar",
+    ],
+    "numpy._core.numeric": [
+        "_frombuffer",
+    ],
     "numpy.random._pickle": [
         "__randomstate_ctor",
         "__generator_ctor",
@@ -765,6 +799,28 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
     ],
     "numpy.random._mt19937": [
         "MT19937",
+    ],
+    # SciPy sparse matrix types — common in sklearn TF-IDF / NLP pipelines
+    "scipy.sparse": [
+        "csr_matrix",
+        "csc_matrix",
+        "coo_matrix",
+        "lil_matrix",
+        "bsr_matrix",
+        "dia_matrix",
+        "dok_matrix",
+    ],
+    "scipy.sparse._csr": [
+        "csr_matrix",
+        "csr_array",
+    ],
+    "scipy.sparse._csc": [
+        "csc_matrix",
+        "csc_array",
+    ],
+    "scipy.sparse._coo": [
+        "coo_matrix",
+        "coo_array",
     ],
     "math": [
         "sqrt",
@@ -1054,6 +1110,10 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "make_pipeline",
         "make_union",
     ],
+    "sklearn.pipeline._pipeline": [
+        "Pipeline",
+        "FeatureUnion",
+    ],
     "sklearn.compose": [
         "ColumnTransformer",
         "TransformedTargetRegressor",
@@ -1071,6 +1131,12 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "RandomizedSearchCV",
     ],
     "sklearn.feature_extraction.text": [
+        "CountVectorizer",
+        "TfidfVectorizer",
+        "TfidfTransformer",
+        "HashingVectorizer",
+    ],
+    "sklearn.feature_extraction._text": [
         "CountVectorizer",
         "TfidfVectorizer",
         "TfidfTransformer",
@@ -2127,13 +2193,25 @@ def is_dangerous_reduce_pattern(
                     break
 
         # Check for INST or OBJ opcodes which can also be used for code execution
+        # Skip if the target class is in the ML_SAFE_GLOBALS allowlist
         if opcode.name in ["INST", "OBJ", "NEWOBJ", "NEWOBJ_EX"] and isinstance(arg, str):
-            return {
-                "pattern": f"{opcode.name}_EXECUTION",
-                "argument": arg,
-                "position": pos,
-                "opcode": opcode.name,
-            }
+            parsed = _parse_module_function(arg)
+            is_safe = False
+            if parsed:
+                inst_mod, inst_func = parsed
+                is_safe = _is_safe_ml_global(inst_mod, inst_func)
+            if not is_safe:
+                # Also check via symbolic reference maps for NEWOBJ/OBJ
+                ref = resolved_callables.get(i)
+                if ref:
+                    is_safe = _is_safe_ml_global(ref[0], ref[1])
+            if not is_safe:
+                return {
+                    "pattern": f"{opcode.name}_EXECUTION",
+                    "argument": arg,
+                    "position": pos,
+                    "opcode": opcode.name,
+                }
 
         # Check for suspicious attribute access patterns (GETATTR followed by CALL)
         if opcode.name == "GETATTR" and i + 1 < len(opcodes) and opcodes[i + 1][0].name == "CALL":
