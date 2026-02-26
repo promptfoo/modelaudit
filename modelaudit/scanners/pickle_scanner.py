@@ -50,7 +50,7 @@ def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> 
     Yields: (opcode, arg, pos) tuples from pickletools.genops
     """
     # Maximum number of consecutive non-pickle bytes to skip when resyncing
-    _MAX_RESYNC_BYTES = 256
+    _MAX_RESYNC_BYTES = 4096
     resync_skipped = 0
     # Track whether we've successfully parsed at least one complete stream
     parsed_any_stream = False
@@ -90,8 +90,9 @@ def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> 
 
             if stream_error and had_opcodes:
                 # Partial stream: binary data was misinterpreted as opcodes.
-                # Discard the buffer and stop — no more valid streams.
-                return
+                # Discard the buffer but continue scanning — there may be
+                # valid pickle streams further in the file.
+                pass
 
             if not stream_error:
                 # Stream completed successfully — yield buffered opcodes
@@ -2197,6 +2198,8 @@ def check_opcode_sequence(
     # ML global.  This lets us recognise BINGET → REDUCE patterns where the
     # callable was stored once via GLOBAL + BINPUT and then recalled many times.
     _safe_memo: dict[int, bool] = {}
+    # Track next auto-assigned memo index for MEMOIZE opcodes (protocol 4+)
+    _next_memo_idx = 0
 
     for i, (opcode, arg, pos) in enumerate(opcodes):
         # Reset counters at stream boundaries (STOP) so that multi-stream
@@ -2207,11 +2210,49 @@ def check_opcode_sequence(
             dangerous_opcode_count = 0
             consecutive_dangerous = 0
             max_consecutive = 0
+            _safe_memo.clear()
+            _next_memo_idx = 0
             continue
 
-        # Maintain memo safety map: when BINPUT/LONG_BINPUT stores a value
-        # right after a safe GLOBAL/STACK_GLOBAL, mark that memo slot as safe.
-        if opcode.name in ("BINPUT", "LONG_BINPUT") and isinstance(arg, int):
+        # Maintain memo safety map: when BINPUT/LONG_BINPUT/MEMOIZE stores a
+        # value right after a safe GLOBAL/STACK_GLOBAL, mark that memo slot as
+        # safe.  MEMOIZE (protocol 4+) auto-assigns the next sequential index.
+        if opcode.name == "MEMOIZE":
+            memo_idx = _next_memo_idx
+            _next_memo_idx += 1
+            for j in range(i - 1, max(0, i - 4), -1):
+                prev_opcode, prev_arg, _prev_pos = opcodes[j]
+                if prev_opcode.name == "GLOBAL" and isinstance(prev_arg, str):
+                    parts = (
+                        prev_arg.split(" ", 1)
+                        if " " in prev_arg
+                        else prev_arg.rsplit(".", 1)
+                        if "." in prev_arg
+                        else [prev_arg, ""]
+                    )
+                    if len(parts) == 2:
+                        _safe_memo[memo_idx] = _is_safe_ml_global(parts[0], parts[1])
+                    break
+                if prev_opcode.name == "STACK_GLOBAL":
+                    strs_m: list[str] = []
+                    for k in range(j - 1, max(0, j - 10), -1):
+                        pk_op, pk_arg, _ = opcodes[k]
+                        if pk_op.name in (
+                            "SHORT_BINSTRING",
+                            "BINSTRING",
+                            "STRING",
+                            "SHORT_BINUNICODE",
+                            "BINUNICODE",
+                            "UNICODE",
+                        ) and isinstance(pk_arg, str):
+                            strs_m.insert(0, pk_arg)
+                            if len(strs_m) >= 2:
+                                break
+                    if len(strs_m) >= 2:
+                        _safe_memo[memo_idx] = _is_safe_ml_global(strs_m[0], strs_m[1])
+                    break
+        elif opcode.name in ("BINPUT", "LONG_BINPUT") and isinstance(arg, int):
+            _next_memo_idx = max(_next_memo_idx, arg + 1)
             # Look back for the most recent GLOBAL/STACK_GLOBAL to see if it
             # was safe.  Typical pattern: GLOBAL mod func → BINPUT idx.
             for j in range(i - 1, max(0, i - 4), -1):
