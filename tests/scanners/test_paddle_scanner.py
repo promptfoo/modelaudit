@@ -69,12 +69,8 @@ def test_pdiparams_hex_escape_not_flagged(tmp_path: Path) -> None:
         scanner = PaddleScanner()
         result = scanner.scan(str(path))
 
-    hex_issues = [
-        i for i in result.issues if "\\x[0-9a-fA-F]{2}" in i.details.get("pattern", "")
-    ]
-    assert hex_issues == [], (
-        f"Hex-escape pattern should be suppressed for .pdiparams, got {hex_issues}"
-    )
+    hex_issues = [i for i in result.issues if "\\x[0-9a-fA-F]{2}" in i.details.get("pattern", "")]
+    assert hex_issues == [], f"Hex-escape pattern should be suppressed for .pdiparams, got {hex_issues}"
 
 
 def test_pdiparams_dunder_pattern_not_flagged(tmp_path: Path) -> None:
@@ -88,12 +84,8 @@ def test_pdiparams_dunder_pattern_not_flagged(tmp_path: Path) -> None:
         scanner = PaddleScanner()
         result = scanner.scan(str(path))
 
-    dunder_issues = [
-        i for i in result.issues if "__[\\w]+__" in i.details.get("pattern", "")
-    ]
-    assert dunder_issues == [], (
-        f"Dunder pattern should be suppressed for .pdiparams, got {dunder_issues}"
-    )
+    dunder_issues = [i for i in result.issues if "__[\\w]+__" in i.details.get("pattern", "")]
+    assert dunder_issues == [], f"Dunder pattern should be suppressed for .pdiparams, got {dunder_issues}"
 
 
 def test_pdiparams_real_threats_still_detected(tmp_path: Path) -> None:
@@ -126,9 +118,7 @@ def test_pdmodel_hex_escape_still_flagged(tmp_path: Path) -> None:
         scanner = PaddleScanner()
         result = scanner.scan(str(path))
 
-    hex_issues = [
-        i for i in result.issues if "\\x[0-9a-fA-F]{2}" in i.details.get("pattern", "")
-    ]
+    hex_issues = [i for i in result.issues if "\\x[0-9a-fA-F]{2}" in i.details.get("pattern", "")]
     assert len(hex_issues) > 0, "Hex-escape pattern should still fire for .pdmodel files"
 
 
@@ -139,9 +129,7 @@ def test_pdmodel_magic_bytes_validation_passes(tmp_path: Path) -> None:
     path = tmp_path / "model.pdmodel"
     path.write_bytes(b"\x08\x01\x12\x0asome_data_here_for_testing")
 
-    assert validate_file_type(str(path)), (
-        ".pdmodel should pass file type validation (no magic byte mismatch)"
-    )
+    assert validate_file_type(str(path)), ".pdmodel should pass file type validation (no magic byte mismatch)"
 
 
 def test_pdiparams_magic_bytes_validation_passes(tmp_path: Path) -> None:
@@ -151,6 +139,4 @@ def test_pdiparams_magic_bytes_validation_passes(tmp_path: Path) -> None:
     # Write raw float data (no recognisable magic bytes)
     path.write_bytes(struct.pack("<4f", 1.0, -2.5, 3.14, 0.0))
 
-    assert validate_file_type(str(path)), (
-        ".pdiparams should pass file type validation (no magic byte mismatch)"
-    )
+    assert validate_file_type(str(path)), ".pdiparams should pass file type validation (no magic byte mismatch)"
