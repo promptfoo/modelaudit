@@ -92,12 +92,13 @@ def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> 
 
             if stream_error and had_opcodes:
                 # Partial stream: binary data was misinterpreted as opcodes.
-                # Discard the buffer but keep scanning — a valid malicious
+                # Discard the buffer and keep scanning — a valid malicious
                 # stream may follow later in the file.
+                buffered.clear()
                 had_opcodes = False
                 stream_error = False
 
-            if not stream_error:
+            if not stream_error and buffered:
                 # Stream completed successfully — yield buffered opcodes
                 yield from buffered
 
@@ -1475,6 +1476,15 @@ def _build_symbolic_reference_maps(
 
     for i, (opcode, arg, _pos) in enumerate(opcodes):
         name = opcode.name
+
+        # Reset stack and memo at stream boundaries (STOP) so that stale
+        # references from a previous pickle stream do not leak into the
+        # symbolic simulation of the next stream.
+        if name == "STOP":
+            stack.clear()
+            memo.clear()
+            next_memo_index = 0
+            continue
 
         if name in STRING_OPCODES and isinstance(arg, str):
             stack.append(arg)

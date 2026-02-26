@@ -158,10 +158,7 @@ class TestRealJoblibFiles:
             # failures on others (notably Windows).  Accept any issue that
             # indicates the file could not be parsed as valid pickle.
             format_keywords = ("opcode", "format", "unable to parse", "invalid", "memoryerror", "corrupted")
-            format_issues = [
-                i for i in result.issues
-                if any(kw in str(i.message).lower() for kw in format_keywords)
-            ]
+            format_issues = [i for i in result.issues if any(kw in str(i.message).lower() for kw in format_keywords)]
             assert len(format_issues) > 0, (
                 f"Should report format/parse issues for compressed files. "
                 f"Got: {[str(i.message) for i in result.issues]}"
