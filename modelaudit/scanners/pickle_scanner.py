@@ -703,21 +703,25 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "pi",
         "e",
     ],
-    # operator module functions used by sklearn (e.g., FunctionTransformer with methodcaller).
-    # In ML contexts these are safe; non-ML contexts still flag via ALWAYS_DANGEROUS_FUNCTIONS.
-    "operator": [
-        "methodcaller",
-        "itemgetter",
-        "attrgetter",
-        "getitem",
-    ],
+    # NOTE: operator module (methodcaller, itemgetter, attrgetter, getitem) is
+    # intentionally NOT allowlisted here.  These functions are in
+    # ALWAYS_DANGEROUS_FUNCTIONS because they enable dynamic attribute access
+    # and arbitrary method invocation -- a well-known pickle deserialization
+    # attack vector (see Fickling research).  Even in ML contexts, they must
+    # remain flagged to prevent bypasses.
     # Truncated numpy module references from pickle opcode resolution.
     # The pickle scanner sometimes resolves module names incompletely
     # (e.g., "_reconstruct" instead of "numpy.core.multiarray._reconstruct").
+    #
+    # SECURITY NOTE: These short/generic module names carry bypass risk -- an
+    # attacker could craft a pickle with a custom module named "C" that exports
+    # "dtype".  We accept this risk because:
+    #   1. These only skip the SUSPICIOUS_GLOBAL check; ALWAYS_DANGEROUS still fires.
+    #   2. The function names are narrow and specific to numpy internals.
+    #   3. Removing them causes widespread FPs on legitimate sklearn/joblib models.
     "_reconstruct": ["ndarray", "scalar"],
     "C": ["dtype", "ndarray", "scalar"],
     "multiarray": ["_reconstruct", "scalar"],
-    "brilliant": ["scalar"],  # misparsed numpy.core.multiarray.scalar
     "numpy_pickle": ["NumpyArrayWrapper", "NDArrayWrapper"],
     "MT19937": ["__bit_generator_ctor"],
     # scipy sparse matrices (used by sklearn SVM, text classifiers, etc.)
@@ -1517,14 +1521,10 @@ def _is_actually_dangerous_global(mod: str, func: str, ml_context: dict) -> bool
     """
     full_ref = f"{mod}.{func}"
 
-    # STEP 0: Check ML_SAFE_GLOBALS allowlist first (before dangerous checks)
-    # This prevents false positives for safe functions from otherwise dangerous modules
-    # E.g., __builtin__.set (Python 2) or builtins.set (Python 3) are safe
-    if _is_safe_ml_global(mod, func):
-        logger.debug(f"Allowlisted safe global from potentially dangerous module: {mod}.{func}")
-        return False
-
-    # STEP 1: ALWAYS flag dangerous functions (no ML context exceptions)
+    # STEP 1: ALWAYS flag dangerous functions first (no exceptions, no allowlist override)
+    # This MUST come before the ML_SAFE_GLOBALS check to prevent bypass attacks
+    # where an attacker places dangerous functions (e.g., operator.attrgetter) in a
+    # pickle stream alongside ML references to trick the allowlist.
     if full_ref in ALWAYS_DANGEROUS_FUNCTIONS or func in ALWAYS_DANGEROUS_FUNCTIONS:
         logger.warning(
             f"Always-dangerous function detected: {full_ref} "
@@ -1537,7 +1537,16 @@ def _is_actually_dangerous_global(mod: str, func: str, ml_context: dict) -> bool
         logger.warning(f"Always-dangerous module detected: {mod}.{func} (flagged regardless of ML context)")
         return True
 
-    # STEP 3: Use original suspicious global check for all other cases
+    # STEP 3: Check ML_SAFE_GLOBALS allowlist (after dangerous checks)
+    # This prevents false positives for safe functions that passed the dangerous checks.
+    # E.g., __builtin__.set (Python 2) or builtins.set (Python 3) are safe.
+    # NOTE: This comes AFTER dangerous checks so that ALWAYS_DANGEROUS items
+    # can never be overridden by the allowlist.
+    if _is_safe_ml_global(mod, func):
+        logger.debug(f"Allowlisted safe global: {mod}.{func}")
+        return False
+
+    # STEP 4: Use original suspicious global check for all other cases
     # Removed ML confidence-based whitelisting to prevent bypass attacks
     return is_suspicious_global(mod, func)
 
@@ -2188,15 +2197,15 @@ def is_dangerous_reduce_pattern(
 
     def _is_dangerous_ref(mod: str, func: str) -> bool:
         """Check if a module.function reference is dangerous enough to flag."""
-        # Safe ML globals are never dangerous
-        if _is_safe_ml_global(mod, func):
-            return False
         full_ref = f"{mod}.{func}"
-        # Check ALWAYS_DANGEROUS lists
+        # Check ALWAYS_DANGEROUS lists FIRST (before allowlist to prevent bypass)
         if full_ref in ALWAYS_DANGEROUS_FUNCTIONS or func in ALWAYS_DANGEROUS_FUNCTIONS:
             return True
         if mod in ALWAYS_DANGEROUS_MODULES:
             return True
+        # Safe ML globals (checked after dangerous lists)
+        if _is_safe_ml_global(mod, func):
+            return False
         # Check SUSPICIOUS_GLOBALS (the fallback)
         return is_suspicious_global(mod, func)
 
@@ -2418,14 +2427,17 @@ def check_opcode_sequence(
             "RandomForest",
             "ExtraTrees",
             "GradientBoosting",
+            "HistGradientBoosting",
             "DecisionTree",
             "XGB",
             "LGBM",
             "CatBoost",
             "IsolationForest",
             "AdaBoost",
-            "BaggingClassifier",
-            "BaggingRegressor",
+            # NOTE: BaggingClassifier/BaggingRegressor intentionally excluded --
+            # they are meta-estimators that can wrap any base estimator, not
+            # strictly tree-ensembles.  Threshold escalation should only apply
+            # when we are confident the model is tree-based.
         }
         # Collect all class/function names referenced in the opcode stream so we
         # can check for tree-ensemble markers.
