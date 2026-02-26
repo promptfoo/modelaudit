@@ -744,6 +744,8 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
     def test_smtplib_blocked(self) -> None:
         """smtplib module should be flagged as dangerous."""
         result = self._scan_bytes(self._craft_global_reduce_pickle("smtplib", "SMTP"))
+        assert result.success
+        assert result.issues
         assert result.has_errors
         assert any(i.severity == IssueSeverity.CRITICAL and "smtplib" in i.message for i in result.issues), (
             f"Expected CRITICAL smtplib issue, got: {[i.message for i in result.issues]}"
@@ -752,6 +754,8 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
     def test_sqlite3_blocked(self) -> None:
         """sqlite3 module should be flagged as dangerous."""
         result = self._scan_bytes(self._craft_global_reduce_pickle("sqlite3", "connect"))
+        assert result.success
+        assert result.issues
         assert result.has_errors
         assert any(i.severity == IssueSeverity.CRITICAL and "sqlite3" in i.message for i in result.issues), (
             f"Expected CRITICAL sqlite3 issue, got: {[i.message for i in result.issues]}"
@@ -760,6 +764,8 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
     def test_tarfile_blocked(self) -> None:
         """tarfile module should be flagged as dangerous."""
         result = self._scan_bytes(self._craft_global_reduce_pickle("tarfile", "open"))
+        assert result.success
+        assert result.issues
         assert result.has_errors
         assert any(i.severity == IssueSeverity.CRITICAL and "tarfile" in i.message for i in result.issues), (
             f"Expected CRITICAL tarfile issue, got: {[i.message for i in result.issues]}"
@@ -770,6 +776,8 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
     def test_marshal_blocked(self) -> None:
         """marshal module should be flagged as dangerous."""
         result = self._scan_bytes(self._craft_global_reduce_pickle("marshal", "loads"))
+        assert result.success
+        assert result.issues
         assert result.has_errors
         assert any(i.severity == IssueSeverity.CRITICAL and "marshal" in i.message for i in result.issues), (
             f"Expected CRITICAL marshal issue, got: {[i.message for i in result.issues]}"
@@ -778,6 +786,8 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
     def test_cloudpickle_blocked(self) -> None:
         """cloudpickle module should be flagged as dangerous."""
         result = self._scan_bytes(self._craft_global_reduce_pickle("cloudpickle", "loads"))
+        assert result.success
+        assert result.issues
         assert result.has_errors
         assert any(i.severity == IssueSeverity.CRITICAL and "cloudpickle" in i.message for i in result.issues), (
             f"Expected CRITICAL cloudpickle issue, got: {[i.message for i in result.issues]}"
@@ -786,6 +796,8 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
     def test_webbrowser_blocked(self) -> None:
         """webbrowser module should be flagged as dangerous."""
         result = self._scan_bytes(self._craft_global_reduce_pickle("webbrowser", "open"))
+        assert result.success
+        assert result.issues
         assert result.has_errors
         assert any(i.severity == IssueSeverity.CRITICAL and "webbrowser" in i.message for i in result.issues), (
             f"Expected CRITICAL webbrowser issue, got: {[i.message for i in result.issues]}"

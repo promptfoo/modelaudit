@@ -49,8 +49,10 @@ def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> 
 
     Yields: (opcode, arg, pos) tuples from pickletools.genops
     """
-    # Maximum number of consecutive non-pickle bytes to skip when resyncing
-    _MAX_RESYNC_BYTES = 256
+    # Maximum number of consecutive non-pickle bytes to skip when resyncing.
+    # Use a generous budget so that attackers cannot hide a malicious second
+    # stream behind a padding gap larger than the resync window.
+    _MAX_RESYNC_BYTES = 8192
     resync_skipped = 0
     # Track whether we've successfully parsed at least one complete stream
     parsed_any_stream = False
@@ -90,8 +92,10 @@ def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> 
 
             if stream_error and had_opcodes:
                 # Partial stream: binary data was misinterpreted as opcodes.
-                # Discard the buffer and stop — no more valid streams.
-                return
+                # Discard the buffer but keep scanning — a valid malicious
+                # stream may follow later in the file.
+                had_opcodes = False
+                stream_error = False
 
             if not stream_error:
                 # Stream completed successfully — yield buffered opcodes
@@ -2128,8 +2132,22 @@ def is_dangerous_reduce_pattern(
                 }:
                     break
 
-        # Check for INST or OBJ opcodes which can also be used for code execution
-        if opcode.name in ["INST", "OBJ", "NEWOBJ", "NEWOBJ_EX"] and isinstance(arg, str):
+        # Check for OBJ/NEWOBJ/NEWOBJ_EX opcodes — these are stack-based (arg is
+        # None in the pickle stream), so resolve the class via callable_refs.
+        if opcode.name in ["OBJ", "NEWOBJ", "NEWOBJ_EX"]:
+            ref = resolved_callables.get(i)
+            if ref:
+                mod, func = ref
+                if _is_dangerous_ref(mod, func):
+                    return {
+                        "pattern": f"{opcode.name}_EXECUTION",
+                        "argument": f"{mod}.{func}",
+                        "position": pos,
+                        "opcode": opcode.name,
+                    }
+
+        # INST encodes the class directly in the string argument.
+        if opcode.name == "INST" and isinstance(arg, str):
             return {
                 "pattern": f"{opcode.name}_EXECUTION",
                 "argument": arg,
@@ -2210,6 +2228,9 @@ def check_opcode_sequence(
             dangerous_opcode_count = 0
             consecutive_dangerous = 0
             max_consecutive = 0
+            # Memo indexes are stream-local; stale safe entries from a
+            # previous stream must not carry over to the next one.
+            _safe_memo.clear()
             continue
 
         # Maintain memo safety map: when BINPUT/LONG_BINPUT stores a value
