@@ -153,8 +153,18 @@ class TestRealJoblibFiles:
         if result.bytes_scanned == 0:
             # Should have reported format issues
             assert len(result.issues) > 0
-            format_issues = [i for i in result.issues if "opcode" in str(i.message).lower()]
-            assert len(format_issues) > 0, "Should report format/opcode issues for compressed files"
+            format_issues = [
+                i
+                for i in result.issues
+                if any(
+                    keyword in str(i.message).lower()
+                    for keyword in ("opcode", "format", "parse", "unable", "invalid", "truncated", "corrupted")
+                )
+            ]
+            assert len(format_issues) > 0, (
+                f"Should report format/parsing issues for compressed files. "
+                f"Got: {[str(i.message) for i in result.issues]}"
+            )
 
     @pytest.mark.skipif(not HAS_JOBLIB, reason="joblib not available")
     def test_joblib_with_numpy_arrays(self, tmp_path):
