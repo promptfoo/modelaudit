@@ -49,8 +49,12 @@ def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> 
 
     Yields: (opcode, arg, pos) tuples from pickletools.genops
     """
-    # Maximum number of consecutive non-pickle bytes to skip when resyncing
-    _MAX_RESYNC_BYTES = 256
+    # Maximum number of consecutive non-pickle bytes to skip when resyncing.
+    # A larger budget reduces the chance that binary tensor data (which can be
+    # several KB) between pickle streams causes the scanner to give up before
+    # reaching a subsequent malicious stream.  The trade-off is a slightly
+    # longer scan time on non-pickle files, but 8 KiB is still negligible.
+    _MAX_RESYNC_BYTES = 8192
     resync_skipped = 0
     # Track whether we've successfully parsed at least one complete stream
     parsed_any_stream = False
@@ -90,8 +94,10 @@ def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> 
 
             if stream_error and had_opcodes:
                 # Partial stream: binary data was misinterpreted as opcodes.
-                # Discard the buffer and stop — no more valid streams.
-                return
+                # Discard the buffer but keep scanning — a malicious payload
+                # could be hiding after the binary blob.  Resync from the
+                # current file position to find the next valid stream.
+                continue
 
             if not stream_error:
                 # Stream completed successfully — yield buffered opcodes
@@ -778,6 +784,18 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "tan",
         "pi",
         "e",
+    ],
+    # functools - common safe utilities used in ML pipelines.
+    # NOTE: functools is also in ALWAYS_DANGEROUS_MODULES so it will still be
+    # flagged unless the specific function is in this allowlist.
+    "functools": [
+        "partial",
+        "reduce",
+        "lru_cache",
+        "wraps",
+        "update_wrapper",
+        "total_ordering",
+        "cmp_to_key",
     ],
     # YOLO/Ultralytics safe patterns
     "ultralytics": [
@@ -2210,6 +2228,10 @@ def check_opcode_sequence(
             dangerous_opcode_count = 0
             consecutive_dangerous = 0
             max_consecutive = 0
+            # Clear memo safety map at stream boundaries so that a safe
+            # callable stored in stream N cannot whitelist a dangerous
+            # REDUCE in stream N+1 (memo slots are per-stream).
+            _safe_memo.clear()
             continue
 
         # Maintain memo safety map: when BINPUT/LONG_BINPUT stores a value

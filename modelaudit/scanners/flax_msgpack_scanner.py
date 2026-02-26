@@ -733,7 +733,9 @@ class FlaxMsgpackScanner(BaseScanner):
                         has_transformer_keys = True
                         break
                     # Also check if the top-level key is a known model name
-                    if key.lower() in model_name_keys or any(mk in key.lower() for mk in model_name_keys):
+                    # Guard against non-string keys (msgpack allows int/bytes keys)
+                    key_lower = key.lower() if isinstance(key, str) else str(key).lower()
+                    if key_lower in model_name_keys or any(mk in key_lower for mk in model_name_keys):
                         has_transformer_keys = True
                         break
 
