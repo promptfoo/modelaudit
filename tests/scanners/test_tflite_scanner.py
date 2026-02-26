@@ -14,14 +14,13 @@ except ImportError:
 
 
 def test_tflite_scanner_can_handle(tmp_path):
-    """Test the can_handle method when tflite is available."""
+    """Test the can_handle method recognizes .tflite files regardless of tflite package."""
     path = tmp_path / "model.tflite"
     path.write_bytes(b"some content")
 
-    if HAS_TFLITE:
-        assert TFLiteScanner.can_handle(str(path)) is True
-    else:
-        assert TFLiteScanner.can_handle(str(path)) is False
+    # can_handle should return True for .tflite files even without the
+    # tflite package installed (basic validation still works)
+    assert TFLiteScanner.can_handle(str(path)) is True
 
 
 def test_tflite_scanner_cannot_handle_wrong_extension(tmp_path):
