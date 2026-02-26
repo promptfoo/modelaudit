@@ -158,8 +158,7 @@ class TestRealJoblibFiles:
                 i
                 for i in result.issues
                 if any(
-                    kw in str(i.message).lower()
-                    for kw in ("opcode", "format", "parse", "memory", "unable to parse")
+                    kw in str(i.message).lower() for kw in ("opcode", "format", "parse", "memory", "unable to parse")
                 )
             ]
             assert len(format_issues) > 0, (

@@ -233,6 +233,30 @@ class TestSkopsScannerJoblibFallback:
             f"False positive: schema.json triggered Unsafe Joblib Fallback Detection: {joblib_checks}"
         )
 
+    def test_no_false_positive_sklearn_in_schema_bare(self, tmp_path: Path) -> None:
+        """Regression: bare 'schema' file (no .json ext) must also be excluded.
+
+        Some skops archives use a file named just ``schema`` without the
+        ``.json`` extension.  The metadata exclusion must cover both variants.
+        """
+        skops_file = tmp_path / "legit_bare.skops"
+        schema_content = (
+            '{"__class__": "sklearn.ensemble._forest.RandomForestClassifier",'
+            ' "__module__": "sklearn.ensemble._forest",'
+            ' "content": {"n_estimators": {"__class__": "int", "content": 100}}}'
+        )
+        with zipfile.ZipFile(skops_file, "w") as zf:
+            zf.writestr("schema", schema_content)
+            zf.writestr("step/0/content/0.npy", b"\x93NUMPY\x01\x00model data")
+
+        scanner = SkopsScanner()
+        result = scanner.scan(str(skops_file))
+
+        joblib_checks = [c for c in result.checks if "Joblib" in c.name and c.status == CheckStatus.FAILED]
+        assert len(joblib_checks) == 0, (
+            f"False positive: bare 'schema' file triggered Unsafe Joblib Fallback Detection: {joblib_checks}"
+        )
+
     def test_sklearn_in_data_file_still_detected(self, tmp_path: Path) -> None:
         """Ensure sklearn references in non-metadata files are still flagged."""
         skops_file = tmp_path / "suspicious.skops"
