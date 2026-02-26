@@ -261,6 +261,32 @@ __import__('pickle').loads(data)
         finally:
             os.unlink(temp_path)
 
+    def test_case_insensitive_suspicious_extension_detection(self):
+        """Uppercase/mixed-case executable extensions should be detected."""
+        scanner = KerasZipScanner()
+
+        config = {"class_name": "Sequential", "config": {"layers": []}}
+
+        with tempfile.NamedTemporaryFile(suffix=".keras", delete=False) as f:
+            with zipfile.ZipFile(f, "w") as zf:
+                zf.writestr("config.json", json.dumps(config))
+                zf.writestr("MALWARE.PY", "print('evil')")
+                zf.writestr("run.SH", "#!/bin/bash\necho evil")
+            temp_path = f.name
+
+        try:
+            result = scanner.scan(temp_path)
+            suspicious_files = [
+                check.message
+                for check in result.checks
+                if "Python file found in Keras ZIP" in check.message
+                or "Executable file found in Keras ZIP" in check.message
+            ]
+            assert len(suspicious_files) >= 2, f"Should detect uppercase suspicious files, found: {suspicious_files}"
+
+        finally:
+            os.unlink(temp_path)
+
     def test_nested_models(self):
         """Test scanning of nested model structures."""
         scanner = KerasZipScanner()
