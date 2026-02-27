@@ -175,6 +175,9 @@ class KerasZipScanner(BaseScanner):
                         except json.JSONDecodeError:
                             pass  # Metadata parsing is optional
 
+                # CVE-2025-9906: Check for enable_unsafe_deserialization in raw config
+                self._check_unsafe_deserialization_bypass(config_data, result)
+
                 # Scan model configuration
                 self._scan_model_config(model_config, result)
 

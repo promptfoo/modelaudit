@@ -86,6 +86,7 @@ def pytest_runtest_setup(item):
             "test_pytorch_zip_scanner.py",  # PyTorch ZIP scanner tests
             "test_paddle_scanner.py",  # PaddlePaddle scanner tests
             "test_onnx_scanner.py",  # ONNX scanner CVE detection tests
+            "test_keras_zip_scanner.py",  # Keras ZIP scanner tests
         ]
 
         # Check if this is an allowed test file
