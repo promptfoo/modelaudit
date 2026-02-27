@@ -159,9 +159,8 @@ __import__('pickle').loads(data)
     def test_safe_lambda_layer(self):
         """Test that safe Lambda layers are handled appropriately.
 
-        Note: CVE-2024-3660 means ALL Lambda layers produce a CRITICAL finding
-        for the CVE attribution itself. The Lambda code analysis may still pass
-        if the code is safe, but the Lambda layer's existence is the risk.
+        For vulnerable Keras versions, Lambda layers should have CVE attribution.
+        The Lambda code analysis itself may still pass if code is safe.
         """
         scanner = KerasZipScanner()
 
@@ -187,6 +186,7 @@ __import__('pickle').loads(data)
         with tempfile.NamedTemporaryFile(suffix=".keras", delete=False) as f:
             with zipfile.ZipFile(f, "w") as zf:
                 zf.writestr("config.json", json.dumps(config))
+                zf.writestr("metadata.json", json.dumps({"keras_version": "2.10.0"}))
             temp_path = f.name
 
         try:
@@ -474,6 +474,31 @@ class TestCVE20243660LambdaAttribution:
         }
         result = scanner.scan(self._make_keras_zip(config, tmp_path))
 
+        cve_issues = [i for i in result.issues if "CVE-2024-3660" in i.message]
+        assert len(cve_issues) == 0
+
+    def test_no_cve_for_fixed_keras_version(self, tmp_path):
+        """Lambda in fixed Keras version should not be CVE-attributed."""
+        scanner = KerasZipScanner()
+        encoded = base64.b64encode(b"lambda x: x * 2").decode()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "my_lambda",
+                        "config": {"function": [encoded, None, None]},
+                    }
+                ]
+            },
+        }
+        keras_path = os.path.join(str(tmp_path), "model_fixed.keras")
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            zf.writestr("config.json", json.dumps(config))
+            zf.writestr("metadata.json", json.dumps({"keras_version": "2.13.0"}))
+
+        result = scanner.scan(keras_path)
         cve_issues = [i for i in result.issues if "CVE-2024-3660" in i.message]
         assert len(cve_issues) == 0
 

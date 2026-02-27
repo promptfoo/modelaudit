@@ -105,6 +105,11 @@ class KerasH5Scanner(BaseScanner):
 
             with h5py.File(path, "r") as f:
                 result.bytes_scanned = file_size
+                keras_version_attr = f.attrs.get("keras_version")
+                if isinstance(keras_version_attr, bytes):
+                    keras_version_attr = keras_version_attr.decode("utf-8", errors="ignore")
+                if isinstance(keras_version_attr, str) and keras_version_attr.strip():
+                    result.metadata["keras_version"] = keras_version_attr.strip()
 
                 # Check if this is a Keras model file
                 if "model_config" not in f.attrs:
@@ -266,26 +271,57 @@ class KerasH5Scanner(BaseScanner):
                 if layer_class == "Lambda":
                     layer_name = layer_config.get("name", f"lambda_{layer_counts.get('Lambda', 1)}")
                     self._check_lambda_layer(layer_config, result)
-                    # CVE-2024-3660: Lambda layers enable arbitrary code injection
-                    result.add_check(
-                        name="CVE-2024-3660: Lambda Layer Code Injection",
-                        passed=False,
-                        message=(
-                            f"CVE-2024-3660: Lambda layer '{layer_name}' enables arbitrary "
-                            f"code injection during model loading"
-                        ),
-                        severity=IssueSeverity.CRITICAL,
-                        location=f"{self.current_file_path} (layer: {layer_name})",
-                        details={
-                            "layer_name": layer_name,
-                            "layer_class": "Lambda",
-                            "cve_id": "CVE-2024-3660",
-                            "cvss": 9.8,
-                            "cwe": "CWE-94",
-                            "remediation": "Remove Lambda layers or upgrade Keras to >= 2.13",
-                        },
-                        why=get_cve_2024_3660_explanation("lambda_code_injection"),
-                    )
+                    keras_version = result.metadata.get("keras_version")
+                    if isinstance(keras_version, str) and self._is_vulnerable_to_cve_2024_3660(keras_version):
+                        # CVE-2024-3660: Lambda layers enable arbitrary code injection
+                        result.add_check(
+                            name="CVE-2024-3660: Lambda Layer Code Injection",
+                            passed=False,
+                            message=(
+                                f"CVE-2024-3660: Lambda layer '{layer_name}' in Keras {keras_version} enables "
+                                "arbitrary code injection during model loading"
+                            ),
+                            severity=IssueSeverity.CRITICAL,
+                            location=f"{self.current_file_path} (layer: {layer_name})",
+                            details={
+                                "layer_name": layer_name,
+                                "layer_class": "Lambda",
+                                "keras_version": keras_version,
+                                "cve_id": "CVE-2024-3660",
+                                "cvss": 9.8,
+                                "cwe": "CWE-94",
+                                "remediation": "Remove Lambda layers or upgrade Keras to >= 2.13",
+                            },
+                            why=get_cve_2024_3660_explanation("lambda_code_injection"),
+                        )
+                    elif isinstance(keras_version, str):
+                        result.add_check(
+                            name="H5 Lambda Version Risk Check",
+                            passed=True,
+                            message=(
+                                f"Lambda layer '{layer_name}' detected with Keras {keras_version}; "
+                                "outside known CVE-2024-3660 vulnerable range (<2.13.0)"
+                            ),
+                            location=f"{self.current_file_path} (layer: {layer_name})",
+                            details={"layer_name": layer_name, "layer_class": "Lambda", "keras_version": keras_version},
+                        )
+                    else:
+                        result.add_check(
+                            name="H5 Lambda Risk (Version Unknown)",
+                            passed=False,
+                            message=(
+                                f"Lambda layer '{layer_name}' detected but keras_version is unavailable; "
+                                "cannot confidently attribute CVE-2024-3660 without version context"
+                            ),
+                            severity=IssueSeverity.WARNING,
+                            location=f"{self.current_file_path} (layer: {layer_name})",
+                            details={
+                                "layer_name": layer_name,
+                                "layer_class": "Lambda",
+                                "cve_id": "CVE-2024-3660",
+                                "affected_versions": "Keras < 2.13.0",
+                            },
+                        )
                 else:
                     result.add_check(
                         name="Suspicious Layer Type Detection",
@@ -440,6 +476,22 @@ class KerasH5Scanner(BaseScanner):
                     },
                 )
         # Don't flag Lambda layers without code - they might just be placeholders
+
+    @staticmethod
+    def _is_vulnerable_to_cve_2024_3660(version: str) -> bool:
+        """Return True for Keras versions lower than 2.13.0."""
+        parts = version.split(".", 2)
+        if len(parts) < 3:
+            return False
+        try:
+            major, minor, patch_part = parts
+            patch_digits = "".join(ch for ch in patch_part if ch.isdigit())
+            if not patch_digits:
+                return False
+            parsed = (int(major), int(minor), int(patch_digits))
+            return parsed < (2, 13, 0)
+        except ValueError:
+            return False
 
     def _check_config_for_suspicious_strings(
         self,

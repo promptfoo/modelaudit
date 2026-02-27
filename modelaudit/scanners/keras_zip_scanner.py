@@ -116,9 +116,6 @@ class KerasZipScanner(BaseScanner):
                         result.finish(success=False)
                         return result
 
-                # Scan model configuration
-                self._scan_model_config(model_config, result)
-
                 # Check for metadata.json
                 if "metadata.json" in zf.namelist():
                     with zf.open("metadata.json") as metadata_file:
@@ -126,8 +123,14 @@ class KerasZipScanner(BaseScanner):
                         try:
                             metadata = json.loads(metadata_data)
                             result.metadata["keras_metadata"] = metadata
+                            keras_version = metadata.get("keras_version")
+                            if isinstance(keras_version, str) and keras_version.strip():
+                                result.metadata["keras_version"] = keras_version.strip()
                         except json.JSONDecodeError:
                             pass  # Metadata parsing is optional
+
+                # Scan model configuration
+                self._scan_model_config(model_config, result)
 
                 # Check for suspicious files in the ZIP
                 for filename in zf.namelist():
@@ -215,26 +218,57 @@ class KerasZipScanner(BaseScanner):
             # Check for Lambda layers
             if layer_class == "Lambda":
                 self._check_lambda_layer(layer, result, layer_name)
-                # CVE-2024-3660: Lambda layers enable arbitrary code injection
-                result.add_check(
-                    name="CVE-2024-3660: Lambda Layer Code Injection",
-                    passed=False,
-                    message=(
-                        f"CVE-2024-3660: Lambda layer '{layer_name}' enables arbitrary "
-                        f"code injection during model loading"
-                    ),
-                    severity=IssueSeverity.CRITICAL,
-                    location=f"{self.current_file_path} (layer: {layer_name})",
-                    details={
-                        "layer_name": layer_name,
-                        "layer_class": "Lambda",
-                        "cve_id": "CVE-2024-3660",
-                        "cvss": 9.8,
-                        "cwe": "CWE-94",
-                        "remediation": "Remove Lambda layers or upgrade Keras to >= 2.13",
-                    },
-                    why=get_cve_2024_3660_explanation("lambda_code_injection"),
-                )
+                keras_version = result.metadata.get("keras_version")
+                if isinstance(keras_version, str) and self._is_vulnerable_to_cve_2024_3660(keras_version):
+                    # CVE-2024-3660: Lambda layers enable arbitrary code injection
+                    result.add_check(
+                        name="CVE-2024-3660: Lambda Layer Code Injection",
+                        passed=False,
+                        message=(
+                            f"CVE-2024-3660: Lambda layer '{layer_name}' in Keras {keras_version} enables "
+                            "arbitrary code injection during model loading"
+                        ),
+                        severity=IssueSeverity.CRITICAL,
+                        location=f"{self.current_file_path} (layer: {layer_name})",
+                        details={
+                            "layer_name": layer_name,
+                            "layer_class": "Lambda",
+                            "keras_version": keras_version,
+                            "cve_id": "CVE-2024-3660",
+                            "cvss": 9.8,
+                            "cwe": "CWE-94",
+                            "remediation": "Remove Lambda layers or upgrade Keras to >= 2.13",
+                        },
+                        why=get_cve_2024_3660_explanation("lambda_code_injection"),
+                    )
+                elif isinstance(keras_version, str):
+                    result.add_check(
+                        name="Lambda Version Risk Check",
+                        passed=True,
+                        message=(
+                            f"Lambda layer '{layer_name}' detected with Keras {keras_version}; "
+                            "outside known CVE-2024-3660 vulnerable range (<2.13.0)"
+                        ),
+                        location=f"{self.current_file_path} (layer: {layer_name})",
+                        details={"layer_name": layer_name, "layer_class": "Lambda", "keras_version": keras_version},
+                    )
+                else:
+                    result.add_check(
+                        name="Lambda Risk (Version Unknown)",
+                        passed=False,
+                        message=(
+                            f"Lambda layer '{layer_name}' detected but keras_version is unavailable; "
+                            "cannot confidently attribute CVE-2024-3660 without version context"
+                        ),
+                        severity=IssueSeverity.WARNING,
+                        location=f"{self.current_file_path} (layer: {layer_name})",
+                        details={
+                            "layer_name": layer_name,
+                            "layer_class": "Lambda",
+                            "cve_id": "CVE-2024-3660",
+                            "affected_versions": "Keras < 2.13.0",
+                        },
+                    )
             elif layer_class in self.suspicious_layer_types:
                 result.add_check(
                     name="Suspicious Layer Type Detection",
@@ -418,3 +452,19 @@ class KerasZipScanner(BaseScanner):
                         },
                         why=get_pattern_explanation("lambda_layer"),
                     )
+
+    @staticmethod
+    def _is_vulnerable_to_cve_2024_3660(version: str) -> bool:
+        """Return True for Keras versions lower than 2.13.0."""
+        parts = version.split(".", 2)
+        if len(parts) < 3:
+            return False
+        try:
+            major, minor, patch_part = parts
+            patch_digits = "".join(ch for ch in patch_part if ch.isdigit())
+            if not patch_digits:
+                return False
+            parsed = (int(major), int(minor), int(patch_digits))
+            return parsed < (2, 13, 0)
+        except ValueError:
+            return False
