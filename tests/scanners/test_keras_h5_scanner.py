@@ -407,6 +407,7 @@ def test_keras_h5_scanner_allows_known_safe_classes(tmp_path):
                 },
             }
             f.attrs["model_config"] = json.dumps(model_config)
+            f.attrs["keras_version"] = "3.11.2"
 
         scanner = KerasH5Scanner()
         result = scanner.scan(str(h5_path))
@@ -441,6 +442,7 @@ class TestCVE20259905H5SafeMode:
                 },
             }
             f.attrs["model_config"] = json.dumps(model_config)
+            f.attrs["keras_version"] = "3.11.2"
 
         scanner = KerasH5Scanner()
         result = scanner.scan(str(h5_path))
@@ -497,3 +499,28 @@ class TestCVE20259905H5SafeMode:
 
         cve_issues = [i for i in result.issues if "CVE-2025-9905" in i.message]
         assert len(cve_issues) == 0, "No Lambda = no CVE-2025-9905"
+
+    def test_no_cve_for_fixed_keras_version(self, tmp_path) -> None:
+        """Lambda layer with fixed Keras version should not be CVE-attributed."""
+        h5_path = tmp_path / "model.h5"
+        with h5py.File(h5_path, "w") as f:
+            model_config = {
+                "class_name": "Sequential",
+                "config": {
+                    "name": "test",
+                    "layers": [
+                        {
+                            "class_name": "Lambda",
+                            "config": {"function": "lambda x: x"},
+                        }
+                    ],
+                },
+            }
+            f.attrs["model_config"] = json.dumps(model_config)
+            f.attrs["keras_version"] = "3.11.3"
+
+        scanner = KerasH5Scanner()
+        result = scanner.scan(str(h5_path))
+
+        cve_issues = [i for i in result.issues if "CVE-2025-9905" in i.message]
+        assert len(cve_issues) == 0, "Fixed Keras versions should not trigger CVE-2025-9905 attribution"
