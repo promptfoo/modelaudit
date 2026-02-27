@@ -446,10 +446,6 @@ ALWAYS_DANGEROUS_MODULES: set[str] = {
     "venv",
     "ensurepip",
     "pip",
-    # Threading / signal
-    "signal",
-    "_signal",
-    "threading",
     # Other dangerous
     "webbrowser",
     "asyncio",
