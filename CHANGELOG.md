@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **security:** new NeMo scanner detecting CVE-2025-23304 Hydra `_target_` injection in `.nemo` model files (CVSS 7.6), with recursive config inspection and dangerous callable blocklist
 - **security:** detect CVE-2025-51480 ONNX `save_external_data` arbitrary file overwrite via external_data path traversal (CVSS 8.8)
 - **security:** detect CVE-2025-49655 TorchModuleWrapper deserialization RCE (CVSS 9.8).
+- **keras:** add CVE-2024-3660 attribution to Lambda layer detection in .keras and .h5 scanners (CVSS 9.8)
 
 ### Security
 

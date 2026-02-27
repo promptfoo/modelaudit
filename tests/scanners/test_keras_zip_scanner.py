@@ -159,7 +159,12 @@ __import__('pickle').loads(data)
             os.unlink(temp_path)
 
     def test_safe_lambda_layer(self):
-        """Test that safe Lambda layers are handled appropriately."""
+        """Test that safe Lambda layers are handled appropriately.
+
+        Note: CVE-2024-3660 means ALL Lambda layers produce a CRITICAL finding
+        for the CVE attribution itself. The Lambda code analysis may still pass
+        if the code is safe, but the Lambda layer's existence is the risk.
+        """
         scanner = KerasZipScanner()
 
         # Create a Lambda with safe code
@@ -189,9 +194,16 @@ __import__('pickle').loads(data)
         try:
             result = scanner.scan(temp_path)
 
-            # Safe Lambda should not be CRITICAL
-            critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
-            assert len(critical_issues) == 0, "Safe Lambda should not be CRITICAL"
+            # CVE-2024-3660 always flags Lambda layers as CRITICAL
+            # But the code analysis itself should pass for safe code
+            cve_issues = [i for i in result.issues if "CVE-2024-3660" in i.message]
+            assert len(cve_issues) == 1, "Lambda should have CVE-2024-3660 attribution"
+
+            # The Lambda code analysis should NOT flag safe code as dangerous
+            code_analysis_critical = [
+                i for i in result.issues if i.severity == IssueSeverity.CRITICAL and "CVE-2024-3660" not in i.message
+            ]
+            assert len(code_analysis_critical) == 0, "Safe Lambda code should not be CRITICAL"
 
         finally:
             os.unlink(temp_path)
@@ -862,6 +874,53 @@ class TestCVE20251550ModuleReferences:
         cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-1550"]
         assert len(cve_issues) >= 1, "mathutils should not match safe 'math' prefix"
         assert cve_issues[0].severity == IssueSeverity.WARNING
+
+
+class TestCVE20243660LambdaAttribution:
+    """Test CVE-2024-3660: Lambda layer code injection attribution."""
+
+    def _make_keras_zip(self, config: dict, tmp_path) -> str:
+        keras_path = os.path.join(str(tmp_path), "model.keras")
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            zf.writestr("config.json", json.dumps(config))
+            zf.writestr("metadata.json", json.dumps({"keras_version": "2.10.0"}))
+        return keras_path
+
+    def test_lambda_layer_has_cve_2024_3660_attribution(self, tmp_path):
+        """Lambda layer in .keras file should include CVE-2024-3660 attribution."""
+        scanner = KerasZipScanner()
+        encoded = base64.b64encode(b"lambda x: x * 2").decode()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "my_lambda",
+                        "config": {"function": [encoded, None, None]},
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(config, tmp_path))
+
+        cve_issues = [i for i in result.issues if "CVE-2024-3660" in i.message]
+        assert len(cve_issues) >= 1, "Lambda should have CVE-2024-3660 attribution"
+        assert cve_issues[0].severity == IssueSeverity.CRITICAL
+        assert cve_issues[0].details["cve_id"] == "CVE-2024-3660"
+        assert cve_issues[0].details["cvss"] == 9.8
+
+    def test_no_cve_without_lambda(self, tmp_path):
+        """Non-Lambda model should NOT have CVE-2024-3660 attribution."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {"layers": [{"class_name": "Dense", "name": "dense_1", "config": {"units": 10}}]},
+        }
+        result = scanner.scan(self._make_keras_zip(config, tmp_path))
+
+        cve_issues = [i for i in result.issues if "CVE-2024-3660" in i.message]
+        assert len(cve_issues) == 0
 
 
 class TestKerasZipScannerSubclassed:
