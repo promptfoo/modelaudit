@@ -975,7 +975,8 @@ class PyTorchZipScanner(BaseScanner):
 
             # Parse version string
             vstr = version.strip()
-            is_prerelease = bool(re.search(r"(dev|rc|alpha|beta)", vstr, re.IGNORECASE))
+            # Match PEP 440 prerelease tags: a0, b1, rc1, dev0, alpha, beta
+            is_prerelease = bool(re.search(r"(\.dev|rc|alpha|beta|\d+a\d+|\d+b\d+)", vstr, re.IGNORECASE))
             version_match = re.match(r"^(\d+)\.(\d+)\.(\d+)", vstr)
             if not version_match:
                 # If we can't parse it, assume vulnerable for safety
@@ -1041,6 +1042,17 @@ class PyTorchZipScanner(BaseScanner):
                     "size mismatches, enabling heap layout manipulation and arbitrary code execution."
                 ),
             )
+        else:
+            result.add_check(
+                name="CVE-2026-24747 PyTorch Version Check",
+                passed=True,
+                message=(
+                    f"PyTorch {installed_version} is not vulnerable to CVE-2026-24747 "
+                    f"(fixed in {self.CVE_2026_24747_FIX_VERSION}+)."
+                ),
+                severity=IssueSeverity.INFO,
+                location=path,
+            )
 
     def _is_vulnerable_pytorch_version_2026(self, version: str) -> bool:
         """Check if a PyTorch version is vulnerable to CVE-2026-24747 (< 2.10.0)."""
@@ -1079,7 +1091,8 @@ class PyTorchZipScanner(BaseScanner):
         """
         try:
             vstr = version.strip()
-            is_prerelease = bool(re.search(r"(dev|rc|alpha|beta)", vstr, re.IGNORECASE))
+            # Match PEP 440 prerelease tags: a0, b1, rc1, dev0, alpha, beta
+            is_prerelease = bool(re.search(r"(\.dev|rc|alpha|beta|\d+a\d+|\d+b\d+)", vstr, re.IGNORECASE))
             version_match = re.match(r"^(\d+)\.(\d+)\.(\d+)", vstr)
             if not version_match:
                 return True  # Can't parse, assume vulnerable
@@ -1299,14 +1312,17 @@ class PyTorchZipScanner(BaseScanner):
             # Look for _rebuild_tensor_v2 patterns which declare storage key + element count
             opcodes = list(pickletools.genops(pkl_data))
             for i, (opcode, arg, _pos) in enumerate(opcodes):
-                # Resolve STACK_GLOBAL args (arg=None) by looking at preceding BINUNICODE ops
+                # Resolve STACK_GLOBAL args (arg=None) by walking backwards
+                # for the two preceding string-pushing opcodes (module + name).
+                # Wider window handles MEMOIZE, BINGET, and BINUNICODE8 interleaving.
                 resolved_arg = arg
                 if opcode.name == "STACK_GLOBAL" and not arg:
+                    string_ops = ("SHORT_BINUNICODE", "BINUNICODE", "BINUNICODE8")
                     parts: list[str] = []
-                    for k in range(i - 1, max(0, i - 5) - 1, -1):
+                    for k in range(i - 1, max(0, i - 10) - 1, -1):
                         kop, karg, _ = opcodes[k]
-                        if kop.name in ("SHORT_BINUNICODE", "BINUNICODE") and karg:
-                            parts.insert(0, str(karg))
+                        if kop.name in string_ops and isinstance(karg, str) and karg:
+                            parts.insert(0, karg)
                             if len(parts) == 2:
                                 break
                     if parts:

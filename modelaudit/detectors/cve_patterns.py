@@ -346,8 +346,13 @@ def _check_cve_2026_24747_multiline(content: str, binary_content: bytes) -> list
             matches.extend(binary_indicators)
 
     # Independent metadata-mismatch vector (no SETITEM required)
-    if has_pytorch and has_metadata_mismatch and not has_setitem:
+    elif has_pytorch and has_metadata_mismatch:
         matches.append("PyTorch tensor metadata mismatch indicators")
+        if binary_indicators:
+            matches.extend(binary_indicators)
+    # Broader storage-metadata path: tensor reconstruction + storage context
+    elif has_pytorch and has_storage:
+        matches.append("PyTorch tensor reconstruction with suspicious storage metadata context")
         if binary_indicators:
             matches.extend(binary_indicators)
 
@@ -448,10 +453,20 @@ def _check_cve_2024_5480_multiline(content: str, binary_content: bytes) -> list[
 
     # Required indicators for CVE-2024-5480
     rpc_indicators = ["torch.distributed.rpc", "rpc_sync", "rpc_async", "pythonudf"]
-    eval_indicators = ["eval", "exec"]
+    # Broader dangerous callable list: CVE-2024-5480 allows arbitrary callable
+    # execution, not just eval/exec
+    dangerous_callable_indicators = [
+        "eval",
+        "exec",
+        "__import__",
+        "os.system",
+        "subprocess",
+        "builtins.eval",
+        "builtins.exec",
+    ]
 
     has_rpc = any(indicator in content_lower for indicator in rpc_indicators)
-    has_eval = any(indicator in content_lower for indicator in eval_indicators)
+    has_eval = any(indicator in content_lower for indicator in dangerous_callable_indicators)
 
     # Binary content evidence
     binary_indicators = []

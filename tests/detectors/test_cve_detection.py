@@ -467,7 +467,7 @@ class TestCVEPatternValidation:
 class TestCVE202624747Detection:
     """Test detection of CVE-2026-24747 (PyTorch weights_only SETITEM bypass)."""
 
-    def test_detect_cve_2026_24747_basic_pattern(self, tmp_path):
+    def test_detect_cve_2026_24747_basic_pattern(self, tmp_path: Path) -> None:
         """Test basic detection of CVE-2026-24747 patterns."""
         # Content with PyTorch tensor reconstruction + SETITEM indicators
         malicious_content = b"""
@@ -492,7 +492,7 @@ class TestCVE202624747Detection:
             f"Should detect CVE-2026-24747. Issues found: {[i.message for i in result.issues]}"
         )
 
-    def test_detect_cve_2026_24747_setitem_after_rebuild(self, tmp_path):
+    def test_detect_cve_2026_24747_setitem_after_rebuild(self, tmp_path: Path) -> None:
         """Test detection of SETITEMS applied after tensor reconstruction."""
         malicious_content = b"""
         torch._utils._rebuild_tensor_v2
@@ -510,7 +510,7 @@ class TestCVE202624747Detection:
             f"Should flag tensor rebuild + SETITEMS. Issues: {[i.message for i in result.issues]}"
         )
 
-    def test_no_false_positive_on_normal_setitem(self, tmp_path):
+    def test_no_false_positive_on_normal_setitem(self, tmp_path: Path) -> None:
         """Test that normal dict SETITEM usage does not trigger CVE-2026-24747."""
         # Normal dict pickle — should NOT be flagged
         normal_data = pickle.dumps({"key1": "value1", "key2": "value2", "key3": [1, 2, 3]})
@@ -531,7 +531,7 @@ class TestCVE202624747Detection:
             f"False positives: {[i.message for i in cve_2026_detections]}"
         )
 
-    def test_cve_pattern_analysis_cve_2026_24747(self):
+    def test_cve_pattern_analysis_cve_2026_24747(self) -> None:
         """Test CVE pattern analysis for CVE-2026-24747."""
         content = "torch._utils._rebuild_tensor_v2 SETITEM storage_offset"
         binary_content = b"torch._utils._rebuild_tensor_v2 SETITEM storage_offset"
@@ -547,7 +547,7 @@ class TestCVE202624747Detection:
         assert attr.cwe == "CWE-502"
         assert len(attr.patterns_matched) > 0
 
-    def test_no_cve_2026_24747_in_documentation_content(self):
+    def test_no_cve_2026_24747_in_documentation_content(self) -> None:
         """Test that documentation mentioning CVE patterns is not flagged."""
         doc_content = '"""CVE-2026-24747 vulnerability: _rebuild_tensor SETITEM storage_offset"""'
 
@@ -708,6 +708,10 @@ class TestCVE202624747PickleScanner:
         # Must detect either SETITEM abuse or _rebuild_tensor as dangerous
         assert len(setitem_issues) > 0 or len(rebuild_issues) > 0, (
             f"Should detect _rebuild_tensor + SETITEM abuse. Issues: {[i.message for i in result.issues]}"
+        )
+        # Ensure SETITEM/CVE-2026-24747 signal is actually surfaced (prevents false-pass)
+        assert len(setitem_issues) > 0, (
+            f"Expected SETITEM/CVE-2026-24747 signal. Issues: {[i.message for i in result.issues]}"
         )
 
     def test_pickle_scanner_no_setitem_false_positive(self, tmp_path: Path) -> None:

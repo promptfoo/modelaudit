@@ -4710,6 +4710,10 @@ class PickleScanner(BaseScanner):
         globals) is flagged.
         """
         patterns: list[dict] = []
+        # Pre-compute symbolic references for STACK_GLOBAL resolution.
+        # This handles BINUNICODE8, memoized strings (BINGET/LONG_BINGET),
+        # and indirect stack flows that a narrow lookback would miss.
+        stack_global_refs, _ = _build_symbolic_reference_maps(opcodes)
 
         for i, (opcode, _arg, pos) in enumerate(opcodes):
             if opcode.name not in ("SETITEM", "SETITEMS"):
@@ -4733,19 +4737,14 @@ class PickleScanner(BaseScanner):
                 if prev_op.name in ("REDUCE", "NEWOBJ", "NEWOBJ_EX") and most_recent_container is None:
                     most_recent_container = "object"
 
-                # Resolve STACK_GLOBAL args by walking backwards for the two
-                # preceding SHORT_BINUNICODE/BINUNICODE ops (module + name)
+                # Resolve STACK_GLOBAL args using pre-computed symbolic map
+                # (handles BINUNICODE8, memoized strings via BINGET/LONG_BINGET,
+                # and indirect stack flows)
                 resolved_arg = prev_arg
                 if prev_op.name == "STACK_GLOBAL" and not prev_arg:
-                    parts: list[str] = []
-                    for k in range(j - 1, max(0, j - 5) - 1, -1):
-                        kop, karg, _ = opcodes[k]
-                        if kop.name in ("SHORT_BINUNICODE", "BINUNICODE") and karg:
-                            parts.insert(0, str(karg))
-                            if len(parts) == 2:
-                                break
-                    if parts:
-                        resolved_arg = ".".join(parts)
+                    ref = stack_global_refs.get(j)
+                    if ref:
+                        resolved_arg = f"{ref[0]}.{ref[1]}"
 
                 # Check for _rebuild_tensor context (suspicious with SETITEM)
                 if prev_op.name in ("GLOBAL", "STACK_GLOBAL") and resolved_arg:

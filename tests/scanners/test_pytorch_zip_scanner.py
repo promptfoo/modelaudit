@@ -523,14 +523,14 @@ def test_pytorch_zip_cve_2026_24747_fixed_version(tmp_path: Path, monkeypatch: p
 
     result = scanner.scan(str(model_path))
 
-    # Fixed version: no failed CVE-2026-24747 checks should be emitted
-    cve_2026_failed = [c for c in result.checks if "CVE-2026-24747" in c.name and c.status == CheckStatus.FAILED]
+    # Fixed version: CVE-2026-24747 check should be present but not failed
+    cve_2026_checks = [c for c in result.checks if "CVE-2026-24747" in c.name]
+    assert len(cve_2026_checks) > 0, "Expected CVE-2026-24747 check to be present"
+    cve_2026_failed = [c for c in cve_2026_checks if c.status == CheckStatus.FAILED]
     assert len(cve_2026_failed) == 0, (
         f"PyTorch 2.10.0 should NOT trigger CVE-2026-24747. "
         f"Failed checks: {[(c.name, c.message) for c in cve_2026_failed]}"
     )
-    # Verify the vulnerable version test DID produce a check (regression guard)
-    # This is validated by test_pytorch_zip_cve_2026_24747_vulnerable_version above
 
 
 def test_pytorch_zip_tensor_metadata_validation(tmp_path: Path) -> None:
@@ -554,6 +554,50 @@ def test_pytorch_zip_tensor_metadata_validation(tmp_path: Path) -> None:
     mismatch_checks = [c for c in result.checks if "Tensor Metadata" in c.name and c.status == CheckStatus.FAILED]
     assert len(mismatch_checks) == 0, (
         f"Normal model should not have metadata mismatches. Failed: {[(c.name, c.message) for c in mismatch_checks]}"
+    )
+
+
+def test_pytorch_zip_tensor_metadata_mismatch_detection(tmp_path: Path) -> None:
+    """Test that intentionally mismatched tensor metadata is detected.
+
+    Creates a PyTorch ZIP where the pickle declares a tensor requiring more
+    storage than the actual blob provides, which is the core CVE-2026-24747
+    metadata-mismatch exploitation vector.
+    """
+    import pickletools
+    import struct
+
+    # Build a minimal pickle that references _rebuild_tensor_v2 with a
+    # declared element count that wildly exceeds the actual blob size.
+    # Protocol 2 GLOBAL opcode referencing torch._utils._rebuild_tensor_v2
+    pkl_data = bytearray()
+    pkl_data.extend(b"\x80\x02")  # PROTO 2
+    pkl_data.extend(b"ctorch._utils\n_rebuild_tensor_v2\n")  # GLOBAL
+    # Push storage key "0" as SHORT_BINUNICODE
+    pkl_data.extend(b"\x8c\x010")  # SHORT_BINUNICODE "0"
+    # Push a large element count (1_000_000) as BININT
+    pkl_data.extend(b"J")  # BININT opcode
+    pkl_data.extend(struct.pack("<i", 1_000_000))
+    pkl_data.extend(b".")  # STOP
+
+    # Verify our pickle is parseable by pickletools
+    list(pickletools.genops(bytes(pkl_data)))
+
+    zip_path = tmp_path / "mismatch_model.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", bytes(pkl_data))
+        # Blob is only 24 bytes but pickle declares 1M elements
+        zipf.writestr("archive/data/0", b"\x00" * 24)
+
+    scanner = PyTorchZipScanner()
+    result = scanner.scan(str(zip_path))
+
+    assert result is not None
+    mismatch_checks = [c for c in result.checks if "Tensor Metadata" in c.name and c.status == CheckStatus.FAILED]
+    assert len(mismatch_checks) > 0, (
+        f"Should detect tensor storage size mismatch (24 bytes vs 1M declared elements). "
+        f"Checks: {[(c.name, c.status, c.message) for c in result.checks]}"
     )
 
 
