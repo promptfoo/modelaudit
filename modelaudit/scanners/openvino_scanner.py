@@ -80,7 +80,12 @@ class OpenVinoScanner(BaseScanner):
         if version:
             result.metadata["ir_version"] = version
 
-        suspicious_pattern = re.compile("|".join(SUSPICIOUS_STRING_PATTERNS), re.IGNORECASE)
+        # Use only code-execution patterns for OpenVINO XML attributes.
+        # The dunder pattern (__[\w]+__) is pickle-specific and produces false
+        # positives on PyTorch operator names preserved during model conversion
+        # (e.g., aten::__and__/BitwiseAnd).
+        openvino_patterns = [p for p in SUSPICIOUS_STRING_PATTERNS if p != r"__[\w]+__"]
+        suspicious_pattern = re.compile("|".join(openvino_patterns), re.IGNORECASE) if openvino_patterns else None
 
         for layer in root.findall(".//layer"):
             layer_type = layer.attrib.get("type", "").lower()
@@ -104,16 +109,17 @@ class OpenVinoScanner(BaseScanner):
                     location=path,
                     details={"layer_name": layer_name, "library": library},
                 )
-            for attr_val in layer.attrib.values():
-                if suspicious_pattern.search(str(attr_val)):
-                    result.add_check(
-                        name="Layer Attribute Security Check",
-                        passed=False,
-                        message="Suspicious content in layer attributes",
-                        severity=IssueSeverity.CRITICAL,
-                        location=path,
-                        details={"attribute": attr_val},
-                    )
+            if suspicious_pattern:
+                for attr_val in layer.attrib.values():
+                    if suspicious_pattern.search(str(attr_val)):
+                        result.add_check(
+                            name="Layer Attribute Security Check",
+                            passed=False,
+                            message="Suspicious content in layer attributes",
+                            severity=IssueSeverity.CRITICAL,
+                            location=path,
+                            details={"attribute": attr_val},
+                        )
 
         result.finish(success=not result.has_errors)
         return result

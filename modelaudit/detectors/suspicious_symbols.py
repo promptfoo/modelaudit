@@ -294,8 +294,10 @@ SUSPICIOUS_STRING_PATTERNS = [
     r"\bimport\s+[\w\.]+",  # Import statements referencing modules
     r"importlib",  # Dynamic import library
     r"__import__",  # Built-in import function
-    # Code construction - MEDIUM RISK
-    r"lambda",  # Anonymous function creation
+    # NOTE: "lambda" was removed from this list because it matches vocabulary entries
+    # in text classifiers (e.g., TF-IDF vectorizers). Lambda exploitation is detected
+    # by the dedicated Pattern 5 check in check_opcode_sequence() which looks for
+    # lambda strings followed by REDUCE opcodes (the actual attack vector).
     # Hex encoding - possible obfuscation
     r"\\x[0-9a-fA-F]{2}",  # Hex-encoded characters
     # getattr-based evasion patterns - bypass string matching via dynamic attribute access
@@ -383,9 +385,11 @@ CVE_COMBINED_PATTERNS = {
 # The regex CVE patterns (CVE_2020_13092_PATTERNS, CVE_2024_34997_PATTERNS) correctly detect
 # actual exploits by requiring COMBINATIONS (e.g., "sklearn.*joblib.*os.system"), not individual keywords.
 CVE_BINARY_PATTERNS = [
-    # CVE-2020-13092 binary signatures
-    b"joblib.load",
-    b"__reduce__",
+    # Only patterns that are genuine indicators of exploitation.
+    # Removed overly broad patterns (b"Pipeline", b"__reduce__", b"joblib.load",
+    # b"read_array") that match ALL legitimate sklearn/numpy pickle files.
+    # The regex CVE patterns (CVE_2020_13092_PATTERNS, CVE_2024_34997_PATTERNS)
+    # correctly detect actual exploits by requiring dangerous COMBINATIONS.
     b"os.system",
     # NOTE: b"Pipeline" removed — it matches all legitimate sklearn Pipeline pickles.
     # The CVE-2020-13092 exploit requires Pipeline + __reduce__ + system call, which

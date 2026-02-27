@@ -33,6 +33,8 @@ from ..detectors.cve_patterns import analyze_cve_patterns, enhance_scan_result_w
 from ..detectors.suspicious_symbols import DANGEROUS_OPCODES
 from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult, logger
 
+_RESYNC_BUDGET = 8192  # Max bytes to scan forward when resyncing after an unknown opcode
+
 
 def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> Any:
     """
@@ -40,7 +42,8 @@ def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> 
 
     Some files (especially joblib) may declare protocol 4 but use protocol 5 opcodes
     like READONLY_BUFFER (0x0f). This function attempts to parse as much as possible
-    before hitting unknown opcodes.
+    before hitting unknown opcodes, then tries to resync and continue scanning
+    rather than terminating on partial stream errors.
 
     When *multi_stream* is True the generator continues parsing after the first STOP
     opcode so that malicious payloads hidden in a second pickle stream are not missed.
@@ -689,6 +692,18 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "any",
         "iter",
         "next",
+        # Python 2 type names used by frameworks like fastai during serialization
+        "long",
+        "unicode",
+        "print",
+        "basestring",
+        "xrange",
+        "complex",
+        "memoryview",
+        "property",
+        "staticmethod",
+        "classmethod",
+        "super",
     ],
     "builtins": [  # Python 3 builtins
         "set",
@@ -804,9 +819,19 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
     "numpy.random._pickle": [
         "__randomstate_ctor",
         "__generator_ctor",
+        "__bit_generator_ctor",
     ],
     "numpy.random.mtrand": [
         "RandomState",
+    ],
+    "numpy.random._common": [
+        "BitGenerator",
+    ],
+    "numpy.random._generator": [
+        "Generator",
+    ],
+    "numpy.random._bounded_integers": [
+        "_bounded_integers",
     ],
     "numpy.random._mt19937": [
         "MT19937",
@@ -820,6 +845,9 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "bsr_matrix",
         "dia_matrix",
         "dok_matrix",
+        "csr_array",
+        "csc_array",
+        "coo_array",
     ],
     "scipy.sparse._csr": [
         "csr_matrix",
@@ -833,6 +861,10 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "coo_matrix",
         "coo_array",
     ],
+    "scipy.sparse._bsr": ["bsr_matrix", "bsr_array"],
+    "scipy.sparse._dia": ["dia_matrix", "dia_array"],
+    "scipy.sparse._lil": ["lil_matrix", "lil_array"],
+    "scipy.sparse._dok": ["dok_matrix", "dok_array"],
     "math": [
         "sqrt",
         "pow",
@@ -844,6 +876,42 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "pi",
         "e",
     ],
+    # NOTE: operator module (methodcaller, itemgetter, attrgetter, getitem) is
+    # intentionally NOT allowlisted here.  These functions are in
+    # ALWAYS_DANGEROUS_FUNCTIONS because they enable dynamic attribute access
+    # and arbitrary method invocation -- a well-known pickle deserialization
+    # attack vector (see Fickling research).  Even in ML contexts, they must
+    # remain flagged to prevent bypasses.
+    # Truncated numpy module references from pickle opcode resolution.
+    # The pickle scanner sometimes resolves module names incompletely
+    # (e.g., "_reconstruct" instead of "numpy.core.multiarray._reconstruct").
+    #
+    # SECURITY NOTE: These short/generic module names carry bypass risk -- an
+    # attacker could craft a pickle with a custom module named "C" that exports
+    # "dtype".  We accept this risk because:
+    #   1. These only skip the SUSPICIOUS_GLOBAL check; ALWAYS_DANGEROUS still fires.
+    #   2. The function names are narrow and specific to numpy internals.
+    #   3. Removing them causes widespread FPs on legitimate sklearn/joblib models.
+    "_reconstruct": ["ndarray", "scalar"],
+    "C": ["dtype", "ndarray", "scalar"],
+    "multiarray": ["_reconstruct", "scalar"],
+    "numpy_pickle": ["NumpyArrayWrapper", "NDArrayWrapper"],
+    # Truncated sklearn class names from joblib opcode resolution.
+    # When joblib serializes sklearn objects it sometimes resolves class names
+    # without the full module path, e.g. "LabelEncoder" instead of
+    # "sklearn.preprocessing._label.LabelEncoder".
+    "LabelEncoder": ["dtype"],
+    "OrdinalEncoder": ["dtype"],
+    "OneHotEncoder": ["dtype"],
+    "MT19937": ["__bit_generator_ctor"],
+    # Old-style scipy paths (without underscore, used in older scipy versions)
+    "scipy.sparse.csr": ["csr_matrix", "csr_array"],
+    "scipy.sparse.csc": ["csc_matrix", "csc_array"],
+    "scipy.sparse.coo": ["coo_matrix", "coo_array"],
+    "scipy.sparse.bsr": ["bsr_matrix", "bsr_array"],
+    "scipy.sparse.dia": ["dia_matrix", "dia_array"],
+    "scipy.sparse.lil": ["lil_matrix", "lil_array"],
+    "scipy.sparse.dok": ["dok_matrix", "dok_array"],
     # YOLO/Ultralytics safe patterns
     "ultralytics": [
         "YOLO",
@@ -929,6 +997,31 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
     "sklearn.ensemble._hist_gradient_boosting.gradient_boosting": [
         "HistGradientBoostingClassifier",
         "HistGradientBoostingRegressor",
+    ],
+    "sklearn.ensemble._hist_gradient_boosting.binning": [
+        "_BinMapper",
+    ],
+    "sklearn.ensemble._hist_gradient_boosting.predictor": [
+        "TreePredictor",
+    ],
+    "sklearn.ensemble._hist_gradient_boosting._predictor": [
+        "TreePredictor",
+    ],
+    "sklearn.ensemble._hist_gradient_boosting.grower": [
+        "TreeGrower",
+        "TreeNode",
+    ],
+    "sklearn.ensemble._hist_gradient_boosting.splitting": [
+        "Splitter",
+        "SplitInfo",
+    ],
+    "sklearn.ensemble._hist_gradient_boosting.common": [
+        "MonotonicConstraint",
+        "X_DTYPE",
+        "X_BINNED_DTYPE",
+        "Y_DTYPE",
+        "G_H_DTYPE",
+        "X_BITSET_INNER_DTYPE",
     ],
     "sklearn.linear_model": [
         "LinearRegression",
@@ -1205,6 +1298,125 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
     "sklearn.utils._tags": [
         "Tags",
     ],
+    "sklearn.neural_network": [
+        "MLPClassifier",
+        "MLPRegressor",
+        "BernoulliRBM",
+    ],
+    "sklearn.neural_network._multilayer_perceptron": [
+        "MLPClassifier",
+        "MLPRegressor",
+    ],
+    "sklearn.calibration": [
+        "CalibratedClassifierCV",
+    ],
+    "sklearn.discriminant_analysis": [
+        "LinearDiscriminantAnalysis",
+        "QuadraticDiscriminantAnalysis",
+    ],
+    "sklearn.gaussian_process": [
+        "GaussianProcessClassifier",
+        "GaussianProcessRegressor",
+    ],
+    "sklearn.isotonic": [
+        "IsotonicRegression",
+    ],
+    "sklearn.kernel_ridge": [
+        "KernelRidge",
+    ],
+    "sklearn.mixture": [
+        "GaussianMixture",
+        "BayesianGaussianMixture",
+    ],
+    "sklearn.semi_supervised": [
+        "LabelPropagation",
+        "LabelSpreading",
+        "SelfTrainingClassifier",
+    ],
+    # sklearn loss functions (used by HistGradientBoosting regressors)
+    "sklearn._loss.loss": [
+        "HalfSquaredError",
+        "HalfBinomialLoss",
+        "HalfMultinomialLoss",
+        "HalfPoissonLoss",
+        "HalfGammaLoss",
+        "HalfTweedieLoss",
+        "HalfTweedieLossIdentity",
+        "AbsoluteError",
+        "PinballLoss",
+        "HuberLoss",
+        "ExponentialLoss",
+        "CyHalfSquaredError",
+        "CyHalfBinomialLoss",
+        "CyHalfMultinomialLoss",
+        "CyHalfPoissonLoss",
+        "CyHalfGammaLoss",
+        "CyHalfTweedieLoss",
+        "CyHalfTweedieLossIdentity",
+        "CyAbsoluteError",
+        "CyPinballLoss",
+        "CyHuberLoss",
+        "CyExponentialLoss",
+    ],
+    "sklearn._loss.link": [
+        "IdentityLink",
+        "LogLink",
+        "LogitLink",
+        "HalfLogitLink",
+        "MultinomialLogit",
+        "Interval",
+    ],
+    # Truncated _loss module name (joblib opcode resolution) + Cython unpickle functions
+    "_loss": [
+        "CyHalfSquaredError",
+        "CyHalfBinomialLoss",
+        "CyHalfMultinomialLoss",
+        "CyHalfPoissonLoss",
+        "CyHalfGammaLoss",
+        "CyAbsoluteError",
+        "CyPinballLoss",
+        "CyHuberLoss",
+        "CyExponentialLoss",
+        "CyHalfTweedieLoss",
+        "CyHalfTweedieLossIdentity",
+        # Cython __pyx_unpickle_* reconstruction functions
+        "__pyx_unpickle_CyHalfSquaredError",
+        "__pyx_unpickle_CyHalfBinomialLoss",
+        "__pyx_unpickle_CyHalfMultinomialLoss",
+        "__pyx_unpickle_CyHalfPoissonLoss",
+        "__pyx_unpickle_CyHalfGammaLoss",
+        "__pyx_unpickle_CyAbsoluteError",
+        "__pyx_unpickle_CyPinballLoss",
+        "__pyx_unpickle_CyHuberLoss",
+        "__pyx_unpickle_CyExponentialLoss",
+        "__pyx_unpickle_CyHalfTweedieLoss",
+        "__pyx_unpickle_CyHalfTweedieLossIdentity",
+    ],
+    # Old sklearn module paths (pre-underscore convention, used in older models)
+    "sklearn.linear_model.stochastic_gradient": [
+        "SGDClassifier",
+        "SGDRegressor",
+    ],
+    # LightGBM
+    "lightgbm.sklearn": [
+        "LGBMClassifier",
+        "LGBMRegressor",
+        "LGBMRanker",
+    ],
+    "lightgbm.basic": [
+        "Booster",
+        "Dataset",
+    ],
+    # numpy masked arrays (used by older sklearn models)
+    "numpy.ma.core": [
+        "_mareconstruct",
+        "MaskedArray",
+        "MaskedConstant",
+    ],
+    "numpy.ma": [
+        "core",
+        "MaskedArray",
+    ],
     "transformers": [
         "AutoModel",
         "AutoTokenizer",
@@ -1386,14 +1598,30 @@ def _detect_ml_context(opcodes: list[tuple]) -> dict[str, Any]:
         matches: list[str] = []
 
         # Check module matches with improved scoring
+        # Uses prefix matching so that e.g. module pattern "sklearn" matches
+        # global refs like "sklearn.pipeline", "sklearn.ensemble._iforest", etc.
         modules = patterns["modules"]
+        counted_modules: set[str] = set()
         if isinstance(modules, list):
             for module in modules:
-                if module in global_refs:
+                # Aggregate counts from all global_refs that match this module
+                # either exactly or as a prefix (e.g. "sklearn" matches "sklearn.pipeline").
+                # Use counted_modules to prevent double-counting: for STACK_GLOBAL flows
+                # both the module key (e.g. "sklearn") and the full ref
+                # (e.g. "sklearn.ensemble") are stored in global_refs, so a prefix
+                # match could count one logical reference more than once.
+                ref_count = 0
+                for ref_key, ref_cnt in global_refs.items():
+                    base_module = ref_key.split(".")[0] if "." in ref_key else ref_key
+                    if base_module in counted_modules:
+                        continue
+                    if ref_key == module or ref_key.startswith(module + "."):
+                        ref_count += ref_cnt
+                        counted_modules.add(base_module)
+
+                if ref_count > 0:
                     # Score based on presence and frequency,
                     # not proportion of total opcodes
-                    ref_count = global_refs[module]
-
                     # Base score for presence
                     module_score = 10.0  # Base score for any ML module presence
 
@@ -1435,6 +1663,49 @@ def _detect_ml_context(opcodes: list[tuple]) -> dict[str, Any]:
     return context
 
 
+def _is_plausible_python_module(name: str) -> bool:
+    """
+    Check whether *name* looks like a real Python module/package path.
+
+    Legitimate module names follow Python identifier rules:
+    - Each dotted segment is a valid Python identifier (letters, digits,
+      underscores; cannot start with a digit).
+    - Conventionally all-lowercase, though private/internal modules may use
+      a leading underscore.
+
+    Names that contain uppercase letters, start with digits, or include
+    characters outside ``[a-z0-9_.]`` are almost certainly **not** real
+    modules -- they are more likely DataFrame column names, user labels,
+    or other data strings that ended up as pickle GLOBAL arguments
+    (e.g. ``PEDRA_2020``).
+
+    The check is intentionally conservative: a handful of legitimate but
+    unusual module names (e.g. ``PIL``, ``Cython``) are covered by
+    ``ML_SAFE_GLOBALS`` and will pass the allowlist before this function
+    is ever consulted.
+
+    Returns:
+        True if *name* plausibly refers to a real Python module.
+    """
+    import re
+
+    if not name:
+        return False
+
+    # Fast reject: real module paths never contain whitespace.
+    if " " in name or "\t" in name:
+        return False
+
+    # Split on dots; each segment must be a valid Python identifier that
+    # looks like a conventional module name (lowercase + digits + _).
+    segments = name.split(".")
+    if not segments or any(s == "" for s in segments):
+        return False
+
+    _MODULE_SEGMENT_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
+    return all(_MODULE_SEGMENT_RE.match(seg) for seg in segments)
+
+
 def _is_safe_ml_global(mod: str, func: str) -> bool:
     """
     Check if a module.function is in the ML_SAFE_GLOBALS allowlist.
@@ -1463,14 +1734,10 @@ def _is_actually_dangerous_global(mod: str, func: str, ml_context: dict) -> bool
     """
     full_ref = f"{mod}.{func}"
 
-    # STEP 0: Check ML_SAFE_GLOBALS allowlist first (before dangerous checks)
-    # This prevents false positives for safe functions from otherwise dangerous modules
-    # E.g., __builtin__.set (Python 2) or builtins.set (Python 3) are safe
-    if _is_safe_ml_global(mod, func):
-        logger.debug(f"Allowlisted safe global from potentially dangerous module: {mod}.{func}")
-        return False
-
-    # STEP 1: ALWAYS flag dangerous functions (no ML context exceptions)
+    # STEP 1: ALWAYS flag dangerous functions first (no exceptions, no allowlist override)
+    # This MUST come before the ML_SAFE_GLOBALS check to prevent bypass attacks
+    # where an attacker places dangerous functions (e.g., operator.attrgetter) in a
+    # pickle stream alongside ML references to trick the allowlist.
     if full_ref in ALWAYS_DANGEROUS_FUNCTIONS or func in ALWAYS_DANGEROUS_FUNCTIONS:
         logger.warning(
             f"Always-dangerous function detected: {full_ref} "
@@ -1478,12 +1745,30 @@ def _is_actually_dangerous_global(mod: str, func: str, ml_context: dict) -> bool
         )
         return True
 
-    # STEP 2: ALWAYS flag dangerous modules (no exceptions)
+    # STEP 2: Flag dangerous modules, but allow explicitly safe-listed functions.
+    # The truly dangerous functions from these modules (eval, exec, open, getattr,
+    # setattr, delattr, __import__, compile, etc.) are already caught in STEP 1 via
+    # ALWAYS_DANGEROUS_FUNCTIONS, so any function reaching this point that is in the
+    # ML_SAFE_GLOBALS allowlist (e.g., builtins.slice, builtins.set) is genuinely safe.
     if mod in ALWAYS_DANGEROUS_MODULES:
+        if _is_safe_ml_global(mod, func):
+            logger.debug(
+                f"Safe function from dangerous module: {mod}.{func} (explicitly allowlisted in ML_SAFE_GLOBALS)"
+            )
+            return False
         logger.warning(f"Always-dangerous module detected: {mod}.{func} (flagged regardless of ML context)")
         return True
 
-    # STEP 3: Use original suspicious global check for all other cases
+    # STEP 3: Check ML_SAFE_GLOBALS allowlist (after dangerous checks)
+    # This prevents false positives for safe functions that passed the dangerous checks.
+    # E.g., __builtin__.set (Python 2) or builtins.set (Python 3) are safe.
+    # NOTE: This comes AFTER dangerous checks so that ALWAYS_DANGEROUS items
+    # can never be overridden by the allowlist.
+    if _is_safe_ml_global(mod, func):
+        logger.debug(f"Allowlisted safe global: {mod}.{func}")
+        return False
+
+    # STEP 4: Use original suspicious global check for all other cases
     # Removed ML confidence-based whitelisting to prevent bypass attacks
     return is_suspicious_global(mod, func)
 
@@ -1720,6 +2005,14 @@ def _build_symbolic_reference_maps(
             "BINUNICODE8",
         }:
             stack.append(unknown)
+
+        if name == "STOP":
+            # Reset memo and stack at pickle stream boundaries so that
+            # references from one stream don't leak into the next in
+            # multi-pickle files (e.g. PyTorch .pt containers).
+            memo.clear()
+            stack.clear()
+            next_memo_index = 0
 
     return stack_global_refs, callable_refs
 
@@ -2111,11 +2404,17 @@ def is_suspicious_string(s: str) -> str | None:
             return pattern
 
     # Check for base64-like strings (long strings with base64 charset), but avoid repeating patterns
+    # and TF-IDF vocabulary strings (which are long alphanumeric but all lowercase words)
     if (
         len(s) > 40
         and re.match(r"^[A-Za-z0-9+/=]+$", s)
         and not re.match(r"^(.)\1*$", s)  # Not all same character
         and len(set(s)) > 4  # Must have some character diversity
+        # Require characteristics of actual base64: mixed case AND digits present
+        # This avoids matching TF-IDF vocabulary (all lowercase concatenated words)
+        and re.search(r"[A-Z]", s)
+        and re.search(r"[a-z]", s)
+        and re.search(r"[0-9]", s)
     ):
         return "potential_base64"
 
@@ -2138,15 +2437,17 @@ def is_dangerous_reduce_pattern(
 
     def _is_dangerous_ref(mod: str, func: str) -> bool:
         """Check if a module.function reference is dangerous enough to flag."""
-        # Safe ML globals are never dangerous
-        if _is_safe_ml_global(mod, func):
-            return False
         full_ref = f"{mod}.{func}"
-        # Check ALWAYS_DANGEROUS lists
+        # Check ALWAYS_DANGEROUS functions FIRST (before allowlist to prevent bypass)
         if full_ref in ALWAYS_DANGEROUS_FUNCTIONS or func in ALWAYS_DANGEROUS_FUNCTIONS:
             return True
+        # Check dangerous modules, but allow explicitly safe-listed functions
+        # (truly dangerous functions like eval/exec/open are caught above)
         if mod in ALWAYS_DANGEROUS_MODULES:
-            return True
+            return not _is_safe_ml_global(mod, func)
+        # Safe ML globals (checked after dangerous lists)
+        if _is_safe_ml_global(mod, func):
+            return False
         # Check SUSPICIOUS_GLOBALS (the fallback)
         return is_suspicious_global(mod, func)
 
@@ -2367,11 +2668,13 @@ def check_opcode_sequence(
                 # (e.g. nested __setstate__ calls in sklearn trees).
 
             # GLOBAL/STACK_GLOBAL: only count when referencing non-safe modules
+            # Also skip counting when the "module" name is not a plausible
+            # Python module (e.g. DataFrame column names like "PEDRA_2020").
             elif opcode.name == "GLOBAL" and isinstance(arg, str):
                 parts = arg.split(" ", 1) if " " in arg else arg.rsplit(".", 1) if "." in arg else [arg, ""]
                 if len(parts) == 2:
                     mod, func = parts
-                    if not _is_safe_ml_global(mod, func):
+                    if not _is_safe_ml_global(mod, func) and _is_plausible_python_module(mod):
                         is_dangerous_opcode = True
                 else:
                     is_dangerous_opcode = True
@@ -2380,10 +2683,19 @@ def check_opcode_sequence(
                 stack_ref = resolved_stack_globals.get(i)
                 if stack_ref:
                     mod, func = stack_ref
-                    if not _is_safe_ml_global(mod, func):
+                    if not _is_safe_ml_global(mod, func) and _is_plausible_python_module(mod):
                         is_dangerous_opcode = True
                 else:
                     is_dangerous_opcode = True
+
+            elif opcode.name in ("NEWOBJ", "NEWOBJ_EX"):
+                # NEWOBJ/NEWOBJ_EX: check associated class via resolved_callables
+                is_dangerous_opcode = True
+                associated_ref = resolved_callables.get(i)
+                if associated_ref:
+                    mod, func = associated_ref
+                    if _is_safe_ml_global(mod, func):
+                        is_dangerous_opcode = False
 
             else:
                 # Other dangerous opcodes (INST, OBJ, EXT*)
@@ -2401,8 +2713,65 @@ def check_opcode_sequence(
 
         # Fixed threshold for dangerous opcode detection.
         # Only execution-related opcodes are counted (memo/framing excluded),
-        # and safe ML globals are skipped for REDUCE/GLOBAL/STACK_GLOBAL.
+        # and safe ML globals are skipped for REDUCE/GLOBAL/STACK_GLOBAL/NEWOBJ.
         threshold = 50
+
+        # In high-confidence ML contexts with tree-ensemble models (e.g. sklearn
+        # RandomForest, xgboost, lightgbm), tree-based models legitimately produce
+        # hundreds of REDUCE/NEWOBJ/BUILD opcodes for each estimator node.  A Random
+        # Forest with 100 trees can easily produce 5000+ BUILD opcodes from
+        # __setstate__ calls on tree nodes.
+        # Raise the threshold significantly to suppress false positives, but ONLY
+        # when tree-ensemble markers are present -- not for all sklearn/xgboost refs.
+        _ml_frameworks = ml_context.get("frameworks", {})
+        _tree_ensemble_frameworks = {"sklearn", "xgboost", "lightgbm"}
+        _tree_ensemble_markers = {
+            "RandomForest",
+            "ExtraTrees",
+            "GradientBoosting",
+            "HistGradientBoosting",
+            "DecisionTree",
+            "XGB",
+            "LGBM",
+            "CatBoost",
+            "IsolationForest",
+            "AdaBoost",
+            # NOTE: BaggingClassifier/BaggingRegressor intentionally excluded --
+            # they are meta-estimators that can wrap any base estimator, not
+            # strictly tree-ensembles.  Threshold escalation should only apply
+            # when we are confident the model is tree-based.
+        }
+        # Collect all class/function names referenced in the opcode stream so we
+        # can check for tree-ensemble markers.
+        _all_refs_str = (
+            " ".join(f"{mod}.{func}" for mod, func in resolved_stack_globals.values())
+            + " "
+            + " ".join(f"{mod}.{func}" for mod, func in resolved_callables.values())
+            + " "
+            + " ".join(str(arg) for op, arg, _p in opcodes if op.name == "GLOBAL" and isinstance(arg, str))
+        )
+        has_tree_markers = any(marker in _all_refs_str for marker in _tree_ensemble_markers)
+        if (
+            ml_context.get("is_ml_content", False)
+            and _tree_ensemble_frameworks & set(_ml_frameworks.keys())
+            and has_tree_markers
+        ):
+            # Tree-ensemble markers in the opcode stream (e.g. RandomForest,
+            # DecisionTree class references) are themselves strong evidence of
+            # a legitimate model.  A low confidence threshold (0.15) is enough
+            # because the structural markers already confirm the file's nature;
+            # the previous 0.4 threshold caused false positives on real sklearn
+            # tree ensemble .pkl files with ml_context_confidence ~0.27.
+            ml_confidence_val = ml_context.get("overall_confidence", 0)
+            if ml_confidence_val >= 0.15:
+                # Scale threshold with total opcodes: large tree ensembles can have
+                # 200K+ opcodes where most are legitimate BUILD/REDUCE for tree nodes.
+                # Use max(5000, total_opcodes // 2) to avoid FPs on large models.
+                threshold = max(5000, len(opcodes) // 2)
+            elif ml_confidence_val < 0.15 and has_tree_markers:
+                # Even with very low confidence, tree markers warrant a
+                # moderately raised threshold to avoid flooding with warnings.
+                threshold = max(500, len(opcodes) // 10)
 
         if dangerous_opcode_count > threshold:
             suspicious_patterns.append(
@@ -3761,22 +4130,54 @@ class PickleScanner(BaseScanner):
                                         issue_type="dangerous_global",
                                     )
                                 else:
+                                    # Non-allowlisted but not explicitly dangerous.
+                                    # Before flagging, check if the "module" name
+                                    # actually looks like a real Python module.
+                                    # Pickle GLOBAL args can contain arbitrary data
+                                    # strings (e.g. DataFrame column names like
+                                    # "PEDRA_2020") that are not real modules.
+                                    if not _is_plausible_python_module(reduce_mod):
+                                        # Not a real module -- record as safe (INFO)
+                                        result.add_check(
+                                            name="REDUCE Opcode Safety Check",
+                                            passed=True,
+                                            message=(
+                                                f"REDUCE opcode with implausible module name "
+                                                f"'{reduce_mod}' (likely data, not a real import): "
+                                                f"{associated_global}"
+                                            ),
+                                            severity=IssueSeverity.INFO,
+                                            location=f"{self.current_file_path} (pos {pos})",
+                                            details={
+                                                "position": pos,
+                                                "opcode": opcode.name,
+                                                "associated_global": associated_global,
+                                                "implausible_module": True,
+                                                "ml_context_confidence": ml_context.get(
+                                                    "overall_confidence",
+                                                    0,
+                                                ),
+                                            },
+                                        )
+                                        continue
                                     # Non-allowlisted but not explicitly dangerous - WARNING
                                     severity = _get_context_aware_severity(
                                         IssueSeverity.WARNING,
                                         ml_context,
                                     )
 
-                                result.add_check(
-                                    name="REDUCE Opcode Safety Check",
-                                    passed=False,
-                                    message=(
+                                # CVE-2025-32434 is specific to torch.load() and
+                                # should only be referenced for PyTorch file formats
+                                _ext = os.path.splitext(self.current_file_path)[1].lower()
+                                _is_pytorch_file = _ext in {".pt", ".pth"} or (
+                                    _ext == ".bin" and "pytorch" in ml_context.get("frameworks", {})
+                                )
+                                if _is_pytorch_file:
+                                    _reduce_msg = (
                                         f"Found REDUCE opcode with non-allowlisted global: {associated_global}. "
                                         f"This may indicate CVE-2025-32434 exploitation (RCE via torch.load)"
-                                    ),
-                                    severity=severity,
-                                    location=f"{self.current_file_path} (pos {pos})",
-                                    details={
+                                    )
+                                    _reduce_details: dict[str, Any] = {
                                         "position": pos,
                                         "opcode": opcode.name,
                                         "associated_global": associated_global,
@@ -3785,11 +4186,32 @@ class PickleScanner(BaseScanner):
                                             "overall_confidence",
                                             0,
                                         ),
-                                    },
+                                    }
+                                else:
+                                    _reduce_msg = (
+                                        f"Found REDUCE opcode with non-allowlisted global: {associated_global}"
+                                    )
+                                    _reduce_details = {
+                                        "position": pos,
+                                        "opcode": opcode.name,
+                                        "associated_global": associated_global,
+                                        "ml_context_confidence": ml_context.get(
+                                            "overall_confidence",
+                                            0,
+                                        ),
+                                    }
+
+                                result.add_check(
+                                    name="REDUCE Opcode Safety Check",
+                                    passed=False,
+                                    message=_reduce_msg,
+                                    severity=severity,
+                                    location=f"{self.current_file_path} (pos {pos})",
+                                    details=_reduce_details,
                                     why=get_opcode_explanation("REDUCE"),
                                 )
 
-                # Check NEWOBJ/OBJ/INST opcodes for potential security issues
+                # Check NEWOBJ/NEWOBJ_EX/OBJ/INST opcodes for potential security issues
                 # Apply same logic as REDUCE: check if class is in ML_SAFE_GLOBALS
                 if opcode.name in ["INST", "OBJ", "NEWOBJ", "NEWOBJ_EX"]:
                     # Look back to find the associated class (GLOBAL or STACK_GLOBAL)
@@ -3806,7 +4228,7 @@ class PickleScanner(BaseScanner):
                         if is_safe_class:
                             # Safe class (in ML_SAFE_GLOBALS) - show as INFO
                             result.add_check(
-                                name="INST/OBJ/NEWOBJ Opcode Safety Check",
+                                name="INST/OBJ/NEWOBJ/NEWOBJ_EX Opcode Safety Check",
                                 passed=True,
                                 message=f"{opcode.name} opcode with safe ML class: {associated_class}",
                                 severity=IssueSeverity.INFO,
@@ -3837,6 +4259,31 @@ class PickleScanner(BaseScanner):
                                         issue_type="dangerous_global",
                                     )
                                 else:
+                                    # Skip if module name is not a plausible Python module
+                                    # (e.g. DataFrame column names like "PEDRA_2020")
+                                    if not _is_plausible_python_module(class_mod):
+                                        result.add_check(
+                                            name="INST/OBJ/NEWOBJ/NEWOBJ_EX Opcode Safety Check",
+                                            passed=True,
+                                            message=(
+                                                f"{opcode.name} opcode with implausible module name "
+                                                f"'{class_mod}' (likely data, not a real import): "
+                                                f"{associated_class}"
+                                            ),
+                                            severity=IssueSeverity.INFO,
+                                            location=f"{self.current_file_path} (pos {pos})",
+                                            details={
+                                                "position": pos,
+                                                "opcode": opcode.name,
+                                                "associated_class": associated_class,
+                                                "implausible_module": True,
+                                                "ml_context_confidence": ml_context.get(
+                                                    "overall_confidence",
+                                                    0,
+                                                ),
+                                            },
+                                        )
+                                        continue
                                     # Non-allowlisted but not explicitly dangerous - WARNING
                                     severity = _get_context_aware_severity(
                                         IssueSeverity.WARNING,
@@ -3844,7 +4291,7 @@ class PickleScanner(BaseScanner):
                                     )
 
                                 result.add_check(
-                                    name="INST/OBJ/NEWOBJ Opcode Safety Check",
+                                    name="INST/OBJ/NEWOBJ/NEWOBJ_EX Opcode Safety Check",
                                     passed=False,
                                     message=(
                                         f"Found {opcode.name} opcode with non-allowlisted class: {associated_class}"
@@ -3876,7 +4323,7 @@ class PickleScanner(BaseScanner):
                                 if is_safe_class:
                                     # Safe class found via arg parsing - INFO
                                     result.add_check(
-                                        name="INST/OBJ/NEWOBJ Opcode Safety Check",
+                                        name="INST/OBJ/NEWOBJ/NEWOBJ_EX Opcode Safety Check",
                                         passed=True,
                                         message=f"{opcode.name} opcode with safe ML class: {associated_class}",
                                         severity=IssueSeverity.INFO,
@@ -3910,7 +4357,7 @@ class PickleScanner(BaseScanner):
                                 ml_context,
                             )
                             result.add_check(
-                                name="INST/OBJ/NEWOBJ Opcode Safety Check",
+                                name="INST/OBJ/NEWOBJ/NEWOBJ_EX Opcode Safety Check",
                                 passed=False,
                                 message=f"Found {opcode.name} opcode - potential code execution (class unknown)",
                                 severity=severity,

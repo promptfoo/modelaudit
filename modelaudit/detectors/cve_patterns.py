@@ -125,7 +125,10 @@ def _check_cve_2020_13092_multiline(content: str, binary_content: bytes) -> list
 
     # Required indicators for CVE-2020-13092
     sklearn_indicators = ["sklearn", "joblib"]
-    dangerous_operations = ["os.system", "subprocess", "__reduce__", "eval", "exec"]
+    # NOTE: __reduce__ was removed because it appears in ALL pickle files
+    # (it is a standard Python serialization protocol method). Keeping it
+    # caused false positives on every legitimate ML model.
+    dangerous_operations = ["os.system", "subprocess", "eval(", "exec("]
     loading_operations = ["joblib.load", "joblib.dump", "pickle.load"]
 
     # Check if we have sklearn/joblib context
@@ -139,7 +142,7 @@ def _check_cve_2020_13092_multiline(content: str, binary_content: bytes) -> list
 
     # Also check binary content for additional evidence
     binary_indicators = []
-    for indicator in [b"sklearn", b"joblib", b"os.system", b"__reduce__", b"subprocess"]:
+    for indicator in [b"os.system", b"subprocess"]:
         if indicator in binary_content:
             binary_indicators.append(indicator.decode("utf-8", errors="ignore"))
 
@@ -157,8 +160,8 @@ def _check_cve_2020_13092_multiline(content: str, binary_content: bytes) -> list
             matches.extend(binary_indicators)
 
         # Check for specific dangerous combinations
-        if "__reduce__" in content_lower and "os.system" in content_lower:
-            matches.append("__reduce__ with os.system (high risk)")
+        if "os.system" in content_lower and "subprocess" in content_lower:
+            matches.append("os.system with subprocess (high risk)")
 
     return matches
 
@@ -181,7 +184,8 @@ def _check_cve_2024_34997_multiline(content: str, binary_content: bytes) -> list
 
     # Required indicators for CVE-2024-34997
     numpy_indicators = ["numpyarraywrapper", "read_array", "numpy_pickle"]
-    dangerous_operations = ["pickle.load", "os.system", "subprocess", "__reduce__", "eval", "exec"]
+    # NOTE: __reduce__ was removed because it appears in ALL pickle files
+    dangerous_operations = ["pickle.load", "os.system", "subprocess", "eval(", "exec("]
     joblib_context = ["joblib", "joblib.cache"]
 
     # Check if we have numpy wrapper context
@@ -195,7 +199,7 @@ def _check_cve_2024_34997_multiline(content: str, binary_content: bytes) -> list
 
     # Also check binary content for additional evidence
     binary_indicators = []
-    for indicator in [b"NumpyArrayWrapper", b"read_array", b"pickle.load", b"joblib", b"os.system"]:
+    for indicator in [b"NumpyArrayWrapper", b"read_array", b"os.system"]:
         if indicator in binary_content:
             binary_indicators.append(indicator.decode("utf-8", errors="ignore"))
 
