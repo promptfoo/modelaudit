@@ -1332,25 +1332,36 @@ class PyTorchZipScanner(BaseScanner):
                     and resolved_arg
                     and "_rebuild_tensor" in str(resolved_arg)
                 ):
-                    # Look ahead for storage key reference (usually a small integer string)
-                    # and element count / dtype info
+                    # Look ahead for the persistent storage reference pattern:
+                    #   GLOBAL 'torch FloatStorage' -> storage_key (BINUNICODE) ->
+                    #   device -> element_count (BININT*) -> TUPLE -> BINPERSID
+                    # The element count is the BININT* that immediately precedes TUPLE/BINPERSID
                     storage_key = None
                     declared_size = None
 
-                    for j in range(i + 1, min(i + 20, len(opcodes))):
+                    # Find the storage GLOBAL (e.g., "torch FloatStorage")
+                    for j in range(i + 1, min(i + 30, len(opcodes))):
                         next_op, next_arg, _next_pos = opcodes[j]
-                        # Storage keys are typically stored as short integers
+                        # Storage keys are small integer strings (e.g., "0", "1", "123")
                         if next_op.name in ("SHORT_BINUNICODE", "BINUNICODE") and next_arg:
                             arg_str = str(next_arg)
-                            if arg_str.isdigit():
+                            if arg_str.isdigit() and storage_key is None:
                                 storage_key = arg_str
-                        # Element counts appear as integer arguments
+                        # The element count is the integer argument just before
+                        # TUPLE/BINPERSID in the storage constructor call.
+                        # Only capture the FIRST sizable integer after storage_key
+                        # (subsequent small integers are shape/stride values).
                         if (
-                            next_op.name in ("BININT", "BININT1", "BININT2", "LONG1")
+                            storage_key is not None
+                            and declared_size is None
+                            and next_op.name in ("BININT", "BININT1", "BININT2", "LONG1", "LONG4")
                             and isinstance(next_arg, int)
                             and next_arg > 0
                         ):
                             declared_size = next_arg
+                        # Stop scanning at BINPERSID (end of storage reference)
+                        if next_op.name == "BINPERSID":
+                            break
 
                     if storage_key is not None and declared_size is not None:
                         # Find matching blob in archive
