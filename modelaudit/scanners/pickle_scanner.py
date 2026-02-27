@@ -474,8 +474,6 @@ ALWAYS_DANGEROUS_MODULES: set[str] = {
     "uuid",
     # NOTE: linecache and logging.config are intentionally NOT in this set.
     # - linecache.getline: file read (not code execution), flagged as WARNING
-    # - logging.config.listen: network listener (not direct code exec), flagged as WARNING
-    # They are caught by SUSPICIOUS_GLOBALS or general suspicious-string detection.
 }
 
 # Modules that are suspicious but should only be flagged at WARNING severity.
@@ -2556,6 +2554,20 @@ def is_dangerous_reduce_pattern(
                     "position": pos,
                     "opcode": opcode.name,
                 }
+
+        # Check for OBJ/NEWOBJ/NEWOBJ_EX opcodes which produce arg=None;
+        # use the resolved callable map to get the associated class reference.
+        if opcode.name in {"OBJ", "NEWOBJ", "NEWOBJ_EX"}:
+            ref = resolved_callables.get(i)
+            if ref:
+                mod, func = ref
+                if _is_dangerous_ref(mod, func):
+                    return {
+                        "pattern": f"{opcode.name}_EXECUTION",
+                        "argument": f"{mod}.{func}",
+                        "position": pos,
+                        "opcode": opcode.name,
+                    }
 
         # Check for suspicious attribute access patterns (GETATTR followed by CALL)
         if opcode.name == "GETATTR" and i + 1 < len(opcodes) and opcodes[i + 1][0].name == "CALL":
