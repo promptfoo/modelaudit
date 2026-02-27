@@ -12,6 +12,8 @@ import json
 import os
 import tempfile
 import zipfile
+from pathlib import Path
+from typing import Any
 
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.keras_zip_scanner import KerasZipScanner
@@ -422,7 +424,7 @@ __import__('pickle').loads(data)
 class TestCVE202549655TorchModuleWrapper:
     """Test CVE-2025-49655: TorchModuleWrapper deserialization RCE detection."""
 
-    def _make_keras_zip(self, config: dict, tmp_path) -> str:
+    def _make_keras_zip(self, config: dict[str, Any], tmp_path: Path) -> str:
         """Helper to create a .keras ZIP with the given config.json."""
         keras_path = os.path.join(str(tmp_path), "model.keras")
         with zipfile.ZipFile(keras_path, "w") as zf:
