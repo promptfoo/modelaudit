@@ -668,3 +668,26 @@ def get_pytorch_security_explanation(issue_type: str) -> str:
         "This is a PyTorch-specific security concern. Review PyTorch security best practices "
         "and ensure you're following safe model loading procedures.",
     )
+
+
+def get_cve_2025_49655_explanation(issue_type: str) -> str:
+    """Get explanation for CVE-2025-49655: Keras TorchModuleWrapper deserialization RCE.
+
+    CVE-2025-49655 (CVSS 9.8 CRITICAL): TorchModuleWrapper layer in Keras 3.11.0-3.11.2
+    calls torch.load(weights_only=False) in from_config(), enabling arbitrary code execution
+    via pickle deserialization. Fixed in Keras 3.11.3.
+    """
+    explanations = {
+        "torch_module_wrapper": (
+            "CVE-2025-49655: The TorchModuleWrapper layer in Keras 3.11.0-3.11.2 calls "
+            "torch.load(weights_only=False) during from_config() deserialization, which allows "
+            "arbitrary code execution via crafted pickle payloads in the model weights. "
+            "Any .keras model containing a TorchModuleWrapper layer is potentially exploitable. "
+            "Upgrade to Keras >= 3.11.3 where weights_only=True is enforced."
+        ),
+    }
+
+    return explanations.get(
+        issue_type,
+        "CVE-2025-49655: TorchModuleWrapper uses unsafe torch.load deserialization. Upgrade to Keras >= 3.11.3.",
+    )

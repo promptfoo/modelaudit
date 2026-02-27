@@ -15,7 +15,7 @@ from modelaudit.utils.helpers.code_validation import (
     validate_python_syntax,
 )
 
-from ..config.explanations import get_pattern_explanation
+from ..config.explanations import get_cve_2025_49655_explanation, get_pattern_explanation
 from .base import BaseScanner, IssueSeverity, ScanResult
 from .keras_utils import check_subclassed_model
 
@@ -212,6 +212,10 @@ class KerasZipScanner(BaseScanner):
             # Update layer count
             layer_counts[layer_class] = layer_counts.get(layer_class, 0) + 1
 
+            # CVE-2025-49655: TorchModuleWrapper uses torch.load(weights_only=False)
+            if layer_class == "TorchModuleWrapper":
+                self._check_torch_module_wrapper(layer, result, layer_name)
+
             # Check for Lambda layers
             if layer_class == "Lambda":
                 self._check_lambda_layer(layer, result, layer_name)
@@ -253,6 +257,33 @@ class KerasZipScanner(BaseScanner):
 
         # Add layer counts to metadata
         result.metadata["layer_counts"] = layer_counts
+
+    def _check_torch_module_wrapper(self, layer: dict[str, Any], result: ScanResult, layer_name: str) -> None:
+        """Check for CVE-2025-49655: TorchModuleWrapper deserialization RCE.
+
+        TorchModuleWrapper in Keras 3.11.0-3.11.2 calls torch.load(weights_only=False)
+        in from_config(), enabling arbitrary code execution via pickle deserialization.
+        """
+        result.add_check(
+            name="CVE-2025-49655: TorchModuleWrapper Deserialization RCE",
+            passed=False,
+            message=(
+                f"CVE-2025-49655: Layer '{layer_name}' is a TorchModuleWrapper — "
+                f"uses torch.load(weights_only=False) enabling arbitrary code execution"
+            ),
+            severity=IssueSeverity.CRITICAL,
+            location=f"{self.current_file_path} (layer: {layer_name})",
+            details={
+                "layer_name": layer_name,
+                "layer_class": "TorchModuleWrapper",
+                "cve_id": "CVE-2025-49655",
+                "cvss": 9.8,
+                "cwe": "CWE-502",
+                "affected_versions": "Keras 3.11.0-3.11.2",
+                "remediation": "Upgrade Keras to >= 3.11.3",
+            },
+            why=get_cve_2025_49655_explanation("torch_module_wrapper"),
+        )
 
     def _check_lambda_layer(self, layer: dict[str, Any], result: ScanResult, layer_name: str) -> None:
         """Check Lambda layer for executable Python code"""
