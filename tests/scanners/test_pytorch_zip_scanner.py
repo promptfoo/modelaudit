@@ -535,3 +535,12 @@ class TestPyTorchVersionChecks:
         scanner = PyTorchZipScanner()
         assert scanner._is_pytorch_version_before("2.2.2+cu118", 2, 2, 3) is True
         assert scanner._is_pytorch_version_before("2.5.0+cpu", 2, 5, 0) is False
+
+    def test_prerelease_of_fix_version_is_vulnerable(self):
+        """Pre-release versions of the fix version should be treated as vulnerable."""
+        scanner = PyTorchZipScanner()
+        assert scanner._is_pytorch_version_before("2.5.0rc1", 2, 5, 0) is True
+        assert scanner._is_pytorch_version_before("2.5.0.dev20240101", 2, 5, 0) is True
+        assert scanner._is_pytorch_version_before("1.13.1alpha1", 1, 13, 1) is True
+        # Post-fix version prereleases are fine
+        assert scanner._is_pytorch_version_before("2.6.0rc1", 2, 5, 0) is False

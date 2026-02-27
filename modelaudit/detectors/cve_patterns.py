@@ -114,6 +114,27 @@ def analyze_cve_patterns(content: str, binary_content: bytes = b"") -> list[CVEA
     return attributions
 
 
+def _is_primarily_documentation(content: str) -> bool:
+    """Check if content is primarily documentation/comments rather than executable code.
+
+    Returns True only when the majority of non-empty lines are comments or
+    docstring delimiters, preventing attackers from embedding a single '#' to
+    bypass detection.
+    """
+    lines = [line.strip() for line in content.splitlines() if line.strip()]
+    if not lines:
+        return False
+
+    doc_prefixes = ("#", '"""', "'''", "warning:", "note:")
+    doc_line_count = 0
+    for line in lines:
+        if any(line.startswith(p) for p in doc_prefixes):
+            doc_line_count += 1
+
+    # Content is documentation if >50% of lines are doc/comment lines
+    return doc_line_count > len(lines) / 2
+
+
 def _analyze_cve_patterns_basic(content: str, binary_content: bytes = b"") -> list[CVEAttribution]:
     """
     Basic CVE analysis fallback (original implementation).
@@ -132,10 +153,8 @@ def _check_cve_2020_13092_multiline(content: str, binary_content: bytes) -> list
     matches = []
     content_lower = content.lower()
 
-    # Skip documentation/comments that mention CVE patterns
-    doc_indicators = ['"""', "'''", "#", "warning:", "note:", "documentation", "cve-2020", "vulnerability"]
-    if any(indicator in content_lower for indicator in doc_indicators):
-        # This looks like documentation, not executable code
+    # Skip content that is primarily documentation/comments
+    if _is_primarily_documentation(content):
         return []
 
     # Required indicators for CVE-2020-13092
@@ -188,10 +207,8 @@ def _check_cve_2024_34997_multiline(content: str, binary_content: bytes) -> list
     matches = []
     content_lower = content.lower()
 
-    # Skip documentation/comments that mention CVE patterns
-    doc_indicators = ['"""', "'''", "#", "warning:", "note:", "documentation", "cve-2024", "vulnerability"]
-    if any(indicator in content_lower for indicator in doc_indicators):
-        # This looks like documentation, not executable code
+    # Skip content that is primarily documentation/comments
+    if _is_primarily_documentation(content):
         return []
 
     # Required indicators for CVE-2024-34997
@@ -284,9 +301,8 @@ def _check_cve_2022_45907_multiline(content: str, binary_content: bytes) -> list
     matches = []
     content_lower = content.lower()
 
-    # Skip documentation/comments
-    doc_indicators = ['"""', "'''", "#", "warning:", "note:", "documentation", "cve-2022", "vulnerability"]
-    if any(indicator in content_lower for indicator in doc_indicators):
+    # Skip content that is primarily documentation/comments
+    if _is_primarily_documentation(content):
         return []
 
     # Required indicators
@@ -317,9 +333,8 @@ def _check_cve_2024_5480_multiline(content: str, binary_content: bytes) -> list[
     matches = []
     content_lower = content.lower()
 
-    # Skip documentation/comments
-    doc_indicators = ['"""', "'''", "#", "warning:", "note:", "documentation", "cve-2024", "vulnerability"]
-    if any(indicator in content_lower for indicator in doc_indicators):
+    # Skip content that is primarily documentation/comments
+    if _is_primarily_documentation(content):
         return []
 
     # Required indicators
@@ -349,9 +364,8 @@ def _check_cve_2024_48063_multiline(content: str, binary_content: bytes) -> list
     matches = []
     content_lower = content.lower()
 
-    # Skip documentation/comments
-    doc_indicators = ['"""', "'''", "#", "warning:", "note:", "documentation", "cve-2024", "vulnerability"]
-    if any(indicator in content_lower for indicator in doc_indicators):
+    # Skip content that is primarily documentation/comments
+    if _is_primarily_documentation(content):
         return []
 
     # Required indicators

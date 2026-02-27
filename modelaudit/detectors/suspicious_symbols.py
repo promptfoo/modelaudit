@@ -871,7 +871,13 @@ def validate_patterns() -> list[str]:
 
     # Validate regex patterns
     all_string_patterns = (
-        SUSPICIOUS_STRING_PATTERNS + SUSPICIOUS_METADATA_PATTERNS + CVE_2020_13092_PATTERNS + CVE_2024_34997_PATTERNS
+        SUSPICIOUS_STRING_PATTERNS
+        + SUSPICIOUS_METADATA_PATTERNS
+        + CVE_2020_13092_PATTERNS
+        + CVE_2024_34997_PATTERNS
+        + CVE_2022_45907_PATTERNS
+        + CVE_2024_5480_PATTERNS
+        + CVE_2024_48063_PATTERNS
     )
     for pattern in all_string_patterns:
         try:

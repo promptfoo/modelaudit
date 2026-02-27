@@ -1000,15 +1000,23 @@ class PyTorchZipScanner(BaseScanner):
         """Check if a PyTorch version is before the specified fix version.
 
         Returns True if the version is vulnerable (before the fix), False if fixed.
+        Pre-release versions (dev, rc, alpha, beta) of the fix version are treated
+        as vulnerable since they may not contain the complete fix.
         Unparseable versions are treated as vulnerable for safety.
         """
         try:
-            version_match = re.match(r"^(\d+)\.(\d+)\.(\d+)", version.strip())
+            vstr = version.strip()
+            version_match = re.match(r"^(\d+)\.(\d+)\.(\d+)", vstr)
             if not version_match:
                 return True  # Can't parse → assume vulnerable
 
             major, minor, patch = map(int, version_match.groups())
-            return (major, minor, patch) < (fix_major, fix_minor, fix_patch)
+            is_prerelease = bool(re.search(r"(dev|rc|alpha|beta)", vstr, re.IGNORECASE))
+
+            if (major, minor, patch) < (fix_major, fix_minor, fix_patch):
+                return True  # Strictly before fix version
+            # Pre-release of fix version (e.g. 2.5.0rc1) is not yet fully fixed
+            return (major, minor, patch) == (fix_major, fix_minor, fix_patch) and is_prerelease
         except Exception:
             return True
 
@@ -1018,7 +1026,7 @@ class PyTorchZipScanner(BaseScanner):
             import torch
 
             installed_version = torch.__version__
-        except ImportError:
+        except Exception:
             return
 
         if self._is_pytorch_version_before(installed_version, 1, 13, 1):
@@ -1051,7 +1059,7 @@ class PyTorchZipScanner(BaseScanner):
             import torch
 
             installed_version = torch.__version__
-        except ImportError:
+        except Exception:
             return
 
         if self._is_pytorch_version_before(installed_version, 2, 2, 3):
@@ -1085,7 +1093,7 @@ class PyTorchZipScanner(BaseScanner):
             import torch
 
             installed_version = torch.__version__
-        except ImportError:
+        except Exception:
             return
 
         if self._is_pytorch_version_before(installed_version, 2, 5, 0):

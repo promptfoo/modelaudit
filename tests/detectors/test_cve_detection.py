@@ -430,6 +430,13 @@ class TestCVE202245907Detection:
         cve_attrs = [a for a in attributions if a.cve_id == "CVE-2022-45907"]
         assert len(cve_attrs) == 0, "Should not detect CVE in documentation"
 
+    def test_embedded_comment_token_does_not_bypass(self):
+        """A comment token embedded in exploit content should not bypass detection."""
+        content = "parse_type_line eval torch.jit.annotations\n# harmless comment\nos.system"
+        attributions = analyze_cve_patterns(content, b"")
+        cve_attrs = [a for a in attributions if a.cve_id == "CVE-2022-45907"]
+        assert len(cve_attrs) > 0, "Embedded '#' should not bypass detection"
+
     def test_pattern_analysis(self):
         """Test CVE-2022-45907 pattern analysis with binary evidence."""
         content = "torch.jit.annotations parse_type_line eval os.system"
