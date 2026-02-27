@@ -157,6 +157,21 @@ class TestCVE202551480SavePathTraversal:
         cve_checks = [c for c in result.checks if c.details.get("cve_id") == "CVE-2025-51480"]
         assert len(cve_checks) == 0, "Safe paths should not trigger write CVE"
 
+    def test_normalized_in_dir_path_with_dotdot_no_write_vuln(self, tmp_path):
+        """Paths containing '..' but resolving in-dir should not be tagged as CVE-2025-51480."""
+        (tmp_path / "weights.bin").write_bytes(struct.pack("f", 1.0))
+        model_path = create_onnx_model(
+            tmp_path,
+            external=True,
+            external_path="subdir/../weights.bin",
+            missing_external=True,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        cve_checks = [c for c in result.checks if c.details.get("cve_id") == "CVE-2025-51480"]
+        assert len(cve_checks) == 0, "Normalized in-dir path should not trigger write CVE"
+
     def test_write_vuln_details_fields(self, tmp_path):
         """CVE-2025-51480 details should include cve_id, cvss, cwe, remediation."""
         model_path = create_onnx_model(

@@ -274,11 +274,9 @@ class OnnxScanner(BaseScanner):
                     continue
                 external_path = (model_dir / location).resolve()
                 # Check for path traversal BEFORE file existence so
-                # that traversal attempts against non-existent targets
-                # are still properly flagged.
-                has_traversal_raw = ".." in location.replace("\\", "/").split("/")
+                # traversal attempts against non-existent targets are flagged.
                 escapes_model_dir = not _is_contained_in(external_path, model_dir)
-                if has_traversal_raw or escapes_model_dir:
+                if escapes_model_dir:
                     # CVE-2025-51480: Arbitrary file overwrite via
                     # save_external_data path traversal.  The same
                     # traversal paths that enable reads (CVE-2022-25882,
@@ -290,7 +288,7 @@ class OnnxScanner(BaseScanner):
                         message=(
                             f"CVE-2025-51480: External data path "
                             f"traversal for tensor '{tensor.name}' - "
-                            f"path '{location}' enables arbitrary file "
+                            f"path '{location}' can enable arbitrary file "
                             f"overwrite when saving"
                         ),
                         severity=IssueSeverity.CRITICAL,
@@ -318,7 +316,7 @@ class OnnxScanner(BaseScanner):
                             f"This ONNX model contains external data "
                             f"path '{location}' with directory traversal. "
                             f"When onnx.save() writes external data, this "
-                            f"path enables arbitrary file overwrite "
+                            f"path can enable arbitrary file overwrite "
                             f"(CVE-2025-51480). The same path also "
                             f"enables arbitrary file read during loading."
                         ),
