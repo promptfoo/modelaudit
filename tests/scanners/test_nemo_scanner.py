@@ -52,6 +52,20 @@ class TestNemoScannerBasic:
             tar.addfile(info, io.BytesIO(b""))
         assert not NemoScanner.can_handle(str(path))
 
+    def test_missing_yaml_dependency_is_reported_as_warning(self, tmp_path, monkeypatch):
+        """Missing PyYAML should be a non-passing warning, not a pass."""
+        import modelaudit.scanners.nemo_scanner as nemo_scanner_mod
+
+        path = _create_nemo_file(tmp_path, {"model": "test"})
+        monkeypatch.setattr(nemo_scanner_mod, "HAS_YAML", False)
+        scanner = NemoScanner()
+        result = scanner.scan(str(path))
+
+        checks = [c for c in result.checks if c.name == "YAML Parser Availability"]
+        assert len(checks) == 1
+        assert checks[0].status != CheckStatus.PASSED
+        assert checks[0].severity == IssueSeverity.WARNING
+
 
 @pytest.mark.skipif(not HAS_YAML, reason="PyYAML not installed")
 class TestCVE202523304HydraTarget:
@@ -169,6 +183,17 @@ class TestCVE202523304HydraTarget:
         assert details["cvss"] == 7.6
         assert details["cwe"] == "CWE-94"
         assert "remediation" in details
+
+    def test_unknown_target_review_is_info(self, tmp_path):
+        """Unknown targets should be reviewable info, not warning noise."""
+        config = {"model": {"_target_": "custom_package.builders.SafeFactory"}}
+        path = _create_nemo_file(tmp_path, config)
+
+        result = NemoScanner().scan(str(path))
+
+        review_checks = [c for c in result.checks if c.name == "Hydra _target_ Review"]
+        assert len(review_checks) > 0
+        assert review_checks[0].severity == IssueSeverity.INFO
 
     def test_executable_file_in_archive_flagged(self, tmp_path):
         """Executable files (.py, .sh) in the archive should be flagged."""

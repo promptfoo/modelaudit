@@ -134,9 +134,9 @@ class NemoScanner(BaseScanner):
         if not HAS_YAML:
             result.add_check(
                 name="YAML Parser Availability",
-                passed=True,
-                message="PyYAML not available; skipping config analysis",
-                severity=IssueSeverity.INFO,
+                passed=False,
+                message="PyYAML not available; cannot analyze NeMo config for Hydra _target_ injection",
+                severity=IssueSeverity.WARNING,
                 location=path,
             )
             result.bytes_scanned = file_size
@@ -336,7 +336,7 @@ class NemoScanner(BaseScanner):
             name="Hydra _target_ Review",
             passed=False,
             message=(f"Unknown _target_ '{target}' at {config_path} in {config_name} - requires manual review"),
-            severity=IssueSeverity.WARNING,
+            severity=IssueSeverity.INFO,
             location=f"{archive_path}:{config_name}",
             details={
                 "target": target,
