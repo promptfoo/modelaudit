@@ -668,3 +668,36 @@ def get_pytorch_security_explanation(issue_type: str) -> str:
         "This is a PyTorch-specific security concern. Review PyTorch security best practices "
         "and ensure you're following safe model loading procedures.",
     )
+
+
+def get_cve_2025_51480_explanation(vulnerability_type: str) -> str:
+    """Get specific explanation for CVE-2025-51480 (ONNX save_external_data path traversal)."""
+    explanations = {
+        "arbitrary_file_overwrite": (
+            "CVE-2025-51480 (CVSS 8.8): The onnx.save() function with "
+            "save_external_data=True writes tensor data to file paths specified "
+            "in the model's external_data location fields. If these paths contain "
+            "directory traversal sequences (../), an attacker can craft a model "
+            "that overwrites arbitrary files when saved - including scripts, "
+            "configuration files, SSH keys, or other sensitive data."
+        ),
+        "path_traversal": (
+            "ONNX external_data location fields with '..' sequences can direct "
+            "save_external_data to write tensor data outside the intended output "
+            "directory. Unlike the read-direction CVEs (CVE-2022-25882, "
+            "CVE-2024-27318), this vulnerability enables arbitrary file WRITES, "
+            "making it potentially more destructive."
+        ),
+        "onnx_version": (
+            "CVE-2025-51480 affects ONNX versions through 1.17.0. The fix adds "
+            "path validation to save_external_data to reject paths that resolve "
+            "outside the output directory. Update to a patched ONNX version and "
+            "run model processing with minimal filesystem privileges."
+        ),
+    }
+
+    return explanations.get(
+        vulnerability_type,
+        "CVE-2025-51480: ONNX save_external_data path traversal enabling arbitrary "
+        "file overwrite. Validate external_data paths before saving ONNX models.",
+    )

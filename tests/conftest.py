@@ -78,6 +78,7 @@ def pytest_runtest_setup(item):
             "test_weak_hash_detection.py",  # Weak hash detection tests
             "test_cloud_url_detection.py",  # Cloud storage URL detection tests
             "test_skops_scanner.py",  # Skops scanner CVE detection tests
+            "test_onnx_scanner.py",  # ONNX scanner CVE detection tests
         ]
 
         # Check if this is an allowed test file
