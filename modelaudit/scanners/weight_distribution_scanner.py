@@ -476,9 +476,6 @@ class WeightDistributionScanner(BaseScanner):
             # common case for models downloaded from HuggingFace or distributed
             # as standalone .onnx files without their companion data files.
             model = onnx.load(path, load_external_data=False)  # type: ignore[possibly-unresolved-reference]
-        except Exception as e:
-            logger.debug(f"Failed to load ONNX model from {path}: {e}")
-            return weights_info
 
             # Extract 2D+ initializers — these are weight matrices (conv kernels,
             # linear layers, embeddings). 1D tensors (biases, batch-norm params)
