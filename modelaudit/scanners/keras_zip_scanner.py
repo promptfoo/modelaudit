@@ -319,6 +319,7 @@ class KerasZipScanner(BaseScanner):
             if isinstance(config_value, str) and config_value.strip():
                 module_keys_to_check.append((key, config_value.strip()))
 
+        layer_class = str(layer.get("class_name", ""))
         for key, module_value in module_keys_to_check:
             # Extract the top-level module name (e.g., "os" from "os.path")
             top_module = module_value.split(".")[0]
@@ -351,7 +352,7 @@ class KerasZipScanner(BaseScanner):
                     },
                     why=get_cve_2025_1550_explanation("dangerous_module"),
                 )
-            elif is_outside_allowlist:
+            elif is_outside_allowlist and (key == "fn_module" or layer_class == "Lambda"):
                 result.add_check(
                     name="CVE-2025-1550: Untrusted Module in Config",
                     passed=False,

@@ -497,17 +497,18 @@ class TestCVE20251550ModuleReferences:
         assert "builtins" in cve_issues[0].message
 
     def test_untrusted_module_custom_package(self, tmp_path):
-        """A layer referencing an unknown module should be flagged as WARNING."""
+        """Unknown module references in callable context should be flagged as WARNING."""
         scanner = KerasZipScanner()
         config = {
             "class_name": "Sequential",
             "config": {
                 "layers": [
                     {
-                        "class_name": "Dense",
-                        "name": "dense_1",
-                        "module": "my_custom_package.layers",
-                        "config": {"units": 10},
+                        "class_name": "Lambda",
+                        "name": "lambda_1",
+                        "config": {
+                            "fn_module": "my_custom_package.layers",
+                        },
                     }
                 ]
             },
@@ -636,8 +637,8 @@ class TestCVE20251550ModuleReferences:
         cve_issues = [i for i in result.issues if "CVE-2025-1550" in i.message]
         assert len(cve_issues) == 0, "None module should not trigger CVE"
 
-    def test_prefix_collision_module_is_not_allowlisted(self, tmp_path):
-        """Module like 'mathutils.payload' should NOT be treated as safe 'math'."""
+    def test_non_callable_layer_unknown_module_not_flagged(self, tmp_path):
+        """Unknown module on non-callable layers should not produce noisy CVE warnings."""
         scanner = KerasZipScanner()
         config = {
             "class_name": "Sequential",
@@ -646,8 +647,30 @@ class TestCVE20251550ModuleReferences:
                     {
                         "class_name": "Dense",
                         "name": "dense_1",
-                        "module": "mathutils.payload",
+                        "module": "my_custom_package.layers",
                         "config": {"units": 10},
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(config, tmp_path))
+
+        cve_issues = [i for i in result.issues if "CVE-2025-1550" in i.message]
+        assert len(cve_issues) == 0, "Non-callable layer module should not trigger CVE-2025-1550 warning"
+
+    def test_prefix_collision_module_is_not_allowlisted(self, tmp_path):
+        """Module like 'mathutils.payload' should NOT be treated as safe 'math'."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "lambda_1",
+                        "config": {
+                            "fn_module": "mathutils.payload",
+                        },
                     }
                 ]
             },
