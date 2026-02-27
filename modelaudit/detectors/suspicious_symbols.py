@@ -378,6 +378,12 @@ BINARY_CODE_PATTERNS: list[bytes] = [
     # Memory mapping (code injection vector)
     b"mmap.mmap",
     b"mmap(",
+    # CVE-2025-10155: Pickle protocol 0/1 internal module names
+    # Python pickle uses 'posix' (Unix) or 'nt' (Windows) instead of 'os'
+    b"posix\nsystem",
+    b"posix\npopen",
+    b"nt\nsystem",
+    b"nt\npopen",
 ]
 
 # Common executable file signatures found in malicious model data
