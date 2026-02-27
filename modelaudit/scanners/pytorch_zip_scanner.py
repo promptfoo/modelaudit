@@ -385,10 +385,10 @@ class PyTorchZipScanner(BaseScanner):
         pytorch_version_info = self._extract_pytorch_version_info(zip_file, safe_entries)
         result.metadata.update(pytorch_version_info)
         self._check_cve_2025_32434_vulnerability(pytorch_version_info, result, path)
-        self._check_cve_2026_24747_vulnerability(result, path)
-        self._check_cve_2022_45907_vulnerability(result, path)
-        self._check_cve_2024_5480_vulnerability(result, path)
-        self._check_cve_2024_48063_vulnerability(result, path)
+        self._check_cve_2026_24747_vulnerability(pytorch_version_info, result, path)
+        self._check_cve_2022_45907_vulnerability(pytorch_version_info, result, path)
+        self._check_cve_2024_5480_vulnerability(pytorch_version_info, result, path)
+        self._check_cve_2024_48063_vulnerability(pytorch_version_info, result, path)
 
     def _scan_pickle_files(
         self, zip_file: zipfile.ZipFile, pickle_files: list[str], result: ScanResult, path: str
@@ -930,35 +930,36 @@ class PyTorchZipScanner(BaseScanner):
         # PyTorch versions typically start with 1.x or 2.x
         return text.strip().startswith(("1.", "2."))
 
+    def _get_detected_pytorch_version(self, version_info: dict[str, Any]) -> tuple[str | None, str | None]:
+        """Get framework version detected from artifact metadata."""
+        version = version_info.get("pytorch_framework_version")
+        source = version_info.get("pytorch_version_source")
+        if isinstance(version, str) and version.strip():
+            return version.strip(), source if isinstance(source, str) else None
+        return None, source if isinstance(source, str) else None
+
     def _check_cve_2025_32434_vulnerability(self, version_info: dict[str, Any], result: ScanResult, path: str) -> None:
-        """Check for CVE-2025-32434 vulnerability based on installed PyTorch version"""
-
-        # Only check if PyTorch is actually installed
-        try:
-            import torch
-
-            installed_version = torch.__version__
-        except ImportError:
-            # PyTorch not installed, skip the check entirely
+        """Check for CVE-2025-32434 using PyTorch version from model metadata."""
+        detected_version, version_source = self._get_detected_pytorch_version(version_info)
+        if not detected_version:
             return
 
-        # Check if the installed PyTorch version is vulnerable (< 2.6.0)
-        is_vulnerable = self._is_vulnerable_pytorch_version(installed_version)
+        is_vulnerable = self._is_vulnerable_pytorch_version(detected_version)
 
         if is_vulnerable:
-            # Only warn if the installed version is vulnerable
             result.add_check(
                 name="CVE-2025-32434 PyTorch Version Check",
                 passed=False,
                 message=(
-                    f"PyTorch {installed_version} is installed and vulnerable to CVE-2025-32434 RCE. "
+                    f"Model metadata indicates PyTorch {detected_version} is vulnerable to CVE-2025-32434 RCE. "
                     f"Upgrade to PyTorch 2.6.0 or later."
                 ),
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={
                     "cve_id": self.CVE_2025_32434_ID,
-                    "installed_pytorch_version": installed_version,
+                    "detected_pytorch_version": detected_version,
+                    "pytorch_version_source": version_source,
                     "vulnerability_description": "RCE when loading models with torch.load(weights_only=True)",
                     "fixed_in": f"PyTorch {self.CVE_2025_32434_FIX_VERSION}",
                     "recommendation": (
@@ -966,7 +967,6 @@ class PyTorchZipScanner(BaseScanner):
                     ),
                 },
             )
-        # If not vulnerable, don't show anything
 
     def _is_vulnerable_pytorch_version(self, version: str) -> bool:
         """Check if a PyTorch version is vulnerable to CVE-2025-32434 (≤2.5.1)"""
@@ -1005,22 +1005,21 @@ class PyTorchZipScanner(BaseScanner):
             # If version parsing fails, assume vulnerable for safety
             return True
 
-    def _check_cve_2026_24747_vulnerability(self, result: ScanResult, path: str) -> None:
-        """Check for CVE-2026-24747 vulnerability based on installed PyTorch version."""
-        try:
-            import torch
-
-            installed_version = torch.__version__
-        except ImportError:
+    def _check_cve_2026_24747_vulnerability(
+        self, version_info: dict[str, Any], result: ScanResult, path: str
+    ) -> None:
+        """Check for CVE-2026-24747 using PyTorch version from model metadata."""
+        detected_version, version_source = self._get_detected_pytorch_version(version_info)
+        if not detected_version:
             return
 
-        is_vulnerable = self._is_vulnerable_pytorch_version_2026(installed_version)
+        is_vulnerable = self._is_vulnerable_pytorch_version_2026(detected_version)
         if is_vulnerable:
             result.add_check(
                 name="CVE-2026-24747 PyTorch Version Check",
                 passed=False,
                 message=(
-                    f"PyTorch {installed_version} is vulnerable to CVE-2026-24747 "
+                    f"Model metadata indicates PyTorch {detected_version} is vulnerable to CVE-2026-24747 "
                     f"(weights_only=True bypass via SETITEM abuse and tensor metadata mismatch). "
                     f"Upgrade to PyTorch {self.CVE_2026_24747_FIX_VERSION} or later."
                 ),
@@ -1028,7 +1027,8 @@ class PyTorchZipScanner(BaseScanner):
                 location=path,
                 details={
                     "cve_id": self.CVE_2026_24747_ID,
-                    "installed_pytorch_version": installed_version,
+                    "detected_pytorch_version": detected_version,
+                    "pytorch_version_source": version_source,
                     "vulnerability_description": self.CVE_2026_24747_DESCRIPTION,
                     "fixed_in": f"PyTorch {self.CVE_2026_24747_FIX_VERSION}",
                     "recommendation": (
@@ -1047,7 +1047,7 @@ class PyTorchZipScanner(BaseScanner):
                 name="CVE-2026-24747 PyTorch Version Check",
                 passed=True,
                 message=(
-                    f"PyTorch {installed_version} is not vulnerable to CVE-2026-24747 "
+                    f"PyTorch {detected_version} is not vulnerable to CVE-2026-24747 "
                     f"(fixed in {self.CVE_2026_24747_FIX_VERSION}+)."
                 ),
                 severity=IssueSeverity.INFO,
@@ -1119,22 +1119,21 @@ class PyTorchZipScanner(BaseScanner):
         except Exception:
             return True
 
-    def _check_cve_2022_45907_vulnerability(self, result: ScanResult, path: str) -> None:
-        """Check for CVE-2022-45907 vulnerability based on installed PyTorch version."""
-        try:
-            import torch
-
-            installed_version = torch.__version__
-        except ImportError:
+    def _check_cve_2022_45907_vulnerability(
+        self, version_info: dict[str, Any], result: ScanResult, path: str
+    ) -> None:
+        """Check for CVE-2022-45907 using PyTorch version from model metadata."""
+        detected_version, version_source = self._get_detected_pytorch_version(version_info)
+        if not detected_version:
             return
 
-        is_vulnerable = self._is_vulnerable_pytorch_version_for(installed_version, 1, 13, 1)
+        is_vulnerable = self._is_vulnerable_pytorch_version_for(detected_version, 1, 13, 1)
         if is_vulnerable:
             result.add_check(
                 name="CVE-2022-45907 PyTorch Version Check",
                 passed=False,
                 message=(
-                    f"PyTorch {installed_version} is vulnerable to CVE-2022-45907 "
+                    f"Model metadata indicates PyTorch {detected_version} is vulnerable to CVE-2022-45907 "
                     f"(unsafe eval() in torch.jit.annotations.parse_type_line). "
                     f"Upgrade to PyTorch {self.CVE_2022_45907_FIX_VERSION} or later."
                 ),
@@ -1142,7 +1141,8 @@ class PyTorchZipScanner(BaseScanner):
                 location=path,
                 details={
                     "cve_id": self.CVE_2022_45907_ID,
-                    "installed_pytorch_version": installed_version,
+                    "detected_pytorch_version": detected_version,
+                    "pytorch_version_source": version_source,
                     "vulnerability_description": self.CVE_2022_45907_DESCRIPTION,
                     "fixed_in": f"PyTorch {self.CVE_2022_45907_FIX_VERSION}",
                     "recommendation": (
@@ -1157,22 +1157,21 @@ class PyTorchZipScanner(BaseScanner):
                 ),
             )
 
-    def _check_cve_2024_5480_vulnerability(self, result: ScanResult, path: str) -> None:
-        """Check for CVE-2024-5480 vulnerability based on installed PyTorch version."""
-        try:
-            import torch
-
-            installed_version = torch.__version__
-        except ImportError:
+    def _check_cve_2024_5480_vulnerability(
+        self, version_info: dict[str, Any], result: ScanResult, path: str
+    ) -> None:
+        """Check for CVE-2024-5480 using PyTorch version from model metadata."""
+        detected_version, version_source = self._get_detected_pytorch_version(version_info)
+        if not detected_version:
             return
 
-        is_vulnerable = self._is_vulnerable_pytorch_version_for(installed_version, 2, 2, 3)
+        is_vulnerable = self._is_vulnerable_pytorch_version_for(detected_version, 2, 2, 3)
         if is_vulnerable:
             result.add_check(
                 name="CVE-2024-5480 PyTorch Version Check",
                 passed=False,
                 message=(
-                    f"PyTorch {installed_version} is vulnerable to CVE-2024-5480 "
+                    f"Model metadata indicates PyTorch {detected_version} is vulnerable to CVE-2024-5480 "
                     f"(RPC framework arbitrary function execution via PythonUDF). "
                     f"Upgrade to PyTorch {self.CVE_2024_5480_FIX_VERSION} or later."
                 ),
@@ -1180,7 +1179,8 @@ class PyTorchZipScanner(BaseScanner):
                 location=path,
                 details={
                     "cve_id": self.CVE_2024_5480_ID,
-                    "installed_pytorch_version": installed_version,
+                    "detected_pytorch_version": detected_version,
+                    "pytorch_version_source": version_source,
                     "vulnerability_description": self.CVE_2024_5480_DESCRIPTION,
                     "fixed_in": f"PyTorch {self.CVE_2024_5480_FIX_VERSION}",
                     "recommendation": (
@@ -1195,22 +1195,21 @@ class PyTorchZipScanner(BaseScanner):
                 ),
             )
 
-    def _check_cve_2024_48063_vulnerability(self, result: ScanResult, path: str) -> None:
-        """Check for CVE-2024-48063 vulnerability based on installed PyTorch version."""
-        try:
-            import torch
-
-            installed_version = torch.__version__
-        except ImportError:
+    def _check_cve_2024_48063_vulnerability(
+        self, version_info: dict[str, Any], result: ScanResult, path: str
+    ) -> None:
+        """Check for CVE-2024-48063 using PyTorch version from model metadata."""
+        detected_version, version_source = self._get_detected_pytorch_version(version_info)
+        if not detected_version:
             return
 
-        is_vulnerable = self._is_vulnerable_pytorch_version_for(installed_version, 2, 5, 0)
+        is_vulnerable = self._is_vulnerable_pytorch_version_for(detected_version, 2, 5, 0)
         if is_vulnerable:
             result.add_check(
                 name="CVE-2024-48063 PyTorch Version Check",
                 passed=False,
                 message=(
-                    f"PyTorch {installed_version} is vulnerable to CVE-2024-48063 "
+                    f"Model metadata indicates PyTorch {detected_version} is vulnerable to CVE-2024-48063 "
                     f"(RemoteModule deserialization RCE via pickle). "
                     f"Upgrade to PyTorch {self.CVE_2024_48063_FIX_VERSION} or later."
                 ),
@@ -1218,7 +1217,8 @@ class PyTorchZipScanner(BaseScanner):
                 location=path,
                 details={
                     "cve_id": self.CVE_2024_48063_ID,
-                    "installed_pytorch_version": installed_version,
+                    "detected_pytorch_version": detected_version,
+                    "pytorch_version_source": version_source,
                     "vulnerability_description": self.CVE_2024_48063_DESCRIPTION,
                     "fixed_in": f"PyTorch {self.CVE_2024_48063_FIX_VERSION}",
                     "recommendation": (
