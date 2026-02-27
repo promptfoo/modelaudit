@@ -287,6 +287,49 @@ CVE_2024_34997_PATTERNS = [
     r"numpy_pickle.*__reduce__.*subprocess",  # numpy_pickle + __reduce__ + subprocess
 ]
 
+# CVE-2022-45907: PyTorch torch.jit.annotations.parse_type_line eval() injection
+# parse_type_line() passes untrusted input directly to eval(), enabling RCE
+CVE_2022_45907_PATTERNS = [
+    # Direct exploitation: parse_type_line with eval
+    r"parse_type_line.*eval",  # parse_type_line passing input to eval
+    r"torch\.jit\.annotations.*eval",  # torch.jit.annotations context with eval
+    r"torch\.jit.*parse_type_line",  # torch.jit with parse_type_line reference
+    # Attack vector patterns: type annotation injection
+    r"jit\.annotations.*__import__",  # annotations context with __import__
+    r"parse_type_line.*os\.system",  # parse_type_line leading to system calls
+    r"parse_type_line.*subprocess",  # parse_type_line leading to subprocess
+    r"torch\.jit\.annotations.*exec",  # annotations context with exec
+]
+
+# CVE-2024-5480: PyTorch torch.distributed.rpc eval/exec injection
+# RPC framework doesn't validate function calls; attacker can send eval/exec as PythonUDF
+CVE_2024_5480_PATTERNS = [
+    # Direct exploitation: RPC with code execution
+    r"torch\.distributed\.rpc.*eval",  # RPC context with eval
+    r"torch\.distributed\.rpc.*exec",  # RPC context with exec
+    r"rpc_sync.*eval",  # rpc_sync with eval
+    r"rpc_async.*eval",  # rpc_async with eval
+    r"PythonUDF.*eval",  # PythonUDF with eval
+    r"PythonUDF.*exec",  # PythonUDF with exec
+    # Attack vector patterns: RPC function injection
+    r"torch\.distributed\.rpc.*os\.system",  # RPC with system calls
+    r"torch\.distributed\.rpc.*subprocess",  # RPC with subprocess
+    r"rpc_sync.*__import__",  # rpc_sync with __import__
+]
+
+# CVE-2024-48063: PyTorch torch.distributed.rpc.RemoteModule deserialization RCE
+# RemoteModule uses pickle deserialization, enabling arbitrary code execution
+CVE_2024_48063_PATTERNS = [
+    # Direct exploitation: RemoteModule with deserialization
+    r"RemoteModule.*__reduce__",  # RemoteModule with __reduce__ exploitation
+    r"RemoteModule.*pickle",  # RemoteModule with pickle deserialization
+    r"torch\.distributed\.rpc.*RemoteModule.*__reduce__",  # Full path with __reduce__
+    # Attack vector patterns: RPC deserialization
+    r"RemoteModule.*os\.system",  # RemoteModule leading to system calls
+    r"RemoteModule.*subprocess",  # RemoteModule leading to subprocess
+    r"torch\.distributed\.rpc.*__reduce__.*system",  # RPC __reduce__ with system
+]
+
 # Combined CVE patterns for efficient scanning
 # Used by scanners to detect CVE-specific exploitation attempts
 CVE_COMBINED_PATTERNS = {
@@ -307,6 +350,39 @@ CVE_COMBINED_PATTERNS = {
         "cvss": 8.1,  # High severity
         "affected_versions": "joblib v1.4.2",
         "remediation": "Update joblib, validate cache integrity, avoid untrusted NumpyArrayWrapper data",
+    },
+    "CVE-2022-45907": {
+        "patterns": CVE_2022_45907_PATTERNS,
+        "description": "PyTorch torch.jit.annotations.parse_type_line eval() injection",
+        "severity": "CRITICAL",
+        "cwe": "CWE-94",  # Improper Control of Generation of Code ('Code Injection')
+        "cvss": 9.8,
+        "affected_versions": "PyTorch < 1.13.1",
+        "remediation": "Update to PyTorch >= 1.13.1. Avoid processing untrusted type annotations.",
+    },
+    "CVE-2024-5480": {
+        "patterns": CVE_2024_5480_PATTERNS,
+        "description": "PyTorch torch.distributed.rpc arbitrary function execution",
+        "severity": "CRITICAL",
+        "cwe": "CWE-94",  # Code Injection
+        "cvss": 10.0,
+        "affected_versions": "PyTorch < 2.2.3",
+        "remediation": (
+            "Update to PyTorch >= 2.2.3. Restrict RPC access to trusted nodes. "
+            "Never expose RPC endpoints to untrusted networks."
+        ),
+    },
+    "CVE-2024-48063": {
+        "patterns": CVE_2024_48063_PATTERNS,
+        "description": "PyTorch torch.distributed.rpc.RemoteModule deserialization RCE",
+        "severity": "CRITICAL",
+        "cwe": "CWE-502",  # Deserialization of Untrusted Data
+        "cvss": 9.8,
+        "affected_versions": "PyTorch < 2.5.0",
+        "remediation": (
+            "Update to PyTorch >= 2.5.0. Avoid using RemoteModule with untrusted peers. "
+            "This CVE is disputed as 'intended behavior' by PyTorch maintainers."
+        ),
     },
 }
 

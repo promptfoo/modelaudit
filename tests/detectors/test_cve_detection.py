@@ -4,6 +4,9 @@ Comprehensive test suite for CVE-specific detection in ModelAudit.
 This module tests detection of:
 - CVE-2020-13092: scikit-learn joblib.load deserialization vulnerability
 - CVE-2024-34997: joblib NumpyArrayWrapper deserialization vulnerability
+- CVE-2022-45907: PyTorch torch.jit.annotations.parse_type_line eval() injection
+- CVE-2024-5480: PyTorch torch.distributed.rpc arbitrary function execution
+- CVE-2024-48063: PyTorch torch.distributed.rpc.RemoteModule deserialization RCE
 
 Test categories:
 1. Positive detection tests (should detect vulnerabilities)
@@ -404,6 +407,95 @@ class TestCVEIntegration:
                 assert len(cve_info) > 0, "Should have CVE attribution information"
 
 
+class TestCVE202245907Detection:
+    """Test detection of CVE-2022-45907 (torch.jit.annotations.parse_type_line eval injection)."""
+
+    def test_detect_cve_2022_45907_basic_pattern(self):
+        """Test basic detection of CVE-2022-45907 patterns."""
+        content = "parse_type_line eval torch.jit.annotations"
+        binary_content = b"parse_type_line eval torch.jit.annotations"
+
+        attributions = analyze_cve_patterns(content, binary_content)
+
+        cve_attrs = [a for a in attributions if a.cve_id == "CVE-2022-45907"]
+        assert len(cve_attrs) > 0, "Should detect CVE-2022-45907 patterns"
+        assert cve_attrs[0].severity == "CRITICAL"
+        assert cve_attrs[0].cvss == 9.8
+        assert cve_attrs[0].cwe == "CWE-94"
+
+    def test_no_false_positive_on_docs(self):
+        """Documentation mentioning CVE-2022-45907 should not trigger detection."""
+        content = '"""CVE-2022-45907: parse_type_line uses eval unsafely"""'
+        attributions = analyze_cve_patterns(content, b"")
+        cve_attrs = [a for a in attributions if a.cve_id == "CVE-2022-45907"]
+        assert len(cve_attrs) == 0, "Should not detect CVE in documentation"
+
+    def test_pattern_analysis(self):
+        """Test CVE-2022-45907 pattern analysis with binary evidence."""
+        content = "torch.jit.annotations parse_type_line eval os.system"
+        binary_content = b"parse_type_line eval torch.jit"
+
+        attributions = analyze_cve_patterns(content, binary_content)
+        cve_attrs = [a for a in attributions if a.cve_id == "CVE-2022-45907"]
+        assert len(cve_attrs) > 0
+        assert len(cve_attrs[0].patterns_matched) >= 2  # Text + binary matches
+
+
+class TestCVE20245480Detection:
+    """Test detection of CVE-2024-5480 (torch.distributed.rpc function injection)."""
+
+    def test_detect_rpc_eval_pattern(self):
+        """RPC with eval should trigger CVE-2024-5480."""
+        content = "torch.distributed.rpc rpc_sync eval"
+        binary_content = b"torch.distributed.rpc rpc_sync eval"
+
+        attributions = analyze_cve_patterns(content, binary_content)
+
+        cve_attrs = [a for a in attributions if a.cve_id == "CVE-2024-5480"]
+        assert len(cve_attrs) > 0, "Should detect CVE-2024-5480 patterns"
+        assert cve_attrs[0].severity == "CRITICAL"
+        assert cve_attrs[0].cvss == 10.0
+        assert cve_attrs[0].cwe == "CWE-94"
+
+    def test_detect_pythonudf_exec_pattern(self):
+        """PythonUDF with exec should trigger CVE-2024-5480."""
+        content = "PythonUDF exec subprocess"
+        attributions = analyze_cve_patterns(content, b"")
+        cve_attrs = [a for a in attributions if a.cve_id == "CVE-2024-5480"]
+        assert len(cve_attrs) > 0, "Should detect PythonUDF + exec pattern"
+
+    def test_no_false_positive_on_docs(self):
+        """Documentation should not trigger CVE-2024-5480."""
+        content = "# CVE-2024-5480: rpc_sync allows eval injection"
+        attributions = analyze_cve_patterns(content, b"")
+        cve_attrs = [a for a in attributions if a.cve_id == "CVE-2024-5480"]
+        assert len(cve_attrs) == 0, "Should not detect CVE in comments"
+
+
+class TestCVE202448063Detection:
+    """Test detection of CVE-2024-48063 (RemoteModule deserialization RCE)."""
+
+    def test_detect_remote_module_deserialization(self):
+        """RemoteModule with deserialization should trigger CVE-2024-48063."""
+        content = "RemoteModule __reduce__ pickle torch.distributed.rpc"
+        binary_content = b"RemoteModule __reduce__ pickle torch.distributed.rpc"
+
+        attributions = analyze_cve_patterns(content, binary_content)
+
+        cve_attrs = [a for a in attributions if a.cve_id == "CVE-2024-48063"]
+        assert len(cve_attrs) > 0, "Should detect CVE-2024-48063 patterns"
+        assert cve_attrs[0].severity == "CRITICAL"
+        assert cve_attrs[0].cvss == 9.8
+        assert cve_attrs[0].cwe == "CWE-502"
+
+    def test_no_false_positive_on_docs(self):
+        """Documentation should not trigger CVE-2024-48063."""
+        content = '"""Warning: RemoteModule uses pickle deserialization"""'
+        attributions = analyze_cve_patterns(content, b"")
+        cve_attrs = [a for a in attributions if a.cve_id == "CVE-2024-48063"]
+        assert len(cve_attrs) == 0, "Should not detect CVE in docstrings"
+
+
 class TestCVEPatternValidation:
     """Test validation of CVE patterns themselves."""
 
@@ -411,9 +503,21 @@ class TestCVEPatternValidation:
         """Test that all CVE patterns are valid regex expressions."""
         import re
 
-        from modelaudit.detectors.suspicious_symbols import CVE_2020_13092_PATTERNS, CVE_2024_34997_PATTERNS
+        from modelaudit.detectors.suspicious_symbols import (
+            CVE_2020_13092_PATTERNS,
+            CVE_2022_45907_PATTERNS,
+            CVE_2024_5480_PATTERNS,
+            CVE_2024_34997_PATTERNS,
+            CVE_2024_48063_PATTERNS,
+        )
 
-        all_patterns = CVE_2020_13092_PATTERNS + CVE_2024_34997_PATTERNS
+        all_patterns = (
+            CVE_2020_13092_PATTERNS
+            + CVE_2024_34997_PATTERNS
+            + CVE_2022_45907_PATTERNS
+            + CVE_2024_5480_PATTERNS
+            + CVE_2024_48063_PATTERNS
+        )
 
         for pattern in all_patterns:
             try:

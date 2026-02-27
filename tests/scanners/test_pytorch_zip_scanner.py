@@ -481,3 +481,57 @@ def test_pytorch_zip_scanner_combined_security_controls(tmp_path):
     symlink_issues = [i for i in result.issues if "symlink" in i.message.lower()]
     assert len(symlink_issues) > 0
     assert symlink_issues[0].severity == IssueSeverity.WARNING
+
+
+class TestPyTorchVersionChecks:
+    """Tests for CVE version checking helpers."""
+
+    def test_cve_2022_45907_vulnerable_version(self):
+        """PyTorch < 1.13.1 should be vulnerable to CVE-2022-45907."""
+        scanner = PyTorchZipScanner()
+        assert scanner._is_pytorch_version_before("1.13.0", 1, 13, 1) is True
+        assert scanner._is_pytorch_version_before("1.12.0", 1, 13, 1) is True
+        assert scanner._is_pytorch_version_before("1.0.0", 1, 13, 1) is True
+
+    def test_cve_2022_45907_fixed_version(self):
+        """PyTorch >= 1.13.1 should not be vulnerable to CVE-2022-45907."""
+        scanner = PyTorchZipScanner()
+        assert scanner._is_pytorch_version_before("1.13.1", 1, 13, 1) is False
+        assert scanner._is_pytorch_version_before("2.0.0", 1, 13, 1) is False
+
+    def test_cve_2024_5480_vulnerable_version(self):
+        """PyTorch < 2.2.3 should be vulnerable to CVE-2024-5480."""
+        scanner = PyTorchZipScanner()
+        assert scanner._is_pytorch_version_before("2.2.2", 2, 2, 3) is True
+        assert scanner._is_pytorch_version_before("2.1.0", 2, 2, 3) is True
+        assert scanner._is_pytorch_version_before("1.13.1", 2, 2, 3) is True
+
+    def test_cve_2024_5480_fixed_version(self):
+        """PyTorch >= 2.2.3 should not be vulnerable to CVE-2024-5480."""
+        scanner = PyTorchZipScanner()
+        assert scanner._is_pytorch_version_before("2.2.3", 2, 2, 3) is False
+        assert scanner._is_pytorch_version_before("2.3.0", 2, 2, 3) is False
+
+    def test_cve_2024_48063_vulnerable_version(self):
+        """PyTorch < 2.5.0 should be vulnerable to CVE-2024-48063."""
+        scanner = PyTorchZipScanner()
+        assert scanner._is_pytorch_version_before("2.4.9", 2, 5, 0) is True
+        assert scanner._is_pytorch_version_before("2.2.3", 2, 5, 0) is True
+
+    def test_cve_2024_48063_fixed_version(self):
+        """PyTorch >= 2.5.0 should not be vulnerable to CVE-2024-48063."""
+        scanner = PyTorchZipScanner()
+        assert scanner._is_pytorch_version_before("2.5.0", 2, 5, 0) is False
+        assert scanner._is_pytorch_version_before("2.6.0", 2, 5, 0) is False
+
+    def test_unparseable_version_is_vulnerable(self):
+        """Unparseable version strings should be treated as vulnerable."""
+        scanner = PyTorchZipScanner()
+        assert scanner._is_pytorch_version_before("unknown", 2, 5, 0) is True
+        assert scanner._is_pytorch_version_before("", 2, 5, 0) is True
+
+    def test_version_with_suffix(self):
+        """Version strings with suffixes should parse correctly."""
+        scanner = PyTorchZipScanner()
+        assert scanner._is_pytorch_version_before("2.2.2+cu118", 2, 2, 3) is True
+        assert scanner._is_pytorch_version_before("2.5.0+cpu", 2, 5, 0) is False
