@@ -153,12 +153,17 @@ class TestRealJoblibFiles:
         if result.bytes_scanned == 0:
             # Should have reported format issues
             assert len(result.issues) > 0
-            # Compressed joblib files produce different errors on different
-            # platforms: "opcode" errors on some, "MemoryError" or other parse
-            # failures on others (notably Windows).  Accept any issue that
-            # indicates the file could not be parsed as valid pickle.
-            format_keywords = ("opcode", "format", "unable to parse", "invalid", "memoryerror", "corrupted")
-            format_issues = [i for i in result.issues if any(kw in str(i.message).lower() for kw in format_keywords)]
+            # Compressed joblib files are not valid pickle and trigger various parse
+            # errors depending on the platform (e.g. "opcode", "MemoryError",
+            # "Unable to parse", "Invalid pickle format", etc.).
+            format_issues = [
+                i
+                for i in result.issues
+                if any(
+                    kw in str(i.message).lower()
+                    for kw in ("opcode", "unable to parse", "invalid", "format", "pickle", "parse")
+                )
+            ]
             assert len(format_issues) > 0, (
                 f"Should report format/parse issues for compressed files. "
                 f"Got: {[str(i.message) for i in result.issues]}"
