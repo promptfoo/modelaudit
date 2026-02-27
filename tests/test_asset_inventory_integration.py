@@ -138,10 +138,11 @@ class TestAssetInventoryIntegration:
 
         # Verify nested contents have correct paths
         nested_paths = {c["path"] for c in zip_asset.contents}
+        zip_path = os.path.join(str(complex_model_dir), "weights.zip")
         expected_nested = {
-            f"{complex_model_dir}/weights.zip:model_state.pkl",
-            f"{complex_model_dir}/weights.zip:optimizer.safetensors",
-            f"{complex_model_dir}/weights.zip:README.txt",
+            f"{zip_path}:model_state.pkl",
+            f"{zip_path}:optimizer.safetensors",
+            f"{zip_path}:README.txt",
         }
         assert expected_nested.issubset(nested_paths)
 
