@@ -390,6 +390,15 @@ class ScannerRegistry:
                 "dependencies": ["xgboost", "ubjson"],  # ubjson optional for UBJ support
                 "numpy_sensitive": True,  # XGBoost can be sensitive to NumPy version
             },
+            "nemo": {
+                "module": "modelaudit.scanners.nemo_scanner",
+                "class": "NemoScanner",
+                "description": "Scans NVIDIA NeMo model files for Hydra _target_ injection",
+                "extensions": [".nemo"],
+                "priority": 14,
+                "dependencies": [],  # pyyaml optional, handled gracefully
+                "numpy_sensitive": False,
+            },
             "zip": {
                 "module": "modelaudit.scanners.zip_scanner",
                 "class": "ZipScanner",

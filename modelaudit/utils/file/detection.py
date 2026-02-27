@@ -260,6 +260,8 @@ def detect_file_format(path: str) -> str:
         return "flax_msgpack"
     if ext == ".onnx":
         return "onnx"
+    if ext == ".nemo":
+        return "nemo"
     ggml_exts = {".ggml", ".ggmf", ".ggjt", ".ggla", ".ggsa"}
     if ext in (".gguf", *ggml_exts):
         # Check magic bytes first for accuracy
