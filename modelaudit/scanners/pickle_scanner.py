@@ -502,7 +502,6 @@ ALWAYS_DANGEROUS_MODULES: set[str] = {
     # Virtual environments / package install
     "venv",
     "ensurepip",
-    "pip",
     # Other dangerous
     "webbrowser",
     "asyncio",
@@ -536,6 +535,18 @@ WARNING_SEVERITY_MODULES: set[str] = {
     # cannot directly execute code.
     "glob",
 }
+
+
+def _is_dangerous_module(mod: str) -> bool:
+    """Check if module is in ALWAYS_DANGEROUS_MODULES (exact or prefix match).
+
+    Prefix matching ensures deeper sub-modules like pip._internal.cli.main_parser
+    are still caught when their parent (pip) is in the blocklist.
+    """
+    if mod in ALWAYS_DANGEROUS_MODULES:
+        return True
+    return any(mod.startswith(f"{m}.") for m in ALWAYS_DANGEROUS_MODULES)
+
 
 # String opcodes that push text onto the pickle stack.
 # Used for STACK_GLOBAL reconstruction and suspicious string detection.
@@ -1840,7 +1851,7 @@ def _is_actually_dangerous_global(mod: str, func: str, ml_context: dict) -> bool
     # setattr, delattr, __import__, compile, etc.) are already caught in STEP 1 via
     # ALWAYS_DANGEROUS_FUNCTIONS, so any function reaching this point that is in the
     # ML_SAFE_GLOBALS allowlist (e.g., builtins.slice, builtins.set) is genuinely safe.
-    if mod in ALWAYS_DANGEROUS_MODULES:
+    if _is_dangerous_module(mod):
         if _is_safe_ml_global(mod, func):
             logger.debug(
                 f"Safe function from dangerous module: {mod}.{func} (explicitly allowlisted in ML_SAFE_GLOBALS)"
@@ -2549,7 +2560,7 @@ def is_dangerous_reduce_pattern(
             return True
         # Check dangerous modules, but allow explicitly safe-listed functions
         # (truly dangerous functions like eval/exec/open are caught above)
-        if mod in ALWAYS_DANGEROUS_MODULES:
+        if _is_dangerous_module(mod):
             return not _is_safe_ml_global(mod, func)
         # Safe ML globals (checked after dangerous lists)
         if _is_safe_ml_global(mod, func):
