@@ -280,9 +280,11 @@ class OnnxScanner(BaseScanner):
                 # non-existent targets are still flagged.
                 has_traversal_raw = ".." in location.replace("\\", "/").split("/")
                 escapes_model_dir = not _is_contained_in(external_path, model_dir)
-                if has_traversal_raw or escapes_model_dir:
+                if escapes_model_dir:
                     # Determine specific CVE attribution
-                    if has_traversal_raw and not location.startswith(".."):
+                    normalized_parts = [p for p in location.replace("\\", "/").split("/") if p]
+                    starts_with_parent = bool(normalized_parts and normalized_parts[0] == "..")
+                    if has_traversal_raw and not starts_with_parent:
                         # Nested traversal (subdir/../../) - CVE-2024-27318
                         cve_id = "CVE-2024-27318"
                         cve_desc = (

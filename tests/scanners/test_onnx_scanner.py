@@ -177,6 +177,21 @@ class TestCVE202427318NestedPathTraversal:
         traversal_checks = [c for c in result.checks if "traversal" in c.message.lower() and not c.passed]
         assert len(traversal_checks) == 0, "Safe paths should not trigger traversal alerts"
 
+    def test_normalized_in_dir_path_with_dotdot_no_traversal_flag(self, tmp_path):
+        """A path containing '..' that resolves in-dir should not be flagged as traversal."""
+        (tmp_path / "weights.bin").write_bytes(struct.pack("f", 1.0))
+        model_path = create_onnx_model(
+            tmp_path,
+            external=True,
+            external_path="subdir/../weights.bin",
+            missing_external=True,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        traversal_checks = [c for c in result.checks if "traversal" in c.message.lower() and not c.passed]
+        assert len(traversal_checks) == 0, "Normalized in-dir paths should not trigger traversal alerts"
+
     def test_nested_traversal_details_contain_cwe(self, tmp_path):
         """CVE-2024-27318 details should include CWE-22."""
         model_path = create_onnx_model(
