@@ -116,8 +116,8 @@ class KerasZipScanner(BaseScanner):
                         result.finish(success=False)
                         return result
 
-                # CVE-2025-9906: Check for enable_unsafe_deserialization in raw config
-                self._check_unsafe_deserialization_bypass(config_data, result)
+                # CVE-2025-9906: Check structured config for unsafe-deserialization gadget
+                self._check_unsafe_deserialization_bypass(model_config, result)
 
                 # Scan model configuration
                 self._scan_model_config(model_config, result)
@@ -257,21 +257,33 @@ class KerasZipScanner(BaseScanner):
         # Add layer counts to metadata
         result.metadata["layer_counts"] = layer_counts
 
-    def _check_unsafe_deserialization_bypass(self, config_data: bytes, result: ScanResult) -> None:
+    def _check_unsafe_deserialization_bypass(self, model_config: dict[str, Any], result: ScanResult) -> None:
         """Check for CVE-2025-9906: enable_unsafe_deserialization bypass in config.json.
 
         CVE-2025-9906: config.json in .keras archives can reference
         keras.config.enable_unsafe_deserialization to disable safe_mode
         from within the deserialization process itself, then load malicious layers.
         """
-        config_str = config_data.decode("utf-8", errors="ignore")
-        if "enable_unsafe_deserialization" in config_str:
+        tokens = list(self._collect_string_tokens(model_config))
+        has_enable_unsafe = any(
+            token == "enable_unsafe_deserialization" or token.endswith(".enable_unsafe_deserialization")
+            for token in tokens
+        )
+        has_keras_config_context = any(
+            token == "keras.config"
+            or token.startswith("keras.config.")
+            or token == "keras.src.config"
+            or token.startswith("keras.src.config.")
+            for token in tokens
+        )
+
+        if has_enable_unsafe and has_keras_config_context:
             result.add_check(
                 name="CVE-2025-9906: Unsafe Deserialization Bypass",
                 passed=False,
                 message=(
-                    "CVE-2025-9906: config.json contains 'enable_unsafe_deserialization' "
-                    "reference - safe_mode bypass attempt"
+                    "CVE-2025-9906: config.json contains structured reference to "
+                    "keras.config.enable_unsafe_deserialization (safe_mode bypass attempt)"
                 ),
                 severity=IssueSeverity.CRITICAL,
                 location=f"{self.current_file_path}/config.json",
@@ -283,6 +295,23 @@ class KerasZipScanner(BaseScanner):
                 },
                 why=get_cve_2025_9906_explanation("config_bypass"),
             )
+
+    def _collect_string_tokens(self, obj: Any) -> list[str]:
+        """Recursively collect normalized string tokens from parsed config."""
+        if isinstance(obj, str):
+            token = obj.strip()
+            return [token] if token else []
+        if isinstance(obj, dict):
+            out: list[str] = []
+            for value in obj.values():
+                out.extend(self._collect_string_tokens(value))
+            return out
+        if isinstance(obj, list):
+            out: list[str] = []
+            for value in obj:
+                out.extend(self._collect_string_tokens(value))
+            return out
+        return []
 
     def _check_lambda_layer(self, layer: dict[str, Any], result: ScanResult, layer_name: str) -> None:
         """Check Lambda layer for executable Python code"""
