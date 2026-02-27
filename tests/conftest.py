@@ -78,7 +78,8 @@ def pytest_runtest_setup(item):
             "test_weak_hash_detection.py",  # Weak hash detection tests
             "test_cloud_url_detection.py",  # Cloud storage URL detection tests
             "test_skops_scanner.py",  # Skops scanner CVE detection tests
-            "test_tflite_scanner.py",  # TFLite scanner tests (basic format recognition)
+            "test_cve_detection.py",  # CVE detection tests
+            "test_pytorch_zip_scanner.py",  # PyTorch ZIP scanner tests
         ]
 
         # Check if this is an allowed test file

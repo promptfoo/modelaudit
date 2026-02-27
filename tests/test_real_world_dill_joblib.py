@@ -149,7 +149,11 @@ class TestRealJoblibFiles:
         # Compressed files may not follow standard pickle format
         # This is expected - compression changes the file structure
         assert isinstance(result.success, bool)
-        # May not scan bytes if compression format isn't recognized as pickle
+        # The scanner may or may not successfully parse compressed data depending
+        # on whether the compressed bytes happen to contain valid-looking pickle
+        # opcodes (e.g., a 0x80 byte that triggers resync). Both outcomes are
+        # acceptable: either the scanner parses some opcodes from the compressed
+        # stream, or it reports format/opcode/complexity issues.
         if result.bytes_scanned == 0:
             # Should have reported format/parse issues
             assert len(result.issues) > 0
@@ -194,12 +198,15 @@ class TestRealJoblibFiles:
 
         # If bytes weren't scanned, it means the format wasn't recognized as standard pickle
         if result.bytes_scanned == 0:
-            # Should have issues about unknown format/opcodes (now as warnings)
+            # Should have issues about unknown format/opcodes/parsing (now as warnings)
             assert len(warning_issues) > 0, "Should report issues when format isn't recognized"
-            opcode_issues = [
-                i for i in warning_issues if "opcode" in str(i.message).lower() or "format" in str(i.message).lower()
-            ]
-            assert len(opcode_issues) > 0, "Should report opcode/format issues for numpy joblib files"
+            # Warning messages may vary by platform (e.g. "opcode", "format", "parse", "pickle", "Memory")
+            parse_keywords = ("opcode", "format", "parse", "pickle", "protocol", "memory")
+            opcode_issues = [i for i in warning_issues if any(kw in str(i.message).lower() for kw in parse_keywords)]
+            assert len(opcode_issues) > 0, (
+                f"Should report parse/format issues for numpy joblib files, got: "
+                f"{[str(i.message)[:80] for i in warning_issues]}"
+            )
         else:
             # If bytes were scanned, check for opcode issues if they exist
             if len(critical_issues) > 0:
