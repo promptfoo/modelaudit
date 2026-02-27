@@ -10,7 +10,6 @@ suite verifies that:
 3. BINARY_CODE_PATTERNS includes posix/nt internal module names
 """
 
-
 from modelaudit.detectors.suspicious_symbols import BINARY_CODE_PATTERNS
 from modelaudit.scanners import PickleScanner
 from modelaudit.scanners.base import IssueSeverity
@@ -62,6 +61,30 @@ class TestCVE202510155FormatDetection:
         # Random-looking binary data that doesn't match pickle patterns
         bin_path.write_bytes(b"\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f")
         assert detect_file_format(str(bin_path)) == "pytorch_binary"
+
+    def test_bracket_start_not_misdetected(self, tmp_path):
+        """A .bin file starting with ']' but lacking pickle opcodes should not be detected as pickle.
+
+        ']' is the EMPTY_LIST opcode in pickle protocol 0/1 and could appear at the
+        start of a pickle stream. Without a subsequent GLOBAL opcode ('c') or protocol
+        2+ magic byte (0x80), it should not be classified as pickle.
+        """
+        bin_path = tmp_path / "model.bin"
+        bin_path.write_bytes(b"]not a pickle content here")
+        result = detect_file_format(str(bin_path))
+        assert result != "pickle", f"Expected non-pickle format, got {result!r}"
+
+    def test_brace_start_not_misdetected(self, tmp_path):
+        """A .bin file starting with '}' but lacking pickle opcodes should not be detected as pickle.
+
+        '}' is the EMPTY_DICT opcode in pickle protocol 0/1 and could appear at the
+        start of a pickle stream. Without a subsequent GLOBAL opcode ('c') or protocol
+        2+ magic byte (0x80), it should not be classified as pickle.
+        """
+        bin_path = tmp_path / "model.bin"
+        bin_path.write_bytes(b"}not a pickle or json content")
+        result = detect_file_format(str(bin_path))
+        assert result != "pickle", f"Expected non-pickle format, got {result!r}"
 
 
 class TestCVE202510155PickleScanning:
