@@ -331,6 +331,18 @@ ALWAYS_DANGEROUS_MODULES: set[str] = {
     # They are caught by SUSPICIOUS_GLOBALS or general suspicious-string detection.
 }
 
+
+def _is_dangerous_module(mod: str) -> bool:
+    """Check if module is in ALWAYS_DANGEROUS_MODULES (exact or prefix match).
+
+    Prefix matching ensures deeper sub-modules like pip._internal.cli.main_parser
+    are still caught when their parent (pip) is in the blocklist.
+    """
+    if mod in ALWAYS_DANGEROUS_MODULES:
+        return True
+    return any(mod.startswith(f"{m}.") for m in ALWAYS_DANGEROUS_MODULES)
+
+
 # String opcodes that push text onto the pickle stack.
 # Used for STACK_GLOBAL reconstruction and suspicious string detection.
 STRING_OPCODES: frozenset[str] = frozenset(
@@ -1280,7 +1292,7 @@ def _is_actually_dangerous_global(mod: str, func: str, ml_context: dict) -> bool
         return True
 
     # STEP 2: ALWAYS flag dangerous modules (no exceptions)
-    if mod in ALWAYS_DANGEROUS_MODULES:
+    if _is_dangerous_module(mod):
         logger.warning(f"Always-dangerous module detected: {mod}.{func} (flagged regardless of ML context)")
         return True
 
@@ -1928,7 +1940,7 @@ def is_dangerous_reduce_pattern(
         # Check ALWAYS_DANGEROUS lists
         if full_ref in ALWAYS_DANGEROUS_FUNCTIONS or func in ALWAYS_DANGEROUS_FUNCTIONS:
             return True
-        if mod in ALWAYS_DANGEROUS_MODULES:
+        if _is_dangerous_module(mod):
             return True
         # Check SUSPICIOUS_GLOBALS (the fallback)
         return is_suspicious_global(mod, func)
