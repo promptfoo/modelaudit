@@ -154,7 +154,7 @@ class TestRealJoblibFiles:
         # 2. Report issues when the compressed data isn't valid pickle
         # Either outcome is acceptable — what matters is no unhandled crash.
         if result.bytes_scanned == 0:
-            # Should have reported format issues
+            # Should have reported format/parse issues
             assert len(result.issues) > 0
             # Compressed joblib files are not valid pickle and trigger various parse
             # errors depending on the platform (e.g. "opcode", "MemoryError",
