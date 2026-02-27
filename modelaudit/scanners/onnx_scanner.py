@@ -7,6 +7,15 @@ from typing import Any, ClassVar
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 
+def _is_contained_in(child: Path, parent: Path) -> bool:
+    """Check if child path is contained within parent directory."""
+    try:
+        child.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
 def _get_onnx_mapping() -> Any:
     """Get ONNX mapping module from different locations depending on version."""
     try:
@@ -273,7 +282,7 @@ class OnnxScanner(BaseScanner):
                         location=str(external_path),
                         details={"tensor": tensor.name, "file": location},
                     )
-                elif not str(external_path).startswith(str(model_dir)):
+                elif not _is_contained_in(external_path, model_dir):
                     result.add_check(
                         name="CVE-2022-25882: External Data Path Traversal",
                         passed=False,
