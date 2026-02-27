@@ -13,6 +13,19 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     HAS_PADDLE = False
 
+# Patterns that are expected in raw binary weight files and should be skipped
+# for .pdiparams files to avoid false positives.  The hex-escape pattern
+# (r"\\x[0-9a-fA-F]{2}") fires on virtually every .pdiparams file because
+# raw float32 tensor data decoded as lossy UTF-8 produces abundant \xNN
+# sequences.  The __[\w]+__ (magic-method) pattern similarly matches
+# byte sequences that look like dunder names after lossy decoding.
+_BINARY_WEIGHT_SKIP_PATTERNS: frozenset[str] = frozenset(
+    {
+        r"\\x[0-9a-fA-F]{2}",
+        r"__[\w]+__",
+    }
+)
+
 
 class PaddleScanner(BaseScanner):
     """Scanner for PaddlePaddle model files (.pdmodel/.pdiparams)."""
@@ -58,6 +71,10 @@ class PaddleScanner(BaseScanner):
         counterpart_path = os.path.splitext(path)[0] + counterpart_ext
         result.metadata["has_counterpart"] = os.path.exists(counterpart_path)
 
+        # For binary weight files (.pdiparams), skip string patterns that are
+        # expected to match raw tensor data (hex escapes, dunder-like byte runs).
+        is_binary_weights = ext == ".pdiparams"
+
         bytes_scanned = 0
         chunk_size = 1024 * 1024
         try:
@@ -67,7 +84,7 @@ class PaddleScanner(BaseScanner):
                     if not chunk:
                         break
                     bytes_scanned += len(chunk)
-                    self._check_chunk(chunk, result, bytes_scanned - len(chunk), path)
+                    self._check_chunk(chunk, result, bytes_scanned - len(chunk), path, is_binary_weights)
             result.bytes_scanned = bytes_scanned
         except Exception as e:  # pragma: no cover - unexpected I/O errors
             result.add_check(
@@ -84,7 +101,14 @@ class PaddleScanner(BaseScanner):
         result.finish(success=not result.has_errors)
         return result
 
-    def _check_chunk(self, chunk: bytes, result: ScanResult, offset: int, path: str) -> None:
+    def _check_chunk(
+        self,
+        chunk: bytes,
+        result: ScanResult,
+        offset: int,
+        path: str,
+        is_binary_weights: bool = False,
+    ) -> None:
         for pattern in BINARY_CODE_PATTERNS:
             if pattern in chunk:
                 pos = chunk.find(pattern)
@@ -102,6 +126,10 @@ class PaddleScanner(BaseScanner):
         except UnicodeDecodeError:
             text = chunk.decode("utf-8", "ignore")
         for regex in SUSPICIOUS_STRING_PATTERNS:
+            # Skip patterns known to produce false positives on raw binary
+            # weight data (e.g. hex-escape sequences in float tensors).
+            if is_binary_weights and regex in _BINARY_WEIGHT_SKIP_PATTERNS:
+                continue
             if re.search(regex, text):
                 result.add_check(
                     name="String Pattern Detection",
