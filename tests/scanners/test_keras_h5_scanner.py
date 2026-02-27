@@ -424,7 +424,7 @@ def test_keras_h5_scanner_allows_known_safe_classes(tmp_path):
 class TestCVE20259905H5SafeMode:
     """Test CVE-2025-9905: Keras H5 safe_mode ignored for Lambda layers."""
 
-    def test_lambda_layer_triggers_cve_2025_9905(self, tmp_path):
+    def test_lambda_layer_triggers_cve_2025_9905(self, tmp_path) -> None:
         """Lambda layer in H5 file should flag CVE-2025-9905."""
         h5_path = tmp_path / "model.h5"
         with h5py.File(h5_path, "w") as f:
@@ -449,7 +449,7 @@ class TestCVE20259905H5SafeMode:
         assert len(cve_issues) >= 1, "Lambda in H5 should trigger CVE-2025-9905"
         assert cve_issues[0].severity == IssueSeverity.CRITICAL
 
-    def test_cve_attribution_details(self, tmp_path):
+    def test_cve_attribution_details(self, tmp_path) -> None:
         """CVE details should be present in issue details."""
         h5_path = tmp_path / "model.h5"
         with h5py.File(h5_path, "w") as f:
@@ -477,7 +477,7 @@ class TestCVE20259905H5SafeMode:
         assert details["cvss"] == 7.3
         assert "3.11.3" in details["remediation"]
 
-    def test_no_cve_without_lambda(self, tmp_path):
+    def test_no_cve_without_lambda(self, tmp_path) -> None:
         """H5 model without Lambda should NOT trigger CVE-2025-9905."""
         h5_path = tmp_path / "model.h5"
         with h5py.File(h5_path, "w") as f:
