@@ -702,7 +702,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
             (r"subprocess\.[a-zA-Z_]+\s*\(", "system_command", "subprocess call"),
             # Path traversal patterns
             (r"\.\./+", "path_traversal", "directory traversal"),
-            (r"\.\\.+", "path_traversal", "Windows directory traversal"),
+            (r"\.\.\\+", "path_traversal", "Windows directory traversal"),
             (r"/etc/passwd", "path_traversal", "system file access"),
             (r"/proc/", "path_traversal", "proc filesystem access"),
             # Encoding bypass attempts
