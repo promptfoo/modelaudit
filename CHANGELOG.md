@@ -33,6 +33,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **security**: detect CVE-2019-6446 in NumPy scanner when object dtype arrays are found, with CRITICAL severity attribution (CVSS 9.8) since they require pickle deserialization via `allow_pickle=True`
+
 ### Fixed
 
 - **security**: harden pickle scanner stack resolution to correctly track `STACK_GLOBAL` and memoized `REDUCE` call targets, preventing decoy-string and `BINGET` bypasses
