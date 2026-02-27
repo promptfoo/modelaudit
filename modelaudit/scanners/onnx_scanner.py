@@ -276,7 +276,7 @@ class OnnxScanner(BaseScanner):
                 # Check for path traversal BEFORE file existence so
                 # that traversal attempts against non-existent targets
                 # are still properly flagged.
-                has_traversal_raw = ".." in location
+                has_traversal_raw = ".." in location.replace("\\", "/").split("/")
                 escapes_model_dir = not _is_contained_in(external_path, model_dir)
                 if has_traversal_raw or escapes_model_dir:
                     # CVE-2025-51480: Arbitrary file overwrite via
