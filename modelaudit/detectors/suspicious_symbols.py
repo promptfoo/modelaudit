@@ -227,7 +227,6 @@ SUSPICIOUS_GLOBALS = {
     "select": "*",
     "selectors": "*",
     "logging": ["config"],
-    "logging.config": ["dictConfig", "fileConfig", "listen"],
     "syslog": "*",
     "tarfile": "*",
     "zipfile": "*",
@@ -276,7 +275,9 @@ DANGEROUS_BUILTINS = [
 # Regex patterns that match potentially malicious code in string literals
 SUSPICIOUS_STRING_PATTERNS = [
     # Python magic methods - can hide malicious code
-    r"__[\w]+__",  # Magic methods like __reduce__, __setstate__
+    # Require at least one letter between the double underscores to avoid matching
+    # feature column names like "Occupation________" from one-hot encoding
+    r"(?<!\w)__(?=[a-zA-Z])[a-zA-Z0-9_]*[a-zA-Z]__(?!\w)",  # Magic methods like __reduce__, __setstate__
     # Encoding/decoding operations - often used for obfuscation
     r"base64\.b64decode",  # Base64 decoding
     # Dynamic code execution - CRITICAL
@@ -386,11 +387,9 @@ CVE_BINARY_PATTERNS = [
     b"joblib.load",
     b"__reduce__",
     b"os.system",
-    # NOTE: b"Pipeline" was removed because it matches the class name
-    # "sklearn.pipeline.Pipeline" present in ALL legitimate sklearn Pipeline
-    # models serialized via pickle/joblib (100% false positive rate).
-    # The regex CVE patterns (CVE_2020_13092_PATTERNS) correctly detect actual
-    # exploits by requiring COMBINATIONS (e.g., "Pipeline.*__reduce__.*system").
+    # NOTE: b"Pipeline" removed — it matches all legitimate sklearn Pipeline pickles.
+    # The CVE-2020-13092 exploit requires Pipeline + __reduce__ + system call, which
+    # is detected by the CVE_2020_13092_PATTERNS regex list and the opcode-level checks.
     # CVE-2024-34997 binary signatures
     b"read_array",
     b"pickle.load",
