@@ -275,12 +275,39 @@ class OnnxScanner(BaseScanner):
                     )
                 elif not str(external_path).startswith(str(model_dir)):
                     result.add_check(
-                        name="External Data Path Traversal Check",
+                        name="CVE-2022-25882: External Data Path Traversal",
                         passed=False,
-                        message=f"External data file outside model directory for tensor '{tensor.name}'",
+                        message=(
+                            f"CVE-2022-25882: External data path traversal "
+                            f"for tensor '{tensor.name}' - path '{location}' "
+                            f"resolves outside model directory"
+                        ),
                         severity=IssueSeverity.CRITICAL,
                         location=str(external_path),
-                        details={"tensor": tensor.name, "file": location},
+                        details={
+                            "tensor": tensor.name,
+                            "file": location,
+                            "cve_id": "CVE-2022-25882",
+                            "cvss": 7.5,
+                            "cwe": "CWE-22",
+                            "description": (
+                                "ONNX external_data location fields can use "
+                                "path traversal sequences to read arbitrary "
+                                "files outside the model directory"
+                            ),
+                            "remediation": (
+                                "Validate that external_data paths do not "
+                                "contain '..' or resolve outside the model "
+                                "directory before loading"
+                            ),
+                        },
+                        why=(
+                            "This ONNX model references external data that "
+                            "resolves outside the model directory, which is "
+                            "a path traversal attack (CVE-2022-25882). An "
+                            "attacker can craft an ONNX model that reads "
+                            "arbitrary files from the filesystem."
+                        ),
                     )
                 else:
                     result.add_check(

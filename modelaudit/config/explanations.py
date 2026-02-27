@@ -668,3 +668,35 @@ def get_pytorch_security_explanation(issue_type: str) -> str:
         "This is a PyTorch-specific security concern. Review PyTorch security best practices "
         "and ensure you're following safe model loading procedures.",
     )
+
+
+def get_cve_2022_25882_explanation(vulnerability_type: str) -> str:
+    """Get specific explanation for CVE-2022-25882 (ONNX external_data path traversal)."""
+    explanations = {
+        "path_traversal": (
+            "CVE-2022-25882 (CVSS 7.5): ONNX models can reference external data files "
+            "using the external_data location field. By using path traversal sequences "
+            "like '../../etc/passwd', an attacker can craft an ONNX model that reads "
+            "arbitrary files from the filesystem when loaded. This enables information "
+            "disclosure attacks, including reading sensitive configuration files, SSH keys, "
+            "and other private data."
+        ),
+        "directory_escape": (
+            "The external_data location field resolves to a path outside the model "
+            "directory. This is a directory traversal attack that bypasses the expected "
+            "sandboxing of model files. Legitimate ONNX models should only reference "
+            "external data files within the same directory as the model file."
+        ),
+        "onnx_version": (
+            "CVE-2022-25882 affects ONNX versions prior to 1.13.0. The fix adds "
+            "validation to reject external data paths that resolve outside the model "
+            "directory. Update to ONNX 1.13.0 or later and validate model files before "
+            "loading with untrusted inputs."
+        ),
+    }
+
+    return explanations.get(
+        vulnerability_type,
+        "CVE-2022-25882: ONNX external_data path traversal vulnerability. "
+        "Validate that external_data paths do not escape the model directory.",
+    )
