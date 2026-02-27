@@ -121,8 +121,8 @@ class KerasZipScanner(BaseScanner):
                         result.finish(success=False)
                         return result
 
-                # CVE-2025-8747: Check for get_file gadget with URL
-                self._check_get_file_gadget(config_data, result)
+                # CVE-2025-8747: Check for structured get_file gadget usage
+                self._check_get_file_gadget(model_config, result)
 
                 # Scan model configuration
                 self._scan_model_config(model_config, result)
@@ -262,29 +262,36 @@ class KerasZipScanner(BaseScanner):
         # Add layer counts to metadata
         result.metadata["layer_counts"] = layer_counts
 
-    def _check_get_file_gadget(self, config_data: bytes, result: ScanResult) -> None:
+    def _check_get_file_gadget(self, model_config: dict[str, Any], result: ScanResult) -> None:
         """Check for CVE-2025-8747: keras.utils.get_file gadget bypass.
 
         CVE-2025-8747: Bypass of CVE-2025-1550 fix. Uses keras.utils.get_file
         as a gadget to download and execute arbitrary files even with safe_mode=True.
-        Detected when config.json references get_file AND contains URL strings.
+        Detected when a single config object references get_file and includes URL arguments.
         """
-        config_str = config_data.decode("utf-8", errors="ignore")
-        has_get_file = _GET_FILE_PATTERN.search(config_str) is not None
-        has_url = _URL_PATTERN.search(config_str) is not None
-
-        if has_get_file and has_url:
+        for context, node in self._iter_dict_nodes(model_config):
+            string_values = [value for value in node.values() if isinstance(value, str)]
+            has_get_file = any(
+                _GET_FILE_PATTERN.fullmatch(value.strip()) is not None
+                or value.strip().lower().endswith(".get_file")
+                or "keras.utils.get_file" in value.strip().lower()
+                for value in string_values
+            )
+            has_url = any(_URL_PATTERN.search(value) is not None for value in string_values)
+            if not (has_get_file and has_url):
+                continue
             result.add_check(
                 name="CVE-2025-8747: get_file Gadget Bypass",
                 passed=False,
                 message=(
-                    "CVE-2025-8747: config.json references 'get_file' with URL - "
+                    "CVE-2025-8747: config.json contains structured 'get_file' invocation with URL - "
                     "potential safe_mode bypass via file download gadget"
                 ),
                 severity=IssueSeverity.CRITICAL,
                 location=f"{self.current_file_path}/config.json",
                 details={
                     "cve_id": "CVE-2025-8747",
+                    "context": context,
                     "cvss": 8.8,
                     "cwe": "CWE-502",
                     "affected_versions": "Keras 3.0.0-3.10.0",
@@ -292,6 +299,21 @@ class KerasZipScanner(BaseScanner):
                 },
                 why=get_cve_2025_8747_explanation("get_file_gadget"),
             )
+            return
+
+    def _iter_dict_nodes(self, obj: Any, path: str = "root") -> list[tuple[str, dict[str, Any]]]:
+        """Yield all dict nodes with their traversal path."""
+        if isinstance(obj, dict):
+            nodes = [(path, obj)]
+            for key, value in obj.items():
+                nodes.extend(self._iter_dict_nodes(value, f"{path}.{key}"))
+            return nodes
+        if isinstance(obj, list):
+            nodes: list[tuple[str, dict[str, Any]]] = []
+            for idx, value in enumerate(obj):
+                nodes.extend(self._iter_dict_nodes(value, f"{path}[{idx}]"))
+            return nodes
+        return []
 
     def _check_lambda_layer(self, layer: dict[str, Any], result: ScanResult, layer_name: str) -> None:
         """Check Lambda layer for executable Python code"""

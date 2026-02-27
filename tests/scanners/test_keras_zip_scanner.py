@@ -487,6 +487,21 @@ class TestCVE20258747GetFileGadget:
         cve_issues = [i for i in result.issues if "CVE-2025-8747" in i.message]
         assert len(cve_issues) == 0
 
+    def test_get_file_and_url_in_different_contexts_not_flagged(self, tmp_path):
+        """Keyword co-occurrence across unrelated dicts should not trigger CVE."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Model",
+            "config": {
+                "layers": [{"class_name": "Dense", "name": "dense_1", "config": {"fn": "get_file"}}],
+                "metadata": {"download_url": "https://example.com/model-info"},
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
+
+        cve_issues = [i for i in result.issues if "CVE-2025-8747" in i.message]
+        assert len(cve_issues) == 0, "get_file and URL in unrelated contexts should not trigger CVE-2025-8747"
+
     def test_cve_attribution_details(self, tmp_path):
         """CVE details should be in issue details."""
         scanner = KerasZipScanner()
