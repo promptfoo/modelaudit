@@ -59,6 +59,19 @@ class TestCVE20196446ObjectDtype:
         cve_checks = [c for c in result.checks if "CVE-2019-6446" in (c.name + c.message)]
         assert len(cve_checks) == 0, "Numeric dtype should not trigger CVE"
 
+    def test_structured_numeric_dtype_no_cve(self, tmp_path):
+        """Structured dtype with only numeric fields should not trigger CVE-2019-6446."""
+        dt = np.dtype([("x", np.float32), ("y", np.int32)])
+        arr = np.array([(1.0, 2), (3.0, 4)], dtype=dt)
+        path = tmp_path / "structured.npy"
+        np.save(path, arr)
+
+        scanner = NumPyScanner()
+        result = scanner.scan(str(path))
+
+        cve_checks = [c for c in result.checks if "CVE-2019-6446" in (c.name + c.message)]
+        assert len(cve_checks) == 0, "Pure numeric structured dtype should not trigger CVE"
+
     def test_cve_details_fields(self, tmp_path):
         """CVE-2019-6446 check should include cvss, cwe, remediation."""
         arr = np.array([None, "test"], dtype=object)

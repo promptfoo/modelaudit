@@ -93,10 +93,10 @@ class NumPyScanner(BaseScanner):
         # Check for problematic data types
         # CVE-2019-6446: object dtype requires pickle deserialization,
         # enabling arbitrary code execution via numpy.load(allow_pickle=True)
-        dangerous_names = ["object"]
-        dangerous_kinds = ["O", "V"]  # Object and Void kinds
-
-        if dtype.name in dangerous_names or dtype.kind in dangerous_kinds:
+        # dtype.hasobject is True when the dtype contains Python objects
+        # (including object arrays and structured dtypes with object fields).
+        # Pure numeric structured dtypes (kind="V") are safe.
+        if dtype.kind == "O" or bool(getattr(dtype, "hasobject", False)):
             raise ValueError(
                 f"Dangerous dtype not allowed: {dtype.name} (kind: {dtype.kind})",
             )
@@ -248,7 +248,9 @@ class NumPyScanner(BaseScanner):
                         # CVE-2019-6446: object dtype requires pickle
                         # deserialization via numpy.load(allow_pickle=True),
                         # enabling arbitrary code execution.
-                        if dtype.kind in ("O", "V"):
+                        # dtype.hasobject catches structured dtypes with
+                        # object fields; kind=="O" catches plain object arrays.
+                        if dtype.kind == "O" or bool(getattr(dtype, "hasobject", False)):
                             result.add_check(
                                 name=f"{self.CVE_2019_6446_ID}: Object Dtype Pickle Deserialization",
                                 passed=False,
