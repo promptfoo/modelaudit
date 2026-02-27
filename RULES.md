@@ -1,8 +1,8 @@
 # ModelAudit Security Rules
 
-## Implementation Status: ⚠️ PARTIAL
+## Implementation Status: ✅ INTEGRATED
 
-**Current State**: Rule system is defined but NOT fully integrated with scanners.
+**Current State**: Rule codes are integrated into scanner output. ModelAudit uses explicit `rule_code` fields where available and message-pattern fallback for legacy checks.
 
 ## How It Works
 
@@ -12,9 +12,9 @@
 
 ## Current Limitations
 
-1. Some scanners still rely on message-based auto-detection for edge cases.
-2. Rule taxonomy and severities are being tuned; defaults may change.
-3. A small number of checks may still lack codes; please file issues with examples.
+1. Some legacy checks still rely on message-based fallback matching.
+2. Rule taxonomy and severities may evolve as new detections are added.
+3. If you find a check without an expected rule code, file an issue with a reproducer.
 
 ## All Security Rules (105 Total)
 
@@ -178,20 +178,20 @@
 
 ## Status Summary
 
-- ✅ **Working**: ~5% (Rules that actually match messages)
-- ⚠️ **Partial**: ~15% (Some patterns match, others don't)
-- ❌ **No Matches**: ~80% (Patterns never match actual messages)
+- ✅ Rule codes are emitted in scanner output and supported by CLI suppression/severity overrides.
+- ⚠️ Pattern fallback remains in place for legacy message-only detections.
+- 🔄 Coverage tuning is ongoing as new scanners and CVE checks are added.
 
 ## Configuration
 
-Despite incomplete rule matching, configuration works:
+Rule configuration is supported:
 
 ```toml
 # .modelaudit.toml
 suppress = ["S710", "S801"]  # Suppress rules (if they match)
 
 [severity]
-S301 = "HIGH"  # Change severity (if they match)
+S301 = "HIGH"  # Change severity
 
 [ignore]
 "tests/**" = ["S101"]  # File-specific suppression
@@ -205,13 +205,12 @@ modelaudit rules S101     # Explain specific rule
 modelaudit scan --suppress S101 --severity S301=HIGH
 ```
 
-## Next Steps Required
+## Next Steps
 
-1. **Fix Pattern Matching**: Update all 105 patterns to match actual messages
-2. **Explicit Rule Codes**: Modify scanners to explicitly set rule codes
-3. **Validation System**: Add tests to ensure all messages have rules
-4. **Documentation**: Document which scanners emit which rules
+1. Expand explicit `rule_code` coverage where fallback matching is still used.
+2. Add targeted regression tests for newly added rule mappings.
+3. Keep rule descriptions and examples aligned with scanner output text.
 
 ## Conclusion
 
-The rule system infrastructure exists but is **not fully functional**. Most security checks will not have rule codes assigned, making suppression and severity configuration ineffective for ~80% of detections.
+The rule system is integrated and configurable today. Coverage and tuning continue as detection logic evolves.

@@ -3021,8 +3021,6 @@ class PickleScanner(BaseScanner):
                                 "overall_confidence",
                                 0,
                             ),
-                            "entropy_classification": data_type,
-                            "entropy_confidence": confidence,
                         },
                         why=get_opcode_explanation("REDUCE"),
                     )
