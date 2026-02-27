@@ -170,6 +170,71 @@ SUSPICIOUS_GLOBALS = {
     ],  # dill's load helpers can execute arbitrary code when unpickling
     # References to the private dill._dill module are also suspicious
     "dill._dill": "*",
+    # Dynamic resolution / import trampolines
+    "pkgutil": ["resolve_name", "get_importer", "walk_packages"],
+    "zipimport": "*",
+    # uuid — _get_command_stdout/_popen internally call subprocess.Popen
+    "uuid": ["_get_command_stdout", "_popen"],
+    # Network / exfiltration
+    "smtplib": "*",
+    "xmlrpc": "*",
+    "xmlrpc.client": "*",
+    "xmlrpc.server": "*",
+    "poplib": "*",
+    "imaplib": "*",
+    "nntplib": "*",
+    "ssl": "*",
+    "socketserver": "*",
+    "requests": "*",
+    "aiohttp": "*",
+    # Code execution / compilation
+    "codeop": "*",
+    "marshal": ["loads", "load", "dumps", "dump"],
+    "compileall": "*",
+    "py_compile": "*",
+    # FFI / native code
+    "_ctypes": "*",
+    # Profiling / debugging (can execute code)
+    "cProfile": "*",
+    "profile": "*",
+    "pdb": "*",
+    "timeit": ["timeit", "repeat"],
+    "trace": "*",
+    # Operator / functools bypasses
+    "functools": ["reduce", "partial"],
+    "_operator": "*",
+    # Pickle recursion
+    "cloudpickle": "*",
+    "joblib": "*",
+    # Filesystem / shell
+    "filecmp": "*",
+    "distutils": "*",
+    "pydoc": "*",
+    "pexpect": "*",
+    "fileinput": "*",
+    "glob": "*",
+    # Virtual environments / package install
+    "venv": "*",
+    "ensurepip": "*",
+    "pip": "*",
+    # Threading / process / signal
+    "_signal": "*",
+    "threading": "*",
+    "_thread": "*",
+    # Database / archive / other
+    "sqlite3": "*",
+    "_sqlite3": "*",
+    "select": "*",
+    "selectors": "*",
+    "logging": ["config"],
+    "syslog": "*",
+    "tarfile": "*",
+    "zipfile": "*",
+    "shelve": "*",
+    # Documentation / tooling (can execute code)
+    "doctest": "*",
+    "idlelib": "*",
+    "lib2to3": "*",
 }
 
 # Advanced pickle patterns targeting sophisticated exploitation techniques
@@ -209,6 +274,10 @@ DANGEROUS_BUILTINS = [
 # Suspicious string patterns used by PickleScanner
 # Regex patterns that match potentially malicious code in string literals
 SUSPICIOUS_STRING_PATTERNS = [
+    # Python magic methods - can hide malicious code
+    # Require at least one letter between the double underscores to avoid matching
+    # feature column names like "Occupation________" from one-hot encoding
+    r"(?<!\w)__(?=[a-zA-Z])[a-zA-Z0-9_]*[a-zA-Z]__(?!\w)",  # Magic methods like __reduce__, __setstate__
     # Encoding/decoding operations - often used for obfuscation
     r"base64\.b64decode",  # Base64 decoding
     # Dynamic code execution - CRITICAL
@@ -322,6 +391,11 @@ CVE_BINARY_PATTERNS = [
     # The regex CVE patterns (CVE_2020_13092_PATTERNS, CVE_2024_34997_PATTERNS)
     # correctly detect actual exploits by requiring dangerous COMBINATIONS.
     b"os.system",
+    # NOTE: b"Pipeline" removed — it matches all legitimate sklearn Pipeline pickles.
+    # The CVE-2020-13092 exploit requires Pipeline + __reduce__ + system call, which
+    # is detected by the CVE_2020_13092_PATTERNS regex list and the opcode-level checks.
+    # CVE-2024-34997 binary signatures
+    b"read_array",
     b"pickle.load",
     b"joblib.cache",
 ]
