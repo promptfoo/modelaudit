@@ -33,6 +33,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **security**: detect CVE-2024-27318 ONNX nested path traversal bypass (e.g. `subdir/../../etc/passwd`) with proper CVE attribution, fixing logic bug where non-existent traversal paths were only reported as "file not found"
+
 ### Fixed
 
 - **security**: harden pickle scanner stack resolution to correctly track `STACK_GLOBAL` and memoized `REDUCE` call targets, preventing decoy-string and `BINGET` bypasses

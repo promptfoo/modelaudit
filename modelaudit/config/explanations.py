@@ -668,3 +668,35 @@ def get_pytorch_security_explanation(issue_type: str) -> str:
         "This is a PyTorch-specific security concern. Review PyTorch security best practices "
         "and ensure you're following safe model loading procedures.",
     )
+
+
+def get_cve_2024_27318_explanation(vulnerability_type: str) -> str:
+    """Get specific explanation for CVE-2024-27318 (ONNX nested path traversal bypass)."""
+    explanations = {
+        "nested_traversal": (
+            "CVE-2024-27318 (CVSS 7.5): The fix for CVE-2022-25882 used "
+            "str.lstrip('/.') which only strips leading characters. An attacker "
+            "can bypass this by using nested traversal like 'subdir/../../etc/passwd' "
+            "where the path starts with a legitimate directory name. The lstrip "
+            "sanitization leaves these paths completely untouched, enabling "
+            "arbitrary file reads."
+        ),
+        "path_traversal": (
+            "ONNX external_data location fields with nested '..' sequences "
+            "can escape the model directory even after the CVE-2022-25882 fix. "
+            "Paths like 'data/../../secret' first enter a subdirectory then "
+            "traverse upward past the model directory boundary."
+        ),
+        "onnx_version": (
+            "CVE-2024-27318 affects ONNX 1.13.0 through 1.15.0 (versions that "
+            "had the incomplete CVE-2022-25882 fix). Update to ONNX 1.16.0 or "
+            "later which replaced lstrip sanitization with proper C++ path "
+            "validation that rejects any path containing '..' components."
+        ),
+    }
+
+    return explanations.get(
+        vulnerability_type,
+        "CVE-2024-27318: ONNX nested path traversal bypass. Paths with embedded "
+        "'../' sequences can bypass the CVE-2022-25882 fix. Update to ONNX >= 1.16.0.",
+    )
