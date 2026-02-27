@@ -201,11 +201,7 @@ SUSPICIOUS_GLOBALS = {
     "timeit": ["timeit", "repeat"],
     "trace": "*",
     # Operator / functools bypasses
-    # NOTE: functools.partial is excluded — it is heavily used in legitimate
-    # PyTorch models (e.g. torch.nn modules) and cannot execute arbitrary code
-    # on its own.  Only functools.reduce is flagged because it accepts a
-    # callable and iterates, which can be abused.
-    "functools": ["reduce"],
+    "functools": ["reduce", "partial"],
     "_operator": "*",
     # Pickle recursion
     "cloudpickle": "*",
@@ -216,10 +212,7 @@ SUSPICIOUS_GLOBALS = {
     "pydoc": "*",
     "pexpect": "*",
     "fileinput": "*",
-    # NOTE: glob.glob / glob.iglob are common in dataset loading pipelines and
-    # cannot directly execute code.  Only flagged at WARNING severity via
-    # WARNING_SEVERITY_MODULES in pickle_scanner.py.
-    "glob": ["glob", "iglob"],
+    "glob": "*",
     # Virtual environments / package install
     "venv": "*",
     "ensurepip": "*",
@@ -282,7 +275,9 @@ DANGEROUS_BUILTINS = [
 # Regex patterns that match potentially malicious code in string literals
 SUSPICIOUS_STRING_PATTERNS = [
     # Python magic methods - can hide malicious code
-    r"__[\w]+__",  # Magic methods like __reduce__, __setstate__
+    # Require at least one letter between the double underscores to avoid matching
+    # feature column names like "Occupation________" from one-hot encoding
+    r"(?<!\w)__(?=[a-zA-Z])[a-zA-Z0-9_]*[a-zA-Z]__(?!\w)",  # Magic methods like __reduce__, __setstate__
     # Encoding/decoding operations - often used for obfuscation
     r"base64\.b64decode",  # Base64 decoding
     # Dynamic code execution - CRITICAL
@@ -392,7 +387,9 @@ CVE_BINARY_PATTERNS = [
     b"joblib.load",
     b"__reduce__",
     b"os.system",
-    b"Pipeline",
+    # NOTE: b"Pipeline" removed — it matches all legitimate sklearn Pipeline pickles.
+    # The CVE-2020-13092 exploit requires Pipeline + __reduce__ + system call, which
+    # is detected by the CVE_2020_13092_PATTERNS regex list and the opcode-level checks.
     # CVE-2024-34997 binary signatures
     b"read_array",
     b"pickle.load",
