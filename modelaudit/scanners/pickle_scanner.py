@@ -49,12 +49,9 @@ def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> 
 
     Yields: (opcode, arg, pos) tuples from pickletools.genops
     """
-    # Maximum number of consecutive non-pickle bytes to skip when resyncing.
-    # Also serves as the total cumulative limit across the entire file to prevent
-    # attackers from distributing padding across multiple inter-stream gaps.
-    _MAX_RESYNC_BYTES = 4096
+    # Maximum number of consecutive non-pickle bytes to skip when resyncing
+    _MAX_RESYNC_BYTES = 256
     resync_skipped = 0
-    total_resync_skipped = 0
     # Track whether we've successfully parsed at least one complete stream
     parsed_any_stream = False
 
@@ -75,13 +72,6 @@ def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> 
                     logger.info(
                         f"Protocol mismatch in pickle (joblib may use protocol 5 opcodes in protocol 4 files): {e}"
                     )
-                elif multi_stream and had_opcodes:
-                    # In multi-stream mode, don't abort on first-stream parse
-                    # errors when we already yielded some opcodes -- a partially
-                    # corrupted first stream should not prevent scanning
-                    # subsequent (potentially malicious) streams.
-                    logger.info(f"First pickle stream parse error (continuing multi-stream scan): {e}")
-                    stream_error = True
                 else:
                     raise
         else:
@@ -100,9 +90,8 @@ def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> 
 
             if stream_error and had_opcodes:
                 # Partial stream: binary data was misinterpreted as opcodes.
-                # Discard the buffer but continue scanning — there may be a
-                # valid malicious stream hidden after the binary blob.
-                pass
+                # Discard the buffer and stop — no more valid streams.
+                return
 
             if not stream_error:
                 # Stream completed successfully — yield buffered opcodes
@@ -121,12 +110,22 @@ def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> 
             if not file_obj.read(1):
                 return  # EOF
             resync_skipped += 1
-            total_resync_skipped += 1
-            if resync_skipped >= _MAX_RESYNC_BYTES or total_resync_skipped >= _MAX_RESYNC_BYTES:
-                return
+            if resync_skipped >= _MAX_RESYNC_BYTES:
+                # Bounded fast-forward search for the next likely protocol header
+                # so simple padding cannot terminate multi-stream scanning.
+                probe_start = file_obj.tell()
+                probe = file_obj.read(64 * 1024)
+                candidate = next(
+                    (idx for idx in range(len(probe) - 1) if probe[idx] == 0x80 and probe[idx + 1] in (2, 3, 4, 5)),
+                    -1,
+                )
+                if candidate < 0:
+                    return
+                file_obj.seek(probe_start + candidate, 0)
+                resync_skipped = 0
             continue
 
-        # Found a valid stream — reset per-gap resync counter (cumulative total persists)
+        # Found a valid stream — reset resync counter
         resync_skipped = 0
         # Check if there is another pickle stream after STOP
         next_byte = file_obj.read(1)
@@ -210,7 +209,7 @@ ML_FRAMEWORK_PATTERNS: dict[str, dict[str, list[str] | float]] = {
         "confidence_boost": 0.8,
     },
     "sklearn": {
-        "modules": ["sklearn", "joblib", "numpy", "numpy.core", "numpy.dtype"],
+        "modules": ["sklearn", "joblib", "numpy", "numpy.core", "numpy._core", "numpy.dtype", "scipy.sparse"],
         "classes": [
             "Pipeline",
             "StandardScaler",
@@ -226,7 +225,14 @@ ML_FRAMEWORK_PATTERNS: dict[str, dict[str, list[str] | float]] = {
             "Ridge",
             "Lasso",
         ],
-        "patterns": [r"sklearn\..*", r"joblib\..*", r"numpy\..*", r"numpy\.core\..*"],
+        "patterns": [
+            r"sklearn\..*",
+            r"joblib\..*",
+            r"numpy\..*",
+            r"numpy\.core\..*",
+            r"numpy\._core\..*",
+            r"scipy\.sparse\..*",
+        ],
         "confidence_boost": 0.9,
     },
     "huggingface": {
@@ -383,13 +389,14 @@ ALWAYS_DANGEROUS_MODULES: set[str] = {
     # Native code execution (ctypes)
     "ctypes",
     "ctypes.util",
-    # FFI / native code
     "_ctypes",
     # Profiling/debugging - can execute arbitrary Python code via run()
     "cProfile",
     "profile",
     "pdb",
     "timeit",
+    "bdb",
+    "trace",
     # Thread/process spawning
     "_thread",
     "multiprocessing",
@@ -415,9 +422,6 @@ ALWAYS_DANGEROUS_MODULES: set[str] = {
     "types",
     "compileall",
     "py_compile",
-    # Profiling / debugging (additional)
-    "bdb",
-    "trace",
     # Operator / functools bypasses
     "_operator",
     "functools",
@@ -439,7 +443,7 @@ ALWAYS_DANGEROUS_MODULES: set[str] = {
     "venv",
     "ensurepip",
     "pip",
-    # Threading / process / signal (additional)
+    # Threading / signal
     "signal",
     "_signal",
     "threading",
@@ -459,14 +463,9 @@ ALWAYS_DANGEROUS_MODULES: set[str] = {
     "doctest",
     "idlelib",
     "lib2to3",
-    # uuid — _get_command_stdout internally calls subprocess.Popen (VULN-6)
+    # uuid — _get_command_stdout internally calls subprocess.Popen
     "uuid",
-    # NOTE: `logging` the top-level module IS in this set because instantiating
-    # arbitrary handlers (e.g. logging.FileHandler, logging.StreamHandler) can be
-    # abused for file writes and other side-effects.  The specific dangerous
-    # sub-module functions (e.g. logging.config.listen) are caught separately in
-    # SUSPICIOUS_GLOBALS / suspicious_symbols.py.
-    # linecache is intentionally NOT in this set:
+    # NOTE: linecache and logging.config are intentionally NOT in this set.
     # - linecache.getline: file read (not code execution), flagged as WARNING
 }
 
@@ -773,6 +772,22 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "_reconstruct",
         "scalar",
     ],
+    "numpy.core.numeric": [
+        "_frombuffer",
+    ],
+    # numpy._core is the internal path used in NumPy 2.x+
+    "numpy._core": [
+        "multiarray",
+        "numeric",
+        "_internal",
+    ],
+    "numpy._core.multiarray": [
+        "_reconstruct",
+        "scalar",
+    ],
+    "numpy._core.numeric": [
+        "_frombuffer",
+    ],
     "numpy.random._pickle": [
         "__randomstate_ctor",
         "__generator_ctor",
@@ -782,6 +797,28 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
     ],
     "numpy.random._mt19937": [
         "MT19937",
+    ],
+    # SciPy sparse matrix types — common in sklearn TF-IDF / NLP pipelines
+    "scipy.sparse": [
+        "csr_matrix",
+        "csc_matrix",
+        "coo_matrix",
+        "lil_matrix",
+        "bsr_matrix",
+        "dia_matrix",
+        "dok_matrix",
+    ],
+    "scipy.sparse._csr": [
+        "csr_matrix",
+        "csr_array",
+    ],
+    "scipy.sparse._csc": [
+        "csc_matrix",
+        "csc_array",
+    ],
+    "scipy.sparse._coo": [
+        "coo_matrix",
+        "coo_array",
     ],
     "math": [
         "sqrt",
@@ -1071,6 +1108,10 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "make_pipeline",
         "make_union",
     ],
+    "sklearn.pipeline._pipeline": [
+        "Pipeline",
+        "FeatureUnion",
+    ],
     "sklearn.compose": [
         "ColumnTransformer",
         "TransformedTargetRegressor",
@@ -1088,6 +1129,12 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "RandomizedSearchCV",
     ],
     "sklearn.feature_extraction.text": [
+        "CountVectorizer",
+        "TfidfVectorizer",
+        "TfidfTransformer",
+        "HashingVectorizer",
+    ],
+    "sklearn.feature_extraction._text": [
         "CountVectorizer",
         "TfidfVectorizer",
         "TfidfTransformer",
@@ -2143,14 +2190,26 @@ def is_dangerous_reduce_pattern(
                 }:
                     break
 
-        # Check for INST opcode (carries class info as a string arg)
-        if opcode.name == "INST" and isinstance(arg, str):
-            return {
-                "pattern": f"{opcode.name}_EXECUTION",
-                "argument": arg,
-                "position": pos,
-                "opcode": opcode.name,
-            }
+        # Check for INST or OBJ opcodes which can also be used for code execution
+        # Skip if the target class is in the ML_SAFE_GLOBALS allowlist
+        if opcode.name in ["INST", "OBJ", "NEWOBJ", "NEWOBJ_EX"] and isinstance(arg, str):
+            parsed = _parse_module_function(arg)
+            is_safe = False
+            if parsed:
+                inst_mod, inst_func = parsed
+                is_safe = _is_safe_ml_global(inst_mod, inst_func)
+            if not is_safe:
+                # Also check via symbolic reference maps for NEWOBJ/OBJ
+                ref = resolved_callables.get(i)
+                if ref:
+                    is_safe = _is_safe_ml_global(ref[0], ref[1])
+            if not is_safe:
+                return {
+                    "pattern": f"{opcode.name}_EXECUTION",
+                    "argument": arg,
+                    "position": pos,
+                    "opcode": opcode.name,
+                }
 
         # Check for OBJ/NEWOBJ/NEWOBJ_EX opcodes which produce arg=None;
         # use the resolved callable map to get the associated class reference.
@@ -2224,6 +2283,10 @@ def check_opcode_sequence(
     dangerous_opcode_count = 0
     consecutive_dangerous = 0
     max_consecutive = 0
+    # Track whether the last object construction used a safe ML global.
+    # BUILD opcodes restore state on the previously-constructed object via
+    # __setstate__ and are benign when the object comes from a safe ML class.
+    last_construction_safe = False
 
     # Track pickle memo: maps memo index -> True if the stored value is a safe
     # ML global.  This lets us recognise BINGET → REDUCE patterns where the
@@ -2239,45 +2302,8 @@ def check_opcode_sequence(
             dangerous_opcode_count = 0
             consecutive_dangerous = 0
             max_consecutive = 0
-            _safe_memo.clear()
+            last_construction_safe = False
             continue
-
-        # Maintain memo safety map: when BINPUT/LONG_BINPUT stores a value
-        # right after a safe GLOBAL/STACK_GLOBAL, mark that memo slot as safe.
-        if opcode.name in ("BINPUT", "LONG_BINPUT") and isinstance(arg, int):
-            # Look back for the most recent GLOBAL/STACK_GLOBAL to see if it
-            # was safe.  Typical pattern: GLOBAL mod func → BINPUT idx.
-            for j in range(i - 1, max(0, i - 4), -1):
-                prev_opcode, prev_arg, _prev_pos = opcodes[j]
-                if prev_opcode.name == "GLOBAL" and isinstance(prev_arg, str):
-                    parts = (
-                        prev_arg.split(" ", 1)
-                        if " " in prev_arg
-                        else prev_arg.rsplit(".", 1)
-                        if "." in prev_arg
-                        else [prev_arg, ""]
-                    )
-                    if len(parts) == 2:
-                        _safe_memo[arg] = _is_safe_ml_global(parts[0], parts[1])
-                    break
-                if prev_opcode.name == "STACK_GLOBAL":
-                    strs: list[str] = []
-                    for k in range(j - 1, max(0, j - 10), -1):
-                        pk_op, pk_arg, _ = opcodes[k]
-                        if pk_op.name in (
-                            "SHORT_BINSTRING",
-                            "BINSTRING",
-                            "STRING",
-                            "SHORT_BINUNICODE",
-                            "BINUNICODE",
-                            "UNICODE",
-                        ) and isinstance(pk_arg, str):
-                            strs.insert(0, pk_arg)
-                            if len(strs) >= 2:
-                                break
-                    if len(strs) >= 2:
-                        _safe_memo[arg] = _is_safe_ml_global(strs[0], strs[1])
-                    break
 
         # Track dangerous opcodes, skipping safe ML globals and structural opcodes
         is_dangerous_opcode = False
@@ -2291,25 +2317,35 @@ def check_opcode_sequence(
             elif opcode.name == "REDUCE":
                 # Default to dangerous if no associated GLOBAL/STACK_GLOBAL found
                 is_dangerous_opcode = True
+                last_construction_safe = False
                 associated_ref = resolved_callables.get(i)
                 if associated_ref:
                     mod, func = associated_ref
                     # Only skip if in safe globals
                     if _is_safe_ml_global(mod, func):
                         is_dangerous_opcode = False
-                else:
-                    # Fallback: Handle memo pattern where BINGET retrieves a
-                    # previously stored callable.  If the preceding opcode is a
-                    # BINGET/LONG_BINGET and that memo slot was marked safe,
-                    # treat this REDUCE as safe too.
-                    if i > 0:
-                        prev_opcode, prev_arg, _prev_pos = opcodes[i - 1]
-                        if (
-                            prev_opcode.name in ("BINGET", "LONG_BINGET")
-                            and isinstance(prev_arg, int)
-                            and _safe_memo.get(prev_arg, False)
-                        ):
-                            is_dangerous_opcode = False
+                        last_construction_safe = True
+
+            # NEWOBJ/NEWOBJ_EX: check callable refs like REDUCE
+            elif opcode.name in ("NEWOBJ", "NEWOBJ_EX"):
+                is_dangerous_opcode = True
+                last_construction_safe = False
+                associated_ref = resolved_callables.get(i)
+                if associated_ref:
+                    mod, func = associated_ref
+                    if _is_safe_ml_global(mod, func):
+                        is_dangerous_opcode = False
+                        last_construction_safe = True
+
+            # BUILD: restores object state via __setstate__.  When the
+            # preceding construction used a safe ML global the BUILD is
+            # benign — it just sets attributes on a known-safe object.
+            elif opcode.name == "BUILD":
+                if not last_construction_safe:
+                    is_dangerous_opcode = True
+                # BUILD does not reset last_construction_safe because
+                # multiple BUILD opcodes can follow a single construction
+                # (e.g. nested __setstate__ calls in sklearn trees).
 
             # GLOBAL/STACK_GLOBAL: only count when referencing non-safe modules
             elif opcode.name == "GLOBAL" and isinstance(arg, str):
@@ -2331,8 +2367,9 @@ def check_opcode_sequence(
                     is_dangerous_opcode = True
 
             else:
-                # Other dangerous opcodes (INST, OBJ, NEWOBJ, NEWOBJ_EX, BUILD, EXT*)
+                # Other dangerous opcodes (INST, OBJ, EXT*)
                 is_dangerous_opcode = True
+                last_construction_safe = False
 
             if is_dangerous_opcode:
                 dangerous_opcode_count += 1
