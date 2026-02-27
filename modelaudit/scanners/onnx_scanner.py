@@ -264,20 +264,61 @@ class OnnxScanner(BaseScanner):
                     )
                     continue
                 external_path = (model_dir / location).resolve()
-                if not external_path.exists():
+                # Check for path traversal BEFORE file existence so
+                # that traversal attempts against non-existent targets
+                # are still properly flagged.
+                has_traversal_raw = ".." in location
+                escapes_model_dir = not str(external_path).startswith(str(model_dir))
+                if has_traversal_raw or escapes_model_dir:
+                    # CVE-2025-51480: Arbitrary file overwrite via
+                    # save_external_data path traversal.  The same
+                    # traversal paths that enable reads (CVE-2022-25882,
+                    # CVE-2024-27318) also enable writes when onnx.save
+                    # is called with save_external_data=True.
+                    result.add_check(
+                        name="CVE-2025-51480: External Data Write Path Traversal",
+                        passed=False,
+                        message=(
+                            f"CVE-2025-51480: External data path "
+                            f"traversal for tensor '{tensor.name}' - "
+                            f"path '{location}' enables arbitrary file "
+                            f"overwrite when saving"
+                        ),
+                        severity=IssueSeverity.CRITICAL,
+                        location=str(external_path),
+                        details={
+                            "tensor": tensor.name,
+                            "file": location,
+                            "cve_id": "CVE-2025-51480",
+                            "cvss": 8.8,
+                            "cwe": "CWE-22",
+                            "description": (
+                                "ONNX save_external_data writes tensor "
+                                "data to paths specified in external_data "
+                                "location fields. Path traversal allows "
+                                "overwriting arbitrary files."
+                            ),
+                            "remediation": (
+                                "Validate external_data paths before "
+                                "calling onnx.save(). Update to a "
+                                "patched ONNX version. Run model "
+                                "processing with minimal privileges."
+                            ),
+                        },
+                        why=(
+                            f"This ONNX model contains external data "
+                            f"path '{location}' with directory traversal. "
+                            f"When onnx.save() writes external data, this "
+                            f"path enables arbitrary file overwrite "
+                            f"(CVE-2025-51480). The same path also "
+                            f"enables arbitrary file read during loading."
+                        ),
+                    )
+                elif not external_path.exists():
                     result.add_check(
                         name="External Data File Existence",
                         passed=False,
                         message=f"External data file not found for tensor '{tensor.name}'",
-                        severity=IssueSeverity.CRITICAL,
-                        location=str(external_path),
-                        details={"tensor": tensor.name, "file": location},
-                    )
-                elif not str(external_path).startswith(str(model_dir)):
-                    result.add_check(
-                        name="External Data Path Traversal Check",
-                        passed=False,
-                        message=f"External data file outside model directory for tensor '{tensor.name}'",
                         severity=IssueSeverity.CRITICAL,
                         location=str(external_path),
                         details={"tensor": tensor.name, "file": location},
