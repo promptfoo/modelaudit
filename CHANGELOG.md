@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.27](https://github.com/promptfoo/modelaudit/compare/v0.2.26...v0.2.27) (2026-02-27)
+
+
+### Features
+
+* **security:** detect 4 PyTorch CVEs via static scanning ([#595](https://github.com/promptfoo/modelaudit/issues/595)) ([024f583](https://github.com/promptfoo/modelaudit/commit/024f583dad37cdf054a3fa6c5846bc892346fea2))
+
+
+### Bug Fixes
+
+* **ci:** resolve 4 release pipeline failures ([#572](https://github.com/promptfoo/modelaudit/issues/572)) ([7e2e7ed](https://github.com/promptfoo/modelaudit/commit/7e2e7edf30ba8ad1959a98293241c8a79568bf18))
+* **cli:** surface operational scan error status in text output ([#578](https://github.com/promptfoo/modelaudit/issues/578)) ([ddbbec6](https://github.com/promptfoo/modelaudit/commit/ddbbec600f832be348fd4b3d52afa3c8457e6b46))
+* **deps:** promote msgpack to core dependency for Flax scanner ([#583](https://github.com/promptfoo/modelaudit/issues/583)) ([ebba6b2](https://github.com/promptfoo/modelaudit/commit/ebba6b20eb9d59f4c7d2f9f8edd8874ee30d999f))
+* eliminate false positive in skops Unsafe Joblib Fallback Detection ([#584](https://github.com/promptfoo/modelaudit/issues/584)) ([c1dd2a6](https://github.com/promptfoo/modelaudit/commit/c1dd2a69acf32d9d170c0bf805b5a08477e5cfac))
+* **pickle-scanner:** three targeted false-positive reductions ([#591](https://github.com/promptfoo/modelaudit/issues/591)) ([7a5567e](https://github.com/promptfoo/modelaudit/commit/7a5567ebd7ece2e6b6969acda67e9b589b7c8659))
+* prevent false positives in TF SavedModel scanner ([#588](https://github.com/promptfoo/modelaudit/issues/588)) ([89282e2](https://github.com/promptfoo/modelaudit/commit/89282e22c4ac678c738670da9c32f3f9c865cf18))
+* report actual file size in scan summary when scanner exits early ([#587](https://github.com/promptfoo/modelaudit/issues/587)) ([7d066fb](https://github.com/promptfoo/modelaudit/commit/7d066fb1c8439c4ff1a27a9cf137bcedd47b93c4))
+* resolve false positive for .keras ZIP files (Keras 3.x) ([#582](https://github.com/promptfoo/modelaudit/issues/582)) ([f575769](https://github.com/promptfoo/modelaudit/commit/f575769e8e435971938d9d0d935692133d6fd950))
+* resolve ONNX weight extraction failure ([#589](https://github.com/promptfoo/modelaudit/issues/589)) ([3f54602](https://github.com/promptfoo/modelaudit/commit/3f546025a69295f176a167730032e762336629a9))
+* **security:** close scanner RCE bypasses and add regressions ([#518](https://github.com/promptfoo/modelaudit/issues/518)) ([e736ebb](https://github.com/promptfoo/modelaudit/commit/e736ebbeca111f30a34e07ae9100a10909711f01))
+* **security:** harden pickle scanner blocklist and multi-stream analysis ([#581](https://github.com/promptfoo/modelaudit/issues/581)) ([f0c7246](https://github.com/promptfoo/modelaudit/commit/f0c7246c5c9402884d2a5fa522cef7dd52b69581))
+* suppress false positives in PaddlePaddle scanner ([#586](https://github.com/promptfoo/modelaudit/issues/586)) ([ec7fc48](https://github.com/promptfoo/modelaudit/commit/ec7fc48b22baa44bd5e7275a391ce98970a8b255))
+* **tests:** prevent multiple_stream_attack fixture rewrites ([#580](https://github.com/promptfoo/modelaudit/issues/580)) ([0eb47c9](https://github.com/promptfoo/modelaudit/commit/0eb47c973408c055a44e61cec23682cdc26390c2))
+* **tests:** resolve 3 nightly CI failures across Linux and Windows ([#576](https://github.com/promptfoo/modelaudit/issues/576)) ([dd115d1](https://github.com/promptfoo/modelaudit/commit/dd115d16e716041044f399c1d07b0d6bf64731eb))
+* **tests:** resolve nightly CI failures on Linux and Windows ([#597](https://github.com/promptfoo/modelaudit/issues/597)) ([7f88c52](https://github.com/promptfoo/modelaudit/commit/7f88c524a5a2f794a4b269910f03326cea82dfce))
+* **tflite:** recognize .tflite format without tflite package installed ([#585](https://github.com/promptfoo/modelaudit/issues/585)) ([8276184](https://github.com/promptfoo/modelaudit/commit/8276184b018f864acb8d9a1a2adc89108b7e07fd))
+
+
+### Documentation
+
+* rewrite SECURITY.md with comprehensive vulnerability policy ([#594](https://github.com/promptfoo/modelaudit/issues/594)) ([968a2c2](https://github.com/promptfoo/modelaudit/commit/968a2c2362a0e25862bece1ad5bb3fad4ad715fa))
+* update scanner architecture example ([#579](https://github.com/promptfoo/modelaudit/issues/579)) ([20de35d](https://github.com/promptfoo/modelaudit/commit/20de35db738c828f5a29b8904834ecf5ea50e5ae))
+
 ## [Unreleased]
 
 ### Added
