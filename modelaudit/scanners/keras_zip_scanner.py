@@ -15,7 +15,7 @@ from modelaudit.utils.helpers.code_validation import (
     validate_python_syntax,
 )
 
-from ..config.explanations import get_pattern_explanation
+from ..config.explanations import get_cve_2025_9906_explanation, get_pattern_explanation
 from .base import BaseScanner, IssueSeverity, ScanResult
 from .keras_utils import check_subclassed_model
 
@@ -115,6 +115,9 @@ class KerasZipScanner(BaseScanner):
                         )
                         result.finish(success=False)
                         return result
+
+                # CVE-2025-9906: Check for enable_unsafe_deserialization in raw config
+                self._check_unsafe_deserialization_bypass(config_data, result)
 
                 # Scan model configuration
                 self._scan_model_config(model_config, result)
@@ -253,6 +256,33 @@ class KerasZipScanner(BaseScanner):
 
         # Add layer counts to metadata
         result.metadata["layer_counts"] = layer_counts
+
+    def _check_unsafe_deserialization_bypass(self, config_data: bytes, result: ScanResult) -> None:
+        """Check for CVE-2025-9906: enable_unsafe_deserialization bypass in config.json.
+
+        CVE-2025-9906: config.json in .keras archives can reference
+        keras.config.enable_unsafe_deserialization to disable safe_mode
+        from within the deserialization process itself, then load malicious layers.
+        """
+        config_str = config_data.decode("utf-8", errors="ignore")
+        if "enable_unsafe_deserialization" in config_str:
+            result.add_check(
+                name="CVE-2025-9906: Unsafe Deserialization Bypass",
+                passed=False,
+                message=(
+                    "CVE-2025-9906: config.json contains 'enable_unsafe_deserialization' "
+                    "reference - safe_mode bypass attempt"
+                ),
+                severity=IssueSeverity.CRITICAL,
+                location=f"{self.current_file_path}/config.json",
+                details={
+                    "cve_id": "CVE-2025-9906",
+                    "cvss": 8.8,
+                    "cwe": "CWE-693",
+                    "remediation": "Upgrade Keras to >= 3.11.0 and remove untrusted model files",
+                },
+                why=get_cve_2025_9906_explanation("config_bypass"),
+            )
 
     def _check_lambda_layer(self, layer: dict[str, Any], result: ScanResult, layer_name: str) -> None:
         """Check Lambda layer for executable Python code"""
