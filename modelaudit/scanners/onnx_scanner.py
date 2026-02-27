@@ -20,15 +20,6 @@ def _is_contained_in(child: Path, parent: Path) -> bool:
         return False
 
 
-def _is_contained_in(child: Path, parent: Path) -> bool:
-    """Check if child path is contained within parent directory."""
-    try:
-        child.relative_to(parent)
-        return True
-    except ValueError:
-        return False
-
-
 def _get_onnx_mapping() -> Any:
     """Get ONNX mapping module from different locations depending on version."""
     try:
@@ -295,9 +286,8 @@ class OnnxScanner(BaseScanner):
                 external_path = (model_dir / location).resolve()
                 # Check for path traversal BEFORE file existence so
                 # traversal attempts are flagged even for non-existent targets.
-                has_traversal_raw = ".." in location.replace("\\", "/").split("/")
                 escapes_model_dir = not _is_contained_in(external_path, model_dir)
-                if has_traversal_raw or escapes_model_dir:
+                if escapes_model_dir:
                     result.add_check(
                         name="CVE-2022-25882: External Data Path Traversal",
                         passed=False,
