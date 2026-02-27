@@ -229,8 +229,9 @@ class TestPerformanceBenchmarks:
         scan_duration = time.perf_counter() - start_time
 
         # Should complete within reasonable time
-        # CI environments may have variable performance; Windows runners are slower
-        threshold = 5.0 if sys.platform == "win32" else 2.0
+        # CI environments may have variable performance; use generous thresholds
+        # to avoid flaky failures from runner contention (Linux ~2s, Windows ~4s typical)
+        threshold = 8.0 if sys.platform == "win32" else 5.0
         assert scan_duration < threshold, f"Scan took {scan_duration:.2f}s, expected < {threshold}s"
         assert result.bytes_scanned > 0
 
