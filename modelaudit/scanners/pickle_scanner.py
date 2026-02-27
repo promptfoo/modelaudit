@@ -245,6 +245,11 @@ ALWAYS_DANGEROUS_FUNCTIONS: set[str] = {
     "torch.storage._load_from_bytes",
     # NumPy dangerous functions (Fickling)
     "numpy.testing._private.utils.runstring",
+    # pip as callable (CVE-2025-1716: picklescan bypass via pip.main)
+    "pip.main",
+    "pip._internal.main",
+    "pip._internal.cli.main.main",
+    "pip._vendor.distlib.scripts.ScriptMaker",
     # Shell utilities
     "shutil.rmtree",
     "shutil.move",
@@ -308,6 +313,14 @@ ALWAYS_DANGEROUS_MODULES: set[str] = {
     # Thread/process spawning
     "_thread",
     "multiprocessing",
+    # Package manager as callable (CVE-2025-1716: picklescan bypass)
+    "pip",
+    "pip._internal",
+    "pip._internal.cli",
+    "pip._internal.cli.main",
+    "pip._vendor",
+    "pip._vendor.distlib",
+    "pip._vendor.distlib.scripts",
     # Module loading from untrusted sources
     "zipimport",
     "importlib",

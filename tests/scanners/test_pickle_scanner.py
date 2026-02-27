@@ -1,6 +1,8 @@
+import os
 import pickle
 import struct
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -610,6 +612,64 @@ class TestPickleScannerAdvanced(unittest.TestCase):
 
             finally:
                 os.unlink(f.name)
+
+
+class TestCVE20251716PipMainBlocklist(unittest.TestCase):
+    """Test CVE-2025-1716: pickle bypass via pip.main() as callable."""
+
+    def test_pip_main_detected_as_critical(self):
+        """Pickle with GLOBAL pip.main + REDUCE should be flagged CRITICAL."""
+        # Protocol 2 pickle: GLOBAL pip\nmain\n, EMPTY_TUPLE, REDUCE, STOP
+        payload = b"\x80\x02cpip\nmain\n)R."
+        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
+            f.write(payload)
+            f.flush()
+            try:
+                scanner = PickleScanner()
+                result = scanner.scan(f.name)
+
+                # Should have CRITICAL issues referencing pip.main
+                critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
+                assert len(critical_issues) > 0, (
+                    f"pip.main should be flagged as CRITICAL. Issues: {[i.message for i in result.issues]}"
+                )
+                assert any("pip" in i.message for i in critical_issues), (
+                    f"Should reference pip in message. Issues: {[i.message for i in critical_issues]}"
+                )
+            finally:
+                os.unlink(f.name)
+
+    def test_pip_internal_main_detected(self):
+        """Pickle with GLOBAL pip._internal.main should be flagged."""
+        payload = b"\x80\x02cpip._internal\nmain\n)R."
+        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
+            f.write(payload)
+            f.flush()
+            try:
+                scanner = PickleScanner()
+                result = scanner.scan(f.name)
+
+                critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
+                assert len(critical_issues) > 0, (
+                    f"pip._internal.main should be flagged. Issues: {[i.message for i in result.issues]}"
+                )
+            finally:
+                os.unlink(f.name)
+
+    def test_pip_main_in_always_dangerous(self):
+        """Verify pip.main is in ALWAYS_DANGEROUS_FUNCTIONS set."""
+        from modelaudit.scanners.pickle_scanner import ALWAYS_DANGEROUS_FUNCTIONS
+
+        assert "pip.main" in ALWAYS_DANGEROUS_FUNCTIONS
+        assert "pip._internal.main" in ALWAYS_DANGEROUS_FUNCTIONS
+        assert "pip._internal.cli.main.main" in ALWAYS_DANGEROUS_FUNCTIONS
+
+    def test_pip_module_in_always_dangerous_modules(self):
+        """Verify pip module prefixes are in ALWAYS_DANGEROUS_MODULES set."""
+        from modelaudit.scanners.pickle_scanner import ALWAYS_DANGEROUS_MODULES
+
+        assert "pip" in ALWAYS_DANGEROUS_MODULES
+        assert "pip._internal" in ALWAYS_DANGEROUS_MODULES
 
 
 if __name__ == "__main__":
