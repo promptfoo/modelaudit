@@ -260,6 +260,8 @@ def detect_file_format(path: str) -> str:
         return "flax_msgpack"
     if ext == ".onnx":
         return "onnx"
+    if ext == ".nemo":
+        return "nemo"
     ggml_exts = {".ggml", ".ggmf", ".ggjt", ".ggla", ".ggsa"}
     if ext in (".gguf", *ggml_exts):
         # Check magic bytes first for accuracy
@@ -344,6 +346,7 @@ EXTENSION_FORMAT_MAP = {
     ".engine": "tensorrt",
     ".plan": "tensorrt",
     ".msgpack": "flax_msgpack",
+    ".nemo": "nemo",
 }
 
 
@@ -397,6 +400,8 @@ def detect_format_from_extension_pattern_matching(extension: FileExtension) -> F
             return "numpy"
         case ".msgpack":
             return "flax_msgpack"
+        case ".nemo":
+            return "nemo"
         case ".7z":
             return "sevenzip"
         case _:
