@@ -153,16 +153,19 @@ class TestRealJoblibFiles:
         if result.bytes_scanned == 0:
             # Should have reported format/parse issues
             assert len(result.issues) > 0
-            # After scanner hardening (resync, memo clearing), compressed joblib
-            # files may produce various parse-related issues: opcode errors,
-            # MemoryError, or other "unable to parse" messages.
+            # Compressed joblib files are not valid pickle and trigger various parse
+            # errors depending on the platform (e.g. "opcode", "MemoryError",
+            # "Unable to parse", "Invalid pickle format", etc.).
             format_issues = [
                 i
                 for i in result.issues
-                if any(kw in str(i.message).lower() for kw in ("opcode", "format", "parse", "memory", "unable"))
+                if any(
+                    kw in str(i.message).lower()
+                    for kw in ("opcode", "unable to parse", "invalid", "format", "pickle", "parse")
+                )
             ]
             assert len(format_issues) > 0, (
-                "Should report format/parse issues for compressed files. "
+                f"Should report format/parse issues for compressed files. "
                 f"Got: {[str(i.message) for i in result.issues]}"
             )
 
