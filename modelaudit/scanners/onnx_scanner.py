@@ -278,7 +278,7 @@ class OnnxScanner(BaseScanner):
                 # sanitization.  Check the raw location for ".." BEFORE
                 # the existence check so traversal attempts against
                 # non-existent targets are still flagged.
-                has_traversal_raw = ".." in location
+                has_traversal_raw = ".." in location.replace("\\", "/").split("/")
                 escapes_model_dir = not _is_contained_in(external_path, model_dir)
                 if has_traversal_raw or escapes_model_dir:
                     # Determine specific CVE attribution
