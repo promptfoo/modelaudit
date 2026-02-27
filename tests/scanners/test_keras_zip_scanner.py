@@ -418,6 +418,109 @@ __import__('pickle').loads(data)
         assert subclass_checks[0].status != CheckStatus.PASSED
         assert subclass_checks[0].severity == IssueSeverity.INFO
 
+
+class TestCVE20259906UnsafeDeserialization:
+    """Test CVE-2025-9906: enable_unsafe_deserialization config bypass detection."""
+
+    def _make_keras_zip(self, config_str: str, tmp_path) -> str:
+        """Helper to create a .keras ZIP with raw config string."""
+        keras_path = os.path.join(str(tmp_path), "model.keras")
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            zf.writestr("config.json", config_str)
+            zf.writestr("metadata.json", json.dumps({"keras_version": "3.0.0"}))
+        return keras_path
+
+    def test_enable_unsafe_deserialization_detected(self, tmp_path):
+        """Config referencing enable_unsafe_deserialization should be CRITICAL."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "name": "dense_1",
+                        "module": "keras.config",
+                        "config": {
+                            "fn": "enable_unsafe_deserialization",
+                        },
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
+
+        cve_issues = [i for i in result.issues if "CVE-2025-9906" in i.message]
+        assert len(cve_issues) >= 1, "Should detect enable_unsafe_deserialization reference"
+        assert cve_issues[0].severity == IssueSeverity.CRITICAL
+
+    def test_enable_unsafe_deserialization_in_nested_value(self, tmp_path):
+        """enable_unsafe_deserialization anywhere in config should be detected."""
+        scanner = KerasZipScanner()
+        # Embed the string in a deeply nested config value
+        config_str = json.dumps(
+            {
+                "class_name": "Model",
+                "config": {
+                    "layers": [],
+                    "metadata": {"loader": "keras.config.enable_unsafe_deserialization"},
+                },
+            }
+        )
+        result = scanner.scan(self._make_keras_zip(config_str, tmp_path))
+
+        cve_issues = [i for i in result.issues if "CVE-2025-9906" in i.message]
+        assert len(cve_issues) >= 1
+
+    def test_no_false_positive_normal_config(self, tmp_path):
+        """Normal config without enable_unsafe_deserialization should be clean."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "name": "dense_1",
+                        "config": {"units": 10},
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
+
+        cve_issues = [i for i in result.issues if "CVE-2025-9906" in i.message]
+        assert len(cve_issues) == 0, "Normal config should not trigger CVE-2025-9906"
+
+    def test_cve_attribution_details(self, tmp_path):
+        """CVE details should be present in issue details."""
+        scanner = KerasZipScanner()
+        config_str = json.dumps(
+            {
+                "class_name": "Sequential",
+                "config": {
+                    "layers": [
+                        {
+                            "class_name": "Dense",
+                            "name": "d",
+                            "config": {"fn": "enable_unsafe_deserialization"},
+                        }
+                    ]
+                },
+            }
+        )
+        result = scanner.scan(self._make_keras_zip(config_str, tmp_path))
+
+        cve_issues = [i for i in result.issues if "CVE-2025-9906" in i.message]
+        assert len(cve_issues) >= 1
+        details = cve_issues[0].details
+        assert details["cve_id"] == "CVE-2025-9906"
+        assert details["cwe"] == "CWE-693"
+
+
+class TestKerasZipScannerSubclassed:
+    """Tests for subclassed model detection in ZIP format."""
+
     def test_allows_known_safe_model_classes_in_zip(self, tmp_path):
         """Test that scanner passes for known safe model classes."""
         from modelaudit.scanners.base import CheckStatus

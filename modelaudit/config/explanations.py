@@ -668,3 +668,27 @@ def get_pytorch_security_explanation(issue_type: str) -> str:
         "This is a PyTorch-specific security concern. Review PyTorch security best practices "
         "and ensure you're following safe model loading procedures.",
     )
+
+
+def get_cve_2025_9906_explanation(issue_type: str) -> str:
+    """Get explanation for CVE-2025-9906: Keras enable_unsafe_deserialization config bypass.
+
+    CVE-2025-9906 (HIGH): config.json in .keras archives can invoke
+    keras.config.enable_unsafe_deserialization() to disable safe_mode from within
+    the loading process, then include malicious Lambda layers. Fixed in Keras 3.11.0.
+    """
+    explanations = {
+        "config_bypass": (
+            "CVE-2025-9906: The config.json inside this .keras archive references "
+            "enable_unsafe_deserialization, which can disable safe_mode from within the "
+            "deserialization process itself. This allows an attacker to bypass safe_mode=True "
+            "and then load malicious Lambda layers or other unsafe components. "
+            "Upgrade to Keras >= 3.11.0 and only load models from trusted sources."
+        ),
+    }
+
+    return explanations.get(
+        issue_type,
+        "CVE-2025-9906: config.json can disable safe_mode via enable_unsafe_deserialization. "
+        "Upgrade to Keras >= 3.11.0.",
+    )
