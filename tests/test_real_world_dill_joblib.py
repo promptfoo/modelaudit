@@ -155,7 +155,7 @@ class TestRealJoblibFiles:
         # acceptable: either the scanner parses some opcodes from the compressed
         # stream, or it reports format/opcode/complexity issues.
         if result.bytes_scanned == 0:
-            # Should have reported format issues
+            # Should have reported format/parse issues
             assert len(result.issues) > 0
             # Compressed joblib files are not valid pickle and trigger various parse
             # errors depending on the platform (e.g. "opcode", "MemoryError",
