@@ -315,7 +315,7 @@ EXTENSION_FORMAT_MAP = {
     ".dill": "pickle",
     ".h5": "hdf5",
     ".hdf5": "hdf5",
-    ".keras": "hdf5",
+    ".keras": "keras",  # Keras 3.x uses ZIP, legacy Keras uses HDF5
     ".pb": "protobuf",
     ".safetensors": "safetensors",
     ".onnx": "onnx",
@@ -355,8 +355,11 @@ def detect_format_from_extension_pattern_matching(extension: FileExtension) -> F
         case ".pt" | ".pth" | ".ckpt" | ".pkl" | ".pickle" | ".dill":
             return "pickle"
         # HDF5 formats
-        case ".h5" | ".hdf5" | ".keras":
+        case ".h5" | ".hdf5":
             return "hdf5"
+        # Keras format: Keras 3.x uses ZIP, legacy Keras uses HDF5
+        case ".keras":
+            return "keras"
         # Archive formats
         case ".zip":
             return "zip"
@@ -462,6 +465,10 @@ def validate_file_type(path: str) -> bool:
         # ExecuTorch files should be zip archives
         if ext_format == "executorch":
             return header_format == "zip"
+
+        # Keras files can be either ZIP (Keras 3.x) or HDF5 (legacy Keras)
+        if ext_format == "keras":
+            return header_format in {"zip", "hdf5"}
 
         # HDF5 files should always match
         if ext_format == "hdf5":
