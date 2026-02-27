@@ -15,7 +15,7 @@ from modelaudit.utils.helpers.code_validation import (
     validate_python_syntax,
 )
 
-from ..config.explanations import get_pattern_explanation
+from ..config.explanations import get_cve_2024_3660_explanation, get_pattern_explanation
 from .base import BaseScanner, IssueSeverity, ScanResult
 from .keras_utils import check_subclassed_model
 
@@ -215,6 +215,26 @@ class KerasZipScanner(BaseScanner):
             # Check for Lambda layers
             if layer_class == "Lambda":
                 self._check_lambda_layer(layer, result, layer_name)
+                # CVE-2024-3660: Lambda layers enable arbitrary code injection
+                result.add_check(
+                    name="CVE-2024-3660: Lambda Layer Code Injection",
+                    passed=False,
+                    message=(
+                        f"CVE-2024-3660: Lambda layer '{layer_name}' enables arbitrary "
+                        f"code injection during model loading"
+                    ),
+                    severity=IssueSeverity.CRITICAL,
+                    location=f"{self.current_file_path} (layer: {layer_name})",
+                    details={
+                        "layer_name": layer_name,
+                        "layer_class": "Lambda",
+                        "cve_id": "CVE-2024-3660",
+                        "cvss": 9.8,
+                        "cwe": "CWE-94",
+                        "remediation": "Remove Lambda layers or upgrade Keras to >= 2.13",
+                    },
+                    why=get_cve_2024_3660_explanation("lambda_code_injection"),
+                )
             elif layer_class in self.suspicious_layer_types:
                 result.add_check(
                     name="Suspicious Layer Type Detection",

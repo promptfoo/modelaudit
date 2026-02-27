@@ -668,3 +668,27 @@ def get_pytorch_security_explanation(issue_type: str) -> str:
         "This is a PyTorch-specific security concern. Review PyTorch security best practices "
         "and ensure you're following safe model loading procedures.",
     )
+
+
+def get_cve_2024_3660_explanation(issue_type: str) -> str:
+    """Get explanation for CVE-2024-3660: Keras Lambda layer code injection.
+
+    CVE-2024-3660 (CVSS 9.8 CRITICAL): Keras Lambda layers allow arbitrary Python
+    code injection during model loading. The code is executed when the model is
+    deserialized, enabling remote code execution. Fixed in Keras 2.13.
+    """
+    explanations = {
+        "lambda_code_injection": (
+            "CVE-2024-3660: Keras Lambda layers contain arbitrary Python code that executes "
+            "during model loading/deserialization. An attacker can craft a malicious model "
+            "with Lambda layers that run arbitrary code when the model is loaded. "
+            "Remove Lambda layers from untrusted models or upgrade Keras to >= 2.13 "
+            "which adds safe_mode protections (though note H5 format safe_mode has its own "
+            "issues per CVE-2025-9905)."
+        ),
+    }
+
+    return explanations.get(
+        issue_type,
+        "CVE-2024-3660: Lambda layers enable arbitrary code injection during model loading. Upgrade to Keras >= 2.13.",
+    )
