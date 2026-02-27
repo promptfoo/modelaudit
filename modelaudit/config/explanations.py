@@ -668,3 +668,36 @@ def get_pytorch_security_explanation(issue_type: str) -> str:
         "This is a PyTorch-specific security concern. Review PyTorch security best practices "
         "and ensure you're following safe model loading procedures.",
     )
+
+
+def get_cve_2019_6446_explanation(vulnerability_type: str) -> str:
+    """Get specific explanation for CVE-2019-6446 (NumPy allow_pickle RCE)."""
+    explanations = {
+        "object_dtype": (
+            "CVE-2019-6446 (CVSS 9.8): NumPy .npy/.npz files with object dtype "
+            "use pickle serialization to store arbitrary Python objects. When "
+            "numpy.load() is called with allow_pickle=True (the default before "
+            "NumPy 1.16.3), these files can execute arbitrary code during "
+            "deserialization. The attacker embeds malicious pickle payloads in "
+            "the array data that execute when loaded."
+        ),
+        "allow_pickle": (
+            "Prior to NumPy 1.16.3, numpy.load() defaulted to allow_pickle=True, "
+            "which automatically deserializes pickled objects in .npy/.npz files. "
+            "After the fix, allow_pickle defaults to False and raises an error "
+            "when loading object arrays. However, many codebases still explicitly "
+            "pass allow_pickle=True, remaining vulnerable."
+        ),
+        "numpy_version": (
+            "CVE-2019-6446 was addressed in NumPy 1.16.3 by changing the "
+            "default of allow_pickle from True to False. Update to NumPy >= "
+            "1.16.3 and ensure your code never uses allow_pickle=True with "
+            "untrusted input files. Prefer numeric dtypes over object arrays."
+        ),
+    }
+
+    return explanations.get(
+        vulnerability_type,
+        "CVE-2019-6446: NumPy allow_pickle enables RCE via object dtype arrays. "
+        "Use NumPy >= 1.16.3 and never allow_pickle=True with untrusted files.",
+    )

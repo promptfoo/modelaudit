@@ -83,9 +83,16 @@ class NumPyScanner(BaseScanner):
                     f"Dimension {i} too large: {dim} (max: {self.max_dimension_size})",
                 )
 
+    # CVE-2019-6446 constants
+    CVE_2019_6446_ID = "CVE-2019-6446"
+    CVE_2019_6446_CVSS = 9.8
+    CVE_2019_6446_CWE = "CWE-502"
+
     def _validate_dtype(self, dtype: Any) -> None:
         """Validate numpy dtype for security"""
         # Check for problematic data types
+        # CVE-2019-6446: object dtype requires pickle deserialization,
+        # enabling arbitrary code execution via numpy.load(allow_pickle=True)
         dangerous_names = ["object"]
         dangerous_kinds = ["O", "V"]  # Object and Void kinds
 
@@ -237,6 +244,51 @@ class NumPyScanner(BaseScanner):
                                 "max_dimensions": self.max_dimensions,
                             },
                         )
+
+                        # CVE-2019-6446: object dtype requires pickle
+                        # deserialization via numpy.load(allow_pickle=True),
+                        # enabling arbitrary code execution.
+                        if dtype.kind in ("O", "V"):
+                            result.add_check(
+                                name=f"{self.CVE_2019_6446_ID}: Object Dtype Pickle Deserialization",
+                                passed=False,
+                                message=(
+                                    f"{self.CVE_2019_6446_ID}: NumPy array "
+                                    f"uses '{dtype}' dtype which requires "
+                                    f"pickle deserialization (allow_pickle=True) "
+                                    f"to load, enabling arbitrary code execution"
+                                ),
+                                severity=IssueSeverity.CRITICAL,
+                                location=path,
+                                details={
+                                    "dtype": str(dtype),
+                                    "dtype_kind": dtype.kind,
+                                    "cve_id": self.CVE_2019_6446_ID,
+                                    "cvss": self.CVE_2019_6446_CVSS,
+                                    "cwe": self.CVE_2019_6446_CWE,
+                                    "description": (
+                                        "NumPy object arrays use pickle for "
+                                        "serialization. numpy.load() with "
+                                        "allow_pickle=True deserializes "
+                                        "arbitrary Python objects, enabling RCE."
+                                    ),
+                                    "remediation": (
+                                        "Use NumPy >= 1.16.3 where "
+                                        "allow_pickle defaults to False. "
+                                        "Never set allow_pickle=True with "
+                                        "untrusted .npy/.npz files. Use "
+                                        "numeric dtypes instead of object."
+                                    ),
+                                },
+                                why=(
+                                    "This NumPy file contains an array with "
+                                    f"'{dtype}' dtype that stores arbitrary "
+                                    "Python objects via pickle. Loading this "
+                                    "file with numpy.load(allow_pickle=True) "
+                                    "will execute any embedded code "
+                                    f"({self.CVE_2019_6446_ID}, CVSS 9.8)."
+                                ),
+                            )
 
                         self._validate_dtype(dtype)
                         result.add_check(
