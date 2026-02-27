@@ -138,6 +138,14 @@ class OpcodeSequenceAnalyzer:
                 severity="warning",
                 cve_references=["CVE-2026-24747"],
             ),
+            # CVE-2026-24747: STACK_GLOBAL tensor rebuild followed by SETITEM (protocol 4/5)
+            OpcodePattern(
+                name="stack_global_rebuild_setitem",
+                opcodes=["STACK_GLOBAL", "REDUCE", "SETITEM"],
+                description="STACK_GLOBAL tensor rebuild followed by SETITEM - CVE-2026-24747 (protocol 4/5)",
+                severity="warning",
+                cve_references=["CVE-2026-24747"],
+            ),
             # CVE-2026-24747: SETITEMS on non-dict after NEWOBJ
             OpcodePattern(
                 name="setitems_after_newobj",

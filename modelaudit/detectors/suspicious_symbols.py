@@ -893,6 +893,7 @@ def validate_patterns() -> list[str]:
         + SUSPICIOUS_METADATA_PATTERNS
         + CVE_2020_13092_PATTERNS
         + CVE_2024_34997_PATTERNS
+        + CVE_2026_24747_PATTERNS
         + CVE_2022_45907_PATTERNS
         + CVE_2024_5480_PATTERNS
         + CVE_2024_48063_PATTERNS

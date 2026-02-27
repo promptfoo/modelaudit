@@ -1047,7 +1047,8 @@ class PyTorchZipScanner(BaseScanner):
         try:
             # Parse version string
             vstr = version.strip()
-            is_prerelease = bool(re.search(r"(dev|rc|alpha|beta)", vstr, re.IGNORECASE))
+            # Match PEP 440 prerelease tags: a0, b1, rc1, dev0, alpha, beta
+            is_prerelease = bool(re.search(r"(\.dev|rc|alpha|beta|\d+a\d+|\d+b\d+)", vstr, re.IGNORECASE))
             version_match = re.match(r"^(\d+)\.(\d+)\.(\d+)", vstr)
             if not version_match:
                 return True  # Can't parse, assume vulnerable
@@ -1247,9 +1248,16 @@ class PyTorchZipScanner(BaseScanner):
             return  # No tensor blobs to validate
 
         # Parse pickle to look for tensor rebuild patterns and cross-reference storage
+        # Use bounded reads to avoid memory spikes on large pickle entries
+        max_pkl_read = 10 * 1024 * 1024  # 10 MB limit for metadata validation
         for pkl_name in pickle_files:
             try:
-                pkl_data = zip_file.read(pkl_name)
+                pkl_info = zip_file.getinfo(pkl_name)
+                if pkl_info.file_size > max_pkl_read:
+                    with zip_file.open(pkl_name) as f:
+                        pkl_data = f.read(max_pkl_read)
+                else:
+                    pkl_data = zip_file.read(pkl_name)
                 mismatches = self._check_tensor_storage_mismatches(pkl_data, data_blob_sizes)
                 if mismatches:
                     result.add_check(
@@ -1291,7 +1299,23 @@ class PyTorchZipScanner(BaseScanner):
             # Look for _rebuild_tensor_v2 patterns which declare storage key + element count
             opcodes = list(pickletools.genops(pkl_data))
             for i, (opcode, arg, _pos) in enumerate(opcodes):
-                if opcode.name in ("GLOBAL", "STACK_GLOBAL") and arg and "_rebuild_tensor" in str(arg):
+                # Resolve STACK_GLOBAL args (arg=None) by looking at preceding BINUNICODE ops
+                resolved_arg = arg
+                if opcode.name == "STACK_GLOBAL" and not arg:
+                    parts: list[str] = []
+                    for k in range(i - 1, max(0, i - 5) - 1, -1):
+                        kop, karg, _ = opcodes[k]
+                        if kop.name in ("SHORT_BINUNICODE", "BINUNICODE") and karg:
+                            parts.insert(0, str(karg))
+                            if len(parts) == 2:
+                                break
+                    if parts:
+                        resolved_arg = ".".join(parts)
+                if (
+                    opcode.name in ("GLOBAL", "STACK_GLOBAL")
+                    and resolved_arg
+                    and "_rebuild_tensor" in str(resolved_arg)
+                ):
                     # Look ahead for storage key reference (usually a small integer string)
                     # and element count / dtype info
                     storage_key = None

@@ -4718,24 +4718,41 @@ class PickleScanner(BaseScanner):
             # Look backward to determine context
             has_rebuild_tensor = False
             has_dangerous_global = False
-            has_empty_dict = False
             context_details: list[str] = []
 
             lookback = min(i, 30)
+            # Track whether a dict DIRECTLY produces the object that SETITEM targets.
+            # Only suppress when the dict is the most recent container-producing op.
+            most_recent_container: str | None = None
             for j in range(i - 1, max(0, i - lookback) - 1, -1):
                 prev_op, prev_arg, _prev_pos = opcodes[j]
 
-                # SETITEM on a dict is legitimate — skip entirely
-                if prev_op.name in ("EMPTY_DICT", "DICT"):
-                    has_empty_dict = True
-                    break
+                # Track the most recent container-producing op
+                if prev_op.name in ("EMPTY_DICT", "DICT") and most_recent_container is None:
+                    most_recent_container = "dict"
+                if prev_op.name in ("REDUCE", "NEWOBJ", "NEWOBJ_EX") and most_recent_container is None:
+                    most_recent_container = "object"
+
+                # Resolve STACK_GLOBAL args by walking backwards for the two
+                # preceding SHORT_BINUNICODE/BINUNICODE ops (module + name)
+                resolved_arg = prev_arg
+                if prev_op.name == "STACK_GLOBAL" and not prev_arg:
+                    parts: list[str] = []
+                    for k in range(j - 1, max(0, j - 5) - 1, -1):
+                        kop, karg, _ = opcodes[k]
+                        if kop.name in ("SHORT_BINUNICODE", "BINUNICODE") and karg:
+                            parts.insert(0, str(karg))
+                            if len(parts) == 2:
+                                break
+                    if parts:
+                        resolved_arg = ".".join(parts)
 
                 # Check for _rebuild_tensor context (suspicious with SETITEM)
-                if prev_op.name in ("GLOBAL", "STACK_GLOBAL") and prev_arg:
-                    arg_str = str(prev_arg).lower()
+                if prev_op.name in ("GLOBAL", "STACK_GLOBAL") and resolved_arg:
+                    arg_str = str(resolved_arg).lower()
                     if "_rebuild_tensor" in arg_str or "_rebuild_parameter" in arg_str:
                         has_rebuild_tensor = True
-                        context_details.append(f"_rebuild operation: {prev_arg}")
+                        context_details.append(f"_rebuild operation: {resolved_arg}")
 
                     # Check for dangerous modules near SETITEM
                     if any(
@@ -4752,10 +4769,12 @@ class PickleScanner(BaseScanner):
                         ]
                     ):
                         has_dangerous_global = True
-                        context_details.append(f"dangerous global: {prev_arg}")
+                        context_details.append(f"dangerous global: {resolved_arg}")
 
-            # Skip if SETITEM is on a dict (legitimate dict construction)
-            if has_empty_dict:
+            # Skip only when the dict is the most recent container-producing op,
+            # meaning the SETITEM is directly targeting a dict (legitimate).
+            # If a REDUCE/NEWOBJ is more recent, the dict is unrelated.
+            if most_recent_container == "dict":
                 continue
 
             if has_rebuild_tensor:

@@ -2,7 +2,10 @@ import pickle
 import sys
 import time
 import zipfile
+from pathlib import Path
 from unittest.mock import MagicMock
+
+import pytest
 
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.pytorch_zip_scanner import PyTorchZipScanner
@@ -488,7 +491,7 @@ def test_pytorch_zip_scanner_combined_security_controls(tmp_path):
 # CVE-2026-24747 Tests
 
 
-def test_pytorch_zip_cve_2026_24747_version_check(tmp_path, monkeypatch):
+def test_pytorch_zip_cve_2026_24747_version_check(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Test CVE-2026-24747 version checking flags vulnerable PyTorch."""
     model_path = create_mock_pytorch_zip(tmp_path / "model.pt")
     scanner = PyTorchZipScanner()
@@ -508,7 +511,7 @@ def test_pytorch_zip_cve_2026_24747_version_check(tmp_path, monkeypatch):
     )
 
 
-def test_pytorch_zip_cve_2026_24747_fixed_version(tmp_path, monkeypatch):
+def test_pytorch_zip_cve_2026_24747_fixed_version(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Test that PyTorch 2.10.0+ does not trigger CVE-2026-24747 warning."""
     model_path = create_mock_pytorch_zip(tmp_path / "model.pt")
     scanner = PyTorchZipScanner()
@@ -520,14 +523,17 @@ def test_pytorch_zip_cve_2026_24747_fixed_version(tmp_path, monkeypatch):
 
     result = scanner.scan(str(model_path))
 
+    # Fixed version: no failed CVE-2026-24747 checks should be emitted
     cve_2026_failed = [c for c in result.checks if "CVE-2026-24747" in c.name and c.status == CheckStatus.FAILED]
     assert len(cve_2026_failed) == 0, (
         f"PyTorch 2.10.0 should NOT trigger CVE-2026-24747. "
         f"Failed checks: {[(c.name, c.message) for c in cve_2026_failed]}"
     )
+    # Verify the vulnerable version test DID produce a check (regression guard)
+    # This is validated by test_pytorch_zip_cve_2026_24747_vulnerable_version above
 
 
-def test_pytorch_zip_tensor_metadata_validation(tmp_path):
+def test_pytorch_zip_tensor_metadata_validation(tmp_path: Path) -> None:
     """Test tensor metadata consistency validation runs without errors."""
     # Create a PyTorch ZIP model with data blobs
     zip_path = tmp_path / "model_with_data.pt"
@@ -544,12 +550,17 @@ def test_pytorch_zip_tensor_metadata_validation(tmp_path):
 
     # Should complete without crashing (best-effort validation)
     assert result is not None
+    # Should not report metadata mismatches for a normal model
+    mismatch_checks = [c for c in result.checks if "Tensor Metadata" in c.name and c.status == CheckStatus.FAILED]
+    assert len(mismatch_checks) == 0, (
+        f"Normal model should not have metadata mismatches. Failed: {[(c.name, c.message) for c in mismatch_checks]}"
+    )
 
 
 # --- CVE-2022-45907 version check tests ---
 
 
-def test_pytorch_zip_cve_2022_45907_version_check(tmp_path, monkeypatch):
+def test_pytorch_zip_cve_2022_45907_version_check(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Test CVE-2022-45907 version checking flags vulnerable PyTorch."""
     model_path = create_mock_pytorch_zip(tmp_path / "model.pt")
     scanner = PyTorchZipScanner()
@@ -568,7 +579,7 @@ def test_pytorch_zip_cve_2022_45907_version_check(tmp_path, monkeypatch):
     )
 
 
-def test_pytorch_zip_cve_2022_45907_fixed_version(tmp_path, monkeypatch):
+def test_pytorch_zip_cve_2022_45907_fixed_version(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Test that PyTorch 1.13.1+ does not trigger CVE-2022-45907 warning."""
     model_path = create_mock_pytorch_zip(tmp_path / "model.pt")
     scanner = PyTorchZipScanner()
@@ -588,7 +599,7 @@ def test_pytorch_zip_cve_2022_45907_fixed_version(tmp_path, monkeypatch):
 # --- CVE-2024-5480 version check tests ---
 
 
-def test_pytorch_zip_cve_2024_5480_version_check(tmp_path, monkeypatch):
+def test_pytorch_zip_cve_2024_5480_version_check(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Test CVE-2024-5480 version checking flags vulnerable PyTorch."""
     model_path = create_mock_pytorch_zip(tmp_path / "model.pt")
     scanner = PyTorchZipScanner()
@@ -607,7 +618,7 @@ def test_pytorch_zip_cve_2024_5480_version_check(tmp_path, monkeypatch):
     )
 
 
-def test_pytorch_zip_cve_2024_5480_fixed_version(tmp_path, monkeypatch):
+def test_pytorch_zip_cve_2024_5480_fixed_version(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Test that PyTorch 2.2.3+ does not trigger CVE-2024-5480 warning."""
     model_path = create_mock_pytorch_zip(tmp_path / "model.pt")
     scanner = PyTorchZipScanner()
@@ -627,7 +638,7 @@ def test_pytorch_zip_cve_2024_5480_fixed_version(tmp_path, monkeypatch):
 # --- CVE-2024-48063 version check tests ---
 
 
-def test_pytorch_zip_cve_2024_48063_version_check(tmp_path, monkeypatch):
+def test_pytorch_zip_cve_2024_48063_version_check(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Test CVE-2024-48063 version checking flags vulnerable PyTorch."""
     model_path = create_mock_pytorch_zip(tmp_path / "model.pt")
     scanner = PyTorchZipScanner()
@@ -646,7 +657,7 @@ def test_pytorch_zip_cve_2024_48063_version_check(tmp_path, monkeypatch):
     )
 
 
-def test_pytorch_zip_cve_2024_48063_fixed_version(tmp_path, monkeypatch):
+def test_pytorch_zip_cve_2024_48063_fixed_version(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Test that PyTorch 2.5.0+ does not trigger CVE-2024-48063 warning."""
     model_path = create_mock_pytorch_zip(tmp_path / "model.pt")
     scanner = PyTorchZipScanner()

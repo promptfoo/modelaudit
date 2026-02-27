@@ -16,6 +16,7 @@ Test categories:
 """
 
 import pickle
+from pathlib import Path
 
 import pytest
 
@@ -559,7 +560,7 @@ class TestCVE202624747Detection:
 class TestCVE202245907Detection:
     """Test detection of CVE-2022-45907 (PyTorch parse_type_line eval injection)."""
 
-    def test_detect_cve_2022_45907_basic_pattern(self):
+    def test_detect_cve_2022_45907_basic_pattern(self) -> None:
         """Test basic detection of CVE-2022-45907 patterns."""
         content = "torch.jit.annotations parse_type_line eval malicious_code"
         binary_content = b"torch.jit.annotations parse_type_line eval"
@@ -575,7 +576,7 @@ class TestCVE202245907Detection:
         assert attr.cwe == "CWE-94"
         assert len(attr.patterns_matched) > 0
 
-    def test_no_false_positive_on_docs(self):
+    def test_no_false_positive_on_docs(self) -> None:
         """Test that documentation mentioning parse_type_line is not flagged."""
         doc_content = '"""CVE-2022-45907 vulnerability: parse_type_line eval injection"""'
 
@@ -584,7 +585,7 @@ class TestCVE202245907Detection:
         cve_attrs = [attr for attr in attributions if attr.cve_id == "CVE-2022-45907"]
         assert len(cve_attrs) == 0, "Documentation content should not trigger CVE detection"
 
-    def test_pattern_analysis_jit_annotations(self):
+    def test_pattern_analysis_jit_annotations(self) -> None:
         """Test detection of jit.annotations + eval combination."""
         content = "jit.annotations exec code_injection"
 
@@ -597,7 +598,7 @@ class TestCVE202245907Detection:
 class TestCVE20245480Detection:
     """Test detection of CVE-2024-5480 (PyTorch RPC arbitrary function execution)."""
 
-    def test_detect_rpc_eval_pattern(self):
+    def test_detect_rpc_eval_pattern(self) -> None:
         """Test detection of torch.distributed.rpc + eval."""
         content = "torch.distributed.rpc rpc_sync eval payload"
         binary_content = b"torch.distributed.rpc rpc_sync eval"
@@ -612,7 +613,7 @@ class TestCVE20245480Detection:
         assert attr.cvss == 10.0
         assert attr.cwe == "CWE-94"
 
-    def test_detect_pythonudf_exec_pattern(self):
+    def test_detect_pythonudf_exec_pattern(self) -> None:
         """Test detection of PythonUDF + exec combination."""
         content = "PythonUDF exec arbitrary_code"
 
@@ -621,7 +622,7 @@ class TestCVE20245480Detection:
         cve_attrs = [attr for attr in attributions if attr.cve_id == "CVE-2024-5480"]
         assert len(cve_attrs) > 0, "Should detect PythonUDF with exec"
 
-    def test_no_false_positive_on_rpc_docs(self):
+    def test_no_false_positive_on_rpc_docs(self) -> None:
         """Test that RPC documentation is not flagged."""
         doc_content = '"""CVE-2024-5480 vulnerability: torch.distributed.rpc eval injection"""'
 
@@ -634,7 +635,7 @@ class TestCVE20245480Detection:
 class TestCVE202448063Detection:
     """Test detection of CVE-2024-48063 (PyTorch RemoteModule deserialization RCE)."""
 
-    def test_detect_remote_module_deserialization(self):
+    def test_detect_remote_module_deserialization(self) -> None:
         """Test detection of RemoteModule + deserialization indicators."""
         content = "RemoteModule __reduce__ pickle deserialization"
         binary_content = b"RemoteModule __reduce__ pickle"
@@ -649,7 +650,7 @@ class TestCVE202448063Detection:
         assert attr.cvss == 9.8
         assert attr.cwe == "CWE-502"
 
-    def test_no_false_positive_on_remote_module_docs(self):
+    def test_no_false_positive_on_remote_module_docs(self) -> None:
         """Test that RemoteModule documentation is not flagged."""
         doc_content = '"""CVE-2024-48063: RemoteModule pickle deserialization RCE"""'
 
@@ -658,7 +659,7 @@ class TestCVE202448063Detection:
         cve_attrs = [attr for attr in attributions if attr.cve_id == "CVE-2024-48063"]
         assert len(cve_attrs) == 0, "Documentation should not trigger CVE-2024-48063"
 
-    def test_detect_remote_module_pickled_pattern(self):
+    def test_detect_remote_module_pickled_pattern(self) -> None:
         """Test detection of remote_module_pickled internal representation."""
         content = "RemoteModule remote_module_pickled unpickle"
 
@@ -671,7 +672,7 @@ class TestCVE202448063Detection:
 class TestCVE202624747PickleScanner:
     """Test SETITEM abuse detection in PickleScanner for CVE-2026-24747."""
 
-    def test_pickle_scanner_detects_setitem_after_rebuild_tensor(self, tmp_path):
+    def test_pickle_scanner_detects_setitem_after_rebuild_tensor(self, tmp_path: Path) -> None:
         """Test that SETITEM after _rebuild_tensor is detected."""
         # Craft a pickle-like byte sequence with GLOBAL _rebuild_tensor + NEWOBJ + SETITEM
         # Protocol 2, GLOBAL referencing torch._utils._rebuild_tensor_v2,
@@ -694,16 +695,22 @@ class TestCVE202624747PickleScanner:
         scanner = PickleScanner()
         result = scanner.scan(str(test_file))
 
-        # Should detect suspicious SETITEM usage
+        # Should detect suspicious SETITEM usage or _rebuild_tensor reference
         setitem_issues = [
             issue for issue in result.issues if "SETITEM" in issue.message or "CVE-2026-24747" in str(issue.details)
         ]
+        rebuild_issues = [
+            issue
+            for issue in result.issues
+            if "_rebuild_tensor" in issue.message or "torch._utils" in str(issue.details)
+        ]
 
-        # The crafted pickle may not fully parse, but should still be scanned
-        # At minimum, the binary pattern detection should catch _rebuild_tensor
-        assert result is not None
+        # Must detect either SETITEM abuse or _rebuild_tensor as dangerous
+        assert len(setitem_issues) > 0 or len(rebuild_issues) > 0, (
+            f"Should detect _rebuild_tensor + SETITEM abuse. Issues: {[i.message for i in result.issues]}"
+        )
 
-    def test_pickle_scanner_no_setitem_false_positive(self, tmp_path):
+    def test_pickle_scanner_no_setitem_false_positive(self, tmp_path: Path) -> None:
         """Test that normal dict SETITEM is not flagged by CVE-2026-24747 detection."""
         # Standard pickle with dict + SETITEM (the normal case)
         normal_data = pickle.dumps({"a": 1, "b": 2, "c": 3, "d": 4, "e": 5})
