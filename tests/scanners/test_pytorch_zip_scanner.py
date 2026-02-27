@@ -1,3 +1,4 @@
+import json
 import pickle
 import time
 import zipfile
@@ -481,6 +482,37 @@ def test_pytorch_zip_scanner_combined_security_controls(tmp_path):
     symlink_issues = [i for i in result.issues if "symlink" in i.message.lower()]
     assert len(symlink_issues) > 0
     assert symlink_issues[0].severity == IssueSeverity.WARNING
+
+
+def _create_pytorch_zip_with_framework_version(path, pytorch_version: str):
+    with zipfile.ZipFile(path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1.0, 2.0, 3.0]}))
+        zipf.writestr("config.json", json.dumps({"pytorch_version": pytorch_version}))
+    return path
+
+
+def test_pytorch_zip_cve_2024_5480_uses_artifact_metadata_version(tmp_path):
+    model_path = _create_pytorch_zip_with_framework_version(tmp_path / "model.pt", "2.2.2")
+    scanner = PyTorchZipScanner()
+    result = scanner.scan(str(model_path))
+
+    cve_checks = [c for c in result.checks if "CVE-2024-5480" in c.name and c.status == CheckStatus.FAILED]
+    assert len(cve_checks) > 0, f"Expected vulnerable metadata version to trigger CVE check: {result.checks}"
+    assert cve_checks[0].details.get("detected_pytorch_version") == "2.2.2"
+    assert cve_checks[0].details.get("pytorch_version_source") == "metadata:config.json"
+
+
+def test_pytorch_zip_cve_2024_5480_fixed_artifact_version_not_flagged(tmp_path):
+    model_path = _create_pytorch_zip_with_framework_version(tmp_path / "model.pt", "2.2.3")
+    scanner = PyTorchZipScanner()
+    result = scanner.scan(str(model_path))
+
+    cve_failed = [c for c in result.checks if "CVE-2024-5480" in c.name and c.status == CheckStatus.FAILED]
+    assert len(cve_failed) == 0, (
+        f"Fixed artifact version should not trigger CVE-2024-5480: "
+        f"{[(c.name, c.message) for c in cve_failed]}"
+    )
 
 
 class TestPyTorchVersionChecks:

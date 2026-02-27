@@ -412,8 +412,8 @@ class TestCVE202245907Detection:
 
     def test_detect_cve_2022_45907_basic_pattern(self):
         """Test basic detection of CVE-2022-45907 patterns."""
-        content = "parse_type_line eval torch.jit.annotations"
-        binary_content = b"parse_type_line eval torch.jit.annotations"
+        content = "torch.jit.annotations.parse_type_line(user_type)\neval(user_type)"
+        binary_content = b"parse_type_line eval( torch.jit.annotations"
 
         attributions = analyze_cve_patterns(content, binary_content)
 
@@ -432,20 +432,27 @@ class TestCVE202245907Detection:
 
     def test_embedded_comment_token_does_not_bypass(self):
         """A comment token embedded in exploit content should not bypass detection."""
-        content = "parse_type_line eval torch.jit.annotations\n# harmless comment\nos.system"
+        content = "parse_type_line torch.jit.annotations\n# harmless comment\neval(user)\nos.system('id')"
         attributions = analyze_cve_patterns(content, b"")
         cve_attrs = [a for a in attributions if a.cve_id == "CVE-2022-45907"]
         assert len(cve_attrs) > 0, "Embedded '#' should not bypass detection"
 
     def test_pattern_analysis(self):
         """Test CVE-2022-45907 pattern analysis with binary evidence."""
-        content = "torch.jit.annotations parse_type_line eval os.system"
-        binary_content = b"parse_type_line eval torch.jit"
+        content = "torch.jit.annotations parse_type_line(user)\neval(user)\nos.system('id')"
+        binary_content = b"parse_type_line eval( torch.jit"
 
         attributions = analyze_cve_patterns(content, binary_content)
         cve_attrs = [a for a in attributions if a.cve_id == "CVE-2022-45907"]
         assert len(cve_attrs) > 0
         assert len(cve_attrs[0].patterns_matched) >= 2  # Text + binary matches
+
+    def test_no_false_positive_without_call_context(self):
+        """Keyword mentions alone should not trigger CVE-2022-45907."""
+        content = "parse_type_line eval torch.jit.annotations"
+        attributions = analyze_cve_patterns(content, b"")
+        cve_attrs = [a for a in attributions if a.cve_id == "CVE-2022-45907"]
+        assert len(cve_attrs) == 0, "Should require callable dangerous operations (e.g., eval(...))"
 
 
 class TestCVE20245480Detection:
@@ -453,8 +460,8 @@ class TestCVE20245480Detection:
 
     def test_detect_rpc_eval_pattern(self):
         """RPC with eval should trigger CVE-2024-5480."""
-        content = "torch.distributed.rpc rpc_sync eval"
-        binary_content = b"torch.distributed.rpc rpc_sync eval"
+        content = "torch.distributed.rpc.rpc_sync('node', fn)\neval(payload)"
+        binary_content = b"torch.distributed.rpc rpc_sync( eval("
 
         attributions = analyze_cve_patterns(content, binary_content)
 
@@ -466,7 +473,7 @@ class TestCVE20245480Detection:
 
     def test_detect_pythonudf_exec_pattern(self):
         """PythonUDF with exec should trigger CVE-2024-5480."""
-        content = "PythonUDF exec subprocess"
+        content = "PythonUDF exec(payload)\nsubprocess.run(cmd)"
         attributions = analyze_cve_patterns(content, b"")
         cve_attrs = [a for a in attributions if a.cve_id == "CVE-2024-5480"]
         assert len(cve_attrs) > 0, "Should detect PythonUDF + exec pattern"
@@ -477,6 +484,13 @@ class TestCVE20245480Detection:
         attributions = analyze_cve_patterns(content, b"")
         cve_attrs = [a for a in attributions if a.cve_id == "CVE-2024-5480"]
         assert len(cve_attrs) == 0, "Should not detect CVE in comments"
+
+    def test_no_false_positive_without_call_context(self):
+        """Loose token co-occurrence should not trigger CVE-2024-5480."""
+        content = "torch.distributed.rpc rpc_sync eval pythonudf"
+        attributions = analyze_cve_patterns(content, b"")
+        cve_attrs = [a for a in attributions if a.cve_id == "CVE-2024-5480"]
+        assert len(cve_attrs) == 0, "Should require call-context indicators"
 
 
 class TestCVE202448063Detection:
@@ -501,6 +515,13 @@ class TestCVE202448063Detection:
         attributions = analyze_cve_patterns(content, b"")
         cve_attrs = [a for a in attributions if a.cve_id == "CVE-2024-48063"]
         assert len(cve_attrs) == 0, "Should not detect CVE in docstrings"
+
+    def test_no_false_positive_without_deserialization_or_exec_calls(self):
+        """RemoteModule mentions without deserialization/exec evidence should not trigger."""
+        content = "RemoteModule torch.distributed.rpc pickle format description"
+        attributions = analyze_cve_patterns(content, b"")
+        cve_attrs = [a for a in attributions if a.cve_id == "CVE-2024-48063"]
+        assert len(cve_attrs) == 0, "Should require __reduce__/pickle.load(s)/dangerous call evidence"
 
 
 class TestCVEPatternValidation:

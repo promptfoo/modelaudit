@@ -307,10 +307,16 @@ def _check_cve_2022_45907_multiline(content: str, binary_content: bytes) -> list
 
     # Required indicators
     jit_indicators = ["parse_type_line", "torch.jit.annotations", "jit.annotations"]
-    dangerous_operations = ["eval", "exec", "os.system", "subprocess", "__import__"]
+    dangerous_call_patterns = [
+        r"\beval\s*\(",
+        r"\bexec\s*\(",
+        r"\bos\.system\s*\(",
+        r"\bsubprocess\.(?:run|call|popen|check_output|check_call)\s*\(",
+        r"\b__import__\s*\(",
+    ]
 
     has_jit = any(indicator in content_lower for indicator in jit_indicators)
-    has_dangerous = any(op in content_lower for op in dangerous_operations)
+    has_dangerous = any(re.search(pattern, content_lower) for pattern in dangerous_call_patterns)
 
     if has_jit and has_dangerous:
         matches.append("torch.jit.annotations context with dangerous operations")
@@ -337,12 +343,21 @@ def _check_cve_2024_5480_multiline(content: str, binary_content: bytes) -> list[
     if _is_primarily_documentation(content):
         return []
 
-    # Required indicators
-    rpc_indicators = ["torch.distributed.rpc", "rpc_sync", "rpc_async", "pythonudf"]
-    dangerous_operations = ["eval", "exec", "os.system", "subprocess", "__import__"]
-
-    has_rpc = any(indicator in content_lower for indicator in rpc_indicators)
-    has_dangerous = any(op in content_lower for op in dangerous_operations)
+    has_rpc = bool(
+        re.search(r"\brpc_(?:sync|async)\s*\(", content_lower)
+        or re.search(r"\btorch\.distributed\.rpc\.[a-z_]+\s*\(", content_lower)
+        or "pythonudf" in content_lower
+    )
+    has_dangerous = any(
+        re.search(pattern, content_lower)
+        for pattern in [
+            r"\beval\s*\(",
+            r"\bexec\s*\(",
+            r"\bos\.system\s*\(",
+            r"\bsubprocess\.(?:run|call|popen|check_output|check_call)\s*\(",
+            r"\b__import__\s*\(",
+        ]
+    )
 
     if has_rpc and has_dangerous:
         matches.append("torch.distributed.rpc context with dangerous operations")
@@ -368,14 +383,16 @@ def _check_cve_2024_48063_multiline(content: str, binary_content: bytes) -> list
     if _is_primarily_documentation(content):
         return []
 
-    # Required indicators
-    remote_indicators = ["remotemodule", "torch.distributed.rpc"]
-    dangerous_operations = ["__reduce__", "pickle", "os.system", "subprocess"]
+    has_remote = "remotemodule" in content_lower and "torch.distributed.rpc" in content_lower
+    has_deserialization = bool(
+        re.search(r"\bpickle\.(?:load|loads)\s*\(", content_lower) or re.search(r"\b__reduce__\b", content_lower)
+    )
+    has_dangerous = bool(
+        re.search(r"\bos\.system\s*\(", content_lower)
+        or re.search(r"\bsubprocess\.(?:run|call|popen|check_output|check_call)\s*\(", content_lower)
+    )
 
-    has_remote = any(indicator in content_lower for indicator in remote_indicators)
-    has_dangerous = any(op in content_lower for op in dangerous_operations)
-
-    if has_remote and has_dangerous:
+    if has_remote and (has_deserialization or has_dangerous):
         matches.append("RemoteModule context with deserialization/dangerous operations")
 
         for indicator in [b"RemoteModule", b"torch.distributed.rpc", b"__reduce__", b"pickle"]:
