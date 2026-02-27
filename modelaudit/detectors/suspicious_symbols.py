@@ -300,6 +300,39 @@ CVE_2026_24747_PATTERNS = [
     r"torch\._utils.*_rebuild.*SETITEM",  # torch._utils rebuild with SETITEM
 ]
 
+# CVE-2022-45907: PyTorch torch.jit.annotations.parse_type_line uses eval() unsafely
+# Allows arbitrary code execution via crafted type annotations. Fixed in PyTorch 1.13.1.
+CVE_2022_45907_PATTERNS = [
+    r"parse_type_line.*eval",  # parse_type_line leading to eval
+    r"torch\.jit\.annotations.*eval",  # torch.jit.annotations with eval
+    r"torch\.jit\.annotations.*parse_type_line",  # direct reference to vulnerable function
+    r"jit\.annotations.*exec",  # jit.annotations with exec
+    r"parse_type_line.*compile",  # parse_type_line with compile (alternate exploit)
+]
+
+# CVE-2024-5480: torch.distributed.rpc framework doesn't validate function calls
+# Attacker sends eval/exec as PythonUDF via RPC. Fixed in PyTorch 2.2.3.
+CVE_2024_5480_PATTERNS = [
+    r"torch\.distributed\.rpc.*eval",  # RPC framework with eval
+    r"torch\.distributed\.rpc.*exec",  # RPC framework with exec
+    r"PythonUDF.*eval",  # PythonUDF with eval injection
+    r"PythonUDF.*exec",  # PythonUDF with exec injection
+    r"rpc_sync.*eval",  # rpc_sync with eval
+    r"rpc_sync.*exec",  # rpc_sync with exec
+    r"rpc_async.*eval",  # rpc_async with eval
+    r"rpc_async.*exec",  # rpc_async with exec
+]
+
+# CVE-2024-48063: torch.distributed.rpc.RemoteModule deserialization RCE via pickle
+# Disputed as "intended behavior" but still dangerous. Fixed in PyTorch 2.5.0.
+CVE_2024_48063_PATTERNS = [
+    r"RemoteModule.*__reduce__",  # RemoteModule with __reduce__ exploitation
+    r"RemoteModule.*pickle",  # RemoteModule with pickle deserialization
+    r"RemoteModule.*deserializ",  # RemoteModule deserialization context
+    r"torch\.distributed\.rpc\.RemoteModule.*__reduce__",  # fully qualified + __reduce__
+    r"remote_module_pickled",  # internal pickle representation
+]
+
 # Combined CVE patterns for efficient scanning
 # Used by scanners to detect CVE-specific exploitation attempts
 CVE_COMBINED_PATTERNS = {
@@ -331,6 +364,42 @@ CVE_COMBINED_PATTERNS = {
         "remediation": (
             "Update to PyTorch 2.10.0+, use SafeTensors format, "
             "never load untrusted .pth/.pt checkpoints without integrity verification"
+        ),
+    },
+    "CVE-2022-45907": {
+        "patterns": CVE_2022_45907_PATTERNS,
+        "description": "PyTorch torch.jit.annotations.parse_type_line unsafe eval() injection",
+        "severity": "CRITICAL",
+        "cwe": "CWE-94",  # Improper Control of Generation of Code ('Code Injection')
+        "cvss": 9.8,
+        "affected_versions": "PyTorch < 1.13.1",
+        "remediation": (
+            "Update to PyTorch 1.13.1+, avoid loading untrusted TorchScript models "
+            "or annotations from untrusted sources"
+        ),
+    },
+    "CVE-2024-5480": {
+        "patterns": CVE_2024_5480_PATTERNS,
+        "description": "PyTorch torch.distributed.rpc arbitrary function execution via PythonUDF",
+        "severity": "CRITICAL",
+        "cwe": "CWE-94",  # Improper Control of Generation of Code ('Code Injection')
+        "cvss": 10.0,
+        "affected_versions": "PyTorch < 2.2.3",
+        "remediation": (
+            "Update to PyTorch 2.2.3+, restrict RPC access to trusted nodes only, "
+            "never expose torch.distributed.rpc endpoints to untrusted networks"
+        ),
+    },
+    "CVE-2024-48063": {
+        "patterns": CVE_2024_48063_PATTERNS,
+        "description": "PyTorch torch.distributed.rpc.RemoteModule deserialization RCE via pickle",
+        "severity": "CRITICAL",
+        "cwe": "CWE-502",  # Deserialization of Untrusted Data
+        "cvss": 9.8,
+        "affected_versions": "PyTorch < 2.5.0",
+        "remediation": (
+            "Update to PyTorch 2.5.0+, avoid deserializing RemoteModule objects "
+            "from untrusted sources, restrict RPC to trusted networks"
         ),
     },
 }
@@ -820,7 +889,13 @@ def validate_patterns() -> list[str]:
 
     # Validate regex patterns
     all_string_patterns = (
-        SUSPICIOUS_STRING_PATTERNS + SUSPICIOUS_METADATA_PATTERNS + CVE_2020_13092_PATTERNS + CVE_2024_34997_PATTERNS
+        SUSPICIOUS_STRING_PATTERNS
+        + SUSPICIOUS_METADATA_PATTERNS
+        + CVE_2020_13092_PATTERNS
+        + CVE_2024_34997_PATTERNS
+        + CVE_2022_45907_PATTERNS
+        + CVE_2024_5480_PATTERNS
+        + CVE_2024_48063_PATTERNS
     )
     for pattern in all_string_patterns:
         try:

@@ -101,6 +101,21 @@ def analyze_cve_patterns(content: str, binary_content: bytes = b"") -> list[CVEA
     if cve_2026_matches:
         attributions.append(_create_cve_2026_24747_attribution(cve_2026_matches))
 
+    # Check CVE-2022-45907 patterns
+    cve_2022_matches = _check_cve_2022_45907_multiline(content, binary_content)
+    if cve_2022_matches:
+        attributions.append(_create_cve_2022_45907_attribution(cve_2022_matches))
+
+    # Check CVE-2024-5480 patterns
+    cve_5480_matches = _check_cve_2024_5480_multiline(content, binary_content)
+    if cve_5480_matches:
+        attributions.append(_create_cve_2024_5480_attribution(cve_5480_matches))
+
+    # Check CVE-2024-48063 patterns
+    cve_48063_matches = _check_cve_2024_48063_multiline(content, binary_content)
+    if cve_48063_matches:
+        attributions.append(_create_cve_2024_48063_attribution(cve_48063_matches))
+
     return attributions
 
 
@@ -324,6 +339,183 @@ def _create_cve_2026_24747_attribution(matches: list[str]) -> CVEAttribution:
 
     return CVEAttribution(
         cve_id="CVE-2026-24747",
+        description=str(cve_info["description"]),
+        severity=str(cve_info["severity"]),
+        cvss=float(cve_info.get("cvss", 0.0)),  # type: ignore[arg-type]
+        cwe=str(cve_info["cwe"]),
+        affected_versions=str(cve_info["affected_versions"]),
+        remediation=str(cve_info["remediation"]),
+        confidence=confidence,
+        patterns_matched=matches,
+    )
+
+
+def _check_cve_2022_45907_multiline(content: str, binary_content: bytes) -> list[str]:
+    """
+    Check for CVE-2022-45907 using multi-line aware detection.
+
+    CVE-2022-45907: PyTorch < 1.13.1 torch.jit.annotations.parse_type_line uses eval() unsafely,
+    allowing arbitrary code execution via crafted type annotations.
+    """
+    matches = []
+    content_lower = content.lower()
+
+    # Skip documentation/comments
+    doc_indicators = ['"""', "'''", "#", "warning:", "note:", "documentation", "cve-2022", "vulnerability"]
+    if any(indicator in content_lower for indicator in doc_indicators):
+        return []
+
+    # Required indicators for CVE-2022-45907
+    jit_indicators = ["parse_type_line", "torch.jit.annotations", "jit.annotations"]
+    eval_indicators = ["eval", "exec", "compile"]
+
+    has_jit = any(indicator in content_lower for indicator in jit_indicators)
+    has_eval = any(indicator in content_lower for indicator in eval_indicators)
+
+    # Binary content evidence
+    binary_indicators = []
+    for indicator in [b"parse_type_line", b"torch.jit.annotations", b"eval"]:
+        if indicator in binary_content:
+            binary_indicators.append(indicator.decode("utf-8", errors="ignore"))
+
+    if has_jit and has_eval:
+        matches.append("torch.jit.annotations context with eval/exec operations")
+
+        if binary_indicators:
+            matches.extend(binary_indicators)
+
+        if "parse_type_line" in content_lower and "eval" in content_lower:
+            matches.append("parse_type_line with eval (high risk)")
+
+    return matches
+
+
+def _create_cve_2022_45907_attribution(matches: list[str]) -> CVEAttribution:
+    """Create CVE-2022-45907 attribution with matched patterns."""
+    cve_info = CVE_COMBINED_PATTERNS["CVE-2022-45907"]
+
+    confidence = min(1.0, 0.7 + (len(matches) * 0.1))
+
+    return CVEAttribution(
+        cve_id="CVE-2022-45907",
+        description=str(cve_info["description"]),
+        severity=str(cve_info["severity"]),
+        cvss=float(cve_info.get("cvss", 0.0)),  # type: ignore[arg-type]
+        cwe=str(cve_info["cwe"]),
+        affected_versions=str(cve_info["affected_versions"]),
+        remediation=str(cve_info["remediation"]),
+        confidence=confidence,
+        patterns_matched=matches,
+    )
+
+
+def _check_cve_2024_5480_multiline(content: str, binary_content: bytes) -> list[str]:
+    """
+    Check for CVE-2024-5480 using multi-line aware detection.
+
+    CVE-2024-5480: PyTorch < 2.2.3 torch.distributed.rpc framework doesn't validate
+    function calls; attacker sends eval/exec as PythonUDF.
+    """
+    matches = []
+    content_lower = content.lower()
+
+    # Skip documentation/comments
+    doc_indicators = ['"""', "'''", "#", "warning:", "note:", "documentation", "cve-2024-5480", "vulnerability"]
+    if any(indicator in content_lower for indicator in doc_indicators):
+        return []
+
+    # Required indicators for CVE-2024-5480
+    rpc_indicators = ["torch.distributed.rpc", "rpc_sync", "rpc_async", "pythonudf"]
+    eval_indicators = ["eval", "exec"]
+
+    has_rpc = any(indicator in content_lower for indicator in rpc_indicators)
+    has_eval = any(indicator in content_lower for indicator in eval_indicators)
+
+    # Binary content evidence
+    binary_indicators = []
+    for indicator in [b"torch.distributed.rpc", b"rpc_sync", b"PythonUDF", b"rpc_async"]:
+        if indicator in binary_content:
+            binary_indicators.append(indicator.decode("utf-8", errors="ignore"))
+
+    if has_rpc and has_eval:
+        matches.append("torch.distributed.rpc context with eval/exec operations")
+
+        if binary_indicators:
+            matches.extend(binary_indicators)
+
+        if "pythonudf" in content_lower and ("eval" in content_lower or "exec" in content_lower):
+            matches.append("PythonUDF with eval/exec (high risk)")
+
+    return matches
+
+
+def _create_cve_2024_5480_attribution(matches: list[str]) -> CVEAttribution:
+    """Create CVE-2024-5480 attribution with matched patterns."""
+    cve_info = CVE_COMBINED_PATTERNS["CVE-2024-5480"]
+
+    confidence = min(1.0, 0.7 + (len(matches) * 0.1))
+
+    return CVEAttribution(
+        cve_id="CVE-2024-5480",
+        description=str(cve_info["description"]),
+        severity=str(cve_info["severity"]),
+        cvss=float(cve_info.get("cvss", 0.0)),  # type: ignore[arg-type]
+        cwe=str(cve_info["cwe"]),
+        affected_versions=str(cve_info["affected_versions"]),
+        remediation=str(cve_info["remediation"]),
+        confidence=confidence,
+        patterns_matched=matches,
+    )
+
+
+def _check_cve_2024_48063_multiline(content: str, binary_content: bytes) -> list[str]:
+    """
+    Check for CVE-2024-48063 using multi-line aware detection.
+
+    CVE-2024-48063: PyTorch < 2.5.0 torch.distributed.rpc.RemoteModule deserialization
+    RCE via pickle. Disputed as "intended behavior."
+    """
+    matches = []
+    content_lower = content.lower()
+
+    # Skip documentation/comments
+    doc_indicators = ['"""', "'''", "#", "warning:", "note:", "documentation", "cve-2024-48063", "vulnerability"]
+    if any(indicator in content_lower for indicator in doc_indicators):
+        return []
+
+    # Required indicators for CVE-2024-48063
+    remote_indicators = ["remotemodule", "remote_module_pickled", "torch.distributed.rpc.remotemodule"]
+    deser_indicators = ["__reduce__", "pickle", "deserializ", "unpickl"]
+
+    has_remote = any(indicator in content_lower for indicator in remote_indicators)
+    has_deser = any(indicator in content_lower for indicator in deser_indicators)
+
+    # Binary content evidence
+    binary_indicators = []
+    for indicator in [b"RemoteModule", b"remote_module_pickled", b"torch.distributed.rpc"]:
+        if indicator in binary_content:
+            binary_indicators.append(indicator.decode("utf-8", errors="ignore"))
+
+    if has_remote and has_deser:
+        matches.append("RemoteModule context with deserialization operations")
+
+        if binary_indicators:
+            matches.extend(binary_indicators)
+
+        if "remotemodule" in content_lower and "__reduce__" in content_lower:
+            matches.append("RemoteModule with __reduce__ (high risk)")
+
+    return matches
+
+
+def _create_cve_2024_48063_attribution(matches: list[str]) -> CVEAttribution:
+    """Create CVE-2024-48063 attribution with matched patterns."""
+    cve_info = CVE_COMBINED_PATTERNS["CVE-2024-48063"]
+
+    confidence = min(1.0, 0.7 + (len(matches) * 0.1))
+
+    return CVEAttribution(
+        cve_id="CVE-2024-48063",
         description=str(cve_info["description"]),
         severity=str(cve_info["severity"]),
         cvss=float(cve_info.get("cvss", 0.0)),  # type: ignore[arg-type]

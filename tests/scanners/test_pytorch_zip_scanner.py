@@ -544,3 +544,120 @@ def test_pytorch_zip_tensor_metadata_validation(tmp_path):
 
     # Should complete without crashing (best-effort validation)
     assert result is not None
+
+
+# --- CVE-2022-45907 version check tests ---
+
+
+def test_pytorch_zip_cve_2022_45907_version_check(tmp_path, monkeypatch):
+    """Test CVE-2022-45907 version checking flags vulnerable PyTorch."""
+    model_path = create_mock_pytorch_zip(tmp_path / "model.pt")
+    scanner = PyTorchZipScanner()
+
+    mock_torch = MagicMock()
+    mock_torch.__version__ = "1.13.0"
+    monkeypatch.setitem(sys.modules, "torch", mock_torch)
+
+    result = scanner.scan(str(model_path))
+
+    cve_checks = [c for c in result.checks if "CVE-2022-45907" in c.name]
+    failed_checks = [c for c in cve_checks if c.status == CheckStatus.FAILED]
+    assert len(failed_checks) > 0, (
+        f"Should flag PyTorch 1.13.0 as vulnerable to CVE-2022-45907. "
+        f"Checks: {[(c.name, c.status) for c in result.checks]}"
+    )
+
+
+def test_pytorch_zip_cve_2022_45907_fixed_version(tmp_path, monkeypatch):
+    """Test that PyTorch 1.13.1+ does not trigger CVE-2022-45907 warning."""
+    model_path = create_mock_pytorch_zip(tmp_path / "model.pt")
+    scanner = PyTorchZipScanner()
+
+    mock_torch = MagicMock()
+    mock_torch.__version__ = "1.13.1"
+    monkeypatch.setitem(sys.modules, "torch", mock_torch)
+
+    result = scanner.scan(str(model_path))
+
+    cve_failed = [c for c in result.checks if "CVE-2022-45907" in c.name and c.status == CheckStatus.FAILED]
+    assert len(cve_failed) == 0, (
+        f"PyTorch 1.13.1 should NOT trigger CVE-2022-45907. Failed checks: {[(c.name, c.message) for c in cve_failed]}"
+    )
+
+
+# --- CVE-2024-5480 version check tests ---
+
+
+def test_pytorch_zip_cve_2024_5480_version_check(tmp_path, monkeypatch):
+    """Test CVE-2024-5480 version checking flags vulnerable PyTorch."""
+    model_path = create_mock_pytorch_zip(tmp_path / "model.pt")
+    scanner = PyTorchZipScanner()
+
+    mock_torch = MagicMock()
+    mock_torch.__version__ = "2.2.2"
+    monkeypatch.setitem(sys.modules, "torch", mock_torch)
+
+    result = scanner.scan(str(model_path))
+
+    cve_checks = [c for c in result.checks if "CVE-2024-5480" in c.name]
+    failed_checks = [c for c in cve_checks if c.status == CheckStatus.FAILED]
+    assert len(failed_checks) > 0, (
+        f"Should flag PyTorch 2.2.2 as vulnerable to CVE-2024-5480. "
+        f"Checks: {[(c.name, c.status) for c in result.checks]}"
+    )
+
+
+def test_pytorch_zip_cve_2024_5480_fixed_version(tmp_path, monkeypatch):
+    """Test that PyTorch 2.2.3+ does not trigger CVE-2024-5480 warning."""
+    model_path = create_mock_pytorch_zip(tmp_path / "model.pt")
+    scanner = PyTorchZipScanner()
+
+    mock_torch = MagicMock()
+    mock_torch.__version__ = "2.2.3"
+    monkeypatch.setitem(sys.modules, "torch", mock_torch)
+
+    result = scanner.scan(str(model_path))
+
+    cve_failed = [c for c in result.checks if "CVE-2024-5480" in c.name and c.status == CheckStatus.FAILED]
+    assert len(cve_failed) == 0, (
+        f"PyTorch 2.2.3 should NOT trigger CVE-2024-5480. Failed checks: {[(c.name, c.message) for c in cve_failed]}"
+    )
+
+
+# --- CVE-2024-48063 version check tests ---
+
+
+def test_pytorch_zip_cve_2024_48063_version_check(tmp_path, monkeypatch):
+    """Test CVE-2024-48063 version checking flags vulnerable PyTorch."""
+    model_path = create_mock_pytorch_zip(tmp_path / "model.pt")
+    scanner = PyTorchZipScanner()
+
+    mock_torch = MagicMock()
+    mock_torch.__version__ = "2.4.1"
+    monkeypatch.setitem(sys.modules, "torch", mock_torch)
+
+    result = scanner.scan(str(model_path))
+
+    cve_checks = [c for c in result.checks if "CVE-2024-48063" in c.name]
+    failed_checks = [c for c in cve_checks if c.status == CheckStatus.FAILED]
+    assert len(failed_checks) > 0, (
+        f"Should flag PyTorch 2.4.1 as vulnerable to CVE-2024-48063. "
+        f"Checks: {[(c.name, c.status) for c in result.checks]}"
+    )
+
+
+def test_pytorch_zip_cve_2024_48063_fixed_version(tmp_path, monkeypatch):
+    """Test that PyTorch 2.5.0+ does not trigger CVE-2024-48063 warning."""
+    model_path = create_mock_pytorch_zip(tmp_path / "model.pt")
+    scanner = PyTorchZipScanner()
+
+    mock_torch = MagicMock()
+    mock_torch.__version__ = "2.5.0"
+    monkeypatch.setitem(sys.modules, "torch", mock_torch)
+
+    result = scanner.scan(str(model_path))
+
+    cve_failed = [c for c in result.checks if "CVE-2024-48063" in c.name and c.status == CheckStatus.FAILED]
+    assert len(cve_failed) == 0, (
+        f"PyTorch 2.5.0 should NOT trigger CVE-2024-48063. Failed checks: {[(c.name, c.message) for c in cve_failed]}"
+    )

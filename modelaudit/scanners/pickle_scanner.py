@@ -245,6 +245,11 @@ ALWAYS_DANGEROUS_FUNCTIONS: set[str] = {
     "torch.storage._load_from_bytes",
     # NumPy dangerous functions (Fickling)
     "numpy.testing._private.utils.runstring",
+    # PyTorch distributed RPC functions (CVE-2024-5480, CVE-2024-48063)
+    "torch.distributed.rpc.rpc_sync",
+    "torch.distributed.rpc.rpc_async",
+    "torch.distributed.rpc.remote",
+    "torch.distributed.rpc.RemoteModule",
     # Shell utilities
     "shutil.rmtree",
     "shutil.move",
