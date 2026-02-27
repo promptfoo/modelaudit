@@ -273,16 +273,11 @@ class OnnxScanner(BaseScanner):
                     )
                     continue
                 external_path = (model_dir / location).resolve()
-                if not external_path.exists():
-                    result.add_check(
-                        name="External Data File Existence",
-                        passed=False,
-                        message=f"External data file not found for tensor '{tensor.name}'",
-                        severity=IssueSeverity.CRITICAL,
-                        location=str(external_path),
-                        details={"tensor": tensor.name, "file": location},
-                    )
-                elif not _is_contained_in(external_path, model_dir):
+                # Check for path traversal BEFORE file existence so
+                # traversal attempts are flagged even for non-existent targets.
+                has_traversal_raw = ".." in location.replace("\\", "/").split("/")
+                escapes_model_dir = not _is_contained_in(external_path, model_dir)
+                if has_traversal_raw or escapes_model_dir:
                     result.add_check(
                         name="CVE-2022-25882: External Data Path Traversal",
                         passed=False,
@@ -317,6 +312,15 @@ class OnnxScanner(BaseScanner):
                             "attacker can craft an ONNX model that reads "
                             "arbitrary files from the filesystem."
                         ),
+                    )
+                elif not external_path.exists():
+                    result.add_check(
+                        name="External Data File Existence",
+                        passed=False,
+                        message=f"External data file not found for tensor '{tensor.name}'",
+                        severity=IssueSeverity.CRITICAL,
+                        location=str(external_path),
+                        details={"tensor": tensor.name, "file": location},
                     )
                 else:
                     result.add_check(
