@@ -615,6 +615,49 @@ class TestCVE20251550ModuleReferences:
         assert details["cvss"] == 9.8
         assert details["cwe"] == "CWE-502"
 
+    def test_none_module_value_not_flagged(self, tmp_path):
+        """Layer with module=None should not trigger CVE-2025-1550."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "name": "dense_1",
+                        "module": None,
+                        "config": {"units": 10},
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(config, tmp_path))
+
+        cve_issues = [i for i in result.issues if "CVE-2025-1550" in i.message]
+        assert len(cve_issues) == 0, "None module should not trigger CVE"
+
+    def test_prefix_collision_module_is_not_allowlisted(self, tmp_path):
+        """Module like 'mathutils.payload' should NOT be treated as safe 'math'."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "name": "dense_1",
+                        "module": "mathutils.payload",
+                        "config": {"units": 10},
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(config, tmp_path))
+
+        cve_issues = [i for i in result.issues if "CVE-2025-1550" in i.message]
+        assert len(cve_issues) >= 1, "mathutils should not match safe 'math' prefix"
+        assert cve_issues[0].severity == IssueSeverity.WARNING
+
 
 class TestKerasZipScannerSubclassed:
     """Tests for subclassed model detection in ZIP format."""

@@ -20,16 +20,10 @@ from .base import BaseScanner, IssueSeverity, ScanResult
 from .keras_utils import check_subclassed_model
 
 # CVE-2025-1550: Keras safe_mode bypass via arbitrary module references in config.json
-# Allowlist of module prefixes that are safe in Keras model configs.
+# Allowlist of top-level module names that are safe in Keras model configs.
 # Any module outside this list in a layer's "module" or "fn_module" key is suspicious.
-_SAFE_KERAS_MODULE_PREFIXES = (
-    "keras.",
-    "tensorflow.",
-    "tf_keras.",
-    "tf.",
-    "numpy.",
-    "math",
-)
+# Uses exact root matching: "math" matches "math" and "math.ops" but NOT "mathutils".
+_SAFE_KERAS_MODULE_ROOTS: frozenset[str] = frozenset({"keras", "tensorflow", "tf_keras", "tf", "numpy", "math"})
 
 # Modules that are explicitly dangerous when referenced in config.json
 _DANGEROUS_CONFIG_MODULES = frozenset(
@@ -318,26 +312,22 @@ class KerasZipScanner(BaseScanner):
         # Check both the layer-level and config-level module references
         module_keys_to_check: list[tuple[str, str]] = []
         for key in ("module", "fn_module"):
-            if key in layer:
-                module_keys_to_check.append((key, str(layer[key])))
-            if key in layer_config:
-                module_keys_to_check.append((key, str(layer_config[key])))
+            layer_value = layer.get(key)
+            if isinstance(layer_value, str) and layer_value.strip():
+                module_keys_to_check.append((key, layer_value.strip()))
+            config_value = layer_config.get(key)
+            if isinstance(config_value, str) and config_value.strip():
+                module_keys_to_check.append((key, config_value.strip()))
 
         for key, module_value in module_keys_to_check:
-            if not module_value:
-                continue
-
             # Extract the top-level module name (e.g., "os" from "os.path")
             top_module = module_value.split(".")[0]
 
             # Check if it's an explicitly dangerous module
             is_dangerous = top_module in _DANGEROUS_CONFIG_MODULES
 
-            # Check if it's outside the safe allowlist
-            is_outside_allowlist = not any(
-                module_value.startswith(prefix) or module_value == prefix.rstrip(".")
-                for prefix in _SAFE_KERAS_MODULE_PREFIXES
-            )
+            # Check if it's outside the safe allowlist (exact root matching)
+            is_outside_allowlist = top_module not in _SAFE_KERAS_MODULE_ROOTS
 
             if is_dangerous:
                 result.add_check(
