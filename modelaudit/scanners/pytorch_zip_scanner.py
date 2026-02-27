@@ -1005,9 +1005,7 @@ class PyTorchZipScanner(BaseScanner):
             # If version parsing fails, assume vulnerable for safety
             return True
 
-    def _check_cve_2026_24747_vulnerability(
-        self, version_info: dict[str, Any], result: ScanResult, path: str
-    ) -> None:
+    def _check_cve_2026_24747_vulnerability(self, version_info: dict[str, Any], result: ScanResult, path: str) -> None:
         """Check for CVE-2026-24747 using PyTorch version from model metadata."""
         detected_version, version_source = self._get_detected_pytorch_version(version_info)
         if not detected_version:
@@ -1119,9 +1117,7 @@ class PyTorchZipScanner(BaseScanner):
         except Exception:
             return True
 
-    def _check_cve_2022_45907_vulnerability(
-        self, version_info: dict[str, Any], result: ScanResult, path: str
-    ) -> None:
+    def _check_cve_2022_45907_vulnerability(self, version_info: dict[str, Any], result: ScanResult, path: str) -> None:
         """Check for CVE-2022-45907 using PyTorch version from model metadata."""
         detected_version, version_source = self._get_detected_pytorch_version(version_info)
         if not detected_version:
@@ -1157,9 +1153,7 @@ class PyTorchZipScanner(BaseScanner):
                 ),
             )
 
-    def _check_cve_2024_5480_vulnerability(
-        self, version_info: dict[str, Any], result: ScanResult, path: str
-    ) -> None:
+    def _check_cve_2024_5480_vulnerability(self, version_info: dict[str, Any], result: ScanResult, path: str) -> None:
         """Check for CVE-2024-5480 using PyTorch version from model metadata."""
         detected_version, version_source = self._get_detected_pytorch_version(version_info)
         if not detected_version:
@@ -1195,9 +1189,7 @@ class PyTorchZipScanner(BaseScanner):
                 ),
             )
 
-    def _check_cve_2024_48063_vulnerability(
-        self, version_info: dict[str, Any], result: ScanResult, path: str
-    ) -> None:
+    def _check_cve_2024_48063_vulnerability(self, version_info: dict[str, Any], result: ScanResult, path: str) -> None:
         """Check for CVE-2024-48063 using PyTorch version from model metadata."""
         detected_version, version_source = self._get_detected_pytorch_version(version_info)
         if not detected_version:
