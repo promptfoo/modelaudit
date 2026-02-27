@@ -264,15 +264,20 @@ class KerasH5Scanner(BaseScanner):
 
                 # Special handling for Lambda layers - validate Python code
                 if layer_class == "Lambda":
+                    layer_name = layer_config.get("name", f"lambda_{layer_counts.get('Lambda', 1)}")
                     self._check_lambda_layer(layer_config, result)
                     # CVE-2024-3660: Lambda layers enable arbitrary code injection
                     result.add_check(
                         name="CVE-2024-3660: Lambda Layer Code Injection",
                         passed=False,
-                        message=("CVE-2024-3660: Lambda layer enables arbitrary code injection during model loading"),
+                        message=(
+                            f"CVE-2024-3660: Lambda layer '{layer_name}' enables arbitrary "
+                            f"code injection during model loading"
+                        ),
                         severity=IssueSeverity.CRITICAL,
-                        location=self.current_file_path,
+                        location=f"{self.current_file_path} (layer: {layer_name})",
                         details={
+                            "layer_name": layer_name,
                             "layer_class": "Lambda",
                             "cve_id": "CVE-2024-3660",
                             "cvss": 9.8,
