@@ -654,7 +654,6 @@ KNOWN_SAFE_MODEL_CLASSES: set[str] = {"Sequential", "Functional", "Model"}
 SUSPICIOUS_LAYER_TYPES = {
     "Lambda": "Can contain arbitrary Python code",
     "TFOpLambda": "Can call TensorFlow operations",
-    "Functional": "Complex layer that might hide malicious components",
     "PyFunc": "Can execute Python code",
     "CallbackLambda": "Can execute callbacks at runtime",
 }

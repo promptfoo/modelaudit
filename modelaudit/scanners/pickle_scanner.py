@@ -475,6 +475,18 @@ ALWAYS_DANGEROUS_MODULES: set[str] = {
     # They are caught by SUSPICIOUS_GLOBALS or general suspicious-string detection.
 }
 
+# Modules that are suspicious but should only be flagged at WARNING severity.
+# These modules appear frequently in legitimate ML pipelines and cannot directly
+# execute arbitrary code, so CRITICAL would cause too many false positives.
+WARNING_SEVERITY_MODULES: set[str] = {
+    # functools.partial is heavily used in PyTorch models; functools.reduce is
+    # the only genuinely dangerous entry and is still in SUSPICIOUS_GLOBALS.
+    "functools",
+    # glob.glob / glob.iglob are common in dataset loading pipelines and
+    # cannot directly execute code.
+    "glob",
+}
+
 # String opcodes that push text onto the pickle stack.
 # Used for STACK_GLOBAL reconstruction and suspicious string detection.
 STRING_OPCODES: frozenset[str] = frozenset(
@@ -1669,6 +1681,15 @@ def _build_symbolic_reference_maps(
         if name in {"BINPERSID"}:
             _pop()
             stack.append(unknown)
+            continue
+
+        if name == "STOP":
+            # Clear memo at stream boundaries so that a safe memo entry from
+            # stream 1 cannot be inherited by a dangerous callable in stream 2
+            # (cross-stream memo contamination).
+            memo.clear()
+            next_memo_index = 0
+            stack.clear()
             continue
 
         if name in {
@@ -3604,8 +3625,9 @@ class PickleScanner(BaseScanner):
             for mod, func in advanced_globals:
                 if _is_actually_dangerous_global(mod, func, ml_context):
                     suspicious_count += 1
+                    base_sev = IssueSeverity.WARNING if mod in WARNING_SEVERITY_MODULES else IssueSeverity.CRITICAL
                     severity = _get_context_aware_severity(
-                        IssueSeverity.CRITICAL,
+                        base_sev,
                         ml_context,
                         issue_type="dangerous_global",
                     )
@@ -3652,8 +3674,11 @@ class PickleScanner(BaseScanner):
                         mod, func = parts
                         if _is_actually_dangerous_global(mod, func, ml_context):
                             suspicious_count += 1
+                            base_sev = (
+                                IssueSeverity.WARNING if mod in WARNING_SEVERITY_MODULES else IssueSeverity.CRITICAL
+                            )
                             severity = _get_context_aware_severity(
-                                IssueSeverity.CRITICAL,
+                                base_sev,
                                 ml_context,
                                 issue_type="dangerous_global",
                             )
@@ -4030,8 +4055,11 @@ class PickleScanner(BaseScanner):
                         mod, func = resolved
                         if _is_actually_dangerous_global(mod, func, ml_context):
                             suspicious_count += 1
+                            base_sev = (
+                                IssueSeverity.WARNING if mod in WARNING_SEVERITY_MODULES else IssueSeverity.CRITICAL
+                            )
                             severity = _get_context_aware_severity(
-                                IssueSeverity.CRITICAL,
+                                base_sev,
                                 ml_context,
                                 issue_type="dangerous_global",
                             )
