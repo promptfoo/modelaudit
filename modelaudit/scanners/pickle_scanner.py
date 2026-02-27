@@ -400,6 +400,9 @@ ALWAYS_DANGEROUS_MODULES: set[str] = {
     # Thread/process spawning
     "_thread",
     "multiprocessing",
+    "signal",
+    "_signal",
+    "threading",
     # Module loading from untrusted sources
     "zipimport",
     "importlib",
@@ -443,10 +446,6 @@ ALWAYS_DANGEROUS_MODULES: set[str] = {
     "venv",
     "ensurepip",
     "pip",
-    # Threading / signal
-    "signal",
-    "_signal",
-    "threading",
     # Other dangerous
     "webbrowser",
     "asyncio",
@@ -2292,6 +2291,8 @@ def check_opcode_sequence(
     # ML global.  This lets us recognise BINGET → REDUCE patterns where the
     # callable was stored once via GLOBAL + BINPUT and then recalled many times.
     _safe_memo: dict[int, bool] = {}
+    # Track next auto-assigned memo index for MEMOIZE opcodes (protocol 4+)
+    _next_memo_idx = 0
 
     for i, (opcode, arg, pos) in enumerate(opcodes):
         # Reset counters at stream boundaries (STOP) so that multi-stream
