@@ -424,11 +424,11 @@ class TestCVE20258747GetFileGadget:
 
     def _make_keras_zip(self, config_str: str, tmp_path) -> str:
         """Helper to create a .keras ZIP with raw config string."""
-        keras_path = os.path.join(str(tmp_path), "model.keras")
+        keras_path = tmp_path / "model.keras"
         with zipfile.ZipFile(keras_path, "w") as zf:
             zf.writestr("config.json", config_str)
             zf.writestr("metadata.json", json.dumps({"keras_version": "3.5.0"}))
-        return keras_path
+        return str(keras_path)
 
     def test_get_file_with_url_detected(self, tmp_path):
         """Config referencing get_file with URL should be CRITICAL."""
