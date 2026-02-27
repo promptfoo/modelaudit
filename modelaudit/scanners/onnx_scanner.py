@@ -284,13 +284,51 @@ class OnnxScanner(BaseScanner):
                     )
                     continue
                 external_path = (model_dir / location).resolve()
-                # Check containment before existence so traversal attempts
-                # against missing paths are still classified as traversal.
-                escapes_model_dir = not _is_contained_in(external_path, model_dir)
-                if escapes_model_dir:
-                    traversal_files.setdefault(location, []).append(tensor.name)
-                elif not external_path.exists():
-                    missing_files.setdefault(location, []).append(tensor.name)
+                if not external_path.exists():
+                    result.add_check(
+                        name="External Data File Existence",
+                        passed=False,
+                        message=f"External data file not found for tensor '{tensor.name}'",
+                        severity=IssueSeverity.CRITICAL,
+                        location=str(external_path),
+                        details={"tensor": tensor.name, "file": location},
+                    )
+                elif not str(external_path).startswith(str(model_dir)):
+                    result.add_check(
+                        name="CVE-2022-25882: External Data Path Traversal",
+                        passed=False,
+                        message=(
+                            f"CVE-2022-25882: External data path traversal "
+                            f"for tensor '{tensor.name}' - path '{location}' "
+                            f"resolves outside model directory"
+                        ),
+                        severity=IssueSeverity.CRITICAL,
+                        location=str(external_path),
+                        details={
+                            "tensor": tensor.name,
+                            "file": location,
+                            "cve_id": "CVE-2022-25882",
+                            "cvss": 7.5,
+                            "cwe": "CWE-22",
+                            "description": (
+                                "ONNX external_data location fields can use "
+                                "path traversal sequences to read arbitrary "
+                                "files outside the model directory"
+                            ),
+                            "remediation": (
+                                "Validate that external_data paths do not "
+                                "contain '..' or resolve outside the model "
+                                "directory before loading"
+                            ),
+                        },
+                        why=(
+                            "This ONNX model references external data that "
+                            "resolves outside the model directory, which is "
+                            "a path traversal attack (CVE-2022-25882). An "
+                            "attacker can craft an ONNX model that reads "
+                            "arbitrary files from the filesystem."
+                        ),
+                    )
                 else:
                     if location not in safe_files:
                         safe_files.add(location)
