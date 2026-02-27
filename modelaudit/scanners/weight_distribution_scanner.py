@@ -447,7 +447,7 @@ class WeightDistributionScanner(BaseScanner):
                         if ("weight" in node.name.lower() or "kernel" in node.name.lower()) and len(array.shape) >= 2:
                             weights_info[node.name] = array
         except Exception as e:
-            logger.debug(f"Failed to extract weights from {path}: {e}")
+            logger.warning(f"Weight analysis incomplete for {path}: {e}")
 
         return weights_info
 
@@ -467,14 +467,29 @@ class WeightDistributionScanner(BaseScanner):
             # linear layers, embeddings). 1D tensors (biases, batch-norm params)
             # aren't relevant for weight distribution analysis. This approach is
             # framework-agnostic since ONNX naming conventions vary by exporter.
+            import numpy as np
+
             for initializer in model.graph.initializer:
                 if len(initializer.dims) >= 2:
-                    weights_info[initializer.name] = onnx.numpy_helper.to_array(  # type: ignore[possibly-unresolved-reference]
-                        initializer,
-                    )
+                    # Pre-check estimated byte size before materializing the
+                    # full array — avoids memory exhaustion on huge tensors.
+                    try:
+                        _onnx_mapping = getattr(onnx, "mapping", None)
+                        if _onnx_mapping is not None and hasattr(_onnx_mapping, "TENSOR_TYPE_TO_NP_TYPE"):
+                            tensor_dtype = _onnx_mapping.TENSOR_TYPE_TO_NP_TYPE[initializer.data_type]
+                            estimated_size = int(np.prod(initializer.dims)) * np.dtype(tensor_dtype).itemsize
+                            if self.max_array_size and self.max_array_size > 0 and estimated_size > self.max_array_size:
+                                continue
+                    except Exception:
+                        pass  # Fall through and let to_array handle it
+
+                    arr = onnx.numpy_helper.to_array(initializer)  # type: ignore[possibly-unresolved-reference]
+                    if self.max_array_size and self.max_array_size > 0 and arr.nbytes > self.max_array_size:
+                        continue
+                    weights_info[initializer.name] = arr
 
         except Exception as e:
-            logger.debug(f"Failed to extract weights from {path}: {e}")
+            logger.warning(f"Failed to extract ONNX weights from {path}: {e}")
 
         return weights_info
 
