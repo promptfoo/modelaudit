@@ -149,10 +149,11 @@ class TestRealJoblibFiles:
         # Compressed files may not follow standard pickle format.
         # This is expected - compression changes the file structure.
         assert isinstance(result.success, bool)
-        # The scanner may:
-        # 1. Successfully scan some bytes (multi-stream parsing may consume compressed data)
-        # 2. Report issues when the compressed data isn't valid pickle
-        # Either outcome is acceptable — what matters is no unhandled crash.
+        # The scanner may or may not successfully parse compressed data depending
+        # on whether the compressed bytes happen to contain valid-looking pickle
+        # opcodes (e.g., a 0x80 byte that triggers resync). Both outcomes are
+        # acceptable: either the scanner parses some opcodes from the compressed
+        # stream, or it reports format/opcode/complexity issues.
         if result.bytes_scanned == 0:
             # Should have reported format/parse issues
             assert len(result.issues) > 0
