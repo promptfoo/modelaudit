@@ -155,9 +155,22 @@ class TestRealJoblibFiles:
         # acceptable: either the scanner parses some opcodes from the compressed
         # stream, or it reports format/opcode/complexity issues.
         if result.bytes_scanned == 0:
-            # Should have reported some kind of format/parsing issue
-            assert len(result.issues) > 0 or len(result.checks) > 0, (
-                "Should report issues or checks when compressed file cannot be parsed"
+            # Should have reported format issues
+            assert len(result.issues) > 0
+            # Compressed joblib files are not valid pickle and trigger various parse
+            # errors depending on the platform (e.g. "opcode", "MemoryError",
+            # "Unable to parse", "Invalid pickle format", etc.).
+            format_issues = [
+                i
+                for i in result.issues
+                if any(
+                    kw in str(i.message).lower()
+                    for kw in ("opcode", "unable to parse", "invalid", "format", "pickle", "parse")
+                )
+            ]
+            assert len(format_issues) > 0, (
+                f"Should report format/parse issues for compressed files. "
+                f"Got: {[str(i.message) for i in result.issues]}"
             )
 
     @pytest.mark.skipif(not HAS_JOBLIB, reason="joblib not available")
