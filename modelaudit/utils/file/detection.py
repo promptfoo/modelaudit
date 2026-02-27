@@ -13,6 +13,11 @@ GGML_MAGIC_VARIANTS = {
     b"GGSA",
 }
 
+# Pickle protocol 0/1 GLOBAL opcode signatures used for .bin fallback detection.
+# Format: c<module>\n<name>\n
+PROTOCOL0_GLOBAL_RE = re.compile(rb"^c[^\n\r]{1,64}\n[^\n\r]{1,64}\n")
+MARKED_PROTOCOL0_GLOBAL_RE = re.compile(rb"^[\(\]\}]c[^\n\r]{1,64}\n[^\n\r]{1,64}\n")
+
 
 def is_zipfile(path: str) -> bool:
     """Check if file is a ZIP by reading the signature."""
@@ -215,11 +220,23 @@ def detect_file_format(path: str) -> str:
 
     # For .bin files, do more sophisticated detection
     if ext == ".bin":
+        magic64 = read_magic_bytes(path, 64)
         # IMPORTANT: Check ZIP format first (PyTorch models saved with torch.save())
         if magic4.startswith(b"PK"):
             return "zip"
-        # Check if it's a pickle file
+        # Check if it's a pickle file (protocol 2-5)
         if any(magic4.startswith(m) for m in pickle_magics):
+            return "pickle"
+        # CVE-2025-10155: Detect protocol 0/1 pickles that lack magic bytes.
+        # Protocol 0 GLOBAL opcode: c<module>\n<name>\n
+        # Use a strict shape match to avoid classifying arbitrary binaries as pickle.
+        if PROTOCOL0_GLOBAL_RE.match(magic64):
+            return "pickle"
+        # Also detect pickle protocol 0/1 streams starting with MARK '(' (tuple/reduce
+        # preamble), EMPTY_LIST ']', or EMPTY_DICT '}' opcodes.  These are valid
+        # protocol 0/1 start bytes but are only treated as pickle when immediately
+        # followed by a properly formed GLOBAL opcode sequence.
+        if MARKED_PROTOCOL0_GLOBAL_RE.match(magic64):
             return "pickle"
         # Check for safetensors format (starts with JSON header)
         if magic4[0:1] == b"{" or (size > 8 and b'"__metadata__"' in magic16):
