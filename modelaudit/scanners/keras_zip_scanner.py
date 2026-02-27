@@ -116,9 +116,6 @@ class KerasZipScanner(BaseScanner):
                         result.finish(success=False)
                         return result
 
-                # Scan model configuration
-                self._scan_model_config(model_config, result)
-
                 # Check for metadata.json
                 if "metadata.json" in zf.namelist():
                     with zf.open("metadata.json") as metadata_file:
@@ -126,8 +123,14 @@ class KerasZipScanner(BaseScanner):
                         try:
                             metadata = json.loads(metadata_data)
                             result.metadata["keras_metadata"] = metadata
+                            keras_version = metadata.get("keras_version")
+                            if isinstance(keras_version, str) and keras_version.strip():
+                                result.metadata["keras_version"] = keras_version.strip()
                         except json.JSONDecodeError:
                             pass  # Metadata parsing is optional
+
+                # Scan model configuration
+                self._scan_model_config(model_config, result)
 
                 # Check for suspicious files in the ZIP
                 for filename in zf.namelist():
@@ -264,26 +267,80 @@ class KerasZipScanner(BaseScanner):
         TorchModuleWrapper in Keras 3.11.0-3.11.2 calls torch.load(weights_only=False)
         in from_config(), enabling arbitrary code execution via pickle deserialization.
         """
+        keras_version = result.metadata.get("keras_version")
+        is_vulnerable = isinstance(keras_version, str) and self._is_vulnerable_keras_3_11_x(keras_version)
+
+        if is_vulnerable:
+            result.add_check(
+                name="CVE-2025-49655: TorchModuleWrapper Deserialization RCE",
+                passed=False,
+                message=(
+                    f"CVE-2025-49655: Layer '{layer_name}' is a TorchModuleWrapper in "
+                    f"Keras {keras_version} (3.11.0-3.11.2 vulnerable range) — "
+                    "uses torch.load(weights_only=False) enabling arbitrary code execution"
+                ),
+                severity=IssueSeverity.CRITICAL,
+                location=f"{self.current_file_path} (layer: {layer_name})",
+                details={
+                    "layer_name": layer_name,
+                    "layer_class": "TorchModuleWrapper",
+                    "keras_version": keras_version,
+                    "cve_id": "CVE-2025-49655",
+                    "cvss": 9.8,
+                    "cwe": "CWE-502",
+                    "affected_versions": "Keras 3.11.0-3.11.2",
+                    "remediation": "Upgrade Keras to >= 3.11.3",
+                },
+                why=get_cve_2025_49655_explanation("torch_module_wrapper"),
+            )
+            return
+
+        if isinstance(keras_version, str):
+            result.add_check(
+                name="TorchModuleWrapper Version Risk Check",
+                passed=True,
+                message=(
+                    f"TorchModuleWrapper detected in Keras {keras_version}; "
+                    "not in known CVE-2025-49655 vulnerable range (3.11.0-3.11.2)"
+                ),
+                location=f"{self.current_file_path} (layer: {layer_name})",
+                details={"layer_name": layer_name, "layer_class": "TorchModuleWrapper", "keras_version": keras_version},
+            )
+            return
+
         result.add_check(
-            name="CVE-2025-49655: TorchModuleWrapper Deserialization RCE",
+            name="TorchModuleWrapper Risk (Version Unknown)",
             passed=False,
             message=(
-                f"CVE-2025-49655: Layer '{layer_name}' is a TorchModuleWrapper — "
-                f"uses torch.load(weights_only=False) enabling arbitrary code execution"
+                f"Layer '{layer_name}' is a TorchModuleWrapper but keras_version is unavailable; "
+                "cannot confidently attribute CVE-2025-49655 without version context"
             ),
-            severity=IssueSeverity.CRITICAL,
+            severity=IssueSeverity.WARNING,
             location=f"{self.current_file_path} (layer: {layer_name})",
             details={
                 "layer_name": layer_name,
                 "layer_class": "TorchModuleWrapper",
                 "cve_id": "CVE-2025-49655",
-                "cvss": 9.8,
-                "cwe": "CWE-502",
                 "affected_versions": "Keras 3.11.0-3.11.2",
-                "remediation": "Upgrade Keras to >= 3.11.3",
+                "remediation": "Ensure model metadata includes keras_version and upgrade to >= 3.11.3",
             },
-            why=get_cve_2025_49655_explanation("torch_module_wrapper"),
         )
+
+    @staticmethod
+    def _is_vulnerable_keras_3_11_x(version: str) -> bool:
+        """Return True for Keras versions in the CVE-2025-49655 vulnerable range."""
+        parts = version.split(".", 2)
+        if len(parts) < 3:
+            return False
+        try:
+            major, minor, patch_part = parts
+            patch_digits = "".join(ch for ch in patch_part if ch.isdigit())
+            if not patch_digits:
+                return False
+            patch = int(patch_digits)
+            return int(major) == 3 and int(minor) == 11 and 0 <= patch <= 2
+        except ValueError:
+            return False
 
     def _check_lambda_layer(self, layer: dict[str, Any], result: ScanResult, layer_name: str) -> None:
         """Check Lambda layer for executable Python code"""
