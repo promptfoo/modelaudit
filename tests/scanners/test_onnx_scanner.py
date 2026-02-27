@@ -111,3 +111,108 @@ def test_onnx_scanner_python_op(tmp_path):
     # Python operators are flagged at CRITICAL or INFO level depending on scanner version
     assert any(i.severity in (IssueSeverity.CRITICAL, IssueSeverity.INFO) for i in result.issues)
     assert any(i.details.get("op_type") == "PythonOp" for i in result.issues)
+
+
+class TestCVE202225882PathTraversal:
+    """Tests for CVE-2022-25882: ONNX external_data path traversal."""
+
+    @staticmethod
+    def _create_escaped_target(tmp_path: Path) -> tuple[Path, str]:
+        """Create a target file at the correct path-traversal resolution location.
+
+        The model is saved at ``tmp_path / "model.onnx"``, so the model directory
+        is ``tmp_path``.  A relative path of ``../outside/secret.txt`` therefore
+        resolves to ``tmp_path.parent / "outside" / "secret.txt"`` — one level
+        *above* ``tmp_path``, not inside it.
+
+        Returns:
+            (target_file, traversal_string) where ``traversal_string`` is the
+            relative path to embed in the ONNX model's external_data location.
+        """
+        outside_dir = tmp_path.parent / "outside"
+        outside_dir.mkdir(exist_ok=True)
+        target = outside_dir / "secret.txt"
+        target.write_bytes(b"\x00" * 4)
+        return target, "../outside/secret.txt"
+
+    def test_path_traversal_detected(self, tmp_path):
+        """external_data pointing outside model dir should trigger CVE-2022-25882."""
+        _target, traversal_path = self._create_escaped_target(tmp_path)
+
+        model_path = create_onnx_model(
+            tmp_path,
+            external=True,
+            external_path=traversal_path,
+            missing_external=True,  # Don't create in model dir
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        cve_checks = [c for c in result.checks if "CVE-2022-25882" in c.name or "CVE-2022-25882" in c.message]
+        assert len(cve_checks) > 0, (
+            f"Should detect CVE-2022-25882 path traversal. Checks: {[c.message for c in result.checks]}"
+        )
+        assert cve_checks[0].severity == IssueSeverity.CRITICAL
+        assert cve_checks[0].details.get("cve_id") == "CVE-2022-25882"
+
+    def test_safe_external_data_no_cve(self, tmp_path):
+        """External data within model directory should not trigger CVE-2022-25882."""
+        model_path = create_onnx_model(tmp_path, external=True, external_path="weights.bin")
+
+        result = OnnxScanner().scan(str(model_path))
+
+        cve_issues = [c for c in result.checks if "CVE-2022-25882" in (c.name + c.message)]
+        assert len(cve_issues) == 0, "Safe external data should not trigger CVE-2022-25882"
+
+    def test_normalized_in_dir_path_with_dotdot_no_cve(self, tmp_path):
+        """Paths containing '..' but normalizing inside model dir should not be CVE-tagged."""
+        (tmp_path / "weights.bin").write_bytes(struct.pack("f", 1.0))
+        model_path = create_onnx_model(
+            tmp_path,
+            external=True,
+            external_path="subdir/../weights.bin",
+            missing_external=True,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+        cve_issues = [c for c in result.checks if "CVE-2022-25882" in (c.name + c.message)]
+        assert len(cve_issues) == 0, "Normalized in-dir path should not trigger CVE-2022-25882"
+
+    def test_path_traversal_message_includes_path(self, tmp_path):
+        """CVE-2022-25882 check message should include the offending path."""
+        _target, traversal_path = self._create_escaped_target(tmp_path)
+
+        model_path = create_onnx_model(
+            tmp_path,
+            external=True,
+            external_path=traversal_path,
+            missing_external=True,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        # The traversal path should appear in a check message
+        all_messages = " ".join(c.message for c in result.checks)
+        assert traversal_path in all_messages or "path traversal" in all_messages.lower(), (
+            f"Path traversal info should appear in messages. Got: {all_messages}"
+        )
+
+    def test_cve_details_contain_required_fields(self, tmp_path):
+        """CVE-2022-25882 details should include cve_id, cvss, cwe, remediation."""
+        _target, traversal_path = self._create_escaped_target(tmp_path)
+
+        model_path = create_onnx_model(
+            tmp_path,
+            external=True,
+            external_path=traversal_path,
+            missing_external=True,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        cve_checks = [c for c in result.checks if c.details.get("cve_id") == "CVE-2022-25882"]
+        assert len(cve_checks) > 0, "Should find CVE-2022-25882 check"
+        details = cve_checks[0].details
+        assert details["cvss"] == 7.5
+        assert details["cwe"] == "CWE-22"
+        assert "remediation" in details
