@@ -488,6 +488,19 @@ class TestCVE202549655TorchModuleWrapper:
 
     def test_no_false_positive_dense_layer(self, tmp_path: Path) -> None:
         """Dense layers should NOT trigger CVE-2025-49655."""
+class TestCVE20251550ModuleReferences:
+    """Test CVE-2025-1550: Keras safe_mode bypass via arbitrary module references in config.json."""
+
+    def _make_keras_zip(self, config: dict, tmp_path) -> str:
+        """Helper to create a .keras ZIP with the given config.json."""
+        keras_path = os.path.join(str(tmp_path), "model.keras")
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            zf.writestr("config.json", json.dumps(config))
+            zf.writestr("metadata.json", json.dumps({"keras_version": "3.0.0"}))
+        return keras_path
+
+    def test_dangerous_module_os_in_layer(self, tmp_path):
+        """A layer referencing 'os' module should be flagged as CRITICAL."""
         scanner = KerasZipScanner()
         config = {
             "class_name": "Sequential",
@@ -496,6 +509,9 @@ class TestCVE202549655TorchModuleWrapper:
                     {
                         "class_name": "Dense",
                         "name": "dense_1",
+=======
+                        "module": "os",
+>>>>>>> 004a918 (feat(security): detect CVE-2025-1550 Keras safe_mode bypass via config.json module references)
                         "config": {"units": 10},
                     }
                 ]
@@ -508,6 +524,120 @@ class TestCVE202549655TorchModuleWrapper:
 
     def test_nested_torch_module_wrapper(self, tmp_path: Path) -> None:
         """TorchModuleWrapper in nested model should still be detected."""
+        cve_issues = [i for i in result.issues if "CVE-2025-1550" in i.message]
+        assert len(cve_issues) >= 1, "Should detect dangerous 'os' module reference"
+        assert cve_issues[0].severity == IssueSeverity.CRITICAL
+
+    def test_dangerous_module_subprocess_in_fn_module(self, tmp_path):
+        """A layer with fn_module='subprocess' should be flagged as CRITICAL."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Functional",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "name": "dense_1",
+                        "config": {"units": 10, "fn_module": "subprocess"},
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(config, tmp_path))
+
+        cve_issues = [i for i in result.issues if "CVE-2025-1550" in i.message]
+        assert len(cve_issues) >= 1, "Should detect dangerous 'subprocess' fn_module reference"
+        assert cve_issues[0].severity == IssueSeverity.CRITICAL
+
+    def test_dangerous_module_builtins_dotpath(self, tmp_path):
+        """A layer referencing 'builtins.eval' should be flagged as CRITICAL."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "name": "evil_dense",
+                        "module": "builtins",
+                        "config": {"units": 1},
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(config, tmp_path))
+
+        cve_issues = [i for i in result.issues if "CVE-2025-1550" in i.message]
+        assert len(cve_issues) >= 1
+        assert cve_issues[0].severity == IssueSeverity.CRITICAL
+        assert "builtins" in cve_issues[0].message
+
+    def test_untrusted_module_custom_package(self, tmp_path):
+        """A layer referencing an unknown module should be flagged as WARNING."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "name": "dense_1",
+                        "module": "my_custom_package.layers",
+                        "config": {"units": 10},
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(config, tmp_path))
+
+        cve_issues = [i for i in result.issues if "CVE-2025-1550" in i.message]
+        assert len(cve_issues) >= 1, "Should flag non-allowlisted module"
+        assert cve_issues[0].severity == IssueSeverity.WARNING
+
+    def test_safe_keras_module_no_false_positive(self, tmp_path):
+        """A layer referencing 'keras.layers' should NOT be flagged."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "name": "dense_1",
+                        "module": "keras.layers",
+                        "config": {"units": 10},
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(config, tmp_path))
+
+        cve_issues = [i for i in result.issues if "CVE-2025-1550" in i.message]
+        assert len(cve_issues) == 0, "Safe keras.layers module should not be flagged"
+
+    def test_safe_tensorflow_module_no_false_positive(self, tmp_path):
+        """A layer referencing 'tensorflow.keras.layers' should NOT be flagged."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "name": "dense_1",
+                        "module": "tensorflow.keras.layers",
+                        "config": {"units": 10},
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(config, tmp_path))
+
+        cve_issues = [i for i in result.issues if "CVE-2025-1550" in i.message]
+        assert len(cve_issues) == 0, "Safe tensorflow module should not be flagged"
+
+    def test_nested_model_module_reference(self, tmp_path):
+        """Dangerous module in nested model layer should be detected."""
         scanner = KerasZipScanner()
         config = {
             "class_name": "Model",
@@ -522,6 +652,10 @@ class TestCVE202549655TorchModuleWrapper:
                                     "class_name": "TorchModuleWrapper",
                                     "name": "nested_wrapper",
                                     "config": {},
+                                    "class_name": "Dense",
+                                    "name": "nested_evil",
+                                    "module": "shutil",
+                                    "config": {"units": 1},
                                 }
                             ]
                         },
@@ -536,6 +670,12 @@ class TestCVE202549655TorchModuleWrapper:
 
     def test_no_cve_for_fixed_keras_version(self, tmp_path: Path) -> None:
         """Keras >=3.11.3 should not be CVE-attributed for TorchModuleWrapper."""
+        cve_issues = [i for i in result.issues if "CVE-2025-1550" in i.message]
+        assert len(cve_issues) >= 1, "Should detect dangerous module in nested model"
+        assert cve_issues[0].severity == IssueSeverity.CRITICAL
+
+    def test_cve_attribution_details(self, tmp_path):
+        """CVE details should be present in issue details."""
         scanner = KerasZipScanner()
         config = {
             "class_name": "Sequential",
@@ -545,6 +685,10 @@ class TestCVE202549655TorchModuleWrapper:
                         "class_name": "TorchModuleWrapper",
                         "name": "torch_wrapper_1",
                         "config": {"module": "my_torch_module"},
+                        "class_name": "Dense",
+                        "name": "dense_1",
+                        "module": "os.path",
+                        "config": {"units": 10},
                     }
                 ]
             },
@@ -598,6 +742,14 @@ class TestCVE202549655TorchModuleWrapper:
         warning_checks = [c for c in result.checks if "Version Unknown" in c.name]
         assert len(warning_checks) >= 1
         assert warning_checks[0].severity == IssueSeverity.WARNING
+        result = scanner.scan(self._make_keras_zip(config, tmp_path))
+
+        cve_issues = [i for i in result.issues if "CVE-2025-1550" in i.message]
+        assert len(cve_issues) >= 1
+        details = cve_issues[0].details
+        assert details["cve_id"] == "CVE-2025-1550"
+        assert details["cvss"] == 9.8
+        assert details["cwe"] == "CWE-502"
 
 
 class TestKerasZipScannerSubclassed:

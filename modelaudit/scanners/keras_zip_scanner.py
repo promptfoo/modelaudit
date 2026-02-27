@@ -17,8 +17,56 @@ from modelaudit.utils.helpers.code_validation import (
 )
 
 from ..config.explanations import get_cve_2025_49655_explanation, get_pattern_explanation
+from ..config.explanations import get_cve_2025_1550_explanation, get_pattern_explanation
 from .base import BaseScanner, IssueSeverity, ScanResult
 from .keras_utils import check_subclassed_model
+
+# CVE-2025-1550: Keras safe_mode bypass via arbitrary module references in config.json
+# Allowlist of module prefixes that are safe in Keras model configs.
+# Any module outside this list in a layer's "module" or "fn_module" key is suspicious.
+_SAFE_KERAS_MODULE_PREFIXES = (
+    "keras.",
+    "tensorflow.",
+    "tf_keras.",
+    "tf.",
+    "numpy.",
+    "math",
+)
+
+# Modules that are explicitly dangerous when referenced in config.json
+_DANGEROUS_CONFIG_MODULES = frozenset(
+    {
+        "os",
+        "sys",
+        "subprocess",
+        "builtins",
+        "__builtin__",
+        "importlib",
+        "shutil",
+        "socket",
+        "http",
+        "pickle",
+        "marshal",
+        "ctypes",
+        "code",
+        "codeop",
+        "compileall",
+        "runpy",
+        "webbrowser",
+        "tempfile",
+        "signal",
+        "multiprocessing",
+        "threading",
+        "pty",
+        "commands",
+        "pdb",
+        "profile",
+        "trace",
+        "pip",
+        "setuptools",
+        "distutils",
+    }
+)
 
 
 class KerasZipScanner(BaseScanner):
@@ -219,6 +267,8 @@ class KerasZipScanner(BaseScanner):
             # CVE-2025-49655: TorchModuleWrapper uses torch.load(weights_only=False)
             if layer_class == "TorchModuleWrapper":
                 self._check_torch_module_wrapper(result, layer_name)
+            # CVE-2025-1550: Check ALL layers for dangerous module references
+            self._check_layer_module_references(layer, result, layer_name)
 
             # Check for Lambda layers
             if layer_class == "Lambda":
@@ -376,6 +426,85 @@ class KerasZipScanner(BaseScanner):
             return major == 3 and minor == 11 and 0 <= patch <= 2
         except ValueError:
             return None
+    def _check_layer_module_references(self, layer: dict[str, Any], result: ScanResult, layer_name: str) -> None:
+        """Check layer config for dangerous module references (CVE-2025-1550).
+
+        CVE-2025-1550: Keras Model.load_model allows arbitrary code execution even
+        with safe_mode=True by specifying arbitrary Python modules/functions in
+        config.json's module/fn_module keys. This checks ALL layers, not just Lambda.
+        """
+        layer_config = layer.get("config", {})
+        if not isinstance(layer_config, dict):
+            return
+
+        # Check both the layer-level and config-level module references
+        module_keys_to_check: list[tuple[str, str]] = []
+        for key in ("module", "fn_module"):
+            if key in layer:
+                module_keys_to_check.append((key, str(layer[key])))
+            if key in layer_config:
+                module_keys_to_check.append((key, str(layer_config[key])))
+
+        for key, module_value in module_keys_to_check:
+            if not module_value:
+                continue
+
+            # Extract the top-level module name (e.g., "os" from "os.path")
+            top_module = module_value.split(".")[0]
+
+            # Check if it's an explicitly dangerous module
+            is_dangerous = top_module in _DANGEROUS_CONFIG_MODULES
+
+            # Check if it's outside the safe allowlist
+            is_outside_allowlist = not any(
+                module_value.startswith(prefix) or module_value == prefix.rstrip(".")
+                for prefix in _SAFE_KERAS_MODULE_PREFIXES
+            )
+
+            if is_dangerous:
+                result.add_check(
+                    name="CVE-2025-1550: Dangerous Module in Config",
+                    passed=False,
+                    message=(
+                        f"CVE-2025-1550: Layer '{layer_name}' references dangerous module "
+                        f"'{module_value}' in {key} field — arbitrary code execution via safe_mode bypass"
+                    ),
+                    severity=IssueSeverity.CRITICAL,
+                    location=f"{self.current_file_path} (layer: {layer_name})",
+                    details={
+                        "layer_name": layer_name,
+                        "layer_class": layer.get("class_name", ""),
+                        "key": key,
+                        "module": module_value,
+                        "cve_id": "CVE-2025-1550",
+                        "cvss": 9.8,
+                        "cwe": "CWE-502",
+                        "remediation": "Upgrade Keras to >= 3.9.0 or remove untrusted module references",
+                    },
+                    why=get_cve_2025_1550_explanation("dangerous_module"),
+                )
+            elif is_outside_allowlist:
+                result.add_check(
+                    name="CVE-2025-1550: Untrusted Module in Config",
+                    passed=False,
+                    message=(
+                        f"CVE-2025-1550: Layer '{layer_name}' references non-allowlisted module "
+                        f"'{module_value}' in {key} field — potential safe_mode bypass"
+                    ),
+                    severity=IssueSeverity.WARNING,
+                    location=f"{self.current_file_path} (layer: {layer_name})",
+                    details={
+                        "layer_name": layer_name,
+                        "layer_class": layer.get("class_name", ""),
+                        "key": key,
+                        "module": module_value,
+                        "cve_id": "CVE-2025-1550",
+                        "cvss": 9.8,
+                        "cwe": "CWE-502",
+                        "remediation": "Upgrade Keras to >= 3.9.0 or verify this module is safe",
+                    },
+                    why=get_cve_2025_1550_explanation("untrusted_module"),
+                )
 
     def _check_lambda_layer(self, layer: dict[str, Any], result: ScanResult, layer_name: str) -> None:
         """Check Lambda layer for executable Python code"""
