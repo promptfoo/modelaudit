@@ -29,6 +29,13 @@ class PyTorchZipScanner(BaseScanner):
     CVE_2025_32434_FIX_VERSION: ClassVar[str] = "2.6.0"
     CVE_2025_32434_DESCRIPTION: ClassVar[str] = "RCE when loading models with torch.load(weights_only=True)"
 
+    # CVE-2026-24747 constants
+    CVE_2026_24747_ID: ClassVar[str] = "CVE-2026-24747"
+    CVE_2026_24747_FIX_VERSION: ClassVar[str] = "2.10.0"
+    CVE_2026_24747_DESCRIPTION: ClassVar[str] = (
+        "weights_only=True bypass via SETITEM abuse and tensor metadata mismatch"
+    )
+
     # Security limits for archive manipulation protection
     MAX_COMPRESSION_RATIO: ClassVar[int] = 100  # 100:1 compression ratio threshold
     MAX_ARCHIVE_ENTRIES: ClassVar[int] = 10000  # Maximum number of entries in archive
@@ -107,6 +114,9 @@ class PyTorchZipScanner(BaseScanner):
                 # Scan all discovered pickle files
                 bytes_scanned = self._scan_pickle_files(zip_file, pickle_files, result, path)
                 self._check_timeout()  # Check timeout after pickle scanning
+
+                # Validate tensor metadata consistency (CVE-2026-24747)
+                self._validate_tensor_metadata_consistency(zip_file, safe_entries, pickle_files, result, path)
 
                 # Check for JIT/Script code execution risks
                 bytes_scanned += self._scan_for_jit_patterns(zip_file, safe_entries, result, path)
@@ -356,6 +366,7 @@ class PyTorchZipScanner(BaseScanner):
         pytorch_version_info = self._extract_pytorch_version_info(zip_file, safe_entries)
         result.metadata.update(pytorch_version_info)
         self._check_cve_2025_32434_vulnerability(pytorch_version_info, result, path)
+        self._check_cve_2026_24747_vulnerability(result, path)
 
     def _scan_pickle_files(
         self, zip_file: zipfile.ZipFile, pickle_files: list[str], result: ScanResult, path: str
@@ -970,6 +981,190 @@ class PyTorchZipScanner(BaseScanner):
         except Exception:
             # If version parsing fails, assume vulnerable for safety
             return True
+
+    def _check_cve_2026_24747_vulnerability(self, result: ScanResult, path: str) -> None:
+        """Check for CVE-2026-24747 vulnerability based on installed PyTorch version."""
+        try:
+            import torch
+
+            installed_version = torch.__version__
+        except ImportError:
+            return
+
+        is_vulnerable = self._is_vulnerable_pytorch_version_2026(installed_version)
+        if is_vulnerable:
+            result.add_check(
+                name="CVE-2026-24747 PyTorch Version Check",
+                passed=False,
+                message=(
+                    f"PyTorch {installed_version} is vulnerable to CVE-2026-24747 "
+                    f"(weights_only=True bypass via SETITEM abuse and tensor metadata mismatch). "
+                    f"Upgrade to PyTorch {self.CVE_2026_24747_FIX_VERSION} or later."
+                ),
+                severity=IssueSeverity.CRITICAL,
+                location=path,
+                details={
+                    "cve_id": self.CVE_2026_24747_ID,
+                    "installed_pytorch_version": installed_version,
+                    "vulnerability_description": self.CVE_2026_24747_DESCRIPTION,
+                    "fixed_in": f"PyTorch {self.CVE_2026_24747_FIX_VERSION}",
+                    "recommendation": (
+                        "Update to PyTorch 2.10.0 or later. Use SafeTensors format "
+                        "for inherent safety against deserialization attacks."
+                    ),
+                },
+                why=(
+                    "CVE-2026-24747 allows bypassing the weights_only=True restricted unpickler "
+                    "via SETITEM/SETITEMS opcodes applied to non-dict objects and tensor storage "
+                    "size mismatches, enabling heap layout manipulation and arbitrary code execution."
+                ),
+            )
+
+    def _is_vulnerable_pytorch_version_2026(self, version: str) -> bool:
+        """Check if a PyTorch version is vulnerable to CVE-2026-24747 (< 2.10.0)."""
+        try:
+            # Parse version string
+            vstr = version.strip()
+            is_prerelease = bool(re.search(r"(dev|rc|alpha|beta)", vstr, re.IGNORECASE))
+            version_match = re.match(r"^(\d+)\.(\d+)\.(\d+)", vstr)
+            if not version_match:
+                return True  # Can't parse, assume vulnerable
+
+            major, minor, _patch = map(int, version_match.groups())
+
+            if major < 2:
+                return True  # All 1.x versions are vulnerable
+            elif major == 2:
+                if minor < 10:
+                    return True  # 2.0.x through 2.9.x are vulnerable
+                elif minor == 10:
+                    return is_prerelease  # 2.10.0-dev still vulnerable
+                else:
+                    return False  # 2.11.0+ are fixed
+            else:
+                return is_prerelease  # 3.x+ stable releases are fixed
+
+        except Exception:
+            return True
+
+    def _validate_tensor_metadata_consistency(
+        self,
+        zip_file: zipfile.ZipFile,
+        safe_entries: list[str],
+        pickle_files: list[str],
+        result: ScanResult,
+        path: str,
+    ) -> None:
+        """Validate tensor storage sizes declared in pickle match actual archive blob sizes.
+
+        CVE-2026-24747 exploits mismatches between declared tensor metadata and
+        actual storage blob sizes to manipulate heap layout.
+        """
+
+        # Collect actual blob sizes from data/ directory
+        data_blob_sizes: dict[str, int] = {}
+        for name in safe_entries:
+            if re.match(r"^(?:.+/)?data/\d+$", name):
+                try:
+                    info = zip_file.getinfo(name)
+                    data_blob_sizes[name] = info.file_size
+                except KeyError:
+                    continue
+
+        if not data_blob_sizes:
+            return  # No tensor blobs to validate
+
+        # Parse pickle to look for tensor rebuild patterns and cross-reference storage
+        for pkl_name in pickle_files:
+            try:
+                pkl_data = zip_file.read(pkl_name)
+                mismatches = self._check_tensor_storage_mismatches(pkl_data, data_blob_sizes)
+                if mismatches:
+                    result.add_check(
+                        name="CVE-2026-24747 Tensor Metadata Validation",
+                        passed=False,
+                        message=(
+                            f"Tensor storage size mismatches detected in {pkl_name}: "
+                            f"{len(mismatches)} inconsistencies found"
+                        ),
+                        severity=IssueSeverity.WARNING,
+                        location=f"{path}:{pkl_name}",
+                        details={
+                            "cve_id": self.CVE_2026_24747_ID,
+                            "mismatches": mismatches[:10],
+                            "total_mismatches": len(mismatches),
+                        },
+                        why=(
+                            "CVE-2026-24747 exploits mismatches between declared tensor metadata "
+                            "in pickle and actual binary blob sizes to manipulate heap layout "
+                            "during deserialization. Legitimate models have consistent metadata."
+                        ),
+                    )
+            except Exception:
+                continue
+
+    def _check_tensor_storage_mismatches(
+        self, pkl_data: bytes, data_blob_sizes: dict[str, int]
+    ) -> list[dict[str, Any]]:
+        """Check for mismatches between pickle tensor declarations and actual blob sizes.
+
+        Best-effort parsing: returns empty list if pickle cannot be parsed.
+        """
+        import pickletools
+
+        mismatches: list[dict[str, Any]] = []
+
+        try:
+            # Extract storage references and declared sizes from pickle opcodes
+            # Look for _rebuild_tensor_v2 patterns which declare storage key + element count
+            opcodes = list(pickletools.genops(pkl_data))
+            for i, (opcode, arg, _pos) in enumerate(opcodes):
+                if opcode.name in ("GLOBAL", "STACK_GLOBAL") and arg and "_rebuild_tensor" in str(arg):
+                    # Look ahead for storage key reference (usually a small integer string)
+                    # and element count / dtype info
+                    storage_key = None
+                    declared_size = None
+
+                    for j in range(i + 1, min(i + 20, len(opcodes))):
+                        next_op, next_arg, _next_pos = opcodes[j]
+                        # Storage keys are typically stored as short integers
+                        if next_op.name in ("SHORT_BINUNICODE", "BINUNICODE") and next_arg:
+                            arg_str = str(next_arg)
+                            if arg_str.isdigit():
+                                storage_key = arg_str
+                        # Element counts appear as integer arguments
+                        if (
+                            next_op.name in ("BININT", "BININT1", "BININT2", "LONG1")
+                            and isinstance(next_arg, int)
+                            and next_arg > 0
+                        ):
+                            declared_size = next_arg
+
+                    if storage_key is not None and declared_size is not None:
+                        # Find matching blob in archive
+                        matching_blobs = [
+                            (name, size) for name, size in data_blob_sizes.items() if name.endswith(f"/{storage_key}")
+                        ]
+                        for blob_name, actual_size in matching_blobs:
+                            # Check if declared element count is wildly inconsistent with blob size
+                            # Each float32 element = 4 bytes, float16 = 2 bytes
+                            # A mismatch of more than 10x is suspicious
+                            min_expected = declared_size  # At least 1 byte per element
+                            max_expected = declared_size * 8  # At most 8 bytes per element (float64)
+                            if actual_size < min_expected or actual_size > max_expected:
+                                mismatches.append(
+                                    {
+                                        "storage_key": storage_key,
+                                        "blob_name": blob_name,
+                                        "declared_elements": declared_size,
+                                        "actual_blob_bytes": actual_size,
+                                        "expected_range": f"{min_expected}-{max_expected} bytes",
+                                    }
+                                )
+        except Exception:
+            pass  # Best-effort: don't fail the scan if pickle parsing encounters issues
+
+        return mismatches
 
     def _check_safetensors_available(self, model_path: str) -> bool:
         """Check if a SafeTensors alternative exists in the same directory"""

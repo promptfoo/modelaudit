@@ -96,6 +96,11 @@ def analyze_cve_patterns(content: str, binary_content: bytes = b"") -> list[CVEA
     if cve_2024_matches:
         attributions.append(_create_cve_2024_34997_attribution(cve_2024_matches))
 
+    # Check CVE-2026-24747 patterns
+    cve_2026_matches = _check_cve_2026_24747_multiline(content, binary_content)
+    if cve_2026_matches:
+        attributions.append(_create_cve_2026_24747_attribution(cve_2026_matches))
+
     return attributions
 
 
@@ -248,6 +253,77 @@ def _create_cve_2024_34997_attribution(matches: list[str]) -> CVEAttribution:
 
     return CVEAttribution(
         cve_id="CVE-2024-34997",
+        description=str(cve_info["description"]),
+        severity=str(cve_info["severity"]),
+        cvss=float(cve_info.get("cvss", 0.0)),  # type: ignore[arg-type]
+        cwe=str(cve_info["cwe"]),
+        affected_versions=str(cve_info["affected_versions"]),
+        remediation=str(cve_info["remediation"]),
+        confidence=confidence,
+        patterns_matched=matches,
+    )
+
+
+def _check_cve_2026_24747_multiline(content: str, binary_content: bytes) -> list[str]:
+    """
+    Check for CVE-2026-24747 using multi-line aware detection.
+
+    CVE-2026-24747: PyTorch < 2.10.0 weights_only restricted unpickler bypass
+    via SETITEM/SETITEMS abuse on non-dict objects and tensor metadata mismatches.
+    """
+    matches = []
+    content_lower = content.lower()
+
+    # Skip documentation/comments that mention CVE patterns
+    doc_indicators = ['"""', "'''", "#", "warning:", "note:", "documentation", "cve-2026", "vulnerability"]
+    if any(indicator in content_lower for indicator in doc_indicators):
+        return []
+
+    # Required indicators for CVE-2026-24747
+    pytorch_indicators = [
+        "_rebuild_tensor",
+        "torch._utils",
+        "torch.storage",
+        "floatstorage",
+        "longstorage",
+        "halfstorage",
+        "bfloat16storage",
+    ]
+    setitem_indicators = ["setitem", "setitems"]
+    storage_indicators = ["storage_offset", "element_size", "numel"]
+
+    has_pytorch = any(indicator in content_lower for indicator in pytorch_indicators)
+    has_setitem = any(indicator in content_lower for indicator in setitem_indicators)
+    has_storage = any(indicator in content_lower for indicator in storage_indicators)
+
+    # Binary content evidence
+    binary_indicators = []
+    for indicator in [b"_rebuild_tensor", b"SETITEM", b"storage_offset", b"torch._utils"]:
+        if indicator in binary_content:
+            binary_indicators.append(indicator.decode("utf-8", errors="ignore"))
+
+    # Detection logic: Need PyTorch tensor reconstruction context AND SETITEM abuse
+    if has_pytorch and has_setitem:
+        matches.append("PyTorch tensor reconstruction with SETITEM operations")
+
+        if has_storage:
+            matches.append("tensor storage metadata present")
+
+        if binary_indicators:
+            matches.extend(binary_indicators)
+
+    return matches
+
+
+def _create_cve_2026_24747_attribution(matches: list[str]) -> CVEAttribution:
+    """Create CVE-2026-24747 attribution with matched patterns."""
+    cve_info = CVE_COMBINED_PATTERNS["CVE-2026-24747"]
+
+    # Calculate confidence based on pattern complexity and number of matches
+    confidence = min(1.0, 0.7 + (len(matches) * 0.1))
+
+    return CVEAttribution(
+        cve_id="CVE-2026-24747",
         description=str(cve_info["description"]),
         severity=str(cve_info["severity"]),
         cvss=float(cve_info.get("cvss", 0.0)),  # type: ignore[arg-type]

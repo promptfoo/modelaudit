@@ -633,6 +633,45 @@ def get_cve_2025_32434_explanation(vulnerability_type: str) -> str:
     )
 
 
+def get_cve_2026_24747_explanation(vulnerability_type: str) -> str:
+    """Get specific explanation for CVE-2026-24747 vulnerability types."""
+
+    explanations = {
+        "setitem_abuse": (
+            "CVE-2026-24747 exploits a flaw in PyTorch's weights_only=True restricted "
+            "unpickler that allows SETITEM/SETITEMS opcodes to operate on unexpected "
+            "object types. In legitimate pickles, SETITEM populates dicts. In this attack, "
+            "SETITEM is applied to reconstructed tensor objects, allowing the attacker to "
+            "manipulate object attributes and achieve heap layout control for code execution."
+        ),
+        "tensor_metadata_mismatch": (
+            "This model contains tensor storage declarations that do not match the actual "
+            "binary blob sizes in the archive. CVE-2026-24747 exploits such mismatches to "
+            "cause the restricted unpickler to allocate incorrectly sized memory regions, "
+            "enabling heap layout manipulation. Legitimate PyTorch models always have "
+            "consistent tensor metadata."
+        ),
+        "restricted_unpickler_bypass": (
+            "Unlike CVE-2025-32434 (where weights_only=True did not enforce restrictions), "
+            "CVE-2026-24747 bypasses the enforcement mechanism itself. The restricted unpickler "
+            "correctly blocks REDUCE/GLOBAL with dangerous modules, but fails to restrict "
+            "SETITEM/SETITEMS on non-dict objects, allowing type confusion attacks that "
+            "ultimately achieve control flow hijacking."
+        ),
+        "pytorch_version": (
+            "CVE-2026-24747 affects all PyTorch versions before 2.10.0. The fix adds type "
+            "checking to SETITEM/SETITEMS opcodes in the restricted unpickler, ensuring they "
+            "can only operate on dict objects. Upgrade immediately and consider SafeTensors."
+        ),
+    }
+
+    return explanations.get(
+        vulnerability_type,
+        "This issue is related to CVE-2026-24747, a high-severity PyTorch vulnerability "
+        "that bypasses weights_only=True via SETITEM abuse. Update to PyTorch 2.10.0+.",
+    )
+
+
 def get_pytorch_security_explanation(issue_type: str) -> str:
     """Get PyTorch-specific security explanations"""
 

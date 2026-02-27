@@ -122,6 +122,30 @@ class OpcodeSequenceAnalyzer:
                 description="Stack manipulation potentially used for obfuscation",
                 severity="warning",
             ),
+            # CVE-2026-24747: SETITEM after REDUCE (object attribute manipulation)
+            OpcodePattern(
+                name="setitem_after_reduce",
+                opcodes=["REDUCE", "SETITEM"],
+                description="SETITEM applied to REDUCE result - may indicate CVE-2026-24747 object mutation",
+                severity="warning",
+                cve_references=["CVE-2026-24747"],
+            ),
+            # CVE-2026-24747: GLOBAL tensor rebuild followed by SETITEM
+            OpcodePattern(
+                name="tensor_rebuild_setitem",
+                opcodes=["GLOBAL", "REDUCE", "SETITEM"],
+                description="Tensor rebuild followed by SETITEM - potential CVE-2026-24747 heap manipulation",
+                severity="warning",
+                cve_references=["CVE-2026-24747"],
+            ),
+            # CVE-2026-24747: SETITEMS on non-dict after NEWOBJ
+            OpcodePattern(
+                name="setitems_after_newobj",
+                opcodes=["NEWOBJ", "SETITEMS"],
+                description="SETITEMS applied to NEWOBJ result - potential attribute injection",
+                severity="warning",
+                cve_references=["CVE-2026-24747"],
+            ),
         ]
 
     def analyze_opcode(

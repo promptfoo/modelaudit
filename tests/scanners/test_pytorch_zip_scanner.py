@@ -1,6 +1,8 @@
 import pickle
+import sys
 import time
 import zipfile
+from unittest.mock import MagicMock
 
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.pytorch_zip_scanner import PyTorchZipScanner
@@ -481,3 +483,64 @@ def test_pytorch_zip_scanner_combined_security_controls(tmp_path):
     symlink_issues = [i for i in result.issues if "symlink" in i.message.lower()]
     assert len(symlink_issues) > 0
     assert symlink_issues[0].severity == IssueSeverity.WARNING
+
+
+# CVE-2026-24747 Tests
+
+
+def test_pytorch_zip_cve_2026_24747_version_check(tmp_path, monkeypatch):
+    """Test CVE-2026-24747 version checking flags vulnerable PyTorch."""
+    model_path = create_mock_pytorch_zip(tmp_path / "model.pt")
+    scanner = PyTorchZipScanner()
+
+    # Mock torch as vulnerable version
+    mock_torch = MagicMock()
+    mock_torch.__version__ = "2.9.0"
+    monkeypatch.setitem(sys.modules, "torch", mock_torch)
+
+    result = scanner.scan(str(model_path))
+
+    cve_2026_checks = [c for c in result.checks if "CVE-2026-24747" in c.name]
+    failed_checks = [c for c in cve_2026_checks if c.status == CheckStatus.FAILED]
+    assert len(failed_checks) > 0, (
+        f"Should flag PyTorch 2.9.0 as vulnerable to CVE-2026-24747. "
+        f"Checks: {[(c.name, c.status) for c in result.checks]}"
+    )
+
+
+def test_pytorch_zip_cve_2026_24747_fixed_version(tmp_path, monkeypatch):
+    """Test that PyTorch 2.10.0+ does not trigger CVE-2026-24747 warning."""
+    model_path = create_mock_pytorch_zip(tmp_path / "model.pt")
+    scanner = PyTorchZipScanner()
+
+    # Mock torch as fixed version
+    mock_torch = MagicMock()
+    mock_torch.__version__ = "2.10.0"
+    monkeypatch.setitem(sys.modules, "torch", mock_torch)
+
+    result = scanner.scan(str(model_path))
+
+    cve_2026_failed = [c for c in result.checks if "CVE-2026-24747" in c.name and c.status == CheckStatus.FAILED]
+    assert len(cve_2026_failed) == 0, (
+        f"PyTorch 2.10.0 should NOT trigger CVE-2026-24747. "
+        f"Failed checks: {[(c.name, c.message) for c in cve_2026_failed]}"
+    )
+
+
+def test_pytorch_zip_tensor_metadata_validation(tmp_path):
+    """Test tensor metadata consistency validation runs without errors."""
+    # Create a PyTorch ZIP model with data blobs
+    zip_path = tmp_path / "model_with_data.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        # Simple pickle with a dict
+        data = {"weights": [1.0, 2.0, 3.0]}
+        zipf.writestr("archive/data.pkl", pickle.dumps(data))
+        # Add a data blob
+        zipf.writestr("archive/data/0", b"\x00" * 24)  # 6 float32 values
+
+    scanner = PyTorchZipScanner()
+    result = scanner.scan(str(zip_path))
+
+    # Should complete without crashing (best-effort validation)
+    assert result is not None

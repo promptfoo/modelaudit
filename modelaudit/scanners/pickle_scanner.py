@@ -3208,6 +3208,25 @@ class PickleScanner(BaseScanner):
             # CVE-2025-32434 specific opcode sequence analysis - REMOVED
             # Now only show CVE info in REDUCE opcode detection messages
 
+            # CVE-2026-24747: Context-aware SETITEM/SETITEMS abuse detection
+            cve_2026_patterns = self._detect_cve_2026_24747_sequences(opcodes, file_size)
+            if cve_2026_patterns:
+                for pattern in cve_2026_patterns:
+                    result.add_check(
+                        name="CVE-2026-24747 SETITEM Abuse Detection",
+                        passed=False,
+                        message=pattern["description"],
+                        severity=IssueSeverity.WARNING,
+                        location=f"{self.current_file_path} (pos {pattern['position']})",
+                        details=pattern,
+                        why=(
+                            "CVE-2026-24747 exploits SETITEM/SETITEMS opcodes applied to non-dict "
+                            "objects (particularly tensor reconstruction results) to bypass the "
+                            "weights_only=True restricted unpickler in PyTorch < 2.10.0, enabling "
+                            "heap layout manipulation and control flow hijacking."
+                        ),
+                    )
+
             # Stack depth validation with tiered limits
             # Tiered approach: 0-3000 (OK), 3000-5000 (INFO), 5000-10000 (WARNING), 10000+ (CRITICAL)
             # This prevents false positives for legitimate large models while maintaining security
@@ -4671,6 +4690,99 @@ class PickleScanner(BaseScanner):
                     "status": "normal",
                 }
             )
+
+        return patterns
+
+    def _detect_cve_2026_24747_sequences(self, opcodes: list[tuple], file_size: int) -> list[dict]:
+        """Detect opcode sequences indicating CVE-2026-24747 exploitation.
+
+        CVE-2026-24747 bypasses PyTorch's weights_only=True restricted unpickler
+        via SETITEM/SETITEMS applied to non-dict objects (particularly after
+        _rebuild_tensor operations) and tensor metadata mismatches.
+
+        Uses context-aware analysis: SETITEM on dicts is normal and skipped.
+        Only SETITEM in suspicious contexts (after tensor rebuild, near dangerous
+        globals) is flagged.
+        """
+        patterns: list[dict] = []
+
+        for i, (opcode, _arg, pos) in enumerate(opcodes):
+            if opcode.name not in ("SETITEM", "SETITEMS"):
+                continue
+
+            # Look backward to determine context
+            has_rebuild_tensor = False
+            has_dangerous_global = False
+            has_empty_dict = False
+            context_details: list[str] = []
+
+            lookback = min(i, 30)
+            for j in range(i - 1, max(0, i - lookback) - 1, -1):
+                prev_op, prev_arg, _prev_pos = opcodes[j]
+
+                # SETITEM on a dict is legitimate — skip entirely
+                if prev_op.name in ("EMPTY_DICT", "DICT"):
+                    has_empty_dict = True
+                    break
+
+                # Check for _rebuild_tensor context (suspicious with SETITEM)
+                if prev_op.name in ("GLOBAL", "STACK_GLOBAL") and prev_arg:
+                    arg_str = str(prev_arg).lower()
+                    if "_rebuild_tensor" in arg_str or "_rebuild_parameter" in arg_str:
+                        has_rebuild_tensor = True
+                        context_details.append(f"_rebuild operation: {prev_arg}")
+
+                    # Check for dangerous modules near SETITEM
+                    if any(
+                        d in arg_str
+                        for d in [
+                            "os.",
+                            "subprocess",
+                            "eval",
+                            "exec",
+                            "__import__",
+                            "builtins",
+                            "ctypes",
+                            "socket",
+                        ]
+                    ):
+                        has_dangerous_global = True
+                        context_details.append(f"dangerous global: {prev_arg}")
+
+            # Skip if SETITEM is on a dict (legitimate dict construction)
+            if has_empty_dict:
+                continue
+
+            if has_rebuild_tensor:
+                patterns.append(
+                    {
+                        "pattern_type": "setitem_on_tensor_object",
+                        "description": (
+                            f"{opcode.name} applied after tensor reconstruction ({', '.join(context_details)})"
+                        ),
+                        "opcodes": [opcode.name],
+                        "exploitation_method": (
+                            "CVE-2026-24747: SETITEM abuse on reconstructed tensor object "
+                            "bypasses weights_only=True restricted unpickler"
+                        ),
+                        "position": pos,
+                        "cve_id": "CVE-2026-24747",
+                    }
+                )
+
+            if has_dangerous_global:
+                patterns.append(
+                    {
+                        "pattern_type": "setitem_near_dangerous_global",
+                        "description": (
+                            f"{opcode.name} near dangerous global reference ({', '.join(context_details)})"
+                        ),
+                        "opcodes": [opcode.name],
+                        "exploitation_method": ("CVE-2026-24747: SETITEM used to inject into dangerous context"),
+                        "position": pos,
+                        "cve_id": "CVE-2026-24747",
+                    }
+                )
 
         return patterns
 

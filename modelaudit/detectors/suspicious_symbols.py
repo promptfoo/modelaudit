@@ -287,6 +287,19 @@ CVE_2024_34997_PATTERNS = [
     r"numpy_pickle.*__reduce__.*subprocess",  # numpy_pickle + __reduce__ + subprocess
 ]
 
+# CVE-2026-24747: PyTorch weights_only restricted unpickler bypass
+# via SETITEM/SETITEMS abuse on non-dict objects and tensor metadata mismatches
+CVE_2026_24747_PATTERNS = [
+    # SETITEM applied to tensor reconstruction results (not normal dict construction)
+    r"_rebuild_tensor.*SETITEM",  # tensor rebuild followed by SETITEM abuse
+    r"_rebuild_tensor.*SETITEMS",  # tensor rebuild followed by SETITEMS abuse
+    # Tensor metadata inconsistency indicators
+    r"_rebuild_tensor_v2.*storage_offset.*(?:dtype|shape)",  # metadata mismatch context
+    # weights_only bypass via SETITEM on unexpected types
+    r"weights_only.*SETITEM.*storage",  # weights_only context with SETITEM + storage
+    r"torch\._utils.*_rebuild.*SETITEM",  # torch._utils rebuild with SETITEM
+]
+
 # Combined CVE patterns for efficient scanning
 # Used by scanners to detect CVE-specific exploitation attempts
 CVE_COMBINED_PATTERNS = {
@@ -307,6 +320,18 @@ CVE_COMBINED_PATTERNS = {
         "cvss": 8.1,  # High severity
         "affected_versions": "joblib v1.4.2",
         "remediation": "Update joblib, validate cache integrity, avoid untrusted NumpyArrayWrapper data",
+    },
+    "CVE-2026-24747": {
+        "patterns": CVE_2026_24747_PATTERNS,
+        "description": "PyTorch checkpoint deserialization bypass via weights_only restricted unpickler",
+        "severity": "HIGH",
+        "cwe": "CWE-502",  # Deserialization of Untrusted Data
+        "cvss": 8.8,  # High severity
+        "affected_versions": "PyTorch < 2.10.0",
+        "remediation": (
+            "Update to PyTorch 2.10.0+, use SafeTensors format, "
+            "never load untrusted .pth/.pt checkpoints without integrity verification"
+        ),
     },
 }
 
