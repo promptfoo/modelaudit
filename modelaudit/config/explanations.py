@@ -668,3 +668,27 @@ def get_pytorch_security_explanation(issue_type: str) -> str:
         "This is a PyTorch-specific security concern. Review PyTorch security best practices "
         "and ensure you're following safe model loading procedures.",
     )
+
+
+def get_cve_2025_8747_explanation(issue_type: str) -> str:
+    """Get explanation for CVE-2025-8747: Keras get_file gadget bypass.
+
+    CVE-2025-8747 (HIGH): Bypass of CVE-2025-1550 fix. Uses keras.utils.get_file
+    as a gadget to download and execute arbitrary files even with safe_mode=True.
+    Fixed in Keras 3.11.0.
+    """
+    explanations = {
+        "get_file_gadget": (
+            "CVE-2025-8747: The config.json references keras.utils.get_file along with "
+            "a URL, indicating a potential safe_mode bypass. This gadget can download "
+            "arbitrary files from remote URLs during model loading, even with safe_mode=True. "
+            "This bypasses the CVE-2025-1550 module allowlist fix. "
+            "Upgrade to Keras >= 3.11.0 and only load models from trusted sources."
+        ),
+    }
+
+    return explanations.get(
+        issue_type,
+        "CVE-2025-8747: keras.utils.get_file can be abused as a gadget to bypass safe_mode. "
+        "Upgrade to Keras >= 3.11.0.",
+    )

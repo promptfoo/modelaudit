@@ -3,6 +3,7 @@
 import base64
 import json
 import os
+import re
 import zipfile
 from typing import Any, ClassVar
 
@@ -15,9 +16,13 @@ from modelaudit.utils.helpers.code_validation import (
     validate_python_syntax,
 )
 
-from ..config.explanations import get_pattern_explanation
+from ..config.explanations import get_cve_2025_8747_explanation, get_pattern_explanation
 from .base import BaseScanner, IssueSeverity, ScanResult
 from .keras_utils import check_subclassed_model
+
+# CVE-2025-8747: keras.utils.get_file used as gadget to download + execute files
+_GET_FILE_PATTERN = re.compile(r"get_file", re.IGNORECASE)
+_URL_PATTERN = re.compile(r"https?://", re.IGNORECASE)
 
 
 class KerasZipScanner(BaseScanner):
@@ -115,6 +120,9 @@ class KerasZipScanner(BaseScanner):
                         )
                         result.finish(success=False)
                         return result
+
+                # CVE-2025-8747: Check for get_file gadget with URL
+                self._check_get_file_gadget(config_data, result)
 
                 # Scan model configuration
                 self._scan_model_config(model_config, result)
@@ -253,6 +261,37 @@ class KerasZipScanner(BaseScanner):
 
         # Add layer counts to metadata
         result.metadata["layer_counts"] = layer_counts
+
+    def _check_get_file_gadget(self, config_data: bytes, result: ScanResult) -> None:
+        """Check for CVE-2025-8747: keras.utils.get_file gadget bypass.
+
+        CVE-2025-8747: Bypass of CVE-2025-1550 fix. Uses keras.utils.get_file
+        as a gadget to download and execute arbitrary files even with safe_mode=True.
+        Detected when config.json references get_file AND contains URL strings.
+        """
+        config_str = config_data.decode("utf-8", errors="ignore")
+        has_get_file = _GET_FILE_PATTERN.search(config_str) is not None
+        has_url = _URL_PATTERN.search(config_str) is not None
+
+        if has_get_file and has_url:
+            result.add_check(
+                name="CVE-2025-8747: get_file Gadget Bypass",
+                passed=False,
+                message=(
+                    "CVE-2025-8747: config.json references 'get_file' with URL - "
+                    "potential safe_mode bypass via file download gadget"
+                ),
+                severity=IssueSeverity.CRITICAL,
+                location=f"{self.current_file_path}/config.json",
+                details={
+                    "cve_id": "CVE-2025-8747",
+                    "cvss": 8.8,
+                    "cwe": "CWE-502",
+                    "affected_versions": "Keras 3.0.0-3.10.0",
+                    "remediation": "Upgrade Keras to >= 3.11.0",
+                },
+                why=get_cve_2025_8747_explanation("get_file_gadget"),
+            )
 
     def _check_lambda_layer(self, layer: dict[str, Any], result: ScanResult, layer_name: str) -> None:
         """Check Lambda layer for executable Python code"""
