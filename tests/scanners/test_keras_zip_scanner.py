@@ -503,6 +503,7 @@ class TestCVE20259906UnsafeDeserialization:
                         {
                             "class_name": "Dense",
                             "name": "d",
+                            "module": "keras.config",
                             "config": {"fn": "enable_unsafe_deserialization"},
                         }
                     ]
@@ -516,6 +517,23 @@ class TestCVE20259906UnsafeDeserialization:
         details = cve_issues[0].details
         assert details["cve_id"] == "CVE-2025-9906"
         assert details["cwe"] == "CWE-693"
+
+    def test_plain_text_mention_without_keras_context_not_flagged(self, tmp_path):
+        """A plain text mention should not trigger when no keras.config context exists."""
+        scanner = KerasZipScanner()
+        config_str = json.dumps(
+            {
+                "class_name": "Model",
+                "config": {
+                    "layers": [],
+                    "notes": "This doc mentions enable_unsafe_deserialization for awareness only",
+                },
+            }
+        )
+        result = scanner.scan(self._make_keras_zip(config_str, tmp_path))
+
+        cve_issues = [i for i in result.issues if "CVE-2025-9906" in i.message]
+        assert len(cve_issues) == 0
 
 
 class TestKerasZipScannerSubclassed:
