@@ -85,6 +85,7 @@ def pytest_runtest_setup(item):
             "test_cve_detection.py",  # CVE detection tests
             "test_pytorch_zip_scanner.py",  # PyTorch ZIP scanner tests
             "test_paddle_scanner.py",  # PaddlePaddle scanner tests
+            "test_cve_2025_10155_bin_pickle.py",  # CVE-2025-10155 .bin pickle detection tests
         ]
 
         # Check if this is an allowed test file
