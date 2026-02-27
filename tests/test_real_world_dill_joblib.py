@@ -146,8 +146,8 @@ class TestRealJoblibFiles:
         scanner = PickleScanner()
         result = scanner.scan(str(compressed_file))
 
-        # Compressed files may not follow standard pickle format
-        # This is expected - compression changes the file structure
+        # Compressed files may not follow standard pickle format.
+        # This is expected - compression changes the file structure.
         assert isinstance(result.success, bool)
         # The scanner may or may not successfully parse compressed data depending
         # on whether the compressed bytes happen to contain valid-looking pickle
