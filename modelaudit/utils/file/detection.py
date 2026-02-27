@@ -226,8 +226,16 @@ def detect_file_format(path: str) -> str:
         # Protocol 1 uses the same GLOBAL opcode pattern.
         if magic16[:1] == b"c" and b"\n" in magic16[1:]:
             return "pickle"
-        # Also detect pickle protocol 0 with MARK+LIST/DICT opcode starts
-        if magic16[:1] in (b"(", b"]", b"}") and any(op in magic16 for op in (b"c", b"\x80")):
+        # Also detect pickle protocol 0/1 streams starting with MARK '(' (tuple/reduce
+        # preamble), EMPTY_LIST ']', or EMPTY_DICT '}' opcodes.  These are valid
+        # protocol 0/1 start bytes but are only treated as pickle when the header also
+        # shows a properly-formed GLOBAL opcode sequence ('c' followed by '\n', matching
+        # the "cmodule\nname\n" pattern) or a protocol 2+ magic byte (0x80).  Checking
+        # for 'c\n' rather than bare 'c' avoids false-positives from files whose first
+        # 16 bytes happen to contain the ASCII letter 'c' without a newline-terminated
+        # module name.
+        has_global_opcode = b"c" in magic16 and b"\n" in magic16[magic16.find(b"c") + 1 :]
+        if magic16[:1] in (b"(", b"]", b"}") and (has_global_opcode or b"\x80" in magic16):
             return "pickle"
         # Check for safetensors format (starts with JSON header)
         if magic4[0:1] == b"{" or (size > 8 and b'"__metadata__"' in magic16):
