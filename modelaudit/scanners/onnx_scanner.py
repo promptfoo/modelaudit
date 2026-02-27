@@ -20,6 +20,15 @@ def _is_contained_in(child: Path, parent: Path) -> bool:
         return False
 
 
+def _is_contained_in(child: Path, parent: Path) -> bool:
+    """Check if child path is contained within parent directory."""
+    try:
+        child.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
 def _get_onnx_mapping() -> Any:
     """Get ONNX mapping module from different locations depending on version."""
     try:
@@ -290,7 +299,7 @@ class OnnxScanner(BaseScanner):
                 # the existence check so traversal attempts against
                 # non-existent targets are still flagged.
                 has_traversal_raw = ".." in location
-                escapes_model_dir = not str(external_path).startswith(str(model_dir))
+                escapes_model_dir = not _is_contained_in(external_path, model_dir)
                 if has_traversal_raw or escapes_model_dir:
                     # Determine specific CVE attribution
                     if has_traversal_raw and not location.startswith(".."):
