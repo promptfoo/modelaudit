@@ -633,6 +633,137 @@ def get_cve_2025_32434_explanation(vulnerability_type: str) -> str:
     )
 
 
+def get_cve_2026_24747_explanation(vulnerability_type: str) -> str:
+    """Get specific explanation for CVE-2026-24747 vulnerability types."""
+
+    explanations = {
+        "setitem_abuse": (
+            "CVE-2026-24747 exploits a flaw in PyTorch's weights_only=True restricted "
+            "unpickler that allows SETITEM/SETITEMS opcodes to operate on unexpected "
+            "object types. In legitimate pickles, SETITEM populates dicts. In this attack, "
+            "SETITEM is applied to reconstructed tensor objects, allowing the attacker to "
+            "manipulate object attributes and achieve heap layout control for code execution."
+        ),
+        "tensor_metadata_mismatch": (
+            "This model contains tensor storage declarations that do not match the actual "
+            "binary blob sizes in the archive. CVE-2026-24747 exploits such mismatches to "
+            "cause the restricted unpickler to allocate incorrectly sized memory regions, "
+            "enabling heap layout manipulation. Legitimate PyTorch models always have "
+            "consistent tensor metadata."
+        ),
+        "restricted_unpickler_bypass": (
+            "Unlike CVE-2025-32434 (where weights_only=True did not enforce restrictions), "
+            "CVE-2026-24747 bypasses the enforcement mechanism itself. The restricted unpickler "
+            "correctly blocks REDUCE/GLOBAL with dangerous modules, but fails to restrict "
+            "SETITEM/SETITEMS on non-dict objects, allowing type confusion attacks that "
+            "ultimately achieve control flow hijacking."
+        ),
+        "pytorch_version": (
+            "CVE-2026-24747 affects all PyTorch versions before 2.10.0. The fix adds type "
+            "checking to SETITEM/SETITEMS opcodes in the restricted unpickler, ensuring they "
+            "can only operate on dict objects. Upgrade immediately and consider SafeTensors."
+        ),
+    }
+
+    return explanations.get(
+        vulnerability_type,
+        "This issue is related to CVE-2026-24747, a high-severity PyTorch vulnerability "
+        "that bypasses weights_only=True via SETITEM abuse. Update to PyTorch 2.10.0+.",
+    )
+
+
+def get_cve_2022_45907_explanation(vulnerability_type: str) -> str:
+    """Get specific explanation for CVE-2022-45907 vulnerability types."""
+
+    explanations = {
+        "eval_injection": (
+            "CVE-2022-45907 exploits torch.jit.annotations.parse_type_line(), which passes "
+            "user-controlled type annotation strings directly to Python's eval(). An attacker "
+            "can craft a malicious type annotation string that, when parsed, executes arbitrary "
+            "code. This affects any code path that processes untrusted TorchScript type annotations."
+        ),
+        "type_annotation_parsing": (
+            "The vulnerable function parse_type_line in torch.jit.annotations processes type "
+            "annotation strings from TorchScript models. Since it uses eval() internally, any "
+            "string that reaches this function can execute arbitrary Python code, including "
+            "system commands, file operations, and network access."
+        ),
+        "pytorch_version": (
+            "CVE-2022-45907 affects all PyTorch versions before 1.13.1. The fix replaces the "
+            "unsafe eval()-based type parsing with a safe AST-based parser. Upgrade to "
+            "PyTorch 1.13.1+ immediately and avoid processing type annotations from untrusted sources."
+        ),
+    }
+
+    return explanations.get(
+        vulnerability_type,
+        "This issue is related to CVE-2022-45907, a critical PyTorch vulnerability "
+        "involving unsafe eval() in type annotation parsing. Update to PyTorch 1.13.1+.",
+    )
+
+
+def get_cve_2024_5480_explanation(vulnerability_type: str) -> str:
+    """Get specific explanation for CVE-2024-5480 vulnerability types."""
+
+    explanations = {
+        "rpc_function_injection": (
+            "CVE-2024-5480 exploits the torch.distributed.rpc framework's lack of function "
+            "call validation. The RPC framework accepts arbitrary callable references, including "
+            "builtins.eval and builtins.exec, allowing a remote attacker to execute arbitrary "
+            "code on any node in the distributed training cluster."
+        ),
+        "python_udf_exploit": (
+            "The PythonUDF mechanism in torch.distributed.rpc allows sending arbitrary Python "
+            "functions to remote workers. Without validation, an attacker can send eval() or "
+            "exec() calls as PythonUDF payloads, achieving remote code execution on the target "
+            "node. This is especially dangerous in distributed training setups."
+        ),
+        "pytorch_version": (
+            "CVE-2024-5480 (CVSS 10.0) affects all PyTorch versions before 2.2.3. The fix adds "
+            "validation to restrict which functions can be called via RPC. Upgrade to "
+            "PyTorch 2.2.3+ immediately and restrict RPC access to trusted nodes only."
+        ),
+    }
+
+    return explanations.get(
+        vulnerability_type,
+        "This issue is related to CVE-2024-5480, a maximum-severity PyTorch vulnerability "
+        "in the RPC framework. Update to PyTorch 2.2.3+ and restrict RPC access.",
+    )
+
+
+def get_cve_2024_48063_explanation(vulnerability_type: str) -> str:
+    """Get specific explanation for CVE-2024-48063 vulnerability types."""
+
+    explanations = {
+        "remote_module_deserialization": (
+            "CVE-2024-48063 exploits the deserialization of torch.distributed.rpc.RemoteModule "
+            "objects. RemoteModule uses Python's pickle for serialization, and its __reduce__ "
+            "method can be crafted to execute arbitrary code during deserialization. An attacker "
+            "can create a malicious RemoteModule pickle payload that runs code when loaded."
+        ),
+        "rpc_pickle_exploit": (
+            "The RemoteModule class in torch.distributed.rpc serializes its state using pickle. "
+            "Since pickle deserialization can execute arbitrary code via __reduce__, an attacker "
+            "who can inject a crafted RemoteModule payload into the RPC communication channel "
+            "can achieve remote code execution. This is disputed by PyTorch maintainers as "
+            "'intended behavior' since pickle is inherently unsafe."
+        ),
+        "pytorch_version": (
+            "CVE-2024-48063 affects all PyTorch versions before 2.5.0. While disputed as "
+            "'intended behavior,' the vulnerability poses real risks in environments where "
+            "RemoteModule objects may come from untrusted sources. Upgrade to PyTorch 2.5.0+ "
+            "and avoid deserializing RemoteModule objects from untrusted sources."
+        ),
+    }
+
+    return explanations.get(
+        vulnerability_type,
+        "This issue is related to CVE-2024-48063, a critical PyTorch vulnerability "
+        "involving RemoteModule deserialization. Update to PyTorch 2.5.0+.",
+    )
+
+
 def get_pytorch_security_explanation(issue_type: str) -> str:
     """Get PyTorch-specific security explanations"""
 

@@ -29,6 +29,32 @@ class PyTorchZipScanner(BaseScanner):
     CVE_2025_32434_FIX_VERSION: ClassVar[str] = "2.6.0"
     CVE_2025_32434_DESCRIPTION: ClassVar[str] = "RCE when loading models with torch.load(weights_only=True)"
 
+    # CVE-2026-24747 constants
+    CVE_2026_24747_ID: ClassVar[str] = "CVE-2026-24747"
+    CVE_2026_24747_FIX_VERSION: ClassVar[str] = "2.10.0"
+    CVE_2026_24747_DESCRIPTION: ClassVar[str] = (
+        "weights_only=True bypass via SETITEM abuse and tensor metadata mismatch"
+    )
+
+    # CVE-2022-45907 constants
+    CVE_2022_45907_ID: ClassVar[str] = "CVE-2022-45907"
+    CVE_2022_45907_FIX_VERSION: ClassVar[str] = "1.13.1"
+    CVE_2022_45907_DESCRIPTION: ClassVar[str] = (
+        "torch.jit.annotations.parse_type_line uses eval() unsafely, allowing arbitrary code execution"
+    )
+
+    # CVE-2024-5480 constants
+    CVE_2024_5480_ID: ClassVar[str] = "CVE-2024-5480"
+    CVE_2024_5480_FIX_VERSION: ClassVar[str] = "2.2.3"
+    CVE_2024_5480_DESCRIPTION: ClassVar[str] = (
+        "torch.distributed.rpc framework doesn't validate function calls, enabling arbitrary code execution"
+    )
+
+    # CVE-2024-48063 constants
+    CVE_2024_48063_ID: ClassVar[str] = "CVE-2024-48063"
+    CVE_2024_48063_FIX_VERSION: ClassVar[str] = "2.5.0"
+    CVE_2024_48063_DESCRIPTION: ClassVar[str] = "torch.distributed.rpc.RemoteModule deserialization RCE via pickle"
+
     # Security limits for archive manipulation protection
     MAX_COMPRESSION_RATIO: ClassVar[int] = 100  # 100:1 compression ratio threshold
     MAX_ARCHIVE_ENTRIES: ClassVar[int] = 10000  # Maximum number of entries in archive
@@ -107,6 +133,9 @@ class PyTorchZipScanner(BaseScanner):
                 # Scan all discovered pickle files
                 bytes_scanned = self._scan_pickle_files(zip_file, pickle_files, result, path)
                 self._check_timeout()  # Check timeout after pickle scanning
+
+                # Validate tensor metadata consistency (CVE-2026-24747)
+                self._validate_tensor_metadata_consistency(zip_file, safe_entries, pickle_files, result, path)
 
                 # Check for JIT/Script code execution risks
                 bytes_scanned += self._scan_for_jit_patterns(zip_file, safe_entries, result, path)
@@ -356,6 +385,10 @@ class PyTorchZipScanner(BaseScanner):
         pytorch_version_info = self._extract_pytorch_version_info(zip_file, safe_entries)
         result.metadata.update(pytorch_version_info)
         self._check_cve_2025_32434_vulnerability(pytorch_version_info, result, path)
+        self._check_cve_2026_24747_vulnerability(pytorch_version_info, result, path)
+        self._check_cve_2022_45907_vulnerability(pytorch_version_info, result, path)
+        self._check_cve_2024_5480_vulnerability(pytorch_version_info, result, path)
+        self._check_cve_2024_48063_vulnerability(pytorch_version_info, result, path)
 
     def _scan_pickle_files(
         self, zip_file: zipfile.ZipFile, pickle_files: list[str], result: ScanResult, path: str
@@ -897,35 +930,36 @@ class PyTorchZipScanner(BaseScanner):
         # PyTorch versions typically start with 1.x or 2.x
         return text.strip().startswith(("1.", "2."))
 
+    def _get_detected_pytorch_version(self, version_info: dict[str, Any]) -> tuple[str | None, str | None]:
+        """Get framework version detected from artifact metadata."""
+        version = version_info.get("pytorch_framework_version")
+        source = version_info.get("pytorch_version_source")
+        if isinstance(version, str) and version.strip():
+            return version.strip(), source if isinstance(source, str) else None
+        return None, source if isinstance(source, str) else None
+
     def _check_cve_2025_32434_vulnerability(self, version_info: dict[str, Any], result: ScanResult, path: str) -> None:
-        """Check for CVE-2025-32434 vulnerability based on installed PyTorch version"""
-
-        # Only check if PyTorch is actually installed
-        try:
-            import torch
-
-            installed_version = torch.__version__
-        except ImportError:
-            # PyTorch not installed, skip the check entirely
+        """Check for CVE-2025-32434 using PyTorch version from model metadata."""
+        detected_version, version_source = self._get_detected_pytorch_version(version_info)
+        if not detected_version:
             return
 
-        # Check if the installed PyTorch version is vulnerable (< 2.6.0)
-        is_vulnerable = self._is_vulnerable_pytorch_version(installed_version)
+        is_vulnerable = self._is_vulnerable_pytorch_version(detected_version)
 
         if is_vulnerable:
-            # Only warn if the installed version is vulnerable
             result.add_check(
                 name="CVE-2025-32434 PyTorch Version Check",
                 passed=False,
                 message=(
-                    f"PyTorch {installed_version} is installed and vulnerable to CVE-2025-32434 RCE. "
+                    f"Model metadata indicates PyTorch {detected_version} is vulnerable to CVE-2025-32434 RCE. "
                     f"Upgrade to PyTorch 2.6.0 or later."
                 ),
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={
                     "cve_id": self.CVE_2025_32434_ID,
-                    "installed_pytorch_version": installed_version,
+                    "detected_pytorch_version": detected_version,
+                    "pytorch_version_source": version_source,
                     "vulnerability_description": "RCE when loading models with torch.load(weights_only=True)",
                     "fixed_in": f"PyTorch {self.CVE_2025_32434_FIX_VERSION}",
                     "recommendation": (
@@ -933,7 +967,6 @@ class PyTorchZipScanner(BaseScanner):
                     ),
                 },
             )
-        # If not vulnerable, don't show anything
 
     def _is_vulnerable_pytorch_version(self, version: str) -> bool:
         """Check if a PyTorch version is vulnerable to CVE-2025-32434 (≤2.5.1)"""
@@ -942,7 +975,8 @@ class PyTorchZipScanner(BaseScanner):
 
             # Parse version string
             vstr = version.strip()
-            is_prerelease = bool(re.search(r"(dev|rc|alpha|beta)", vstr, re.IGNORECASE))
+            # Match PEP 440 prerelease tags: a0, b1, rc1, dev0, alpha, beta
+            is_prerelease = bool(re.search(r"(\.dev|rc|alpha|beta|\d+a\d+|\d+b\d+)", vstr, re.IGNORECASE))
             version_match = re.match(r"^(\d+)\.(\d+)\.(\d+)", vstr)
             if not version_match:
                 # If we can't parse it, assume vulnerable for safety
@@ -970,6 +1004,382 @@ class PyTorchZipScanner(BaseScanner):
         except Exception:
             # If version parsing fails, assume vulnerable for safety
             return True
+
+    def _check_cve_2026_24747_vulnerability(self, version_info: dict[str, Any], result: ScanResult, path: str) -> None:
+        """Check for CVE-2026-24747 using PyTorch version from model metadata."""
+        detected_version, version_source = self._get_detected_pytorch_version(version_info)
+        if not detected_version:
+            return
+
+        is_vulnerable = self._is_vulnerable_pytorch_version_2026(detected_version)
+        if is_vulnerable:
+            result.add_check(
+                name="CVE-2026-24747 PyTorch Version Check",
+                passed=False,
+                message=(
+                    f"Model metadata indicates PyTorch {detected_version} is vulnerable to CVE-2026-24747 "
+                    f"(weights_only=True bypass via SETITEM abuse and tensor metadata mismatch). "
+                    f"Upgrade to PyTorch {self.CVE_2026_24747_FIX_VERSION} or later."
+                ),
+                severity=IssueSeverity.CRITICAL,
+                location=path,
+                details={
+                    "cve_id": self.CVE_2026_24747_ID,
+                    "detected_pytorch_version": detected_version,
+                    "pytorch_version_source": version_source,
+                    "vulnerability_description": self.CVE_2026_24747_DESCRIPTION,
+                    "fixed_in": f"PyTorch {self.CVE_2026_24747_FIX_VERSION}",
+                    "recommendation": (
+                        "Update to PyTorch 2.10.0 or later. Use SafeTensors format "
+                        "for inherent safety against deserialization attacks."
+                    ),
+                },
+                why=(
+                    "CVE-2026-24747 allows bypassing the weights_only=True restricted unpickler "
+                    "via SETITEM/SETITEMS opcodes applied to non-dict objects and tensor storage "
+                    "size mismatches, enabling heap layout manipulation and arbitrary code execution."
+                ),
+            )
+        else:
+            result.add_check(
+                name="CVE-2026-24747 PyTorch Version Check",
+                passed=True,
+                message=(
+                    f"PyTorch {detected_version} is not vulnerable to CVE-2026-24747 "
+                    f"(fixed in {self.CVE_2026_24747_FIX_VERSION}+)."
+                ),
+                severity=IssueSeverity.INFO,
+                location=path,
+            )
+
+    def _is_vulnerable_pytorch_version_2026(self, version: str) -> bool:
+        """Check if a PyTorch version is vulnerable to CVE-2026-24747 (< 2.10.0)."""
+        try:
+            # Parse version string
+            vstr = version.strip()
+            # Match PEP 440 prerelease tags: a0, b1, rc1, dev0, alpha, beta
+            is_prerelease = bool(re.search(r"(\.dev|rc|alpha|beta|\d+a\d+|\d+b\d+)", vstr, re.IGNORECASE))
+            version_match = re.match(r"^(\d+)\.(\d+)\.(\d+)", vstr)
+            if not version_match:
+                return True  # Can't parse, assume vulnerable
+
+            major, minor, _patch = map(int, version_match.groups())
+
+            if major < 2:
+                return True  # All 1.x versions are vulnerable
+            elif major == 2:
+                if minor < 10:
+                    return True  # 2.0.x through 2.9.x are vulnerable
+                elif minor == 10:
+                    return is_prerelease  # 2.10.0-dev still vulnerable
+                else:
+                    return False  # 2.11.0+ are fixed
+            else:
+                return is_prerelease  # 3.x+ stable releases are fixed
+
+        except Exception:
+            return True
+
+    @staticmethod
+    def _is_vulnerable_pytorch_version_for(version: str, fix_major: int, fix_minor: int, fix_patch: int) -> bool:
+        """Check if a PyTorch version is vulnerable (< fix_major.fix_minor.fix_patch).
+
+        Shared helper that DRYs up version comparison for multiple CVEs.
+        Pre-release versions of the fix release are treated as vulnerable.
+        """
+        try:
+            vstr = version.strip()
+            # Match PEP 440 prerelease tags: a0, b1, rc1, dev0, alpha, beta
+            is_prerelease = bool(re.search(r"(\.dev|rc|alpha|beta|\d+a\d+|\d+b\d+)", vstr, re.IGNORECASE))
+            version_match = re.match(r"^(\d+)\.(\d+)\.(\d+)", vstr)
+            if not version_match:
+                return True  # Can't parse, assume vulnerable
+
+            major, minor, patch = map(int, version_match.groups())
+
+            if major < fix_major:
+                return True
+            elif major == fix_major:
+                if minor < fix_minor:
+                    return True
+                elif minor == fix_minor:
+                    if patch < fix_patch:
+                        return True
+                    elif patch == fix_patch:
+                        return is_prerelease  # fix_patch-dev still vulnerable
+                    else:
+                        return False
+                else:
+                    return False  # minor > fix_minor
+            else:
+                return is_prerelease  # major > fix_major, pre-releases still vulnerable
+
+        except Exception:
+            return True
+
+    def _check_cve_2022_45907_vulnerability(self, version_info: dict[str, Any], result: ScanResult, path: str) -> None:
+        """Check for CVE-2022-45907 using PyTorch version from model metadata."""
+        detected_version, version_source = self._get_detected_pytorch_version(version_info)
+        if not detected_version:
+            return
+
+        is_vulnerable = self._is_vulnerable_pytorch_version_for(detected_version, 1, 13, 1)
+        if is_vulnerable:
+            result.add_check(
+                name="CVE-2022-45907 PyTorch Version Check",
+                passed=False,
+                message=(
+                    f"Model metadata indicates PyTorch {detected_version} is vulnerable to CVE-2022-45907 "
+                    f"(unsafe eval() in torch.jit.annotations.parse_type_line). "
+                    f"Upgrade to PyTorch {self.CVE_2022_45907_FIX_VERSION} or later."
+                ),
+                severity=IssueSeverity.CRITICAL,
+                location=path,
+                details={
+                    "cve_id": self.CVE_2022_45907_ID,
+                    "detected_pytorch_version": detected_version,
+                    "pytorch_version_source": version_source,
+                    "vulnerability_description": self.CVE_2022_45907_DESCRIPTION,
+                    "fixed_in": f"PyTorch {self.CVE_2022_45907_FIX_VERSION}",
+                    "recommendation": (
+                        "Update to PyTorch 1.13.1 or later, avoid loading untrusted "
+                        "TorchScript models or type annotations from untrusted sources"
+                    ),
+                },
+                why=(
+                    "CVE-2022-45907 (CVSS 9.8) allows arbitrary code execution via crafted type "
+                    "annotations processed by torch.jit.annotations.parse_type_line, which passes "
+                    "user-controlled strings to Python's eval()."
+                ),
+            )
+
+    def _check_cve_2024_5480_vulnerability(self, version_info: dict[str, Any], result: ScanResult, path: str) -> None:
+        """Check for CVE-2024-5480 using PyTorch version from model metadata."""
+        detected_version, version_source = self._get_detected_pytorch_version(version_info)
+        if not detected_version:
+            return
+
+        is_vulnerable = self._is_vulnerable_pytorch_version_for(detected_version, 2, 2, 3)
+        if is_vulnerable:
+            result.add_check(
+                name="CVE-2024-5480 PyTorch Version Check",
+                passed=False,
+                message=(
+                    f"Model metadata indicates PyTorch {detected_version} is vulnerable to CVE-2024-5480 "
+                    f"(RPC framework arbitrary function execution via PythonUDF). "
+                    f"Upgrade to PyTorch {self.CVE_2024_5480_FIX_VERSION} or later."
+                ),
+                severity=IssueSeverity.CRITICAL,
+                location=path,
+                details={
+                    "cve_id": self.CVE_2024_5480_ID,
+                    "detected_pytorch_version": detected_version,
+                    "pytorch_version_source": version_source,
+                    "vulnerability_description": self.CVE_2024_5480_DESCRIPTION,
+                    "fixed_in": f"PyTorch {self.CVE_2024_5480_FIX_VERSION}",
+                    "recommendation": (
+                        "Update to PyTorch 2.2.3 or later, restrict RPC access to "
+                        "trusted nodes only, never expose RPC endpoints to untrusted networks"
+                    ),
+                },
+                why=(
+                    "CVE-2024-5480 (CVSS 10.0) allows remote code execution because "
+                    "torch.distributed.rpc does not validate function calls, enabling an "
+                    "attacker to send eval/exec as PythonUDF payloads."
+                ),
+            )
+
+    def _check_cve_2024_48063_vulnerability(self, version_info: dict[str, Any], result: ScanResult, path: str) -> None:
+        """Check for CVE-2024-48063 using PyTorch version from model metadata."""
+        detected_version, version_source = self._get_detected_pytorch_version(version_info)
+        if not detected_version:
+            return
+
+        is_vulnerable = self._is_vulnerable_pytorch_version_for(detected_version, 2, 5, 0)
+        if is_vulnerable:
+            result.add_check(
+                name="CVE-2024-48063 PyTorch Version Check",
+                passed=False,
+                message=(
+                    f"Model metadata indicates PyTorch {detected_version} is vulnerable to CVE-2024-48063 "
+                    f"(RemoteModule deserialization RCE via pickle). "
+                    f"Upgrade to PyTorch {self.CVE_2024_48063_FIX_VERSION} or later."
+                ),
+                severity=IssueSeverity.CRITICAL,
+                location=path,
+                details={
+                    "cve_id": self.CVE_2024_48063_ID,
+                    "detected_pytorch_version": detected_version,
+                    "pytorch_version_source": version_source,
+                    "vulnerability_description": self.CVE_2024_48063_DESCRIPTION,
+                    "fixed_in": f"PyTorch {self.CVE_2024_48063_FIX_VERSION}",
+                    "recommendation": (
+                        "Update to PyTorch 2.5.0 or later, avoid deserializing "
+                        "RemoteModule objects from untrusted sources"
+                    ),
+                },
+                why=(
+                    "CVE-2024-48063 (CVSS 9.8) allows RCE through deserialization of "
+                    "torch.distributed.rpc.RemoteModule objects, which use pickle internally. "
+                    "Disputed as 'intended behavior' but still poses a critical risk."
+                ),
+            )
+
+    def _validate_tensor_metadata_consistency(
+        self,
+        zip_file: zipfile.ZipFile,
+        safe_entries: list[str],
+        pickle_files: list[str],
+        result: ScanResult,
+        path: str,
+    ) -> None:
+        """Validate tensor storage sizes declared in pickle match actual archive blob sizes.
+
+        CVE-2026-24747 exploits mismatches between declared tensor metadata and
+        actual storage blob sizes to manipulate heap layout.
+        """
+
+        # Collect actual blob sizes from data/ directory
+        data_blob_sizes: dict[str, int] = {}
+        for name in safe_entries:
+            if re.match(r"^(?:.+/)?data/\d+$", name):
+                try:
+                    info = zip_file.getinfo(name)
+                    data_blob_sizes[name] = info.file_size
+                except KeyError:
+                    continue
+
+        if not data_blob_sizes:
+            return  # No tensor blobs to validate
+
+        # Parse pickle to look for tensor rebuild patterns and cross-reference storage
+        # Use bounded reads to avoid memory spikes on large pickle entries
+        max_pkl_read = 10 * 1024 * 1024  # 10 MB limit for metadata validation
+        for pkl_name in pickle_files:
+            try:
+                pkl_info = zip_file.getinfo(pkl_name)
+                if pkl_info.file_size > max_pkl_read:
+                    with zip_file.open(pkl_name) as f:
+                        pkl_data = f.read(max_pkl_read)
+                else:
+                    pkl_data = zip_file.read(pkl_name)
+                mismatches = self._check_tensor_storage_mismatches(pkl_data, data_blob_sizes)
+                if mismatches:
+                    result.add_check(
+                        name="CVE-2026-24747 Tensor Metadata Validation",
+                        passed=False,
+                        message=(
+                            f"Tensor storage size mismatches detected in {pkl_name}: "
+                            f"{len(mismatches)} inconsistencies found"
+                        ),
+                        severity=IssueSeverity.WARNING,
+                        location=f"{path}:{pkl_name}",
+                        details={
+                            "cve_id": self.CVE_2026_24747_ID,
+                            "mismatches": mismatches[:10],
+                            "total_mismatches": len(mismatches),
+                        },
+                        why=(
+                            "CVE-2026-24747 exploits mismatches between declared tensor metadata "
+                            "in pickle and actual binary blob sizes to manipulate heap layout "
+                            "during deserialization. Legitimate models have consistent metadata."
+                        ),
+                    )
+            except Exception:
+                continue
+
+    def _check_tensor_storage_mismatches(
+        self, pkl_data: bytes, data_blob_sizes: dict[str, int]
+    ) -> list[dict[str, Any]]:
+        """Check for mismatches between pickle tensor declarations and actual blob sizes.
+
+        Best-effort parsing: returns empty list if pickle cannot be parsed.
+        """
+        import pickletools
+
+        mismatches: list[dict[str, Any]] = []
+
+        try:
+            # Extract storage references and declared sizes from pickle opcodes
+            # Look for _rebuild_tensor_v2 patterns which declare storage key + element count
+            opcodes = list(pickletools.genops(pkl_data))
+            for i, (opcode, arg, _pos) in enumerate(opcodes):
+                # Resolve STACK_GLOBAL args (arg=None) by walking backwards
+                # for the two preceding string-pushing opcodes (module + name).
+                # Wider window handles MEMOIZE, BINGET, and BINUNICODE8 interleaving.
+                resolved_arg = arg
+                if opcode.name == "STACK_GLOBAL" and not arg:
+                    string_ops = ("SHORT_BINUNICODE", "BINUNICODE", "BINUNICODE8")
+                    parts: list[str] = []
+                    for k in range(i - 1, max(0, i - 10) - 1, -1):
+                        kop, karg, _ = opcodes[k]
+                        if kop.name in string_ops and isinstance(karg, str) and karg:
+                            parts.insert(0, karg)
+                            if len(parts) == 2:
+                                break
+                    if parts:
+                        resolved_arg = ".".join(parts)
+                if (
+                    opcode.name in ("GLOBAL", "STACK_GLOBAL")
+                    and resolved_arg
+                    and "_rebuild_tensor" in str(resolved_arg)
+                ):
+                    # Look ahead for the persistent storage reference pattern:
+                    #   GLOBAL 'torch FloatStorage' -> storage_key (BINUNICODE) ->
+                    #   device -> element_count (BININT*) -> TUPLE -> BINPERSID
+                    # The element count is the BININT* that immediately precedes TUPLE/BINPERSID
+                    storage_key = None
+                    declared_size = None
+
+                    # Find the storage GLOBAL (e.g., "torch FloatStorage")
+                    for j in range(i + 1, min(i + 30, len(opcodes))):
+                        next_op, next_arg, _next_pos = opcodes[j]
+                        # Storage keys are small integer strings (e.g., "0", "1", "123")
+                        if next_op.name in ("SHORT_BINUNICODE", "BINUNICODE") and next_arg:
+                            arg_str = str(next_arg)
+                            if arg_str.isdigit() and storage_key is None:
+                                storage_key = arg_str
+                        # The element count is the integer argument just before
+                        # TUPLE/BINPERSID in the storage constructor call.
+                        # Only capture the FIRST sizable integer after storage_key
+                        # (subsequent small integers are shape/stride values).
+                        if (
+                            storage_key is not None
+                            and declared_size is None
+                            and next_op.name in ("BININT", "BININT1", "BININT2", "LONG1", "LONG4")
+                            and isinstance(next_arg, int)
+                            and next_arg > 0
+                        ):
+                            declared_size = next_arg
+                        # Stop scanning at BINPERSID (end of storage reference)
+                        if next_op.name == "BINPERSID":
+                            break
+
+                    if storage_key is not None and declared_size is not None:
+                        # Find matching blob in archive
+                        matching_blobs = [
+                            (name, size) for name, size in data_blob_sizes.items() if name.endswith(f"/{storage_key}")
+                        ]
+                        for blob_name, actual_size in matching_blobs:
+                            # Check if declared element count is wildly inconsistent with blob size
+                            # Each float32 element = 4 bytes, float16 = 2 bytes
+                            # A mismatch of more than 10x is suspicious
+                            min_expected = declared_size  # At least 1 byte per element
+                            max_expected = declared_size * 8  # At most 8 bytes per element (float64)
+                            if actual_size < min_expected or actual_size > max_expected:
+                                mismatches.append(
+                                    {
+                                        "storage_key": storage_key,
+                                        "blob_name": blob_name,
+                                        "declared_elements": declared_size,
+                                        "actual_blob_bytes": actual_size,
+                                        "expected_range": f"{min_expected}-{max_expected} bytes",
+                                    }
+                                )
+        except Exception:
+            pass  # Best-effort: don't fail the scan if pickle parsing encounters issues
+
+        return mismatches
 
     def _check_safetensors_available(self, model_path: str) -> bool:
         """Check if a SafeTensors alternative exists in the same directory"""
