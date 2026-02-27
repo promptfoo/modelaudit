@@ -105,6 +105,42 @@ uv run pytest -n auto -m "not slow and not integration" --maxfail=1
 - Add comprehensive tests, including edge cases and regression coverage.
 - Ensure compatibility across Python 3.10–3.13 and handle missing optional deps gracefully.
 
+## CVE Detection Checklist
+
+When adding CVE detections to existing scanners, follow these rules distilled from recurring review feedback across 13 CVE implementations.
+
+### Detection Logic
+
+- **Doc/comment guards:** Use majority-line analysis (>50% doc lines via `_is_primarily_documentation()`), not substring checks — `"#" in content` is trivially bypassable by embedding a comment token in a payload.
+- **`STACK_GLOBAL` handling:** These opcodes have `arg=None` in pickletools; reconstruct `module.class` by walking backwards to find preceding `SHORT_BINUNICODE`/`BINUNICODE` ops.
+- **Dict short-circuit scope:** Track which op produces the `SETITEM` target — an unrelated `EMPTY_DICT` in the lookback window must not suppress detection of a `SETITEM` targeting a `REDUCE`/`NEWOBJ` result.
+- **Version comparison:** Handle PEP 440 prerelease tags (`a`, `b`, `rc`, `dev`) — `2.10.0a0` is still vulnerable, not the fix.
+- **Bounded reads:** Cap archive member reads for metadata validation (10 MB) to prevent memory spikes on large pickles.
+- **Pattern registration:** New CVE pattern lists must be added to `validate_patterns()` in `suspicious_symbols.py`.
+
+### CVE Attribution Consistency
+
+- Always include `cve_id`, `cvss`, `cwe`, `description`, `remediation` in the `details` dict.
+- Include context fields (e.g., `layer_name` for Keras, `installed_pytorch_version` for PyTorch) — keep consistent across scanner variants (H5 vs ZIP).
+- Use `except Exception` (not `except ImportError`) when importing frameworks for version checks, since mocked/broken modules may raise other errors.
+
+### Testing
+
+- Assert the actual signal — never `assert result is not None` alone; verify specific check names, issue messages, or detail fields.
+- For "fixed version" tests: also verify the vulnerable version test produces a failed check (prevents silent regression).
+- Test bypass prevention: verify that embedding a single comment token in a malicious payload does NOT suppress detection.
+- Deterministic fixtures only — never reference host paths like `/etc/passwd`; create all targets under `tmp_path`.
+- Type hints: `-> None` on all test methods, `tmp_path: Path` / `monkeypatch: pytest.MonkeyPatch` on parameters.
+- Use pathlib (`tmp_path / "file.ext"`) instead of `os.path.join`.
+
+### Registration
+
+- Add new test files to `allowed_test_files` in `tests/conftest.py` (Python 3.10/3.12/3.13 CI allowlist).
+- Add CVE explanation functions to `modelaudit/config/explanations.py`.
+- Add CHANGELOG entry under the existing `[Unreleased]` section (never create a second one).
+
+For the full multi-file workflow, see `docs/agents/new-scanner-quickstart.md` § "Adding CVE Detections to Existing Scanners".
+
 ## Project Map & References
 
 ```bash
