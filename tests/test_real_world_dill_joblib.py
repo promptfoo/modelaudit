@@ -151,7 +151,7 @@ class TestRealJoblibFiles:
         assert isinstance(result.success, bool)
         # May not scan bytes if compression format isn't recognized as pickle
         if result.bytes_scanned == 0:
-            # Should have reported format issues (may mention opcode, parse, memory, or format)
+            # Should have reported format/parse issues
             assert len(result.issues) > 0
             # Compressed joblib files are not valid pickle and trigger various parse
             # errors depending on the platform (e.g. "opcode", "MemoryError",
