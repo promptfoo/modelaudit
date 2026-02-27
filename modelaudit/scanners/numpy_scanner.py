@@ -257,10 +257,10 @@ class NumPyScanner(BaseScanner):
                                 message=(
                                     f"{self.CVE_2019_6446_ID}: NumPy array "
                                     f"uses '{dtype}' dtype which requires "
-                                    f"pickle deserialization (allow_pickle=True) "
-                                    f"to load, enabling arbitrary code execution"
+                                    "pickle deserialization. This is a potential RCE vector "
+                                    "when consumer code loads with allow_pickle=True."
                                 ),
-                                severity=IssueSeverity.CRITICAL,
+                                severity=IssueSeverity.WARNING,
                                 location=path,
                                 details={
                                     "dtype": str(dtype),
@@ -268,6 +268,7 @@ class NumPyScanner(BaseScanner):
                                     "cve_id": self.CVE_2019_6446_ID,
                                     "cvss": self.CVE_2019_6446_CVSS,
                                     "cwe": self.CVE_2019_6446_CWE,
+                                    "requires_allow_pickle_true": True,
                                     "description": (
                                         "NumPy object arrays use pickle for "
                                         "serialization. numpy.load() with "
@@ -285,9 +286,9 @@ class NumPyScanner(BaseScanner):
                                 why=(
                                     "This NumPy file contains an array with "
                                     f"'{dtype}' dtype that stores arbitrary "
-                                    "Python objects via pickle. Loading this "
-                                    "file with numpy.load(allow_pickle=True) "
-                                    "will execute any embedded code "
+                                    "Python objects via pickle. If consumer code "
+                                    "loads this file with numpy.load(allow_pickle=True), "
+                                    "it can execute embedded code "
                                     f"({self.CVE_2019_6446_ID}, CVSS 9.8)."
                                 ),
                             )
