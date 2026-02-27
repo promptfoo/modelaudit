@@ -5,6 +5,7 @@ CVE-2025-23304: Hydra _target_ fields in NeMo configs can specify arbitrary
 Python callables, enabling RCE when loaded via hydra.utils.instantiate().
 """
 
+import logging
 import os
 import tarfile
 from typing import Any, ClassVar
@@ -18,6 +19,8 @@ try:
 except ImportError:
     HAS_YAML = False
     yaml = None  # type: ignore[assignment]
+
+logger = logging.getLogger(__name__)
 
 # Safe _target_ prefixes that are expected in legitimate NeMo configs
 _SAFE_TARGET_PREFIXES = (
@@ -106,6 +109,9 @@ class NemoScanner(BaseScanner):
     description = "Scans NeMo files for Hydra _target_ injection (CVE-2025-23304)"
     supported_extensions: ClassVar[list[str]] = [".nemo"]
 
+    # Maximum size for individual YAML configs to prevent YAML bombs
+    MAX_CONFIG_SIZE: ClassVar[int] = 10 * 1024 * 1024  # 10MB
+
     @classmethod
     def can_handle(cls, path: str) -> bool:
         if not os.path.isfile(path):
@@ -180,26 +186,25 @@ class NemoScanner(BaseScanner):
                     f = tar.extractfile(member)
                     if f is None:
                         continue
-                    try:
-                        raw = f.read()
-                        # Safety: limit size to avoid YAML bomb
-                        if len(raw) > 10 * 1024 * 1024:  # 10MB
-                            result.add_check(
-                                name="NeMo Config Size Check",
-                                passed=False,
-                                message=(f"Config file too large: {member.name} ({len(raw)} bytes)"),
-                                severity=IssueSeverity.WARNING,
-                                location=f"{path}:{member.name}",
-                            )
-                            continue
-                        config = yaml.safe_load(raw)
-                        if isinstance(config, dict):
-                            yaml_configs_found += 1
-                            self._check_hydra_targets(config, member.name, path, result)
-                    except yaml.YAMLError:
-                        pass  # Skip unparseable YAML
-                    finally:
-                        f.close()
+                    with f:
+                        try:
+                            raw = f.read()
+                            # Safety: limit size to avoid YAML bomb
+                            if len(raw) > self.MAX_CONFIG_SIZE:
+                                result.add_check(
+                                    name="NeMo Config Size Check",
+                                    passed=False,
+                                    message=(f"Config file too large: {member.name} ({len(raw)} bytes)"),
+                                    severity=IssueSeverity.WARNING,
+                                    location=f"{path}:{member.name}",
+                                )
+                                continue
+                            config = yaml.safe_load(raw)
+                            if isinstance(config, dict):
+                                yaml_configs_found += 1
+                                self._check_hydra_targets(config, member.name, path, result)
+                        except yaml.YAMLError:
+                            logger.debug("Failed to parse YAML config %s in %s", member.name, path)
 
         if yaml_configs_found == 0:
             result.add_check(
@@ -256,7 +261,7 @@ class NemoScanner(BaseScanner):
         result: ScanResult,
     ) -> None:
         """Evaluate a single _target_ value for dangerous patterns."""
-        # Check against known dangerous targets
+        # Check against known dangerous targets (always flag, even if safe prefix)
         if target in _DANGEROUS_TARGETS:
             result.add_check(
                 name=f"{CVE_2025_23304_ID}: Dangerous Hydra _target_",
@@ -288,7 +293,19 @@ class NemoScanner(BaseScanner):
             )
             return
 
-        # Check for suspicious patterns in target
+        # Check safe prefixes BEFORE suspicious patterns to avoid
+        # false positives on legitimate targets like nemo.eval_utils
+        if any(target.startswith(prefix) for prefix in _SAFE_TARGET_PREFIXES):
+            result.add_check(
+                name="Hydra _target_ Safety Check",
+                passed=True,
+                message=(f"Safe _target_ '{target}' at {config_path} in {config_name}"),
+                location=f"{archive_path}:{config_name}",
+                details={"target": target, "config_path": config_path},
+            )
+            return
+
+        # Check for suspicious patterns in target (only for non-safe targets)
         target_lower = target.lower()
         for pattern in _SUSPICIOUS_TARGET_PATTERNS:
             if pattern in target_lower:
@@ -314,26 +331,16 @@ class NemoScanner(BaseScanner):
                 )
                 return
 
-        # Check if target is from a known-safe prefix
-        if any(target.startswith(prefix) for prefix in _SAFE_TARGET_PREFIXES):
-            result.add_check(
-                name="Hydra _target_ Safety Check",
-                passed=True,
-                message=(f"Safe _target_ '{target}' at {config_path} in {config_name}"),
-                location=f"{archive_path}:{config_name}",
-                details={"target": target, "config_path": config_path},
-            )
-        else:
-            # Unknown target - flag for review
-            result.add_check(
-                name="Hydra _target_ Review",
-                passed=False,
-                message=(f"Unknown _target_ '{target}' at {config_path} in {config_name} - requires manual review"),
-                severity=IssueSeverity.WARNING,
-                location=f"{archive_path}:{config_name}",
-                details={
-                    "target": target,
-                    "config_path": config_path,
-                    "config_file": config_name,
-                },
-            )
+        # Unknown target - flag for review
+        result.add_check(
+            name="Hydra _target_ Review",
+            passed=False,
+            message=(f"Unknown _target_ '{target}' at {config_path} in {config_name} - requires manual review"),
+            severity=IssueSeverity.WARNING,
+            location=f"{archive_path}:{config_name}",
+            details={
+                "target": target,
+                "config_path": config_path,
+                "config_file": config_name,
+            },
+        )

@@ -695,6 +695,7 @@ def __getattr__(name: str) -> Any:
         "SevenZipScanner": "sevenzip",
         "TextScanner": "text",
         "XGBoostScanner": "xgboost",
+        "NemoScanner": "nemo",
         "ZipScanner": "zip",
     }
 

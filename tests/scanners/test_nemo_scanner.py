@@ -12,7 +12,7 @@ try:
 except ImportError:
     HAS_YAML = False
 
-from modelaudit.scanners.base import IssueSeverity
+from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.nemo_scanner import NemoScanner
 
 
@@ -119,6 +119,20 @@ class TestCVE202523304HydraTarget:
         cve_checks = [c for c in result.checks if "CVE-2025-23304" in c.name]
         assert len(cve_checks) == 0, f"Safe targets should not trigger CVE. Checks: {[c.name for c in result.checks]}"
 
+    def test_safe_prefix_not_flagged_for_suspicious_pattern(self, tmp_path):
+        """Safe-prefixed target containing suspicious keyword (e.g. 'eval') should not be flagged."""
+        config = {
+            "model": {"_target_": "nemo.collections.nlp.eval_utils.EvalModule"},
+        }
+        path = _create_nemo_file(tmp_path, config)
+
+        result = NemoScanner().scan(str(path))
+
+        cve_checks = [c for c in result.checks if "CVE-2025-23304" in c.name]
+        assert len(cve_checks) == 0, (
+            f"Safe-prefixed target with 'eval' should not trigger CVE. Checks: {[c.name for c in result.checks]}"
+        )
+
     def test_nested_target_detected(self, tmp_path):
         """Deeply nested _target_ should still be found."""
         config = {
@@ -186,8 +200,6 @@ class TestCVE202523304HydraTarget:
             tar.addfile(info, io.BytesIO(data))
 
         result = NemoScanner().scan(str(nemo_path))
-
-        from modelaudit.scanners.base import CheckStatus
 
         no_config = [c for c in result.checks if "Config Presence" in c.name and c.status != CheckStatus.PASSED]
         assert len(no_config) > 0, "Should note missing YAML configs"

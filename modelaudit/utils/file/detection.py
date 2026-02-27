@@ -346,6 +346,7 @@ EXTENSION_FORMAT_MAP = {
     ".engine": "tensorrt",
     ".plan": "tensorrt",
     ".msgpack": "flax_msgpack",
+    ".nemo": "nemo",
 }
 
 
@@ -396,6 +397,8 @@ def detect_format_from_extension_pattern_matching(extension: FileExtension) -> F
             return "numpy"
         case ".msgpack":
             return "flax_msgpack"
+        case ".nemo":
+            return "nemo"
         case ".7z":
             return "sevenzip"
         case _:
