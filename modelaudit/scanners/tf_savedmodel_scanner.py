@@ -301,8 +301,22 @@ class TensorFlowSavedModelScanner(BaseScanner):
 
     def _analyze_saved_model(self, saved_model: Any, result: ScanResult) -> None:
         """Analyze the saved model for suspicious operations"""
+        import re
+
         suspicious_op_found = False
         op_counts: dict[str, int] = {}
+
+        # Regex to detect Lambda-layer node names in the graph.
+        # Matches node names that start with "lambda" (case-insensitive)
+        # followed by "/" or "_<digit>" which is the standard Keras naming
+        # convention for Lambda layers (e.g. "lambda/StatefulPartitionedCall",
+        # "lambda_1/PartitionedCall").  This is intentionally stricter than
+        # the plain substring check that was previously used in
+        # suspicious_func_patterns, which caused false positives on standard
+        # Keras preprocessing layers whose *function* names also contain
+        # "lambda" (e.g. "__inference_lambda_layer_call_fn_123").
+        _lambda_node_re = re.compile(r"^(?:lambda(?:_\d+)?)(?:/|$)", re.IGNORECASE)
+        _reported_lambda_layers: set[str] = set()
 
         for meta_graph in saved_model.meta_graphs:
             graph_def = meta_graph.graph_def
@@ -344,9 +358,15 @@ class TensorFlowSavedModelScanner(BaseScanner):
                     if hasattr(func_attr, "func") and hasattr(func_attr.func, "name"):
                         func_name = func_attr.func.name
 
-                        # Check for suspicious function names
+                        # Check for suspicious function names.
+                        # NOTE: "lambda" is intentionally excluded because
+                        # standard Keras preprocessing layers generate
+                        # StatefulPartitionedCall nodes whose function names
+                        # contain "lambda" as part of normal TF internal
+                        # naming (e.g. "__inference_lambda_layer_call_fn_123").
+                        # Lambda layers are already detected separately via
+                        # _scan_keras_metadata.
                         suspicious_func_patterns = [
-                            "lambda",
                             "eval",
                             "exec",
                             "compile",
@@ -378,6 +398,37 @@ class TensorFlowSavedModelScanner(BaseScanner):
                                     ),
                                 )
                                 break
+
+                # Detect Lambda layers by node name.  This catches Lambda
+                # layers even when scanning a standalone saved_model.pb
+                # file (where _scan_keras_metadata is not invoked).
+                # Only report each distinct layer prefix once to avoid
+                # flooding the results (a single Lambda layer produces
+                # many graph nodes under the same prefix).
+                m = _lambda_node_re.match(node.name)
+                if m:
+                    layer_prefix = m.group(0).rstrip("/")
+                    if layer_prefix not in _reported_lambda_layers:
+                        _reported_lambda_layers.add(layer_prefix)
+                        result.add_check(
+                            name="Lambda Layer Detection",
+                            passed=False,
+                            message="Lambda layer detected in graph",
+                            severity=IssueSeverity.WARNING,
+                            location=f"{self.current_file_path} (node: {node.name})",
+                            details={
+                                "node_name": node.name,
+                                "op_type": node.op,
+                                "layer_prefix": layer_prefix,
+                                "meta_graph": (
+                                    meta_graph.meta_info_def.tags[0] if meta_graph.meta_info_def.tags else "unknown"
+                                ),
+                            },
+                            why=(
+                                "Lambda layers can execute arbitrary Python code during "
+                                "model inference, which poses a security risk."
+                            ),
+                        )
 
         # Add operation counts to metadata
         result.metadata["op_counts"] = op_counts
@@ -707,8 +758,11 @@ class TensorFlowSavedModelScanner(BaseScanner):
             (r"<script[^>]*>", "script_injection", "HTML script tag"),
             (r"javascript:", "script_injection", "JavaScript URI"),
             (r"vbscript:", "script_injection", "VBScript URI"),
-            # Base64 encoded payloads
-            (r"[A-Za-z0-9+/]{20,}={0,2}", "encoded_payload", "potential base64 payload"),
+            # Base64 encoded payloads — require at least one trailing '=' pad
+            # character to avoid matching normal TF node names that use '/'
+            # as a hierarchical separator (e.g. "bidirectional/forward_lstm",
+            # "Adam/embedding/embeddings").
+            (r"[A-Za-z0-9+/]{20,}={1,2}", "encoded_payload", "potential base64 payload"),
         ]
 
         import re

@@ -452,7 +452,7 @@ class WeightDistributionScanner(BaseScanner):
                         if ("weight" in node.name.lower() or "kernel" in node.name.lower()) and len(array.shape) >= 2:
                             weights_info[node.name] = array
         except Exception as e:
-            logger.debug(f"Failed to extract weights from {path}: {e}")
+            logger.warning(f"Weight analysis incomplete for {path}: {e}")
 
         return weights_info
 
@@ -480,42 +480,33 @@ class WeightDistributionScanner(BaseScanner):
             logger.debug(f"Failed to load ONNX model from {path}: {e}")
             return weights_info
 
-        # Extract 2D+ initializers — these are weight matrices (conv kernels,
-        # linear layers, embeddings). 1D tensors (biases, batch-norm params)
-        # aren't relevant for weight distribution analysis. This approach is
-        # framework-agnostic since ONNX naming conventions vary by exporter.
-        for initializer in model.graph.initializer:
-            try:
-                # Skip external-data tensors — their raw bytes are not available
-                # when loaded with load_external_data=False and calling to_array
-                # on them would raise a ValidationError.
-                if initializer.data_location == onnx.TensorProto.EXTERNAL:
-                    continue
+            # Extract 2D+ initializers — these are weight matrices (conv kernels,
+            # linear layers, embeddings). 1D tensors (biases, batch-norm params)
+            # aren't relevant for weight distribution analysis. This approach is
+            # framework-agnostic since ONNX naming conventions vary by exporter.
+            import numpy as np
+
+            for initializer in model.graph.initializer:
                 if len(initializer.dims) >= 2:
-                    # Pre-check estimated size before materializing the tensor
-                    # to avoid memory spikes from oversized arrays.
-                    if self.max_array_size and self.max_array_size > 0:
-                        import math
+                    # Pre-check estimated byte size before materializing the
+                    # full array — avoids memory exhaustion on huge tensors.
+                    try:
+                        _onnx_mapping = getattr(onnx, "mapping", None)
+                        if _onnx_mapping is not None and hasattr(_onnx_mapping, "TENSOR_TYPE_TO_NP_TYPE"):
+                            tensor_dtype = _onnx_mapping.TENSOR_TYPE_TO_NP_TYPE[initializer.data_type]
+                            estimated_size = int(np.prod(initializer.dims)) * np.dtype(tensor_dtype).itemsize
+                            if self.max_array_size and self.max_array_size > 0 and estimated_size > self.max_array_size:
+                                continue
+                    except Exception:
+                        pass  # Fall through and let to_array handle it
 
-                        import numpy as np
+                    arr = onnx.numpy_helper.to_array(initializer)  # type: ignore[possibly-unresolved-reference]
+                    if self.max_array_size and self.max_array_size > 0 and arr.nbytes > self.max_array_size:
+                        continue
+                    weights_info[initializer.name] = arr
 
-                        numel = math.prod(int(dim) for dim in initializer.dims)
-                        np_dtype = onnx.helper.tensor_dtype_to_np_dtype(initializer.data_type)
-                        estimated_nbytes = numel * int(np.dtype(np_dtype).itemsize)
-                        if estimated_nbytes > self.max_array_size:
-                            continue
-                    array = onnx.numpy_helper.to_array(  # type: ignore[possibly-unresolved-reference]
-                        initializer,
-                    )
-                    weights_info[initializer.name] = array
-            except Exception as e:
-                logger.warning(
-                    "Failed to extract ONNX initializer '%s' from %s: %s",
-                    initializer.name,
-                    path,
-                    e,
-                )
-                continue
+        except Exception as e:
+            logger.warning(f"Failed to extract ONNX weights from {path}: {e}")
 
         return weights_info
 
