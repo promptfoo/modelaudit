@@ -34,7 +34,7 @@ from ..detectors.suspicious_symbols import DANGEROUS_OPCODES
 from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult, logger
 
 
-def _genops_with_fallback(file_obj):
+def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> Any:
     """
     Wrapper around pickletools.genops that handles protocol mismatches.
 
@@ -42,21 +42,96 @@ def _genops_with_fallback(file_obj):
     like READONLY_BUFFER (0x0f). This function attempts to parse as much as possible
     before hitting unknown opcodes.
 
+    When *multi_stream* is True the generator continues parsing after the first STOP
+    opcode so that malicious payloads hidden in a second pickle stream are not missed.
+    Non-pickle separator bytes between streams are skipped (up to a limit) so that a
+    single junk byte cannot bypass detection.
+
     Yields: (opcode, arg, pos) tuples from pickletools.genops
     """
-    try:
-        yield from pickletools.genops(file_obj)
-    except ValueError as e:
-        error_str = str(e).lower()
-        # Check if it's an unknown opcode error (protocol mismatch)
-        if "opcode" in error_str and "unknown" in error_str:
-            # Log that we hit a protocol mismatch - this is expected for joblib files
-            logger.info(f"Protocol mismatch in pickle (joblib may use protocol 5 opcodes in protocol 4 files): {e}")
-            # Don't re-raise - we've already yielded all valid opcodes before the unknown one
-            return
+    # Maximum number of consecutive non-pickle bytes to skip when resyncing
+    _MAX_RESYNC_BYTES = 256
+    resync_skipped = 0
+    # Track whether we've successfully parsed at least one complete stream
+    parsed_any_stream = False
+
+    while True:
+        stream_start = file_obj.tell()
+        had_opcodes = False
+        stream_error = False
+
+        if not parsed_any_stream:
+            # First stream: yield opcodes directly (no buffering needed)
+            try:
+                for item in pickletools.genops(file_obj):
+                    had_opcodes = True
+                    yield item
+            except ValueError as e:
+                error_str = str(e).lower()
+                if "opcode" in error_str and "unknown" in error_str:
+                    logger.info(
+                        f"Protocol mismatch in pickle (joblib may use protocol 5 opcodes in protocol 4 files): {e}"
+                    )
+                else:
+                    raise
         else:
-            # Re-raise other ValueError types
-            raise
+            # Subsequent streams: buffer opcodes so that partial streams
+            # (e.g. binary tensor data misinterpreted as opcodes) don't
+            # produce false positives.
+            buffered: list[Any] = []
+            try:
+                for item in pickletools.genops(file_obj):
+                    had_opcodes = True
+                    buffered.append(item)
+            except ValueError:
+                # Any ValueError on a subsequent stream means we hit
+                # non-pickle data or a junk separator byte.
+                stream_error = True
+
+            if stream_error and had_opcodes:
+                # Partial stream: binary data was misinterpreted as opcodes.
+                # Discard the buffer and stop — no more valid streams.
+                return
+
+            if not stream_error:
+                # Stream completed successfully — yield buffered opcodes
+                yield from buffered
+
+        if not multi_stream:
+            return
+
+        if had_opcodes and not stream_error:
+            parsed_any_stream = True
+
+        if not had_opcodes:
+            # Resync: the current byte was not a valid pickle start.
+            # Skip one byte and keep searching for the next stream, up to a limit.
+            file_obj.seek(stream_start, 0)
+            if not file_obj.read(1):
+                return  # EOF
+            resync_skipped += 1
+            if resync_skipped >= _MAX_RESYNC_BYTES:
+                # Bounded fast-forward search for the next likely protocol header
+                # so simple padding cannot terminate multi-stream scanning.
+                probe_start = file_obj.tell()
+                probe = file_obj.read(64 * 1024)
+                candidate = next(
+                    (idx for idx in range(len(probe) - 1) if probe[idx] == 0x80 and probe[idx + 1] in (2, 3, 4, 5)),
+                    -1,
+                )
+                if candidate < 0:
+                    return
+                file_obj.seek(probe_start + candidate, 0)
+                resync_skipped = 0
+            continue
+
+        # Found a valid stream — reset resync counter
+        resync_skipped = 0
+        # Check if there is another pickle stream after STOP
+        next_byte = file_obj.read(1)
+        if not next_byte:
+            return  # EOF
+        file_obj.seek(-1, 1)  # put the byte back for the next genops call
 
 
 def _compute_pickle_length(path: str) -> int:
@@ -134,7 +209,7 @@ ML_FRAMEWORK_PATTERNS: dict[str, dict[str, list[str] | float]] = {
         "confidence_boost": 0.8,
     },
     "sklearn": {
-        "modules": ["sklearn", "joblib", "numpy", "numpy.core", "numpy.dtype"],
+        "modules": ["sklearn", "joblib", "numpy", "numpy.core", "numpy._core", "numpy.dtype", "scipy.sparse"],
         "classes": [
             "Pipeline",
             "StandardScaler",
@@ -150,7 +225,14 @@ ML_FRAMEWORK_PATTERNS: dict[str, dict[str, list[str] | float]] = {
             "Ridge",
             "Lasso",
         ],
-        "patterns": [r"sklearn\..*", r"joblib\..*", r"numpy\..*", r"numpy\.core\..*"],
+        "patterns": [
+            r"sklearn\..*",
+            r"joblib\..*",
+            r"numpy\..*",
+            r"numpy\.core\..*",
+            r"numpy\._core\..*",
+            r"scipy\.sparse\..*",
+        ],
         "confidence_boost": 0.9,
     },
     "huggingface": {
@@ -250,6 +332,11 @@ ALWAYS_DANGEROUS_FUNCTIONS: set[str] = {
     "shutil.move",
     "shutil.copy",
     "shutil.copytree",
+    # Dynamic resolution trampolines (can resolve arbitrary callables)
+    "pkgutil.resolve_name",
+    # uuid internal functions that call subprocess.Popen
+    "uuid._get_command_stdout",
+    "uuid._popen",
     # Profiling/debugging modules that execute arbitrary Python code
     "cProfile.run",
     "cProfile.runctx",
@@ -277,7 +364,9 @@ ALWAYS_DANGEROUS_FUNCTIONS: set[str] = {
 }
 
 # Module prefixes that are always dangerous (Fickling-based + additional)
+# This must be a superset of fickling's 68-module blocklist (PR #215)
 ALWAYS_DANGEROUS_MODULES: set[str] = {
+    # Original modules
     "__builtin__",
     "__builtins__",
     "builtins",
@@ -300,11 +389,14 @@ ALWAYS_DANGEROUS_MODULES: set[str] = {
     # Native code execution (ctypes)
     "ctypes",
     "ctypes.util",
+    "_ctypes",
     # Profiling/debugging - can execute arbitrary Python code via run()
     "cProfile",
     "profile",
     "pdb",
     "timeit",
+    "bdb",
+    "trace",
     # Thread/process spawning
     "_thread",
     "multiprocessing",
@@ -312,6 +404,67 @@ ALWAYS_DANGEROUS_MODULES: set[str] = {
     "zipimport",
     "importlib",
     "runpy",
+    # Dynamic resolution / import trampolines
+    "pkgutil",
+    # Network / exfiltration
+    "smtplib",
+    "imaplib",
+    "poplib",
+    "nntplib",
+    "xmlrpc",
+    "socketserver",
+    "ssl",
+    "requests",
+    "aiohttp",
+    # Code execution / compilation
+    "codeop",
+    "marshal",
+    "types",
+    "compileall",
+    "py_compile",
+    # Operator / functools bypasses
+    "_operator",
+    "functools",
+    # Pickle recursion
+    "pickle",
+    "_pickle",
+    "dill",
+    "cloudpickle",
+    "joblib",
+    # Filesystem / shell
+    "tempfile",
+    "filecmp",
+    "fileinput",
+    "glob",
+    "distutils",
+    "pydoc",
+    "pexpect",
+    # Virtual environments / package install
+    "venv",
+    "ensurepip",
+    "pip",
+    # Threading / signal
+    "signal",
+    "_signal",
+    "threading",
+    # Other dangerous
+    "webbrowser",
+    "asyncio",
+    "mmap",
+    "select",
+    "selectors",
+    "logging",
+    "syslog",
+    "tarfile",
+    "zipfile",
+    "shelve",
+    "sqlite3",
+    "_sqlite3",
+    "doctest",
+    "idlelib",
+    "lib2to3",
+    # uuid — _get_command_stdout internally calls subprocess.Popen
+    "uuid",
     # NOTE: linecache and logging.config are intentionally NOT in this set.
     # - linecache.getline: file read (not code execution), flagged as WARNING
     # - logging.config.listen: network listener (not direct code exec), flagged as WARNING
@@ -621,6 +774,22 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "_reconstruct",
         "scalar",
     ],
+    "numpy.core.numeric": [
+        "_frombuffer",
+    ],
+    # numpy._core is the internal path used in NumPy 2.x+
+    "numpy._core": [
+        "multiarray",
+        "numeric",
+        "_internal",
+    ],
+    "numpy._core.multiarray": [
+        "_reconstruct",
+        "scalar",
+    ],
+    "numpy._core.numeric": [
+        "_frombuffer",
+    ],
     "numpy.random._pickle": [
         "__randomstate_ctor",
         "__generator_ctor",
@@ -630,6 +799,28 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
     ],
     "numpy.random._mt19937": [
         "MT19937",
+    ],
+    # SciPy sparse matrix types — common in sklearn TF-IDF / NLP pipelines
+    "scipy.sparse": [
+        "csr_matrix",
+        "csc_matrix",
+        "coo_matrix",
+        "lil_matrix",
+        "bsr_matrix",
+        "dia_matrix",
+        "dok_matrix",
+    ],
+    "scipy.sparse._csr": [
+        "csr_matrix",
+        "csr_array",
+    ],
+    "scipy.sparse._csc": [
+        "csc_matrix",
+        "csc_array",
+    ],
+    "scipy.sparse._coo": [
+        "coo_matrix",
+        "coo_array",
     ],
     "math": [
         "sqrt",
@@ -919,6 +1110,10 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "make_pipeline",
         "make_union",
     ],
+    "sklearn.pipeline._pipeline": [
+        "Pipeline",
+        "FeatureUnion",
+    ],
     "sklearn.compose": [
         "ColumnTransformer",
         "TransformedTargetRegressor",
@@ -936,6 +1131,12 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "RandomizedSearchCV",
     ],
     "sklearn.feature_extraction.text": [
+        "CountVectorizer",
+        "TfidfVectorizer",
+        "TfidfTransformer",
+        "HashingVectorizer",
+    ],
+    "sklearn.feature_extraction._text": [
         "CountVectorizer",
         "TfidfVectorizer",
         "TfidfTransformer",
@@ -1992,13 +2193,25 @@ def is_dangerous_reduce_pattern(
                     break
 
         # Check for INST or OBJ opcodes which can also be used for code execution
-        if opcode.name in ["INST", "OBJ", "NEWOBJ"] and isinstance(arg, str):
-            return {
-                "pattern": f"{opcode.name}_EXECUTION",
-                "argument": arg,
-                "position": pos,
-                "opcode": opcode.name,
-            }
+        # Skip if the target class is in the ML_SAFE_GLOBALS allowlist
+        if opcode.name in ["INST", "OBJ", "NEWOBJ", "NEWOBJ_EX"] and isinstance(arg, str):
+            parsed = _parse_module_function(arg)
+            is_safe = False
+            if parsed:
+                inst_mod, inst_func = parsed
+                is_safe = _is_safe_ml_global(inst_mod, inst_func)
+            if not is_safe:
+                # Also check via symbolic reference maps for NEWOBJ/OBJ
+                ref = resolved_callables.get(i)
+                if ref:
+                    is_safe = _is_safe_ml_global(ref[0], ref[1])
+            if not is_safe:
+                return {
+                    "pattern": f"{opcode.name}_EXECUTION",
+                    "argument": arg,
+                    "position": pos,
+                    "opcode": opcode.name,
+                }
 
         # Check for suspicious attribute access patterns (GETATTR followed by CALL)
         if opcode.name == "GETATTR" and i + 1 < len(opcodes) and opcodes[i + 1][0].name == "CALL":
@@ -2058,8 +2271,23 @@ def check_opcode_sequence(
     dangerous_opcode_count = 0
     consecutive_dangerous = 0
     max_consecutive = 0
+    # Track whether the last object construction used a safe ML global.
+    # BUILD opcodes restore state on the previously-constructed object via
+    # __setstate__ and are benign when the object comes from a safe ML class.
+    last_construction_safe = False
 
     for i, (opcode, arg, pos) in enumerate(opcodes):
+        # Reset counters at stream boundaries (STOP) so that multi-stream
+        # analysis evaluates each pickle stream independently.  Without this,
+        # legitimate ML models with many REDUCE calls spread across multiple
+        # streams would accumulate past the threshold.
+        if opcode.name == "STOP":
+            dangerous_opcode_count = 0
+            consecutive_dangerous = 0
+            max_consecutive = 0
+            last_construction_safe = False
+            continue
+
         # Track dangerous opcodes, skipping safe ML globals and structural opcodes
         is_dangerous_opcode = False
 
@@ -2072,12 +2300,35 @@ def check_opcode_sequence(
             elif opcode.name == "REDUCE":
                 # Default to dangerous if no associated GLOBAL/STACK_GLOBAL found
                 is_dangerous_opcode = True
+                last_construction_safe = False
                 associated_ref = resolved_callables.get(i)
                 if associated_ref:
                     mod, func = associated_ref
                     # Only skip if in safe globals
                     if _is_safe_ml_global(mod, func):
                         is_dangerous_opcode = False
+                        last_construction_safe = True
+
+            # NEWOBJ/NEWOBJ_EX: check callable refs like REDUCE
+            elif opcode.name in ("NEWOBJ", "NEWOBJ_EX"):
+                is_dangerous_opcode = True
+                last_construction_safe = False
+                associated_ref = resolved_callables.get(i)
+                if associated_ref:
+                    mod, func = associated_ref
+                    if _is_safe_ml_global(mod, func):
+                        is_dangerous_opcode = False
+                        last_construction_safe = True
+
+            # BUILD: restores object state via __setstate__.  When the
+            # preceding construction used a safe ML global the BUILD is
+            # benign — it just sets attributes on a known-safe object.
+            elif opcode.name == "BUILD":
+                if not last_construction_safe:
+                    is_dangerous_opcode = True
+                # BUILD does not reset last_construction_safe because
+                # multiple BUILD opcodes can follow a single construction
+                # (e.g. nested __setstate__ calls in sklearn trees).
 
             # GLOBAL/STACK_GLOBAL: only count when referencing non-safe modules
             elif opcode.name == "GLOBAL" and isinstance(arg, str):
@@ -2099,8 +2350,9 @@ def check_opcode_sequence(
                     is_dangerous_opcode = True
 
             else:
-                # Other dangerous opcodes (INST, OBJ, NEWOBJ, NEWOBJ_EX, BUILD, EXT*)
+                # Other dangerous opcodes (INST, OBJ, EXT*)
                 is_dangerous_opcode = True
+                last_construction_safe = False
 
             if is_dangerous_opcode:
                 dangerous_opcode_count += 1
@@ -2346,10 +2598,15 @@ class PickleScanner(BaseScanner):
                 # For .bin files, also scan the remaining binary content
                 # PyTorch files have pickle header followed by tensor data
                 if is_bin_file and scan_result.success:
-                    pickle_end_pos = f.tell()
+                    # Use the first pickle stream end position (before multi-stream
+                    # scanning consumed additional bytes) for binary content scanning.
+                    pickle_end_pos = scan_result.metadata.get("first_pickle_end_pos", f.tell())
                     remaining_bytes = file_size - pickle_end_pos
 
                     if remaining_bytes > 0:
+                        # Seek to the pickle end position (multi-stream scanning may
+                        # have advanced the file pointer beyond this point).
+                        f.seek(pickle_end_pos)
                         # Always scan binary content after pickle
                         # Removed ML confidence-based skipping to prevent security bypasses
                         binary_result = self._scan_binary_content(
@@ -3078,6 +3335,8 @@ class PickleScanner(BaseScanner):
             opcodes = []
             # Track strings on the stack for STACK_GLOBAL opcode analysis
             string_stack = []
+            # Track end position of the first pickle stream for binary scanning
+            first_pickle_end_pos: int | None = None
 
             # Track stack depth for complexity analysis
             current_stack_depth = 0
@@ -3089,7 +3348,7 @@ class PickleScanner(BaseScanner):
             # Store warnings for ML-context-aware processing
             stack_depth_warnings: list[dict[str, int | str]] = []
 
-            for opcode, arg, pos in _genops_with_fallback(file_obj):
+            for opcode, arg, pos in _genops_with_fallback(file_obj, multi_stream=True):
                 # Check for interrupts periodically during opcode processing
                 if opcode_count % 1000 == 0:  # Check every 1000 opcodes
                     self.check_interrupted()
@@ -3116,6 +3375,8 @@ class PickleScanner(BaseScanner):
                 # STOP resets the stack
                 elif opcode.name == "STOP":
                     current_stack_depth = 0
+                    if first_pickle_end_pos is None:
+                        first_pickle_end_pos = start_pos + pos + 1
 
                 # Store stack depth warnings for ML-context-aware processing later
                 if current_stack_depth > base_stack_depth_limit:
@@ -3306,6 +3567,8 @@ class PickleScanner(BaseScanner):
                     "suspicious_count": suspicious_count,
                 },
             )
+            if first_pickle_end_pos is not None:
+                result.metadata["first_pickle_end_pos"] = first_pickle_end_pos
 
             # Analyze globals extracted from all pickle streams
             for mod, func in advanced_globals:
@@ -3488,7 +3751,7 @@ class PickleScanner(BaseScanner):
 
                 # Check NEWOBJ/OBJ/INST opcodes for potential security issues
                 # Apply same logic as REDUCE: check if class is in ML_SAFE_GLOBALS
-                if opcode.name in ["INST", "OBJ", "NEWOBJ"]:
+                if opcode.name in ["INST", "OBJ", "NEWOBJ", "NEWOBJ_EX"]:
                     # Look back to find the associated class (GLOBAL or STACK_GLOBAL)
                     class_mod, class_name, associated_class = _find_associated_global_or_class(
                         opcodes,
@@ -3879,7 +4142,8 @@ class PickleScanner(BaseScanner):
                         },
                         why=(
                             "This pickle contains an unusually high concentration of opcodes that can execute code "
-                            "(REDUCE, INST, OBJ, NEWOBJ). Such patterns are uncommon in legitimate model files."
+                            "(REDUCE, INST, OBJ, NEWOBJ, NEWOBJ_EX). "
+                            "Such patterns are uncommon in legitimate model files."
                         ),
                     )
             else:
@@ -4402,7 +4666,7 @@ class PickleScanner(BaseScanner):
             # Count dangerous opcodes
             # Note: STACK_GLOBAL is only dangerous with malicious imports, not with legitimate ML framework imports
             is_dangerous = False
-            if opcode.name in ["REDUCE", "INST", "OBJ", "NEWOBJ"]:
+            if opcode.name in ["REDUCE", "INST", "OBJ", "NEWOBJ", "NEWOBJ_EX"]:
                 is_dangerous = True
             elif opcode.name == "STACK_GLOBAL" and arg:
                 # Only count STACK_GLOBAL as dangerous if it's NOT a legitimate ML framework import
@@ -4445,7 +4709,7 @@ class PickleScanner(BaseScanner):
                 # Note: We check ALL torch operations since even legitimate ones can be part of attacks
                 for j in range(i + 1, min(i + 31, len(opcodes))):
                     next_opcode, _next_arg, next_pos = opcodes[j]
-                    if next_opcode.name in ["REDUCE", "INST", "OBJ", "NEWOBJ"]:
+                    if next_opcode.name in ["REDUCE", "INST", "OBJ", "NEWOBJ", "NEWOBJ_EX"]:
                         # Only flag clearly suspicious torch operations
                         is_suspicious = (
                             # Suspicious torch modules/functions
