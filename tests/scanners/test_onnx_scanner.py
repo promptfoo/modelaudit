@@ -164,6 +164,20 @@ class TestCVE202225882PathTraversal:
         cve_issues = [c for c in result.checks if "CVE-2022-25882" in (c.name + c.message)]
         assert len(cve_issues) == 0, "Safe external data should not trigger CVE-2022-25882"
 
+    def test_normalized_in_dir_path_with_dotdot_no_cve(self, tmp_path):
+        """Paths containing '..' but normalizing inside model dir should not be CVE-tagged."""
+        (tmp_path / "weights.bin").write_bytes(struct.pack("f", 1.0))
+        model_path = create_onnx_model(
+            tmp_path,
+            external=True,
+            external_path="subdir/../weights.bin",
+            missing_external=True,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+        cve_issues = [c for c in result.checks if "CVE-2022-25882" in (c.name + c.message)]
+        assert len(cve_issues) == 0, "Normalized in-dir path should not trigger CVE-2022-25882"
+
     def test_path_traversal_message_includes_path(self, tmp_path):
         """CVE-2022-25882 check message should include the offending path."""
         _target, traversal_path = self._create_escaped_target(tmp_path)

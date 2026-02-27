@@ -275,9 +275,8 @@ class OnnxScanner(BaseScanner):
                 external_path = (model_dir / location).resolve()
                 # Check for path traversal BEFORE file existence so
                 # traversal attempts are flagged even for non-existent targets.
-                has_traversal_raw = ".." in location.replace("\\", "/").split("/")
                 escapes_model_dir = not _is_contained_in(external_path, model_dir)
-                if has_traversal_raw or escapes_model_dir:
+                if escapes_model_dir:
                     result.add_check(
                         name="CVE-2022-25882: External Data Path Traversal",
                         passed=False,
