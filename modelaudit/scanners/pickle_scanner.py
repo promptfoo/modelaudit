@@ -325,6 +325,11 @@ ALWAYS_DANGEROUS_FUNCTIONS: set[str] = {
     "torch.hub.load",
     "torch.hub.load_state_dict_from_url",
     "torch.storage._load_from_bytes",
+    # CVE-2024-5480 / CVE-2024-48063: PyTorch RPC functions
+    "torch.distributed.rpc.rpc_sync",
+    "torch.distributed.rpc.rpc_async",
+    "torch.distributed.rpc.remote",
+    "torch.distributed.rpc.RemoteModule",
     # NumPy dangerous functions (Fickling)
     "numpy.testing._private.utils.runstring",
     # Shell utilities

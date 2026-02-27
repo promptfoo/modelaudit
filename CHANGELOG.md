@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Detect CVE-2022-45907 (CVSS 9.8): PyTorch `torch.jit.annotations.parse_type_line` eval() injection (fixed in PyTorch 1.13.1)
+- Detect CVE-2024-5480 (CVSS 10.0): PyTorch `torch.distributed.rpc` arbitrary function execution (fixed in PyTorch 2.2.3)
+- Detect CVE-2024-48063 (CVSS 9.8): PyTorch `torch.distributed.rpc.RemoteModule` deserialization RCE (fixed in PyTorch 2.5.0)
+- PyTorch version checks for all 3 new CVEs in PyTorch ZIP scanner
+- RPC functions added to pickle scanner dangerous functions blocklist
+
 ## [0.2.26](https://github.com/promptfoo/modelaudit/compare/v0.2.25...v0.2.26) (2026-02-24)
 
 ### Bug Fixes

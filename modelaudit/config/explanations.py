@@ -668,3 +668,88 @@ def get_pytorch_security_explanation(issue_type: str) -> str:
         "This is a PyTorch-specific security concern. Review PyTorch security best practices "
         "and ensure you're following safe model loading procedures.",
     )
+
+
+def get_cve_2022_45907_explanation(vulnerability_type: str) -> str:
+    """Get explanation for CVE-2022-45907: torch.jit.annotations.parse_type_line eval() injection."""
+    explanations = {
+        "eval_injection": (
+            "CVE-2022-45907 (CVSS 9.8): torch.jit.annotations.parse_type_line() passes "
+            "user-supplied type annotation strings directly to Python's eval(), enabling "
+            "arbitrary code execution. An attacker can craft a malicious type annotation "
+            "string that, when parsed by the JIT compiler, executes arbitrary Python code "
+            "on the host system."
+        ),
+        "type_annotation_parsing": (
+            "The vulnerable function parse_type_line() is used internally by the PyTorch "
+            "JIT compiler to process type annotations in TorchScript code. Because it uses "
+            "eval() without sanitization, any string that reaches this function can execute "
+            "arbitrary code, including system commands, file operations, and network access."
+        ),
+        "pytorch_version": (
+            "This vulnerability affects PyTorch versions before 1.13.1. The fix replaces "
+            "the unsafe eval() call with a proper type annotation parser. Upgrade to "
+            "PyTorch >= 1.13.1 to remediate this vulnerability."
+        ),
+    }
+
+    return explanations.get(
+        vulnerability_type,
+        "CVE-2022-45907: PyTorch JIT type annotation parsing vulnerability. Update to PyTorch >= 1.13.1.",
+    )
+
+
+def get_cve_2024_5480_explanation(vulnerability_type: str) -> str:
+    """Get explanation for CVE-2024-5480: torch.distributed.rpc function injection."""
+    explanations = {
+        "rpc_function_injection": (
+            "CVE-2024-5480 (CVSS 10.0): The PyTorch torch.distributed.rpc framework does "
+            "not validate the functions passed in RPC calls. An attacker with network access "
+            "to an RPC endpoint can send eval(), exec(), or os.system() as the target "
+            "function, achieving arbitrary code execution on the remote worker."
+        ),
+        "python_udf_exploit": (
+            "The PythonUDF mechanism in PyTorch RPC allows sending arbitrary Python "
+            "callables to remote workers. Without validation, an attacker can send "
+            "dangerous built-in functions (eval, exec, __import__) as UDFs, bypassing "
+            "any application-level security controls."
+        ),
+        "pytorch_version": (
+            "This vulnerability affects PyTorch versions before 2.2.3. The fix adds "
+            "function validation to RPC calls. Upgrade to PyTorch >= 2.2.3 and restrict "
+            "RPC access to trusted nodes only."
+        ),
+    }
+
+    return explanations.get(
+        vulnerability_type,
+        "CVE-2024-5480: PyTorch RPC arbitrary function execution vulnerability. Update to PyTorch >= 2.2.3.",
+    )
+
+
+def get_cve_2024_48063_explanation(vulnerability_type: str) -> str:
+    """Get explanation for CVE-2024-48063: RemoteModule deserialization RCE."""
+    explanations = {
+        "remote_module_deserialization": (
+            "CVE-2024-48063 (CVSS 9.8): torch.distributed.rpc.RemoteModule uses pickle "
+            "deserialization when receiving module state from remote peers. An attacker "
+            "can craft a malicious serialized payload that executes arbitrary code when "
+            "deserialized by the receiving worker node."
+        ),
+        "rpc_pickle_exploit": (
+            "The RemoteModule class serializes and deserializes module state using pickle "
+            "during RPC communication. Since pickle can execute arbitrary code via "
+            "__reduce__ methods, a malicious peer can embed code execution payloads "
+            "in the serialized module state. This CVE is disputed by PyTorch maintainers "
+            "as 'intended behavior'."
+        ),
+        "pytorch_version": (
+            "This vulnerability affects PyTorch versions before 2.5.0. Upgrade to "
+            "PyTorch >= 2.5.0 and avoid using RemoteModule with untrusted peers."
+        ),
+    }
+
+    return explanations.get(
+        vulnerability_type,
+        "CVE-2024-48063: PyTorch RemoteModule deserialization RCE vulnerability. Update to PyTorch >= 2.5.0.",
+    )
