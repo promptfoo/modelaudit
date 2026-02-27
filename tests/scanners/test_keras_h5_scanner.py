@@ -419,3 +419,81 @@ def test_keras_h5_scanner_allows_known_safe_classes(tmp_path):
         subclass_checks = [c for c in result.checks if "subclassed" in c.name.lower()]
         assert len(subclass_checks) > 0
         assert all(c.status == CheckStatus.PASSED for c in subclass_checks)
+
+
+class TestCVE20259905H5SafeMode:
+    """Test CVE-2025-9905: Keras H5 safe_mode ignored for Lambda layers."""
+
+    def test_lambda_layer_triggers_cve_2025_9905(self, tmp_path):
+        """Lambda layer in H5 file should flag CVE-2025-9905."""
+        h5_path = tmp_path / "model.h5"
+        with h5py.File(h5_path, "w") as f:
+            model_config = {
+                "class_name": "Sequential",
+                "config": {
+                    "name": "test",
+                    "layers": [
+                        {
+                            "class_name": "Lambda",
+                            "config": {"function": "lambda x: x * 2"},
+                        }
+                    ],
+                },
+            }
+            f.attrs["model_config"] = json.dumps(model_config)
+
+        scanner = KerasH5Scanner()
+        result = scanner.scan(str(h5_path))
+
+        cve_issues = [i for i in result.issues if "CVE-2025-9905" in i.message]
+        assert len(cve_issues) >= 1, "Lambda in H5 should trigger CVE-2025-9905"
+        assert cve_issues[0].severity == IssueSeverity.CRITICAL
+
+    def test_cve_attribution_details(self, tmp_path):
+        """CVE details should be present in issue details."""
+        h5_path = tmp_path / "model.h5"
+        with h5py.File(h5_path, "w") as f:
+            model_config = {
+                "class_name": "Sequential",
+                "config": {
+                    "name": "test",
+                    "layers": [
+                        {
+                            "class_name": "Lambda",
+                            "config": {"function": "lambda x: x"},
+                        }
+                    ],
+                },
+            }
+            f.attrs["model_config"] = json.dumps(model_config)
+
+        scanner = KerasH5Scanner()
+        result = scanner.scan(str(h5_path))
+
+        cve_issues = [i for i in result.issues if "CVE-2025-9905" in i.message]
+        assert len(cve_issues) >= 1
+        details = cve_issues[0].details
+        assert details["cve_id"] == "CVE-2025-9905"
+        assert details["cvss"] == 7.3
+        assert "3.11.3" in details["remediation"]
+
+    def test_no_cve_without_lambda(self, tmp_path):
+        """H5 model without Lambda should NOT trigger CVE-2025-9905."""
+        h5_path = tmp_path / "model.h5"
+        with h5py.File(h5_path, "w") as f:
+            model_config = {
+                "class_name": "Sequential",
+                "config": {
+                    "name": "test",
+                    "layers": [
+                        {"class_name": "Dense", "config": {"units": 10}},
+                    ],
+                },
+            }
+            f.attrs["model_config"] = json.dumps(model_config)
+
+        scanner = KerasH5Scanner()
+        result = scanner.scan(str(h5_path))
+
+        cve_issues = [i for i in result.issues if "CVE-2025-9905" in i.message]
+        assert len(cve_issues) == 0, "No Lambda = no CVE-2025-9905"

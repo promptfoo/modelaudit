@@ -668,3 +668,26 @@ def get_pytorch_security_explanation(issue_type: str) -> str:
         "This is a PyTorch-specific security concern. Review PyTorch security best practices "
         "and ensure you're following safe model loading procedures.",
     )
+
+
+def get_cve_2025_9905_explanation(issue_type: str) -> str:
+    """Get explanation for CVE-2025-9905: Keras H5 safe_mode ignored for Lambda layers.
+
+    CVE-2025-9905 (CVSS 7.3 HIGH): Keras Model.load_model silently ignores
+    safe_mode=True when loading .h5/.hdf5 files. Lambda layers execute arbitrary
+    code without any safe mode check. Fixed in Keras 3.11.3.
+    """
+    explanations = {
+        "h5_safe_mode_bypass": (
+            "CVE-2025-9905: Keras Model.load_model silently ignores safe_mode=True when "
+            "loading H5/HDF5 files. Lambda layers in H5 models can execute arbitrary Python "
+            "code during deserialization with no safe mode protection. This means passing "
+            "safe_mode=True provides a false sense of security for H5 format models. "
+            "Upgrade to Keras >= 3.11.3 or convert models to .keras format which supports safe_mode."
+        ),
+    }
+
+    return explanations.get(
+        issue_type,
+        "CVE-2025-9905: H5 format ignores safe_mode=True for Lambda layers. Upgrade to Keras >= 3.11.3.",
+    )

@@ -13,7 +13,7 @@ from modelaudit.utils.helpers.code_validation import (
     validate_python_syntax,
 )
 
-from ..config.explanations import get_pattern_explanation
+from ..config.explanations import get_cve_2025_9905_explanation, get_pattern_explanation
 from .base import BaseScanner, IssueSeverity, ScanResult
 from .keras_utils import check_subclassed_model
 
@@ -265,6 +265,26 @@ class KerasH5Scanner(BaseScanner):
                 # Special handling for Lambda layers - validate Python code
                 if layer_class == "Lambda":
                     self._check_lambda_layer(layer_config, result)
+                    # CVE-2025-9905: safe_mode=True is silently ignored for H5 format
+                    result.add_check(
+                        name="CVE-2025-9905: H5 safe_mode Bypass",
+                        passed=False,
+                        message=(
+                            "CVE-2025-9905: Lambda layer in H5 format - "
+                            "safe_mode=True is silently ignored for .h5/.hdf5 files"
+                        ),
+                        severity=IssueSeverity.CRITICAL,
+                        location=self.current_file_path,
+                        details={
+                            "layer_class": "Lambda",
+                            "cve_id": "CVE-2025-9905",
+                            "cvss": 7.3,
+                            "cwe": "CWE-693",
+                            "affected_versions": "Keras 3.0.0-3.11.2",
+                            "remediation": "Upgrade Keras to >= 3.11.3 or convert to .keras format",
+                        },
+                        why=get_cve_2025_9905_explanation("h5_safe_mode_bypass"),
+                    )
                 else:
                     result.add_check(
                         name="Suspicious Layer Type Detection",
