@@ -668,3 +668,34 @@ def get_pytorch_security_explanation(issue_type: str) -> str:
         "This is a PyTorch-specific security concern. Review PyTorch security best practices "
         "and ensure you're following safe model loading procedures.",
     )
+
+
+def get_cve_2025_1550_explanation(issue_type: str) -> str:
+    """Get explanation for CVE-2025-1550: Keras safe_mode bypass via config.json module references.
+
+    CVE-2025-1550 (CVSS 9.8 CRITICAL): Keras Model.load_model allows arbitrary code execution
+    even with safe_mode=True by specifying arbitrary Python modules/functions in config.json
+    inside .keras ZIP archives. Fixed in Keras 3.9.0.
+    """
+    explanations = {
+        "dangerous_module": (
+            "CVE-2025-1550: The config.json inside this .keras archive references a dangerous "
+            "Python module (e.g., os, subprocess, builtins) in a layer's module or fn_module field. "
+            "Keras versions < 3.9.0 import and execute these modules during Model.load_model even "
+            "with safe_mode=True, enabling arbitrary code execution. "
+            "Upgrade to Keras >= 3.9.0 and re-save models from trusted sources only."
+        ),
+        "untrusted_module": (
+            "CVE-2025-1550: The config.json inside this .keras archive references a Python module "
+            "outside the standard Keras/TensorFlow ecosystem in a layer's module or fn_module field. "
+            "Keras versions < 3.9.0 do not restrict which modules can be referenced in config.json, "
+            "allowing safe_mode bypass. While this module may be benign, verify it is not being used "
+            "to execute arbitrary code. Upgrade to Keras >= 3.9.0."
+        ),
+    }
+
+    return explanations.get(
+        issue_type,
+        "CVE-2025-1550: Keras config.json can reference arbitrary Python modules, bypassing "
+        "safe_mode. Upgrade to Keras >= 3.9.0.",
+    )
