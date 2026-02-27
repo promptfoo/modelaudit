@@ -56,13 +56,15 @@ class SkopsScanner(BaseScanner):
         This CVE allows arbitrary code execution through malicious OperatorFuncNode
         objects that bypass trusted type validation.
         """
-        # Check for OperatorFuncNode patterns in file structure and content
+        # Check for OperatorFuncNode patterns in file structure and content.
+        # NOTE: __reduce__ and get_state were removed because they are standard
+        # Python serialization methods used by ALL sklearn Cython types
+        # (e.g., sklearn.tree._tree.Tree). Only flag patterns specific to the
+        # actual CVE-2025-54412 exploit (OperatorFuncNode abuse).
         suspicious_patterns = [
             "OperatorFuncNode",
             "operator.func",
             "trusted_types",
-            "__reduce__",
-            "get_state",
         ]
 
         # Binary patterns for content scanning
@@ -70,8 +72,6 @@ class SkopsScanner(BaseScanner):
             b"OperatorFuncNode",
             b"operator.func",
             b"trusted_types",
-            b"__reduce__",
-            b"get_state",
         ]
 
         # Look for suspicious patterns in ZIP file names
@@ -257,6 +257,26 @@ class SkopsScanner(BaseScanner):
         except Exception:
             pass
 
+    # Metadata files that are part of the skops format and should be excluded
+    # from joblib fallback pattern matching. These files legitimately contain
+    # strings like "sklearn" as type references, not as pickle/joblib code.
+    _SKOPS_METADATA_FILES: ClassVar[frozenset[str]] = frozenset(
+        {
+            "schema.json",
+            "schema",
+        }
+    )
+
+    @classmethod
+    def _is_skops_metadata(cls, filename: str) -> bool:
+        """Return True if *filename* is a known skops metadata/schema file.
+
+        Only the basename is checked so that nested paths like
+        ``subdir/schema.json`` are also excluded.
+        """
+        basename = os.path.basename(filename).lower()
+        return basename in cls._SKOPS_METADATA_FILES
+
     def _check_unsafe_joblib_fallback(self, zip_file: zipfile.ZipFile, result: ScanResult, zip_path: str) -> None:
         """Check for unsafe joblib fallback patterns in skops files."""
         # Scan all files for joblib deserialization patterns
@@ -270,9 +290,16 @@ class SkopsScanner(BaseScanner):
         files_with_joblib = []
 
         for file_info in zip_file.filelist:
+            is_metadata = self._is_skops_metadata(file_info.filename)
+
             try:
                 content = zip_file.read(file_info)
                 for pattern in joblib_patterns:
+                    # Only suppress the broad `sklearn` heuristic for metadata
+                    # files; explicit signals like `joblib.load` / `pickle.load`
+                    # must still be reported even inside schema.json.
+                    if is_metadata and pattern == b"sklearn":
+                        continue
                     if pattern in content:
                         files_with_joblib.append(
                             {

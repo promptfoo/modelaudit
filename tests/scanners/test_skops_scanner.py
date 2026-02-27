@@ -60,9 +60,15 @@ class TestSkopsScannerCVE2025_54412:
         assert cve_checks[0].status == CheckStatus.FAILED
         assert cve_checks[0].severity == IssueSeverity.CRITICAL
 
-    def test_detects_reduce_pattern(self, tmp_path: Path) -> None:
-        """Test detection of __reduce__ pattern."""
-        skops_file = tmp_path / "malicious.skops"
+    def test_reduce_pattern_no_false_positive(self, tmp_path: Path) -> None:
+        """Test that __reduce__ filenames do NOT trigger CVE-2025-54412.
+
+        __reduce__ is a standard Python serialization method used by ALL
+        sklearn Cython types (e.g. sklearn.tree._tree.Tree).  It was
+        intentionally removed from CVE-2025-54412 pattern matching to
+        prevent false positives on legitimate models.
+        """
+        skops_file = tmp_path / "legitimate.skops"
         with zipfile.ZipFile(skops_file, "w") as zf:
             zf.writestr("__reduce__payload.bin", b"malicious content")
             zf.writestr("schema.json", '{"version": "1.0"}')
@@ -71,9 +77,9 @@ class TestSkopsScannerCVE2025_54412:
         result = scanner.scan(str(skops_file))
 
         cve_checks = [c for c in result.checks if "CVE-2025-54412" in c.name]
-        assert len(cve_checks) > 0
-        assert cve_checks[0].status == CheckStatus.FAILED
-        assert cve_checks[0].severity == IssueSeverity.CRITICAL
+        # __reduce__ alone should NOT trigger CVE-2025-54412
+        failed = [c for c in cve_checks if c.status == CheckStatus.FAILED]
+        assert len(failed) == 0
 
     def test_no_false_positive_clean_file(self, tmp_path: Path) -> None:
         """Test that clean skops files don't trigger CVE-2025-54412."""
@@ -201,6 +207,69 @@ class TestSkopsScannerJoblibFallback:
         assert len(joblib_checks) > 0
         assert joblib_checks[0].status == CheckStatus.FAILED
         assert joblib_checks[0].severity == IssueSeverity.WARNING
+
+    def test_no_false_positive_sklearn_in_schema_json(self, tmp_path: Path) -> None:
+        """Regression: schema.json with sklearn type refs must NOT trigger joblib fallback.
+
+        Real .skops files contain a schema.json that references sklearn module
+        paths (e.g. "sklearn.linear_model.LogisticRegression"). These are type
+        schema references, not pickle/joblib deserialization code.
+        """
+        skops_file = tmp_path / "legit.skops"
+        schema_content = (
+            '{"__class__": "sklearn.linear_model._logistic.LogisticRegression",'
+            ' "__module__": "sklearn.linear_model._logistic",'
+            ' "content": {"C": {"__class__": "float", "content": 1.0}}}'
+        )
+        with zipfile.ZipFile(skops_file, "w") as zf:
+            zf.writestr("schema.json", schema_content)
+            zf.writestr("step/0/content/0.npy", b"\x93NUMPY\x01\x00model data")
+
+        scanner = SkopsScanner()
+        result = scanner.scan(str(skops_file))
+
+        joblib_checks = [c for c in result.checks if "Joblib" in c.name and c.status == CheckStatus.FAILED]
+        assert len(joblib_checks) == 0, (
+            f"False positive: schema.json triggered Unsafe Joblib Fallback Detection: {joblib_checks}"
+        )
+
+    def test_no_false_positive_sklearn_in_schema_bare(self, tmp_path: Path) -> None:
+        """Regression: bare 'schema' file (no .json ext) must also be excluded.
+
+        Some skops archives use a file named just ``schema`` without the
+        ``.json`` extension.  The metadata exclusion must cover both variants.
+        """
+        skops_file = tmp_path / "legit_bare.skops"
+        schema_content = (
+            '{"__class__": "sklearn.ensemble._forest.RandomForestClassifier",'
+            ' "__module__": "sklearn.ensemble._forest",'
+            ' "content": {"n_estimators": {"__class__": "int", "content": 100}}}'
+        )
+        with zipfile.ZipFile(skops_file, "w") as zf:
+            zf.writestr("schema", schema_content)
+            zf.writestr("step/0/content/0.npy", b"\x93NUMPY\x01\x00model data")
+
+        scanner = SkopsScanner()
+        result = scanner.scan(str(skops_file))
+
+        joblib_checks = [c for c in result.checks if "Joblib" in c.name and c.status == CheckStatus.FAILED]
+        assert len(joblib_checks) == 0, (
+            f"False positive: bare 'schema' file triggered Unsafe Joblib Fallback Detection: {joblib_checks}"
+        )
+
+    def test_sklearn_in_data_file_still_detected(self, tmp_path: Path) -> None:
+        """Ensure sklearn references in non-metadata files are still flagged."""
+        skops_file = tmp_path / "suspicious.skops"
+        with zipfile.ZipFile(skops_file, "w") as zf:
+            zf.writestr("schema.json", '{"version": "1.0"}')
+            # sklearn reference in a data file IS suspicious
+            zf.writestr("payload.bin", b"import sklearn; sklearn.externals.joblib.load(f)")
+
+        scanner = SkopsScanner()
+        result = scanner.scan(str(skops_file))
+
+        joblib_checks = [c for c in result.checks if "Joblib" in c.name and c.status == CheckStatus.FAILED]
+        assert len(joblib_checks) > 0, "sklearn in a data file should still be flagged"
 
 
 class TestSkopsScannerEdgeCases:

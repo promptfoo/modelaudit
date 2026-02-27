@@ -1972,6 +1972,15 @@ def _build_symbolic_reference_maps(
             stack.append(unknown)
             continue
 
+        if name == "STOP":
+            # Reset stack and memo at pickle stream boundaries so that
+            # references from a previous stream cannot leak into the next
+            # one (multi-stream / appended-pickle scenarios).
+            stack.clear()
+            memo.clear()
+            next_memo_index = 0
+            continue
+
         if name in {"BINPERSID"}:
             _pop()
             stack.append(unknown)

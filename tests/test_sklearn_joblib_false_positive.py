@@ -63,6 +63,43 @@ class TestSklearnJoblibFalsePositive:
             f"Found {len(sklearn_warnings)} false positive sklearn warnings: {[w.message for w in sklearn_warnings]}"
         )
 
+    def test_sklearn_pipeline_no_legacy_pattern_warnings(self, tmp_path):
+        """
+        Verify sklearn Pipeline models don't trigger legacy pattern WARNINGs.
+
+        Before fix: Pipeline models triggered WARNING for "Pipeline" pattern
+        because b"Pipeline" in CVE_BINARY_PATTERNS matched the class name
+        sklearn.pipeline.Pipeline present in all serialized Pipeline objects.
+        After fix: Pipeline models should not trigger legacy pattern WARNINGs.
+        """
+        from sklearn.pipeline import Pipeline
+        from sklearn.preprocessing import StandardScaler
+
+        # Create a Pipeline model (the most common sklearn pattern)
+        pipe = Pipeline([("scaler", StandardScaler()), ("clf", LogisticRegression())])
+        X = np.array([[0, 0], [1, 1], [2, 2]])
+        y = np.array([0, 1, 1])
+        pipe.fit(X, y)
+
+        # Save as pickle
+        model_path = tmp_path / "pipeline_model.pkl"
+        with open(model_path, "wb") as f:
+            pickle.dump(pipe, f)
+
+        # Scan the model
+        result = scan_file(str(model_path))
+
+        # Check for legacy pattern WARNINGs mentioning Pipeline
+        pipeline_warnings = [
+            issue
+            for issue in result.issues
+            if "Legacy" in issue.message and issue.severity == IssueSeverity.WARNING and "Pipeline" in issue.message
+        ]
+
+        assert len(pipeline_warnings) == 0, (
+            f"Found {len(pipeline_warnings)} false positive Pipeline warnings: {[w.message for w in pipeline_warnings]}"
+        )
+
     def test_sklearn_model_no_exit_code_1_from_patterns(self, tmp_path):
         """
         Verify sklearn models don't cause exit code 1 due to legacy patterns.
@@ -223,7 +260,7 @@ def test_false_positive_summary():
                 if "Legacy" in issue.message
                 and issue.severity == IssueSeverity.WARNING
                 and any(
-                    pattern in issue.message.lower() for pattern in ["sklearn", "numpyarraywrapper", "numpy_pickle"]
+                    pattern in issue.message for pattern in ["sklearn", "NumpyArrayWrapper", "numpy_pickle", "Pipeline"]
                 )
             ]
 
