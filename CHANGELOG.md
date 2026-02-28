@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **keras:** detect CVE-2025-9905 H5 safe_mode bypass for Lambda layers (CVSS 7.3)
+
+### Fixed
+
+- **security**: harden pickle scanner stack resolution to correctly track `STACK_GLOBAL` and memoized `REDUCE` call targets, preventing decoy-string and `BINGET` bypasses
+- **security**: tighten manifest trusted-domain matching to validate URL hostnames instead of substring matches
+- **security**: make `.keras` suspicious file extension checks case-insensitive to catch uppercase executable/script payloads
+- **security**: block unsafe in-process `torch.load` in `WeightDistributionScanner` by default unless explicitly opted in
+
 ## [0.2.26](https://github.com/promptfoo/modelaudit/compare/v0.2.25...v0.2.26) (2026-02-24)
 
 ### Bug Fixes
@@ -30,19 +43,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **readme:** add cache management flag ([#521](https://github.com/promptfoo/modelaudit/issues/521)) ([33d74bd](https://github.com/promptfoo/modelaudit/commit/33d74bd9135f667ef3dd002889bae14031e4dd79))
 - ship next-phase open-source readiness docs ([#532](https://github.com/promptfoo/modelaudit/issues/532)) ([c88035d](https://github.com/promptfoo/modelaudit/commit/c88035d705dda3b9d2cba8f9f03a1b70b4ed41f7))
 - trim README to essentials, fix inaccuracies ([#517](https://github.com/promptfoo/modelaudit/issues/517)) ([59c056c](https://github.com/promptfoo/modelaudit/commit/59c056c5a0414b7700d0c3afc3bcc79f3679edcd))
-
-## [Unreleased]
-
-### Security
-
-- **keras:** detect CVE-2025-9905 H5 safe_mode bypass for Lambda layers (CVSS 7.3)
-
-### Fixed
-
-- **security**: harden pickle scanner stack resolution to correctly track `STACK_GLOBAL` and memoized `REDUCE` call targets, preventing decoy-string and `BINGET` bypasses
-- **security**: tighten manifest trusted-domain matching to validate URL hostnames instead of substring matches
-- **security**: make `.keras` suspicious file extension checks case-insensitive to catch uppercase executable/script payloads
-- **security**: block unsafe in-process `torch.load` in `WeightDistributionScanner` by default unless explicitly opted in
 
 ## [0.2.25] - 2026-02-12
 
