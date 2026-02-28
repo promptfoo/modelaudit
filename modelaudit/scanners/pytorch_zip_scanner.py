@@ -1020,9 +1020,7 @@ class PyTorchZipScanner(BaseScanner):
         except Exception:
             return True
 
-    def _check_cve_2022_45907_vulnerability(
-        self, version_info: dict[str, Any], result: ScanResult, path: str
-    ) -> None:
+    def _check_cve_2022_45907_vulnerability(self, version_info: dict[str, Any], result: ScanResult, path: str) -> None:
         """Check for CVE-2022-45907: torch.jit.annotations.parse_type_line eval() injection"""
         detected_version, version_source = self._get_detected_pytorch_version(version_info)
         if not detected_version:
@@ -1053,9 +1051,7 @@ class PyTorchZipScanner(BaseScanner):
                 },
             )
 
-    def _check_cve_2024_5480_vulnerability(
-        self, version_info: dict[str, Any], result: ScanResult, path: str
-    ) -> None:
+    def _check_cve_2024_5480_vulnerability(self, version_info: dict[str, Any], result: ScanResult, path: str) -> None:
         """Check for CVE-2024-5480: torch.distributed.rpc arbitrary function execution"""
         detected_version, version_source = self._get_detected_pytorch_version(version_info)
         if not detected_version:
@@ -1087,9 +1083,7 @@ class PyTorchZipScanner(BaseScanner):
                 },
             )
 
-    def _check_cve_2024_48063_vulnerability(
-        self, version_info: dict[str, Any], result: ScanResult, path: str
-    ) -> None:
+    def _check_cve_2024_48063_vulnerability(self, version_info: dict[str, Any], result: ScanResult, path: str) -> None:
         """Check for CVE-2024-48063: RemoteModule deserialization RCE"""
         detected_version, version_source = self._get_detected_pytorch_version(version_info)
         if not detected_version:

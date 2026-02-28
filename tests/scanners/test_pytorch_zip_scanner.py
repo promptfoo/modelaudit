@@ -2,6 +2,7 @@ import json
 import pickle
 import time
 import zipfile
+from pathlib import Path
 
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.pytorch_zip_scanner import PyTorchZipScanner
@@ -484,7 +485,7 @@ def test_pytorch_zip_scanner_combined_security_controls(tmp_path):
     assert symlink_issues[0].severity == IssueSeverity.WARNING
 
 
-def _create_pytorch_zip_with_framework_version(path, pytorch_version: str):
+def _create_pytorch_zip_with_framework_version(path: Path, pytorch_version: str) -> Path:
     with zipfile.ZipFile(path, "w") as zipf:
         zipf.writestr("archive/version", "3")
         zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1.0, 2.0, 3.0]}))
@@ -510,8 +511,7 @@ def test_pytorch_zip_cve_2024_5480_fixed_artifact_version_not_flagged(tmp_path):
 
     cve_failed = [c for c in result.checks if "CVE-2024-5480" in c.name and c.status == CheckStatus.FAILED]
     assert len(cve_failed) == 0, (
-        f"Fixed artifact version should not trigger CVE-2024-5480: "
-        f"{[(c.name, c.message) for c in cve_failed]}"
+        f"Fixed artifact version should not trigger CVE-2024-5480: {[(c.name, c.message) for c in cve_failed]}"
     )
 
 
