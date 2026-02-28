@@ -10,7 +10,7 @@ import onnx
 from onnx import TensorProto, helper
 from onnx.onnx_ml_pb2 import StringStringEntryProto
 
-from modelaudit.scanners.base import IssueSeverity
+from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.onnx_scanner import OnnxScanner
 
 
@@ -174,7 +174,9 @@ class TestCVE202427318NestedPathTraversal:
 
         result = OnnxScanner().scan(str(model_path))
 
-        traversal_checks = [c for c in result.checks if "traversal" in c.message.lower() and not c.passed]
+        traversal_checks = [
+            c for c in result.checks if "traversal" in c.message.lower() and c.status == CheckStatus.FAILED
+        ]
         assert len(traversal_checks) == 0, "Safe paths should not trigger traversal alerts"
 
     def test_normalized_in_dir_path_with_dotdot_no_traversal_flag(self, tmp_path):
@@ -189,7 +191,9 @@ class TestCVE202427318NestedPathTraversal:
 
         result = OnnxScanner().scan(str(model_path))
 
-        traversal_checks = [c for c in result.checks if "traversal" in c.message.lower() and not c.passed]
+        traversal_checks = [
+            c for c in result.checks if "traversal" in c.message.lower() and c.status == CheckStatus.FAILED
+        ]
         assert len(traversal_checks) == 0, "Normalized in-dir paths should not trigger traversal alerts"
 
     def test_nested_traversal_details_contain_cwe(self, tmp_path):
