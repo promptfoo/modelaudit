@@ -12,6 +12,7 @@ import json
 import os
 import tempfile
 import zipfile
+from pathlib import Path
 
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.keras_zip_scanner import KerasZipScanner
@@ -434,7 +435,7 @@ __import__('pickle').loads(data)
 class TestCVE20243660LambdaAttribution:
     """Test CVE-2024-3660: Lambda layer code injection attribution."""
 
-    def _make_keras_zip(self, config: dict, tmp_path) -> str:
+    def _make_keras_zip(self, config: dict, tmp_path: Path) -> str:
         keras_path = os.path.join(str(tmp_path), "model.keras")
         with zipfile.ZipFile(keras_path, "w") as zf:
             zf.writestr("config.json", json.dumps(config))
