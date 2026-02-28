@@ -301,13 +301,12 @@ class KerasZipScanner(BaseScanner):
         if isinstance(obj, str):
             token = obj.strip()
             return [token] if token else []
+        out: list[str] = []
         if isinstance(obj, dict):
-            out: list[str] = []
             for value in obj.values():
                 out.extend(self._collect_string_tokens(value))
             return out
         if isinstance(obj, list):
-            out: list[str] = []
             for value in obj:
                 out.extend(self._collect_string_tokens(value))
             return out

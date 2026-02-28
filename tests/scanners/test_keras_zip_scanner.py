@@ -12,6 +12,7 @@ import json
 import os
 import tempfile
 import zipfile
+from pathlib import Path
 
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.keras_zip_scanner import KerasZipScanner
@@ -422,7 +423,7 @@ __import__('pickle').loads(data)
 class TestCVE20259906UnsafeDeserialization:
     """Test CVE-2025-9906: enable_unsafe_deserialization config bypass detection."""
 
-    def _make_keras_zip(self, config_str: str, tmp_path) -> str:
+    def _make_keras_zip(self, config_str: str, tmp_path: Path) -> str:
         """Helper to create a .keras ZIP with raw config string."""
         keras_path = os.path.join(str(tmp_path), "model.keras")
         with zipfile.ZipFile(keras_path, "w") as zf:
