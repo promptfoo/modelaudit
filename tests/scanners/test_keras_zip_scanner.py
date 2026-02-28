@@ -12,6 +12,7 @@ import json
 import os
 import tempfile
 import zipfile
+from pathlib import Path
 
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.keras_zip_scanner import KerasZipScanner
@@ -422,7 +423,7 @@ __import__('pickle').loads(data)
 class TestCVE20251550ModuleReferences:
     """Test CVE-2025-1550: Keras safe_mode bypass via arbitrary module references in config.json."""
 
-    def _make_keras_zip(self, config: dict, tmp_path) -> str:
+    def _make_keras_zip(self, config: dict, tmp_path: Path) -> str:
         """Helper to create a .keras ZIP with the given config.json."""
         keras_path = os.path.join(str(tmp_path), "model.keras")
         with zipfile.ZipFile(keras_path, "w") as zf:
