@@ -303,13 +303,13 @@ class KerasZipScanner(BaseScanner):
 
     def _iter_dict_nodes(self, obj: Any, path: str = "root") -> list[tuple[str, dict[str, Any]]]:
         """Yield all dict nodes with their traversal path."""
+        nodes: list[tuple[str, dict[str, Any]]] = []
         if isinstance(obj, dict):
             nodes = [(path, obj)]
             for key, value in obj.items():
                 nodes.extend(self._iter_dict_nodes(value, f"{path}.{key}"))
             return nodes
         if isinstance(obj, list):
-            nodes: list[tuple[str, dict[str, Any]]] = []
             for idx, value in enumerate(obj):
                 nodes.extend(self._iter_dict_nodes(value, f"{path}[{idx}]"))
             return nodes
