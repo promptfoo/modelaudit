@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **security**: tighten manifest trusted-domain matching to validate URL hostnames instead of substring matches
 - **security**: make `.keras` suspicious file extension checks case-insensitive to catch uppercase executable/script payloads
 - **security**: block unsafe in-process `torch.load` in `WeightDistributionScanner` by default unless explicitly opted in
+- **fix**: tighten metadata scanner suspicious URL matching to use exact hostname/subdomain checks and add focused regression coverage
 
 ## [0.2.26](https://github.com/promptfoo/modelaudit/compare/v0.2.25...v0.2.26) (2026-02-24)
 
