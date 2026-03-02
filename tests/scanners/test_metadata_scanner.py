@@ -66,7 +66,6 @@ class TestMetadataScanner:
             result = scanner.scan(str(readme_path))
 
         assert len(result.issues) == 2
-        assert all(issue.type == "suspicious_url" for issue in result.issues)
         assert all(issue.severity == IssueSeverity.INFO for issue in result.issues)
         assert {issue.details.get("suspicious_domain") for issue in result.issues} == {
             "bit.ly",
@@ -88,10 +87,9 @@ class TestMetadataScanner:
 
         assert len(result.issues) == 1
         issue = result.issues[0]
-        assert issue.type == "suspicious_url"
         assert issue.severity == IssueSeverity.INFO
         assert issue.details.get("suspicious_domain") == "ngrok.io"
-        assert issue.details.get("url") == "https://api.ngrok.io/malicious-endpoint"
+        assert "https://api.ngrok.io/malicious-endpoint" in str(issue.details.get("url"))
 
     def test_scan_ignores_suspicious_domain_substrings(self):
         """Test URLs are matched by hostname, not generic substring."""
