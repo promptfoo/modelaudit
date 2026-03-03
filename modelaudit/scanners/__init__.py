@@ -364,6 +364,15 @@ class ScannerRegistry:
                 "dependencies": [],
                 "numpy_sensitive": False,
             },
+            "torch7": {
+                "module": "modelaudit.scanners.torch7_scanner",
+                "class": "Torch7Scanner",
+                "description": "Scans legacy Torch7 serialized model files",
+                "extensions": [".t7", ".th", ".net"],
+                "priority": 19,
+                "dependencies": [],
+                "numpy_sensitive": False,
+            },
             "tar": {
                 "module": "modelaudit.scanners.tar_scanner",
                 "class": "TarScanner",
@@ -736,6 +745,7 @@ def __getattr__(name: str) -> Any:
         "PaddleScanner": "paddle",
         "CntkScanner": "cntk",
         "RknnScanner": "rknn",
+        "Torch7Scanner": "torch7",
         "TarScanner": "tar",
         "Jinja2TemplateScanner": "jinja2_template",
         "MetadataScanner": "metadata",
