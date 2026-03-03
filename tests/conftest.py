@@ -93,6 +93,7 @@ def pytest_runtest_setup(item):
             "test_llamafile_scanner.py",  # Llamafile executable scanner tests
             "test_coreml_scanner.py",  # CoreML scanner tests
             "test_mxnet_scanner.py",  # MXNet scanner tests
+            "test_tf_metagraph_scanner.py",  # TensorFlow MetaGraph scanner tests
         ]
 
         # Check if this is an allowed test file
