@@ -90,6 +90,11 @@ class WeightDistributionScanner(BaseScanner):
                 get_protobuf_classes()
             except ImportError:
                 return False
+        if ext == ".onnx":
+            try:
+                import onnx  # noqa: F401
+            except ImportError:
+                return False
         return True
 
     def scan(self, path: str) -> ScanResult:
@@ -447,12 +452,17 @@ class WeightDistributionScanner(BaseScanner):
                         if ("weight" in node.name.lower() or "kernel" in node.name.lower()) and len(array.shape) >= 2:
                             weights_info[node.name] = array
         except Exception as e:
-            logger.debug(f"Failed to extract weights from {path}: {e}")
+            logger.warning(f"Weight analysis incomplete for {path}: {e}")
 
         return weights_info
 
     def _extract_onnx_weights(self, path: str) -> dict[str, Any]:
-        """Extract weights from ONNX model files"""
+        """Extract weights from ONNX model files.
+
+        Uses load_external_data=False to avoid failures when external data files
+        are missing (common with HuggingFace downloads or standalone .onnx files).
+        External-data tensors are skipped since their data is not available inline.
+        """
         try:
             import onnx
         except ImportError:
@@ -461,20 +471,39 @@ class WeightDistributionScanner(BaseScanner):
         weights_info: dict[str, Any] = {}
 
         try:
-            model = onnx.load(path)  # type: ignore[possibly-unresolved-reference]
+            # Use load_external_data=False to prevent ValidationError when
+            # external data files (e.g. weights.pb) are missing. This is the
+            # common case for models downloaded from HuggingFace or distributed
+            # as standalone .onnx files without their companion data files.
+            model = onnx.load(path, load_external_data=False)  # type: ignore[possibly-unresolved-reference]
 
             # Extract 2D+ initializers — these are weight matrices (conv kernels,
             # linear layers, embeddings). 1D tensors (biases, batch-norm params)
             # aren't relevant for weight distribution analysis. This approach is
             # framework-agnostic since ONNX naming conventions vary by exporter.
+            import numpy as np
+
             for initializer in model.graph.initializer:
                 if len(initializer.dims) >= 2:
-                    weights_info[initializer.name] = onnx.numpy_helper.to_array(  # type: ignore[possibly-unresolved-reference]
-                        initializer,
-                    )
+                    # Pre-check estimated byte size before materializing the
+                    # full array — avoids memory exhaustion on huge tensors.
+                    try:
+                        _onnx_mapping = getattr(onnx, "mapping", None)
+                        if _onnx_mapping is not None and hasattr(_onnx_mapping, "TENSOR_TYPE_TO_NP_TYPE"):
+                            tensor_dtype = _onnx_mapping.TENSOR_TYPE_TO_NP_TYPE[initializer.data_type]
+                            estimated_size = int(np.prod(initializer.dims)) * np.dtype(tensor_dtype).itemsize
+                            if self.max_array_size and self.max_array_size > 0 and estimated_size > self.max_array_size:
+                                continue
+                    except Exception:
+                        pass  # Fall through and let to_array handle it
+
+                    arr = onnx.numpy_helper.to_array(initializer)  # type: ignore[possibly-unresolved-reference]
+                    if self.max_array_size and self.max_array_size > 0 and arr.nbytes > self.max_array_size:
+                        continue
+                    weights_info[initializer.name] = arr
 
         except Exception as e:
-            logger.debug(f"Failed to extract weights from {path}: {e}")
+            logger.warning(f"Failed to extract ONNX weights from {path}: {e}")
 
         return weights_info
 

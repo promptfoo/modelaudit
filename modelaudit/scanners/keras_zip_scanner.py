@@ -217,7 +217,7 @@ class KerasZipScanner(BaseScanner):
 
             # CVE-2025-49655: TorchModuleWrapper uses torch.load(weights_only=False)
             if layer_class == "TorchModuleWrapper":
-                self._check_torch_module_wrapper(layer, result, layer_name)
+                self._check_torch_module_wrapper(result, layer_name)
 
             # Check for Lambda layers
             if layer_class == "Lambda":
@@ -261,16 +261,18 @@ class KerasZipScanner(BaseScanner):
         # Add layer counts to metadata
         result.metadata["layer_counts"] = layer_counts
 
-    def _check_torch_module_wrapper(self, layer: dict[str, Any], result: ScanResult, layer_name: str) -> None:
+    def _check_torch_module_wrapper(self, result: ScanResult, layer_name: str) -> None:
         """Check for CVE-2025-49655: TorchModuleWrapper deserialization RCE.
 
         TorchModuleWrapper in Keras 3.11.0-3.11.2 calls torch.load(weights_only=False)
         in from_config(), enabling arbitrary code execution via pickle deserialization.
         """
         keras_version = result.metadata.get("keras_version")
-        is_vulnerable = isinstance(keras_version, str) and self._is_vulnerable_keras_3_11_x(keras_version)
+        vulnerability_status: bool | None = None
+        if isinstance(keras_version, str):
+            vulnerability_status = self._is_vulnerable_keras_3_11_x(keras_version)
 
-        if is_vulnerable:
+        if vulnerability_status is True:
             result.add_check(
                 name="CVE-2025-49655: TorchModuleWrapper Deserialization RCE",
                 passed=False,
@@ -295,7 +297,7 @@ class KerasZipScanner(BaseScanner):
             )
             return
 
-        if isinstance(keras_version, str):
+        if vulnerability_status is False and isinstance(keras_version, str):
             result.add_check(
                 name="TorchModuleWrapper Version Risk Check",
                 passed=True,
@@ -308,39 +310,53 @@ class KerasZipScanner(BaseScanner):
             )
             return
 
+        version_context = (
+            f"keras_version '{keras_version}' is non-canonical"
+            if isinstance(keras_version, str)
+            else "keras_version is unavailable"
+        )
         result.add_check(
             name="TorchModuleWrapper Risk (Version Unknown)",
             passed=False,
             message=(
-                f"Layer '{layer_name}' is a TorchModuleWrapper but keras_version is unavailable; "
-                "cannot confidently attribute CVE-2025-49655 without version context"
+                f"Layer '{layer_name}' is a TorchModuleWrapper but {version_context}; "
+                "cannot confidently attribute CVE-2025-49655 without reliable version context"
             ),
             severity=IssueSeverity.WARNING,
             location=f"{self.current_file_path} (layer: {layer_name})",
             details={
                 "layer_name": layer_name,
                 "layer_class": "TorchModuleWrapper",
+                "keras_version": keras_version,
+                "parse_status": "unknown",
                 "cve_id": "CVE-2025-49655",
+                "cvss": 9.8,
+                "cwe": "CWE-502",
                 "affected_versions": "Keras 3.11.0-3.11.2",
                 "remediation": "Ensure model metadata includes keras_version and upgrade to >= 3.11.3",
             },
+            why=get_cve_2025_49655_explanation("torch_module_wrapper"),
         )
 
     @staticmethod
-    def _is_vulnerable_keras_3_11_x(version: str) -> bool:
-        """Return True for Keras versions in the CVE-2025-49655 vulnerable range."""
-        parts = version.split(".", 2)
-        if len(parts) < 3:
-            return False
+    def _is_vulnerable_keras_3_11_x(version: str) -> bool | None:
+        """Return True/False for canonical versions, else None."""
+        parts = version.strip().split(".", 2)
+        if len(parts) < 2:
+            return None
+        if not parts[0].isdigit() or not parts[1].isdigit():
+            return None
         try:
-            major, minor, patch_part = parts
-            patch_digits = "".join(ch for ch in patch_part if ch.isdigit())
-            if not patch_digits:
-                return False
-            patch = int(patch_digits)
+            major = int(parts[0])
+            minor = int(parts[1])
+            patch = 0
+            if len(parts) == 3:
+                if not parts[2].isdigit():
+                    return None
+                patch = int(parts[2])
             return int(major) == 3 and int(minor) == 11 and 0 <= patch <= 2
         except ValueError:
-            return False
+            return None
 
     def _check_lambda_layer(self, layer: dict[str, Any], result: ScanResult, layer_name: str) -> None:
         """Check Lambda layer for executable Python code"""

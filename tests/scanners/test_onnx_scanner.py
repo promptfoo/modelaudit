@@ -111,3 +111,102 @@ def test_onnx_scanner_python_op(tmp_path):
     # Python operators are flagged at CRITICAL or INFO level depending on scanner version
     assert any(i.severity in (IssueSeverity.CRITICAL, IssueSeverity.INFO) for i in result.issues)
     assert any(i.details.get("op_type") == "PythonOp" for i in result.issues)
+
+
+class TestCVE202551480SavePathTraversal:
+    """Tests for CVE-2025-51480: ONNX save_external_data arbitrary file overwrite."""
+
+    def test_traversal_detected_as_write_vuln(self, tmp_path: Path) -> None:
+        """Path traversal in external_data should trigger CVE-2025-51480 (write direction)."""
+        model_path = create_onnx_model(
+            tmp_path,
+            external=True,
+            external_path="../../../tmp/overwrite_target",
+            missing_external=True,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        cve_checks = [c for c in result.checks if "CVE-2025-51480" in c.name or "CVE-2025-51480" in c.message]
+        assert len(cve_checks) > 0, (
+            f"Should detect CVE-2025-51480 write traversal. Checks: {[c.message for c in result.checks]}"
+        )
+        assert cve_checks[0].severity == IssueSeverity.CRITICAL
+        assert cve_checks[0].details.get("cve_id") == "CVE-2025-51480"
+        # Traversal should be classified as CVE traversal, not missing file.
+        assert all(c.name != "External Data File Existence" for c in result.checks)
+        assert all("External Data File Existence" not in c.message for c in result.checks)
+
+    def test_nested_traversal_triggers_write_vuln(self, tmp_path: Path) -> None:
+        """Nested traversal (lstrip bypass) should also be detected for write direction."""
+        model_path = create_onnx_model(
+            tmp_path,
+            external=True,
+            external_path="subdir/../../overwrite_target",
+            missing_external=True,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        cve_checks = [c for c in result.checks if c.details.get("cve_id") == "CVE-2025-51480"]
+        assert len(cve_checks) > 0, "Nested traversal should trigger write CVE too"
+
+    def test_safe_path_no_write_vuln(self, tmp_path: Path) -> None:
+        """Safe external data should not trigger CVE-2025-51480."""
+        model_path = create_onnx_model(tmp_path, external=True, external_path="weights.bin")
+
+        result = OnnxScanner().scan(str(model_path))
+
+        cve_checks = [c for c in result.checks if c.details.get("cve_id") == "CVE-2025-51480"]
+        assert len(cve_checks) == 0, "Safe paths should not trigger write CVE"
+
+    def test_normalized_in_dir_path_with_dotdot_no_write_vuln(self, tmp_path: Path) -> None:
+        """Paths containing '..' but resolving in-dir should not be tagged as CVE-2025-51480."""
+        (tmp_path / "weights.bin").write_bytes(struct.pack("f", 1.0))
+        model_path = create_onnx_model(
+            tmp_path,
+            external=True,
+            external_path="subdir/../weights.bin",
+            missing_external=True,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        cve_checks = [c for c in result.checks if c.details.get("cve_id") == "CVE-2025-51480"]
+        assert len(cve_checks) == 0, "Normalized in-dir path should not trigger write CVE"
+
+    def test_absolute_sibling_path_triggers_write_vuln(self, tmp_path: Path) -> None:
+        """Absolute sibling path should still be flagged as out-of-dir traversal."""
+        sibling_dir = tmp_path.parent / f"{tmp_path.name}_evil"
+        sibling_dir.mkdir(parents=True, exist_ok=True)
+        sibling_file = sibling_dir / "weights.bin"
+        sibling_file.write_bytes(struct.pack("f", 1.0))
+
+        model_path = create_onnx_model(
+            tmp_path,
+            external=True,
+            external_path=str(sibling_file),
+            missing_external=True,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+        cve_checks = [c for c in result.checks if c.details.get("cve_id") == "CVE-2025-51480"]
+        assert len(cve_checks) > 0, "Absolute sibling path must be detected as traversal"
+
+    def test_write_vuln_details_fields(self, tmp_path: Path) -> None:
+        """CVE-2025-51480 details should include cve_id, cvss, cwe, remediation."""
+        model_path = create_onnx_model(
+            tmp_path,
+            external=True,
+            external_path="../overwrite_me",
+            missing_external=True,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        cve_checks = [c for c in result.checks if c.details.get("cve_id") == "CVE-2025-51480"]
+        assert len(cve_checks) > 0
+        details = cve_checks[0].details
+        assert details["cvss"] == 8.8
+        assert details["cwe"] == "CWE-22"
+        assert "remediation" in details
