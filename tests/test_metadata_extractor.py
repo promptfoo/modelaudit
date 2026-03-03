@@ -7,6 +7,7 @@ import pickletools
 import struct
 import tempfile
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -16,7 +17,7 @@ from modelaudit.metadata_extractor import ModelMetadataExtractor
 class TestModelMetadataExtractor:
     """Test the ModelMetadataExtractor class."""
 
-    def test_extract_metadata_unknown_format(self):
+    def test_extract_metadata_unknown_format(self) -> None:
         """Test metadata extraction with unknown file format."""
         extractor = ModelMetadataExtractor()
 
@@ -30,7 +31,7 @@ class TestModelMetadataExtractor:
             assert "error" in metadata
             assert metadata["file"] == Path(tmp.name).name
 
-    def test_extract_metadata_basic(self, tmp_path):
+    def test_extract_metadata_basic(self, tmp_path: Path) -> None:
         """Test basic metadata extraction functionality."""
         extractor = ModelMetadataExtractor()
 
@@ -53,7 +54,7 @@ class TestModelMetadataExtractor:
         assert metadata["total_parameters"] == 4
         assert "tensors" in metadata
 
-    def test_extract_directory_metadata(self):
+    def test_extract_directory_metadata(self) -> None:
         """Test directory metadata extraction."""
         extractor = ModelMetadataExtractor()
 
@@ -84,7 +85,7 @@ class TestModelMetadataExtractor:
             assert "safetensors" in metadata["summary"]["formats"]
             assert "pickle" in metadata["summary"]["formats"]
 
-    def test_security_only_filter(self, tmp_path):
+    def test_security_only_filter(self, tmp_path: Path) -> None:
         """Test security-only metadata filtering."""
         extractor = ModelMetadataExtractor()
 
@@ -112,7 +113,7 @@ class TestModelMetadataExtractor:
         if "custom_metadata" in metadata:
             assert metadata["custom_metadata"]["framework"] == "test"
 
-    def test_format_table_single_file(self):
+    def test_format_table_single_file(self) -> None:
         """Test table formatting for single file."""
         from modelaudit.cli import _format_metadata_table
 
@@ -132,7 +133,7 @@ class TestModelMetadataExtractor:
         assert "Tensor Count: 2" in output
         assert "framework: pytorch" in output
 
-    def test_format_table_directory(self):
+    def test_format_table_directory(self) -> None:
         """Test table formatting for directory."""
         from modelaudit.cli import _format_metadata_table
 
@@ -154,7 +155,7 @@ class TestModelMetadataExtractor:
         assert "model1.safetensors (safetensors)" in output
         assert "model2.pkl (pickle)" in output
 
-    def test_pickle_metadata_no_deserialization(self, monkeypatch, tmp_path):
+    def test_pickle_metadata_no_deserialization(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         """Ensure pickle metadata extraction does not deserialize by default."""
         extractor = ModelMetadataExtractor()
 
@@ -166,7 +167,7 @@ class TestModelMetadataExtractor:
 
         import pickle as std_pickle
 
-        def fail_load(*_args, **_kwargs):
+        def fail_load(*_args: Any, **_kwargs: Any) -> None:
             raise AssertionError("pickle.load should not be called during metadata extraction")
 
         monkeypatch.setattr(std_pickle, "load", fail_load, raising=True)
@@ -176,7 +177,7 @@ class TestModelMetadataExtractor:
         assert metadata.get("deserialization_skipped") is True
         assert metadata.get("safe_loading") is False
 
-    def test_joblib_metadata_no_deserialization(self, monkeypatch, tmp_path):
+    def test_joblib_metadata_no_deserialization(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         """Ensure joblib metadata extraction does not deserialize by default."""
         joblib_mod = pytest.importorskip("joblib")
         extractor = ModelMetadataExtractor()
@@ -184,7 +185,7 @@ class TestModelMetadataExtractor:
         joblib_file = tmp_path / "model.joblib"
         joblib_mod.dump({"x": 1}, joblib_file)
 
-        def fail_load(*_args, **_kwargs):
+        def fail_load(*_args: Any, **_kwargs: Any) -> None:
             raise AssertionError("joblib.load should not be called during metadata extraction")
 
         monkeypatch.setattr(joblib_mod, "load", fail_load, raising=True)
@@ -194,7 +195,8 @@ class TestModelMetadataExtractor:
         assert metadata.get("deserialization_skipped") is True
         assert metadata.get("reason") == "Deserialization disabled for metadata extraction"
 
-    def test_tf_savedmodel_metadata_no_deserialization(self, tmp_path):
+    @pytest.mark.slow
+    def test_tf_savedmodel_metadata_no_deserialization(self, tmp_path: Path) -> None:
         """Ensure TensorFlow SavedModel metadata extraction does not deserialize by default."""
         try:
             import tensorflow as tf
@@ -215,7 +217,7 @@ class TestModelMetadataExtractor:
         assert metadata.get("deserialization_skipped") is True
         assert metadata.get("reason") == "Deserialization disabled for metadata extraction"
 
-    def test_numpy_metadata_no_deserialization(self, tmp_path):
+    def test_numpy_metadata_no_deserialization(self, tmp_path: Path) -> None:
         """Ensure NumPy metadata extraction uses allow_pickle=False by default."""
         np = pytest.importorskip("numpy")
         extractor = ModelMetadataExtractor()
@@ -233,7 +235,7 @@ class TestModelMetadataExtractor:
         assert metadata.get("array_dtype") == "float32"
         assert metadata.get("deserialization_skipped") is not True
 
-    def test_numpy_object_array_blocked_without_deserialization(self, tmp_path):
+    def test_numpy_object_array_blocked_without_deserialization(self, tmp_path: Path) -> None:
         """Ensure NumPy object arrays are blocked by default (require pickle)."""
         np = pytest.importorskip("numpy")
         extractor = ModelMetadataExtractor()
@@ -249,7 +251,7 @@ class TestModelMetadataExtractor:
         assert metadata.get("deserialization_skipped") is True
         assert "pickle" in metadata.get("reason", "").lower()
 
-    def test_numpy_object_array_allowed_with_deserialization(self, tmp_path):
+    def test_numpy_object_array_allowed_with_deserialization(self, tmp_path: Path) -> None:
         """Ensure NumPy object arrays load when deserialization is explicitly allowed."""
         np = pytest.importorskip("numpy")
         extractor = ModelMetadataExtractor()
@@ -265,7 +267,7 @@ class TestModelMetadataExtractor:
         assert metadata.get("array_dtype") == "object"
         assert metadata.get("contains_objects") is True
 
-    def test_xgboost_metadata_no_deserialization(self, tmp_path):
+    def test_xgboost_metadata_no_deserialization(self, tmp_path: Path) -> None:
         """Ensure XGBoost metadata extraction is blocked without deserialization flag."""
         pytest.importorskip("xgboost")
         extractor = ModelMetadataExtractor()
@@ -284,7 +286,7 @@ class TestModelMetadataExtractor:
         assert metadata.get("deserialization_skipped") is True
         assert metadata.get("reason") == "Deserialization disabled for metadata extraction"
 
-    def test_metadata_extractor_setdefault_preserves_scanner_values(self, tmp_path):
+    def test_metadata_extractor_setdefault_preserves_scanner_values(self, tmp_path: Path) -> None:
         """Ensure scanner metadata isn't overwritten by extractor's setdefault calls."""
         extractor = ModelMetadataExtractor()
 
@@ -305,7 +307,7 @@ class TestModelMetadataExtractor:
         assert metadata["file"] == "model.safetensors"
         assert metadata["path"] == str(st_file)
 
-    def test_security_only_includes_deserialization_keys(self):
+    def test_security_only_includes_deserialization_keys(self) -> None:
         """Ensure security filter preserves deserialization-related keys."""
         extractor = ModelMetadataExtractor()
 
@@ -331,7 +333,9 @@ class TestModelMetadataExtractor:
         assert "training_epochs" not in filtered
         assert "learning_rate" not in filtered
 
-    def test_extract_metadata_handles_scanner_exception(self, tmp_path, monkeypatch):
+    def test_extract_metadata_handles_scanner_exception(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Ensure metadata extraction gracefully handles scanner exceptions."""
         extractor = ModelMetadataExtractor()
 
@@ -348,9 +352,7 @@ class TestModelMetadataExtractor:
         # Monkey-patch the scanner's extract_metadata to raise
         from modelaudit.scanners.safetensors_scanner import SafeTensorsScanner
 
-        original = SafeTensorsScanner.extract_metadata
-
-        def broken_extract(self, file_path):
+        def broken_extract(self: Any, file_path: str) -> dict[str, Any]:
             raise RuntimeError("Simulated extraction failure")
 
         monkeypatch.setattr(SafeTensorsScanner, "extract_metadata", broken_extract)
@@ -367,7 +369,7 @@ class TestModelMetadataExtractor:
 class TestPickleDangerousOpcodes:
     """Test that pickle scanner detects NEWOBJ_EX and BUILD opcodes."""
 
-    def test_pickle_detects_build_opcode(self, tmp_path):
+    def test_pickle_detects_build_opcode(self, tmp_path: Path) -> None:
         """Ensure BUILD opcode is detected as dangerous."""
         from modelaudit.scanners.pickle_scanner import PickleScanner
 
@@ -399,7 +401,7 @@ class TestPickleDangerousOpcodes:
         assert "BUILD" in metadata.get("dangerous_opcodes", [])
         assert metadata.get("has_dangerous_opcodes") is True
 
-    def test_pickle_metadata_reports_reduce(self, tmp_path):
+    def test_pickle_metadata_reports_reduce(self, tmp_path: Path) -> None:
         """Ensure REDUCE opcode is reported as dangerous in metadata."""
         from modelaudit.scanners.pickle_scanner import PickleScanner
 
@@ -418,7 +420,7 @@ class TestPickleDangerousOpcodes:
         assert "REDUCE" in metadata.get("dangerous_opcodes", [])
         assert metadata.get("has_dangerous_opcodes") is True
 
-    def test_pickle_safe_data_no_dangerous_opcodes(self, tmp_path):
+    def test_pickle_safe_data_no_dangerous_opcodes(self, tmp_path: Path) -> None:
         """Ensure simple data structures don't trigger dangerous opcode detection."""
         from modelaudit.scanners.pickle_scanner import PickleScanner
 
@@ -440,7 +442,7 @@ class TestPickleDangerousOpcodes:
 class TestCLIMetadataCommand:
     """Test the CLI metadata command integration."""
 
-    def test_cli_metadata_json_output(self, tmp_path):
+    def test_cli_metadata_json_output(self, tmp_path: Path) -> None:
         """Test CLI metadata command with JSON output."""
         from click.testing import CliRunner
 
@@ -464,7 +466,7 @@ class TestCLIMetadataCommand:
         assert output["format"] == "safetensors"
         assert output["file_size"] > 0
 
-    def test_cli_metadata_security_only(self, tmp_path):
+    def test_cli_metadata_security_only(self, tmp_path: Path) -> None:
         """Test CLI metadata command with security-only flag."""
         from click.testing import CliRunner
 
@@ -487,7 +489,7 @@ class TestCLIMetadataCommand:
         assert "file" in output
         assert "format" in output
 
-    def test_cli_metadata_table_output(self, tmp_path):
+    def test_cli_metadata_table_output(self, tmp_path: Path) -> None:
         """Test CLI metadata command with default table output."""
         from click.testing import CliRunner
 
