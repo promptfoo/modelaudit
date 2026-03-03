@@ -426,18 +426,18 @@ class TestCVE202549655TorchModuleWrapper:
 
     def _make_keras_zip(self, config: dict[str, Any], tmp_path: Path) -> str:
         """Helper to create a .keras ZIP with the given config.json."""
-        keras_path = os.path.join(str(tmp_path), "model.keras")
+        keras_path = tmp_path / "model.keras"
         with zipfile.ZipFile(keras_path, "w") as zf:
             zf.writestr("config.json", json.dumps(config))
             zf.writestr("metadata.json", json.dumps({"keras_version": "3.11.0"}))
-        return keras_path
+        return str(keras_path)
 
     def _make_keras_zip_with_version(self, config: dict[str, Any], tmp_path: Path, keras_version: str) -> str:
-        keras_path = os.path.join(str(tmp_path), "model.keras")
+        keras_path = tmp_path / "model.keras"
         with zipfile.ZipFile(keras_path, "w") as zf:
             zf.writestr("config.json", json.dumps(config))
             zf.writestr("metadata.json", json.dumps({"keras_version": keras_version}))
-        return keras_path
+        return str(keras_path)
 
     def test_torch_module_wrapper_detected_critical(self, tmp_path: Path) -> None:
         """TorchModuleWrapper layer should be flagged as CRITICAL."""
@@ -483,6 +483,7 @@ class TestCVE202549655TorchModuleWrapper:
         assert details["cve_id"] == "CVE-2025-49655"
         assert details["cvss"] == 9.8
         assert details["cwe"] == "CWE-502"
+        assert details["description"]
         assert "3.11.3" in details["remediation"]
 
     def test_no_false_positive_dense_layer(self, tmp_path: Path) -> None:
@@ -551,6 +552,9 @@ class TestCVE202549655TorchModuleWrapper:
         result = scanner.scan(self._make_keras_zip_with_version(config, tmp_path, "3.11.3"))
         cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-49655"]
         assert len(cve_issues) == 0, "Fixed Keras versions should not get CVE-2025-49655 attribution"
+        risk_checks = [c for c in result.checks if c.name == "TorchModuleWrapper Version Risk Check"]
+        assert len(risk_checks) >= 1
+        assert risk_checks[0].severity == IssueSeverity.WARNING
 
     def test_two_part_version_is_treated_as_vulnerable(self, tmp_path: Path) -> None:
         """Keras 3.11 should be interpreted as vulnerable (patch=0)."""

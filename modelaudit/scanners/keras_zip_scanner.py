@@ -290,6 +290,10 @@ class KerasZipScanner(BaseScanner):
                     "cve_id": "CVE-2025-49655",
                     "cvss": 9.8,
                     "cwe": "CWE-502",
+                    "description": (
+                        "TorchModuleWrapper in vulnerable Keras versions can deserialize attacker-controlled "
+                        "pickles via torch.load(weights_only=False), enabling RCE."
+                    ),
                     "affected_versions": "Keras 3.11.0-3.11.2",
                     "remediation": "Upgrade Keras to >= 3.11.3",
                 },
@@ -300,13 +304,20 @@ class KerasZipScanner(BaseScanner):
         if vulnerability_status is False and isinstance(keras_version, str):
             result.add_check(
                 name="TorchModuleWrapper Version Risk Check",
-                passed=True,
+                passed=False,
                 message=(
                     f"TorchModuleWrapper detected in Keras {keras_version}; "
-                    "not in known CVE-2025-49655 vulnerable range (3.11.0-3.11.2)"
+                    "version metadata is outside known CVE-2025-49655 range (3.11.0-3.11.2), "
+                    "but metadata-only assessment is inconclusive without runtime verification"
                 ),
+                severity=IssueSeverity.WARNING,
                 location=f"{self.current_file_path} (layer: {layer_name})",
-                details={"layer_name": layer_name, "layer_class": "TorchModuleWrapper", "keras_version": keras_version},
+                details={
+                    "layer_name": layer_name,
+                    "layer_class": "TorchModuleWrapper",
+                    "keras_version": keras_version,
+                    "metadata_only_assessment": True,
+                },
             )
             return
 
@@ -332,6 +343,10 @@ class KerasZipScanner(BaseScanner):
                 "cve_id": "CVE-2025-49655",
                 "cvss": 9.8,
                 "cwe": "CWE-502",
+                "description": (
+                    "TorchModuleWrapper may deserialize unsafe content, but version data was missing or "
+                    "non-canonical so CVE attribution confidence is reduced."
+                ),
                 "affected_versions": "Keras 3.11.0-3.11.2",
                 "remediation": "Ensure model metadata includes keras_version and upgrade to >= 3.11.3",
             },
