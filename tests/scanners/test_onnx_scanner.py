@@ -162,6 +162,9 @@ class TestCVE202551480SavePathTraversal:
 
     def test_normalized_in_dir_path_with_dotdot_no_write_vuln(self, tmp_path: Path) -> None:
         """Paths containing '..' but resolving in-dir should not be tagged as CVE-2025-51480."""
+        # We create the real target file in-dir, but build the ONNX with an external_data
+        # reference of "subdir/../weights.bin" and `missing_external=True` so the model keeps
+        # the external reference metadata while the resolved path still lands inside model_dir.
         (tmp_path / "weights.bin").write_bytes(struct.pack("f", 1.0))
         model_path = create_onnx_model(
             tmp_path,
