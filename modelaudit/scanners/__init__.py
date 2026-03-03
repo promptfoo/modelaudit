@@ -453,6 +453,15 @@ class ScannerRegistry:
                 "dependencies": ["xgboost", "ubjson"],  # ubjson optional for UBJ support
                 "numpy_sensitive": True,  # XGBoost can be sensitive to NumPy version
             },
+            "mxnet": {
+                "module": "modelaudit.scanners.mxnet_scanner",
+                "class": "MXNetScanner",
+                "description": "Scans MXNet symbol/params model artifacts",
+                "extensions": [".json", ".params"],
+                "priority": 8,  # Before generic manifest/json scanners
+                "dependencies": [],
+                "numpy_sensitive": False,
+            },
             "catboost": {
                 "module": "modelaudit.scanners.catboost_scanner",
                 "class": "CatBoostScanner",
@@ -783,6 +792,7 @@ def __getattr__(name: str) -> Any:
         "LightGBMScanner": "lightgbm",
         "LlamafileScanner": "llamafile",
         "XGBoostScanner": "xgboost",
+        "MXNetScanner": "mxnet",
         "CatBoostScanner": "catboost",
         "NemoScanner": "nemo",
         "CompressedScanner": "compressed",
