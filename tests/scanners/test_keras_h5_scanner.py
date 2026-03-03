@@ -478,6 +478,9 @@ class TestCVE20259905H5SafeMode:
         details = cve_issues[0].details
         assert details["cve_id"] == "CVE-2025-9905"
         assert details["cvss"] == 7.3
+        assert details["cwe"] == "CWE-693"
+        assert details["description"]
+        assert details["layer_name"] == "lambda_1"
         assert "3.11.3" in details["remediation"]
 
     def test_no_cve_without_lambda(self, tmp_path: Path) -> None:

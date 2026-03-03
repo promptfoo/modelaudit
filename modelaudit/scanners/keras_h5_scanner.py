@@ -269,6 +269,10 @@ class KerasH5Scanner(BaseScanner):
 
                 # Special handling for Lambda layers - validate Python code
                 if layer_class == "Lambda":
+                    raw_layer_name = layer.get("name")
+                    if not raw_layer_name and isinstance(layer_config, dict):
+                        raw_layer_name = layer_config.get("name")
+                    layer_name = raw_layer_name or f"lambda_{layer_counts.get('Lambda', 1)}"
                     self._check_lambda_layer(layer_config, result)
                     keras_version = result.metadata.get("keras_version")
                     if isinstance(keras_version, str) and self._is_vulnerable_to_cve_2025_9905(keras_version):
@@ -277,17 +281,22 @@ class KerasH5Scanner(BaseScanner):
                             name="CVE-2025-9905: H5 safe_mode Bypass",
                             passed=False,
                             message=(
-                                f"CVE-2025-9905: Lambda layer in H5 format with Keras {keras_version} - "
+                                f"CVE-2025-9905: Lambda layer '{layer_name}' in H5 format with Keras {keras_version} - "
                                 "safe_mode=True is silently ignored for .h5/.hdf5 files"
                             ),
                             severity=IssueSeverity.CRITICAL,
-                            location=self.current_file_path,
+                            location=f"{self.current_file_path} (layer: {layer_name})",
                             details={
                                 "layer_class": "Lambda",
+                                "layer_name": layer_name,
                                 "keras_version": keras_version,
                                 "cve_id": "CVE-2025-9905",
                                 "cvss": 7.3,
                                 "cwe": "CWE-693",
+                                "description": (
+                                    "Keras H5 format can ignore safe_mode=True for Lambda layers, "
+                                    "allowing arbitrary code execution during model load."
+                                ),
                                 "affected_versions": "Keras 3.0.0-3.11.2",
                                 "remediation": "Upgrade Keras to >= 3.11.3 or convert to .keras format",
                             },
@@ -298,25 +307,35 @@ class KerasH5Scanner(BaseScanner):
                             name="H5 Lambda Version Risk Check",
                             passed=True,
                             message=(
-                                f"Lambda layer detected with Keras {keras_version}; "
+                                f"Lambda layer '{layer_name}' detected with Keras {keras_version}; "
                                 "outside known CVE-2025-9905 vulnerable range (3.0.0-3.11.2)"
                             ),
-                            location=self.current_file_path,
-                            details={"layer_class": "Lambda", "keras_version": keras_version},
+                            location=f"{self.current_file_path} (layer: {layer_name})",
+                            details={"layer_class": "Lambda", "layer_name": layer_name, "keras_version": keras_version},
                         )
                     else:
                         result.add_check(
                             name="H5 Lambda Risk (Version Unknown)",
                             passed=False,
                             message=(
-                                "Lambda layer detected in H5 model but keras_version is unavailable; "
-                                "cannot confidently attribute CVE-2025-9905 without version context"
+                                f"Lambda layer '{layer_name}' detected in H5 model but "
+                                f"{version_context}; cannot confidently attribute "
+                                "CVE-2025-9905 without reliable version context"
                             ),
                             severity=IssueSeverity.WARNING,
-                            location=self.current_file_path,
+                            location=f"{self.current_file_path} (layer: {layer_name})",
                             details={
                                 "layer_class": "Lambda",
+                                "layer_name": layer_name,
+                                "keras_version": keras_version,
+                                "parse_status": "unknown",
                                 "cve_id": "CVE-2025-9905",
+                                "cvss": 7.3,
+                                "cwe": "CWE-693",
+                                "description": (
+                                    "Keras H5 format can ignore safe_mode=True for Lambda layers; "
+                                    "version context could not be parsed confidently."
+                                ),
                                 "affected_versions": "Keras 3.0.0-3.11.2",
                             },
                         )
