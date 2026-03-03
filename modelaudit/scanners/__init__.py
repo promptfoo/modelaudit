@@ -390,6 +390,15 @@ class ScannerRegistry:
                 "dependencies": ["xgboost", "ubjson"],  # ubjson optional for UBJ support
                 "numpy_sensitive": True,  # XGBoost can be sensitive to NumPy version
             },
+            "catboost": {
+                "module": "modelaudit.scanners.catboost_scanner",
+                "class": "CatBoostScanner",
+                "description": "Scans CatBoost .cbm model files for suspicious metadata indicators",
+                "extensions": [".cbm"],
+                "priority": 8,
+                "dependencies": [],
+                "numpy_sensitive": False,
+            },
             "nemo": {
                 "module": "modelaudit.scanners.nemo_scanner",
                 "class": "NemoScanner",
@@ -695,6 +704,7 @@ def __getattr__(name: str) -> Any:
         "SevenZipScanner": "sevenzip",
         "TextScanner": "text",
         "XGBoostScanner": "xgboost",
+        "CatBoostScanner": "catboost",
         "NemoScanner": "nemo",
         "ZipScanner": "zip",
     }
