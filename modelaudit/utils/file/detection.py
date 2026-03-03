@@ -28,6 +28,7 @@ _CNTK_LEGACY_VERSION_MARKER = b"B\x00V\x00e\x00r\x00s\x00i\x00o\x00n\x00\x00\x00
 _CNTK_V2_REQUIRED_MARKERS = (b"\x0a\x07version", b"\x0a\x03uid")
 _CNTK_V2_STRUCTURE_MARKERS = (b"CompositeFunction", b"primitive_functions", b"PrimitiveFunction")
 _CNTK_SIGNATURE_READ_BYTES = 4096
+_TORCH7_SIGNATURE_READ_BYTES = 4096
 _GZIP_MAGIC = b"\x1f\x8b"
 _BZIP2_MAGIC = b"BZh"
 _XZ_MAGIC = b"\xfd7zXZ\x00"
@@ -70,6 +71,15 @@ def _is_cntk_signature(prefix: bytes) -> bool:
     return _looks_like_cntk_v2_signature(prefix)
 
 
+def _is_torch7_signature(prefix: bytes) -> bool:
+    lowered = prefix.lower()
+    if prefix.startswith(b"T7\x00\x00"):
+        return True
+    has_torch_marker = b"torch" in lowered or b"luat" in lowered
+    has_structure_marker = b"nn." in lowered or b"tensor" in lowered or b"thnn" in lowered
+    return has_torch_marker and has_structure_marker
+
+
 def _is_zlib_header(prefix: bytes) -> bool:
     if len(prefix) < 2:
         return False
@@ -108,6 +118,8 @@ def detect_format_from_magic_bytes(magic4: MagicBytes, magic8: MagicBytes, magic
             return "catboost"
         case b"RKNN":
             return "rknn"
+        case b"T7\x00\x00":
+            return "torch7"
         case b"GGUF":
             return "gguf"
         case magic if magic in GGML_MAGIC_VARIANTS:
@@ -200,6 +212,11 @@ def detect_file_format_from_magic(path: str) -> str:
             cntk_prefix = f.read(_CNTK_SIGNATURE_READ_BYTES)
             if _is_cntk_signature(cntk_prefix):
                 return "cntk"
+
+            f.seek(0)
+            torch7_prefix = f.read(_TORCH7_SIGNATURE_READ_BYTES)
+            if _is_torch7_signature(torch7_prefix):
+                return "torch7"
 
             # Check for XML-based formats (OpenVINO and PMML)
             if magic16.startswith(b"<?xml"):
@@ -352,6 +369,11 @@ def detect_file_format(path: str) -> str:
         if _is_cntk_signature(prefix):
             return "cntk"
         return "unknown"
+    if ext in (".t7", ".th", ".net"):
+        prefix = read_magic_bytes(path, _TORCH7_SIGNATURE_READ_BYTES)
+        if _is_torch7_signature(prefix):
+            return "torch7"
+        return "unknown"
     if ext == ".rknn":
         if magic4 == b"RKNN":
             return "rknn"
@@ -428,6 +450,9 @@ EXTENSION_FORMAT_MAP = {
     ".ckpt": "pickle",
     ".dnn": "cntk",
     ".cmf": "cntk",
+    ".t7": "torch7",
+    ".th": "torch7",
+    ".net": "torch7",
     ".rknn": "rknn",
     ".pkl": "pickle",
     ".pickle": "pickle",
@@ -485,6 +510,8 @@ def detect_format_from_extension_pattern_matching(extension: FileExtension) -> F
             return "pickle"
         case ".dnn" | ".cmf":
             return "cntk"
+        case ".t7" | ".th" | ".net":
+            return "torch7"
         case ".rknn":
             return "rknn"
         # HDF5 formats
@@ -694,6 +721,10 @@ def validate_file_type(path: str) -> bool:
         # RKNN files require RKNN signature bytes.
         if ext_format == "rknn":
             return header_format == "rknn"
+
+        if ext_format == "torch7":
+            torch7_prefix = read_magic_bytes(path, _TORCH7_SIGNATURE_READ_BYTES)
+            return _is_torch7_signature(torch7_prefix)
 
         # R serialized workspace/data files may be uncompressed or wrapped;
         # extension-based intent is authoritative for static scanning.
