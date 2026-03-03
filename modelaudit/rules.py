@@ -38,6 +38,7 @@ class RuleRegistry:
     """Central registry for all security rules."""
 
     _rules: ClassVar[dict[str, Rule]] = {}
+    _message_match_cache: ClassVar[dict[str, tuple[str, Rule] | None]] = {}
     _initialized = False
 
     @classmethod
@@ -45,6 +46,8 @@ class RuleRegistry:
         """Initialize all rules. Called once at startup."""
         if cls._initialized:
             return
+
+        cls._message_match_cache.clear()
 
         # S100-S199: Code Execution
         cls._add_rule(
@@ -886,6 +889,7 @@ class RuleRegistry:
         """Add a rule to the registry."""
         compiled_patterns = [re.compile(p, re.IGNORECASE) for p in patterns]
         cls._rules[code] = Rule(code, name, severity, description, compiled_patterns)
+        cls._message_match_cache.clear()
 
     @classmethod
     def get_rule(cls, code: str) -> Rule | None:
@@ -897,10 +901,20 @@ class RuleRegistry:
     def find_matching_rule(cls, message: str) -> tuple[str, Rule] | None:
         """Find the first rule that matches a message."""
         cls.initialize()
+        if message in cls._message_match_cache:
+            return cls._message_match_cache[message]
+
+        match: tuple[str, Rule] | None = None
         for code, rule in cls._rules.items():
             if rule.matches_message(message):
-                return code, rule
-        return None
+                match = (code, rule)
+                break
+
+        # Bound cache growth for long-running scans with highly variable messages.
+        if len(cls._message_match_cache) >= 4096:
+            cls._message_match_cache.clear()
+        cls._message_match_cache[message] = match
+        return match
 
     @classmethod
     def get_all_rules(cls) -> dict[str, Rule]:
