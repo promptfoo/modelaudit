@@ -526,7 +526,11 @@ class KerasZipScanner(BaseScanner):
         Detected when a single config object references get_file and includes URL arguments.
         """
         for context, node in self._iter_dict_nodes(model_config):
-            string_values = [value for value in node.values() if isinstance(value, str)]
+            if self._is_primarily_documentation(context, node):
+                continue
+            string_values: list[str] = []
+            for value in node.values():
+                string_values.extend(self._extract_string_literals(value))
             has_get_file = any(
                 _GET_FILE_PATTERN.fullmatch(value.strip()) is not None
                 or value.strip().lower().endswith(".get_file")
@@ -550,12 +554,41 @@ class KerasZipScanner(BaseScanner):
                     "context": context,
                     "cvss": 8.8,
                     "cwe": "CWE-502",
+                    "description": (
+                        "Keras config references get_file with a remote URL in executable context, "
+                        "which can bypass safe_mode protections and load attacker-controlled payloads."
+                    ),
                     "affected_versions": "Keras 3.0.0-3.10.0",
                     "remediation": "Upgrade Keras to >= 3.11.0",
                 },
                 why=get_cve_2025_8747_explanation("get_file_gadget"),
             )
             return
+
+    @staticmethod
+    def _extract_string_literals(value: Any) -> list[str]:
+        """Extract string literals from simple container values."""
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, (list, tuple, set)):
+            values: list[str] = []
+            for item in value:
+                values.extend(KerasZipScanner._extract_string_literals(item))
+            return values
+        return []
+
+    @staticmethod
+    def _is_primarily_documentation(context: str, node: dict[str, Any]) -> bool:
+        """Heuristically detect documentation-only nodes to reduce false positives."""
+        context_lower = context.lower()
+        doc_markers = (".description", ".doc", ".docs", ".comment", ".comments", ".notes", ".help", ".readme")
+        if any(marker in context_lower for marker in doc_markers):
+            return True
+
+        lowered_keys = {str(key).lower() for key in node}
+        doc_keys = {"description", "doc", "docs", "comment", "comments", "notes", "help", "readme", "citation"}
+        execution_keys = {"fn", "function", "module", "url", "args", "kwargs", "class_name", "callable"}
+        return bool(lowered_keys) and lowered_keys.issubset(doc_keys) and lowered_keys.isdisjoint(execution_keys)
 
     def _iter_dict_nodes(self, obj: Any, path: str = "root") -> list[tuple[str, dict[str, Any]]]:
         """Yield all dict nodes with their traversal path."""

