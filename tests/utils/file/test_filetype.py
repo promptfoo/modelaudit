@@ -61,6 +61,9 @@ def test_detect_file_format_by_extension(tmp_path):
         ".pkl": "pickle",
         ".pickle": "pickle",
         ".dill": "pickle",  # .dill files are treated as pickle files
+        # CNTK detection is signature-based to avoid misclassifying arbitrary .dnn/.cmf files
+        ".dnn": "unknown",
+        ".cmf": "unknown",
         ".msgpack": "flax_msgpack",
         ".h5": "hdf5",
         ".pb": "protobuf",
@@ -94,6 +97,24 @@ def test_detect_r_serialized_magic_headers(tmp_path: Path) -> None:
     assert detect_file_format_from_magic(str(rds)) == "r_serialized"
     assert detect_file_format(str(rds)) == "r_serialized"
     assert validate_file_type(str(rds)) is True
+
+
+def test_detect_cntk_formats_by_signature(tmp_path: Path) -> None:
+    legacy_path = tmp_path / "legacy.dnn"
+    legacy_path.write_bytes(
+        b"B\x00C\x00N\x00\x00\x00" + b"B\x00V\x00e\x00r\x00s\x00i\x00o\x00n\x00\x00\x00" + b"inputs outputs"
+    )
+    assert detect_format_from_extension(str(legacy_path)) == "cntk"
+    assert detect_file_format(str(legacy_path)) == "cntk"
+    assert detect_file_format_from_magic(str(legacy_path)) == "cntk"
+
+    v2_path = tmp_path / "graph.cmf"
+    v2_path.write_bytes(
+        b"\x0a\x07version\x12\x031.0\x12\x09\x0a\x03uid\x12\x02ab CompositeFunction primitive_functions"
+    )
+    assert detect_format_from_extension(str(v2_path)) == "cntk"
+    assert detect_file_format(str(v2_path)) == "cntk"
+    assert detect_file_format_from_magic(str(v2_path)) == "cntk"
 
 
 def test_detect_file_format_small_file(tmp_path):
@@ -402,6 +423,25 @@ def test_catboost_validation_valid_and_invalid_files(tmp_path: Path) -> None:
     bad_catboost = tmp_path / "bad_model.cbm"
     bad_catboost.write_bytes(b"FAKE" + b"\x00" * 20)
     assert validate_file_type(str(bad_catboost)) is False
+
+
+def test_cntk_validation_valid_and_invalid_files(tmp_path: Path) -> None:
+    """Valid CNTK signatures pass validation; misnamed files fail."""
+    cntk_legacy = tmp_path / "legacy.dnn"
+    cntk_legacy.write_bytes(
+        b"B\x00C\x00N\x00\x00\x00" + b"B\x00V\x00e\x00r\x00s\x00i\x00o\x00n\x00\x00\x00" + b"inputs outputs"
+    )
+    assert validate_file_type(str(cntk_legacy)) is True
+
+    cntk_v2 = tmp_path / "graph.cmf"
+    cntk_v2.write_bytes(
+        b"\x0a\x07version\x12\x031.0\x12\x09\x0a\x03uid\x12\x02ab CompositeFunction primitive_functions"
+    )
+    assert validate_file_type(str(cntk_v2)) is True
+
+    bad_cntk = tmp_path / "not_cntk.dnn"
+    bad_cntk.write_text("not a cntk model")
+    assert validate_file_type(str(bad_cntk)) is False
 
 
 def test_detect_generic_xml_format(tmp_path):

@@ -87,6 +87,7 @@ def pytest_runtest_setup(item):
             "test_paddle_scanner.py",  # PaddlePaddle scanner tests
             "test_catboost_scanner.py",  # CatBoost scanner tests
             "test_r_serialized_scanner.py",  # R serialized scanner tests
+            "test_cntk_scanner.py",  # CNTK .dnn/.cmf scanner tests
         ]
 
         # Check if this is an allowed test file
