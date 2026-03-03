@@ -79,6 +79,8 @@ def pytest_runtest_setup(item):
             "test_cloud_url_detection.py",  # Cloud storage URL detection tests
             "test_skops_scanner.py",  # Skops scanner CVE detection tests
             "test_numpy_scanner.py",  # NumPy scanner CVE-2019-6446 tests
+            "test_cve_detection.py",  # CVE detection tests
+            "test_pytorch_zip_scanner.py",  # PyTorch ZIP scanner tests
         ]
 
         # Check if this is an allowed test file

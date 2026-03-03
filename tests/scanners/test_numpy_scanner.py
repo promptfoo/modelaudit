@@ -87,3 +87,16 @@ class TestCVE20196446ObjectDtype:
         assert details["cvss"] == 9.8
         assert details["cwe"] == "CWE-502"
         assert "remediation" in details
+
+    def test_structured_with_object_field_triggers_cve(self, tmp_path):
+        """Structured dtype with object fields should trigger CVE-2019-6446."""
+        dt = np.dtype([("x", np.float32), ("obj", object)])
+        arr = np.array([(1.0, {"nested": "payload"})], dtype=dt)
+        path = tmp_path / "struct_with_obj.npy"
+        np.save(path, arr, allow_pickle=True)
+
+        scanner = NumPyScanner()
+        result = scanner.scan(str(path))
+
+        cve_checks = [c for c in result.checks if "CVE-2019-6446" in (c.name + c.message)]
+        assert len(cve_checks) > 0, "Structured dtype with object field should trigger CVE"

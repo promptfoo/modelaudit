@@ -1,10 +1,14 @@
 """Scanner for ONNX model files (.onnx)."""
 
+import logging
+import math
 import os
 from pathlib import Path
 from typing import Any, ClassVar
 
 from .base import BaseScanner, IssueSeverity, ScanResult
+
+logger = logging.getLogger("modelaudit.scanners")
 
 
 def _get_onnx_mapping() -> Any:
@@ -171,6 +175,7 @@ class OnnxScanner(BaseScanner):
         self._check_custom_ops(model, path, result)
         self._check_external_data(model, path, result)
         self._check_tensor_sizes(model, path, result)
+        self._check_weight_distribution(model, path, result)
 
         result.finish(success=True)
         return result
@@ -245,10 +250,16 @@ class OnnxScanner(BaseScanner):
 
     def _check_external_data(self, model: Any, path: str, result: ScanResult) -> None:
         model_dir = Path(path).resolve().parent
+        import onnx
+
+        # Track per-file status to avoid flooding the result with one check
+        # per tensor when many tensors share the same external data file.
+        missing_files: dict[str, list[str]] = {}  # file -> [tensor_names]
+        traversal_files: dict[str, list[str]] = {}  # file -> [tensor_names]
+        safe_files: set[str] = set()
+
         for tensor in model.graph.initializer:
-            # Check for interrupts during external data processing
             self.check_interrupted()
-            import onnx
 
             if tensor.data_location == onnx.TensorProto.EXTERNAL:
                 info = {entry.key: entry.value for entry in tensor.external_data}
@@ -265,32 +276,59 @@ class OnnxScanner(BaseScanner):
                     continue
                 external_path = (model_dir / location).resolve()
                 if not external_path.exists():
-                    result.add_check(
-                        name="External Data File Existence",
-                        passed=False,
-                        message=f"External data file not found for tensor '{tensor.name}'",
-                        severity=IssueSeverity.CRITICAL,
-                        location=str(external_path),
-                        details={"tensor": tensor.name, "file": location},
-                    )
+                    missing_files.setdefault(location, []).append(tensor.name)
                 elif not str(external_path).startswith(str(model_dir)):
-                    result.add_check(
-                        name="External Data Path Traversal Check",
-                        passed=False,
-                        message=f"External data file outside model directory for tensor '{tensor.name}'",
-                        severity=IssueSeverity.CRITICAL,
-                        location=str(external_path),
-                        details={"tensor": tensor.name, "file": location},
-                    )
+                    traversal_files.setdefault(location, []).append(tensor.name)
                 else:
-                    result.add_check(
-                        name="External Data Path Traversal Check",
-                        passed=True,
-                        message=f"External data file path is safe for tensor '{tensor.name}'",
-                        location=str(external_path),
-                        details={"tensor": tensor.name, "file": location},
-                    )
+                    if location not in safe_files:
+                        safe_files.add(location)
+                        result.add_check(
+                            name="External Data Path Traversal Check",
+                            passed=True,
+                            message=f"External data file path is safe: {location}",
+                            location=str(external_path),
+                            details={"file": location},
+                        )
                     self._validate_external_size(tensor, external_path, result)
+
+        # Report missing files once per file (not per tensor)
+        for location, tensors in missing_files.items():
+            external_path = (model_dir / location).resolve()
+            result.add_check(
+                name="External Data File Existence",
+                passed=False,
+                message=(
+                    f"External data file '{location}' not found "
+                    f"({len(tensors)} tensor{'s' if len(tensors) != 1 else ''} affected). "
+                    "This is common for HuggingFace models downloaded without companion data files."
+                ),
+                severity=IssueSeverity.WARNING,
+                location=str(external_path),
+                details={
+                    "file": location,
+                    "affected_tensor_count": len(tensors),
+                    "sample_tensors": tensors[:5],
+                },
+            )
+
+        # Path traversal is a genuine security issue -- keep CRITICAL
+        for location, tensors in traversal_files.items():
+            external_path = (model_dir / location).resolve()
+            result.add_check(
+                name="External Data Path Traversal Check",
+                passed=False,
+                message=(
+                    f"External data file outside model directory: {location} "
+                    f"({len(tensors)} tensor{'s' if len(tensors) != 1 else ''} affected)"
+                ),
+                severity=IssueSeverity.CRITICAL,
+                location=str(external_path),
+                details={
+                    "file": location,
+                    "affected_tensor_count": len(tensors),
+                    "sample_tensors": tensors[:5],
+                },
+            )
 
     def _validate_external_size(
         self,
@@ -392,3 +430,96 @@ class OnnxScanner(BaseScanner):
                         severity=IssueSeverity.DEBUG,
                         location=path,
                     )
+
+    def _check_weight_distribution(self, model: Any, path: str, result: ScanResult) -> None:
+        """Extract weights from ONNX initializers and run weight distribution analysis.
+
+        The model is already loaded with load_external_data=False, so external-data
+        tensors have no raw bytes and must be skipped.  Only inline 2-D+ tensors
+        (conv kernels, linear layers, embeddings) are relevant for distribution
+        analysis; 1-D tensors (biases, batch-norm params) are excluded.
+        """
+        try:
+            import onnx
+
+            # Lazy-import the weight distribution scanner to avoid circular deps
+            # and heavy library loads when the scanner is not needed.
+            from modelaudit.scanners.weight_distribution_scanner import WeightDistributionScanner
+        except ImportError:
+            # numpy / scipy / onnx not available — silently skip
+            return
+
+        # Max in-memory array size (default 100 MB)
+        max_array_size = self.config.get("max_array_size", 100 * 1024 * 1024)
+
+        import numpy as np
+
+        extraction_failures = 0
+        weights_info: dict[str, Any] = {}
+        for initializer in model.graph.initializer:
+            try:
+                self.check_interrupted()
+
+                # Skip external-data tensors — their bytes were not loaded.
+                if initializer.data_location == onnx.TensorProto.EXTERNAL:
+                    continue
+
+                # Only 2-D+ tensors are interesting for distribution analysis.
+                if len(initializer.dims) < 2:
+                    continue
+
+                # Pre-check estimated size before materializing the array.
+                # Use math.prod for arbitrary-precision arithmetic (np.prod
+                # can silently overflow for very large dimension products).
+                numel = math.prod(int(dim) for dim in initializer.dims)
+                itemsize = int(np.dtype(onnx.helper.tensor_dtype_to_np_dtype(initializer.data_type)).itemsize)
+                estimated_bytes = numel * itemsize
+                if max_array_size and max_array_size > 0 and estimated_bytes > max_array_size:
+                    continue
+
+                array = onnx.numpy_helper.to_array(initializer)
+
+                weights_info[initializer.name] = array
+            except Exception as e:
+                extraction_failures += 1
+                logger.warning(
+                    "Failed to extract ONNX initializer '%s' for distribution analysis: %s",
+                    initializer.name,
+                    e,
+                )
+                continue
+
+        if not weights_info:
+            # Nothing to analyse (external-only model, or all tensors too small / too large).
+            return
+
+        # Delegate the actual statistical analysis to WeightDistributionScanner.
+        try:
+            wd_scanner = WeightDistributionScanner(self.config)
+            anomalies = wd_scanner._analyze_weight_distributions(weights_info)
+
+            for anomaly in anomalies:
+                result.add_check(
+                    name="Weight Distribution Anomaly Detection",
+                    passed=False,
+                    message=anomaly["description"],
+                    severity=anomaly["severity"],
+                    location=path,
+                    details=anomaly["details"],
+                    why=anomaly.get("why"),
+                )
+
+            result.metadata["layers_analyzed"] = len(weights_info)
+            result.metadata["anomalies_found"] = len(anomalies)
+            if extraction_failures > 0:
+                result.metadata["weight_extraction_failures"] = extraction_failures
+        except Exception as e:
+            logger.warning(f"Weight distribution analysis failed: {e}")
+            result.add_check(
+                name="Weight Distribution Analysis",
+                passed=False,
+                message=f"Weight distribution analysis failed: {e!s}",
+                severity=IssueSeverity.DEBUG,
+                location=path,
+                details={"exception": str(e), "exception_type": type(e).__name__},
+            )

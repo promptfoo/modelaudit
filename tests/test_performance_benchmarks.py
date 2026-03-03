@@ -41,9 +41,9 @@ class TestPerformanceBenchmarks:
         results = []
 
         for _ in range(runs):
-            start_time = time.time()
+            start_time = time.perf_counter()
             scan_result = scan_model_directory_or_file(path)
-            end_time = time.time()
+            end_time = time.perf_counter()
 
             duration = end_time - start_time
             results.append(
@@ -218,9 +218,9 @@ class TestPerformanceBenchmarks:
 
         def scan_directory():
             """Scan the directory and return performance metrics."""
-            start_time = time.time()
+            start_time = time.perf_counter()
             results = scan_model_directory_or_file(str(assets_dir))
-            duration = time.time() - start_time
+            duration = time.perf_counter() - start_time
             return {
                 "duration": duration,
                 "success": results.success,
@@ -228,11 +228,13 @@ class TestPerformanceBenchmarks:
             }
 
         # Test with 3 concurrent scans
+        is_ci = bool(os.getenv("CI") or os.getenv("GITHUB_ACTIONS"))
+        future_timeout = 180 if is_ci else 60
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
             futures = [executor.submit(scan_directory) for _ in range(3)]
 
             concurrent_results = []
-            for future in concurrent.futures.as_completed(futures, timeout=60):
+            for future in concurrent.futures.as_completed(futures, timeout=future_timeout):
                 result = future.result()
                 concurrent_results.append(result)
 
@@ -248,9 +250,6 @@ class TestPerformanceBenchmarks:
 
         # Allow some overhead but not excessive
         # More lenient threshold for CI environments
-        import os
-
-        is_ci = os.getenv("CI") or os.getenv("GITHUB_ACTIONS")
         if not is_ci:
             # Skip concurrency overhead check in local environments due to high variance
             pytest.skip(
@@ -274,9 +273,9 @@ class TestPerformanceBenchmarks:
 
         try:
             # Measure performance on large file
-            start_time = time.time()
+            start_time = time.perf_counter()
             results = scan_model_directory_or_file(str(temp_path))
-            duration = time.time() - start_time
+            duration = time.perf_counter() - start_time
 
             # Should handle large files reasonably
             assert duration < 10.0, f"Large file scan took too long: {duration:.2f}s"
@@ -334,9 +333,9 @@ class TestPerformanceBenchmarks:
         durations = []
 
         for i in range(num_iterations):
-            start_time = time.time()
+            start_time = time.perf_counter()
             results = scan_model_directory_or_file(str(assets_dir))
-            duration = time.time() - start_time
+            duration = time.perf_counter() - start_time
             durations.append(duration)
 
             assert results.success, f"Iteration {i + 1} should succeed"

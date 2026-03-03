@@ -52,20 +52,19 @@ class TestSkopsScannerContentAnalysis:
         patterns_matched = details.get("patterns_matched", [])
         assert any("content:" in p for p in patterns_matched)
 
-    def test_detects_reduce_in_content(self, tmp_path: Path) -> None:
-        """Test detection of __reduce__ pattern in file content."""
+    def test_reduce_in_content_not_flagged(self, tmp_path: Path) -> None:
+        """__reduce__ is a standard Python serialization method and should NOT trigger CVE-2025-54412."""
         skops_file = tmp_path / "model.skops"
         with zipfile.ZipFile(skops_file, "w") as zf:
-            # Pattern is in content, not filename
+            # __reduce__ is standard pickle protocol, not specific to CVE-2025-54412
             zf.writestr("object.bin", b'{"method": "__reduce__", "args": ["os.system", "id"]}')
             zf.writestr("schema.json", '{"version": "1.0"}')
 
         scanner = SkopsScanner()
         result = scanner.scan(str(skops_file))
 
-        cve_checks = [c for c in result.checks if "CVE-2025-54412" in c.name]
-        assert len(cve_checks) > 0
-        assert cve_checks[0].status == CheckStatus.FAILED
+        cve_checks = [c for c in result.checks if "CVE-2025-54412" in c.name and c.status == CheckStatus.FAILED]
+        assert len(cve_checks) == 0
 
     def test_detects_getattr_in_content(self, tmp_path: Path) -> None:
         """Test detection of __getattr__ pattern in file content."""
@@ -105,8 +104,8 @@ class TestSkopsScannerContentAnalysis:
         with zipfile.ZipFile(skops_file, "w") as zf:
             # Pattern in filename
             zf.writestr("OperatorFuncNode.json", '{"type": "node"}')
-            # Different pattern in content
-            zf.writestr("data.json", '{"method": "__reduce__"}')
+            # OperatorFuncNode pattern in content of a different file
+            zf.writestr("data.json", '{"node_type": "OperatorFuncNode", "func": "exec"}')
             zf.writestr("schema.json", '{"version": "1.0"}')
 
         scanner = SkopsScanner()

@@ -143,7 +143,7 @@ class TestSuspiciousStringPatterns:
                 r"subprocess\.(?:Popen|call|check_output)",
                 "subprocess.call(['rm', 'file'])",
             ),
-            (r"__[\w]+__", "__reduce__"),
+            (r"(?<!\w)__(?=[a-zA-Z])[a-zA-Z0-9_]*[a-zA-Z]__(?!\w)", "__reduce__"),
             (r"base64\.b64decode", "base64.b64decode(encoded_payload)"),
             (r"\bimport\s+[\w\.]+", "import os"),
             (r"\\x[0-9a-fA-F]{2}", "\\x41\\x42\\x43"),
