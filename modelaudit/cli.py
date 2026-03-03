@@ -2387,6 +2387,8 @@ def rules_command(rule_code: str | None, list_rules: bool, category: str | None,
     else:
         rules = RuleRegistry.get_all_rules()
         display_rules(rules, output_format)
+
+
 def _get_platform_info() -> dict[str, Any]:
     """Get platform information for debug output."""
     import platform
