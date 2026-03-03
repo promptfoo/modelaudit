@@ -73,6 +73,7 @@ def test_detect_file_format_by_extension(tmp_path):
         ".pb": "protobuf",
         ".tflite": "tflite",
         ".cbm": "catboost",
+        ".rknn": "rknn",
         ".rds": "r_serialized",
         ".rda": "r_serialized",
         ".rdata": "r_serialized",
@@ -119,6 +120,22 @@ def test_detect_cntk_formats_by_signature(tmp_path: Path) -> None:
     assert detect_format_from_extension(str(v2_path)) == "cntk"
     assert detect_file_format(str(v2_path)) == "cntk"
     assert detect_file_format_from_magic(str(v2_path)) == "cntk"
+
+
+def test_detect_rknn_format_by_signature(tmp_path: Path) -> None:
+    rknn_path = tmp_path / "model.rknn"
+    rknn_path.write_bytes(b"RKNN\x01\x00\x00\x00runtime=rockchip\n")
+
+    assert detect_format_from_extension(str(rknn_path)) == "rknn"
+    assert detect_file_format(str(rknn_path)) == "rknn"
+    assert detect_file_format_from_magic(str(rknn_path)) == "rknn"
+    assert validate_file_type(str(rknn_path)) is True
+
+    bad_rknn = tmp_path / "bad.rknn"
+    bad_rknn.write_bytes(b"not-rknn-content")
+    assert detect_file_format(str(bad_rknn)) == "rknn"
+    assert detect_file_format_from_magic(str(bad_rknn)) == "unknown"
+    assert validate_file_type(str(bad_rknn)) is False
 
 
 def test_detect_file_format_small_file(tmp_path):
