@@ -892,6 +892,21 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
         assert not critical_messages, f"Unexpected CRITICAL benign detection: {critical_messages}"
 
     # ------------------------------------------------------------------
+    # Fix 3: joblib.load loader trampoline bypass
+    # ------------------------------------------------------------------
+    def test_joblib_load_reduce_is_critical(self) -> None:
+        """joblib.load + REDUCE should be treated as dangerous, not allowlisted."""
+        payload = b"\x80\x04cjoblib\nload\n\x8c\x0bpayload.pkl\x85R."
+        result = self._scan_bytes(payload)
+
+        assert result.success
+        assert result.has_errors
+        critical_messages = [i.message.lower() for i in result.issues if i.severity == IssueSeverity.CRITICAL]
+        assert any("joblib.load" in msg for msg in critical_messages), (
+            f"Expected CRITICAL joblib.load issue, got: {critical_messages}"
+        )
+
+    # ------------------------------------------------------------------
     # Fix 4: NEWOBJ_EX with dangerous class
     # ------------------------------------------------------------------
     def test_newobj_ex_dangerous_class(self) -> None:

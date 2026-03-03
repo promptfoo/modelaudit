@@ -30,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **security**: detect protocol 0/1 ASCII pickle signatures in generic file-format detection to prevent ZIP entry extension bypasses (e.g., malicious `payload.txt`)
 - **security**: harden protocol 0/1 pickle format detection with bounded opcode parsing to catch prefixed payloads (e.g., `MARK/LIST` before `GLOBAL`) while reducing plain-text false positives in ZIP entry scanning
 - **security**: keep opcode-level pickle analysis active when malformed streams trigger unicode/text parse errors after partial opcode extraction
+- **security**: treat `joblib.load` as always dangerous and remove it from pickle ML allowlist to block loader trampoline bypasses
 - **security**: tighten manifest trusted-domain matching to validate URL hostnames instead of substring matches
 - **security**: make `.keras` suspicious file extension checks case-insensitive to catch uppercase executable/script payloads
 - **security**: block unsafe in-process `torch.load` in `WeightDistributionScanner` by default unless explicitly opted in

@@ -356,6 +356,7 @@ ALWAYS_DANGEROUS_FUNCTIONS: set[str] = {
     # Other dangerous operations
     "pickle.loads",
     "pickle.load",
+    "joblib.load",
     "marshal.loads",
     "marshal.load",
     # Torch dangerous functions (Fickling)
@@ -1470,7 +1471,6 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
     ],
     "joblib": [
         "dump",
-        "load",
         "Parallel",
         "delayed",
         "Memory",
