@@ -464,6 +464,10 @@ def validate_file_type(path: str) -> bool:
         if ext_format == "tar" and header_format == "tar":
             return True
 
+        # NeMo files are TAR archives with a dedicated extension
+        if ext_format == "nemo" and header_format == "tar":
+            return True
+
         # ExecuTorch files should be zip archives
         if ext_format == "executorch":
             return header_format == "zip"

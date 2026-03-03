@@ -52,6 +52,21 @@ class TestNemoScannerBasic:
             tar.addfile(info, io.BytesIO(b""))
         assert not NemoScanner.can_handle(str(path))
 
+    def test_valid_nemo_does_not_trigger_file_type_mismatch(self, tmp_path):
+        """Valid .nemo tar archives should not be flagged as spoofed file types."""
+        path = _create_nemo_file(tmp_path, {"model": {"_target_": "nemo.Model"}})
+
+        result = NemoScanner().scan(str(path))
+
+        mismatch_checks = [
+            c
+            for c in result.checks
+            if c.name == "File Type Validation"
+            and c.status != CheckStatus.PASSED
+            and "extension indicates nemo but magic bytes indicate tar" in c.message
+        ]
+        assert len(mismatch_checks) == 0
+
     def test_missing_yaml_dependency_is_reported_as_warning(self, tmp_path, monkeypatch):
         """Missing PyYAML should be a non-passing warning, not a pass."""
         import modelaudit.scanners.nemo_scanner as nemo_scanner_mod

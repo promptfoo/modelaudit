@@ -259,6 +259,15 @@ def test_validate_file_type(tmp_path):
     npy_path.write_bytes(b"\x93NUMPY" + b"\x00" * 20)
     assert validate_file_type(str(npy_path)) is True
 
+    # NeMo .nemo files are TAR archives by design
+    nemo_path = tmp_path / "model.nemo"
+    with tarfile.open(nemo_path, "w") as tar:
+        info = tarfile.TarInfo(name="model_config.yaml")
+        content = b"model: test\n"
+        info.size = len(content)
+        tar.addfile(info, io.BytesIO(content))
+    assert validate_file_type(str(nemo_path)) is True
+
     # Small file should be valid (can't determine magic bytes)
     small_file = tmp_path / "small.h5"
     small_file.write_bytes(b"hi")
