@@ -417,6 +417,15 @@ class ScannerRegistry:
                 "dependencies": ["py7zr"],
                 "numpy_sensitive": False,
             },
+            "lightgbm": {
+                "module": "modelaudit.scanners.lightgbm_scanner",
+                "class": "LightGBMScanner",
+                "description": "Scans native LightGBM model files",
+                "extensions": [".model", ".txt", ".lgb", ".lightgbm"],
+                "priority": 6,  # Before XGBoost for strict .model collision handling
+                "dependencies": [],
+                "numpy_sensitive": False,
+            },
             "xgboost": {
                 "module": "modelaudit.scanners.xgboost_scanner",
                 "class": "XGBoostScanner",
@@ -752,6 +761,7 @@ def __getattr__(name: str) -> Any:
         "KerasZipScanner": "keras_zip",
         "SevenZipScanner": "sevenzip",
         "TextScanner": "text",
+        "LightGBMScanner": "lightgbm",
         "XGBoostScanner": "xgboost",
         "CatBoostScanner": "catboost",
         "NemoScanner": "nemo",

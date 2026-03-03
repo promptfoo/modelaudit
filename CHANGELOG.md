@@ -24,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **feat:** add standalone compressed-wrapper scanner support for `.gz`, `.bz2`, `.xz`, `.lz4`, and `.zlib` with strict signature validation, decompression size/ratio safeguards, and inner-payload scanner routing
 - **security:** add RKNN `.rknn` scanner with strict `RKNN` signature detection, bounded metadata parsing, and contextual command/network/obfuscation checks
 - **security:** add Torch7 (`.t7`, `.th`, `.net`) scanner with strict signature heuristics plus Lua execution primitive and dynamic module-loading detection
+- **security:** add native LightGBM scanner for `.lgb`/`.lightgbm` and signature-validated `.model` artifacts with strict XGBoost collision disambiguation and static command/network/path indicator checks
 
 ### Security
 
