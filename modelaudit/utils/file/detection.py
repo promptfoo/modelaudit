@@ -317,7 +317,7 @@ EXTENSION_FORMAT_MAP = {
     ".dill": "pickle",
     ".h5": "hdf5",
     ".hdf5": "hdf5",
-    ".keras": "hdf5",
+    ".keras": "keras",  # Keras 3.x uses ZIP, legacy Keras uses HDF5
     ".pb": "protobuf",
     ".safetensors": "safetensors",
     ".onnx": "onnx",
@@ -358,8 +358,11 @@ def detect_format_from_extension_pattern_matching(extension: FileExtension) -> F
         case ".pt" | ".pth" | ".ckpt" | ".pkl" | ".pickle" | ".dill":
             return "pickle"
         # HDF5 formats
-        case ".h5" | ".hdf5" | ".keras":
+        case ".h5" | ".hdf5":
             return "hdf5"
+        # Keras format: Keras 3.x uses ZIP, legacy Keras uses HDF5
+        case ".keras":
+            return "keras"
         # Archive formats
         case ".zip":
             return "zip"
@@ -387,7 +390,7 @@ def detect_format_from_extension_pattern_matching(extension: FileExtension) -> F
             return "tflite"
         case ".engine":
             return "tensorrt"
-        case ".pdmodel":
+        case ".pdmodel" | ".pdiparams":
             return "paddle"
         case ".xml":
             return "openvino"
@@ -472,6 +475,10 @@ def validate_file_type(path: str) -> bool:
         if ext_format == "executorch":
             return header_format == "zip"
 
+        # Keras files can be either ZIP (Keras 3.x) or HDF5 (legacy Keras)
+        if ext_format == "keras":
+            return header_format in {"zip", "hdf5"}
+
         # HDF5 files should always match
         if ext_format == "hdf5":
             return header_format == "hdf5"
@@ -497,6 +504,13 @@ def validate_file_type(path: str) -> bool:
             if file_path.suffix.lower() == ".npz":
                 return header_format in {"zip", "numpy"}
             return header_format == "numpy"
+
+        # PaddlePaddle files: .pdmodel files are protobuf serialised program
+        # descriptors and .pdiparams files are raw binary weight tensors.
+        # Neither format has distinctive magic bytes, so magic-based
+        # detection legitimately returns "unknown".  Accept that.
+        if ext_format == "paddle":
+            return True
 
         # Flax msgpack files (less strict validation)
         if ext_format == "flax_msgpack":

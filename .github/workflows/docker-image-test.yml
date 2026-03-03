@@ -85,8 +85,11 @@ jobs:
           docker run --rm modelaudit:lightweight invalid-command && exit 1 || echo "Command properly rejected invalid input"
 
       - name: Scan image for vulnerabilities
-        uses: aquasecurity/trivy-action@e368e328979b113139d6f9068e03accaed98a518 # 0.34.1
+        uses: aquasecurity/trivy-action@97e0b3872f55f89b95b2f65b3dbab56962816478 # 0.34.2
         with:
+          # Pin an explicit released Trivy binary to avoid setup failures when
+          # auto-resolved tags exist without matching release assets.
+          version: v0.69.2
           image-ref: modelaudit:lightweight
           format: table
           exit-code: "1"
@@ -143,8 +146,10 @@ jobs:
           docker run --rm modelaudit:full --version
 
       - name: Scan image for vulnerabilities
-        uses: aquasecurity/trivy-action@e368e328979b113139d6f9068e03accaed98a518 # 0.34.1
+        uses: aquasecurity/trivy-action@97e0b3872f55f89b95b2f65b3dbab56962816478 # 0.34.2
         with:
+          # Keep full-image scan on the same pinned released Trivy version.
+          version: v0.69.2
           image-ref: modelaudit:full
           format: table
           exit-code: "1"

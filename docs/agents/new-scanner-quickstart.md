@@ -94,3 +94,25 @@ uv run pytest -n auto -m "not slow and not integration" --maxfail=1
 - Registry wiring and dependency metadata are correct
 - User-facing docs updated if behavior is visible to end users
 - No security checks were downgraded without explicit rationale
+
+## Adding CVE Detections to Existing Scanners
+
+Adding a CVE detection differs from adding a whole new scanner — you wire into existing scanners and shared detector infrastructure. Here is the typical multi-file workflow:
+
+### Files touched for each new CVE detection
+
+1. **`modelaudit/detectors/suspicious_symbols.py`** — Add regex pattern list, register it in `CVE_COMBINED_PATTERNS`, and update `validate_patterns()`.
+2. **`modelaudit/detectors/cve_patterns.py`** — Add `_check_cve_XXXX_multiline()` detection function + `_create_cve_XXXX_attribution()` helper, then wire into `analyze_cve_patterns()`.
+3. **`modelaudit/scanners/<format>_scanner.py`** — Add version check method (if version-gated) and wire into the scanner's vulnerability checks.
+4. **`modelaudit/config/explanations.py`** — Add explanation function with type-specific messages.
+5. **`tests/detectors/test_cve_detection.py`** — Positive detection + false positive prevention + bypass prevention tests.
+6. **`tests/scanners/test_<format>_scanner.py`** — Version check tests (vulnerable + fixed).
+7. **`tests/conftest.py`** — Add test filenames to `allowed_test_files`.
+
+### Key pitfalls (see AGENTS.md § "CVE Detection Checklist" for full details)
+
+- Use `_is_primarily_documentation()` for doc guards, not substring checks like `"#" in content`.
+- `STACK_GLOBAL` opcodes have `arg=None` — reconstruct by walking backwards to preceding `SHORT_BINUNICODE`/`BINUNICODE` ops.
+- Always assert specific check names/messages in tests, not just `result is not None`.
+- Handle PEP 440 prerelease tags in version comparisons (`2.10.0a0` is still vulnerable).
+- Use `except Exception` (not `except ImportError`) for framework version-check imports.
