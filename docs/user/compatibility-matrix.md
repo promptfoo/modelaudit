@@ -19,6 +19,7 @@ This page shows which model formats work in base install and which require optio
 | TensorFlow SavedModel structure | `.pb`, SavedModel directories                                     | Yes (vendored protos)                    | `modelaudit[tensorflow]` for TensorFlow-dependent checkpoint/weight analysis |
 | Keras H5                        | `.h5`, `.hdf5`                                                    | No                                       | `modelaudit[h5]` (required)                                                  |
 | ONNX                            | `.onnx`                                                           | No                                       | `modelaudit[onnx]` (required)                                                |
+| CNTK native                     | `.dnn`, `.cmf`                                                    | Yes (static signature and string analysis) | None                                                                      |
 | CatBoost native                 | `.cbm`                                                            | Yes (static bounded metadata inspection) | None                                                                         |
 | SafeTensors                     | `.safetensors`                                                    | Yes                                      | None required                                                                |
 | Flax/JAX msgpack                | `.msgpack`, `.flax`, `.orbax`, `.jax`                             | No                                       | `modelaudit[flax]` (required)                                                |
@@ -34,5 +35,6 @@ This page shows which model formats work in base install and which require optio
 
 - Scanner selection is extension- and content-aware; overlapping extensions may be dispatched to different scanners based on file content.
 - R serialized (`.rds/.rda/.rdata`) support is static-only: ModelAudit does not execute R code or evaluate objects in an R runtime.
+- CNTK scanner scope in v1 is `.dnn`/`.cmf`; `.model` remains owned by XGBoost overlap handling.
 - `modelaudit doctor --show-failed` shows unavailable scanners and missing dependencies in your environment.
 - If you need predictable CI behavior across many formats, prefer `modelaudit[all]`.

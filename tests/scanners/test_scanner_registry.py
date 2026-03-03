@@ -79,6 +79,8 @@ def test_scanner_registry_file_extension_coverage():
         ".pt",
         ".pth",
         ".rds",
+        ".dnn",
+        ".cmf",
         ".h5",
         ".hdf5",
         ".keras",

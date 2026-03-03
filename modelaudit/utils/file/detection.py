@@ -23,6 +23,11 @@ R_SERIALIZATION_MARKERS = {
     b"A\n",
     b"B\n",
 }
+_CNTK_LEGACY_MAGIC = b"B\x00C\x00N\x00\x00\x00"
+_CNTK_LEGACY_VERSION_MARKER = b"B\x00V\x00e\x00r\x00s\x00i\x00o\x00n\x00\x00\x00"
+_CNTK_V2_REQUIRED_MARKERS = (b"\x0a\x07version", b"\x0a\x03uid")
+_CNTK_V2_STRUCTURE_MARKERS = (b"CompositeFunction", b"primitive_functions", b"PrimitiveFunction")
+_CNTK_SIGNATURE_READ_BYTES = 4096
 
 
 def is_zipfile(path: str) -> bool:
@@ -40,6 +45,18 @@ def is_zipfile(path: str) -> bool:
 def read_magic_bytes(path: str, num_bytes: int = 8) -> bytes:
     with Path(path).open("rb") as f:
         return f.read(num_bytes)
+
+
+def _looks_like_cntk_v2_signature(prefix: bytes) -> bool:
+    return all(marker in prefix for marker in _CNTK_V2_REQUIRED_MARKERS) and any(
+        marker in prefix for marker in _CNTK_V2_STRUCTURE_MARKERS
+    )
+
+
+def _is_cntk_signature(prefix: bytes) -> bool:
+    if prefix.startswith(_CNTK_LEGACY_MAGIC):
+        return _CNTK_LEGACY_VERSION_MARKER in prefix
+    return _looks_like_cntk_v2_signature(prefix)
 
 
 def detect_format_from_magic_bytes(magic4: MagicBytes, magic8: MagicBytes, magic16: MagicBytes) -> FileFormat:
@@ -61,6 +78,8 @@ def detect_format_from_magic_bytes(magic4: MagicBytes, magic8: MagicBytes, magic
 
     # Check longer magic sequences
     match magic8:
+        case magic if magic == _CNTK_LEGACY_MAGIC:
+            return "cntk"
         case b"\x89HDF\r\n\x1a\n":  # HDF5 magic
             return "hdf5"
         case magic if magic.startswith(b"\x93NUMPY"):
@@ -131,6 +150,13 @@ def detect_file_format_from_magic(path: str) -> str:
             format_result = detect_format_from_magic_bytes(magic4, magic8, magic16)
             if format_result != "unknown":
                 return format_result
+
+            # CNTKv2 has protobuf-style serialization without a fixed first-8-byte magic.
+            # Use bounded signature markers for deterministic identification.
+            f.seek(0)
+            cntk_prefix = f.read(_CNTK_SIGNATURE_READ_BYTES)
+            if _is_cntk_signature(cntk_prefix):
+                return "cntk"
 
             # Check for XML-based formats (OpenVINO and PMML)
             if magic16.startswith(b"<?xml"):
@@ -266,6 +292,11 @@ def detect_file_format(path: str) -> str:
         return "executorch"
     if ext in (".pkl", ".pickle", ".dill"):
         return "pickle"
+    if ext in (".dnn", ".cmf"):
+        prefix = read_magic_bytes(path, _CNTK_SIGNATURE_READ_BYTES)
+        if _is_cntk_signature(prefix):
+            return "cntk"
+        return "unknown"
     if ext == ".cbm":
         return "catboost"
     if ext == ".h5":
@@ -336,6 +367,8 @@ EXTENSION_FORMAT_MAP = {
     ".pt": "pickle",
     ".pth": "pickle",
     ".ckpt": "pickle",
+    ".dnn": "cntk",
+    ".cmf": "cntk",
     ".pkl": "pickle",
     ".pickle": "pickle",
     ".dill": "pickle",
@@ -385,6 +418,8 @@ def detect_format_from_extension_pattern_matching(extension: FileExtension) -> F
         # PyTorch/Pickle formats
         case ".pt" | ".pth" | ".ckpt" | ".pkl" | ".pickle" | ".dill":
             return "pickle"
+        case ".dnn" | ".cmf":
+            return "cntk"
         # HDF5 formats
         case ".h5" | ".hdf5":
             return "hdf5"
@@ -562,6 +597,11 @@ def validate_file_type(path: str) -> bool:
         # CatBoost native .cbm files are expected to have CBM1 header.
         if ext_format == "catboost":
             return header_format == "catboost"
+
+        # CNTK .dnn/.cmf signatures are marker-based and validated via bounded reads.
+        if ext_format == "cntk":
+            cntk_prefix = read_magic_bytes(path, _CNTK_SIGNATURE_READ_BYTES)
+            return _is_cntk_signature(cntk_prefix)
 
         # R serialized workspace/data files may be uncompressed or wrapped;
         # extension-based intent is authoritative for static scanning.
