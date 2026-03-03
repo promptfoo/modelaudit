@@ -12,6 +12,17 @@ GGML_MAGIC_VARIANTS = {
     b"GGLA",
     b"GGSA",
 }
+R_WORKSPACE_HEADERS = {
+    b"RDX2\n",
+    b"RDX3\n",
+    b"RDA2\n",
+    b"RDA3\n",
+}
+R_SERIALIZATION_MARKERS = {
+    b"X\n",
+    b"A\n",
+    b"B\n",
+}
 
 
 def is_zipfile(path: str) -> bool:
@@ -56,6 +67,11 @@ def detect_format_from_magic_bytes(magic4: MagicBytes, magic8: MagicBytes, magic
             return "numpy"
         case _:
             pass
+
+    if any(magic16.startswith(header) for header in R_WORKSPACE_HEADERS):
+        return "r_serialized"
+    if any(magic16.startswith(marker) for marker in R_SERIALIZATION_MARKERS):
+        return "r_serialized"
 
     # Check pickle magic bytes using pattern matching
     match magic4[:2]:
@@ -285,6 +301,8 @@ def detect_file_format(path: str) -> str:
         if magic4.startswith(b"PK"):
             return "zip"
         return "pickle"
+    if ext in (".rds", ".rda", ".rdata"):
+        return "r_serialized"
     if ext in (
         ".tar",
         ".tar.gz",
@@ -354,6 +372,9 @@ EXTENSION_FORMAT_MAP = {
     ".msgpack": "flax_msgpack",
     ".nemo": "nemo",
     ".cbm": "catboost",
+    ".rds": "r_serialized",
+    ".rda": "r_serialized",
+    ".rdata": "r_serialized",
 }
 
 
@@ -411,6 +432,8 @@ def detect_format_from_extension_pattern_matching(extension: FileExtension) -> F
             return "nemo"
         case ".cbm":
             return "catboost"
+        case ".rds" | ".rda" | ".rdata":
+            return "r_serialized"
         case ".7z":
             return "sevenzip"
         case _:
@@ -539,6 +562,13 @@ def validate_file_type(path: str) -> bool:
         # CatBoost native .cbm files are expected to have CBM1 header.
         if ext_format == "catboost":
             return header_format == "catboost"
+
+        # R serialized workspace/data files may be uncompressed or wrapped;
+        # extension-based intent is authoritative for static scanning.
+        if ext_format == "r_serialized":
+            if header_format == "r_serialized":
+                return True
+            return True
 
         # If header format is unknown but extension is known, this might be suspicious
         # unless the file is very small or empty (checked after format-specific rules)
