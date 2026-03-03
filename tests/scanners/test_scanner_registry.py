@@ -78,6 +78,7 @@ def test_scanner_registry_file_extension_coverage():
         ".pickle",
         ".pt",
         ".pth",
+        ".rds",
         ".h5",
         ".hdf5",
         ".keras",
