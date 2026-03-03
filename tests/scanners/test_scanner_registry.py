@@ -94,6 +94,11 @@ def test_scanner_registry_file_extension_coverage():
         ".pdiparams",
         ".engine",
         ".plan",
+        ".gz",
+        ".bz2",
+        ".xz",
+        ".lz4",
+        ".zlib",
     ]
 
     for ext in common_extensions:
