@@ -91,6 +91,7 @@ def pytest_runtest_setup(item):
             "test_cntk_scanner.py",  # CNTK .dnn/.cmf scanner tests
             "test_rknn_scanner.py",  # RKNN scanner tests
             "test_torch7_scanner.py",  # Torch7 scanner tests
+            "test_lightgbm_scanner.py",  # LightGBM native scanner tests
         ]
 
         # Check if this is an allowed test file
