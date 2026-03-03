@@ -42,6 +42,9 @@ class TestJITScriptIntegration:
         failed_checks = [c for c in jit_checks if c.status.value == "failed"]
         if failed_checks:
             assert any("torch.ops.aten.system" in str(c.details) for c in failed_checks)
+            assert any(c.rule_code == "S510" for c in failed_checks), (
+                "JIT/TorchScript findings should map to the S510 rule family"
+            )
 
     def test_pickle_scanner_without_jit(self, tmp_path):
         """Test that clean pickle files pass JIT/Script check."""

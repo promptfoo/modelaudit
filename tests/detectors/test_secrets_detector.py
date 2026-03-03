@@ -197,6 +197,7 @@ class TestPickleScannerWithSecrets:
         # Check that OpenAI key specifically was found
         failed_checks = [c for c in secret_checks if c.status.value == "failed"]
         assert any("OpenAI" in str(c.details) for c in failed_checks)
+        assert any(c.rule_code == "S701" for c in failed_checks), "API-key secret findings should map to S701"
 
     def test_pickle_without_secrets(self, tmp_path):
         """Test that clean pickle files pass secrets check."""

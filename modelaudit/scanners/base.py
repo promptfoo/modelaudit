@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_serializer
 from ..analysis.unified_context import UnifiedMLContext
 from ..config.explanations import get_message_explanation
 from ..utils.helpers.interrupt_handler import check_interrupted
+from .rule_mapper import get_embedded_code_rule_code, get_network_rule_code, get_secret_rule_code
 
 # Progress tracking imports with circular dependency detection
 PROGRESS_AVAILABLE = False
@@ -675,12 +676,16 @@ class BaseScanner(ABC):
                     "INFO": IssueSeverity.INFO,
                 }
                 severity = severity_map.get(finding.get("severity", "WARNING"), IssueSeverity.WARNING)
+                secret_descriptor = str(
+                    finding.get("secret_type") or finding.get("type") or finding.get("message") or "embedded_secret"
+                )
+                secret_rule_code = get_secret_rule_code(secret_descriptor)
 
                 result.add_check(
                     name="Embedded Secrets Detection",
                     passed=False,
                     message=finding.get("message", "Secret detected"),
-                    rule_code="S609",
+                    rule_code=secret_rule_code,
                     severity=severity,
                     location=finding.get("context", context),
                     details=finding,
@@ -883,12 +888,17 @@ class BaseScanner(ABC):
                     location = getattr(finding, "context", context)
                     recommendation = getattr(finding, "recommendation", "Review JIT/Script code for security")
                     details = finding.__dict__ if hasattr(finding, "__dict__") else {"object": str(finding)}
+                jit_indicator = f"{details.get('type', '')} {message} {model_type}".strip()
+                jit_rule_code = get_embedded_code_rule_code(jit_indicator)
+                if not jit_rule_code:
+                    # JIT detector findings should consistently map to the JIT/TorchScript rule family.
+                    jit_rule_code = get_embedded_code_rule_code("jit")
 
                 result.add_check(
                     name="JIT/Script Code Execution Detection",
                     passed=False,
                     message=message,
-                    rule_code="S507",
+                    rule_code=jit_rule_code,
                     severity=severity,
                     location=location,
                     details=details,
@@ -1065,12 +1075,25 @@ class BaseScanner(ABC):
                     "LOW": IssueSeverity.INFO,
                 }
                 severity = severity_map.get(finding.get("severity", "WARNING"), IssueSeverity.WARNING)
+                network_indicator = " ".join(
+                    str(part)
+                    for part in [
+                        finding.get("type", ""),
+                        finding.get("message", ""),
+                        finding.get("pattern", ""),
+                        finding.get("pattern_type", ""),
+                        finding.get("domain", ""),
+                        finding.get("url", ""),
+                    ]
+                    if part
+                )
+                network_rule_code = get_network_rule_code(network_indicator)
 
                 result.add_check(
                     name="Network Communication Detection",
                     passed=False,
                     message=finding.get("message", "Network communication pattern detected"),
-                    rule_code="S610",
+                    rule_code=network_rule_code,
                     severity=severity,
                     location=finding.get("context", context),
                     details=finding,

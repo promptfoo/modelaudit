@@ -48,6 +48,13 @@ def exfiltrate(data):
 
         assert len(network_checks) > 0
 
+        detection_checks = [c for c in network_checks if c.name == "Network Communication Detection"]
+        assert detection_checks, "Expected explicit network detection checks"
+        valid_network_codes = {f"S{code}" for code in range(301, 311)}
+        assert all(c.rule_code in valid_network_codes for c in detection_checks), (
+            "Network findings should map to S301-S310 and not encoding rule codes"
+        )
+
         # Should detect multiple patterns
         messages = [c.message for c in network_checks]
         assert any("socket" in msg for msg in messages)
