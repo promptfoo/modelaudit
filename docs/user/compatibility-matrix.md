@@ -15,6 +15,7 @@ This page shows which model formats work in base install and which require optio
 | Pickle family                   | `.pkl`, `.pickle`, `.dill`                                        | Yes                                     | `modelaudit[dill]` for broader dill compatibility                            |
 | PyTorch archive/binary          | `.pt`, `.pth`, `.ckpt`, `.bin`                                    | Yes (static archive/pickle checks)      | `modelaudit[pytorch]` optional for broader Torch ecosystem tooling           |
 | NumPy                           | `.npy`, `.npz`                                                    | Yes                                     | None                                                                         |
+| R serialized                    | `.rds`, `.rda`, `.rdata`                                          | Yes (static analysis only)              | None                                                                         |
 | TensorFlow SavedModel structure | `.pb`, SavedModel directories                                     | Yes (vendored protos)                   | `modelaudit[tensorflow]` for TensorFlow-dependent checkpoint/weight analysis |
 | Keras H5                        | `.h5`, `.hdf5`                                                    | No                                      | `modelaudit[h5]` (required)                                                  |
 | ONNX                            | `.onnx`                                                           | No                                      | `modelaudit[onnx]` (required)                                                |
@@ -32,5 +33,6 @@ This page shows which model formats work in base install and which require optio
 ## Notes
 
 - Scanner selection is extension- and content-aware; overlapping extensions may be dispatched to different scanners based on file content.
+- R serialized (`.rds/.rda/.rdata`) support is static-only: ModelAudit does not execute R code or evaluate objects in an R runtime.
 - `modelaudit doctor --show-failed` shows unavailable scanners and missing dependencies in your environment.
 - If you need predictable CI behavior across many formats, prefer `modelaudit[all]`.
