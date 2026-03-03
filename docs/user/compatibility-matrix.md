@@ -24,6 +24,7 @@ This page shows which model formats work in base install and which require optio
 | Torch7 serialized               | `.t7`, `.th`, `.net`                                              | Yes (static string/structure checks)                  | None                                                                         |
 | CatBoost native                 | `.cbm`                                                            | Yes (static bounded metadata inspection)              | None                                                                         |
 | LightGBM native                 | `.lgb`, `.lightgbm`, signature-validated `.model`                 | Yes (static native-text/binary checks)                | None                                                                         |
+| Llamafile binaries              | `.llamafile`, extensionless, `.exe`                               | Yes (executable + embedded GGUF checks)               | None required                                                                |
 | SafeTensors                     | `.safetensors`                                                    | Yes                                                   | None required                                                                |
 | Flax/JAX msgpack                | `.msgpack`, `.flax`, `.orbax`, `.jax`                             | No                                                    | `modelaudit[flax]` (required)                                                |
 | JAX checkpoints                 | `.ckpt`, `.checkpoint`, `.orbax-checkpoint`                       | Yes                                                   | None                                                                         |
@@ -41,5 +42,6 @@ This page shows which model formats work in base install and which require optio
 - Compressed wrappers enforce limits via `compressed_max_decompressed_bytes`, `compressed_max_decompression_ratio`, and `compressed_max_depth`.
 - R serialized (`.rds/.rda/.rdata`) support is static-only: ModelAudit does not execute R code or evaluate objects in an R runtime.
 - CNTK scanner scope in v1 is `.dnn`/`.cmf`; `.model` remains owned by XGBoost overlap handling.
+- Llamafile wrappers are executable by design: executable presence is reported at `INFO`, and severity escalates only when suspicious runtime indicators or malformed embedded payloads are found.
 - `modelaudit doctor --show-failed` shows unavailable scanners and missing dependencies in your environment.
 - If you need predictable CI behavior across many formats, prefer `modelaudit[all]`.

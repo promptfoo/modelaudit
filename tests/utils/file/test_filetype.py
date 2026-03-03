@@ -73,6 +73,7 @@ def test_detect_file_format_by_extension(tmp_path):
         ".pb": "protobuf",
         ".tflite": "tflite",
         ".cbm": "catboost",
+        ".llamafile": "llamafile",
         ".rknn": "rknn",
         ".rds": "r_serialized",
         ".rda": "r_serialized",
@@ -395,6 +396,11 @@ def test_validate_file_type(tmp_path):
     bin_pickle = tmp_path / "weights.bin"
     bin_pickle.write_bytes(b"\x80\x03" + b"pickle data")
     assert validate_file_type(str(bin_pickle)) is True
+
+    # Llamafile wrappers validate by extension with scanner-level marker checks.
+    llamafile_path = tmp_path / "model.llamafile"
+    llamafile_path.write_bytes(b"\x7fELF" + b"\x00" * 32 + b"llamafile")
+    assert validate_file_type(str(llamafile_path)) is True
 
 
 def test_detect_file_format_from_magic_oserror(tmp_path, monkeypatch):

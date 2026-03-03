@@ -68,6 +68,7 @@ ModelAudit includes **30 specialized scanners** covering model, archive, and con
 | **CatBoost**            | `.cbm`                                | MEDIUM |
 | **XGBoost**             | `.bst`, `.model`, `.ubj`              | MEDIUM |
 | **LightGBM**            | `.lgb`, `.lightgbm`, `.model`         | MEDIUM |
+| **Llamafile**           | `.llamafile`, extensionless, `.exe`   | MEDIUM |
 | **SafeTensors**         | `.safetensors`                        | LOW    |
 | **GGUF/GGML**           | `.gguf`, `.ggml`                      | LOW    |
 | **JAX/Flax**            | `.msgpack`, `.flax`, `.orbax`, `.jax` | LOW    |

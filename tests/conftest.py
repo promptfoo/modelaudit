@@ -92,6 +92,7 @@ def pytest_runtest_setup(item):
             "test_rknn_scanner.py",  # RKNN scanner tests
             "test_torch7_scanner.py",  # Torch7 scanner tests
             "test_lightgbm_scanner.py",  # LightGBM native scanner tests
+            "test_llamafile_scanner.py",  # Llamafile executable scanner tests
         ]
 
         # Check if this is an allowed test file
