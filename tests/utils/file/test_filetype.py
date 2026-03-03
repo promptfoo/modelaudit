@@ -138,6 +138,22 @@ def test_detect_rknn_format_by_signature(tmp_path: Path) -> None:
     assert validate_file_type(str(bad_rknn)) is False
 
 
+def test_detect_torch7_formats_by_signature(tmp_path: Path) -> None:
+    torch7_path = tmp_path / "model.t7"
+    torch7_path.write_bytes(b"T7\x00\x00torch.FloatTensor nn.Sequential\n")
+
+    assert detect_format_from_extension(str(torch7_path)) == "torch7"
+    assert detect_file_format(str(torch7_path)) == "torch7"
+    assert detect_file_format_from_magic(str(torch7_path)) == "torch7"
+    assert validate_file_type(str(torch7_path)) is True
+
+    fake_torch7 = tmp_path / "fake.t7"
+    fake_torch7.write_text("not torch7")
+    assert detect_file_format(str(fake_torch7)) == "unknown"
+    assert detect_file_format_from_magic(str(fake_torch7)) == "unknown"
+    assert validate_file_type(str(fake_torch7)) is False
+
+
 def test_detect_file_format_small_file(tmp_path):
     """Test detecting format of a very small file."""
     small_file = tmp_path / "small.dat"
