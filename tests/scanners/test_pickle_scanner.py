@@ -721,27 +721,52 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
     # Fix 3: EXT opcode registry bypass
     # ------------------------------------------------------------------
     def test_ext1_reduce_extension_registry_is_flagged(self) -> None:
-        """EXT1 + REDUCE payloads should be flagged as dangerous."""
+        """EXT1/EXT2/EXT4 + REDUCE payloads should be flagged as dangerous."""
         import copyreg
         from contextlib import suppress
 
-        ext_code = 200
-        copyreg.add_extension("os", "system", ext_code)
-        try:
-            # PROTO 2 | EXT1(code) | MARK | STRING | TUPLE | REDUCE | STOP
-            payload = b"\x80\x02" + b"\x82" + bytes([ext_code]) + b'(S"echo pwned"\ntR.'
-            result = self._scan_bytes(payload)
+        inverted_registry = getattr(copyreg, "_inverted_registry", {})
+        extension_registry = getattr(copyreg, "_extension_registry", {})
+        existing_code = extension_registry.get(("os", "system"))
 
-            assert result.success
-            assert result.has_errors
-            reduce_issues = [i for i in result.issues if "reduce" in i.message.lower()]
-            assert reduce_issues, f"Expected REDUCE issue, got: {[i.message for i in result.issues]}"
-            assert any("os.system" in i.message or "posix.system" in i.message for i in reduce_issues), (
-                f"Expected resolved os/posix.system in REDUCE issues, got: {[i.message for i in reduce_issues]}"
-            )
+        def _pick_free_code(start: int, end: int) -> int:
+            for candidate in range(start, end + 1):
+                if candidate not in inverted_registry:
+                    return candidate
+            pytest.skip(f"No free copyreg extension code available in range {start}-{end}")
+
+        cases = [
+            ("EXT1", b"\x82", _pick_free_code(1, 255), lambda code: bytes([code])),
+            ("EXT2", b"\x83", _pick_free_code(256, 65535), lambda code: struct.pack("<H", code)),
+            ("EXT4", b"\x84", _pick_free_code(65536, 131072), lambda code: struct.pack("<I", code)),
+        ]
+
+        try:
+            if isinstance(existing_code, int):
+                with suppress(ValueError):
+                    copyreg.remove_extension("os", "system", existing_code)
+
+            for _opcode_name, opcode, ext_code, encode in cases:
+                copyreg.add_extension("os", "system", ext_code)
+                try:
+                    # PROTO 2 | EXT*(code) | MARK | STRING | TUPLE | REDUCE | STOP
+                    payload = b"\x80\x02" + opcode + encode(ext_code) + b'(S"echo pwned"\ntR.'
+                    result = self._scan_bytes(payload)
+
+                    assert result.success
+                    assert result.has_errors
+                    reduce_issues = [i for i in result.issues if "reduce" in i.message.lower()]
+                    assert reduce_issues, f"Expected REDUCE issue, got: {[i.message for i in result.issues]}"
+                    assert any("os.system" in i.message or "posix.system" in i.message for i in reduce_issues), (
+                        f"Expected resolved os/posix.system in REDUCE issues, got: {[i.message for i in reduce_issues]}"
+                    )
+                finally:
+                    with suppress(ValueError):
+                        copyreg.remove_extension("os", "system", ext_code)
         finally:
-            with suppress(ValueError):
-                copyreg.remove_extension("os", "system", ext_code)
+            if isinstance(existing_code, int):
+                with suppress(ValueError):
+                    copyreg.add_extension("os", "system", existing_code)
 
     # ------------------------------------------------------------------
     # Fix 4: NEWOBJ_EX with dangerous class
