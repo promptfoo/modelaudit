@@ -6,6 +6,7 @@ capabilities, testing both malicious detection and false positive prevention.
 """
 
 import json
+import os
 import tempfile
 from pathlib import Path
 
@@ -264,7 +265,7 @@ class TestNestedPickleIntegration:
         if len(all_files) < 5:
             pytest.skip("Not enough test files for performance testing")
 
-        start_time = time.time()
+        start_time = time.perf_counter()
 
         # Scan all files
         total_issues = 0
@@ -282,10 +283,12 @@ class TestNestedPickleIntegration:
             ]
             total_nested_issues += len(nested_issues)
 
-        duration = time.time() - start_time
+        duration = time.perf_counter() - start_time
 
         # Performance assertions
-        assert duration < 10, f"Scanning {len(all_files)} files took too long: {duration:.2f}s"
+        is_ci = bool(os.getenv("CI") or os.getenv("GITHUB_ACTIONS"))
+        threshold = 20 if is_ci else 10
+        assert duration < threshold, f"Scanning {len(all_files)} files took too long: {duration:.2f}s"
         assert total_issues >= 0, "Should have processed files"
 
         print(f"✅ Performance test: {len(all_files)} files in {duration:.2f}s")

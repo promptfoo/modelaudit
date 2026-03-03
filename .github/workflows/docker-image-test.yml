@@ -87,6 +87,9 @@ jobs:
       - name: Scan image for vulnerabilities
         uses: aquasecurity/trivy-action@e368e328979b113139d6f9068e03accaed98a518 # 0.34.1
         with:
+          # Pin an explicit released Trivy binary to avoid setup failures when
+          # auto-resolved tags exist without matching release assets.
+          version: v0.69.2
           image-ref: modelaudit:lightweight
           format: table
           exit-code: "1"
@@ -145,6 +148,8 @@ jobs:
       - name: Scan image for vulnerabilities
         uses: aquasecurity/trivy-action@e368e328979b113139d6f9068e03accaed98a518 # 0.34.1
         with:
+          # Keep full-image scan on the same pinned released Trivy version.
+          version: v0.69.2
           image-ref: modelaudit:full
           format: table
           exit-code: "1"

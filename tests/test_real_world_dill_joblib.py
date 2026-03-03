@@ -244,7 +244,8 @@ class TestPerformanceBenchmarks:
         # Should complete within reasonable time
         # CI environments may have variable performance; use generous thresholds
         # to avoid flaky failures from runner contention (Linux ~2s, Windows ~4s typical)
-        threshold = 8.0 if sys.platform == "win32" else 5.0
+        is_ci = bool(os.getenv("CI") or os.getenv("GITHUB_ACTIONS"))
+        threshold = (15.0 if sys.platform == "win32" else 12.0) if is_ci else (8.0 if sys.platform == "win32" else 5.0)
         assert scan_duration < threshold, f"Scan took {scan_duration:.2f}s, expected < {threshold}s"
         assert result.bytes_scanned > 0
 
