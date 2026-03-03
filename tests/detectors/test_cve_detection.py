@@ -485,6 +485,16 @@ class TestCVE20245480Detection:
         cve_attrs = [a for a in attributions if a.cve_id == "CVE-2024-5480"]
         assert len(cve_attrs) == 0, "Should not detect CVE in comments"
 
+    def test_embedded_comment_token_does_not_bypass(self):
+        """A comment token embedded in exploit content should not bypass detection."""
+        content = "torch.distributed.rpc.rpc_sync('node', fn)\n# harmless comment\neval(payload)"
+        attributions = analyze_cve_patterns(content, b"")
+        cve_attrs = [a for a in attributions if a.cve_id == "CVE-2024-5480"]
+        assert len(cve_attrs) > 0, "Embedded '#' should not bypass detection"
+        assert cve_attrs[0].severity == "CRITICAL"
+        assert cve_attrs[0].cvss == 10.0
+        assert cve_attrs[0].cwe == "CWE-94"
+
     def test_no_false_positive_without_call_context(self):
         """Loose token co-occurrence should not trigger CVE-2024-5480."""
         content = "torch.distributed.rpc rpc_sync eval pythonudf"
@@ -515,6 +525,16 @@ class TestCVE202448063Detection:
         attributions = analyze_cve_patterns(content, b"")
         cve_attrs = [a for a in attributions if a.cve_id == "CVE-2024-48063"]
         assert len(cve_attrs) == 0, "Should not detect CVE in docstrings"
+
+    def test_embedded_comment_token_does_not_bypass(self):
+        """A comment token embedded in exploit content should not bypass detection."""
+        content = "RemoteModule __reduce__ pickle torch.distributed.rpc\n# harmless comment"
+        attributions = analyze_cve_patterns(content, b"")
+        cve_attrs = [a for a in attributions if a.cve_id == "CVE-2024-48063"]
+        assert len(cve_attrs) > 0, "Embedded '#' should not bypass detection"
+        assert cve_attrs[0].severity == "CRITICAL"
+        assert cve_attrs[0].cvss == 9.8
+        assert cve_attrs[0].cwe == "CWE-502"
 
     def test_no_false_positive_without_deserialization_or_exec_calls(self):
         """RemoteModule mentions without deserialization/exec evidence should not trigger."""

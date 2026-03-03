@@ -501,7 +501,7 @@ def test_pytorch_zip_cve_2024_5480_uses_artifact_metadata_version(tmp_path):
     cve_checks = [c for c in result.checks if "CVE-2024-5480" in c.name and c.status == CheckStatus.FAILED]
     assert len(cve_checks) > 0, f"Expected vulnerable metadata version to trigger CVE check: {result.checks}"
     assert cve_checks[0].details.get("detected_pytorch_version") == "2.2.2"
-    assert cve_checks[0].details.get("pytorch_version_source") == "metadata:config.json"
+    assert cve_checks[0].details.get("pytorch_version_source") == "metadata:config.json:pytorch_version"
 
 
 def test_pytorch_zip_cve_2024_5480_fixed_artifact_version_not_flagged(tmp_path):
@@ -512,6 +512,29 @@ def test_pytorch_zip_cve_2024_5480_fixed_artifact_version_not_flagged(tmp_path):
     cve_failed = [c for c in result.checks if "CVE-2024-5480" in c.name and c.status == CheckStatus.FAILED]
     assert len(cve_failed) == 0, (
         f"Fixed artifact version should not trigger CVE-2024-5480: {[(c.name, c.message) for c in cve_failed]}"
+    )
+
+
+def test_pytorch_zip_generic_version_metadata_does_not_trigger_cve_checks(tmp_path):
+    """Generic config version fields should not be treated as PyTorch framework version."""
+    model_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(model_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1.0, 2.0, 3.0]}))
+        zipf.writestr("config.json", json.dumps({"version": "0.1.0", "model_type": "bert"}))
+
+    scanner = PyTorchZipScanner()
+    result = scanner.scan(str(model_path))
+
+    cve_checks = [
+        c
+        for c in result.checks
+        if c.status == CheckStatus.FAILED
+        and any(cve in c.name for cve in ["CVE-2025-32434", "CVE-2022-45907", "CVE-2024-5480", "CVE-2024-48063"])
+    ]
+    assert len(cve_checks) == 0, (
+        "Generic metadata version should not trigger PyTorch CVE checks; "
+        f"found: {[(c.name, c.message) for c in cve_checks]}"
     )
 
 
@@ -576,3 +599,14 @@ class TestPyTorchVersionChecks:
         assert scanner._is_pytorch_version_before("1.13.1alpha1", 1, 13, 1) is True
         # Post-fix version prereleases are fine
         assert scanner._is_pytorch_version_before("2.6.0rc1", 2, 5, 0) is False
+
+    def test_post_release_and_build_suffixes_are_not_vulnerable(self):
+        """Build/local and post-release suffixes should be treated as fixed if base version is fixed."""
+        scanner = PyTorchZipScanner()
+        assert scanner._is_pytorch_version_before("2.2.3+cu118", 2, 2, 3) is False
+        assert scanner._is_pytorch_version_before("2.2.3.post1", 2, 2, 3) is False
+
+    def test_unknown_suffix_is_treated_as_vulnerable(self):
+        """Unknown version suffixes should be treated as vulnerable for safety."""
+        scanner = PyTorchZipScanner()
+        assert scanner._is_pytorch_version_before("2.2.3foobar", 2, 2, 3) is True

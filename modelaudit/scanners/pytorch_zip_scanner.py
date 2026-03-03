@@ -849,12 +849,16 @@ class PyTorchZipScanner(BaseScanner):
                         import json
 
                         meta_data = json.loads(zipfile_obj.read(meta_file).decode("utf-8"))
-                        # Look for version fields in metadata
-                        for key in ["pytorch_version", "torch_version", "framework_version", "version"]:
+                        # Look for framework-specific version fields in metadata.
+                        # Avoid generic "version" keys, which commonly refer to model/config
+                        # schema versions and can cause false CVE attributions.
+                        for key in ["pytorch_version", "torch_version", "framework_version"]:
                             if key in meta_data and isinstance(meta_data[key], str):
-                                version_info["pytorch_framework_version"] = meta_data[key]
-                                version_info["pytorch_version_source"] = f"metadata:{meta_file}"
-                                break
+                                candidate = meta_data[key].strip()
+                                if self._looks_like_pytorch_version(candidate):
+                                    version_info["pytorch_framework_version"] = candidate
+                                    version_info["pytorch_version_source"] = f"metadata:{meta_file}:{key}"
+                                    break
                     except (json.JSONDecodeError, UnicodeDecodeError):  # type: ignore[possibly-unresolved-reference]
                         continue
 
@@ -1006,17 +1010,35 @@ class PyTorchZipScanner(BaseScanner):
         """
         try:
             vstr = version.strip()
-            version_match = re.match(r"^(\d+)\.(\d+)\.(\d+)", vstr)
+            version_match = re.match(r"^(\d+)\.(\d+)\.(\d+)(.*)$", vstr)
             if not version_match:
                 return True  # Can't parse → assume vulnerable
 
-            major, minor, patch = map(int, version_match.groups())
-            is_prerelease = bool(re.search(r"(dev|rc|alpha|beta)", vstr, re.IGNORECASE))
+            major, minor, patch = map(int, version_match.groups()[:3])
+            suffix = (version_match.group(4) or "").strip()
+
+            is_prerelease = False
+            if suffix:
+                suffix_lower = suffix.lower()
+
+                # Known pre-release markers
+                if re.search(r"(?:^|[.\-])(dev|rc|alpha|beta|pre|preview)\d*", suffix_lower):
+                    is_prerelease = True
+                # Known non-prerelease metadata suffixes (build/post-release)
+                elif (
+                    suffix_lower.startswith("+") or suffix_lower.startswith(".post") or suffix_lower.startswith("post")
+                ):
+                    is_prerelease = False
+                else:
+                    # Unknown suffix semantics → conservative
+                    return True
 
             if (major, minor, patch) < (fix_major, fix_minor, fix_patch):
                 return True  # Strictly before fix version
-            # Pre-release of fix version (e.g. 2.5.0rc1) is not yet fully fixed
-            return (major, minor, patch) == (fix_major, fix_minor, fix_patch) and is_prerelease
+            if (major, minor, patch) > (fix_major, fix_minor, fix_patch):
+                return False  # After fix version
+            # Same version as fix: only prerelease variants remain vulnerable
+            return is_prerelease
         except Exception:
             return True
 
