@@ -718,6 +718,32 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
         assert os_issues, f"Expected CRITICAL os issue after separator byte, got: {[i.message for i in result.issues]}"
 
     # ------------------------------------------------------------------
+    # Fix 3: EXT opcode registry bypass
+    # ------------------------------------------------------------------
+    def test_ext1_reduce_extension_registry_is_flagged(self) -> None:
+        """EXT1 + REDUCE payloads should be flagged as dangerous."""
+        import copyreg
+        from contextlib import suppress
+
+        ext_code = 200
+        copyreg.add_extension("os", "system", ext_code)
+        try:
+            # PROTO 2 | EXT1(code) | MARK | STRING | TUPLE | REDUCE | STOP
+            payload = b"\x80\x02" + b"\x82" + bytes([ext_code]) + b'(S"echo pwned"\ntR.'
+            result = self._scan_bytes(payload)
+
+            assert result.success
+            assert result.has_errors
+            reduce_issues = [i for i in result.issues if "reduce" in i.message.lower()]
+            assert reduce_issues, f"Expected REDUCE issue, got: {[i.message for i in result.issues]}"
+            assert any("os.system" in i.message or "posix.system" in i.message for i in reduce_issues), (
+                f"Expected resolved os/posix.system in REDUCE issues, got: {[i.message for i in reduce_issues]}"
+            )
+        finally:
+            with suppress(ValueError):
+                copyreg.remove_extension("os", "system", ext_code)
+
+    # ------------------------------------------------------------------
     # Fix 4: NEWOBJ_EX with dangerous class
     # ------------------------------------------------------------------
     def test_newobj_ex_dangerous_class(self) -> None:

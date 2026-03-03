@@ -34,6 +34,8 @@ from ..detectors.suspicious_symbols import DANGEROUS_OPCODES
 from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult, logger
 
 _RESYNC_BUDGET = 8192  # Max bytes to scan forward when resyncing after an unknown opcode
+COPYREG_EXTENSION_MODULE = "__copyreg_extension__"
+COPYREG_EXTENSION_PREFIX = "code_"
 
 
 def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> Any:
@@ -1727,6 +1729,38 @@ def _is_safe_ml_global(mod: str, func: str) -> bool:
     return False
 
 
+def _is_copyreg_extension_ref(mod: str) -> bool:
+    """Return True when a reference came from an EXT opcode extension lookup."""
+    return mod == COPYREG_EXTENSION_MODULE
+
+
+def _resolve_copyreg_extension(code: Any) -> tuple[str, str]:
+    """
+    Resolve EXT opcode codes through copyreg when available.
+
+    Returns a sentinel module/function pair for unresolved extension codes so
+    downstream REDUCE analysis can still flag them as dangerous.
+    """
+    if isinstance(code, int):
+        try:
+            import copyreg
+
+            inverted_registry = getattr(copyreg, "_inverted_registry", None)
+            if isinstance(inverted_registry, dict):
+                resolved = inverted_registry.get(code)
+                if (
+                    isinstance(resolved, tuple)
+                    and len(resolved) == 2
+                    and isinstance(resolved[0], str)
+                    and isinstance(resolved[1], str)
+                ):
+                    return resolved
+        except Exception:
+            pass
+
+    return COPYREG_EXTENSION_MODULE, f"{COPYREG_EXTENSION_PREFIX}{code}"
+
+
 def _is_actually_dangerous_global(mod: str, func: str, ml_context: dict) -> bool:
     """
     Context-aware global reference analysis - distinguishes between legitimate ML operations
@@ -1736,6 +1770,13 @@ def _is_actually_dangerous_global(mod: str, func: str, ml_context: dict) -> bool
     for less critical operations.
     """
     full_ref = f"{mod}.{func}"
+
+    # STEP 0: EXT opcodes (copyreg extension registry) are always suspicious.
+    # They resolve callables indirectly via process-global state and can bypass
+    # explicit GLOBAL/STACK_GLOBAL references.
+    if _is_copyreg_extension_ref(mod):
+        logger.warning(f"Extension-registry callable detected via EXT opcode: {full_ref}")
+        return True
 
     # STEP 1: ALWAYS flag dangerous functions first (no exceptions, no allowlist override)
     # This MUST come before the ML_SAFE_GLOBALS check to prevent bypass attacks
@@ -1851,6 +1892,10 @@ def _build_symbolic_reference_maps(
         if name == "GLOBAL" and isinstance(arg, str):
             parsed = _parse_module_function(arg)
             stack.append(parsed if parsed else unknown)
+            continue
+
+        if name in {"EXT1", "EXT2", "EXT4"}:
+            stack.append(_resolve_copyreg_extension(arg))
             continue
 
         if name == "STACK_GLOBAL":
@@ -2449,6 +2494,9 @@ def is_dangerous_reduce_pattern(
 
     def _is_dangerous_ref(mod: str, func: str) -> bool:
         """Check if a module.function reference is dangerous enough to flag."""
+        if _is_copyreg_extension_ref(mod):
+            return True
+
         full_ref = f"{mod}.{func}"
         # Check ALWAYS_DANGEROUS functions FIRST (before allowlist to prevent bypass)
         if full_ref in ALWAYS_DANGEROUS_FUNCTIONS or func in ALWAYS_DANGEROUS_FUNCTIONS:
