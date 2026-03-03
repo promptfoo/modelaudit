@@ -333,9 +333,7 @@ class TestModelMetadataExtractor:
         assert "training_epochs" not in filtered
         assert "learning_rate" not in filtered
 
-    def test_extract_metadata_handles_scanner_exception(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_extract_metadata_handles_scanner_exception(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Ensure metadata extraction gracefully handles scanner exceptions."""
         extractor = ModelMetadataExtractor()
 
