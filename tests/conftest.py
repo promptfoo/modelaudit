@@ -92,6 +92,7 @@ def pytest_runtest_setup(item):
             "test_lightgbm_scanner.py",  # LightGBM native scanner tests
             "test_llamafile_scanner.py",  # Llamafile executable scanner tests
             "test_coreml_scanner.py",  # CoreML scanner tests
+            "test_mxnet_scanner.py",  # MXNet scanner tests
         ]
 
         # Check if this is an allowed test file
