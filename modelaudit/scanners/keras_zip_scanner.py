@@ -470,6 +470,10 @@ class KerasZipScanner(BaseScanner):
                         "cve_id": "CVE-2025-1550",
                         "cvss": 9.8,
                         "cwe": "CWE-502",
+                        "description": (
+                            "Arbitrary dangerous module references in .keras config can bypass safe_mode "
+                            "and execute attacker-controlled code during model loading."
+                        ),
                         "remediation": "Upgrade Keras to >= 3.9.0 or remove untrusted module references",
                     },
                     why=get_cve_2025_1550_explanation("dangerous_module"),
@@ -492,6 +496,10 @@ class KerasZipScanner(BaseScanner):
                         "cve_id": "CVE-2025-1550",
                         "cvss": 9.8,
                         "cwe": "CWE-502",
+                        "description": (
+                            "Non-allowlisted callable module references may indicate safe_mode bypass "
+                            "paths in untrusted .keras config content."
+                        ),
                         "remediation": "Upgrade Keras to >= 3.9.0 or verify this module is safe",
                     },
                     why=get_cve_2025_1550_explanation("untrusted_module"),

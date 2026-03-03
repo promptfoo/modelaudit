@@ -491,15 +491,15 @@ class TestCVE202549655TorchModuleWrapper:
 class TestCVE20251550ModuleReferences:
     """Test CVE-2025-1550: Keras safe_mode bypass via arbitrary module references in config.json."""
 
-    def _make_keras_zip(self, config: dict, tmp_path) -> str:
+    def _make_keras_zip(self, config: dict[str, Any], tmp_path: Path) -> str:
         """Helper to create a .keras ZIP with the given config.json."""
-        keras_path = os.path.join(str(tmp_path), "model.keras")
+        keras_path = tmp_path / "model.keras"
         with zipfile.ZipFile(keras_path, "w") as zf:
             zf.writestr("config.json", json.dumps(config))
             zf.writestr("metadata.json", json.dumps({"keras_version": "3.0.0"}))
-        return keras_path
+        return str(keras_path)
 
-    def test_dangerous_module_os_in_layer(self, tmp_path):
+    def test_dangerous_module_os_in_layer(self, tmp_path: Path) -> None:
         """A layer referencing 'os' module should be flagged as CRITICAL."""
         scanner = KerasZipScanner()
         config = {
@@ -519,16 +519,11 @@ class TestCVE20251550ModuleReferences:
         }
         result = scanner.scan(self._make_keras_zip(config, tmp_path))
 
-        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-49655"]
-        assert len(cve_issues) == 0, "Dense layer should not trigger CVE-2025-49655"
-
-    def test_nested_torch_module_wrapper(self, tmp_path: Path) -> None:
-        """TorchModuleWrapper in nested model should still be detected."""
-        cve_issues = [i for i in result.issues if "CVE-2025-1550" in i.message]
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-1550"]
         assert len(cve_issues) >= 1, "Should detect dangerous 'os' module reference"
         assert cve_issues[0].severity == IssueSeverity.CRITICAL
 
-    def test_dangerous_module_subprocess_in_fn_module(self, tmp_path):
+    def test_dangerous_module_subprocess_in_fn_module(self, tmp_path: Path) -> None:
         """A layer with fn_module='subprocess' should be flagged as CRITICAL."""
         scanner = KerasZipScanner()
         config = {
@@ -545,11 +540,11 @@ class TestCVE20251550ModuleReferences:
         }
         result = scanner.scan(self._make_keras_zip(config, tmp_path))
 
-        cve_issues = [i for i in result.issues if "CVE-2025-1550" in i.message]
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-1550"]
         assert len(cve_issues) >= 1, "Should detect dangerous 'subprocess' fn_module reference"
         assert cve_issues[0].severity == IssueSeverity.CRITICAL
 
-    def test_dangerous_module_builtins_dotpath(self, tmp_path):
+    def test_dangerous_module_builtins_dotpath(self, tmp_path: Path) -> None:
         """A layer referencing 'builtins.eval' should be flagged as CRITICAL."""
         scanner = KerasZipScanner()
         config = {
@@ -567,12 +562,12 @@ class TestCVE20251550ModuleReferences:
         }
         result = scanner.scan(self._make_keras_zip(config, tmp_path))
 
-        cve_issues = [i for i in result.issues if "CVE-2025-1550" in i.message]
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-1550"]
         assert len(cve_issues) >= 1
         assert cve_issues[0].severity == IssueSeverity.CRITICAL
         assert "builtins" in cve_issues[0].message
 
-    def test_untrusted_module_custom_package(self, tmp_path):
+    def test_untrusted_module_custom_package(self, tmp_path: Path) -> None:
         """Unknown module references in callable context should be flagged as WARNING."""
         scanner = KerasZipScanner()
         config = {
@@ -591,11 +586,11 @@ class TestCVE20251550ModuleReferences:
         }
         result = scanner.scan(self._make_keras_zip(config, tmp_path))
 
-        cve_issues = [i for i in result.issues if "CVE-2025-1550" in i.message]
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-1550"]
         assert len(cve_issues) >= 1, "Should flag non-allowlisted module"
         assert cve_issues[0].severity == IssueSeverity.WARNING
 
-    def test_safe_keras_module_no_false_positive(self, tmp_path):
+    def test_safe_keras_module_no_false_positive(self, tmp_path: Path) -> None:
         """A layer referencing 'keras.layers' should NOT be flagged."""
         scanner = KerasZipScanner()
         config = {
@@ -613,10 +608,10 @@ class TestCVE20251550ModuleReferences:
         }
         result = scanner.scan(self._make_keras_zip(config, tmp_path))
 
-        cve_issues = [i for i in result.issues if "CVE-2025-1550" in i.message]
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-1550"]
         assert len(cve_issues) == 0, "Safe keras.layers module should not be flagged"
 
-    def test_safe_tensorflow_module_no_false_positive(self, tmp_path):
+    def test_safe_tensorflow_module_no_false_positive(self, tmp_path: Path) -> None:
         """A layer referencing 'tensorflow.keras.layers' should NOT be flagged."""
         scanner = KerasZipScanner()
         config = {
@@ -634,10 +629,10 @@ class TestCVE20251550ModuleReferences:
         }
         result = scanner.scan(self._make_keras_zip(config, tmp_path))
 
-        cve_issues = [i for i in result.issues if "CVE-2025-1550" in i.message]
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-1550"]
         assert len(cve_issues) == 0, "Safe tensorflow module should not be flagged"
 
-    def test_nested_model_module_reference(self, tmp_path):
+    def test_nested_model_module_reference(self, tmp_path: Path) -> None:
         """Dangerous module in nested model layer should be detected."""
         scanner = KerasZipScanner()
         config = {
@@ -666,16 +661,11 @@ class TestCVE20251550ModuleReferences:
         }
         result = scanner.scan(self._make_keras_zip(config, tmp_path))
 
-        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-49655"]
-        assert len(cve_issues) >= 1, "Should detect TorchModuleWrapper in nested model"
-
-    def test_no_cve_for_fixed_keras_version(self, tmp_path: Path) -> None:
-        """Keras >=3.11.3 should not be CVE-attributed for TorchModuleWrapper."""
-        cve_issues = [i for i in result.issues if "CVE-2025-1550" in i.message]
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-1550"]
         assert len(cve_issues) >= 1, "Should detect dangerous module in nested model"
         assert cve_issues[0].severity == IssueSeverity.CRITICAL
 
-    def test_cve_attribution_details(self, tmp_path):
+    def test_cve_attribution_details(self, tmp_path: Path) -> None:
         """CVE details should be present in issue details."""
         scanner = KerasZipScanner()
         config = {
@@ -745,14 +735,15 @@ class TestCVE20251550ModuleReferences:
         assert warning_checks[0].severity == IssueSeverity.WARNING
         result = scanner.scan(self._make_keras_zip(config, tmp_path))
 
-        cve_issues = [i for i in result.issues if "CVE-2025-1550" in i.message]
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-1550"]
         assert len(cve_issues) >= 1
         details = cve_issues[0].details
         assert details["cve_id"] == "CVE-2025-1550"
         assert details["cvss"] == 9.8
         assert details["cwe"] == "CWE-502"
+        assert details["description"]
 
-    def test_none_module_value_not_flagged(self, tmp_path):
+    def test_none_module_value_not_flagged(self, tmp_path: Path) -> None:
         """Layer with module=None should not trigger CVE-2025-1550."""
         scanner = KerasZipScanner()
         config = {
@@ -770,10 +761,10 @@ class TestCVE20251550ModuleReferences:
         }
         result = scanner.scan(self._make_keras_zip(config, tmp_path))
 
-        cve_issues = [i for i in result.issues if "CVE-2025-1550" in i.message]
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-1550"]
         assert len(cve_issues) == 0, "None module should not trigger CVE"
 
-    def test_non_callable_layer_unknown_module_not_flagged(self, tmp_path):
+    def test_non_callable_layer_unknown_module_not_flagged(self, tmp_path: Path) -> None:
         """Unknown module on non-callable layers should not produce noisy CVE warnings."""
         scanner = KerasZipScanner()
         config = {
@@ -791,10 +782,10 @@ class TestCVE20251550ModuleReferences:
         }
         result = scanner.scan(self._make_keras_zip(config, tmp_path))
 
-        cve_issues = [i for i in result.issues if "CVE-2025-1550" in i.message]
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-1550"]
         assert len(cve_issues) == 0, "Non-callable layer module should not trigger CVE-2025-1550 warning"
 
-    def test_prefix_collision_module_is_not_allowlisted(self, tmp_path):
+    def test_prefix_collision_module_is_not_allowlisted(self, tmp_path: Path) -> None:
         """Module like 'mathutils.payload' should NOT be treated as safe 'math'."""
         scanner = KerasZipScanner()
         config = {
@@ -813,7 +804,7 @@ class TestCVE20251550ModuleReferences:
         }
         result = scanner.scan(self._make_keras_zip(config, tmp_path))
 
-        cve_issues = [i for i in result.issues if "CVE-2025-1550" in i.message]
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-1550"]
         assert len(cve_issues) >= 1, "mathutils should not match safe 'math' prefix"
         assert cve_issues[0].severity == IssueSeverity.WARNING
 
