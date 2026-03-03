@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from modelaudit.scanners import get_scanner_for_file
-from modelaudit.scanners.base import CheckStatus, IssueSeverity
+from modelaudit.scanners.base import Check, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.lightgbm_scanner import LightGBMScanner
 from modelaudit.utils.file.detection import detect_file_format, detect_format_from_extension, validate_file_type
 
@@ -35,7 +35,7 @@ def _build_lightgbm_text(extra_lines: list[str] | None = None) -> str:
     return "\n".join(base_lines) + "\n"
 
 
-def _check_by_name(result, name: str):
+def _check_by_name(result: ScanResult, name: str) -> list[Check]:
     return [check for check in result.checks if check.name == name]
 
 
