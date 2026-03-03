@@ -6,6 +6,7 @@ capabilities, testing both malicious detection and false positive prevention.
 """
 
 import json
+import os
 import tempfile
 from pathlib import Path
 
@@ -285,8 +286,6 @@ class TestNestedPickleIntegration:
         duration = time.perf_counter() - start_time
 
         # Performance assertions
-        import os
-
         is_ci = bool(os.getenv("CI") or os.getenv("GITHUB_ACTIONS"))
         threshold = 20 if is_ci else 10
         assert duration < threshold, f"Scanning {len(all_files)} files took too long: {duration:.2f}s"

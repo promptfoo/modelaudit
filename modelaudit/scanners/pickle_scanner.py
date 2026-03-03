@@ -2639,10 +2639,31 @@ def check_opcode_sequence(
     # Track next auto-assigned memo index for MEMOIZE opcodes (protocol 4+)
     _next_memo_idx = 0
 
-    # Fixed threshold for dangerous opcode detection.
+    # Fixed baseline threshold for dangerous opcode detection.
     # Only execution-related opcodes are counted (memo/framing excluded),
     # and safe ML globals are skipped for REDUCE/GLOBAL/STACK_GLOBAL/NEWOBJ.
-    threshold = 50
+    default_threshold = 50
+
+    # Track stream membership and stream lengths so thresholding can be applied
+    # per stream. Counters reset at STOP boundaries, so thresholds must align
+    # with those same boundaries to avoid cross-stream dilution.
+    stream_id_by_index: list[int] = []
+    stream_lengths: dict[int, int] = {}
+    current_stream_id = 0
+    current_stream_length = 0
+
+    for op, _arg, _pos in opcodes:
+        stream_id_by_index.append(current_stream_id)
+        current_stream_length += 1
+        if op.name == "STOP":
+            stream_lengths[current_stream_id] = current_stream_length
+            current_stream_id += 1
+            current_stream_length = 0
+
+    if current_stream_length > 0:
+        stream_lengths[current_stream_id] = current_stream_length
+    elif not stream_lengths:
+        stream_lengths[0] = 0
 
     # In high-confidence ML contexts with tree-ensemble models (e.g. sklearn
     # RandomForest, xgboost, lightgbm), tree-based models legitimately produce
@@ -2670,36 +2691,41 @@ def check_opcode_sequence(
         # when we are confident the model is tree-based.
     }
 
-    # Collect all class/function names referenced in the opcode stream so we
-    # can check for tree-ensemble markers. Compute this once to avoid O(n^2)
-    # behavior on large opcode streams.
-    _all_refs_parts = [f"{mod}.{func}" for mod, func in resolved_stack_globals.values()]
-    _all_refs_parts.extend(f"{mod}.{func}" for mod, func in resolved_callables.values())
-    _all_refs_parts.extend(str(arg) for op, arg, _p in opcodes if op.name == "GLOBAL" and isinstance(arg, str))
-    _all_refs_str = " ".join(_all_refs_parts)
-    has_tree_markers = any(marker in _all_refs_str for marker in _tree_ensemble_markers)
-    if (
-        ml_context.get("is_ml_content", False)
-        and _tree_ensemble_frameworks & set(_ml_frameworks.keys())
-        and has_tree_markers
-    ):
-        # Tree-ensemble markers in the opcode stream (e.g. RandomForest,
-        # DecisionTree class references) are themselves strong evidence of
-        # a legitimate model. A low confidence threshold (0.15) is enough
-        # because the structural markers already confirm the file's nature;
-        # the previous 0.4 threshold caused false positives on real sklearn
-        # tree ensemble .pkl files with ml_context_confidence ~0.27.
-        ml_confidence_val = ml_context.get("overall_confidence", 0)
-        if ml_confidence_val >= 0.15:
-            # Scale threshold with total opcodes: large tree ensembles can have
-            # 200K+ opcodes where most are legitimate BUILD/REDUCE for tree nodes.
-            # Use max(5000, total_opcodes // 2) to avoid FPs on large models.
-            threshold = max(5000, len(opcodes) // 2)
-        elif ml_confidence_val < 0.15 and has_tree_markers:
-            # Even with very low confidence, tree markers warrant a
-            # moderately raised threshold to avoid flooding with warnings.
-            threshold = max(500, len(opcodes) // 10)
+    # Compute per-stream thresholds so appended streams are analyzed
+    # independently even when the file contains mixed-size streams.
+    stream_refs: dict[int, list[str]] = {stream_id: [] for stream_id in stream_lengths}
 
+    for idx, (mod, func) in resolved_stack_globals.items():
+        if 0 <= idx < len(stream_id_by_index):
+            stream_refs.setdefault(stream_id_by_index[idx], []).append(f"{mod}.{func}")
+
+    for idx, (mod, func) in resolved_callables.items():
+        if 0 <= idx < len(stream_id_by_index):
+            stream_refs.setdefault(stream_id_by_index[idx], []).append(f"{mod}.{func}")
+
+    for idx, (op, arg, _p) in enumerate(opcodes):
+        if op.name == "GLOBAL" and isinstance(arg, str):
+            stream_refs.setdefault(stream_id_by_index[idx], []).append(str(arg))
+
+    stream_thresholds: dict[int, int] = {}
+    ml_confidence_val = float(ml_context.get("overall_confidence", 0) or 0)
+    has_tree_framework = bool(_tree_ensemble_frameworks & set(_ml_frameworks.keys()))
+
+    for stream_id, stream_length in stream_lengths.items():
+        threshold = default_threshold
+        refs_str = " ".join(stream_refs.get(stream_id, []))
+        has_tree_markers = any(marker in refs_str for marker in _tree_ensemble_markers)
+
+        if ml_context.get("is_ml_content", False) and has_tree_framework and has_tree_markers:
+            # Tree-ensemble markers in-stream (e.g. RandomForest, DecisionTree)
+            # are strong evidence of legitimate model reconstruction behavior.
+            # Scale by stream size to handle large tree ensembles, with a
+            # moderate fallback when confidence is very low.
+            threshold = max(5000, stream_length // 2) if ml_confidence_val >= 0.15 else max(500, stream_length // 10)
+
+        stream_thresholds[stream_id] = threshold
+
+    current_stream_id = 0
     for i, (opcode, arg, pos) in enumerate(opcodes):
         # Reset counters at stream boundaries (STOP) so that multi-stream
         # analysis evaluates each pickle stream independently.  Without this,
@@ -2710,6 +2736,7 @@ def check_opcode_sequence(
             consecutive_dangerous = 0
             max_consecutive = 0
             last_construction_safe = False
+            current_stream_id += 1
             continue
 
         # Track dangerous opcodes, skipping safe ML globals and structural opcodes
@@ -2798,6 +2825,7 @@ def check_opcode_sequence(
         else:
             consecutive_dangerous = 0
 
+        threshold = stream_thresholds.get(current_stream_id, default_threshold)
         if dangerous_opcode_count > threshold:
             suspicious_patterns.append(
                 {

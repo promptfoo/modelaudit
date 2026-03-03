@@ -6,6 +6,7 @@ Focuses on security-specific scanning scenarios.
 """
 
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -424,7 +425,9 @@ class TestSecurityAssetIntegration:
 
         # Should complete in reasonable time
         assert results.success is True, "Performance test scan should succeed"
-        assert duration < 30, f"Scan took too long: {duration:.2f}s"
+        is_ci = bool(os.getenv("CI") or os.getenv("GITHUB_ACTIONS"))
+        threshold = 60 if is_ci else 30
+        assert duration < threshold, f"Scan took too long: {duration:.2f}s"
 
         # Should provide performance metrics
         assert hasattr(results, "duration"), "Results should include timing information"
