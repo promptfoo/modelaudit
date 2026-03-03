@@ -346,6 +346,15 @@ class ScannerRegistry:
                 "dependencies": ["paddlepaddle"],
                 "numpy_sensitive": True,
             },
+            "cntk": {
+                "module": "modelaudit.scanners.cntk_scanner",
+                "class": "CntkScanner",
+                "description": "Scans CNTK .dnn/.cmf model artifacts",
+                "extensions": [".dnn", ".cmf"],
+                "priority": 18,
+                "dependencies": [],
+                "numpy_sensitive": False,
+            },
             "tar": {
                 "module": "modelaudit.scanners.tar_scanner",
                 "class": "TarScanner",
@@ -707,6 +716,7 @@ def __getattr__(name: str) -> Any:
         "TFLiteScanner": "tflite",
         "TensorRTScanner": "tensorrt",
         "PaddleScanner": "paddle",
+        "CntkScanner": "cntk",
         "TarScanner": "tar",
         "Jinja2TemplateScanner": "jinja2_template",
         "MetadataScanner": "metadata",
