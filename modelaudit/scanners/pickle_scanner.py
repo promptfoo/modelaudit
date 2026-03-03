@@ -2672,7 +2672,7 @@ def check_opcode_sequence(
     # __setstate__ calls on tree nodes.
     # Raise the threshold significantly to suppress false positives, but ONLY
     # when tree-ensemble markers are present -- not for all sklearn/xgboost refs.
-    _ml_frameworks = ml_context.get("frameworks", {})
+    _ml_frameworks = {str(name).lower() for name in ml_context.get("frameworks", {})}
     _tree_ensemble_frameworks = {"sklearn", "xgboost", "lightgbm"}
     _tree_ensemble_markers = {
         "RandomForest",
@@ -2709,11 +2709,18 @@ def check_opcode_sequence(
 
     stream_thresholds: dict[int, int] = {}
     ml_confidence_val = float(ml_context.get("overall_confidence", 0) or 0)
-    has_tree_framework = bool(_tree_ensemble_frameworks & set(_ml_frameworks.keys()))
+    known_tree_frameworks = _tree_ensemble_frameworks & _ml_frameworks
 
     for stream_id, stream_length in stream_lengths.items():
         threshold = default_threshold
         refs_str = " ".join(stream_refs.get(stream_id, []))
+        refs_str_lower = refs_str.lower()
+        has_tree_framework = any(
+            f"{framework}." in refs_str_lower
+            or f"{framework} " in refs_str_lower
+            or refs_str_lower.startswith(framework)
+            for framework in known_tree_frameworks
+        )
         has_tree_markers = any(marker in refs_str for marker in _tree_ensemble_markers)
 
         if ml_context.get("is_ml_content", False) and has_tree_framework and has_tree_markers:
