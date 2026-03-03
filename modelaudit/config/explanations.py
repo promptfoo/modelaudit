@@ -696,8 +696,7 @@ def get_cve_2025_51480_explanation(vulnerability_type: str) -> str:
 
     return explanations.get(
         vulnerability_type,
-        "CVE-2025-51480: ONNX external_data path traversal can enable arbitrary "
-        "file overwrite during save operations.",
+        "CVE-2025-51480: ONNX external_data path traversal can enable arbitrary file overwrite during save operations.",
     )
 
 
