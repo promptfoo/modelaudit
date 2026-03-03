@@ -86,6 +86,7 @@ def pytest_runtest_setup(item):
             "test_pytorch_zip_scanner.py",  # PyTorch ZIP scanner tests
             "test_paddle_scanner.py",  # PaddlePaddle scanner tests
             "test_catboost_scanner.py",  # CatBoost scanner tests
+            "test_r_serialized_scanner.py",  # R serialized scanner tests
         ]
 
         # Check if this is an allowed test file
