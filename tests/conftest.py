@@ -85,6 +85,7 @@ def pytest_runtest_setup(item):
             "test_cve_detection.py",  # CVE detection tests
             "test_pytorch_zip_scanner.py",  # PyTorch ZIP scanner tests
             "test_paddle_scanner.py",  # PaddlePaddle scanner tests
+            "test_compressed_scanner.py",  # standalone compressed wrapper scanner tests
             "test_catboost_scanner.py",  # CatBoost scanner tests
             "test_r_serialized_scanner.py",  # R serialized scanner tests
             "test_cntk_scanner.py",  # CNTK .dnn/.cmf scanner tests

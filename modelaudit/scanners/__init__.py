@@ -426,6 +426,15 @@ class ScannerRegistry:
                 "dependencies": [],  # pyyaml optional, handled gracefully
                 "numpy_sensitive": False,
             },
+            "compressed": {
+                "module": "modelaudit.scanners.compressed_scanner",
+                "class": "CompressedScanner",
+                "description": "Scans standalone compressed wrappers and forwards decompressed payloads",
+                "extensions": [".gz", ".bz2", ".xz", ".lz4", ".zlib"],
+                "priority": 95,  # Before generic TAR/ZIP scanners
+                "dependencies": [],  # lz4 is optional and handled in scanner
+                "numpy_sensitive": False,
+            },
             "zip": {
                 "module": "modelaudit.scanners.zip_scanner",
                 "class": "ZipScanner",
@@ -726,6 +735,7 @@ def __getattr__(name: str) -> Any:
         "XGBoostScanner": "xgboost",
         "CatBoostScanner": "catboost",
         "NemoScanner": "nemo",
+        "CompressedScanner": "compressed",
         "ZipScanner": "zip",
     }
 
