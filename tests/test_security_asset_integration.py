@@ -418,9 +418,9 @@ class TestSecurityAssetIntegration:
 
         import time
 
-        start_time = time.time()
+        start_time = time.perf_counter()
         results = scan_model_directory_or_file(str(assets_dir))
-        duration = time.time() - start_time
+        duration = time.perf_counter() - start_time
 
         # Should complete in reasonable time
         assert results.success is True, "Performance test scan should succeed"
