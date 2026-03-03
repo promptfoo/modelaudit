@@ -75,6 +75,7 @@ ModelAudit includes **30 specialized scanners** covering model, archive, and con
 | **OpenVINO**     | `.xml`                                | LOW    |
 | **Skops**        | `.skops`                              | HIGH   |
 | **PMML**         | `.pmml`                               | LOW    |
+| **Compressed Wrappers** | `.gz`, `.bz2`, `.xz`, `.lz4`, `.zlib` | MEDIUM |
 
 Plus scanners for ZIP, TAR, 7-Zip, OCI layers, Jinja2 templates, JSON/YAML metadata, manifests, and text files.
 
