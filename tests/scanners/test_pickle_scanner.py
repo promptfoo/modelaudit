@@ -859,7 +859,7 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
 
         assert result.success
         critical_messages = [i.message.lower() for i in result.issues if i.severity == IssueSeverity.CRITICAL]
-        assert not any("builtins.len" in msg or "len" in msg for msg in critical_messages), (
+        assert not critical_messages, (
             f"Unexpected CRITICAL benign detection: {critical_messages}"
         )
 
