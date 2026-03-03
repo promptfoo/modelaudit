@@ -419,6 +419,8 @@ def detect_file_format(path: str) -> str:
         return "rknn"
     if ext == ".cbm":
         return "catboost"
+    if ext == ".llamafile":
+        return "llamafile"
     if ext == ".h5":
         return "hdf5"
     if ext == ".pb":
@@ -534,6 +536,7 @@ EXTENSION_FORMAT_MAP = {
     ".msgpack": "flax_msgpack",
     ".nemo": "nemo",
     ".cbm": "catboost",
+    ".llamafile": "llamafile",
     ".lgb": "lightgbm",
     ".lightgbm": "lightgbm",
     ".rds": "r_serialized",
@@ -604,6 +607,8 @@ def detect_format_from_extension_pattern_matching(extension: FileExtension) -> F
             return "nemo"
         case ".cbm":
             return "catboost"
+        case ".llamafile":
+            return "llamafile"
         case ".lgb" | ".lightgbm":
             return "lightgbm"
         case ".rds" | ".rda" | ".rdata":
@@ -773,6 +778,10 @@ def validate_file_type(path: str) -> bool:
         if ext_format == "lightgbm":
             lightgbm_prefix = read_magic_bytes(path, _LIGHTGBM_SIGNATURE_READ_BYTES)
             return _is_lightgbm_signature(lightgbm_prefix)
+
+        # Llamafiles are executable wrappers; scanner-level checks validate markers.
+        if ext_format == "llamafile":
+            return True
 
         # R serialized workspace/data files may be uncompressed or wrapped;
         # extension-based intent is authoritative for static scanning.

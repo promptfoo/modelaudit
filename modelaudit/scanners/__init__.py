@@ -426,6 +426,15 @@ class ScannerRegistry:
                 "dependencies": [],
                 "numpy_sensitive": False,
             },
+            "llamafile": {
+                "module": "modelaudit.scanners.llamafile_scanner",
+                "class": "LlamafileScanner",
+                "description": "Scans Llamafile executable model artifacts",
+                "extensions": [".llamafile", ".exe", ""],
+                "priority": 6,
+                "dependencies": [],
+                "numpy_sensitive": False,
+            },
             "xgboost": {
                 "module": "modelaudit.scanners.xgboost_scanner",
                 "class": "XGBoostScanner",
@@ -762,6 +771,7 @@ def __getattr__(name: str) -> Any:
         "SevenZipScanner": "sevenzip",
         "TextScanner": "text",
         "LightGBMScanner": "lightgbm",
+        "LlamafileScanner": "llamafile",
         "XGBoostScanner": "xgboost",
         "CatBoostScanner": "catboost",
         "NemoScanner": "nemo",

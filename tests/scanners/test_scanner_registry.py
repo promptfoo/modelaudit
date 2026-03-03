@@ -14,6 +14,7 @@ def test_scanner_registry_contains_all_scanners():
         "PyTorchZipScanner",
         "SafeTensorsScanner",
         "PmmlScanner",
+        "LlamafileScanner",
     ]
 
     for scanner in core_scanners:
@@ -85,6 +86,7 @@ def test_scanner_registry_file_extension_coverage():
         ".th",
         ".net",
         ".rknn",
+        ".llamafile",
         ".h5",
         ".hdf5",
         ".keras",
