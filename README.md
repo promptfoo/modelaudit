@@ -50,7 +50,7 @@ Files scanned: 1 | Issues found: 2 critical, 1 warning
 
 ## Supported Formats
 
-ModelAudit includes **30 specialized scanners** covering model, archive, and configuration formats:
+ModelAudit includes **31 specialized scanners** covering model, archive, and configuration formats:
 
 | Format                  | Extensions                            | Risk   |
 | ----------------------- | ------------------------------------- | ------ |
@@ -62,6 +62,7 @@ ModelAudit includes **30 specialized scanners** covering model, archive, and con
 | **TensorFlow**          | `.pb`, SavedModel dirs                | MEDIUM |
 | **Keras**               | `.h5`, `.hdf5`, `.keras`              | MEDIUM |
 | **ONNX**                | `.onnx`                               | MEDIUM |
+| **CoreML**              | `.mlmodel`                            | LOW    |
 | **CNTK**                | `.dnn`, `.cmf`                        | MEDIUM |
 | **RKNN**                | `.rknn`                               | MEDIUM |
 | **Torch7**              | `.t7`, `.th`, `.net`                  | HIGH   |

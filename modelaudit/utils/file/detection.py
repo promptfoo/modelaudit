@@ -427,6 +427,8 @@ def detect_file_format(path: str) -> str:
         return "protobuf"
     if ext == ".tflite":
         return "tflite"
+    if ext == ".mlmodel":
+        return "coreml"
     if ext == ".safetensors":
         return "safetensors"
     if ext in (".pdmodel", ".pdiparams"):
@@ -502,6 +504,7 @@ EXTENSION_FORMAT_MAP = {
     ".hdf5": "hdf5",
     ".keras": "keras",  # Keras 3.x uses ZIP, legacy Keras uses HDF5
     ".pb": "protobuf",
+    ".mlmodel": "coreml",
     ".safetensors": "safetensors",
     ".onnx": "onnx",
     ".bin": "pytorch_binary",
@@ -591,6 +594,8 @@ def detect_format_from_extension_pattern_matching(extension: FileExtension) -> F
             return "protobuf"
         case ".tflite":
             return "tflite"
+        case ".mlmodel":
+            return "coreml"
         case ".engine":
             return "tensorrt"
         case ".pdmodel" | ".pdiparams":
@@ -782,6 +787,11 @@ def validate_file_type(path: str) -> bool:
         # Llamafiles are executable wrappers; scanner-level checks validate markers.
         if ext_format == "llamafile":
             return True
+
+        # CoreML .mlmodel files are protobuf-encoded with no stable magic bytes.
+        # Structural validation is performed by the dedicated scanner.
+        if ext_format == "coreml":
+            return header_format in {"coreml", "unknown"}
 
         # R serialized workspace/data files may be uncompressed or wrapped;
         # extension-based intent is authoritative for static scanning.

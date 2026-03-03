@@ -73,6 +73,7 @@ def test_detect_file_format_by_extension(tmp_path):
         ".pb": "protobuf",
         ".tflite": "tflite",
         ".cbm": "catboost",
+        ".mlmodel": "coreml",
         ".llamafile": "llamafile",
         ".rknn": "rknn",
         ".rds": "r_serialized",
@@ -95,6 +96,16 @@ def test_detect_file_format_hdf5(tmp_path):
     hdf5_path.write_bytes(hdf5_magic + b"additional content")
 
     assert detect_file_format(str(hdf5_path)) == "hdf5"
+
+
+def test_detect_file_format_coreml_validation_passthrough(tmp_path):
+    """CoreML extension routing should remain scanner-level validated."""
+    model_path = tmp_path / "model.mlmodel"
+    model_path.write_bytes(b"not-a-real-protobuf")
+
+    assert detect_file_format(str(model_path)) == "coreml"
+    assert detect_format_from_extension(str(model_path)) == "coreml"
+    assert validate_file_type(str(model_path)) is True
 
 
 def test_detect_r_serialized_magic_headers(tmp_path: Path) -> None:

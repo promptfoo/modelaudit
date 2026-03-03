@@ -14,6 +14,7 @@ def test_scanner_registry_contains_all_scanners():
         "PyTorchZipScanner",
         "SafeTensorsScanner",
         "PmmlScanner",
+        "CoreMLScanner",
         "LlamafileScanner",
     ]
 
@@ -90,6 +91,7 @@ def test_scanner_registry_file_extension_coverage():
         ".h5",
         ".hdf5",
         ".keras",
+        ".mlmodel",
         ".lgb",
         ".lightgbm",
         ".pb",
