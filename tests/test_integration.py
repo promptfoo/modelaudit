@@ -272,6 +272,9 @@ def test_tensorflow_savedmodel_integration(tmp_path):
     except ImportError:
         pytest.skip("TensorFlow not available")
 
+    if not hasattr(tf, "keras"):
+        pytest.skip("tf.keras not available (TensorFlow 2.16+ uses standalone Keras)")
+
     from click.testing import CliRunner
 
     from modelaudit.cli import cli
@@ -362,6 +365,9 @@ def test_tensorflow_savedmodel_with_anomalous_weights_integration(tmp_path):
         import tensorflow as tf
     except ImportError:
         pytest.skip("TensorFlow not available")
+
+    if not hasattr(tf, "keras"):
+        pytest.skip("tf.keras not available (TensorFlow 2.16+ uses standalone Keras)")
 
     from modelaudit.core import scan_model_directory_or_file
 

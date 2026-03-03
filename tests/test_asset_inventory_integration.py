@@ -74,6 +74,7 @@ class TestAssetInventoryIntegration:
                 delete=False,
             ) as tmp:
                 save_file(inner_safetensors_data, tmp.name)
+                tmp.close()  # Close temp file before reopening (required on Windows)
                 with open(tmp.name, "rb") as f:
                     zf.writestr("optimizer.safetensors", f.read())
                 os.unlink(tmp.name)
@@ -118,7 +119,7 @@ class TestAssetInventoryIntegration:
         assert hasattr(st_asset, "size") and st_asset.size is not None
 
         # Check for main JSON config with keys metadata
-        main_config_assets = [a for a in assets if a.path.endswith("/config.json")]
+        main_config_assets = [a for a in assets if a.path.endswith(os.sep + "config.json")]
         assert len(main_config_assets) == 1
         config_asset = main_config_assets[0]
         assert config_asset.type == "manifest"
@@ -137,10 +138,11 @@ class TestAssetInventoryIntegration:
 
         # Verify nested contents have correct paths
         nested_paths = {c["path"] for c in zip_asset.contents}
+        zip_path = os.path.join(str(complex_model_dir), "weights.zip")
         expected_nested = {
-            f"{complex_model_dir}/weights.zip:model_state.pkl",
-            f"{complex_model_dir}/weights.zip:optimizer.safetensors",
-            f"{complex_model_dir}/weights.zip:README.txt",
+            f"{zip_path}:model_state.pkl",
+            f"{zip_path}:optimizer.safetensors",
+            f"{zip_path}:README.txt",
         }
         assert expected_nested.issubset(nested_paths)
 
@@ -240,6 +242,7 @@ class TestAssetInventoryIntegration:
                 delete=False,
             ) as tmp:
                 save_file(safetensors_data, tmp.name)
+                tmp.close()  # Close temp file before reopening (required on Windows)
                 with open(tmp.name, "rb") as f:
                     inner_zf.writestr("model.safetensors", f.read())
                 os.unlink(tmp.name)

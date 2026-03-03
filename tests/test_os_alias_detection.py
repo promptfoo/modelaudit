@@ -1,9 +1,13 @@
+from pathlib import Path
+
 from modelaudit.scanners import IssueSeverity, PickleScanner
+
+ASSETS_DIR = Path(__file__).parent / "assets" / "pickles"
 
 
 def test_nt_alias_detection():
     scanner = PickleScanner()
-    result = scanner.scan("tests/assets/pickles/nt_alias_attack.pkl")
+    result = scanner.scan(str(ASSETS_DIR / "nt_alias_attack.pkl"))
 
     assert len(result.issues) > 0, "Expected issues but found none in nt_alias_attack.pkl scan"
     nt_issues = [i for i in result.issues if "nt" in i.message.lower()]
@@ -17,7 +21,7 @@ def test_nt_alias_detection():
 
 def test_posix_alias_detection():
     scanner = PickleScanner()
-    result = scanner.scan("tests/assets/pickles/posix_alias_attack.pkl")
+    result = scanner.scan(str(ASSETS_DIR / "posix_alias_attack.pkl"))
 
     assert len(result.issues) > 0, "Expected issues but found none in posix_alias_attack.pkl scan"
     posix_issues = [i for i in result.issues if "posix" in i.message.lower()]

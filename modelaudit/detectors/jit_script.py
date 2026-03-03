@@ -848,7 +848,6 @@ class JITScriptDetector:
         # Scan based on model type
         if model_type in ["pytorch", "torchscript"]:
             findings.extend(self.scan_torchscript(data, context))
-            # TODO: Fix return type mismatch in scan_advanced_torchscript_vulnerabilities
             findings.extend(self.scan_advanced_torchscript_vulnerabilities(data, context))
 
         if model_type in ["tensorflow", "tf", "keras"]:
@@ -864,7 +863,6 @@ class JITScriptDetector:
         if model_type == "unknown":
             # Check all frameworks if type is unknown
             findings.extend(self.scan_torchscript(data, context))
-            # TODO: Fix return type mismatch in scan_advanced_torchscript_vulnerabilities
             findings.extend(self.scan_advanced_torchscript_vulnerabilities(data, context))
             findings.extend(self.scan_tensorflow(data, context))
             findings.extend(self.scan_onnx(data, context))
@@ -907,10 +905,10 @@ def detect_jit_script_risks(file_path: str, max_size: int = 500 * 1024 * 1024) -
         return [
             create_jit_finding(
                 message=f"File too large: {file_size} bytes (max: {max_size})",
-                severity="WARNING",
+                severity="INFO",
                 context=file_path,
                 pattern=None,
-                recommendation="Use a smaller file for analysis",
+                recommendation="Consider increasing the max_size parameter for large model files",
                 confidence=1.0,
                 framework=None,
                 code_snippet=None,

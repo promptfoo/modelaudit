@@ -605,9 +605,9 @@ import xgboost as xgb
 try:
     booster = xgb.Booster()
     booster.load_model({escaped_path})
-    print("SUCCESS: Model loaded successfully")
+    sys.stdout.write("SUCCESS: Model loaded successfully\\n")
 except Exception as e:
-    print(f"ERROR: {{e}}")
+    sys.stderr.write(f"ERROR: {{e}}\\n")
     sys.exit(1)
 """,
             ]

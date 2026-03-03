@@ -1,3 +1,5 @@
+"""Scanner for ExecuTorch model files (.pte)."""
+
 import io
 import os
 import tempfile

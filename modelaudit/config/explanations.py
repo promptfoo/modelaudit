@@ -135,6 +135,41 @@ DANGEROUS_OPCODES = {
         "The GLOBAL opcode imports and accesses module attributes. When referencing dangerous modules, this "
         "indicates potential security risks."
     ),
+    # Memo-based attack opcodes - can reference previously stored dangerous objects
+    "BINGET": (
+        "The BINGET opcode retrieves an object from the pickle memo by index. Attackers can use this to "
+        "reference dangerous objects that were stored earlier in the pickle stream, enabling indirect attacks."
+    ),
+    "LONG_BINGET": (
+        "The LONG_BINGET opcode retrieves an object from the pickle memo using a 4-byte index. Like BINGET, "
+        "it can be used in memo-based attacks to reference dangerous objects stored earlier."
+    ),
+    "BINPUT": (
+        "The BINPUT opcode stores an object in the pickle memo. In attack chains, this allows storing dangerous "
+        "callable objects for later retrieval via BINGET, enabling multi-stage attacks."
+    ),
+    "LONG_BINPUT": (
+        "The LONG_BINPUT opcode stores an object in the pickle memo using a 4-byte index. Used in conjunction "
+        "with LONG_BINGET for memo-based attacks with larger indexes."
+    ),
+    # Extension registry opcodes - can reference external dangerous modules
+    "EXT1": (
+        "The EXT1 opcode references a registered extension by 1-byte code. Extension registry entries can "
+        "map to dangerous callables, enabling code execution via pre-registered malicious extensions."
+    ),
+    "EXT2": (
+        "The EXT2 opcode references a registered extension by 2-byte code. Like EXT1, it can invoke dangerous "
+        "functionality through the pickle extension registry."
+    ),
+    "EXT4": (
+        "The EXT4 opcode references a registered extension by 4-byte code. Extension registry attacks can "
+        "bypass module-based detection by using numeric codes instead of module names."
+    ),
+    # Protocol 4+ framing opcode
+    "FRAME": (
+        "The FRAME opcode (Protocol 4+) introduces a frame boundary for chunked data. While not directly "
+        "dangerous, it can be used to obfuscate payload structure and evade pattern-based detection."
+    ),
 }
 
 # Explanations for specific patterns and behaviors
@@ -251,6 +286,74 @@ TF_OP_EXPLANATIONS = {
         "DecodeJpeg decodes JPEG images; crafted images may exploit vulnerabilities or consume excessive resources."
     ),
     "DecodePng": ("DecodePng decodes PNG data, which could be abused with malformed inputs."),
+    # Checkpoint and table operations - HIGH RISK
+    "LoadAndRemapMatrix": (
+        "LoadAndRemapMatrix loads matrix data from arbitrary file paths, which could be used to read "
+        "sensitive files or load malicious data into the model."
+    ),
+    "RestoreV2": (
+        "RestoreV2 restores checkpoint data from files, enabling file system access that could be used "
+        "to read sensitive data or load malicious parameters."
+    ),
+    "LookupTableImport": (
+        "LookupTableImport imports data from external files into lookup tables, which could be used to "
+        "read sensitive files or inject malicious data."
+    ),
+    "InitializeTable": (
+        "InitializeTable initializes lookup tables from external files, which could be used to read "
+        "sensitive files or inject malicious data during model initialization."
+    ),
+    "LookupTableImportV2": (
+        "LookupTableImportV2 imports data from external files into lookup tables (V2 variant), which could "
+        "be used to read sensitive files or inject malicious data."
+    ),
+    "InitializeTableV2": (
+        "InitializeTableV2 initializes lookup tables from external files (V2 variant), which could be used "
+        "to read sensitive files or inject malicious data during model initialization."
+    ),
+    # Queue operations - MEDIUM RISK (data exfiltration)
+    "QueueEnqueue": (
+        "QueueEnqueue enqueues data to TensorFlow queues, which could be used as a data exfiltration "
+        "vector to send sensitive information to external systems."
+    ),
+    "QueueEnqueueV2": (
+        "QueueEnqueueV2 enqueues data to TensorFlow queues (V2 variant), which attackers could abuse as a "
+        "data exfiltration vector to send sensitive information to external systems."
+    ),
+    "QueueDequeue": (
+        "QueueDequeue dequeues data from TensorFlow queues, which could be used as a data exfiltration "
+        "vector or to inject malicious data into the inference pipeline."
+    ),
+    "QueueDequeueV2": (
+        "QueueDequeueV2 dequeues data from TensorFlow queues (V2 variant), which could be used as a data "
+        "exfiltration vector or to inject malicious data into the inference pipeline."
+    ),
+    "QueueEnqueueMany": (
+        "QueueEnqueueMany batch enqueues data to TensorFlow queues, which attackers could abuse as a "
+        "high-throughput data exfiltration vector to send large amounts of sensitive information."
+    ),
+    "QueueDequeueMany": (
+        "QueueDequeueMany batch dequeues data from TensorFlow queues, which attackers could abuse as a "
+        "high-throughput data exfiltration vector or to inject large amounts of malicious data."
+    ),
+    # Side-channel operations - MEDIUM RISK
+    "Print": (
+        "Print outputs data to stdout, which attackers could abuse as a side-channel to leak sensitive "
+        "information such as model parameters, input data, or system information."
+    ),
+    "PrintV2": (
+        "PrintV2 outputs data to stdout (V2 variant), which attackers could abuse as a side-channel to leak "
+        "sensitive information such as model parameters, input data, or system information."
+    ),
+    # Denial of service operations - MEDIUM RISK
+    "Assert": (
+        "Assert can crash inference pipelines if assertions fail, which could be used for denial of service "
+        "attacks or to cause unexpected behavior in production systems."
+    ),
+    "Abort": (
+        "Abort immediately terminates execution, which could be used for denial of service attacks "
+        "to crash inference pipelines or disrupt production systems."
+    ),
 }
 
 
@@ -530,6 +633,165 @@ def get_cve_2025_32434_explanation(vulnerability_type: str) -> str:
     )
 
 
+def get_cve_2026_24747_explanation(vulnerability_type: str) -> str:
+    """Get specific explanation for CVE-2026-24747 vulnerability types."""
+
+    explanations = {
+        "setitem_abuse": (
+            "CVE-2026-24747 exploits a flaw in PyTorch's weights_only=True restricted "
+            "unpickler that allows SETITEM/SETITEMS opcodes to operate on unexpected "
+            "object types. In legitimate pickles, SETITEM populates dicts. In this attack, "
+            "SETITEM is applied to reconstructed tensor objects, allowing the attacker to "
+            "manipulate object attributes and achieve heap layout control for code execution."
+        ),
+        "tensor_metadata_mismatch": (
+            "This model contains tensor storage declarations that do not match the actual "
+            "binary blob sizes in the archive. CVE-2026-24747 exploits such mismatches to "
+            "cause the restricted unpickler to allocate incorrectly sized memory regions, "
+            "enabling heap layout manipulation. Legitimate PyTorch models always have "
+            "consistent tensor metadata."
+        ),
+        "restricted_unpickler_bypass": (
+            "Unlike CVE-2025-32434 (where weights_only=True did not enforce restrictions), "
+            "CVE-2026-24747 bypasses the enforcement mechanism itself. The restricted unpickler "
+            "correctly blocks REDUCE/GLOBAL with dangerous modules, but fails to restrict "
+            "SETITEM/SETITEMS on non-dict objects, allowing type confusion attacks that "
+            "ultimately achieve control flow hijacking."
+        ),
+        "pytorch_version": (
+            "CVE-2026-24747 affects all PyTorch versions before 2.10.0. The fix adds type "
+            "checking to SETITEM/SETITEMS opcodes in the restricted unpickler, ensuring they "
+            "can only operate on dict objects. Upgrade immediately and consider SafeTensors."
+        ),
+    }
+
+    return explanations.get(
+        vulnerability_type,
+        "This issue is related to CVE-2026-24747, a high-severity PyTorch vulnerability "
+        "that bypasses weights_only=True via SETITEM abuse. Update to PyTorch 2.10.0+.",
+    )
+
+
+def get_cve_2025_51480_explanation(vulnerability_type: str) -> str:
+    """Get specific explanation for CVE-2025-51480 (ONNX external-data write traversal)."""
+
+    explanations = {
+        "arbitrary_file_overwrite": (
+            "CVE-2025-51480 (CVSS 8.8): onnx.save() with external data can write "
+            "tensor bytes to attacker-controlled external_data locations. If a "
+            "location includes path traversal, saving a malicious model may "
+            "overwrite arbitrary files outside the model directory."
+        ),
+        "path_traversal": (
+            "ONNX external_data locations are file paths. Traversal components "
+            "like '../' can escape the output directory and redirect writes to "
+            "sensitive files when save_external_data is used."
+        ),
+        "onnx_version": (
+            "CVE-2025-51480 affects ONNX versions through 1.17.0. Upgrade to a "
+            "patched version, validate external_data paths, and run model "
+            "processing with least privilege."
+        ),
+    }
+
+    return explanations.get(
+        vulnerability_type,
+        "CVE-2025-51480: ONNX external_data path traversal can enable arbitrary file overwrite during save operations.",
+    )
+
+
+def get_cve_2022_45907_explanation(vulnerability_type: str) -> str:
+    """Get specific explanation for CVE-2022-45907 vulnerability types."""
+
+    explanations = {
+        "eval_injection": (
+            "CVE-2022-45907 exploits torch.jit.annotations.parse_type_line(), which passes "
+            "user-controlled type annotation strings directly to Python's eval(). An attacker "
+            "can craft a malicious type annotation string that, when parsed, executes arbitrary "
+            "code. This affects any code path that processes untrusted TorchScript type annotations."
+        ),
+        "type_annotation_parsing": (
+            "The vulnerable function parse_type_line in torch.jit.annotations processes type "
+            "annotation strings from TorchScript models. Since it uses eval() internally, any "
+            "string that reaches this function can execute arbitrary Python code, including "
+            "system commands, file operations, and network access."
+        ),
+        "pytorch_version": (
+            "CVE-2022-45907 affects all PyTorch versions before 1.13.1. The fix replaces the "
+            "unsafe eval()-based type parsing with a safe AST-based parser. Upgrade to "
+            "PyTorch 1.13.1+ immediately and avoid processing type annotations from untrusted sources."
+        ),
+    }
+
+    return explanations.get(
+        vulnerability_type,
+        "This issue is related to CVE-2022-45907, a critical PyTorch vulnerability "
+        "involving unsafe eval() in type annotation parsing. Update to PyTorch 1.13.1+.",
+    )
+
+
+def get_cve_2024_5480_explanation(vulnerability_type: str) -> str:
+    """Get specific explanation for CVE-2024-5480 vulnerability types."""
+
+    explanations = {
+        "rpc_function_injection": (
+            "CVE-2024-5480 exploits the torch.distributed.rpc framework's lack of function "
+            "call validation. The RPC framework accepts arbitrary callable references, including "
+            "builtins.eval and builtins.exec, allowing a remote attacker to execute arbitrary "
+            "code on any node in the distributed training cluster."
+        ),
+        "python_udf_exploit": (
+            "The PythonUDF mechanism in torch.distributed.rpc allows sending arbitrary Python "
+            "functions to remote workers. Without validation, an attacker can send eval() or "
+            "exec() calls as PythonUDF payloads, achieving remote code execution on the target "
+            "node. This is especially dangerous in distributed training setups."
+        ),
+        "pytorch_version": (
+            "CVE-2024-5480 (CVSS 10.0) affects all PyTorch versions before 2.2.3. The fix adds "
+            "validation to restrict which functions can be called via RPC. Upgrade to "
+            "PyTorch 2.2.3+ immediately and restrict RPC access to trusted nodes only."
+        ),
+    }
+
+    return explanations.get(
+        vulnerability_type,
+        "This issue is related to CVE-2024-5480, a maximum-severity PyTorch vulnerability "
+        "in the RPC framework. Update to PyTorch 2.2.3+ and restrict RPC access.",
+    )
+
+
+def get_cve_2024_48063_explanation(vulnerability_type: str) -> str:
+    """Get specific explanation for CVE-2024-48063 vulnerability types."""
+
+    explanations = {
+        "remote_module_deserialization": (
+            "CVE-2024-48063 exploits the deserialization of torch.distributed.rpc.RemoteModule "
+            "objects. RemoteModule uses Python's pickle for serialization, and its __reduce__ "
+            "method can be crafted to execute arbitrary code during deserialization. An attacker "
+            "can create a malicious RemoteModule pickle payload that runs code when loaded."
+        ),
+        "rpc_pickle_exploit": (
+            "The RemoteModule class in torch.distributed.rpc serializes its state using pickle. "
+            "Since pickle deserialization can execute arbitrary code via __reduce__, an attacker "
+            "who can inject a crafted RemoteModule payload into the RPC communication channel "
+            "can achieve remote code execution. This is disputed by PyTorch maintainers as "
+            "'intended behavior' since pickle is inherently unsafe."
+        ),
+        "pytorch_version": (
+            "CVE-2024-48063 affects all PyTorch versions before 2.5.0. While disputed as "
+            "'intended behavior,' the vulnerability poses real risks in environments where "
+            "RemoteModule objects may come from untrusted sources. Upgrade to PyTorch 2.5.0+ "
+            "and avoid deserializing RemoteModule objects from untrusted sources."
+        ),
+    }
+
+    return explanations.get(
+        vulnerability_type,
+        "This issue is related to CVE-2024-48063, a critical PyTorch vulnerability "
+        "involving RemoteModule deserialization. Update to PyTorch 2.5.0+.",
+    )
+
+
 def get_pytorch_security_explanation(issue_type: str) -> str:
     """Get PyTorch-specific security explanations"""
 
@@ -564,4 +826,69 @@ def get_pytorch_security_explanation(issue_type: str) -> str:
         issue_type,
         "This is a PyTorch-specific security concern. Review PyTorch security best practices "
         "and ensure you're following safe model loading procedures.",
+    )
+
+
+def get_cve_2019_6446_explanation(vulnerability_type: str) -> str:
+    """Get specific explanation for CVE-2019-6446 (NumPy allow_pickle RCE)."""
+    explanations = {
+        "object_dtype": (
+            "CVE-2019-6446 (CVSS 9.8): NumPy .npy/.npz files with object dtype "
+            "use pickle serialization to store arbitrary Python objects. When "
+            "numpy.load() is called with allow_pickle=True (the default before "
+            "NumPy 1.16.3), these files can execute arbitrary code during "
+            "deserialization. The attacker embeds malicious pickle payloads in "
+            "the array data that execute when loaded."
+        ),
+        "allow_pickle": (
+            "Prior to NumPy 1.16.3, numpy.load() defaulted to allow_pickle=True, "
+            "which automatically deserializes pickled objects in .npy/.npz files. "
+            "After the fix, allow_pickle defaults to False and raises an error "
+            "when loading object arrays. However, many codebases still explicitly "
+            "pass allow_pickle=True, remaining vulnerable."
+        ),
+        "numpy_version": (
+            "CVE-2019-6446 was addressed in NumPy 1.16.3 by changing the "
+            "default of allow_pickle from True to False. Update to NumPy >= "
+            "1.16.3 and ensure your code never uses allow_pickle=True with "
+            "untrusted input files. Prefer numeric dtypes over object arrays."
+        ),
+    }
+
+    return explanations.get(
+        vulnerability_type,
+        "CVE-2019-6446: NumPy allow_pickle enables RCE via object dtype arrays. "
+        "Use NumPy >= 1.16.3 and never allow_pickle=True with untrusted files.",
+    )
+
+
+def get_cve_2025_23304_explanation(vulnerability_type: str) -> str:
+    """Get specific explanation for CVE-2025-23304 (NeMo Hydra _target_ injection)."""
+    explanations = {
+        "hydra_target_injection": (
+            "CVE-2025-23304 (CVSS 7.6): NVIDIA NeMo model files (.nemo) contain "
+            "YAML configuration with Hydra _target_ fields that specify Python "
+            "callables to instantiate. An attacker can set _target_ to dangerous "
+            "functions like os.system or subprocess.call. When the model is loaded "
+            "and hydra.utils.instantiate() processes the config, arbitrary code "
+            "executes. Over 700 models on HuggingFace use the NeMo format."
+        ),
+        "dangerous_target": (
+            "The _target_ field references a known dangerous Python callable "
+            "such as os.system, subprocess.Popen, eval, or exec. Hydra will "
+            "attempt to import and call this function with the remaining config "
+            "values as arguments, enabling full remote code execution."
+        ),
+        "nemo_version": (
+            "CVE-2025-23304 was fixed in NeMo 2.3.2 which adds safe_instantiate() "
+            "to validate _target_ values before execution. This function recursively "
+            "checks all _target_ values in the config and rejects dangerous ones. "
+            "Update to NeMo >= 2.3.2 and never load .nemo files from untrusted sources."
+        ),
+    }
+
+    return explanations.get(
+        vulnerability_type,
+        "CVE-2025-23304: NeMo Hydra _target_ injection enables RCE via malicious "
+        "model metadata. Update to NeMo >= 2.3.2.",
     )

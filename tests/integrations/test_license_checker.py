@@ -193,7 +193,7 @@ def example():
 def test():
     pass
 """
-        test_file.write_text(content)
+        test_file.write_text(content, encoding="utf-8")
 
         copyrights = extract_copyright_notices(str(test_file))
 

@@ -67,8 +67,46 @@ class TestMetadataScanner:
 
         assert len(result.issues) == 2
         assert all(issue.severity == IssueSeverity.INFO for issue in result.issues)
+        assert {issue.details.get("suspicious_domain") for issue in result.issues} == {
+            "bit.ly",
+            "ngrok.io",
+        }
         assert any("bit.ly" in issue.message for issue in result.issues)
         assert any("ngrok.io" in issue.message for issue in result.issues)
+
+    def test_scan_detects_suspicious_subdomain_hosts(self):
+        """Test suspicious domains are detected through subdomain matching."""
+        scanner = MetadataScanner()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            readme_path = Path(temp_dir) / "README.md"
+            with open(readme_path, "w") as f:
+                f.write("# Model Info\\n\\n- Endpoint: https://api.ngrok.io/malicious-endpoint\\n")
+
+            result = scanner.scan(str(readme_path))
+
+        assert len(result.issues) == 1
+        issue = result.issues[0]
+        assert issue.severity == IssueSeverity.INFO
+        assert issue.details.get("suspicious_domain") == "ngrok.io"
+        assert "https://api.ngrok.io/malicious-endpoint" in str(issue.details.get("url"))
+
+    def test_scan_ignores_suspicious_domain_substrings(self):
+        """Test URLs are matched by hostname, not generic substring."""
+        scanner = MetadataScanner()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            readme_path = Path(temp_dir) / "README.md"
+            with open(readme_path, "w") as f:
+                f.write(
+                    "# Model Info\\n\\n"
+                    "- Docs: https://example.com/guide?redirect=bit.ly/suspicious-model\\n"
+                    "- API: https://safe-ngrok.io/docs\\n"
+                )
+
+            result = scanner.scan(str(readme_path))
+
+        assert len(result.issues) == 0
 
     def test_scan_exposed_secrets_in_readme(self):
         """Test detection of exposed secrets in README."""
@@ -109,10 +147,10 @@ class TestMetadataScanner:
 
         result = scanner.scan("/nonexistent/README.md")
 
-        assert len(result.issues) == 1
-        # File access errors are WARNING severity (may indicate tampering)
-        assert result.issues[0].severity == IssueSeverity.WARNING
-        assert "Error reading" in result.issues[0].message
+        assert len(result.issues) >= 1
+        # Base class _check_path returns CRITICAL for nonexistent paths
+        assert result.issues[0].severity == IssueSeverity.CRITICAL
+        assert "does not exist" in result.issues[0].message
 
     def test_bytes_scanned_reported(self):
         """Test that bytes scanned is properly reported."""

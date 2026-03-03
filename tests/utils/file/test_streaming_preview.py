@@ -2,7 +2,7 @@ import fsspec
 import pytest
 from fsspec.implementations.local import LocalFileSystem
 
-from modelaudit.utils import streaming
+from modelaudit.utils.file import streaming
 
 
 def _setup_local(monkeypatch: pytest.MonkeyPatch) -> None:

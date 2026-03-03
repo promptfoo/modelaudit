@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.13-slim@sha256:8bc60ca09afaa8ea0d6d1220bde073bacfedd66a4bf8129cbdc8ef0e16c8a952
 
 WORKDIR /app
 
@@ -18,8 +18,7 @@ RUN pip install --no-cache-dir \
     "tensorflow-cpu>=2.13.0,<3.0" \
     "h5py>=3.1,<4.0" \
     "onnx>=1.12.0,<2.0" \
-    "scikit-learn>=1.0.0,<2.0" \
-    "coremltools>=8.0"
+    "scikit-learn>=1.0.0,<2.0"
 
 # Install PyTorch CPU-only from separate index to avoid CUDA dependencies
 RUN pip install --no-cache-dir \

@@ -1,7 +1,10 @@
+import json
 import pickle
+import time
 import zipfile
+from pathlib import Path
 
-from modelaudit.scanners.base import IssueSeverity
+from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.pytorch_zip_scanner import PyTorchZipScanner
 from tests.helpers import create_mock_pytorch_zip
 
@@ -140,8 +143,6 @@ def test_pytorch_zip_scanner_closes_bytesio(tmp_path, monkeypatch):
 
 def test_pytorch_zip_skips_numeric_data_files(tmp_path):
     """Test that numeric tensor data files in archive/data/ are skipped during JIT scanning."""
-    import time
-
     zip_path = tmp_path / "model.pt"
 
     with zipfile.ZipFile(zip_path, "w") as zipf:
@@ -231,3 +232,503 @@ def test_pytorch_zip_numeric_detection_edge_cases(tmp_path):
 
     # Should complete successfully without hanging
     assert result.success is True
+
+
+def test_pytorch_zip_scanner_can_handle_pkl_extension(tmp_path):
+    """Test that PyTorchZipScanner can_handle returns True for ZIP-format .pkl files.
+
+    PyTorch's torch.save() uses ZIP format by default since v1.6 (_use_new_zipfile_serialization=True).
+    This test verifies that .pkl files with ZIP headers are correctly identified.
+    """
+    # Create a ZIP-format .pkl file (simulating torch.save() default behavior)
+    pkl_path = tmp_path / "model.pkl"
+    with zipfile.ZipFile(pkl_path, "w") as zipf:
+        zipf.writestr("version", "3")
+        data = {"weights": [1, 2, 3]}
+        pickled_data = pickle.dumps(data)
+        zipf.writestr("data.pkl", pickled_data)
+
+    assert PyTorchZipScanner.can_handle(str(pkl_path)) is True
+
+
+def test_pytorch_zip_scanner_cannot_handle_raw_pkl(tmp_path):
+    """Test that PyTorchZipScanner can_handle returns False for raw pickle .pkl files.
+
+    Raw pickle files (created with _use_new_zipfile_serialization=False) should not be
+    handled by PyTorchZipScanner - they should go to the PickleScanner instead.
+    """
+    # Create a raw pickle .pkl file (non-ZIP format)
+    pkl_path = tmp_path / "model.pkl"
+    data = {"weights": [1, 2, 3]}
+    with open(pkl_path, "wb") as f:
+        pickle.dump(data, f)
+
+    assert PyTorchZipScanner.can_handle(str(pkl_path)) is False
+
+
+def test_pytorch_zip_scanner_scans_zip_pkl_successfully(tmp_path):
+    """Test that PyTorchZipScanner successfully scans ZIP-format .pkl files.
+
+    This is the fix for the issue where torch.save() creates ZIP files with .pkl extension
+    by default, but ModelAudit was routing them to PickleScanner which failed with
+    UnicodeDecodeError.
+    """
+    # Create a ZIP-format .pkl file (simulating torch.save() default behavior)
+    pkl_path = tmp_path / "model.pkl"
+    with zipfile.ZipFile(pkl_path, "w") as zipf:
+        # Standard PyTorch ZIP structure
+        zipf.writestr("version", "3")
+        zipf.writestr("byteorder", "little")
+        zipf.writestr(".format_version", "1")
+
+        # Create a proper pickle with torch-like structure
+        data = {"linear.weight": [1.0, 2.0], "linear.bias": [0.1]}
+        pickled_data = pickle.dumps(data)
+        zipf.writestr("model/data.pkl", pickled_data)
+
+    scanner = PyTorchZipScanner()
+    result = scanner.scan(str(pkl_path))
+
+    # Should succeed without errors
+    assert result.success is True
+    assert result.bytes_scanned > 0
+
+    # No critical issues
+    critical_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL]
+    assert len(critical_issues) == 0
+
+
+def test_pytorch_zip_scanner_detects_malicious_zip_pkl(tmp_path):
+    """Test that PyTorchZipScanner detects malicious content in ZIP-format .pkl files."""
+    # Create a ZIP-format .pkl file with malicious pickle content
+    pkl_path = tmp_path / "model.pkl"
+    with zipfile.ZipFile(pkl_path, "w") as zipf:
+        zipf.writestr("version", "3")
+
+        # Create a malicious pickle that would execute code
+        class MaliciousClass:
+            def __reduce__(self):
+                return (eval, ("print('pwned')",))
+
+        data = {"malicious": MaliciousClass()}
+        pickled_data = pickle.dumps(data)
+        zipf.writestr("data.pkl", pickled_data)
+
+    scanner = PyTorchZipScanner()
+    result = scanner.scan(str(pkl_path))
+
+    # Should detect the eval function
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+    assert any("eval" in issue.message.lower() for issue in result.issues)
+
+
+def test_pytorch_zip_scanner_entry_limit(tmp_path):
+    """Test that scanner enforces archive entry count limits."""
+    zip_path = tmp_path / "model.pt"
+
+    # Create archive with many entries (exceeding default limit)
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("version", "3")
+        # Create entries exceeding the limit
+        for i in range(15):
+            zipf.writestr(f"entry_{i}.txt", "data")
+
+    # Use a low limit for testing
+    scanner = PyTorchZipScanner(config={"max_archive_entries": 10})
+    result = scanner.scan(str(zip_path))
+
+    # Should have warning about entry count
+    entry_issues = [
+        i
+        for i in result.issues
+        if "entries" in i.message.lower() and ("max" in i.message.lower() or "limit" in i.message.lower())
+    ]
+    assert len(entry_issues) > 0
+    assert entry_issues[0].severity == IssueSeverity.WARNING
+
+
+def test_pytorch_zip_scanner_entry_limit_passes(tmp_path):
+    """Test that scanner passes when entry count is within limits."""
+    zip_path = tmp_path / "model.pt"
+
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("version", "3")
+        data = pickle.dumps({"weights": [1, 2, 3]})
+        zipf.writestr("data.pkl", data)
+
+    scanner = PyTorchZipScanner()
+    result = scanner.scan(str(zip_path))
+
+    # Should pass entry limit check - look for passed checks about entry count
+    entry_checks = [c for c in result.checks if "entry" in c.name.lower()]
+    assert len(entry_checks) > 0
+    assert all(c.status == CheckStatus.PASSED for c in entry_checks)
+
+
+def test_pytorch_zip_scanner_compression_ratio_check(tmp_path):
+    """Test that scanner detects suspicious compression ratios."""
+
+    zip_path = tmp_path / "model.pt"
+
+    # Create a file with extremely high compression ratio (repetitive data compresses well)
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zipf:
+        zipf.writestr("version", "3")
+        # Create highly compressible data (1MB of zeros will compress to almost nothing)
+        highly_compressible = b"\x00" * (1024 * 1024)
+        zipf.writestr("suspicious_data.bin", highly_compressible)
+
+    # Use a low threshold for testing
+    scanner = PyTorchZipScanner(config={"max_compression_ratio": 50})
+    result = scanner.scan(str(zip_path))
+
+    # Should have warning about compression ratio
+    ratio_issues = [i for i in result.issues if "compression" in i.message.lower() and "ratio" in i.message.lower()]
+    assert len(ratio_issues) > 0
+    assert ratio_issues[0].severity == IssueSeverity.WARNING
+
+
+def test_pytorch_zip_scanner_compression_ratio_passes(tmp_path):
+    """Test that scanner passes when compression ratio is within limits."""
+    zip_path = tmp_path / "model.pt"
+
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("version", "3")
+        # Random-ish data doesn't compress well
+        data = pickle.dumps({"weights": list(range(1000))})
+        zipf.writestr("data.pkl", data)
+
+    scanner = PyTorchZipScanner()
+    result = scanner.scan(str(zip_path))
+
+    # Should pass compression check - look for passed checks about compression
+    ratio_checks = [c for c in result.checks if "compression" in c.name.lower()]
+    assert len(ratio_checks) > 0
+    assert all(c.status == CheckStatus.PASSED for c in ratio_checks)
+
+
+def test_pytorch_zip_scanner_symlink_detection(tmp_path):
+    """Test that scanner detects symlinks in archives."""
+
+    zip_path = tmp_path / "model.pt"
+
+    # Create a ZIP file with a symlink entry
+    # Symlinks in ZIP files have external_attr with S_IFLNK flag
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("version", "3")
+
+        # Create a symlink entry manually
+        # The external_attr field encodes the Unix file mode
+        # S_IFLNK = 0o120000 (symlink)
+        symlink_info = zipfile.ZipInfo("malicious_link")
+        # Set external attributes to indicate symlink (Unix mode in upper 16 bits)
+        symlink_info.external_attr = 0o120777 << 16  # symlink with full permissions
+        symlink_info.compress_type = zipfile.ZIP_STORED
+        zipf.writestr(symlink_info, "/etc/passwd")
+
+    scanner = PyTorchZipScanner()
+    result = scanner.scan(str(zip_path))
+
+    # Should have warning about symlink
+    symlink_issues = [i for i in result.issues if "symlink" in i.message.lower()]
+    assert len(symlink_issues) > 0
+    assert symlink_issues[0].severity == IssueSeverity.WARNING
+
+
+def test_pytorch_zip_scanner_no_symlinks_passes(tmp_path):
+    """Test that scanner passes when no symlinks are present."""
+    zip_path = tmp_path / "model.pt"
+
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("version", "3")
+        data = pickle.dumps({"weights": [1, 2, 3]})
+        zipf.writestr("data.pkl", data)
+
+    scanner = PyTorchZipScanner()
+    result = scanner.scan(str(zip_path))
+
+    # Should pass symlink check - look for passed checks about symlinks
+    symlink_checks = [c for c in result.checks if "symlink" in c.name.lower()]
+    assert len(symlink_checks) > 0
+    assert all(c.status == CheckStatus.PASSED for c in symlink_checks)
+
+
+def test_pytorch_zip_scanner_combined_security_controls(tmp_path):
+    """Test that multiple security controls fire together without interfering."""
+    zip_path = tmp_path / "model.pt"
+
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("version", "3")
+        # Generate enough entries to exceed a low limit
+        for i in range(12):
+            zipf.writestr(f"entry_{i}.txt", "data")
+        # Add a symlink entry
+        symlink_info = zipfile.ZipInfo("evil_link")
+        symlink_info.external_attr = 0o120777 << 16
+        symlink_info.compress_type = zipfile.ZIP_STORED
+        zipf.writestr(symlink_info, "/etc/shadow")
+
+    scanner = PyTorchZipScanner(config={"max_archive_entries": 10})
+    result = scanner.scan(str(zip_path))
+
+    # Entry limit should trigger
+    entry_issues = [
+        i
+        for i in result.issues
+        if "entries" in i.message.lower() and ("max" in i.message.lower() or "limit" in i.message.lower())
+    ]
+    assert len(entry_issues) > 0
+    assert entry_issues[0].severity == IssueSeverity.WARNING
+
+    # Symlink should also trigger independently
+    symlink_issues = [i for i in result.issues if "symlink" in i.message.lower()]
+    assert len(symlink_issues) > 0
+    assert symlink_issues[0].severity == IssueSeverity.WARNING
+
+
+# CVE-2026-24747 Tests
+
+
+def _create_pytorch_zip_with_framework_version(path: Path, pytorch_version: str) -> Path:
+    with zipfile.ZipFile(path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1.0, 2.0, 3.0]}))
+        zipf.writestr("config.json", json.dumps({"pytorch_version": pytorch_version}))
+    return path
+
+
+def test_pytorch_zip_cve_2026_24747_version_check(tmp_path: Path) -> None:
+    """Model metadata with vulnerable version should trigger CVE-2026-24747."""
+    model_path = _create_pytorch_zip_with_framework_version(tmp_path / "model.pt", "2.9.0")
+    scanner = PyTorchZipScanner()
+    result = scanner.scan(str(model_path))
+    cve_2026_checks = [c for c in result.checks if "CVE-2026-24747" in c.name]
+    failed_checks = [c for c in cve_2026_checks if c.status == CheckStatus.FAILED]
+    assert len(failed_checks) > 0, (
+        f"Should flag PyTorch 2.9.0 as vulnerable to CVE-2026-24747. "
+        f"Checks: {[(c.name, c.status) for c in result.checks]}"
+    )
+    assert failed_checks[0].details.get("detected_pytorch_version") == "2.9.0"
+    assert failed_checks[0].details.get("pytorch_version_source") == "metadata:config.json:pytorch_version"
+
+
+def test_pytorch_zip_cve_2026_24747_fixed_version(tmp_path: Path) -> None:
+    """Model metadata with fixed version should not trigger CVE-2026-24747."""
+    model_path = _create_pytorch_zip_with_framework_version(tmp_path / "model.pt", "2.10.0")
+    scanner = PyTorchZipScanner()
+    result = scanner.scan(str(model_path))
+
+    # Fixed version: CVE-2026-24747 check should be present but not failed
+    cve_2026_checks = [c for c in result.checks if "CVE-2026-24747" in c.name]
+    assert len(cve_2026_checks) > 0, "Expected CVE-2026-24747 check to be present"
+    cve_2026_failed = [c for c in cve_2026_checks if c.status == CheckStatus.FAILED]
+    assert len(cve_2026_failed) == 0, (
+        f"PyTorch 2.10.0 should NOT trigger CVE-2026-24747. "
+        f"Failed checks: {[(c.name, c.message) for c in cve_2026_failed]}"
+    )
+
+
+def test_pytorch_zip_generic_version_metadata_does_not_trigger_cve_version_checks(tmp_path: Path) -> None:
+    """Generic config version keys should not be treated as framework version."""
+    model_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(model_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1.0, 2.0, 3.0]}))
+        zipf.writestr("config.json", json.dumps({"version": "0.1.0", "model_type": "bert"}))
+
+    scanner = PyTorchZipScanner()
+    result = scanner.scan(str(model_path))
+
+    cve_version_checks = [
+        c
+        for c in result.checks
+        if c.status == CheckStatus.FAILED
+        and "PyTorch Version Check" in c.name
+        and any(
+            cve in c.name
+            for cve in [
+                "CVE-2025-32434",
+                "CVE-2026-24747",
+                "CVE-2022-45907",
+                "CVE-2024-5480",
+                "CVE-2024-48063",
+            ]
+        )
+    ]
+    assert len(cve_version_checks) == 0, (
+        "Generic metadata version should not trigger framework CVE checks. "
+        f"Found: {[(c.name, c.message) for c in cve_version_checks]}"
+    )
+
+
+def test_pytorch_zip_tensor_metadata_validation(tmp_path: Path) -> None:
+    """Test tensor metadata consistency validation runs without errors."""
+    # Create a PyTorch ZIP model with data blobs
+    zip_path = tmp_path / "model_with_data.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        # Simple pickle with a dict
+        data = {"weights": [1.0, 2.0, 3.0]}
+        zipf.writestr("archive/data.pkl", pickle.dumps(data))
+        # Add a data blob
+        zipf.writestr("archive/data/0", b"\x00" * 24)  # 6 float32 values
+
+    scanner = PyTorchZipScanner()
+    result = scanner.scan(str(zip_path))
+
+    # Should complete without crashing (best-effort validation)
+    assert result is not None
+    # Should not report metadata mismatches for a normal model
+    mismatch_checks = [c for c in result.checks if "Tensor Metadata" in c.name and c.status == CheckStatus.FAILED]
+    assert len(mismatch_checks) == 0, (
+        f"Normal model should not have metadata mismatches. Failed: {[(c.name, c.message) for c in mismatch_checks]}"
+    )
+
+
+def test_pytorch_zip_tensor_metadata_mismatch_detection(tmp_path: Path) -> None:
+    """Test that intentionally mismatched tensor metadata is detected.
+
+    Creates a PyTorch ZIP where the pickle declares a tensor requiring more
+    storage than the actual blob provides, which is the core CVE-2026-24747
+    metadata-mismatch exploitation vector.
+    """
+    import pickletools
+    import struct
+
+    # Build a minimal pickle that references _rebuild_tensor_v2 with a
+    # declared element count that wildly exceeds the actual blob size.
+    # Protocol 2 GLOBAL opcode referencing torch._utils._rebuild_tensor_v2
+    pkl_data = bytearray()
+    pkl_data.extend(b"\x80\x02")  # PROTO 2
+    pkl_data.extend(b"ctorch._utils\n_rebuild_tensor_v2\n")  # GLOBAL
+    # Push storage key "0" as SHORT_BINUNICODE
+    pkl_data.extend(b"\x8c\x010")  # SHORT_BINUNICODE "0"
+    # Push a large element count (1_000_000) as BININT
+    pkl_data.extend(b"J")  # BININT opcode
+    pkl_data.extend(struct.pack("<i", 1_000_000))
+    pkl_data.extend(b".")  # STOP
+
+    # Verify our pickle is parseable by pickletools
+    list(pickletools.genops(bytes(pkl_data)))
+
+    zip_path = tmp_path / "mismatch_model.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", bytes(pkl_data))
+        # Blob is only 24 bytes but pickle declares 1M elements
+        zipf.writestr("archive/data/0", b"\x00" * 24)
+
+    scanner = PyTorchZipScanner()
+    result = scanner.scan(str(zip_path))
+
+    assert result is not None
+    mismatch_checks = [c for c in result.checks if "Tensor Metadata" in c.name and c.status == CheckStatus.FAILED]
+    assert len(mismatch_checks) > 0, (
+        f"Should detect tensor storage size mismatch (24 bytes vs 1M declared elements). "
+        f"Checks: {[(c.name, c.status, c.message) for c in result.checks]}"
+    )
+
+
+# --- CVE-2022-45907 version check tests ---
+
+
+def test_pytorch_zip_cve_2022_45907_version_check(tmp_path: Path) -> None:
+    """Model metadata with vulnerable version should trigger CVE-2022-45907."""
+    model_path = _create_pytorch_zip_with_framework_version(tmp_path / "model.pt", "1.13.0")
+    scanner = PyTorchZipScanner()
+    result = scanner.scan(str(model_path))
+
+    cve_checks = [c for c in result.checks if "CVE-2022-45907" in c.name]
+    failed_checks = [c for c in cve_checks if c.status == CheckStatus.FAILED]
+    assert len(failed_checks) > 0, (
+        f"Should flag PyTorch 1.13.0 as vulnerable to CVE-2022-45907. "
+        f"Checks: {[(c.name, c.status) for c in result.checks]}"
+    )
+    assert failed_checks[0].details.get("detected_pytorch_version") == "1.13.0"
+
+
+def test_pytorch_zip_cve_2022_45907_fixed_version(tmp_path: Path) -> None:
+    """Model metadata with fixed version should not trigger CVE-2022-45907."""
+    model_path = _create_pytorch_zip_with_framework_version(tmp_path / "model.pt", "1.13.1")
+    scanner = PyTorchZipScanner()
+    result = scanner.scan(str(model_path))
+
+    cve_failed = [c for c in result.checks if "CVE-2022-45907" in c.name and c.status == CheckStatus.FAILED]
+    assert len(cve_failed) == 0, (
+        f"PyTorch 1.13.1 should NOT trigger CVE-2022-45907. Failed checks: {[(c.name, c.message) for c in cve_failed]}"
+    )
+
+
+# --- CVE-2024-5480 version check tests ---
+
+
+def test_pytorch_zip_cve_2024_5480_version_check(tmp_path: Path) -> None:
+    """Model metadata with vulnerable version should trigger CVE-2024-5480."""
+    model_path = _create_pytorch_zip_with_framework_version(tmp_path / "model.pt", "2.2.2")
+    scanner = PyTorchZipScanner()
+    result = scanner.scan(str(model_path))
+
+    cve_checks = [c for c in result.checks if "CVE-2024-5480" in c.name]
+    failed_checks = [c for c in cve_checks if c.status == CheckStatus.FAILED]
+    assert len(failed_checks) > 0, (
+        f"Should flag PyTorch 2.2.2 as vulnerable to CVE-2024-5480. "
+        f"Checks: {[(c.name, c.status) for c in result.checks]}"
+    )
+    assert failed_checks[0].details.get("detected_pytorch_version") == "2.2.2"
+
+
+def test_pytorch_zip_cve_2024_5480_fixed_version(tmp_path: Path) -> None:
+    """Model metadata with fixed version should not trigger CVE-2024-5480."""
+    model_path = _create_pytorch_zip_with_framework_version(tmp_path / "model.pt", "2.2.3")
+    scanner = PyTorchZipScanner()
+    result = scanner.scan(str(model_path))
+
+    cve_failed = [c for c in result.checks if "CVE-2024-5480" in c.name and c.status == CheckStatus.FAILED]
+    assert len(cve_failed) == 0, (
+        f"PyTorch 2.2.3 should NOT trigger CVE-2024-5480. Failed checks: {[(c.name, c.message) for c in cve_failed]}"
+    )
+
+
+# --- CVE-2024-48063 version check tests ---
+
+
+def test_pytorch_zip_cve_2024_48063_version_check(tmp_path: Path) -> None:
+    """Model metadata with vulnerable version should trigger CVE-2024-48063."""
+    model_path = _create_pytorch_zip_with_framework_version(tmp_path / "model.pt", "2.4.1")
+    scanner = PyTorchZipScanner()
+    result = scanner.scan(str(model_path))
+
+    cve_checks = [c for c in result.checks if "CVE-2024-48063" in c.name]
+    failed_checks = [c for c in cve_checks if c.status == CheckStatus.FAILED]
+    assert len(failed_checks) > 0, (
+        f"Should flag PyTorch 2.4.1 as vulnerable to CVE-2024-48063. "
+        f"Checks: {[(c.name, c.status) for c in result.checks]}"
+    )
+    assert failed_checks[0].details.get("detected_pytorch_version") == "2.4.1"
+
+
+def test_pytorch_zip_cve_2024_48063_fixed_version(tmp_path: Path) -> None:
+    """Model metadata with fixed version should not trigger CVE-2024-48063."""
+    model_path = _create_pytorch_zip_with_framework_version(tmp_path / "model.pt", "2.5.0")
+    scanner = PyTorchZipScanner()
+    result = scanner.scan(str(model_path))
+
+    cve_failed = [c for c in result.checks if "CVE-2024-48063" in c.name and c.status == CheckStatus.FAILED]
+    assert len(cve_failed) == 0, (
+        f"PyTorch 2.5.0 should NOT trigger CVE-2024-48063. Failed checks: {[(c.name, c.message) for c in cve_failed]}"
+    )
+
+
+def test_version_suffix_handling_for_cve_checks() -> None:
+    """Version helper should treat unknown suffixes as vulnerable and known post/build as fixed."""
+    scanner = PyTorchZipScanner()
+
+    # Known safe suffixes on fixed base version
+    assert scanner._is_vulnerable_pytorch_version_for("2.2.3+cu118", 2, 2, 3) is False
+    assert scanner._is_vulnerable_pytorch_version_for("2.2.3.post1", 2, 2, 3) is False
+
+    # Known pre-release suffixes on fix version are still vulnerable
+    assert scanner._is_vulnerable_pytorch_version_for("2.2.3rc1", 2, 2, 3) is True
+    assert scanner._is_vulnerable_pytorch_version_for("2.2.3.dev0", 2, 2, 3) is True
+
+    # Unknown suffix semantics -> conservative vulnerable
+    assert scanner._is_vulnerable_pytorch_version_for("2.2.3foobar", 2, 2, 3) is True

@@ -48,27 +48,50 @@ class SkopsScanner(BaseScanner):
 
         return False
 
-    def _detect_cve_2025_54412(self, result: ScanResult, zip_path: str, file_list: list[str]) -> None:
+    def _detect_cve_2025_54412(
+        self, zip_file: zipfile.ZipFile, result: ScanResult, zip_path: str, file_list: list[str]
+    ) -> None:
         """Detect CVE-2025-54412: OperatorFuncNode trusted-type confusion.
 
         This CVE allows arbitrary code execution through malicious OperatorFuncNode
         objects that bypass trusted type validation.
         """
-        # Check for OperatorFuncNode patterns in file structure
+        # Check for OperatorFuncNode patterns in file structure and content.
+        # NOTE: __reduce__ and get_state were removed because they are standard
+        # Python serialization methods used by ALL sklearn Cython types
+        # (e.g., sklearn.tree._tree.Tree). Only flag patterns specific to the
+        # actual CVE-2025-54412 exploit (OperatorFuncNode abuse).
         suspicious_patterns = [
             "OperatorFuncNode",
             "operator.func",
             "trusted_types",
-            "__reduce__",
-            "get_state",
         ]
 
-        # Look for suspicious patterns in ZIP file names and metadata
+        # Binary patterns for content scanning
+        suspicious_binary_patterns = [
+            b"OperatorFuncNode",
+            b"operator.func",
+            b"trusted_types",
+        ]
+
+        # Look for suspicious patterns in ZIP file names
         found_patterns = []
         for file_name in file_list:
             for pattern in suspicious_patterns:
                 if pattern.lower() in file_name.lower():
-                    found_patterns.append(f"{pattern} in {file_name}")
+                    found_patterns.append(f"filename: {pattern} in {file_name}")
+
+        # Scan file contents for suspicious patterns
+        for file_info in zip_file.filelist:
+            try:
+                content = zip_file.read(file_info)
+                for binary_pattern in suspicious_binary_patterns:
+                    if binary_pattern in content:
+                        found_patterns.append(
+                            f"content: {binary_pattern.decode('utf-8', errors='ignore')} in {file_info.filename}"
+                        )
+            except Exception:
+                pass
 
         if found_patterns:
             result.add_check(
@@ -93,7 +116,9 @@ class SkopsScanner(BaseScanner):
                 ),
             )
 
-    def _detect_cve_2025_54413(self, result: ScanResult, zip_path: str, file_list: list[str]) -> None:
+    def _detect_cve_2025_54413(
+        self, zip_file: zipfile.ZipFile, result: ScanResult, zip_path: str, file_list: list[str]
+    ) -> None:
         """Detect CVE-2025-54413: MethodNode inconsistency → dangerous attribute access.
 
         This CVE allows dangerous attribute access through inconsistent MethodNode objects.
@@ -106,11 +131,32 @@ class SkopsScanner(BaseScanner):
             "getattr",
         ]
 
+        # Binary patterns for content scanning
+        suspicious_binary_patterns = [
+            b"MethodNode",
+            b"__getattr__",
+            b"__setattr__",
+            b"method_node",
+        ]
+
+        # Look for suspicious patterns in ZIP file names
         found_patterns = []
         for file_name in file_list:
             for pattern in suspicious_patterns:
                 if pattern.lower() in file_name.lower():
-                    found_patterns.append(f"{pattern} in {file_name}")
+                    found_patterns.append(f"filename: {pattern} in {file_name}")
+
+        # Scan file contents for suspicious patterns
+        for file_info in zip_file.filelist:
+            try:
+                content = zip_file.read(file_info)
+                for binary_pattern in suspicious_binary_patterns:
+                    if binary_pattern in content:
+                        found_patterns.append(
+                            f"content: {binary_pattern.decode('utf-8', errors='ignore')} in {file_info.filename}"
+                        )
+            except Exception:
+                pass
 
         if found_patterns:
             result.add_check(
@@ -211,6 +257,26 @@ class SkopsScanner(BaseScanner):
         except Exception:
             pass
 
+    # Metadata files that are part of the skops format and should be excluded
+    # from joblib fallback pattern matching. These files legitimately contain
+    # strings like "sklearn" as type references, not as pickle/joblib code.
+    _SKOPS_METADATA_FILES: ClassVar[frozenset[str]] = frozenset(
+        {
+            "schema.json",
+            "schema",
+        }
+    )
+
+    @classmethod
+    def _is_skops_metadata(cls, filename: str) -> bool:
+        """Return True if *filename* is a known skops metadata/schema file.
+
+        Only the basename is checked so that nested paths like
+        ``subdir/schema.json`` are also excluded.
+        """
+        basename = os.path.basename(filename).lower()
+        return basename in cls._SKOPS_METADATA_FILES
+
     def _check_unsafe_joblib_fallback(self, zip_file: zipfile.ZipFile, result: ScanResult, zip_path: str) -> None:
         """Check for unsafe joblib fallback patterns in skops files."""
         # Scan all files for joblib deserialization patterns
@@ -224,9 +290,16 @@ class SkopsScanner(BaseScanner):
         files_with_joblib = []
 
         for file_info in zip_file.filelist:
+            is_metadata = self._is_skops_metadata(file_info.filename)
+
             try:
                 content = zip_file.read(file_info)
                 for pattern in joblib_patterns:
+                    # Only suppress the broad `sklearn` heuristic for metadata
+                    # files; explicit signals like `joblib.load` / `pickle.load`
+                    # must still be reported even inside schema.json.
+                    if is_metadata and pattern == b"sklearn":
+                        continue
                     if pattern in content:
                         files_with_joblib.append(
                             {
@@ -315,9 +388,9 @@ class SkopsScanner(BaseScanner):
                 result.metadata["file_count"] = len(file_list)
                 result.metadata["files"] = file_list[:100]  # Store first 100 files
 
-                # Run CVE detection checks
-                self._detect_cve_2025_54412(result, path, file_list)
-                self._detect_cve_2025_54413(result, path, file_list)
+                # Run CVE detection checks (with content analysis)
+                self._detect_cve_2025_54412(zip_file, result, path, file_list)
+                self._detect_cve_2025_54413(zip_file, result, path, file_list)
                 self._detect_cve_2025_54886(zip_file, result, path)
 
                 # Check protocol version

@@ -2,12 +2,12 @@
 
 Thank you for your interest in contributing to ModelAudit! This guide will help you get started with development and contributing to the project.
 
-## 🛠️ Development Setup
+## Development Setup
 
 ### Prerequisites
 
-- Python 3.9 or higher
-- Rye (recommended) or pip
+- Python 3.10 or higher
+- uv (recommended) or pip
 - Git
 
 ### Setup
@@ -17,8 +17,11 @@ Thank you for your interest in contributing to ModelAudit! This guide will help 
 git clone https://github.com/promptfoo/modelaudit.git
 cd modelaudit
 
-# Install with Rye (recommended)
-rye sync --features all
+# Install with uv (recommended)
+uv sync --extra all
+
+# Windows (lighter optional set)
+uv sync --extra all-ci-windows
 
 # Or with pip
 pip install -e .[all]
@@ -32,17 +35,17 @@ pip install -e .[all]
 # Option 1: Install in development mode with pip
 pip install -e .[all]
 
-# Then test the CLI directly
-modelaudit scan test_model.pkl
+# Then test the CLI directly (both forms work: "modelaudit <path>" or "modelaudit scan <path>")
+modelaudit test_model.pkl
 
-# Option 2: Use Rye (recommended)
-rye sync --features all
+# Option 2: Use uv (recommended)
+uv sync --extra all
 
-# Test with Rye run (no shell activation needed)
-rye run modelaudit scan test_model.pkl
+# Test with uv run (no shell activation needed)
+uv run modelaudit test_model.pkl
 
 # Test with Python import
-rye run python -c "from modelaudit.core import scan_file; print(scan_file('test_model.pkl'))"
+uv run python -c "from modelaudit import scan_file; print(scan_file('test_model.pkl'))"
 ```
 
 **Create test models for development:**
@@ -52,91 +55,55 @@ rye run python -c "from modelaudit.core import scan_file; print(scan_file('test_
 python -c "import pickle; pickle.dump({'test': 'data'}, open('test_model.pkl', 'wb'))"
 
 # Test scanning it
-modelaudit scan test_model.pkl
+modelaudit test_model.pkl
 ```
 
-### Running Tests - Fast & Efficient 🚀
+### Running Tests - Fast & Efficient
 
 This project uses optimized parallel test execution for faster development:
 
-#### 🎯 Quick Reference
+#### Quick Reference
 
-| Command                                                    | Use Case               | Speed              | Tests                            |
-| ---------------------------------------------------------- | ---------------------- | ------------------ | -------------------------------- |
-| `rye run pytest -n auto -m "not slow and not integration"` | **Development**        | ⚡ Fastest         | Unit tests only                  |
-| `rye run pytest -n auto -x --tb=short`                     | **Quick feedback**     | ⚡ Fast, fail-fast | All tests, stop on first failure |
-| `rye run pytest -n auto --cov=modelaudit`                  | **CI/Full validation** | 🐌 Complete        | All tests with coverage          |
-| `rye run pytest -k "test_pattern" -n auto`                 | **Specific testing**   | ⚡ Targeted        | Pattern-matched tests            |
+| Command                                                   | Use Case               | Speed           | Tests                            |
+| --------------------------------------------------------- | ---------------------- | --------------- | -------------------------------- |
+| `uv run pytest -n auto -m "not slow and not integration"` | **Development**        | Fast            | Unit tests only                  |
+| `uv run pytest -n auto -x --tb=short`                     | **Quick feedback**     | Fast, fail-fast | All tests, stop on first failure |
+| `uv run pytest -n auto --cov=modelaudit`                  | **CI/Full validation** | Complete        | All tests with coverage          |
+| `uv run pytest -k "test_pattern" -n auto`                 | **Specific testing**   | Targeted        | Pattern-matched tests            |
 
-#### 🚀 Common Test Commands
+#### Common Test Commands
 
 ```bash
-# 🚀 FAST - Development testing (excludes slow tests)
-rye run pytest -n auto -m "not slow and not integration"
+# FAST - Development testing (excludes slow tests)
+uv run pytest -n auto -m "not slow and not integration"
 
-# ⚡ QUICK FEEDBACK - Fail fast on first error
-rye run pytest -n auto -x --tb=short
+# QUICK FEEDBACK - Fail fast on first error
+uv run pytest -n auto -x --tb=short
 
-# 🧪 COMPLETE - Full test suite with coverage
-rye run pytest -n auto --cov=modelaudit
+# COMPLETE - Full test suite with coverage
+uv run pytest -n auto --cov=modelaudit
 
-# 🎯 SPECIFIC - Test individual files or patterns
-rye run pytest tests/test_pickle_scanner.py -n auto -v
-rye run pytest -k "test_scanner" -n auto
+# SPECIFIC - Test individual files or patterns
+uv run pytest tests/test_pickle_scanner.py -n auto -v
+uv run pytest -k "test_scanner" -n auto
 
-# 📊 PERFORMANCE - Profile slow tests
-rye run pytest --durations=10 --tb=no
+# PERFORMANCE - Profile slow tests
+uv run pytest --durations=10 --tb=no
 ```
-
-#### 🏃‍♂️ Speed Optimizations Implemented
-
-**Parallel Execution:**
-
-- **37% faster** execution using `pytest-xdist`
-- Automatically detects CPU cores with `-n auto`
-- Uses 240%+ CPU utilization
-
-**Smart Test Selection:**
-
-- Exclude slow tests during development: `-m "not slow and not integration"`
-- Run only unit tests: `-m "unit"`
-- Test specific files: `pytest tests/test_specific.py -n auto`
-
-**Performance Comparison:**
-| Configuration | Time | Speedup |
-|--------------|------|---------|
-| Original (sequential) | 68.5s | Baseline |
-| **Parallel (all tests)** | **43.3s** | **37% faster** |
-| **Fast tests only** | **~45s** | **34% faster** |
-| **Specific file/pattern** | **~5-15s** | **80-90% faster** |
-
-**Test Markers Available:**
-
-- `@pytest.mark.slow` - Skip with `-m "not slow"`
-- `@pytest.mark.integration` - Skip with `-m "not integration"`
-- `@pytest.mark.unit` - Run only with `-m "unit"`
-- `@pytest.mark.performance` - Benchmark tests
 
 ### Development Workflow
 
 ```bash
 # Run linting and formatting with Ruff
-rye run ruff check .          # Check entire codebase (including tests)
-rye run ruff check --fix .    # Automatically fix lint issues
-rye run ruff format .         # Format code
+uv run ruff check modelaudit/ tests/           # Check code
+uv run ruff check --fix modelaudit/ tests/     # Automatically fix lint issues
+uv run ruff format modelaudit/ tests/          # Format code
 
 # Type checking
-rye run mypy modelaudit/
+uv run mypy modelaudit/
 
 # Build package
-rye build
-
-# The generated distribution contains only the `modelaudit` code and metadata.
-# Unnecessary files like tests and Docker configurations are excluded via
-# `MANIFEST.in`.
-
-# Publish (maintainers only)
-rye publish
+uv build
 ```
 
 **Code Quality Tools:**
@@ -157,7 +124,7 @@ npx prettier --write .
 npx prettier --check .
 ```
 
-## 🤝 Contributing Guidelines
+## Contributing Guidelines
 
 ### Getting Started
 
@@ -166,7 +133,7 @@ npx prettier --check .
 git checkout -b feature/your-feature-name
 
 # Make your changes...
-git add .
+git add <specific-files>
 git commit -m "feat: description"
 git push origin feature/your-feature-name
 ```
@@ -179,6 +146,26 @@ git push origin feature/your-feature-name
 - Keep changes small and focused
 - Add tests for new functionality
 - Update documentation as needed
+
+### Reporting False Positives / False Negatives
+
+Detection quality reports are high priority and should be reproducible.
+
+Include the following:
+
+- ModelAudit version and Python version
+- Exact command used (including flags)
+- Expected result vs actual result
+- Minimal reproducible sample (or a redacted/synthetic equivalent)
+- Why the behavior is a false positive or false negative
+
+If sharing a model artifact is not possible, include:
+
+- File format and extension
+- Relevant metadata/layout details
+- Representative snippets (redacted) that trigger or evade detection
+
+For sensitive security bypass details, use the private disclosure process in `SECURITY.md` instead of a public issue.
 
 ### Commit Message Format
 
@@ -196,26 +183,14 @@ We use [Conventional Commits](https://www.conventionalcommits.org/) format:
 
 ```
 modelaudit/
-├── modelaudit/
-│   ├── scanners/          # Model format scanners
-│   │   ├── base.py                    # Base scanner class
-│   │   ├── pickle_scanner.py          # Pickle/joblib security scanner
-│   │   ├── tf_savedmodel_scanner.py   # TensorFlow SavedModel scanner
-│   │   ├── keras_h5_scanner.py        # Keras H5 model scanner
-│   │   ├── pytorch_zip_scanner.py     # PyTorch ZIP format scanner
-│   │   ├── pytorch_binary_scanner.py  # PyTorch binary format scanner
-│   │   ├── safetensors_scanner.py     # SafeTensors format scanner
-│   │   ├── weight_distribution_scanner.py # Weight analysis scanner
-│   │   ├── zip_scanner.py             # ZIP archive scanner
-│   │   └── manifest_scanner.py        # Config/manifest scanner
-│   ├── utils/             # Utility modules
-│   ├── auth/              # Authentication modules
-│   ├── name_policies/     # Name policy modules
-│   ├── cli.py            # Command-line interface
+├── modelaudit/           # Main package
+│   ├── scanners/         # Scanner implementations (one per format)
+│   ├── utils/            # Utility modules
+│   ├── cli.py            # CLI interface
 │   └── core.py           # Core scanning logic
 ├── tests/                # Test suite
-├── .github/              # GitHub Actions workflows
-└── README.md             # User documentation
+├── docs/                 # Contributor and security documentation
+└── .github/              # GitHub Actions workflows
 ```
 
 ### Adding New Scanners
@@ -227,6 +202,8 @@ When adding a new scanner for a model format:
 3. Add appropriate tests in `tests/`
 4. Update documentation
 5. Add any new dependencies to `pyproject.toml`
+
+For the security-focused implementation checklist, see `docs/agents/new-scanner-quickstart.md`.
 
 ### Code Style
 
@@ -243,26 +220,23 @@ When adding a new scanner for a model format:
 - Include both unit tests and integration tests
 - Test with different model formats and edge cases
 
-## 📋 Development Tasks
+## Development Tasks
 
 ### Common Development Tasks
 
 ```bash
 # Run full test suite with coverage (optimized parallel execution)
-rye run pytest -n auto --cov=modelaudit --cov-report=html
+uv run pytest -n auto --cov=modelaudit --cov-report=html
 
 # Check for type errors
-rye run mypy modelaudit/
+uv run mypy modelaudit/
 
 # Format and lint code
-rye run ruff format .
-rye run ruff check --fix .
+uv run ruff format modelaudit/ tests/
+uv run ruff check --fix modelaudit/ tests/
 
 # Quick development test cycle
-rye run pytest -n auto -m "not slow and not integration" -x
-
-# Build documentation (if applicable)
-# Add documentation build commands here
+uv run pytest -n auto -m "not slow and not integration" -x
 
 # Create test models for specific formats
 python -c "import torch; torch.save({'model': 'data'}, 'test.pt')"
@@ -271,63 +245,11 @@ python -c "import pickle; pickle.dump({'test': 'malicious'}, open('malicious.pkl
 
 ### Release Process (Maintainers)
 
-#### Version Bump and Release
+Releases are fully automated via [release-please](https://github.com/googleapis/release-please) and GitHub Actions. When conventional commits land on `main`, release-please opens (or updates) a release PR. Merging that PR triggers the build, publish to PyPI, SBOM generation, and provenance attestation pipeline.
 
-1. **Checkout main and pull latest changes**:
+See `docs/agents/release-process.md` for the full workflow details.
 
-   ```bash
-   git checkout main
-   git pull origin main
-   ```
-
-2. **Create version bump branch**:
-
-   ```bash
-   git checkout -b chore/bump-version-X.Y.Z
-   ```
-
-3. **Update version in `pyproject.toml`**:
-
-   ```bash
-   # Edit version = "X.Y.Z" in pyproject.toml
-   ```
-
-4. **Commit and push version bump**:
-
-   ```bash
-   git add pyproject.toml
-   git commit -m "chore: bump version to X.Y.Z"
-   git push -u origin chore/bump-version-X.Y.Z
-   ```
-
-5. **Create and merge version bump PR**:
-   ```bash
-   gh pr create --title "chore: bump version to X.Y.Z" --body "Bump version for release"
-   ```
-
-#### Publishing to PyPI
-
-6. **After version bump PR is merged, checkout main**:
-
-   ```bash
-   git checkout main
-   git pull origin main
-   ```
-
-7. **Clean and publish**:
-
-   ```bash
-   # Build package (clean first)
-   rye build --clean
-
-   # Verify only current version exists
-   ls -la dist/
-
-   # Publish to PyPI
-   rye publish --yes
-   ```
-
-## 🐛 Reporting Issues
+## Reporting Issues
 
 When reporting issues:
 
@@ -337,7 +259,7 @@ When reporting issues:
 - Include error messages and stack traces
 - Mention the model format and size if applicable
 
-## 💡 Feature Requests
+## Feature Requests
 
 For feature requests:
 
@@ -346,39 +268,10 @@ For feature requests:
 - Explain why it would benefit users
 - Consider proposing an implementation approach
 
-## 🐛 Known Issues & False Positives
-
-When contributing scanner improvements, be aware of these known false positive patterns:
-
-### Configuration Pattern False Positives
-
-- **Issue**: Manifest scanner flags `label2id` dictionary keys in HuggingFace `config.json` as security risks
-- **Affected Models**: `openai/clip-vit-base-patch32`, `google/vit-base-patch16-224`
-- **Solution**: Scanner should ignore `label2id` field or add ML context awareness
-
-### Flax Model Structure Warnings
-
-- **Issue**: "Suspicious data structure" warnings on legitimate `flax_model.msgpack` files
-- **Affected Models**: Standard HuggingFace Flax models
-- **Solution**: Improve Flax model structure recognition
-
-### PyTorch Opcode Sensitivity
-
-- **Issue**: "MANY_DANGEROUS_OPCODES" warnings on popular legitimate models
-- **Affected Models**: `ultralytics/yolov5n`, `pytorch/vision` models
-- **Solution**: Adjust opcode thresholds based on ML confidence levels
-
-### Scikit-learn Pickle Opcodes
-
-- **Issue**: `NEWOBJ` and `REDUCE` opcodes flagged in standard scikit-learn models
-- **Solution**: Better context analysis for legitimate ML serialization patterns
-
-When fixing scanner issues, ensure changes don't regress detection of actual malicious models listed in `models.md`.
-
-## 📞 Getting Help
+## Getting Help
 
 - GitHub Issues: For bugs and feature requests
 - GitHub Discussions: For questions and general discussion
 - Email: For security issues or private matters
 
-Thank you for contributing to ModelAudit! 🚀
+Thank you for contributing to ModelAudit!

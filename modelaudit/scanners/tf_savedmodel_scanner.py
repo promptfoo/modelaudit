@@ -1,3 +1,5 @@
+"""Scanner for TensorFlow SavedModel directories and files."""
+
 import logging
 import os
 from pathlib import Path
@@ -24,21 +26,18 @@ DANGEROUS_TF_OPERATIONS = {
 # Python operations that require special handling
 PYTHON_OPS = ("PyFunc", "PyCall", "PyFuncStateless", "EagerPyFunc")
 
-# Defer TensorFlow availability check to avoid module-level imports
-HAS_TENSORFLOW: bool | None = None
+# Defer protobuf availability check to avoid module-level imports
+HAS_PROTOS: bool | None = None
 
 
-def _check_tensorflow() -> bool:
-    """Check if TensorFlow is available, with caching."""
-    global HAS_TENSORFLOW
-    if HAS_TENSORFLOW is None:
-        try:
-            import tensorflow as tf  # noqa: F401
+def _check_protos() -> bool:
+    """Check if TensorFlow protobuf stubs are available (vendored or from TensorFlow)."""
+    global HAS_PROTOS
+    if HAS_PROTOS is None:
+        import modelaudit.protos
 
-            HAS_TENSORFLOW = True
-        except ImportError:
-            HAS_TENSORFLOW = False
-    return HAS_TENSORFLOW
+        HAS_PROTOS = modelaudit.protos._check_vendored_protos()
+    return HAS_PROTOS
 
 
 # Create a placeholder for type hints when TensorFlow is not available
@@ -66,7 +65,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
     @classmethod
     def can_handle(cls, path: str) -> bool:
         """Check if this scanner can handle the given path"""
-        if not _check_tensorflow():
+        if not _check_protos():
             return False
 
         if os.path.isfile(path):
@@ -92,16 +91,20 @@ class TensorFlowSavedModelScanner(BaseScanner):
         # Store the file path for use in issue locations
         self.current_file_path = path
 
-        # Check if TensorFlow is installed
-        if not _check_tensorflow():
+        # Check if TensorFlow protos are available (vendored or from TensorFlow)
+        if not _check_protos():
             result = self._create_result()
             result.add_check(
-                name="TensorFlow Library Check",
+                name="TensorFlow Protos Check",
                 passed=False,
-                message="TensorFlow not installed, cannot scan SavedModel. Install modelaudit[tensorflow].",
+                message="TensorFlow protos unavailable. Vendored protos may be missing or corrupted.",
                 severity=IssueSeverity.WARNING,
                 location=path,
-                details={"path": path, "required_package": "tensorflow"},
+                details={
+                    "path": path,
+                    "required_package": "tensorflow",
+                    "note": "Vendored protos should be bundled; reinstall if missing",
+                },
                 rule_code="S902",
             )
             result.finish(success=False)
@@ -143,7 +146,10 @@ class TensorFlowSavedModelScanner(BaseScanner):
             return result
 
         try:
-            # Import the actual SavedModel from TensorFlow
+            # Import vendored protos module (sets up sys.path for tensorflow.* imports)
+            # Order matters: modelaudit.protos must be imported first to set up sys.path
+            import modelaudit.protos  # noqa: F401, I001
+
             from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
 
             with open(path, "rb") as f:
@@ -305,8 +311,22 @@ class TensorFlowSavedModelScanner(BaseScanner):
 
     def _analyze_saved_model(self, saved_model: Any, result: ScanResult) -> None:
         """Analyze the saved model for suspicious operations"""
+        import re
+
         suspicious_op_found = False
         op_counts: dict[str, int] = {}
+
+        # Regex to detect Lambda-layer node names in the graph.
+        # Matches node names that start with "lambda" (case-insensitive)
+        # followed by "/" or "_<digit>" which is the standard Keras naming
+        # convention for Lambda layers (e.g. "lambda/StatefulPartitionedCall",
+        # "lambda_1/PartitionedCall").  This is intentionally stricter than
+        # the plain substring check that was previously used in
+        # suspicious_func_patterns, which caused false positives on standard
+        # Keras preprocessing layers whose *function* names also contain
+        # "lambda" (e.g. "__inference_lambda_layer_call_fn_123").
+        _lambda_node_re = re.compile(r"^(?:lambda(?:_\d+)?)(?:/|$)", re.IGNORECASE)
+        _reported_lambda_layers: set[str] = set()
 
         for meta_graph in saved_model.meta_graphs:
             graph_def = meta_graph.graph_def
@@ -349,9 +369,15 @@ class TensorFlowSavedModelScanner(BaseScanner):
                     if hasattr(func_attr, "func") and hasattr(func_attr.func, "name"):
                         func_name = func_attr.func.name
 
-                        # Check for suspicious function names
+                        # Check for suspicious function names.
+                        # NOTE: "lambda" is intentionally excluded because
+                        # standard Keras preprocessing layers generate
+                        # StatefulPartitionedCall nodes whose function names
+                        # contain "lambda" as part of normal TF internal
+                        # naming (e.g. "__inference_lambda_layer_call_fn_123").
+                        # Lambda layers are already detected separately via
+                        # _scan_keras_metadata.
                         suspicious_func_patterns = [
-                            "lambda",
                             "eval",
                             "exec",
                             "compile",
@@ -383,6 +409,37 @@ class TensorFlowSavedModelScanner(BaseScanner):
                                     ),
                                 )
                                 break
+
+                # Detect Lambda layers by node name.  This catches Lambda
+                # layers even when scanning a standalone saved_model.pb
+                # file (where _scan_keras_metadata is not invoked).
+                # Only report each distinct layer prefix once to avoid
+                # flooding the results (a single Lambda layer produces
+                # many graph nodes under the same prefix).
+                m = _lambda_node_re.match(node.name)
+                if m:
+                    layer_prefix = m.group(0).rstrip("/")
+                    if layer_prefix not in _reported_lambda_layers:
+                        _reported_lambda_layers.add(layer_prefix)
+                        result.add_check(
+                            name="Lambda Layer Detection",
+                            passed=False,
+                            message="Lambda layer detected in graph",
+                            severity=IssueSeverity.WARNING,
+                            location=f"{self.current_file_path} (node: {node.name})",
+                            details={
+                                "node_name": node.name,
+                                "op_type": node.op,
+                                "layer_prefix": layer_prefix,
+                                "meta_graph": (
+                                    meta_graph.meta_info_def.tags[0] if meta_graph.meta_info_def.tags else "unknown"
+                                ),
+                            },
+                            why=(
+                                "Lambda layers can execute arbitrary Python code during "
+                                "model inference, which poses a security risk."
+                            ),
+                        )
 
         # Add operation counts to metadata
         result.metadata["op_counts"] = op_counts
@@ -716,8 +773,11 @@ class TensorFlowSavedModelScanner(BaseScanner):
             (r"<script[^>]*>", "script_injection", "HTML script tag"),
             (r"javascript:", "script_injection", "JavaScript URI"),
             (r"vbscript:", "script_injection", "VBScript URI"),
-            # Base64 encoded payloads
-            (r"[A-Za-z0-9+/]{20,}={0,2}", "encoded_payload", "potential base64 payload"),
+            # Base64 encoded payloads — require at least one trailing '=' pad
+            # character to avoid matching normal TF node names that use '/'
+            # as a hierarchical separator (e.g. "bidirectional/forward_lstm",
+            # "Adam/embedding/embeddings").
+            (r"[A-Za-z0-9+/]{20,}={1,2}", "encoded_payload", "potential base64 payload"),
         ]
 
         import re

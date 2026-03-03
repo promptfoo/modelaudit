@@ -6,8 +6,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .adaptive_cache_keys import AdaptiveCacheKeyGenerator
 from .scan_results_cache import ScanResultsCache
-from .smart_cache_keys import SmartCacheKeyGenerator
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +29,7 @@ class CacheManager:
         """
         self.enabled = enabled
         self.cache = ScanResultsCache(cache_dir) if enabled else None
-        self.key_generator = SmartCacheKeyGenerator() if enabled else None
+        self.key_generator = AdaptiveCacheKeyGenerator() if enabled else None
 
     def get_cached_result(self, file_path: str) -> dict[str, Any] | None:
         """

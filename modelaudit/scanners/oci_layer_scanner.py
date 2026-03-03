@@ -1,3 +1,5 @@
+"""Scanner for OCI container image layers containing model artifacts."""
+
 import json
 import os
 import tarfile

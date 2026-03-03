@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 
 from modelaudit.utils.file.handlers import (
     AdvancedFileHandler,
-    MemoryMappedScanner,
+    MemoryMappedHandler,
     ShardedModelDetector,
     should_use_advanced_handler,
 )
@@ -82,7 +82,7 @@ class TestShardedModelDetector:
             assert found_config == str(config_path)
 
 
-class TestMemoryMappedScanner:
+class TestMemoryMappedHandler:
     """Test memory-mapped scanning."""
 
     def test_mmap_scanning(self) -> None:
@@ -100,7 +100,7 @@ class TestMemoryMappedScanner:
             mock_scanner = MagicMock()
             mock_scanner.name = "test_scanner"
 
-            mmap_scanner = MemoryMappedScanner(temp_path, mock_scanner)
+            mmap_scanner = MemoryMappedHandler(temp_path, mock_scanner)
             result = mmap_scanner.scan_with_mmap()
 
             # With full scanning, we might not detect patterns in mmap test
@@ -127,7 +127,7 @@ class TestMemoryMappedScanner:
             mock_scanner = MagicMock()
             mock_scanner.name = "test_scanner"
 
-            mmap_scanner = MemoryMappedScanner(temp_path, mock_scanner)
+            mmap_scanner = MemoryMappedHandler(temp_path, mock_scanner)
             result = mmap_scanner.scan_with_mmap()
 
             # With full scanning, mmap test focuses on completion without errors
@@ -140,7 +140,7 @@ class TestMemoryMappedScanner:
 class TestAdvancedFileHandler:
     """Test extreme large file handler."""
 
-    @patch("modelaudit.utils.advanced_file_handler.os.path.getsize")
+    @patch("modelaudit.utils.file.handlers.os.path.getsize")
     def test_extreme_file_detection(self, mock_getsize: Any) -> None:
         """Test detection of extreme large files."""
         # Test file over 200GB threshold
@@ -153,8 +153,8 @@ class TestAdvancedFileHandler:
 
         assert not should_use_advanced_handler("small_model.bin")
 
-    @patch("modelaudit.utils.advanced_file_handler.os.path.getsize")
-    @patch("modelaudit.utils.advanced_file_handler.ShardedModelDetector.detect_shards")
+    @patch("modelaudit.utils.file.handlers.os.path.getsize")
+    @patch("modelaudit.utils.file.handlers.ShardedModelDetector.detect_shards")
     def test_massive_file_handling(self, mock_detect: Any, mock_getsize: Any) -> None:
         """Test handling of massive files (>200GB)."""
         mock_detect.return_value = None  # Not sharded

@@ -1,3 +1,5 @@
+"""Scanner for TensorRT engine files (.engine, .plan, .trt)."""
+
 from __future__ import annotations
 
 import os

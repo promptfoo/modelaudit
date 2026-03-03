@@ -5,7 +5,8 @@ import tempfile
 import zipfile
 from typing import Any, ClassVar
 
-from ..utils import sanitize_archive_path
+from ..utils import is_absolute_archive_path, is_critical_system_path, sanitize_archive_path
+from ..utils.helpers.assets import asset_from_scan_result
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 CRITICAL_SYSTEM_PATHS = [
@@ -202,7 +203,7 @@ class ZipScanner(BaseScanner):
                     )
                     if not target_safe:
                         # Check if it's specifically a critical system path
-                        if os.path.isabs(target) and any(target.startswith(p) for p in CRITICAL_SYSTEM_PATHS):
+                        if is_absolute_archive_path(target) and is_critical_system_path(target, CRITICAL_SYSTEM_PATHS):
                             message = f"Symlink {name} points to critical system path: {target}"
                         else:
                             message = f"Symlink {name} resolves outside extraction directory"
@@ -215,7 +216,7 @@ class ZipScanner(BaseScanner):
                             location=f"{path}:{name}",
                             details={"target": target, "entry": name},
                         )
-                    elif os.path.isabs(target) and any(target.startswith(p) for p in CRITICAL_SYSTEM_PATHS):
+                    elif is_absolute_archive_path(target) and is_critical_system_path(target, CRITICAL_SYSTEM_PATHS):
                         result.add_check(
                             name="Symlink Safety Validation",
                             passed=False,
@@ -327,7 +328,6 @@ class ZipScanner(BaseScanner):
                                         1,
                                     )
                             result.merge(nested_result)
-                            from ..utils.assets import asset_from_scan_result
 
                             asset_entry = asset_from_scan_result(
                                 f"{path}:{name}",
@@ -370,8 +370,6 @@ class ZipScanner(BaseScanner):
                                     issue.details = {"zip_entry": name}
 
                             result.merge(file_result)
-
-                            from ..utils.assets import asset_from_scan_result
 
                             asset_entry = asset_from_scan_result(
                                 f"{path}:{name}",

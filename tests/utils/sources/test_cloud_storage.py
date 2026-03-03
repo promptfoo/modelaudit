@@ -1,4 +1,5 @@
 import asyncio
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -6,6 +7,7 @@ import pytest
 from modelaudit.utils.sources.cloud_storage import (
     analyze_cloud_target,
     download_from_cloud,
+    download_from_cloud_streaming,
     filter_scannable_files,
     get_cloud_object_size,
     is_cloud_url,
@@ -62,6 +64,7 @@ def test_download_from_cloud(mock_fs, tmp_path):
     assert "model.pt" in call_args[1]
 
     # Result should be a path containing the filename
+    assert isinstance(result, Path)
     assert result.name == "model.pt"
     assert result.exists() or True  # Mock doesn't create actual files
 
@@ -92,7 +95,26 @@ def test_download_from_cloud_async_context(mock_fs, mock_analyze, tmp_path):
 
     # With context managers, fs.get is called but then fs is closed
     # Just verify the result is correct since the mock behavior changes with context managers
+    assert isinstance(result, Path)
     assert result.name == "model.pt"
+
+
+@patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+@patch("modelaudit.utils.file.streaming.get_streaming_preview")
+def test_download_from_cloud_streaming_returns_stream_url(mock_preview, mock_analyze, tmp_path):
+    url = "s3://bucket/model.pt"
+    mock_preview.return_value = None
+    mock_analyze.return_value = {
+        "type": "file",
+        "size": 1024,
+        "name": "model.pt",
+        "human_size": "1.0 KB",
+        "estimated_time": "1 second",
+    }
+
+    result = download_from_cloud(url, cache_dir=tmp_path, use_cache=False, stream_analyze=True)
+
+    assert result == f"stream://{url}"
 
 
 @patch("builtins.__import__")
@@ -134,7 +156,7 @@ def test_download_from_cloud_analysis_failure(mock_analyze, mock_fs):
 class TestCloudObjectSize:
     """Test cloud object size retrieval."""
 
-    def test_get_cloud_object_size_single_file(self):
+    def test_get_cloud_object_size_single_file(self) -> None:
         """Test getting size of a single file."""
         fs = MagicMock()
         fs.info.return_value = {"size": 1024 * 1024}  # 1 MB
@@ -142,7 +164,7 @@ class TestCloudObjectSize:
         size = get_cloud_object_size(fs, "s3://bucket/file.bin")
         assert size == 1024 * 1024
 
-    def test_get_cloud_object_size_directory(self):
+    def test_get_cloud_object_size_directory(self) -> None:
         """Test getting total size of a directory."""
         fs = MagicMock()
         fs.info.return_value = {}  # No size means it's a directory
@@ -163,13 +185,31 @@ class TestCloudObjectSize:
         size = get_cloud_object_size(fs, "s3://bucket/dir/")
         assert size == (1024 + 2048 + 512) * 1024  # 3.5 MB
 
-    def test_get_cloud_object_size_error(self):
+    def test_get_cloud_object_size_error(self) -> None:
         """Test size retrieval returns None on error."""
         fs = MagicMock()
         fs.info.side_effect = Exception("Access denied")
 
         size = get_cloud_object_size(fs, "s3://bucket/file.bin")
         assert size is None
+
+    def test_get_cloud_object_size_invalid_top_level_size_non_strict(self) -> None:
+        """Test invalid top-level size values are ignored in non-strict mode."""
+        fs = MagicMock()
+        fs.info.return_value = {"size": None}
+
+        size = get_cloud_object_size(fs, "s3://bucket/file.bin")
+        assert size is None
+
+    def test_get_cloud_object_size_invalid_top_level_size_strict(self) -> None:
+        """Test invalid top-level size values raise ValueError in strict mode."""
+        fs = MagicMock()
+        fs.info.return_value = {"size": None}
+        fs.walk.side_effect = RuntimeError("walk unavailable")
+        fs.ls.side_effect = RuntimeError("ls unavailable")
+
+        with pytest.raises(ValueError, match="invalid size from info\\(\\)"):
+            get_cloud_object_size(fs, "s3://bucket/file.bin", strict=True)
 
 
 class TestDiskSpaceCheckingForCloud:
@@ -253,8 +293,118 @@ class TestDiskSpaceCheckingForCloud:
 
         # Verify download proceeded - with context managers, fs.get is called but then fs is closed
         # Just verify the result is correct since the mock behavior changes with context managers
+        assert isinstance(result, Path)
         assert result.name == "model.bin"
         assert str(tmp_path) in str(result)  # Should be within the cache dir
+
+
+class TestCloudPathSecurity:
+    """Test path-safety behavior for cloud downloads."""
+
+    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+    @patch("fsspec.filesystem")
+    def test_download_rejects_path_traversal(
+        self,
+        mock_fs_class: MagicMock,
+        mock_analyze: AsyncMock,
+        tmp_path: Path,
+    ) -> None:
+        fs = make_fs_mock()
+        fs.info.return_value = {}
+        mock_fs_class.return_value = fs
+
+        mock_analyze.return_value = {
+            "type": "directory",
+            "file_count": 1,
+            "total_size": 1024,
+            "human_size": "1.0 KB",
+            "estimated_time": "instant",
+            "files": [
+                {
+                    "path": "s3://bucket/models/../secrets/evil.pkl",
+                    "name": "evil.pkl",
+                    "size": 1024,
+                    "human_size": "1.0 KB",
+                }
+            ],
+        }
+
+        with pytest.raises(ValueError, match="Path traversal attempt detected"):
+            download_from_cloud(
+                "s3://bucket/models",
+                cache_dir=tmp_path,
+                use_cache=False,
+                selective=False,
+                show_progress=False,
+            )
+
+        fs.get.assert_not_called()
+
+    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+    @patch("fsspec.filesystem")
+    def test_download_continues_when_size_cannot_be_determined(
+        self,
+        mock_fs_class: MagicMock,
+        mock_analyze: AsyncMock,
+    ) -> None:
+        fs = make_fs_mock()
+        fs.info.side_effect = RuntimeError("permission denied")
+        mock_fs_class.return_value = fs
+
+        mock_analyze.return_value = {
+            "type": "file",
+            "size": 0,
+            "name": "model.bin",
+            "human_size": "0 B",
+            "estimated_time": "instant",
+        }
+
+        result = download_from_cloud(
+            "s3://bucket/model.bin",
+            use_cache=False,
+            show_progress=False,
+        )
+
+        assert isinstance(result, Path)
+        assert result.name == "model.bin"
+        fs.get.assert_called_once()
+
+    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+    @patch("fsspec.filesystem")
+    def test_streaming_download_rejects_path_traversal(
+        self,
+        mock_fs_class: MagicMock,
+        mock_analyze: AsyncMock,
+    ) -> None:
+        fs = make_fs_mock()
+        mock_fs_class.return_value = fs
+
+        mock_analyze.return_value = {
+            "type": "directory",
+            "file_count": 1,
+            "total_size": 1024,
+            "human_size": "1.0 KB",
+            "estimated_time": "instant",
+            "files": [
+                {
+                    "path": "s3://bucket/models/../secrets/evil.pkl",
+                    "name": "evil.pkl",
+                    "size": 1024,
+                    "human_size": "1.0 KB",
+                }
+            ],
+        }
+
+        with pytest.raises(ValueError, match="Path traversal attempt detected"):
+            list(
+                download_from_cloud_streaming(
+                    "s3://bucket/models",
+                    show_progress=False,
+                    selective=False,
+                )
+            )
+
+        fs.get.assert_not_called()
 
 
 def test_filter_scannable_files_recognizes_pdiparams():

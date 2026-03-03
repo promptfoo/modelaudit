@@ -181,9 +181,9 @@ def function():
         assert len(components) == 1
 
         component = components[0]
-        # May or may not have licenses field, but should not error
-        # Should handle gracefully even if no licenses
-        assert "licenses" in component or "licenses" not in component  # Either is valid
+        # Component should have expected SBOM fields regardless of license presence
+        assert "name" in component
+        assert "type" in component
 
     def test_sbom_with_license_files_detected(self, tmp_path):
         """Test SBOM when license files are detected in directory."""

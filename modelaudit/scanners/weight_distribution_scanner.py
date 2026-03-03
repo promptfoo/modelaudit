@@ -1,4 +1,8 @@
+"""Scanner for detecting anomalous weight distributions in model files."""
+
+import inspect
 import os
+import re
 import zipfile
 from typing import Any, ClassVar
 
@@ -37,20 +41,23 @@ class WeightDistributionScanner(BaseScanner):
         self.enable_llm_checks = self.config.get("enable_llm_checks", False)
         # Use max_array_size for in-memory array size limits (default 100MB)
         self.max_array_size = self.config.get("max_array_size", 100 * 1024 * 1024)
+        # Direct torch.load on untrusted files can trigger pickle RCE. Keep opt-in.
+        self.enable_unsafe_torch_load = self.config.get("enable_unsafe_torch_load", False)
         # Flag set when weight extraction would be unsafe
         self.extraction_unsafe = False
+        self.extraction_unsafe_reason: str | None = None
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
         """Check if this scanner can handle the given path"""
         if os.path.isdir(path):
+            # Directory-based SavedModel weight extraction requires full TensorFlow
+            # for checkpoint reading (tf.train.list_variables / tf.train.load_variable)
             try:
-                import tensorflow as tf
-
-                has_tensorflow = True
+                import tensorflow  # noqa: F401
             except ImportError:
-                has_tensorflow = False
-            return has_tensorflow and os.path.exists(os.path.join(path, "saved_model.pb"))
+                return False
+            return os.path.exists(os.path.join(path, "saved_model.pb"))
 
         if not os.path.isfile(path):
             return False
@@ -78,7 +85,14 @@ class WeightDistributionScanner(BaseScanner):
                 return False
         if ext == ".pb":
             try:
-                import tensorflow as tf  # noqa: F401
+                from modelaudit.utils.tensorflow_compat import get_protobuf_classes
+
+                get_protobuf_classes()
+            except ImportError:
+                return False
+        if ext == ".onnx":
+            try:
+                import onnx  # noqa: F401
             except ImportError:
                 return False
         return True
@@ -98,6 +112,7 @@ class WeightDistributionScanner(BaseScanner):
         result.metadata["file_size"] = file_size
         # Reset flag before extraction
         self.extraction_unsafe = False
+        self.extraction_unsafe_reason = None
 
         try:
             # Extract weights based on file format
@@ -133,7 +148,7 @@ class WeightDistributionScanner(BaseScanner):
                 message = "Failed to extract weights from model"
                 severity = IssueSeverity.DEBUG
                 if self.extraction_unsafe:
-                    message = "Unsafe to extract weights from data.pkl in PyTorch archive"
+                    message = self.extraction_unsafe_reason or "Unsafe to extract weights from model"
                     severity = IssueSeverity.WARNING
                 result.add_check(
                     name="Weight Extraction",
@@ -193,12 +208,48 @@ class WeightDistributionScanner(BaseScanner):
 
         # Reset safety flag for each extraction
         self.extraction_unsafe = False
+        self.extraction_unsafe_reason = None
 
         weights_info: dict[str, Any] = {}
 
         try:
+            # SECURITY: avoid unsafe torch.load on untrusted files unless explicitly allowed.
+            # Use weights_only=True on patched versions, and block unsafe fallbacks by default.
+            load_kwargs: dict[str, Any] = {"map_location": torch.device("cpu")}
+            torch_version = getattr(torch, "__version__", "unknown")
+            supports_weights_only = False
+            try:
+                load_sig = inspect.signature(torch.load)
+                supports_weights_only = "weights_only" in load_sig.parameters
+            except (TypeError, ValueError):  # pragma: no cover - defensive
+                supports_weights_only = False
+
+            if supports_weights_only:
+                load_kwargs["weights_only"] = True
+                version_match = re.match(r"^(\d+)\.(\d+)", str(torch_version))
+                is_patched_version = False
+                if version_match:
+                    major = int(version_match.group(1))
+                    minor = int(version_match.group(2))
+                    is_patched_version = (major, minor) >= (2, 6)
+
+                if not is_patched_version and not self.enable_unsafe_torch_load:
+                    self.extraction_unsafe = True
+                    self.extraction_unsafe_reason = (
+                        "Blocked torch.load: weights_only=True on PyTorch versions below 2.6 "
+                        "is vulnerable to RCE. Set enable_unsafe_torch_load=true to override."
+                    )
+                    raise RuntimeError(self.extraction_unsafe_reason)
+            elif not self.enable_unsafe_torch_load:
+                self.extraction_unsafe = True
+                self.extraction_unsafe_reason = (
+                    "Blocked torch.load: this PyTorch version does not support weights_only=True. "
+                    "Set enable_unsafe_torch_load=true to override."
+                )
+                raise RuntimeError(self.extraction_unsafe_reason)
+
             # Load model with map_location to CPU to avoid GPU requirements
-            model_data = torch.load(path, map_location=torch.device("cpu"))
+            model_data = torch.load(path, **load_kwargs)
 
             # Handle different PyTorch save formats
             if isinstance(model_data, dict):
@@ -269,6 +320,10 @@ class WeightDistributionScanner(BaseScanner):
 
                         if unsafe:
                             self.extraction_unsafe = True
+                            if self.extraction_unsafe_reason is None:
+                                self.extraction_unsafe_reason = (
+                                    "Unsafe to extract weights from data.pkl in PyTorch archive"
+                                )
                         else:
                             try:
 
@@ -286,13 +341,25 @@ class WeightDistributionScanner(BaseScanner):
                                             weights_info[key] = array
                                 else:
                                     self.extraction_unsafe = True
+                                    if self.extraction_unsafe_reason is None:
+                                        self.extraction_unsafe_reason = (
+                                            "Restricted unpickler could not parse PyTorch archive safely"
+                                        )
                             except Exception as e2:  # pragma: no cover - defensive
                                 logger.debug(
                                     f"Failed restricted unpickle for {path}: {e2}",
                                 )
                                 self.extraction_unsafe = True
+                                if self.extraction_unsafe_reason is None:
+                                    self.extraction_unsafe_reason = (
+                                        "Restricted unpickler failed while extracting PyTorch archive"
+                                    )
             except Exception as e2:  # pragma: no cover - defensive
                 logger.debug(f"Failed to extract weights from {path}: {e2}")
+
+        if weights_info:
+            self.extraction_unsafe = False
+            self.extraction_unsafe_reason = None
 
         return weights_info
 
@@ -321,17 +388,24 @@ class WeightDistributionScanner(BaseScanner):
         return weights_info
 
     def _extract_tensorflow_weights(self, path: str) -> dict[str, Any]:
-        """Extract weights from TensorFlow SavedModel files"""
-        try:
-            import numpy as np
-            import tensorflow as tf
-        except ImportError:
-            return {}
+        """Extract weights from TensorFlow SavedModel files.
+
+        Uses vendored protobuf stubs when available, falling back to full TensorFlow.
+        Checkpoint reading (for SavedModel directories) requires full TensorFlow.
+        """
+        import numpy as np
 
         weights_info: dict[str, Any] = {}
 
         try:
             if os.path.isdir(path):
+                # Checkpoint reading requires full TensorFlow - no lightweight alternative
+                try:
+                    import tensorflow as tf
+                except ImportError:
+                    logger.debug(f"Checkpoint reading requires TensorFlow: {path}")
+                    return {}
+
                 ckpt_prefix = os.path.join(path, "variables", "variables")
                 if os.path.exists(ckpt_prefix + ".index"):
                     for name, _shape in tf.train.list_variables(ckpt_prefix):
@@ -345,9 +419,17 @@ class WeightDistributionScanner(BaseScanner):
                         if len(array.shape) >= 2:
                             weights_info[name] = array
             else:
+                # For .pb files, use vendored protos
                 data = self._read_file_safely(path)
+
+                # Import vendored protos module (sets up sys.path for tensorflow.* imports)
+                # Order matters: modelaudit.protos must be imported first to set up sys.path
+                import modelaudit.protos  # noqa: F401, I001
+
                 from tensorflow.core.framework import graph_pb2
                 from tensorflow.core.protobuf import saved_model_pb2
+
+                from modelaudit.utils.tensorflow_compat import tensor_proto_to_ndarray
 
                 nodes: list[Any] = []
                 saved_model = saved_model_pb2.SavedModel()
@@ -367,18 +449,23 @@ class WeightDistributionScanner(BaseScanner):
                 for node in nodes:
                     if node.op == "Const" and "value" in node.attr:
                         tensor_proto = node.attr["value"].tensor
-                        array = tf.make_ndarray(tensor_proto)
+                        array = tensor_proto_to_ndarray(tensor_proto)
                         if self.max_array_size and self.max_array_size > 0 and array.nbytes > self.max_array_size:
                             continue
                         if ("weight" in node.name.lower() or "kernel" in node.name.lower()) and len(array.shape) >= 2:
                             weights_info[node.name] = array
         except Exception as e:
-            logger.debug(f"Failed to extract weights from {path}: {e}")
+            logger.warning(f"Weight analysis incomplete for {path}: {e}")
 
         return weights_info
 
     def _extract_onnx_weights(self, path: str) -> dict[str, Any]:
-        """Extract weights from ONNX model files"""
+        """Extract weights from ONNX model files.
+
+        Uses load_external_data=False to avoid failures when external data files
+        are missing (common with HuggingFace downloads or standalone .onnx files).
+        External-data tensors are skipped since their data is not available inline.
+        """
         try:
             import onnx
         except ImportError:
@@ -387,17 +474,39 @@ class WeightDistributionScanner(BaseScanner):
         weights_info: dict[str, Any] = {}
 
         try:
-            model = onnx.load(path)  # type: ignore[possibly-unresolved-reference]
+            # Use load_external_data=False to prevent ValidationError when
+            # external data files (e.g. weights.pb) are missing. This is the
+            # common case for models downloaded from HuggingFace or distributed
+            # as standalone .onnx files without their companion data files.
+            model = onnx.load(path, load_external_data=False)  # type: ignore[possibly-unresolved-reference]
 
-            # Extract initializers (weights)
+            # Extract 2D+ initializers — these are weight matrices (conv kernels,
+            # linear layers, embeddings). 1D tensors (biases, batch-norm params)
+            # aren't relevant for weight distribution analysis. This approach is
+            # framework-agnostic since ONNX naming conventions vary by exporter.
+            import numpy as np
+
             for initializer in model.graph.initializer:
-                if "weight" in initializer.name.lower():
-                    weights_info[initializer.name] = onnx.numpy_helper.to_array(  # type: ignore[possibly-unresolved-reference]
-                        initializer,
-                    )
+                if len(initializer.dims) >= 2:
+                    # Pre-check estimated byte size before materializing the
+                    # full array — avoids memory exhaustion on huge tensors.
+                    try:
+                        _onnx_mapping = getattr(onnx, "mapping", None)
+                        if _onnx_mapping is not None and hasattr(_onnx_mapping, "TENSOR_TYPE_TO_NP_TYPE"):
+                            tensor_dtype = _onnx_mapping.TENSOR_TYPE_TO_NP_TYPE[initializer.data_type]
+                            estimated_size = int(np.prod(initializer.dims)) * np.dtype(tensor_dtype).itemsize
+                            if self.max_array_size and self.max_array_size > 0 and estimated_size > self.max_array_size:
+                                continue
+                    except Exception:
+                        pass  # Fall through and let to_array handle it
+
+                    arr = onnx.numpy_helper.to_array(initializer)  # type: ignore[possibly-unresolved-reference]
+                    if self.max_array_size and self.max_array_size > 0 and arr.nbytes > self.max_array_size:
+                        continue
+                    weights_info[initializer.name] = arr
 
         except Exception as e:
-            logger.debug(f"Failed to extract weights from {path}: {e}")
+            logger.warning(f"Failed to extract ONNX weights from {path}: {e}")
 
         return weights_info
 

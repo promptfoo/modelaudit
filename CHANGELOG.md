@@ -7,6 +7,126 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **security:** detect CVE-2026-24747 PyTorch weights_only=True bypass via SETITEM/SETITEMS abuse and tensor metadata mismatch detection
+- **security:** detect CVE-2022-45907 PyTorch torch.jit.annotations.parse_type_line unsafe eval() injection (CVSS 9.8)
+- **security:** detect CVE-2024-5480 PyTorch torch.distributed.rpc arbitrary function execution via PythonUDF (CVSS 10.0)
+- **security:** detect CVE-2024-48063 PyTorch torch.distributed.rpc.RemoteModule deserialization RCE via pickle (CVSS 9.8)
+- **security:** detect CVE-2019-6446 in NumPy scanner when object-dtype arrays are found, with warning-level attribution (CVSS 9.8) due potential pickle deserialization via `allow_pickle=True`
+- **security:** new NeMo scanner detecting CVE-2025-23304 Hydra `_target_` injection in `.nemo` model files (CVSS 7.6), with recursive config inspection and dangerous callable blocklist
+- **security:** detect CVE-2025-51480 ONNX `save_external_data` arbitrary file overwrite via external_data path traversal (CVSS 8.8)
+
+### Fixed
+
+- **security**: harden pickle scanner stack resolution to correctly track `STACK_GLOBAL` and memoized `REDUCE` call targets, preventing decoy-string and `BINGET` bypasses
+- **security**: tighten manifest trusted-domain matching to validate URL hostnames instead of substring matches
+- **security**: make `.keras` suspicious file extension checks case-insensitive to catch uppercase executable/script payloads
+- **security**: block unsafe in-process `torch.load` in `WeightDistributionScanner` by default unless explicitly opted in
+- **fix**: tighten metadata scanner suspicious URL matching to use exact hostname/subdomain checks and add focused regression coverage
+- **fix**: treat `.nemo` files as tar-compatible during file-type validation to avoid false extension/magic mismatch alerts
+
+## [0.2.26](https://github.com/promptfoo/modelaudit/compare/v0.2.25...v0.2.26) (2026-02-24)
+
+### Bug Fixes
+
+- **ci:** pin protoc version for vendored proto reproducibility ([#548](https://github.com/promptfoo/modelaudit/issues/548)) ([03e9d35](https://github.com/promptfoo/modelaudit/commit/03e9d356dd87edbeff37658a81595abe07345b54))
+- **cli:** add --cache-dir and simplify defaults wording ([#550](https://github.com/promptfoo/modelaudit/issues/550)) ([b8701dd](https://github.com/promptfoo/modelaudit/commit/b8701dda1fb9cd71385ff6bdbb1accae531b5ea3))
+- **cli:** fail fast when glob patterns match nothing ([#519](https://github.com/promptfoo/modelaudit/issues/519)) ([404104b](https://github.com/promptfoo/modelaudit/commit/404104b8120e4e4cbcfdb8b456532221da6b3698))
+- **deps:** update dependency xgboost to &gt;=3.2,&lt;3.3 ([#507](https://github.com/promptfoo/modelaudit/issues/507)) ([4489e97](https://github.com/promptfoo/modelaudit/commit/4489e97aa1eb1d4d9b2a56d925648d2f2f9403a4))
+- enforce consistent scanner patterns across all scanners ([#564](https://github.com/promptfoo/modelaudit/issues/564)) ([dd6b8d2](https://github.com/promptfoo/modelaudit/commit/dd6b8d22b35ae85c5e6f3862ed026a47a4444d4b))
+- improve test suite reliability and safety ([#565](https://github.com/promptfoo/modelaudit/issues/565)) ([4bd04a7](https://github.com/promptfoo/modelaudit/commit/4bd04a792a6fd6104b9aec3172bbf934699872e0))
+- remove security anti-patterns from scanning infrastructure ([#562](https://github.com/promptfoo/modelaudit/issues/562)) ([d02cd0b](https://github.com/promptfoo/modelaudit/commit/d02cd0b345e68fb003a4d812058489a7657dc50f))
+- **security:** close critical scanner and CI gating gaps ([#553](https://github.com/promptfoo/modelaudit/issues/553)) ([807a8aa](https://github.com/promptfoo/modelaudit/commit/807a8aa05a69761fc2fcce9267f68ded5e3f6efc))
+- **security:** resolve CodeQL alerts for workflow permissions and sensitive logging ([#570](https://github.com/promptfoo/modelaudit/issues/570)) ([d2dfc79](https://github.com/promptfoo/modelaudit/commit/d2dfc799fe6267d65fb7646eca68d175449d8802))
+- **security:** resolve remaining audit findings ([#4](https://github.com/promptfoo/modelaudit/issues/4)-[#8](https://github.com/promptfoo/modelaudit/issues/8)) ([#556](https://github.com/promptfoo/modelaudit/issues/556)) ([7430436](https://github.com/promptfoo/modelaudit/commit/74304368946e6bc9ea170a23630388e92f8014b0))
+- **security:** use URL hostname parsing instead of substring matching ([#571](https://github.com/promptfoo/modelaudit/issues/571)) ([b4d3696](https://github.com/promptfoo/modelaudit/commit/b4d3696894c0bc3affe56ee77130056ee31c7926))
+- **test:** relax benchmark timing assertions for Windows CI ([#569](https://github.com/promptfoo/modelaudit/issues/569)) ([b06faac](https://github.com/promptfoo/modelaudit/commit/b06faac20c75a8df5d208eb9cb0ed834cb8e22f3))
+
+### Documentation
+
+- clarify README exit codes ([#568](https://github.com/promptfoo/modelaudit/issues/568)) ([e57a0de](https://github.com/promptfoo/modelaudit/commit/e57a0dec6778fa8aab747bf8ef51c5043d9f6c2e))
+- fix accuracy issues across AGENTS.md, README, and CONTRIBUTING ([#566](https://github.com/promptfoo/modelaudit/issues/566)) ([880e7a4](https://github.com/promptfoo/modelaudit/commit/880e7a4455ba7c40e581cc144b25d2bd0a8522dd))
+- **open-source:** add user trust docs batch ([#534](https://github.com/promptfoo/modelaudit/issues/534)) ([dd5e676](https://github.com/promptfoo/modelaudit/commit/dd5e676eac59533212bcea8b5ab9d484eacfd4b8))
+- **readme:** add cache management flag ([#521](https://github.com/promptfoo/modelaudit/issues/521)) ([33d74bd](https://github.com/promptfoo/modelaudit/commit/33d74bd9135f667ef3dd002889bae14031e4dd79))
+- ship next-phase open-source readiness docs ([#532](https://github.com/promptfoo/modelaudit/issues/532)) ([c88035d](https://github.com/promptfoo/modelaudit/commit/c88035d705dda3b9d2cba8f9f03a1b70b4ed41f7))
+- trim README to essentials, fix inaccuracies ([#517](https://github.com/promptfoo/modelaudit/issues/517)) ([59c056c](https://github.com/promptfoo/modelaudit/commit/59c056c5a0414b7700d0c3afc3bcc79f3679edcd))
+
+## [0.2.25] - 2026-02-12
+
+### Features
+
+- add binary patterns for native code loading ([#499](https://github.com/promptfoo/modelaudit/issues/499)) ([ef638f1](https://github.com/promptfoo/modelaudit/commit/ef638f1470b78f1f34ce7866c4a217f8093092f3))
+- add comprehensive Windows compatibility support ([#474](https://github.com/promptfoo/modelaudit/issues/474)) ([d62574e](https://github.com/promptfoo/modelaudit/commit/d62574e264eb3511a2a48d8b6614ea9152aa2efa))
+- add detection for dangerous TensorFlow operations ([#494](https://github.com/promptfoo/modelaudit/issues/494)) ([6c4c0c9](https://github.com/promptfoo/modelaudit/commit/6c4c0c90441706061e6c0e66f00da3c481962bb2))
+- add detection for memo-based and extension registry pickle opcodes ([#493](https://github.com/promptfoo/modelaudit/issues/493)) ([72509f7](https://github.com/promptfoo/modelaudit/commit/72509f727e3105f0706ad80611a7e110096e1d62))
+- add getattr-based evasion detection patterns ([#500](https://github.com/promptfoo/modelaudit/issues/500)) ([87ba295](https://github.com/promptfoo/modelaudit/commit/87ba2955c96e67b3110578f5e567ef76e7644690))
+- add Git LFS pointer detection ([#488](https://github.com/promptfoo/modelaudit/issues/488)) ([6413ae3](https://github.com/promptfoo/modelaudit/commit/6413ae3a07ec2b2849db954d794038cffdf67e10))
+- add Keras subclassed model detection ([#503](https://github.com/promptfoo/modelaudit/issues/503)) ([d9e5663](https://github.com/promptfoo/modelaudit/commit/d9e566346c46355f5b6bda413a0cb98af051dafb))
+- add lambda variadic argument validation ([#501](https://github.com/promptfoo/modelaudit/issues/501)) ([52a6622](https://github.com/promptfoo/modelaudit/commit/52a6622961c7d63221bc44a74e569ba5a511a2af))
+- add PyTorch ZIP archive security controls ([#502](https://github.com/promptfoo/modelaudit/issues/502)) ([09ab087](https://github.com/promptfoo/modelaudit/commit/09ab0871b7625899447a8b05b991ce9a77b9cc09))
+- eliminate TensorFlow dependency with vendored protobuf stubs ([#485](https://github.com/promptfoo/modelaudit/issues/485)) ([56cec5e](https://github.com/promptfoo/modelaudit/commit/56cec5e1727aae973164ad6f8f0ef85004a0ba25))
+- expand SUSPICIOUS_GLOBALS with process and memory modules ([#495](https://github.com/promptfoo/modelaudit/issues/495)) ([8637d2b](https://github.com/promptfoo/modelaudit/commit/8637d2beb00020a19b285a9c7d043fa88e9213b6))
+
+### Bug Fixes
+
+- add content-based CVE detection to SkopsScanner ([#498](https://github.com/promptfoo/modelaudit/issues/498)) ([89895cb](https://github.com/promptfoo/modelaudit/commit/89895cb611f95c6c3119cdd8adf513e1b0c5a818))
+- add logging to critical exception handlers in pickle scanner ([#492](https://github.com/promptfoo/modelaudit/issues/492)) ([b6b06cb](https://github.com/promptfoo/modelaudit/commit/b6b06cb2b0f6adccfa15e43948e78efad005abb6))
+- add logging to silent exception handlers in secrets detector ([#491](https://github.com/promptfoo/modelaudit/issues/491)) ([b59f8a4](https://github.com/promptfoo/modelaudit/commit/b59f8a4924e2285c72b3f40e2ff6bec5f5815727))
+- add security keywords to QueueEnqueueV2 TF op explanation ([#511](https://github.com/promptfoo/modelaudit/issues/511)) ([1d93483](https://github.com/promptfoo/modelaudit/commit/1d93483b79c76a9fbbbd8bc7aa2239c8aca28ec2))
+- **ci:** ensure numpy compatibility job runs ([#478](https://github.com/promptfoo/modelaudit/issues/478)) ([7266160](https://github.com/promptfoo/modelaudit/commit/72661605482c2883a9f7ae28c32416677d0fcd17))
+- **deps:** bump pillow 12.1.0→12.1.1 and cryptography 46.0.4→46.0.5 ([#513](https://github.com/promptfoo/modelaudit/issues/513)) ([5b18d49](https://github.com/promptfoo/modelaudit/commit/5b18d49cd16bd611bb89b41b341475175bca6922))
+- **deps:** update dependency fickling to v0.1.7 [security] ([#479](https://github.com/promptfoo/modelaudit/issues/479)) ([292eb23](https://github.com/promptfoo/modelaudit/commit/292eb234c5c3379706e51372973078b59b2516f9))
+- improve Python version requirement UX ([#508](https://github.com/promptfoo/modelaudit/issues/508)) ([a44d8bb](https://github.com/promptfoo/modelaudit/commit/a44d8bb67f27f4e8b04d55c04fd28f9d257bfec8))
+- reduce false positive scan warnings for HuggingFace models ([#514](https://github.com/promptfoo/modelaudit/issues/514)) ([b545c11](https://github.com/promptfoo/modelaudit/commit/b545c1102c538b7b907af6e4c949afd9b301c0a5))
+- reduce pickle scanner false positives for BERT and standalone REDUCE opcodes ([#510](https://github.com/promptfoo/modelaudit/issues/510)) ([94c22d6](https://github.com/promptfoo/modelaudit/commit/94c22d6d5237e18aaa47f53cde93b4a1ff9e4b08))
+- remove duplicate whitelist downgrading in add_check() ([#490](https://github.com/promptfoo/modelaudit/issues/490)) ([a8c52bc](https://github.com/promptfoo/modelaudit/commit/a8c52bcb85e160e1d80414aa4767ccebe1794707))
+- remove variable shadowing for skip_file_types parameter ([#489](https://github.com/promptfoo/modelaudit/issues/489)) ([bcf99ea](https://github.com/promptfoo/modelaudit/commit/bcf99ea7d0e62b358c130754c38e7f5be3282e18))
+- use deterministic data patterns in anomaly detector tests ([#477](https://github.com/promptfoo/modelaudit/issues/477)) ([df11759](https://github.com/promptfoo/modelaudit/commit/df11759ee22628aed6ed541f819fd5f26920a38b))
+
+## [0.2.24] - 2025-12-23
+
+### Bug Fixes
+
+- **deps:** update dependency contourpy to &lt;1.3.4 ([#463](https://github.com/promptfoo/modelaudit/issues/463)) ([16fb916](https://github.com/promptfoo/modelaudit/commit/16fb916a88020a7d96455edcbd8bddc0a4c4a58b))
+- **deps:** update dependency fickling to v0.1.6 [security] ([#462](https://github.com/promptfoo/modelaudit/issues/462)) ([9413ddc](https://github.com/promptfoo/modelaudit/commit/9413ddc95cb00fd068fd6ee39a3386a4f4db8016))
+- **deps:** update dependency xgboost to v3 ([#469](https://github.com/promptfoo/modelaudit/issues/469)) ([97adbbc](https://github.com/promptfoo/modelaudit/commit/97adbbc0cfe3699264ade222b9949a98f5e6878d))
+- resolve release-please CHANGELOG formatting race condition ([#457](https://github.com/promptfoo/modelaudit/issues/457)) ([4347b83](https://github.com/promptfoo/modelaudit/commit/4347b83e652fde580437964f22feffdbed7b8731))
+
+## [0.2.23] - 2025-12-12
+
+### Documentation
+
+- consolidate agent guidance ([#453](https://github.com/promptfoo/modelaudit/issues/453)) ([a01ceff](https://github.com/promptfoo/modelaudit/commit/a01ceff5daa66750994008e1a9414ce3227115d6))
+- restructure AGENTS.md and CLAUDE.md following 2025 best practices ([#451](https://github.com/promptfoo/modelaudit/issues/451)) ([e87de51](https://github.com/promptfoo/modelaudit/commit/e87de5153c574b9053b507d44f59d5fe85b7204d))
+
+## [0.2.22] - 2025-12-10
+
+### Added
+
+- **feat**: add `modelaudit debug` command for troubleshooting - outputs comprehensive diagnostic information including version, platform, environment variables, authentication status, scanner availability, NumPy compatibility, cache status, and configuration in JSON or pretty-printed format; useful for bug reports and support interactions
+
+## [0.2.21] - 2025-12-09
+
+### Fixed
+
+- **fix**: resolve UnicodeDecodeError when scanning PyTorch .pkl files saved with default ZIP serialization - torch.save() uses ZIP format by default since PyTorch 1.6 (`_use_new_zipfile_serialization=True`), but ModelAudit was incorrectly routing these files to PickleScanner which failed to parse the ZIP header. Now correctly routes ZIP-format .pkl files to PyTorchZipScanner.
+
+## [0.2.20] - 2025-12-01
+
+### Added
+
+- **feat**: detect cloud storage URLs in model configs (AWS S3, GCS, Azure Blob, HuggingFace Hub) - identifies external resource references that could indicate supply chain risks or data exfiltration vectors
+- **feat**: add URL allowlist security scanning to manifest scanner - uses 164 trusted domains to flag untrusted URLs in model configs as potential supply chain risks
+- **feat**: detect weak hash algorithms (MD5, SHA1) in model config files - scans manifest files for hash/checksum fields using cryptographically broken algorithms and reports WARNING with CWE-328 reference; SHA256/SHA512 usage is confirmed as strong
+- **feat**: add comprehensive analytics system with Promptfoo integration - opt-out telemetry for usage insights, respects `PROMPTFOO_DISABLE_TELEMETRY` and `NO_ANALYTICS` environment variables
+- **feat**: auto-enable progress display when output goes to file - shows spinner/progress when stdout is redirected to a file
+
+### Fixed
+
+- **fix**: resolve false positives in pickle and TFLite scanners - improved detection accuracy
+- **fix**: clean up tests for CI reliability - removed flaky tests and improved test isolation
+
 ## [0.2.19] - 2025-11-24
 
 ### Fixed
@@ -568,7 +688,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **style**: improve code formatting and documentation standards (#12, #23)
 - **fix**: improve core scanner functionality and comprehensive test coverage (#11)
 
-[unreleased]: https://github.com/promptfoo/modelaudit/compare/v0.2.14...HEAD
+[unreleased]: https://github.com/promptfoo/modelaudit/compare/v0.2.25...HEAD
+[0.2.25]: https://github.com/promptfoo/modelaudit/compare/v0.2.24...v0.2.25
+[0.2.24]: https://github.com/promptfoo/modelaudit/compare/v0.2.23...v0.2.24
+[0.2.23]: https://github.com/promptfoo/modelaudit/compare/v0.2.22...v0.2.23
+[0.2.22]: https://github.com/promptfoo/modelaudit/compare/v0.2.21...v0.2.22
+[0.2.21]: https://github.com/promptfoo/modelaudit/compare/v0.2.20...v0.2.21
+[0.2.20]: https://github.com/promptfoo/modelaudit/compare/v0.2.19...v0.2.20
+[0.2.19]: https://github.com/promptfoo/modelaudit/compare/v0.2.18...v0.2.19
+[0.2.18]: https://github.com/promptfoo/modelaudit/compare/v0.2.17...v0.2.18
+[0.2.17]: https://github.com/promptfoo/modelaudit/compare/v0.2.16...v0.2.17
+[0.2.16]: https://github.com/promptfoo/modelaudit/compare/v0.2.15...v0.2.16
+[0.2.15]: https://github.com/promptfoo/modelaudit/compare/v0.2.14...v0.2.15
 [0.2.14]: https://github.com/promptfoo/modelaudit/compare/v0.2.13...v0.2.14
 [0.2.13]: https://github.com/promptfoo/modelaudit/compare/v0.2.12...v0.2.13
 [0.2.12]: https://github.com/promptfoo/modelaudit/compare/v0.2.11...v0.2.12

@@ -222,9 +222,8 @@ class ScanResult:
             # Severity should never be None here due to check above, but add assertion for type checker
             assert severity is not None
 
-            # Apply whitelist downgrading logic if scanner is available
-            if self.scanner:
-                severity, details = self.scanner._apply_whitelist_downgrade(severity, details)
+            # Note: whitelist downgrading was already applied above (lines 160-163)
+            # before creating the Check, so we use the same downgraded severity here
 
             issue = Issue(
                 message=message,
@@ -520,7 +519,7 @@ class BaseScanner(ABC):
         """Initialize the unified context for the current file."""
         from pathlib import Path as PathlibPath
 
-        from modelaudit.utils.huggingface import extract_model_id_from_path
+        from modelaudit.utils.sources.huggingface import extract_model_id_from_path
 
         path_obj = PathlibPath(path)
         file_size = self.get_file_size(path)
@@ -1213,12 +1212,13 @@ class BaseScanner(ABC):
             # as zero rather than raising an exception.
             return 0
 
-    def calculate_file_hashes(self, path: str) -> dict[str, str]:
+    def calculate_file_hashes(self, path: str) -> dict[str, str | None]:
         """Calculate MD5, SHA256, and SHA512 hashes of a file.
 
-        Returns a dictionary with hash values or error messages.
+        Returns a dictionary with hash values or None if calculation fails.
+        Uses None instead of empty strings to satisfy Pydantic validation.
         """
-        hashes = {"md5": "", "sha256": "", "sha512": ""}
+        hashes: dict[str, str | None] = {"md5": None, "sha256": None, "sha512": None}
 
         if not os.path.isfile(path):
             return hashes
@@ -1242,7 +1242,7 @@ class BaseScanner(ABC):
 
         except Exception as e:
             logger.warning(f"Failed to calculate hashes for {path}: {e}")
-            # Return empty hashes on error rather than failing
+            # Return None hashes on error - Pydantic will accept None but not empty strings
 
         return hashes
 
@@ -1257,7 +1257,7 @@ class BaseScanner(ABC):
                 name="File Size Limit",
                 passed=False,
                 message=f"File too large: {file_size} bytes (max: {self.max_file_read_size})",
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.INFO,
                 location=path,
                 details={
                     "file_size": file_size,

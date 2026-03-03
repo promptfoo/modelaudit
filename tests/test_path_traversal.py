@@ -2,7 +2,7 @@ from modelaudit.core import scan_model_directory_or_file
 from modelaudit.scanners.base import IssueSeverity
 
 
-def test_symlink_outside_directory(tmp_path):
+def test_symlink_outside_directory(tmp_path, requires_symlinks):
     base_dir = tmp_path / "base"
     base_dir.mkdir()
     outside_dir = tmp_path / "outside"

@@ -1,0 +1,11 @@
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+
+# Vendored protobuf stubs are generated artifacts.
+modelaudit/protos/* linguist-generated=true

@@ -1,4 +1,5 @@
 import pickle
+import struct
 import sys
 import unittest
 from pathlib import Path
@@ -14,7 +15,7 @@ from modelaudit.detectors.suspicious_symbols import (
     BINARY_CODE_PATTERNS,
     EXECUTABLE_SIGNATURES,
 )
-from modelaudit.scanners.base import IssueSeverity
+from modelaudit.scanners.base import IssueSeverity, ScanResult
 from modelaudit.scanners.pickle_scanner import PickleScanner
 from tests.assets.generators.generate_advanced_pickle_tests import (
     generate_memo_based_attack,
@@ -117,6 +118,7 @@ class TestPickleScanner(unittest.TestCase):
                 suspicious_content = b"some_data" + pattern_import + b"more_data" + pattern_eval + b"end_data"
                 f.write(suspicious_content)
                 f.flush()
+                f.close()  # Close file before scanning (required on Windows to allow deletion)
 
                 # Scan the file
                 result = scanner.scan(f.name)
@@ -161,6 +163,7 @@ class TestPickleScanner(unittest.TestCase):
                 f.write(sigs[1])  # Another signature
                 f.write(b"end_padding")
                 f.flush()
+                f.close()  # Close file before scanning (required on Windows to allow deletion)
 
                 # Scan the file
                 result = scanner.scan(f.name)
@@ -198,6 +201,7 @@ class TestPickleScanner(unittest.TestCase):
                 clean_content = b"\x00" * 1000 + b"\x01" * 500 + b"\xff" * 200
                 f.write(clean_content)
                 f.flush()
+                f.close()  # Close file before scanning (required on Windows to allow deletion)
 
                 # Scan the file
                 result = scanner.scan(f.name)
@@ -221,15 +225,19 @@ class TestPickleScannerAdvanced(unittest.TestCase):
 
     def test_stack_global_detection(self) -> None:
         scanner = PickleScanner()
-        result = scanner.scan("tests/assets/pickles/stack_global_attack.pkl")
+        result = scanner.scan(str(Path(__file__).parent.parent / "assets" / "pickles" / "stack_global_attack.pkl"))
 
         assert len(result.issues) > 0, "Expected issues to be detected for STACK_GLOBAL attack"
-        os_issues = [i for i in result.issues if "os" in i.message.lower() or "posix" in i.message.lower()]
+        os_issues = [
+            i
+            for i in result.issues
+            if "os" in i.message.lower() or "posix" in i.message.lower() or "nt" in i.message.lower()
+        ]
         assert len(os_issues) > 0, f"Expected OS-related issues, but found: {[i.message for i in result.issues]}"
 
     def test_memo_object_tracking(self) -> None:
         scanner = PickleScanner()
-        result = scanner.scan("tests/assets/pickles/memo_attack.pkl")
+        result = scanner.scan(str(Path(__file__).parent.parent / "assets" / "pickles" / "memo_attack.pkl"))
 
         assert len(result.issues) > 0, "Expected issues to be detected for memo-based attack"
         subprocess_issues = [i for i in result.issues if "subprocess" in i.message.lower()]
@@ -239,11 +247,107 @@ class TestPickleScannerAdvanced(unittest.TestCase):
 
     def test_multiple_pickle_streams(self) -> None:
         scanner = PickleScanner()
-        result = scanner.scan("tests/assets/pickles/multiple_stream_attack.pkl")
+        result = scanner.scan(str(Path(__file__).parent.parent / "assets" / "pickles" / "multiple_stream_attack.pkl"))
 
         assert len(result.issues) > 0, "Expected issues to be detected for multiple pickle streams"
         eval_issues = [i for i in result.issues if "eval" in i.message.lower()]
         assert len(eval_issues) > 0, f"Expected eval issues, but found: {[i.message for i in result.issues]}"
+
+    def test_reduce_pattern_detects_memoized_callable(self) -> None:
+        """REDUCE analysis should resolve memoized call targets (BINGET/LONG_BINGET)."""
+        scanner = PickleScanner()
+
+        import os
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
+            try:
+                payload = bytearray(b"\x80\x02")
+                payload += b"cposix\nsystem\n"  # GLOBAL posix.system
+                payload += b"q\x01"  # BINPUT 1 (memoize callable)
+                payload += b"0"  # POP original callable from stack
+                # Add filler opcodes so target isn't adjacent to REDUCE
+                for i in range(12):
+                    filler = f"f{i}".encode()
+                    payload += b"X" + struct.pack("<I", len(filler)) + filler
+                    payload += b"0"
+                payload += b"h\x01"  # BINGET 1
+                arg = b"echo test"
+                payload += b"X" + struct.pack("<I", len(arg)) + arg
+                payload += b"\x85R."  # TUPLE1 + REDUCE + STOP
+
+                f.write(payload)
+                f.flush()
+                f.close()
+
+                result = scanner.scan(f.name)
+
+                reduce_pattern_checks = [c for c in result.checks if c.name == "Reduce Pattern Analysis"]
+                assert reduce_pattern_checks, "Expected Reduce Pattern Analysis check"
+                assert any(c.status.value == "failed" for c in reduce_pattern_checks), (
+                    "Reduce Pattern Analysis should fail for memoized posix.system REDUCE target"
+                )
+                assert any("posix.system" in c.message for c in reduce_pattern_checks), (
+                    "Expected posix.system in Reduce Pattern Analysis message: "
+                    f"{[c.message for c in reduce_pattern_checks]}"
+                )
+
+            finally:
+                os.unlink(f.name)
+
+    def test_stack_global_uses_actual_stack_not_popped_decoys(self) -> None:
+        """STACK_GLOBAL resolution should follow stack semantics, not nearby popped strings."""
+        scanner = PickleScanner()
+
+        import os
+        import tempfile
+
+        def short_binunicode(value: bytes) -> bytes:
+            return b"\x8c" + bytes([len(value)]) + value
+
+        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
+            try:
+                payload = bytearray(b"\x80\x04")
+                payload += short_binunicode(b"os")
+                payload += short_binunicode(b"system")
+
+                # Push/pop decoys that should NOT affect STACK_GLOBAL target.
+                for i in range(6):
+                    junk = f"junk{i}".encode()
+                    payload += short_binunicode(junk)
+                    payload += b"0"  # POP
+
+                # Safe-looking decoys near STACK_GLOBAL that are immediately popped.
+                payload += short_binunicode(b"torch._utils")
+                payload += b"0"
+                payload += short_binunicode(b"_rebuild_tensor_v2")
+                payload += b"0"
+
+                payload += b"\x93"  # STACK_GLOBAL (should still resolve to os.system)
+                payload += short_binunicode(b"echo test")
+                payload += b"\x85R."
+
+                f.write(payload)
+                f.flush()
+                f.close()
+
+                result = scanner.scan(f.name)
+
+                stack_checks = [c for c in result.checks if c.name == "STACK_GLOBAL Module Check"]
+                assert stack_checks, "Expected STACK_GLOBAL Module Check"
+                assert any(
+                    c.status.value == "failed" and ("posix.system" in c.message or "os.system" in c.message)
+                    for c in stack_checks
+                ), f"Expected failed STACK_GLOBAL check for os/posix.system, got: {[c.message for c in stack_checks]}"
+
+                reduce_checks = [c for c in result.checks if c.name == "REDUCE Opcode Safety Check"]
+                assert any(
+                    c.status.value == "failed" and ("posix.system" in c.message or "os.system" in c.message)
+                    for c in reduce_checks
+                ), f"Expected REDUCE check to resolve os/posix.system, got: {[c.message for c in reduce_checks]}"
+
+            finally:
+                os.unlink(f.name)
 
     def test_scan_regular_pickle_file(self):
         """Test that regular .pkl files don't trigger binary content scanning"""
@@ -258,6 +362,7 @@ class TestPickleScannerAdvanced(unittest.TestCase):
                 simple_data = {"weights": [1.0, 2.0, 3.0]}
                 pickle.dump(simple_data, f)
                 f.flush()
+                f.close()  # Close file before scanning (required on Windows to allow deletion)
 
                 # Scan the file
                 result = scanner.scan(f.name)
@@ -313,6 +418,7 @@ class TestPickleScannerAdvanced(unittest.TestCase):
                 )
                 f.write(suspicious_binary_content)
                 f.flush()
+                f.close()  # Close file before scanning (required on Windows to allow deletion)
 
                 # Scan the file
                 result = scanner.scan(f.name)
@@ -377,6 +483,7 @@ class TestPickleScannerAdvanced(unittest.TestCase):
                 f.write(b"\x7fELF")  # Linux ELF executable signature
                 f.write(b"more_padding")
                 f.flush()
+                f.close()  # Close file before scanning (required on Windows to allow deletion)
 
                 # Scan the file
                 result = scanner.scan(f.name)
@@ -414,6 +521,7 @@ class TestPickleScannerAdvanced(unittest.TestCase):
                 f.write(b"MZ")  # PE signature but no DOS stub
                 f.write(b"random_data" * 50)  # Random data without DOS stub message
                 f.flush()
+                f.close()  # Close file before scanning (required on Windows to allow deletion)
 
                 # Scan the file
                 result = scanner.scan(f.name)
@@ -450,6 +558,7 @@ class TestPickleScannerAdvanced(unittest.TestCase):
                 f.write(b"This program cannot be run in DOS mode")  # DOS stub message
                 f.write(b"more_data" * 10)
                 f.flush()
+                f.close()  # Close file before scanning (required on Windows to allow deletion)
 
                 # Scan the file
                 result = scanner.scan(f.name)
@@ -485,6 +594,7 @@ class TestPickleScannerAdvanced(unittest.TestCase):
                 }
                 pickle.dump(outer, f)
                 f.flush()
+                f.close()  # Close file before scanning (required on Windows to allow deletion)
 
                 result = scanner.scan(f.name)
 
@@ -500,6 +610,186 @@ class TestPickleScannerAdvanced(unittest.TestCase):
 
             finally:
                 os.unlink(f.name)
+
+
+class TestPickleScannerBlocklistHardening(unittest.TestCase):
+    """Regression tests for fickling/picklescan bypass hardening."""
+
+    @staticmethod
+    def _craft_global_reduce_pickle(module: str, func: str) -> bytes:
+        """Craft a minimal pickle that uses GLOBAL + REDUCE to call module.func.
+
+        The resulting pickle is: PROTO 2 | GLOBAL 'module func' | MARK | TUPLE | REDUCE | STOP
+        This is structurally valid but should be caught by the scanner without
+        actually being unpickled.
+        """
+
+        # Use protocol 2
+        proto = b"\x80\x02"
+        # GLOBAL opcode: 'c' followed by "module\nfunc\n"
+        global_op = b"c" + f"{module}\n{func}\n".encode()
+        # MARK + empty TUPLE (arguments) + REDUCE + STOP
+        call_ops = b"(" + b"t" + b"R" + b"."
+        return proto + global_op + call_ops
+
+    def _scan_bytes(self, data: bytes) -> ScanResult:
+        import os
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
+            f.write(data)
+            f.flush()
+            path = f.name
+        try:
+            scanner = PickleScanner()
+            return scanner.scan(path)
+        finally:
+            os.unlink(path)
+
+    # ------------------------------------------------------------------
+    # Fix 1: pkgutil trampoline — must be CRITICAL
+    # ------------------------------------------------------------------
+    def test_pkgutil_resolve_name_critical(self) -> None:
+        """pkgutil.resolve_name is a dynamic resolution trampoline to arbitrary callables."""
+        result = self._scan_bytes(self._craft_global_reduce_pickle("pkgutil", "resolve_name"))
+        assert result.success
+        assert result.has_errors
+        critical = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
+        pkgutil_issues = [i for i in critical if "pkgutil" in i.message]
+        assert pkgutil_issues, f"Expected CRITICAL pkgutil issue, got: {[i.message for i in result.issues]}"
+
+    # ------------------------------------------------------------------
+    # Fix 1: uuid RCE — must be CRITICAL
+    # ------------------------------------------------------------------
+    def test_uuid_get_command_stdout_critical(self) -> None:
+        """uuid._get_command_stdout internally calls subprocess.Popen."""
+        result = self._scan_bytes(self._craft_global_reduce_pickle("uuid", "_get_command_stdout"))
+        assert result.success
+        assert result.has_errors
+        critical = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
+        uuid_issues = [i for i in critical if "uuid" in i.message]
+        assert uuid_issues, f"Expected CRITICAL uuid issue, got: {[i.message for i in result.issues]}"
+
+    # ------------------------------------------------------------------
+    # Fix 2: Multi-stream exploit (benign stream 1 + malicious stream 2)
+    # ------------------------------------------------------------------
+    def test_multi_stream_benign_then_malicious(self) -> None:
+        """Scanner must detect malicious globals in stream 2 even if stream 1 is benign."""
+        import io
+
+        buf = io.BytesIO()
+        # Stream 1: benign
+        pickle.dump({"safe": True}, buf, protocol=2)
+        # Stream 2: malicious — os.system via GLOBAL+REDUCE
+        buf.write(self._craft_global_reduce_pickle("os", "system"))
+        data = buf.getvalue()
+
+        result = self._scan_bytes(data)
+        assert result.success
+        assert result.has_errors
+        os_issues = [
+            i
+            for i in result.issues
+            if i.severity == IssueSeverity.CRITICAL and ("os" in i.message.lower() or "posix" in i.message.lower())
+        ]
+        assert os_issues, f"Expected CRITICAL os issue in stream 2, got: {[i.message for i in result.issues]}"
+
+    def test_multi_stream_separator_byte_resync(self) -> None:
+        """Scanner must detect malicious stream even with junk separator bytes between streams."""
+        import io
+
+        buf = io.BytesIO()
+        # Stream 1: benign
+        pickle.dump({"safe": True}, buf, protocol=2)
+        # Junk separator byte (non-pickle byte between streams)
+        buf.write(b"\x00")
+        # Stream 2: malicious — os.system via GLOBAL+REDUCE
+        buf.write(self._craft_global_reduce_pickle("os", "system"))
+        data = buf.getvalue()
+
+        result = self._scan_bytes(data)
+        assert result.success
+        assert result.has_errors
+        os_issues = [
+            i
+            for i in result.issues
+            if i.severity == IssueSeverity.CRITICAL and ("os" in i.message.lower() or "posix" in i.message.lower())
+        ]
+        assert os_issues, f"Expected CRITICAL os issue after separator byte, got: {[i.message for i in result.issues]}"
+
+    # ------------------------------------------------------------------
+    # Fix 4: NEWOBJ_EX with dangerous class
+    # ------------------------------------------------------------------
+    def test_newobj_ex_dangerous_class(self) -> None:
+        """NEWOBJ_EX opcode with a dangerous class should be flagged."""
+        # Craft pickle: PROTO 4 | GLOBAL 'os _wrap_close' | EMPTY_TUPLE | EMPTY_DICT | NEWOBJ_EX | STOP
+        # Protocol 4 is needed for NEWOBJ_EX (opcode 0x92)
+        proto = b"\x80\x04"
+        global_op = b"c" + b"os\n_wrap_close\n"
+        empty_tuple = b")"
+        empty_dict = b"}"
+        newobj_ex = b"\x92"  # NEWOBJ_EX opcode
+        stop = b"."
+        data = proto + global_op + empty_tuple + empty_dict + newobj_ex + stop
+
+        result = self._scan_bytes(data)
+        assert result.success
+        assert result.has_errors
+        os_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL and "os" in i.message.lower()]
+        assert os_issues, f"Expected CRITICAL os issue for NEWOBJ_EX, got: {[i.message for i in result.issues]}"
+
+    # ------------------------------------------------------------------
+    # Fix 1: Spot-check newly-added modules
+    # ------------------------------------------------------------------
+    def test_smtplib_blocked(self) -> None:
+        """smtplib module should be flagged as dangerous."""
+        result = self._scan_bytes(self._craft_global_reduce_pickle("smtplib", "SMTP"))
+        assert result.has_errors
+        assert any(i.severity == IssueSeverity.CRITICAL and "smtplib" in i.message for i in result.issues), (
+            f"Expected CRITICAL smtplib issue, got: {[i.message for i in result.issues]}"
+        )
+
+    def test_sqlite3_blocked(self) -> None:
+        """sqlite3 module should be flagged as dangerous."""
+        result = self._scan_bytes(self._craft_global_reduce_pickle("sqlite3", "connect"))
+        assert result.has_errors
+        assert any(i.severity == IssueSeverity.CRITICAL and "sqlite3" in i.message for i in result.issues), (
+            f"Expected CRITICAL sqlite3 issue, got: {[i.message for i in result.issues]}"
+        )
+
+    def test_tarfile_blocked(self) -> None:
+        """tarfile module should be flagged as dangerous."""
+        result = self._scan_bytes(self._craft_global_reduce_pickle("tarfile", "open"))
+        assert result.has_errors
+        assert any(i.severity == IssueSeverity.CRITICAL and "tarfile" in i.message for i in result.issues), (
+            f"Expected CRITICAL tarfile issue, got: {[i.message for i in result.issues]}"
+        )
+
+    # NOTE: ctypes test omitted — ctypes added to ALWAYS_DANGEROUS_MODULES in PR #518
+
+    def test_marshal_blocked(self) -> None:
+        """marshal module should be flagged as dangerous."""
+        result = self._scan_bytes(self._craft_global_reduce_pickle("marshal", "loads"))
+        assert result.has_errors
+        assert any(i.severity == IssueSeverity.CRITICAL and "marshal" in i.message for i in result.issues), (
+            f"Expected CRITICAL marshal issue, got: {[i.message for i in result.issues]}"
+        )
+
+    def test_cloudpickle_blocked(self) -> None:
+        """cloudpickle module should be flagged as dangerous."""
+        result = self._scan_bytes(self._craft_global_reduce_pickle("cloudpickle", "loads"))
+        assert result.has_errors
+        assert any(i.severity == IssueSeverity.CRITICAL and "cloudpickle" in i.message for i in result.issues), (
+            f"Expected CRITICAL cloudpickle issue, got: {[i.message for i in result.issues]}"
+        )
+
+    def test_webbrowser_blocked(self) -> None:
+        """webbrowser module should be flagged as dangerous."""
+        result = self._scan_bytes(self._craft_global_reduce_pickle("webbrowser", "open"))
+        assert result.has_errors
+        assert any(i.severity == IssueSeverity.CRITICAL and "webbrowser" in i.message for i in result.issues), (
+            f"Expected CRITICAL webbrowser issue, got: {[i.message for i in result.issues]}"
+        )
 
 
 if __name__ == "__main__":

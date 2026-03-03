@@ -1,3 +1,5 @@
+"""Scanner for tar-archived model files (.tar, .tar.gz, .tgz)."""
+
 from __future__ import annotations
 
 import os
@@ -7,8 +9,8 @@ import tempfile
 from typing import Any, ClassVar
 
 from .. import core
-from ..utils import sanitize_archive_path
-from ..utils.assets import asset_from_scan_result
+from ..utils import is_absolute_archive_path, is_critical_system_path, sanitize_archive_path
+from ..utils.helpers.assets import asset_from_scan_result
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 CRITICAL_SYSTEM_PATHS = [
@@ -178,7 +180,7 @@ class TarScanner(BaseScanner):
                     _target_resolved, target_safe = sanitize_archive_path(target, target_base)
                     if not target_safe:
                         # Check if it's specifically a critical system path
-                        if os.path.isabs(target) and any(target.startswith(p) for p in CRITICAL_SYSTEM_PATHS):
+                        if is_absolute_archive_path(target) and is_critical_system_path(target, CRITICAL_SYSTEM_PATHS):
                             message = f"Symlink {name} points to critical system path: {target}"
                         else:
                             message = f"Symlink {name} resolves outside extraction directory"
@@ -191,7 +193,7 @@ class TarScanner(BaseScanner):
                             details={"target": target},
                             rule_code="S902",
                         )
-                    elif os.path.isabs(target) and any(target.startswith(p) for p in CRITICAL_SYSTEM_PATHS):
+                    elif is_absolute_archive_path(target) and is_critical_system_path(target, CRITICAL_SYSTEM_PATHS):
                         result.add_check(
                             name="Symlink Safety Validation",
                             passed=False,

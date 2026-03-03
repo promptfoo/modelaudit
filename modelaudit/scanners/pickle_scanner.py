@@ -1,8 +1,10 @@
+"""Scanner for Python pickle serialized files (.pkl, .pickle)."""
+
 import os
 import pickletools
 import struct
 import time
-from typing import IO, Any, BinaryIO, ClassVar
+from typing import IO, Any, BinaryIO, ClassVar, TypeGuard
 
 from modelaudit.analysis.enhanced_pattern_detector import EnhancedPatternDetector, PatternMatch
 from modelaudit.analysis.entropy_analyzer import EntropyAnalyzer
@@ -39,30 +41,108 @@ from .rule_mapper import (
     get_pickle_opcode_rule_code,
 )
 
+_RESYNC_BUDGET = 8192  # Max bytes to scan forward when resyncing after an unknown opcode
 
-def _genops_with_fallback(file_obj):
+
+def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> Any:
     """
     Wrapper around pickletools.genops that handles protocol mismatches.
 
     Some files (especially joblib) may declare protocol 4 but use protocol 5 opcodes
     like READONLY_BUFFER (0x0f). This function attempts to parse as much as possible
-    before hitting unknown opcodes.
+    before hitting unknown opcodes, then tries to resync and continue scanning
+    rather than terminating on partial stream errors.
+
+    When *multi_stream* is True the generator continues parsing after the first STOP
+    opcode so that malicious payloads hidden in a second pickle stream are not missed.
+    Non-pickle separator bytes between streams are skipped (up to a limit) so that a
+    single junk byte cannot bypass detection.
 
     Yields: (opcode, arg, pos) tuples from pickletools.genops
     """
-    try:
-        yield from pickletools.genops(file_obj)
-    except ValueError as e:
-        error_str = str(e).lower()
-        # Check if it's an unknown opcode error (protocol mismatch)
-        if "opcode" in error_str and "unknown" in error_str:
-            # Log that we hit a protocol mismatch - this is expected for joblib files
-            logger.info(f"Protocol mismatch in pickle (joblib may use protocol 5 opcodes in protocol 4 files): {e}")
-            # Don't re-raise - we've already yielded all valid opcodes before the unknown one
-            return
+    # Maximum number of consecutive non-pickle bytes to skip when resyncing
+    _MAX_RESYNC_BYTES = 256
+    resync_skipped = 0
+    # Track whether we've successfully parsed at least one complete stream
+    parsed_any_stream = False
+
+    while True:
+        stream_start = file_obj.tell()
+        had_opcodes = False
+        stream_error = False
+
+        if not parsed_any_stream:
+            # First stream: yield opcodes directly (no buffering needed)
+            try:
+                for item in pickletools.genops(file_obj):
+                    had_opcodes = True
+                    yield item
+            except ValueError as e:
+                error_str = str(e).lower()
+                if "opcode" in error_str and "unknown" in error_str:
+                    logger.info(
+                        f"Protocol mismatch in pickle (joblib may use protocol 5 opcodes in protocol 4 files): {e}"
+                    )
+                else:
+                    raise
         else:
-            # Re-raise other ValueError types
-            raise
+            # Subsequent streams: buffer opcodes so that partial streams
+            # (e.g. binary tensor data misinterpreted as opcodes) don't
+            # produce false positives.
+            buffered: list[Any] = []
+            try:
+                for item in pickletools.genops(file_obj):
+                    had_opcodes = True
+                    buffered.append(item)
+            except ValueError:
+                # Any ValueError on a subsequent stream means we hit
+                # non-pickle data or a junk separator byte.
+                stream_error = True
+
+            if stream_error and had_opcodes:
+                # Partial stream: binary data was misinterpreted as opcodes.
+                # Discard the buffer and stop — no more valid streams.
+                return
+
+            if not stream_error:
+                # Stream completed successfully — yield buffered opcodes
+                yield from buffered
+
+        if not multi_stream:
+            return
+
+        if had_opcodes and not stream_error:
+            parsed_any_stream = True
+
+        if not had_opcodes:
+            # Resync: the current byte was not a valid pickle start.
+            # Skip one byte and keep searching for the next stream, up to a limit.
+            file_obj.seek(stream_start, 0)
+            if not file_obj.read(1):
+                return  # EOF
+            resync_skipped += 1
+            if resync_skipped >= _MAX_RESYNC_BYTES:
+                # Bounded fast-forward search for the next likely protocol header
+                # so simple padding cannot terminate multi-stream scanning.
+                probe_start = file_obj.tell()
+                probe = file_obj.read(64 * 1024)
+                candidate = next(
+                    (idx for idx in range(len(probe) - 1) if probe[idx] == 0x80 and probe[idx + 1] in (2, 3, 4, 5)),
+                    -1,
+                )
+                if candidate < 0:
+                    return
+                file_obj.seek(probe_start + candidate, 0)
+                resync_skipped = 0
+            continue
+
+        # Found a valid stream — reset resync counter
+        resync_skipped = 0
+        # Check if there is another pickle stream after STOP
+        next_byte = file_obj.read(1)
+        if not next_byte:
+            return  # EOF
+        file_obj.seek(-1, 1)  # put the byte back for the next genops call
 
 
 def _compute_pickle_length(path: str) -> int:
@@ -89,7 +169,7 @@ def _compute_pickle_length(path: str) -> int:
 
 
 # ============================================================================
-# SMART DETECTION SYSTEM - ML Context Awareness
+# ML CONTEXT FILTERING SYSTEM
 # ============================================================================
 
 # ML Framework Detection Patterns
@@ -140,7 +220,7 @@ ML_FRAMEWORK_PATTERNS: dict[str, dict[str, list[str] | float]] = {
         "confidence_boost": 0.8,
     },
     "sklearn": {
-        "modules": ["sklearn", "joblib", "numpy", "numpy.core", "numpy.dtype"],
+        "modules": ["sklearn", "joblib", "numpy", "numpy.core", "numpy._core", "numpy.dtype", "scipy.sparse"],
         "classes": [
             "Pipeline",
             "StandardScaler",
@@ -156,7 +236,14 @@ ML_FRAMEWORK_PATTERNS: dict[str, dict[str, list[str] | float]] = {
             "Ridge",
             "Lasso",
         ],
-        "patterns": [r"sklearn\..*", r"joblib\..*", r"numpy\..*", r"numpy\.core\..*"],
+        "patterns": [
+            r"sklearn\..*",
+            r"joblib\..*",
+            r"numpy\..*",
+            r"numpy\.core\..*",
+            r"numpy\._core\..*",
+            r"scipy\.sparse\..*",
+        ],
         "confidence_boost": 0.9,
     },
     "huggingface": {
@@ -249,6 +336,11 @@ ALWAYS_DANGEROUS_FUNCTIONS: set[str] = {
     "torch.hub.load",
     "torch.hub.load_state_dict_from_url",
     "torch.storage._load_from_bytes",
+    # CVE-2024-5480 / CVE-2024-48063: PyTorch RPC functions
+    "torch.distributed.rpc.rpc_sync",
+    "torch.distributed.rpc.rpc_async",
+    "torch.distributed.rpc.remote",
+    "torch.distributed.rpc.RemoteModule",
     # NumPy dangerous functions (Fickling)
     "numpy.testing._private.utils.runstring",
     # Shell utilities
@@ -256,10 +348,41 @@ ALWAYS_DANGEROUS_FUNCTIONS: set[str] = {
     "shutil.move",
     "shutil.copy",
     "shutil.copytree",
+    # Dynamic resolution trampolines (can resolve arbitrary callables)
+    "pkgutil.resolve_name",
+    # uuid internal functions that call subprocess.Popen
+    "uuid._get_command_stdout",
+    "uuid._popen",
+    # Profiling/debugging modules that execute arbitrary Python code
+    "cProfile.run",
+    "cProfile.runctx",
+    "profile.run",
+    "profile.runctx",
+    "pdb.run",
+    "pdb.runeval",
+    "pdb.runcall",
+    "pdb.runctx",
+    "timeit.timeit",
+    "timeit.repeat",
+    # Native code execution
+    "ctypes.CDLL",
+    "ctypes.WinDLL",
+    "ctypes.OleDLL",
+    "ctypes.PyDLL",
+    "ctypes.cdll",
+    "ctypes.windll",
+    "ctypes.oledll",
+    "ctypes.pydll",
+    "ctypes.pythonapi",
+    "ctypes.cast",
+    "ctypes.CFUNCTYPE",
+    "ctypes.WINFUNCTYPE",
 }
 
 # Module prefixes that are always dangerous (Fickling-based + additional)
+# This must be a superset of fickling's 68-module blocklist (PR #215)
 ALWAYS_DANGEROUS_MODULES: set[str] = {
+    # Original modules
     "__builtin__",
     "__builtins__",
     "builtins",
@@ -279,7 +402,113 @@ ALWAYS_DANGEROUS_MODULES: set[str] = {
     "shutil",
     "code",
     "torch.hub",
+    # Native code execution (ctypes)
+    "ctypes",
+    "ctypes.util",
+    "_ctypes",
+    # Profiling/debugging - can execute arbitrary Python code via run()
+    "cProfile",
+    "profile",
+    "pdb",
+    "timeit",
+    "bdb",
+    "trace",
+    # Thread/process spawning
+    "_thread",
+    "multiprocessing",
+    "signal",
+    "_signal",
+    "threading",
+    # Module loading from untrusted sources
+    "zipimport",
+    "importlib",
+    "runpy",
+    # Dynamic resolution / import trampolines
+    "pkgutil",
+    # Network / exfiltration
+    "smtplib",
+    "imaplib",
+    "poplib",
+    "nntplib",
+    "xmlrpc",
+    "socketserver",
+    "ssl",
+    "requests",
+    "aiohttp",
+    # Code execution / compilation
+    "codeop",
+    "marshal",
+    "types",
+    "compileall",
+    "py_compile",
+    # Operator / functools bypasses
+    "_operator",
+    "functools",
+    # Pickle recursion
+    "pickle",
+    "_pickle",
+    "dill",
+    "cloudpickle",
+    "joblib",
+    # Filesystem / shell
+    "tempfile",
+    "filecmp",
+    "fileinput",
+    "glob",
+    "distutils",
+    "pydoc",
+    "pexpect",
+    # Virtual environments / package install
+    "venv",
+    "ensurepip",
+    "pip",
+    # Other dangerous
+    "webbrowser",
+    "asyncio",
+    "mmap",
+    "select",
+    "selectors",
+    "logging",
+    "syslog",
+    "tarfile",
+    "zipfile",
+    "shelve",
+    "sqlite3",
+    "_sqlite3",
+    "doctest",
+    "idlelib",
+    "lib2to3",
+    # uuid — _get_command_stdout internally calls subprocess.Popen
+    "uuid",
+    # NOTE: linecache and logging.config are intentionally NOT in this set.
+    # - linecache.getline: file read (not code execution), flagged as WARNING
 }
+
+# Modules that are suspicious but should only be flagged at WARNING severity.
+# These modules appear frequently in legitimate ML pipelines and cannot directly
+# execute arbitrary code, so CRITICAL would cause too many false positives.
+WARNING_SEVERITY_MODULES: set[str] = {
+    # functools.partial is heavily used in PyTorch models; functools.reduce is
+    # the only genuinely dangerous entry and is still in SUSPICIOUS_GLOBALS.
+    "functools",
+    # glob.glob / glob.iglob are common in dataset loading pipelines and
+    # cannot directly execute code.
+    "glob",
+}
+
+# String opcodes that push text onto the pickle stack.
+# Used for STACK_GLOBAL reconstruction and suspicious string detection.
+STRING_OPCODES: frozenset[str] = frozenset(
+    {
+        "STRING",
+        "BINSTRING",
+        "SHORT_BINSTRING",
+        "UNICODE",
+        "SHORT_BINUNICODE",
+        "BINUNICODE",
+        "BINUNICODE8",
+    }
+)
 
 # Safe ML-specific global patterns (SECURITY: NO WILDCARDS - explicit lists only)
 ML_SAFE_GLOBALS: dict[str, list[str]] = {
@@ -474,6 +703,18 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "any",
         "iter",
         "next",
+        # Python 2 type names used by frameworks like fastai during serialization
+        "long",
+        "unicode",
+        "print",
+        "basestring",
+        "xrange",
+        "complex",
+        "memoryview",
+        "property",
+        "staticmethod",
+        "classmethod",
+        "super",
     ],
     "builtins": [  # Python 3 builtins
         "set",
@@ -570,6 +811,71 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "_reconstruct",
         "scalar",
     ],
+    "numpy.core.numeric": [
+        "_frombuffer",
+    ],
+    # numpy._core is the internal path used in NumPy 2.x+
+    "numpy._core": [
+        "multiarray",
+        "numeric",
+        "_internal",
+    ],
+    "numpy._core.multiarray": [
+        "_reconstruct",
+        "scalar",
+    ],
+    "numpy._core.numeric": [
+        "_frombuffer",
+    ],
+    "numpy.random._pickle": [
+        "__randomstate_ctor",
+        "__generator_ctor",
+        "__bit_generator_ctor",
+    ],
+    "numpy.random.mtrand": [
+        "RandomState",
+    ],
+    "numpy.random._common": [
+        "BitGenerator",
+    ],
+    "numpy.random._generator": [
+        "Generator",
+    ],
+    "numpy.random._bounded_integers": [
+        "_bounded_integers",
+    ],
+    "numpy.random._mt19937": [
+        "MT19937",
+    ],
+    # SciPy sparse matrix types — common in sklearn TF-IDF / NLP pipelines
+    "scipy.sparse": [
+        "csr_matrix",
+        "csc_matrix",
+        "coo_matrix",
+        "lil_matrix",
+        "bsr_matrix",
+        "dia_matrix",
+        "dok_matrix",
+        "csr_array",
+        "csc_array",
+        "coo_array",
+    ],
+    "scipy.sparse._csr": [
+        "csr_matrix",
+        "csr_array",
+    ],
+    "scipy.sparse._csc": [
+        "csc_matrix",
+        "csc_array",
+    ],
+    "scipy.sparse._coo": [
+        "coo_matrix",
+        "coo_array",
+    ],
+    "scipy.sparse._bsr": ["bsr_matrix", "bsr_array"],
+    "scipy.sparse._dia": ["dia_matrix", "dia_array"],
+    "scipy.sparse._lil": ["lil_matrix", "lil_array"],
+    "scipy.sparse._dok": ["dok_matrix", "dok_array"],
     "math": [
         "sqrt",
         "pow",
@@ -581,6 +887,42 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "pi",
         "e",
     ],
+    # NOTE: operator module (methodcaller, itemgetter, attrgetter, getitem) is
+    # intentionally NOT allowlisted here.  These functions are in
+    # ALWAYS_DANGEROUS_FUNCTIONS because they enable dynamic attribute access
+    # and arbitrary method invocation -- a well-known pickle deserialization
+    # attack vector (see Fickling research).  Even in ML contexts, they must
+    # remain flagged to prevent bypasses.
+    # Truncated numpy module references from pickle opcode resolution.
+    # The pickle scanner sometimes resolves module names incompletely
+    # (e.g., "_reconstruct" instead of "numpy.core.multiarray._reconstruct").
+    #
+    # SECURITY NOTE: These short/generic module names carry bypass risk -- an
+    # attacker could craft a pickle with a custom module named "C" that exports
+    # "dtype".  We accept this risk because:
+    #   1. These only skip the SUSPICIOUS_GLOBAL check; ALWAYS_DANGEROUS still fires.
+    #   2. The function names are narrow and specific to numpy internals.
+    #   3. Removing them causes widespread FPs on legitimate sklearn/joblib models.
+    "_reconstruct": ["ndarray", "scalar"],
+    "C": ["dtype", "ndarray", "scalar"],
+    "multiarray": ["_reconstruct", "scalar"],
+    "numpy_pickle": ["NumpyArrayWrapper", "NDArrayWrapper"],
+    # Truncated sklearn class names from joblib opcode resolution.
+    # When joblib serializes sklearn objects it sometimes resolves class names
+    # without the full module path, e.g. "LabelEncoder" instead of
+    # "sklearn.preprocessing._label.LabelEncoder".
+    "LabelEncoder": ["dtype"],
+    "OrdinalEncoder": ["dtype"],
+    "OneHotEncoder": ["dtype"],
+    "MT19937": ["__bit_generator_ctor"],
+    # Old-style scipy paths (without underscore, used in older scipy versions)
+    "scipy.sparse.csr": ["csr_matrix", "csr_array"],
+    "scipy.sparse.csc": ["csc_matrix", "csc_array"],
+    "scipy.sparse.coo": ["coo_matrix", "coo_array"],
+    "scipy.sparse.bsr": ["bsr_matrix", "bsr_array"],
+    "scipy.sparse.dia": ["dia_matrix", "dia_array"],
+    "scipy.sparse.lil": ["lil_matrix", "lil_array"],
+    "scipy.sparse.dok": ["dok_matrix", "dok_array"],
     # YOLO/Ultralytics safe patterns
     "ultralytics": [
         "YOLO",
@@ -598,17 +940,493 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "Segment",
         "Classify",
     ],
-    # Standard ML libraries
-    "sklearn": [
-        "base",
-        "ensemble",
-        "linear_model",
-        "tree",
-        "svm",
-        "neighbors",
-        "cluster",
-        "decomposition",
-        "preprocessing",
+    # Standard ML libraries - sklearn
+    # SECURITY: Use exact module.function matching (no prefix wildcards)
+    # Each submodule must list specific safe classes/functions to prevent
+    # arbitrary function execution under allowed prefixes.
+    "sklearn.base": [
+        "BaseEstimator",
+        "ClassifierMixin",
+        "RegressorMixin",
+        "TransformerMixin",
+        "ClusterMixin",
+        "BiclusterMixin",
+        "DensityMixin",
+        "OutlierMixin",
+        "MetaEstimatorMixin",
+        "MultiOutputMixin",
+        "_clone_parametrized",
+    ],
+    "sklearn.ensemble": [
+        "RandomForestClassifier",
+        "RandomForestRegressor",
+        "GradientBoostingClassifier",
+        "GradientBoostingRegressor",
+        "AdaBoostClassifier",
+        "AdaBoostRegressor",
+        "BaggingClassifier",
+        "BaggingRegressor",
+        "ExtraTreesClassifier",
+        "ExtraTreesRegressor",
+        "VotingClassifier",
+        "VotingRegressor",
+        "StackingClassifier",
+        "StackingRegressor",
+        "IsolationForest",
+        "HistGradientBoostingClassifier",
+        "HistGradientBoostingRegressor",
+    ],
+    "sklearn.ensemble._forest": [
+        "RandomForestClassifier",
+        "RandomForestRegressor",
+        "ExtraTreesClassifier",
+        "ExtraTreesRegressor",
+    ],
+    "sklearn.ensemble._gb": [
+        "GradientBoostingClassifier",
+        "GradientBoostingRegressor",
+    ],
+    "sklearn.ensemble._weight_boosting": [
+        "AdaBoostClassifier",
+        "AdaBoostRegressor",
+    ],
+    "sklearn.ensemble._bagging": [
+        "BaggingClassifier",
+        "BaggingRegressor",
+    ],
+    "sklearn.ensemble._voting": [
+        "VotingClassifier",
+        "VotingRegressor",
+    ],
+    "sklearn.ensemble._stacking": [
+        "StackingClassifier",
+        "StackingRegressor",
+    ],
+    "sklearn.ensemble._iforest": [
+        "IsolationForest",
+    ],
+    "sklearn.ensemble._hist_gradient_boosting.gradient_boosting": [
+        "HistGradientBoostingClassifier",
+        "HistGradientBoostingRegressor",
+    ],
+    "sklearn.ensemble._hist_gradient_boosting.binning": [
+        "_BinMapper",
+    ],
+    "sklearn.ensemble._hist_gradient_boosting.predictor": [
+        "TreePredictor",
+    ],
+    "sklearn.ensemble._hist_gradient_boosting._predictor": [
+        "TreePredictor",
+    ],
+    "sklearn.ensemble._hist_gradient_boosting.grower": [
+        "TreeGrower",
+        "TreeNode",
+    ],
+    "sklearn.ensemble._hist_gradient_boosting.splitting": [
+        "Splitter",
+        "SplitInfo",
+    ],
+    "sklearn.ensemble._hist_gradient_boosting.common": [
+        "MonotonicConstraint",
+        "X_DTYPE",
+        "X_BINNED_DTYPE",
+        "Y_DTYPE",
+        "G_H_DTYPE",
+        "X_BITSET_INNER_DTYPE",
+    ],
+    "sklearn.linear_model": [
+        "LinearRegression",
+        "LogisticRegression",
+        "Ridge",
+        "Lasso",
+        "ElasticNet",
+        "SGDClassifier",
+        "SGDRegressor",
+        "Perceptron",
+        "PassiveAggressiveClassifier",
+        "PassiveAggressiveRegressor",
+        "BayesianRidge",
+        "ARDRegression",
+        "Lars",
+        "LassoLars",
+        "OrthogonalMatchingPursuit",
+        "HuberRegressor",
+        "RANSACRegressor",
+        "TheilSenRegressor",
+    ],
+    "sklearn.linear_model._logistic": [
+        "LogisticRegression",
+    ],
+    "sklearn.linear_model._base": [
+        "LinearRegression",
+    ],
+    "sklearn.linear_model._ridge": [
+        "Ridge",
+        "RidgeClassifier",
+    ],
+    "sklearn.linear_model._coordinate_descent": [
+        "Lasso",
+        "ElasticNet",
+    ],
+    "sklearn.linear_model._stochastic_gradient": [
+        "SGDClassifier",
+        "SGDRegressor",
+    ],
+    "sklearn.tree": [
+        "DecisionTreeClassifier",
+        "DecisionTreeRegressor",
+        "ExtraTreeClassifier",
+        "ExtraTreeRegressor",
+    ],
+    "sklearn.tree._classes": [
+        "DecisionTreeClassifier",
+        "DecisionTreeRegressor",
+        "ExtraTreeClassifier",
+        "ExtraTreeRegressor",
+    ],
+    "sklearn.tree._tree": [
+        "Tree",
+    ],
+    "sklearn.svm": [
+        "SVC",
+        "SVR",
+        "LinearSVC",
+        "LinearSVR",
+        "NuSVC",
+        "NuSVR",
+        "OneClassSVM",
+    ],
+    "sklearn.svm._classes": [
+        "SVC",
+        "SVR",
+        "LinearSVC",
+        "LinearSVR",
+        "NuSVC",
+        "NuSVR",
+        "OneClassSVM",
+    ],
+    "sklearn.neighbors": [
+        "KNeighborsClassifier",
+        "KNeighborsRegressor",
+        "RadiusNeighborsClassifier",
+        "RadiusNeighborsRegressor",
+        "NearestNeighbors",
+        "NearestCentroid",
+        "LocalOutlierFactor",
+        "KernelDensity",
+    ],
+    "sklearn.neighbors._classification": [
+        "KNeighborsClassifier",
+        "RadiusNeighborsClassifier",
+    ],
+    "sklearn.neighbors._regression": [
+        "KNeighborsRegressor",
+        "RadiusNeighborsRegressor",
+    ],
+    "sklearn.neighbors._unsupervised": [
+        "NearestNeighbors",
+    ],
+    "sklearn.neighbors._kde": [
+        "KernelDensity",
+    ],
+    "sklearn.neighbors._lof": [
+        "LocalOutlierFactor",
+    ],
+    "sklearn.cluster": [
+        "KMeans",
+        "MiniBatchKMeans",
+        "AgglomerativeClustering",
+        "DBSCAN",
+        "OPTICS",
+        "SpectralClustering",
+        "Birch",
+        "MeanShift",
+        "AffinityPropagation",
+    ],
+    "sklearn.cluster._kmeans": [
+        "KMeans",
+        "MiniBatchKMeans",
+    ],
+    "sklearn.cluster._agglomerative": [
+        "AgglomerativeClustering",
+    ],
+    "sklearn.cluster._dbscan": [
+        "DBSCAN",
+    ],
+    "sklearn.cluster._optics": [
+        "OPTICS",
+    ],
+    "sklearn.decomposition": [
+        "PCA",
+        "IncrementalPCA",
+        "KernelPCA",
+        "TruncatedSVD",
+        "NMF",
+        "LatentDirichletAllocation",
+        "FastICA",
+    ],
+    "sklearn.decomposition._pca": [
+        "PCA",
+    ],
+    "sklearn.decomposition._incremental_pca": [
+        "IncrementalPCA",
+    ],
+    "sklearn.decomposition._truncated_svd": [
+        "TruncatedSVD",
+    ],
+    "sklearn.decomposition._nmf": [
+        "NMF",
+    ],
+    "sklearn.preprocessing": [
+        "StandardScaler",
+        "MinMaxScaler",
+        "MaxAbsScaler",
+        "RobustScaler",
+        "Normalizer",
+        "Binarizer",
+        "LabelEncoder",
+        "LabelBinarizer",
+        "OneHotEncoder",
+        "OrdinalEncoder",
+        "PolynomialFeatures",
+        "PowerTransformer",
+        "QuantileTransformer",
+        "FunctionTransformer",
+        "KBinsDiscretizer",
+        "SplineTransformer",
+    ],
+    "sklearn.preprocessing._data": [
+        "StandardScaler",
+        "MinMaxScaler",
+        "MaxAbsScaler",
+        "RobustScaler",
+        "Normalizer",
+        "Binarizer",
+        "PolynomialFeatures",
+        "PowerTransformer",
+        "QuantileTransformer",
+        "KBinsDiscretizer",
+        "SplineTransformer",
+    ],
+    "sklearn.preprocessing._label": [
+        "LabelEncoder",
+        "LabelBinarizer",
+    ],
+    "sklearn.preprocessing._encoders": [
+        "OneHotEncoder",
+        "OrdinalEncoder",
+    ],
+    "sklearn.preprocessing._function_transformer": [
+        "FunctionTransformer",
+    ],
+    "sklearn.pipeline": [
+        "Pipeline",
+        "FeatureUnion",
+        "make_pipeline",
+        "make_union",
+    ],
+    "sklearn.pipeline._pipeline": [
+        "Pipeline",
+        "FeatureUnion",
+    ],
+    "sklearn.compose": [
+        "ColumnTransformer",
+        "TransformedTargetRegressor",
+    ],
+    "sklearn.compose._column_transformer": [
+        "ColumnTransformer",
+        "make_column_selector",
+    ],
+    "sklearn.model_selection": [
+        "GridSearchCV",
+        "RandomizedSearchCV",
+    ],
+    "sklearn.model_selection._search": [
+        "GridSearchCV",
+        "RandomizedSearchCV",
+    ],
+    "sklearn.feature_extraction.text": [
+        "CountVectorizer",
+        "TfidfVectorizer",
+        "TfidfTransformer",
+        "HashingVectorizer",
+    ],
+    "sklearn.feature_extraction._text": [
+        "CountVectorizer",
+        "TfidfVectorizer",
+        "TfidfTransformer",
+        "HashingVectorizer",
+    ],
+    "sklearn.feature_extraction._dict_vectorizer": [
+        "DictVectorizer",
+    ],
+    "sklearn.naive_bayes": [
+        "GaussianNB",
+        "MultinomialNB",
+        "BernoulliNB",
+        "ComplementNB",
+    ],
+    "sklearn.metrics": [
+        "make_scorer",
+    ],
+    "sklearn.multiclass": [
+        "OneVsRestClassifier",
+        "OneVsOneClassifier",
+    ],
+    "sklearn.multioutput": [
+        "MultiOutputClassifier",
+        "MultiOutputRegressor",
+    ],
+    "sklearn.impute": [
+        "SimpleImputer",
+        "IterativeImputer",
+        "KNNImputer",
+        "MissingIndicator",
+    ],
+    "sklearn.impute._base": [
+        "SimpleImputer",
+        "MissingIndicator",
+    ],
+    "sklearn.impute._iterative": [
+        "IterativeImputer",
+    ],
+    "sklearn.impute._knn": [
+        "KNNImputer",
+    ],
+    "sklearn.dummy": [
+        "DummyClassifier",
+        "DummyRegressor",
+    ],
+    "sklearn.ensemble._gb_losses": [
+        "LeastSquaresError",
+        "BinomialDeviance",
+        "MultinomialDeviance",
+        "ExponentialLoss",
+        "HuberLossFunction",
+        "QuantileLossFunction",
+        "LeastAbsoluteError",
+    ],
+    "sklearn.utils._tags": [
+        "Tags",
+    ],
+    "sklearn.neural_network": [
+        "MLPClassifier",
+        "MLPRegressor",
+        "BernoulliRBM",
+    ],
+    "sklearn.neural_network._multilayer_perceptron": [
+        "MLPClassifier",
+        "MLPRegressor",
+    ],
+    "sklearn.calibration": [
+        "CalibratedClassifierCV",
+    ],
+    "sklearn.discriminant_analysis": [
+        "LinearDiscriminantAnalysis",
+        "QuadraticDiscriminantAnalysis",
+    ],
+    "sklearn.gaussian_process": [
+        "GaussianProcessClassifier",
+        "GaussianProcessRegressor",
+    ],
+    "sklearn.isotonic": [
+        "IsotonicRegression",
+    ],
+    "sklearn.kernel_ridge": [
+        "KernelRidge",
+    ],
+    "sklearn.mixture": [
+        "GaussianMixture",
+        "BayesianGaussianMixture",
+    ],
+    "sklearn.semi_supervised": [
+        "LabelPropagation",
+        "LabelSpreading",
+        "SelfTrainingClassifier",
+    ],
+    # sklearn loss functions (used by HistGradientBoosting regressors)
+    "sklearn._loss.loss": [
+        "HalfSquaredError",
+        "HalfBinomialLoss",
+        "HalfMultinomialLoss",
+        "HalfPoissonLoss",
+        "HalfGammaLoss",
+        "HalfTweedieLoss",
+        "HalfTweedieLossIdentity",
+        "AbsoluteError",
+        "PinballLoss",
+        "HuberLoss",
+        "ExponentialLoss",
+        "CyHalfSquaredError",
+        "CyHalfBinomialLoss",
+        "CyHalfMultinomialLoss",
+        "CyHalfPoissonLoss",
+        "CyHalfGammaLoss",
+        "CyHalfTweedieLoss",
+        "CyHalfTweedieLossIdentity",
+        "CyAbsoluteError",
+        "CyPinballLoss",
+        "CyHuberLoss",
+        "CyExponentialLoss",
+    ],
+    "sklearn._loss.link": [
+        "IdentityLink",
+        "LogLink",
+        "LogitLink",
+        "HalfLogitLink",
+        "MultinomialLogit",
+        "Interval",
+    ],
+    # Truncated _loss module name (joblib opcode resolution) + Cython unpickle functions
+    "_loss": [
+        "CyHalfSquaredError",
+        "CyHalfBinomialLoss",
+        "CyHalfMultinomialLoss",
+        "CyHalfPoissonLoss",
+        "CyHalfGammaLoss",
+        "CyAbsoluteError",
+        "CyPinballLoss",
+        "CyHuberLoss",
+        "CyExponentialLoss",
+        "CyHalfTweedieLoss",
+        "CyHalfTweedieLossIdentity",
+        # Cython __pyx_unpickle_* reconstruction functions
+        "__pyx_unpickle_CyHalfSquaredError",
+        "__pyx_unpickle_CyHalfBinomialLoss",
+        "__pyx_unpickle_CyHalfMultinomialLoss",
+        "__pyx_unpickle_CyHalfPoissonLoss",
+        "__pyx_unpickle_CyHalfGammaLoss",
+        "__pyx_unpickle_CyAbsoluteError",
+        "__pyx_unpickle_CyPinballLoss",
+        "__pyx_unpickle_CyHuberLoss",
+        "__pyx_unpickle_CyExponentialLoss",
+        "__pyx_unpickle_CyHalfTweedieLoss",
+        "__pyx_unpickle_CyHalfTweedieLossIdentity",
+    ],
+    # Old sklearn module paths (pre-underscore convention, used in older models)
+    "sklearn.linear_model.stochastic_gradient": [
+        "SGDClassifier",
+        "SGDRegressor",
+    ],
+    # LightGBM
+    "lightgbm.sklearn": [
+        "LGBMClassifier",
+        "LGBMRegressor",
+        "LGBMRanker",
+    ],
+    "lightgbm.basic": [
+        "Booster",
+        "Dataset",
+    ],
+    # numpy masked arrays (used by older sklearn models)
+    "numpy.ma.core": [
+        "_mareconstruct",
+        "MaskedArray",
+        "MaskedConstant",
+    ],
+    "numpy.ma": [
+        "core",
+        "MaskedArray",
     ],
     "transformers": [
         "AutoModel",
@@ -766,7 +1584,7 @@ def _detect_ml_context(opcodes: list[tuple]) -> dict[str, Any]:
 
             global_refs[module] = global_refs.get(module, 0) + 1
 
-        elif opcode.name in ["SHORT_BINUNICODE", "BINUNICODE", "UNICODE"] and isinstance(arg, str):
+        elif opcode.name in STRING_OPCODES and isinstance(arg, str):
             # Collect strings that might be used for STACK_GLOBAL
             stack_strings.append(arg)
 
@@ -791,14 +1609,30 @@ def _detect_ml_context(opcodes: list[tuple]) -> dict[str, Any]:
         matches: list[str] = []
 
         # Check module matches with improved scoring
+        # Uses prefix matching so that e.g. module pattern "sklearn" matches
+        # global refs like "sklearn.pipeline", "sklearn.ensemble._iforest", etc.
         modules = patterns["modules"]
+        counted_modules: set[str] = set()
         if isinstance(modules, list):
             for module in modules:
-                if module in global_refs:
+                # Aggregate counts from all global_refs that match this module
+                # either exactly or as a prefix (e.g. "sklearn" matches "sklearn.pipeline").
+                # Use counted_modules to prevent double-counting: for STACK_GLOBAL flows
+                # both the module key (e.g. "sklearn") and the full ref
+                # (e.g. "sklearn.ensemble") are stored in global_refs, so a prefix
+                # match could count one logical reference more than once.
+                ref_count = 0
+                for ref_key, ref_cnt in global_refs.items():
+                    base_module = ref_key.split(".")[0] if "." in ref_key else ref_key
+                    if base_module in counted_modules:
+                        continue
+                    if ref_key == module or ref_key.startswith(module + "."):
+                        ref_count += ref_cnt
+                        counted_modules.add(base_module)
+
+                if ref_count > 0:
                     # Score based on presence and frequency,
                     # not proportion of total opcodes
-                    ref_count = global_refs[module]
-
                     # Base score for presence
                     module_score = 10.0  # Base score for any ML module presence
 
@@ -840,43 +1674,70 @@ def _detect_ml_context(opcodes: list[tuple]) -> dict[str, Any]:
     return context
 
 
+def _is_plausible_python_module(name: str) -> bool:
+    """
+    Check whether *name* looks like a real Python module/package path.
+
+    Legitimate module names follow Python identifier rules:
+    - Each dotted segment is a valid Python identifier (letters, digits,
+      underscores; cannot start with a digit).
+    - Conventionally all-lowercase, though private/internal modules may use
+      a leading underscore.
+
+    Names that contain uppercase letters, start with digits, or include
+    characters outside ``[a-z0-9_.]`` are almost certainly **not** real
+    modules -- they are more likely DataFrame column names, user labels,
+    or other data strings that ended up as pickle GLOBAL arguments
+    (e.g. ``PEDRA_2020``).
+
+    The check is intentionally conservative: a handful of legitimate but
+    unusual module names (e.g. ``PIL``, ``Cython``) are covered by
+    ``ML_SAFE_GLOBALS`` and will pass the allowlist before this function
+    is ever consulted.
+
+    Returns:
+        True if *name* plausibly refers to a real Python module.
+    """
+    import re
+
+    if not name:
+        return False
+
+    # Fast reject: real module paths never contain whitespace.
+    if " " in name or "\t" in name:
+        return False
+
+    # Split on dots; each segment must be a valid Python identifier that
+    # looks like a conventional module name (lowercase + digits + _).
+    segments = name.split(".")
+    if not segments or any(s == "" for s in segments):
+        return False
+
+    _MODULE_SEGMENT_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
+    return all(_MODULE_SEGMENT_RE.match(seg) for seg in segments)
+
+
 def _is_safe_ml_global(mod: str, func: str) -> bool:
     """
     Check if a module.function is in the ML_SAFE_GLOBALS allowlist.
 
-    Supports both exact module matches and prefix matching for nested modules
-    (e.g., sklearn.linear_model._logistic matches sklearn.linear_model).
+    Uses strict exact matching on both module path and function/class name.
+    Every allowed module must explicitly list its safe functions/classes.
 
     Returns:
         True if the global is in the safe list, False otherwise
     """
-    # Try exact match first
     if mod in ML_SAFE_GLOBALS:
         safe_funcs = ML_SAFE_GLOBALS[mod]
         if func in safe_funcs:
             return True
-
-    # For sklearn/xgboost: check if module starts with allowed submodule
-    # e.g., sklearn.linear_model._logistic -> check sklearn.linear_model
-    if mod.startswith("sklearn.") or mod.startswith("xgboost."):
-        # Get the base framework (sklearn or xgboost)
-        base = mod.split(".")[0]
-        if base in ML_SAFE_GLOBALS:
-            safe_submodules = ML_SAFE_GLOBALS[base]
-            # Check if any allowed submodule is a prefix of the actual module
-            for allowed_submodule in safe_submodules:
-                # Build full path: sklearn.linear_model
-                full_allowed = f"{base}.{allowed_submodule}"
-                if mod.startswith(full_allowed):
-                    # Module is under an allowed submodule, func is implicitly safe
-                    return True
 
     return False
 
 
 def _is_actually_dangerous_global(mod: str, func: str, ml_context: dict) -> bool:
     """
-    Smart global reference analysis - distinguishes between legitimate ML operations
+    Context-aware global reference analysis - distinguishes between legitimate ML operations
     and actual dangerous operations.
 
     Security-first approach: Always flag dangerous functions, then check ML context
@@ -884,14 +1745,10 @@ def _is_actually_dangerous_global(mod: str, func: str, ml_context: dict) -> bool
     """
     full_ref = f"{mod}.{func}"
 
-    # STEP 0: Check ML_SAFE_GLOBALS allowlist first (before dangerous checks)
-    # This prevents false positives for safe functions from otherwise dangerous modules
-    # E.g., __builtin__.set (Python 2) or builtins.set (Python 3) are safe
-    if _is_safe_ml_global(mod, func):
-        logger.debug(f"Allowlisted safe global from potentially dangerous module: {mod}.{func}")
-        return False
-
-    # STEP 1: ALWAYS flag dangerous functions (no ML context exceptions)
+    # STEP 1: ALWAYS flag dangerous functions first (no exceptions, no allowlist override)
+    # This MUST come before the ML_SAFE_GLOBALS check to prevent bypass attacks
+    # where an attacker places dangerous functions (e.g., operator.attrgetter) in a
+    # pickle stream alongside ML references to trick the allowlist.
     if full_ref in ALWAYS_DANGEROUS_FUNCTIONS or func in ALWAYS_DANGEROUS_FUNCTIONS:
         logger.warning(
             f"Always-dangerous function detected: {full_ref} "
@@ -899,12 +1756,30 @@ def _is_actually_dangerous_global(mod: str, func: str, ml_context: dict) -> bool
         )
         return True
 
-    # STEP 2: ALWAYS flag dangerous modules (no exceptions)
+    # STEP 2: Flag dangerous modules, but allow explicitly safe-listed functions.
+    # The truly dangerous functions from these modules (eval, exec, open, getattr,
+    # setattr, delattr, __import__, compile, etc.) are already caught in STEP 1 via
+    # ALWAYS_DANGEROUS_FUNCTIONS, so any function reaching this point that is in the
+    # ML_SAFE_GLOBALS allowlist (e.g., builtins.slice, builtins.set) is genuinely safe.
     if mod in ALWAYS_DANGEROUS_MODULES:
+        if _is_safe_ml_global(mod, func):
+            logger.debug(
+                f"Safe function from dangerous module: {mod}.{func} (explicitly allowlisted in ML_SAFE_GLOBALS)"
+            )
+            return False
         logger.warning(f"Always-dangerous module detected: {mod}.{func} (flagged regardless of ML context)")
         return True
 
-    # STEP 3: Use original suspicious global check for all other cases
+    # STEP 3: Check ML_SAFE_GLOBALS allowlist (after dangerous checks)
+    # This prevents false positives for safe functions that passed the dangerous checks.
+    # E.g., __builtin__.set (Python 2) or builtins.set (Python 3) are safe.
+    # NOTE: This comes AFTER dangerous checks so that ALWAYS_DANGEROUS items
+    # can never be overridden by the allowlist.
+    if _is_safe_ml_global(mod, func):
+        logger.debug(f"Allowlisted safe global: {mod}.{func}")
+        return False
+
+    # STEP 4: Use original suspicious global check for all other cases
     # Removed ML confidence-based whitelisting to prevent bypass attacks
     return is_suspicious_global(mod, func)
 
@@ -927,43 +1802,270 @@ def _parse_module_function(arg: str) -> tuple[str, str] | None:
     return None
 
 
-def _find_stack_global_strings(opcodes: list, start_index: int, lookback: int = 10) -> tuple[str, str] | None:
+def _build_symbolic_reference_maps(
+    opcodes: list[tuple],
+) -> tuple[dict[int, tuple[str, str]], dict[int, tuple[str, str]]]:
     """
-    Find the two most recent string opcodes before a STACK_GLOBAL.
+    Build symbolic maps of callable references in an opcode stream.
 
-    STACK_GLOBAL uses two strings from the stack (module and function/class name).
-    This searches backwards to find them.
+    Returns:
+        Tuple of:
+        - stack_global_refs: opcode index -> (module, function) for STACK_GLOBAL
+        - callable_refs: opcode index -> (module, function) for REDUCE/NEWOBJ/OBJ/INST call targets
+    """
+    stack_global_refs: dict[int, tuple[str, str]] = {}
+    callable_refs: dict[int, tuple[str, str]] = {}
+
+    marker = object()
+    unknown = object()
+    stack: list[Any] = []
+    memo: dict[int | str, Any] = {}
+    next_memo_index = 0
+
+    def _pop(default: Any = unknown) -> Any:
+        return stack.pop() if stack else default
+
+    def _peek(default: Any = unknown) -> Any:
+        return stack[-1] if stack else default
+
+    def _pop_to_mark() -> list[Any]:
+        popped: list[Any] = []
+        while stack:
+            item = stack.pop()
+            if item is marker:
+                break
+            popped.append(item)
+        return popped
+
+    def _is_ref(value: Any) -> TypeGuard[tuple[str, str]]:
+        return isinstance(value, tuple) and len(value) == 2 and isinstance(value[0], str) and isinstance(value[1], str)
+
+    for i, (opcode, arg, _pos) in enumerate(opcodes):
+        name = opcode.name
+
+        # Reset stack and memo at stream boundaries (STOP) so that stale
+        # references from a previous pickle stream do not leak into the
+        # symbolic simulation of the next stream.
+        if name == "STOP":
+            stack.clear()
+            memo.clear()
+            next_memo_index = 0
+            continue
+
+        if name in STRING_OPCODES and isinstance(arg, str):
+            stack.append(arg)
+            continue
+
+        if name == "GLOBAL" and isinstance(arg, str):
+            parsed = _parse_module_function(arg)
+            stack.append(parsed if parsed else unknown)
+            continue
+
+        if name == "STACK_GLOBAL":
+            func_name = _pop()
+            mod_name = _pop()
+            if isinstance(mod_name, str) and isinstance(func_name, str):
+                ref = (mod_name, func_name)
+                stack_global_refs[i] = ref
+                stack.append(ref)
+            else:
+                stack.append(unknown)
+            continue
+
+        if name == "INST" and isinstance(arg, str):
+            parsed = _parse_module_function(arg)
+            if parsed:
+                callable_refs[i] = parsed
+            stack.append(unknown)
+            continue
+
+        if name in {"PUT", "BINPUT", "LONG_BINPUT"}:
+            memo[arg] = _peek()
+            if isinstance(arg, int):
+                next_memo_index = max(next_memo_index, arg + 1)
+            continue
+
+        if name == "MEMOIZE":
+            memo[next_memo_index] = _peek()
+            next_memo_index += 1
+            continue
+
+        if name in {"GET", "BINGET", "LONG_BINGET"}:
+            stack.append(memo.get(arg, unknown))
+            continue
+
+        if name == "MARK":
+            stack.append(marker)
+            continue
+
+        if name == "POP":
+            _pop()
+            continue
+
+        if name == "DUP":
+            stack.append(_peek())
+            continue
+
+        if name == "POP_MARK":
+            _pop_to_mark()
+            continue
+
+        if name in {"TUPLE", "LIST", "DICT", "SET", "FROZENSET"}:
+            _pop_to_mark()
+            stack.append(unknown)
+            continue
+
+        if name in {"TUPLE1", "TUPLE2", "TUPLE3"}:
+            size = {"TUPLE1": 1, "TUPLE2": 2, "TUPLE3": 3}[name]
+            for _ in range(size):
+                _pop()
+            stack.append(unknown)
+            continue
+
+        if name in {"EMPTY_TUPLE", "EMPTY_LIST", "EMPTY_DICT", "EMPTY_SET"}:
+            stack.append(unknown)
+            continue
+
+        if name in {"APPEND", "SETITEM"}:
+            # Pop appended item / key-value while keeping container on stack
+            _pop()
+            if name == "SETITEM":
+                _pop()
+            continue
+
+        if name in {"APPENDS", "SETITEMS", "ADDITEMS"}:
+            _pop_to_mark()
+            continue
+
+        if name == "BUILD":
+            # BUILD consumes state and mutates object in-place
+            _pop()
+            continue
+
+        if name == "REDUCE":
+            reduce_args = _pop()
+            callable_item = _pop()
+            del reduce_args
+            if _is_ref(callable_item):
+                callable_refs[i] = callable_item
+            stack.append(unknown)
+            continue
+
+        if name == "NEWOBJ":
+            newobj_args = _pop()
+            class_item = _pop()
+            del newobj_args
+            if _is_ref(class_item):
+                callable_refs[i] = class_item
+            stack.append(unknown)
+            continue
+
+        if name == "NEWOBJ_EX":
+            kwargs = _pop()
+            args = _pop()
+            class_item = _pop()
+            del kwargs, args
+            if _is_ref(class_item):
+                callable_refs[i] = class_item
+            stack.append(unknown)
+            continue
+
+        if name == "OBJ":
+            items = _pop_to_mark()
+            class_item = items[-1] if items else unknown
+            if _is_ref(class_item):
+                callable_refs[i] = class_item
+            stack.append(unknown)
+            continue
+
+        if name == "STOP":
+            # Reset stack and memo at pickle stream boundaries so that
+            # references from a previous stream cannot leak into the next
+            # one (multi-stream / appended-pickle scenarios).
+            stack.clear()
+            memo.clear()
+            next_memo_index = 0
+            continue
+
+        if name in {"BINPERSID"}:
+            _pop()
+            stack.append(unknown)
+            continue
+
+        if name == "STOP":
+            # Clear memo at stream boundaries so that a safe memo entry from
+            # stream 1 cannot be inherited by a dangerous callable in stream 2
+            # (cross-stream memo contamination).
+            memo.clear()
+            next_memo_index = 0
+            stack.clear()
+            continue
+
+        if name in {
+            "PERSID",
+            "NONE",
+            "NEWTRUE",
+            "NEWFALSE",
+            "INT",
+            "BININT",
+            "BININT1",
+            "BININT2",
+            "LONG",
+            "LONG1",
+            "LONG4",
+            "FLOAT",
+            "BINFLOAT",
+            "BINBYTES",
+            "SHORT_BINBYTES",
+            "BINBYTES8",
+            "BYTEARRAY8",
+            "UNICODE",
+            "SHORT_BINUNICODE",
+            "BINUNICODE",
+            "BINUNICODE8",
+        }:
+            stack.append(unknown)
+
+        if name == "STOP":
+            # Reset memo and stack at pickle stream boundaries so that
+            # references from one stream don't leak into the next in
+            # multi-pickle files (e.g. PyTorch .pt containers).
+            memo.clear()
+            stack.clear()
+            next_memo_index = 0
+
+    return stack_global_refs, callable_refs
+
+
+def _find_stack_global_strings(
+    opcodes: list,
+    start_index: int,
+    lookback: int = 10,
+    stack_global_refs: dict[int, tuple[str, str]] | None = None,
+) -> tuple[str, str] | None:
+    """
+    Resolve module/function used by STACK_GLOBAL from symbolic stack state.
 
     Args:
         opcodes: List of (opcode, arg, pos) tuples
-        start_index: Index to start searching backwards from
-        lookback: Maximum number of opcodes to search back
+        start_index: Index of the STACK_GLOBAL opcode
+        lookback: Unused (kept for backward compatibility)
+        stack_global_refs: Optional precomputed STACK_GLOBAL map
 
     Returns:
-        Tuple of (module, function/class) or None if not found
+        Tuple of (module, function/class) or None if not resolved
     """
-    string_opcodes = {
-        "SHORT_BINSTRING",
-        "BINSTRING",
-        "STRING",
-        "SHORT_BINUNICODE",
-        "BINUNICODE",
-        "UNICODE",
-    }
-
-    recent_strings: list[str] = []
-    for k in range(start_index - 1, max(0, start_index - lookback), -1):
-        prev_opcode, prev_arg, _prev_pos = opcodes[k]
-        if prev_opcode.name in string_opcodes and isinstance(prev_arg, str):
-            recent_strings.insert(0, prev_arg)
-            if len(recent_strings) >= 2:
-                return recent_strings[0], recent_strings[1]
-
-    return None
+    del lookback
+    refs = stack_global_refs if stack_global_refs is not None else _build_symbolic_reference_maps(opcodes)[0]
+    return refs.get(start_index)
 
 
 def _find_associated_global_or_class(
-    opcodes: list, current_index: int, lookback: int = 10
+    opcodes: list,
+    current_index: int,
+    lookback: int = 10,
+    stack_global_refs: dict[int, tuple[str, str]] | None = None,
+    callable_refs: dict[int, tuple[str, str]] | None = None,
 ) -> tuple[str | None, str | None, str | None]:
     """
     Look backward to find the associated GLOBAL or STACK_GLOBAL for an opcode.
@@ -975,10 +2077,18 @@ def _find_associated_global_or_class(
         opcodes: List of (opcode, arg, pos) tuples
         current_index: Current opcode index
         lookback: Maximum number of opcodes to search back
+        stack_global_refs: Optional precomputed STACK_GLOBAL map
+        callable_refs: Optional precomputed callable map (for REDUCE/NEWOBJ/OBJ/INST)
 
     Returns:
         Tuple of (module, function/class, full_name) or (None, None, None)
     """
+    callable_map = callable_refs if callable_refs is not None else _build_symbolic_reference_maps(opcodes)[1]
+    direct_ref = callable_map.get(current_index)
+    if direct_ref:
+        mod, func = direct_ref
+        return mod, func, f"{mod}.{func}"
+
     for j in range(current_index - 1, max(0, current_index - lookback), -1):
         prev_opcode, prev_arg, _prev_pos = opcodes[j]
 
@@ -991,7 +2101,12 @@ def _find_associated_global_or_class(
 
         elif prev_opcode.name == "STACK_GLOBAL":
             # Find two strings before STACK_GLOBAL
-            strings = _find_stack_global_strings(opcodes, j, lookback)
+            strings = _find_stack_global_strings(
+                opcodes,
+                j,
+                lookback=lookback,
+                stack_global_refs=stack_global_refs,
+            )
             if strings:
                 mod, func = strings
                 return mod, func, f"{mod}.{func}"
@@ -1001,7 +2116,7 @@ def _find_associated_global_or_class(
 
 def _is_actually_dangerous_string(s: str, ml_context: dict) -> str | None:
     """
-    Smart string analysis - looks for actual executable code rather than ML patterns.
+    Context-aware string analysis - looks for actual executable code rather than ML patterns.
     Now includes py_compile validation to reduce false positives.
     """
     import re
@@ -1103,7 +2218,8 @@ def _looks_like_pickle(data: bytes) -> bool:
             if opcode_count > 20:
                 break
 
-    except Exception:
+    except Exception as e:
+        logger.debug("Error analyzing pickle structure: %s", e)
         return False
 
     return False
@@ -1131,8 +2247,8 @@ def _decode_string_to_bytes(s: str) -> list[tuple[str, bytes]]:
             # Additional validation: decoded should be reasonable binary data
             if len(decoded) >= 8:  # At least 8 bytes for meaningful content
                 candidates.append(("base64", decoded))
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Failed to decode potential base64 string: %s", e)
 
     # More strict hex validation
     try:
@@ -1148,8 +2264,8 @@ def _decode_string_to_bytes(s: str) -> list[tuple[str, bytes]]:
             decoded = binascii.unhexlify(hex_str)
             if len(decoded) >= 8:  # At least 8 bytes
                 candidates.append(("hex", decoded))
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Failed to decode potential hex string: %s", e)
 
     return candidates
 
@@ -1181,7 +2297,7 @@ def _get_context_aware_severity(
 
 
 # ============================================================================
-# END SMART DETECTION SYSTEM
+# END ML CONTEXT FILTERING SYSTEM
 # ============================================================================
 
 
@@ -1269,8 +2385,12 @@ def is_suspicious_global(mod: str, func: str) -> bool:
         val = SUSPICIOUS_GLOBALS[mod]
         if val == "*":
             return True
-        if isinstance(val, list) and func in val:
-            return True
+        if isinstance(val, list):
+            # Handle ["*"] wildcard (all functions in module are suspicious)
+            if "*" in val:
+                return True
+            if func in val:
+                return True
 
     # Enhanced detection for builtin eval/exec patterns
     # These are CRITICAL as they allow arbitrary code execution
@@ -1304,24 +2424,77 @@ def is_suspicious_string(s: str) -> str | None:
             return pattern
 
     # Check for base64-like strings (long strings with base64 charset), but avoid repeating patterns
+    # and TF-IDF vocabulary strings (which are long alphanumeric but all lowercase words)
     if (
         len(s) > 40
         and re.match(r"^[A-Za-z0-9+/=]+$", s)
         and not re.match(r"^(.)\1*$", s)  # Not all same character
         and len(set(s)) > 4  # Must have some character diversity
+        # Require characteristics of actual base64: mixed case AND digits present
+        # This avoids matching TF-IDF vocabulary (all lowercase concatenated words)
+        and re.search(r"[A-Z]", s)
+        and re.search(r"[a-z]", s)
+        and re.search(r"[0-9]", s)
     ):
         return "potential_base64"
 
     return None
 
 
-def is_dangerous_reduce_pattern(opcodes: list[tuple]) -> dict[str, Any] | None:
+def is_dangerous_reduce_pattern(
+    opcodes: list[tuple],
+    stack_global_refs: dict[int, tuple[str, str]] | None = None,
+    callable_refs: dict[int, tuple[str, str]] | None = None,
+) -> dict[str, Any] | None:
     """
-    Check for patterns that indicate a dangerous __reduce__ method
-    Returns details about the dangerous pattern if found, None otherwise
+    Check for patterns that indicate a dangerous __reduce__ method.
+    Returns details about the dangerous pattern if found, None otherwise.
+
+    Only flags GLOBAL/STACK_GLOBAL+REDUCE patterns where the module/function
+    is actually dangerous or suspicious. Safe ML globals and unknown non-dangerous
+    modules are handled by the individual GLOBAL/REDUCE checks in the main loop.
     """
+
+    def _is_dangerous_ref(mod: str, func: str) -> bool:
+        """Check if a module.function reference is dangerous enough to flag."""
+        full_ref = f"{mod}.{func}"
+        # Check ALWAYS_DANGEROUS functions FIRST (before allowlist to prevent bypass)
+        if full_ref in ALWAYS_DANGEROUS_FUNCTIONS or func in ALWAYS_DANGEROUS_FUNCTIONS:
+            return True
+        # Check dangerous modules, but allow explicitly safe-listed functions
+        # (truly dangerous functions like eval/exec/open are caught above)
+        if mod in ALWAYS_DANGEROUS_MODULES:
+            return not _is_safe_ml_global(mod, func)
+        # Safe ML globals (checked after dangerous lists)
+        if _is_safe_ml_global(mod, func):
+            return False
+        # Check SUSPICIOUS_GLOBALS (the fallback)
+        return is_suspicious_global(mod, func)
+
+    if stack_global_refs is None or callable_refs is None:
+        computed_stack_refs, computed_callable_refs = _build_symbolic_reference_maps(opcodes)
+    else:
+        computed_stack_refs, computed_callable_refs = stack_global_refs, callable_refs
+
+    resolved_stack_globals = stack_global_refs if stack_global_refs is not None else computed_stack_refs
+    resolved_callables = callable_refs if callable_refs is not None else computed_callable_refs
+
     # Look for common patterns in __reduce__ exploits
     for i, (opcode, arg, pos) in enumerate(opcodes):
+        # Resolve REDUCE targets from symbolic stack state (handles BINGET/MEMOIZE indirection)
+        if opcode.name == "REDUCE":
+            reduce_ref = resolved_callables.get(i)
+            if reduce_ref:
+                mod, func = reduce_ref
+                if _is_dangerous_ref(mod, func):
+                    return {
+                        "pattern": "RESOLVED_REDUCE_CALL_TARGET",
+                        "module": mod,
+                        "function": func,
+                        "position": pos,
+                        "opcode": opcode.name,
+                    }
+
         # Check for GLOBAL followed by REDUCE - common in exploits
         if (opcode.name == "GLOBAL" and i + 1 < len(opcodes) and opcodes[i + 1][0].name == "REDUCE") and isinstance(
             arg, str
@@ -1329,22 +2502,80 @@ def is_dangerous_reduce_pattern(opcodes: list[tuple]) -> dict[str, Any] | None:
             parts = arg.split(" ", 1) if " " in arg else arg.rsplit(".", 1) if "." in arg else [arg, ""]
             if len(parts) == 2:
                 mod, func = parts
+                if _is_dangerous_ref(mod, func):
+                    return {
+                        "pattern": "GLOBAL+REDUCE",
+                        "module": mod,
+                        "function": func,
+                        "position": pos,
+                        "opcode": opcode.name,
+                    }
+
+        # Check for STACK_GLOBAL followed by REDUCE - protocol 4+ variant
+        if opcode.name == "STACK_GLOBAL":
+            # Check if next non-structural opcode leads to REDUCE
+            for j in range(i + 1, min(i + 5, len(opcodes))):
+                next_op = opcodes[j][0].name
+                if next_op == "REDUCE":
+                    resolved = resolved_stack_globals.get(i)
+                    if resolved:
+                        mod, func = resolved
+                        if _is_dangerous_ref(mod, func):
+                            return {
+                                "pattern": "STACK_GLOBAL+REDUCE",
+                                "module": mod,
+                                "function": func,
+                                "position": pos,
+                                "opcode": opcode.name,
+                            }
+                    break
+                elif next_op not in {
+                    "TUPLE",
+                    "TUPLE1",
+                    "TUPLE2",
+                    "TUPLE3",
+                    "EMPTY_TUPLE",
+                    "MARK",
+                    "BINPUT",
+                    "LONG_BINPUT",
+                    "MEMOIZE",
+                }:
+                    break
+
+        # Check for INST or OBJ opcodes which can also be used for code execution
+        # Skip if the target class is in the ML_SAFE_GLOBALS allowlist
+        if opcode.name in ["INST", "OBJ", "NEWOBJ", "NEWOBJ_EX"] and isinstance(arg, str):
+            parsed = _parse_module_function(arg)
+            is_safe = False
+            if parsed:
+                inst_mod, inst_func = parsed
+                is_safe = _is_safe_ml_global(inst_mod, inst_func)
+            if not is_safe:
+                # Also check via symbolic reference maps for NEWOBJ/OBJ
+                ref = resolved_callables.get(i)
+                if ref:
+                    is_safe = _is_safe_ml_global(ref[0], ref[1])
+            if not is_safe:
                 return {
-                    "pattern": "GLOBAL+REDUCE",
-                    "module": mod,
-                    "function": func,
+                    "pattern": f"{opcode.name}_EXECUTION",
+                    "argument": arg,
                     "position": pos,
                     "opcode": opcode.name,
                 }
 
-        # Check for INST or OBJ opcodes which can also be used for code execution
-        if opcode.name in ["INST", "OBJ", "NEWOBJ"] and isinstance(arg, str):
-            return {
-                "pattern": f"{opcode.name}_EXECUTION",
-                "argument": arg,
-                "position": pos,
-                "opcode": opcode.name,
-            }
+        # Check for OBJ/NEWOBJ/NEWOBJ_EX opcodes which produce arg=None;
+        # use the resolved callable map to get the associated class reference.
+        if opcode.name in {"OBJ", "NEWOBJ", "NEWOBJ_EX"}:
+            ref = resolved_callables.get(i)
+            if ref:
+                mod, func = ref
+                if _is_dangerous_ref(mod, func):
+                    return {
+                        "pattern": f"{opcode.name}_EXECUTION",
+                        "argument": f"{mod}.{func}",
+                        "position": pos,
+                        "opcode": opcode.name,
+                    }
 
         # Check for suspicious attribute access patterns (GETATTR followed by CALL)
         if opcode.name == "GETATTR" and i + 1 < len(opcodes) and opcodes[i + 1][0].name == "CALL":
@@ -1355,13 +2586,8 @@ def is_dangerous_reduce_pattern(opcodes: list[tuple]) -> dict[str, Any] | None:
                 "opcode": opcode.name,
             }
 
-        # Check for suspicious strings in STRING or BINSTRING opcodes
-        if opcode.name in [
-            "STRING",
-            "BINSTRING",
-            "SHORT_BINSTRING",
-            "UNICODE",
-        ] and isinstance(arg, str):
+        # Check for suspicious strings in all string opcodes
+        if opcode.name in STRING_OPCODES and isinstance(arg, str):
             suspicious_pattern = is_suspicious_string(arg)
             if suspicious_pattern:
                 return {
@@ -1378,6 +2604,8 @@ def is_dangerous_reduce_pattern(opcodes: list[tuple]) -> dict[str, Any] | None:
 def check_opcode_sequence(
     opcodes: list[tuple],
     ml_context: dict,
+    stack_global_refs: dict[int, tuple[str, str]] | None = None,
+    callable_refs: dict[int, tuple[str, str]] | None = None,
 ) -> list[dict[str, Any]]:
     """
     Analyze the full sequence of opcodes for suspicious patterns
@@ -1386,67 +2614,222 @@ def check_opcode_sequence(
     """
     suspicious_patterns: list[dict[str, Any]] = []
 
-    # SMART DETECTION: Check if we should ignore this sequence based on ML context
+    # ML CONTEXT FILTERING: Check if we should ignore this sequence based on ML context
     if _should_ignore_opcode_sequence(opcodes, ml_context):
         return suspicious_patterns  # Return empty list for legitimate ML content
+
+    if stack_global_refs is None or callable_refs is None:
+        computed_stack_refs, computed_callable_refs = _build_symbolic_reference_maps(opcodes)
+    else:
+        computed_stack_refs, computed_callable_refs = stack_global_refs, callable_refs
+
+    resolved_stack_globals = stack_global_refs if stack_global_refs is not None else computed_stack_refs
+    resolved_callables = callable_refs if callable_refs is not None else computed_callable_refs
+
+    # Memo and framing opcodes are structural (data storage/retrieval, not code
+    # execution).  They appear in every non-trivial pickle stream and counting
+    # them inflates the dangerous-opcode metric for legitimate ML models.
+    _STRUCTURAL_OPCODES = frozenset({"BINPUT", "LONG_BINPUT", "BINGET", "LONG_BINGET", "FRAME"})
 
     # Count dangerous opcodes with ML context awareness
     dangerous_opcode_count = 0
     consecutive_dangerous = 0
     max_consecutive = 0
+    # Track whether the last object construction used a safe ML global.
+    # BUILD opcodes restore state on the previously-constructed object via
+    # __setstate__ and are benign when the object comes from a safe ML class.
+    last_construction_safe = False
 
+    # Track pickle memo: maps memo index -> True if the stored value is a safe
+    # ML global.  This lets us recognise BINGET → REDUCE patterns where the
+    # callable was stored once via GLOBAL + BINPUT and then recalled many times.
+    _safe_memo: dict[int, bool] = {}
+    # Track next auto-assigned memo index for MEMOIZE opcodes (protocol 4+)
+    _next_memo_idx = 0
+
+    # Fixed baseline threshold for dangerous opcode detection.
+    # Only execution-related opcodes are counted (memo/framing excluded),
+    # and safe ML globals are skipped for REDUCE/GLOBAL/STACK_GLOBAL/NEWOBJ.
+    default_threshold = 50
+
+    # Track stream membership and stream lengths so thresholding can be applied
+    # per stream. Counters reset at STOP boundaries, so thresholds must align
+    # with those same boundaries to avoid cross-stream dilution.
+    stream_id_by_index: list[int] = []
+    stream_lengths: dict[int, int] = {}
+    current_stream_id = 0
+    current_stream_length = 0
+
+    for op, _arg, _pos in opcodes:
+        stream_id_by_index.append(current_stream_id)
+        current_stream_length += 1
+        if op.name == "STOP":
+            stream_lengths[current_stream_id] = current_stream_length
+            current_stream_id += 1
+            current_stream_length = 0
+
+    if current_stream_length > 0:
+        stream_lengths[current_stream_id] = current_stream_length
+    elif not stream_lengths:
+        stream_lengths[0] = 0
+
+    # In high-confidence ML contexts with tree-ensemble models (e.g. sklearn
+    # RandomForest, xgboost, lightgbm), tree-based models legitimately produce
+    # hundreds of REDUCE/NEWOBJ/BUILD opcodes for each estimator node. A Random
+    # Forest with 100 trees can easily produce 5000+ BUILD opcodes from
+    # __setstate__ calls on tree nodes.
+    # Raise the threshold significantly to suppress false positives, but ONLY
+    # when tree-ensemble markers are present -- not for all sklearn/xgboost refs.
+    _ml_frameworks = {str(name).lower() for name in ml_context.get("frameworks", {})}
+    _tree_ensemble_frameworks = {"sklearn", "xgboost", "lightgbm"}
+    _tree_ensemble_markers = {
+        "RandomForest",
+        "ExtraTrees",
+        "GradientBoosting",
+        "HistGradientBoosting",
+        "DecisionTree",
+        "XGB",
+        "LGBM",
+        "CatBoost",
+        "IsolationForest",
+        "AdaBoost",
+        # NOTE: BaggingClassifier/BaggingRegressor intentionally excluded --
+        # they are meta-estimators that can wrap any base estimator, not
+        # strictly tree-ensembles. Threshold escalation should only apply
+        # when we are confident the model is tree-based.
+    }
+
+    # Compute per-stream thresholds so appended streams are analyzed
+    # independently even when the file contains mixed-size streams.
+    stream_refs: dict[int, list[str]] = {stream_id: [] for stream_id in stream_lengths}
+
+    for idx, (mod, func) in resolved_stack_globals.items():
+        if 0 <= idx < len(stream_id_by_index):
+            stream_refs.setdefault(stream_id_by_index[idx], []).append(f"{mod}.{func}")
+
+    for idx, (mod, func) in resolved_callables.items():
+        if 0 <= idx < len(stream_id_by_index):
+            stream_refs.setdefault(stream_id_by_index[idx], []).append(f"{mod}.{func}")
+
+    for idx, (op, arg, _p) in enumerate(opcodes):
+        if op.name == "GLOBAL" and isinstance(arg, str):
+            stream_refs.setdefault(stream_id_by_index[idx], []).append(str(arg))
+
+    stream_thresholds: dict[int, int] = {}
+    ml_confidence_val = float(ml_context.get("overall_confidence", 0) or 0)
+    known_tree_frameworks = _tree_ensemble_frameworks & _ml_frameworks
+
+    for stream_id, stream_length in stream_lengths.items():
+        threshold = default_threshold
+        refs_str = " ".join(stream_refs.get(stream_id, []))
+        refs_str_lower = refs_str.lower()
+        has_tree_framework = any(
+            f"{framework}." in refs_str_lower
+            or f"{framework} " in refs_str_lower
+            or refs_str_lower.startswith(framework)
+            for framework in known_tree_frameworks
+        )
+        has_tree_markers = any(marker in refs_str for marker in _tree_ensemble_markers)
+
+        if ml_context.get("is_ml_content", False) and has_tree_framework and has_tree_markers:
+            # Tree-ensemble markers in-stream (e.g. RandomForest, DecisionTree)
+            # are strong evidence of legitimate model reconstruction behavior.
+            # Scale by stream size to handle large tree ensembles, with a
+            # moderate fallback when confidence is very low.
+            threshold = max(5000, stream_length // 2) if ml_confidence_val >= 0.15 else max(500, stream_length // 10)
+
+        stream_thresholds[stream_id] = threshold
+
+    current_stream_id = 0
     for i, (opcode, arg, pos) in enumerate(opcodes):
-        # Track dangerous opcodes, but skip REDUCE if it's using safe ML globals
+        # Reset counters at stream boundaries (STOP) so that multi-stream
+        # analysis evaluates each pickle stream independently.  Without this,
+        # legitimate ML models with many REDUCE calls spread across multiple
+        # streams would accumulate past the threshold.
+        if opcode.name == "STOP":
+            dangerous_opcode_count = 0
+            consecutive_dangerous = 0
+            max_consecutive = 0
+            last_construction_safe = False
+            current_stream_id += 1
+            continue
+
+        # Track dangerous opcodes, skipping safe ML globals and structural opcodes
         is_dangerous_opcode = False
 
         if opcode.name in DANGEROUS_OPCODES:
+            # Skip structural/memo opcodes — they cannot execute code on their own
+            if opcode.name in _STRUCTURAL_OPCODES:
+                pass
+
             # Special handling for REDUCE - check if it's using safe globals
-            if opcode.name == "REDUCE":
-                # Look back to find the associated GLOBAL or STACK_GLOBAL
-                for j in range(i - 1, max(0, i - 10), -1):
-                    prev_opcode, prev_arg, _prev_pos = opcodes[j]
-
-                    if prev_opcode.name == "GLOBAL" and isinstance(prev_arg, str):
-                        parts = (
-                            prev_arg.split(" ", 1)
-                            if " " in prev_arg
-                            else prev_arg.rsplit(".", 1)
-                            if "." in prev_arg
-                            else [prev_arg, ""]
-                        )
-                        if len(parts) == 2:
-                            mod, func = parts
-                            # Only count as dangerous if NOT in safe globals
-                            if not _is_safe_ml_global(mod, func):
-                                is_dangerous_opcode = True
-                            break
-
-                    elif prev_opcode.name == "STACK_GLOBAL":
-                        # Look for the two most recent string opcodes
-                        recent_strings: list[str] = []
-                        for k in range(j - 1, max(0, j - 10), -1):
-                            stack_prev_opcode, stack_prev_arg, _stack_prev_pos = opcodes[k]
-                            if stack_prev_opcode.name in [
-                                "SHORT_BINSTRING",
-                                "BINSTRING",
-                                "STRING",
-                                "SHORT_BINUNICODE",
-                                "BINUNICODE",
-                                "UNICODE",
-                            ] and isinstance(stack_prev_arg, str):
-                                recent_strings.insert(0, stack_prev_arg)
-                                if len(recent_strings) >= 2:
-                                    break
-
-                        if len(recent_strings) >= 2:
-                            mod, func = recent_strings[0], recent_strings[1]
-                            # Only count as dangerous if NOT in safe globals
-                            if not _is_safe_ml_global(mod, func):
-                                is_dangerous_opcode = True
-                            break
-            else:
-                # Other dangerous opcodes are always counted
+            elif opcode.name == "REDUCE":
+                # Default to dangerous if no associated GLOBAL/STACK_GLOBAL found
                 is_dangerous_opcode = True
+                last_construction_safe = False
+                associated_ref = resolved_callables.get(i)
+                if associated_ref:
+                    mod, func = associated_ref
+                    # Only skip if in safe globals
+                    if _is_safe_ml_global(mod, func):
+                        is_dangerous_opcode = False
+                        last_construction_safe = True
+
+            # NEWOBJ/NEWOBJ_EX: check callable refs like REDUCE
+            elif opcode.name in ("NEWOBJ", "NEWOBJ_EX"):
+                is_dangerous_opcode = True
+                last_construction_safe = False
+                associated_ref = resolved_callables.get(i)
+                if associated_ref:
+                    mod, func = associated_ref
+                    if _is_safe_ml_global(mod, func):
+                        is_dangerous_opcode = False
+                        last_construction_safe = True
+
+            # BUILD: restores object state via __setstate__.  When the
+            # preceding construction used a safe ML global the BUILD is
+            # benign — it just sets attributes on a known-safe object.
+            elif opcode.name == "BUILD":
+                if not last_construction_safe:
+                    is_dangerous_opcode = True
+                # BUILD does not reset last_construction_safe because
+                # multiple BUILD opcodes can follow a single construction
+                # (e.g. nested __setstate__ calls in sklearn trees).
+
+            # GLOBAL/STACK_GLOBAL: only count when referencing non-safe modules
+            # Also skip counting when the "module" name is not a plausible
+            # Python module (e.g. DataFrame column names like "PEDRA_2020").
+            elif opcode.name == "GLOBAL" and isinstance(arg, str):
+                parts = arg.split(" ", 1) if " " in arg else arg.rsplit(".", 1) if "." in arg else [arg, ""]
+                if len(parts) == 2:
+                    mod, func = parts
+                    if not _is_safe_ml_global(mod, func) and _is_plausible_python_module(mod):
+                        is_dangerous_opcode = True
+                else:
+                    is_dangerous_opcode = True
+
+            elif opcode.name == "STACK_GLOBAL":
+                stack_ref = resolved_stack_globals.get(i)
+                if stack_ref:
+                    mod, func = stack_ref
+                    if not _is_safe_ml_global(mod, func) and _is_plausible_python_module(mod):
+                        is_dangerous_opcode = True
+                else:
+                    is_dangerous_opcode = True
+
+            elif opcode.name in ("NEWOBJ", "NEWOBJ_EX"):
+                # NEWOBJ/NEWOBJ_EX: check associated class via resolved_callables
+                is_dangerous_opcode = True
+                associated_ref = resolved_callables.get(i)
+                if associated_ref:
+                    mod, func = associated_ref
+                    if _is_safe_ml_global(mod, func):
+                        is_dangerous_opcode = False
+
+            else:
+                # Other dangerous opcodes (INST, OBJ, EXT*)
+                is_dangerous_opcode = True
+                last_construction_safe = False
 
             if is_dangerous_opcode:
                 dangerous_opcode_count += 1
@@ -1457,10 +2840,7 @@ def check_opcode_sequence(
         else:
             consecutive_dangerous = 0
 
-        # Fixed threshold for dangerous opcode detection
-        # Removed ML confidence-based adjustments to prevent security bypasses
-        threshold = 50  # Lower threshold for stronger security (may increase false positives on large models)
-
+        threshold = stream_thresholds.get(current_stream_id, default_threshold)
         if dangerous_opcode_count > threshold:
             suspicious_patterns.append(
                 {
@@ -1691,10 +3071,15 @@ class PickleScanner(BaseScanner):
                 # For .bin files, also scan the remaining binary content
                 # PyTorch files have pickle header followed by tensor data
                 if is_bin_file and scan_result.success:
-                    pickle_end_pos = f.tell()
+                    # Use the first pickle stream end position (before multi-stream
+                    # scanning consumed additional bytes) for binary content scanning.
+                    pickle_end_pos = scan_result.metadata.get("first_pickle_end_pos", f.tell())
                     remaining_bytes = file_size - pickle_end_pos
 
                     if remaining_bytes > 0:
+                        # Seek to the pickle end position (multi-stream scanning may
+                        # have advanced the file pointer beyond this point).
+                        f.seek(pickle_end_pos)
                         # Always scan binary content after pickle
                         # Removed ML confidence-based skipping to prevent security bypasses
                         binary_result = self._scan_binary_content(
@@ -2327,6 +3712,8 @@ class PickleScanner(BaseScanner):
                 logger.debug(f"Pickle parsing failed with no globals found: {e}")
                 return set()
 
+            stack_global_refs, _callable_refs = _build_symbolic_reference_maps(ops)
+
             last_byte = data.read(1)
             if last_byte:
                 data.seek(-1, 1)
@@ -2344,11 +3731,11 @@ class PickleScanner(BaseScanner):
                     elif parts:
                         globals_found.add((parts[0], ""))
                 elif op_name == "STACK_GLOBAL":
-                    values = self._extract_stack_global_values(ops, n, memo)
-                    if len(values) == 2:
-                        globals_found.add((values[1], values[0]))
+                    resolved = stack_global_refs.get(n)
+                    if resolved:
+                        globals_found.add(resolved)
                     else:
-                        logger.debug(f"STACK_GLOBAL parsing failed at position {n}, found {len(values)} values")
+                        logger.debug(f"STACK_GLOBAL parsing failed at position {n}")
                         globals_found.add(("unknown", "unknown"))
 
             if not multiple_pickles:
@@ -2370,7 +3757,7 @@ class PickleScanner(BaseScanner):
                 continue
             if op_name in {"GET", "BINGET", "LONG_BINGET"}:
                 values.append(memo.get(op_value, "unknown"))
-            elif op_name in {"SHORT_BINUNICODE", "UNICODE", "BINUNICODE", "BINUNICODE8"}:
+            elif op_name in STRING_OPCODES:
                 values.append(str(op_value))
             else:
                 logger.debug(f"Non-string opcode {op_name} in STACK_GLOBAL analysis")
@@ -2483,6 +3870,8 @@ class PickleScanner(BaseScanner):
             opcodes = []
             # Track strings on the stack for STACK_GLOBAL opcode analysis
             string_stack = []
+            # Track end position of the first pickle stream for binary scanning
+            first_pickle_end_pos: int | None = None
 
             # Track stack depth for complexity analysis
             current_stack_depth = 0
@@ -2494,7 +3883,7 @@ class PickleScanner(BaseScanner):
             # Store warnings for ML-context-aware processing
             stack_depth_warnings: list[dict[str, int | str]] = []
 
-            for opcode, arg, pos in _genops_with_fallback(file_obj):
+            for opcode, arg, pos in _genops_with_fallback(file_obj, multi_stream=True):
                 # Check for interrupts periodically during opcode processing
                 if opcode_count % 1000 == 0:  # Check every 1000 opcodes
                     self.check_interrupted()
@@ -2521,6 +3910,8 @@ class PickleScanner(BaseScanner):
                 # STOP resets the stack
                 elif opcode.name == "STOP":
                     current_stack_depth = 0
+                    if first_pickle_end_pos is None:
+                        first_pickle_end_pos = start_pos + pos + 1
 
                 # Store stack depth warnings for ML-context-aware processing later
                 if current_stack_depth > base_stack_depth_limit:
@@ -2555,13 +3946,7 @@ class PickleScanner(BaseScanner):
                         break
 
                 # Track strings for STACK_GLOBAL analysis
-                if opcode.name in [
-                    "STRING",
-                    "BINSTRING",
-                    "SHORT_BINSTRING",
-                    "SHORT_BINUNICODE",
-                    "UNICODE",
-                ] and isinstance(arg, str):
+                if opcode.name in STRING_OPCODES and isinstance(arg, str):
                     string_stack.append(arg)
                     # Keep only the last 10 strings to avoid memory issues
                     if len(string_stack) > 10:
@@ -2615,11 +4000,31 @@ class PickleScanner(BaseScanner):
                     },
                 )
 
-            # SMART DETECTION: Analyze ML context once for the entire pickle
+            # ML CONTEXT FILTERING: Analyze ML context once for the entire pickle
             ml_context = _detect_ml_context(opcodes)
+            stack_global_refs, callable_refs = _build_symbolic_reference_maps(opcodes)
 
             # CVE-2025-32434 specific opcode sequence analysis - REMOVED
             # Now only show CVE info in REDUCE opcode detection messages
+
+            # CVE-2026-24747: Context-aware SETITEM/SETITEMS abuse detection
+            cve_2026_patterns = self._detect_cve_2026_24747_sequences(opcodes, file_size)
+            if cve_2026_patterns:
+                for pattern in cve_2026_patterns:
+                    result.add_check(
+                        name="CVE-2026-24747 SETITEM Abuse Detection",
+                        passed=False,
+                        message=pattern["description"],
+                        severity=IssueSeverity.WARNING,
+                        location=f"{self.current_file_path} (pos {pattern['position']})",
+                        details=pattern,
+                        why=(
+                            "CVE-2026-24747 exploits SETITEM/SETITEMS opcodes applied to non-dict "
+                            "objects (particularly tensor reconstruction results) to bypass the "
+                            "weights_only=True restricted unpickler in PyTorch < 2.10.0, enabling "
+                            "heap layout manipulation and control flow hijacking."
+                        ),
+                    )
 
             # Stack depth validation with tiered limits
             # Tiered approach: 0-3000 (OK), 3000-5000 (INFO), 5000-10000 (WARNING), 10000+ (CRITICAL)
@@ -2720,13 +4125,16 @@ class PickleScanner(BaseScanner):
                     "suspicious_count": suspicious_count,
                 },
             )
+            if first_pickle_end_pos is not None:
+                result.metadata["first_pickle_end_pos"] = first_pickle_end_pos
 
             # Analyze globals extracted from all pickle streams
             for mod, func in advanced_globals:
                 if _is_actually_dangerous_global(mod, func, ml_context):
                     suspicious_count += 1
+                    base_sev = IssueSeverity.WARNING if mod in WARNING_SEVERITY_MODULES else IssueSeverity.CRITICAL
                     severity = _get_context_aware_severity(
-                        IssueSeverity.CRITICAL,
+                        base_sev,
                         ml_context,
                         issue_type="dangerous_global",
                     )
@@ -2773,8 +4181,11 @@ class PickleScanner(BaseScanner):
                         mod, func = parts
                         if _is_actually_dangerous_global(mod, func, ml_context):
                             suspicious_count += 1
+                            base_sev = (
+                                IssueSeverity.WARNING if mod in WARNING_SEVERITY_MODULES else IssueSeverity.CRITICAL
+                            )
                             severity = _get_context_aware_severity(
-                                IssueSeverity.CRITICAL,
+                                base_sev,
                                 ml_context,
                                 issue_type="dangerous_global",
                             )
@@ -2825,7 +4236,12 @@ class PickleScanner(BaseScanner):
                 # Flag as WARNING if not in safe globals, INFO if in safe globals
                 if opcode.name == "REDUCE":
                     # Look back to find the associated GLOBAL or STACK_GLOBAL
-                    reduce_mod, reduce_func, associated_global = _find_associated_global_or_class(opcodes, i)
+                    reduce_mod, reduce_func, associated_global = _find_associated_global_or_class(
+                        opcodes,
+                        i,
+                        stack_global_refs=stack_global_refs,
+                        callable_refs=callable_refs,
+                    )
                     is_safe_global = (
                         _is_safe_ml_global(reduce_mod, reduce_func) if reduce_mod and reduce_func else False
                     )
@@ -2871,22 +4287,54 @@ class PickleScanner(BaseScanner):
                                         issue_type="dangerous_global",
                                     )
                                 else:
+                                    # Non-allowlisted but not explicitly dangerous.
+                                    # Before flagging, check if the "module" name
+                                    # actually looks like a real Python module.
+                                    # Pickle GLOBAL args can contain arbitrary data
+                                    # strings (e.g. DataFrame column names like
+                                    # "PEDRA_2020") that are not real modules.
+                                    if not _is_plausible_python_module(reduce_mod):
+                                        # Not a real module -- record as safe (INFO)
+                                        result.add_check(
+                                            name="REDUCE Opcode Safety Check",
+                                            passed=True,
+                                            message=(
+                                                f"REDUCE opcode with implausible module name "
+                                                f"'{reduce_mod}' (likely data, not a real import): "
+                                                f"{associated_global}"
+                                            ),
+                                            severity=IssueSeverity.INFO,
+                                            location=f"{self.current_file_path} (pos {pos})",
+                                            details={
+                                                "position": pos,
+                                                "opcode": opcode.name,
+                                                "associated_global": associated_global,
+                                                "implausible_module": True,
+                                                "ml_context_confidence": ml_context.get(
+                                                    "overall_confidence",
+                                                    0,
+                                                ),
+                                            },
+                                        )
+                                        continue
                                     # Non-allowlisted but not explicitly dangerous - WARNING
                                     severity = _get_context_aware_severity(
                                         IssueSeverity.WARNING,
                                         ml_context,
                                     )
 
-                                result.add_check(
-                                    name="REDUCE Opcode Safety Check",
-                                    passed=False,
-                                    message=(
+                                # CVE-2025-32434 is specific to torch.load() and
+                                # should only be referenced for PyTorch file formats
+                                _ext = os.path.splitext(self.current_file_path)[1].lower()
+                                _is_pytorch_file = _ext in {".pt", ".pth"} or (
+                                    _ext == ".bin" and "pytorch" in ml_context.get("frameworks", {})
+                                )
+                                if _is_pytorch_file:
+                                    _reduce_msg = (
                                         f"Found REDUCE opcode with non-allowlisted global: {associated_global}. "
                                         f"This may indicate CVE-2025-32434 exploitation (RCE via torch.load)"
-                                    ),
-                                    severity=severity,
-                                    location=f"{self.current_file_path} (pos {pos})",
-                                    details={
+                                    )
+                                    _reduce_details: dict[str, Any] = {
                                         "position": pos,
                                         "opcode": opcode.name,
                                         "associated_global": associated_global,
@@ -2895,15 +4343,41 @@ class PickleScanner(BaseScanner):
                                             "overall_confidence",
                                             0,
                                         ),
-                                    },
+                                    }
+                                else:
+                                    _reduce_msg = (
+                                        f"Found REDUCE opcode with non-allowlisted global: {associated_global}"
+                                    )
+                                    _reduce_details = {
+                                        "position": pos,
+                                        "opcode": opcode.name,
+                                        "associated_global": associated_global,
+                                        "ml_context_confidence": ml_context.get(
+                                            "overall_confidence",
+                                            0,
+                                        ),
+                                    }
+
+                                result.add_check(
+                                    name="REDUCE Opcode Safety Check",
+                                    passed=False,
+                                    message=_reduce_msg,
+                                    severity=severity,
+                                    location=f"{self.current_file_path} (pos {pos})",
+                                    details=_reduce_details,
                                     why=get_opcode_explanation("REDUCE"),
                                 )
 
-                # Check NEWOBJ/OBJ/INST opcodes for potential security issues
+                # Check NEWOBJ/NEWOBJ_EX/OBJ/INST opcodes for potential security issues
                 # Apply same logic as REDUCE: check if class is in ML_SAFE_GLOBALS
-                if opcode.name in ["INST", "OBJ", "NEWOBJ"]:
+                if opcode.name in ["INST", "OBJ", "NEWOBJ", "NEWOBJ_EX"]:
                     # Look back to find the associated class (GLOBAL or STACK_GLOBAL)
-                    class_mod, class_name, associated_class = _find_associated_global_or_class(opcodes, i)
+                    class_mod, class_name, associated_class = _find_associated_global_or_class(
+                        opcodes,
+                        i,
+                        stack_global_refs=stack_global_refs,
+                        callable_refs=callable_refs,
+                    )
                     is_safe_class = _is_safe_ml_global(class_mod, class_name) if class_mod and class_name else False
 
                     # Report based on safe class check (same logic as REDUCE)
@@ -2911,7 +4385,7 @@ class PickleScanner(BaseScanner):
                         if is_safe_class:
                             # Safe class (in ML_SAFE_GLOBALS) - show as INFO
                             result.add_check(
-                                name="INST/OBJ/NEWOBJ Opcode Safety Check",
+                                name="INST/OBJ/NEWOBJ/NEWOBJ_EX Opcode Safety Check",
                                 passed=True,
                                 message=f"{opcode.name} opcode with safe ML class: {associated_class}",
                                 severity=IssueSeverity.INFO,
@@ -2942,6 +4416,31 @@ class PickleScanner(BaseScanner):
                                         issue_type="dangerous_global",
                                     )
                                 else:
+                                    # Skip if module name is not a plausible Python module
+                                    # (e.g. DataFrame column names like "PEDRA_2020")
+                                    if not _is_plausible_python_module(class_mod):
+                                        result.add_check(
+                                            name="INST/OBJ/NEWOBJ/NEWOBJ_EX Opcode Safety Check",
+                                            passed=True,
+                                            message=(
+                                                f"{opcode.name} opcode with implausible module name "
+                                                f"'{class_mod}' (likely data, not a real import): "
+                                                f"{associated_class}"
+                                            ),
+                                            severity=IssueSeverity.INFO,
+                                            location=f"{self.current_file_path} (pos {pos})",
+                                            details={
+                                                "position": pos,
+                                                "opcode": opcode.name,
+                                                "associated_class": associated_class,
+                                                "implausible_module": True,
+                                                "ml_context_confidence": ml_context.get(
+                                                    "overall_confidence",
+                                                    0,
+                                                ),
+                                            },
+                                        )
+                                        continue
                                     # Non-allowlisted but not explicitly dangerous - WARNING
                                     severity = _get_context_aware_severity(
                                         IssueSeverity.WARNING,
@@ -2949,7 +4448,7 @@ class PickleScanner(BaseScanner):
                                     )
 
                                 result.add_check(
-                                    name="INST/OBJ/NEWOBJ Opcode Safety Check",
+                                    name="INST/OBJ/NEWOBJ/NEWOBJ_EX Opcode Safety Check",
                                     passed=False,
                                     message=(
                                         f"Found {opcode.name} opcode with non-allowlisted class: {associated_class}"
@@ -2981,7 +4480,7 @@ class PickleScanner(BaseScanner):
                                 if is_safe_class:
                                     # Safe class found via arg parsing - INFO
                                     result.add_check(
-                                        name="INST/OBJ/NEWOBJ Opcode Safety Check",
+                                        name="INST/OBJ/NEWOBJ/NEWOBJ_EX Opcode Safety Check",
                                         passed=True,
                                         message=f"{opcode.name} opcode with safe ML class: {associated_class}",
                                         severity=IssueSeverity.INFO,
@@ -3025,68 +4524,31 @@ class PickleScanner(BaseScanner):
                         why=get_opcode_explanation("REDUCE"),
                     )
 
-                # SMART DETECTION: Only flag other dangerous opcodes
-                # if not clearly ML content
-                data_type: str | None = None
-                confidence: float | None = None
-
-                if opcode.name in ["INST", "OBJ", "NEWOBJ"] and not ml_context.get(
-                    "is_ml_content",
-                    False,
-                ):
-                    # Use entropy analysis to check if this is ML data
-                    if pos is not None:
-                        surrounding_data = self._get_surrounding_data(file_data, pos, 1024)
-                    else:
-                        surrounding_data = file_data[:1024]  # Use first 1024 bytes if pos is None
-                    data_type, confidence = self.entropy_analyzer.classify_data_type(surrounding_data)
-
-                    # Skip if it looks like ML weights with high confidence
-                    if data_type == "ml_weights" and confidence > 0.7:
-                        continue
-
-                    # For sklearn models, NEWOBJ is expected for constructing objects
-                    if (
-                        opcode.name == "NEWOBJ"
-                        and ml_context.get("frameworks", {}).get("sklearn", {}).get("confidence", 0) > 0.3
-                    ):
-                        continue
-
-                    severity = _get_context_aware_severity(
-                        IssueSeverity.WARNING,
-                        ml_context,
-                    )
-                    # Get rule code for this pickle opcode
-                    opcode_rule = get_pickle_opcode_rule_code(opcode.name)
-                    result.add_check(
-                        name="INST/OBJ Opcode Safety Check",
-                        passed=False,
-                        message=f"Found {opcode.name} opcode - potential code execution",
-                        severity=severity,
-                        location=f"{self.current_file_path} (pos {pos})",
-                        rule_code=opcode_rule,
-                        details={
-                            "position": pos,
-                            "opcode": opcode.name,
-                            "argument": str(arg),
-                            "ml_context_confidence": ml_context.get(
-                                "overall_confidence",
-                                0,
-                            ),
-                            "entropy_classification": data_type,
-                            "entropy_confidence": confidence,
-                        },
-                        why=get_opcode_explanation(opcode.name),
-                    )
+                        severity = _get_context_aware_severity(
+                            IssueSeverity.WARNING,
+                            ml_context,
+                        )
+                        result.add_check(
+                            name="INST/OBJ/NEWOBJ/NEWOBJ_EX Opcode Safety Check",
+                            passed=False,
+                            message=f"Found {opcode.name} opcode - potential code execution (class unknown)",
+                            severity=severity,
+                            location=f"{self.current_file_path} (pos {pos})",
+                            rule_code=get_pickle_opcode_rule_code(opcode.name),
+                            details={
+                                "position": pos,
+                                "opcode": opcode.name,
+                                "argument": str(arg),
+                                "ml_context_confidence": ml_context.get(
+                                    "overall_confidence",
+                                    0,
+                                ),
+                            },
+                            why=get_opcode_explanation(opcode.name),
+                        )
 
                 # Check for suspicious strings
-                if opcode.name in [
-                    "STRING",
-                    "BINSTRING",
-                    "SHORT_BINSTRING",
-                    "UNICODE",
-                    "SHORT_BINUNICODE",
-                ] and isinstance(arg, str):
+                if opcode.name in STRING_OPCODES and isinstance(arg, str):
                     suspicious_pattern = _is_actually_dangerous_string(arg, ml_context)
                     if suspicious_pattern:
                         severity = _get_context_aware_severity(
@@ -3154,13 +4616,7 @@ class PickleScanner(BaseScanner):
                         )
 
                 # Detect encoded nested pickle strings
-                if opcode.name in [
-                    "STRING",
-                    "BINSTRING",
-                    "SHORT_BINSTRING",
-                    "UNICODE",
-                    "SHORT_BINUNICODE",
-                ] and isinstance(arg, str):
+                if opcode.name in STRING_OPCODES and isinstance(arg, str):
                     for enc, decoded in _decode_string_to_bytes(arg):
                         if _looks_like_pickle(decoded[:1024]):
                             severity = _get_context_aware_severity(IssueSeverity.CRITICAL, ml_context)
@@ -3227,38 +4683,16 @@ class PickleScanner(BaseScanner):
             # (rebuild from opcodes to get proper context)
             for i, (opcode, _arg, pos) in enumerate(opcodes):
                 if opcode.name == "STACK_GLOBAL":
-                    # Find the two immediately preceding STRING-like opcodes
-                    # STACK_GLOBAL expects exactly two strings on the stack:
-                    # module and function
-                    recent_strings: list[str] = []
-                    for j in range(
-                        i - 1,
-                        max(0, i - 10),
-                        -1,
-                    ):  # Look back at most 10 opcodes
-                        prev_opcode, prev_arg, _prev_pos = opcodes[j]
-                        if prev_opcode.name in [
-                            "STRING",
-                            "BINSTRING",
-                            "SHORT_BINSTRING",
-                            "SHORT_BINUNICODE",
-                            "UNICODE",
-                        ] and isinstance(prev_arg, str):
-                            recent_strings.insert(
-                                0,
-                                prev_arg,
-                            )  # Insert at beginning to maintain order
-                            if len(recent_strings) >= 2:
-                                break
-
-                    if len(recent_strings) >= 2:
-                        # The two strings are module and function in that order
-                        mod = recent_strings[0]  # First string pushed (module)
-                        func = recent_strings[1]  # Second string pushed (function)
+                    resolved = stack_global_refs.get(i)
+                    if resolved:
+                        mod, func = resolved
                         if _is_actually_dangerous_global(mod, func, ml_context):
                             suspicious_count += 1
+                            base_sev = (
+                                IssueSeverity.WARNING if mod in WARNING_SEVERITY_MODULES else IssueSeverity.CRITICAL
+                            )
                             severity = _get_context_aware_severity(
-                                IssueSeverity.CRITICAL,
+                                base_sev,
                                 ml_context,
                                 issue_type="dangerous_global",
                             )
@@ -3317,7 +4751,7 @@ class PickleScanner(BaseScanner):
                                 details={
                                     "position": pos,
                                     "opcode": opcode.name,
-                                    "stack_size": len(recent_strings),
+                                    "stack_size": "unknown",
                                     "ml_context_confidence": ml_context.get(
                                         "overall_confidence",
                                         0,
@@ -3331,8 +4765,14 @@ class PickleScanner(BaseScanner):
                             )
 
             # Check for dangerous patterns in the opcodes
-            dangerous_pattern = is_dangerous_reduce_pattern(opcodes)
-            if dangerous_pattern and not ml_context.get("is_ml_content", False):
+            # SECURITY: Always run reduce pattern analysis regardless of ML context.
+            # ML context must not suppress security-critical pattern detection.
+            dangerous_pattern = is_dangerous_reduce_pattern(
+                opcodes,
+                stack_global_refs=stack_global_refs,
+                callable_refs=callable_refs,
+            )
+            if dangerous_pattern:
                 suspicious_count += 1
                 severity = _get_context_aware_severity(
                     IssueSeverity.CRITICAL,
@@ -3379,7 +4819,12 @@ class PickleScanner(BaseScanner):
                 )
 
             # Check for suspicious opcode sequences with ML context
-            suspicious_sequences = check_opcode_sequence(opcodes, ml_context)
+            suspicious_sequences = check_opcode_sequence(
+                opcodes,
+                ml_context,
+                stack_global_refs=stack_global_refs,
+                callable_refs=callable_refs,
+            )
             if suspicious_sequences:
                 for sequence in suspicious_sequences:
                     suspicious_count += 1
@@ -3403,7 +4848,8 @@ class PickleScanner(BaseScanner):
                         },
                         why=(
                             "This pickle contains an unusually high concentration of opcodes that can execute code "
-                            "(REDUCE, INST, OBJ, NEWOBJ). Such patterns are uncommon in legitimate model files."
+                            "(REDUCE, INST, OBJ, NEWOBJ, NEWOBJ_EX). "
+                            "Such patterns are uncommon in legitimate model files."
                         ),
                     )
             else:
@@ -3985,7 +5431,7 @@ class PickleScanner(BaseScanner):
             # Count dangerous opcodes
             # Note: STACK_GLOBAL is only dangerous with malicious imports, not with legitimate ML framework imports
             is_dangerous = False
-            if opcode.name in ["REDUCE", "INST", "OBJ", "NEWOBJ"]:
+            if opcode.name in ["REDUCE", "INST", "OBJ", "NEWOBJ", "NEWOBJ_EX"]:
                 is_dangerous = True
             elif opcode.name == "STACK_GLOBAL" and arg:
                 # Only count STACK_GLOBAL as dangerous if it's NOT a legitimate ML framework import
@@ -4028,7 +5474,7 @@ class PickleScanner(BaseScanner):
                 # Note: We check ALL torch operations since even legitimate ones can be part of attacks
                 for j in range(i + 1, min(i + 31, len(opcodes))):
                     next_opcode, _next_arg, next_pos = opcodes[j]
-                    if next_opcode.name in ["REDUCE", "INST", "OBJ", "NEWOBJ"]:
+                    if next_opcode.name in ["REDUCE", "INST", "OBJ", "NEWOBJ", "NEWOBJ_EX"]:
                         # Only flag clearly suspicious torch operations
                         is_suspicious = (
                             # Suspicious torch modules/functions
@@ -4254,6 +5700,117 @@ class PickleScanner(BaseScanner):
                     "status": "normal",
                 }
             )
+
+        return patterns
+
+    def _detect_cve_2026_24747_sequences(self, opcodes: list[tuple], file_size: int) -> list[dict]:
+        """Detect opcode sequences indicating CVE-2026-24747 exploitation.
+
+        CVE-2026-24747 bypasses PyTorch's weights_only=True restricted unpickler
+        via SETITEM/SETITEMS applied to non-dict objects (particularly after
+        _rebuild_tensor operations) and tensor metadata mismatches.
+
+        Uses context-aware analysis: SETITEM on dicts is normal and skipped.
+        Only SETITEM in suspicious contexts (after tensor rebuild, near dangerous
+        globals) is flagged.
+        """
+        patterns: list[dict] = []
+        # Pre-compute symbolic references for STACK_GLOBAL resolution.
+        # This handles BINUNICODE8, memoized strings (BINGET/LONG_BINGET),
+        # and indirect stack flows that a narrow lookback would miss.
+        stack_global_refs, _ = _build_symbolic_reference_maps(opcodes)
+
+        for i, (opcode, _arg, pos) in enumerate(opcodes):
+            if opcode.name not in ("SETITEM", "SETITEMS"):
+                continue
+
+            # Look backward to determine context
+            has_rebuild_tensor = False
+            has_dangerous_global = False
+            context_details: list[str] = []
+
+            lookback = min(i, 30)
+            # Track whether a dict DIRECTLY produces the object that SETITEM targets.
+            # Only suppress when the dict is the most recent container-producing op.
+            most_recent_container: str | None = None
+            for j in range(i - 1, max(0, i - lookback) - 1, -1):
+                prev_op, prev_arg, _prev_pos = opcodes[j]
+
+                # Track the most recent container-producing op
+                if prev_op.name in ("EMPTY_DICT", "DICT") and most_recent_container is None:
+                    most_recent_container = "dict"
+                if prev_op.name in ("REDUCE", "NEWOBJ", "NEWOBJ_EX") and most_recent_container is None:
+                    most_recent_container = "object"
+
+                # Resolve STACK_GLOBAL args using pre-computed symbolic map
+                # (handles BINUNICODE8, memoized strings via BINGET/LONG_BINGET,
+                # and indirect stack flows)
+                resolved_arg = prev_arg
+                if prev_op.name == "STACK_GLOBAL" and not prev_arg:
+                    ref = stack_global_refs.get(j)
+                    if ref:
+                        resolved_arg = f"{ref[0]}.{ref[1]}"
+
+                # Check for _rebuild_tensor context (suspicious with SETITEM)
+                if prev_op.name in ("GLOBAL", "STACK_GLOBAL") and resolved_arg:
+                    arg_str = str(resolved_arg).lower()
+                    if "_rebuild_tensor" in arg_str or "_rebuild_parameter" in arg_str:
+                        has_rebuild_tensor = True
+                        context_details.append(f"_rebuild operation: {resolved_arg}")
+
+                    # Check for dangerous modules near SETITEM
+                    if any(
+                        d in arg_str
+                        for d in [
+                            "os.",
+                            "subprocess",
+                            "eval",
+                            "exec",
+                            "__import__",
+                            "builtins",
+                            "ctypes",
+                            "socket",
+                        ]
+                    ):
+                        has_dangerous_global = True
+                        context_details.append(f"dangerous global: {resolved_arg}")
+
+            # Skip only when the dict is the most recent container-producing op,
+            # meaning the SETITEM is directly targeting a dict (legitimate).
+            # If a REDUCE/NEWOBJ is more recent, the dict is unrelated.
+            if most_recent_container == "dict":
+                continue
+
+            if has_rebuild_tensor:
+                patterns.append(
+                    {
+                        "pattern_type": "setitem_on_tensor_object",
+                        "description": (
+                            f"{opcode.name} applied after tensor reconstruction ({', '.join(context_details)})"
+                        ),
+                        "opcodes": [opcode.name],
+                        "exploitation_method": (
+                            "CVE-2026-24747: SETITEM abuse on reconstructed tensor object "
+                            "bypasses weights_only=True restricted unpickler"
+                        ),
+                        "position": pos,
+                        "cve_id": "CVE-2026-24747",
+                    }
+                )
+
+            if has_dangerous_global:
+                patterns.append(
+                    {
+                        "pattern_type": "setitem_near_dangerous_global",
+                        "description": (
+                            f"{opcode.name} near dangerous global reference ({', '.join(context_details)})"
+                        ),
+                        "opcodes": [opcode.name],
+                        "exploitation_method": ("CVE-2026-24747: SETITEM used to inject into dangerous context"),
+                        "position": pos,
+                        "cve_id": "CVE-2026-24747",
+                    }
+                )
 
         return patterns
 

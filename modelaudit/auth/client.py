@@ -87,10 +87,8 @@ class AuthClient:
             )
 
             if not response.ok:
-                error_message = response.text
                 logger.error(
-                    f"[Cloud] Failed to validate API token: {error_message}. "
-                    f"HTTP Status: {response.status_code} - {response.reason}."
+                    f"[Cloud] Failed to validate API token. HTTP Status: {response.status_code} - {response.reason}."
                 )
                 raise Exception(f"Failed to validate API token: {response.reason}")
 
@@ -107,10 +105,7 @@ class AuthClient:
             return {"user": CloudUser(user), "organization": CloudOrganization(organization), "app": CloudApp(app)}
 
         except requests.RequestException as error:
-            error_message = str(error)
-            logger.error(f"[Cloud] Failed to validate API token with host {host}: {error_message}")
-            if hasattr(error, "__cause__") and error.__cause__:
-                logger.error(f"Cause: {error.__cause__}")
+            logger.error(f"[Cloud] Failed to validate API token: {type(error).__name__}")
             raise
 
     def get_user_info(self) -> dict[str, Any]:

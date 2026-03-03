@@ -1,3 +1,5 @@
+"""Scanner for NumPy serialized array files (.npy, .npz)."""
+
 from __future__ import annotations
 
 import sys
@@ -81,13 +83,20 @@ class NumPyScanner(BaseScanner):
                     f"Dimension {i} too large: {dim} (max: {self.max_dimension_size})",
                 )
 
+    # CVE-2019-6446 constants
+    CVE_2019_6446_ID = "CVE-2019-6446"
+    CVE_2019_6446_CVSS = 9.8
+    CVE_2019_6446_CWE = "CWE-502"
+
     def _validate_dtype(self, dtype: Any) -> None:
         """Validate numpy dtype for security"""
         # Check for problematic data types
-        dangerous_names = ["object"]
-        dangerous_kinds = ["O", "V"]  # Object and Void kinds
-
-        if dtype.name in dangerous_names or dtype.kind in dangerous_kinds:
+        # CVE-2019-6446: object dtype requires pickle deserialization,
+        # enabling arbitrary code execution via numpy.load(allow_pickle=True)
+        # dtype.hasobject is True when the dtype contains Python objects
+        # (including object arrays and structured dtypes with object fields).
+        # Pure numeric structured dtypes (kind="V") are safe.
+        if dtype.kind == "O" or bool(getattr(dtype, "hasobject", False)):
             raise ValueError(
                 f"Dangerous dtype not allowed: {dtype.name} (kind: {dtype.kind})",
             )
@@ -242,6 +251,54 @@ class NumPyScanner(BaseScanner):
                             },
                         )
 
+                        # CVE-2019-6446: object dtype requires pickle
+                        # deserialization via numpy.load(allow_pickle=True),
+                        # enabling arbitrary code execution.
+                        # dtype.hasobject catches structured dtypes with
+                        # object fields; kind=="O" catches plain object arrays.
+                        if dtype.kind == "O" or bool(getattr(dtype, "hasobject", False)):
+                            result.add_check(
+                                name=f"{self.CVE_2019_6446_ID}: Object Dtype Pickle Deserialization",
+                                passed=False,
+                                message=(
+                                    f"{self.CVE_2019_6446_ID}: NumPy array "
+                                    f"uses '{dtype}' dtype which requires "
+                                    "pickle deserialization. This is a potential RCE vector "
+                                    "when consumer code loads with allow_pickle=True."
+                                ),
+                                severity=IssueSeverity.WARNING,
+                                location=path,
+                                details={
+                                    "dtype": str(dtype),
+                                    "dtype_kind": dtype.kind,
+                                    "cve_id": self.CVE_2019_6446_ID,
+                                    "cvss": self.CVE_2019_6446_CVSS,
+                                    "cwe": self.CVE_2019_6446_CWE,
+                                    "requires_allow_pickle_true": True,
+                                    "description": (
+                                        "NumPy object arrays use pickle for "
+                                        "serialization. numpy.load() with "
+                                        "allow_pickle=True deserializes "
+                                        "arbitrary Python objects, enabling RCE."
+                                    ),
+                                    "remediation": (
+                                        "Use NumPy >= 1.16.3 where "
+                                        "allow_pickle defaults to False. "
+                                        "Never set allow_pickle=True with "
+                                        "untrusted .npy/.npz files. Use "
+                                        "numeric dtypes instead of object."
+                                    ),
+                                },
+                                why=(
+                                    "This NumPy file contains an array with "
+                                    f"'{dtype}' dtype that stores arbitrary "
+                                    "Python objects via pickle. If consumer code "
+                                    "loads this file with numpy.load(allow_pickle=True), "
+                                    "it can execute embedded code "
+                                    f"({self.CVE_2019_6446_ID}, CVSS 9.8)."
+                                ),
+                            )
+
                         self._validate_dtype(dtype)
                         result.add_check(
                             name="Data Type Safety Check",
@@ -273,14 +330,15 @@ class NumPyScanner(BaseScanner):
                         expected_size = data_offset + expected_data_size
                     except ValueError as e:
                         # Determine which validation failed based on error message
-                        if "dimensions" in str(e).lower():
+                        error_msg = str(e).lower()
+                        if "dimensions" in error_msg:
                             check_name = "Array Dimension Validation"
-                        elif "dtype" in str(e).lower():
+                        elif "dtype" in error_msg:
                             check_name = "Data Type Safety Check"
                         else:
                             check_name = "Array Size Validation"
 
-                        # Determine rule code based on error
+                        # Determine rule code based on validation failure type.
                         validation_rule = None
                         error_msg = str(e).lower()
                         if "dimension" in error_msg or "excessive" in error_msg:
@@ -290,13 +348,15 @@ class NumPyScanner(BaseScanner):
                         elif "dtype" in error_msg or "object" in error_msg:
                             validation_rule = "S213"  # Pickle/serialization risk
                         else:
-                            validation_rule = "S902"  # Generic corruption
+                            validation_rule = "S902"  # Generic structural corruption
 
+                        # Size/dimension limit errors are informational - they may indicate
+                        # large legitimate arrays as well as malformed content.
                         result.add_check(
                             name=check_name,
                             passed=False,
                             message=f"Array validation failed: {e}",
-                            severity=IssueSeverity.CRITICAL,
+                            severity=IssueSeverity.INFO,
                             location=path,
                             rule_code=validation_rule,
                             details={

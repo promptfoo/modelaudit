@@ -37,7 +37,8 @@ class TestJoblibScannerSecurity:
         assert result.success is False
         bomb_issues = [issue for issue in result.issues if "compression ratio" in issue.message.lower()]
         assert len(bomb_issues) > 0
-        assert any(issue.severity == IssueSeverity.CRITICAL for issue in bomb_issues)
+        # Compression bombs are INFO (DoS concern, not RCE vector)
+        assert any(issue.severity == IssueSeverity.INFO for issue in bomb_issues)
 
     def test_large_file_protection(self, tmp_path):
         """Test protection against reading very large files."""
@@ -382,11 +383,13 @@ class TestNumPyScannerSecurity:
         itemsize_issues = [issue for issue in result.issues if "itemsize too large" in issue.message.lower()]
         assert len(itemsize_issues) > 0
 
-    def test_void_dtype_rejection(self, tmp_path):
-        """Test rejection of void dtype."""
+    def test_void_dtype_accepted(self, tmp_path):
+        """Test that pure void dtype (no object fields) is accepted as safe."""
         scanner = NumPyScanner()
 
         # Create numpy file with void dtype manually
+        # Pure void (kind="V") without object fields is safe — it's a
+        # fixed-size binary blob that doesn't require pickle deserialization.
         npy_file = tmp_path / "void_dtype.npy"
 
         with open(npy_file, "wb") as f:
@@ -401,9 +404,9 @@ class TestNumPyScannerSecurity:
 
         result = scanner.scan(str(npy_file))
 
-        assert result.success is False
+        # Pure void dtype should NOT be flagged — only object-containing dtypes are dangerous
         dtype_issues = [issue for issue in result.issues if "dangerous dtype" in issue.message.lower()]
-        assert len(dtype_issues) > 0
+        assert len(dtype_issues) == 0
 
     def test_unsupported_numpy_version(self, tmp_path):
         """Test handling of unsupported NumPy file versions."""

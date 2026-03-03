@@ -276,6 +276,27 @@ class TestSevenZipScanner:
             if os.path.exists(temp_pickle_path):
                 os.unlink(temp_pickle_path)
 
+    def test_unsafe_entries_are_excluded_from_extraction_targets(self, scanner, temp_7z_file):
+        """Path traversal entries should be reported but never extracted."""
+        with (
+            patch("modelaudit.scanners.sevenzip_scanner.HAS_PY7ZR", True),
+            patch("modelaudit.scanners.sevenzip_scanner.py7zr") as mock_py7zr,
+            patch.object(scanner, "_scan_extracted_file"),
+            patch("os.path.isfile", return_value=True),
+            patch("os.path.getsize", return_value=32),
+        ):
+            mock_archive = MagicMock()
+            mock_archive.getnames.return_value = ["../../../escape.pkl", "safe.pkl", "readme.txt"]
+            mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
+
+            result = scanner.scan(temp_7z_file)
+
+            assert result.metadata["total_files"] == 3
+            assert result.metadata["unsafe_entries"] == 1
+            assert result.metadata["scannable_files"] == 1
+            mock_archive.extract.assert_called_once()
+            assert mock_archive.extract.call_args.kwargs["targets"] == ["safe.pkl"]
+
     def test_max_entries_protection(self, scanner, temp_7z_file):
         """Test protection against archives with too many entries"""
         # Set a low limit for testing

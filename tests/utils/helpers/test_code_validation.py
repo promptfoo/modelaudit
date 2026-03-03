@@ -147,6 +147,32 @@ print(result)
         assert not constructs["file_operations"]
         assert not constructs["subprocess_operations"]
         assert not constructs["network_operations"]
+        assert not constructs["variadic_lambdas"]
+
+    def test_detects_lambda_with_args(self):
+        """Test detection of lambda with *args."""
+        code = "f = lambda *args: sum(args)"
+        constructs = extract_dangerous_constructs(code)
+        assert "*args" in constructs["variadic_lambdas"]
+
+    def test_detects_lambda_with_kwargs(self):
+        """Test detection of lambda with **kwargs."""
+        code = "f = lambda **kwargs: kwargs.get('key')"
+        constructs = extract_dangerous_constructs(code)
+        assert "**kwargs" in constructs["variadic_lambdas"]
+
+    def test_detects_lambda_with_both_variadic(self):
+        """Test detection of lambda with both *args and **kwargs."""
+        code = "f = lambda *args, **kwargs: (args, kwargs)"
+        constructs = extract_dangerous_constructs(code)
+        assert "*args" in constructs["variadic_lambdas"]
+        assert "**kwargs" in constructs["variadic_lambdas"]
+
+    def test_allows_simple_lambda(self):
+        """Test that simple lambdas without variadic args are not flagged."""
+        code = "f = lambda x, y: x + y"
+        constructs = extract_dangerous_constructs(code)
+        assert not constructs["variadic_lambdas"]
 
     def test_invalid_code(self):
         """Test handling of invalid code."""
@@ -218,3 +244,22 @@ open("/tmp/test", "w")
         assert "Subprocess operations" in description
         assert "File operations" in description
         assert "Dangerous imports" in description
+
+    def test_variadic_lambda_risk(self):
+        """Test that variadic lambdas are included in risk assessment."""
+        code = "f = lambda *args, **kwargs: sum(args)"
+        _, description = is_code_potentially_dangerous(code, "low")
+        assert "Variadic lambdas" in description
+        assert "*args" in description or "**kwargs" in description
+
+    def test_detects_nested_variadic_lambda(self):
+        """Test detection of variadic lambda nested inside another lambda."""
+        code = "f = lambda x: (lambda *args: sum(args))"
+        constructs = extract_dangerous_constructs(code)
+        assert "*args" in constructs["variadic_lambdas"]
+
+    def test_detects_variadic_lambda_inside_call(self):
+        """Test detection of variadic lambda used as argument in a function call."""
+        code = "result = map(lambda *args: sum(args), data)"
+        constructs = extract_dangerous_constructs(code)
+        assert "*args" in constructs["variadic_lambdas"]

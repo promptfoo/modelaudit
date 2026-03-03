@@ -1,3 +1,5 @@
+"""Command-line interface for ModelAudit security scanner."""
+
 import json
 import logging
 import os
@@ -12,7 +14,15 @@ from yaspin.spinners import Spinners
 
 from . import __version__
 from .auth.client import auth_client
-from .auth.config import cloud_config, config, get_user_email, is_delegated_from_promptfoo, set_user_email
+from .auth.config import (
+    cloud_config,
+    config,
+    get_config_directory_path,
+    get_user_email,
+    get_user_id,
+    is_delegated_from_promptfoo,
+    set_user_email,
+)
 from .config import ModelAuditConfig, set_config
 from .core import determine_exit_code, scan_model_directory_or_file
 from .integrations.jfrog import scan_jfrog_artifact
@@ -31,8 +41,8 @@ from .telemetry import (
     record_scan_started,
 )
 from .utils import resolve_dvc_file
+from .utils.helpers.auto_defaults import apply_auto_overrides, generate_auto_defaults, parse_size_string
 from .utils.helpers.interrupt_handler import interruptible_scan
-from .utils.helpers.smart_detection import apply_smart_overrides, generate_smart_defaults, parse_size_string
 from .utils.sources.cloud_storage import download_from_cloud, is_cloud_url
 from .utils.sources.huggingface import (
     download_file_from_hf,
@@ -68,9 +78,10 @@ def style_text(text: str, **kwargs: Any) -> str:
     return text
 
 
-def expand_paths(paths: tuple[str, ...]) -> list[str]:
+def expand_paths(paths: tuple[str, ...]) -> tuple[list[str], list[str]]:
     """Expand and validate input paths with type safety."""
     expanded: list[str] = []
+    missing_globs: list[str] = []
     for path_str in paths:
         # Handle glob patterns and resolve paths
         path = Path(path_str)
@@ -79,10 +90,13 @@ def expand_paths(paths: tuple[str, ...]) -> list[str]:
             import glob
 
             matches = glob.glob(path_str, recursive=True)
-            expanded.extend(matches)
+            if matches:
+                expanded.extend(matches)
+            else:
+                missing_globs.append(path_str)
         else:
             expanded.append(str(path.resolve()) if path.exists() else path_str)
-    return expanded
+    return expanded, missing_globs
 
 
 def parse_severity_overrides(values: tuple[str, ...]) -> dict[str, str]:
@@ -489,7 +503,7 @@ def delegate_info() -> None:
     type=click.Path(),
     help="Write CycloneDX SBOM to the specified file",
 )
-# Override smart detection (2 flags)
+# Override defaults (2 flags)
 @click.option(
     "--timeout",
     "-t",
@@ -510,7 +524,12 @@ def delegate_info() -> None:
 @click.option(
     "--no-cache",
     is_flag=True,
-    help="Force disable caching (overrides smart detection)",
+    help="Force disable caching (overrides defaults)",
+)
+@click.option(
+    "--cache-dir",
+    type=click.Path(),
+    help="Cache directory path (overrides default cache location)",
 )
 @click.option(
     "--stream",
@@ -533,12 +552,13 @@ def scan_command(
     max_size: str | None,
     dry_run: bool,
     no_cache: bool,
+    cache_dir: str | None,
     stream: bool,
 ) -> None:
     """Scan files, directories, HuggingFace models, MLflow models, cloud storage,
     or JFrog artifacts for security issues.
 
-    Uses smart detection to automatically configure optimal settings based on input type.
+    Uses defaults based on input type.
 
     \b
     Examples:
@@ -547,14 +567,14 @@ def scan_command(
         modelaudit scan hf://user/llama              # HuggingFace - selective download
         modelaudit scan models:/model/v1             # MLflow - registry integration
 
-        # Override smart detection when needed
+        # Override defaults when needed
         modelaudit scan large-model.pt --max-size 20GB --timeout 7200
 
         # Strict mode for security-critical scans
         modelaudit scan model.pkl --strict --format json --output report.json
 
     \b
-    Smart Detection:
+    Defaults:
         • Input type (local/cloud/registry) → optimal download & caching
         • File size (>1GB) → large model optimizations + progress bars
         • Terminal type (TTY/CI) → appropriate UI (progress vs quiet)
@@ -597,7 +617,7 @@ def scan_command(
     record_scan_started(list(paths), telemetry_options)
 
     # Expand and validate paths with type safety
-    expanded_paths: list[str] = expand_paths(paths)
+    expanded_paths, missing_globs = expand_paths(paths)
 
     # Process DVC pointer files
     dvc_expanded_paths: list[str] = []
@@ -614,7 +634,30 @@ def scan_command(
     # Use the DVC-expanded paths as the final list
     expanded_paths = dvc_expanded_paths
 
-    # Apply rule configuration from CLI and files
+    if missing_globs:
+        click.echo(
+            style_text(
+                f"Warning: glob pattern(s) did not match any files: {', '.join(missing_globs)}",
+                fg="yellow",
+            ),
+            err=True,
+        )
+        click.echo("Note: glob expansion is only applied to local paths.", err=True)
+
+    if not expanded_paths:
+        click.echo(
+            style_text(
+                "No matching paths found. Check your paths or glob patterns.",
+                fg="red",
+                bold=True,
+            ),
+            err=True,
+        )
+        record_scan_failed(time.time() - scan_start_time, "No matching paths")
+        flush_telemetry()
+        sys.exit(2)
+
+    # Apply rule configuration from CLI and config files
     severity_overrides = parse_severity_overrides(severity)
     cli_config = ModelAuditConfig.from_cli_args(
         suppress=list(suppress) if suppress else None,
@@ -622,8 +665,8 @@ def scan_command(
     )
     set_config(cli_config)
 
-    # Generate smart defaults based on input analysis
-    smart_defaults = generate_smart_defaults(expanded_paths)
+    # Generate defaults based on input analysis
+    auto_defaults = generate_auto_defaults(expanded_paths)
 
     # Prepare user overrides (only non-None values)
     user_overrides: dict[str, Any] = {}
@@ -641,7 +684,11 @@ def scan_command(
 
             sys_module.exit(2)
 
-    # Override smart detection with explicit user flags
+    if cache_dir is not None:
+        user_overrides["cache_dir"] = str(Path(cache_dir).expanduser())
+        user_overrides["use_cache"] = True
+
+    # Override defaults with explicit user flags
     if progress:
         user_overrides["show_progress"] = True
     if no_cache:
@@ -656,8 +703,8 @@ def scan_command(
     if quiet:
         user_overrides["verbose"] = False
 
-    # Apply smart defaults + user overrides
-    config = apply_smart_overrides(user_overrides, smart_defaults)
+    # Apply defaults + user overrides
+    config = apply_auto_overrides(user_overrides, auto_defaults)
 
     # Handle environment variables for removed flags
     jfrog_api_token = os.getenv("JFROG_API_TOKEN")
@@ -673,7 +720,6 @@ def scan_command(
     # Determine if we should show styled console output (spinners, colors, headers)
     # Show styled output when: text format OR output goes to file (stdout is free)
     show_styled_output = final_format == "text" or bool(output)
-    # final_large_model_support = config.get("large_model_support", True)  # Unused in new implementation
     final_selective = config.get("selective_download", True)
     final_stream = config.get("stream_analysis", False)
     final_scan_and_delete = config.get("scan_and_delete", False)
@@ -682,7 +728,7 @@ def scan_command(
     final_skip_files = config.get("skip_non_model_files", True)
     final_strict_license = config.get("strict_license", False)
 
-    # Handle max download size from smart defaults or max_size override
+    # Handle max download size from automatic defaults or max_size override
     max_download_bytes = None
     if max_size is not None:
         import contextlib
@@ -690,15 +736,15 @@ def scan_command(
         with contextlib.suppress(ValueError):
             max_download_bytes = parse_size_string(max_size)
 
-    # Show smart detection info if not quiet
+    # Show defaults info if not quiet
     if not quiet and show_styled_output:
         if verbose:
-            click.echo(f"🧠 Smart detection: {len(expanded_paths)} path(s) analyzed")
+            click.echo(f"Defaults: {len(expanded_paths)} path(s) analyzed")
             for key, value in config.items():
                 if key != "cache_dir":  # Skip showing long paths
                     click.echo(f"   • {key}: {value}")
         elif not config.get("colors", True):  # In CI mode
-            pass  # No smart detection message needed
+            pass  # No defaults message needed
 
     # Print a nice header if not in structured format mode
     if show_styled_output and not quiet:
@@ -733,7 +779,7 @@ def scan_command(
         # Suppress INFO logs from technical modules in normal mode to reduce noise
         # Users can still see these with --verbose if needed
         logging.getLogger("modelaudit.core").setLevel(logging.WARNING)
-        logging.getLogger("modelaudit.utils.secure_hasher").setLevel(logging.WARNING)
+        logging.getLogger("modelaudit.utils.helpers.secure_hasher").setLevel(logging.WARNING)
         logging.getLogger("modelaudit.cache.cache_manager").setLevel(logging.WARNING)
 
     # Setup progress tracking
@@ -750,17 +796,17 @@ def scan_command(
 
             # Create progress tracker
             progress_tracker = ProgressTracker(
-                update_interval=2.0,  # Smart default
+                update_interval=2.0,  # Default interval
             )
 
             # Add console reporter based on format preference
             # Only enable ProgressTracker for text format without output file
             # (ProgressTracker has threading issues that cause segfaults)
             if progress_tracker and final_format == "text" and not output:
-                if True:  # Always use tqdm format (smart default)
+                if True:  # Always use tqdm format (default)
                     # Use tqdm progress bars if available and appropriate
                     console_reporter = ConsoleProgressReporter(  # type: ignore[possibly-unresolved-reference]
-                        update_interval=2.0,  # Smart default
+                        update_interval=2.0,  # Default interval
                         disable_on_non_tty=True,
                         show_bytes=True,
                         show_items=True,
@@ -769,7 +815,7 @@ def scan_command(
                 progress_reporters.append(console_reporter)
                 progress_tracker.add_reporter(console_reporter)
 
-            # File logging removed - use smart defaults only
+            # File logging removed - use automatic defaults only
 
         except (ImportError, RecursionError) as e:
             if verbose:
@@ -1114,8 +1160,8 @@ def scan_command(
                 # Check if this is a cloud storage URL
                 elif is_cloud_url(path):
                     # Max download size already handled above
-                    # max_download_bytes is already set from smart defaults
-                    # Max download size parsing removed - handled by smart defaults
+                    # max_download_bytes is already set from automatic defaults
+                    # Max download size parsing removed - handled by automatic defaults
 
                     # Handle dry-run mode (replaces preview)
                     if dry_run:
@@ -1209,7 +1255,7 @@ def scan_command(
                             # Convert cache_dir string to Path if provided
                             cache_path = Path(final_cache_dir) if final_cache_dir else None
 
-                            download_path = download_from_cloud(
+                            download_path = download_from_cloud(  # type: ignore[assignment]
                                 path,
                                 cache_dir=cache_path,
                                 max_size=max_download_bytes,
@@ -1486,12 +1532,12 @@ def scan_command(
                     # Run the scan with progress reporting (NORMAL MODE)
                     config_overrides = {
                         "enable_progress": bool(progress_tracker),
-                        "progress_update_interval": 2.0,  # Smart default
+                        "progress_update_interval": 2.0,  # Default interval
                         "cache_enabled": final_cache,
                         "cache_dir": final_cache_dir,
                     }
 
-                    # Record feature usage for large model support (based on smart detection)
+                    # Record feature usage for large model support (based on automatic defaults)
                     # Note: DO NOT send actual path - only track that the feature was used
                     if final_max_file_size > 0 or final_max_total_size > 0:
                         record_feature_used(
@@ -2034,9 +2080,19 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
     output_lines.append("")
     output_lines.append("═" * 80)
 
-    # Check if no files were scanned
+    # Check if scan had operational errors first (highest priority in exit code)
+    has_operational_errors = bool(results.get("has_errors"))
     files_scanned = results.get("files_scanned", 0)
-    if files_scanned == 0:
+    if has_operational_errors:
+        status_icon = "❌"
+        status_msg = "SCAN COMPLETED WITH OPERATIONAL ERRORS"
+        status_color = "red"
+        output_lines.append(f"  {style_text(f'{status_icon} {status_msg}', fg=status_color, bold=True)}")
+        output_lines.append(
+            f"  {style_text('Review warnings above and use --verbose for troubleshooting details.', fg='yellow')}"
+        )
+    # Check if no files were scanned
+    elif files_scanned == 0:
         status_icon = "❌"
         status_msg = "NO FILES SCANNED"
         status_color = "red"
@@ -2331,9 +2387,420 @@ def rules_command(rule_code: str | None, list_rules: bool, category: str | None,
     else:
         rules = RuleRegistry.get_all_rules()
         display_rules(rules, output_format)
+def _get_platform_info() -> dict[str, Any]:
+    """Get platform information for debug output."""
+    import platform
+
+    return {
+        "os": sys.platform,
+        "release": platform.release(),
+        "arch": platform.machine(),
+        "pythonVersion": platform.python_version(),
+        "pythonExecutable": sys.executable,
+        "pythonRecursionLimit": sys.getrecursionlimit(),
+    }
+
+
+def _get_install_info() -> dict[str, Any]:
+    """Get ModelAudit installation information for debug output."""
+    from importlib.metadata import PackageNotFoundError
+
+    info: dict[str, Any] = {}
+
+    # Check if editable install
+    try:
+        from importlib.metadata import distribution
+
+        dist = distribution("modelaudit")
+
+        # Get install location using public API (locate_file returns install root)
+        try:
+            install_root = dist.locate_file("")
+            install_path = str(install_root)
+            home = str(Path.home())
+            if install_path.startswith(home):
+                install_path = "~" + install_path[len(home) :]
+            info["location"] = install_path
+        except Exception:
+            pass  # location is optional
+
+        # Check for editable install via direct_url.json
+        direct_url_text = dist.read_text("direct_url.json")
+        if direct_url_text:
+            direct_url = json.loads(direct_url_text)
+            if direct_url.get("dir_info", {}).get("editable", False):
+                info["editable"] = True
+            else:
+                info["editable"] = False
+        else:
+            info["editable"] = False
+
+    except PackageNotFoundError:
+        info["editable"] = None
+        info["location"] = "not installed as package"
+    except Exception:
+        info["editable"] = None
+
+    return info
+
+
+def _redact_proxy_url(proxy_url: str | None) -> str | None:
+    """Redact credentials from proxy URLs while preserving host/port for debugging.
+
+    Proxy URLs often contain credentials (http://user:pass@host:port).
+    Since debug output is meant to be pasted in bug reports, we must redact
+    the credentials while keeping the scheme/host/port for troubleshooting.
+    """
+    if not proxy_url:
+        return None
+    try:
+        from urllib.parse import urlsplit, urlunsplit
+
+        parts = urlsplit(proxy_url)
+        if parts.username or parts.password:
+            # Rebuild URL without credentials
+            netloc = parts.hostname or ""
+            if parts.port:
+                netloc += f":{parts.port}"
+            return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+    except Exception:
+        # If parsing fails, return a safe indicator rather than the raw URL
+        return "<proxy configured>"
+    return proxy_url
+
+
+def _get_env_info() -> dict[str, Any]:
+    """Get environment variable information for debug output."""
+    from .telemetry import is_telemetry_enabled
+
+    return {
+        "telemetryDisabled": not is_telemetry_enabled(),
+        "noColor": bool(os.getenv("NO_COLOR")),
+        "ciEnvironment": bool(os.getenv("CI")),
+        "jfrogConfigured": bool(os.getenv("JFROG_API_TOKEN") or os.getenv("JFROG_ACCESS_TOKEN")),
+        "mlflowConfigured": bool(os.getenv("MLFLOW_TRACKING_URI")),
+        "httpProxy": _redact_proxy_url(os.getenv("HTTP_PROXY") or os.getenv("http_proxy")),
+        "httpsProxy": _redact_proxy_url(os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")),
+        "noProxy": os.getenv("NO_PROXY") or os.getenv("no_proxy") or None,
+    }
+
+
+def _get_dependency_versions() -> dict[str, Any]:
+    """Get versions of key dependencies for debug output.
+
+    Uses importlib.metadata to get versions WITHOUT importing modules.
+    This avoids mutex/threading issues from ML framework initialization.
+    """
+    from importlib.metadata import PackageNotFoundError, version
+
+    def _get_version(package_name: str) -> str | None:
+        """Get package version from metadata without importing the module."""
+        try:
+            return version(package_name)
+        except PackageNotFoundError:
+            return None
+        except Exception:
+            return None
+
+    # Core dependencies (should always be installed)
+    core = {
+        "click": _get_version("click"),
+        "pyyaml": _get_version("pyyaml"),
+        "requests": _get_version("requests"),
+        "platformdirs": _get_version("platformdirs"),
+    }
+
+    # ML framework dependencies (optional, scanner-specific)
+    ml_frameworks = {
+        "numpy": _get_version("numpy"),
+        "torch": _get_version("torch"),
+        "tensorflow": _get_version("tensorflow"),
+        "onnx": _get_version("onnx"),
+        "jax": _get_version("jax"),
+        "flax": _get_version("flax"),
+    }
+
+    # Format/serialization dependencies (optional)
+    serialization = {
+        "h5py": _get_version("h5py"),
+        "safetensors": _get_version("safetensors"),
+        "msgpack": _get_version("msgpack"),
+        "joblib": _get_version("joblib"),
+    }
+
+    # Utility dependencies (optional)
+    utilities = {
+        "huggingface_hub": _get_version("huggingface-hub"),
+        "posthog": _get_version("posthog"),
+        "jinja2": _get_version("jinja2"),
+        "py7zr": _get_version("py7zr"),
+        "xgboost": _get_version("xgboost"),
+    }
+
+    # Filter out None values for cleaner output
+    def filter_installed(deps: dict[str, str | None]) -> dict[str, str]:
+        return {k: v for k, v in deps.items() if v is not None}
+
+    result: dict[str, Any] = {
+        "core": filter_installed(core),
+        "mlFrameworks": filter_installed(ml_frameworks),
+        "serialization": filter_installed(serialization),
+        "utilities": filter_installed(utilities),
+    }
+
+    return result
+
+
+def _get_auth_info() -> dict[str, Any]:
+    """Get authentication information for debug output."""
+    return {
+        "authenticated": config.is_authenticated(),
+        "authSource": config.get_auth_source() if config.is_authenticated() else None,
+        "delegatedFromPromptfoo": is_delegated_from_promptfoo(),
+    }
+
+
+def _get_scanner_info(verbose: bool = False) -> dict[str, Any]:
+    """Get scanner information for debug output."""
+    from .scanners import _registry
+
+    summary = _registry.get_available_scanners_summary()
+
+    info: dict[str, Any] = {
+        "total": summary["total_scanners"],
+        "available": summary["loaded_scanners"],
+        "failed": summary["failed_scanners"],
+        "successRate": summary["success_rate"],
+        "availableList": summary.get("loaded_scanner_list", []),
+    }
+
+    # Only include failure details if there are failures
+    if summary["failed_scanners"] > 0:
+        info["failedList"] = list(summary["failed_scanner_details"].keys())
+
+        if verbose:
+            info["failedDetails"] = summary["failed_scanner_details"]
+            if summary["dependency_errors"]:
+                info["dependencyErrors"] = summary["dependency_errors"]
+            if summary["numpy_errors"]:
+                info["numpyErrors"] = summary["numpy_errors"]
+
+    return info
+
+
+def _get_cache_info() -> dict[str, Any]:
+    """Get cache information for debug output."""
+    try:
+        from .cache import get_cache_manager
+
+        cache_manager = get_cache_manager(enabled=True)
+        stats = cache_manager.get_stats()
+
+        # Get cache directory path with ~ expansion for privacy
+        cache_dir_path: str | None = None
+        if cache_manager.cache is not None:
+            cache_dir_path = str(cache_manager.cache.cache_dir)
+            home = str(Path.home())
+            if cache_dir_path.startswith(home):
+                cache_dir_path = "~" + cache_dir_path[len(home) :]
+            elif os.path.isabs(cache_dir_path):
+                # Redact absolute paths in debug output while preserving a readable structure.
+                cache_dir_path = "~" + cache_dir_path
+
+        return {
+            "enabled": True,
+            "directory": cache_dir_path,
+            "entries": stats.get("total_entries", 0),
+            "sizeMb": round(stats.get("total_size_mb", 0.0), 2),
+            "hitRate": round(stats.get("hit_rate", 0.0), 4),
+        }
+    except Exception as e:
+        return {
+            "enabled": False,
+            "error": str(e)[:100],
+        }
+
+
+def _get_config_info() -> dict[str, Any]:
+    """Get configuration information for debug output."""
+    home = str(Path.home())
+
+    # Shared config with promptfoo
+    shared_config_dir = get_config_directory_path()
+    shared_config_path = os.path.join(shared_config_dir, "promptfoo.yaml")
+    shared_display_path = shared_config_path
+    if shared_display_path.startswith(home):
+        shared_display_path = "~" + shared_display_path[len(home) :]
+
+    # ModelAudit-specific config
+    modelaudit_config_path = os.path.join(home, ".modelaudit", "user_config.json")
+    modelaudit_display_path = "~/.modelaudit/user_config.json"
+
+    return {
+        "sharedConfigPath": shared_display_path,
+        "sharedConfigExists": os.path.exists(shared_config_path),
+        "modelauditConfigPath": modelaudit_display_path,
+        "modelauditConfigExists": os.path.exists(modelaudit_config_path),
+        "userIdGenerated": bool(get_user_id()),
+    }
+
+
+def _safe_get_section(func: Any, section_name: str) -> dict[str, Any]:
+    """Safely execute a debug info function, returning error on failure."""
+    try:
+        result = func()
+        return result if isinstance(result, dict) else {"value": result}
+    except Exception as e:
+        return {"error": f"Failed to retrieve {section_name}: {str(e)[:100]}"}
+
+
+def _format_debug_output(debug_info: dict[str, Any], verbose: bool) -> str:
+    """Format debug info as pretty-printed output with quick diagnosis."""
+    lines = []
+
+    # Header
+    border = "═" * 80
+    lines.append(border)
+    lines.append(style_text("ModelAudit Debug Information", fg="blue", bold=True))
+    lines.append(border)
+
+    # JSON output
+    lines.append(json.dumps(debug_info, indent=2, default=str))
+
+    lines.append(border)
+    lines.append(
+        style_text(
+            "Please include this output when reporting issues:",
+            fg="yellow",
+        )
+    )
+    lines.append(style_text("https://github.com/promptfoo/modelaudit/issues", fg="cyan"))
+    lines.append("")
+
+    # Quick diagnosis section
+    lines.append(style_text("Quick diagnosis:", fg="white", bold=True))
+
+    # Platform status
+    platform_info = debug_info.get("platform", {})
+    python_ver = platform_info.get("pythonVersion", "unknown")
+    os_name = platform_info.get("os", "unknown")
+    arch = platform_info.get("arch", "unknown")
+    lines.append(f"  ✅ Python {python_ver} on {os_name} ({arch})")
+
+    # Dependencies summary
+    deps_info = debug_info.get("dependencies", {})
+    ml_frameworks = deps_info.get("mlFrameworks", {})
+    ml_installed = [k for k in ["torch", "tensorflow", "onnx", "jax"] if k in ml_frameworks]
+    if ml_installed:
+        lines.append(f"  ✅ ML frameworks: {', '.join(ml_installed)}")
+    else:
+        lines.append(style_text("  ⚠️  No ML frameworks installed (torch, tensorflow, onnx, jax)", fg="yellow"))
+
+    # Scanner status
+    scanner_info = debug_info.get("scanners", {})
+    available = scanner_info.get("available", 0)
+    total = scanner_info.get("total", 0)
+    failed = scanner_info.get("failed", 0)
+
+    if failed == 0:
+        lines.append(f"  ✅ {available}/{total} scanners available")
+    else:
+        lines.append(style_text(f"  ⚠️  {available}/{total} scanners available ({failed} unavailable)", fg="yellow"))
+        if not verbose:
+            lines.append(style_text("     Run with --verbose for failure details", dim=True))
+
+    # NumPy status (get from dependencies)
+    numpy_version = ml_frameworks.get("numpy")
+    if numpy_version:
+        # NumPy 2.x may have compatibility issues with some ML frameworks
+        major_version = int(numpy_version.split(".")[0]) if numpy_version else 0
+        if major_version >= 2:
+            lines.append(style_text(f"  ⚠️  NumPy {numpy_version} (v2 may have ML framework issues)", fg="yellow"))
+        else:
+            lines.append(f"  ✅ NumPy {numpy_version}")
+    else:
+        lines.append(style_text("  ⚠️  NumPy not installed", fg="yellow"))
+
+    # Cache status
+    cache_info = debug_info.get("cache", {})
+    if cache_info.get("enabled"):
+        entries = cache_info.get("entries", 0)
+        size_mb = cache_info.get("sizeMb", 0)
+        lines.append(f"  ✅ Cache enabled ({entries} entries, {size_mb} MB)")
+    else:
+        cache_error = cache_info.get("error", "disabled")
+        lines.append(style_text(f"  ⚠️  Cache: {cache_error}", fg="yellow"))
+
+    # Auth status
+    auth_info = debug_info.get("auth", {})
+    if auth_info.get("authenticated"):
+        source = auth_info.get("authSource", "unknown")
+        lines.append(f"  ✅ Authenticated via {source}")
+    else:
+        lines.append(style_text("  ⚠️  Not authenticated (enhanced scanning unavailable)", fg="yellow"))
+
+    # Telemetry status
+    env_info = debug_info.get("env", {})
+    if env_info.get("telemetryDisabled"):
+        lines.append("  [i] Telemetry disabled")
+
+    lines.append(border)
+
+    return "\n".join(lines)
+
+
+@cli.command()
+@click.option("--json", "output_json", is_flag=True, help="Output raw JSON without formatting")
+@click.option("--verbose", "-v", is_flag=True, help="Include additional diagnostic details")
+def debug(output_json: bool, verbose: bool) -> None:
+    """Display debug information for troubleshooting.
+
+    Outputs comprehensive diagnostic information useful for:
+
+    \b
+    - Filing bug reports on GitHub
+    - Troubleshooting scanner issues
+    - Verifying configuration and authentication
+    - Checking environment setup
+
+    \b
+    Examples:
+        modelaudit debug                    # Pretty-printed output
+        modelaudit debug --json             # Raw JSON for scripting
+        modelaudit debug --verbose          # Include detailed scanner errors
+    """
+    # Build debug info dictionary
+    debug_info: dict[str, Any] = {
+        "version": __version__,
+        "platform": _safe_get_section(_get_platform_info, "platform"),
+        "install": _safe_get_section(_get_install_info, "install"),
+        "dependencies": _safe_get_section(_get_dependency_versions, "dependencies"),
+        "env": _safe_get_section(_get_env_info, "env"),
+        "auth": _safe_get_section(_get_auth_info, "auth"),
+        "scanners": _safe_get_section(lambda: _get_scanner_info(verbose), "scanners"),
+        "cache": _safe_get_section(_get_cache_info, "cache"),
+        "config": _safe_get_section(_get_config_info, "config"),
+    }
+
+    if output_json:
+        # Raw JSON output for scripting
+        click.echo(json.dumps(debug_info, indent=2, default=str))
+    else:
+        # Pretty-printed output with quick diagnosis
+        click.echo(_format_debug_output(debug_info, verbose))
 
 
 def main() -> None:
+    if sys.version_info < (3, 10):  # noqa: UP036 — intentional safety net for bypassed requires-python
+        click.echo(
+            click.style(
+                f"WARNING: modelaudit requires Python 3.10+, but you are running "
+                f"Python {sys.version_info[0]}.{sys.version_info[1]}. "
+                f"Please upgrade: https://www.promptfoo.dev/docs/model-audit/",
+                fg="yellow",
+            ),
+            err=True,
+        )
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",

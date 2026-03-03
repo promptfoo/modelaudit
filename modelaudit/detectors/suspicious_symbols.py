@@ -149,8 +149,17 @@ SUSPICIOUS_GLOBALS = {
     "pty": ["spawn"],  # Pseudo-terminal spawning
     "platform": ["system", "popen"],  # System information/execution
     # Low-level system access - CRITICAL RISK
-    "ctypes": ["*"],  # C library access
-    "socket": ["*"],  # Network communication
+    "ctypes": "*",  # C library access (FIXED: was ["*"] which bypassed wildcard check)
+    "ctypes.util": "*",  # Library finding utilities (find_library, etc.)
+    "socket": "*",  # Network communication (FIXED: was ["*"] which bypassed wildcard check)
+    "mmap": "*",  # Memory mapping (can map files, shared memory)
+    # Process and signal control - CRITICAL RISK
+    "multiprocessing": "*",  # Process spawning and pool execution
+    "multiprocessing.pool": "*",  # Process pools
+    "concurrent.futures": ["ProcessPoolExecutor", "ThreadPoolExecutor"],  # Executor pools
+    "signal": "*",  # Signal handling manipulation (can alter program flow)
+    # Async subprocess - CRITICAL RISK
+    "asyncio.subprocess": "*",  # Async subprocess execution
     # Serialization libraries that can execute arbitrary code - HIGH RISK
     "dill": [
         "load",
@@ -161,6 +170,71 @@ SUSPICIOUS_GLOBALS = {
     ],  # dill's load helpers can execute arbitrary code when unpickling
     # References to the private dill._dill module are also suspicious
     "dill._dill": "*",
+    # Dynamic resolution / import trampolines
+    "pkgutil": ["resolve_name", "get_importer", "walk_packages"],
+    "zipimport": "*",
+    # uuid — _get_command_stdout/_popen internally call subprocess.Popen
+    "uuid": ["_get_command_stdout", "_popen"],
+    # Network / exfiltration
+    "smtplib": "*",
+    "xmlrpc": "*",
+    "xmlrpc.client": "*",
+    "xmlrpc.server": "*",
+    "poplib": "*",
+    "imaplib": "*",
+    "nntplib": "*",
+    "ssl": "*",
+    "socketserver": "*",
+    "requests": "*",
+    "aiohttp": "*",
+    # Code execution / compilation
+    "codeop": "*",
+    "marshal": ["loads", "load", "dumps", "dump"],
+    "compileall": "*",
+    "py_compile": "*",
+    # FFI / native code
+    "_ctypes": "*",
+    # Profiling / debugging (can execute code)
+    "cProfile": "*",
+    "profile": "*",
+    "pdb": "*",
+    "timeit": ["timeit", "repeat"],
+    "trace": "*",
+    # Operator / functools bypasses
+    "functools": ["reduce", "partial"],
+    "_operator": "*",
+    # Pickle recursion
+    "cloudpickle": "*",
+    "joblib": "*",
+    # Filesystem / shell
+    "filecmp": "*",
+    "distutils": "*",
+    "pydoc": "*",
+    "pexpect": "*",
+    "fileinput": "*",
+    "glob": "*",
+    # Virtual environments / package install
+    "venv": "*",
+    "ensurepip": "*",
+    "pip": "*",
+    # Threading / process / signal
+    "_signal": "*",
+    "threading": "*",
+    "_thread": "*",
+    # Database / archive / other
+    "sqlite3": "*",
+    "_sqlite3": "*",
+    "select": "*",
+    "selectors": "*",
+    "logging": ["config"],
+    "syslog": "*",
+    "tarfile": "*",
+    "zipfile": "*",
+    "shelve": "*",
+    # Documentation / tooling (can execute code)
+    "doctest": "*",
+    "idlelib": "*",
+    "lib2to3": "*",
 }
 
 # Advanced pickle patterns targeting sophisticated exploitation techniques
@@ -201,7 +275,9 @@ DANGEROUS_BUILTINS = [
 # Regex patterns that match potentially malicious code in string literals
 SUSPICIOUS_STRING_PATTERNS = [
     # Python magic methods - can hide malicious code
-    r"__[\w]+__",  # Magic methods like __reduce__, __setstate__
+    # Require at least one letter between the double underscores to avoid matching
+    # feature column names like "Occupation________" from one-hot encoding
+    r"(?<!\w)__(?=[a-zA-Z])[a-zA-Z0-9_]*[a-zA-Z]__(?!\w)",  # Magic methods like __reduce__, __setstate__
     # Encoding/decoding operations - often used for obfuscation
     r"base64\.b64decode",  # Base64 decoding
     # Dynamic code execution - CRITICAL
@@ -218,10 +294,22 @@ SUSPICIOUS_STRING_PATTERNS = [
     r"\bimport\s+[\w\.]+",  # Import statements referencing modules
     r"importlib",  # Dynamic import library
     r"__import__",  # Built-in import function
-    # Code construction - MEDIUM RISK
-    r"lambda",  # Anonymous function creation
+    # NOTE: "lambda" was removed from this list because it matches vocabulary entries
+    # in text classifiers (e.g., TF-IDF vectorizers). Lambda exploitation is detected
+    # by the dedicated Pattern 5 check in check_opcode_sequence() which looks for
+    # lambda strings followed by REDUCE opcodes (the actual attack vector).
     # Hex encoding - possible obfuscation
     r"\\x[0-9a-fA-F]{2}",  # Hex-encoded characters
+    # getattr-based evasion patterns - bypass string matching via dynamic attribute access
+    r"getattr\s*\(\s*\w+\s*,\s*['\"]system['\"]\s*\)",  # getattr(os, 'system')
+    r"getattr\s*\(\s*\w+\s*,\s*['\"]exec['\"]\s*\)",  # getattr(builtins, 'exec')
+    r"getattr\s*\(\s*\w+\s*,\s*['\"]eval['\"]\s*\)",  # getattr(builtins, 'eval')
+    r"getattr\s*\(\s*\w+\s*,\s*['\"]popen['\"]\s*\)",  # getattr(os, 'popen')
+    r"getattr\s*\(\s*\w+\s*,\s*['\"]spawn['\"]\s*\)",  # getattr(os, 'spawn*')
+    r"getattr\s*\(\s*\w+\s*,\s*['\"]call['\"]\s*\)",  # getattr(subprocess, 'call')
+    r"getattr\s*\(\s*\w+\s*,\s*['\"]run['\"]\s*\)",  # getattr(subprocess, 'run')
+    r"getattr\s*\(\s*\w+\s*,\s*['\"]Popen['\"]\s*\)",  # getattr(subprocess, 'Popen')
+    r"getattr\s*\(\s*getattr\s*\(",  # Nested getattr chains - obfuscation technique
 ]
 
 # =============================================================================
@@ -268,6 +356,52 @@ CVE_2024_34997_PATTERNS = [
     r"numpy_pickle.*__reduce__.*subprocess",  # numpy_pickle + __reduce__ + subprocess
 ]
 
+# CVE-2026-24747: PyTorch weights_only restricted unpickler bypass
+# via SETITEM/SETITEMS abuse on non-dict objects and tensor metadata mismatches
+CVE_2026_24747_PATTERNS = [
+    # SETITEM applied to tensor reconstruction results (not normal dict construction)
+    r"_rebuild_tensor.*SETITEM",  # tensor rebuild followed by SETITEM abuse
+    r"_rebuild_tensor.*SETITEMS",  # tensor rebuild followed by SETITEMS abuse
+    # Tensor metadata inconsistency indicators
+    r"_rebuild_tensor_v2.*storage_offset.*(?:dtype|shape)",  # metadata mismatch context
+    # weights_only bypass via SETITEM on unexpected types
+    r"weights_only.*SETITEM.*storage",  # weights_only context with SETITEM + storage
+    r"torch\._utils.*_rebuild.*SETITEM",  # torch._utils rebuild with SETITEM
+]
+
+# CVE-2022-45907: PyTorch torch.jit.annotations.parse_type_line uses eval() unsafely
+# Allows arbitrary code execution via crafted type annotations. Fixed in PyTorch 1.13.1.
+CVE_2022_45907_PATTERNS = [
+    r"parse_type_line.*eval",  # parse_type_line leading to eval
+    r"torch\.jit\.annotations.*eval",  # torch.jit.annotations with eval
+    r"torch\.jit\.annotations.*parse_type_line",  # direct reference to vulnerable function
+    r"jit\.annotations.*exec",  # jit.annotations with exec
+    r"parse_type_line.*compile",  # parse_type_line with compile (alternate exploit)
+]
+
+# CVE-2024-5480: torch.distributed.rpc framework doesn't validate function calls
+# Attacker sends eval/exec as PythonUDF via RPC. Fixed in PyTorch 2.2.3.
+CVE_2024_5480_PATTERNS = [
+    r"torch\.distributed\.rpc.*eval",  # RPC framework with eval
+    r"torch\.distributed\.rpc.*exec",  # RPC framework with exec
+    r"PythonUDF.*eval",  # PythonUDF with eval injection
+    r"PythonUDF.*exec",  # PythonUDF with exec injection
+    r"rpc_sync.*eval",  # rpc_sync with eval
+    r"rpc_sync.*exec",  # rpc_sync with exec
+    r"rpc_async.*eval",  # rpc_async with eval
+    r"rpc_async.*exec",  # rpc_async with exec
+]
+
+# CVE-2024-48063: torch.distributed.rpc.RemoteModule deserialization RCE via pickle
+# Disputed as "intended behavior" but still dangerous. Fixed in PyTorch 2.5.0.
+CVE_2024_48063_PATTERNS = [
+    r"RemoteModule.*__reduce__",  # RemoteModule with __reduce__ exploitation
+    r"RemoteModule.*pickle",  # RemoteModule with pickle deserialization
+    r"RemoteModule.*deserializ",  # RemoteModule deserialization context
+    r"torch\.distributed\.rpc\.RemoteModule.*__reduce__",  # fully qualified + __reduce__
+    r"remote_module_pickled",  # internal pickle representation
+]
+
 # Combined CVE patterns for efficient scanning
 # Used by scanners to detect CVE-specific exploitation attempts
 CVE_COMBINED_PATTERNS = {
@@ -289,6 +423,54 @@ CVE_COMBINED_PATTERNS = {
         "affected_versions": "joblib v1.4.2",
         "remediation": "Update joblib, validate cache integrity, avoid untrusted NumpyArrayWrapper data",
     },
+    "CVE-2026-24747": {
+        "patterns": CVE_2026_24747_PATTERNS,
+        "description": "PyTorch checkpoint deserialization bypass via weights_only restricted unpickler",
+        "severity": "HIGH",
+        "cwe": "CWE-502",  # Deserialization of Untrusted Data
+        "cvss": 8.8,  # High severity
+        "affected_versions": "PyTorch < 2.10.0",
+        "remediation": (
+            "Update to PyTorch 2.10.0+, use SafeTensors format, "
+            "never load untrusted .pth/.pt checkpoints without integrity verification"
+        ),
+    },
+    "CVE-2022-45907": {
+        "patterns": CVE_2022_45907_PATTERNS,
+        "description": "PyTorch torch.jit.annotations.parse_type_line unsafe eval() injection",
+        "severity": "CRITICAL",
+        "cwe": "CWE-94",  # Improper Control of Generation of Code ('Code Injection')
+        "cvss": 9.8,
+        "affected_versions": "PyTorch < 1.13.1",
+        "remediation": (
+            "Update to PyTorch 1.13.1+, avoid loading untrusted TorchScript models "
+            "or annotations from untrusted sources"
+        ),
+    },
+    "CVE-2024-5480": {
+        "patterns": CVE_2024_5480_PATTERNS,
+        "description": "PyTorch torch.distributed.rpc arbitrary function execution via PythonUDF",
+        "severity": "CRITICAL",
+        "cwe": "CWE-94",  # Improper Control of Generation of Code ('Code Injection')
+        "cvss": 10.0,
+        "affected_versions": "PyTorch < 2.2.3",
+        "remediation": (
+            "Update to PyTorch 2.2.3+, restrict RPC access to trusted nodes only, "
+            "never expose torch.distributed.rpc endpoints to untrusted networks"
+        ),
+    },
+    "CVE-2024-48063": {
+        "patterns": CVE_2024_48063_PATTERNS,
+        "description": "PyTorch torch.distributed.rpc.RemoteModule deserialization RCE via pickle",
+        "severity": "CRITICAL",
+        "cwe": "CWE-502",  # Deserialization of Untrusted Data
+        "cvss": 9.8,
+        "affected_versions": "PyTorch < 2.5.0",
+        "remediation": (
+            "Update to PyTorch 2.5.0+, avoid deserializing RemoteModule objects "
+            "from untrusted sources, restrict RPC to trusted networks"
+        ),
+    },
 }
 
 # Binary patterns for CVE detection in raw file content
@@ -297,11 +479,15 @@ CVE_COMBINED_PATTERNS = {
 # The regex CVE patterns (CVE_2020_13092_PATTERNS, CVE_2024_34997_PATTERNS) correctly detect
 # actual exploits by requiring COMBINATIONS (e.g., "sklearn.*joblib.*os.system"), not individual keywords.
 CVE_BINARY_PATTERNS = [
-    # CVE-2020-13092 binary signatures
-    b"joblib.load",
-    b"__reduce__",
+    # Only patterns that are genuine indicators of exploitation.
+    # Removed overly broad patterns (b"Pipeline", b"__reduce__", b"joblib.load",
+    # b"read_array") that match ALL legitimate sklearn/numpy pickle files.
+    # The regex CVE patterns (CVE_2020_13092_PATTERNS, CVE_2024_34997_PATTERNS)
+    # correctly detect actual exploits by requiring dangerous COMBINATIONS.
     b"os.system",
-    b"Pipeline",
+    # NOTE: b"Pipeline" removed — it matches all legitimate sklearn Pipeline pickles.
+    # The CVE-2020-13092 exploit requires Pipeline + __reduce__ + system call, which
+    # is detected by the CVE_2020_13092_PATTERNS regex list and the opcode-level checks.
     # CVE-2024-34997 binary signatures
     b"read_array",
     b"pickle.load",
@@ -345,6 +531,20 @@ BINARY_CODE_PATTERNS: list[bytes] = [
     b"subprocess.call",
     b"subprocess.Popen",
     b"socket.socket",
+    # Native code loading - ctypes
+    b"ctypes.CDLL",
+    b"ctypes.cdll",
+    b"ctypes.windll",
+    b"ctypes.WinDLL",
+    # Native code loading - cffi
+    b"cffi.FFI",
+    b"ffi.dlopen",
+    # Direct dynamic loading
+    b"dlopen(",
+    b"LoadLibrary",
+    # Memory mapping (code injection vector)
+    b"mmap.mmap",
+    b"mmap(",
 ]
 
 # Common executable file signatures found in malicious model data
@@ -372,6 +572,13 @@ SUSPICIOUS_OPS = {
     "MergeV2Checkpoints",  # Checkpoint manipulation
     "Save",  # Save operations (potential overwrite)
     "SaveV2",  # SaveV2 operations
+    "LoadAndRemapMatrix",  # Load matrix from files with arbitrary paths
+    "RestoreV2",  # Restore checkpoint data (file access)
+    # External data loading - HIGH RISK
+    "LookupTableImport",  # Import data from external files
+    "InitializeTable",  # Initialize lookup tables from files
+    "LookupTableImportV2",  # Import data from external files (V2)
+    "InitializeTableV2",  # Initialize lookup tables from files (V2)
     # Code execution - CRITICAL RISK
     "PyFunc",  # Execute Python functions
     "PyFuncStateless",  # Execute Python functions (stateless variant)
@@ -381,6 +588,19 @@ SUSPICIOUS_OPS = {
     "ShellExecute",  # Execute shell commands
     "ExecuteOp",  # Execute arbitrary operations
     "SystemConfig",  # System configuration access
+    # Queue operations - data exfiltration risk
+    "QueueEnqueue",  # Enqueue data (potential exfiltration)
+    "QueueEnqueueV2",  # Enqueue data V2
+    "QueueDequeue",  # Dequeue data (potential exfiltration)
+    "QueueDequeueV2",  # Dequeue data V2
+    "QueueEnqueueMany",  # Batch enqueue (potential exfiltration)
+    "QueueDequeueMany",  # Batch dequeue (potential exfiltration)
+    # Side-channel information leakage
+    "Print",  # Print to stdout (information leakage)
+    "PrintV2",  # Print to stdout V2 (information leakage)
+    # Pipeline disruption
+    "Assert",  # Can crash inference pipelines
+    "Abort",  # Can abort execution
     # Data decoding - CRITICAL (scanner emits CRITICAL for these ops in suspicious-ops path)
     "DecodeRaw",  # Raw data decoding
     "DecodeJpeg",  # JPEG decoding (image processing)
@@ -394,6 +614,13 @@ TENSORFLOW_DANGEROUS_OPS: dict[str, str] = {
     "MergeV2Checkpoints": "Can manipulate checkpoint files",
     "Save": "Can save data to arbitrary locations",
     "SaveV2": "Can save data to arbitrary locations",
+    "LoadAndRemapMatrix": "Can load matrix data from arbitrary file paths",
+    "RestoreV2": "Can restore checkpoint data, enabling file system access",
+    # External data loading - HIGH RISK
+    "LookupTableImport": "Can import data from external files",
+    "InitializeTable": "Can initialize lookup tables from external files",
+    "LookupTableImportV2": "Can import data from external files (V2 variant)",
+    "InitializeTableV2": "Can initialize lookup tables from external files (V2 variant)",
     # Code execution - CRITICAL RISK
     "PyFunc": "Can execute arbitrary Python functions",
     "PyFuncStateless": "Can execute arbitrary Python functions (stateless variant)",
@@ -403,18 +630,34 @@ TENSORFLOW_DANGEROUS_OPS: dict[str, str] = {
     "ShellExecute": "Can execute shell commands",
     "ExecuteOp": "Can execute arbitrary operations",
     "SystemConfig": "Can access system configuration",
+    # Queue operations - data exfiltration risk
+    "QueueEnqueue": "Can enqueue data to queues, potential data exfiltration vector",
+    "QueueEnqueueV2": "Can enqueue data to queues (V2 variant)",
+    "QueueDequeue": "Can dequeue data from queues, potential data exfiltration vector",
+    "QueueDequeueV2": "Can dequeue data from queues (V2 variant)",
+    "QueueEnqueueMany": "Can batch enqueue data, potential data exfiltration vector",
+    "QueueDequeueMany": "Can batch dequeue data, potential data exfiltration vector",
+    # Side-channel information leakage
+    "Print": "Can print to stdout, enabling side-channel information leakage",
+    "PrintV2": "Can print to stdout (V2 variant), enabling side-channel information leakage",
+    # Pipeline disruption
+    "Assert": "Can crash inference pipelines if assertion fails",
+    "Abort": "Can abort execution, enabling denial of service",
     # Data decoding - CRITICAL (scanner emits CRITICAL for these ops in suspicious-ops path)
     "DecodeRaw": "Can decode raw image data, potential injection of malicious content",
     "DecodeJpeg": "Can decode JPEG data, potential injection of malicious content",
     "DecodePng": "Can decode PNG data, potential injection of malicious content",
 }
 
+# Known safe Keras model classes that use declarative layer configurations
+# without custom code execution (Sequential, Functional, Model)
+KNOWN_SAFE_MODEL_CLASSES: set[str] = {"Sequential", "Functional", "Model"}
+
 # Suspicious Keras layer types
 # Layer types that can contain arbitrary code or complex functionality
 SUSPICIOUS_LAYER_TYPES = {
     "Lambda": "Can contain arbitrary Python code",
     "TFOpLambda": "Can call TensorFlow operations",
-    "Functional": "Complex layer that might hide malicious components",
     "PyFunc": "Can execute Python code",
     "CallbackLambda": "Can execute callbacks at runtime",
 }
@@ -718,7 +961,14 @@ def validate_patterns() -> list[str]:
 
     # Validate regex patterns
     all_string_patterns = (
-        SUSPICIOUS_STRING_PATTERNS + SUSPICIOUS_METADATA_PATTERNS + CVE_2020_13092_PATTERNS + CVE_2024_34997_PATTERNS
+        SUSPICIOUS_STRING_PATTERNS
+        + SUSPICIOUS_METADATA_PATTERNS
+        + CVE_2020_13092_PATTERNS
+        + CVE_2024_34997_PATTERNS
+        + CVE_2026_24747_PATTERNS
+        + CVE_2022_45907_PATTERNS
+        + CVE_2024_5480_PATTERNS
+        + CVE_2024_48063_PATTERNS
     )
     for pattern in all_string_patterns:
         try:

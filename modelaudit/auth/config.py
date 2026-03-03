@@ -1,6 +1,7 @@
 """Configuration management for ModelAudit authentication."""
 
 import os
+import tempfile
 from typing import Any, cast
 from uuid import uuid4
 
@@ -104,7 +105,7 @@ def get_config_directory_path(create_if_not_exists: bool = False) -> str:
             os.makedirs(config_dir, exist_ok=True)
         except (OSError, PermissionError):
             # In Docker or restricted environments, use a temporary directory
-            config_dir = "/tmp/promptfoo"
+            config_dir = os.path.join(tempfile.gettempdir(), "promptfoo")
             os.makedirs(config_dir, exist_ok=True)
     return config_dir
 

@@ -239,8 +239,7 @@ class TestAdvancedObfuscationDetection:
         """Test detection through multiple layers of obfuscation."""
         detector = EnhancedPatternDetector()
 
-        # For now, test single-layer obfuscation
-        # TODO: Implement recursive deobfuscation for layered attacks
+        # Current scope validates single-layer obfuscation handling.
         dangerous_content = "eval("
         matches = detector.detect_patterns(dangerous_content)
 

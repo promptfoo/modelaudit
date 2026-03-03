@@ -1,7 +1,6 @@
-# Rye
+# uv / Python environment
 .venv/
 .python-version
-.rye/
 
 # Development files
 *.egg-info/

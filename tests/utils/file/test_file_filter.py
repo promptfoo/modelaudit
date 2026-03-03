@@ -1,6 +1,6 @@
 """Tests for file filtering functionality."""
 
-from modelaudit.utils.file_filter import (
+from modelaudit.utils.file.filtering import (
     should_skip_file,
 )
 

@@ -37,13 +37,13 @@ def generate_multiple_pickle_attack() -> None:
     buffer = io.BytesIO()
 
     safe_data = {"model": "safe_weights"}
-    pickle.dump(safe_data, buffer)
+    pickle.dump(safe_data, buffer, protocol=pickle.HIGHEST_PROTOCOL)
 
     class HiddenAttack:
         def __reduce__(self):
             return (eval, ("'HIDDEN_ATTACK_PAYLOAD'",))
 
-    pickle.dump(HiddenAttack(), buffer)
+    pickle.dump(HiddenAttack(), buffer, protocol=pickle.HIGHEST_PROTOCOL)
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     with (OUTPUT_DIR / "multiple_stream_attack.pkl").open("wb") as f:

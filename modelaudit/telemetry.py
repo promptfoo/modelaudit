@@ -593,11 +593,12 @@ class TelemetryClient:
         path_lower = path.lower()
 
         if path_lower.startswith(("http://", "https://")):
-            if "huggingface.co" in path_lower:
+            hostname = (urlparse(path).hostname or "").lower()
+            if hostname == "huggingface.co" or hostname.endswith(".huggingface.co"):
                 return "huggingface"
-            elif "pytorch.org" in path_lower:
+            elif hostname == "pytorch.org" or hostname.endswith(".pytorch.org"):
                 return "pytorch_hub"
-            elif "jfrog" in path_lower:
+            elif hostname.endswith(".jfrog.io") or hostname == "jfrog.io":
                 return "jfrog"
             else:
                 return "http"

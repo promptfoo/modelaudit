@@ -17,7 +17,7 @@ def test_is_within_directory_outside(tmp_path):
     assert is_within_directory(str(base_dir), str(outside)) is False
 
 
-def test_is_within_directory_symlink_inside_to_outside(tmp_path):
+def test_is_within_directory_symlink_inside_to_outside(tmp_path, requires_symlinks):
     base_dir = tmp_path / "base"
     base_dir.mkdir()
     outside_dir = tmp_path / "outside"
@@ -29,7 +29,7 @@ def test_is_within_directory_symlink_inside_to_outside(tmp_path):
     assert is_within_directory(str(base_dir), str(link)) is False
 
 
-def test_is_within_directory_symlink_outside_to_inside(tmp_path):
+def test_is_within_directory_symlink_outside_to_inside(tmp_path, requires_symlinks):
     base_dir = tmp_path / "base"
     base_dir.mkdir()
     inside_file = base_dir / "inside.txt"
