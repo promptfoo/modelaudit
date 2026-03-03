@@ -3,6 +3,7 @@ import gzip
 import lzma
 import pickle
 import zlib
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -12,7 +13,7 @@ from modelaudit.scanners.compressed_scanner import CompressedScanner, _MissingOp
 
 
 class _MaliciousPayload:
-    def __reduce__(self):
+    def __reduce__(self) -> tuple[object, tuple[str]]:
         return (eval, ("print('owned')",))
 
 
@@ -79,7 +80,7 @@ def test_compressed_scanner_corrupt_stream_is_warning_not_critical(tmp_path: Pat
 def test_compressed_scanner_enforces_decompression_size_limit(
     tmp_path: Path,
     extension: str,
-    compressor,
+    compressor: Callable[[bytes], bytes],
 ) -> None:
     data = b"A" * 4096
     path = tmp_path / f"oversize_payload.bin{extension}"
