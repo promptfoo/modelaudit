@@ -851,6 +851,18 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
             f"Expected CRITICAL __import__ detection, got: {critical_messages}"
         )
 
+    def test_malformed_unicode_tail_with_benign_prefix_does_not_raise_critical(self) -> None:
+        """Malformed tails after benign opcodes should not create CRITICAL findings."""
+        payload = b"\x80\x02cbuiltins\nlen\nq\x00c\xff\n"
+
+        result = self._scan_bytes(payload)
+
+        assert result.success
+        critical_messages = [i.message.lower() for i in result.issues if i.severity == IssueSeverity.CRITICAL]
+        assert not any("builtins.len" in msg or "len" in msg for msg in critical_messages), (
+            f"Unexpected CRITICAL benign detection: {critical_messages}"
+        )
+
     # ------------------------------------------------------------------
     # Fix 4: NEWOBJ_EX with dangerous class
     # ------------------------------------------------------------------
