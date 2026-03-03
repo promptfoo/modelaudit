@@ -62,6 +62,7 @@ ModelAudit includes **30 specialized scanners** covering model, archive, and con
 | **TensorFlow**   | `.pb`, SavedModel dirs                | MEDIUM |
 | **Keras**        | `.h5`, `.hdf5`, `.keras`              | MEDIUM |
 | **ONNX**         | `.onnx`                               | MEDIUM |
+| **CNTK**         | `.dnn`, `.cmf`                        | MEDIUM |
 | **CatBoost**     | `.cbm`                                | MEDIUM |
 | **XGBoost**      | `.bst`, `.model`, `.ubj`              | MEDIUM |
 | **SafeTensors**  | `.safetensors`                        | LOW    |
