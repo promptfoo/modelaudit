@@ -65,6 +65,7 @@ def test_detect_file_format_by_extension(tmp_path):
         ".h5": "hdf5",
         ".pb": "protobuf",
         ".tflite": "tflite",
+        ".cbm": "catboost",
         ".unknown": "unknown",
     }
 
@@ -377,6 +378,19 @@ def test_msgpack_validation_valid_format(tmp_path):
 
     # Test that validation passes (this was the bug - it was failing before)
     assert validate_file_type(str(msgpack_path)) is True
+
+
+def test_catboost_validation_valid_and_invalid_files(tmp_path: Path) -> None:
+    """Valid CatBoost files pass validation; spoofed ones fail."""
+    catboost_path = tmp_path / "model.cbm"
+    catboost_path.write_bytes(b"CBM1" + b"\x04\x00\x00\x00" + b"core")
+    assert detect_file_format(str(catboost_path)) == "catboost"
+    assert detect_format_from_extension(str(catboost_path)) == "catboost"
+    assert validate_file_type(str(catboost_path)) is True
+
+    bad_catboost = tmp_path / "bad_model.cbm"
+    bad_catboost.write_bytes(b"FAKE" + b"\x00" * 20)
+    assert validate_file_type(str(bad_catboost)) is False
 
 
 def test_detect_generic_xml_format(tmp_path):
