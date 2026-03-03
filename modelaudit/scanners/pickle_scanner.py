@@ -73,10 +73,30 @@ def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> 
                     yield item
             except ValueError as e:
                 error_str = str(e).lower()
-                if "opcode" in error_str and "unknown" in error_str:
-                    logger.info(
-                        f"Protocol mismatch in pickle (joblib may use protocol 5 opcodes in protocol 4 files): {e}"
-                    )
+                is_unknown_opcode = "opcode" in error_str and "unknown" in error_str
+                is_decode_or_text_error = (
+                    isinstance(e, UnicodeDecodeError)
+                    or "unicode" in error_str
+                    or "codec can't decode" in error_str
+                    or "no newline found" in error_str
+                )
+
+                if is_unknown_opcode or is_decode_or_text_error:
+                    if had_opcodes:
+                        logger.info(
+                            "Pickle stream parsing interrupted after partial opcode extraction; "
+                            "continuing with partial security analysis"
+                        )
+                        stream_error = True
+                    elif is_unknown_opcode:
+                        # Keep prior behavior for joblib-style protocol/opcode mismatches.
+                        logger.info(
+                            f"Protocol mismatch in pickle (joblib may use protocol 5 opcodes in protocol 4 files): {e}"
+                        )
+                    else:
+                        # No opcodes were parsed; allow outer error handling to report
+                        # malformed payloads instead of silently treating as empty.
+                        raise
                 else:
                     raise
         else:
@@ -101,6 +121,11 @@ def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> 
             if not stream_error:
                 # Stream completed successfully — yield buffered opcodes
                 yield from buffered
+
+        if stream_error and had_opcodes:
+            # First stream parse interruption after yielding some opcodes.
+            # Return the parsed prefix for security analysis.
+            return
 
         if not multi_stream:
             return

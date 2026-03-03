@@ -833,6 +833,25 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
             )
 
     # ------------------------------------------------------------------
+    # Fix 3c: parser crash resilience on mixed malformed payloads
+    # ------------------------------------------------------------------
+    def test_malformed_unicode_tail_still_flags_dangerous_global(self) -> None:
+        """Malformed tails should not suppress opcode-level dangerous global detection."""
+        # Valid prefix with dangerous GLOBAL, followed by malformed GLOBAL bytes
+        # that previously caused parse fallback before opcode analysis completed.
+        payload = b"\x80\x02cbuiltins\n__import__\nq\x00c\xff\n"
+
+        result = self._scan_bytes(payload)
+
+        assert result.success
+        assert result.has_errors
+
+        critical_messages = [i.message.lower() for i in result.issues if i.severity == IssueSeverity.CRITICAL]
+        assert any("__import__" in msg for msg in critical_messages), (
+            f"Expected CRITICAL __import__ detection, got: {critical_messages}"
+        )
+
+    # ------------------------------------------------------------------
     # Fix 4: NEWOBJ_EX with dangerous class
     # ------------------------------------------------------------------
     def test_newobj_ex_dangerous_class(self) -> None:
