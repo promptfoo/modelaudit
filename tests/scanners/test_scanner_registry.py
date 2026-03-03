@@ -83,6 +83,7 @@ def test_scanner_registry_file_extension_coverage():
         ".keras",
         ".pb",
         ".onnx",
+        ".cbm",
         ".safetensors",
         ".msgpack",
         ".tflite",
