@@ -832,3 +832,35 @@ def get_cve_2019_6446_explanation(vulnerability_type: str) -> str:
         "CVE-2019-6446: NumPy allow_pickle enables RCE via object dtype arrays. "
         "Use NumPy >= 1.16.3 and never allow_pickle=True with untrusted files.",
     )
+
+
+def get_cve_2025_23304_explanation(vulnerability_type: str) -> str:
+    """Get specific explanation for CVE-2025-23304 (NeMo Hydra _target_ injection)."""
+    explanations = {
+        "hydra_target_injection": (
+            "CVE-2025-23304 (CVSS 7.6): NVIDIA NeMo model files (.nemo) contain "
+            "YAML configuration with Hydra _target_ fields that specify Python "
+            "callables to instantiate. An attacker can set _target_ to dangerous "
+            "functions like os.system or subprocess.call. When the model is loaded "
+            "and hydra.utils.instantiate() processes the config, arbitrary code "
+            "executes. Over 700 models on HuggingFace use the NeMo format."
+        ),
+        "dangerous_target": (
+            "The _target_ field references a known dangerous Python callable "
+            "such as os.system, subprocess.Popen, eval, or exec. Hydra will "
+            "attempt to import and call this function with the remaining config "
+            "values as arguments, enabling full remote code execution."
+        ),
+        "nemo_version": (
+            "CVE-2025-23304 was fixed in NeMo 2.3.2 which adds safe_instantiate() "
+            "to validate _target_ values before execution. This function recursively "
+            "checks all _target_ values in the config and rejects dangerous ones. "
+            "Update to NeMo >= 2.3.2 and never load .nemo files from untrusted sources."
+        ),
+    }
+
+    return explanations.get(
+        vulnerability_type,
+        "CVE-2025-23304: NeMo Hydra _target_ injection enables RCE via malicious "
+        "model metadata. Update to NeMo >= 2.3.2.",
+    )
