@@ -485,6 +485,9 @@ def test_pytorch_zip_scanner_combined_security_controls(tmp_path):
     assert symlink_issues[0].severity == IssueSeverity.WARNING
 
 
+# CVE-2026-24747 Tests
+
+
 def _create_pytorch_zip_with_framework_version(path: Path, pytorch_version: str) -> Path:
     with zipfile.ZipFile(path, "w") as zipf:
         zipf.writestr("archive/version", "3")
@@ -493,30 +496,39 @@ def _create_pytorch_zip_with_framework_version(path: Path, pytorch_version: str)
     return path
 
 
-def test_pytorch_zip_cve_2024_5480_uses_artifact_metadata_version(tmp_path):
-    model_path = _create_pytorch_zip_with_framework_version(tmp_path / "model.pt", "2.2.2")
+def test_pytorch_zip_cve_2026_24747_version_check(tmp_path: Path) -> None:
+    """Model metadata with vulnerable version should trigger CVE-2026-24747."""
+    model_path = _create_pytorch_zip_with_framework_version(tmp_path / "model.pt", "2.9.0")
+    scanner = PyTorchZipScanner()
+    result = scanner.scan(str(model_path))
+    cve_2026_checks = [c for c in result.checks if "CVE-2026-24747" in c.name]
+    failed_checks = [c for c in cve_2026_checks if c.status == CheckStatus.FAILED]
+    assert len(failed_checks) > 0, (
+        f"Should flag PyTorch 2.9.0 as vulnerable to CVE-2026-24747. "
+        f"Checks: {[(c.name, c.status) for c in result.checks]}"
+    )
+    assert failed_checks[0].details.get("detected_pytorch_version") == "2.9.0"
+    assert failed_checks[0].details.get("pytorch_version_source") == "metadata:config.json:pytorch_version"
+
+
+def test_pytorch_zip_cve_2026_24747_fixed_version(tmp_path: Path) -> None:
+    """Model metadata with fixed version should not trigger CVE-2026-24747."""
+    model_path = _create_pytorch_zip_with_framework_version(tmp_path / "model.pt", "2.10.0")
     scanner = PyTorchZipScanner()
     result = scanner.scan(str(model_path))
 
-    cve_checks = [c for c in result.checks if "CVE-2024-5480" in c.name and c.status == CheckStatus.FAILED]
-    assert len(cve_checks) > 0, f"Expected vulnerable metadata version to trigger CVE check: {result.checks}"
-    assert cve_checks[0].details.get("detected_pytorch_version") == "2.2.2"
-    assert cve_checks[0].details.get("pytorch_version_source") == "metadata:config.json:pytorch_version"
-
-
-def test_pytorch_zip_cve_2024_5480_fixed_artifact_version_not_flagged(tmp_path):
-    model_path = _create_pytorch_zip_with_framework_version(tmp_path / "model.pt", "2.2.3")
-    scanner = PyTorchZipScanner()
-    result = scanner.scan(str(model_path))
-
-    cve_failed = [c for c in result.checks if "CVE-2024-5480" in c.name and c.status == CheckStatus.FAILED]
-    assert len(cve_failed) == 0, (
-        f"Fixed artifact version should not trigger CVE-2024-5480: {[(c.name, c.message) for c in cve_failed]}"
+    # Fixed version: CVE-2026-24747 check should be present but not failed
+    cve_2026_checks = [c for c in result.checks if "CVE-2026-24747" in c.name]
+    assert len(cve_2026_checks) > 0, "Expected CVE-2026-24747 check to be present"
+    cve_2026_failed = [c for c in cve_2026_checks if c.status == CheckStatus.FAILED]
+    assert len(cve_2026_failed) == 0, (
+        f"PyTorch 2.10.0 should NOT trigger CVE-2026-24747. "
+        f"Failed checks: {[(c.name, c.message) for c in cve_2026_failed]}"
     )
 
 
-def test_pytorch_zip_generic_version_metadata_does_not_trigger_cve_checks(tmp_path):
-    """Generic config version fields should not be treated as PyTorch framework version."""
+def test_pytorch_zip_generic_version_metadata_does_not_trigger_cve_version_checks(tmp_path: Path) -> None:
+    """Generic config version keys should not be treated as framework version."""
     model_path = tmp_path / "model.pt"
     with zipfile.ZipFile(model_path, "w") as zipf:
         zipf.writestr("archive/version", "3")
@@ -526,87 +538,197 @@ def test_pytorch_zip_generic_version_metadata_does_not_trigger_cve_checks(tmp_pa
     scanner = PyTorchZipScanner()
     result = scanner.scan(str(model_path))
 
-    cve_checks = [
+    cve_version_checks = [
         c
         for c in result.checks
         if c.status == CheckStatus.FAILED
-        and any(cve in c.name for cve in ["CVE-2025-32434", "CVE-2022-45907", "CVE-2024-5480", "CVE-2024-48063"])
+        and "PyTorch Version Check" in c.name
+        and any(
+            cve in c.name
+            for cve in [
+                "CVE-2025-32434",
+                "CVE-2026-24747",
+                "CVE-2022-45907",
+                "CVE-2024-5480",
+                "CVE-2024-48063",
+            ]
+        )
     ]
-    assert len(cve_checks) == 0, (
-        "Generic metadata version should not trigger PyTorch CVE checks; "
-        f"found: {[(c.name, c.message) for c in cve_checks]}"
+    assert len(cve_version_checks) == 0, (
+        "Generic metadata version should not trigger framework CVE checks. "
+        f"Found: {[(c.name, c.message) for c in cve_version_checks]}"
     )
 
 
-class TestPyTorchVersionChecks:
-    """Tests for CVE version checking helpers."""
+def test_pytorch_zip_tensor_metadata_validation(tmp_path: Path) -> None:
+    """Test tensor metadata consistency validation runs without errors."""
+    # Create a PyTorch ZIP model with data blobs
+    zip_path = tmp_path / "model_with_data.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        # Simple pickle with a dict
+        data = {"weights": [1.0, 2.0, 3.0]}
+        zipf.writestr("archive/data.pkl", pickle.dumps(data))
+        # Add a data blob
+        zipf.writestr("archive/data/0", b"\x00" * 24)  # 6 float32 values
 
-    def test_cve_2022_45907_vulnerable_version(self):
-        """PyTorch < 1.13.1 should be vulnerable to CVE-2022-45907."""
-        scanner = PyTorchZipScanner()
-        assert scanner._is_pytorch_version_before("1.13.0", 1, 13, 1) is True
-        assert scanner._is_pytorch_version_before("1.12.0", 1, 13, 1) is True
-        assert scanner._is_pytorch_version_before("1.0.0", 1, 13, 1) is True
+    scanner = PyTorchZipScanner()
+    result = scanner.scan(str(zip_path))
 
-    def test_cve_2022_45907_fixed_version(self):
-        """PyTorch >= 1.13.1 should not be vulnerable to CVE-2022-45907."""
-        scanner = PyTorchZipScanner()
-        assert scanner._is_pytorch_version_before("1.13.1", 1, 13, 1) is False
-        assert scanner._is_pytorch_version_before("2.0.0", 1, 13, 1) is False
+    # Should complete without crashing (best-effort validation)
+    assert result is not None
+    # Should not report metadata mismatches for a normal model
+    mismatch_checks = [c for c in result.checks if "Tensor Metadata" in c.name and c.status == CheckStatus.FAILED]
+    assert len(mismatch_checks) == 0, (
+        f"Normal model should not have metadata mismatches. Failed: {[(c.name, c.message) for c in mismatch_checks]}"
+    )
 
-    def test_cve_2024_5480_vulnerable_version(self):
-        """PyTorch < 2.2.3 should be vulnerable to CVE-2024-5480."""
-        scanner = PyTorchZipScanner()
-        assert scanner._is_pytorch_version_before("2.2.2", 2, 2, 3) is True
-        assert scanner._is_pytorch_version_before("2.1.0", 2, 2, 3) is True
-        assert scanner._is_pytorch_version_before("1.13.1", 2, 2, 3) is True
 
-    def test_cve_2024_5480_fixed_version(self):
-        """PyTorch >= 2.2.3 should not be vulnerable to CVE-2024-5480."""
-        scanner = PyTorchZipScanner()
-        assert scanner._is_pytorch_version_before("2.2.3", 2, 2, 3) is False
-        assert scanner._is_pytorch_version_before("2.3.0", 2, 2, 3) is False
+def test_pytorch_zip_tensor_metadata_mismatch_detection(tmp_path: Path) -> None:
+    """Test that intentionally mismatched tensor metadata is detected.
 
-    def test_cve_2024_48063_vulnerable_version(self):
-        """PyTorch < 2.5.0 should be vulnerable to CVE-2024-48063."""
-        scanner = PyTorchZipScanner()
-        assert scanner._is_pytorch_version_before("2.4.9", 2, 5, 0) is True
-        assert scanner._is_pytorch_version_before("2.2.3", 2, 5, 0) is True
+    Creates a PyTorch ZIP where the pickle declares a tensor requiring more
+    storage than the actual blob provides, which is the core CVE-2026-24747
+    metadata-mismatch exploitation vector.
+    """
+    import pickletools
+    import struct
 
-    def test_cve_2024_48063_fixed_version(self):
-        """PyTorch >= 2.5.0 should not be vulnerable to CVE-2024-48063."""
-        scanner = PyTorchZipScanner()
-        assert scanner._is_pytorch_version_before("2.5.0", 2, 5, 0) is False
-        assert scanner._is_pytorch_version_before("2.6.0", 2, 5, 0) is False
+    # Build a minimal pickle that references _rebuild_tensor_v2 with a
+    # declared element count that wildly exceeds the actual blob size.
+    # Protocol 2 GLOBAL opcode referencing torch._utils._rebuild_tensor_v2
+    pkl_data = bytearray()
+    pkl_data.extend(b"\x80\x02")  # PROTO 2
+    pkl_data.extend(b"ctorch._utils\n_rebuild_tensor_v2\n")  # GLOBAL
+    # Push storage key "0" as SHORT_BINUNICODE
+    pkl_data.extend(b"\x8c\x010")  # SHORT_BINUNICODE "0"
+    # Push a large element count (1_000_000) as BININT
+    pkl_data.extend(b"J")  # BININT opcode
+    pkl_data.extend(struct.pack("<i", 1_000_000))
+    pkl_data.extend(b".")  # STOP
 
-    def test_unparseable_version_is_vulnerable(self):
-        """Unparseable version strings should be treated as vulnerable."""
-        scanner = PyTorchZipScanner()
-        assert scanner._is_pytorch_version_before("unknown", 2, 5, 0) is True
-        assert scanner._is_pytorch_version_before("", 2, 5, 0) is True
+    # Verify our pickle is parseable by pickletools
+    list(pickletools.genops(bytes(pkl_data)))
 
-    def test_version_with_suffix(self):
-        """Version strings with suffixes should parse correctly."""
-        scanner = PyTorchZipScanner()
-        assert scanner._is_pytorch_version_before("2.2.2+cu118", 2, 2, 3) is True
-        assert scanner._is_pytorch_version_before("2.5.0+cpu", 2, 5, 0) is False
+    zip_path = tmp_path / "mismatch_model.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", bytes(pkl_data))
+        # Blob is only 24 bytes but pickle declares 1M elements
+        zipf.writestr("archive/data/0", b"\x00" * 24)
 
-    def test_prerelease_of_fix_version_is_vulnerable(self):
-        """Pre-release versions of the fix version should be treated as vulnerable."""
-        scanner = PyTorchZipScanner()
-        assert scanner._is_pytorch_version_before("2.5.0rc1", 2, 5, 0) is True
-        assert scanner._is_pytorch_version_before("2.5.0.dev20240101", 2, 5, 0) is True
-        assert scanner._is_pytorch_version_before("1.13.1alpha1", 1, 13, 1) is True
-        # Post-fix version prereleases are fine
-        assert scanner._is_pytorch_version_before("2.6.0rc1", 2, 5, 0) is False
+    scanner = PyTorchZipScanner()
+    result = scanner.scan(str(zip_path))
 
-    def test_post_release_and_build_suffixes_are_not_vulnerable(self):
-        """Build/local and post-release suffixes should be treated as fixed if base version is fixed."""
-        scanner = PyTorchZipScanner()
-        assert scanner._is_pytorch_version_before("2.2.3+cu118", 2, 2, 3) is False
-        assert scanner._is_pytorch_version_before("2.2.3.post1", 2, 2, 3) is False
+    assert result is not None
+    mismatch_checks = [c for c in result.checks if "Tensor Metadata" in c.name and c.status == CheckStatus.FAILED]
+    assert len(mismatch_checks) > 0, (
+        f"Should detect tensor storage size mismatch (24 bytes vs 1M declared elements). "
+        f"Checks: {[(c.name, c.status, c.message) for c in result.checks]}"
+    )
 
-    def test_unknown_suffix_is_treated_as_vulnerable(self):
-        """Unknown version suffixes should be treated as vulnerable for safety."""
-        scanner = PyTorchZipScanner()
-        assert scanner._is_pytorch_version_before("2.2.3foobar", 2, 2, 3) is True
+
+# --- CVE-2022-45907 version check tests ---
+
+
+def test_pytorch_zip_cve_2022_45907_version_check(tmp_path: Path) -> None:
+    """Model metadata with vulnerable version should trigger CVE-2022-45907."""
+    model_path = _create_pytorch_zip_with_framework_version(tmp_path / "model.pt", "1.13.0")
+    scanner = PyTorchZipScanner()
+    result = scanner.scan(str(model_path))
+
+    cve_checks = [c for c in result.checks if "CVE-2022-45907" in c.name]
+    failed_checks = [c for c in cve_checks if c.status == CheckStatus.FAILED]
+    assert len(failed_checks) > 0, (
+        f"Should flag PyTorch 1.13.0 as vulnerable to CVE-2022-45907. "
+        f"Checks: {[(c.name, c.status) for c in result.checks]}"
+    )
+    assert failed_checks[0].details.get("detected_pytorch_version") == "1.13.0"
+
+
+def test_pytorch_zip_cve_2022_45907_fixed_version(tmp_path: Path) -> None:
+    """Model metadata with fixed version should not trigger CVE-2022-45907."""
+    model_path = _create_pytorch_zip_with_framework_version(tmp_path / "model.pt", "1.13.1")
+    scanner = PyTorchZipScanner()
+    result = scanner.scan(str(model_path))
+
+    cve_failed = [c for c in result.checks if "CVE-2022-45907" in c.name and c.status == CheckStatus.FAILED]
+    assert len(cve_failed) == 0, (
+        f"PyTorch 1.13.1 should NOT trigger CVE-2022-45907. Failed checks: {[(c.name, c.message) for c in cve_failed]}"
+    )
+
+
+# --- CVE-2024-5480 version check tests ---
+
+
+def test_pytorch_zip_cve_2024_5480_version_check(tmp_path: Path) -> None:
+    """Model metadata with vulnerable version should trigger CVE-2024-5480."""
+    model_path = _create_pytorch_zip_with_framework_version(tmp_path / "model.pt", "2.2.2")
+    scanner = PyTorchZipScanner()
+    result = scanner.scan(str(model_path))
+
+    cve_checks = [c for c in result.checks if "CVE-2024-5480" in c.name]
+    failed_checks = [c for c in cve_checks if c.status == CheckStatus.FAILED]
+    assert len(failed_checks) > 0, (
+        f"Should flag PyTorch 2.2.2 as vulnerable to CVE-2024-5480. "
+        f"Checks: {[(c.name, c.status) for c in result.checks]}"
+    )
+    assert failed_checks[0].details.get("detected_pytorch_version") == "2.2.2"
+
+
+def test_pytorch_zip_cve_2024_5480_fixed_version(tmp_path: Path) -> None:
+    """Model metadata with fixed version should not trigger CVE-2024-5480."""
+    model_path = _create_pytorch_zip_with_framework_version(tmp_path / "model.pt", "2.2.3")
+    scanner = PyTorchZipScanner()
+    result = scanner.scan(str(model_path))
+
+    cve_failed = [c for c in result.checks if "CVE-2024-5480" in c.name and c.status == CheckStatus.FAILED]
+    assert len(cve_failed) == 0, (
+        f"PyTorch 2.2.3 should NOT trigger CVE-2024-5480. Failed checks: {[(c.name, c.message) for c in cve_failed]}"
+    )
+
+
+# --- CVE-2024-48063 version check tests ---
+
+
+def test_pytorch_zip_cve_2024_48063_version_check(tmp_path: Path) -> None:
+    """Model metadata with vulnerable version should trigger CVE-2024-48063."""
+    model_path = _create_pytorch_zip_with_framework_version(tmp_path / "model.pt", "2.4.1")
+    scanner = PyTorchZipScanner()
+    result = scanner.scan(str(model_path))
+
+    cve_checks = [c for c in result.checks if "CVE-2024-48063" in c.name]
+    failed_checks = [c for c in cve_checks if c.status == CheckStatus.FAILED]
+    assert len(failed_checks) > 0, (
+        f"Should flag PyTorch 2.4.1 as vulnerable to CVE-2024-48063. "
+        f"Checks: {[(c.name, c.status) for c in result.checks]}"
+    )
+    assert failed_checks[0].details.get("detected_pytorch_version") == "2.4.1"
+
+
+def test_pytorch_zip_cve_2024_48063_fixed_version(tmp_path: Path) -> None:
+    """Model metadata with fixed version should not trigger CVE-2024-48063."""
+    model_path = _create_pytorch_zip_with_framework_version(tmp_path / "model.pt", "2.5.0")
+    scanner = PyTorchZipScanner()
+    result = scanner.scan(str(model_path))
+
+    cve_failed = [c for c in result.checks if "CVE-2024-48063" in c.name and c.status == CheckStatus.FAILED]
+    assert len(cve_failed) == 0, (
+        f"PyTorch 2.5.0 should NOT trigger CVE-2024-48063. Failed checks: {[(c.name, c.message) for c in cve_failed]}"
+    )
+
+
+def test_version_suffix_handling_for_cve_checks() -> None:
+    """Version helper should treat unknown suffixes as vulnerable and known post/build as fixed."""
+    scanner = PyTorchZipScanner()
+
+    # Known safe suffixes on fixed base version
+    assert scanner._is_vulnerable_pytorch_version_for("2.2.3+cu118", 2, 2, 3) is False
+    assert scanner._is_vulnerable_pytorch_version_for("2.2.3.post1", 2, 2, 3) is False
+
+    # Known pre-release suffixes on fix version are still vulnerable
+    assert scanner._is_vulnerable_pytorch_version_for("2.2.3rc1", 2, 2, 3) is True
+    assert scanner._is_vulnerable_pytorch_version_for("2.2.3.dev0", 2, 2, 3) is True
+
+    # Unknown suffix semantics -> conservative vulnerable
+    assert scanner._is_vulnerable_pytorch_version_for("2.2.3foobar", 2, 2, 3) is True

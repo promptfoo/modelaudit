@@ -2,6 +2,7 @@
 
 import logging
 from pathlib import Path
+from urllib.parse import urlparse
 
 from .base import BaseScanner, Issue, IssueSeverity, ScanResult
 
@@ -130,8 +131,10 @@ class MetadataScanner(BaseScanner):
         for url in urls:
             if url in seen:
                 continue
+            parsed = urlparse(url)
+            hostname = parsed.hostname.lower() if parsed.hostname else ""
             for domain in suspicious_domains:
-                if domain in url.lower():
+                if hostname == domain or hostname.endswith(f".{domain}"):
                     seen.add(url)
                     issues.append(
                         Issue(

@@ -1285,6 +1285,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         if not (
             (ext_format == "pytorch_binary" and header_format in ["zip", "pickle"] and ext == ".bin")
             or (ext_format == "pytorch_binary" and header_format == "pickle" and ext in [".pt", ".pth"])
+            or (ext_format == "keras" and header_format in ["zip", "hdf5"])
         ):
             discrepancy_msg = f"File extension indicates {ext_format} but header indicates {header_format}."
             logger.debug(discrepancy_msg)
@@ -1295,7 +1296,10 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     # Special handling for PyTorch files that are ZIP-based
     # PyTorch's torch.save() uses ZIP format by default since v1.6 (_use_new_zipfile_serialization=True)
     # This applies to .pt, .pth, and .pkl files saved with torch.save()
-    if header_format == "zip" and ext in [".pt", ".pth", ".pkl"]:
+    if header_format == "zip" and ext == ".keras":
+        # Keras 3.x .keras files are ZIP archives - use the dedicated Keras ZIP scanner
+        preferred_scanner = _registry.load_scanner_by_id("keras_zip")
+    elif header_format == "zip" and ext in [".pt", ".pth", ".pkl"]:
         preferred_scanner = _registry.load_scanner_by_id("pytorch_zip")
     elif header_format == "zip" and ext == ".bin":
         # PyTorch .bin files saved with torch.save() are ZIP format internally
@@ -1434,6 +1438,14 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                 "file_type_validation_failed": not file_type_valid,
             },
         )
+
+    # Ensure bytes_scanned reflects the actual file size even when a scanner
+    # returns early (e.g. missing optional dependency, parse error).  The file
+    # size was already computed above via os.path.getsize and is guaranteed to
+    # be accurate.  Without this fallback the scan summary reports "Size: 0
+    # bytes" for every file whose scanner didn't explicitly set the field.
+    if result.bytes_scanned == 0 and file_size > 0:
+        result.bytes_scanned = file_size
 
     return result
 

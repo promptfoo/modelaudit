@@ -233,7 +233,8 @@ class FlaxMsgpackScanner(BaseScanner):
             return metadata
 
         # Check for Orbax format indicators
-        if any(key.startswith("__orbax") for key in obj):
+        # Guard against non-string keys (msgpack allows int/bytes keys)
+        if any(isinstance(key, str) and key.startswith("__orbax") for key in obj):
             metadata["orbax_format"] = True
             result.add_check(
                 name="Checkpoint Format Detection",
@@ -692,7 +693,57 @@ class FlaxMsgpackScanner(BaseScanner):
 
         # Also check for common transformer model patterns (BERT, GPT, T5, etc.)
         transformer_keys = {"embeddings", "encoder", "decoder", "pooler", "lm_head", "transformer", "model"}
+        # Common HuggingFace model name keys that wrap transformer substructure
+        model_name_keys = {
+            "bert",
+            "roberta",
+            "distilbert",
+            "albert",
+            "electra",
+            "xlm",
+            "gpt2",
+            "gpt_neo",
+            "gpt_neox",
+            "gptj",
+            "opt",
+            "llama",
+            "t5",
+            "bart",
+            "pegasus",
+            "mbart",
+            "blenderbot",
+            "vit",
+            "clip",
+            "whisper",
+            "wav2vec2",
+            "flax_model",
+            "classifier",
+            "qa_outputs",
+            "lm_head",
+            "score",
+        }
         has_transformer_keys = any(key in found_keys for key in transformer_keys)
+
+        # Check if any top-level key contains transformer sub-keys (nested model structure)
+        if not has_transformer_keys:
+            for key in found_keys:
+                value = obj.get(key)
+                if isinstance(value, dict):
+                    sub_keys = set(value.keys())
+                    if sub_keys & transformer_keys:
+                        has_transformer_keys = True
+                        break
+                    # Also check if the top-level key is a known model name.
+                    # Only check string keys — msgpack allows int/bytes keys which
+                    # are never valid model names and would cause crashes on .lower().
+                    if not isinstance(key, str):
+                        continue
+                    key_lower = key.lower()
+                    # Use exact match only to avoid false positives from substring
+                    # matching (e.g. "opt" matching "optional", "t5" matching "t500").
+                    if key_lower in model_name_keys:
+                        has_transformer_keys = True
+                        break
 
         has_standard_flax_keys = any(key in found_keys for key in expected_keys)
 
