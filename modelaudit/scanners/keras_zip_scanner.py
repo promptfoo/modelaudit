@@ -547,6 +547,12 @@ class KerasZipScanner(BaseScanner):
                     "cve_id": "CVE-2025-9906",
                     "cvss": 8.8,
                     "cwe": "CWE-693",
+                    "description": (
+                        "A crafted .keras config can invoke "
+                        "keras.config.enable_unsafe_deserialization during loading, "
+                        "disabling safe_mode and enabling unsafe component "
+                        "deserialization."
+                    ),
                     "remediation": "Upgrade Keras to >= 3.11.0 and remove untrusted model files",
                 },
                 why=get_cve_2025_9906_explanation("config_bypass"),

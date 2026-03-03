@@ -996,7 +996,10 @@ class TestCVE20259906UnsafeDeserialization:
         assert len(cve_issues) >= 1
         details = cve_issues[0].details
         assert details["cve_id"] == "CVE-2025-9906"
+        assert details["cvss"] == 8.8
         assert details["cwe"] == "CWE-693"
+        assert "description" in details
+        assert "remediation" in details
 
     def test_plain_text_mention_without_keras_context_not_flagged(self, tmp_path):
         """A plain text mention should not trigger when no keras.config context exists."""
