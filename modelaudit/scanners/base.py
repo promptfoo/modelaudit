@@ -168,13 +168,13 @@ class ScanResult:
             Severity.INFO: IssueSeverity.INFO,
         }
 
-        # Auto-detect rule code if not provided
+        # Auto-detect rule code if not provided.
+        # Preserve scanner-provided severity semantics by only attaching the
+        # code here, not remapping severity from rule defaults.
         if not rule_code and not passed:
             match = RuleRegistry.find_matching_rule(message)
             if match:
-                rule_code, rule = match
-                if severity is None:
-                    severity = severity_map.get(rule.default_severity, IssueSeverity.WARNING)
+                rule_code, _rule = match
 
         config = get_config()
 
@@ -183,14 +183,12 @@ class ScanResult:
             logger.debug(f"Suppressed {rule_code}: {message}")
             return
 
-        # Apply severity override from config if available
-        if rule_code:
-            config_rule = RuleRegistry.get_rule(rule_code)
-            if config_rule:
-                configured_severity = config.get_severity(rule_code, config_rule.default_severity)
-                mapped = severity_map.get(configured_severity)
-                if mapped is not None:
-                    severity = mapped
+        # Apply severity override only when explicitly configured by the user.
+        if rule_code and rule_code in config.severity:
+            configured_severity = config.get_severity(rule_code, Severity.MEDIUM)
+            mapped = severity_map.get(configured_severity)
+            if mapped is not None:
+                severity = mapped
 
         status = CheckStatus.PASSED if passed else CheckStatus.FAILED
 

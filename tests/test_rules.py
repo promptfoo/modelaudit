@@ -34,13 +34,13 @@ class TestRuleRegistry:
         # Test exact pattern match
         match = RuleRegistry.find_matching_rule("import os")
         assert match is not None
-        code, rule = match
+        code, _rule = match
         assert code == "S101"
 
         # Test another pattern
         match = RuleRegistry.find_matching_rule("import sys")
         assert match is not None
-        code, rule = match
+        code, _rule = match
         assert code == "S102"
 
         # Test no match
