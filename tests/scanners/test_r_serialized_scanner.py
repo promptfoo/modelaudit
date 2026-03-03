@@ -4,7 +4,7 @@ import gzip
 from pathlib import Path
 
 from modelaudit.scanners import get_scanner_for_file
-from modelaudit.scanners.base import CheckStatus, IssueSeverity
+from modelaudit.scanners.base import Check, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.r_serialized_scanner import RSerializedScanner
 from modelaudit.utils.file.detection import detect_file_format, detect_format_from_extension
 
@@ -20,7 +20,7 @@ def _write_gzip_r_serialized(path: Path, body: str, *, workspace_header: bool = 
         stream.write((payload_prefix + body).encode("utf-8"))
 
 
-def _check_by_name(result, name: str):
+def _check_by_name(result: ScanResult, name: str) -> list[Check]:
     return [check for check in result.checks if check.name == name]
 
 
