@@ -720,7 +720,7 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
     # ------------------------------------------------------------------
     # Fix 3: EXT opcode registry bypass
     # ------------------------------------------------------------------
-    def test_ext1_reduce_extension_registry_is_flagged(self) -> None:
+    def test_ext_reduce_extension_registry_is_flagged(self) -> None:
         """EXT1/EXT2/EXT4 + REDUCE payloads should be flagged as dangerous."""
         import copyreg
         from contextlib import suppress
