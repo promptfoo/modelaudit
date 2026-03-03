@@ -880,11 +880,11 @@ class TestCVE20243660LambdaAttribution:
     """Test CVE-2024-3660: Lambda layer code injection attribution."""
 
     def _make_keras_zip(self, config: dict, tmp_path: Path) -> str:
-        keras_path = os.path.join(str(tmp_path), "model.keras")
+        keras_path = tmp_path / "model.keras"
         with zipfile.ZipFile(keras_path, "w") as zf:
             zf.writestr("config.json", json.dumps(config))
             zf.writestr("metadata.json", json.dumps({"keras_version": "2.10.0"}))
-        return keras_path
+        return str(keras_path)
 
     def test_lambda_layer_has_cve_2024_3660_attribution(self, tmp_path):
         """Lambda layer in .keras file should include CVE-2024-3660 attribution."""
@@ -938,12 +938,12 @@ class TestCVE20243660LambdaAttribution:
                 ]
             },
         }
-        keras_path = os.path.join(str(tmp_path), "model_fixed.keras")
+        keras_path = tmp_path / "model_fixed.keras"
         with zipfile.ZipFile(keras_path, "w") as zf:
             zf.writestr("config.json", json.dumps(config))
             zf.writestr("metadata.json", json.dumps({"keras_version": "2.13.0"}))
 
-        result = scanner.scan(keras_path)
+        result = scanner.scan(str(keras_path))
         cve_issues = [i for i in result.issues if "CVE-2024-3660" in i.message]
         assert len(cve_issues) == 0
 
