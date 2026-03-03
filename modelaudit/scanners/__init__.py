@@ -355,6 +355,15 @@ class ScannerRegistry:
                 "dependencies": [],
                 "numpy_sensitive": False,
             },
+            "rknn": {
+                "module": "modelaudit.scanners.rknn_scanner",
+                "class": "RknnScanner",
+                "description": "Scans Rockchip RKNN model files",
+                "extensions": [".rknn"],
+                "priority": 19,
+                "dependencies": [],
+                "numpy_sensitive": False,
+            },
             "tar": {
                 "module": "modelaudit.scanners.tar_scanner",
                 "class": "TarScanner",
@@ -726,6 +735,7 @@ def __getattr__(name: str) -> Any:
         "TensorRTScanner": "tensorrt",
         "PaddleScanner": "paddle",
         "CntkScanner": "cntk",
+        "RknnScanner": "rknn",
         "TarScanner": "tar",
         "Jinja2TemplateScanner": "jinja2_template",
         "MetadataScanner": "metadata",

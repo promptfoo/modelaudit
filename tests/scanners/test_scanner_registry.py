@@ -81,6 +81,7 @@ def test_scanner_registry_file_extension_coverage():
         ".rds",
         ".dnn",
         ".cmf",
+        ".rknn",
         ".h5",
         ".hdf5",
         ".keras",
