@@ -58,6 +58,7 @@ ModelAudit includes **30 specialized scanners** covering model, archive, and con
 | **PyTorch**      | `.pt`, `.pth`, `.ckpt`, `.bin`        | HIGH   |
 | **Joblib**       | `.joblib`                             | HIGH   |
 | **NumPy**        | `.npy`, `.npz`                        | HIGH   |
+| **R Serialized** | `.rds`, `.rda`, `.rdata`              | HIGH   |
 | **TensorFlow**   | `.pb`, SavedModel dirs                | MEDIUM |
 | **Keras**        | `.h5`, `.hdf5`, `.keras`              | MEDIUM |
 | **ONNX**         | `.onnx`                               | MEDIUM |
