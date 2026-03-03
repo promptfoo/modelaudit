@@ -2968,41 +2968,37 @@ class PickleScanner(BaseScanner):
         if file_ext in [".pkl", ".pickle", ".dill", ".joblib"]:
             return True
 
-        # For ambiguous extensions, check the actual file format
-        if file_ext in [".bin", ".pt", ".pth", ".ckpt"]:
-            try:
-                # Import here to avoid circular dependency
-                from modelaudit.utils.file.detection import (
-                    detect_file_format,
-                    validate_file_type,
+        try:
+            # Import here to avoid circular dependency
+            from modelaudit.utils.file.detection import (
+                detect_file_format,
+                validate_file_type,
+            )
+
+            file_format = detect_file_format(path)
+
+            # For security-sensitive pickle files, also validate file type
+            # This helps detect potential file spoofing attacks
+            if file_format == "pickle" and not validate_file_type(path):
+                # File type validation failed - this could be suspicious
+                # Log but still allow scanning for now (let scanner handle the validation)
+                logger.warning(
+                    f"File type validation failed for potential pickle file: {path}",
                 )
 
-                file_format = detect_file_format(path)
-
-                # For security-sensitive pickle files, also validate file type
-                # This helps detect potential file spoofing attacks
-                if file_format == "pickle" and not validate_file_type(path):
-                    # File type validation failed - this could be suspicious
-                    # Log but still allow scanning for now (let scanner handle the validation)
-                    logger.warning(
-                        f"File type validation failed for potential pickle file: {path}",
-                    )
-
-                # Handle both pickle and zip formats (PyTorch .bin files are often zip)
-                # PyTorch files saved with torch.save() are ZIP archives containing pickled data
-                if file_format == "pickle":
-                    return True
-                elif file_format == "zip" and file_ext in [".bin", ".pt", ".pth"]:
-                    # PyTorch ZIP files should be handled by PyTorchZipScanner or PyTorchBinaryScanner
-                    # The pickle scanner shouldn't try to parse them as regular pickle files
-                    return False
-
+            # Handle both pickle and zip formats (PyTorch .bin files are often zip)
+            # PyTorch files saved with torch.save() are ZIP archives containing pickled data
+            if file_format == "pickle":
+                return True
+            elif file_format == "zip" and file_ext in [".bin", ".pt", ".pth"]:
+                # PyTorch ZIP files should be handled by PyTorchZipScanner or PyTorchBinaryScanner
+                # The pickle scanner shouldn't try to parse them as regular pickle files
                 return False
-            except Exception:
-                # If detection fails, fall back to extension check
-                return file_ext in cls.supported_extensions
 
-        return False
+            return False
+        except Exception:
+            # If detection fails, fall back to extension check
+            return file_ext in cls.supported_extensions
 
     def _get_surrounding_data(self, data: bytes, position: int, window_size: int = 1024) -> bytes:
         """Get data surrounding a specific position for analysis."""

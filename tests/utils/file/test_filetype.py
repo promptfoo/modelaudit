@@ -84,6 +84,15 @@ def test_detect_file_format_hdf5(tmp_path):
     assert detect_file_format(str(hdf5_path)) == "hdf5"
 
 
+def test_detect_file_format_proto0_pickle_with_text_extension(tmp_path):
+    """Protocol 0 pickle payloads should be detected even with non-model extensions."""
+    payload = tmp_path / "payload.txt"
+    payload.write_bytes(b'cos\nsystem\n(S"echo pwned"\ntR.')
+
+    assert detect_file_format(str(payload)) == "pickle"
+    assert detect_file_format_from_magic(str(payload)) == "pickle"
+
+
 def test_detect_file_format_small_file(tmp_path):
     """Test detecting format of a very small file."""
     small_file = tmp_path / "small.dat"

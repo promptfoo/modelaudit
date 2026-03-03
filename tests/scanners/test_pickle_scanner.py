@@ -808,6 +808,33 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
             )
 
     # ------------------------------------------------------------------
+    # Fix 3b: ZIP proto0/1 extension bypass
+    # ------------------------------------------------------------------
+    def test_zip_entry_with_proto0_pickle_text_extension_is_detected(self) -> None:
+        """Protocol 0 pickle payloads in ZIP entries should not be skipped by extension."""
+        import os
+        import tempfile
+        import zipfile
+
+        from modelaudit.core import scan_file
+
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as f:
+            try:
+                with zipfile.ZipFile(f.name, "w") as zf:
+                    zf.writestr("payload.txt", b'cos\nsystem\n(S"echo pwned"\ntR.')
+
+                result = scan_file(f.name)
+
+                assert result.success
+                assert result.has_errors
+                critical_messages = [i.message.lower() for i in result.issues if i.severity == IssueSeverity.CRITICAL]
+                assert any("os.system" in msg or "posix.system" in msg for msg in critical_messages), (
+                    f"Expected critical os/posix.system issue, got: {critical_messages}"
+                )
+            finally:
+                os.unlink(f.name)
+
+    # ------------------------------------------------------------------
     # Fix 4: NEWOBJ_EX with dangerous class
     # ------------------------------------------------------------------
     def test_newobj_ex_dangerous_class(self) -> None:

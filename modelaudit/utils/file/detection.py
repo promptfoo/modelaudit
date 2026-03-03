@@ -13,6 +13,25 @@ GGML_MAGIC_VARIANTS = {
     b"GGSA",
 }
 
+# Protocol 0/1 pickle payloads are ASCII and have no \x80 protocol header.
+# These signatures cover common GLOBAL/INST starts used in real-world payloads.
+PROTO0_1_PICKLE_SIGNATURES = (
+    b"cos\n",
+    b"cposix\n",
+    b"cnt\n",
+    b"csubprocess",
+    b"cbuiltins",
+    b"c__builtin__",
+    b"cjoblib\n",
+    b"(c",
+    b"(i",
+)
+
+
+def _looks_like_proto0_or_1_pickle(magic16: MagicBytes) -> bool:
+    """Best-effort detection for protocol 0/1 pickles without binary magic."""
+    return any(magic16.startswith(sig) for sig in PROTO0_1_PICKLE_SIGNATURES)
+
 
 def is_zipfile(path: str) -> bool:
     """Check if file is a ZIP by reading the signature."""
@@ -61,6 +80,8 @@ def detect_format_from_magic_bytes(magic4: MagicBytes, magic8: MagicBytes, magic
             return "pickle"
         case _:
             pass
+    if _looks_like_proto0_or_1_pickle(magic16):
+        return "pickle"
 
     # Check for JSON-like formats (SafeTensors, etc.)
     match magic4[0:1]:
@@ -211,6 +232,8 @@ def detect_file_format(path: str) -> str:
         b"\x80\x05",  # Protocol 5
     ]
     if any(magic4.startswith(m) for m in pickle_magics):
+        return "pickle"
+    if _looks_like_proto0_or_1_pickle(magic16):
         return "pickle"
 
     # For .bin files, do more sophisticated detection

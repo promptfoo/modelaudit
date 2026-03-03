@@ -279,6 +279,27 @@ class TestZipScanner:
         finally:
             os.unlink(tmp_path)
 
+    def test_scan_zip_with_proto0_pickle_disguised_as_text(self):
+        """Protocol 0 pickle in .txt entry should still be detected as pickle content."""
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+            with zipfile.ZipFile(tmp.name, "w") as z:
+                z.writestr("payload.txt", b'cos\nsystem\n(S"echo pwned"\ntR.')
+            tmp_path = tmp.name
+
+        try:
+            result = self.scanner.scan(tmp_path)
+            assert result.success is True
+            assert result.has_errors
+
+            critical_messages = [
+                issue.message.lower() for issue in result.issues if issue.severity == IssueSeverity.CRITICAL
+            ]
+            assert any("os.system" in msg or "posix.system" in msg for msg in critical_messages), (
+                f"Expected critical os/posix.system issue, got: {critical_messages}"
+            )
+        finally:
+            os.unlink(tmp_path)
+
     def test_scan_nonexistent_file(self):
         """Test scanning a file that doesn't exist"""
         result = self.scanner.scan("/nonexistent/file.zip")
