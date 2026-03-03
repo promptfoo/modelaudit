@@ -489,6 +489,15 @@ class ScannerRegistry:
                 "dependencies": [],  # pyyaml optional, handled gracefully
                 "numpy_sensitive": False,
             },
+            "torchserve_mar": {
+                "module": "modelaudit.scanners.torchserve_mar_scanner",
+                "class": "TorchServeMarScanner",
+                "description": "Scans TorchServe .mar model archive files",
+                "extensions": [".mar"],
+                "priority": 96,  # Specific archive scanner before generic archive scanners
+                "dependencies": [],
+                "numpy_sensitive": False,
+            },
             "compressed": {
                 "module": "modelaudit.scanners.compressed_scanner",
                 "class": "CompressedScanner",
@@ -805,6 +814,7 @@ def __getattr__(name: str) -> Any:
         "MXNetScanner": "mxnet",
         "CatBoostScanner": "catboost",
         "NemoScanner": "nemo",
+        "TorchServeMarScanner": "torchserve_mar",
         "CompressedScanner": "compressed",
         "ZipScanner": "zip",
     }

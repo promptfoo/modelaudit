@@ -94,6 +94,7 @@ def pytest_runtest_setup(item):
             "test_coreml_scanner.py",  # CoreML scanner tests
             "test_mxnet_scanner.py",  # MXNet scanner tests
             "test_tf_metagraph_scanner.py",  # TensorFlow MetaGraph scanner tests
+            "test_torchserve_mar_scanner.py",  # TorchServe .mar scanner tests
         ]
 
         # Check if this is an allowed test file
