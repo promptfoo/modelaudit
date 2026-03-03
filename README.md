@@ -50,7 +50,7 @@ Files scanned: 1 | Issues found: 2 critical, 1 warning
 
 ## Supported Formats
 
-ModelAudit includes **31 specialized scanners** covering model, archive, and configuration formats:
+ModelAudit includes specialized scanners covering model, archive, and configuration formats:
 
 | Format                  | Extensions                            | Risk   |
 | ----------------------- | ------------------------------------- | ------ |
@@ -59,7 +59,7 @@ ModelAudit includes **31 specialized scanners** covering model, archive, and con
 | **Joblib**              | `.joblib`                             | HIGH   |
 | **NumPy**               | `.npy`, `.npz`                        | HIGH   |
 | **R Serialized**        | `.rds`, `.rda`, `.rdata`              | HIGH   |
-| **TensorFlow**          | `.pb`, SavedModel dirs                | MEDIUM |
+| **TensorFlow**          | `.pb`, `.meta`, SavedModel dirs       | MEDIUM |
 | **Keras**               | `.h5`, `.hdf5`, `.keras`              | MEDIUM |
 | **ONNX**                | `.onnx`                               | MEDIUM |
 | **CoreML**              | `.mlmodel`                            | LOW    |

@@ -8,6 +8,8 @@ import zipfile
 import zlib
 from pathlib import Path
 
+import pytest
+
 from modelaudit.utils.file.detection import (
     detect_file_format,
     detect_file_format_from_magic,
@@ -16,6 +18,26 @@ from modelaudit.utils.file.detection import (
     is_zipfile,
     validate_file_type,
 )
+
+
+def _has_tf_protos() -> bool:
+    import modelaudit.protos
+
+    return modelaudit.protos._check_vendored_protos()
+
+
+def _build_tf_metagraph_bytes() -> bytes:
+    from tensorflow.core.protobuf.meta_graph_pb2 import MetaGraphDef
+
+    import modelaudit.protos  # noqa: F401
+
+    metagraph = MetaGraphDef()
+    metagraph.meta_info_def.meta_graph_version = "test_meta_graph"
+    metagraph.meta_info_def.tags.append("serve")
+    node = metagraph.graph_def.node.add()
+    node.name = "const_node"
+    node.op = "Const"
+    return metagraph.SerializeToString()
 
 
 def test_detect_file_format_directory(tmp_path):
@@ -142,6 +164,31 @@ def test_detect_cntk_formats_by_signature(tmp_path: Path) -> None:
     assert detect_format_from_extension(str(v2_path)) == "cntk"
     assert detect_file_format(str(v2_path)) == "cntk"
     assert detect_file_format_from_magic(str(v2_path)) == "cntk"
+
+
+def test_detect_tf_metagraph_by_strict_parse(tmp_path: Path) -> None:
+    """Detect TensorFlow MetaGraph `.meta` files through strict protobuf parsing."""
+    if not _has_tf_protos():
+        pytest.skip("TensorFlow protobuf stubs unavailable")
+
+    metagraph_path = tmp_path / "graph.meta"
+    metagraph_path.write_bytes(_build_tf_metagraph_bytes())
+
+    assert detect_format_from_extension(str(metagraph_path)) == "tf_metagraph"
+    assert detect_file_format(str(metagraph_path)) == "tf_metagraph"
+    assert detect_file_format_from_magic(str(metagraph_path)) == "tf_metagraph"
+    assert validate_file_type(str(metagraph_path)) is True
+
+
+def test_detect_tf_metagraph_rejects_renamed_non_protobuf(tmp_path: Path) -> None:
+    """Reject text or arbitrary data renamed with `.meta` extension."""
+    fake_metagraph = tmp_path / "not_meta.meta"
+    fake_metagraph.write_text("not a tensorflow metagraph", encoding="utf-8")
+
+    assert detect_format_from_extension(str(fake_metagraph)) == "tf_metagraph"
+    assert detect_file_format(str(fake_metagraph)) == "unknown"
+    assert detect_file_format_from_magic(str(fake_metagraph)) == "unknown"
+    assert validate_file_type(str(fake_metagraph)) is False
 
 
 def test_detect_rknn_format_by_signature(tmp_path: Path) -> None:

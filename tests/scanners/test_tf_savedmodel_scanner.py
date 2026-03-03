@@ -9,10 +9,11 @@ from modelaudit.scanners.tf_savedmodel_scanner import TensorFlowSavedModelScanne
 # Defer TensorFlow check to avoid module-level imports
 def has_tensorflow():
     try:
-        import tensorflow  # noqa: F401
+        import tensorflow as tf
 
-        return True
-    except ImportError:
+        # Avoid treating vendored protobuf-only stubs as full TensorFlow runtime.
+        return bool(getattr(tf, "__version__", None)) and hasattr(tf, "constant")
+    except Exception:
         return False
 
 

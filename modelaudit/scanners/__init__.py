@@ -121,6 +121,15 @@ class ScannerRegistry:
                 "dependencies": ["tensorflow"],  # Heavy dependency
                 "numpy_sensitive": True,  # TensorFlow is sensitive to NumPy version
             },
+            "tf_metagraph": {
+                "module": "modelaudit.scanners.tf_metagraph_scanner",
+                "class": "TensorFlowMetaGraphScanner",
+                "description": "Scans TensorFlow MetaGraph .meta files",
+                "extensions": [".meta"],
+                "priority": 4,
+                "dependencies": [],
+                "numpy_sensitive": False,
+            },
             "keras_zip": {
                 "module": "modelaudit.scanners.keras_zip_scanner",
                 "class": "KerasZipScanner",
@@ -759,6 +768,7 @@ def __getattr__(name: str) -> Any:
         "PickleScanner": "pickle",
         "PyTorchBinaryScanner": "pytorch_binary",
         "TensorFlowSavedModelScanner": "tf_savedmodel",
+        "TensorFlowMetaGraphScanner": "tf_metagraph",
         "KerasH5Scanner": "keras_h5",
         "OnnxScanner": "onnx",
         "CoreMLScanner": "coreml",
