@@ -170,7 +170,6 @@ class KerasZipScanner(BaseScanner):
                 # CVE-2025-8747: Check for structured get_file gadget usage
                 self._check_get_file_gadget(model_config, result)
 
-
                 # Check for metadata.json
                 if "metadata.json" in zf.namelist():
                     with zf.open("metadata.json") as metadata_file:
