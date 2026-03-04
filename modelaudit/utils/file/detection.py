@@ -99,9 +99,11 @@ def _is_tensorflow_metagraph_file(path: str) -> bool:
         if size < _TF_METAGRAPH_MIN_BYTES or size > _TF_METAGRAPH_MAX_VALIDATE_BYTES:
             return False
 
-        from tensorflow.core.protobuf.meta_graph_pb2 import MetaGraphDef
+        # Import vendored protos module (sets up sys.path for tensorflow.* imports)
+        # Order matters: modelaudit.protos must be imported first to set up sys.path
+        import modelaudit.protos  # noqa: F401, I001
 
-        import modelaudit.protos  # noqa: F401
+        from tensorflow.core.protobuf.meta_graph_pb2 import MetaGraphDef
 
         content = file_path.read_bytes()
         metagraph = MetaGraphDef()

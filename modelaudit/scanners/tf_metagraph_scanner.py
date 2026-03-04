@@ -98,9 +98,11 @@ def _read_bounded(path: str, max_bytes: int) -> tuple[bytes, bool]:
 
 
 def _parse_metagraph(data: bytes) -> Any:
-    from tensorflow.core.protobuf.meta_graph_pb2 import MetaGraphDef
+    # Import vendored protos module (sets up sys.path for tensorflow.* imports)
+    # Order matters: modelaudit.protos must be imported first to set up sys.path
+    import modelaudit.protos  # noqa: F401, I001
 
-    import modelaudit.protos  # noqa: F401
+    from tensorflow.core.protobuf.meta_graph_pb2 import MetaGraphDef
 
     metagraph = MetaGraphDef()
     metagraph.ParseFromString(data)
