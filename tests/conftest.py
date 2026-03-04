@@ -78,11 +78,13 @@ def pytest_runtest_setup(item):
             "test_weak_hash_detection.py",  # Weak hash detection tests
             "test_cloud_url_detection.py",  # Cloud storage URL detection tests
             "test_skops_scanner.py",  # Skops scanner CVE detection tests
+            "test_keras_zip_scanner.py",  # Keras ZIP scanner tests
             "test_nemo_scanner.py",  # NeMo scanner CVE-2025-23304 tests
             "test_numpy_scanner.py",  # NumPy scanner CVE-2019-6446 tests
             "test_onnx_scanner.py",  # ONNX scanner CVE-2025-51480 tests
             "test_cve_detection.py",  # CVE detection tests
             "test_pytorch_zip_scanner.py",  # PyTorch ZIP scanner tests
+            "test_paddle_scanner.py",  # PaddlePaddle scanner tests
             "test_compressed_scanner.py",  # standalone compressed wrapper scanner tests
             "test_catboost_scanner.py",  # CatBoost scanner tests
             "test_r_serialized_scanner.py",  # R serialized scanner tests

@@ -12,6 +12,8 @@ import json
 import os
 import tempfile
 import zipfile
+from pathlib import Path
+from typing import Any
 
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.keras_zip_scanner import KerasZipScanner
@@ -417,6 +419,189 @@ __import__('pickle').loads(data)
         assert len(subclass_checks) > 0
         assert subclass_checks[0].status != CheckStatus.PASSED
         assert subclass_checks[0].severity == IssueSeverity.INFO
+
+
+class TestCVE202549655TorchModuleWrapper:
+    """Test CVE-2025-49655: TorchModuleWrapper deserialization RCE detection."""
+
+    def _make_keras_zip(self, config: dict[str, Any], tmp_path: Path) -> str:
+        """Helper to create a .keras ZIP with the given config.json."""
+        keras_path = tmp_path / "model.keras"
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            zf.writestr("config.json", json.dumps(config))
+            zf.writestr("metadata.json", json.dumps({"keras_version": "3.11.0"}))
+        return str(keras_path)
+
+    def _make_keras_zip_with_version(self, config: dict[str, Any], tmp_path: Path, keras_version: str) -> str:
+        keras_path = tmp_path / "model.keras"
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            zf.writestr("config.json", json.dumps(config))
+            zf.writestr("metadata.json", json.dumps({"keras_version": keras_version}))
+        return str(keras_path)
+
+    def test_torch_module_wrapper_detected_critical(self, tmp_path: Path) -> None:
+        """TorchModuleWrapper layer should be flagged as CRITICAL."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "TorchModuleWrapper",
+                        "name": "torch_wrapper_1",
+                        "config": {"module": "my_torch_module"},
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(config, tmp_path))
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-49655"]
+        assert len(cve_issues) >= 1, "Should detect TorchModuleWrapper as CVE-2025-49655"
+        assert cve_issues[0].severity == IssueSeverity.CRITICAL
+
+    def test_torch_module_wrapper_attribution_details(self, tmp_path: Path) -> None:
+        """CVE attribution details should be present."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Functional",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "TorchModuleWrapper",
+                        "name": "wrapper",
+                        "config": {},
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(config, tmp_path))
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-49655"]
+        assert len(cve_issues) >= 1
+        details = cve_issues[0].details
+        assert details["cve_id"] == "CVE-2025-49655"
+        assert details["cvss"] == 9.8
+        assert details["cwe"] == "CWE-502"
+        assert details["description"]
+        assert "3.11.3" in details["remediation"]
+
+    def test_no_false_positive_dense_layer(self, tmp_path: Path) -> None:
+        """Dense layers should NOT trigger CVE-2025-49655."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "name": "dense_1",
+                        "config": {"units": 10},
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(config, tmp_path))
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-49655"]
+        assert len(cve_issues) == 0, "Dense layer should not trigger CVE-2025-49655"
+
+    def test_nested_torch_module_wrapper(self, tmp_path: Path) -> None:
+        """TorchModuleWrapper in nested model should still be detected."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Model",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Model",
+                        "name": "submodel",
+                        "config": {
+                            "layers": [
+                                {
+                                    "class_name": "TorchModuleWrapper",
+                                    "name": "nested_wrapper",
+                                    "config": {},
+                                }
+                            ]
+                        },
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(config, tmp_path))
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-49655"]
+        assert len(cve_issues) >= 1, "Should detect TorchModuleWrapper in nested model"
+
+    def test_no_cve_for_fixed_keras_version(self, tmp_path: Path) -> None:
+        """Keras >=3.11.3 should not be CVE-attributed for TorchModuleWrapper."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "TorchModuleWrapper",
+                        "name": "torch_wrapper_1",
+                        "config": {"module": "my_torch_module"},
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip_with_version(config, tmp_path, "3.11.3"))
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-49655"]
+        assert len(cve_issues) == 0, "Fixed Keras versions should not get CVE-2025-49655 attribution"
+        risk_checks = [c for c in result.checks if c.name == "TorchModuleWrapper Version Risk Check"]
+        assert len(risk_checks) >= 1
+        assert risk_checks[0].severity == IssueSeverity.WARNING
+
+    def test_two_part_version_is_treated_as_vulnerable(self, tmp_path: Path) -> None:
+        """Keras 3.11 should be interpreted as vulnerable (patch=0)."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {"layers": [{"class_name": "TorchModuleWrapper", "name": "wrapper", "config": {}}]},
+        }
+        result = scanner.scan(self._make_keras_zip_with_version(config, tmp_path, "3.11"))
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-49655"]
+        assert len(cve_issues) >= 1
+        assert cve_issues[0].severity == IssueSeverity.CRITICAL
+
+    def test_prerelease_versions_treated_as_vulnerable(self, tmp_path: Path) -> None:
+        """PEP 440 prerelease/dev versions in vulnerable 3.11.x range should be flagged."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {"layers": [{"class_name": "TorchModuleWrapper", "name": "wrapper", "config": {}}]},
+        }
+
+        for prerelease_version in ["3.11.0a0", "3.11.1rc1", "3.11.2.dev0"]:
+            result = scanner.scan(self._make_keras_zip_with_version(config, tmp_path, prerelease_version))
+            cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-49655"]
+            assert len(cve_issues) >= 1, f"Prerelease {prerelease_version} should be treated as vulnerable"
+            assert cve_issues[0].severity == IssueSeverity.CRITICAL
+
+    def test_torch_module_wrapper_version_unknown(self, tmp_path: Path) -> None:
+        """Missing or non-canonical version should emit warning, not pass."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {"layers": [{"class_name": "TorchModuleWrapper", "name": "wrapper", "config": {}}]},
+        }
+        keras_path = tmp_path / "unknown_version.keras"
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            zf.writestr("config.json", json.dumps(config))
+            zf.writestr("metadata.json", json.dumps({}))  # No keras_version
+
+        result = scanner.scan(str(keras_path))
+        warning_checks = [c for c in result.checks if "Version Unknown" in c.name]
+        assert len(warning_checks) >= 1
+        assert warning_checks[0].severity == IssueSeverity.WARNING
+
+
+class TestKerasZipScannerSubclassed:
+    """Tests for subclassed model detection in ZIP format."""
 
     def test_allows_known_safe_model_classes_in_zip(self, tmp_path):
         """Test that scanner passes for known safe model classes."""
