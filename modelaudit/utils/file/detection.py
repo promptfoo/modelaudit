@@ -29,6 +29,17 @@ _CNTK_LEGACY_VERSION_MARKER = b"B\x00V\x00e\x00r\x00s\x00i\x00o\x00n\x00\x00\x00
 _CNTK_V2_REQUIRED_MARKERS = (b"\x0a\x07version", b"\x0a\x03uid")
 _CNTK_V2_STRUCTURE_MARKERS = (b"CompositeFunction", b"primitive_functions", b"PrimitiveFunction")
 _CNTK_SIGNATURE_READ_BYTES = 4096
+_GZIP_MAGIC = b"\x1f\x8b"
+_BZIP2_MAGIC = b"BZh"
+_XZ_MAGIC = b"\xfd7zXZ\x00"
+_LZ4_FRAME_MAGIC = b"\x04\x22\x4d\x18"
+_COMPRESSED_EXTENSION_CODECS = {
+    ".gz": "gzip",
+    ".bz2": "bzip2",
+    ".xz": "xz",
+    ".lz4": "lz4",
+    ".zlib": "zlib",
+}
 
 # Pickle protocol 0/1 GLOBAL opcode signatures used for .bin fallback detection.
 # Format: c<module>\n<name>\n
@@ -110,8 +121,39 @@ def _is_cntk_signature(prefix: bytes) -> bool:
     return _looks_like_cntk_v2_signature(prefix)
 
 
+def _is_zlib_header(prefix: bytes) -> bool:
+    if len(prefix) < 2:
+        return False
+    cmf = prefix[0]
+    flg = prefix[1]
+    if (cmf & 0x0F) != 8:
+        return False
+    if (cmf >> 4) > 7:
+        return False
+    return ((cmf << 8) + flg) % 31 == 0
+
+
+def _detect_compression_format(prefix: bytes) -> str | None:
+    if prefix.startswith(_GZIP_MAGIC):
+        return "gzip"
+    if prefix.startswith(_BZIP2_MAGIC):
+        return "bzip2"
+    if prefix.startswith(_XZ_MAGIC):
+        return "xz"
+    if prefix.startswith(_LZ4_FRAME_MAGIC):
+        return "lz4"
+    if _is_zlib_header(prefix[:2]):
+        return "zlib"
+    return None
+
+
+
 def detect_format_from_magic_bytes(magic4: MagicBytes, magic8: MagicBytes, magic16: MagicBytes) -> FileFormat:
     """Detect file format using Python 3.10+ pattern matching on magic bytes."""
+    compression_format = _detect_compression_format(magic16)
+    if compression_format:
+        return compression_format
+
     # Use pattern matching for cleaner magic byte detection
     match magic4:
         case b"CBM1":
@@ -300,6 +342,18 @@ def detect_file_format(path: str) -> str:
         return "ggml"
 
     ext = file_path.suffix.lower()
+    filename_lower = file_path.name.lower()
+
+    # Compound tar wrappers should route to TAR scanner semantics.
+    if filename_lower.endswith((".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz")):
+        return "tar"
+
+    compression_format = _detect_compression_format(header)
+    if ext in _COMPRESSED_EXTENSION_CODECS:
+        expected_codec = _COMPRESSED_EXTENSION_CODECS[ext]
+        if compression_format == expected_codec:
+            return "compressed"
+        return "unknown"
 
     # Check ZIP magic first (for .pt/.pth files that are actually zips)
     if magic4.startswith(b"PK"):
@@ -450,6 +504,11 @@ EXTENSION_FORMAT_MAP = {
     ".safetensors": "safetensors",
     ".onnx": "onnx",
     ".bin": "pytorch_binary",
+    ".gz": "compressed",
+    ".bz2": "compressed",
+    ".xz": "compressed",
+    ".lz4": "compressed",
+    ".zlib": "compressed",
     ".zip": "zip",
     ".gguf": "gguf",
     ".ggml": "ggml",
@@ -500,6 +559,8 @@ def detect_format_from_extension_pattern_matching(extension: FileExtension) -> F
         # Archive formats
         case ".zip":
             return "zip"
+        case ".gz" | ".bz2" | ".xz" | ".lz4" | ".zlib":
+            return "compressed"
         case ".tar" | ".tar.gz" | ".tgz":
             return "tar"
         # ML model formats
@@ -554,6 +615,10 @@ def detect_format_from_extension(path: FilePath) -> FileFormat:
             return "tensorflow_directory"
         return "directory"
 
+    filename_lower = file_path.name.lower()
+    if filename_lower.endswith((".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz")):
+        return "tar"
+
     # Use pattern matching for modern Python 3.10+ approach
     return detect_format_from_extension_pattern_matching(file_path.suffix)
 
@@ -602,8 +667,23 @@ def validate_file_type(path: str) -> bool:
             return True
 
         # TAR files must match
-        if ext_format == "tar" and header_format == "tar":
-            return True
+        if ext_format == "tar":
+            filename_lower = Path(path).name.lower()
+            if filename_lower.endswith((".tar.gz", ".tgz")):
+                return header_format in {"tar", "gzip"}
+            if filename_lower.endswith((".tar.bz2", ".tbz2")):
+                return header_format in {"tar", "bzip2"}
+            if filename_lower.endswith((".tar.xz", ".txz")):
+                return header_format in {"tar", "xz"}
+            return header_format == "tar"
+
+        # Standalone compressed wrappers must match their declared codecs.
+        if ext_format == "compressed":
+            file_extension = Path(path).suffix.lower()
+            expected_codec = _COMPRESSED_EXTENSION_CODECS.get(file_extension)
+            if expected_codec is None:
+                return False
+            return header_format == expected_codec
 
         # NeMo files are TAR archives with a dedicated extension
         if ext_format == "nemo" and header_format == "tar":
@@ -681,7 +761,6 @@ def validate_file_type(path: str) -> bool:
             if header_format == "r_serialized":
                 return True
             return True
-
 
 
         # If header format is unknown but extension is known, this might be suspicious

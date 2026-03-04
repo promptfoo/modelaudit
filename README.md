@@ -52,29 +52,30 @@ Files scanned: 1 | Issues found: 2 critical, 1 warning
 
 ModelAudit includes **30 specialized scanners** covering model, archive, and configuration formats:
 
-| Format           | Extensions                            | Risk   |
-| ---------------- | ------------------------------------- | ------ |
-| **Pickle**       | `.pkl`, `.pickle`, `.dill`            | HIGH   |
-| **PyTorch**      | `.pt`, `.pth`, `.ckpt`, `.bin`        | HIGH   |
-| **Joblib**       | `.joblib`                             | HIGH   |
-| **NumPy**        | `.npy`, `.npz`                        | HIGH   |
-| **R Serialized** | `.rds`, `.rda`, `.rdata`              | HIGH   |
-| **TensorFlow**   | `.pb`, SavedModel dirs                | MEDIUM |
-| **Keras**        | `.h5`, `.hdf5`, `.keras`              | MEDIUM |
-| **ONNX**         | `.onnx`                               | MEDIUM |
-| **CNTK**         | `.dnn`, `.cmf`                        | MEDIUM |
-| **CatBoost**     | `.cbm`                                | MEDIUM |
-| **XGBoost**      | `.bst`, `.model`, `.ubj`              | MEDIUM |
-| **SafeTensors**  | `.safetensors`                        | LOW    |
-| **GGUF/GGML**    | `.gguf`, `.ggml`                      | LOW    |
-| **JAX/Flax**     | `.msgpack`, `.flax`, `.orbax`, `.jax` | LOW    |
-| **TFLite**       | `.tflite`                             | LOW    |
-| **ExecuTorch**   | `.ptl`, `.pte`                        | LOW    |
-| **TensorRT**     | `.engine`, `.plan`                    | LOW    |
-| **PaddlePaddle** | `.pdmodel`, `.pdiparams`              | LOW    |
-| **OpenVINO**     | `.xml`                                | LOW    |
-| **Skops**        | `.skops`                              | HIGH   |
-| **PMML**         | `.pmml`                               | LOW    |
+| Format                  | Extensions                            | Risk   |
+| ----------------------- | ------------------------------------- | ------ |
+| **Pickle**              | `.pkl`, `.pickle`, `.dill`            | HIGH   |
+| **PyTorch**             | `.pt`, `.pth`, `.ckpt`, `.bin`        | HIGH   |
+| **Joblib**              | `.joblib`                             | HIGH   |
+| **NumPy**               | `.npy`, `.npz`                        | HIGH   |
+| **R Serialized**        | `.rds`, `.rda`, `.rdata`              | HIGH   |
+| **TensorFlow**          | `.pb`, SavedModel dirs                | MEDIUM |
+| **Keras**               | `.h5`, `.hdf5`, `.keras`              | MEDIUM |
+| **ONNX**                | `.onnx`                               | MEDIUM |
+| **CNTK**                | `.dnn`, `.cmf`                        | MEDIUM |
+| **CatBoost**            | `.cbm`                                | MEDIUM |
+| **XGBoost**             | `.bst`, `.model`, `.ubj`              | MEDIUM |
+| **SafeTensors**         | `.safetensors`                        | LOW    |
+| **GGUF/GGML**           | `.gguf`, `.ggml`                      | LOW    |
+| **JAX/Flax**            | `.msgpack`, `.flax`, `.orbax`, `.jax` | LOW    |
+| **TFLite**              | `.tflite`                             | LOW    |
+| **ExecuTorch**          | `.ptl`, `.pte`                        | LOW    |
+| **TensorRT**            | `.engine`, `.plan`                    | LOW    |
+| **PaddlePaddle**        | `.pdmodel`, `.pdiparams`              | LOW    |
+| **OpenVINO**            | `.xml`                                | LOW    |
+| **Skops**               | `.skops`                              | HIGH   |
+| **PMML**                | `.pmml`                               | LOW    |
+| **Compressed Wrappers** | `.gz`, `.bz2`, `.xz`, `.lz4`, `.zlib` | MEDIUM |
 
 Plus scanners for ZIP, TAR, 7-Zip, OCI layers, Jinja2 templates, JSON/YAML metadata, manifests, and text files.
 

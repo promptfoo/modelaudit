@@ -1,6 +1,10 @@
+import bz2
+import gzip
 import io
+import lzma
 import tarfile
 import zipfile
+import zlib
 from pathlib import Path
 
 from modelaudit.utils.file.detection import (
@@ -199,6 +203,38 @@ def test_detect_file_format_tar(tmp_path):
 
     assert detect_file_format_from_magic(str(tar_path)) == "tar"
     assert detect_file_format(str(tar_path)) == "tar"
+
+
+def test_detect_file_format_compressed_wrappers(tmp_path: Path) -> None:
+    gzip_path = tmp_path / "model.pkl.gz"
+    gzip_path.write_bytes(gzip.compress(b"pickle-payload"))
+    assert detect_file_format(str(gzip_path)) == "compressed"
+    assert detect_file_format_from_magic(str(gzip_path)) == "gzip"
+    assert detect_format_from_extension(str(gzip_path)) == "compressed"
+
+    bz2_path = tmp_path / "model.bin.bz2"
+    bz2_path.write_bytes(bz2.compress(b"weights"))
+    assert detect_file_format(str(bz2_path)) == "compressed"
+    assert detect_file_format_from_magic(str(bz2_path)) == "bzip2"
+
+    xz_path = tmp_path / "model.bin.xz"
+    xz_path.write_bytes(lzma.compress(b"weights"))
+    assert detect_file_format(str(xz_path)) == "compressed"
+    assert detect_file_format_from_magic(str(xz_path)) == "xz"
+
+    zlib_path = tmp_path / "model.bin.zlib"
+    zlib_path.write_bytes(zlib.compress(b"weights"))
+    assert detect_file_format(str(zlib_path)) == "compressed"
+    assert detect_file_format_from_magic(str(zlib_path)) == "zlib"
+
+
+def test_detect_file_format_tar_wrappers_preserve_tar_routing(tmp_path: Path) -> None:
+    tar_gz = tmp_path / "archive.tar.gz"
+    tar_gz.write_bytes(gzip.compress(b"fake tar payload"))
+    assert detect_file_format(str(tar_gz)) == "tar"
+    assert detect_file_format_from_magic(str(tar_gz)) == "gzip"
+    assert detect_format_from_extension(str(tar_gz)) == "tar"
+    assert validate_file_type(str(tar_gz)) is True
 
 
 def test_zip_magic_variants(tmp_path):
@@ -491,6 +527,17 @@ def test_cntk_validation_valid_and_invalid_files(tmp_path: Path) -> None:
     bad_cntk = tmp_path / "not_cntk.dnn"
     bad_cntk.write_text("not a cntk model")
     assert validate_file_type(str(bad_cntk)) is False
+
+
+def test_compressed_validation_valid_and_invalid_files(tmp_path: Path) -> None:
+    """Standalone compressed wrappers must match declared codecs."""
+    gzip_payload = tmp_path / "payload.pkl.gz"
+    gzip_payload.write_bytes(gzip.compress(b"payload"))
+    assert validate_file_type(str(gzip_payload)) is True
+
+    bad_gzip_payload = tmp_path / "payload_bad.pkl.gz"
+    bad_gzip_payload.write_bytes(bz2.compress(b"payload"))
+    assert validate_file_type(str(bad_gzip_payload)) is False
 
 
 
