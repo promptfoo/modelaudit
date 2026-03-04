@@ -288,7 +288,7 @@ class TestZipScanner:
 
         result = self.scanner.scan(str(archive_path))
         assert result.success is True
-        assert result.has_errors
+        assert result.has_errors is True
 
         critical_messages = [
             issue.message.lower() for issue in result.issues if issue.severity == IssueSeverity.CRITICAL
@@ -305,7 +305,7 @@ class TestZipScanner:
 
         result = self.scanner.scan(str(archive_path))
         assert result.success is True
-        assert result.has_errors
+        assert result.has_errors is True
 
         critical_messages = [
             issue.message.lower() for issue in result.issues if issue.severity == IssueSeverity.CRITICAL
@@ -338,7 +338,7 @@ class TestZipScanner:
 
         result = self.scanner.scan(str(archive_path))
         assert result.success is True
-        assert result.has_errors
+        assert result.has_errors is True
 
         critical_messages = [
             issue.message.lower() for issue in result.issues if issue.severity == IssueSeverity.CRITICAL

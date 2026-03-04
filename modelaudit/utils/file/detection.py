@@ -54,7 +54,7 @@ def _looks_like_proto0_or_1_pickle(sample: bytes) -> bool:
 
 def _read_pickle_probe_sample(path: Path, size: int, header16: bytes) -> bytes:
     """Read a bounded prefix for protocol 0/1 pickle probing."""
-    if size <= len(header16) or len(header16) >= PROTO0_1_MAX_PROBE_BYTES:
+    if size <= len(header16):
         return header16
     with path.open("rb") as f:
         return f.read(min(size, PROTO0_1_MAX_PROBE_BYTES))
