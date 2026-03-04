@@ -744,9 +744,7 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
 
         assert result.success
         critical_messages = [i.message.lower() for i in result.issues if i.severity == IssueSeverity.CRITICAL]
-        assert not critical_messages, (
-            f"Unexpected CRITICAL benign detection: {critical_messages}"
-        )
+        assert not critical_messages, f"Unexpected CRITICAL benign detection: {critical_messages}"
 
     # ------------------------------------------------------------------
     # Fix 4: NEWOBJ_EX with dangerous class
