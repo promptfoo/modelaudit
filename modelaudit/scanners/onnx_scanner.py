@@ -292,6 +292,8 @@ class OnnxScanner(BaseScanner):
                 has_traversal_raw = ".." in location.replace("\\", "/").split("/")
                 escapes_model_dir = not _is_contained_in(external_path, model_dir)
                 if escapes_model_dir:
+                    # Track for per-file CVE-2025-51480 (write direction) reporting
+                    traversal_files.setdefault(location, []).append(tensor.name)
                     # Determine specific CVE attribution
                     normalized_parts = [p for p in location.replace("\\", "/").split("/") if p]
                     starts_with_parent = bool(normalized_parts and normalized_parts[0] == "..")
