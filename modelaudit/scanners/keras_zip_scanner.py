@@ -3,6 +3,7 @@
 import base64
 import json
 import os
+import re
 import zipfile
 from typing import Any, ClassVar
 
@@ -299,9 +300,7 @@ class KerasZipScanner(BaseScanner):
                 },
                 why=get_cve_2025_49655_explanation("torch_module_wrapper"),
             )
-            return
-
-        if vulnerability_status is False and isinstance(keras_version, str):
+        elif vulnerability_status is False and isinstance(keras_version, str):
             result.add_check(
                 name="TorchModuleWrapper Version Risk Check",
                 passed=False,
@@ -317,59 +316,64 @@ class KerasZipScanner(BaseScanner):
                     "layer_class": "TorchModuleWrapper",
                     "keras_version": keras_version,
                     "metadata_only_assessment": True,
+                    "parse_status": "metadata_non_vulnerable",
                 },
             )
-            return
-
-        version_context = (
-            f"keras_version '{keras_version}' is non-canonical"
-            if isinstance(keras_version, str)
-            else "keras_version is unavailable"
-        )
-        result.add_check(
-            name="TorchModuleWrapper Risk (Version Unknown)",
-            passed=False,
-            message=(
-                f"Layer '{layer_name}' is a TorchModuleWrapper but {version_context}; "
-                "cannot confidently attribute CVE-2025-49655 without reliable version context"
-            ),
-            severity=IssueSeverity.WARNING,
-            location=f"{self.current_file_path} (layer: {layer_name})",
-            details={
-                "layer_name": layer_name,
-                "layer_class": "TorchModuleWrapper",
-                "keras_version": keras_version,
-                "parse_status": "unknown",
-                "cve_id": "CVE-2025-49655",
-                "cvss": 9.8,
-                "cwe": "CWE-502",
-                "description": (
-                    "TorchModuleWrapper may deserialize unsafe content, but version data was missing or "
-                    "non-canonical so CVE attribution confidence is reduced."
+        else:
+            version_context = (
+                f"keras_version '{keras_version}' is non-canonical"
+                if isinstance(keras_version, str)
+                else "keras_version is unavailable"
+            )
+            result.add_check(
+                name="TorchModuleWrapper Risk (Version Unknown)",
+                passed=False,
+                message=(
+                    f"Layer '{layer_name}' is a TorchModuleWrapper but {version_context}; "
+                    "cannot confidently attribute CVE-2025-49655 without reliable version context"
                 ),
-                "affected_versions": "Keras 3.11.0-3.11.2",
-                "remediation": "Ensure model metadata includes keras_version and upgrade to >= 3.11.3",
-            },
-            why=get_cve_2025_49655_explanation("torch_module_wrapper"),
-        )
+                severity=IssueSeverity.WARNING,
+                location=f"{self.current_file_path} (layer: {layer_name})",
+                details={
+                    "layer_name": layer_name,
+                    "layer_class": "TorchModuleWrapper",
+                    "keras_version": keras_version,
+                    "parse_status": "unknown",
+                    "cve_id": "CVE-2025-49655",
+                    "cvss": 9.8,
+                    "cwe": "CWE-502",
+                    "description": (
+                        "TorchModuleWrapper may deserialize unsafe content, but version data was missing or "
+                        "non-canonical so CVE attribution confidence is reduced."
+                    ),
+                    "affected_versions": "Keras 3.11.0-3.11.2",
+                    "remediation": "Ensure model metadata includes keras_version and upgrade to >= 3.11.3",
+                },
+                why=get_cve_2025_49655_explanation("torch_module_wrapper"),
+            )
 
     @staticmethod
     def _is_vulnerable_keras_3_11_x(version: str) -> bool | None:
-        """Return True/False for canonical versions, else None."""
-        parts = version.strip().split(".", 2)
-        if len(parts) < 2:
+        """Return True for Keras 3.11.0-3.11.2 (including prerelease/dev), else False/None."""
+        version_match = re.match(r"^(\d+)\.(\d+)(?:\.(\d+))?([A-Za-z0-9.+-]*)$", version.strip())
+        if not version_match:
             return None
-        if not parts[0].isdigit() or not parts[1].isdigit():
-            return None
+
         try:
-            major = int(parts[0])
-            minor = int(parts[1])
-            patch = 0
-            if len(parts) == 3:
-                if not parts[2].isdigit():
-                    return None
-                patch = int(parts[2])
-            return int(major) == 3 and int(minor) == 11 and 0 <= patch <= 2
+            major = int(version_match.group(1))
+            minor = int(version_match.group(2))
+            patch = int(version_match.group(3) or 0)
+            suffix = (version_match.group(4) or "").strip().lower()
+
+            if suffix and not (
+                re.search(r"(?:^|[.\-])(dev|rc|a|b|alpha|beta|pre|preview)\d*", suffix)
+                or suffix.startswith("+")
+                or suffix.startswith(".post")
+                or suffix.startswith("post")
+            ):
+                return None
+
+            return major == 3 and minor == 11 and 0 <= patch <= 2
         except ValueError:
             return None
 

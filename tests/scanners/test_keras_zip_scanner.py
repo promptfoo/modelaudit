@@ -568,6 +568,20 @@ class TestCVE202549655TorchModuleWrapper:
         assert len(cve_issues) >= 1
         assert cve_issues[0].severity == IssueSeverity.CRITICAL
 
+    def test_prerelease_versions_treated_as_vulnerable(self, tmp_path: Path) -> None:
+        """PEP 440 prerelease/dev versions in vulnerable 3.11.x range should be flagged."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {"layers": [{"class_name": "TorchModuleWrapper", "name": "wrapper", "config": {}}]},
+        }
+
+        for prerelease_version in ["3.11.0a0", "3.11.1rc1", "3.11.2.dev0"]:
+            result = scanner.scan(self._make_keras_zip_with_version(config, tmp_path, prerelease_version))
+            cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-49655"]
+            assert len(cve_issues) >= 1, f"Prerelease {prerelease_version} should be treated as vulnerable"
+            assert cve_issues[0].severity == IssueSeverity.CRITICAL
+
     def test_torch_module_wrapper_version_unknown(self, tmp_path: Path) -> None:
         """Missing or non-canonical version should emit warning, not pass."""
         scanner = KerasZipScanner()
