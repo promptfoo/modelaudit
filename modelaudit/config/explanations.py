@@ -829,6 +829,30 @@ def get_pytorch_security_explanation(issue_type: str) -> str:
     )
 
 
+def get_cve_2025_9906_explanation(issue_type: str) -> str:
+    """Get explanation for CVE-2025-9906: Keras enable_unsafe_deserialization config bypass.
+
+    CVE-2025-9906 (HIGH): config.json in .keras archives can invoke
+    keras.config.enable_unsafe_deserialization() to disable safe_mode from within
+    the loading process, then include malicious Lambda layers. Fixed in Keras 3.11.0.
+    """
+    explanations = {
+        "config_bypass": (
+            "CVE-2025-9906: The config.json inside this .keras archive references "
+            "enable_unsafe_deserialization, which can disable safe_mode from within the "
+            "deserialization process itself. This allows an attacker to bypass safe_mode=True "
+            "and then load malicious Lambda layers or other unsafe components. "
+            "Upgrade to Keras >= 3.11.0 and only load models from trusted sources."
+        ),
+    }
+
+    return explanations.get(
+        issue_type,
+        "CVE-2025-9906: config.json can disable safe_mode via enable_unsafe_deserialization. "
+        "Upgrade to Keras >= 3.11.0.",
+    )
+
+
 def get_cve_2025_49655_explanation(issue_type: str) -> str:
     """Get explanation for CVE-2025-49655: Keras TorchModuleWrapper deserialization RCE.
 
@@ -849,6 +873,107 @@ def get_cve_2025_49655_explanation(issue_type: str) -> str:
     return explanations.get(
         issue_type,
         "CVE-2025-49655: TorchModuleWrapper uses unsafe torch.load deserialization. Upgrade to Keras >= 3.11.3.",
+    )
+
+
+def get_cve_2025_1550_explanation(issue_type: str) -> str:
+    """Get explanation for CVE-2025-1550: Keras safe_mode bypass via config.json module references.
+
+    CVE-2025-1550 (CVSS 9.8 CRITICAL): Keras Model.load_model allows arbitrary code execution
+    even with safe_mode=True by specifying arbitrary Python modules/functions in config.json
+    inside .keras ZIP archives. Fixed in Keras 3.9.0.
+    """
+    explanations = {
+        "dangerous_module": (
+            "CVE-2025-1550: The config.json inside this .keras archive references a dangerous "
+            "Python module (e.g., os, subprocess, builtins) in a layer's module or fn_module field. "
+            "Keras versions < 3.9.0 import and execute these modules during Model.load_model even "
+            "with safe_mode=True, enabling arbitrary code execution. "
+            "Upgrade to Keras >= 3.9.0 and re-save models from trusted sources only."
+        ),
+        "untrusted_module": (
+            "CVE-2025-1550: The config.json inside this .keras archive references a Python module "
+            "outside the standard Keras/TensorFlow ecosystem in a layer's module or fn_module field. "
+            "Keras versions < 3.9.0 do not restrict which modules can be referenced in config.json, "
+            "allowing safe_mode bypass. While this module may be benign, verify it is not being used "
+            "to execute arbitrary code. Upgrade to Keras >= 3.9.0."
+        ),
+    }
+
+    return explanations.get(
+        issue_type,
+        "CVE-2025-1550: Keras config.json module references may bypass safe_mode. Upgrade to Keras >= 3.9.0.",
+    )
+
+
+def get_cve_2025_8747_explanation(issue_type: str) -> str:
+    """Get explanation for CVE-2025-8747: Keras get_file gadget bypass.
+
+    CVE-2025-8747 (HIGH): Bypass of CVE-2025-1550 fix. Uses keras.utils.get_file
+    as a gadget to download and execute arbitrary files even with safe_mode=True.
+    Fixed in Keras 3.11.0.
+    """
+    explanations = {
+        "get_file_gadget": (
+            "CVE-2025-8747: The config.json references keras.utils.get_file along with "
+            "a URL, indicating a potential safe_mode bypass. This gadget can download "
+            "arbitrary files from remote URLs during model loading, even with safe_mode=True. "
+            "This bypasses the CVE-2025-1550 module allowlist fix. "
+            "Upgrade to Keras >= 3.11.0 and only load models from trusted sources."
+        ),
+    }
+
+    return explanations.get(
+        issue_type,
+        "CVE-2025-8747: keras.utils.get_file can be abused as a gadget to bypass safe_mode. "
+        "Upgrade to Keras >= 3.11.0.",
+    )
+
+
+def get_cve_2025_9905_explanation(issue_type: str) -> str:
+    """Get explanation for CVE-2025-9905: Keras H5 safe_mode ignored for Lambda layers.
+
+    CVE-2025-9905 (CVSS 7.3 HIGH): Keras Model.load_model silently ignores
+    safe_mode=True when loading .h5/.hdf5 files. Lambda layers execute arbitrary
+    code without any safe mode check. Fixed in Keras 3.11.3.
+    """
+    explanations = {
+        "h5_safe_mode_bypass": (
+            "CVE-2025-9905: Keras Model.load_model silently ignores safe_mode=True when "
+            "loading H5/HDF5 files. Lambda layers in H5 models can execute arbitrary Python "
+            "code during deserialization with no safe mode protection. This means passing "
+            "safe_mode=True provides a false sense of security for H5 format models. "
+            "Upgrade to Keras >= 3.11.3 or convert models to .keras format which supports safe_mode."
+        ),
+    }
+
+    return explanations.get(
+        issue_type,
+        "CVE-2025-9905: H5 format ignores safe_mode=True for Lambda layers. Upgrade to Keras >= 3.11.3.",
+    )
+
+
+def get_cve_2024_3660_explanation(issue_type: str) -> str:
+    """Get explanation for CVE-2024-3660: Keras Lambda layer code injection.
+
+    CVE-2024-3660 (CVSS 9.8 CRITICAL): Keras Lambda layers allow arbitrary Python
+    code injection during model loading. The code is executed when the model is
+    deserialized, enabling remote code execution. Fixed in Keras 2.13.
+    """
+    explanations = {
+        "lambda_code_injection": (
+            "CVE-2024-3660: Keras Lambda layers contain arbitrary Python code that executes "
+            "during model loading/deserialization. An attacker can craft a malicious model "
+            "with Lambda layers that run arbitrary code when the model is loaded. "
+            "Remove Lambda layers from untrusted models or upgrade Keras to >= 2.13 "
+            "which adds safe_mode protections (though note H5 format safe_mode has its own "
+            "issues per CVE-2025-9905)."
+        ),
+    }
+
+    return explanations.get(
+        issue_type,
+        "CVE-2024-3660: Lambda layers enable arbitrary code injection during model loading. Upgrade to Keras >= 2.13.",
     )
 
 

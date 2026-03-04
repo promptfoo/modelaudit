@@ -1,3 +1,4 @@
+import pickletools
 import re
 import struct
 from pathlib import Path
@@ -17,6 +18,51 @@ GGML_MAGIC_VARIANTS = {
 # Format: c<module>\n<name>\n
 PROTOCOL0_GLOBAL_RE = re.compile(rb"^c[^\n\r]{1,64}\n[^\n\r]{1,64}\n")
 MARKED_PROTOCOL0_GLOBAL_RE = re.compile(rb"^[\(\]\}]c[^\n\r]{1,64}\n[^\n\r]{1,64}\n")
+
+# Protocol 0/1 pickles are ASCII and may not start with GLOBAL/INST.
+# Use bounded opcode parsing to reduce false positives on plain text and
+# still detect prefixed payloads (e.g., MARK/LIST/POP before GLOBAL).
+PROTO0_1_MAX_PROBE_BYTES: int = 64 * 1024
+PROTO0_1_MAX_PROBE_OPCODES: int = 4096
+PROTO0_1_START_BYTES: bytes = b"(]})cilp0IJSVNTF"
+
+
+def _looks_like_proto0_or_1_pickle(sample: bytes) -> bool:
+    """Best-effort protocol 0/1 detection via bounded pickle opcode parsing."""
+    if len(sample) < 2:
+        return False
+
+    def _matches_proto_stream(candidate: bytes) -> bool:
+        # Only attempt expensive parsing for likely text-protocol starters.
+        if len(candidate) < 2 or candidate[0] not in PROTO0_1_START_BYTES:
+            return False
+
+        opcode_count = 0
+        try:
+            for opcode, _arg, _pos in pickletools.genops(candidate):
+                opcode_count += 1
+                if opcode.name == "STOP":
+                    return opcode_count >= 2
+                if opcode_count >= PROTO0_1_MAX_PROBE_OPCODES:
+                    return False
+        except Exception:
+            return False
+        return False
+
+    if _matches_proto_stream(sample):
+        return True
+
+    # Regression hardening: a single leading "#" token should not suppress
+    # protocol 0/1 detection for otherwise valid pickle streams.
+    return sample.startswith(b"#") and _matches_proto_stream(sample[1:])
+
+
+def _read_pickle_probe_sample(path: Path, size: int, header16: bytes) -> bytes:
+    """Read a bounded prefix for protocol 0/1 pickle probing."""
+    if size <= len(header16):
+        return header16
+    with path.open("rb") as f:
+        return f.read(min(size, PROTO0_1_MAX_PROBE_BYTES))
 
 
 def is_zipfile(path: str) -> bool:
@@ -66,7 +112,6 @@ def detect_format_from_magic_bytes(magic4: MagicBytes, magic8: MagicBytes, magic
             return "pickle"
         case _:
             pass
-
     # Check for JSON-like formats (SafeTensors, etc.)
     match magic4[0:1]:
         case b"{":
@@ -118,6 +163,12 @@ def detect_file_format_from_magic(path: str) -> str:
             format_result = detect_format_from_magic_bytes(magic4, magic8, magic16)
             if format_result != "unknown":
                 return format_result
+
+            # Protocol 0/1 pickle payloads can evade short magic-byte checks.
+            # Probe a bounded prefix and require a valid opcode stream.
+            pickle_probe_sample = _read_pickle_probe_sample(file_path, size, magic16)
+            if _looks_like_proto0_or_1_pickle(pickle_probe_sample):
+                return "pickle"
 
             # Check for XML-based formats (OpenVINO and PMML)
             if magic16.startswith(b"<?xml"):
@@ -216,6 +267,9 @@ def detect_file_format(path: str) -> str:
         b"\x80\x05",  # Protocol 5
     ]
     if any(magic4.startswith(m) for m in pickle_magics):
+        return "pickle"
+    pickle_probe_sample = _read_pickle_probe_sample(file_path, size, magic16)
+    if _looks_like_proto0_or_1_pickle(pickle_probe_sample):
         return "pickle"
 
     # For .bin files, do more sophisticated detection
