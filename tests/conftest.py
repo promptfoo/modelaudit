@@ -83,6 +83,7 @@ def pytest_runtest_setup(item):
             "test_onnx_scanner.py",  # ONNX scanner CVE-2025-51480 tests
             "test_cve_detection.py",  # CVE detection tests
             "test_pytorch_zip_scanner.py",  # PyTorch ZIP scanner tests
+            "test_paddle_scanner.py",  # PaddlePaddle scanner tests
         ]
 
         # Check if this is an allowed test file
