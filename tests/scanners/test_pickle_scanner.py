@@ -1024,6 +1024,36 @@ class TestCVE20251716PipMainBlocklist(unittest.TestCase):
             assert len(critical_issues) > 0, (
                 f"pip._internal.main should be flagged. Issues: {[i.message for i in result.issues]}"
             )
+            assert any("pip" in i.message.lower() for i in critical_issues), (
+                f"Should reference pip in message. Issues: {[i.message for i in critical_issues]}"
+            )
+        finally:
+            os.unlink(path)
+
+    def test_comment_token_does_not_bypass_pip_detection(self) -> None:
+        """Embedding a comment-like token in a malicious pip payload must not suppress detection."""
+        # Build a pickle that includes a benign SHORT_BINUNICODE string containing "#"
+        # before the dangerous pip.main GLOBAL+REDUCE sequence.
+        # Protocol 2: PROTO 2, SHORT_BINUNICODE "# comment", POP, GLOBAL pip\nmain\n, EMPTY_TUPLE, REDUCE, STOP
+        comment_token = b"# this is a comment"
+        comment_op = b"\x8c" + bytes([len(comment_token)]) + comment_token  # SHORT_BINUNICODE
+        pop_op = b"0"  # POP to discard the string from the stack
+        payload = b"\x80\x02" + comment_op + pop_op + b"cpip\nmain\n)R."
+        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
+            f.write(payload)
+            f.flush()
+            path = f.name
+        try:
+            scanner = PickleScanner()
+            result = scanner.scan(path)
+
+            critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
+            assert len(critical_issues) > 0, (
+                f"Comment token must not suppress pip.main detection. Issues: {[i.message for i in result.issues]}"
+            )
+            assert any("pip" in i.message.lower() for i in critical_issues), (
+                f"Should reference pip in message despite comment token. Issues: {[i.message for i in critical_issues]}"
+            )
         finally:
             os.unlink(path)
 
