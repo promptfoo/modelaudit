@@ -75,7 +75,8 @@ class TestDillJoblibSecurity:
 
         # Should have specific safe functions
         assert "dump" in joblib_perms
-        assert "load" in joblib_perms
+        # joblib.load is explicitly treated as dangerous (loader trampoline bypass)
+        assert "load" not in joblib_perms
         assert "dump" in dill_perms
         assert "loads" in dill_perms
 
