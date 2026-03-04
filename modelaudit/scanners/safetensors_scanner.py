@@ -606,15 +606,29 @@ class SafeTensorsScanner(BaseScanner):
                 header = json.loads(header_bytes)
 
                 # Extract tensor info
-                tensors = {}
+                tensors: dict[str, dict[str, Any]] = {}
                 total_params = 0
+                invalid_tensor_entries: list[str] = []
 
                 for name, info in header.items():
                     if name != "__metadata__":  # Skip metadata entry
-                        tensors[name] = {"dtype": info["dtype"], "shape": info["shape"]}
+                        if not isinstance(info, dict):
+                            invalid_tensor_entries.append(name)
+                            continue
+
+                        dtype = info.get("dtype")
+                        shape = info.get("shape")
+                        if not isinstance(dtype, str) or not isinstance(shape, list):
+                            invalid_tensor_entries.append(name)
+                            continue
+                        if not all(isinstance(dim, int) and dim >= 0 for dim in shape):
+                            invalid_tensor_entries.append(name)
+                            continue
+
+                        tensors[name] = {"dtype": dtype, "shape": shape}
                         # Calculate parameter count
                         param_count = 1
-                        for dim in info["shape"]:
+                        for dim in shape:
                             param_count *= dim
                         total_params += param_count
 
@@ -623,9 +637,11 @@ class SafeTensorsScanner(BaseScanner):
                         "tensor_count": len(tensors),
                         "total_parameters": total_params,
                         "tensors": tensors,
-                        "dtypes": list({info["dtype"] for info in tensors.values()}),
+                        "dtypes": sorted({info["dtype"] for info in tensors.values()}),
                     }
                 )
+                if invalid_tensor_entries:
+                    metadata["invalid_tensor_entries"] = invalid_tensor_entries[:20]
 
                 # Extract custom metadata if present
                 if "__metadata__" in header:

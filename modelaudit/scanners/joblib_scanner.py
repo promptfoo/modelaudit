@@ -316,7 +316,10 @@ class JoblibScanner(BaseScanner):
 
             if hasattr(obj, "get_params"):
                 try:
-                    params = obj.get_params()
+                    try:
+                        params = obj.get_params(deep=False)
+                    except TypeError:
+                        params = obj.get_params()
                     metadata.update(
                         {
                             "model_parameters": len(params),

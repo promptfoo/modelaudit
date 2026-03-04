@@ -366,8 +366,6 @@ class ZipScanner(BaseScanner):
         metadata = super().extract_metadata(file_path)
 
         try:
-            import zipfile
-
             with zipfile.ZipFile(file_path, "r") as zip_file:
                 file_list = zip_file.namelist()
 
@@ -394,13 +392,16 @@ class ZipScanner(BaseScanner):
                         directories.add(name)
                         continue
 
+                    lower_name = name.lower()
                     # Track file extensions
                     if "." in name:
                         ext = name.split(".")[-1].lower()
                         file_extensions[ext] = file_extensions.get(ext, 0) + 1
 
-                    # Check for executable files
-                    if any(name.endswith(ext) for ext in [".exe", ".bat", ".sh", ".py", ".js"]):
+                    # Check for executable files by extension or UNIX executable mode bits.
+                    mode = zip_file.getinfo(name).external_attr >> 16
+                    has_exec_mode = bool(mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH))
+                    if has_exec_mode or any(lower_name.endswith(ext) for ext in [".exe", ".bat", ".sh", ".py", ".js"]):
                         executable_files.append(name)
 
                 metadata.update(
@@ -419,9 +420,10 @@ class ZipScanner(BaseScanner):
                     "onnx": any(name.endswith(".onnx") for name in file_list),
                     "pickle": any(name.endswith(".pkl") for name in file_list),
                     "keras": any(name.endswith(".h5") for name in file_list),
+                    "safetensors": any(name.endswith(".safetensors") for name in file_list),
                 }
 
-                detected_formats = [k for k, v in model_indicators.items() if v]
+                detected_formats = sorted(k for k, v in model_indicators.items() if v)
                 if detected_formats:
                     metadata["detected_model_formats"] = detected_formats
 
@@ -432,7 +434,7 @@ class ZipScanner(BaseScanner):
                     if any(pattern in name.lower() for pattern in ["config", "manifest", "metadata", "readme"])
                 ]
                 if config_files:
-                    metadata["config_files"] = config_files
+                    metadata["config_files"] = sorted(set(config_files))
 
                 # Security analysis
                 metadata["security_notes"] = []
