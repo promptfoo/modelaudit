@@ -768,6 +768,45 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
                 with suppress(ValueError):
                     copyreg.add_extension("os", "system", existing_code)
 
+    def test_ext_unresolved_code_still_flagged(self) -> None:
+        """EXT1/EXT2/EXT4 with codes NOT in copyreg registry should still be flagged."""
+        import copyreg
+
+        inverted_registry = getattr(copyreg, "_inverted_registry", {})
+
+        def _pick_unregistered_code(start: int, end: int) -> int:
+            for candidate in range(start, end + 1):
+                if candidate not in inverted_registry:
+                    return candidate
+            pytest.skip(f"No unregistered copyreg code in range {start}-{end}")
+
+        cases = [
+            ("EXT1", b"\x82", _pick_unregistered_code(1, 255), lambda code: bytes([code])),
+            ("EXT2", b"\x83", _pick_unregistered_code(256, 65535), lambda code: struct.pack("<H", code)),
+            ("EXT4", b"\x84", _pick_unregistered_code(65536, 131072), lambda code: struct.pack("<I", code)),
+        ]
+
+        for opcode_name, opcode, ext_code, encode in cases:
+            # Verify the code is truly unregistered
+            assert ext_code not in inverted_registry, (
+                f"{opcode_name} code {ext_code} unexpectedly in copyreg._inverted_registry"
+            )
+            # PROTO 2 | EXT*(code) | MARK | STRING | TUPLE | REDUCE | STOP
+            payload = b"\x80\x02" + opcode + encode(ext_code) + b'(S"echo pwned"\ntR.'
+            result = self._scan_bytes(payload)
+
+            assert result.success, f"{opcode_name}: scan did not succeed"
+            assert result.has_errors, (
+                f"{opcode_name}: unresolved EXT code {ext_code} + REDUCE was not flagged, "
+                f"issues: {[i.message for i in result.issues]}"
+            )
+            # The scanner should flag the REDUCE even when the EXT target is unresolved
+            critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
+            assert critical_issues, (
+                f"{opcode_name}: expected CRITICAL issue for unresolved EXT code {ext_code}, "
+                f"got: {[i.message for i in result.issues]}"
+            )
+
     # ------------------------------------------------------------------
     # Fix 4: NEWOBJ_EX with dangerous class
     # ------------------------------------------------------------------
