@@ -86,6 +86,8 @@ def detect_format_from_magic_bytes(magic4: MagicBytes, magic8: MagicBytes, magic
     """Detect file format using Python 3.10+ pattern matching on magic bytes."""
     # Use pattern matching for cleaner magic byte detection
     match magic4:
+        case b"CBM1":
+            return "catboost"
         case b"GGUF":
             return "gguf"
         case magic if magic in GGML_MAGIC_VARIANTS:
@@ -248,6 +250,8 @@ def detect_file_format(path: str) -> str:
         return "hdf5"
 
     # Check for GGUF/GGML magic bytes
+    if magic4 == b"CBM1":
+        return "catboost"
     if magic4 == b"GGUF":
         return "gguf"
     if magic4 in GGML_MAGIC_VARIANTS:
@@ -317,6 +321,8 @@ def detect_file_format(path: str) -> str:
         return "executorch"
     if ext in (".pkl", ".pickle", ".dill"):
         return "pickle"
+    if ext == ".cbm":
+        return "catboost"
     if ext == ".h5":
         return "hdf5"
     if ext == ".pb":
@@ -418,6 +424,7 @@ EXTENSION_FORMAT_MAP = {
     ".plan": "tensorrt",
     ".msgpack": "flax_msgpack",
     ".nemo": "nemo",
+    ".cbm": "catboost",
 }
 
 
@@ -473,6 +480,8 @@ def detect_format_from_extension_pattern_matching(extension: FileExtension) -> F
             return "flax_msgpack"
         case ".nemo":
             return "nemo"
+        case ".cbm":
+            return "catboost"
         case ".7z":
             return "sevenzip"
         case _:
@@ -597,6 +606,10 @@ def validate_file_type(path: str) -> bool:
 
         if ext_format == "tensorrt":
             return True  # TensorRT engine files have complex binary format
+
+        # CatBoost native .cbm files are expected to have CBM1 header.
+        if ext_format == "catboost":
+            return header_format == "catboost"
 
         # If header format is unknown but extension is known, this might be suspicious
         # unless the file is very small or empty (checked after format-specific rules)
