@@ -148,6 +148,15 @@ class ScannerRegistry:
                 "dependencies": ["onnx"],  # Heavy dependency
                 "numpy_sensitive": True,  # ONNX can be sensitive to NumPy version
             },
+            "coreml": {
+                "module": "modelaudit.scanners.coreml_scanner",
+                "class": "CoreMLScanner",
+                "description": "Scans CoreML .mlmodel files",
+                "extensions": [".mlmodel"],
+                "priority": 7,  # Above generic metadata/manifest/text scanners
+                "dependencies": [],
+                "numpy_sensitive": False,
+            },
             "openvino": {
                 "module": "modelaudit.scanners.openvino_scanner",
                 "class": "OpenVinoScanner",
@@ -191,6 +200,15 @@ class ScannerRegistry:
                 "extensions": [".joblib"],
                 "priority": 8,
                 "dependencies": [],  # No heavy dependencies
+                "numpy_sensitive": False,
+            },
+            "r_serialized": {
+                "module": "modelaudit.scanners.r_serialized_scanner",
+                "class": "RSerializedScanner",
+                "description": "Scans R serialized model files",
+                "extensions": [".rds", ".rda", ".rdata"],
+                "priority": 8,
+                "dependencies": [],
                 "numpy_sensitive": False,
             },
             "skops": {
@@ -337,6 +355,33 @@ class ScannerRegistry:
                 "dependencies": ["paddlepaddle"],
                 "numpy_sensitive": True,
             },
+            "cntk": {
+                "module": "modelaudit.scanners.cntk_scanner",
+                "class": "CntkScanner",
+                "description": "Scans CNTK .dnn/.cmf model artifacts",
+                "extensions": [".dnn", ".cmf"],
+                "priority": 18,
+                "dependencies": [],
+                "numpy_sensitive": False,
+            },
+            "rknn": {
+                "module": "modelaudit.scanners.rknn_scanner",
+                "class": "RknnScanner",
+                "description": "Scans Rockchip RKNN model files",
+                "extensions": [".rknn"],
+                "priority": 19,
+                "dependencies": [],
+                "numpy_sensitive": False,
+            },
+            "torch7": {
+                "module": "modelaudit.scanners.torch7_scanner",
+                "class": "Torch7Scanner",
+                "description": "Scans legacy Torch7 serialized model files",
+                "extensions": [".t7", ".th", ".net"],
+                "priority": 19,
+                "dependencies": [],
+                "numpy_sensitive": False,
+            },
             "tar": {
                 "module": "modelaudit.scanners.tar_scanner",
                 "class": "TarScanner",
@@ -381,6 +426,24 @@ class ScannerRegistry:
                 "dependencies": ["py7zr"],
                 "numpy_sensitive": False,
             },
+            "lightgbm": {
+                "module": "modelaudit.scanners.lightgbm_scanner",
+                "class": "LightGBMScanner",
+                "description": "Scans native LightGBM model files",
+                "extensions": [".model", ".txt", ".lgb", ".lightgbm"],
+                "priority": 6,  # Before XGBoost for strict .model collision handling
+                "dependencies": [],
+                "numpy_sensitive": False,
+            },
+            "llamafile": {
+                "module": "modelaudit.scanners.llamafile_scanner",
+                "class": "LlamafileScanner",
+                "description": "Scans Llamafile executable model artifacts",
+                "extensions": [".llamafile", ".exe", ""],
+                "priority": 6,
+                "dependencies": [],
+                "numpy_sensitive": False,
+            },
             "xgboost": {
                 "module": "modelaudit.scanners.xgboost_scanner",
                 "class": "XGBoostScanner",
@@ -390,6 +453,24 @@ class ScannerRegistry:
                 "dependencies": ["xgboost", "ubjson"],  # ubjson optional for UBJ support
                 "numpy_sensitive": True,  # XGBoost can be sensitive to NumPy version
             },
+            "mxnet": {
+                "module": "modelaudit.scanners.mxnet_scanner",
+                "class": "MXNetScanner",
+                "description": "Scans MXNet symbol/params model artifacts",
+                "extensions": [".json", ".params"],
+                "priority": 8,  # Before generic manifest/json scanners
+                "dependencies": [],
+                "numpy_sensitive": False,
+            },
+            "catboost": {
+                "module": "modelaudit.scanners.catboost_scanner",
+                "class": "CatBoostScanner",
+                "description": "Scans CatBoost .cbm model files for suspicious metadata indicators",
+                "extensions": [".cbm"],
+                "priority": 8,
+                "dependencies": [],
+                "numpy_sensitive": False,
+            },
             "nemo": {
                 "module": "modelaudit.scanners.nemo_scanner",
                 "class": "NemoScanner",
@@ -397,6 +478,15 @@ class ScannerRegistry:
                 "extensions": [".nemo"],
                 "priority": 14,
                 "dependencies": [],  # pyyaml optional, handled gracefully
+                "numpy_sensitive": False,
+            },
+            "compressed": {
+                "module": "modelaudit.scanners.compressed_scanner",
+                "class": "CompressedScanner",
+                "description": "Scans standalone compressed wrappers and forwards decompressed payloads",
+                "extensions": [".gz", ".bz2", ".xz", ".lz4", ".zlib"],
+                "priority": 95,  # Before generic TAR/ZIP scanners
+                "dependencies": [],  # lz4 is optional and handled in scanner
                 "numpy_sensitive": False,
             },
             "zip": {
@@ -671,11 +761,13 @@ def __getattr__(name: str) -> Any:
         "TensorFlowSavedModelScanner": "tf_savedmodel",
         "KerasH5Scanner": "keras_h5",
         "OnnxScanner": "onnx",
+        "CoreMLScanner": "coreml",
         "OpenVinoScanner": "openvino",
         "PyTorchZipScanner": "pytorch_zip",
         "ExecuTorchScanner": "executorch",
         "GgufScanner": "gguf",
         "JoblibScanner": "joblib",
+        "RSerializedScanner": "r_serialized",
         "SkopsScanner": "skops",
         "NumPyScanner": "numpy",
         "OciLayerScanner": "oci_layer",
@@ -688,14 +780,22 @@ def __getattr__(name: str) -> Any:
         "TFLiteScanner": "tflite",
         "TensorRTScanner": "tensorrt",
         "PaddleScanner": "paddle",
+        "CntkScanner": "cntk",
+        "RknnScanner": "rknn",
+        "Torch7Scanner": "torch7",
         "TarScanner": "tar",
         "Jinja2TemplateScanner": "jinja2_template",
         "MetadataScanner": "metadata",
         "KerasZipScanner": "keras_zip",
         "SevenZipScanner": "sevenzip",
         "TextScanner": "text",
+        "LightGBMScanner": "lightgbm",
+        "LlamafileScanner": "llamafile",
         "XGBoostScanner": "xgboost",
+        "MXNetScanner": "mxnet",
+        "CatBoostScanner": "catboost",
         "NemoScanner": "nemo",
+        "CompressedScanner": "compressed",
         "ZipScanner": "zip",
     }
 

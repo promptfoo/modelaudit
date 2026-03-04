@@ -1,3 +1,4 @@
+import pickletools
 import re
 import struct
 from pathlib import Path
@@ -12,6 +13,100 @@ GGML_MAGIC_VARIANTS = {
     b"GGLA",
     b"GGSA",
 }
+R_WORKSPACE_HEADERS = {
+    b"RDX2\n",
+    b"RDX3\n",
+    b"RDA2\n",
+    b"RDA3\n",
+}
+R_SERIALIZATION_MARKERS = {
+    b"X\n",
+    b"A\n",
+    b"B\n",
+}
+_CNTK_LEGACY_MAGIC = b"B\x00C\x00N\x00\x00\x00"
+_CNTK_LEGACY_VERSION_MARKER = b"B\x00V\x00e\x00r\x00s\x00i\x00o\x00n\x00\x00\x00"
+_CNTK_V2_REQUIRED_MARKERS = (b"\x0a\x07version", b"\x0a\x03uid")
+_CNTK_V2_STRUCTURE_MARKERS = (b"CompositeFunction", b"primitive_functions", b"PrimitiveFunction")
+_CNTK_SIGNATURE_READ_BYTES = 4096
+_TORCH7_SIGNATURE_READ_BYTES = 4096
+_LIGHTGBM_SIGNATURE_READ_BYTES = 8192
+_LIGHTGBM_HEADER_MARKERS = (
+    "version=",
+    "num_class=",
+    "num_tree_per_iteration=",
+    "max_feature_idx=",
+    "feature_names=",
+    "tree_sizes=",
+)
+_LIGHTGBM_TREE_MARKERS = (
+    "tree=",
+    "num_leaves=",
+    "split_feature=",
+    "leaf_value=",
+)
+_LIGHTGBM_XGBOOST_JSON_MARKERS = ('"learner"', '"gradient_booster"', '"tree_param"')
+_GZIP_MAGIC = b"\x1f\x8b"
+_BZIP2_MAGIC = b"BZh"
+_XZ_MAGIC = b"\xfd7zXZ\x00"
+_LZ4_FRAME_MAGIC = b"\x04\x22\x4d\x18"
+_COMPRESSED_EXTENSION_CODECS = {
+    ".gz": "gzip",
+    ".bz2": "bzip2",
+    ".xz": "xz",
+    ".lz4": "lz4",
+    ".zlib": "zlib",
+}
+
+# Pickle protocol 0/1 GLOBAL opcode signatures used for .bin fallback detection.
+# Format: c<module>\n<name>\n
+PROTOCOL0_GLOBAL_RE = re.compile(rb"^c[^\n\r]{1,64}\n[^\n\r]{1,64}\n")
+MARKED_PROTOCOL0_GLOBAL_RE = re.compile(rb"^[\(\]\}]c[^\n\r]{1,64}\n[^\n\r]{1,64}\n")
+
+# Protocol 0/1 pickles are ASCII and may not start with GLOBAL/INST.
+# Use bounded opcode parsing to reduce false positives on plain text and
+# still detect prefixed payloads (e.g., MARK/LIST/POP before GLOBAL).
+PROTO0_1_MAX_PROBE_BYTES: int = 64 * 1024
+PROTO0_1_MAX_PROBE_OPCODES: int = 4096
+PROTO0_1_START_BYTES: bytes = b"(]})cilp0IJSVNTF"
+
+
+def _looks_like_proto0_or_1_pickle(sample: bytes) -> bool:
+    """Best-effort protocol 0/1 detection via bounded pickle opcode parsing."""
+    if len(sample) < 2:
+        return False
+
+    def _matches_proto_stream(candidate: bytes) -> bool:
+        # Only attempt expensive parsing for likely text-protocol starters.
+        if len(candidate) < 2 or candidate[0] not in PROTO0_1_START_BYTES:
+            return False
+
+        opcode_count = 0
+        try:
+            for opcode, _arg, _pos in pickletools.genops(candidate):
+                opcode_count += 1
+                if opcode.name == "STOP":
+                    return opcode_count >= 2
+                if opcode_count >= PROTO0_1_MAX_PROBE_OPCODES:
+                    return False
+        except Exception:
+            return False
+        return False
+
+    if _matches_proto_stream(sample):
+        return True
+
+    # Regression hardening: a single leading "#" token should not suppress
+    # protocol 0/1 detection for otherwise valid pickle streams.
+    return sample.startswith(b"#") and _matches_proto_stream(sample[1:])
+
+
+def _read_pickle_probe_sample(path: Path, size: int, header16: bytes) -> bytes:
+    """Read a bounded prefix for protocol 0/1 pickle probing."""
+    if size <= len(header16):
+        return header16
+    with path.open("rb") as f:
+        return f.read(min(size, PROTO0_1_MAX_PROBE_BYTES))
 
 
 def is_zipfile(path: str) -> bool:
@@ -31,10 +126,77 @@ def read_magic_bytes(path: str, num_bytes: int = 8) -> bytes:
         return f.read(num_bytes)
 
 
+def _looks_like_cntk_v2_signature(prefix: bytes) -> bool:
+    return all(marker in prefix for marker in _CNTK_V2_REQUIRED_MARKERS) and any(
+        marker in prefix for marker in _CNTK_V2_STRUCTURE_MARKERS
+    )
+
+
+def _is_cntk_signature(prefix: bytes) -> bool:
+    if prefix.startswith(_CNTK_LEGACY_MAGIC):
+        return _CNTK_LEGACY_VERSION_MARKER in prefix
+    return _looks_like_cntk_v2_signature(prefix)
+
+
+def _is_torch7_signature(prefix: bytes) -> bool:
+    lowered = prefix.lower()
+    if prefix.startswith(b"T7\x00\x00"):
+        return True
+    has_torch_marker = b"torch" in lowered or b"luat" in lowered
+    has_structure_marker = b"nn." in lowered or b"tensor" in lowered or b"thnn" in lowered
+    return has_torch_marker and has_structure_marker
+
+
+def _is_lightgbm_signature(prefix: bytes) -> bool:
+    preview = prefix.decode("utf-8", errors="ignore").replace("\x00", "\n").lower()
+    starts_with_tree = preview.lstrip().startswith("tree")
+    header_hits = sum(1 for marker in _LIGHTGBM_HEADER_MARKERS if marker in preview)
+    tree_hits = sum(1 for marker in _LIGHTGBM_TREE_MARKERS if marker in preview)
+    xgboost_like = all(marker in preview for marker in _LIGHTGBM_XGBOOST_JSON_MARKERS)
+    return (starts_with_tree or "tree=" in preview) and header_hits >= 3 and tree_hits >= 2 and not xgboost_like
+
+
+def _is_zlib_header(prefix: bytes) -> bool:
+    if len(prefix) < 2:
+        return False
+    cmf = prefix[0]
+    flg = prefix[1]
+    if (cmf & 0x0F) != 8:
+        return False
+    if (cmf >> 4) > 7:
+        return False
+    return ((cmf << 8) + flg) % 31 == 0
+
+
+def _detect_compression_format(prefix: bytes) -> str | None:
+    if prefix.startswith(_GZIP_MAGIC):
+        return "gzip"
+    if prefix.startswith(_BZIP2_MAGIC):
+        return "bzip2"
+    if prefix.startswith(_XZ_MAGIC):
+        return "xz"
+    if prefix.startswith(_LZ4_FRAME_MAGIC):
+        return "lz4"
+    if _is_zlib_header(prefix[:2]):
+        return "zlib"
+    return None
+
+
+
 def detect_format_from_magic_bytes(magic4: MagicBytes, magic8: MagicBytes, magic16: MagicBytes) -> FileFormat:
     """Detect file format using Python 3.10+ pattern matching on magic bytes."""
+    compression_format = _detect_compression_format(magic16)
+    if compression_format:
+        return compression_format
+
     # Use pattern matching for cleaner magic byte detection
     match magic4:
+        case b"CBM1":
+            return "catboost"
+        case b"RKNN":
+            return "rknn"
+        case b"T7\x00\x00":
+            return "torch7"
         case b"GGUF":
             return "gguf"
         case magic if magic in GGML_MAGIC_VARIANTS:
@@ -48,6 +210,8 @@ def detect_format_from_magic_bytes(magic4: MagicBytes, magic8: MagicBytes, magic
 
     # Check longer magic sequences
     match magic8:
+        case magic if magic == _CNTK_LEGACY_MAGIC:
+            return "cntk"
         case b"\x89HDF\r\n\x1a\n":  # HDF5 magic
             return "hdf5"
         case magic if magic.startswith(b"\x93NUMPY"):
@@ -55,13 +219,17 @@ def detect_format_from_magic_bytes(magic4: MagicBytes, magic8: MagicBytes, magic
         case _:
             pass
 
+    if any(magic16.startswith(header) for header in R_WORKSPACE_HEADERS):
+        return "r_serialized"
+    if any(magic16.startswith(marker) for marker in R_SERIALIZATION_MARKERS):
+        return "r_serialized"
+
     # Check pickle magic bytes using pattern matching
     match magic4[:2]:
         case b"\x80\x02" | b"\x80\x03" | b"\x80\x04" | b"\x80\x05":
             return "pickle"
         case _:
             pass
-
     # Check for JSON-like formats (SafeTensors, etc.)
     match magic4[0:1]:
         case b"{":
@@ -113,6 +281,28 @@ def detect_file_format_from_magic(path: str) -> str:
             format_result = detect_format_from_magic_bytes(magic4, magic8, magic16)
             if format_result != "unknown":
                 return format_result
+
+            # CNTKv2 has protobuf-style serialization without a fixed first-8-byte magic.
+            # Use bounded signature markers for deterministic identification.
+            f.seek(0)
+            cntk_prefix = f.read(_CNTK_SIGNATURE_READ_BYTES)
+            if _is_cntk_signature(cntk_prefix):
+                return "cntk"
+
+            f.seek(0)
+            torch7_prefix = f.read(_TORCH7_SIGNATURE_READ_BYTES)
+            if _is_torch7_signature(torch7_prefix):
+                return "torch7"
+
+            f.seek(0)
+            lightgbm_prefix = f.read(_LIGHTGBM_SIGNATURE_READ_BYTES)
+            if _is_lightgbm_signature(lightgbm_prefix):
+                return "lightgbm"
+            # Protocol 0/1 pickle payloads can evade short magic-byte checks.
+            # Probe a bounded prefix and require a valid opcode stream.
+            pickle_probe_sample = _read_pickle_probe_sample(file_path, size, magic16)
+            if _looks_like_proto0_or_1_pickle(pickle_probe_sample):
+                return "pickle"
 
             # Check for XML-based formats (OpenVINO and PMML)
             if magic16.startswith(b"<?xml"):
@@ -192,12 +382,26 @@ def detect_file_format(path: str) -> str:
         return "hdf5"
 
     # Check for GGUF/GGML magic bytes
+    if magic4 == b"CBM1":
+        return "catboost"
     if magic4 == b"GGUF":
         return "gguf"
     if magic4 in GGML_MAGIC_VARIANTS:
         return "ggml"
 
     ext = file_path.suffix.lower()
+    filename_lower = file_path.name.lower()
+
+    # Compound tar wrappers should route to TAR scanner semantics.
+    if filename_lower.endswith((".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz")):
+        return "tar"
+
+    compression_format = _detect_compression_format(header)
+    if ext in _COMPRESSED_EXTENSION_CODECS:
+        expected_codec = _COMPRESSED_EXTENSION_CODECS[ext]
+        if compression_format == expected_codec:
+            return "compressed"
+        return "unknown"
 
     # Check ZIP magic first (for .pt/.pth files that are actually zips)
     if magic4.startswith(b"PK"):
@@ -212,14 +416,29 @@ def detect_file_format(path: str) -> str:
     ]
     if any(magic4.startswith(m) for m in pickle_magics):
         return "pickle"
+    pickle_probe_sample = _read_pickle_probe_sample(file_path, size, magic16)
+    if _looks_like_proto0_or_1_pickle(pickle_probe_sample):
+        return "pickle"
 
     # For .bin files, do more sophisticated detection
     if ext == ".bin":
+        magic64 = read_magic_bytes(path, 64)
         # IMPORTANT: Check ZIP format first (PyTorch models saved with torch.save())
         if magic4.startswith(b"PK"):
             return "zip"
-        # Check if it's a pickle file
+        # Check if it's a pickle file (protocol 2-5)
         if any(magic4.startswith(m) for m in pickle_magics):
+            return "pickle"
+        # CVE-2025-10155: Detect protocol 0/1 pickles that lack magic bytes.
+        # Protocol 0 GLOBAL opcode: c<module>\n<name>\n
+        # Use a strict shape match to avoid classifying arbitrary binaries as pickle.
+        if PROTOCOL0_GLOBAL_RE.match(magic64):
+            return "pickle"
+        # Also detect pickle protocol 0/1 streams starting with MARK '(' (tuple/reduce
+        # preamble), EMPTY_LIST ']', or EMPTY_DICT '}' opcodes.  These are valid
+        # protocol 0/1 start bytes but are only treated as pickle when immediately
+        # followed by a properly formed GLOBAL opcode sequence.
+        if MARKED_PROTOCOL0_GLOBAL_RE.match(magic64):
             return "pickle"
         # Check for safetensors format (starts with JSON header)
         if magic4[0:1] == b"{" or (size > 8 and b'"__metadata__"' in magic16):
@@ -246,12 +465,45 @@ def detect_file_format(path: str) -> str:
         return "executorch"
     if ext in (".pkl", ".pickle", ".dill"):
         return "pickle"
+    if ext in (".dnn", ".cmf"):
+        prefix = read_magic_bytes(path, _CNTK_SIGNATURE_READ_BYTES)
+        if _is_cntk_signature(prefix):
+            return "cntk"
+        return "unknown"
+    if ext in (".t7", ".th", ".net"):
+        prefix = read_magic_bytes(path, _TORCH7_SIGNATURE_READ_BYTES)
+        if _is_torch7_signature(prefix):
+            return "torch7"
+        return "unknown"
+    if ext in (".lgb", ".lightgbm"):
+        prefix = read_magic_bytes(path, _LIGHTGBM_SIGNATURE_READ_BYTES)
+        if _is_lightgbm_signature(prefix):
+            return "lightgbm"
+        return "unknown"
+    if ext == ".model":
+        prefix = read_magic_bytes(path, _LIGHTGBM_SIGNATURE_READ_BYTES)
+        if _is_lightgbm_signature(prefix):
+            return "lightgbm"
+    if ext == ".rknn":
+        if magic4 == b"RKNN":
+            return "rknn"
+        return "rknn"
+    if ext == ".json" and file_path.name.lower().endswith("-symbol.json"):
+        return "mxnet"
+    if ext == ".params":
+        return "mxnet"
+    if ext == ".cbm":
+        return "catboost"
+    if ext == ".llamafile":
+        return "llamafile"
     if ext == ".h5":
         return "hdf5"
     if ext == ".pb":
         return "protobuf"
     if ext == ".tflite":
         return "tflite"
+    if ext == ".mlmodel":
+        return "coreml"
     if ext == ".safetensors":
         return "safetensors"
     if ext in (".pdmodel", ".pdiparams"):
@@ -279,6 +531,8 @@ def detect_file_format(path: str) -> str:
         if magic4.startswith(b"PK"):
             return "zip"
         return "pickle"
+    if ext in (".rds", ".rda", ".rdata"):
+        return "r_serialized"
     if ext in (
         ".tar",
         ".tar.gz",
@@ -312,6 +566,12 @@ EXTENSION_FORMAT_MAP = {
     ".pt": "pickle",
     ".pth": "pickle",
     ".ckpt": "pickle",
+    ".dnn": "cntk",
+    ".cmf": "cntk",
+    ".t7": "torch7",
+    ".th": "torch7",
+    ".net": "torch7",
+    ".rknn": "rknn",
     ".pkl": "pickle",
     ".pickle": "pickle",
     ".dill": "pickle",
@@ -319,9 +579,15 @@ EXTENSION_FORMAT_MAP = {
     ".hdf5": "hdf5",
     ".keras": "keras",  # Keras 3.x uses ZIP, legacy Keras uses HDF5
     ".pb": "protobuf",
+    ".mlmodel": "coreml",
     ".safetensors": "safetensors",
     ".onnx": "onnx",
     ".bin": "pytorch_binary",
+    ".gz": "compressed",
+    ".bz2": "compressed",
+    ".xz": "compressed",
+    ".lz4": "compressed",
+    ".zlib": "compressed",
     ".zip": "zip",
     ".gguf": "gguf",
     ".ggml": "ggml",
@@ -343,10 +609,18 @@ EXTENSION_FORMAT_MAP = {
     ".joblib": "pickle",  # joblib can be either zip or pickle format
     ".pdmodel": "paddle",
     ".pdiparams": "paddle",
+    ".params": "mxnet",
     ".engine": "tensorrt",
     ".plan": "tensorrt",
     ".msgpack": "flax_msgpack",
     ".nemo": "nemo",
+    ".cbm": "catboost",
+    ".llamafile": "llamafile",
+    ".lgb": "lightgbm",
+    ".lightgbm": "lightgbm",
+    ".rds": "r_serialized",
+    ".rda": "r_serialized",
+    ".rdata": "r_serialized",
 }
 
 
@@ -357,6 +631,12 @@ def detect_format_from_extension_pattern_matching(extension: FileExtension) -> F
         # PyTorch/Pickle formats
         case ".pt" | ".pth" | ".ckpt" | ".pkl" | ".pickle" | ".dill":
             return "pickle"
+        case ".dnn" | ".cmf":
+            return "cntk"
+        case ".t7" | ".th" | ".net":
+            return "torch7"
+        case ".rknn":
+            return "rknn"
         # HDF5 formats
         case ".h5" | ".hdf5":
             return "hdf5"
@@ -366,6 +646,8 @@ def detect_format_from_extension_pattern_matching(extension: FileExtension) -> F
         # Archive formats
         case ".zip":
             return "zip"
+        case ".gz" | ".bz2" | ".xz" | ".lz4" | ".zlib":
+            return "compressed"
         case ".tar" | ".tar.gz" | ".tgz":
             return "tar"
         # ML model formats
@@ -388,10 +670,14 @@ def detect_format_from_extension_pattern_matching(extension: FileExtension) -> F
             return "protobuf"
         case ".tflite":
             return "tflite"
+        case ".mlmodel":
+            return "coreml"
         case ".engine":
             return "tensorrt"
         case ".pdmodel" | ".pdiparams":
             return "paddle"
+        case ".params":
+            return "mxnet"
         case ".xml":
             return "openvino"
         case ".pmml":
@@ -402,6 +688,14 @@ def detect_format_from_extension_pattern_matching(extension: FileExtension) -> F
             return "flax_msgpack"
         case ".nemo":
             return "nemo"
+        case ".cbm":
+            return "catboost"
+        case ".llamafile":
+            return "llamafile"
+        case ".lgb" | ".lightgbm":
+            return "lightgbm"
+        case ".rds" | ".rda" | ".rdata":
+            return "r_serialized"
         case ".7z":
             return "sevenzip"
         case _:
@@ -415,6 +709,12 @@ def detect_format_from_extension(path: FilePath) -> FileFormat:
         if (file_path / "saved_model.pb").exists():
             return "tensorflow_directory"
         return "directory"
+
+    filename_lower = file_path.name.lower()
+    if filename_lower.endswith((".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz")):
+        return "tar"
+    if file_path.suffix.lower() == ".json" and filename_lower.endswith("-symbol.json"):
+        return "mxnet"
 
     # Use pattern matching for modern Python 3.10+ approach
     return detect_format_from_extension_pattern_matching(file_path.suffix)
@@ -464,8 +764,23 @@ def validate_file_type(path: str) -> bool:
             return True
 
         # TAR files must match
-        if ext_format == "tar" and header_format == "tar":
-            return True
+        if ext_format == "tar":
+            filename_lower = Path(path).name.lower()
+            if filename_lower.endswith((".tar.gz", ".tgz")):
+                return header_format in {"tar", "gzip"}
+            if filename_lower.endswith((".tar.bz2", ".tbz2")):
+                return header_format in {"tar", "bzip2"}
+            if filename_lower.endswith((".tar.xz", ".txz")):
+                return header_format in {"tar", "xz"}
+            return header_format == "tar"
+
+        # Standalone compressed wrappers must match their declared codecs.
+        if ext_format == "compressed":
+            file_extension = Path(path).suffix.lower()
+            expected_codec = _COMPRESSED_EXTENSION_CODECS.get(file_extension)
+            if expected_codec is None:
+                return False
+            return header_format == expected_codec
 
         # NeMo files are TAR archives with a dedicated extension
         if ext_format == "nemo" and header_format == "tar":
@@ -526,6 +841,50 @@ def validate_file_type(path: str) -> bool:
 
         if ext_format == "tensorrt":
             return True  # TensorRT engine files have complex binary format
+
+        # CatBoost native .cbm files are expected to have CBM1 header.
+        if ext_format == "catboost":
+            return header_format == "catboost"
+
+        # CNTK .dnn/.cmf signatures are marker-based and validated via bounded reads.
+        if ext_format == "cntk":
+            cntk_prefix = read_magic_bytes(path, _CNTK_SIGNATURE_READ_BYTES)
+            return _is_cntk_signature(cntk_prefix)
+
+        # RKNN files require RKNN signature bytes.
+        if ext_format == "rknn":
+            return header_format == "rknn"
+
+        if ext_format == "torch7":
+            torch7_prefix = read_magic_bytes(path, _TORCH7_SIGNATURE_READ_BYTES)
+            return _is_torch7_signature(torch7_prefix)
+
+        # LightGBM native formats are validated with strict marker heuristics.
+        if ext_format == "lightgbm":
+            lightgbm_prefix = read_magic_bytes(path, _LIGHTGBM_SIGNATURE_READ_BYTES)
+            return _is_lightgbm_signature(lightgbm_prefix)
+
+        # Llamafiles are executable wrappers; scanner-level checks validate markers.
+        if ext_format == "llamafile":
+            return True
+
+        # MXNet params and symbol JSON artifacts rely on strict scanner-level
+        # structural checks rather than magic-byte signatures.
+        if ext_format == "mxnet":
+            return True
+
+        # CoreML .mlmodel files are protobuf-encoded with no stable magic bytes.
+        # Structural validation is performed by the dedicated scanner.
+        if ext_format == "coreml":
+            return header_format in {"coreml", "unknown"}
+
+        # R serialized workspace/data files may be uncompressed or wrapped;
+        # extension-based intent is authoritative for static scanning.
+        if ext_format == "r_serialized":
+            if header_format == "r_serialized":
+                return True
+            return True
+
 
         # If header format is unknown but extension is known, this might be suspicious
         # unless the file is very small or empty (checked after format-specific rules)

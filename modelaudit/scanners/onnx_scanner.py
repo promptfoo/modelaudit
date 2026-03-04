@@ -284,13 +284,79 @@ class OnnxScanner(BaseScanner):
                     )
                     continue
                 external_path = (model_dir / location).resolve()
-                # Check containment before existence so traversal attempts
-                # against missing paths are still classified as traversal.
+                # CVE-2024-27318: Detect nested path traversal (e.g.
+                # "subdir/../../etc/passwd") which bypasses naive lstrip
+                # sanitization.  Check the raw location for ".." BEFORE
+                # the existence check so traversal attempts against
+                # non-existent targets are still flagged.
+                has_traversal_raw = ".." in location.replace("\\", "/").split("/")
                 escapes_model_dir = not _is_contained_in(external_path, model_dir)
                 if escapes_model_dir:
+                    # Track for per-file CVE-2025-51480 (write direction) reporting
                     traversal_files.setdefault(location, []).append(tensor.name)
+                    # Determine specific CVE attribution
+                    normalized_parts = [p for p in location.replace("\\", "/").split("/") if p]
+                    starts_with_parent = bool(normalized_parts and normalized_parts[0] == "..")
+                    if has_traversal_raw and not starts_with_parent:
+                        # Nested traversal (subdir/../../) - CVE-2024-27318
+                        cve_id = "CVE-2024-27318"
+                        cve_desc = (
+                            "ONNX external_data path contains nested "
+                            "traversal sequences that bypass naive "
+                            "sanitization (lstrip fix for CVE-2022-25882)"
+                        )
+                        cvss = 7.5
+                    else:
+                        # Direct traversal (../../) - CVE-2022-25882
+                        cve_id = "CVE-2022-25882"
+                        cve_desc = (
+                            "ONNX external_data location uses path "
+                            "traversal to access files outside the "
+                            "model directory"
+                        )
+                        cvss = 7.5
+                    result.add_check(
+                        name=f"{cve_id}: External Data Path Traversal",
+                        passed=False,
+                        message=(
+                            f"{cve_id}: External data path traversal "
+                            f"for tensor '{tensor.name}' - path "
+                            f"'{location}' resolves outside model "
+                            f"directory"
+                        ),
+                        severity=IssueSeverity.CRITICAL,
+                        location=str(external_path),
+                        details={
+                            "tensor": tensor.name,
+                            "file": location,
+                            "cve_id": cve_id,
+                            "cvss": cvss,
+                            "cwe": "CWE-22",
+                            "description": cve_desc,
+                            "remediation": (
+                                "Validate that external_data paths do "
+                                "not contain '..' or resolve outside "
+                                "the model directory before loading. "
+                                "Update to ONNX >= 1.16.0."
+                            ),
+                        },
+                        why=(
+                            f"This ONNX model references external data "
+                            f"via path '{location}' which contains "
+                            f"directory traversal sequences. An "
+                            f"attacker can craft an ONNX model that "
+                            f"reads arbitrary files ({cve_id})."
+                        ),
+                    )
                 elif not external_path.exists():
-                    missing_files.setdefault(location, []).append(tensor.name)
+                    result.add_check(
+                        name="External Data File Existence",
+                        passed=False,
+                        message=f"External data file not found for tensor '{tensor.name}'",
+                        severity=IssueSeverity.CRITICAL,
+                        location=str(external_path),
+                        details={"tensor": tensor.name, "file": location},
+                    )
                 else:
                     if location not in safe_files:
                         safe_files.add(location)

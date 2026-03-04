@@ -34,6 +34,8 @@ from ..detectors.suspicious_symbols import DANGEROUS_OPCODES
 from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult, logger
 
 _RESYNC_BUDGET = 8192  # Max bytes to scan forward when resyncing after an unknown opcode
+COPYREG_EXTENSION_MODULE = "__copyreg_extension__"
+COPYREG_EXTENSION_PREFIX = "code_"
 
 
 def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> Any:
@@ -71,10 +73,30 @@ def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> 
                     yield item
             except ValueError as e:
                 error_str = str(e).lower()
-                if "opcode" in error_str and "unknown" in error_str:
-                    logger.info(
-                        f"Protocol mismatch in pickle (joblib may use protocol 5 opcodes in protocol 4 files): {e}"
-                    )
+                is_unknown_opcode = "opcode" in error_str and "unknown" in error_str
+                is_decode_or_text_error = (
+                    isinstance(e, UnicodeDecodeError)
+                    or "unicode" in error_str
+                    or "codec can't decode" in error_str
+                    or "no newline found" in error_str
+                )
+
+                if is_unknown_opcode or is_decode_or_text_error:
+                    if had_opcodes:
+                        logger.info(
+                            "Pickle stream parsing interrupted after partial opcode extraction; "
+                            "continuing with partial security analysis"
+                        )
+                        stream_error = True
+                    elif is_unknown_opcode:
+                        # Keep prior behavior for joblib-style protocol/opcode mismatches.
+                        logger.info(
+                            f"Protocol mismatch in pickle (joblib may use protocol 5 opcodes in protocol 4 files): {e}"
+                        )
+                    else:
+                        # No opcodes were parsed; allow outer error handling to report
+                        # malformed payloads instead of silently treating as empty.
+                        raise
                 else:
                     raise
         else:
@@ -93,12 +115,25 @@ def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> 
 
             if stream_error and had_opcodes:
                 # Partial stream: binary data was misinterpreted as opcodes.
-                # Discard the buffer and stop — no more valid streams.
+                # Discard the buffer but keep scanning — a valid malicious
+                # stream may follow.
+                if multi_stream:
+                    continue
                 return
 
             if not stream_error:
                 # Stream completed successfully — yield buffered opcodes
                 yield from buffered
+
+        if stream_error and had_opcodes:
+            # First stream parse interruption after yielding some opcodes.
+            if multi_stream:
+                # Mark as parsed so subsequent streams are buffered, and
+                # keep scanning — a malicious payload may follow.
+                parsed_any_stream = True
+                continue
+            # Single-stream mode: return the parsed prefix for security analysis.
+            return
 
         if not multi_stream:
             return
@@ -321,6 +356,7 @@ ALWAYS_DANGEROUS_FUNCTIONS: set[str] = {
     # Other dangerous operations
     "pickle.loads",
     "pickle.load",
+    "joblib.load",
     "marshal.loads",
     "marshal.load",
     # Torch dangerous functions (Fickling)
@@ -335,6 +371,11 @@ ALWAYS_DANGEROUS_FUNCTIONS: set[str] = {
     "torch.distributed.rpc.RemoteModule",
     # NumPy dangerous functions (Fickling)
     "numpy.testing._private.utils.runstring",
+    # pip as callable (CVE-2025-1716: picklescan bypass via pip.main)
+    "pip.main",
+    "pip._internal.main",
+    "pip._internal.cli.main.main",
+    "pip._vendor.distlib.scripts.ScriptMaker",
     # Shell utilities
     "shutil.rmtree",
     "shutil.move",
@@ -411,6 +452,14 @@ ALWAYS_DANGEROUS_MODULES: set[str] = {
     "signal",
     "_signal",
     "threading",
+    # Package manager as callable (CVE-2025-1716: picklescan bypass)
+    "pip",
+    "pip._internal",
+    "pip._internal.cli",
+    "pip._internal.cli.main",
+    "pip._vendor",
+    "pip._vendor.distlib",
+    "pip._vendor.distlib.scripts",
     # Module loading from untrusted sources
     "zipimport",
     "importlib",
@@ -453,7 +502,6 @@ ALWAYS_DANGEROUS_MODULES: set[str] = {
     # Virtual environments / package install
     "venv",
     "ensurepip",
-    "pip",
     # Other dangerous
     "webbrowser",
     "asyncio",
@@ -487,6 +535,18 @@ WARNING_SEVERITY_MODULES: set[str] = {
     # cannot directly execute code.
     "glob",
 }
+
+
+def _is_dangerous_module(mod: str) -> bool:
+    """Check if module is in ALWAYS_DANGEROUS_MODULES (exact or prefix match).
+
+    Prefix matching ensures deeper sub-modules like pip._internal.cli.main_parser
+    are still caught when their parent (pip) is in the blocklist.
+    """
+    if mod in ALWAYS_DANGEROUS_MODULES:
+        return True
+    return any(mod.startswith(f"{m}.") for m in ALWAYS_DANGEROUS_MODULES)
+
 
 # String opcodes that push text onto the pickle stack.
 # Used for STACK_GLOBAL reconstruction and suspicious string detection.
@@ -1435,7 +1495,6 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
     ],
     "joblib": [
         "dump",
-        "load",
         "Parallel",
         "delayed",
         "Memory",
@@ -1727,6 +1786,38 @@ def _is_safe_ml_global(mod: str, func: str) -> bool:
     return False
 
 
+def _is_copyreg_extension_ref(mod: str) -> bool:
+    """Return True when a reference came from an EXT opcode extension lookup."""
+    return mod == COPYREG_EXTENSION_MODULE
+
+
+def _resolve_copyreg_extension(code: Any) -> tuple[str, str]:
+    """
+    Resolve EXT opcode codes through copyreg when available.
+
+    Returns a sentinel module/function pair for unresolved extension codes so
+    downstream REDUCE analysis can still flag them as dangerous.
+    """
+    if isinstance(code, int):
+        try:
+            import copyreg
+
+            inverted_registry = getattr(copyreg, "_inverted_registry", None)
+            if isinstance(inverted_registry, dict):
+                resolved = inverted_registry.get(code)
+                if (
+                    isinstance(resolved, tuple)
+                    and len(resolved) == 2
+                    and isinstance(resolved[0], str)
+                    and isinstance(resolved[1], str)
+                ):
+                    return resolved
+        except Exception:
+            pass
+
+    return COPYREG_EXTENSION_MODULE, f"{COPYREG_EXTENSION_PREFIX}{code}"
+
+
 def _is_actually_dangerous_global(mod: str, func: str, ml_context: dict) -> bool:
     """
     Context-aware global reference analysis - distinguishes between legitimate ML operations
@@ -1736,6 +1827,13 @@ def _is_actually_dangerous_global(mod: str, func: str, ml_context: dict) -> bool
     for less critical operations.
     """
     full_ref = f"{mod}.{func}"
+
+    # STEP 0: EXT opcodes (copyreg extension registry) are always suspicious.
+    # They resolve callables indirectly via process-global state and can bypass
+    # explicit GLOBAL/STACK_GLOBAL references.
+    if _is_copyreg_extension_ref(mod):
+        logger.warning(f"Extension-registry callable detected via EXT opcode: {full_ref}")
+        return True
 
     # STEP 1: ALWAYS flag dangerous functions first (no exceptions, no allowlist override)
     # This MUST come before the ML_SAFE_GLOBALS check to prevent bypass attacks
@@ -1753,7 +1851,7 @@ def _is_actually_dangerous_global(mod: str, func: str, ml_context: dict) -> bool
     # setattr, delattr, __import__, compile, etc.) are already caught in STEP 1 via
     # ALWAYS_DANGEROUS_FUNCTIONS, so any function reaching this point that is in the
     # ML_SAFE_GLOBALS allowlist (e.g., builtins.slice, builtins.set) is genuinely safe.
-    if mod in ALWAYS_DANGEROUS_MODULES:
+    if _is_dangerous_module(mod):
         if _is_safe_ml_global(mod, func):
             logger.debug(
                 f"Safe function from dangerous module: {mod}.{func} (explicitly allowlisted in ML_SAFE_GLOBALS)"
@@ -1851,6 +1949,10 @@ def _build_symbolic_reference_maps(
         if name == "GLOBAL" and isinstance(arg, str):
             parsed = _parse_module_function(arg)
             stack.append(parsed if parsed else unknown)
+            continue
+
+        if name in {"EXT1", "EXT2", "EXT4"}:
+            stack.append(_resolve_copyreg_extension(arg))
             continue
 
         if name == "STACK_GLOBAL":
@@ -2449,13 +2551,16 @@ def is_dangerous_reduce_pattern(
 
     def _is_dangerous_ref(mod: str, func: str) -> bool:
         """Check if a module.function reference is dangerous enough to flag."""
+        if _is_copyreg_extension_ref(mod):
+            return True
+
         full_ref = f"{mod}.{func}"
         # Check ALWAYS_DANGEROUS functions FIRST (before allowlist to prevent bypass)
         if full_ref in ALWAYS_DANGEROUS_FUNCTIONS or func in ALWAYS_DANGEROUS_FUNCTIONS:
             return True
         # Check dangerous modules, but allow explicitly safe-listed functions
         # (truly dangerous functions like eval/exec/open are caught above)
-        if mod in ALWAYS_DANGEROUS_MODULES:
+        if _is_dangerous_module(mod):
             return not _is_safe_ml_global(mod, func)
         # Safe ML globals (checked after dangerous lists)
         if _is_safe_ml_global(mod, func):
@@ -2920,41 +3025,37 @@ class PickleScanner(BaseScanner):
         if file_ext in [".pkl", ".pickle", ".dill", ".joblib"]:
             return True
 
-        # For ambiguous extensions, check the actual file format
-        if file_ext in [".bin", ".pt", ".pth", ".ckpt"]:
-            try:
-                # Import here to avoid circular dependency
-                from modelaudit.utils.file.detection import (
-                    detect_file_format,
-                    validate_file_type,
+        try:
+            # Import here to avoid circular dependency
+            from modelaudit.utils.file.detection import (
+                detect_file_format,
+                validate_file_type,
+            )
+
+            file_format = detect_file_format(path)
+
+            # For security-sensitive pickle files, also validate file type
+            # This helps detect potential file spoofing attacks
+            if file_format == "pickle" and not validate_file_type(path):
+                # File type validation failed - this could be suspicious
+                # Log but still allow scanning for now (let scanner handle the validation)
+                logger.warning(
+                    f"File type validation failed for potential pickle file: {path}",
                 )
 
-                file_format = detect_file_format(path)
-
-                # For security-sensitive pickle files, also validate file type
-                # This helps detect potential file spoofing attacks
-                if file_format == "pickle" and not validate_file_type(path):
-                    # File type validation failed - this could be suspicious
-                    # Log but still allow scanning for now (let scanner handle the validation)
-                    logger.warning(
-                        f"File type validation failed for potential pickle file: {path}",
-                    )
-
-                # Handle both pickle and zip formats (PyTorch .bin files are often zip)
-                # PyTorch files saved with torch.save() are ZIP archives containing pickled data
-                if file_format == "pickle":
-                    return True
-                elif file_format == "zip" and file_ext in [".bin", ".pt", ".pth"]:
-                    # PyTorch ZIP files should be handled by PyTorchZipScanner or PyTorchBinaryScanner
-                    # The pickle scanner shouldn't try to parse them as regular pickle files
-                    return False
-
+            # Handle both pickle and zip formats (PyTorch .bin files are often zip)
+            # PyTorch files saved with torch.save() are ZIP archives containing pickled data
+            if file_format == "pickle":
+                return True
+            elif file_format == "zip" and file_ext in [".bin", ".pt", ".pth"]:
+                # PyTorch ZIP files should be handled by PyTorchZipScanner or PyTorchBinaryScanner
+                # The pickle scanner shouldn't try to parse them as regular pickle files
                 return False
-            except Exception:
-                # If detection fails, fall back to extension check
-                return file_ext in cls.supported_extensions
 
-        return False
+            return False
+        except Exception:
+            # If detection fails, fall back to extension check
+            return file_ext in cls.supported_extensions
 
     def _get_surrounding_data(self, data: bytes, position: int, window_size: int = 1024) -> bytes:
         """Get data surrounding a specific position for analysis."""

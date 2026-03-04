@@ -1347,13 +1347,14 @@ def scan_command(
 
                 # Early exit for common non-model file extensions
                 # Note: Allow .json, .yaml, .yml, .md as they can be model config/documentation files
+                # Note: .txt is used by LightGBM native format, so only skip if
+                #       no registered scanner can handle the file.
                 # Use actual_path (which may be a downloaded file) instead of original path
                 scan_path = actual_path if url_handled else path
                 if os.path.isfile(scan_path):
                     _, ext = os.path.splitext(scan_path)
                     ext = ext.lower()
                     if ext in (
-                        ".txt",
                         ".py",
                         ".js",
                         ".html",
@@ -1363,6 +1364,16 @@ def scan_command(
                             logger.debug(f"Skipped: {scan_path} (non-model file)")
                         click.echo(f"Skipping non-model file: {scan_path}")
                         continue
+                    if ext == ".txt":
+                        # .txt may be a LightGBM native text-format model.
+                        # Let the scanner registry decide via can_handle.
+                        from modelaudit.scanners import SCANNER_REGISTRY
+
+                        if not any(cls().can_handle(scan_path) for cls in SCANNER_REGISTRY):
+                            if verbose:
+                                logger.debug(f"Skipped: {scan_path} (non-model .txt file)")
+                            click.echo(f"Skipping non-model file: {scan_path}")
+                            continue
 
                 # Show progress indicator if in text mode and not writing to a file
                 spinner = None
