@@ -20,15 +20,6 @@ def _is_contained_in(child: Path, parent: Path) -> bool:
         return False
 
 
-def _is_contained_in(child: Path, parent: Path) -> bool:
-    """Check if child path is contained within parent directory."""
-    try:
-        child.relative_to(parent)
-        return True
-    except ValueError:
-        return False
-
-
 def _get_onnx_mapping() -> Any:
     """Get ONNX mapping module from different locations depending on version."""
     try:

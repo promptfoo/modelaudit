@@ -569,7 +569,7 @@ class KerasZipScanner(BaseScanner):
                 out.extend(self._collect_string_tokens(value))
             return out
         if isinstance(obj, list):
-            out: list[str] = []
+            out = []
             for value in obj:
                 out.extend(self._collect_string_tokens(value))
             return out
