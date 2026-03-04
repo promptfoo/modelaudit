@@ -1,6 +1,7 @@
 import os
 import tempfile
 import zipfile
+from pathlib import Path
 
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.zip_scanner import ZipScanner
@@ -279,66 +280,54 @@ class TestZipScanner:
         finally:
             os.unlink(tmp_path)
 
-    def test_scan_zip_with_proto0_pickle_disguised_as_text(self) -> None:
+    def test_scan_zip_with_proto0_pickle_disguised_as_text(self, tmp_path: Path) -> None:
         """Protocol 0 pickle in .txt entry should still be detected as pickle content."""
-        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
-            with zipfile.ZipFile(tmp.name, "w") as z:
-                z.writestr("payload.txt", b'cos\nsystem\n(S"echo pwned"\ntR.')
-            tmp_path = tmp.name
+        archive_path = tmp_path / "proto0_payload.zip"
+        with zipfile.ZipFile(archive_path, "w") as z:
+            z.writestr("payload.txt", b'cos\nsystem\n(S"echo pwned"\ntR.')
 
-        try:
-            result = self.scanner.scan(tmp_path)
-            assert result.success is True
-            assert result.has_errors
+        result = self.scanner.scan(str(archive_path))
+        assert result.success is True
+        assert result.has_errors
 
-            critical_messages = [
-                issue.message.lower() for issue in result.issues if issue.severity == IssueSeverity.CRITICAL
-            ]
-            assert any("os.system" in msg or "posix.system" in msg for msg in critical_messages), (
-                f"Expected critical os/posix.system issue, got: {critical_messages}"
-            )
-        finally:
-            os.unlink(tmp_path)
+        critical_messages = [
+            issue.message.lower() for issue in result.issues if issue.severity == IssueSeverity.CRITICAL
+        ]
+        assert any("os.system" in msg or "posix.system" in msg for msg in critical_messages), (
+            f"Expected critical os/posix.system issue, got: {critical_messages}"
+        )
 
-    def test_scan_zip_with_prefixed_proto0_pickle_disguised_as_text(self) -> None:
+    def test_scan_zip_with_prefixed_proto0_pickle_disguised_as_text(self, tmp_path: Path) -> None:
         """Protocol 0 pickles with MARK/LIST prefixes in .txt entries should be detected."""
-        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
-            with zipfile.ZipFile(tmp.name, "w") as z:
-                z.writestr("payload.txt", b'(lp0\n0cos\nsystem\n(S"echo pwned"\ntR.')
-            tmp_path = tmp.name
+        archive_path = tmp_path / "proto0_prefixed_payload.zip"
+        with zipfile.ZipFile(archive_path, "w") as z:
+            z.writestr("payload.txt", b'(lp0\n0cos\nsystem\n(S"echo pwned"\ntR.')
 
-        try:
-            result = self.scanner.scan(tmp_path)
-            assert result.success is True
-            assert result.has_errors
+        result = self.scanner.scan(str(archive_path))
+        assert result.success is True
+        assert result.has_errors
 
-            critical_messages = [
-                issue.message.lower() for issue in result.issues if issue.severity == IssueSeverity.CRITICAL
-            ]
-            assert any("os.system" in msg or "posix.system" in msg for msg in critical_messages), (
-                f"Expected critical os/posix.system issue, got: {critical_messages}"
-            )
-        finally:
-            os.unlink(tmp_path)
+        critical_messages = [
+            issue.message.lower() for issue in result.issues if issue.severity == IssueSeverity.CRITICAL
+        ]
+        assert any("os.system" in msg or "posix.system" in msg for msg in critical_messages), (
+            f"Expected critical os/posix.system issue, got: {critical_messages}"
+        )
 
-    def test_scan_zip_with_plain_text_global_prefix_not_treated_as_pickle(self) -> None:
+    def test_scan_zip_with_plain_text_global_prefix_not_treated_as_pickle(self, tmp_path: Path) -> None:
         """Plain text entries that start with GLOBAL-like bytes should not trigger pickle parse warnings."""
-        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
-            with zipfile.ZipFile(tmp.name, "w") as z:
-                z.writestr("notes.txt", b"c\nthis is plain text\nnot a pickle stream")
-            tmp_path = tmp.name
+        archive_path = tmp_path / "plain_text_payload.zip"
+        with zipfile.ZipFile(archive_path, "w") as z:
+            z.writestr("notes.txt", b"c\nthis is plain text\nnot a pickle stream")
 
-        try:
-            result = self.scanner.scan(tmp_path)
-            assert result.success is True
-            noisy_pickle_warnings = [
-                issue for issue in result.issues if "incomplete or corrupted pickle file" in issue.message.lower()
-            ]
-            assert not noisy_pickle_warnings, (
-                f"Expected no noisy pickle warning for plain text, got: {[i.message for i in noisy_pickle_warnings]}"
-            )
-        finally:
-            os.unlink(tmp_path)
+        result = self.scanner.scan(str(archive_path))
+        assert result.success is True
+        noisy_pickle_warnings = [
+            issue for issue in result.issues if "incomplete or corrupted pickle file" in issue.message.lower()
+        ]
+        assert not noisy_pickle_warnings, (
+            f"Expected no noisy pickle warning for plain text, got: {[i.message for i in noisy_pickle_warnings]}"
+        )
 
     def test_scan_nonexistent_file(self):
         """Test scanning a file that doesn't exist"""

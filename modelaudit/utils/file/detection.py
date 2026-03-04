@@ -17,9 +17,9 @@ GGML_MAGIC_VARIANTS = {
 # Protocol 0/1 pickles are ASCII and may not start with GLOBAL/INST.
 # Use bounded opcode parsing to reduce false positives on plain text and
 # still detect prefixed payloads (e.g., MARK/LIST/POP before GLOBAL).
-PROTO0_1_MAX_PROBE_BYTES = 64 * 1024
-PROTO0_1_MAX_PROBE_OPCODES = 4096
-PROTO0_1_START_BYTES = b"(]})cilp0IJSVNTF"
+PROTO0_1_MAX_PROBE_BYTES: int = 64 * 1024
+PROTO0_1_MAX_PROBE_OPCODES: int = 4096
+PROTO0_1_START_BYTES: bytes = b"(]})cilp0IJSVNTF"
 
 
 def _looks_like_proto0_or_1_pickle(sample: bytes) -> bool:
