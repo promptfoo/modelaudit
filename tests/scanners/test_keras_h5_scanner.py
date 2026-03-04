@@ -528,3 +528,64 @@ class TestCVE20259905H5SafeMode:
 
         cve_issues = [i for i in result.issues if "CVE-2025-9905" in i.message]
         assert len(cve_issues) == 0, "Fixed Keras versions should not trigger CVE-2025-9905 attribution"
+
+    def test_unparseable_keras_versions_mark_unknown_risk(self, tmp_path: Path) -> None:
+        """Unparseable versions must not be treated as safely non-vulnerable."""
+        scanner = KerasH5Scanner()
+        versions = ["3.11", "3.11.x", "not-a-version"]
+
+        for version in versions:
+            h5_path = tmp_path / f"model_{version.replace('.', '_')}.h5"
+            with h5py.File(h5_path, "w") as f:
+                model_config = {
+                    "class_name": "Sequential",
+                    "config": {
+                        "name": "test",
+                        "layers": [
+                            {
+                                "class_name": "Lambda",
+                                "config": {"function": "lambda x: x"},
+                            }
+                        ],
+                    },
+                }
+                f.attrs["model_config"] = json.dumps(model_config)
+                f.attrs["keras_version"] = version
+
+            result = scanner.scan(str(h5_path))
+            cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-9905"]
+            assert len(cve_issues) >= 1, f"Expected CVE uncertainty issue for non-canonical version {version}"
+            assert all(i.severity == IssueSeverity.WARNING for i in cve_issues)
+            assert all(i.details.get("parse_status") == "unknown" for i in cve_issues)
+
+            passed_checks = [c for c in result.checks if c.name == "H5 Lambda Version Risk Check"]
+            assert len(passed_checks) == 0, f"Version {version} should not be marked as safely outside vulnerable range"
+
+    def test_pep440_keras_versions_within_vulnerable_range_are_critical(self, tmp_path: Path) -> None:
+        """PEP 440 prerelease/postrelease variants in vulnerable range should be attributed."""
+        scanner = KerasH5Scanner()
+        versions = ["3.11.2rc1", "3.11.2.post1", "3.11.3rc1"]
+
+        for version in versions:
+            h5_path = tmp_path / f"model_{version.replace('.', '_')}.h5"
+            with h5py.File(h5_path, "w") as f:
+                model_config = {
+                    "class_name": "Sequential",
+                    "config": {
+                        "name": "test",
+                        "layers": [
+                            {
+                                "class_name": "Lambda",
+                                "config": {"function": "lambda x: x"},
+                            }
+                        ],
+                    },
+                }
+                f.attrs["model_config"] = json.dumps(model_config)
+                f.attrs["keras_version"] = version
+
+            result = scanner.scan(str(h5_path))
+            cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-9905"]
+            assert len(cve_issues) >= 1, f"Expected CVE attribution for version {version}"
+            assert all(i.severity == IssueSeverity.CRITICAL for i in cve_issues)
+            assert all(i.details.get("parse_status") != "unknown" for i in cve_issues)

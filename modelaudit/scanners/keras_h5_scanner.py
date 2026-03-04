@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 from typing import Any, ClassVar
 
 from modelaudit.detectors.suspicious_symbols import (
@@ -297,7 +298,7 @@ class KerasH5Scanner(BaseScanner):
                                     "Keras H5 format can ignore safe_mode=True for Lambda layers, "
                                     "allowing arbitrary code execution during model load."
                                 ),
-                                "affected_versions": "Keras 3.0.0-3.11.2",
+                                "affected_versions": "Keras >= 3.0.0, < 3.11.3",
                                 "remediation": "Upgrade Keras to >= 3.11.3 or convert to .keras format",
                             },
                             why=get_cve_2025_9905_explanation("h5_safe_mode_bypass"),
@@ -308,7 +309,7 @@ class KerasH5Scanner(BaseScanner):
                             passed=True,
                             message=(
                                 f"Lambda layer '{layer_name}' detected with Keras {keras_version}; "
-                                "outside known CVE-2025-9905 vulnerable range (3.0.0-3.11.2)"
+                                "outside known CVE-2025-9905 vulnerable range (>=3.0.0, <3.11.3)"
                             ),
                             location=f"{self.current_file_path} (layer: {layer_name})",
                             details={"layer_class": "Lambda", "layer_name": layer_name, "keras_version": keras_version},
@@ -336,7 +337,8 @@ class KerasH5Scanner(BaseScanner):
                                     "Keras H5 format can ignore safe_mode=True for Lambda layers; "
                                     "version context could not be parsed confidently."
                                 ),
-                                "affected_versions": "Keras 3.0.0-3.11.2",
+                                "affected_versions": "Keras >= 3.0.0, < 3.11.3",
+                                "remediation": "Upgrade Keras to >= 3.11.3 or convert to .keras format",
                             },
                         )
                 else:
@@ -495,18 +497,40 @@ class KerasH5Scanner(BaseScanner):
         # Don't flag Lambda layers without code - they might just be placeholders
 
     @staticmethod
-    def _is_vulnerable_to_cve_2025_9905(version: str) -> bool:
-        """Return True if version falls in Keras 3.0.0-3.11.2."""
-        parts = version.split(".", 2)
-        if len(parts) < 3:
-            return False
+    def _is_vulnerable_to_cve_2025_9905(version: str) -> bool | None:
+        """Return True/False for parseable Keras versions, else None."""
+        version_match = re.match(r"^(\d+)\.(\d+)\.(\d+)(.*)$", version.strip())
+        if not version_match:
+            return None
+
         try:
-            major, minor, patch_part = parts
-            patch_digits = "".join(ch for ch in patch_part if ch.isdigit())
-            if not patch_digits:
+            major, minor, patch = map(int, version_match.groups()[:3])
+            suffix = (version_match.group(4) or "").strip().lower()
+
+            is_prerelease = False
+            if suffix:
+                # PEP 440-like prerelease/dev identifiers should be treated as pre-fix builds.
+                if re.search(r"(?:^|[.\-])(dev|rc|a|b|alpha|beta|pre|preview)\d*", suffix):
+                    is_prerelease = True
+                elif suffix.startswith("+") or suffix.startswith(".post") or suffix.startswith("post"):
+                    is_prerelease = False
+                else:
+                    return None
+
+            if major != 3:
                 return False
-            patch = int(patch_digits)
-            return int(major) == 3 and (int(minor) < 11 or (int(minor) == 11 and patch <= 2))
+
+            if (major, minor, patch) < (3, 0, 0):
+                return False
+
+            fix_version = (3, 11, 3)
+            if (major, minor, patch) < fix_version:
+                return True
+            if (major, minor, patch) > fix_version:
+                return False
+
+            # Equal to the fix release: prerelease variants are still vulnerable.
+            return is_prerelease
         except ValueError:
             return False
 
