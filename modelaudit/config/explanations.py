@@ -882,6 +882,7 @@ def get_cve_2025_1550_explanation(issue_type: str) -> str:
     )
 
 
+
 def get_cve_2019_6446_explanation(vulnerability_type: str) -> str:
     """Get specific explanation for CVE-2019-6446 (NumPy allow_pickle RCE)."""
     explanations = {

@@ -6,7 +6,7 @@ import os
 import re
 import tempfile
 from pathlib import Path
-from typing import ClassVar
+from typing import Any, ClassVar
 
 from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 
@@ -55,7 +55,7 @@ class LlamafileScanner(BaseScanner):
     description = "Scans Llamafile executables and embedded GGUF payloads"
     supported_extensions: ClassVar[list[str]] = [".llamafile", ".exe", ""]
 
-    def __init__(self, config: dict | None = None):
+    def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
         self.preview_bytes = int(self.config.get("llamafile_preview_bytes", 2 * 1024 * 1024))
         self.max_payload_scan_bytes = int(self.config.get("llamafile_payload_scan_bytes", 512 * 1024 * 1024))
