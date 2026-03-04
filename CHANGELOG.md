@@ -24,6 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **feat:** add standalone compressed-wrapper scanner support for `.gz`, `.bz2`, `.xz`, `.lz4`, and `.zlib` with strict signature validation, decompression size/ratio safeguards, and inner-payload scanner routing
 - **security:** add RKNN `.rknn` scanner with strict `RKNN` signature detection, bounded metadata parsing, and contextual command/network/obfuscation checks
 
+### Security
+
+- **keras:** detect CVE-2025-1550 arbitrary module references in `.keras` config.json (CVSS 9.8, safe_mode bypass)
+
 ### Fixed
 
 - **security**: harden pickle scanner stack resolution to correctly track `STACK_GLOBAL` and memoized `REDUCE` call targets, preventing decoy-string and `BINGET` bypasses
