@@ -276,7 +276,10 @@ class KerasH5Scanner(BaseScanner):
                     layer_name = raw_layer_name or f"lambda_{layer_counts.get('Lambda', 1)}"
                     self._check_lambda_layer(layer_config, result)
                     keras_version = result.metadata.get("keras_version")
-                    if isinstance(keras_version, str) and self._is_vulnerable_to_cve_2025_9905(keras_version):
+                    vuln_status = (
+                        self._is_vulnerable_to_cve_2025_9905(keras_version) if isinstance(keras_version, str) else None
+                    )
+                    if vuln_status is True:
                         # CVE-2025-9905: safe_mode=True is silently ignored for H5 format
                         result.add_check(
                             name="CVE-2025-9905: H5 safe_mode Bypass",
@@ -303,7 +306,7 @@ class KerasH5Scanner(BaseScanner):
                             },
                             why=get_cve_2025_9905_explanation("h5_safe_mode_bypass"),
                         )
-                    elif isinstance(keras_version, str):
+                    elif vuln_status is False:
                         result.add_check(
                             name="H5 Lambda Version Risk Check",
                             passed=True,
