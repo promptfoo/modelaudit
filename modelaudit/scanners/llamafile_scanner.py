@@ -47,6 +47,23 @@ NETWORK_TOKENS = (
     "connect(",
 )
 
+# Patterns found in the legitimate llamafile/cosmopolitan runtime that are
+# NOT indicators of compromise.  These appear in error messages, debug format
+# strings, and server status output.
+LLAMAFILE_RUNTIME_SAFE_PATTERNS = (
+    "llamafile",
+    "llama server listening",
+    "llama.cpp",
+    "cosmopolitan",
+    "APE is running on WIN32 inside WSL",
+    "binfmt_misc",
+    "%rSYS",
+    "json-schema.org",
+    "%'18T connect",
+    "%'18T socket",
+    "llama_new_context_with_model",
+)
+
 
 class LlamafileScanner(BaseScanner):
     """Scanner for Llamafile binaries that package runtime + embedded model data."""
@@ -164,12 +181,20 @@ class LlamafileScanner(BaseScanner):
         result.finish(success=not result.has_errors)
         return result
 
+    @staticmethod
+    def _is_known_runtime_string(text: str) -> bool:
+        """Return True if the string matches a known-safe llamafile runtime pattern."""
+        lowered = text.lower()
+        return any(pattern.lower() in lowered for pattern in LLAMAFILE_RUNTIME_SAFE_PATTERNS)
+
     def _scan_runtime_strings(self, path: str, blob: bytes, result: ScanResult) -> None:
         command_hits: set[str] = set()
         network_hits: set[str] = set()
 
         for match in PRINTABLE_TEXT_RE.finditer(blob):
             text = match.group().decode("utf-8", errors="ignore").strip()
+            if self._is_known_runtime_string(text):
+                continue
             lowered = text.lower()
             for token in COMMAND_TOKENS:
                 if token in lowered:
