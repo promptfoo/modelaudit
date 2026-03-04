@@ -281,7 +281,7 @@ class GgufScanner(BaseScanner):
                         name="Tensor Dimension Validation",
                         passed=False,
                         message=f"Tensor {t_name} has excessive dimensions ({nd}), skipping for security",
-                        rule_code="S703",
+                        rule_code="S804",
                         severity=IssueSeverity.CRITICAL,
                         location=self.current_file_path,
                         details={"tensor_name": t_name, "dimensions": nd, "max_allowed": 1000},
@@ -298,7 +298,7 @@ class GgufScanner(BaseScanner):
                         severity=IssueSeverity.WARNING,
                         location=self.current_file_path,
                         details={"tensor_name": t_name, "dimensions": nd, "max_normal": 8},
-                        rule_code="S703",
+                        rule_code="S804",
                     )
 
                 dims = [struct.unpack("<Q", f.read(8))[0] for _ in range(nd)]
@@ -411,7 +411,7 @@ class GgufScanner(BaseScanner):
                             severity=IssueSeverity.WARNING,
                             location=self.current_file_path,
                             details={"tensor_name": tensor["name"], "block_size": blck, "elements": nelements},
-                            rule_code="S703",
+                            rule_code="S804",
                         )
 
                     expected = ((nelements + blck - 1) // blck) * ts
@@ -460,7 +460,7 @@ class GgufScanner(BaseScanner):
                     severity=IssueSeverity.INFO,
                     location=self.current_file_path,
                     details={"tensor_name": tensor["name"], "error": str(e)},
-                    rule_code="S703",
+                    rule_code="S804",
                 )
 
         result.bytes_scanned = f.tell()
