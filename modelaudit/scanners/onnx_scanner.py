@@ -562,7 +562,7 @@ class OnnxScanner(BaseScanner):
         metadata = super().extract_metadata(file_path)
 
         if not _check_onnx():
-            metadata["error"] = "ONNX library not available"
+            metadata["extraction_error"] = "ONNX library not available"
             return metadata
 
         try:
@@ -589,20 +589,22 @@ class OnnxScanner(BaseScanner):
 
             # Inputs/outputs
             metadata["inputs"] = [
-                {"name": inp.name, "type": str(inp.type.tensor_type.elem_type)} for inp in model.graph.input
+                {"name": inp.name, "type": onnx.helper.printable_type(inp.type)} for inp in model.graph.input
             ]
             metadata["outputs"] = [
-                {"name": out.name, "type": str(out.type.tensor_type.elem_type)} for out in model.graph.output
+                {"name": out.name, "type": onnx.helper.printable_type(out.type)} for out in model.graph.output
             ]
 
             # Operators used
-            operators = list({node.op_type for node in model.graph.node})
+            operators = sorted({node.op_type for node in model.graph.node})
             metadata["operators"] = operators
 
             # Custom domains
-            custom_domains = [node.domain for node in model.graph.node if node.domain and node.domain != ""]
+            custom_domains = sorted(
+                {node.domain for node in model.graph.node if node.domain and node.domain not in {"", "ai.onnx"}}
+            )
             if custom_domains:
-                metadata["custom_domains"] = list(set(custom_domains))
+                metadata["custom_domains"] = custom_domains
 
         except Exception as e:
             metadata["extraction_error"] = str(e)

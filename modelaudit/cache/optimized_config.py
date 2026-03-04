@@ -112,7 +112,11 @@ class ConfigurationExtractor:
         if not file_path:
             return CacheConfiguration({}), None
 
-        # Check cache for parsed configuration
+        # Cache entries are keyed by id(config_dict), so callers must treat config dicts as
+        # immutable after CacheConfiguration construction. This is safe for current flows that
+        # use apply_smart_overrides() to build fresh dicts, but mutating a config object later
+        # can cause stale _config_cache/_result_cache entries until _cache_expiry elapses.
+        # Check cache for parsed configuration.
         config_key = id(config_dict) if config_dict else "default"
         now = time.monotonic()
 

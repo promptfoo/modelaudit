@@ -589,7 +589,7 @@ class SafeTensorsScanner(BaseScanner):
                 # Read header length
                 header_len_bytes = f.read(8)
                 if len(header_len_bytes) != 8:
-                    metadata["error"] = "Invalid SafeTensors header"
+                    metadata["extraction_error"] = "Invalid SafeTensors header"
                     return metadata
 
                 header_len = struct.unpack("<Q", header_len_bytes)[0]
@@ -597,11 +597,11 @@ class SafeTensorsScanner(BaseScanner):
                 MAX_HEADER_BYTES = int(self.config.get("max_safetensors_header_bytes", 16 * 1024 * 1024))
                 max_allowed = max(0, min(MAX_HEADER_BYTES, file_size - 8))
                 if header_len <= 0 or header_len > max_allowed:
-                    metadata["error"] = f"Invalid SafeTensors header length: {header_len}"
+                    metadata["extraction_error"] = f"Invalid SafeTensors header length: {header_len}"
                     return metadata
                 header_bytes = f.read(header_len)
                 if len(header_bytes) != header_len:
-                    metadata["error"] = "Truncated SafeTensors header"
+                    metadata["extraction_error"] = "Truncated SafeTensors header"
                     return metadata
                 header = json.loads(header_bytes)
 

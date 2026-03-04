@@ -14,6 +14,12 @@ import pytest
 from modelaudit.metadata_extractor import ModelMetadataExtractor
 
 
+def _has_tf_protos() -> bool:
+    import modelaudit.protos
+
+    return modelaudit.protos._check_vendored_protos()
+
+
 class TestModelMetadataExtractor:
     """Test the ModelMetadataExtractor class."""
 
@@ -195,27 +201,69 @@ class TestModelMetadataExtractor:
         assert metadata.get("deserialization_skipped") is True
         assert metadata.get("reason") == "Deserialization disabled for metadata extraction"
 
-    @pytest.mark.slow
     def test_tf_savedmodel_metadata_no_deserialization(self, tmp_path: Path) -> None:
         """Ensure TensorFlow SavedModel metadata extraction does not deserialize by default."""
-        try:
-            import tensorflow as tf
-
-            # Verify that tf.saved_model.load is actually importable
-            _ = tf.saved_model.load
-        except (ImportError, AttributeError):
-            pytest.skip("TensorFlow with saved_model.load not available")
+        if not _has_tf_protos():
+            pytest.skip("TensorFlow protobuf stubs unavailable")
 
         extractor = ModelMetadataExtractor()
 
         saved_model_dir = tmp_path / "saved_model"
         saved_model_dir.mkdir()
-        (saved_model_dir / "saved_model.pb").write_bytes(b"")  # Minimal placeholder
+        saved_model_pb = saved_model_dir / "saved_model.pb"
+        saved_model_pb.write_bytes(b"")  # Minimal placeholder
 
-        metadata = extractor.extract(str(saved_model_dir))
+        metadata = extractor.extract(str(saved_model_pb))
 
         assert metadata.get("deserialization_skipped") is True
         assert metadata.get("reason") == "Deserialization disabled for metadata extraction"
+
+    def test_tf_savedmodel_metadata_signature_extraction_without_runtime_load(self, tmp_path: Path) -> None:
+        """Ensure SavedModel metadata comes from protobuf parsing, not runtime loading."""
+        if not _has_tf_protos():
+            pytest.skip("TensorFlow protobuf stubs unavailable")
+
+        from tensorflow.core.framework.types_pb2 import DataType
+        from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
+
+        saved_model = SavedModel()
+        meta_graph = saved_model.meta_graphs.add()
+        meta_graph.meta_info_def.tags.append("serve")
+        signature = meta_graph.signature_def["serving_default"]
+        signature.method_name = "tensorflow/serving/predict"
+
+        input_tensor = signature.inputs["input_tensor"]
+        input_tensor.name = "serving_default_input:0"
+        input_tensor.dtype = DataType.DT_FLOAT
+        input_tensor.tensor_shape.dim.add().size = 1
+        input_tensor.tensor_shape.dim.add().size = 4
+
+        output_tensor = signature.outputs["output_tensor"]
+        output_tensor.name = "StatefulPartitionedCall:0"
+        output_tensor.dtype = DataType.DT_FLOAT
+        output_tensor.tensor_shape.dim.add().size = 1
+        output_tensor.tensor_shape.dim.add().size = 2
+
+        saved_model_dir = tmp_path / "saved_model_runtime_free"
+        saved_model_dir.mkdir()
+        saved_model_pb = saved_model_dir / "saved_model.pb"
+        saved_model_pb.write_bytes(saved_model.SerializeToString())
+
+        extractor = ModelMetadataExtractor()
+        metadata = extractor.extract(str(saved_model_pb), allow_deserialization=True)
+
+        assert metadata["format"] == "tf_savedmodel"
+        assert metadata.get("deserialization_skipped") is not True
+        assert "extraction_error" not in metadata
+        assert metadata.get("meta_graph_count") == 1
+        assert metadata.get("signatures") == ["serving_default"]
+
+        signature_details = metadata.get("signature_details", {})
+        serving_sig = signature_details.get("serving_default", {})
+        assert serving_sig.get("inputs") == ["input_tensor"]
+        assert serving_sig.get("outputs") == ["output_tensor"]
+        assert serving_sig.get("method_name") == "tensorflow/serving/predict"
+        assert serving_sig.get("input_tensors", {}).get("input_tensor", {}).get("dtype") == "DT_FLOAT"
 
     def test_numpy_metadata_no_deserialization(self, tmp_path: Path) -> None:
         """Ensure NumPy metadata extraction uses allow_pickle=False by default."""

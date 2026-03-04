@@ -1,5 +1,6 @@
 """Scanner for TensorFlow SavedModel directories and files."""
 
+import contextlib
 import logging
 import os
 from pathlib import Path
@@ -930,56 +931,84 @@ class TensorFlowSavedModelScanner(BaseScanner):
             metadata["reason"] = "Deserialization disabled for metadata extraction"
             return metadata
 
+        if not _check_protos():
+            metadata["extraction_error"] = "TensorFlow protobuf stubs unavailable for metadata extraction"
+            return metadata
+
         try:
-            import tensorflow as tf
+            import modelaudit.protos  # noqa: F401, I001
+            from importlib.metadata import PackageNotFoundError, version
 
-            # Load the SavedModel
-            model = tf.saved_model.load(file_path)
+            from tensorflow.core.framework.types_pb2 import DataType
+            from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
 
-            # Basic model info
+            def _tensor_info_to_dict(tensor_info: Any) -> dict[str, Any]:
+                try:
+                    dtype_name = DataType.Name(tensor_info.dtype)
+                except ValueError:
+                    dtype_name = str(tensor_info.dtype)
+                return {
+                    "tensor_name": tensor_info.name,
+                    "dtype": dtype_name,
+                    "shape": [int(dim.size) for dim in tensor_info.tensor_shape.dim],
+                }
+
+            path_obj = Path(file_path)
+            export_dir = path_obj if path_obj.is_dir() else path_obj.parent
+
+            saved_model_pb = export_dir / "saved_model.pb"
+            if not saved_model_pb.exists():
+                metadata["extraction_error"] = f"saved_model.pb not found in export directory: {export_dir}"
+                return metadata
+
+            with open(saved_model_pb, "rb") as f:
+                content = f.read()
+
+            saved_model = SavedModel()
+            saved_model.ParseFromString(content)
+
+            signature_details: dict[str, dict[str, Any]] = {}
+            tag_sets: list[list[str]] = []
+            trackable_objects = 0
+
+            for meta_graph_index, meta_graph in enumerate(saved_model.meta_graphs):
+                tags = list(meta_graph.meta_info_def.tags)
+                if tags:
+                    tag_sets.append(tags)
+                trackable_objects += len(meta_graph.object_graph_def.nodes)
+
+                for signature_name, signature_def in sorted(meta_graph.signature_def.items()):
+                    detail_key = signature_name
+                    if detail_key in signature_details:
+                        suffix = ",".join(tags) if tags else str(meta_graph_index)
+                        detail_key = f"{signature_name}@{suffix}"
+
+                    input_items = sorted(signature_def.inputs.items())
+                    output_items = sorted(signature_def.outputs.items())
+                    signature_details[detail_key] = {
+                        "inputs": [name for name, _ in input_items],
+                        "outputs": [name for name, _ in output_items],
+                        "method_name": signature_def.method_name,
+                        "input_tensors": {name: _tensor_info_to_dict(tensor_info) for name, tensor_info in input_items},
+                        "output_tensors": {
+                            name: _tensor_info_to_dict(tensor_info) for name, tensor_info in output_items
+                        },
+                    }
+
+            with contextlib.suppress(PackageNotFoundError, Exception):
+                metadata["tensorflow_version"] = version("tensorflow")
+
             metadata.update(
                 {
-                    "tensorflow_version": tf.__version__,
-                    "signatures": list(model.signatures.keys()) if hasattr(model, "signatures") else [],
-                    "trackable_objects": len(model._list_all_trackable_objects())
-                    if hasattr(model, "_list_all_trackable_objects")
-                    else 0,
+                    "meta_graph_count": len(saved_model.meta_graphs),
+                    "saved_model_pb_size": len(content),
+                    "signatures": sorted(signature_details.keys()),
+                    "signature_details": signature_details,
+                    "trackable_objects": trackable_objects,
                 }
             )
-
-            # Try to get more detailed signature info
-            if hasattr(model, "signatures"):
-                signature_details = {}
-                for sig_name, signature in model.signatures.items():
-                    sig_info = {
-                        "inputs": list(signature.inputs.keys()) if hasattr(signature, "inputs") else [],
-                        "outputs": list(signature.outputs.keys()) if hasattr(signature, "outputs") else [],
-                    }
-                    signature_details[sig_name] = sig_info
-
-                if signature_details:
-                    metadata["signature_details"] = signature_details
-
-            # Check for variables
-            try:
-                variables = model.variables if hasattr(model, "variables") else []
-                if variables:
-                    metadata.update(
-                        {
-                            "variable_count": len(variables),
-                            "trainable_variables": sum(1 for v in variables if getattr(v, "trainable", True)),
-                        }
-                    )
-
-                    # Calculate total parameters
-                    total_params = sum(
-                        v.shape.num_elements() if hasattr(v.shape, "num_elements") else 0 for v in variables
-                    )
-                    if total_params > 0:
-                        metadata["total_parameters"] = total_params
-
-            except Exception:
-                pass  # Variables might not be accessible
+            if tag_sets:
+                metadata["tag_sets"] = tag_sets
 
         except Exception as e:
             metadata["extraction_error"] = str(e)

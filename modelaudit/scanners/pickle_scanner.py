@@ -5848,17 +5848,12 @@ class PickleScanner(BaseScanner):
 
     def _detect_pickle_protocol(self, data: bytes) -> int:
         """Detect pickle protocol version."""
-        if len(data) < 2:
+        if not data:
             return 0
 
-        # Protocol is usually indicated in the first few bytes
-        first_byte = data[0]
-
-        # Protocol 0: ASCII
-        if first_byte in [ord(b"("), ord(b"c"), ord(b"N"), ord(b"S")]:
-            return 0
-        # Protocol 2+: Binary
-        elif first_byte == 0x80 and len(data) > 1:
+        # Binary protocols start with PROTO opcode (0x80) followed by protocol number.
+        # Any non-binary opener is protocol 0/1 ASCII style; report as 0 for scanner logic.
+        if data[0] == 0x80 and len(data) > 1:
             return data[1]
 
-        return -1  # Unknown protocol
+        return 0
