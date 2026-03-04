@@ -472,7 +472,11 @@ class KerasH5Scanner(BaseScanner):
 
         try:
             import h5py
+        except Exception:
+            metadata["extraction_error"] = "h5py is not installed"
+            return metadata
 
+        try:
             with h5py.File(file_path, "r") as h5_file:
                 # Basic H5 structure
                 metadata.update(
