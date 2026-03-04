@@ -10,10 +10,15 @@ suite verifies that:
 3. BINARY_CODE_PATTERNS includes posix/nt internal module names
 """
 
+from pathlib import Path
+from typing import Any
+
 from modelaudit.detectors.suspicious_symbols import BINARY_CODE_PATTERNS
 from modelaudit.scanners import PickleScanner
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.utils.file.detection import detect_file_format
+
+PROTOCOL1_POSIX_PAYLOAD = b"cposix\nsystem\nq\x00(X\x02\x00\x00\x00idq\x01tq\x02Rq\x03."
 
 
 class TestCVE202510155FormatDetection:
@@ -38,6 +43,12 @@ class TestCVE202510155FormatDetection:
         bin_path = tmp_path / "model.bin"
         # Protocol 2 magic bytes
         bin_path.write_bytes(b"\x80\x02cposix\nsystem\n.")
+        assert detect_file_format(str(bin_path)) == "pickle"
+
+    def test_protocol1_global_opcode_detected_as_pickle(self, tmp_path: Path) -> None:
+        """Protocol 1 payloads using GLOBAL + memo opcodes should be detected."""
+        bin_path = tmp_path / "model.bin"
+        bin_path.write_bytes(PROTOCOL1_POSIX_PAYLOAD)
         assert detect_file_format(str(bin_path)) == "pickle"
 
     def test_safetensors_bin_not_misdetected(self, tmp_path: Path) -> None:
@@ -139,6 +150,18 @@ class TestCVE202510155PickleScanning:
         assert self._has_critical_symbol_issue(result, "posix.system"), (
             f"Expected CRITICAL issue for posix.system in protocol 2 payload. "
             f"Issues: {[i.message for i in result.issues]}"
+        )
+
+    def test_protocol1_posix_in_bin_detected(self, tmp_path: Path) -> None:
+        """Protocol 1 payload with posix.system in .bin should be flagged CRITICAL."""
+        bin_path = tmp_path / "payload.bin"
+        bin_path.write_bytes(PROTOCOL1_POSIX_PAYLOAD)
+
+        scanner = PickleScanner()
+        result = scanner.scan(str(bin_path))
+
+        assert self._has_critical_symbol_issue(result, "posix.system"), (
+            f"Expected CRITICAL issue for protocol 1 posix.system. Issues: {[i.message for i in result.issues]}"
         )
 
     def test_comment_token_does_not_bypass_detection(self, tmp_path: Path) -> None:
