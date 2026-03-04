@@ -23,7 +23,7 @@ from ..config.explanations import (
     get_pattern_explanation,
 )
 from .base import BaseScanner, IssueSeverity, ScanResult
-from .keras_utils import check_subclassed_model, is_keras_version_vulnerable_to_cve_2024_3660
+from .keras_utils import check_subclassed_model
 
 # CVE-2025-1550: Keras safe_mode bypass via arbitrary module references in config.json
 # Allowlist of top-level module names that are safe in Keras model configs.
@@ -290,6 +290,7 @@ class KerasZipScanner(BaseScanner):
                             "cve_id": "CVE-2024-3660",
                             "cvss": 9.8,
                             "cwe": "CWE-94",
+                            "description": "Lambda layer deserialization can enable arbitrary code injection.",
                             "remediation": "Remove Lambda layers or upgrade Keras to >= 2.13",
                         },
                         why=get_cve_2024_3660_explanation("lambda_code_injection"),
@@ -708,16 +709,21 @@ class KerasZipScanner(BaseScanner):
 
     @staticmethod
     def _is_vulnerable_to_cve_2024_3660(version: str) -> bool:
-        """Return True for Keras versions lower than 2.13.0."""
+        """Return True for Keras versions lower than 2.13.0.
+
+        Handles two-part versions (e.g. "2.10") by treating missing patch as 0.
+        """
         parts = version.split(".", 2)
-        if len(parts) < 3:
+        if len(parts) < 2:
             return False
         try:
-            major, minor, patch_part = parts
-            patch_digits = "".join(ch for ch in patch_part if ch.isdigit())
-            if not patch_digits:
-                return False
-            parsed = (int(major), int(minor), int(patch_digits))
-            return parsed < (2, 13, 0)
+            major = int(parts[0])
+            minor = int(parts[1])
+            patch = 0
+            if len(parts) == 3:
+                patch_digits = "".join(ch for ch in parts[2] if ch.isdigit())
+                if patch_digits:
+                    patch = int(patch_digits)
+            return (major, minor, patch) < (2, 13, 0)
         except ValueError:
             return False

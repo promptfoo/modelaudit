@@ -290,6 +290,7 @@ class KerasH5Scanner(BaseScanner):
                                 "cve_id": "CVE-2024-3660",
                                 "cvss": 9.8,
                                 "cwe": "CWE-94",
+                                "description": "Lambda layer deserialization can enable arbitrary code injection.",
                                 "remediation": "Remove Lambda layers or upgrade Keras to >= 2.13",
                             },
                             why=get_cve_2024_3660_explanation("lambda_code_injection"),
