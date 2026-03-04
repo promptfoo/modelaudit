@@ -1009,6 +1009,32 @@ def get_cve_2022_25882_explanation(vulnerability_type: str) -> str:
     )
 
 
+def get_cve_2024_27318_explanation(vulnerability_type: str) -> str:
+    """Get specific explanation for CVE-2024-27318 (ONNX nested path traversal bypass)."""
+    explanations = {
+        "nested_traversal": (
+            "CVE-2024-27318 (CVSS 7.5): ONNX external_data locations that start "
+            "with a legitimate directory prefix followed by '../' segments bypass "
+            "the lstrip-based sanitization added for CVE-2022-25882. For example, "
+            "'subdir/../../etc/passwd' passes the lstrip('.') check but still "
+            "resolves outside the model directory."
+        ),
+        "onnx_version": (
+            "CVE-2024-27318 affects ONNX versions through 1.15.x where the "
+            "external_data path validation relied on lstrip-based sanitization. "
+            "Upgrade to ONNX >= 1.16.0 and validate that external_data paths "
+            "resolve within the model directory."
+        ),
+    }
+
+    return explanations.get(
+        vulnerability_type,
+        "CVE-2024-27318: ONNX nested path traversal bypasses CVE-2022-25882 "
+        "sanitization via paths like 'subdir/../../etc/passwd'. Validate "
+        "external_data paths resolve within the model directory.",
+    )
+
+
 def get_cve_2019_6446_explanation(vulnerability_type: str) -> str:
     """Get specific explanation for CVE-2019-6446 (NumPy allow_pickle RCE)."""
     explanations = {
