@@ -981,6 +981,8 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
         assert any(i.severity == IssueSeverity.CRITICAL and "webbrowser" in i.message for i in result.issues), (
             f"Expected CRITICAL webbrowser issue, got: {[i.message for i in result.issues]}"
         )
+
+
 class TestCVE20251716PipMainBlocklist(unittest.TestCase):
     """Test CVE-2025-1716: pickle bypass via pip.main() as callable."""
 
