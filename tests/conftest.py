@@ -89,6 +89,7 @@ def pytest_runtest_setup(item):
             "test_onnx_scanner.py",  # ONNX scanner CVE detection tests
             "test_cve_2025_10155_bin_pickle.py",  # CVE-2025-10155 .bin pickle detection tests
             "test_catboost_scanner.py",  # CatBoost scanner tests
+            "test_r_serialized_scanner.py",  # R serialized scanner tests
         ]
 
         # Check if this is an allowed test file

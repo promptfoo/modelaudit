@@ -66,6 +66,9 @@ def test_detect_file_format_by_extension(tmp_path):
         ".pb": "protobuf",
         ".tflite": "tflite",
         ".cbm": "catboost",
+        ".rds": "r_serialized",
+        ".rda": "r_serialized",
+        ".rdata": "r_serialized",
         ".unknown": "unknown",
     }
 
@@ -83,6 +86,14 @@ def test_detect_file_format_hdf5(tmp_path):
     hdf5_path.write_bytes(hdf5_magic + b"additional content")
 
     assert detect_file_format(str(hdf5_path)) == "hdf5"
+
+
+def test_detect_r_serialized_magic_headers(tmp_path: Path) -> None:
+    rds = tmp_path / "model.rds"
+    rds.write_bytes(b"RDX3\n" + b"\x00" * 20)
+    assert detect_file_format_from_magic(str(rds)) == "r_serialized"
+    assert detect_file_format(str(rds)) == "r_serialized"
+    assert validate_file_type(str(rds)) is True
 
 
 def test_detect_file_format_proto0_pickle_with_text_extension(tmp_path: Path) -> None:

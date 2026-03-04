@@ -193,6 +193,15 @@ class ScannerRegistry:
                 "dependencies": [],  # No heavy dependencies
                 "numpy_sensitive": False,
             },
+            "r_serialized": {
+                "module": "modelaudit.scanners.r_serialized_scanner",
+                "class": "RSerializedScanner",
+                "description": "Scans R serialized model files",
+                "extensions": [".rds", ".rda", ".rdata"],
+                "priority": 8,
+                "dependencies": [],
+                "numpy_sensitive": False,
+            },
             "skops": {
                 "module": "modelaudit.scanners.skops_scanner",
                 "class": "SkopsScanner",
@@ -685,6 +694,7 @@ def __getattr__(name: str) -> Any:
         "ExecuTorchScanner": "executorch",
         "GgufScanner": "gguf",
         "JoblibScanner": "joblib",
+        "RSerializedScanner": "r_serialized",
         "SkopsScanner": "skops",
         "NumPyScanner": "numpy",
         "OciLayerScanner": "oci_layer",
