@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **tests:** enable existing PaddlePaddle scanner tests in CI by adding `test_paddle_scanner.py` to the allowed test files list (Python 3.10/3.12/3.13)
 - **security:** detect CVE-2026-24747 PyTorch weights_only=True bypass via SETITEM/SETITEMS abuse and tensor metadata mismatch detection
 - **security:** detect CVE-2022-45907 PyTorch torch.jit.annotations.parse_type_line unsafe eval() injection (CVSS 9.8)
 - **security:** detect CVE-2024-5480 PyTorch torch.distributed.rpc arbitrary function execution via PythonUDF (CVSS 10.0)
@@ -16,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **security:** detect CVE-2019-6446 in NumPy scanner when object-dtype arrays are found, with warning-level attribution (CVSS 9.8) due potential pickle deserialization via `allow_pickle=True`
 - **security:** new NeMo scanner detecting CVE-2025-23304 Hydra `_target_` injection in `.nemo` model files (CVSS 7.6), with recursive config inspection and dangerous callable blocklist
 - **security:** detect CVE-2025-51480 ONNX `save_external_data` arbitrary file overwrite via external_data path traversal (CVSS 8.8)
+- **security:** detect CVE-2025-49655 TorchModuleWrapper deserialization RCE (CVSS 9.8).
 - **security:** add CatBoost `.cbm` scanner with strict `CBM1` format validation, bounded parsing, and suspicious command/network/script indicator checks
 - **security:** add dedicated scanner support for R serialized artifacts (`.rds`, `.rda`, `.rdata`) with bounded decompression and static detection of executable symbol/payload indicators
 - **security:** add CNTK `.dnn`/`.cmf` scanner with strict signature validation, bounded reads, and multi-signal suspicious content correlation
@@ -26,10 +28,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **feat:** add Llamafile executable scanner with bounded runtime-string analysis and embedded GGUF payload carving/forwarding
 - **feat:** add CoreML `.mlmodel` scanner with strict protobuf structure validation, custom layer/custom model detection, metadata abuse checks, and linked-model path safety checks
 - **feat:** add MXNet scanner support for paired `*-symbol.json` and `*-NNNN.params` artifacts with strict contract validation, companion-file checks, and suspicious reference/payload detection
+- **security:** detect CVE-2025-1716 pickle bypass via `pip.main()` as dangerous callable (CVSS 9.8)
+- **keras:** detect CVE-2025-9906 `enable_unsafe_deserialization` config bypass in `.keras` archives (CVSS 8.6, safe_mode bypass)
+- **security:** detect CVE-2025-8747 Keras get_file gadget safe_mode bypass
+- **keras:** detect CVE-2025-9905 H5 safe_mode bypass for Lambda layers (CVSS 7.3)
+- **keras:** add CVE-2024-3660 attribution to Lambda layer detection in .keras and .h5 scanners (CVSS 9.8)
+- **security:** detect CVE-2025-10155 pickle protocol 0/1 payloads disguised as `.bin` files by extending `detect_file_format()` to recognize GLOBAL opcode patterns and adding `posix`/`nt` internal module names to binary code pattern blocklist
+- **security:** detect CVE-2022-25882 ONNX external_data path traversal with CVE attribution, CVSS score, and CWE classification in scan results
+- **security:** detect CVE-2024-27318 ONNX nested external_data path traversal bypass via path segment sanitization evasion
+
+### Security
+
+- **keras:** detect CVE-2025-1550 arbitrary module references in `.keras` config.json (CVSS 9.8, safe_mode bypass)
 
 ### Fixed
 
 - **security**: harden pickle scanner stack resolution to correctly track `STACK_GLOBAL` and memoized `REDUCE` call targets, preventing decoy-string and `BINGET` bypasses
+- **security**: flag pickle `EXT1`/`EXT2`/`EXT4` extension-registry call targets in `REDUCE` analysis to close EXT opcode bypasses
+- **security**: detect protocol 0/1 ASCII pickle signatures in generic file-format detection to prevent ZIP entry extension bypasses (e.g., malicious `payload.txt`)
+- **security**: harden protocol 0/1 pickle format detection with bounded opcode parsing to catch prefixed payloads (e.g., `MARK/LIST` before `GLOBAL`) while reducing plain-text false positives in ZIP entry scanning
+- **security**: keep opcode-level pickle analysis active when malformed streams trigger unicode/text parse errors after partial opcode extraction
+- **security**: treat `joblib.load` as always dangerous and remove it from pickle ML allowlist to block loader trampoline bypasses
 - **security**: tighten manifest trusted-domain matching to validate URL hostnames instead of substring matches
 - **security**: make `.keras` suspicious file extension checks case-insensitive to catch uppercase executable/script payloads
 - **security**: block unsafe in-process `torch.load` in `WeightDistributionScanner` by default unless explicitly opted in
@@ -698,7 +717,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **style**: improve code formatting and documentation standards (#12, #23)
 - **fix**: improve core scanner functionality and comprehensive test coverage (#11)
 
-[unreleased]: https://github.com/promptfoo/modelaudit/compare/v0.2.25...HEAD
+[unreleased]: https://github.com/promptfoo/modelaudit/compare/v0.2.26...HEAD
 [0.2.25]: https://github.com/promptfoo/modelaudit/compare/v0.2.24...v0.2.25
 [0.2.24]: https://github.com/promptfoo/modelaudit/compare/v0.2.23...v0.2.24
 [0.2.23]: https://github.com/promptfoo/modelaudit/compare/v0.2.22...v0.2.23
