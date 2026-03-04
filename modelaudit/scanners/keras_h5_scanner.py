@@ -315,6 +315,11 @@ class KerasH5Scanner(BaseScanner):
                             details={"layer_class": "Lambda", "layer_name": layer_name, "keras_version": keras_version},
                         )
                     else:
+                        version_context = (
+                            f"keras_version '{keras_version}' is non-canonical"
+                            if isinstance(keras_version, str)
+                            else "keras_version is unavailable"
+                        )
                         result.add_check(
                             name="H5 Lambda Risk (Version Unknown)",
                             passed=False,
