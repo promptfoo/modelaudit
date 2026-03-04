@@ -67,6 +67,7 @@ ModelAudit includes **30 specialized scanners** covering model, archive, and con
 | **Torch7**              | `.t7`, `.th`, `.net`                  | HIGH   |
 | **CatBoost**            | `.cbm`                                | MEDIUM |
 | **XGBoost**             | `.bst`, `.model`, `.ubj`              | MEDIUM |
+| **LightGBM**            | `.lgb`, `.lightgbm`, `.model`         | MEDIUM |
 | **SafeTensors**         | `.safetensors`                        | LOW    |
 | **GGUF/GGML**           | `.gguf`, `.ggml`                      | LOW    |
 | **JAX/Flax**            | `.msgpack`, `.flax`, `.orbax`, `.jax` | LOW    |

@@ -30,6 +30,22 @@ _CNTK_V2_REQUIRED_MARKERS = (b"\x0a\x07version", b"\x0a\x03uid")
 _CNTK_V2_STRUCTURE_MARKERS = (b"CompositeFunction", b"primitive_functions", b"PrimitiveFunction")
 _CNTK_SIGNATURE_READ_BYTES = 4096
 _TORCH7_SIGNATURE_READ_BYTES = 4096
+_LIGHTGBM_SIGNATURE_READ_BYTES = 8192
+_LIGHTGBM_HEADER_MARKERS = (
+    "version=",
+    "num_class=",
+    "num_tree_per_iteration=",
+    "max_feature_idx=",
+    "feature_names=",
+    "tree_sizes=",
+)
+_LIGHTGBM_TREE_MARKERS = (
+    "tree=",
+    "num_leaves=",
+    "split_feature=",
+    "leaf_value=",
+)
+_LIGHTGBM_XGBOOST_JSON_MARKERS = ('"learner"', '"gradient_booster"', '"tree_param"')
 _GZIP_MAGIC = b"\x1f\x8b"
 _BZIP2_MAGIC = b"BZh"
 _XZ_MAGIC = b"\xfd7zXZ\x00"
@@ -129,6 +145,15 @@ def _is_torch7_signature(prefix: bytes) -> bool:
     has_torch_marker = b"torch" in lowered or b"luat" in lowered
     has_structure_marker = b"nn." in lowered or b"tensor" in lowered or b"thnn" in lowered
     return has_torch_marker and has_structure_marker
+
+
+def _is_lightgbm_signature(prefix: bytes) -> bool:
+    preview = prefix.decode("utf-8", errors="ignore").replace("\x00", "\n").lower()
+    starts_with_tree = preview.lstrip().startswith("tree")
+    header_hits = sum(1 for marker in _LIGHTGBM_HEADER_MARKERS if marker in preview)
+    tree_hits = sum(1 for marker in _LIGHTGBM_TREE_MARKERS if marker in preview)
+    xgboost_like = all(marker in preview for marker in _LIGHTGBM_XGBOOST_JSON_MARKERS)
+    return (starts_with_tree or "tree=" in preview) and header_hits >= 3 and tree_hits >= 2 and not xgboost_like
 
 
 def _is_zlib_header(prefix: bytes) -> bool:
@@ -268,6 +293,11 @@ def detect_file_format_from_magic(path: str) -> str:
             torch7_prefix = f.read(_TORCH7_SIGNATURE_READ_BYTES)
             if _is_torch7_signature(torch7_prefix):
                 return "torch7"
+
+            f.seek(0)
+            lightgbm_prefix = f.read(_LIGHTGBM_SIGNATURE_READ_BYTES)
+            if _is_lightgbm_signature(lightgbm_prefix):
+                return "lightgbm"
             # Protocol 0/1 pickle payloads can evade short magic-byte checks.
             # Probe a bounded prefix and require a valid opcode stream.
             pickle_probe_sample = _read_pickle_probe_sample(file_path, size, magic16)
@@ -445,6 +475,15 @@ def detect_file_format(path: str) -> str:
         if _is_torch7_signature(prefix):
             return "torch7"
         return "unknown"
+    if ext in (".lgb", ".lightgbm"):
+        prefix = read_magic_bytes(path, _LIGHTGBM_SIGNATURE_READ_BYTES)
+        if _is_lightgbm_signature(prefix):
+            return "lightgbm"
+        return "unknown"
+    if ext == ".model":
+        prefix = read_magic_bytes(path, _LIGHTGBM_SIGNATURE_READ_BYTES)
+        if _is_lightgbm_signature(prefix):
+            return "lightgbm"
     if ext == ".rknn":
         if magic4 == b"RKNN":
             return "rknn"
@@ -566,6 +605,8 @@ EXTENSION_FORMAT_MAP = {
     ".msgpack": "flax_msgpack",
     ".nemo": "nemo",
     ".cbm": "catboost",
+    ".lgb": "lightgbm",
+    ".lightgbm": "lightgbm",
     ".rds": "r_serialized",
     ".rda": "r_serialized",
     ".rdata": "r_serialized",
@@ -634,6 +675,8 @@ def detect_format_from_extension_pattern_matching(extension: FileExtension) -> F
             return "nemo"
         case ".cbm":
             return "catboost"
+        case ".lgb" | ".lightgbm":
+            return "lightgbm"
         case ".rds" | ".rda" | ".rdata":
             return "r_serialized"
         case ".7z":
@@ -796,6 +839,11 @@ def validate_file_type(path: str) -> bool:
         if ext_format == "torch7":
             torch7_prefix = read_magic_bytes(path, _TORCH7_SIGNATURE_READ_BYTES)
             return _is_torch7_signature(torch7_prefix)
+
+        # LightGBM native formats are validated with strict marker heuristics.
+        if ext_format == "lightgbm":
+            lightgbm_prefix = read_magic_bytes(path, _LIGHTGBM_SIGNATURE_READ_BYTES)
+            return _is_lightgbm_signature(lightgbm_prefix)
 
         # R serialized workspace/data files may be uncompressed or wrapped;
         # extension-based intent is authoritative for static scanning.

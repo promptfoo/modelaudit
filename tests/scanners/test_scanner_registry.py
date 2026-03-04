@@ -88,6 +88,8 @@ def test_scanner_registry_file_extension_coverage():
         ".h5",
         ".hdf5",
         ".keras",
+        ".lgb",
+        ".lightgbm",
         ".pb",
         ".onnx",
         ".cbm",
