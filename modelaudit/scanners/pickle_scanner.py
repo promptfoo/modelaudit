@@ -115,7 +115,10 @@ def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> 
 
             if stream_error and had_opcodes:
                 # Partial stream: binary data was misinterpreted as opcodes.
-                # Discard the buffer and stop — no more valid streams.
+                # Discard the buffer but keep scanning — a valid malicious
+                # stream may follow.
+                if multi_stream:
+                    continue
                 return
 
             if not stream_error:
@@ -124,7 +127,12 @@ def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> 
 
         if stream_error and had_opcodes:
             # First stream parse interruption after yielding some opcodes.
-            # Return the parsed prefix for security analysis.
+            if multi_stream:
+                # Mark as parsed so subsequent streams are buffered, and
+                # keep scanning — a malicious payload may follow.
+                parsed_any_stream = True
+                continue
+            # Single-stream mode: return the parsed prefix for security analysis.
             return
 
         if not multi_stream:

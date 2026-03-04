@@ -717,6 +717,36 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
         ]
         assert os_issues, f"Expected CRITICAL os issue after separator byte, got: {[i.message for i in result.issues]}"
 
+    def test_multi_stream_malformed_first_stream_still_detects_second(self) -> None:
+        """Scanner must detect malicious stream 2 even when stream 1 is malformed.
+
+        A malformed first stream that triggers a ValueError during parsing must
+        not cause the scanner to return early and skip subsequent streams.
+        """
+        import io
+
+        buf = io.BytesIO()
+        # Stream 1: starts with valid proto + benign GLOBAL, then malformed
+        # bytes that cause a ValueError (invalid UTF-8 in GLOBAL arg).
+        # This triggers the stream_error + had_opcodes early-return path.
+        buf.write(b"\x80\x02cbuiltins\nlen\nq\x00c\xff\n")
+        # Stream 2: malicious — os.system via GLOBAL+REDUCE
+        buf.write(self._craft_global_reduce_pickle("os", "system"))
+        data = buf.getvalue()
+
+        result = self._scan_bytes(data)
+        assert result.success
+        assert result.has_errors
+        os_issues = [
+            i
+            for i in result.issues
+            if i.severity == IssueSeverity.CRITICAL and ("os" in i.message.lower() or "posix" in i.message.lower())
+        ]
+        assert os_issues, (
+            f"Expected CRITICAL os issue from stream 2 after malformed stream 1, "
+            f"got: {[i.message for i in result.issues]}"
+        )
+
     # ------------------------------------------------------------------
     # Fix 3: EXT opcode registry bypass
     # ------------------------------------------------------------------
