@@ -843,6 +843,15 @@ def get_cve_2025_49655_explanation(issue_type: str) -> str:
             "arbitrary code execution via crafted pickle payloads in the model weights. "
             "Any .keras model containing a TorchModuleWrapper layer is potentially exploitable. "
             "Upgrade to Keras >= 3.11.3 where weights_only=True is enforced."
+        ),
+    }
+
+    return explanations.get(
+        issue_type,
+        "CVE-2025-49655: TorchModuleWrapper uses unsafe torch.load deserialization. Upgrade to Keras >= 3.11.3.",
+    )
+
+
 def get_cve_2025_1550_explanation(issue_type: str) -> str:
     """Get explanation for CVE-2025-1550: Keras safe_mode bypass via config.json module references.
 
@@ -869,7 +878,7 @@ def get_cve_2025_1550_explanation(issue_type: str) -> str:
 
     return explanations.get(
         issue_type,
-        "CVE-2025-49655: TorchModuleWrapper uses unsafe torch.load deserialization. Upgrade to Keras >= 3.11.3.",
+        "CVE-2025-1550: Keras config.json module references may bypass safe_mode. Upgrade to Keras >= 3.9.0.",
     )
 
 
@@ -935,6 +944,4 @@ def get_cve_2025_23304_explanation(vulnerability_type: str) -> str:
         vulnerability_type,
         "CVE-2025-23304: NeMo Hydra _target_ injection enables RCE via malicious "
         "model metadata. Update to NeMo >= 2.3.2.",
-        "CVE-2025-1550: Keras config.json can reference arbitrary Python modules, bypassing "
-        "safe_mode. Upgrade to Keras >= 3.9.0.",
     )

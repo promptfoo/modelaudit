@@ -16,8 +16,11 @@ from modelaudit.utils.helpers.code_validation import (
     validate_python_syntax,
 )
 
-from ..config.explanations import get_cve_2025_49655_explanation, get_pattern_explanation
-from ..config.explanations import get_cve_2025_1550_explanation, get_pattern_explanation
+from ..config.explanations import (
+    get_cve_2025_1550_explanation,
+    get_cve_2025_49655_explanation,
+    get_pattern_explanation,
+)
 from .base import BaseScanner, IssueSeverity, ScanResult
 from .keras_utils import check_subclassed_model
 
@@ -420,6 +423,7 @@ class KerasZipScanner(BaseScanner):
             return major == 3 and minor == 11 and 0 <= patch <= 2
         except ValueError:
             return None
+
     def _check_layer_module_references(self, layer: dict[str, Any], result: ScanResult, layer_name: str) -> None:
         """Check layer config for dangerous module references (CVE-2025-1550).
 
