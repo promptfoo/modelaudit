@@ -717,6 +717,36 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
         ]
         assert os_issues, f"Expected CRITICAL os issue after separator byte, got: {[i.message for i in result.issues]}"
 
+    def test_multi_stream_malformed_first_stream_still_detects_second(self) -> None:
+        """Scanner must detect malicious stream 2 even when stream 1 is malformed.
+
+        A malformed first stream that triggers a ValueError during parsing must
+        not cause the scanner to return early and skip subsequent streams.
+        """
+        import io
+
+        buf = io.BytesIO()
+        # Stream 1: starts with valid proto + benign GLOBAL, then malformed
+        # bytes that cause a ValueError (invalid UTF-8 in GLOBAL arg).
+        # This triggers the stream_error + had_opcodes early-return path.
+        buf.write(b"\x80\x02cbuiltins\nlen\nq\x00c\xff\n")
+        # Stream 2: malicious — os.system via GLOBAL+REDUCE
+        buf.write(self._craft_global_reduce_pickle("os", "system"))
+        data = buf.getvalue()
+
+        result = self._scan_bytes(data)
+        assert result.success
+        assert result.has_errors
+        os_issues = [
+            i
+            for i in result.issues
+            if i.severity == IssueSeverity.CRITICAL and ("os" in i.message.lower() or "posix" in i.message.lower())
+        ]
+        assert os_issues, (
+            f"Expected CRITICAL os issue from stream 2 after malformed stream 1, "
+            f"got: {[i.message for i in result.issues]}"
+        )
+
     # ------------------------------------------------------------------
     # Fix 3: EXT opcode registry bypass
     # ------------------------------------------------------------------
@@ -831,6 +861,35 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
             assert any("os.system" in msg or "posix.system" in msg for msg in critical_messages), (
                 f"Expected critical os/posix.system issue, got: {critical_messages}"
             )
+
+    # ------------------------------------------------------------------
+    # Fix 3c: parser crash resilience on mixed malformed payloads
+    # ------------------------------------------------------------------
+    def test_malformed_unicode_tail_still_flags_dangerous_global(self) -> None:
+        """Malformed tails should not suppress opcode-level dangerous global detection."""
+        # Valid prefix with dangerous GLOBAL, followed by malformed GLOBAL bytes
+        # that previously caused parse fallback before opcode analysis completed.
+        payload = b"\x80\x02cbuiltins\n__import__\nq\x00c\xff\n"
+
+        result = self._scan_bytes(payload)
+
+        assert result.success
+        assert result.has_errors
+
+        critical_messages = [i.message.lower() for i in result.issues if i.severity == IssueSeverity.CRITICAL]
+        assert any("__import__" in msg for msg in critical_messages), (
+            f"Expected CRITICAL __import__ detection, got: {critical_messages}"
+        )
+
+    def test_malformed_unicode_tail_with_benign_prefix_does_not_raise_critical(self) -> None:
+        """Malformed tails after benign opcodes should not create CRITICAL findings."""
+        payload = b"\x80\x02cbuiltins\nlen\nq\x00c\xff\n"
+
+        result = self._scan_bytes(payload)
+
+        assert result.success
+        critical_messages = [i.message.lower() for i in result.issues if i.severity == IssueSeverity.CRITICAL]
+        assert not critical_messages, f"Unexpected CRITICAL benign detection: {critical_messages}"
 
     # ------------------------------------------------------------------
     # Fix 4: NEWOBJ_EX with dangerous class
