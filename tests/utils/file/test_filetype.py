@@ -84,6 +84,55 @@ def test_detect_file_format_hdf5(tmp_path):
     assert detect_file_format(str(hdf5_path)) == "hdf5"
 
 
+def test_detect_file_format_proto0_pickle_with_text_extension(tmp_path: Path) -> None:
+    """Protocol 0 pickle payloads should be detected even with non-model extensions."""
+    payload = tmp_path / "payload.txt"
+    payload.write_bytes(b'cos\nsystem\n(S"echo pwned"\ntR.')
+
+    assert detect_file_format(str(payload)) == "pickle"
+    assert detect_file_format_from_magic(str(payload)) == "pickle"
+
+
+def test_detect_file_format_proto0_pickle_with_single_comment_token_prefix(tmp_path: Path) -> None:
+    """A single leading comment token should not suppress proto0 detection."""
+    payload = tmp_path / "comment-prefixed-payload.txt"
+    payload.write_bytes(b"#" + b'cos\nsystem\n(S"echo pwned"\ntR.')
+
+    assert detect_file_format(str(payload)) == "pickle"
+    assert detect_file_format_from_magic(str(payload)) == "pickle"
+
+
+def test_detect_file_format_proto0_mark_prefix_requires_structure(tmp_path: Path) -> None:
+    """MARK + GLOBAL/INST prefixes should only match when structure is pickle-like."""
+    non_pickle_payload = tmp_path / "not-pickle.txt"
+    non_pickle_payload.write_bytes(b"(cat this is plain text")
+    assert detect_file_format(str(non_pickle_payload)) != "pickle"
+    assert detect_file_format_from_magic(str(non_pickle_payload)) != "pickle"
+
+    pickle_like_payload = tmp_path / "mark-prefixed-pickle.txt"
+    pickle_like_payload.write_bytes(b'(cos\nsystem\n(S"echo pwned"\ntR.')
+    assert detect_file_format(str(pickle_like_payload)) == "pickle"
+    assert detect_file_format_from_magic(str(pickle_like_payload)) == "pickle"
+
+
+def test_detect_file_format_proto0_prefixed_pickle_with_extended_probe(tmp_path: Path) -> None:
+    """Valid protocol 0 streams with non-trivial prefixes should still be detected."""
+    payload = tmp_path / "prefixed-pickle.txt"
+    payload.write_bytes(b'(lp0\n0cos\nsystem\n(S"echo pwned"\ntR.')
+
+    assert detect_file_format(str(payload)) == "pickle"
+    assert detect_file_format_from_magic(str(payload)) == "pickle"
+
+
+def test_detect_file_format_plain_text_global_prefix_not_pickle(tmp_path: Path) -> None:
+    """Plain text that begins with GLOBAL-like bytes should not be treated as pickle."""
+    payload = tmp_path / "notes.txt"
+    payload.write_bytes(b"c\nthis is plain text\nnot a pickle stream")
+
+    assert detect_file_format(str(payload)) != "pickle"
+    assert detect_file_format_from_magic(str(payload)) != "pickle"
+
+
 def test_detect_file_format_small_file(tmp_path):
     """Test detecting format of a very small file."""
     small_file = tmp_path / "small.dat"

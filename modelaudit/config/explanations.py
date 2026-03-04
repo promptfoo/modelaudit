@@ -829,6 +829,30 @@ def get_pytorch_security_explanation(issue_type: str) -> str:
     )
 
 
+def get_cve_2025_9906_explanation(issue_type: str) -> str:
+    """Get explanation for CVE-2025-9906: Keras enable_unsafe_deserialization config bypass.
+
+    CVE-2025-9906 (HIGH): config.json in .keras archives can invoke
+    keras.config.enable_unsafe_deserialization() to disable safe_mode from within
+    the loading process, then include malicious Lambda layers. Fixed in Keras 3.11.0.
+    """
+    explanations = {
+        "config_bypass": (
+            "CVE-2025-9906: The config.json inside this .keras archive references "
+            "enable_unsafe_deserialization, which can disable safe_mode from within the "
+            "deserialization process itself. This allows an attacker to bypass safe_mode=True "
+            "and then load malicious Lambda layers or other unsafe components. "
+            "Upgrade to Keras >= 3.11.0 and only load models from trusted sources."
+        ),
+    }
+
+    return explanations.get(
+        issue_type,
+        "CVE-2025-9906: config.json can disable safe_mode via enable_unsafe_deserialization. "
+        "Upgrade to Keras >= 3.11.0.",
+    )
+
+
 def get_cve_2025_49655_explanation(issue_type: str) -> str:
     """Get explanation for CVE-2025-49655: Keras TorchModuleWrapper deserialization RCE.
 
@@ -879,6 +903,30 @@ def get_cve_2025_1550_explanation(issue_type: str) -> str:
     return explanations.get(
         issue_type,
         "CVE-2025-1550: Keras config.json module references may bypass safe_mode. Upgrade to Keras >= 3.9.0.",
+    )
+
+
+def get_cve_2025_8747_explanation(issue_type: str) -> str:
+    """Get explanation for CVE-2025-8747: Keras get_file gadget bypass.
+
+    CVE-2025-8747 (HIGH): Bypass of CVE-2025-1550 fix. Uses keras.utils.get_file
+    as a gadget to download and execute arbitrary files even with safe_mode=True.
+    Fixed in Keras 3.11.0.
+    """
+    explanations = {
+        "get_file_gadget": (
+            "CVE-2025-8747: The config.json references keras.utils.get_file along with "
+            "a URL, indicating a potential safe_mode bypass. This gadget can download "
+            "arbitrary files from remote URLs during model loading, even with safe_mode=True. "
+            "This bypasses the CVE-2025-1550 module allowlist fix. "
+            "Upgrade to Keras >= 3.11.0 and only load models from trusted sources."
+        ),
+    }
+
+    return explanations.get(
+        issue_type,
+        "CVE-2025-8747: keras.utils.get_file can be abused as a gadget to bypass safe_mode. "
+        "Upgrade to Keras >= 3.11.0.",
     )
 
 
