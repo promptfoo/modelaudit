@@ -15,7 +15,7 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
-from modelaudit.scanners.base import IssueSeverity
+from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.keras_zip_scanner import KerasZipScanner
 
 
@@ -862,6 +862,172 @@ class TestCVE20251550ModuleReferences:
         cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-1550"]
         assert len(cve_issues) >= 1, "mathutils should not match safe 'math' prefix"
         assert cve_issues[0].severity == IssueSeverity.WARNING
+
+
+class TestCVE20259906UnsafeDeserialization:
+    """Test CVE-2025-9906: enable_unsafe_deserialization config bypass detection."""
+
+    def _make_keras_zip(self, config_str: str, tmp_path: Path) -> str:
+        """Helper to create a .keras ZIP with raw config string."""
+        keras_path = tmp_path / "model.keras"
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            zf.writestr("config.json", config_str)
+            zf.writestr("metadata.json", json.dumps({"keras_version": "3.0.0"}))
+        return str(keras_path)
+
+    def test_enable_unsafe_deserialization_detected(self, tmp_path: Path) -> None:
+        """Config referencing enable_unsafe_deserialization should be CRITICAL."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "name": "dense_1",
+                        "module": "keras.config",
+                        "config": {
+                            "fn": "enable_unsafe_deserialization",
+                        },
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-9906"]
+        assert len(cve_issues) >= 1, "Should detect enable_unsafe_deserialization reference"
+        assert cve_issues[0].severity == IssueSeverity.CRITICAL
+        cve_checks = [c for c in result.checks if c.name == "CVE-2025-9906: Unsafe Deserialization Bypass"]
+        assert len(cve_checks) >= 1
+        assert any(c.status != CheckStatus.PASSED for c in cve_checks)
+
+    def test_enable_unsafe_deserialization_in_nested_value(self, tmp_path: Path) -> None:
+        """enable_unsafe_deserialization anywhere in config should be detected."""
+        scanner = KerasZipScanner()
+        # Embed the string in a deeply nested config value
+        config_str = json.dumps(
+            {
+                "class_name": "Model",
+                "config": {
+                    "layers": [],
+                    "metadata": {"loader": "keras.config.enable_unsafe_deserialization"},
+                },
+            }
+        )
+        result = scanner.scan(self._make_keras_zip(config_str, tmp_path))
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-9906"]
+        assert len(cve_issues) >= 1
+        cve_checks = [c for c in result.checks if c.name == "CVE-2025-9906: Unsafe Deserialization Bypass"]
+        assert len(cve_checks) >= 1
+        assert any(c.status != CheckStatus.PASSED for c in cve_checks)
+
+    def test_no_false_positive_normal_config(self, tmp_path: Path) -> None:
+        """Normal config without enable_unsafe_deserialization should be clean."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "name": "dense_1",
+                        "config": {"units": 10},
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-9906"]
+        assert len(cve_issues) == 0, "Normal config should not trigger CVE-2025-9906"
+
+    def test_cve_attribution_details(self, tmp_path: Path) -> None:
+        """CVE details should be present in issue details."""
+        scanner = KerasZipScanner()
+        config_str = json.dumps(
+            {
+                "class_name": "Sequential",
+                "config": {
+                    "layers": [
+                        {
+                            "class_name": "Dense",
+                            "name": "d",
+                            "module": "keras.config",
+                            "config": {"fn": "enable_unsafe_deserialization"},
+                        }
+                    ]
+                },
+            }
+        )
+        result = scanner.scan(self._make_keras_zip(config_str, tmp_path))
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-9906"]
+        assert len(cve_issues) >= 1
+        details = cve_issues[0].details
+        assert details["cve_id"] == "CVE-2025-9906"
+        assert details["cwe"] == "CWE-502"
+        assert details["cvss"] == 8.6
+        assert details["description"]
+        assert details["config_path"] == "config.json"
+        assert details["matched_symbol"] == "enable_unsafe_deserialization"
+        assert details["detection_method"] in {"structured_config_scan", "raw_config_scan"}
+
+    def test_plain_text_mention_without_keras_context_not_flagged(self, tmp_path: Path) -> None:
+        """A plain text mention should not trigger when no keras.config context exists."""
+        scanner = KerasZipScanner()
+        config_str = json.dumps(
+            {
+                "class_name": "Model",
+                "config": {
+                    "layers": [],
+                    "notes": "This doc mentions enable_unsafe_deserialization for awareness only",
+                },
+            }
+        )
+        result = scanner.scan(self._make_keras_zip(config_str, tmp_path))
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-9906"]
+        assert len(cve_issues) == 0
+
+    def test_cross_object_tokens_do_not_trigger_false_positive(self, tmp_path: Path) -> None:
+        """Separate context/token in different objects should not trigger CVE."""
+        scanner = KerasZipScanner()
+        config_str = json.dumps(
+            {
+                "class_name": "Model",
+                "config": {
+                    "layers": [
+                        {"class_name": "Dense", "name": "d1", "config": {"fn": "enable_unsafe_deserialization"}},
+                        {"class_name": "Dense", "name": "d2", "module": "keras.config", "config": {"units": 16}},
+                    ],
+                },
+            }
+        )
+        result = scanner.scan(self._make_keras_zip(config_str, tmp_path))
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-9906"]
+        assert len(cve_issues) == 0, "Cross-object token co-occurrence should not trigger CVE-2025-9906"
+
+    def test_comment_token_does_not_suppress_malicious_detection(self, tmp_path: Path) -> None:
+        """Embedding a single comment token should not suppress CVE detection."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "name": "d",
+                        "module": "keras.config",
+                        "config": {"fn": "enable_unsafe_deserialization", "notes": "#"},
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-9906"]
+        assert len(cve_issues) >= 1
 
 
 class TestKerasZipScannerSubclassed:

@@ -18,6 +18,7 @@ from modelaudit.utils.helpers.code_validation import (
 
 from ..config.explanations import (
     get_cve_2025_1550_explanation,
+    get_cve_2025_9906_explanation,
     get_cve_2025_49655_explanation,
     get_pattern_explanation,
 )
@@ -148,6 +149,9 @@ class KerasZipScanner(BaseScanner):
                 # Read and parse config.json
                 with zf.open("config.json") as config_file:
                     config_data = config_file.read()
+                    raw_config_text = config_data.decode("utf-8", errors="ignore")
+                    # Run raw-text CVE detection before JSON parsing so malformed JSON cannot bypass it.
+                    self._check_unsafe_deserialization_bypass_raw(raw_config_text, result)
                     try:
                         model_config = json.loads(config_data)
                     except json.JSONDecodeError as e:
@@ -161,6 +165,9 @@ class KerasZipScanner(BaseScanner):
                         )
                         result.finish(success=False)
                         return result
+
+                # CVE-2025-9906: structured fallback check on parsed config
+                self._check_unsafe_deserialization_bypass(model_config, result)
 
                 # Check for metadata.json
                 if "metadata.json" in zf.namelist():
@@ -508,6 +515,167 @@ class KerasZipScanner(BaseScanner):
                     },
                     why=get_cve_2025_1550_explanation("untrusted_module"),
                 )
+
+    def _check_unsafe_deserialization_bypass(self, model_config: dict[str, Any], result: ScanResult) -> None:
+        """Check for CVE-2025-9906: enable_unsafe_deserialization bypass in config.json.
+
+        CVE-2025-9906: config.json in .keras archives can reference
+        keras.config.enable_unsafe_deserialization to disable safe_mode
+        from within the deserialization process itself, then load malicious layers.
+        """
+        if self._has_cve_2025_9906_issue(result):
+            return
+
+        if self._has_unsafe_deserialization_reference(model_config):
+            result.add_check(
+                name="CVE-2025-9906: Unsafe Deserialization Bypass",
+                passed=False,
+                message=(
+                    "CVE-2025-9906: config.json contains structured reference to "
+                    "keras.config.enable_unsafe_deserialization (safe_mode bypass attempt)"
+                ),
+                severity=IssueSeverity.CRITICAL,
+                location=f"{self.current_file_path}/config.json",
+                details={
+                    "cve_id": "CVE-2025-9906",
+                    "cvss": 8.6,
+                    "cwe": "CWE-502",
+                    "description": (
+                        "config.json can invoke enable_unsafe_deserialization during model loading, "
+                        "disabling safe_mode protections for subsequent deserialization."
+                    ),
+                    "remediation": "Upgrade Keras to >= 3.11.0 and remove untrusted model files",
+                    "config_path": "config.json",
+                    "matched_symbol": "enable_unsafe_deserialization",
+                    "detection_method": "structured_config_scan",
+                },
+                why=get_cve_2025_9906_explanation("config_bypass"),
+            )
+
+    def _check_unsafe_deserialization_bypass_raw(self, raw_config_text: str, result: ScanResult) -> None:
+        """Raw-text CVE check to catch references before JSON parsing."""
+        if self._has_cve_2025_9906_issue(result):
+            return
+
+        lowered = raw_config_text.lower()
+        raw_symbols = (
+            "keras.config.enable_unsafe_deserialization",
+            "keras.src.config.enable_unsafe_deserialization",
+        )
+        matched_symbol = next((symbol for symbol in raw_symbols if symbol in lowered), None)
+        if not matched_symbol:
+            return
+        if self._is_primarily_documentation(raw_config_text):
+            return
+
+        result.add_check(
+            name="CVE-2025-9906: Unsafe Deserialization Bypass",
+            passed=False,
+            message=(
+                "CVE-2025-9906: config.json contains raw reference to "
+                "enable_unsafe_deserialization (safe_mode bypass attempt)"
+            ),
+            severity=IssueSeverity.CRITICAL,
+            location=f"{self.current_file_path}/config.json",
+            details={
+                "cve_id": "CVE-2025-9906",
+                "cvss": 8.6,
+                "cwe": "CWE-502",
+                "description": (
+                    "config.json can invoke enable_unsafe_deserialization during model loading, "
+                    "disabling safe_mode protections for subsequent deserialization."
+                ),
+                "remediation": "Upgrade Keras to >= 3.11.0 and remove untrusted model files",
+                "config_path": "config.json",
+                "matched_symbol": matched_symbol,
+                "detection_method": "raw_config_scan",
+            },
+            why=get_cve_2025_9906_explanation("config_bypass"),
+        )
+
+    def _has_unsafe_deserialization_reference(self, obj: Any) -> bool:
+        """Recursively detect object-scoped unsafe-deserialization references."""
+        if isinstance(obj, str):
+            token = obj.strip()
+            if self._is_primarily_documentation(token):
+                return False
+            lowered = token.lower()
+            return lowered in {
+                "keras.config.enable_unsafe_deserialization",
+                "keras.src.config.enable_unsafe_deserialization",
+            }
+
+        if isinstance(obj, dict):
+            string_values = [
+                value.strip().lower()
+                for value in obj.values()
+                if isinstance(value, str) and not self._is_primarily_documentation(value)
+            ]
+            has_enable_unsafe = any(
+                token == "enable_unsafe_deserialization" or token.endswith(".enable_unsafe_deserialization")
+                for token in string_values
+            )
+            has_keras_config_context = any(
+                token == "keras.config"
+                or token.startswith("keras.config.")
+                or token == "keras.src.config"
+                or token.startswith("keras.src.config.")
+                for token in string_values
+            )
+            if has_enable_unsafe and has_keras_config_context:
+                return True
+
+            if has_keras_config_context and any(self._subtree_has_enable_unsafe(value) for value in obj.values()):
+                return True
+
+            return any(self._has_unsafe_deserialization_reference(value) for value in obj.values())
+
+        if isinstance(obj, list):
+            return any(self._has_unsafe_deserialization_reference(value) for value in obj)
+
+        return False
+
+    def _subtree_has_enable_unsafe(self, obj: Any) -> bool:
+        """Return True if subtree contains an enable_unsafe_deserialization token."""
+        if isinstance(obj, str):
+            if self._is_primarily_documentation(obj):
+                return False
+            token = obj.strip().lower()
+            return token == "enable_unsafe_deserialization" or token.endswith(".enable_unsafe_deserialization")
+
+        if isinstance(obj, dict):
+            return any(self._subtree_has_enable_unsafe(value) for value in obj.values())
+
+        if isinstance(obj, list):
+            return any(self._subtree_has_enable_unsafe(value) for value in obj)
+
+        return False
+
+    @staticmethod
+    def _has_cve_2025_9906_issue(result: ScanResult) -> bool:
+        """Avoid duplicate CVE-2025-9906 checks from raw + structured paths."""
+        return any(issue.details.get("cve_id") == "CVE-2025-9906" for issue in result.issues)
+
+    @staticmethod
+    def _is_primarily_documentation(text: str) -> bool:
+        """Return True when content is mostly documentation-style text."""
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if not lines:
+            return False
+
+        doc_like_lines = 0
+        for line in lines:
+            lowered = line.lower()
+            if (
+                line.startswith(("#", "//", "/*", "*", "- ", "* "))
+                or "documentation" in lowered
+                or "example" in lowered
+                or "for awareness" in lowered
+                or (len(line.split()) >= 7 and "." not in line)
+            ):
+                doc_like_lines += 1
+
+        return (doc_like_lines / len(lines)) > 0.5
 
     def _check_lambda_layer(self, layer: dict[str, Any], result: ScanResult, layer_name: str) -> None:
         """Check Lambda layer for executable Python code"""
