@@ -509,7 +509,6 @@ class KerasZipScanner(BaseScanner):
                     why=get_cve_2025_1550_explanation("untrusted_module"),
                 )
 
-
     def _check_lambda_layer(self, layer: dict[str, Any], result: ScanResult, layer_name: str) -> None:
         """Check Lambda layer for executable Python code"""
         layer_config = layer.get("config", {})

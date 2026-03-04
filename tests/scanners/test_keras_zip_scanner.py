@@ -864,7 +864,6 @@ class TestCVE20251550ModuleReferences:
         assert cve_issues[0].severity == IssueSeverity.WARNING
 
 
-
 class TestKerasZipScannerSubclassed:
     """Tests for subclassed model detection in ZIP format."""
 
