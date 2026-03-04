@@ -1021,8 +1021,10 @@ class TestCVE20258747GetFileGadget:
         assert len(cve_issues) >= 1
         details = cve_issues[0].details
         assert details["cve_id"] == "CVE-2025-8747"
+        assert details["cvss"] == 8.8
         assert details["cwe"] == "CWE-502"
         assert details["description"]
+        assert "3.11.0" in details["remediation"]
 
 
 class TestKerasZipScannerSubclassed:
