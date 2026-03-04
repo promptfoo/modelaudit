@@ -312,7 +312,7 @@ class JoblibScanner(BaseScanner):
 
             # Analyze sklearn models specifically
             if hasattr(obj, "_sklearn_version"):
-                metadata["sklearn_version"] = obj._sklearn_version
+                metadata["sklearn_version"] = str(obj._sklearn_version)
 
             if hasattr(obj, "get_params"):
                 try:
@@ -367,5 +367,6 @@ class JoblibScanner(BaseScanner):
 
         except Exception as e:
             metadata["extraction_error"] = str(e)
+            metadata["extraction_error_type"] = type(e).__name__
 
         return metadata

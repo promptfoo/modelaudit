@@ -1,6 +1,7 @@
 """Optimized configuration handling for cache operations."""
 
 import functools
+import threading
 import time
 from typing import Any
 
@@ -80,6 +81,7 @@ class ConfigurationExtractor:
         self._result_cache: dict[tuple[Any, str | None], tuple[CacheConfiguration, str | None, float]] = {}
         self._cache_expiry = 30.0  # 30 seconds
         self._last_cleanup = time.monotonic()
+        self._lock = threading.RLock()
 
     def extract_fast(self, args: tuple, kwargs: dict) -> tuple[CacheConfiguration | None, str | None]:
         """
@@ -114,49 +116,50 @@ class ConfigurationExtractor:
         config_key = id(config_dict) if config_dict else "default"
         now = time.monotonic()
 
-        # Fast path: reuse result for the same config/path combination
-        result_key = (config_key, file_path)
-        cached_result = self._result_cache.get(result_key)
-        if cached_result and cached_result[2] > now:
-            return cached_result[0], cached_result[1]
+        with self._lock:
+            # Fast path: reuse result for the same config/path combination
+            result_key = (config_key, file_path)
+            cached_result = self._result_cache.get(result_key)
+            if cached_result and cached_result[2] > now:
+                return cached_result[0], cached_result[1]
 
-        # Reuse cached configuration if still valid
-        cached_config = self._config_cache.get(config_key)
-        if cached_config and (now - cached_config[1]) < self._cache_expiry:
-            cache_config = cached_config[0]
-        else:
-            cache_config = CacheConfiguration(config_dict if isinstance(config_dict, dict) else {})
-            self._config_cache[config_key] = (cache_config, now)
+            # Reuse cached configuration if still valid
+            cached_config = self._config_cache.get(config_key)
+            if cached_config and (now - cached_config[1]) < self._cache_expiry:
+                cache_config = cached_config[0]
+            else:
+                cache_config = CacheConfiguration(config_dict if isinstance(config_dict, dict) else {})
+                self._config_cache[config_key] = (cache_config, now)
 
-        expiry_time = now + self._cache_expiry
-        self._result_cache[result_key] = (cache_config, file_path, expiry_time)
+            expiry_time = now + self._cache_expiry
+            self._result_cache[result_key] = (cache_config, file_path, expiry_time)
 
-        # Cleanup old cache entries periodically to avoid unbounded growth
-        if (len(self._config_cache) > 20 or len(self._result_cache) > 64) and (now - self._last_cleanup) > 5.0:
-            self._cleanup_config_cache(current_time=now)
-            self._cleanup_result_cache(current_time=now)
-            self._last_cleanup = now
+            # Cleanup old cache entries periodically to avoid unbounded growth
+            if (len(self._config_cache) > 20 or len(self._result_cache) > 64) and (now - self._last_cleanup) > 5.0:
+                self._cleanup_config_cache(current_time=now)
+                self._cleanup_result_cache(current_time=now)
+                self._last_cleanup = now
 
         return cache_config, file_path
 
     def _cleanup_config_cache(self, current_time: float | None = None) -> None:
         """Remove expired configuration cache entries."""
         now = current_time if current_time is not None else time.monotonic()
+        with self._lock:
+            expired_keys = [
+                key for key, (_, timestamp) in self._config_cache.items() if now - timestamp > self._cache_expiry
+            ]
 
-        expired_keys = [
-            key for key, (_, timestamp) in self._config_cache.items() if now - timestamp > self._cache_expiry
-        ]
-
-        for key in expired_keys:
-            del self._config_cache[key]
+            for key in expired_keys:
+                del self._config_cache[key]
 
     def _cleanup_result_cache(self, current_time: float | None = None) -> None:
         """Remove expired cached result entries."""
         now = current_time if current_time is not None else time.monotonic()
-
-        expired_keys = [key for key, (_, _, expiry) in self._result_cache.items() if expiry <= now]
-        for key in expired_keys:
-            del self._result_cache[key]
+        with self._lock:
+            expired_keys = [key for key, (_, _, expiry) in self._result_cache.items() if expiry <= now]
+            for key in expired_keys:
+                del self._result_cache[key]
 
 
 # Global extractor instance to reuse across decorators
