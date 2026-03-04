@@ -300,6 +300,46 @@ class TestZipScanner:
         finally:
             os.unlink(tmp_path)
 
+    def test_scan_zip_with_prefixed_proto0_pickle_disguised_as_text(self) -> None:
+        """Protocol 0 pickles with MARK/LIST prefixes in .txt entries should be detected."""
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+            with zipfile.ZipFile(tmp.name, "w") as z:
+                z.writestr("payload.txt", b'(lp0\n0cos\nsystem\n(S"echo pwned"\ntR.')
+            tmp_path = tmp.name
+
+        try:
+            result = self.scanner.scan(tmp_path)
+            assert result.success is True
+            assert result.has_errors
+
+            critical_messages = [
+                issue.message.lower() for issue in result.issues if issue.severity == IssueSeverity.CRITICAL
+            ]
+            assert any("os.system" in msg or "posix.system" in msg for msg in critical_messages), (
+                f"Expected critical os/posix.system issue, got: {critical_messages}"
+            )
+        finally:
+            os.unlink(tmp_path)
+
+    def test_scan_zip_with_plain_text_global_prefix_not_treated_as_pickle(self) -> None:
+        """Plain text entries that start with GLOBAL-like bytes should not trigger pickle parse warnings."""
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+            with zipfile.ZipFile(tmp.name, "w") as z:
+                z.writestr("notes.txt", b"c\nthis is plain text\nnot a pickle stream")
+            tmp_path = tmp.name
+
+        try:
+            result = self.scanner.scan(tmp_path)
+            assert result.success is True
+            noisy_pickle_warnings = [
+                issue for issue in result.issues if "incomplete or corrupted pickle file" in issue.message.lower()
+            ]
+            assert not noisy_pickle_warnings, (
+                f"Expected no noisy pickle warning for plain text, got: {[i.message for i in noisy_pickle_warnings]}"
+            )
+        finally:
+            os.unlink(tmp_path)
+
     def test_scan_nonexistent_file(self):
         """Test scanning a file that doesn't exist"""
         result = self.scanner.scan("/nonexistent/file.zip")
