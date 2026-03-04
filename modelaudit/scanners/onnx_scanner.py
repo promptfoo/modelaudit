@@ -288,6 +288,8 @@ class OnnxScanner(BaseScanner):
                 # traversal attempts are flagged even for non-existent targets.
                 escapes_model_dir = not _is_contained_in(external_path, model_dir)
                 if escapes_model_dir:
+                    # Track for per-file CVE-2025-51480 (write direction) reporting
+                    traversal_files.setdefault(location, []).append(tensor.name)
                     result.add_check(
                         name="CVE-2022-25882: External Data Path Traversal",
                         passed=False,
