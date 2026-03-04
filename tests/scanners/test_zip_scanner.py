@@ -279,7 +279,7 @@ class TestZipScanner:
         finally:
             os.unlink(tmp_path)
 
-    def test_scan_zip_with_proto0_pickle_disguised_as_text(self):
+    def test_scan_zip_with_proto0_pickle_disguised_as_text(self) -> None:
         """Protocol 0 pickle in .txt entry should still be detected as pickle content."""
         with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
             with zipfile.ZipFile(tmp.name, "w") as z:

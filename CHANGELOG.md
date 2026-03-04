@@ -27,7 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **security**: harden pickle scanner stack resolution to correctly track `STACK_GLOBAL` and memoized `REDUCE` call targets, preventing decoy-string and `BINGET` bypasses
 - **security**: flag pickle `EXT1`/`EXT2`/`EXT4` extension-registry call targets in `REDUCE` analysis to close EXT opcode bypasses
-- **security**: detect protocol 0/1 ASCII pickle signatures in generic file-format detection to prevent ZIP entry extension bypasses (e.g. malicious `payload.txt`)
+- **security**: detect protocol 0/1 ASCII pickle signatures in generic file-format detection to prevent ZIP entry extension bypasses (e.g., malicious `payload.txt`)
 - **security**: tighten manifest trusted-domain matching to validate URL hostnames instead of substring matches
 - **security**: make `.keras` suspicious file extension checks case-insensitive to catch uppercase executable/script payloads
 - **security**: block unsafe in-process `torch.load` in `WeightDistributionScanner` by default unless explicitly opted in

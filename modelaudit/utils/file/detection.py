@@ -23,14 +23,27 @@ PROTO0_1_PICKLE_SIGNATURES = (
     b"cbuiltins",
     b"c__builtin__",
     b"cjoblib\n",
-    b"(c",
-    b"(i",
 )
+
+PROTO0_1_MARK_PREFIXES = (b"(c", b"(i")
+PROTO0_1_IDENTIFIER_BYTES = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_."
 
 
 def _looks_like_proto0_or_1_pickle(magic16: MagicBytes) -> bool:
     """Best-effort detection for protocol 0/1 pickles without binary magic."""
-    return any(magic16.startswith(sig) for sig in PROTO0_1_PICKLE_SIGNATURES)
+    if any(magic16.startswith(sig) for sig in PROTO0_1_PICKLE_SIGNATURES):
+        return True
+
+    # MARK + GLOBAL/INST starts: "(c<module>\n" or "(i<module>\n".
+    if len(magic16) < 4 or magic16[:2] not in PROTO0_1_MARK_PREFIXES:
+        return False
+
+    newline_index = magic16.find(b"\n", 2)
+    if newline_index == -1:
+        return False
+
+    identifier = magic16[2:newline_index]
+    return bool(identifier) and all(byte in PROTO0_1_IDENTIFIER_BYTES for byte in identifier)
 
 
 def is_zipfile(path: str) -> bool:

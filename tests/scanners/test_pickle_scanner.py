@@ -814,7 +814,6 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
         """Protocol 0 pickle payloads in ZIP entries should not be skipped by extension."""
         import tempfile
         import zipfile
-        from pathlib import Path
 
         from modelaudit.core import scan_file
 
