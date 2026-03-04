@@ -269,7 +269,7 @@ class KerasH5Scanner(BaseScanner):
 
                 # Special handling for Lambda layers - validate Python code
                 if layer_class == "Lambda":
-                    layer_name = layer_config.get("name", f"lambda_{layer_counts.get('Lambda', 1)}")
+                    layer_name = layer_config.get("name") or f"lambda_{layer_counts.get('Lambda', 1)}"
                     self._check_lambda_layer(layer_config, result)
                     keras_version = result.metadata.get("keras_version")
                     if isinstance(keras_version, str) and self._is_vulnerable_to_cve_2024_3660(keras_version):
@@ -480,17 +480,22 @@ class KerasH5Scanner(BaseScanner):
 
     @staticmethod
     def _is_vulnerable_to_cve_2024_3660(version: str) -> bool:
-        """Return True for Keras versions lower than 2.13.0."""
+        """Return True for Keras versions lower than 2.13.0.
+
+        Handles two-part versions (e.g. "2.10") by treating missing patch as 0.
+        """
         parts = version.split(".", 2)
-        if len(parts) < 3:
+        if len(parts) < 2:
             return False
         try:
-            major, minor, patch_part = parts
-            patch_digits = "".join(ch for ch in patch_part if ch.isdigit())
-            if not patch_digits:
-                return False
-            parsed = (int(major), int(minor), int(patch_digits))
-            return parsed < (2, 13, 0)
+            major = int(parts[0])
+            minor = int(parts[1])
+            patch = 0
+            if len(parts) == 3:
+                patch_digits = "".join(ch for ch in parts[2] if ch.isdigit())
+                if patch_digits:
+                    patch = int(patch_digits)
+            return (major, minor, patch) < (2, 13, 0)
         except ValueError:
             return False
 
