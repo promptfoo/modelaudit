@@ -93,6 +93,15 @@ def test_detect_file_format_proto0_pickle_with_text_extension(tmp_path: Path) ->
     assert detect_file_format_from_magic(str(payload)) == "pickle"
 
 
+def test_detect_file_format_proto0_pickle_with_single_comment_token_prefix(tmp_path: Path) -> None:
+    """A single leading comment token should not suppress proto0 detection."""
+    payload = tmp_path / "comment-prefixed-payload.txt"
+    payload.write_bytes(b"#" + b'cos\nsystem\n(S"echo pwned"\ntR.')
+
+    assert detect_file_format(str(payload)) == "pickle"
+    assert detect_file_format_from_magic(str(payload)) == "pickle"
+
+
 def test_detect_file_format_proto0_mark_prefix_requires_structure(tmp_path: Path) -> None:
     """MARK + GLOBAL/INST prefixes should only match when structure is pickle-like."""
     non_pickle_payload = tmp_path / "not-pickle.txt"

@@ -27,22 +27,29 @@ def _looks_like_proto0_or_1_pickle(sample: bytes) -> bool:
     if len(sample) < 2:
         return False
 
-    # Only attempt expensive parsing for likely text-protocol starters.
-    if sample[0] not in PROTO0_1_START_BYTES:
+    def _matches_proto_stream(candidate: bytes) -> bool:
+        # Only attempt expensive parsing for likely text-protocol starters.
+        if len(candidate) < 2 or candidate[0] not in PROTO0_1_START_BYTES:
+            return False
+
+        opcode_count = 0
+        try:
+            for opcode, _arg, _pos in pickletools.genops(candidate):
+                opcode_count += 1
+                if opcode.name == "STOP":
+                    return opcode_count >= 2
+                if opcode_count >= PROTO0_1_MAX_PROBE_OPCODES:
+                    return False
+        except Exception:
+            return False
         return False
 
-    opcode_count = 0
-    try:
-        for opcode, _arg, _pos in pickletools.genops(sample):
-            opcode_count += 1
-            if opcode.name == "STOP":
-                return opcode_count >= 2
-            if opcode_count >= PROTO0_1_MAX_PROBE_OPCODES:
-                return False
-    except Exception:
-        return False
+    if _matches_proto_stream(sample):
+        return True
 
-    return False
+    # Regression hardening: a single leading "#" token should not suppress
+    # protocol 0/1 detection for otherwise valid pickle streams.
+    return sample.startswith(b"#") and _matches_proto_stream(sample[1:])
 
 
 def _read_pickle_probe_sample(path: Path, size: int, header16: bytes) -> bytes:

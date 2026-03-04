@@ -329,6 +329,24 @@ class TestZipScanner:
             f"Expected no noisy pickle warning for plain text, got: {[i.message for i in noisy_pickle_warnings]}"
         )
 
+    def test_scan_zip_with_proto0_pickle_with_single_comment_token_bypass_regression(self, tmp_path: Path) -> None:
+        """Single comment-token prefix must not suppress proto0 payload detection."""
+        archive_path = tmp_path / "proto0_comment_prefixed_payload.zip"
+        payload = b"#" + b'cos\nsystem\n(S"echo pwned"\ntR.'
+        with zipfile.ZipFile(archive_path, "w") as z:
+            z.writestr("payload.txt", payload)
+
+        result = self.scanner.scan(str(archive_path))
+        assert result.success is True
+        assert result.has_errors
+
+        critical_messages = [
+            issue.message.lower() for issue in result.issues if issue.severity == IssueSeverity.CRITICAL
+        ]
+        assert any("os.system" in msg or "posix.system" in msg for msg in critical_messages), (
+            f"Expected critical os/posix.system issue, got: {critical_messages}"
+        )
+
     def test_scan_nonexistent_file(self):
         """Test scanning a file that doesn't exist"""
         result = self.scanner.scan("/nonexistent/file.zip")
