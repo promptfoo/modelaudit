@@ -63,6 +63,7 @@ ModelAudit includes **31 specialized scanners** covering model, archive, and con
 | **Keras**               | `.h5`, `.hdf5`, `.keras`              | MEDIUM |
 | **ONNX**                | `.onnx`                               | MEDIUM |
 | **CoreML**              | `.mlmodel`                            | LOW    |
+| **MXNet**               | `*-symbol.json`, `*-NNNN.params`      | LOW    |
 | **CNTK**                | `.dnn`, `.cmf`                        | MEDIUM |
 | **RKNN**                | `.rknn`                               | MEDIUM |
 | **Torch7**              | `.t7`, `.th`, `.net`                  | HIGH   |

@@ -15,6 +15,7 @@ def test_scanner_registry_contains_all_scanners():
         "SafeTensorsScanner",
         "PmmlScanner",
         "CoreMLScanner",
+        "MXNetScanner",
         "LlamafileScanner",
     ]
 
@@ -102,6 +103,7 @@ def test_scanner_registry_file_extension_coverage():
         ".tflite",
         ".pdmodel",
         ".pdiparams",
+        ".params",
         ".engine",
         ".plan",
         ".gz",
