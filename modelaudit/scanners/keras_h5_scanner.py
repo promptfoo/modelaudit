@@ -14,7 +14,7 @@ from modelaudit.utils.helpers.code_validation import (
     validate_python_syntax,
 )
 
-from ..config.explanations import get_cve_2025_9905_explanation, get_pattern_explanation
+from ..config.explanations import get_cve_2024_3660_explanation, get_cve_2025_9905_explanation, get_pattern_explanation
 from .base import BaseScanner, IssueSeverity, ScanResult
 from .keras_utils import check_subclassed_model
 
@@ -276,11 +276,36 @@ class KerasH5Scanner(BaseScanner):
                     layer_name = raw_layer_name or f"lambda_{layer_counts.get('Lambda', 1)}"
                     self._check_lambda_layer(layer_config, result)
                     keras_version = result.metadata.get("keras_version")
+
+                    # CVE-2024-3660: Lambda layers enable arbitrary code injection
+                    if isinstance(keras_version, str) and self._is_vulnerable_to_cve_2024_3660(keras_version):
+                        result.add_check(
+                            name="CVE-2024-3660: Lambda Layer Code Injection",
+                            passed=False,
+                            message=(
+                                f"CVE-2024-3660: Lambda layer '{layer_name}' in Keras {keras_version} enables "
+                                "arbitrary code injection during model loading"
+                            ),
+                            severity=IssueSeverity.CRITICAL,
+                            location=f"{self.current_file_path} (layer: {layer_name})",
+                            details={
+                                "layer_name": layer_name,
+                                "layer_class": "Lambda",
+                                "keras_version": keras_version,
+                                "cve_id": "CVE-2024-3660",
+                                "cvss": 9.8,
+                                "cwe": "CWE-94",
+                                "description": "Lambda layer deserialization can enable arbitrary code injection.",
+                                "remediation": "Remove Lambda layers or upgrade Keras to >= 2.13",
+                            },
+                            why=get_cve_2024_3660_explanation("lambda_code_injection"),
+                        )
+
+                    # CVE-2025-9905: safe_mode=True is silently ignored for H5 format
                     vuln_status = (
                         self._is_vulnerable_to_cve_2025_9905(keras_version) if isinstance(keras_version, str) else None
                     )
                     if vuln_status is True:
-                        # CVE-2025-9905: safe_mode=True is silently ignored for H5 format
                         result.add_check(
                             name="CVE-2025-9905: H5 safe_mode Bypass",
                             passed=False,
@@ -317,7 +342,7 @@ class KerasH5Scanner(BaseScanner):
                             location=f"{self.current_file_path} (layer: {layer_name})",
                             details={"layer_class": "Lambda", "layer_name": layer_name, "keras_version": keras_version},
                         )
-                    else:
+                    elif vuln_status is None:
                         version_context = (
                             f"keras_version '{keras_version}' is non-canonical"
                             if isinstance(keras_version, str)
@@ -503,6 +528,27 @@ class KerasH5Scanner(BaseScanner):
                     },
                 )
         # Don't flag Lambda layers without code - they might just be placeholders
+
+    @staticmethod
+    def _is_vulnerable_to_cve_2024_3660(version: str) -> bool:
+        """Return True for Keras versions lower than 2.13.0.
+
+        Handles two-part versions (e.g. "2.10") by treating missing patch as 0.
+        """
+        parts = version.split(".", 2)
+        if len(parts) < 2:
+            return False
+        try:
+            major = int(parts[0])
+            minor = int(parts[1])
+            patch = 0
+            if len(parts) == 3:
+                patch_digits = "".join(ch for ch in parts[2] if ch.isdigit())
+                if patch_digits:
+                    patch = int(patch_digits)
+            return (major, minor, patch) < (2, 13, 0)
+        except ValueError:
+            return False
 
     @staticmethod
     def _is_vulnerable_to_cve_2025_9905(version: str) -> bool | None:

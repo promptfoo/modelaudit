@@ -1193,6 +1193,103 @@ class TestCVE20259906UnsafeDeserialization:
         assert len(cve_issues) >= 1
 
 
+class TestCVE20243660LambdaAttribution:
+    """Test CVE-2024-3660: Lambda layer code injection attribution."""
+
+    def _make_keras_zip(self, config: dict, tmp_path: Path, keras_version: str = "2.10.0") -> str:
+        keras_path = tmp_path / "model.keras"
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            zf.writestr("config.json", json.dumps(config))
+            zf.writestr("metadata.json", json.dumps({"keras_version": keras_version}))
+        return str(keras_path)
+
+    def test_lambda_layer_has_cve_2024_3660_attribution(self, tmp_path: Path) -> None:
+        """Lambda layer in .keras file should include CVE-2024-3660 attribution."""
+        scanner = KerasZipScanner()
+        encoded = base64.b64encode(b"lambda x: x * 2").decode()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "my_lambda",
+                        "config": {"function": [encoded, None, None]},
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(config, tmp_path))
+
+        cve_issues = [i for i in result.issues if "CVE-2024-3660" in i.message]
+        assert len(cve_issues) >= 1, "Lambda should have CVE-2024-3660 attribution"
+        assert cve_issues[0].severity == IssueSeverity.CRITICAL
+        assert cve_issues[0].details["cve_id"] == "CVE-2024-3660"
+        assert cve_issues[0].details["cvss"] == 9.8
+        assert cve_issues[0].details["cwe"] == "CWE-94"
+        assert cve_issues[0].details["description"]
+        assert cve_issues[0].details["remediation"]
+        assert cve_issues[0].details["layer_name"] == "my_lambda"
+
+    def test_no_cve_without_lambda(self, tmp_path: Path) -> None:
+        """Non-Lambda model should NOT have CVE-2024-3660 attribution."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {"layers": [{"class_name": "Dense", "name": "dense_1", "config": {"units": 10}}]},
+        }
+        result = scanner.scan(self._make_keras_zip(config, tmp_path))
+
+        cve_issues = [i for i in result.issues if "CVE-2024-3660" in i.message]
+        assert len(cve_issues) == 0
+
+    def test_no_cve_for_fixed_keras_version(self, tmp_path: Path) -> None:
+        """Lambda in fixed Keras version should not be CVE-attributed."""
+        scanner = KerasZipScanner()
+        encoded = base64.b64encode(b"lambda x: x * 2").decode()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "my_lambda",
+                        "config": {"function": [encoded, None, None]},
+                    }
+                ]
+            },
+        }
+        keras_path = tmp_path / "model_fixed.keras"
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            zf.writestr("config.json", json.dumps(config))
+            zf.writestr("metadata.json", json.dumps({"keras_version": "2.13.0"}))
+
+        result = scanner.scan(str(keras_path))
+        cve_issues = [i for i in result.issues if "CVE-2024-3660" in i.message]
+        assert len(cve_issues) == 0
+
+    def test_cve_for_two_part_keras_version(self, tmp_path: Path) -> None:
+        """Lambda in Keras 2.10 (two-part version) should be CVE-attributed."""
+        scanner = KerasZipScanner()
+        encoded = base64.b64encode(b"lambda x: x * 2").decode()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "my_lambda",
+                        "config": {"function": [encoded, None, None]},
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(config, tmp_path, keras_version="2.10"))
+        cve_issues = [i for i in result.issues if "CVE-2024-3660" in i.message]
+        assert len(cve_issues) >= 1, "Keras 2.10 should be attributed as vulnerable"
+        assert cve_issues[0].severity == IssueSeverity.CRITICAL
+
+
 class TestKerasZipScannerSubclassed:
     """Tests for subclassed model detection in ZIP format."""
 
