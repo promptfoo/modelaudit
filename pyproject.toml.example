@@ -1,5 +1,6 @@
 # Example pyproject.toml configuration for ModelAudit
 # Add this [tool.modelaudit] section to your existing pyproject.toml
+# Rule IDs are documented in RULES.md and can be listed with: modelaudit rules
 
 [tool.modelaudit]
 # Suppress noisy rules
@@ -12,7 +13,7 @@ suppress = [
 
 # Adjust severity levels
 [tool.modelaudit.severity]
-S101 = "HIGH"      # Downgrade os module (we need it)
+S101 = "HIGH"      # Lower os-module severity from CRITICAL to HIGH
 S301 = "LOW"       # Socket usage is expected
 S701 = "CRITICAL"  # API keys are critical
 

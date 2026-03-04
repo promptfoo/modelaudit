@@ -1,5 +1,6 @@
 # ModelAudit Configuration Example
 # Copy this file to .modelaudit.toml to use
+# Rule IDs are documented in RULES.md and can be listed with: modelaudit rules
 
 # Suppress specific rules (they won't be reported)
 suppress = [
@@ -19,6 +20,7 @@ S1008 = "HIGH"     # License issues are important
 
 # File-specific suppressions (gitignore-style patterns)
 [ignore]
+# Ranges like S200-S299 are supported in addition to individual codes.
 "tests/**" = ["S200-S299"]           # Ignore all pickle issues in tests
 "vendor/**" = ["S1000-S1099"]        # Ignore supply chain in vendored files
 "*.onnx" = ["S107"]                  # ONNX models often have importlib
