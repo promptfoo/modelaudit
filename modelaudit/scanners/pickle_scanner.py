@@ -3088,7 +3088,7 @@ class PickleScanner(BaseScanner):
                             file_size,
                         )
 
-                        # Add binary scanning results
+                        # Add binary scanning results (preserve original rule codes)
                         for issue in binary_result.issues:
                             result.add_check(
                                 name="Binary Content Check",
@@ -3098,25 +3098,13 @@ class PickleScanner(BaseScanner):
                                 location=issue.location,
                                 details=issue.details,
                                 why=issue.why,
+                                rule_code=issue.rule_code,
                             )
 
-                            # Add binary scanning results
-                            for issue in binary_result.issues:
-                                result.add_check(
-                                    name="Binary Content Check",
-                                    passed=False,
-                                    message=issue.message,
-                                    severity=issue.severity,
-                                    location=issue.location,
-                                    details=issue.details,
-                                    why=issue.why,
-                                    rule_code=issue.rule_code,  # Preserve original rule code
-                                )
-
-                            # Update total bytes scanned
-                            result.bytes_scanned = file_size
-                            result.metadata["pickle_bytes"] = pickle_end_pos
-                            result.metadata["binary_bytes"] = remaining_bytes
+                        # Update total bytes scanned
+                        result.bytes_scanned = file_size
+                        result.metadata["pickle_bytes"] = pickle_end_pos
+                        result.metadata["binary_bytes"] = remaining_bytes
 
         except Exception as e:
             # Check if we already found security issues in the early pattern detection
@@ -4602,8 +4590,8 @@ class PickleScanner(BaseScanner):
                     for enc, decoded in _decode_string_to_bytes(arg):
                         if _looks_like_pickle(decoded[:1024]):
                             severity = _get_context_aware_severity(IssueSeverity.CRITICAL, ml_context)
-                            # Get rule code for encoding type
-                            enc_rule = get_encoding_rule_code("base64")
+                            # Get rule code for the detected encoding type
+                            enc_rule = get_encoding_rule_code(enc)
                             result.add_check(
                                 name="Encoded Pickle Detection",
                                 passed=False,

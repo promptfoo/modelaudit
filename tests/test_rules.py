@@ -14,7 +14,7 @@ class TestRuleRegistry:
     def test_initialize(self):
         """Test that rules are initialized properly."""
         RuleRegistry.initialize()
-        assert len(RuleRegistry.get_all_rules()) == 105  # Current count via public API
+        assert len(RuleRegistry.get_all_rules()) == 110  # Current count via public API
 
     def test_get_rule(self):
         """Test getting a specific rule."""
@@ -50,7 +50,7 @@ class TestRuleRegistry:
     def test_get_all_rules(self):
         """Test getting all rules."""
         rules = RuleRegistry.get_all_rules()
-        assert len(rules) == 105
+        assert len(rules) == 110
         assert "S101" in rules
         assert "S1110" in rules
 

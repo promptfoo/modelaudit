@@ -130,6 +130,14 @@ class RuleRegistry:
             [r"import\s+ctypes", r"from\s+ctypes\s+import", r"ctypes\."],
         )
 
+        cls._add_rule(
+            "S115",
+            "Builtins code-execution access",
+            Severity.HIGH,
+            "Access to dangerous builtins that can enable code execution",
+            [r"builtins", r"__builtin__", r"__builtins__"],
+        )
+
         # S200-S299: Pickle & Deserialization
         cls._add_rule(
             "S201",
@@ -209,6 +217,14 @@ class RuleRegistry:
             Severity.MEDIUM,
             "Multiple item assignment via pickle",
             [r"pickle.*SETITEMS", r"SETITEMS.*opcode"],
+        )
+
+        cls._add_rule(
+            "S213",
+            "Nested/encoded pickle payload",
+            Severity.CRITICAL,
+            "Nested or encoded pickle payload detected",
+            [r"nested.*pickle", r"encoded.*pickle", r"pickle.*payload"],
         )
 
         # S300-S399: Network & Communication
@@ -497,6 +513,22 @@ class RuleRegistry:
             [r"xor.*encrypt", r"xor.*obfuscat", r"\^.*key"],
         )
 
+        cls._add_rule(
+            "S609",
+            "URL/percent encoding obfuscation",
+            Severity.LOW,
+            "URL-encoded content used to obfuscate payloads",
+            [r"url.*encode", r"percent.*encoding", r"%[0-9a-fA-F]{2}"],
+        )
+
+        cls._add_rule(
+            "S610",
+            "Custom/unknown encoding",
+            Severity.MEDIUM,
+            "Custom or unknown encoding used to hide payloads",
+            [r"custom.*encoding", r"unknown.*encoding", r"obfuscat.*encoding"],
+        )
+
         # S700-S799: Secrets & Credentials
         cls._add_rule(
             "S701", "API key pattern", Severity.MEDIUM, "API key detected", [r"api[_-]?key", r"apikey", r"api_secret"]
@@ -718,6 +750,14 @@ class RuleRegistry:
             Severity.HIGH,
             "File valid as multiple formats",
             [r"polyglot", r"multiple.*valid.*format", r"dual.*purpose"],
+        )
+
+        cls._add_rule(
+            "S999",
+            "Binary scan error",
+            Severity.LOW,
+            "Scanner encountered an unexpected binary parsing error",
+            [r"binary.*scan.*error", r"scan.*exception", r"parsing.*error"],
         )
 
         # S1000-S1099: Supply Chain & Dependencies

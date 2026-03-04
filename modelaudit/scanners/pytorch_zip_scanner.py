@@ -364,6 +364,8 @@ class PyTorchZipScanner(BaseScanner):
                             details={"file": name},
                             rule_code="S507",  # Python embedded code
                         )
+                        python_files_found = True
+                    elif name.endswith((".sh", ".bash", ".cmd", ".exe", ".dll", ".so", ".dylib")):
                         # Determine rule code based on file type
                         exec_rule = None
                         if name.endswith(".exe"):
@@ -372,16 +374,17 @@ class PyTorchZipScanner(BaseScanner):
                             exec_rule = "S504"  # Shell script
                         elif name.endswith(".cmd"):
                             exec_rule = "S505"  # Batch script
-                        result.add_check(
-                            name="Executable File Detection",
-                            passed=False,
-                            message=f"Executable file found in PyTorch model: {name}",
-                            severity=IssueSeverity.CRITICAL,
-                            location=f"{path}:{name}",
-                            details={"file": name},
-                            rule_code=exec_rule,
-                        )
-                        executable_files_found = True
+                        if exec_rule is not None:
+                            result.add_check(
+                                name="Executable File Detection",
+                                passed=False,
+                                message=f"Executable file found in PyTorch model: {name}",
+                                severity=IssueSeverity.CRITICAL,
+                                location=f"{path}:{name}",
+                                details={"file": name},
+                                rule_code=exec_rule,
+                            )
+                            executable_files_found = True
 
                 if not python_files_found and safe_entries:
                     result.add_check(
