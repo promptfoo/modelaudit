@@ -96,6 +96,7 @@ def test_detect_file_format_by_extension(tmp_path):
         ".h5": "hdf5",
         ".pb": "protobuf",
         ".tflite": "tflite",
+        ".mar": "torchserve_mar",
         ".cbm": "catboost",
         ".mlmodel": "coreml",
         ".llamafile": "llamafile",
@@ -464,6 +465,14 @@ def test_validate_file_type(tmp_path):
     bin_pickle = tmp_path / "weights.bin"
     bin_pickle.write_bytes(b"\x80\x03" + b"pickle data")
     assert validate_file_type(str(bin_pickle)) is True
+
+    # TorchServe archives are zip-based .mar files.
+    mar_path = tmp_path / "model.mar"
+    with zipfile.ZipFile(mar_path, "w") as mar:
+        mar.writestr("MAR-INF/MANIFEST.json", '{"model":{"serializedFile":"weights.bin","handler":"handler.py"}}')
+        mar.writestr("weights.bin", b"weights")
+        mar.writestr("handler.py", b"def handle(data, context):\n    return data\n")
+    assert validate_file_type(str(mar_path)) is True
 
     # Llamafile wrappers validate by extension with scanner-level marker checks.
     llamafile_path = tmp_path / "model.llamafile"

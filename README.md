@@ -71,6 +71,7 @@ ModelAudit includes specialized scanners covering model, archive, and configurat
 | **XGBoost**             | `.bst`, `.model`, `.ubj`              | MEDIUM |
 | **LightGBM**            | `.lgb`, `.lightgbm`, `.model`         | MEDIUM |
 | **Llamafile**           | `.llamafile`, extensionless, `.exe`   | MEDIUM |
+| **TorchServe**          | `.mar`                                | HIGH   |
 | **SafeTensors**         | `.safetensors`                        | LOW    |
 | **GGUF/GGML**           | `.gguf`, `.ggml`                      | LOW    |
 | **JAX/Flax**            | `.msgpack`, `.flax`, `.orbax`, `.jax` | LOW    |

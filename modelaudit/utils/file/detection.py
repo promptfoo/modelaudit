@@ -383,6 +383,12 @@ def detect_file_format(path: str) -> str:
             return "compressed"
         return "unknown"
 
+    # TorchServe .mar archives are ZIP-based and route to a dedicated scanner.
+    if ext == ".mar":
+        if magic4.startswith(b"PK"):
+            return "torchserve_mar"
+        return "torchserve_mar"
+
     # Check ZIP magic first (for .pt/.pth files that are actually zips)
     if magic4.startswith(b"PK"):
         return "zip"
@@ -512,6 +518,8 @@ def detect_file_format(path: str) -> str:
         ".txz",
     ):
         return "tar"
+    if ext == ".mar":
+        return "torchserve_mar"
 
     return "unknown"
 
@@ -559,6 +567,7 @@ EXTENSION_FORMAT_MAP = {
     ".lz4": "compressed",
     ".zlib": "compressed",
     ".zip": "zip",
+    ".mar": "torchserve_mar",
     ".gguf": "gguf",
     ".ggml": "ggml",
     ".ggmf": "ggml",
@@ -618,6 +627,8 @@ def detect_format_from_extension_pattern_matching(extension: FileExtension) -> F
             return "zip"
         case ".gz" | ".bz2" | ".xz" | ".lz4" | ".zlib":
             return "compressed"
+        case ".mar":
+            return "torchserve_mar"
         case ".tar" | ".tar.gz" | ".tgz":
             return "tar"
         # ML model formats
@@ -736,7 +747,13 @@ def validate_file_type(path: str) -> bool:
             return True
 
         # ZIP files can have various extensions (.zip, .pt, .pth, .ckpt, .ptl, .pte)
-        if header_format == "zip" and ext_format in {"zip", "pickle", "pytorch_binary", "executorch"}:
+        if header_format == "zip" and ext_format in {
+            "zip",
+            "pickle",
+            "pytorch_binary",
+            "executorch",
+            "torchserve_mar",
+        }:
             return True
 
         # TAR files must match
