@@ -59,22 +59,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ship next-phase open-source readiness docs ([#532](https://github.com/promptfoo/modelaudit/issues/532)) ([c88035d](https://github.com/promptfoo/modelaudit/commit/c88035d705dda3b9d2cba8f9f03a1b70b4ed41f7))
 - trim README to essentials, fix inaccuracies ([#517](https://github.com/promptfoo/modelaudit/issues/517)) ([59c056c](https://github.com/promptfoo/modelaudit/commit/59c056c5a0414b7700d0c3afc3bcc79f3679edcd))
 
-<<<<<<< HEAD
-=======
-## [Unreleased]
-
-### Security
-
-- **keras:** add CVE-2024-3660 attribution to Lambda layer detection in .keras and .h5 scanners (CVSS 9.8)
-
-### Fixed
-
-- **security**: harden pickle scanner stack resolution to correctly track `STACK_GLOBAL` and memoized `REDUCE` call targets, preventing decoy-string and `BINGET` bypasses
-- **security**: tighten manifest trusted-domain matching to validate URL hostnames instead of substring matches
-- **security**: make `.keras` suspicious file extension checks case-insensitive to catch uppercase executable/script payloads
-- **security**: block unsafe in-process `torch.load` in `WeightDistributionScanner` by default unless explicitly opted in
-
->>>>>>> cf85c3f (fix: consolidate duplicate [Unreleased] CHANGELOG section)
 ## [0.2.25] - 2026-02-12
 
 ### Features
