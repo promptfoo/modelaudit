@@ -315,7 +315,6 @@ class GgufScanner(BaseScanner):
                 )
 
             result.metadata["tensors"] = [{"name": t["name"], "type": t["type"], "dims": t["dims"]} for t in tensors]
-            result.metadata["tensors"] = [{"name": t["name"], "type": t["type"], "dims": t["dims"]} for t in tensors]
         except Exception as e:
             # Parsing errors are informational - indicate corruption/format issues, not security threats
             result.add_check(

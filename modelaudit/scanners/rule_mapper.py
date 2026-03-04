@@ -80,7 +80,7 @@ def get_import_rule_code(module: str, function: str | None = None) -> str | None
         return _rule("S404")
 
     # Pickle/serialization
-    elif module_lower in ["pickle", "cPickle", "_pickle"] or module_lower in ["dill", "cloudpickle"]:
+    elif module_lower in ["pickle", "cpickle", "_pickle"] or module_lower in ["dill", "cloudpickle"]:
         return _rule("S213")
 
     return None

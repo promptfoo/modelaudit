@@ -335,7 +335,7 @@ class FlaxMsgpackScanner(BaseScanner):
                                     "transform": transform,
                                     "context": value_str[:200] if len(value_str) > 200 else value_str,
                                 },
-                                rule_code="S510",  # JIT/TorchScript (closest match for JAX transforms)
+                                rule_code="S1105",  # JAX compilation risks
                             )
 
                     check_jax_transforms(value, f"{path}/{key}" if path else key)
@@ -382,7 +382,7 @@ class FlaxMsgpackScanner(BaseScanner):
                             severity=IssueSeverity.WARNING,
                             location=path,
                             details={"shape": shape, "max_safe_dimension": 10**9},
-                            rule_code="S703",
+                            rule_code="S804",
                         )
 
                 for key, value in data.items():
