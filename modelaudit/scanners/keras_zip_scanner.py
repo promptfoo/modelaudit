@@ -520,6 +520,13 @@ class KerasZipScanner(BaseScanner):
         keras.config.enable_unsafe_deserialization to disable safe_mode
         from within the deserialization process itself, then load malicious layers.
         """
+        # Design note: tokens are collected document-wide rather than per-object.
+        # This is a deliberate trade-off — the two indicator tokens
+        # (enable_unsafe_deserialization + keras.config context) must co-occur in
+        # the same config, but are not required to appear in the same nested
+        # object.  A per-object check would miss payloads that split the
+        # references across sibling keys, so document-wide scanning is the safer
+        # detection strategy.
         tokens = list(self._collect_string_tokens(model_config))
         has_enable_unsafe = any(
             token == "enable_unsafe_deserialization" or token.endswith(".enable_unsafe_deserialization")
