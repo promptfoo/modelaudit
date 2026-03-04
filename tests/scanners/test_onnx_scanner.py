@@ -292,8 +292,8 @@ class TestCVE202225882PathTraversal:
 
         # The traversal path should appear in a check message
         all_messages = " ".join(c.message for c in result.checks)
-        assert traversal_path in all_messages or "path traversal" in all_messages.lower(), (
-            f"Path traversal info should appear in messages. Got: {all_messages}"
+        assert traversal_path in all_messages, (
+            f"Expected traversal path '{traversal_path}' in check messages. Got: {all_messages}"
         )
 
     def test_cve_details_contain_required_fields(self, tmp_path):
@@ -314,4 +314,5 @@ class TestCVE202225882PathTraversal:
         details = cve_checks[0].details
         assert details["cvss"] == 7.5
         assert details["cwe"] == "CWE-22"
+        assert "description" in details
         assert "remediation" in details
