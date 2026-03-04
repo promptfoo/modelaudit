@@ -91,9 +91,28 @@ def test_onnx_scanner_custom_op(tmp_path):
 
 
 def test_onnx_scanner_external_data_missing(tmp_path):
+    """Missing external data file should produce a WARNING-level issue."""
     model_path = create_onnx_model(tmp_path, external=True, missing_external=True)
     result = OnnxScanner().scan(str(model_path))
-    assert any("external data reference" in i.message.lower() for i in result.issues)
+    missing_checks = [
+        c for c in result.checks if c.name == "External Data Reference Check" and "file may not be present" in c.message
+    ]
+    assert len(missing_checks) > 0, f"Should flag missing external data. Checks: {[c.message for c in result.checks]}"
+    assert missing_checks[0].severity == IssueSeverity.WARNING
+
+
+def test_onnx_scanner_external_data_exists(tmp_path: Path) -> None:
+    """Existing external data file within model dir should produce INFO-level issue."""
+    model_path = create_onnx_model(tmp_path, external=True, external_path="weights.bin")
+    result = OnnxScanner().scan(str(model_path))
+    resolved_checks = [
+        c for c in result.checks if c.name == "External Data Reference Check" and "resolved successfully" in c.message
+    ]
+    assert len(resolved_checks) > 0, (
+        f"Should report resolved external data. Checks: {[c.message for c in result.checks]}"
+    )
+    assert resolved_checks[0].severity == IssueSeverity.INFO
+    assert resolved_checks[0].passed is True
 
 
 def test_onnx_scanner_corrupted(tmp_path):

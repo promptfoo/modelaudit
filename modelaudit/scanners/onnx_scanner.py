@@ -363,8 +363,8 @@ class OnnxScanner(BaseScanner):
                         result.add_check(
                             name="External Data Reference Check",
                             passed=True,
-                            message=f"External data reference found (file may not be present): {location}",
-                            severity=IssueSeverity.WARNING,
+                            message=f"External data reference resolved successfully: {location}",
+                            severity=IssueSeverity.INFO,
                             location=str(external_path),
                             details={"file": location},
                         )
