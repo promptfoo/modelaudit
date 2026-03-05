@@ -321,10 +321,40 @@ class TestTelemetryClient:
             assert properties["file_types"]["pickle"] == 1
             assert properties["file_types"]["zip"] == 1
             assert sorted(properties["scanners_used"]) == ["pickle", "zip"]
-            assert "files_scanned" not in properties
+            assert properties["files_scanned"] == ["/tmp/a.pkl", "/tmp/b.zip"]
 
-    def test_path_and_url_fields_are_hashed_in_payloads(self):
-        """Test that raw path/URL strings are not sent in telemetry payloads."""
+    def test_scan_started_includes_per_path_fields(self):
+        """Scan started events include per-path arrays and model names."""
+        mock_posthog = MagicMock()
+
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch("modelaudit.telemetry.Path.home") as mock_home,
+            patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
+            patch.dict(
+                os.environ,
+                {"CI": "", "IS_TESTING": "", "PROMPTFOO_DISABLE_TELEMETRY": "", "NO_ANALYTICS": ""},
+                clear=False,
+            ),
+        ):
+            mock_home.return_value = Path(temp_dir)
+            client = TelemetryClient()
+            client._posthog_client = mock_posthog
+            client._user_config.telemetry_enabled = True
+
+            paths = ["/tmp/model.pkl", "hf://meta-llama/Llama-2-7b"]
+            client.record_scan_started(paths, {"format": "json"})
+
+            properties = mock_posthog.capture.call_args.kwargs["properties"]
+            assert properties["paths"] == paths
+            assert properties["model_names"][0] == "model.pkl"
+            assert properties["model_names"][1] == "meta-llama/Llama-2-7b"
+            assert properties["source_types"] == ["local", "huggingface"]
+            assert properties["path_types"][0] in {"file", "unknown"}
+            assert properties["path_types"][1] == "huggingface_shorthand"
+
+    def test_path_and_url_fields_include_raw_and_hashed_values(self):
+        """Raw path/URL fields are present along with hashed identifiers."""
         mock_posthog = MagicMock()
 
         with (
@@ -347,17 +377,20 @@ class TestTelemetryClient:
 
             client.record_file_type_detected(sensitive_path, "pickle")
             file_props = mock_posthog.capture.call_args.kwargs["properties"]
-            assert "file_path" not in file_props
+            assert file_props["file_path"] == sensitive_path
+            assert file_props["model_name"] == "model.pkl"
             assert "path_identifier" in file_props
 
             client.record_issue_found("dangerous pattern", "critical", "pickle", sensitive_path)
             issue_props = mock_posthog.capture.call_args.kwargs["properties"]
-            assert "file_path" not in issue_props
+            assert issue_props["file_path"] == sensitive_path
+            assert issue_props["model_name"] == "model.pkl"
             assert "path_identifier" in issue_props
 
             client.record_download_started("http", sensitive_url)
             download_props = mock_posthog.capture.call_args.kwargs["properties"]
-            assert "url" not in download_props
+            assert download_props["url"] == sensitive_url
+            assert download_props["model_name"] == "model.bin?token=secret"
             assert "url_identifier" in download_props
 
     def test_telemetry_available_false_when_posthog_unavailable(self):
