@@ -4,9 +4,9 @@
 
 - `cli.py`: Click-based CLI interface
 - `core.py`: Main scanning logic and file traversal
-- `risk_scoring.py`: Normalizes issues to 0.0-1.0 risk scores
+- `metadata_extractor.py`: Metadata extraction command backend (`modelaudit metadata`)
 - `scanners/`: Format-specific scanner implementations
-- `utils/filetype.py`: File type detection utilities
+- `utils/file/detection.py`: File type and content detection utilities
 
 ## Scanner System
 

@@ -50,7 +50,7 @@ Files scanned: 1 | Issues found: 2 critical, 1 warning
 
 ## Supported Formats
 
-ModelAudit includes **31 specialized scanners** covering model, archive, and configuration formats:
+ModelAudit includes specialized scanners covering model, archive, and configuration formats:
 
 | Format                  | Extensions                            | Risk   |
 | ----------------------- | ------------------------------------- | ------ |
@@ -64,6 +64,7 @@ ModelAudit includes **31 specialized scanners** covering model, archive, and con
 | **ONNX**                | `.onnx`                               | MEDIUM |
 | **CoreML**              | `.mlmodel`                            | LOW    |
 | **MXNet**               | `*-symbol.json`, `*-NNNN.params`      | LOW    |
+| **NeMo**                | `.nemo`                               | MEDIUM |
 | **CNTK**                | `.dnn`, `.cmf`                        | MEDIUM |
 | **RKNN**                | `.rknn`                               | MEDIUM |
 | **Torch7**              | `.t7`, `.th`, `.net`                  | HIGH   |
@@ -142,10 +143,23 @@ docker run --rm -v "$(pwd)":/app ghcr.io/promptfoo/modelaudit:latest model.pkl
 
 ## CLI Options
 
+Primary commands:
+
+```bash
+modelaudit [PATHS...]                           # Default scan command
+modelaudit scan [OPTIONS] PATHS...              # Explicit scan command
+modelaudit metadata [OPTIONS] PATH              # Extract model metadata safely (no deserialization by default)
+modelaudit doctor [--show-failed]               # Diagnose scanner/dependency availability
+modelaudit debug [--json] [--verbose]           # Environment and configuration diagnostics
+modelaudit cache [stats|clear|cleanup] [OPTIONS]
 ```
---format {text,json,sarif}   Output format (default: text)
+
+Common scan options:
+
+```
+--format {text,json,sarif}   Output format (default: auto-detected)
 --output FILE                Write results to file
---strict                     Fail on warnings, scan all file types
+--strict                     Fail on warnings, scan all file types, strict license validation
 --sbom FILE                  Generate CycloneDX SBOM
 --stream                     Download, scan, and delete files one-by-one (saves disk)
 --max-size SIZE              Size limit (e.g., 10GB)
@@ -157,6 +171,21 @@ docker run --rm -v "$(pwd)":/app ghcr.io/promptfoo/modelaudit:latest model.pkl
 --cache-dir DIR              Set cache directory for downloads and scan results
 --progress                   Force progress display
 ```
+
+## Metadata Extraction
+
+```bash
+# Human-readable summary (safe default: no model deserialization)
+modelaudit metadata model.safetensors
+
+# Machine-readable output
+modelaudit metadata ./models --format json --output metadata.json
+
+# Focus only on security-relevant metadata fields
+modelaudit metadata model.onnx --security-only
+```
+
+`--trust-loaders` enables scanner metadata loaders that may deserialize model content. Only use this on trusted artifacts in isolated environments.
 
 ## Exit Codes
 
@@ -199,6 +228,8 @@ modelaudit model.pkl --format sarif --output results.sarif
 ## Troubleshooting
 
 - Run `modelaudit doctor --show-failed` to list unavailable scanners and missing optional deps.
+- Run `modelaudit debug --json` to collect environment/config diagnostics for bug reports.
+- Use `modelaudit cache cleanup --max-age 30` to remove stale cache entries safely.
 - If `pip` installs an older release, verify Python is `3.10+` (`python --version`).
 - For additional troubleshooting and cloud auth guidance, see:
   - https://www.promptfoo.dev/docs/model-audit/
@@ -212,6 +243,7 @@ modelaudit model.pkl --format sarif --output results.sarif
 - **[Support policy](SUPPORT.md)** — supported Python/OS versions and maintenance policy
 - **[Security model and limitations](docs/user/security-model.md)** — what ModelAudit does and does not guarantee
 - **[Compatibility matrix](docs/user/compatibility-matrix.md)** — file formats vs optional dependencies
+- **[Metadata extraction guide](docs/user/metadata-extraction.md)** — safe metadata workflows and `--trust-loaders` guidance
 - **[Offline/air-gapped guide](docs/user/offline-air-gapped.md)** — secure operation without internet access
 - **[Scanner contributor quickstart](docs/agents/new-scanner-quickstart.md)** — safe workflow for new scanner development
 - **Troubleshooting** — run `modelaudit doctor --show-failed` to check scanner availability

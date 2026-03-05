@@ -4,26 +4,31 @@
 
 ModelAudit uses optional dependencies to keep the base installation lightweight:
 
-- **Base install**: Only includes core dependencies (pickle, numpy, zip scanning)
+- **Base install**: Supports many static scanners out-of-the-box; optional extras expand framework-specific validation paths
 - **Feature-specific installs**: Add only what you need
 - **Graceful degradation**: Missing dependencies disable specific scanners, don't break the tool
 - **Clear guidance**: Error messages tell you exactly what to install
 
 ## Optional Dependencies
 
-| Feature       | Package     | Purpose                               |
-| ------------- | ----------- | ------------------------------------- |
-| `h5`          | h5py        | Keras H5 model scanning               |
-| `pytorch`     | torch       | PyTorch model scanning                |
-| `yaml`        | pyyaml      | YAML manifest scanning                |
-| `safetensors` | safetensors | SafeTensors model scanning            |
-| `onnx`        | onnx        | ONNX model scanning                   |
-| `dill`        | dill        | Enhanced pickle support               |
-| `joblib`      | joblib      | Joblib model scanning                 |
-| `flax`        | flax        | Flax msgpack scanning                 |
-| `tflite`      | tflite      | TensorFlow Lite scanning              |
-| `tensorflow`  | tensorflow  | TF checkpoint reading (rarely needed) |
-| `all`         | All above   | Everything                            |
+| Extra         | Key packages                                | Purpose                                                                 |
+| ------------- | ------------------------------------------- | ----------------------------------------------------------------------- |
+| `h5`          | `h5py`                                      | Keras H5 model scanning                                                 |
+| `pytorch`     | `torch`                                     | PyTorch ecosystem compatibility paths                                   |
+| `safetensors` | `safetensors`                               | SafeTensors runtime-backed validation paths                             |
+| `onnx`        | `onnx`                                      | ONNX parsing/validation                                                  |
+| `dill`        | `dill`                                      | Extended pickle-family compatibility                                    |
+| `joblib`      | `joblib`, `scikit-learn`                    | Joblib/sklearn ecosystem compatibility                                  |
+| `flax`        | `msgpack`                                   | Flax/JAX msgpack checkpoint support                                     |
+| `tflite`      | `tflite`                                    | TensorFlow Lite parsing                                                  |
+| `tensorflow`  | `tensorflow`                                | Optional TF runtime-dependent paths (for example checkpoint inspection) |
+| `xgboost`     | `xgboost`, `py-ubjson`                      | XGBoost UBJ/full validation paths                                       |
+| `mlflow`      | `mlflow`                                    | MLflow registry source support                                           |
+| `sevenzip`    | `py7zr`                                     | 7z archive scanner                                                       |
+| `all-ci`      | most extras except platform-specific ones   | CI profile                                                               |
+| `all`         | all optional extras                         | Broadest local scanner coverage                                          |
+
+`pyyaml`, `msgpack`, and cloud storage dependencies (`fsspec`, `s3fs`, `gcsfs`) are core dependencies in the base install.
 
 ## TensorFlow SavedModel Scanning (No TensorFlow Required)
 
