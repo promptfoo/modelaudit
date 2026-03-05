@@ -5,10 +5,11 @@ import os
 import re
 import shutil
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Callable, Coroutine, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 from urllib.parse import urlparse
 
 import click
@@ -17,6 +18,21 @@ from yaspin import yaspin
 from modelaudit.utils.helpers.retry import retry_with_backoff
 
 from ..helpers.disk_space import check_disk_space
+
+_T = TypeVar("_T")
+
+
+def _run_coroutine_sync(coro_factory: Callable[[], Coroutine[Any, Any, _T]]) -> _T:
+    """Run a coroutine from sync code without deadlocking an active event loop."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro_factory())
+
+    # A loop is already running in this thread. Running the coroutine in a worker
+    # thread avoids blocking that loop while still giving synchronous call semantics.
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        return executor.submit(lambda: asyncio.run(coro_factory())).result()
 
 
 def is_cloud_url(url: str) -> bool:
@@ -512,12 +528,7 @@ def download_from_cloud(
             return cached_path
 
     # Analyze target
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        metadata = asyncio.run(analyze_cloud_target(url))
-    else:
-        metadata = asyncio.run_coroutine_threadsafe(analyze_cloud_target(url), loop).result()
+    metadata = _run_coroutine_sync(lambda: analyze_cloud_target(url))
 
     # Ensure target was analyzed successfully
     if "error" in metadata or metadata.get("type") == "unknown":
@@ -689,12 +700,7 @@ def download_from_cloud_streaming(
         ) from e
 
     # Analyze target to get file list
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        metadata = asyncio.run(analyze_cloud_target(url))
-    else:
-        metadata = asyncio.run_coroutine_threadsafe(analyze_cloud_target(url), loop).result()
+    metadata = _run_coroutine_sync(lambda: analyze_cloud_target(url))
 
     if "error" in metadata or metadata.get("type") == "unknown":
         error_msg = metadata.get("error", "Unknown cloud target type")

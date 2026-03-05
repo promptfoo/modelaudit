@@ -71,30 +71,31 @@ def test_download_from_cloud(mock_fs, tmp_path):
     # Note: fsspec filesystems don't need explicit cleanup according to implementation
 
 
-@patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
-@patch("fsspec.filesystem")
-def test_download_from_cloud_async_context(mock_fs, mock_analyze, tmp_path):
-    fs = MagicMock()
-    mock_fs.return_value = fs
-
+@pytest.mark.asyncio
+async def test_download_from_cloud_async_context(tmp_path: Path) -> None:
+    fs = make_fs_mock()
     fs.info.return_value = {"type": "file", "size": 1024}
 
-    # Mock analyze_cloud_target to return file metadata
-    mock_analyze.return_value = {
-        "type": "file",
-        "size": 1024,
-        "name": "model.pt",
-        "human_size": "1.0 KB",
-        "estimated_time": "1 second",
-    }
+    async def mock_analyze(_url: str) -> dict[str, object]:
+        return {
+            "type": "file",
+            "size": 1024,
+            "name": "model.pt",
+            "human_size": "1.0 KB",
+            "estimated_time": "1 second",
+        }
 
-    url = "s3://bucket/model.pt"
+    await asyncio.sleep(0)
+    with (
+        patch("fsspec.filesystem", return_value=fs),
+        patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new=mock_analyze),
+        patch(
+            "modelaudit.utils.sources.cloud_storage.asyncio.run_coroutine_threadsafe",
+            side_effect=AssertionError("run_coroutine_threadsafe should not be used"),
+        ),
+    ):
+        result = download_from_cloud("s3://bucket/model.pt", cache_dir=tmp_path, use_cache=False)
 
-    # Test that the function works in a synchronous context
-    result = download_from_cloud(url, cache_dir=tmp_path)
-
-    # With context managers, fs.get is called but then fs is closed
-    # Just verify the result is correct since the mock behavior changes with context managers
     assert isinstance(result, Path)
     assert result.name == "model.pt"
 
@@ -115,6 +116,38 @@ def test_download_from_cloud_streaming_returns_stream_url(mock_preview, mock_ana
     result = download_from_cloud(url, cache_dir=tmp_path, use_cache=False, stream_analyze=True)
 
     assert result == f"stream://{url}"
+
+
+@pytest.mark.asyncio
+async def test_download_from_cloud_streaming_async_context() -> None:
+    fs = make_fs_mock()
+    fs.info.return_value = {"type": "file", "size": 1024}
+    fs.get.side_effect = lambda _src, dst: Path(dst).write_bytes(b"data")
+
+    async def mock_analyze(_url: str) -> dict[str, object]:
+        return {
+            "type": "file",
+            "size": 1024,
+            "name": "model.pt",
+            "human_size": "1.0 KB",
+            "estimated_time": "1 second",
+        }
+
+    await asyncio.sleep(0)
+    with (
+        patch("fsspec.filesystem", return_value=fs),
+        patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new=mock_analyze),
+        patch(
+            "modelaudit.utils.sources.cloud_storage.asyncio.run_coroutine_threadsafe",
+            side_effect=AssertionError("run_coroutine_threadsafe should not be used"),
+        ),
+    ):
+        streamed = list(download_from_cloud_streaming("s3://bucket/model.pt", show_progress=False))
+
+    assert len(streamed) == 1
+    streamed_path, is_last = streamed[0]
+    assert streamed_path.name == "model.pt"
+    assert is_last is True
 
 
 @patch("builtins.__import__")
