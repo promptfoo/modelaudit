@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 import pytest
 
-from modelaudit.scanners import _registry
+from modelaudit.scanners import ScannerRegistry, _registry
 from modelaudit.scanners.base import BaseScanner
 
 
@@ -142,16 +142,17 @@ class TestScannerRegistry:
     @patch("importlib.import_module")
     def test_scanner_load_failure_handling(self, mock_import):
         """Test handling of scanner loading failures."""
-        # Reset loaded scanners
-        _registry._loaded_scanners.clear()
+        # Use an isolated registry so this test can't pollute global state.
+        fresh_registry = ScannerRegistry()
 
         # Mock import failure
         mock_import.side_effect = ImportError("Module not found")
 
         # Should return None for failed import
-        scanner = _registry._load_scanner("tf_savedmodel")
+        scanner = fresh_registry._load_scanner("tf_savedmodel")
         assert scanner is None
-        assert "tf_savedmodel" not in _registry._loaded_scanners
+        assert "tf_savedmodel" not in fresh_registry._loaded_scanners
+        assert "tf_savedmodel" in fresh_registry._failed_scanners
 
     def test_get_scanner_classes_loads_available_scanners(self):
         """Test that get_scanner_classes loads all available scanners."""
