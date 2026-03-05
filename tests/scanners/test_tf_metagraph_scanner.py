@@ -23,7 +23,7 @@ def _get_metagraph_class() -> type:
     import modelaudit.protos  # noqa: F401
 
     meta_graph_pb2 = importlib.import_module("tensorflow.core.protobuf.meta_graph_pb2")
-    return meta_graph_pb2.MetaGraphDef
+    return cast(type, meta_graph_pb2.MetaGraphDef)
 
 
 def _build_metagraph(

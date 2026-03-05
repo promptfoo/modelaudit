@@ -8,6 +8,7 @@ import tarfile
 import zipfile
 import zlib
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -37,7 +38,7 @@ def _build_tf_metagraph_bytes() -> bytes:
     node = metagraph.graph_def.node.add()
     node.name = "const_node"
     node.op = "Const"
-    return metagraph.SerializeToString()
+    return cast(bytes, metagraph.SerializeToString())
 
 
 def test_detect_file_format_directory(tmp_path):
