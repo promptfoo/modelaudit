@@ -4852,7 +4852,8 @@ class PickleScanner(BaseScanner):
             # Detect joblib/sklearn content from parsed globals for extensionless files
             # (e.g. HuggingFace cache stores files as hash blobs without extensions)
             has_joblib_globals = any(
-                mod.startswith("joblib.") or mod.startswith("sklearn.") for mod, _func in advanced_globals
+                mod in {"joblib", "sklearn"} or mod.startswith(("joblib.", "sklearn."))
+                for mod, _func in advanced_globals
             )
             is_joblib_content = is_serialization_ext or (not file_ext and has_joblib_globals)
 
