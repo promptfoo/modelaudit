@@ -5,7 +5,6 @@ Supports TOML-based configuration for suppressing rules and adjusting severity.
 
 from __future__ import annotations
 
-import contextlib
 import logging
 import re
 from dataclasses import dataclass, field
@@ -39,6 +38,15 @@ def _expand_rule_codes(codes: list[str]) -> list[str]:
         else:
             expanded.append(code)
     return expanded
+
+
+def _summarize_codes(codes: set[str], limit: int = 10) -> str:
+    """Summarize a set of codes for warning logs."""
+    sorted_codes = sorted(codes)
+    if len(sorted_codes) <= limit:
+        return ", ".join(sorted_codes)
+    remaining = len(sorted_codes) - limit
+    return f"{', '.join(sorted_codes[:limit])}, ... (+{remaining} more)"
 
 
 @dataclass
@@ -102,20 +110,59 @@ class ModelAuditConfig:
 
     def _parse_config(self, data: dict[str, Any]) -> None:
         """Parse configuration dictionary into this object."""
+        valid_rule_codes = set(RuleRegistry.get_all_rules().keys())
+
         if "suppress" in data and isinstance(data["suppress"], list):
-            self.suppress = set(_expand_rule_codes(data["suppress"]))
+            raw_suppress = [str(code).strip().upper() for code in data["suppress"] if isinstance(code, str)]
+            expanded_suppress = _expand_rule_codes(raw_suppress)
+            unknown_suppress = {code for code in expanded_suppress if code not in valid_rule_codes}
+            if unknown_suppress:
+                logger.warning(
+                    "Ignoring unknown suppress rule code(s): %s",
+                    _summarize_codes(unknown_suppress),
+                )
+            self.suppress = {code for code in expanded_suppress if code in valid_rule_codes}
 
         if "severity" in data and isinstance(data["severity"], dict):
             for rule_code, severity_str in data["severity"].items():
-                with contextlib.suppress(ValueError, AttributeError):
-                    self.severity[rule_code] = Severity(severity_str.upper())
+                normalized_code = str(rule_code).strip().upper()
+                if normalized_code not in valid_rule_codes:
+                    logger.warning("Ignoring unknown severity override rule code: %s", normalized_code)
+                    continue
+                try:
+                    self.severity[normalized_code] = Severity(str(severity_str).strip().upper())
+                except (ValueError, AttributeError):
+                    logger.warning(
+                        "Ignoring invalid severity '%s' for rule %s",
+                        severity_str,
+                        normalized_code,
+                    )
 
         if "ignore" in data and isinstance(data["ignore"], dict):
             expanded: dict[str, list[str]] = {}
             for pattern, codes in data["ignore"].items():
                 if not isinstance(codes, list):
                     continue
-                expanded[pattern] = _expand_rule_codes(codes)
+                raw_codes = [str(code).strip().upper() for code in codes if isinstance(code, str)]
+                expanded_codes = _expand_rule_codes(raw_codes)
+
+                valid_codes: list[str] = []
+                unknown_codes: set[str] = set()
+                for code in expanded_codes:
+                    if code == "ALL" or code in valid_rule_codes:
+                        valid_codes.append(code)
+                    else:
+                        unknown_codes.add(code)
+
+                if unknown_codes:
+                    logger.warning(
+                        "Ignoring unknown ignore rule code(s) for pattern '%s': %s",
+                        pattern,
+                        _summarize_codes(unknown_codes),
+                    )
+
+                if valid_codes:
+                    expanded[pattern] = list(dict.fromkeys(valid_codes))
             self.ignore = expanded
 
         if "options" in data and isinstance(data["options"], dict):

@@ -6,7 +6,7 @@
 
 ## How It Works
 
-1. **Rule Registry**: 105 rules defined in `modelaudit/rules.py`
+1. **Rule Registry**: 110 rules defined in `modelaudit/rules.py`
 2. **Auto-Detection**: Messages are matched to rules via regex patterns
 3. **Configuration**: Rules can be suppressed or severity adjusted via `.modelaudit.toml`
 
@@ -16,7 +16,7 @@
 2. Rule taxonomy and severities may evolve as new detections are added.
 3. If you find a check without an expected rule code, file an issue with a reproducer.
 
-## All Security Rules (105 Total)
+## All Security Rules (110 Total)
 
 ### S100–S199: Module/Import Security
 

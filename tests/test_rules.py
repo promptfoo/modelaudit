@@ -172,9 +172,24 @@ S701 = "CRITICAL"
         config._parse_config({"ignore": {"tests/**": ["S200-S202", "S999"]}})
 
         assert "tests/**" in config.ignore
-        assert set(config.ignore["tests/**"]) == {"S200", "S201", "S202", "S999"}
+        assert set(config.ignore["tests/**"]) == {"S201", "S202", "S999"}
         assert config.is_suppressed("S201", "tests/example.py")
         assert not config.is_suppressed("S203", "tests/example.py")
+
+    def test_parse_config_filters_unknown_codes(self):
+        """Unknown config rule codes should be ignored instead of persisted."""
+        config = ModelAuditConfig()
+        config._parse_config(
+            {
+                "suppress": ["S710", "S700-S702", "s9999"],
+                "severity": {"s301": "HIGH", "S302": "INVALID", "S9999": "CRITICAL"},
+                "ignore": {"tests/**": ["S200-S202", "S9999", "all"]},
+            }
+        )
+
+        assert config.suppress == {"S701", "S702", "S710"}
+        assert config.severity == {"S301": Severity.HIGH}
+        assert set(config.ignore["tests/**"]) == {"S201", "S202", "ALL"}
 
 
 class TestScanResultIntegration:

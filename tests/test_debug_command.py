@@ -10,6 +10,11 @@ from click.testing import CliRunner
 from modelaudit.cli import cli
 
 
+def _is_private_debug_path(path: str) -> bool:
+    """Path is privacy-safe when home-prefixed or fully redacted."""
+    return path.startswith("~") or path == "<outside-home path redacted>"
+
+
 @pytest.mark.unit
 class TestDebugCommand:
     """Tests for the modelaudit debug command."""
@@ -280,12 +285,25 @@ class TestDebugCommand:
             return
         shared_config_path = config_info.get("sharedConfigPath")
         if shared_config_path:
-            assert shared_config_path.startswith("~"), f"Config path should use ~, got: {shared_config_path}"
+            assert _is_private_debug_path(shared_config_path), (
+                f"Config path should be sanitized, got: {shared_config_path}"
+            )
 
         # Cache directory should use ~
         cache_info = parsed.get("cache", {})
         if cache_info.get("enabled") and cache_info.get("directory"):
-            assert cache_info["directory"].startswith("~")
+            assert _is_private_debug_path(cache_info["directory"])
+
+    def test_debug_redacts_outside_home_shared_config_path(self, runner: CliRunner) -> None:
+        """Outside-home shared config paths should be redacted."""
+        with patch("modelaudit.cli.get_config_directory_path", return_value="/var/lib/modelaudit-test"):
+            result = runner.invoke(cli, ["debug", "--json"])
+
+        assert result.exit_code == 0
+        parsed = json.loads(result.output)
+        config_info = parsed.get("config", {})
+        if "error" not in config_info:
+            assert config_info["sharedConfigPath"] == "<outside-home path redacted>"
 
     def test_debug_command_is_fast(self, runner):
         """Debug command should complete quickly (under 10 seconds)."""

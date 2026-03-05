@@ -2692,6 +2692,16 @@ def _get_scanner_info(verbose: bool = False) -> dict[str, Any]:
     return info
 
 
+def _sanitize_debug_path(path: str) -> str:
+    """Sanitize filesystem paths for debug output."""
+    home = str(Path.home())
+    if path.startswith(home):
+        return "~" + path[len(home) :]
+    if os.path.isabs(path):
+        return "<outside-home path redacted>"
+    return path
+
+
 def _get_cache_info() -> dict[str, Any]:
     """Get cache information for debug output."""
     try:
@@ -2703,13 +2713,7 @@ def _get_cache_info() -> dict[str, Any]:
         # Get cache directory path with ~ expansion for privacy
         cache_dir_path: str | None = None
         if cache_manager.cache is not None:
-            cache_dir_path = str(cache_manager.cache.cache_dir)
-            home = str(Path.home())
-            if cache_dir_path.startswith(home):
-                cache_dir_path = "~" + cache_dir_path[len(home) :]
-            elif os.path.isabs(cache_dir_path):
-                # Redact non-home absolute paths without implying they live under "~".
-                cache_dir_path = "<outside-home path redacted>"
+            cache_dir_path = _sanitize_debug_path(str(cache_manager.cache.cache_dir))
 
         return {
             "enabled": True,
@@ -2727,16 +2731,13 @@ def _get_cache_info() -> dict[str, Any]:
 
 def _get_config_info() -> dict[str, Any]:
     """Get configuration information for debug output."""
-    home = str(Path.home())
-
     # Shared config with promptfoo
     shared_config_dir = get_config_directory_path()
     shared_config_path = os.path.join(shared_config_dir, "promptfoo.yaml")
-    shared_display_path = shared_config_path
-    if shared_display_path.startswith(home):
-        shared_display_path = "~" + shared_display_path[len(home) :]
+    shared_display_path = _sanitize_debug_path(shared_config_path)
 
     # ModelAudit-specific config
+    home = str(Path.home())
     modelaudit_config_path = os.path.join(home, ".modelaudit", "user_config.json")
     modelaudit_display_path = "~/.modelaudit/user_config.json"
 
