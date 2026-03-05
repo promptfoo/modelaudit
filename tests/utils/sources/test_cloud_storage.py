@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from modelaudit.utils.sources.cloud_storage import (
+    GCSCache,
     analyze_cloud_target,
     download_from_cloud,
     download_from_cloud_streaming,
@@ -248,12 +249,18 @@ class TestCloudObjectSize:
 class TestDiskSpaceCheckingForCloud:
     """Test disk space checking for cloud downloads."""
 
-    @pytest.mark.skip(reason="Context manager behavior needs to be fixed - tracked separately")
     @patch("modelaudit.utils.sources.cloud_storage.get_cloud_object_size")
     @patch("modelaudit.utils.sources.cloud_storage.check_disk_space")
     @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
     @patch("fsspec.filesystem")
-    def test_download_insufficient_disk_space(self, mock_fs_class, mock_analyze, mock_check_disk_space, mock_get_size):
+    def test_download_insufficient_disk_space(
+        self,
+        mock_fs_class: MagicMock,
+        mock_analyze: AsyncMock,
+        mock_check_disk_space: MagicMock,
+        mock_get_size: MagicMock,
+        tmp_path: Path,
+    ) -> None:
         """Test download fails when disk space is insufficient."""
         fs = make_fs_mock()
         mock_fs_class.return_value = fs
@@ -274,12 +281,16 @@ class TestDiskSpaceCheckingForCloud:
         mock_check_disk_space.return_value = (False, "Insufficient disk space. Required: 12.0 GB, Available: 5.0 GB")
 
         # Test download failure
-        with pytest.raises(Exception, match=r"Cannot download from.*Insufficient disk space"):
+        temp_download_dir = tmp_path / "modelaudit_test_cloud_disk_space"
+        with (
+            patch("modelaudit.utils.sources.cloud_storage.tempfile.mkdtemp", return_value=str(temp_download_dir)),
+            pytest.raises(Exception, match=r"Cannot download from.*Insufficient disk space"),
+        ):
             download_from_cloud("s3://bucket/large-model.bin", use_cache=False)
 
         # Verify download was not attempted
         fs.get.assert_not_called()
-        fs.close.assert_called_once()
+        assert not temp_download_dir.exists()
 
         # Verify the disk space check was actually called
         mock_check_disk_space.assert_called_once()
@@ -438,6 +449,82 @@ class TestCloudPathSecurity:
             )
 
         fs.get.assert_not_called()
+
+
+class TestCloudCacheSafety:
+    def test_cache_file_does_not_trust_prefix_sibling_path(self, tmp_path: Path) -> None:
+        cache = GCSCache(cache_dir=tmp_path / "cache")
+        sibling_dir = tmp_path / "cache_evil"
+        sibling_dir.mkdir(parents=True, exist_ok=True)
+        source_file = sibling_dir / "artifact.bin"
+        source_file.write_bytes(b"artifact")
+
+        cache.cache_file("s3://bucket/model.bin", source_file)
+
+        cached_path = cache.get_cached_path("s3://bucket/model.bin")
+        assert cached_path is not None
+        assert cached_path.resolve() != source_file.resolve()
+        cached_path.resolve().relative_to(cache.cache_dir.resolve())
+        assert source_file.exists()
+
+    def test_clean_old_cache_does_not_delete_outside_cache(self, tmp_path: Path) -> None:
+        cache = GCSCache(cache_dir=tmp_path / "cache")
+        outside_file = tmp_path / "outside" / "artifact.bin"
+        outside_file.parent.mkdir(parents=True, exist_ok=True)
+        outside_file.write_bytes(b"artifact")
+
+        poisoned_url = "s3://bucket/poisoned"
+        poisoned_key = cache.get_cache_key(poisoned_url)
+        cache.metadata[poisoned_key] = {
+            "url": poisoned_url,
+            "path": str(outside_file),
+            "etag": None,
+            "size": outside_file.stat().st_size,
+            "cached_at": "2000-01-01T00:00:00",
+            "last_accessed": "2000-01-01T00:00:00",
+        }
+        cache._save_metadata()
+
+        cache.clean_old_cache(max_age_days=0)
+
+        assert outside_file.exists()
+        assert poisoned_key not in cache.metadata
+
+
+class TestCloudDownloadCleanup:
+    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+    @patch("modelaudit.utils.sources.cloud_storage.retry_with_backoff")
+    @patch("fsspec.filesystem")
+    def test_download_failure_cleans_temp_dir(
+        self,
+        mock_fs_class: MagicMock,
+        mock_retry_with_backoff: MagicMock,
+        mock_analyze: AsyncMock,
+        tmp_path: Path,
+    ) -> None:
+        fs = make_fs_mock()
+        fs.info.return_value = {"type": "file", "size": 1024}
+        fs.get.side_effect = RuntimeError("network failure")
+        mock_fs_class.return_value = fs
+
+        mock_analyze.return_value = {
+            "type": "file",
+            "size": 1024,
+            "name": "model.bin",
+            "human_size": "1.0 KB",
+            "estimated_time": "1 second",
+        }
+        mock_retry_with_backoff.side_effect = lambda *_args, **_kwargs: lambda func: func
+
+        temp_download_dir = tmp_path / "modelaudit_cloud_temp"
+        temp_download_dir.mkdir(parents=True, exist_ok=True)
+        with (
+            patch("modelaudit.utils.sources.cloud_storage.tempfile.mkdtemp", return_value=str(temp_download_dir)),
+            pytest.raises(RuntimeError, match="network failure"),
+        ):
+            download_from_cloud("s3://bucket/model.bin", use_cache=False, show_progress=False)
+
+        assert not temp_download_dir.exists()
 
 
 def test_filter_scannable_files_recognizes_pdiparams():

@@ -336,6 +336,11 @@ class GCSCache:
             cached = self.metadata[cache_key]
             cached_path = Path(cached["path"])
 
+            if not _is_within_directory(self.cache_dir, cached_path):
+                del self.metadata[cache_key]
+                self._save_metadata()
+                return None
+
             # Check if file still exists
             if not cached_path.exists():
                 del self.metadata[cache_key]
@@ -366,7 +371,7 @@ class GCSCache:
         if local_path.is_file():
             cache_path = cache_subdir / local_path.name
             # Don't copy if it's already in the cache directory
-            if not str(local_path).startswith(str(self.cache_dir)):
+            if not _is_within_directory(self.cache_dir, local_path):
                 shutil.copy2(local_path, cache_path)
             else:
                 cache_path = local_path
@@ -374,7 +379,7 @@ class GCSCache:
             # It's a directory
             cache_path = cache_subdir / "content"
             # Don't copy if it's already in the cache directory
-            if not str(local_path).startswith(str(self.cache_dir)):
+            if not _is_within_directory(self.cache_dir, local_path):
                 if cache_path.exists():
                     shutil.rmtree(cache_path)
                 shutil.copytree(local_path, cache_path)
@@ -402,7 +407,7 @@ class GCSCache:
             if now - last_accessed > timedelta(days=max_age_days):
                 # Remove cached file
                 cached_path = Path(cached["path"])
-                if cached_path.exists():
+                if _is_within_directory(self.cache_dir, cached_path) and cached_path.exists():
                     if cached_path.is_file():
                         cached_path.unlink()
                     else:
@@ -571,102 +576,105 @@ def download_from_cloud(
         download_path = Path(cache_dir)
         download_path.mkdir(parents=True, exist_ok=True)
 
-    # Get filesystem
-    fs_protocol = get_fs_protocol(url)
-    fs_args = {"token": "anon"} if fs_protocol == "gcs" else {}
-
-    # fsspec filesystems don't need explicit cleanup - use directly without 'with' statement
-    fs = fsspec.filesystem(fs_protocol, **fs_args)
-
-    # Check available disk space before downloading
-    object_size: int | None
+    should_cleanup_temp_dir = cache is None and cache_dir is None
     try:
-        object_size = get_cloud_object_size(fs, url, strict=True)
-    except ValueError as exc:
-        # Fall back to metadata-derived size when available. If no reliable size is
-        # available, continue without a pre-download disk check (legacy behavior).
-        if size > 0:
-            object_size = int(size)
-            if show_progress:
-                click.echo(f"⚠️  Falling back to metadata size estimate for disk check: {exc}")
+        # Get filesystem
+        fs_protocol = get_fs_protocol(url)
+        fs_args = {"token": "anon"} if fs_protocol == "gcs" else {}
+
+        # fsspec filesystems don't need explicit cleanup - use directly without 'with' statement
+        fs = fsspec.filesystem(fs_protocol, **fs_args)
+
+        # Check available disk space before downloading
+        object_size: int | None
+        try:
+            object_size = get_cloud_object_size(fs, url, strict=True)
+        except ValueError as exc:
+            # Fall back to metadata-derived size when available. If no reliable size is
+            # available, continue without a pre-download disk check (legacy behavior).
+            if size > 0:
+                object_size = int(size)
+                if show_progress:
+                    click.echo(f"⚠️  Falling back to metadata size estimate for disk check: {exc}")
+            else:
+                object_size = None
+                if show_progress:
+                    click.echo(f"⚠️  Unable to determine download size for {url}; continuing without disk check: {exc}")
+
+        if object_size is not None:
+            has_space, message = check_disk_space(download_path, object_size)
+            if not has_space:
+                raise Exception(f"Cannot download from {url}: {message}")
+
+        # Download based on type
+        if metadata["type"] == "directory":
+            # Handle directory download
+            raw_files = metadata.get("files")
+            if raw_files is None:
+                files = []
+            elif isinstance(raw_files, list):
+                files = raw_files
+            else:
+                raise ValueError(f"Invalid metadata for 'files': expected list, got {type(raw_files).__name__}")
+
+            if selective:
+                # Filter to only scannable files
+                files = filter_scannable_files(files)
+                if show_progress:
+                    total = metadata.get("file_count", 0)
+                    if files:
+                        click.echo(f"Found {len(files)} scannable files out of {total} total files")
+                    else:
+                        click.echo(f"No scannable files found out of {total} total files")
+
+            if not files:
+                raise ValueError("No scannable model files found in directory")
+
+            # Download files
+            for file_info in files:
+                file_url = file_info["path"]
+                local_path = _build_safe_local_path(url, file_url, download_path)
+                local_path.parent.mkdir(parents=True, exist_ok=True)
+
+                if show_progress:
+                    click.echo(f"Downloading {file_info['name']} ({file_info['human_size']})")
+
+                @retry_with_backoff(max_retries=3, verbose=show_progress)
+                def download_file(url=file_url, path=local_path):
+                    fs.get(url, str(path))
+
+                download_file()
         else:
-            object_size = None
-            if show_progress:
-                click.echo(f"⚠️  Unable to determine download size for {url}; continuing without disk check: {exc}")
-
-    if object_size is not None:
-        has_space, message = check_disk_space(download_path, object_size)
-        if not has_space:
-            # Clean up temp directory if we created one
-            if cache_dir is None and download_path.exists():
-                shutil.rmtree(download_path)
-            raise Exception(f"Cannot download from {url}: {message}")
-
-    # Download based on type
-    if metadata["type"] == "directory":
-        # Handle directory download
-        raw_files = metadata.get("files")
-        if raw_files is None:
-            files = []
-        elif isinstance(raw_files, list):
-            files = raw_files
-        else:
-            raise ValueError(f"Invalid metadata for 'files': expected list, got {type(raw_files).__name__}")
-
-        if selective:
-            # Filter to only scannable files
-            files = filter_scannable_files(files)
-            if show_progress:
-                total = metadata.get("file_count", 0)
-                if files:
-                    click.echo(f"Found {len(files)} scannable files out of {total} total files")
-                else:
-                    click.echo(f"No scannable files found out of {total} total files")
-
-        if not files:
-            raise ValueError("No scannable model files found in directory")
-
-        # Download files
-        for file_info in files:
-            file_url = file_info["path"]
-            local_path = _build_safe_local_path(url, file_url, download_path)
-            local_path.parent.mkdir(parents=True, exist_ok=True)
-
-            if show_progress:
-                click.echo(f"Downloading {file_info['name']} ({file_info['human_size']})")
+            # Single file download
+            file_name = Path(url).name
+            local_file = download_path / file_name
 
             @retry_with_backoff(max_retries=3, verbose=show_progress)
-            def download_file(url=file_url, path=local_path):
-                fs.get(url, str(path))
+            def download_single_file():
+                fs.get(url, str(local_file))
 
-            download_file()
-    else:
-        # Single file download
-        file_name = Path(url).name
-        local_file = download_path / file_name
-
-        @retry_with_backoff(max_retries=3, verbose=show_progress)
-        def download_single_file():
-            fs.get(url, str(local_file))
-
-        if show_progress and size > 100 * 1024 * 1024 * 1024:  # Show progress for files > 100GB
-            with yaspin(text=f"Downloading {file_name}") as spinner:
+            if show_progress and size > 100 * 1024 * 1024 * 1024:  # Show progress for files > 100GB
+                with yaspin(text=f"Downloading {file_name}") as spinner:
+                    download_single_file()
+                    spinner.ok("✓")
+            else:
                 download_single_file()
-                spinner.ok("✓")
-        else:
-            download_single_file()
 
-        # Cache the download
+            # Cache the download
+            if cache:
+                cache.cache_file(url, local_file)  # Cache the actual file, not the directory
+
+            return local_file  # Return the actual file path for single files
+
+        # Cache the download (for directories)
         if cache:
-            cache.cache_file(url, local_file)  # Cache the actual file, not the directory
+            cache.cache_file(url, download_path)
 
-        return local_file  # Return the actual file path for single files
-
-    # Cache the download (for directories)
-    if cache:
-        cache.cache_file(url, download_path)
-
-    return download_path
+        return download_path
+    except Exception:
+        if should_cleanup_temp_dir and download_path.exists():
+            shutil.rmtree(download_path, ignore_errors=True)
+        raise
 
 
 def download_from_cloud_streaming(
