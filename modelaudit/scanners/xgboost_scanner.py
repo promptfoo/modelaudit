@@ -21,7 +21,6 @@ Security Focus:
 import json
 import os
 import re
-import shlex
 import subprocess
 import sys
 from typing import Any, ClassVar
@@ -594,22 +593,21 @@ class XGBoostScanner(BaseScanner):
         try:
             # Use subprocess for isolation
             timeout = min(self.timeout, 30)  # Max 30 seconds for model loading
-            # Safely escape the path for subprocess
-            escaped_path = shlex.quote(path)
             cmd = [
                 sys.executable,
                 "-c",
-                f"""
+                """
 import sys
 import xgboost as xgb
 try:
     booster = xgb.Booster()
-    booster.load_model({escaped_path})
+    booster.load_model(sys.argv[1])
     sys.stdout.write("SUCCESS: Model loaded successfully\\n")
 except Exception as e:
-    sys.stderr.write(f"ERROR: {{e}}\\n")
+    sys.stderr.write(f"ERROR: {e}\\n")
     sys.exit(1)
 """,
+                path,
             ]
 
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=os.getcwd())

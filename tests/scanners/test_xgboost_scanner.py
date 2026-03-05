@@ -364,6 +364,31 @@ class TestXGBoostBinaryScanning:
 
     @patch("modelaudit.scanners.xgboost_scanner._check_xgboost_available")
     @patch("modelaudit.scanners.xgboost_scanner.subprocess")
+    def test_xgboost_loading_windows_path_passed_via_argv(self, mock_subprocess, mock_check_xgb):
+        """Test subprocess load command handles backslashes by passing paths via argv."""
+        mock_check_xgb.return_value = True
+        mock_proc = Mock()
+        mock_proc.returncode = 0
+        mock_proc.stdout = "SUCCESS: Model loaded successfully"
+        mock_proc.stderr = ""
+        mock_subprocess.run.return_value = mock_proc
+
+        loading_scanner = XGBoostScanner({"enable_xgb_loading": True})
+        result = loading_scanner._create_result()
+        windows_path = r"C:\temp\model\xgboost.bin"
+
+        loading_scanner._safe_xgboost_load(windows_path, result)
+
+        run_args, _ = mock_subprocess.run.call_args
+        cmd = run_args[0]
+        script = cmd[2]
+        assert "sys.argv[1]" in script
+        assert windows_path not in script
+        assert cmd[3] == windows_path
+        assert any("loaded successfully" in str(check.message) for check in result.checks)
+
+    @patch("modelaudit.scanners.xgboost_scanner._check_xgboost_available")
+    @patch("modelaudit.scanners.xgboost_scanner.subprocess")
     def test_xgboost_loading_timeout(self, mock_subprocess, mock_check_xgb, temp_dir):
         """Test XGBoost model loading timeout handling."""
         mock_check_xgb.return_value = True
