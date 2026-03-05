@@ -59,6 +59,7 @@ class ExecuTorchScanner(BaseScanner):
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"path": path},
+                rule_code="S104",
             )
             result.finish(success=False)
             return result
@@ -78,6 +79,7 @@ class ExecuTorchScanner(BaseScanner):
                             severity=IssueSeverity.CRITICAL,
                             location=f"{path}:{name}",
                             details={"entry": name},
+                            rule_code="S405",
                         )
                         continue
                     safe_entries.append(name)
@@ -111,8 +113,8 @@ class ExecuTorchScanner(BaseScanner):
                             severity=IssueSeverity.INFO,
                             location=f"{path}:{name}",
                             details={"file": name},
+                            rule_code="S507",  # Python embedded code
                         )
-                    elif name.endswith((".sh", ".bash", ".cmd", ".exe")):
                         result.add_check(
                             name="Executable File Detection",
                             passed=False,
@@ -120,6 +122,7 @@ class ExecuTorchScanner(BaseScanner):
                             severity=IssueSeverity.CRITICAL,
                             location=f"{path}:{name}",
                             details={"file": name},
+                            rule_code="S104",
                         )
 
                 result.bytes_scanned = bytes_scanned
@@ -131,6 +134,7 @@ class ExecuTorchScanner(BaseScanner):
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"path": path},
+                rule_code="S902",
             )
             result.finish(success=False)
             return result
@@ -141,7 +145,11 @@ class ExecuTorchScanner(BaseScanner):
                 message=f"Error scanning ExecuTorch file: {e!s}",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
-                details={"exception": str(e), "exception_type": type(e).__name__},
+                details={
+                    "exception": str(e),
+                    "exception_type": type(e).__name__,
+                },
+                rule_code="S902",
             )
             result.finish(success=False)
             return result

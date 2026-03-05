@@ -82,6 +82,7 @@ def pytest_runtest_setup(item):
             "test_nemo_scanner.py",  # NeMo scanner CVE-2025-23304 tests
             "test_numpy_scanner.py",  # NumPy scanner CVE-2019-6446 tests
             "test_onnx_scanner.py",  # ONNX scanner CVE-2025-51480 tests
+            "test_rule_mapper.py",  # Rule mapper validity and network mapping tests
             "test_keras_h5_scanner.py",  # Keras H5 scanner CVE-2025-9905 tests
             "test_cve_detection.py",  # CVE detection tests
             "test_pytorch_zip_scanner.py",  # PyTorch ZIP scanner tests

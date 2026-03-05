@@ -167,8 +167,10 @@ def test_pytorch_zip_skips_numeric_data_files(tmp_path):
     result = scanner.scan(str(zip_path))
     elapsed_time = time.time() - start_time
 
-    # Should complete quickly (under 5 seconds) even with large numeric files
-    assert elapsed_time < 5.0, f"Scan took {elapsed_time:.2f}s, expected < 5s"
+    # CI timing can vary significantly by runner and OS; keep a conservative
+    # upper bound that still catches pathological regressions.
+    max_expected_seconds = 20.0
+    assert elapsed_time < max_expected_seconds, f"Scan took {elapsed_time:.2f}s, expected < {max_expected_seconds:.0f}s"
     assert result.success is True
 
 

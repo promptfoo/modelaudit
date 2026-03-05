@@ -59,6 +59,7 @@ class OpenVinoScanner(BaseScanner):
                 severity=IssueSeverity.INFO,
                 location=bin_path,
                 details={"expected_file": bin_path},
+                rule_code="S701",
             )
 
         try:
@@ -71,7 +72,11 @@ class OpenVinoScanner(BaseScanner):
                 message=f"Invalid OpenVINO XML: {e}",
                 severity=IssueSeverity.INFO,
                 location=path,
-                details={"exception": str(e), "exception_type": type(e).__name__},
+                details={
+                    "exception": str(e),
+                    "exception_type": type(e).__name__,
+                },
+                rule_code="S902",
             )
             result.finish(success=False)
             return result
@@ -98,8 +103,11 @@ class OpenVinoScanner(BaseScanner):
                     severity=IssueSeverity.CRITICAL,
                     location=path,
                     details={"layer_type": layer_type, "layer_name": layer_name},
+                    rule_code="S902",
                 )
-            library = layer.attrib.get("library")
+
+            # Check for external library references in layer attributes
+            library = layer.attrib.get("library") or layer.attrib.get("implementation")
             if library:
                 result.add_check(
                     name="External Library Reference Check",
@@ -108,6 +116,7 @@ class OpenVinoScanner(BaseScanner):
                     severity=IssueSeverity.CRITICAL,
                     location=path,
                     details={"layer_name": layer_name, "library": library},
+                    rule_code="S902",
                 )
             if suspicious_pattern:
                 for attr_val in layer.attrib.values():
@@ -119,6 +128,7 @@ class OpenVinoScanner(BaseScanner):
                             severity=IssueSeverity.CRITICAL,
                             location=path,
                             details={"attribute": attr_val},
+                            rule_code="S902",
                         )
 
         result.finish(success=not result.has_errors)

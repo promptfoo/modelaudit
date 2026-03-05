@@ -70,6 +70,7 @@ class OciLayerScanner(BaseScanner):
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"exception_type": type(e).__name__},
+                rule_code="S902",
             )
             result.finish(success=False)
             return result
@@ -106,6 +107,7 @@ class OciLayerScanner(BaseScanner):
                     severity=IssueSeverity.CRITICAL,
                     location=f"{path}:{layer_ref}",
                     details={"layer": layer_ref},
+                    rule_code="S405",
                 )
                 continue
 
@@ -116,6 +118,7 @@ class OciLayerScanner(BaseScanner):
                     message=f"Layer not found: {layer_ref}",
                     severity=IssueSeverity.WARNING,
                     location=f"{path}:{layer_ref}",
+                    rule_code="S902",
                 )
                 continue
             try:
@@ -162,6 +165,7 @@ class OciLayerScanner(BaseScanner):
                     severity=IssueSeverity.WARNING,
                     location=f"{path}:{layer_ref}",
                     details={"exception_type": type(e).__name__},
+                    rule_code="S902",
                 )
 
         result.finish(success=True)

@@ -23,10 +23,12 @@ from .auth.config import (
     is_delegated_from_promptfoo,
     set_user_email,
 )
+from .config import ModelAuditConfig, set_config
 from .core import determine_exit_code, scan_model_directory_or_file
 from .integrations.jfrog import scan_jfrog_artifact
 from .integrations.sarif_formatter import format_sarif_output
 from .models import ModelAuditResultModel
+from .rules import Rule, RuleRegistry, Severity
 from .scanners.base import IssueSeverity
 from .telemetry import (
     flush_telemetry,
@@ -95,6 +97,39 @@ def expand_paths(paths: tuple[str, ...]) -> tuple[list[str], list[str]]:
         else:
             expanded.append(str(path.resolve()) if path.exists() else path_str)
     return expanded, missing_globs
+
+
+def parse_severity_overrides(values: tuple[str, ...]) -> dict[str, str]:
+    """Parse CLI severity override arguments of the form CODE=LEVEL."""
+    overrides: dict[str, str] = {}
+    valid_levels = {severity.value for severity in Severity}
+    for entry in values:
+        if "=" not in entry:
+            raise click.BadParameter("Severity overrides must use CODE=LEVEL format (e.g., S101=CRITICAL)")
+        code, level = entry.split("=", 1)
+        code = code.strip().upper()
+        level = level.strip().upper()
+        if not code or not level:
+            raise click.BadParameter("Severity overrides must include both a rule code and a severity level")
+        if RuleRegistry.get_rule(code) is None:
+            raise click.BadParameter(f"Unknown rule code '{code}' in --severity override")
+        if level not in valid_levels:
+            allowed = ", ".join(sorted(valid_levels))
+            raise click.BadParameter(f"Invalid severity level '{level}'. Allowed values: {allowed}")
+        overrides[code] = level
+    return overrides
+
+
+def get_severity_color(severity: str) -> str:
+    """Map severity string to a color for CLI display."""
+    mapping = {
+        "CRITICAL": "red",
+        "HIGH": "red",
+        "MEDIUM": "yellow",
+        "LOW": "blue",
+        "INFO": "green",
+    }
+    return mapping.get(severity.upper(), "white")
 
 
 def create_progress_callback_wrapper(progress_callback: Any | None, spinner: Any | None) -> Any | None:
@@ -451,6 +486,18 @@ def delegate_info() -> None:
     is_flag=True,
     help="Strict mode: fail on warnings, scan all file types, strict license validation",
 )
+@click.option(
+    "--suppress",
+    "-s",
+    multiple=True,
+    help="Suppress specific rule codes (e.g., -s S101). Can be specified multiple times.",
+)
+@click.option(
+    "--severity",
+    "-S",
+    multiple=True,
+    help="Override rule severities, format CODE=LEVEL (e.g., S101=CRITICAL). Can be specified multiple times.",
+)
 # Progress & reporting (2 flags)
 @click.option(
     "--progress",
@@ -503,6 +550,8 @@ def scan_command(
     quiet: bool,
     blacklist: tuple[str, ...],
     strict: bool,
+    suppress: tuple[str, ...],
+    severity: tuple[str, ...],
     progress: bool,
     sbom: str | None,
     timeout: int | None,
@@ -613,6 +662,17 @@ def scan_command(
         record_scan_failed(time.time() - scan_start_time, "No matching paths")
         flush_telemetry()
         sys.exit(2)
+
+    # Apply rule configuration from CLI and config files
+    severity_overrides = parse_severity_overrides(severity)
+    try:
+        cli_config = ModelAuditConfig.from_cli_args(
+            suppress=list(suppress) if suppress else None,
+            severity=severity_overrides if severity_overrides else None,
+        )
+    except ValueError as exc:
+        raise click.BadParameter(str(exc)) from exc
+    set_config(cli_config)
 
     # Generate defaults based on input analysis
     auto_defaults = generate_auto_defaults(expanded_paths)
@@ -2345,6 +2405,90 @@ def doctor(show_failed: bool) -> None:
         click.echo("• Run 'modelaudit doctor --show-failed' for detailed error messages")
     else:
         click.secho("\n✓ All scanners loaded successfully!", fg="green")
+
+
+def display_rules(rules: dict[str, Rule], output_format: str) -> None:
+    """Display rules in requested format."""
+    if output_format == "json":
+        rules_list = [
+            {
+                "code": code,
+                "name": rule.name,
+                "severity": rule.default_severity.value,
+                "description": rule.description,
+            }
+            for code, rule in sorted(rules.items())
+        ]
+        click.echo(json.dumps(rules_list, indent=2))
+    else:
+        click.echo(style_text("Code   Severity   Name", bold=True))
+        click.echo(style_text("----   --------   ----", bold=True))
+        for code, rule in sorted(rules.items()):
+            severity_text = style_text(rule.default_severity.value, fg=get_severity_color(rule.default_severity.value))
+            click.echo(f"{code:<6} {severity_text:<10} {rule.name}")
+
+
+@cli.command("rules")
+@click.argument("rule_code", required=False)
+@click.option("--list", "list_rules", is_flag=True, help="List all rules")
+@click.option("--category", help="Show rules in a category range (e.g., 100-199)")
+@click.option(
+    "--format",
+    "output_format",
+    type=click.Choice(["table", "json"]),
+    default="table",
+    help="Output format",
+)
+def rules_command(rule_code: str | None, list_rules: bool, category: str | None, output_format: str) -> None:
+    """View and explain security rules."""
+    RuleRegistry.initialize()
+
+    if rule_code:
+        rule = RuleRegistry.get_rule(rule_code.upper())
+        if not rule:
+            click.echo(f"Rule {rule_code} not found", err=True)
+            sys.exit(1)
+
+        if output_format == "json":
+            click.echo(
+                json.dumps(
+                    {
+                        "code": rule.code,
+                        "name": rule.name,
+                        "severity": rule.default_severity.value,
+                        "description": rule.description,
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            click.echo(f"Code: {style_text(rule.code, bold=True)}")
+            click.echo(f"Name: {rule.name}")
+            severity_text = style_text(rule.default_severity.value, fg=get_severity_color(rule.default_severity.value))
+            click.echo(f"Default Severity: {severity_text}")
+            click.echo(f"Description: {rule.description}")
+    elif category:
+        try:
+            if "-" in category:
+                start_str, end_str = category.split("-")
+                start = int(start_str)
+                end = int(end_str)
+            else:
+                start = int(category)
+                end = start + 99
+
+            rules = RuleRegistry.get_rules_by_range(start, end)
+            if not rules:
+                click.echo(f"No rules found in range S{start}-S{end}", err=True)
+                sys.exit(1)
+
+            display_rules(rules, output_format)
+        except ValueError:
+            click.echo(f"Invalid category format: {category}", err=True)
+            sys.exit(1)
+    else:
+        rules = RuleRegistry.get_all_rules()
+        display_rules(rules, output_format)
 
 
 def _get_platform_info() -> dict[str, Any]:

@@ -514,6 +514,7 @@ class ManifestScanner(BaseScanner):
                     message=f"Unable to parse file as a manifest or configuration: {path}",
                     severity=IssueSeverity.DEBUG,
                     location=path,
+                    rule_code="S902",
                 )
 
         except Exception as e:
@@ -556,6 +557,7 @@ class ManifestScanner(BaseScanner):
                             "identify models or configurations that violate security policies or contain known "
                             "malicious indicators."
                         ),
+                        rule_code="S1001",
                     )
                     found_blacklisted = True
 
@@ -575,6 +577,7 @@ class ManifestScanner(BaseScanner):
                 severity=IssueSeverity.WARNING,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
+                rule_code="S1001",
             )
 
     def _parse_file(
@@ -621,6 +624,7 @@ class ManifestScanner(BaseScanner):
                     severity=IssueSeverity.DEBUG,
                     location=path,
                     details={"exception": str(e), "exception_type": type(e).__name__},
+                    rule_code="S902",
                 )
 
         return None
@@ -709,7 +713,8 @@ class ManifestScanner(BaseScanner):
                             },
                         )
 
-                # Recursively check nested structures
+                # ALWAYS recursively check nested structures,
+                # regardless of pattern matches
                 if isinstance(value, dict):
                     check_dict(value, full_key)
                 elif isinstance(value, list):

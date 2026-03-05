@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_serializer
 from ..analysis.unified_context import UnifiedMLContext
 from ..config.explanations import get_message_explanation
 from ..utils.helpers.interrupt_handler import check_interrupted
+from .rule_mapper import get_embedded_code_rule_code, get_network_rule_code, get_secret_rule_code
 
 # Progress tracking imports with circular dependency detection
 PROGRESS_AVAILABLE = False
@@ -65,6 +66,7 @@ class Check(BaseModel):
     location: str | None = Field(None, description="File position, line number, etc.")
     details: dict[str, Any] = Field(default_factory=dict, description="Additional check details")
     why: str | None = Field(None, description="Explanation (mainly for failed checks)")
+    rule_code: str | None = Field(default=None, description="Rule code associated with this check")
     timestamp: float = Field(default_factory=time.time, description="Timestamp when check was performed")
 
     @field_serializer("status")
@@ -85,6 +87,8 @@ class Check(BaseModel):
         """String representation of the check"""
         status_symbol = "✓" if self.status == CheckStatus.PASSED else "✗"
         prefix = f"[{status_symbol}] {self.name}"
+        if self.rule_code:
+            prefix = f"[{self.rule_code}] {prefix}"
         if self.location:
             prefix += f" ({self.location})"
         return f"{prefix}: {self.message}"
@@ -105,6 +109,7 @@ class Issue(BaseModel):
     why: str | None = Field(None, description="Explanation of why this is a security concern")
     timestamp: float = Field(default_factory=time.time, description="Timestamp when issue was detected")
     type: str | None = Field(None, description="Type of issue for categorization")
+    rule_code: str | None = Field(default=None, description="Rule code associated with this issue")
 
     @field_serializer("severity")
     def serialize_severity(self, severity: IssueSeverity) -> str:
@@ -119,6 +124,8 @@ class Issue(BaseModel):
         """String representation of the issue"""
         severity_str = self.severity.value if hasattr(self.severity, "value") else str(self.severity)
         prefix = f"[{severity_str.upper()}]"
+        if self.rule_code:
+            prefix = f"[{self.rule_code}] {prefix}"
         if self.location:
             prefix += f" ({self.location})"
         return f"{prefix}: {self.message}"
@@ -147,8 +154,42 @@ class ScanResult:
         location: str | None = None,
         details: dict[str, Any] | None = None,
         why: str | None = None,
+        rule_code: str | None = None,
     ) -> None:
-        """Add a check result (passed or failed)"""
+        """Add a check result (passed or failed) with rule support and rule-based severity."""
+        from ..config import get_config
+        from ..rules import RuleRegistry, Severity
+
+        severity_map = {
+            Severity.CRITICAL: IssueSeverity.CRITICAL,
+            Severity.HIGH: IssueSeverity.CRITICAL,
+            Severity.MEDIUM: IssueSeverity.WARNING,
+            Severity.LOW: IssueSeverity.INFO,
+            Severity.INFO: IssueSeverity.INFO,
+        }
+
+        # Auto-detect rule code if not provided.
+        # Preserve scanner-provided severity semantics by only attaching the
+        # code here, not remapping severity from rule defaults.
+        if not rule_code and not passed:
+            match = RuleRegistry.find_matching_rule(message)
+            if match:
+                rule_code, _rule = match
+
+        config = get_config()
+
+        # Check if rule is suppressed
+        if rule_code and config.is_suppressed(rule_code, location):
+            logger.debug(f"Suppressed {rule_code}: {message}")
+            return
+
+        # Apply severity override only when explicitly configured by the user.
+        if rule_code and rule_code in config.severity:
+            configured_severity = config.get_severity(rule_code, Severity.MEDIUM)
+            mapped = severity_map.get(configured_severity)
+            if mapped is not None:
+                severity = mapped
+
         status = CheckStatus.PASSED if passed else CheckStatus.FAILED
 
         # For failed checks, ensure we have a severity
@@ -156,7 +197,6 @@ class ScanResult:
             severity = IssueSeverity.WARNING
 
         # Apply whitelist downgrading logic for failed checks if scanner is available
-        # This must happen BEFORE creating the Check to ensure consistent severity
         if not passed and self.scanner:
             # At this point severity cannot be None due to the check above
             assert severity is not None
@@ -170,6 +210,7 @@ class ScanResult:
             location=location,
             details=details or {},
             why=why,
+            rule_code=rule_code,
         )
         self.checks.append(check)
 
@@ -190,6 +231,7 @@ class ScanResult:
                 details=details or {},
                 why=why,
                 type=f"{self.scanner_name}_check",
+                rule_code=rule_code,
             )
             self.issues.append(issue)
 
@@ -214,15 +256,11 @@ class ScanResult:
         location: str | None = None,
         details: dict[str, Any] | None = None,
         why: str | None = None,
+        rule_code: str | None = None,
     ) -> None:
-        """Private legacy method - use add_check() instead.
-
-        This method is deprecated and should not be used in new code.
-        It exists only for backward compatibility with unmigrated scanner code.
-        """
-        # INFO/DEBUG are informational (passed checks), WARNING/CRITICAL are failures
+        """Add an issue to the result with rule support"""
+        # For backward compatibility: INFO/DEBUG severities are treated as passing checks
         passed = severity in (IssueSeverity.DEBUG, IssueSeverity.INFO)
-
         self.add_check(
             name="Legacy Security Check",
             passed=passed,
@@ -231,7 +269,22 @@ class ScanResult:
             location=location,
             details=details,
             why=why,
+            rule_code=rule_code,
         )
+        if passed:
+            return
+
+    def add_issue(
+        self,
+        message: str,
+        severity: IssueSeverity = IssueSeverity.WARNING,
+        location: str | None = None,
+        details: dict[str, Any] | None = None,
+        why: str | None = None,
+        rule_code: str | None = None,
+    ) -> None:
+        """Backward-compatible public issue adder."""
+        self._add_issue(message, severity=severity, location=location, details=details, why=why, rule_code=rule_code)
 
     def merge(self, other: "ScanResult") -> None:
         """Merge another scan result into this one"""
@@ -621,11 +674,16 @@ class BaseScanner(ABC):
                     "INFO": IssueSeverity.INFO,
                 }
                 severity = severity_map.get(finding.get("severity", "WARNING"), IssueSeverity.WARNING)
+                secret_descriptor = str(
+                    finding.get("secret_type") or finding.get("type") or finding.get("message") or "embedded_secret"
+                )
+                secret_rule_code = get_secret_rule_code(secret_descriptor)
 
                 result.add_check(
                     name="Embedded Secrets Detection",
                     passed=False,
                     message=finding.get("message", "Secret detected"),
+                    rule_code=secret_rule_code,
                     severity=severity,
                     location=finding.get("context", context),
                     details=finding,
@@ -797,58 +855,7 @@ class BaseScanner(ABC):
 
             detector = JITScriptDetector(self.config.get("jit_script_config"))
             findings = detector.scan_model(data, model_type, context)
-
-            for finding in findings:
-                severity_map = {
-                    "CRITICAL": IssueSeverity.CRITICAL,
-                    "WARNING": IssueSeverity.WARNING,
-                    "INFO": IssueSeverity.INFO,
-                }
-                # Handle both dict and Pydantic model findings
-                if hasattr(finding, "model_dump"):
-                    # Pydantic model (JITScriptFinding)
-                    severity_value = finding.severity if isinstance(finding.severity, str) else finding.severity.value
-                    severity = severity_map.get(severity_value, IssueSeverity.WARNING)
-                    message = finding.message
-                    location = finding.context
-                    recommendation = finding.recommendation or "Review JIT/Script code for security"
-                    details = finding.model_dump()
-                elif hasattr(finding, "get"):
-                    # Dict format (backward compatibility)
-                    severity = severity_map.get(finding.get("severity", "WARNING"), IssueSeverity.WARNING)
-                    message = finding.get("message", "JIT/Script code risk detected")
-                    location = finding.get("context", context)
-                    recommendation = finding.get("recommendation", "Review JIT/Script code for security")
-                    details = dict(finding)  # Ensure it's a dict
-                else:
-                    # Object with attributes but not Pydantic
-                    severity_value = getattr(finding, "severity", "WARNING")
-                    severity = severity_map.get(severity_value, IssueSeverity.WARNING)
-                    message = getattr(finding, "message", "JIT/Script code risk detected")
-                    location = getattr(finding, "context", context)
-                    recommendation = getattr(finding, "recommendation", "Review JIT/Script code for security")
-                    details = finding.__dict__ if hasattr(finding, "__dict__") else {"object": str(finding)}
-
-                result.add_check(
-                    name="JIT/Script Code Execution Detection",
-                    passed=False,
-                    message=message,
-                    severity=severity,
-                    location=location,
-                    details=details,
-                    why=recommendation,
-                )
-
-            # Add a passing check if no risks were found
-            if not findings and context:
-                result.add_check(
-                    name="JIT/Script Code Execution Detection",
-                    passed=True,
-                    message="No JIT/Script code execution risks detected",
-                    location=context,
-                )
-
-            return len(findings)
+            return self.add_jit_script_findings(findings, result, model_type=model_type, context=context)
 
         except ImportError:
             # JITScriptDetector not available, log as debug
@@ -857,6 +864,70 @@ class BaseScanner(ABC):
         except Exception as e:
             logger.warning(f"Error checking for JIT/Script code: {e}")
             return 0
+
+    def add_jit_script_findings(
+        self,
+        findings: list[Any],
+        result: ScanResult,
+        model_type: str = "unknown",
+        context: str = "",
+    ) -> int:
+        """Emit explicit JIT/Script checks from detector findings and return the count."""
+        severity_map = {
+            "CRITICAL": IssueSeverity.CRITICAL,
+            "WARNING": IssueSeverity.WARNING,
+            "INFO": IssueSeverity.INFO,
+        }
+
+        for finding in findings:
+            # Handle both dict and Pydantic model findings.
+            if hasattr(finding, "model_dump"):
+                severity_value = finding.severity if isinstance(finding.severity, str) else finding.severity.value
+                severity = severity_map.get(severity_value, IssueSeverity.WARNING)
+                message = finding.message
+                location = finding.context
+                recommendation = finding.recommendation or "Review JIT/Script code for security"
+                details = finding.model_dump()
+            elif hasattr(finding, "get"):
+                severity = severity_map.get(finding.get("severity", "WARNING"), IssueSeverity.WARNING)
+                message = finding.get("message", "JIT/Script code risk detected")
+                location = finding.get("context", context)
+                recommendation = finding.get("recommendation", "Review JIT/Script code for security")
+                details = dict(finding)
+            else:
+                severity_value = getattr(finding, "severity", "WARNING")
+                severity = severity_map.get(severity_value, IssueSeverity.WARNING)
+                message = getattr(finding, "message", "JIT/Script code risk detected")
+                location = getattr(finding, "context", context)
+                recommendation = getattr(finding, "recommendation", "Review JIT/Script code for security")
+                details = finding.__dict__ if hasattr(finding, "__dict__") else {"object": str(finding)}
+
+            jit_indicator = f"{details.get('type', '')} {message} {model_type}".strip()
+            jit_rule_code = get_embedded_code_rule_code(jit_indicator)
+            if not jit_rule_code:
+                # JIT detector findings should consistently map to the JIT/TorchScript rule family.
+                jit_rule_code = get_embedded_code_rule_code("jit")
+
+            result.add_check(
+                name="JIT/Script Code Execution Detection",
+                passed=False,
+                message=message,
+                rule_code=jit_rule_code,
+                severity=severity,
+                location=location,
+                details=details,
+                why=recommendation,
+            )
+
+        if not findings and context:
+            result.add_check(
+                name="JIT/Script Code Execution Detection",
+                passed=True,
+                message="No JIT/Script code execution risks detected",
+                location=context,
+            )
+
+        return len(findings)
 
     def collect_network_communication_findings(
         self,
@@ -1000,36 +1071,7 @@ class BaseScanner(ABC):
 
             detector = NetworkCommDetector(self.config.get("network_comm_config"))
             findings = detector.scan(data, context)
-
-            for finding in findings:
-                severity_map = {
-                    "CRITICAL": IssueSeverity.CRITICAL,
-                    "HIGH": IssueSeverity.CRITICAL,
-                    "MEDIUM": IssueSeverity.WARNING,
-                    "LOW": IssueSeverity.INFO,
-                }
-                severity = severity_map.get(finding.get("severity", "WARNING"), IssueSeverity.WARNING)
-
-                result.add_check(
-                    name="Network Communication Detection",
-                    passed=False,
-                    message=finding.get("message", "Network communication pattern detected"),
-                    severity=severity,
-                    location=finding.get("context", context),
-                    details=finding,
-                    why="Models should not contain network communication capabilities",
-                )
-
-            # Add a passing check if no patterns were found
-            if not findings and context:
-                result.add_check(
-                    name="Network Communication Detection",
-                    passed=True,
-                    message="No network communication patterns detected",
-                    location=context,
-                )
-
-            return len(findings)
+            return self.add_network_communication_findings(findings, result, context=context)
 
         except ImportError:
             # NetworkCommDetector not available, log as debug
@@ -1038,6 +1080,56 @@ class BaseScanner(ABC):
         except Exception as e:
             logger.warning(f"Error checking for network communication: {e}")
             return 0
+
+    def add_network_communication_findings(
+        self,
+        findings: list[dict[str, Any]],
+        result: ScanResult,
+        context: str = "",
+    ) -> int:
+        """Emit explicit network communication checks from detector findings and return the count."""
+        for finding in findings:
+            severity_map = {
+                "CRITICAL": IssueSeverity.CRITICAL,
+                "HIGH": IssueSeverity.CRITICAL,
+                "MEDIUM": IssueSeverity.WARNING,
+                "LOW": IssueSeverity.INFO,
+            }
+            severity = severity_map.get(finding.get("severity", "WARNING"), IssueSeverity.WARNING)
+            network_indicator = " ".join(
+                str(part)
+                for part in [
+                    finding.get("type", ""),
+                    finding.get("message", ""),
+                    finding.get("pattern", ""),
+                    finding.get("pattern_type", ""),
+                    finding.get("domain", ""),
+                    finding.get("url", ""),
+                ]
+                if part
+            )
+            network_rule_code = get_network_rule_code(network_indicator)
+
+            result.add_check(
+                name="Network Communication Detection",
+                passed=False,
+                message=finding.get("message", "Network communication pattern detected"),
+                rule_code=network_rule_code,
+                severity=severity,
+                location=finding.get("context", context),
+                details=finding,
+                why="Models should not contain network communication capabilities",
+            )
+
+        if not findings and context:
+            result.add_check(
+                name="Network Communication Detection",
+                passed=True,
+                message="No network communication patterns detected",
+                location=context,
+            )
+
+        return len(findings)
 
     def _check_path(self, path: str) -> ScanResult | None:
         """Common path checks and validation
@@ -1116,6 +1208,7 @@ class BaseScanner(ABC):
                             "extension_format": ext_format,
                             "security_check": "file_type_validation",
                         },
+                        rule_code="S901",  # File type mismatch
                     )
                 else:
                     result.add_check(
