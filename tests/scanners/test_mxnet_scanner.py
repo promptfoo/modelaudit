@@ -130,6 +130,19 @@ def test_mxnet_scanner_detects_encoded_metadata_payload(tmp_path: Path) -> None:
     assert any("Encoded Metadata Payload" in check.name for check in result.checks)
 
 
+def test_mxnet_scanner_comment_token_does_not_suppress_encoded_payload_detection(tmp_path: Path) -> None:
+    symbol_path = tmp_path / "payload-comment-symbol.json"
+    params_path = tmp_path / "payload-comment-0000.params"
+
+    encoded_payload = base64.b64encode(b"# __import__('os').system('id')").decode("ascii")
+    _write_symbol_file(symbol_path, metadata=encoded_payload)
+    _write_params_file(params_path)
+
+    result = MXNetScanner().scan(str(symbol_path))
+
+    assert any("Encoded Metadata Payload" in check.name for check in result.checks)
+
+
 def test_mxnet_scanner_handles_corrupt_params_file(tmp_path: Path) -> None:
     params_path = tmp_path / "corrupt-0000.params"
     params_path.write_bytes(b"")

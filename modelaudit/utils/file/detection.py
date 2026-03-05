@@ -29,6 +29,8 @@ _CNTK_LEGACY_VERSION_MARKER = b"B\x00V\x00e\x00r\x00s\x00i\x00o\x00n\x00\x00\x00
 _CNTK_V2_REQUIRED_MARKERS = (b"\x0a\x07version", b"\x0a\x03uid")
 _CNTK_V2_STRUCTURE_MARKERS = (b"CompositeFunction", b"primitive_functions", b"PrimitiveFunction")
 _CNTK_SIGNATURE_READ_BYTES = 4096
+_TF_METAGRAPH_MIN_BYTES = 8
+_TF_METAGRAPH_MAX_VALIDATE_BYTES = 20 * 1024 * 1024
 _TORCH7_SIGNATURE_READ_BYTES = 4096
 _LIGHTGBM_SIGNATURE_READ_BYTES = 8192
 _LIGHTGBM_HEADER_MARKERS = (
@@ -136,6 +138,37 @@ def _is_cntk_signature(prefix: bytes) -> bool:
     if prefix.startswith(_CNTK_LEGACY_MAGIC):
         return _CNTK_LEGACY_VERSION_MARKER in prefix
     return _looks_like_cntk_v2_signature(prefix)
+
+
+def _is_tensorflow_metagraph_file(path: str) -> bool:
+    file_path = Path(path)
+    if not file_path.is_file():
+        return False
+
+    try:
+        size = file_path.stat().st_size
+        if size < _TF_METAGRAPH_MIN_BYTES or size > _TF_METAGRAPH_MAX_VALIDATE_BYTES:
+            return False
+
+        # Import vendored protos module (sets up sys.path for tensorflow.* imports)
+        # Order matters: modelaudit.protos must be imported first to set up sys.path
+        import modelaudit.protos  # noqa: F401, I001
+
+        from tensorflow.core.protobuf.meta_graph_pb2 import MetaGraphDef
+
+        content = file_path.read_bytes()
+        metagraph = MetaGraphDef()
+        metagraph.ParseFromString(content)
+
+        if not metagraph.HasField("graph_def"):
+            return False
+
+        graph_node_count = len(metagraph.graph_def.node)
+        function_node_count = sum(len(function.node_def) for function in metagraph.graph_def.library.function)
+        collection_count = len(metagraph.collection_def)
+        return graph_node_count > 0 or function_node_count > 0 or collection_count > 0
+    except Exception:
+        return False
 
 
 def _is_torch7_signature(prefix: bytes) -> bool:
@@ -260,6 +293,9 @@ def detect_file_format_from_magic(path: str) -> str:
         size = file_path.stat().st_size
         if size < 4:
             return "unknown"
+
+        if file_path.suffix.lower() == ".meta":
+            return "tf_metagraph" if _is_tensorflow_metagraph_file(path) else "unknown"
 
         with file_path.open("rb") as f:
             header = f.read(16)
@@ -401,6 +437,9 @@ def detect_file_format(path: str) -> str:
         if compression_format == expected_codec:
             return "compressed"
         return "unknown"
+    # TorchServe .mar archives are ZIP-based and route to a dedicated scanner.
+    if ext == ".mar":
+        return "torchserve_mar"
 
     # Check ZIP magic first (for .pt/.pth files that are actually zips)
     if magic4.startswith(b"PK"):
@@ -458,6 +497,10 @@ def detect_file_format(path: str) -> str:
             return "zip"
         # If not ZIP, assume pickle format
         return "pickle"
+    if ext == ".meta":
+        if _is_tensorflow_metagraph_file(path):
+            return "tf_metagraph"
+        return "unknown"
     if ext in (".ptl", ".pte"):
         if magic4.startswith(b"PK"):
             return "executorch"
@@ -542,7 +585,6 @@ def detect_file_format(path: str) -> str:
         ".txz",
     ):
         return "tar"
-
     return "unknown"
 
 
@@ -578,6 +620,7 @@ EXTENSION_FORMAT_MAP = {
     ".hdf5": "hdf5",
     ".keras": "keras",  # Keras 3.x uses ZIP, legacy Keras uses HDF5
     ".pb": "protobuf",
+    ".meta": "tf_metagraph",
     ".mlmodel": "coreml",
     ".safetensors": "safetensors",
     ".onnx": "onnx",
@@ -588,6 +631,7 @@ EXTENSION_FORMAT_MAP = {
     ".lz4": "compressed",
     ".zlib": "compressed",
     ".zip": "zip",
+    ".mar": "torchserve_mar",
     ".gguf": "gguf",
     ".ggml": "ggml",
     ".ggmf": "ggml",
@@ -647,6 +691,8 @@ def detect_format_from_extension_pattern_matching(extension: FileExtension) -> F
             return "zip"
         case ".gz" | ".bz2" | ".xz" | ".lz4" | ".zlib":
             return "compressed"
+        case ".mar":
+            return "torchserve_mar"
         case ".tar" | ".tar.gz" | ".tgz":
             return "tar"
         # ML model formats
@@ -667,6 +713,8 @@ def detect_format_from_extension_pattern_matching(extension: FileExtension) -> F
         # Other formats
         case ".pb":
             return "protobuf"
+        case ".meta":
+            return "tf_metagraph"
         case ".tflite":
             return "tflite"
         case ".mlmodel":
@@ -754,12 +802,22 @@ def validate_file_type(path: str) -> bool:
         if ext_format == "protobuf" and header_format in {"protobuf", "unknown"}:
             return True
 
+        # TensorFlow MetaGraph files (.meta extension) require strict protobuf validation.
+        if ext_format == "tf_metagraph":
+            return _is_tensorflow_metagraph_file(path)
+
         # PMML files are XML-based with <PMML> tag detection
         if ext_format == "pmml" and header_format == "pmml":
             return True
 
         # ZIP files can have various extensions (.zip, .pt, .pth, .ckpt, .ptl, .pte)
-        if header_format == "zip" and ext_format in {"zip", "pickle", "pytorch_binary", "executorch"}:
+        if header_format == "zip" and ext_format in {
+            "zip",
+            "pickle",
+            "pytorch_binary",
+            "executorch",
+            "torchserve_mar",
+        }:
             return True
 
         # TAR files must match

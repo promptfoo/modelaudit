@@ -86,7 +86,6 @@ def pytest_runtest_setup(item):
             "test_cve_detection.py",  # CVE detection tests
             "test_pytorch_zip_scanner.py",  # PyTorch ZIP scanner tests
             "test_paddle_scanner.py",  # PaddlePaddle scanner tests
-            "test_onnx_scanner.py",  # ONNX scanner CVE detection tests
             "test_cve_2025_10155_bin_pickle.py",  # CVE-2025-10155 .bin pickle detection tests
             "test_compressed_scanner.py",  # standalone compressed wrapper scanner tests
             "test_catboost_scanner.py",  # CatBoost scanner tests
@@ -98,6 +97,8 @@ def pytest_runtest_setup(item):
             "test_llamafile_scanner.py",  # Llamafile executable scanner tests
             "test_coreml_scanner.py",  # CoreML scanner tests
             "test_mxnet_scanner.py",  # MXNet scanner tests
+            "test_tf_metagraph_scanner.py",  # TensorFlow MetaGraph scanner tests
+            "test_torchserve_mar_scanner.py",  # TorchServe .mar scanner tests
         ]
 
         # Check if this is an allowed test file

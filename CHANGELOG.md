@@ -28,6 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **feat:** add Llamafile executable scanner with bounded runtime-string analysis and embedded GGUF payload carving/forwarding
 - **feat:** add CoreML `.mlmodel` scanner with strict protobuf structure validation, custom layer/custom model detection, metadata abuse checks, and linked-model path safety checks
 - **feat:** add MXNet scanner support for paired `*-symbol.json` and `*-NNNN.params` artifacts with strict contract validation, companion-file checks, and suspicious reference/payload detection
+- **security:** add TensorFlow MetaGraph (`.meta`) scanner support with strict protobuf `can_handle()`, bounded MetaGraph parsing, unsafe op detection (`PyFunc`/`PyCall`/`LoadLibrary`), executable-context string checks, and payload-stuffing anomaly controls
+- **security:** add dedicated TorchServe `.mar` scanner with strict archive validation, bounded manifest/member reads, manifest policy checks, and recursive embedded payload scanning
 - **security:** detect CVE-2025-1716 pickle bypass via `pip.main()` as dangerous callable (CVSS 9.8)
 - **keras:** detect CVE-2025-9906 `enable_unsafe_deserialization` config bypass in `.keras` archives (CVSS 8.6, safe_mode bypass)
 - **security:** detect CVE-2025-8747 Keras get_file gadget safe_mode bypass

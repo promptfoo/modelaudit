@@ -14,9 +14,11 @@ def test_scanner_registry_contains_all_scanners():
         "PyTorchZipScanner",
         "SafeTensorsScanner",
         "PmmlScanner",
+        "TensorFlowMetaGraphScanner",
         "CoreMLScanner",
         "MXNetScanner",
         "LlamafileScanner",
+        "TorchServeMarScanner",
     ]
 
     for scanner in core_scanners:
@@ -96,6 +98,7 @@ def test_scanner_registry_file_extension_coverage():
         ".lgb",
         ".lightgbm",
         ".pb",
+        ".meta",
         ".onnx",
         ".cbm",
         ".safetensors",
@@ -104,6 +107,7 @@ def test_scanner_registry_file_extension_coverage():
         ".pdmodel",
         ".pdiparams",
         ".params",
+        ".mar",
         ".engine",
         ".plan",
         ".gz",

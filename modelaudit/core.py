@@ -1305,6 +1305,9 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         # PyTorch .bin files saved with torch.save() are ZIP format internally
         # Use PickleScanner which can handle both pickle and ZIP-based PyTorch files
         preferred_scanner = _registry.load_scanner_by_id("pickle")
+    elif header_format == "zip" and ext == ".mar":
+        # TorchServe .mar model archives are ZIP-based - use dedicated MAR scanner
+        preferred_scanner = _registry.load_scanner_by_id("torchserve_mar")
     else:
         format_to_scanner = {
             "pickle": "pickle",
