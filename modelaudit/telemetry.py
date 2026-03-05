@@ -287,8 +287,9 @@ class TelemetryClient:
                 logger.debug(f"Failed to initialize PostHog client: {e}")
                 self._posthog_client = None
 
-        # Ensure any buffered events are flushed on process exit.
-        atexit.register(self.flush)
+        # Ensure any buffered events are flushed on process exit when telemetry is active.
+        if self._posthog_client:
+            atexit.register(self.flush)
 
     def _is_disabled(self) -> bool:
         """Check if telemetry is disabled via environment variables or user config."""
@@ -407,22 +408,6 @@ class TelemetryClient:
             self._send_event_internal(event, properties)
         except Exception as e:
             logger.debug(f"Failed to record telemetry event: {e}")
-
-    def _extract_model_name(self, path: str) -> str | None:
-        """Extract model name from path or URL."""
-        # HuggingFace format: hf://org/model or https://huggingface.co/org/model
-        if "huggingface.co/" in path or path.startswith("hf://"):
-            parts = path.replace("hf://", "").replace("https://huggingface.co/", "").split("/")
-            if len(parts) >= 2:
-                return f"{parts[0]}/{parts[1]}"
-        # PyTorch Hub format: pytorch://org/repo/model
-        if "pytorch" in path.lower() and "/" in path:
-            parts = path.split("/")
-            return "/".join(parts[-2:]) if len(parts) >= 2 else parts[-1]
-        # Local file: just the filename
-        if "/" in path or "\\" in path:
-            return Path(path).name
-        return path
 
     def record_scan_started(self, paths: list[str], scan_options: dict[str, Any]) -> None:
         """Record that a scan has started."""
@@ -687,14 +672,6 @@ class TelemetryClient:
             severity = str(issue.get("severity", "unknown"))
             severities[severity] = severities.get(severity, 0) + 1
         return severities
-
-    def _count_file_types(self, results: dict[str, Any]) -> dict[str, int]:
-        """Count scanned files by type."""
-        file_types: dict[str, int] = {}
-        for asset in self._iter_result_assets(results):
-            file_type = str(asset.get("type", "unknown"))
-            file_types[file_type] = file_types.get(file_type, 0) + 1
-        return file_types
 
 
 # Global telemetry client instance

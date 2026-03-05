@@ -399,28 +399,6 @@ class TestDataHandling:
             sanitized = client._sanitize_error(long_error)
             assert len(sanitized) <= 100
 
-    def test_model_name_extraction(self):
-        """Test model name extraction from various path formats."""
-        with (
-            tempfile.TemporaryDirectory() as temp_dir,
-            patch("modelaudit.telemetry.Path.home") as mock_home,
-            patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
-        ):
-            mock_home.return_value = Path(temp_dir)
-            client = TelemetryClient()
-
-            # HuggingFace URL
-            hf_url = "https://huggingface.co/meta-llama/Llama-2-7b/blob/main/model.pkl"
-            assert client._extract_model_name(hf_url) == "meta-llama/Llama-2-7b"
-
-            # HuggingFace shorthand
-            hf_short = "hf://meta-llama/Llama-2-7b"
-            assert client._extract_model_name(hf_short) == "meta-llama/Llama-2-7b"
-
-            # Local path
-            local_path = "/home/user/models/my_model.pkl"
-            assert client._extract_model_name(local_path) == "my_model.pkl"
-
 
 class TestPrivacyCompliance:
     """Test privacy and compliance features."""
