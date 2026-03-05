@@ -396,19 +396,36 @@ class TelemetryClient:
 
     def _extract_model_name(self, path: str) -> str | None:
         """Extract model name from path or URL."""
+        is_http_url = path.startswith(("http://", "https://"))
+        is_hf_shorthand = path.startswith("hf://")
+        parsed = urlparse(path) if (is_http_url or is_hf_shorthand) else None
+
         # HuggingFace format: hf://org/model or https://huggingface.co/org/model
-        if "huggingface.co/" in path or path.startswith("hf://"):
-            parts = path.replace("hf://", "").replace("https://huggingface.co/", "").split("/")
+        if is_hf_shorthand and parsed:
+            parts = [part for part in [parsed.netloc, *parsed.path.lstrip("/").split("/")] if part]
             if len(parts) >= 2:
                 return f"{parts[0]}/{parts[1]}"
+        if is_http_url and parsed and (parsed.netloc == "huggingface.co" or parsed.netloc.endswith(".huggingface.co")):
+            parts = [part for part in parsed.path.lstrip("/").split("/") if part]
+            if len(parts) >= 2:
+                return f"{parts[0]}/{parts[1]}"
+
         # PyTorch Hub format: pytorch://org/repo/model
         if "pytorch" in path.lower() and "/" in path:
-            parts = path.split("/")
+            parts = (parsed.path if is_http_url and parsed else path).split("/")
             return "/".join(parts[-2:]) if len(parts) >= 2 else parts[-1]
-        # Local file: just the filename
-        if "/" in path or "\\" in path:
-            return Path(path).name
-        return path
+
+        # Local file: filename, or URL path leaf (query and fragments excluded for HTTP URLs).
+        name_source = parsed.path if is_http_url and parsed else path
+        if "/" in name_source or "\\" in name_source:
+            model_name = Path(name_source).name
+            if model_name:
+                return model_name
+
+        if is_http_url and parsed and parsed.netloc:
+            return parsed.netloc
+
+        return name_source
 
     def record_event(self, event: TelemetryEvent, properties: dict[str, Any] | None = None) -> None:
         """Record a telemetry event."""

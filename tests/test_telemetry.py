@@ -395,14 +395,27 @@ class TestTelemetryClient:
             client.record_download_started("http", sensitive_url)
             download_props = mock_posthog.capture.call_args.kwargs["properties"]
             assert download_props["url"] == sensitive_url
-            assert download_props["model_name"] == "model.bin?token=secret"
+            assert download_props["model_name"] == "model.bin"
             assert "url_identifier" in download_props
 
             client.record_download_completed("http", 2.0, 2048, sensitive_url)
             completed_props = mock_posthog.capture.call_args.kwargs["properties"]
             assert completed_props["url"] == sensitive_url
-            assert completed_props["model_name"] == "model.bin?token=secret"
+            assert completed_props["model_name"] == "model.bin"
             assert "url_identifier" in completed_props
+
+    def test_extract_model_name_strips_query_string_for_http_urls(self):
+        """Model name extraction should not include URL query parameters."""
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch("modelaudit.telemetry.Path.home") as mock_home,
+            patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
+        ):
+            mock_home.return_value = Path(temp_dir)
+            client = TelemetryClient()
+
+            assert client._extract_model_name("https://example.com/model.bin?token=secret") == "model.bin"
+            assert client._extract_model_name("https://example.com/model.bin#fragment") == "model.bin"
 
     def test_telemetry_available_false_when_posthog_unavailable(self):
         """Telemetry should be unavailable when transport client is missing."""
