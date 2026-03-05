@@ -81,6 +81,7 @@ def is_telemetry_available() -> bool:
             return False
         if client._is_disabled():
             return False
+        client._ensure_posthog_client()
         return client._posthog_client is not None
     except Exception:
         return False
@@ -157,6 +158,23 @@ def _is_development_install() -> bool:
 
 # Cache the development check at module load time
 _IS_DEVELOPMENT = _is_development_install()
+
+
+def _runtime_signature() -> tuple[Any, ...]:
+    """Capture runtime state that affects the cached telemetry client."""
+    return (
+        str(Path.home()),
+        POSTHOG_AVAILABLE,
+        POSTHOG_PROJECT_KEY,
+        POSTHOG_HOST,
+        _IS_DEVELOPMENT,
+        os.getenv("MODELAUDIT_TELEMETRY_DEV", "").lower(),
+        os.getenv("PROMPTFOO_DISABLE_TELEMETRY", "").lower(),
+        os.getenv("NO_ANALYTICS", "").lower(),
+        os.getenv("CI", "").lower(),
+        os.getenv("IS_TESTING", "").lower(),
+        os.getenv("MODELAUDIT_TELEMETRY_FLUSH_IMMEDIATELY", "").lower(),
+    )
 
 
 class UserConfig:
@@ -265,31 +283,19 @@ class TelemetryClient:
     _posthog_client: Any
 
     def __init__(self) -> None:
+        self._runtime_signature = _runtime_signature()
         self._user_config = UserConfig()
         self._posthog_client = None
         self._session_id = str(uuid.uuid4())
         self._telemetry_disabled_recorded = False
+        self._atexit_flush_registered = False
         self._flush_immediately = os.getenv("MODELAUDIT_TELEMETRY_FLUSH_IMMEDIATELY", "").lower() in (
             "1",
             "true",
             "yes",
         )
 
-        # Initialize PostHog client if available and configured
-        if POSTHOG_AVAILABLE and POSTHOG_PROJECT_KEY and not self._is_disabled():
-            try:
-                self._posthog_client = Posthog(
-                    project_api_key=POSTHOG_PROJECT_KEY,
-                    host=POSTHOG_HOST,
-                )
-                self._identify_user()
-            except Exception as e:
-                logger.debug(f"Failed to initialize PostHog client: {e}")
-                self._posthog_client = None
-
-        # Ensure any buffered events are flushed on process exit when telemetry is active.
-        if self._posthog_client:
-            atexit.register(self.flush)
+        self._ensure_posthog_client()
 
     def _is_disabled(self) -> bool:
         """Check if telemetry is disabled via environment variables or user config."""
@@ -334,6 +340,26 @@ class TelemetryClient:
                 self._posthog_client.flush()
         except Exception as e:
             logger.debug(f"Failed to set user properties: {e}")
+
+    def _ensure_posthog_client(self) -> None:
+        """Lazily initialize the transport when telemetry is currently allowed."""
+        if self._posthog_client is not None:
+            return
+        if not POSTHOG_AVAILABLE or not POSTHOG_PROJECT_KEY or self._is_disabled():
+            return
+
+        try:
+            self._posthog_client = Posthog(
+                project_api_key=POSTHOG_PROJECT_KEY,
+                host=POSTHOG_HOST,
+            )
+            self._identify_user()
+            if not self._atexit_flush_registered:
+                atexit.register(self.flush)
+                self._atexit_flush_registered = True
+        except Exception as e:
+            logger.debug(f"Failed to initialize PostHog client: {e}")
+            self._posthog_client = None
 
     def _record_telemetry_disabled(self) -> None:
         """Mark that telemetry was disabled (no network calls for true decoupling)."""
@@ -438,6 +464,7 @@ class TelemetryClient:
             return
 
         try:
+            self._ensure_posthog_client()
             self._send_event_internal(event, properties)
         except Exception as e:
             logger.debug(f"Failed to record telemetry event: {e}")
@@ -725,14 +752,15 @@ class TelemetryClient:
 
 
 # Global telemetry client instance
-_telemetry_client = None
+_telemetry_client: TelemetryClient | None = None
 
 
 def get_telemetry_client() -> TelemetryClient | None:
     """Get the global telemetry client instance."""
     global _telemetry_client
     try:
-        if _telemetry_client is None:
+        current_signature = _runtime_signature()
+        if _telemetry_client is None or getattr(_telemetry_client, "_runtime_signature", None) != current_signature:
             _telemetry_client = TelemetryClient()
         return _telemetry_client
     except Exception as e:
@@ -850,6 +878,7 @@ def enable_telemetry() -> None:
     client = get_telemetry_client()
     if client is not None:
         client._user_config.telemetry_enabled = True
+        client._ensure_posthog_client()
 
 
 def is_telemetry_enabled() -> bool:
