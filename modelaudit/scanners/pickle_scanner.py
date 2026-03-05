@@ -2421,7 +2421,9 @@ def _is_legitimate_serialization_file(path: str) -> bool:
                 return False
 
             # For joblib files, look for joblib-specific patterns
-            if path.lower().endswith(".joblib"):
+            # Also check extensionless files (e.g. HuggingFace cache blob hashes)
+            ext_lower = os.path.splitext(path)[1].lower()
+            if ext_lower == ".joblib" or not ext_lower:
                 f.seek(0)
                 # Try to find joblib-specific markers in first 2KB
                 sample = f.read(2048)
@@ -2435,10 +2437,15 @@ def _is_legitimate_serialization_file(path: str) -> bool:
                     b"_pickle",
                     b"NumpyArrayWrapper",
                 ]
-                return any(marker in sample for marker in joblib_indicators)
+                if any(marker in sample for marker in joblib_indicators):
+                    return True
+                # For extensionless files, only return False if no indicators found
+                # (don't fall through to dill check)
+                if not ext_lower:
+                    return False
 
             # For dill files, they're usually just enhanced pickle
-            if path.lower().endswith(".dill"):
+            if ext_lower == ".dill":
                 # Dill files should contain standard pickle format
                 # Additional validation could check for dill-specific patterns
                 return True
@@ -4840,6 +4847,14 @@ class PickleScanner(BaseScanner):
             # Handle known issues with legitimate serialization files
             file_ext = os.path.splitext(self.current_file_path)[1].lower()
             is_pytorch_like_ext = file_ext in {".bin", ".pt", ".pth", ".ckpt"}
+            is_serialization_ext = file_ext in {".joblib", ".dill"}
+
+            # Detect joblib/sklearn content from parsed globals for extensionless files
+            # (e.g. HuggingFace cache stores files as hash blobs without extensions)
+            has_joblib_globals = any(
+                mod.startswith("joblib.") or mod.startswith("sklearn.") for mod, _func in advanced_globals
+            )
+            is_joblib_content = is_serialization_ext or (not file_ext and has_joblib_globals)
 
             # Check for recursion errors on legitimate ML model files
             is_recursion_error = isinstance(e, RecursionError)
@@ -4850,9 +4865,9 @@ class PickleScanner(BaseScanner):
 
             # Pre-validate file legitimacy to avoid nested exceptions
             is_legitimate_file = False
-            if file_ext in {".joblib", ".dill"} or is_large_ml_model or is_pytorch_like_ext:
+            if is_joblib_content or is_large_ml_model or is_pytorch_like_ext:
                 try:
-                    if file_ext in {".joblib", ".dill"}:
+                    if is_joblib_content:
                         is_legitimate_file = _is_legitimate_serialization_file(self.current_file_path)
                     elif is_pytorch_like_ext:
                         # For PyTorch model files, check if they look legitimate.
@@ -4889,7 +4904,7 @@ class PickleScanner(BaseScanner):
             has_minimum_bin_size = file_ext != ".bin" or file_size >= 128 * 1024
             is_memory_limit_on_legitimate_model = (
                 isinstance(e, MemoryError)
-                and is_pytorch_like_ext
+                and (is_pytorch_like_ext or is_joblib_content)
                 and is_legitimate_file
                 and passes_global_gate
                 and has_minimum_bin_size
@@ -4908,7 +4923,7 @@ class PickleScanner(BaseScanner):
                         "bad marshal data",
                     ]
                 )
-                and file_ext in {".joblib", ".dill"}
+                and is_joblib_content
                 and is_legitimate_file
             )
 
@@ -4916,15 +4931,17 @@ class PickleScanner(BaseScanner):
             is_recursion_on_legitimate_model = is_recursion_error and is_large_ml_model and is_legitimate_file
 
             if is_memory_limit_on_legitimate_model:
+                file_type_label = "serialization" if is_joblib_content else "PyTorch"
+                file_type_meta = "legitimate_serialization_file" if is_joblib_content else "legitimate_pytorch_model"
                 logger.info(
                     f"Memory limit reached scanning {self.current_file_path}. "
-                    f"Treating as scanner limitation for legitimate PyTorch pickle."
+                    f"Treating as scanner limitation for legitimate {file_type_label} pickle."
                 )
                 result.metadata.update(
                     {
                         "memory_limited": True,
                         "file_size": file_size,
-                        "file_type": "legitimate_pytorch_model",
+                        "file_type": file_type_meta,
                         "opcodes_analyzed": opcode_count,
                         "scanner_limitation": True,
                         "analysis_incomplete": True,
@@ -4946,8 +4963,9 @@ class PickleScanner(BaseScanner):
                         "analysis_incomplete": True,
                     },
                     why=(
-                        "This file appears to be a legitimate PyTorch pickle, but analysis hit memory limits while "
-                        "walking complex object graphs. The analyzable portion was scanned for security issues."
+                        f"This file appears to be a legitimate {file_type_label} pickle, but analysis hit memory "
+                        "limits while walking complex object graphs. The analyzable portion was scanned for "
+                        "security issues."
                     ),
                 )
             elif is_recursion_on_legitimate_model:
