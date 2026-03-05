@@ -322,6 +322,11 @@ class TestTelemetryClient:
             assert properties["file_types"]["zip"] == 1
             assert sorted(properties["scanners_used"]) == ["pickle", "zip"]
             assert properties["files_scanned"] == ["/tmp/a.pkl", "/tmp/b.zip"]
+            canonical_issue = next(
+                detail for detail in properties["issue_details"] if detail["type"] == "pickle_dangerous_global"
+            )
+            assert canonical_issue["file_path"] == "/tmp/a.pkl"
+            assert canonical_issue["model_name"] == "a.pkl"
 
     def test_scan_started_includes_per_path_fields(self):
         """Scan started events include per-path arrays and model names."""
@@ -392,6 +397,12 @@ class TestTelemetryClient:
             assert download_props["url"] == sensitive_url
             assert download_props["model_name"] == "model.bin?token=secret"
             assert "url_identifier" in download_props
+
+            client.record_download_completed("http", 2.0, 2048, sensitive_url)
+            completed_props = mock_posthog.capture.call_args.kwargs["properties"]
+            assert completed_props["url"] == sensitive_url
+            assert completed_props["model_name"] == "model.bin?token=secret"
+            assert "url_identifier" in completed_props
 
     def test_telemetry_available_false_when_posthog_unavailable(self):
         """Telemetry should be unavailable when transport client is missing."""

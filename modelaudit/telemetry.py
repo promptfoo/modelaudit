@@ -478,7 +478,7 @@ class TelemetryClient:
             issue_type = str(issue.get("type") or issue.get("message") or "unknown")
             severity = str(issue.get("severity", "unknown"))
             issue_types[issue_type] = issue_types.get(issue_type, 0) + 1
-            # Capture first 50 issues in detail (without raw paths)
+            # Capture first 50 issues in detail (including raw paths when available)
             if len(issue_details) < 50:
                 issue_location = str(issue.get("location", ""))
                 issue_details.append(
