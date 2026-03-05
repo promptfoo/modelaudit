@@ -74,6 +74,7 @@ def test_download_from_cloud(mock_fs, tmp_path):
 
 @pytest.mark.asyncio
 async def test_download_from_cloud_async_context(tmp_path: Path) -> None:
+    """download_from_cloud should work from an active event loop context."""
     fs = make_fs_mock()
     fs.info.return_value = {"type": "file", "size": 1024}
 
@@ -121,6 +122,7 @@ def test_download_from_cloud_streaming_returns_stream_url(mock_preview, mock_ana
 
 @pytest.mark.asyncio
 async def test_download_from_cloud_streaming_async_context() -> None:
+    """download_from_cloud_streaming should work from an active event loop context."""
     fs = make_fs_mock()
     fs.info.return_value = {"type": "file", "size": 1024}
     fs.get.side_effect = lambda _src, dst: Path(dst).write_bytes(b"data")
@@ -452,7 +454,10 @@ class TestCloudPathSecurity:
 
 
 class TestCloudCacheSafety:
+    """Regression tests for cloud cache boundary enforcement."""
+
     def test_cache_file_does_not_trust_prefix_sibling_path(self, tmp_path: Path) -> None:
+        """Cacheing a sibling path should copy into cache, not trust prefix similarity."""
         cache = GCSCache(cache_dir=tmp_path / "cache")
         sibling_dir = tmp_path / "cache_evil"
         sibling_dir.mkdir(parents=True, exist_ok=True)
@@ -468,6 +473,7 @@ class TestCloudCacheSafety:
         assert source_file.exists()
 
     def test_clean_old_cache_does_not_delete_outside_cache(self, tmp_path: Path) -> None:
+        """Cleanup must not delete files that are outside cache_dir."""
         cache = GCSCache(cache_dir=tmp_path / "cache")
         outside_file = tmp_path / "outside" / "artifact.bin"
         outside_file.parent.mkdir(parents=True, exist_ok=True)
@@ -492,6 +498,8 @@ class TestCloudCacheSafety:
 
 
 class TestCloudDownloadCleanup:
+    """Regression tests for temporary download directory cleanup."""
+
     @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
     @patch("modelaudit.utils.sources.cloud_storage.retry_with_backoff")
     @patch("fsspec.filesystem")
@@ -502,6 +510,7 @@ class TestCloudDownloadCleanup:
         mock_analyze: AsyncMock,
         tmp_path: Path,
     ) -> None:
+        """Failed single-file downloads should remove auto-created temp directories."""
         fs = make_fs_mock()
         fs.info.return_value = {"type": "file", "size": 1024}
         fs.get.side_effect = RuntimeError("network failure")
