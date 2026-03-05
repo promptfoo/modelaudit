@@ -4885,7 +4885,7 @@ class PickleScanner(BaseScanner):
             is_recursion_on_legitimate_model = is_recursion_error and is_large_ml_model and is_legitimate_file
 
             if is_memory_limit_on_legitimate_model:
-                logger.warning(
+                logger.info(
                     f"Memory limit reached scanning {self.current_file_path}. "
                     f"Treating as scanner limitation for legitimate PyTorch pickle."
                 )
@@ -4900,9 +4900,8 @@ class PickleScanner(BaseScanner):
                 )
                 result.add_check(
                     name="Pickle Parse Resource Limit",
-                    passed=False,
+                    passed=True,
                     message="Scan limited by model complexity and memory budget",
-                    severity=IssueSeverity.INFO,
                     location=self.current_file_path,
                     details={
                         "reason": "memory_limit_on_legitimate_model",

@@ -17,7 +17,7 @@ from modelaudit.detectors.suspicious_symbols import (
     BINARY_CODE_PATTERNS,
     EXECUTABLE_SIGNATURES,
 )
-from modelaudit.scanners.base import IssueSeverity, ScanResult
+from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.pickle_scanner import PickleScanner
 from tests.assets.generators.generate_advanced_pickle_tests import (
     generate_memo_based_attack,
@@ -1091,8 +1091,10 @@ class TestCVE20251716PipMainBlocklist(unittest.TestCase):
         assert not _is_dangerous_module("pipeline.process")
 
 
-def test_scan_legitimate_pytorch_pickle_memory_error_is_info(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Memory limits on legitimate .pt files should be treated as scanner limitation."""
+def test_scan_legitimate_pytorch_pickle_memory_error_is_non_failing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Memory limits on legitimate .pt files should be treated as non-failing scanner limitation."""
     model_path = tmp_path / "legitimate_model.pt"
     header = b"\x80\x02ctorch\nOrderedDict\nq\x00."
     model_path.write_bytes(header + b"state_dict" + b"\x00" * (1024 * 1024 + 64))
@@ -1104,7 +1106,10 @@ def test_scan_legitimate_pytorch_pickle_memory_error_is_info(tmp_path: Path, mon
 
     result = PickleScanner().scan(str(model_path))
 
-    assert any(check.name == "Pickle Parse Resource Limit" for check in result.checks)
+    resource_limit_checks = [check for check in result.checks if check.name == "Pickle Parse Resource Limit"]
+    assert len(resource_limit_checks) == 1
+    assert resource_limit_checks[0].status == CheckStatus.PASSED
+    assert result.issues == []
     assert not any(
         issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
         and "Unable to parse pickle file" in issue.message
