@@ -36,25 +36,25 @@ Out of scope:
 - Reuse vendored TensorFlow protobuf stubs where possible.
 - Define bounded parse limits for message size and node counts.
 
-2. Scanner implementation
+1. Scanner implementation
 
 - Implement strict `can_handle()` for `.meta` with protobuf parse sanity check.
 - Enforce path/size validation pre-parse.
 - Extract graph ops, function defs, and collection metadata.
 
-3. Security checks
+1. Security checks
 
 - Flag unsafe ops and constructs (`PyFunc`, dynamic library loading patterns, external path references).
 - Flag suspicious command/network strings in node attributes where relevant.
 - Flag graph anomalies indicating payload stuffing.
 
-4. Integration
+1. Integration
 
 - Add scanner registration and extension map entry for `.meta`.
 - Ensure coexistence with current SavedModel `.pb` handling.
 - Reuse shared TensorFlow explanation mappings where appropriate.
 
-5. Robustness
+1. Robustness
 
 - Gracefully handle partial/corrupt protobuf data.
 - Keep deterministic output across Python versions.
@@ -74,11 +74,11 @@ Out of scope:
 - Corrupt protobuf fixture.
 - Non-meta file renamed `.meta`.
 
-2. False-positive tests
+1. False-positive tests
 
 - Benign graphs with ops whose names contain risky substrings should not escalate incorrectly.
 
-3. Regression tests
+1. Regression tests
 
 - Existing TensorFlow SavedModel scanner tests remain green.
 - `.meta` no longer routes to unknown.
@@ -91,8 +91,8 @@ Out of scope:
 uv run pytest tests/scanners/test_tf_metagraph_scanner.py -q
 ```
 
-2. TensorFlow scanner regression subset.
-3. Full validation gate.
+1. TensorFlow scanner regression subset.
+1. Full validation gate.
 
 ## Documentation Tasks
 

@@ -579,3 +579,75 @@ class SafeTensorsScanner(BaseScanner):
 
         # For primitive types (str, int, float, bool, None)
         return current_depth
+
+    def extract_metadata(self, file_path: str) -> dict[str, Any]:
+        """Extract SafeTensors metadata."""
+        metadata = super().extract_metadata(file_path)
+
+        try:
+            with open(file_path, "rb") as f:
+                # Read header length
+                header_len_bytes = f.read(8)
+                if len(header_len_bytes) != 8:
+                    metadata["extraction_error"] = "Invalid SafeTensors header"
+                    return metadata
+
+                header_len = struct.unpack("<Q", header_len_bytes)[0]
+                file_size = self.get_file_size(file_path)
+                MAX_HEADER_BYTES = int(self.config.get("max_safetensors_header_bytes", 16 * 1024 * 1024))
+                max_allowed = max(0, min(MAX_HEADER_BYTES, file_size - 8))
+                if header_len <= 0 or header_len > max_allowed:
+                    metadata["extraction_error"] = f"Invalid SafeTensors header length: {header_len}"
+                    return metadata
+                header_bytes = f.read(header_len)
+                if len(header_bytes) != header_len:
+                    metadata["extraction_error"] = "Truncated SafeTensors header"
+                    return metadata
+                header = json.loads(header_bytes)
+
+                # Extract tensor info
+                tensors: dict[str, dict[str, Any]] = {}
+                total_params = 0
+                invalid_tensor_entries: list[str] = []
+
+                for name, info in header.items():
+                    if name != "__metadata__":  # Skip metadata entry
+                        if not isinstance(info, dict):
+                            invalid_tensor_entries.append(name)
+                            continue
+
+                        dtype = info.get("dtype")
+                        shape = info.get("shape")
+                        if not isinstance(dtype, str) or not isinstance(shape, list):
+                            invalid_tensor_entries.append(name)
+                            continue
+                        if not all(isinstance(dim, int) and dim >= 0 for dim in shape):
+                            invalid_tensor_entries.append(name)
+                            continue
+
+                        tensors[name] = {"dtype": dtype, "shape": shape}
+                        # Calculate parameter count
+                        param_count = 1
+                        for dim in shape:
+                            param_count *= dim
+                        total_params += param_count
+
+                metadata.update(
+                    {
+                        "tensor_count": len(tensors),
+                        "total_parameters": total_params,
+                        "tensors": tensors,
+                        "dtypes": sorted({info["dtype"] for info in tensors.values()}),
+                    }
+                )
+                if invalid_tensor_entries:
+                    metadata["invalid_tensor_entries"] = invalid_tensor_entries[:20]
+
+                # Extract custom metadata if present
+                if "__metadata__" in header:
+                    metadata["custom_metadata"] = header["__metadata__"]
+
+        except Exception as e:
+            metadata["extraction_error"] = str(e)
+
+        return metadata

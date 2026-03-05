@@ -45,7 +45,7 @@ Out of scope:
 - Create malicious fixtures with synthetic payloads: path traversal member names, suspicious handlers, embedded malicious pickle.
 - Record minimal required archive structure (`MAR-INF/MANIFEST.json`, serialized file path).
 
-2. Scanner implementation
+1. Scanner implementation
 
 - Implement `TorchServeMarScanner(BaseScanner)` with `supported_extensions = [".mar"]`.
 - Implement strict `can_handle()`:
@@ -54,7 +54,7 @@ Out of scope:
   - Reject non-archive files renamed to `.mar`.
 - In `scan()` call `_check_path()` and `_check_size_limit()` before archive parsing.
 
-3. Manifest validation checks
+1. Manifest validation checks
 
 - Parse manifest JSON with bounded read (max 1 MB).
 - Validate required keys and path fields (`model`, `handler`, `serializedFile`, `extraFiles`).
@@ -63,7 +63,7 @@ Out of scope:
   - Handler values pointing outside archive root.
   - Suspicious URL-like references in local-only fields.
 
-4. Embedded payload scanning
+1. Embedded payload scanning
 
 - Iterate archive members without full extraction.
 - For each member:
@@ -75,20 +75,20 @@ Out of scope:
   - max recursion depth
   - max uncompressed bytes budget
 
-5. TorchServe-specific risk checks
+1. TorchServe-specific risk checks
 
 - Flag executable handlers (`.py`) that include high-risk primitives (`os.system`, `subprocess`, dynamic import patterns).
 - Flag dangerous pickle-like serialized payloads via existing pickle scanner.
 - Add explicit check for mismatched manifest references (manifest points to missing/alternate file).
 
-6. Registry and routing
+1. Registry and routing
 
 - Add scanner registration entry with priority before generic ZIP scanner.
 - Add class mapping in `__getattr__`.
 - Add extension mapping for `.mar` in `EXTENSION_FORMAT_MAP`.
 - Ensure fallback behavior keeps `.mar` from being treated as unknown.
 
-7. Performance and resilience
+1. Performance and resilience
 
 - Cap manifest/member reads to avoid decompression bomb behavior.
 - Handle corrupt ZIPs gracefully with `INFO`/`WARNING` checks, not crashes.
@@ -114,13 +114,13 @@ Out of scope:
 - Corrupt archive renamed `.mar`.
 - Archive with nested ZIP + malicious member.
 
-2. Regression tests
+1. Regression tests
 
 - Ensure `.mar` no longer produces `unknown` scanner result.
 - Ensure benign custom handler code does not produce `CRITICAL` unless risky primitives appear.
 - Ensure comment-token bypass attempts do not suppress real findings.
 
-3. Type and quality checks
+1. Type and quality checks
 
 - Test functions use explicit return type annotations (`-> None`).
 - Use `tmp_path: Path` fixtures only; no host path assumptions.
@@ -133,13 +133,13 @@ Out of scope:
 uv run pytest tests/scanners/test_torchserve_mar_scanner.py -q
 ```
 
-2. Core routing smoke test:
+1. Core routing smoke test:
 
 ```bash
 uv run python -m modelaudit.cli tests/fixtures/torchserve/safe.mar --format json
 ```
 
-3. Full project gate:
+1. Full project gate:
 
 ```bash
 uv run ruff format modelaudit/ tests/

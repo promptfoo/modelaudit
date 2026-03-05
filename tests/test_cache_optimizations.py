@@ -274,8 +274,8 @@ class TestCacheOptimizationPerformance:
                     fingerprints.append(fp.quick_key())
                 return fingerprints
 
-            # Time optimized approach
-            iterations = 100
+            # Time optimized approach (more iterations to reduce noise)
+            iterations = 300
             start_time = time.perf_counter()
             for _ in range(iterations):
                 opt_result = optimized_fingerprints()

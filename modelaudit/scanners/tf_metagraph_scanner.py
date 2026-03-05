@@ -37,7 +37,9 @@ _MAX_COLLECTION_VALUE_BYTES = 256 * 1024
 _MAX_SIGNAL_EXAMPLES = 8
 
 # Align dangerous operation severity with SavedModel scanner behavior.
-_EXCLUDE_GENERIC_DANGEROUS = {"DecodeRaw", "DecodeJpeg", "DecodePng"}
+# Save/Restore ops are common in benign checkpoints and are not direct
+# code-execution primitives in MetaGraph context.
+_EXCLUDE_GENERIC_DANGEROUS = {"DecodeRaw", "DecodeJpeg", "DecodePng", "SaveV2", "RestoreV2"}
 _DANGEROUS_TF_OPS = {
     op: IssueSeverity.CRITICAL for op in TENSORFLOW_DANGEROUS_OPS if op not in _EXCLUDE_GENERIC_DANGEROUS
 }
@@ -79,6 +81,7 @@ _COMMAND_RE = re.compile(
 _NETWORK_RE = re.compile(r"(?i)(?:https?://|wss?://|ftp://|tcp://|udp://|\bsocket\b|\b(?:\d{1,3}\.){3}\d{1,3}\b)")
 _ENCODED_PAYLOAD_RE = re.compile(r"\b[A-Za-z0-9+/]{120,}={0,2}\b")
 _DECODE_HINT_RE = re.compile(r"(?i)(?:base64|b64decode|frombase64string|decode\(|eval\(|exec\()")
+_BENIGN_CHECKPOINT_IO_OPS = frozenset({"SaveV2", "RestoreV2"})
 
 
 def _check_protos() -> bool:
@@ -350,6 +353,9 @@ class TensorFlowMetaGraphScanner(BaseScanner):
         }
 
         for ctx in _iter_nodes(metagraph):
+            if ctx.op in _BENIGN_CHECKPOINT_IO_OPS:
+                continue
+
             if ctx.op in _DANGEROUS_TF_OPS:
                 result.add_check(
                     name="TensorFlow MetaGraph Operation Security Check",

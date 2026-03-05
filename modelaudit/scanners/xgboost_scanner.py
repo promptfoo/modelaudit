@@ -656,3 +656,95 @@ except Exception as e:
                 location=path,
                 details={"exception": str(e)},
             )
+
+    def extract_metadata(self, file_path: str) -> dict[str, Any]:
+        """Extract XGBoost model metadata."""
+        metadata = super().extract_metadata(file_path)
+        allow_deserialization = self.config.get("allow_metadata_deserialization", False)
+
+        if not allow_deserialization:
+            metadata["deserialization_skipped"] = True
+            metadata["reason"] = "Deserialization disabled for metadata extraction"
+            return metadata
+
+        try:
+            import xgboost as xgb
+
+            # SECURITY: xgb.Booster().load_model() deserializes the model in-process.
+            # Only reached when allow_metadata_deserialization is explicitly True.
+            model = xgb.Booster()
+            model.load_model(file_path)
+
+            # Basic model info
+            metadata.update(
+                {
+                    "xgboost_version": xgb.__version__,
+                    "model_type": "XGBoost Booster",
+                }
+            )
+
+            # Get model attributes
+            try:
+                # Number of boosting rounds
+                num_boosted_rounds = model.num_boosted_rounds()
+                metadata["num_boosted_rounds"] = num_boosted_rounds
+
+                # Number of features
+                num_features = model.num_features()
+                metadata["num_features"] = num_features
+
+                # Model configuration
+                config = model.save_config()
+                if config:
+                    import json
+
+                    try:
+                        config_dict = json.loads(config)
+
+                        # Extract key parameters
+                        learner_config = config_dict.get("learner", {})
+                        if learner_config:
+                            gradient_booster = learner_config.get("gradient_booster", {})
+                            objective = learner_config.get("objective", {})
+
+                            metadata.update(
+                                {
+                                    "booster_type": gradient_booster.get("name", "unknown"),
+                                    "objective_type": objective.get("name", "unknown"),
+                                }
+                            )
+
+                            # Tree-specific parameters
+                            if gradient_booster.get("name") == "gbtree":
+                                gbtree_params = gradient_booster.get("gbtree_train_param", {})
+                                metadata.update(
+                                    {
+                                        "max_depth": gbtree_params.get("max_depth", "unknown"),
+                                        "eta": gbtree_params.get("eta", "unknown"),
+                                        "subsample": gbtree_params.get("subsample", "unknown"),
+                                        "colsample_bytree": gbtree_params.get("colsample_bytree", "unknown"),
+                                    }
+                                )
+                    except Exception:
+                        pass
+
+                # Feature importance (if available)
+                try:
+                    importance = model.get_score(importance_type="gain")
+                    if importance:
+                        metadata.update(
+                            {
+                                "feature_importance_available": True,
+                                "top_features": dict(sorted(importance.items(), key=lambda x: x[1], reverse=True)[:10]),
+                            }
+                        )
+                except Exception:
+                    metadata["feature_importance_available"] = False
+
+            except Exception as e:
+                metadata["model_info_error"] = str(e)
+
+        except Exception as e:
+            metadata["extraction_error"] = str(e)
+
+        return metadata

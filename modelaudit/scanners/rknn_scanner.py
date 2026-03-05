@@ -51,6 +51,17 @@ KNOWN_SAFE_KEYS = frozenset(
     }
 )
 
+# Paths starting with known system/user directory prefixes are more likely
+# to be genuine filesystem references rather than ONNX-style tensor names.
+REAL_FS_PREFIX_PATTERN = re.compile(
+    r"^(?:"
+    r"/(?:bin|dev|etc|home|lib|mnt|opt|proc|root|run|sbin|srv|sys|tmp|usr|var)/"
+    r"|/(?:Users|Windows|Program Files|AppData)/"
+    r"|[a-zA-Z]:[\\/]"
+    r"|~/"
+    r")"
+)
+
 
 class RknnScanner(BaseScanner):
     """Static scanner for RKNN models."""
@@ -170,14 +181,15 @@ class RknnScanner(BaseScanner):
             result.finish(success=False)
             return result
 
-        if payload.count(RKNN_MAGIC) > 1:
+        structural_magic_count = self._count_structural_magic(payload)
+        if structural_magic_count > 2:
             result.add_check(
                 name="RKNN Structural Integrity",
                 passed=False,
-                message="Multiple RKNN magic headers found in a single file; possible tampering",
+                message="Unexpectedly many RKNN structural magic headers found; possible tampering",
                 severity=IssueSeverity.WARNING,
                 location=path,
-                details={"magic_count": payload.count(RKNN_MAGIC)},
+                details={"structural_magic_count": structural_magic_count},
             )
         else:
             result.add_check(
@@ -196,6 +208,40 @@ class RknnScanner(BaseScanner):
 
         result.finish(success=not result.has_errors)
         return result
+
+    @staticmethod
+    def _count_structural_magic(payload: bytes) -> int:
+        """Count RKNN magic bytes that appear as structural headers.
+
+        RKNN files legitimately contain two structural magic markers (file
+        header + FlatBuffer header) plus occurrences inside JSON metadata
+        strings like ``RKNN_OP_NNBG``.  Only count magic bytes that are
+        NOT part of a longer ASCII identifier (i.e. not preceded or followed
+        by an alphanumeric/underscore character).
+        """
+        count = 0
+        idx = 0
+        while True:
+            pos = payload.find(RKNN_MAGIC, idx)
+            if pos == -1:
+                break
+            before_ok = pos == 0 or payload[pos - 1 : pos] not in (
+                b"_",
+                *[bytes([c]) for c in range(ord("A"), ord("Z") + 1)],
+                *[bytes([c]) for c in range(ord("a"), ord("z") + 1)],
+                *[bytes([c]) for c in range(ord("0"), ord("9") + 1)],
+            )
+            after_pos = pos + len(RKNN_MAGIC)
+            after_ok = after_pos >= len(payload) or payload[after_pos : after_pos + 1] not in (
+                b"_",
+                *[bytes([c]) for c in range(ord("A"), ord("Z") + 1)],
+                *[bytes([c]) for c in range(ord("a"), ord("z") + 1)],
+                *[bytes([c]) for c in range(ord("0"), ord("9") + 1)],
+            )
+            if before_ok and after_ok:
+                count += 1
+            idx = pos + 4
+        return count
 
     def _extract_strings(self, payload: bytes) -> list[str]:
         strings: list[str] = []
@@ -235,7 +281,14 @@ class RknnScanner(BaseScanner):
             if self._is_safe_metadata_string(text):
                 continue
 
-            if ABSOLUTE_PATH_PATTERN.search(text) or TRAVERSAL_PATH_PATTERN.search(text):
+            if TRAVERSAL_PATH_PATTERN.search(text):
+                risky_references.append({"reference": self._snippet(text), "type": "filesystem_path"})
+                continue
+            if REAL_FS_PREFIX_PATTERN.search(text):
+                # Short strings matching ~/ are likely binary noise, not real
+                # home-directory references — require a minimum length.
+                if text.startswith("~/") and len(text) < 8:
+                    continue
                 risky_references.append({"reference": self._snippet(text), "type": "filesystem_path"})
                 continue
             if URL_PATTERN.search(text):

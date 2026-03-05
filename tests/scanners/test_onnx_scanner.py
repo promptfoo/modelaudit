@@ -10,7 +10,7 @@ import onnx
 from onnx import TensorProto, helper
 from onnx.onnx_ml_pb2 import StringStringEntryProto
 
-from modelaudit.scanners.base import IssueSeverity
+from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.onnx_scanner import OnnxScanner
 
 
@@ -162,6 +162,9 @@ class TestCVE202551480SavePathTraversal:
 
     def test_normalized_in_dir_path_with_dotdot_no_write_vuln(self, tmp_path: Path) -> None:
         """Paths containing '..' but resolving in-dir should not be tagged as CVE-2025-51480."""
+        # We create the real target file in-dir, but build the ONNX with an external_data
+        # reference of "subdir/../weights.bin" and `missing_external=True` so the model keeps
+        # the external reference metadata while the resolved path still lands inside model_dir.
         (tmp_path / "weights.bin").write_bytes(struct.pack("f", 1.0))
         model_path = create_onnx_model(
             tmp_path,
@@ -210,3 +213,103 @@ class TestCVE202551480SavePathTraversal:
         assert details["cvss"] == 8.8
         assert details["cwe"] == "CWE-22"
         assert "remediation" in details
+
+
+class TestCVE202427318NestedPathTraversal:
+    """Tests for CVE-2024-27318: ONNX nested path traversal bypass."""
+
+    def test_nested_traversal_detected(self, tmp_path):
+        """Nested traversal like 'subdir/../../etc/passwd' should trigger CVE-2024-27318."""
+        model_path = create_onnx_model(
+            tmp_path,
+            external=True,
+            external_path="subdir/../../etc/passwd",
+            missing_external=True,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        cve_checks = [c for c in result.checks if "CVE-2024-27318" in c.name or "CVE-2024-27318" in c.message]
+        assert len(cve_checks) > 0, (
+            f"Should detect CVE-2024-27318 nested traversal. Checks: {[c.message for c in result.checks]}"
+        )
+        assert cve_checks[0].severity == IssueSeverity.CRITICAL
+        assert cve_checks[0].details.get("cve_id") == "CVE-2024-27318"
+
+    def test_direct_traversal_attributed_to_cve_2022(self, tmp_path):
+        """Direct traversal like '../../etc/passwd' should be CVE-2022-25882."""
+        model_path = create_onnx_model(
+            tmp_path,
+            external=True,
+            external_path="../../etc/passwd",
+            missing_external=True,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        cve_checks = [c for c in result.checks if c.details.get("cve_id") == "CVE-2022-25882"]
+        assert len(cve_checks) > 0, (
+            f"Direct traversal should be CVE-2022-25882. Checks: {[(c.name, c.details) for c in result.checks]}"
+        )
+
+    def test_nested_traversal_nonexistent_target_still_detected(self, tmp_path):
+        """Traversal to non-existent paths should still be flagged (not just 'file not found')."""
+        model_path = create_onnx_model(
+            tmp_path,
+            external=True,
+            external_path="data/../../../nonexistent/secret",
+            missing_external=True,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        # Should NOT be just a "file not found" - should be path traversal
+        traversal_checks = [c for c in result.checks if "traversal" in c.message.lower() or "CVE-" in c.name]
+        assert len(traversal_checks) > 0, (
+            f"Nested traversal should be detected even for non-existent targets. "
+            f"Checks: {[c.message for c in result.checks]}"
+        )
+
+    def test_safe_external_data_no_traversal_flag(self, tmp_path):
+        """Legitimate external data should not be flagged as traversal."""
+        model_path = create_onnx_model(tmp_path, external=True, external_path="weights.bin")
+
+        result = OnnxScanner().scan(str(model_path))
+
+        traversal_checks = [
+            c for c in result.checks if "traversal" in c.message.lower() and c.status == CheckStatus.FAILED
+        ]
+        assert len(traversal_checks) == 0, "Safe paths should not trigger traversal alerts"
+
+    def test_normalized_in_dir_path_with_dotdot_no_traversal_flag(self, tmp_path):
+        """A path containing '..' that resolves in-dir should not be flagged as traversal."""
+        (tmp_path / "weights.bin").write_bytes(struct.pack("f", 1.0))
+        model_path = create_onnx_model(
+            tmp_path,
+            external=True,
+            external_path="subdir/../weights.bin",
+            missing_external=True,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        traversal_checks = [
+            c for c in result.checks if "traversal" in c.message.lower() and c.status == CheckStatus.FAILED
+        ]
+        assert len(traversal_checks) == 0, "Normalized in-dir paths should not trigger traversal alerts"
+
+    def test_nested_traversal_details_contain_cwe(self, tmp_path):
+        """CVE-2024-27318 details should include CWE-22."""
+        model_path = create_onnx_model(
+            tmp_path,
+            external=True,
+            external_path="weights/../../../tmp/exfil",
+            missing_external=True,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        cve_checks = [c for c in result.checks if c.details.get("cve_id") == "CVE-2024-27318"]
+        assert len(cve_checks) > 0
+        assert cve_checks[0].details["cwe"] == "CWE-22"
+        assert cve_checks[0].details["cvss"] == 7.5

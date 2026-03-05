@@ -372,3 +372,45 @@ class PyTorchBinaryScanner(BaseScanner):
                 location=self.current_file_path,
                 details={"exception": str(e)},
             )
+
+    def extract_metadata(self, file_path: str) -> dict[str, Any]:
+        """Extract PyTorch binary metadata."""
+        metadata = super().extract_metadata(file_path)
+
+        try:
+            file_size = self.get_file_size(file_path)
+
+            # Basic binary analysis
+            with open(file_path, "rb") as f:
+                # Read first few KB to analyze structure
+                header_data = f.read(min(8192, file_size))
+
+                # Look for PyTorch signatures
+                pytorch_signatures = [b"PK\x03\x04", b"\x93NUMPY", b"pytorch", b"torch"]
+                detected_format = "pytorch_binary"
+
+                for sig in pytorch_signatures:
+                    if sig in header_data:
+                        if sig == b"PK\x03\x04":
+                            detected_format = "pytorch_zip"
+                        elif sig == b"\x93NUMPY":
+                            detected_format = "numpy_compatible"
+                        break
+
+                metadata.update(
+                    {
+                        "detected_format": detected_format,
+                        "header_size": len(header_data),
+                        "has_pytorch_signature": any(sig in header_data for sig in pytorch_signatures),
+                    }
+                )
+
+                # Try to estimate tensor count from binary patterns
+                tensor_markers = header_data.count(b"tensor") + header_data.count(b"Tensor")
+                if tensor_markers > 0:
+                    metadata["estimated_tensors"] = tensor_markers
+
+        except Exception as e:
+            metadata["extraction_error"] = str(e)
+
+        return metadata

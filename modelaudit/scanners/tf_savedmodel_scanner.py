@@ -1,5 +1,6 @@
 """Scanner for TensorFlow SavedModel directories and files."""
 
+import contextlib
 import logging
 import os
 from pathlib import Path
@@ -830,3 +831,186 @@ class TensorFlowSavedModelScanner(BaseScanner):
                                         },
                                     )
                                     break  # Only report first match per string to avoid spam
+
+    def _check_protobuf_buffer_overflow(self, saved_model: Any, result: ScanResult) -> None:
+        """Check for potential buffer overflow patterns in protobuf data"""
+
+        for meta_graph in saved_model.meta_graphs:
+            graph_def = meta_graph.graph_def
+
+            # Check for nodes with extremely long names (potential buffer overflow)
+            for node in graph_def.node:
+                if len(node.name) > 2048:  # 2KB threshold for node names
+                    result.add_check(
+                        name="Protobuf Node Name Length Check",
+                        passed=False,
+                        message=(
+                            f"Abnormally long node name (length: {len(node.name)}) may indicate buffer overflow attempt"
+                        ),
+                        severity=IssueSeverity.WARNING,
+                        location=f"{self.current_file_path} (node: {node.name[:100]}...)",
+                        details={
+                            "node_name_length": len(node.name),
+                            "name_threshold": 2048,
+                            "attack_type": "protobuf_buffer_overflow",
+                            "node_name_preview": node.name[:200],  # First 200 chars
+                        },
+                    )
+
+                # Check input names for excessive length
+                for input_name in node.input:
+                    if len(input_name) > 2048:
+                        result.add_check(
+                            name="Protobuf Input Name Length Check",
+                            passed=False,
+                            message=f"Abnormally long input name (length: {len(input_name)}) in node {node.name}",
+                            severity=IssueSeverity.WARNING,
+                            location=f"{self.current_file_path} (node: {node.name})",
+                            details={
+                                "node_name": node.name,
+                                "input_name_length": len(input_name),
+                                "name_threshold": 2048,
+                                "attack_type": "protobuf_buffer_overflow",
+                            },
+                        )
+
+    def _check_protobuf_field_bomb(self, saved_model: Any, result: ScanResult) -> None:
+        """Check for protobuf field bombs (DoS via excessive fields)"""
+
+        total_nodes = 0
+        total_attrs = 0
+
+        for meta_graph in saved_model.meta_graphs:
+            graph_def = meta_graph.graph_def
+            meta_graph_nodes = len(graph_def.node)
+            total_nodes += meta_graph_nodes
+
+            # Count total attributes across all nodes
+            meta_graph_attrs = sum(len(node.attr) if hasattr(node, "attr") else 0 for node in graph_def.node)
+            total_attrs += meta_graph_attrs
+
+            # Check for excessive nodes in single meta graph
+            if meta_graph_nodes > 50000:  # 50k nodes threshold
+                result.add_check(
+                    name="Protobuf Node Count Bomb Check",
+                    passed=False,
+                    message=f"Meta graph contains excessive nodes ({meta_graph_nodes:,}) - potential DoS attack",
+                    severity=IssueSeverity.WARNING,
+                    location=self.current_file_path,
+                    details={
+                        "node_count": meta_graph_nodes,
+                        "node_threshold": 50000,
+                        "attack_type": "protobuf_node_bomb",
+                    },
+                )
+
+        # Check total model complexity
+        if total_nodes > 100000:  # 100k total nodes
+            result.add_check(
+                name="Protobuf Total Complexity Check",
+                passed=False,
+                message=f"Model has excessive total complexity ({total_nodes:,} nodes, {total_attrs:,} attributes)",
+                severity=IssueSeverity.WARNING,
+                location=self.current_file_path,
+                details={
+                    "total_nodes": total_nodes,
+                    "total_attributes": total_attrs,
+                    "node_threshold": 100000,
+                    "attack_type": "protobuf_complexity_bomb",
+                },
+            )
+
+    def extract_metadata(self, file_path: str) -> dict[str, Any]:
+        """Extract TensorFlow SavedModel metadata."""
+        metadata = super().extract_metadata(file_path)
+
+        allow_deserialization = bool(self.config.get("allow_metadata_deserialization"))
+
+        if not allow_deserialization:
+            metadata["deserialization_skipped"] = True
+            metadata["reason"] = "Deserialization disabled for metadata extraction"
+            return metadata
+
+        if not _check_protos():
+            metadata["extraction_error"] = "TensorFlow protobuf stubs unavailable for metadata extraction"
+            return metadata
+
+        try:
+            import modelaudit.protos  # noqa: F401, I001
+            from importlib.metadata import PackageNotFoundError, version
+
+            from tensorflow.core.framework.types_pb2 import DataType
+            from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
+
+            def _tensor_info_to_dict(tensor_info: Any) -> dict[str, Any]:
+                try:
+                    dtype_name = DataType.Name(tensor_info.dtype)
+                except ValueError:
+                    dtype_name = str(tensor_info.dtype)
+                return {
+                    "tensor_name": tensor_info.name,
+                    "dtype": dtype_name,
+                    "shape": [int(dim.size) for dim in tensor_info.tensor_shape.dim],
+                }
+
+            path_obj = Path(file_path)
+            export_dir = path_obj if path_obj.is_dir() else path_obj.parent
+
+            saved_model_pb = export_dir / "saved_model.pb"
+            if not saved_model_pb.exists():
+                metadata["extraction_error"] = f"saved_model.pb not found in export directory: {export_dir}"
+                return metadata
+
+            with open(saved_model_pb, "rb") as f:
+                content = f.read()
+
+            saved_model = SavedModel()
+            saved_model.ParseFromString(content)
+
+            signature_details: dict[str, dict[str, Any]] = {}
+            tag_sets: list[list[str]] = []
+            trackable_objects = 0
+
+            for meta_graph_index, meta_graph in enumerate(saved_model.meta_graphs):
+                tags = list(meta_graph.meta_info_def.tags)
+                if tags:
+                    tag_sets.append(tags)
+                trackable_objects += len(meta_graph.object_graph_def.nodes)
+
+                for signature_name, signature_def in sorted(meta_graph.signature_def.items()):
+                    detail_key = signature_name
+                    if detail_key in signature_details:
+                        suffix = ",".join(tags) if tags else str(meta_graph_index)
+                        detail_key = f"{signature_name}@{suffix}"
+
+                    input_items = sorted(signature_def.inputs.items())
+                    output_items = sorted(signature_def.outputs.items())
+                    signature_details[detail_key] = {
+                        "inputs": [name for name, _ in input_items],
+                        "outputs": [name for name, _ in output_items],
+                        "method_name": signature_def.method_name,
+                        "input_tensors": {name: _tensor_info_to_dict(tensor_info) for name, tensor_info in input_items},
+                        "output_tensors": {
+                            name: _tensor_info_to_dict(tensor_info) for name, tensor_info in output_items
+                        },
+                    }
+
+            with contextlib.suppress(PackageNotFoundError, Exception):
+                metadata["tensorflow_version"] = version("tensorflow")
+
+            metadata.update(
+                {
+                    "meta_graph_count": len(saved_model.meta_graphs),
+                    "saved_model_pb_size": len(content),
+                    "signatures": sorted(signature_details.keys()),
+                    "signature_details": signature_details,
+                    "trackable_objects": trackable_objects,
+                }
+            )
+            if tag_sets:
+                metadata["tag_sets"] = tag_sets
+
+        except Exception as e:
+            metadata["extraction_error"] = str(e)
+
+        return metadata
