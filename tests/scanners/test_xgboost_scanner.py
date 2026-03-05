@@ -364,9 +364,7 @@ class TestXGBoostBinaryScanning:
 
     @patch("modelaudit.scanners.xgboost_scanner._check_xgboost_available")
     @patch("modelaudit.scanners.xgboost_scanner.subprocess")
-    def test_xgboost_loading_windows_path_passed_via_argv(
-        self, mock_subprocess: Mock, mock_check_xgb: Mock
-    ) -> None:
+    def test_xgboost_loading_windows_path_passed_via_argv(self, mock_subprocess: Mock, mock_check_xgb: Mock) -> None:
         """Test subprocess load command handles backslashes by passing paths via argv."""
         mock_check_xgb.return_value = True
         mock_proc = Mock()
