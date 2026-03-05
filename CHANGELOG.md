@@ -5,6 +5,75 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.27](https://github.com/promptfoo/modelaudit/compare/v0.2.26...v0.2.27) (2026-03-05)
+
+
+### Features
+
+* add CatBoost .cbm scanner support ([#627](https://github.com/promptfoo/modelaudit/issues/627)) ([9138066](https://github.com/promptfoo/modelaudit/commit/9138066a94000d9d0ac4c23a733686c9794c3d42))
+* add CNTK scanner support ([#629](https://github.com/promptfoo/modelaudit/issues/629)) ([74a60b9](https://github.com/promptfoo/modelaudit/commit/74a60b9a91cf536042f4564a2f22673bee45d410))
+* add CoreML .mlmodel scanner support ([#635](https://github.com/promptfoo/modelaudit/issues/635)) ([4e24291](https://github.com/promptfoo/modelaudit/commit/4e24291bbe5b981b9af80de339de3e09a18b32d4))
+* add llamafile executable scanner support ([#634](https://github.com/promptfoo/modelaudit/issues/634)) ([8d2c37d](https://github.com/promptfoo/modelaudit/commit/8d2c37d5c18673f21589cdbbe326594a6df0e02c))
+* add Model Metadata Extractor feature ([#383](https://github.com/promptfoo/modelaudit/issues/383)) ([ff66f33](https://github.com/promptfoo/modelaudit/commit/ff66f339639aa72b1731879f9c2de94f74e4d6a7))
+* add native LightGBM scanner support ([#633](https://github.com/promptfoo/modelaudit/issues/633)) ([d3aca64](https://github.com/promptfoo/modelaudit/commit/d3aca64f2203e5933a490f3be806c208e0e8c284))
+* add R serialized scanner support ([#628](https://github.com/promptfoo/modelaudit/issues/628)) ([e27667c](https://github.com/promptfoo/modelaudit/commit/e27667c1a93c8d7fb91e8c02e8d4e0ead8ee2984))
+* add RKNN scanner support ([#631](https://github.com/promptfoo/modelaudit/issues/631)) ([f1bbfb7](https://github.com/promptfoo/modelaudit/commit/f1bbfb76741b438834b93332315bf2b2d87e36a1))
+* add standalone compressed wrapper scanner ([#630](https://github.com/promptfoo/modelaudit/issues/630)) ([c5f0dba](https://github.com/promptfoo/modelaudit/commit/c5f0dba48fe443974d708109969db17c7400d8e0))
+* add TensorFlow MetaGraph scanner support ([#637](https://github.com/promptfoo/modelaudit/issues/637)) ([7c3c25d](https://github.com/promptfoo/modelaudit/commit/7c3c25d671d60147d05e58d1864db0deeab85461))
+* add Torch7 scanner support ([#632](https://github.com/promptfoo/modelaudit/issues/632)) ([2e6f2c4](https://github.com/promptfoo/modelaudit/commit/2e6f2c4d5d25e83ce7887ff99a850d4152b2aacd))
+* **security:** add CVE-2019-6446 attribution for NumPy object dtype RCE ([#610](https://github.com/promptfoo/modelaudit/issues/610)) ([5d707b5](https://github.com/promptfoo/modelaudit/commit/5d707b5968995eec50fb6ca9896cab6acae0500d))
+* **security:** add CVE-2022-25882 attribution to ONNX external_data path traversal ([#606](https://github.com/promptfoo/modelaudit/issues/606)) ([4d69e83](https://github.com/promptfoo/modelaudit/commit/4d69e83623a1b057c9bf3b3ad2eb2cec49e55a87))
+* **security:** add CVE-2024-3660 Lambda code injection attribution ([#604](https://github.com/promptfoo/modelaudit/issues/604)) ([60ca40f](https://github.com/promptfoo/modelaudit/commit/60ca40fd84cb92f9269d7835f80f4f5467f0c557))
+* **security:** add NeMo scanner for CVE-2025-23304 Hydra _target_ injection ([#609](https://github.com/promptfoo/modelaudit/issues/609)) ([6d2dee3](https://github.com/promptfoo/modelaudit/commit/6d2dee3918dd64c7650052e9ff157e410969b519))
+* **security:** detect 3 PyTorch CVEs (JIT eval, RPC injection, RemoteModule RCE) ([#611](https://github.com/promptfoo/modelaudit/issues/611)) ([98f2af6](https://github.com/promptfoo/modelaudit/commit/98f2af6d68ea50ca9b0c11591974e1fb43215bf6))
+* **security:** detect 4 PyTorch CVEs via static scanning ([#595](https://github.com/promptfoo/modelaudit/issues/595)) ([024f583](https://github.com/promptfoo/modelaudit/commit/024f583dad37cdf054a3fa6c5846bc892346fea2))
+* **security:** detect CVE-2024-27318 ONNX nested path traversal bypass ([#607](https://github.com/promptfoo/modelaudit/issues/607)) ([fe8837c](https://github.com/promptfoo/modelaudit/commit/fe8837c1e49a0fd8fb8d5c33b181b14900c2168e))
+* **security:** detect CVE-2025-10155 pickle protocol 0/1 bypass via .bin extension ([#605](https://github.com/promptfoo/modelaudit/issues/605)) ([88a5901](https://github.com/promptfoo/modelaudit/commit/88a59017dc64c104c783bf897f8dffcc332ad1a8))
+* **security:** detect CVE-2025-1550 Keras safe_mode bypass ([#599](https://github.com/promptfoo/modelaudit/issues/599)) ([432c383](https://github.com/promptfoo/modelaudit/commit/432c38314e40e6212d6f5d69413553fb827a11ee))
+* **security:** detect CVE-2025-1716 pickle bypass via pip.main() ([#598](https://github.com/promptfoo/modelaudit/issues/598)) ([2f2ae20](https://github.com/promptfoo/modelaudit/commit/2f2ae2041657f6755af9e1ceea81892d68d87255))
+* **security:** detect CVE-2025-49655 TorchModuleWrapper RCE ([#600](https://github.com/promptfoo/modelaudit/issues/600)) ([0c12d2d](https://github.com/promptfoo/modelaudit/commit/0c12d2dd47470104b4dcf43839ea2006d8b28d0a))
+* **security:** detect CVE-2025-51480 ONNX save_external_data file overwrite ([#608](https://github.com/promptfoo/modelaudit/issues/608)) ([fe04271](https://github.com/promptfoo/modelaudit/commit/fe0427100aab3fb1377a660c7146e5a03a9dea35))
+* **security:** detect CVE-2025-8747 get_file gadget bypass ([#602](https://github.com/promptfoo/modelaudit/issues/602)) ([16308d0](https://github.com/promptfoo/modelaudit/commit/16308d02745913ce15bd6d2347a56b996be3d0cf))
+* **security:** detect CVE-2025-9905 H5 safe_mode bypass ([#603](https://github.com/promptfoo/modelaudit/issues/603)) ([1676693](https://github.com/promptfoo/modelaudit/commit/16766932ac7ef6dd4f1aa9bba31c14052650a5a4))
+* **security:** detect CVE-2025-9906 Keras enable_unsafe_deserialization config bypass ([#601](https://github.com/promptfoo/modelaudit/issues/601)) ([b493806](https://github.com/promptfoo/modelaudit/commit/b493806550e39d5e90def4f59613ac2cf9030c3c))
+
+
+### Bug Fixes
+
+* block joblib.load pickle trampoline ([#626](https://github.com/promptfoo/modelaudit/issues/626)) ([966c223](https://github.com/promptfoo/modelaudit/commit/966c2233afb9c5b677640e2e301ff9902d48ad0b))
+* **ci:** resolve 4 release pipeline failures ([#572](https://github.com/promptfoo/modelaudit/issues/572)) ([7e2e7ed](https://github.com/promptfoo/modelaudit/commit/7e2e7edf30ba8ad1959a98293241c8a79568bf18))
+* **ci:** resolve Ruff failures on main ([#621](https://github.com/promptfoo/modelaudit/issues/621)) ([bd186f0](https://github.com/promptfoo/modelaudit/commit/bd186f0fbca43c12a3ecd38a9824908f3ff6da0c))
+* **cli:** surface operational scan error status in text output ([#578](https://github.com/promptfoo/modelaudit/issues/578)) ([ddbbec6](https://github.com/promptfoo/modelaudit/commit/ddbbec600f832be348fd4b3d52afa3c8457e6b46))
+* close pickle EXT opcode bypass ([#623](https://github.com/promptfoo/modelaudit/issues/623)) ([ffb5ec1](https://github.com/promptfoo/modelaudit/commit/ffb5ec1cbfe4eb70306e6bb3327f102ed1bc8bdc))
+* **deps:** promote msgpack to core dependency for Flax scanner ([#583](https://github.com/promptfoo/modelaudit/issues/583)) ([ebba6b2](https://github.com/promptfoo/modelaudit/commit/ebba6b20eb9d59f4c7d2f9f8edd8874ee30d999f))
+* detect proto0/1 pickles inside zip entries ([#624](https://github.com/promptfoo/modelaudit/issues/624)) ([2bce49d](https://github.com/promptfoo/modelaudit/commit/2bce49d4f1d506b34b41ef3f57933cc891c7868a))
+* downgrade non-traversal ONNX external data refs to WARNING ([#642](https://github.com/promptfoo/modelaudit/issues/642)) ([44eb3ab](https://github.com/promptfoo/modelaudit/commit/44eb3ab25d839f42dc0ea65d585b22de9fd87777))
+* eliminate false positive in skops Unsafe Joblib Fallback Detection ([#584](https://github.com/promptfoo/modelaudit/issues/584)) ([c1dd2a6](https://github.com/promptfoo/modelaudit/commit/c1dd2a69acf32d9d170c0bf805b5a08477e5cfac))
+* handle MemoryError gracefully for joblib/sklearn pickle files ([#645](https://github.com/promptfoo/modelaudit/issues/645)) ([f8599fe](https://github.com/promptfoo/modelaudit/commit/f8599fea063f7977813eb413e8caba2c62fe0c09))
+* **pickle-scanner:** three targeted false-positive reductions ([#591](https://github.com/promptfoo/modelaudit/issues/591)) ([7a5567e](https://github.com/promptfoo/modelaudit/commit/7a5567ebd7ece2e6b6969acda67e9b589b7c8659))
+* preserve opcode analysis on malformed pickle tails ([#625](https://github.com/promptfoo/modelaudit/issues/625)) ([4fe4dee](https://github.com/promptfoo/modelaudit/commit/4fe4deec464dd93b622aea7f4552b90376ebdbcc))
+* prevent false positives in TF SavedModel scanner ([#588](https://github.com/promptfoo/modelaudit/issues/588)) ([89282e2](https://github.com/promptfoo/modelaudit/commit/89282e22c4ac678c738670da9c32f3f9c865cf18))
+* report actual file size in scan summary when scanner exits early ([#587](https://github.com/promptfoo/modelaudit/issues/587)) ([7d066fb](https://github.com/promptfoo/modelaudit/commit/7d066fb1c8439c4ff1a27a9cf137bcedd47b93c4))
+* resolve false positive for .keras ZIP files (Keras 3.x) ([#582](https://github.com/promptfoo/modelaudit/issues/582)) ([f575769](https://github.com/promptfoo/modelaudit/commit/f575769e8e435971938d9d0d935692133d6fd950))
+* resolve ONNX weight extraction failure ([#589](https://github.com/promptfoo/modelaudit/issues/589)) ([3f54602](https://github.com/promptfoo/modelaudit/commit/3f546025a69295f176a167730032e762336629a9))
+* **security:** close scanner RCE bypasses and add regressions ([#518](https://github.com/promptfoo/modelaudit/issues/518)) ([e736ebb](https://github.com/promptfoo/modelaudit/commit/e736ebbeca111f30a34e07ae9100a10909711f01))
+* **security:** harden pickle scanner blocklist and multi-stream analysis ([#581](https://github.com/promptfoo/modelaudit/issues/581)) ([f0c7246](https://github.com/promptfoo/modelaudit/commit/f0c7246c5c9402884d2a5fa522cef7dd52b69581))
+* stabilize nightly performance CI and optimize pickle opcode analysis ([#619](https://github.com/promptfoo/modelaudit/issues/619)) ([e5dcec5](https://github.com/promptfoo/modelaudit/commit/e5dcec5a7d30a5e05e47f31007395b1ad4f87a75))
+* suppress false positives in PaddlePaddle scanner ([#586](https://github.com/promptfoo/modelaudit/issues/586)) ([ec7fc48](https://github.com/promptfoo/modelaudit/commit/ec7fc48b22baa44bd5e7275a391ce98970a8b255))
+* **tests:** prevent multiple_stream_attack fixture rewrites ([#580](https://github.com/promptfoo/modelaudit/issues/580)) ([0eb47c9](https://github.com/promptfoo/modelaudit/commit/0eb47c973408c055a44e61cec23682cdc26390c2))
+* **tests:** resolve 3 nightly CI failures across Linux and Windows ([#576](https://github.com/promptfoo/modelaudit/issues/576)) ([dd115d1](https://github.com/promptfoo/modelaudit/commit/dd115d16e716041044f399c1d07b0d6bf64731eb))
+* **tests:** resolve nightly CI failures on Linux and Windows ([#597](https://github.com/promptfoo/modelaudit/issues/597)) ([7f88c52](https://github.com/promptfoo/modelaudit/commit/7f88c524a5a2f794a4b269910f03326cea82dfce))
+* **tflite:** recognize .tflite format without tflite package installed ([#585](https://github.com/promptfoo/modelaudit/issues/585)) ([8276184](https://github.com/promptfoo/modelaudit/commit/8276184b018f864acb8d9a1a2adc89108b7e07fd))
+* tighten metadata URL hostname matching ([#617](https://github.com/promptfoo/modelaudit/issues/617)) ([c2af8c1](https://github.com/promptfoo/modelaudit/commit/c2af8c1d18641475457b443c3a28f975d34ed08b))
+
+
+### Documentation
+
+* add CVE detection checklist from 13 CVE implementation learnings ([#612](https://github.com/promptfoo/modelaudit/issues/612)) ([7ea1869](https://github.com/promptfoo/modelaudit/commit/7ea18695cd637cad76ff22fc973935ac4c35a3a7))
+* audit and refresh README, user docs, and maintainer guides ([#643](https://github.com/promptfoo/modelaudit/issues/643)) ([015acdc](https://github.com/promptfoo/modelaudit/commit/015acdcbecd86db9e5baeef8db34df4bda5bb81b))
+* rewrite SECURITY.md with comprehensive vulnerability policy ([#594](https://github.com/promptfoo/modelaudit/issues/594)) ([968a2c2](https://github.com/promptfoo/modelaudit/commit/968a2c2362a0e25862bece1ad5bb3fad4ad715fa))
+* update scanner architecture example ([#579](https://github.com/promptfoo/modelaudit/issues/579)) ([20de35d](https://github.com/promptfoo/modelaudit/commit/20de35db738c828f5a29b8904834ecf5ea50e5ae))
+
 ## [Unreleased]
 
 ### Added
