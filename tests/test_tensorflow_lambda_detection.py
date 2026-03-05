@@ -19,10 +19,11 @@ from modelaudit.scanners.tf_savedmodel_scanner import TensorFlowSavedModelScanne
 def has_tensorflow():
     """Check if TensorFlow is available."""
     try:
-        import tensorflow  # noqa: F401
+        import tensorflow as tf
 
-        return True
-    except ImportError:
+        # Vendored protobuf stubs expose `tensorflow.*` modules but not runtime APIs.
+        return bool(getattr(tf, "__version__", None)) and hasattr(tf, "constant")
+    except Exception:
         return False
 
 

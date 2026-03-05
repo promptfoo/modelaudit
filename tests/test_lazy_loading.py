@@ -351,7 +351,8 @@ class TestSpecificFileTypes:
 
                 # Should have loaded minimal scanners (or none if no match).
                 # JSON dispatch can probe metadata/xgboost/mxnet/manifest scanners.
-                assert len(_registry._loaded_scanners) <= 4
+                expected_json_probe_scanners = {"metadata", "xgboost", "mxnet", "manifest"}
+                assert set(_registry._loaded_scanners).issubset(expected_json_probe_scanners)
             finally:
                 Path(f.name).unlink(missing_ok=True)
 

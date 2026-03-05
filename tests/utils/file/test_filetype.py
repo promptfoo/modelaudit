@@ -1,5 +1,6 @@
 import bz2
 import gzip
+import importlib
 import io
 import lzma
 import struct
@@ -7,6 +8,9 @@ import tarfile
 import zipfile
 import zlib
 from pathlib import Path
+from typing import cast
+
+import pytest
 
 from modelaudit.utils.file.detection import (
     detect_file_format,
@@ -16,6 +20,25 @@ from modelaudit.utils.file.detection import (
     is_zipfile,
     validate_file_type,
 )
+
+
+def _has_tf_protos() -> bool:
+    import modelaudit.protos
+
+    return modelaudit.protos._check_vendored_protos()
+
+
+def _build_tf_metagraph_bytes() -> bytes:
+    import modelaudit.protos  # noqa: F401
+
+    meta_graph_pb2 = importlib.import_module("tensorflow.core.protobuf.meta_graph_pb2")
+    metagraph = meta_graph_pb2.MetaGraphDef()
+    metagraph.meta_info_def.meta_graph_version = "test_meta_graph"
+    metagraph.meta_info_def.tags.append("serve")
+    node = metagraph.graph_def.node.add()
+    node.name = "const_node"
+    node.op = "Const"
+    return cast(bytes, metagraph.SerializeToString())
 
 
 def test_detect_file_format_directory(tmp_path):
@@ -74,6 +97,7 @@ def test_detect_file_format_by_extension(tmp_path):
         ".h5": "hdf5",
         ".pb": "protobuf",
         ".tflite": "tflite",
+        ".mar": "torchserve_mar",
         ".cbm": "catboost",
         ".mlmodel": "coreml",
         ".llamafile": "llamafile",
@@ -100,7 +124,7 @@ def test_detect_file_format_hdf5(tmp_path):
     assert detect_file_format(str(hdf5_path)) == "hdf5"
 
 
-def test_detect_file_format_coreml_validation_passthrough(tmp_path):
+def test_detect_file_format_coreml_validation_passthrough(tmp_path: Path) -> None:
     """CoreML extension routing should remain scanner-level validated."""
     model_path = tmp_path / "model.mlmodel"
     model_path.write_bytes(b"not-a-real-protobuf")
@@ -110,7 +134,7 @@ def test_detect_file_format_coreml_validation_passthrough(tmp_path):
     assert validate_file_type(str(model_path)) is True
 
 
-def test_detect_format_from_extension_mxnet_symbol(tmp_path):
+def test_detect_format_from_extension_mxnet_symbol(tmp_path: Path) -> None:
     """MXNet symbol files should be detected by filename pattern."""
     symbol_path = tmp_path / "resnet-symbol.json"
     symbol_path.write_text('{"nodes":[{"op":"null","name":"data","inputs":[]}],"arg_nodes":[0],"heads":[[0,0,0]]}')
@@ -144,6 +168,31 @@ def test_detect_cntk_formats_by_signature(tmp_path: Path) -> None:
     assert detect_file_format_from_magic(str(v2_path)) == "cntk"
 
 
+def test_detect_tf_metagraph_by_strict_parse(tmp_path: Path) -> None:
+    """Detect TensorFlow MetaGraph `.meta` files through strict protobuf parsing."""
+    if not _has_tf_protos():
+        pytest.skip("TensorFlow protobuf stubs unavailable")
+
+    metagraph_path = tmp_path / "graph.meta"
+    metagraph_path.write_bytes(_build_tf_metagraph_bytes())
+
+    assert detect_format_from_extension(str(metagraph_path)) == "tf_metagraph"
+    assert detect_file_format(str(metagraph_path)) == "tf_metagraph"
+    assert detect_file_format_from_magic(str(metagraph_path)) == "tf_metagraph"
+    assert validate_file_type(str(metagraph_path)) is True
+
+
+def test_detect_tf_metagraph_rejects_renamed_non_protobuf(tmp_path: Path) -> None:
+    """Reject text or arbitrary data renamed with `.meta` extension."""
+    fake_metagraph = tmp_path / "not_meta.meta"
+    fake_metagraph.write_text("not a tensorflow metagraph", encoding="utf-8")
+
+    assert detect_format_from_extension(str(fake_metagraph)) == "tf_metagraph"
+    assert detect_file_format(str(fake_metagraph)) == "unknown"
+    assert detect_file_format_from_magic(str(fake_metagraph)) == "unknown"
+    assert validate_file_type(str(fake_metagraph)) is False
+
+
 def test_detect_rknn_format_by_signature(tmp_path: Path) -> None:
     rknn_path = tmp_path / "model.rknn"
     rknn_path.write_bytes(b"RKNN\x01\x00\x00\x00runtime=rockchip\n")
@@ -174,6 +223,8 @@ def test_detect_torch7_formats_by_signature(tmp_path: Path) -> None:
     assert detect_file_format(str(fake_torch7)) == "unknown"
     assert detect_file_format_from_magic(str(fake_torch7)) == "unknown"
     assert validate_file_type(str(fake_torch7)) is False
+
+
 def test_detect_file_format_proto0_pickle_with_text_extension(tmp_path: Path) -> None:
     """Protocol 0 pickle payloads should be detected even with non-model extensions."""
     payload = tmp_path / "payload.txt"
@@ -465,6 +516,13 @@ def test_validate_file_type(tmp_path):
     bin_pickle.write_bytes(b"\x80\x03" + b"pickle data")
     assert validate_file_type(str(bin_pickle)) is True
 
+    # TorchServe archives are zip-based .mar files.
+    mar_path = tmp_path / "model.mar"
+    with zipfile.ZipFile(mar_path, "w") as mar:
+        mar.writestr("MAR-INF/MANIFEST.json", '{"model":{"serializedFile":"weights.bin","handler":"handler.py"}}')
+        mar.writestr("weights.bin", b"weights")
+        mar.writestr("handler.py", b"def handle(data, context):\n    return data\n")
+    assert validate_file_type(str(mar_path)) is True
     # Llamafile wrappers validate by extension with scanner-level marker checks.
     llamafile_path = tmp_path / "model.llamafile"
     llamafile_path.write_bytes(b"\x7fELF" + b"\x00" * 32 + b"llamafile")
@@ -606,7 +664,6 @@ def test_compressed_validation_valid_and_invalid_files(tmp_path: Path) -> None:
     bad_gzip_payload = tmp_path / "payload_bad.pkl.gz"
     bad_gzip_payload.write_bytes(bz2.compress(b"payload"))
     assert validate_file_type(str(bad_gzip_payload)) is False
-
 
 
 def test_detect_generic_xml_format(tmp_path):

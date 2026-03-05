@@ -39,26 +39,26 @@ Out of scope:
   - packaged archives if common
 - Document required file relationships for multi-file models.
 
-2. Scanner implementation
+1. Scanner implementation
 
 - Implement strict `can_handle()` with extension and structural checks.
 - For paired artifacts, support directory-aware scanning and correlation checks.
 - Enforce path and size validation via base scanner helpers.
 
-3. Security checks
+1. Security checks
 
 - Detect suspicious custom operator/library references.
 - Detect unsafe filesystem/network references in graph attributes.
 - Detect suspicious encoded payload strings in metadata sections.
 - Detect archive traversal risks if packaged variant is supported.
 
-4. Routing and integration
+1. Routing and integration
 
 - Register scanner with proper priority relative to manifest/text scanners.
 - Add extension mapping entries for selected MXNet artifacts.
 - Ensure lazy loader class mapping is added.
 
-5. Robustness
+1. Robustness
 
 - Handle missing companion files with explicit informational checks.
 - Keep bounded reads for params blobs and graph files.
@@ -81,12 +81,12 @@ Out of scope:
 - Corrupt params file handling.
 - Non-MXNet files renamed to MXNet-like names.
 
-2. False-positive tests
+1. False-positive tests
 
 - Common operator names and graph metadata should not trigger high severity.
 - Numeric-heavy params blobs should not trigger encoded-payload false alarms.
 
-3. Regression tests
+1. Regression tests
 
 - Directory scan correctly identifies MXNet model pairs.
 - Issues include file-specific location context.
@@ -99,13 +99,13 @@ Out of scope:
 uv run pytest tests/scanners/test_mxnet_scanner.py -q
 ```
 
-2. Directory-level CLI smoke:
+1. Directory-level CLI smoke:
 
 ```bash
 uv run python -m modelaudit.cli tests/fixtures/mxnet/ --format json
 ```
 
-3. Full validation gate.
+1. Full validation gate.
 
 ## Documentation Tasks
 
@@ -115,6 +115,6 @@ uv run python -m modelaudit.cli tests/fixtures/mxnet/ --format json
 
 ## Definition of Done
 
-- Primary MXNet artifacts are scanable and no longer unknown.
+- Primary MXNet artifacts are scannable and no longer unknown.
 - Detection quality validated on benign and malicious fixtures.
 - False-positive guardrails and full CI checks pass.

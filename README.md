@@ -59,7 +59,7 @@ ModelAudit includes specialized scanners covering model, archive, and configurat
 | **Joblib**              | `.joblib`                             | HIGH   |
 | **NumPy**               | `.npy`, `.npz`                        | HIGH   |
 | **R Serialized**        | `.rds`, `.rda`, `.rdata`              | HIGH   |
-| **TensorFlow**          | `.pb`, SavedModel dirs                | MEDIUM |
+| **TensorFlow**          | `.pb`, `.meta`, SavedModel dirs       | MEDIUM |
 | **Keras**               | `.h5`, `.hdf5`, `.keras`              | MEDIUM |
 | **ONNX**                | `.onnx`                               | MEDIUM |
 | **CoreML**              | `.mlmodel`                            | LOW    |
@@ -72,6 +72,7 @@ ModelAudit includes specialized scanners covering model, archive, and configurat
 | **XGBoost**             | `.bst`, `.model`, `.ubj`              | MEDIUM |
 | **LightGBM**            | `.lgb`, `.lightgbm`, `.model`         | MEDIUM |
 | **Llamafile**           | `.llamafile`, extensionless, `.exe`   | MEDIUM |
+| **TorchServe**          | `.mar`                                | HIGH   |
 | **SafeTensors**         | `.safetensors`                        | LOW    |
 | **GGUF/GGML**           | `.gguf`, `.ggml`                      | LOW    |
 | **JAX/Flax**            | `.msgpack`, `.flax`, `.orbax`, `.jax` | LOW    |

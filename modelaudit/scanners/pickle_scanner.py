@@ -4839,6 +4839,7 @@ class PickleScanner(BaseScanner):
         except Exception as e:
             # Handle known issues with legitimate serialization files
             file_ext = os.path.splitext(self.current_file_path)[1].lower()
+            is_pytorch_like_ext = file_ext in {".bin", ".pt", ".pth", ".ckpt"}
 
             # Check for recursion errors on legitimate ML model files
             is_recursion_error = isinstance(e, RecursionError)
@@ -4849,16 +4850,51 @@ class PickleScanner(BaseScanner):
 
             # Pre-validate file legitimacy to avoid nested exceptions
             is_legitimate_file = False
-            if file_ext in {".joblib", ".dill"} or is_large_ml_model:
+            if file_ext in {".joblib", ".dill"} or is_large_ml_model or is_pytorch_like_ext:
                 try:
                     if file_ext in {".joblib", ".dill"}:
                         is_legitimate_file = _is_legitimate_serialization_file(self.current_file_path)
-                    elif is_large_ml_model:
-                        # For large PyTorch model files, check if they look legitimate
+                    elif is_pytorch_like_ext:
+                        # For PyTorch model files, check if they look legitimate.
                         is_legitimate_file = self._is_legitimate_pytorch_model(self.current_file_path)
                 except Exception:
                     # If validation itself fails, treat as non-legitimate
                     is_legitimate_file = False
+
+            # Tighten MemoryError downgrade: only allow when parsed globals look like
+            # legitimate PyTorch structures and no dangerous global references appear.
+            global_validation_context = {"is_ml_content": False, "overall_confidence": 0.0, "frameworks": {}}
+            has_dangerous_advanced_global = any(
+                _is_actually_dangerous_global(mod, func, global_validation_context) for mod, func in advanced_globals
+            )
+            has_pytorch_advanced_global = any(
+                mod == "torch" or mod.startswith("torch.") for mod, _func in advanced_globals
+            )
+            has_ordereddict_global = ("collections", "OrderedDict") in advanced_globals or (
+                "torch",
+                "OrderedDict",
+            ) in advanced_globals
+            has_legitimate_pytorch_globals = (
+                bool(advanced_globals)
+                and (has_pytorch_advanced_global or has_ordereddict_global)
+                and not has_dangerous_advanced_global
+            )
+            passes_global_gate = (
+                has_legitimate_pytorch_globals if file_ext == ".bin" else not has_dangerous_advanced_global
+            )
+
+            has_non_info_findings = any(
+                issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues
+            )
+            has_minimum_bin_size = file_ext != ".bin" or file_size >= 128 * 1024
+            is_memory_limit_on_legitimate_model = (
+                isinstance(e, MemoryError)
+                and is_pytorch_like_ext
+                and is_legitimate_file
+                and passes_global_gate
+                and has_minimum_bin_size
+                and not has_non_info_findings
+            )
 
             # Check if this is a known benign error in legitimate serialization files
             is_benign_error = (
@@ -4879,7 +4915,42 @@ class PickleScanner(BaseScanner):
             # Check if this is a recursion error on a legitimate ML model
             is_recursion_on_legitimate_model = is_recursion_error and is_large_ml_model and is_legitimate_file
 
-            if is_recursion_on_legitimate_model:
+            if is_memory_limit_on_legitimate_model:
+                logger.info(
+                    f"Memory limit reached scanning {self.current_file_path}. "
+                    f"Treating as scanner limitation for legitimate PyTorch pickle."
+                )
+                result.metadata.update(
+                    {
+                        "memory_limited": True,
+                        "file_size": file_size,
+                        "file_type": "legitimate_pytorch_model",
+                        "opcodes_analyzed": opcode_count,
+                        "scanner_limitation": True,
+                        "analysis_incomplete": True,
+                    }
+                )
+                result.add_check(
+                    name="Pickle Parse Resource Limit",
+                    passed=False,
+                    message="Scan limited by model complexity and memory budget",
+                    severity=IssueSeverity.INFO,
+                    location=self.current_file_path,
+                    details={
+                        "reason": "memory_limit_on_legitimate_model",
+                        "opcodes_analyzed": opcode_count,
+                        "file_size": file_size,
+                        "file_format": file_ext,
+                        "exception_type": "MemoryError",
+                        "scanner_limitation": True,
+                        "analysis_incomplete": True,
+                    },
+                    why=(
+                        "This file appears to be a legitimate PyTorch pickle, but analysis hit memory limits while "
+                        "walking complex object graphs. The analyzable portion was scanned for security issues."
+                    ),
+                )
+            elif is_recursion_on_legitimate_model:
                 # Recursion error on legitimate ML model - treat as scanner limitation, not security issue
                 logger.debug(f"Recursion limit reached: {self.current_file_path} (complex nested structure)")
                 result.metadata.update(
@@ -5079,11 +5150,15 @@ class PickleScanner(BaseScanner):
                 # Check if it contains PyTorch indicators
                 has_pytorch_patterns = any(indicator in header for indicator in pytorch_indicators)
 
-                # For large files with PyTorch patterns, likely legitimate
+                # For large-enough files with multiple PyTorch indicators, likely legitimate.
+                # Keep lower bound modest so small public checkpoints (e.g., tiny HF models)
+                # do not trigger parser-limit false positives.
                 file_size = os.path.getsize(path)
-                is_reasonable_size = 1024 * 1024 < file_size < 1024 * 1024 * 1024 * 1024  # 1MB to 1TB
+                is_reasonable_size = 128 * 1024 <= file_size < 1024 * 1024 * 1024 * 1024  # 128KB to 1TB
+                indicator_count = sum(1 for indicator in pytorch_indicators if indicator in header)
+                has_strong_pytorch_signature = indicator_count >= 2
 
-                return has_pytorch_patterns and is_reasonable_size
+                return has_pytorch_patterns and has_strong_pytorch_signature and is_reasonable_size
 
         except Exception:
             return False

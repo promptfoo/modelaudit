@@ -91,9 +91,28 @@ def test_onnx_scanner_custom_op(tmp_path):
 
 
 def test_onnx_scanner_external_data_missing(tmp_path):
+    """Missing external data file should produce a WARNING-level issue."""
     model_path = create_onnx_model(tmp_path, external=True, missing_external=True)
     result = OnnxScanner().scan(str(model_path))
-    assert any("external data file" in i.message.lower() for i in result.issues)
+    missing_checks = [
+        c for c in result.checks if c.name == "External Data Reference Check" and "file may not be present" in c.message
+    ]
+    assert len(missing_checks) > 0, f"Should flag missing external data. Checks: {[c.message for c in result.checks]}"
+    assert missing_checks[0].severity == IssueSeverity.WARNING
+
+
+def test_onnx_scanner_external_data_exists(tmp_path: Path) -> None:
+    """Existing external data file within model dir should produce INFO-level issue."""
+    model_path = create_onnx_model(tmp_path, external=True, external_path="weights.bin")
+    result = OnnxScanner().scan(str(model_path))
+    resolved_checks = [
+        c for c in result.checks if c.name == "External Data Reference Check" and "resolved successfully" in c.message
+    ]
+    assert len(resolved_checks) > 0, (
+        f"Should report resolved external data. Checks: {[c.message for c in result.checks]}"
+    )
+    assert resolved_checks[0].severity == IssueSeverity.INFO
+    assert resolved_checks[0].status.value == "passed"
 
 
 def test_onnx_scanner_corrupted(tmp_path):
@@ -133,9 +152,9 @@ class TestCVE202551480SavePathTraversal:
         )
         assert cve_checks[0].severity == IssueSeverity.CRITICAL
         assert cve_checks[0].details.get("cve_id") == "CVE-2025-51480"
-        # Traversal should be classified as CVE traversal, not missing file.
-        assert all(c.name != "External Data File Existence" for c in result.checks)
-        assert all("External Data File Existence" not in c.message for c in result.checks)
+        # Traversal should be classified as CVE traversal, not a simple reference.
+        assert all(c.name != "External Data Reference Check" for c in result.checks)
+        assert all("External Data Reference Check" not in c.message for c in result.checks)
 
     def test_nested_traversal_triggers_write_vuln(self, tmp_path: Path) -> None:
         """Nested traversal (lstrip bypass) should also be detected for write direction."""

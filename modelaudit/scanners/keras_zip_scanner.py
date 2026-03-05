@@ -16,7 +16,6 @@ from modelaudit.utils.helpers.code_validation import (
     validate_python_syntax,
 )
 
-from ..config.explanations import get_cve_2025_49655_explanation, get_pattern_explanation
 from ..config.explanations import (
     get_cve_2024_3660_explanation,
     get_cve_2025_1550_explanation,
