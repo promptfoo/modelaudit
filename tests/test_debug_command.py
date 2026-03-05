@@ -2,12 +2,13 @@
 
 import json
 import os
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 from click.testing import CliRunner
 
-from modelaudit.cli import cli
+from modelaudit.cli import _sanitize_debug_path, cli
 
 
 def _is_private_debug_path(path: str) -> bool:
@@ -294,16 +295,10 @@ class TestDebugCommand:
         if cache_info.get("enabled") and cache_info.get("directory"):
             assert _is_private_debug_path(cache_info["directory"])
 
-    def test_debug_redacts_outside_home_shared_config_path(self, runner: CliRunner) -> None:
-        """Outside-home shared config paths should be redacted."""
-        with patch("modelaudit.cli.get_config_directory_path", return_value="/var/lib/modelaudit-test"):
-            result = runner.invoke(cli, ["debug", "--json"])
-
-        assert result.exit_code == 0
-        parsed = json.loads(result.output)
-        config_info = parsed.get("config", {})
-        if "error" not in config_info:
-            assert config_info["sharedConfigPath"] == "<outside-home path redacted>"
+    def test_sanitize_debug_path_redacts_outside_home(self) -> None:
+        """Outside-home absolute paths should be redacted."""
+        outside_path = str(Path.home().parent / "__modelaudit_test__" / "promptfoo.yaml")
+        assert _sanitize_debug_path(outside_path) == "<outside-home path redacted>"
 
     def test_debug_command_is_fast(self, runner):
         """Debug command should complete quickly (under 10 seconds)."""
