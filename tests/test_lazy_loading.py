@@ -331,7 +331,7 @@ class TestSpecificFileTypes:
     """Test lazy loading behavior with specific file types."""
 
     def test_json_file_loading(self):
-        """Test that JSON files load only manifest scanner."""
+        """Test that JSON files load only a small set of JSON-capable scanners."""
         _registry._loaded_scanners.clear()
 
         # Use a realistic ML config filename that manifest scanner will handle
@@ -349,8 +349,10 @@ class TestSpecificFileTypes:
                 # May be None if manifest scanner doesn't handle this specific file
                 # This is actually expected behavior - not all JSON files are ML-related
 
-                # Should have loaded minimal scanners (or none if no match)
-                assert len(_registry._loaded_scanners) <= 3
+                # Should have loaded minimal scanners (or none if no match).
+                # JSON dispatch can probe metadata/xgboost/mxnet/manifest scanners.
+                expected_json_probe_scanners = {"metadata", "xgboost", "mxnet", "manifest"}
+                assert set(_registry._loaded_scanners).issubset(expected_json_probe_scanners)
             finally:
                 Path(f.name).unlink(missing_ok=True)
 

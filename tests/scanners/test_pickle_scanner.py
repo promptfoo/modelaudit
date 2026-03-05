@@ -1,6 +1,8 @@
+import os
 import pickle
 import struct
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -15,7 +17,7 @@ from modelaudit.detectors.suspicious_symbols import (
     BINARY_CODE_PATTERNS,
     EXECUTABLE_SIGNATURES,
 )
-from modelaudit.scanners.base import IssueSeverity, ScanResult
+from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.pickle_scanner import PickleScanner
 from tests.assets.generators.generate_advanced_pickle_tests import (
     generate_memo_based_attack,
@@ -717,6 +719,195 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
         ]
         assert os_issues, f"Expected CRITICAL os issue after separator byte, got: {[i.message for i in result.issues]}"
 
+    def test_multi_stream_malformed_first_stream_still_detects_second(self) -> None:
+        """Scanner must detect malicious stream 2 even when stream 1 is malformed.
+
+        A malformed first stream that triggers a ValueError during parsing must
+        not cause the scanner to return early and skip subsequent streams.
+        """
+        import io
+
+        buf = io.BytesIO()
+        # Stream 1: starts with valid proto + benign GLOBAL, then malformed
+        # bytes that cause a ValueError (invalid UTF-8 in GLOBAL arg).
+        # This triggers the stream_error + had_opcodes early-return path.
+        buf.write(b"\x80\x02cbuiltins\nlen\nq\x00c\xff\n")
+        # Stream 2: malicious — os.system via GLOBAL+REDUCE
+        buf.write(self._craft_global_reduce_pickle("os", "system"))
+        data = buf.getvalue()
+
+        result = self._scan_bytes(data)
+        assert result.success
+        assert result.has_errors
+        os_issues = [
+            i
+            for i in result.issues
+            if i.severity == IssueSeverity.CRITICAL and ("os" in i.message.lower() or "posix" in i.message.lower())
+        ]
+        assert os_issues, (
+            f"Expected CRITICAL os issue from stream 2 after malformed stream 1, "
+            f"got: {[i.message for i in result.issues]}"
+        )
+
+    # ------------------------------------------------------------------
+    # Fix 3: EXT opcode registry bypass
+    # ------------------------------------------------------------------
+    def test_ext_reduce_extension_registry_is_flagged(self) -> None:
+        """EXT1/EXT2/EXT4 + REDUCE payloads should be flagged as dangerous."""
+        import copyreg
+        from contextlib import suppress
+
+        inverted_registry = getattr(copyreg, "_inverted_registry", {})
+        extension_registry = getattr(copyreg, "_extension_registry", {})
+        existing_code = extension_registry.get(("os", "system"))
+
+        def _pick_free_code(start: int, end: int) -> int:
+            for candidate in range(start, end + 1):
+                if candidate not in inverted_registry:
+                    return candidate
+            pytest.skip(f"No free copyreg extension code available in range {start}-{end}")
+
+        cases = [
+            ("EXT1", b"\x82", _pick_free_code(1, 255), lambda code: bytes([code])),
+            ("EXT2", b"\x83", _pick_free_code(256, 65535), lambda code: struct.pack("<H", code)),
+            ("EXT4", b"\x84", _pick_free_code(65536, 131072), lambda code: struct.pack("<I", code)),
+        ]
+
+        try:
+            if isinstance(existing_code, int):
+                with suppress(ValueError):
+                    copyreg.remove_extension("os", "system", existing_code)
+
+            for _opcode_name, opcode, ext_code, encode in cases:
+                copyreg.add_extension("os", "system", ext_code)
+                try:
+                    # PROTO 2 | EXT*(code) | MARK | STRING | TUPLE | REDUCE | STOP
+                    payload = b"\x80\x02" + opcode + encode(ext_code) + b'(S"echo pwned"\ntR.'
+                    result = self._scan_bytes(payload)
+
+                    assert result.success
+                    assert result.has_errors
+                    reduce_issues = [i for i in result.issues if "reduce" in i.message.lower()]
+                    assert reduce_issues, f"Expected REDUCE issue, got: {[i.message for i in result.issues]}"
+                    assert any("os.system" in i.message or "posix.system" in i.message for i in reduce_issues), (
+                        f"Expected resolved os/posix.system in REDUCE issues, got: {[i.message for i in reduce_issues]}"
+                    )
+                finally:
+                    with suppress(ValueError):
+                        copyreg.remove_extension("os", "system", ext_code)
+        finally:
+            if isinstance(existing_code, int):
+                with suppress(ValueError):
+                    copyreg.add_extension("os", "system", existing_code)
+
+    def test_ext_unresolved_code_still_flagged(self) -> None:
+        """EXT1/EXT2/EXT4 with codes NOT in copyreg registry should still be flagged."""
+        import copyreg
+
+        inverted_registry = getattr(copyreg, "_inverted_registry", {})
+
+        def _pick_unregistered_code(start: int, end: int) -> int:
+            for candidate in range(start, end + 1):
+                if candidate not in inverted_registry:
+                    return candidate
+            pytest.skip(f"No unregistered copyreg code in range {start}-{end}")
+
+        cases = [
+            ("EXT1", b"\x82", _pick_unregistered_code(1, 255), lambda code: bytes([code])),
+            ("EXT2", b"\x83", _pick_unregistered_code(256, 65535), lambda code: struct.pack("<H", code)),
+            ("EXT4", b"\x84", _pick_unregistered_code(65536, 131072), lambda code: struct.pack("<I", code)),
+        ]
+
+        for opcode_name, opcode, ext_code, encode in cases:
+            # Verify the code is truly unregistered
+            assert ext_code not in inverted_registry, (
+                f"{opcode_name} code {ext_code} unexpectedly in copyreg._inverted_registry"
+            )
+            # PROTO 2 | EXT*(code) | MARK | STRING | TUPLE | REDUCE | STOP
+            payload = b"\x80\x02" + opcode + encode(ext_code) + b'(S"echo pwned"\ntR.'
+            result = self._scan_bytes(payload)
+
+            assert result.success, f"{opcode_name}: scan did not succeed"
+            assert result.has_errors, (
+                f"{opcode_name}: unresolved EXT code {ext_code} + REDUCE was not flagged, "
+                f"issues: {[i.message for i in result.issues]}"
+            )
+            # The scanner should flag the REDUCE even when the EXT target is unresolved
+            critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
+            assert critical_issues, (
+                f"{opcode_name}: expected CRITICAL issue for unresolved EXT code {ext_code}, "
+                f"got: {[i.message for i in result.issues]}"
+            )
+
+    # ------------------------------------------------------------------
+    # Fix 3b: ZIP proto0/1 extension bypass
+    # ------------------------------------------------------------------
+    def test_zip_entry_with_proto0_pickle_text_extension_is_detected(self) -> None:
+        """Protocol 0 pickle payloads in ZIP entries should not be skipped by extension."""
+        import tempfile
+        import zipfile
+
+        from modelaudit.core import scan_file
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            zip_path = Path(tmp_dir) / "payload.zip"
+
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr("payload.txt", b'cos\nsystem\n(S"echo pwned"\ntR.')
+
+            result = scan_file(str(zip_path))
+
+            assert result.success
+            assert result.has_errors
+            critical_messages = [i.message.lower() for i in result.issues if i.severity == IssueSeverity.CRITICAL]
+            assert any("os.system" in msg or "posix.system" in msg for msg in critical_messages), (
+                f"Expected critical os/posix.system issue, got: {critical_messages}"
+            )
+
+    # ------------------------------------------------------------------
+    # Fix 3c: parser crash resilience on mixed malformed payloads
+    # ------------------------------------------------------------------
+    def test_malformed_unicode_tail_still_flags_dangerous_global(self) -> None:
+        """Malformed tails should not suppress opcode-level dangerous global detection."""
+        # Valid prefix with dangerous GLOBAL, followed by malformed GLOBAL bytes
+        # that previously caused parse fallback before opcode analysis completed.
+        payload = b"\x80\x02cbuiltins\n__import__\nq\x00c\xff\n"
+
+        result = self._scan_bytes(payload)
+
+        assert result.success
+        assert result.has_errors
+
+        critical_messages = [i.message.lower() for i in result.issues if i.severity == IssueSeverity.CRITICAL]
+        assert any("__import__" in msg for msg in critical_messages), (
+            f"Expected CRITICAL __import__ detection, got: {critical_messages}"
+        )
+
+    def test_malformed_unicode_tail_with_benign_prefix_does_not_raise_critical(self) -> None:
+        """Malformed tails after benign opcodes should not create CRITICAL findings."""
+        payload = b"\x80\x02cbuiltins\nlen\nq\x00c\xff\n"
+
+        result = self._scan_bytes(payload)
+
+        assert result.success
+        critical_messages = [i.message.lower() for i in result.issues if i.severity == IssueSeverity.CRITICAL]
+        assert not critical_messages, f"Unexpected CRITICAL benign detection: {critical_messages}"
+
+    # ------------------------------------------------------------------
+    # Fix 3: joblib.load loader trampoline bypass
+    # ------------------------------------------------------------------
+    def test_joblib_load_reduce_is_critical(self) -> None:
+        """joblib.load + REDUCE should be treated as dangerous, not allowlisted."""
+        payload = b"\x80\x04cjoblib\nload\n\x8c\x0bpayload.pkl\x85R."
+        result = self._scan_bytes(payload)
+
+        assert result.success
+        assert result.has_errors
+        critical_messages = [i.message.lower() for i in result.issues if i.severity == IssueSeverity.CRITICAL]
+        assert any("joblib.load" in msg for msg in critical_messages), (
+            f"Expected CRITICAL joblib.load issue, got: {critical_messages}"
+        )
+
     # ------------------------------------------------------------------
     # Fix 4: NEWOBJ_EX with dangerous class
     # ------------------------------------------------------------------
@@ -790,6 +981,222 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
         assert any(i.severity == IssueSeverity.CRITICAL and "webbrowser" in i.message for i in result.issues), (
             f"Expected CRITICAL webbrowser issue, got: {[i.message for i in result.issues]}"
         )
+
+
+class TestCVE20251716PipMainBlocklist(unittest.TestCase):
+    """Test CVE-2025-1716: pickle bypass via pip.main() as callable."""
+
+    def test_pip_main_detected_as_critical(self) -> None:
+        """Pickle with GLOBAL pip.main + REDUCE should be flagged CRITICAL."""
+        # Protocol 2 pickle: GLOBAL pip\nmain\n, EMPTY_TUPLE, REDUCE, STOP
+        payload = b"\x80\x02cpip\nmain\n)R."
+        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
+            f.write(payload)
+            f.flush()
+            path = f.name
+        try:
+            scanner = PickleScanner()
+            result = scanner.scan(path)
+
+            # Should have CRITICAL issues referencing pip.main
+            critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
+            assert len(critical_issues) > 0, (
+                f"pip.main should be flagged as CRITICAL. Issues: {[i.message for i in result.issues]}"
+            )
+            assert any("pip" in i.message for i in critical_issues), (
+                f"Should reference pip in message. Issues: {[i.message for i in critical_issues]}"
+            )
+        finally:
+            os.unlink(path)
+
+    def test_pip_internal_main_detected(self) -> None:
+        """Pickle with GLOBAL pip._internal.main should be flagged."""
+        payload = b"\x80\x02cpip._internal\nmain\n)R."
+        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
+            f.write(payload)
+            f.flush()
+            path = f.name
+        try:
+            scanner = PickleScanner()
+            result = scanner.scan(path)
+
+            critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
+            assert len(critical_issues) > 0, (
+                f"pip._internal.main should be flagged. Issues: {[i.message for i in result.issues]}"
+            )
+            assert any("pip" in i.message.lower() for i in critical_issues), (
+                f"Should reference pip in message. Issues: {[i.message for i in critical_issues]}"
+            )
+        finally:
+            os.unlink(path)
+
+    def test_comment_token_does_not_bypass_pip_detection(self) -> None:
+        """Embedding a comment-like token in a malicious pip payload must not suppress detection."""
+        # Build a pickle that includes a benign SHORT_BINUNICODE string containing "#"
+        # before the dangerous pip.main GLOBAL+REDUCE sequence.
+        # Protocol 2: PROTO 2, SHORT_BINUNICODE "# comment", POP, GLOBAL pip\nmain\n, EMPTY_TUPLE, REDUCE, STOP
+        comment_token = b"# this is a comment"
+        comment_op = b"\x8c" + bytes([len(comment_token)]) + comment_token  # SHORT_BINUNICODE
+        pop_op = b"0"  # POP to discard the string from the stack
+        payload = b"\x80\x02" + comment_op + pop_op + b"cpip\nmain\n)R."
+        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
+            f.write(payload)
+            f.flush()
+            path = f.name
+        try:
+            scanner = PickleScanner()
+            result = scanner.scan(path)
+
+            critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
+            assert len(critical_issues) > 0, (
+                f"Comment token must not suppress pip.main detection. Issues: {[i.message for i in result.issues]}"
+            )
+            assert any("pip" in i.message.lower() for i in critical_issues), (
+                f"Should reference pip in message despite comment token. Issues: {[i.message for i in critical_issues]}"
+            )
+        finally:
+            os.unlink(path)
+
+    def test_pip_main_in_always_dangerous(self) -> None:
+        """Verify pip.main is in ALWAYS_DANGEROUS_FUNCTIONS set."""
+        from modelaudit.scanners.pickle_scanner import ALWAYS_DANGEROUS_FUNCTIONS
+
+        assert "pip.main" in ALWAYS_DANGEROUS_FUNCTIONS
+        assert "pip._internal.main" in ALWAYS_DANGEROUS_FUNCTIONS
+        assert "pip._internal.cli.main.main" in ALWAYS_DANGEROUS_FUNCTIONS
+        assert "pip._vendor.distlib.scripts.ScriptMaker" in ALWAYS_DANGEROUS_FUNCTIONS
+
+    def test_pip_module_in_always_dangerous_modules(self) -> None:
+        """Verify pip module prefixes are in ALWAYS_DANGEROUS_MODULES set."""
+        from modelaudit.scanners.pickle_scanner import ALWAYS_DANGEROUS_MODULES
+
+        assert "pip" in ALWAYS_DANGEROUS_MODULES
+        assert "pip._internal" in ALWAYS_DANGEROUS_MODULES
+        assert "pip._internal.cli" in ALWAYS_DANGEROUS_MODULES
+        assert "pip._internal.cli.main" in ALWAYS_DANGEROUS_MODULES
+        assert "pip._vendor" in ALWAYS_DANGEROUS_MODULES
+        assert "pip._vendor.distlib" in ALWAYS_DANGEROUS_MODULES
+        assert "pip._vendor.distlib.scripts" in ALWAYS_DANGEROUS_MODULES
+
+    def test_prefix_matching_catches_deep_pip_submodules(self) -> None:
+        """Verify _is_dangerous_module catches pip sub-modules not explicitly listed."""
+        from modelaudit.scanners.pickle_scanner import _is_dangerous_module
+
+        # These are not explicitly in the set but should match via prefix
+        assert _is_dangerous_module("pip._internal.cli.main_parser")
+        assert _is_dangerous_module("pip._vendor.distlib.scripts.run")
+        assert _is_dangerous_module("pip._internal.commands.install")
+        # Non-pip modules should not match
+        assert not _is_dangerous_module("pipx.main")
+        assert not _is_dangerous_module("pipeline.process")
+
+
+def test_scan_legitimate_pytorch_pickle_memory_error_is_non_failing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Memory limits on legitimate .pt files should be surfaced as informational scanner limitation."""
+    model_path = tmp_path / "legitimate_model.pt"
+    header = b"\x80\x02ctorch\nOrderedDict\nq\x00."
+    model_path.write_bytes(header + b"state_dict" + b"\x00" * (1024 * 1024 + 64))
+
+    def _raise_memory_error(*args: object, **kwargs: object) -> object:
+        raise MemoryError("simulated parser memory limit")
+
+    monkeypatch.setattr("modelaudit.scanners.pickle_scanner.pickletools.genops", _raise_memory_error)
+    monkeypatch.setattr(
+        PickleScanner,
+        "_extract_globals_advanced",
+        lambda self, file_obj: {("torch", "OrderedDict")},
+    )
+
+    result = PickleScanner().scan(str(model_path))
+
+    resource_limit_checks = [check for check in result.checks if check.name == "Pickle Parse Resource Limit"]
+    assert len(resource_limit_checks) == 1
+    resource_limit_check = resource_limit_checks[0]
+    assert resource_limit_check.status == CheckStatus.FAILED
+    assert resource_limit_check.severity == IssueSeverity.INFO
+    assert resource_limit_check.details["reason"] == "memory_limit_on_legitimate_model"
+    assert resource_limit_check.details["exception_type"] == "MemoryError"
+    assert resource_limit_check.details["analysis_incomplete"] is True
+    assert resource_limit_check.details["scanner_limitation"] is True
+
+    assert result.metadata["memory_limited"] is True
+    assert result.metadata["scanner_limitation"] is True
+    assert result.metadata["analysis_incomplete"] is True
+
+    info_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.INFO]
+    assert len(info_issues) == 1
+    assert info_issues[0].message == "Scan limited by model complexity and memory budget"
+    assert not any(
+        issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        and "Unable to parse pickle file" in issue.message
+        for issue in result.issues
+    )
+
+
+def test_scan_legitimate_pytorch_bin_memory_error_is_informational(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Memory limits on legitimate pytorch_model.bin should be informational only."""
+    model_path = tmp_path / "pytorch_model.bin"
+    header = b"\x80\x02ctorch\nOrderedDict\nq\x00."
+    model_path.write_bytes(header + b"state_dict" + b"\x00" * (256 * 1024))
+
+    def _raise_memory_error(*args: object, **kwargs: object) -> object:
+        raise MemoryError("simulated parser memory limit")
+
+    monkeypatch.setattr("modelaudit.scanners.pickle_scanner.pickletools.genops", _raise_memory_error)
+    monkeypatch.setattr(
+        PickleScanner,
+        "_extract_globals_advanced",
+        lambda self, file_obj: {("torch._utils", "_rebuild_tensor_v2"), ("collections", "OrderedDict")},
+    )
+
+    result = PickleScanner().scan(str(model_path))
+
+    resource_limit_checks = [check for check in result.checks if check.name == "Pickle Parse Resource Limit"]
+    assert len(resource_limit_checks) == 1
+    resource_limit_check = resource_limit_checks[0]
+    assert resource_limit_check.status == CheckStatus.FAILED
+    assert resource_limit_check.severity == IssueSeverity.INFO
+    assert resource_limit_check.details["reason"] == "memory_limit_on_legitimate_model"
+    assert resource_limit_check.details["exception_type"] == "MemoryError"
+    assert resource_limit_check.details["analysis_incomplete"] is True
+    assert resource_limit_check.details["scanner_limitation"] is True
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+def test_scan_memory_error_with_dangerous_globals_not_downgraded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Dangerous globals must keep MemoryError path as warning, not limitation-info downgrade."""
+    model_path = tmp_path / "pytorch_model.bin"
+    model_path.write_bytes(b"\x80\x02cbuiltins\neval\nq\x00." + b"\x00" * (256 * 1024))
+
+    def _raise_memory_error(*args: object, **kwargs: object) -> object:
+        raise MemoryError("simulated parser memory limit")
+
+    monkeypatch.setattr("modelaudit.scanners.pickle_scanner.pickletools.genops", _raise_memory_error)
+    monkeypatch.setattr(
+        PickleScanner,
+        "_is_legitimate_pytorch_model",
+        lambda self, path: True,  # force heuristic pass; dangerous-global gate must still block downgrade
+    )
+    monkeypatch.setattr(
+        PickleScanner,
+        "_extract_globals_advanced",
+        lambda self, file_obj: {("builtins", "eval")},
+    )
+
+    result = PickleScanner().scan(str(model_path))
+
+    assert not any(check.name == "Pickle Parse Resource Limit" for check in result.checks)
+    format_validation_checks = [check for check in result.checks if check.name == "Pickle Format Validation"]
+    assert len(format_validation_checks) == 1
+    assert format_validation_checks[0].status == CheckStatus.FAILED
+    assert format_validation_checks[0].severity == IssueSeverity.WARNING
+    assert format_validation_checks[0].details["exception_type"] == "MemoryError"
 
 
 if __name__ == "__main__":

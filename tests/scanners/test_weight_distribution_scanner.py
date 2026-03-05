@@ -41,9 +41,10 @@ def has_h5py():
 
 def has_tensorflow():
     try:
-        import tensorflow as tf  # noqa: F401
+        import tensorflow as tf
 
-        return True
+        # Vendored protobuf stubs are not sufficient for weight-distribution tests.
+        return bool(getattr(tf, "__version__", None)) and hasattr(tf, "constant")
     except Exception:
         return False
 

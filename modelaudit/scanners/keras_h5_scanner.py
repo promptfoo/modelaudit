@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 from typing import Any, ClassVar
 
 from modelaudit.detectors.suspicious_symbols import (
@@ -13,7 +14,7 @@ from modelaudit.utils.helpers.code_validation import (
     validate_python_syntax,
 )
 
-from ..config.explanations import get_pattern_explanation
+from ..config.explanations import get_cve_2024_3660_explanation, get_cve_2025_9905_explanation, get_pattern_explanation
 from .base import BaseScanner, IssueSeverity, ScanResult
 from .keras_utils import check_subclassed_model
 
@@ -106,6 +107,11 @@ class KerasH5Scanner(BaseScanner):
 
             with h5py.File(path, "r") as f:
                 result.bytes_scanned = file_size
+                keras_version_attr = f.attrs.get("keras_version")
+                if isinstance(keras_version_attr, bytes):
+                    keras_version_attr = keras_version_attr.decode("utf-8", errors="ignore")
+                if isinstance(keras_version_attr, str) and keras_version_attr.strip():
+                    result.metadata["keras_version"] = keras_version_attr.strip()
 
                 # Check if this is a Keras model file
                 if "model_config" not in f.attrs:
@@ -272,7 +278,110 @@ class KerasH5Scanner(BaseScanner):
 
                 # Special handling for Lambda layers - validate Python code
                 if layer_class == "Lambda":
+                    raw_layer_name = layer.get("name")
+                    if not raw_layer_name and isinstance(layer_config, dict):
+                        raw_layer_name = layer_config.get("name")
+                    layer_name = raw_layer_name or f"lambda_{layer_counts.get('Lambda', 1)}"
                     self._check_lambda_layer(layer_config, result)
+                    keras_version = result.metadata.get("keras_version")
+
+                    # CVE-2024-3660: Lambda layers enable arbitrary code injection
+                    if isinstance(keras_version, str) and self._is_vulnerable_to_cve_2024_3660(keras_version):
+                        result.add_check(
+                            name="CVE-2024-3660: Lambda Layer Code Injection",
+                            passed=False,
+                            message=(
+                                f"CVE-2024-3660: Lambda layer '{layer_name}' in Keras {keras_version} enables "
+                                "arbitrary code injection during model loading"
+                            ),
+                            severity=IssueSeverity.CRITICAL,
+                            location=f"{self.current_file_path} (layer: {layer_name})",
+                            details={
+                                "layer_name": layer_name,
+                                "layer_class": "Lambda",
+                                "keras_version": keras_version,
+                                "cve_id": "CVE-2024-3660",
+                                "cvss": 9.8,
+                                "cwe": "CWE-94",
+                                "description": "Lambda layer deserialization can enable arbitrary code injection.",
+                                "remediation": "Remove Lambda layers or upgrade Keras to >= 2.13",
+                            },
+                            why=get_cve_2024_3660_explanation("lambda_code_injection"),
+                        )
+
+                    # CVE-2025-9905: safe_mode=True is silently ignored for H5 format
+                    vuln_status = (
+                        self._is_vulnerable_to_cve_2025_9905(keras_version) if isinstance(keras_version, str) else None
+                    )
+                    if vuln_status is True:
+                        result.add_check(
+                            name="CVE-2025-9905: H5 safe_mode Bypass",
+                            passed=False,
+                            message=(
+                                f"CVE-2025-9905: Lambda layer '{layer_name}' in H5 format with Keras {keras_version} - "
+                                "safe_mode=True is silently ignored for .h5/.hdf5 files"
+                            ),
+                            severity=IssueSeverity.CRITICAL,
+                            location=f"{self.current_file_path} (layer: {layer_name})",
+                            details={
+                                "layer_class": "Lambda",
+                                "layer_name": layer_name,
+                                "keras_version": keras_version,
+                                "cve_id": "CVE-2025-9905",
+                                "cvss": 7.3,
+                                "cwe": "CWE-693",
+                                "description": (
+                                    "Keras H5 format can ignore safe_mode=True for Lambda layers, "
+                                    "allowing arbitrary code execution during model load."
+                                ),
+                                "affected_versions": "Keras >= 3.0.0, < 3.11.3",
+                                "remediation": "Upgrade Keras to >= 3.11.3 or convert to .keras format",
+                            },
+                            why=get_cve_2025_9905_explanation("h5_safe_mode_bypass"),
+                        )
+                    elif vuln_status is False:
+                        result.add_check(
+                            name="H5 Lambda Version Risk Check",
+                            passed=True,
+                            message=(
+                                f"Lambda layer '{layer_name}' detected with Keras {keras_version}; "
+                                "outside known CVE-2025-9905 vulnerable range (>=3.0.0, <3.11.3)"
+                            ),
+                            location=f"{self.current_file_path} (layer: {layer_name})",
+                            details={"layer_class": "Lambda", "layer_name": layer_name, "keras_version": keras_version},
+                        )
+                    elif vuln_status is None:
+                        version_context = (
+                            f"keras_version '{keras_version}' is non-canonical"
+                            if isinstance(keras_version, str)
+                            else "keras_version is unavailable"
+                        )
+                        result.add_check(
+                            name="H5 Lambda Risk (Version Unknown)",
+                            passed=False,
+                            message=(
+                                f"Lambda layer '{layer_name}' detected in H5 model but "
+                                f"{version_context}; cannot confidently attribute "
+                                "CVE-2025-9905 without reliable version context"
+                            ),
+                            severity=IssueSeverity.WARNING,
+                            location=f"{self.current_file_path} (layer: {layer_name})",
+                            details={
+                                "layer_class": "Lambda",
+                                "layer_name": layer_name,
+                                "keras_version": keras_version,
+                                "parse_status": "unknown",
+                                "cve_id": "CVE-2025-9905",
+                                "cvss": 7.3,
+                                "cwe": "CWE-693",
+                                "description": (
+                                    "Keras H5 format can ignore safe_mode=True for Lambda layers; "
+                                    "version context could not be parsed confidently."
+                                ),
+                                "affected_versions": "Keras >= 3.0.0, < 3.11.3",
+                                "remediation": "Upgrade Keras to >= 3.11.3 or convert to .keras format",
+                            },
+                        )
                 else:
                     result.add_check(
                         name="Suspicious Layer Type Detection",
@@ -433,6 +542,65 @@ class KerasH5Scanner(BaseScanner):
                 )
         # Don't flag Lambda layers without code - they might just be placeholders
 
+    @staticmethod
+    def _is_vulnerable_to_cve_2024_3660(version: str) -> bool:
+        """Return True for Keras versions lower than 2.13.0.
+
+        Handles two-part versions (e.g. "2.10") by treating missing patch as 0.
+        """
+        parts = version.split(".", 2)
+        if len(parts) < 2:
+            return False
+        try:
+            major = int(parts[0])
+            minor = int(parts[1])
+            patch = 0
+            if len(parts) == 3:
+                patch_digits = "".join(ch for ch in parts[2] if ch.isdigit())
+                if patch_digits:
+                    patch = int(patch_digits)
+            return (major, minor, patch) < (2, 13, 0)
+        except ValueError:
+            return False
+
+    @staticmethod
+    def _is_vulnerable_to_cve_2025_9905(version: str) -> bool | None:
+        """Return True/False for parseable Keras versions, else None."""
+        version_match = re.match(r"^(\d+)\.(\d+)\.(\d+)(.*)$", version.strip())
+        if not version_match:
+            return None
+
+        try:
+            major, minor, patch = map(int, version_match.groups()[:3])
+            suffix = (version_match.group(4) or "").strip().lower()
+
+            is_prerelease = False
+            if suffix:
+                # PEP 440-like prerelease/dev identifiers should be treated as pre-fix builds.
+                if re.search(r"(?:^|[.\-])(dev|rc|a|b|alpha|beta|pre|preview)\d*", suffix):
+                    is_prerelease = True
+                elif suffix.startswith("+") or suffix.startswith(".post") or suffix.startswith("post"):
+                    is_prerelease = False
+                else:
+                    return None
+
+            if major != 3:
+                return False
+
+            if (major, minor, patch) < (3, 0, 0):
+                return False
+
+            fix_version = (3, 11, 3)
+            if (major, minor, patch) < fix_version:
+                return True
+            if (major, minor, patch) > fix_version:
+                return False
+
+            # Equal to the fix release: prerelease variants are still vulnerable.
+            return is_prerelease
+        except ValueError:
+            return False
+
     def _check_config_for_suspicious_strings(
         self,
         config: Any,
@@ -479,3 +647,98 @@ class KerasH5Scanner(BaseScanner):
                             result,
                             f"{context}.{key}[{i}]",
                         )
+
+    def extract_metadata(self, file_path: str) -> dict[str, Any]:
+        """Extract Keras H5 model metadata."""
+        metadata = super().extract_metadata(file_path)
+
+        try:
+            import h5py
+        except Exception:
+            metadata["extraction_error"] = "h5py is not installed"
+            return metadata
+
+        try:
+            with h5py.File(file_path, "r") as h5_file:
+                # Basic H5 structure
+                metadata.update(
+                    {
+                        "h5_keys": list(h5_file.keys()),
+                        "has_model_config": "model_config" in h5_file.attrs,
+                        "has_model_weights": "model_weights" in h5_file,
+                    }
+                )
+
+                # Try to extract model configuration
+                if "model_config" in h5_file.attrs:
+                    try:
+                        import json
+
+                        config_json = h5_file.attrs["model_config"]
+                        if isinstance(config_json, bytes):
+                            config_json = config_json.decode("utf-8")
+
+                        config = json.loads(config_json)
+
+                        metadata.update(
+                            {
+                                "model_class": config.get("class_name", "Unknown"),
+                                "keras_version": h5_file.attrs.get("keras_version", "unknown").decode("utf-8")
+                                if isinstance(h5_file.attrs.get("keras_version"), bytes)
+                                else h5_file.attrs.get("keras_version", "unknown"),
+                            }
+                        )
+
+                        # Extract layer information
+                        if "config" in config:
+                            layers = config["config"].get("layers", [])
+                            metadata.update(
+                                {
+                                    "layer_count": len(layers),
+                                    "layer_types": list({layer.get("class_name", "Unknown") for layer in layers}),
+                                }
+                            )
+
+                    except Exception:
+                        pass
+
+                # Analyze model weights structure
+                if "model_weights" in h5_file:
+                    try:
+                        weights_group = h5_file["model_weights"]
+
+                        # Count parameters
+                        total_params = 0
+                        weight_layers = []
+
+                        def count_params(name, obj):
+                            nonlocal total_params
+                            if isinstance(obj, h5py.Dataset):
+                                param_count = obj.size
+                                total_params += param_count
+                                weight_layers.append(
+                                    {
+                                        "name": name,
+                                        "shape": list(obj.shape),
+                                        "dtype": str(obj.dtype),
+                                        "size": param_count,
+                                    }
+                                )
+
+                        weights_group.visititems(count_params)
+
+                        metadata.update(
+                            {
+                                "total_parameters": total_params,
+                                "weight_layers": len(weight_layers),
+                                "parameter_details": weight_layers[:10],  # First 10 layers
+                            }
+                        )
+
+                    except Exception:
+                        pass
+
+        except Exception as e:
+            metadata["extraction_error"] = str(e)
+
+        return metadata

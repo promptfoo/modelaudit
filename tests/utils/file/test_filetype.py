@@ -1,7 +1,16 @@
+import bz2
+import gzip
+import importlib
 import io
+import lzma
+import struct
 import tarfile
 import zipfile
+import zlib
 from pathlib import Path
+from typing import cast
+
+import pytest
 
 from modelaudit.utils.file.detection import (
     detect_file_format,
@@ -11,6 +20,25 @@ from modelaudit.utils.file.detection import (
     is_zipfile,
     validate_file_type,
 )
+
+
+def _has_tf_protos() -> bool:
+    import modelaudit.protos
+
+    return modelaudit.protos._check_vendored_protos()
+
+
+def _build_tf_metagraph_bytes() -> bytes:
+    import modelaudit.protos  # noqa: F401
+
+    meta_graph_pb2 = importlib.import_module("tensorflow.core.protobuf.meta_graph_pb2")
+    metagraph = meta_graph_pb2.MetaGraphDef()
+    metagraph.meta_info_def.meta_graph_version = "test_meta_graph"
+    metagraph.meta_info_def.tags.append("serve")
+    node = metagraph.graph_def.node.add()
+    node.name = "const_node"
+    node.op = "Const"
+    return cast(bytes, metagraph.SerializeToString())
 
 
 def test_detect_file_format_directory(tmp_path):
@@ -61,10 +89,22 @@ def test_detect_file_format_by_extension(tmp_path):
         ".pkl": "pickle",
         ".pickle": "pickle",
         ".dill": "pickle",  # .dill files are treated as pickle files
+        # CNTK detection is signature-based to avoid misclassifying arbitrary .dnn/.cmf files
+        ".dnn": "unknown",
+        ".cmf": "unknown",
         ".msgpack": "flax_msgpack",
+        ".params": "mxnet",
         ".h5": "hdf5",
         ".pb": "protobuf",
         ".tflite": "tflite",
+        ".mar": "torchserve_mar",
+        ".cbm": "catboost",
+        ".mlmodel": "coreml",
+        ".llamafile": "llamafile",
+        ".rknn": "rknn",
+        ".rds": "r_serialized",
+        ".rda": "r_serialized",
+        ".rdata": "r_serialized",
         ".unknown": "unknown",
     }
 
@@ -82,6 +122,156 @@ def test_detect_file_format_hdf5(tmp_path):
     hdf5_path.write_bytes(hdf5_magic + b"additional content")
 
     assert detect_file_format(str(hdf5_path)) == "hdf5"
+
+
+def test_detect_file_format_coreml_validation_passthrough(tmp_path: Path) -> None:
+    """CoreML extension routing should remain scanner-level validated."""
+    model_path = tmp_path / "model.mlmodel"
+    model_path.write_bytes(b"not-a-real-protobuf")
+
+    assert detect_file_format(str(model_path)) == "coreml"
+    assert detect_format_from_extension(str(model_path)) == "coreml"
+    assert validate_file_type(str(model_path)) is True
+
+
+def test_detect_format_from_extension_mxnet_symbol(tmp_path: Path) -> None:
+    """MXNet symbol files should be detected by filename pattern."""
+    symbol_path = tmp_path / "resnet-symbol.json"
+    symbol_path.write_text('{"nodes":[{"op":"null","name":"data","inputs":[]}],"arg_nodes":[0],"heads":[[0,0,0]]}')
+
+    assert detect_format_from_extension(str(symbol_path)) == "mxnet"
+
+
+def test_detect_r_serialized_magic_headers(tmp_path: Path) -> None:
+    rds = tmp_path / "model.rds"
+    rds.write_bytes(b"RDX3\n" + b"\x00" * 20)
+    assert detect_file_format_from_magic(str(rds)) == "r_serialized"
+    assert detect_file_format(str(rds)) == "r_serialized"
+    assert validate_file_type(str(rds)) is True
+
+
+def test_detect_cntk_formats_by_signature(tmp_path: Path) -> None:
+    legacy_path = tmp_path / "legacy.dnn"
+    legacy_path.write_bytes(
+        b"B\x00C\x00N\x00\x00\x00" + b"B\x00V\x00e\x00r\x00s\x00i\x00o\x00n\x00\x00\x00" + b"inputs outputs"
+    )
+    assert detect_format_from_extension(str(legacy_path)) == "cntk"
+    assert detect_file_format(str(legacy_path)) == "cntk"
+    assert detect_file_format_from_magic(str(legacy_path)) == "cntk"
+
+    v2_path = tmp_path / "graph.cmf"
+    v2_path.write_bytes(
+        b"\x0a\x07version\x12\x031.0\x12\x09\x0a\x03uid\x12\x02ab CompositeFunction primitive_functions"
+    )
+    assert detect_format_from_extension(str(v2_path)) == "cntk"
+    assert detect_file_format(str(v2_path)) == "cntk"
+    assert detect_file_format_from_magic(str(v2_path)) == "cntk"
+
+
+def test_detect_tf_metagraph_by_strict_parse(tmp_path: Path) -> None:
+    """Detect TensorFlow MetaGraph `.meta` files through strict protobuf parsing."""
+    if not _has_tf_protos():
+        pytest.skip("TensorFlow protobuf stubs unavailable")
+
+    metagraph_path = tmp_path / "graph.meta"
+    metagraph_path.write_bytes(_build_tf_metagraph_bytes())
+
+    assert detect_format_from_extension(str(metagraph_path)) == "tf_metagraph"
+    assert detect_file_format(str(metagraph_path)) == "tf_metagraph"
+    assert detect_file_format_from_magic(str(metagraph_path)) == "tf_metagraph"
+    assert validate_file_type(str(metagraph_path)) is True
+
+
+def test_detect_tf_metagraph_rejects_renamed_non_protobuf(tmp_path: Path) -> None:
+    """Reject text or arbitrary data renamed with `.meta` extension."""
+    fake_metagraph = tmp_path / "not_meta.meta"
+    fake_metagraph.write_text("not a tensorflow metagraph", encoding="utf-8")
+
+    assert detect_format_from_extension(str(fake_metagraph)) == "tf_metagraph"
+    assert detect_file_format(str(fake_metagraph)) == "unknown"
+    assert detect_file_format_from_magic(str(fake_metagraph)) == "unknown"
+    assert validate_file_type(str(fake_metagraph)) is False
+
+
+def test_detect_rknn_format_by_signature(tmp_path: Path) -> None:
+    rknn_path = tmp_path / "model.rknn"
+    rknn_path.write_bytes(b"RKNN\x01\x00\x00\x00runtime=rockchip\n")
+
+    assert detect_format_from_extension(str(rknn_path)) == "rknn"
+    assert detect_file_format(str(rknn_path)) == "rknn"
+    assert detect_file_format_from_magic(str(rknn_path)) == "rknn"
+    assert validate_file_type(str(rknn_path)) is True
+
+    bad_rknn = tmp_path / "bad.rknn"
+    bad_rknn.write_bytes(b"not-rknn-content")
+    assert detect_file_format(str(bad_rknn)) == "rknn"
+    assert detect_file_format_from_magic(str(bad_rknn)) == "unknown"
+    assert validate_file_type(str(bad_rknn)) is False
+
+
+def test_detect_torch7_formats_by_signature(tmp_path: Path) -> None:
+    torch7_path = tmp_path / "model.t7"
+    torch7_path.write_bytes(b"T7\x00\x00torch.FloatTensor nn.Sequential\n")
+
+    assert detect_format_from_extension(str(torch7_path)) == "torch7"
+    assert detect_file_format(str(torch7_path)) == "torch7"
+    assert detect_file_format_from_magic(str(torch7_path)) == "torch7"
+    assert validate_file_type(str(torch7_path)) is True
+
+    fake_torch7 = tmp_path / "fake.t7"
+    fake_torch7.write_text("not torch7")
+    assert detect_file_format(str(fake_torch7)) == "unknown"
+    assert detect_file_format_from_magic(str(fake_torch7)) == "unknown"
+    assert validate_file_type(str(fake_torch7)) is False
+
+
+def test_detect_file_format_proto0_pickle_with_text_extension(tmp_path: Path) -> None:
+    """Protocol 0 pickle payloads should be detected even with non-model extensions."""
+    payload = tmp_path / "payload.txt"
+    payload.write_bytes(b'cos\nsystem\n(S"echo pwned"\ntR.')
+
+    assert detect_file_format(str(payload)) == "pickle"
+    assert detect_file_format_from_magic(str(payload)) == "pickle"
+
+
+def test_detect_file_format_proto0_pickle_with_single_comment_token_prefix(tmp_path: Path) -> None:
+    """A single leading comment token should not suppress proto0 detection."""
+    payload = tmp_path / "comment-prefixed-payload.txt"
+    payload.write_bytes(b"#" + b'cos\nsystem\n(S"echo pwned"\ntR.')
+
+    assert detect_file_format(str(payload)) == "pickle"
+    assert detect_file_format_from_magic(str(payload)) == "pickle"
+
+
+def test_detect_file_format_proto0_mark_prefix_requires_structure(tmp_path: Path) -> None:
+    """MARK + GLOBAL/INST prefixes should only match when structure is pickle-like."""
+    non_pickle_payload = tmp_path / "not-pickle.txt"
+    non_pickle_payload.write_bytes(b"(cat this is plain text")
+    assert detect_file_format(str(non_pickle_payload)) != "pickle"
+    assert detect_file_format_from_magic(str(non_pickle_payload)) != "pickle"
+
+    pickle_like_payload = tmp_path / "mark-prefixed-pickle.txt"
+    pickle_like_payload.write_bytes(b'(cos\nsystem\n(S"echo pwned"\ntR.')
+    assert detect_file_format(str(pickle_like_payload)) == "pickle"
+    assert detect_file_format_from_magic(str(pickle_like_payload)) == "pickle"
+
+
+def test_detect_file_format_proto0_prefixed_pickle_with_extended_probe(tmp_path: Path) -> None:
+    """Valid protocol 0 streams with non-trivial prefixes should still be detected."""
+    payload = tmp_path / "prefixed-pickle.txt"
+    payload.write_bytes(b'(lp0\n0cos\nsystem\n(S"echo pwned"\ntR.')
+
+    assert detect_file_format(str(payload)) == "pickle"
+    assert detect_file_format_from_magic(str(payload)) == "pickle"
+
+
+def test_detect_file_format_plain_text_global_prefix_not_pickle(tmp_path: Path) -> None:
+    """Plain text that begins with GLOBAL-like bytes should not be treated as pickle."""
+    payload = tmp_path / "notes.txt"
+    payload.write_bytes(b"c\nthis is plain text\nnot a pickle stream")
+
+    assert detect_file_format(str(payload)) != "pickle"
+    assert detect_file_format_from_magic(str(payload)) != "pickle"
 
 
 def test_detect_file_format_small_file(tmp_path):
@@ -117,6 +307,38 @@ def test_detect_file_format_tar(tmp_path):
 
     assert detect_file_format_from_magic(str(tar_path)) == "tar"
     assert detect_file_format(str(tar_path)) == "tar"
+
+
+def test_detect_file_format_compressed_wrappers(tmp_path: Path) -> None:
+    gzip_path = tmp_path / "model.pkl.gz"
+    gzip_path.write_bytes(gzip.compress(b"pickle-payload"))
+    assert detect_file_format(str(gzip_path)) == "compressed"
+    assert detect_file_format_from_magic(str(gzip_path)) == "gzip"
+    assert detect_format_from_extension(str(gzip_path)) == "compressed"
+
+    bz2_path = tmp_path / "model.bin.bz2"
+    bz2_path.write_bytes(bz2.compress(b"weights"))
+    assert detect_file_format(str(bz2_path)) == "compressed"
+    assert detect_file_format_from_magic(str(bz2_path)) == "bzip2"
+
+    xz_path = tmp_path / "model.bin.xz"
+    xz_path.write_bytes(lzma.compress(b"weights"))
+    assert detect_file_format(str(xz_path)) == "compressed"
+    assert detect_file_format_from_magic(str(xz_path)) == "xz"
+
+    zlib_path = tmp_path / "model.bin.zlib"
+    zlib_path.write_bytes(zlib.compress(b"weights"))
+    assert detect_file_format(str(zlib_path)) == "compressed"
+    assert detect_file_format_from_magic(str(zlib_path)) == "zlib"
+
+
+def test_detect_file_format_tar_wrappers_preserve_tar_routing(tmp_path: Path) -> None:
+    tar_gz = tmp_path / "archive.tar.gz"
+    tar_gz.write_bytes(gzip.compress(b"fake tar payload"))
+    assert detect_file_format(str(tar_gz)) == "tar"
+    assert detect_file_format_from_magic(str(tar_gz)) == "gzip"
+    assert detect_format_from_extension(str(tar_gz)) == "tar"
+    assert validate_file_type(str(tar_gz)) is True
 
 
 def test_zip_magic_variants(tmp_path):
@@ -294,6 +516,28 @@ def test_validate_file_type(tmp_path):
     bin_pickle.write_bytes(b"\x80\x03" + b"pickle data")
     assert validate_file_type(str(bin_pickle)) is True
 
+    # TorchServe archives are zip-based .mar files.
+    mar_path = tmp_path / "model.mar"
+    with zipfile.ZipFile(mar_path, "w") as mar:
+        mar.writestr("MAR-INF/MANIFEST.json", '{"model":{"serializedFile":"weights.bin","handler":"handler.py"}}')
+        mar.writestr("weights.bin", b"weights")
+        mar.writestr("handler.py", b"def handle(data, context):\n    return data\n")
+    assert validate_file_type(str(mar_path)) is True
+    # Llamafile wrappers validate by extension with scanner-level marker checks.
+    llamafile_path = tmp_path / "model.llamafile"
+    llamafile_path.write_bytes(b"\x7fELF" + b"\x00" * 32 + b"llamafile")
+    assert validate_file_type(str(llamafile_path)) is True
+
+    # MXNet params files do not expose stable magic bytes and validate by extension.
+    mxnet_params = tmp_path / "model-0000.params"
+    mxnet_params.write_bytes(struct.pack("<4f", 0.1, 0.2, 0.3, 0.4))
+    assert validate_file_type(str(mxnet_params)) is True
+
+    # MXNet symbol JSON files follow a filename contract, not magic-byte signatures.
+    mxnet_symbol = tmp_path / "model-symbol.json"
+    mxnet_symbol.write_text('{"nodes":[{"op":"null","name":"data","inputs":[]}],"arg_nodes":[0],"heads":[[0,0,0]]}')
+    assert validate_file_type(str(mxnet_symbol)) is True
+
 
 def test_detect_file_format_from_magic_oserror(tmp_path, monkeypatch):
     """Return 'unknown' when reading magic bytes fails."""
@@ -377,6 +621,49 @@ def test_msgpack_validation_valid_format(tmp_path):
 
     # Test that validation passes (this was the bug - it was failing before)
     assert validate_file_type(str(msgpack_path)) is True
+
+
+def test_catboost_validation_valid_and_invalid_files(tmp_path: Path) -> None:
+    """Valid CatBoost files pass validation; spoofed ones fail."""
+    catboost_path = tmp_path / "model.cbm"
+    catboost_path.write_bytes(b"CBM1" + b"\x04\x00\x00\x00" + b"core")
+    assert detect_file_format(str(catboost_path)) == "catboost"
+    assert detect_format_from_extension(str(catboost_path)) == "catboost"
+    assert validate_file_type(str(catboost_path)) is True
+
+    bad_catboost = tmp_path / "bad_model.cbm"
+    bad_catboost.write_bytes(b"FAKE" + b"\x00" * 20)
+    assert validate_file_type(str(bad_catboost)) is False
+
+
+def test_cntk_validation_valid_and_invalid_files(tmp_path: Path) -> None:
+    """Valid CNTK signatures pass validation; misnamed files fail."""
+    cntk_legacy = tmp_path / "legacy.dnn"
+    cntk_legacy.write_bytes(
+        b"B\x00C\x00N\x00\x00\x00" + b"B\x00V\x00e\x00r\x00s\x00i\x00o\x00n\x00\x00\x00" + b"inputs outputs"
+    )
+    assert validate_file_type(str(cntk_legacy)) is True
+
+    cntk_v2 = tmp_path / "graph.cmf"
+    cntk_v2.write_bytes(
+        b"\x0a\x07version\x12\x031.0\x12\x09\x0a\x03uid\x12\x02ab CompositeFunction primitive_functions"
+    )
+    assert validate_file_type(str(cntk_v2)) is True
+
+    bad_cntk = tmp_path / "not_cntk.dnn"
+    bad_cntk.write_text("not a cntk model")
+    assert validate_file_type(str(bad_cntk)) is False
+
+
+def test_compressed_validation_valid_and_invalid_files(tmp_path: Path) -> None:
+    """Standalone compressed wrappers must match declared codecs."""
+    gzip_payload = tmp_path / "payload.pkl.gz"
+    gzip_payload.write_bytes(gzip.compress(b"payload"))
+    assert validate_file_type(str(gzip_payload)) is True
+
+    bad_gzip_payload = tmp_path / "payload_bad.pkl.gz"
+    bad_gzip_payload.write_bytes(bz2.compress(b"payload"))
+    assert validate_file_type(str(bad_gzip_payload)) is False
 
 
 def test_detect_generic_xml_format(tmp_path):

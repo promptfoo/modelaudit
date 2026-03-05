@@ -78,12 +78,28 @@ def pytest_runtest_setup(item):
             "test_weak_hash_detection.py",  # Weak hash detection tests
             "test_cloud_url_detection.py",  # Cloud storage URL detection tests
             "test_skops_scanner.py",  # Skops scanner CVE detection tests
+            "test_keras_zip_scanner.py",  # Keras ZIP scanner tests
             "test_nemo_scanner.py",  # NeMo scanner CVE-2025-23304 tests
             "test_numpy_scanner.py",  # NumPy scanner CVE-2019-6446 tests
             "test_onnx_scanner.py",  # ONNX scanner CVE-2025-51480 tests
             "test_rule_mapper.py",  # Rule mapper validity and network mapping tests
+            "test_keras_h5_scanner.py",  # Keras H5 scanner CVE-2025-9905 tests
             "test_cve_detection.py",  # CVE detection tests
             "test_pytorch_zip_scanner.py",  # PyTorch ZIP scanner tests
+            "test_paddle_scanner.py",  # PaddlePaddle scanner tests
+            "test_cve_2025_10155_bin_pickle.py",  # CVE-2025-10155 .bin pickle detection tests
+            "test_compressed_scanner.py",  # standalone compressed wrapper scanner tests
+            "test_catboost_scanner.py",  # CatBoost scanner tests
+            "test_r_serialized_scanner.py",  # R serialized scanner tests
+            "test_cntk_scanner.py",  # CNTK .dnn/.cmf scanner tests
+            "test_rknn_scanner.py",  # RKNN scanner tests
+            "test_torch7_scanner.py",  # Torch7 scanner tests
+            "test_lightgbm_scanner.py",  # LightGBM native scanner tests
+            "test_llamafile_scanner.py",  # Llamafile executable scanner tests
+            "test_coreml_scanner.py",  # CoreML scanner tests
+            "test_mxnet_scanner.py",  # MXNet scanner tests
+            "test_tf_metagraph_scanner.py",  # TensorFlow MetaGraph scanner tests
+            "test_torchserve_mar_scanner.py",  # TorchServe .mar scanner tests
         ]
 
         # Check if this is an allowed test file

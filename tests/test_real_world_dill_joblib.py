@@ -195,17 +195,20 @@ class TestRealJoblibFiles:
         # Joblib with numpy may use custom protocols/opcodes that aren't standard pickle
         critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
         warning_issues = [i for i in result.issues if i.severity == IssueSeverity.WARNING]
+        info_issues = [i for i in result.issues if i.severity == IssueSeverity.INFO]
 
         # If bytes weren't scanned, it means the format wasn't recognized as standard pickle
         if result.bytes_scanned == 0:
-            # Should have issues about unknown format/opcodes/parsing (now as warnings)
-            assert len(warning_issues) > 0, "Should report issues when format isn't recognized"
-            # Warning messages may vary by platform (e.g. "opcode", "format", "parse", "pickle", "Memory")
+            # Legitimate joblib files that hit MemoryError are downgraded to INFO level
+            # (not WARNING) since they are recognized as valid serialization files.
+            # Accept either WARNING or INFO level issues about format/parse problems.
+            relevant_issues = warning_issues + info_issues
+            assert len(relevant_issues) > 0, "Should report issues when format isn't recognized"
             parse_keywords = ("opcode", "format", "parse", "pickle", "protocol", "memory")
-            opcode_issues = [i for i in warning_issues if any(kw in str(i.message).lower() for kw in parse_keywords)]
+            opcode_issues = [i for i in relevant_issues if any(kw in str(i.message).lower() for kw in parse_keywords)]
             assert len(opcode_issues) > 0, (
                 f"Should report parse/format issues for numpy joblib files, got: "
-                f"{[str(i.message)[:80] for i in warning_issues]}"
+                f"{[str(i.message)[:80] for i in relevant_issues]}"
             )
         else:
             # If bytes were scanned, check for opcode issues if they exist
