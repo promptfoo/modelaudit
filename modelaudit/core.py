@@ -46,6 +46,19 @@ from modelaudit.utils.lfs import check_lfs_pointer, get_lfs_issue_details, get_l
 logger = logging.getLogger("modelaudit.core")
 
 
+def _to_telemetry_severity(severity: Any) -> str:
+    """Normalize severity values to stable telemetry strings."""
+    if hasattr(severity, "value"):
+        return str(severity.value).lower()
+    if hasattr(severity, "name"):
+        return str(severity.name).lower()
+
+    severity_str = str(severity).lower()
+    if severity_str.startswith("issueseverity."):
+        severity_str = severity_str.split(".", 1)[1]
+    return severity_str
+
+
 def _add_asset_to_results(
     results: ModelAuditResultModel,
     file_path: str,
@@ -93,6 +106,12 @@ def _add_scan_result_to_model(
     for issue in file_result.issues:
         issue_dict = issue.to_dict() if hasattr(issue, "to_dict") else issue
         if isinstance(issue_dict, dict):
+            record_issue_found(
+                issue_type=str(issue_dict.get("message", "unknown_issue")),
+                severity=_to_telemetry_severity(issue_dict.get("severity", "unknown")),
+                scanner=file_result.scanner_name,
+                file_path=file_path,
+            )
             results.issues.append(Issue(**issue_dict))
 
     # Convert and add checks
@@ -792,6 +811,12 @@ def scan_model_directory_or_file(
                         for issue in file_result.issues:
                             issue_dict = issue.to_dict() if hasattr(issue, "to_dict") else issue
                             if isinstance(issue_dict, dict):
+                                record_issue_found(
+                                    issue_type=str(issue_dict.get("message", "unknown_issue")),
+                                    severity=_to_telemetry_severity(issue_dict.get("severity", "unknown")),
+                                    scanner=file_result.scanner_name,
+                                    file_path=representative_file,
+                                )
                                 # Update location to include all file paths with this content
                                 if len(file_paths) > 1:
                                     all_locations = " ".join(file_paths)

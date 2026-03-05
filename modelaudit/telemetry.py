@@ -6,6 +6,7 @@ Follows privacy-first principles with comprehensive opt-out controls.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -77,7 +78,9 @@ def is_telemetry_available() -> bool:
         client = get_telemetry_client()
         if client is None:
             return False
-        return not client._is_disabled()
+        if client._is_disabled():
+            return False
+        return client._posthog_client is not None
     except Exception:
         return False
 
@@ -328,6 +331,35 @@ class TelemetryClient:
             # Just mark that we've acknowledged telemetry is disabled - no actual recording
             self._telemetry_disabled_recorded = True
 
+    def _hash_identifier(self, value: str) -> str:
+        """Create a stable, non-reversible identifier hash for paths/URLs."""
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+
+    def _iter_result_issues(self, results: dict[str, Any]) -> list[dict[str, Any]]:
+        """Normalize top-level issue records from scan results."""
+        normalized: list[dict[str, Any]] = []
+        for issue in results.get("issues", []):
+            if isinstance(issue, dict):
+                normalized.append(issue)
+        return normalized
+
+    def _iter_result_assets(self, results: dict[str, Any]) -> list[dict[str, Any]]:
+        """Normalize asset records from scan results."""
+        normalized: list[dict[str, Any]] = []
+        for asset in results.get("assets", []):
+            if isinstance(asset, dict):
+                normalized.append(asset)
+        return normalized
+
+    def _count_values(self, values: list[str]) -> dict[str, int]:
+        """Count values in a list, skipping empty items."""
+        counts: dict[str, int] = {}
+        for value in values:
+            if not value:
+                continue
+            counts[value] = counts.get(value, 0) + 1
+        return counts
+
     def _send_event_internal(self, event: TelemetryEvent, properties: dict[str, Any]) -> None:
         """Internal method to send events without checking disabled state."""
         event_properties = {
@@ -386,14 +418,16 @@ class TelemetryClient:
 
     def record_scan_started(self, paths: list[str], scan_options: dict[str, Any]) -> None:
         """Record that a scan has started."""
+        source_types = [self._classify_source_type(path) for path in paths]
+        path_types = [self._classify_path(path) for path in paths]
+
         self.record_event(
             TelemetryEvent.SCAN_STARTED,
             {
                 "num_paths": len(paths),
-                "paths": paths,
-                "model_names": [self._extract_model_name(p) for p in paths],
-                "source_types": [self._classify_source_type(p) for p in paths],
-                "path_types": [self._classify_path(path) for path in paths],
+                "source_type_counts": self._count_values(source_types),
+                "path_type_counts": self._count_values(path_types),
+                "path_identifiers": [self._hash_identifier(path) for path in paths],
                 "timeout": scan_options.get("timeout"),
                 "max_file_size": scan_options.get("max_file_size"),
                 "format": scan_options.get("format", "text"),
@@ -419,42 +453,44 @@ class TelemetryClient:
 
     def record_scan_completed(self, duration: float, results: dict[str, Any]) -> None:
         """Record that a scan has completed successfully."""
+        issues = self._iter_result_issues(results)
+        assets = self._iter_result_assets(results)
+
         # Collect all unique issue types with counts
         issue_types: dict[str, int] = {}
         issue_details: list[dict[str, Any]] = []
-        for asset in results.get("assets", []):
-            file_path = asset.get("path", "")
-            model_name = self._extract_model_name(file_path) if file_path else None
-            for issue in asset.get("issues", []):
-                issue_type = issue.get("message", "unknown")
-                severity = issue.get("severity", "unknown")
-                issue_types[issue_type] = issue_types.get(issue_type, 0) + 1
-                # Capture first 50 issues in detail
-                if len(issue_details) < 50:
-                    issue_details.append(
-                        {
-                            "type": issue_type,
-                            "severity": severity,
-                            "scanner": issue.get("scanner", "unknown"),
-                            "file_path": file_path,
-                            "model_name": model_name,
-                        }
-                    )
+
+        for issue in issues:
+            issue_type = str(issue.get("type") or issue.get("message") or "unknown")
+            severity = str(issue.get("severity", "unknown"))
+            issue_types[issue_type] = issue_types.get(issue_type, 0) + 1
+            # Capture first 50 issues in detail (without raw paths)
+            if len(issue_details) < 50:
+                issue_details.append(
+                    {
+                        "type": issue_type,
+                        "severity": severity,
+                        "location_type": self._classify_path(str(issue.get("location", ""))),
+                    }
+                )
+
+        scanner_names = [str(name) for name in results.get("scanner_names", []) if name]
+        file_types: dict[str, int] = {}
+        for asset in assets:
+            file_type = str(asset.get("type", "unknown"))
+            file_types[file_type] = file_types.get(file_type, 0) + 1
 
         self.record_event(
             TelemetryEvent.SCAN_COMPLETED,
             {
                 "duration": duration,
-                "total_files": len(results.get("assets", [])),
-                "total_issues": sum(len(asset.get("issues", [])) for asset in results.get("assets", [])),
+                "total_files": int(results.get("files_scanned", len(assets))),
+                "total_issues": len(issues),
                 "issue_severities": self._count_issue_severities(results),
-                "file_types": self._count_file_types(results),
-                "scanners_used": list(
-                    {scanner for asset in results.get("assets", []) for scanner in asset.get("scanners_used", [])}
-                ),
+                "file_types": file_types,
+                "scanners_used": sorted(set(scanner_names)),
                 "issue_types": issue_types,
                 "issue_details": issue_details,
-                "files_scanned": [asset.get("path", "") for asset in results.get("assets", [])],
             },
         )
 
@@ -489,8 +525,7 @@ class TelemetryClient:
                 "confidence": confidence,
                 "file_extension": Path(file_path).suffix.lower(),
                 "path_type": self._classify_path(file_path),
-                "file_path": file_path,
-                "model_name": self._extract_model_name(file_path),
+                "path_identifier": self._hash_identifier(file_path),
             },
         )
 
@@ -510,8 +545,8 @@ class TelemetryClient:
         }
 
         if file_path:
-            properties["file_path"] = file_path
-            properties["model_name"] = self._extract_model_name(file_path)
+            properties["path_identifier"] = self._hash_identifier(file_path)
+            properties["path_type"] = self._classify_path(file_path)
             properties["file_extension"] = Path(file_path).suffix.lower()
 
         self.record_event(TelemetryEvent.ISSUE_FOUND, properties)
@@ -558,8 +593,8 @@ class TelemetryClient:
                 "source_type": source_type,
                 "domain": self._extract_domain(url),
                 "size_bytes": size_bytes,
-                "url": url,
-                "model_name": self._extract_model_name(url),
+                "url_identifier": self._hash_identifier(url),
+                "path_type": self._classify_path(url),
             },
         )
 
@@ -575,8 +610,9 @@ class TelemetryClient:
         }
 
         if url:
-            properties["url"] = url
-            properties["model_name"] = self._extract_model_name(url)
+            properties["url_identifier"] = self._hash_identifier(url)
+            properties["domain"] = self._extract_domain(url)
+            properties["path_type"] = self._classify_path(url)
 
         self.record_event(TelemetryEvent.DOWNLOAD_COMPLETED, properties)
 
@@ -639,17 +675,16 @@ class TelemetryClient:
     def _count_issue_severities(self, results: dict[str, Any]) -> dict[str, int]:
         """Count issues by severity."""
         severities: dict[str, int] = {}
-        for asset in results.get("assets", []):
-            for issue in asset.get("issues", []):
-                severity = issue.get("severity", "unknown")
-                severities[severity] = severities.get(severity, 0) + 1
+        for issue in self._iter_result_issues(results):
+            severity = str(issue.get("severity", "unknown"))
+            severities[severity] = severities.get(severity, 0) + 1
         return severities
 
     def _count_file_types(self, results: dict[str, Any]) -> dict[str, int]:
         """Count scanned files by type."""
         file_types: dict[str, int] = {}
-        for asset in results.get("assets", []):
-            file_type = asset.get("file_type", "unknown")
+        for asset in self._iter_result_assets(results):
+            file_type = str(asset.get("type", "unknown"))
             file_types[file_type] = file_types.get(file_type, 0) + 1
         return file_types
 

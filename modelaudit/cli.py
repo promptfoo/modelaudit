@@ -557,7 +557,7 @@ def scan_command(
     telemetry_options = {
         "format": format,
         "timeout": timeout,
-        "max_size": max_size,
+        "max_file_size": max_size,
         "has_blacklist": bool(blacklist),
         "num_blacklist_patterns": len(blacklist) if blacklist else 0,
         "progress": progress,
@@ -935,7 +935,7 @@ def scan_command(
 
                             # Record download/scan completion for streaming mode
                             download_duration = time.time() - download_start
-                            record_download_completed("huggingface", download_duration, 0)
+                            record_download_completed("huggingface", download_duration, 0, path)
 
                             if show_styled_output:
                                 click.echo(style_text("✅ Streaming scan complete", fg="green", bold=True))
@@ -964,9 +964,9 @@ def scan_command(
                                 download_size = sum(
                                     f.stat().st_size for f in Path(download_path).rglob("*") if f.is_file()
                                 )
-                                record_download_completed("huggingface", download_duration, download_size)
+                                record_download_completed("huggingface", download_duration, download_size, path)
                             except Exception:
-                                record_download_completed("huggingface", download_duration, 0)
+                                record_download_completed("huggingface", download_duration, 0, path)
 
                             if download_spinner:
                                 download_spinner.ok(style_text("✅ Downloaded", fg="green", bold=True))
@@ -1039,7 +1039,7 @@ def scan_command(
 
                             # Record download/scan completion for streaming mode
                             download_duration = time.time() - download_start
-                            record_download_completed("pytorch_hub", download_duration, 0)
+                            record_download_completed("pytorch_hub", download_duration, 0, path)
 
                             if show_styled_output:
                                 click.echo(style_text("✅ Streaming scan complete", fg="green", bold=True))
@@ -1070,9 +1070,9 @@ def scan_command(
                                 download_size = sum(
                                     f.stat().st_size for f in Path(download_path).rglob("*") if f.is_file()
                                 )
-                                record_download_completed("pytorch_hub", download_duration, download_size)
+                                record_download_completed("pytorch_hub", download_duration, download_size, path)
                             except Exception:
-                                record_download_completed("pytorch_hub", download_duration, 0)
+                                record_download_completed("pytorch_hub", download_duration, 0, path)
 
                             if download_spinner:
                                 download_spinner.ok(style_text("✅ Downloaded", fg="green", bold=True))
@@ -1150,6 +1150,11 @@ def scan_command(
                     # Normal download mode
                     download_spinner = None  # Initialize for error handling
                     try:
+                        # Record download start and feature usage
+                        record_download_started("cloud_storage", path)
+                        record_feature_used("cloud_storage_download", cache_enabled=final_cache)
+                        download_start = time.time()
+
                         if final_scan_and_delete:
                             # STREAMING MODE: Download files one-by-one, scan, delete
                             from .core import scan_model_streaming
@@ -1185,6 +1190,10 @@ def scan_command(
                             # Merge streaming results
                             audit_result.aggregate_scan_result(streaming_result.model_dump())
 
+                            # Record download/scan completion for streaming mode
+                            download_duration = time.time() - download_start
+                            record_download_completed("cloud_storage", download_duration, 0, path)
+
                             if show_styled_output:
                                 click.echo(style_text("✅ Streaming scan complete", fg="green", bold=True))
 
@@ -1215,6 +1224,16 @@ def scan_command(
                             )
                             actual_path = str(download_path)
                             temp_dir = str(download_path) if not final_cache else None  # Don't clean up cached files
+
+                            # Record download completion
+                            download_duration = time.time() - download_start
+                            try:
+                                download_size = sum(
+                                    f.stat().st_size for f in Path(download_path).rglob("*") if f.is_file()
+                                )
+                                record_download_completed("cloud_storage", download_duration, download_size, path)
+                            except Exception:
+                                record_download_completed("cloud_storage", download_duration, 0, path)
 
                             if download_spinner:
                                 download_spinner.ok(style_text("✅ Downloaded", fg="green", bold=True))
@@ -1258,6 +1277,11 @@ def scan_command(
                         click.echo(f"Downloading from {path}...")
 
                     try:
+                        # Record download start and feature usage
+                        record_download_started("mlflow", path)
+                        record_feature_used("mlflow_download")
+                        download_start = time.time()
+
                         from .integrations.mlflow import scan_mlflow_model
 
                         # Use scan_mlflow_model to download and get scan results directly
@@ -1277,6 +1301,7 @@ def scan_command(
 
                         # Aggregate results directly from MLflow scan using Pydantic model
                         audit_result.aggregate_scan_result(results.model_dump())
+                        record_download_completed("mlflow", time.time() - download_start, results.bytes_scanned, path)
 
                         # Skip the normal scanning logic since we already have results
                         continue
@@ -1304,6 +1329,11 @@ def scan_command(
                         click.echo(f"Downloading and scanning from {path}...")
 
                     try:
+                        # Record download start and feature usage
+                        record_download_started("jfrog", path)
+                        record_feature_used("jfrog_download")
+                        download_start = time.time()
+
                         # Use the integrated JFrog scanning function
                         jfrog_results: ModelAuditResultModel = scan_jfrog_artifact(
                             path,
@@ -1324,6 +1354,9 @@ def scan_command(
 
                         # Aggregate results using Pydantic model
                         audit_result.aggregate_scan_result(jfrog_results.model_dump())
+                        record_download_completed(
+                            "jfrog", time.time() - download_start, jfrog_results.bytes_scanned, path
+                        )
 
                         continue  # Skip the regular scanning flow
 

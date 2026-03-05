@@ -198,7 +198,7 @@ modelaudit metadata model.onnx --security-only
 
 ModelAudit includes telemetry for product reliability and usage analytics.
 
-- Collected metadata can include command usage, scan timing, scanner/file-type usage, issue severity/type aggregates, and model path or URL identifiers.
+- Collected metadata can include command usage, scan timing, scanner/file-type usage, issue severity/type aggregates, and hashed path/URL identifiers (plus coarse metadata like file extension/domain).
 - Model files are scanned locally and ModelAudit does not upload model binary contents as telemetry events.
 - Telemetry is disabled automatically in CI/test environments and in editable development installs by default.
 

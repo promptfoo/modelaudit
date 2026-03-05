@@ -14,6 +14,7 @@ from modelaudit.telemetry import (
     TelemetryEvent,
     UserConfig,
     get_telemetry_client,
+    is_telemetry_available,
     record_event,
     record_scan_started,
 )
@@ -235,6 +236,106 @@ class TestTelemetryClient:
             # Should not call PostHog
             mock_posthog.capture.assert_not_called()
 
+    def test_scan_completed_uses_top_level_results_schema(self):
+        """Test that scan completion telemetry aggregates from top-level issues/assets."""
+        mock_posthog = MagicMock()
+
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch("modelaudit.telemetry.Path.home") as mock_home,
+            patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
+            patch.dict(
+                os.environ,
+                {"CI": "", "IS_TESTING": "", "PROMPTFOO_DISABLE_TELEMETRY": "", "NO_ANALYTICS": ""},
+                clear=False,
+            ),
+        ):
+            mock_home.return_value = Path(temp_dir)
+            client = TelemetryClient()
+            client._posthog_client = mock_posthog
+            client._user_config.telemetry_enabled = True
+
+            results = {
+                "files_scanned": 2,
+                "scanner_names": ["pickle", "zip"],
+                "assets": [
+                    {"path": "/tmp/a.pkl", "type": "pickle"},
+                    {"path": "/tmp/b.zip", "type": "zip"},
+                ],
+                "issues": [
+                    {"message": "Issue A", "severity": "critical", "location": "/tmp/a.pkl"},
+                    {"message": "Issue B", "severity": "warning", "location": "/tmp/b.zip"},
+                ],
+            }
+
+            client.record_scan_completed(1.5, results)
+            properties = mock_posthog.capture.call_args.kwargs["properties"]
+
+            assert properties["total_files"] == 2
+            assert properties["total_issues"] == 2
+            assert properties["issue_types"]["Issue A"] == 1
+            assert properties["issue_types"]["Issue B"] == 1
+            assert properties["issue_severities"]["critical"] == 1
+            assert properties["issue_severities"]["warning"] == 1
+            assert properties["file_types"]["pickle"] == 1
+            assert properties["file_types"]["zip"] == 1
+            assert sorted(properties["scanners_used"]) == ["pickle", "zip"]
+            assert "files_scanned" not in properties
+
+    def test_path_and_url_fields_are_hashed_in_payloads(self):
+        """Test that raw path/URL strings are not sent in telemetry payloads."""
+        mock_posthog = MagicMock()
+
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch("modelaudit.telemetry.Path.home") as mock_home,
+            patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
+            patch.dict(
+                os.environ,
+                {"CI": "", "IS_TESTING": "", "PROMPTFOO_DISABLE_TELEMETRY": "", "NO_ANALYTICS": ""},
+                clear=False,
+            ),
+        ):
+            mock_home.return_value = Path(temp_dir)
+            client = TelemetryClient()
+            client._posthog_client = mock_posthog
+            client._user_config.telemetry_enabled = True
+
+            sensitive_path = "/home/user/private/model.pkl"
+            sensitive_url = "https://example.com/model.bin?token=secret"
+
+            client.record_file_type_detected(sensitive_path, "pickle")
+            file_props = mock_posthog.capture.call_args.kwargs["properties"]
+            assert "file_path" not in file_props
+            assert "path_identifier" in file_props
+
+            client.record_issue_found("dangerous pattern", "critical", "pickle", sensitive_path)
+            issue_props = mock_posthog.capture.call_args.kwargs["properties"]
+            assert "file_path" not in issue_props
+            assert "path_identifier" in issue_props
+
+            client.record_download_started("http", sensitive_url)
+            download_props = mock_posthog.capture.call_args.kwargs["properties"]
+            assert "url" not in download_props
+            assert "url_identifier" in download_props
+
+    def test_telemetry_available_false_when_posthog_unavailable(self):
+        """Telemetry should be unavailable when transport client is missing."""
+        with (
+            patch("modelaudit.telemetry.POSTHOG_AVAILABLE", False),
+            patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch("modelaudit.telemetry.Path.home") as mock_home,
+            patch.dict(
+                os.environ,
+                {"CI": "", "IS_TESTING": "", "PROMPTFOO_DISABLE_TELEMETRY": "", "NO_ANALYTICS": ""},
+                clear=False,
+            ),
+            patch("modelaudit.telemetry._telemetry_client", None),
+        ):
+            mock_home.return_value = Path(temp_dir)
+            assert is_telemetry_available() is False
+
 
 class TestDataHandling:
     """Test data handling and sanitization."""
@@ -368,6 +469,17 @@ class TestTelemetryIntegration:
 
             # Should still work without PostHog
             assert client._posthog_client is None
+
+    @patch("modelaudit.core.record_issue_found")
+    def test_core_scan_emits_issue_found_telemetry(self, mock_record_issue_found):
+        """Core scans should emit issue telemetry for detected findings."""
+        from modelaudit.core import scan_model_directory_or_file
+
+        sample = Path(__file__).parent / "assets" / "samples" / "pickles" / "malicious_system_call.pkl"
+        result = scan_model_directory_or_file(str(sample))
+
+        assert len(result.issues) > 0
+        assert mock_record_issue_found.call_count > 0
 
 
 if __name__ == "__main__":
