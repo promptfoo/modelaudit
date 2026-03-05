@@ -31,7 +31,8 @@ Release-As: 1.0.0
 
 - **NEVER commit directly to main branch** - always create a feature branch
 - Use Conventional Commit format for ALL commit messages
-- **Do NOT manually edit CHANGELOG.md** - release-please auto-generates it
+- Add user-visible entries under `## [Unreleased]` in `CHANGELOG.md` during feature/fix work
+- release-please creates versioned release sections from commit history when the Release PR is merged
 - Keep commit messages concise and descriptive
 
 Examples:

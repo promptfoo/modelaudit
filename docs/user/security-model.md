@@ -22,6 +22,11 @@ ModelAudit is a static security scanner for model artifacts. It analyzes files a
 - Security decisions should combine scan output with provenance checks (source trust, signatures, checksums, release process).
 - High-risk findings should block promotion until reviewed and resolved.
 
+## Metadata extraction safety
+
+- `modelaudit metadata` defaults to non-deserializing extraction for untrusted inputs.
+- `--trust-loaders` may deserialize model content and should only be used on trusted artifacts in isolated environments.
+
 ## Interpreting scan results
 
 - `CRITICAL`: High-confidence risk indicator. Block release/use by default.
