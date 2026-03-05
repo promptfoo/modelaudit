@@ -174,6 +174,8 @@ def test_detect_torch7_formats_by_signature(tmp_path: Path) -> None:
     assert detect_file_format(str(fake_torch7)) == "unknown"
     assert detect_file_format_from_magic(str(fake_torch7)) == "unknown"
     assert validate_file_type(str(fake_torch7)) is False
+
+
 def test_detect_file_format_proto0_pickle_with_text_extension(tmp_path: Path) -> None:
     """Protocol 0 pickle payloads should be detected even with non-model extensions."""
     payload = tmp_path / "payload.txt"
@@ -606,7 +608,6 @@ def test_compressed_validation_valid_and_invalid_files(tmp_path: Path) -> None:
     bad_gzip_payload = tmp_path / "payload_bad.pkl.gz"
     bad_gzip_payload.write_bytes(bz2.compress(b"payload"))
     assert validate_file_type(str(bad_gzip_payload)) is False
-
 
 
 def test_detect_generic_xml_format(tmp_path):
