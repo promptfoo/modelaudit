@@ -6,6 +6,7 @@ Follows privacy-first principles with comprehensive opt-out controls.
 
 from __future__ import annotations
 
+import atexit
 import hashlib
 import json
 import logging
@@ -268,6 +269,11 @@ class TelemetryClient:
         self._posthog_client = None
         self._session_id = str(uuid.uuid4())
         self._telemetry_disabled_recorded = False
+        self._flush_immediately = os.getenv("MODELAUDIT_TELEMETRY_FLUSH_IMMEDIATELY", "").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
 
         # Initialize PostHog client if available and configured
         if POSTHOG_AVAILABLE and POSTHOG_PROJECT_KEY and not self._is_disabled():
@@ -280,6 +286,9 @@ class TelemetryClient:
             except Exception as e:
                 logger.debug(f"Failed to initialize PostHog client: {e}")
                 self._posthog_client = None
+
+        # Ensure any buffered events are flushed on process exit.
+        atexit.register(self.flush)
 
     def _is_disabled(self) -> bool:
         """Check if telemetry is disabled via environment variables or user config."""
@@ -320,8 +329,8 @@ class TelemetryClient:
 
             # PostHog v7 uses set() instead of identify()
             self._posthog_client.set(distinct_id=self._user_config.user_id, properties=properties)
-            # Flush immediately (matches Promptfoo's pattern)
-            self._posthog_client.flush()
+            if self._flush_immediately:
+                self._posthog_client.flush()
         except Exception as e:
             logger.debug(f"Failed to set user properties: {e}")
 
@@ -379,9 +388,8 @@ class TelemetryClient:
                 self._posthog_client.capture(
                     distinct_id=self._user_config.user_id, event=event.value, properties=event_properties
                 )
-                # Flush immediately to ensure events are sent before process exits
-                # (matches Promptfoo's pattern with flushInterval: 0)
-                self._posthog_client.flush()
+                if self._flush_immediately:
+                    self._posthog_client.flush()
             except Exception as e:
                 logger.debug(f"Failed to send event to PostHog: {e}")
 

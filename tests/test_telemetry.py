@@ -214,6 +214,38 @@ class TestTelemetryClient:
 
             # Should call PostHog capture
             mock_posthog.capture.assert_called_once()
+            mock_posthog.flush.assert_not_called()
+
+    def test_event_recording_can_flush_immediately_when_configured(self):
+        """Immediate flush can be enabled for low-latency delivery."""
+        mock_posthog = MagicMock()
+
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch("modelaudit.telemetry.Path.home") as mock_home,
+            patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
+            patch("modelaudit.telemetry.POSTHOG_AVAILABLE", True),
+            patch("modelaudit.telemetry.Posthog", return_value=mock_posthog),
+            patch.dict(
+                os.environ,
+                {
+                    "CI": "",
+                    "IS_TESTING": "",
+                    "PROMPTFOO_DISABLE_TELEMETRY": "",
+                    "NO_ANALYTICS": "",
+                    "MODELAUDIT_TELEMETRY_FLUSH_IMMEDIATELY": "1",
+                },
+                clear=False,
+            ),
+        ):
+            mock_home.return_value = Path(temp_dir)
+            client = TelemetryClient()
+            client._posthog_client = mock_posthog
+            client._user_config.telemetry_enabled = True
+
+            client.record_event(TelemetryEvent.COMMAND_USED, {"command": "test"})
+
+            mock_posthog.capture.assert_called_once()
             mock_posthog.flush.assert_called()
 
     def test_event_not_recorded_when_disabled(self):
