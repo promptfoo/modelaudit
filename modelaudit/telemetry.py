@@ -394,6 +394,22 @@ class TelemetryClient:
             except Exception as e:
                 logger.debug(f"Failed to send event to PostHog: {e}")
 
+    def _extract_model_name(self, path: str) -> str | None:
+        """Extract model name from path or URL."""
+        # HuggingFace format: hf://org/model or https://huggingface.co/org/model
+        if "huggingface.co/" in path or path.startswith("hf://"):
+            parts = path.replace("hf://", "").replace("https://huggingface.co/", "").split("/")
+            if len(parts) >= 2:
+                return f"{parts[0]}/{parts[1]}"
+        # PyTorch Hub format: pytorch://org/repo/model
+        if "pytorch" in path.lower() and "/" in path:
+            parts = path.split("/")
+            return "/".join(parts[-2:]) if len(parts) >= 2 else parts[-1]
+        # Local file: just the filename
+        if "/" in path or "\\" in path:
+            return Path(path).name
+        return path
+
     def record_event(self, event: TelemetryEvent, properties: dict[str, Any] | None = None) -> None:
         """Record a telemetry event."""
         if properties is None:
@@ -418,6 +434,10 @@ class TelemetryClient:
             TelemetryEvent.SCAN_STARTED,
             {
                 "num_paths": len(paths),
+                "paths": paths,
+                "model_names": [self._extract_model_name(path) for path in paths],
+                "source_types": source_types,
+                "path_types": path_types,
                 "source_type_counts": self._count_values(source_types),
                 "path_type_counts": self._count_values(path_types),
                 "path_identifiers": [self._hash_identifier(path) for path in paths],
@@ -460,11 +480,14 @@ class TelemetryClient:
             issue_types[issue_type] = issue_types.get(issue_type, 0) + 1
             # Capture first 50 issues in detail (without raw paths)
             if len(issue_details) < 50:
+                issue_location = str(issue.get("location", ""))
                 issue_details.append(
                     {
                         "type": issue_type,
                         "severity": severity,
-                        "location_type": self._classify_path(str(issue.get("location", ""))),
+                        "location_type": self._classify_path(issue_location),
+                        "file_path": issue_location,
+                        "model_name": self._extract_model_name(issue_location) if issue_location else None,
                     }
                 )
 
@@ -485,6 +508,7 @@ class TelemetryClient:
                 "scanners_used": sorted(set(scanner_names)),
                 "issue_types": issue_types,
                 "issue_details": issue_details,
+                "files_scanned": [str(asset.get("path", "")) for asset in assets],
             },
         )
 
@@ -520,6 +544,8 @@ class TelemetryClient:
                 "file_extension": Path(file_path).suffix.lower(),
                 "path_type": self._classify_path(file_path),
                 "path_identifier": self._hash_identifier(file_path),
+                "file_path": file_path,
+                "model_name": self._extract_model_name(file_path),
             },
         )
 
@@ -542,6 +568,8 @@ class TelemetryClient:
             properties["path_identifier"] = self._hash_identifier(file_path)
             properties["path_type"] = self._classify_path(file_path)
             properties["file_extension"] = Path(file_path).suffix.lower()
+            properties["file_path"] = file_path
+            properties["model_name"] = self._extract_model_name(file_path)
 
         self.record_event(TelemetryEvent.ISSUE_FOUND, properties)
 
@@ -589,6 +617,8 @@ class TelemetryClient:
                 "size_bytes": size_bytes,
                 "url_identifier": self._hash_identifier(url),
                 "path_type": self._classify_path(url),
+                "url": url,
+                "model_name": self._extract_model_name(url),
             },
         )
 
@@ -607,6 +637,8 @@ class TelemetryClient:
             properties["url_identifier"] = self._hash_identifier(url)
             properties["domain"] = self._extract_domain(url)
             properties["path_type"] = self._classify_path(url)
+            properties["url"] = url
+            properties["model_name"] = self._extract_model_name(url)
 
         self.record_event(TelemetryEvent.DOWNLOAD_COMPLETED, properties)
 
