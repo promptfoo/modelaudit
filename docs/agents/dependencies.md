@@ -19,7 +19,7 @@ ModelAudit uses optional dependencies to keep the base installation lightweight:
 | `onnx`        | `onnx`                                    | ONNX parsing/validation                                                 |
 | `dill`        | `dill`                                    | Extended pickle-family compatibility                                    |
 | `joblib`      | `joblib`, `scikit-learn`                  | Joblib/sklearn ecosystem compatibility                                  |
-| `flax`        | `msgpack`                                 | Flax/JAX msgpack checkpoint support                                     |
+| `flax`        | no extra package (uses base `msgpack`)    | Flax/JAX msgpack checkpoint support                                     |
 | `tflite`      | `tflite`                                  | TensorFlow Lite parsing                                                 |
 | `tensorflow`  | `tensorflow`                              | Optional TF runtime-dependent paths (for example checkpoint inspection) |
 | `xgboost`     | `xgboost`, `py-ubjson`                    | XGBoost UBJ/full validation paths                                       |

@@ -156,7 +156,7 @@ modelaudit cache [stats|clear|cleanup] [OPTIONS]
 
 Common scan options:
 
-```
+```text
 --format {text,json,sarif}   Output format (default: auto-detected)
 --output FILE                Write results to file
 --strict                     Fail on warnings, scan all file types, strict license validation
