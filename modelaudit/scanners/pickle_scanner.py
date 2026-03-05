@@ -4243,12 +4243,16 @@ class PickleScanner(BaseScanner):
                         ml_context,
                         issue_type="dangerous_global",
                     )
+                    rule_code = get_import_rule_code(mod, func)
+                    if not rule_code:
+                        rule_code = "S205"  # STACK_GLOBAL/GLOBAL fallback
                     result.add_check(
                         name="Advanced Global Reference Check",
                         passed=False,
                         message=f"Suspicious reference {mod}.{func}",
                         severity=severity,
                         location=self.current_file_path,
+                        rule_code=rule_code,
                         details={
                             "module": mod,
                             "function": func,

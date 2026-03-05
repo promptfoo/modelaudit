@@ -111,6 +111,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **rules:** preserve `rule_code` metadata through direct result aggregation and ensure dangerous advanced pickle globals emit explicit rule codes (with regression coverage)
 - **rules:** ignore unknown rule IDs in config files with warning logs, normalize rule-code casing in config parsing, and prevent invalid severity entries from being applied
 - **tests:** add scanner literal `rule_code` registry-consistency coverage to catch unknown rule identifiers early
 - **security**: harden pickle scanner stack resolution to correctly track `STACK_GLOBAL` and memoized `REDUCE` call targets, preventing decoy-string and `BINGET` bypasses

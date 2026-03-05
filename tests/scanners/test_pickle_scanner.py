@@ -237,6 +237,17 @@ class TestPickleScannerAdvanced(unittest.TestCase):
         ]
         assert len(os_issues) > 0, f"Expected OS-related issues, but found: {[i.message for i in result.issues]}"
 
+    def test_advanced_global_reference_issue_has_rule_code(self) -> None:
+        """Dangerous advanced global references should carry a rule code."""
+        scanner = PickleScanner()
+        result = scanner.scan(str(Path(__file__).parent.parent / "assets" / "pickles" / "stack_global_attack.pkl"))
+
+        advanced_issues = [i for i in result.issues if i.message.startswith("Suspicious reference ")]
+        assert advanced_issues, f"Expected advanced global issues, got: {[i.message for i in result.issues]}"
+        assert all(i.rule_code for i in advanced_issues), (
+            f"Expected rule codes on advanced global issues, got: {[i.rule_code for i in advanced_issues]}"
+        )
+
     def test_memo_object_tracking(self) -> None:
         scanner = PickleScanner()
         result = scanner.scan(str(Path(__file__).parent.parent / "assets" / "pickles" / "memo_attack.pkl"))

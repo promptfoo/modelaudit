@@ -29,7 +29,7 @@ from modelaudit.models import (
     create_initial_audit_result,
     rebuild_models,
 )
-from modelaudit.scanners.base import Issue, IssueSeverity
+from modelaudit.scanners.base import Issue, IssueSeverity, ScanResult
 
 
 class TestDetectorFinding:
@@ -518,6 +518,25 @@ class TestModelAuditResultModel:
         result = create_initial_audit_result()
         assert result["bytes_scanned"] == 0
         assert result.get("nonexistent", "default") == "default"
+
+    def test_aggregate_scan_result_direct_preserves_rule_code(self):
+        """Direct scan-result aggregation should preserve issue/check rule codes."""
+        result = create_initial_audit_result()
+        scan_result = ScanResult(scanner_name="test_scanner")
+        scan_result.add_check(
+            name="Dangerous Import Check",
+            passed=False,
+            message="import os",
+            severity=IssueSeverity.CRITICAL,
+            rule_code="S101",
+        )
+
+        result.aggregate_scan_result_direct(scan_result)
+
+        assert len(result.issues) == 1
+        assert len(result.checks) == 1
+        assert result.issues[0].rule_code == "S101"
+        assert result.checks[0].rule_code == "S101"
 
 
 class TestScanConfigModel:

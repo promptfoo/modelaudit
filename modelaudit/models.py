@@ -451,7 +451,7 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
         This is more efficient than converting to dict first and provides better type safety.
         """
         # Import here to avoid circular import
-        from ..scanners.base import Check, Issue, ScanResult  # type: ignore[import-untyped]
+        from .scanners.base import ScanResult
 
         if not isinstance(scan_result, ScanResult):
             raise TypeError(f"Expected ScanResult, got {type(scan_result)}")
@@ -478,6 +478,7 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
                     timestamp=issue.timestamp,
                     why=issue.why,
                     type=getattr(issue, "type", None),  # Include type if available
+                    rule_code=getattr(issue, "rule_code", None),
                 )
             )
 
@@ -493,6 +494,7 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
                     timestamp=check.timestamp,
                     severity=check.severity if check.severity else None,
                     why=check.why,
+                    rule_code=getattr(check, "rule_code", None),
                 )
             )
 
