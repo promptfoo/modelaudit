@@ -1094,7 +1094,7 @@ class TestCVE20251716PipMainBlocklist(unittest.TestCase):
 def test_scan_legitimate_pytorch_pickle_memory_error_is_non_failing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Memory limits on legitimate .pt files should be treated as non-failing scanner limitation."""
+    """Memory limits on legitimate .pt files should be surfaced as informational scanner limitation."""
     model_path = tmp_path / "legitimate_model.pt"
     header = b"\x80\x02ctorch\nOrderedDict\nq\x00."
     model_path.write_bytes(header + b"state_dict" + b"\x00" * (1024 * 1024 + 64))
@@ -1108,8 +1108,21 @@ def test_scan_legitimate_pytorch_pickle_memory_error_is_non_failing(
 
     resource_limit_checks = [check for check in result.checks if check.name == "Pickle Parse Resource Limit"]
     assert len(resource_limit_checks) == 1
-    assert resource_limit_checks[0].status == CheckStatus.PASSED
-    assert result.issues == []
+    resource_limit_check = resource_limit_checks[0]
+    assert resource_limit_check.status == CheckStatus.FAILED
+    assert resource_limit_check.severity == IssueSeverity.INFO
+    assert resource_limit_check.details["reason"] == "memory_limit_on_legitimate_model"
+    assert resource_limit_check.details["exception_type"] == "MemoryError"
+    assert resource_limit_check.details["analysis_incomplete"] is True
+    assert resource_limit_check.details["scanner_limitation"] is True
+
+    assert result.metadata["memory_limited"] is True
+    assert result.metadata["scanner_limitation"] is True
+    assert result.metadata["analysis_incomplete"] is True
+
+    info_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.INFO]
+    assert len(info_issues) == 1
+    assert info_issues[0].message == "Scan limited by model complexity and memory budget"
     assert not any(
         issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
         and "Unable to parse pickle file" in issue.message

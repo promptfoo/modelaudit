@@ -4839,7 +4839,9 @@ class PickleScanner(BaseScanner):
         except Exception as e:
             # Handle known issues with legitimate serialization files
             file_ext = os.path.splitext(self.current_file_path)[1].lower()
-            is_pytorch_like_ext = file_ext in {".bin", ".pt", ".pth", ".ckpt"}
+            # Keep this downgrade narrow: only canonical PyTorch checkpoint extensions.
+            # `.bin` is intentionally excluded due to spoofing risk.
+            is_pytorch_like_ext = file_ext in {".pt", ".pth", ".ckpt"}
 
             # Check for recursion errors on legitimate ML model files
             is_recursion_error = isinstance(e, RecursionError)
@@ -4861,8 +4863,11 @@ class PickleScanner(BaseScanner):
                     # If validation itself fails, treat as non-legitimate
                     is_legitimate_file = False
 
+            has_non_info_findings = any(
+                issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues
+            )
             is_memory_limit_on_legitimate_model = (
-                isinstance(e, MemoryError) and is_pytorch_like_ext and is_legitimate_file
+                isinstance(e, MemoryError) and is_pytorch_like_ext and is_legitimate_file and not has_non_info_findings
             )
 
             # Check if this is a known benign error in legitimate serialization files
@@ -4896,12 +4901,14 @@ class PickleScanner(BaseScanner):
                         "file_type": "legitimate_pytorch_model",
                         "opcodes_analyzed": opcode_count,
                         "scanner_limitation": True,
+                        "analysis_incomplete": True,
                     }
                 )
                 result.add_check(
                     name="Pickle Parse Resource Limit",
-                    passed=True,
+                    passed=False,
                     message="Scan limited by model complexity and memory budget",
+                    severity=IssueSeverity.INFO,
                     location=self.current_file_path,
                     details={
                         "reason": "memory_limit_on_legitimate_model",
@@ -4909,6 +4916,8 @@ class PickleScanner(BaseScanner):
                         "file_size": file_size,
                         "file_format": file_ext,
                         "exception_type": "MemoryError",
+                        "scanner_limitation": True,
+                        "analysis_incomplete": True,
                     },
                     why=(
                         "This file appears to be a legitimate PyTorch pickle, but analysis hit memory limits while "

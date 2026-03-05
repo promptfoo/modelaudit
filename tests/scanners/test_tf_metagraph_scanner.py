@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 from pathlib import Path
 from typing import cast
 
@@ -19,11 +20,10 @@ pytestmark = pytest.mark.skipif(not _has_tf_protos(), reason="TensorFlow protobu
 
 
 def _get_metagraph_class() -> type:
-    from tensorflow.core.protobuf.meta_graph_pb2 import MetaGraphDef
-
     import modelaudit.protos  # noqa: F401
 
-    return MetaGraphDef
+    meta_graph_pb2 = importlib.import_module("tensorflow.core.protobuf.meta_graph_pb2")
+    return meta_graph_pb2.MetaGraphDef
 
 
 def _build_metagraph(

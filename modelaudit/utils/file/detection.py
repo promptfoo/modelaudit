@@ -439,8 +439,6 @@ def detect_file_format(path: str) -> str:
         return "unknown"
     # TorchServe .mar archives are ZIP-based and route to a dedicated scanner.
     if ext == ".mar":
-        if magic4.startswith(b"PK"):
-            return "torchserve_mar"
         return "torchserve_mar"
 
     # Check ZIP magic first (for .pt/.pth files that are actually zips)
@@ -587,9 +585,6 @@ def detect_file_format(path: str) -> str:
         ".txz",
     ):
         return "tar"
-    if ext == ".mar":
-        return "torchserve_mar"
-
     return "unknown"
 
 

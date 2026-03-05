@@ -1,5 +1,6 @@
 import bz2
 import gzip
+import importlib
 import io
 import lzma
 import struct
@@ -27,11 +28,10 @@ def _has_tf_protos() -> bool:
 
 
 def _build_tf_metagraph_bytes() -> bytes:
-    from tensorflow.core.protobuf.meta_graph_pb2 import MetaGraphDef
-
     import modelaudit.protos  # noqa: F401
 
-    metagraph = MetaGraphDef()
+    meta_graph_pb2 = importlib.import_module("tensorflow.core.protobuf.meta_graph_pb2")
+    metagraph = meta_graph_pb2.MetaGraphDef()
     metagraph.meta_info_def.meta_graph_version = "test_meta_graph"
     metagraph.meta_info_def.tags.append("serve")
     node = metagraph.graph_def.node.add()

