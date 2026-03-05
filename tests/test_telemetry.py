@@ -297,6 +297,12 @@ class TestTelemetryClient:
                 "issues": [
                     {"message": "Issue A", "severity": "critical", "location": "/tmp/a.pkl"},
                     {"message": "Issue B", "severity": "warning", "location": "/tmp/b.zip"},
+                    {
+                        "type": "pickle_dangerous_global",
+                        "message": "Legacy message should not be used when type exists",
+                        "severity": "info",
+                        "location": "/tmp/a.pkl",
+                    },
                 ],
             }
 
@@ -304,11 +310,14 @@ class TestTelemetryClient:
             properties = mock_posthog.capture.call_args.kwargs["properties"]
 
             assert properties["total_files"] == 2
-            assert properties["total_issues"] == 2
+            assert properties["total_issues"] == 3
             assert properties["issue_types"]["Issue A"] == 1
             assert properties["issue_types"]["Issue B"] == 1
+            assert properties["issue_types"]["pickle_dangerous_global"] == 1
+            assert "Legacy message should not be used when type exists" not in properties["issue_types"]
             assert properties["issue_severities"]["critical"] == 1
             assert properties["issue_severities"]["warning"] == 1
+            assert properties["issue_severities"]["info"] == 1
             assert properties["file_types"]["pickle"] == 1
             assert properties["file_types"]["zip"] == 1
             assert sorted(properties["scanners_used"]) == ["pickle", "zip"]

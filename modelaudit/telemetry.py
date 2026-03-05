@@ -454,6 +454,7 @@ class TelemetryClient:
         issue_details: list[dict[str, Any]] = []
 
         for issue in issues:
+            # Prefer structured issue type when available, fall back to message for legacy payloads.
             issue_type = str(issue.get("type") or issue.get("message") or "unknown")
             severity = str(issue.get("severity", "unknown"))
             issue_types[issue_type] = issue_types.get(issue_type, 0) + 1
