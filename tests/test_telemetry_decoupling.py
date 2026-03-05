@@ -207,10 +207,13 @@ class TestTelemetryFunctionalityWhenWorking:
 
     def test_telemetry_works_when_enabled_and_available(self):
         """Test that telemetry actually works when properly configured."""
+        mock_posthog = MagicMock()
         with (
             tempfile.TemporaryDirectory() as temp_dir,
             patch("modelaudit.telemetry.Path.home") as mock_home,
             patch("modelaudit.telemetry._IS_DEVELOPMENT", False),  # Simulate production
+            patch("modelaudit.telemetry.POSTHOG_AVAILABLE", True),
+            patch("modelaudit.telemetry.Posthog", return_value=mock_posthog),
             patch.dict(
                 os.environ,
                 {"CI": "", "IS_TESTING": "", "PROMPTFOO_DISABLE_TELEMETRY": "", "NO_ANALYTICS": ""},

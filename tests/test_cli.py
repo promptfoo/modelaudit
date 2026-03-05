@@ -1419,3 +1419,22 @@ class TestScanGlobFailFast:
         assert duration_arg >= 0.0
         assert mock_record_failed.call_args[0][1] == "No matching paths"
         mock_flush.assert_called_once()
+
+    @patch("modelaudit.cli.record_scan_failed")
+    @patch("modelaudit.cli.flush_telemetry")
+    def test_scan_invalid_max_size_records_telemetry(self, mock_flush, mock_record_failed, tmp_path):
+        """Invalid --max-size should record telemetry failure and flush before exit."""
+        runner = CliRunner()
+        target = tmp_path / "model.pkl"
+        target.write_bytes(b"content")
+
+        result = runner.invoke(cli, ["scan", str(target), "--max-size", "not-a-size"])
+
+        assert result.exit_code == 2
+        assert "Error parsing --max-size" in result.output
+        mock_record_failed.assert_called_once()
+        duration_arg = mock_record_failed.call_args[0][0]
+        assert isinstance(duration_arg, float)
+        assert duration_arg >= 0.0
+        assert "Invalid max-size" in mock_record_failed.call_args[0][1]
+        mock_flush.assert_called_once()

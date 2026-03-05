@@ -231,6 +231,9 @@ def auth() -> None:
 @click.option("-k", "--api-key", help="Login using an API key.")
 def login(org_id: str | None, host: str | None, api_key: str | None) -> None:
     """Login"""
+    import time
+
+    start_time = time.time()
     try:
         token = None
         api_host = host or cloud_config.get_api_host()
@@ -250,6 +253,7 @@ def login(org_id: str | None, host: str | None, api_key: str | None) -> None:
                     style_text(f"Updating local email configuration from {existing_email} to {user.email}", fg="yellow")
                 )
             set_user_email(user.email)
+            record_command_used("auth_login", duration=time.time() - start_time, success=True, api_key_login=True)
             click.echo(style_text("Successfully logged in", fg="green"))
             return
         else:
@@ -260,11 +264,18 @@ def login(org_id: str | None, host: str | None, api_key: str | None) -> None:
                 f"After logging in, you can get your api token at "
                 f"{style_text('https://promptfoo.app/welcome', fg='green')}"
             )
+            record_command_used("auth_login", duration=time.time() - start_time, success=False, api_key_login=False)
 
         return
 
     except Exception as error:
         error_message = str(error)
+        record_command_used(
+            "auth_login",
+            duration=time.time() - start_time,
+            success=False,
+            error_type=type(error).__name__,
+        )
         click.echo(f"Authentication failed: {error_message}", err=True)
         sys.exit(1)
 
@@ -272,16 +283,21 @@ def login(org_id: str | None, host: str | None, api_key: str | None) -> None:
 @auth.command()
 def logout() -> None:
     """Logout"""
+    import time
+
+    start_time = time.time()
     email = get_user_email()
     api_key = cloud_config.get_api_key()
 
     if not email and not api_key:
+        record_command_used("auth_logout", duration=time.time() - start_time, success=True, was_logged_in=False)
         click.echo(style_text("You're already logged out - no active session to terminate", fg="yellow"))
         return
 
     cloud_config.delete()
     # Always unset email on logout
     set_user_email("")
+    record_command_used("auth_logout", duration=time.time() - start_time, success=True, was_logged_in=True)
     click.echo(style_text("Successfully logged out", fg="green"))
     return
 
@@ -289,11 +305,15 @@ def logout() -> None:
 @auth.command()
 def whoami() -> None:
     """Show current user information"""
+    import time
+
+    start_time = time.time()
     try:
         email = get_user_email()
         api_key = cloud_config.get_api_key()
 
         if not email or not api_key:
+            record_command_used("auth_whoami", duration=time.time() - start_time, success=False, logged_in=False)
             click.echo(f"Not logged in. Run {style_text('modelaudit auth login', bold=True)} to login.")
             return
 
@@ -308,9 +328,16 @@ def whoami() -> None:
 
         # Record telemetry (stub for now)
         # telemetry.record('command_used', {'name': 'auth whoami'})
+        record_command_used("auth_whoami", duration=time.time() - start_time, success=True, logged_in=True)
 
     except Exception as error:
         error_message = str(error)
+        record_command_used(
+            "auth_whoami",
+            duration=time.time() - start_time,
+            success=False,
+            error_type=type(error).__name__,
+        )
         click.echo(f"Failed to get user info: {error_message}", err=True)
         sys.exit(1)
 
@@ -326,6 +353,9 @@ def cache() -> None:
 @click.option("--dry-run", is_flag=True, help="Show what would be cleared without actually clearing")
 def clear(cache_dir: str | None, dry_run: bool) -> None:
     """Clear the entire scan results cache"""
+    import time
+
+    start_time = time.time()
     from .cache import get_cache_manager
 
     try:
@@ -336,6 +366,13 @@ def clear(cache_dir: str | None, dry_run: bool) -> None:
             total_entries = stats.get("total_entries", 0)
             total_size_mb = stats.get("total_size_mb", 0.0)
 
+            record_command_used(
+                "cache_clear",
+                duration=time.time() - start_time,
+                success=True,
+                dry_run=True,
+                entries=total_entries,
+            )
             click.echo(f"Would clear {total_entries} cache entries ({total_size_mb:.1f}MB)")
             return
 
@@ -348,19 +385,47 @@ def clear(cache_dir: str | None, dry_run: bool) -> None:
         try:
             cache_manager.clear()
             success_msg = f"Cleared {total_entries} cache entries ({total_size_mb:.1f}MB)"
+            record_command_used(
+                "cache_clear",
+                duration=time.time() - start_time,
+                success=True,
+                dry_run=False,
+                entries=total_entries,
+            )
             click.echo(style_text(success_msg, fg="green"))
         except PermissionError as e:
             error_msg = f"Permission denied while clearing cache: {e}"
+            record_command_used(
+                "cache_clear",
+                duration=time.time() - start_time,
+                success=False,
+                dry_run=False,
+                error_type=type(e).__name__,
+            )
             click.echo(style_text(error_msg, fg="red"), err=True)
             click.echo("Try running with elevated permissions or check cache directory permissions.", err=True)
             sys.exit(1)
         except OSError as e:
             error_msg = f"File system error while clearing cache: {e}"
+            record_command_used(
+                "cache_clear",
+                duration=time.time() - start_time,
+                success=False,
+                dry_run=False,
+                error_type=type(e).__name__,
+            )
             click.echo(style_text(error_msg, fg="red"), err=True)
             sys.exit(1)
 
     except Exception as e:
         error_msg = f"Failed to clear cache: {e}"
+        record_command_used(
+            "cache_clear",
+            duration=time.time() - start_time,
+            success=False,
+            dry_run=dry_run,
+            error_type=type(e).__name__,
+        )
         click.echo(style_text(error_msg, fg="red"), err=True)
         sys.exit(1)
 
@@ -371,6 +436,9 @@ def clear(cache_dir: str | None, dry_run: bool) -> None:
 @click.option("--dry-run", is_flag=True, help="Show what would be cleaned without actually cleaning")
 def cleanup(cache_dir: str | None, max_age: int, dry_run: bool) -> None:
     """Clean up old cache entries"""
+    import time
+
+    start_time = time.time()
     from .cache import get_cache_manager
 
     try:
@@ -383,12 +451,28 @@ def cleanup(cache_dir: str | None, max_age: int, dry_run: bool) -> None:
             total_entries = stats.get("total_entries", 0)
             total_size_mb = stats.get("total_size_mb", 0.0)
 
+            record_command_used(
+                "cache_cleanup",
+                duration=time.time() - start_time,
+                success=True,
+                dry_run=True,
+                max_age=max_age,
+                entries=total_entries,
+            )
             click.echo(f"Would cleanup cache entries older than {max_age} days")
             click.echo(f"Current cache: {total_entries} entries ({total_size_mb:.1f}MB)")
             return
 
         # Clean up old entries
         removed_count = cache_manager.cleanup(max_age)
+        record_command_used(
+            "cache_cleanup",
+            duration=time.time() - start_time,
+            success=True,
+            dry_run=False,
+            max_age=max_age,
+            removed_count=removed_count,
+        )
 
         if removed_count > 0:
             success_msg = f"Removed {removed_count} old cache entries (>{max_age} days old)"
@@ -398,6 +482,14 @@ def cleanup(cache_dir: str | None, max_age: int, dry_run: bool) -> None:
 
     except Exception as e:
         error_msg = f"Failed to cleanup cache: {e}"
+        record_command_used(
+            "cache_cleanup",
+            duration=time.time() - start_time,
+            success=False,
+            dry_run=dry_run,
+            max_age=max_age,
+            error_type=type(e).__name__,
+        )
         click.echo(style_text(error_msg, fg="red"), err=True)
         sys.exit(1)
 
@@ -406,6 +498,9 @@ def cleanup(cache_dir: str | None, max_age: int, dry_run: bool) -> None:
 @click.option("--cache-dir", type=click.Path(), help="Cache directory path [default: ~/.modelaudit/cache/scan_results]")
 def stats(cache_dir: str | None) -> None:
     """Show cache statistics"""
+    import time
+
+    start_time = time.time()
     from .cache import get_cache_manager
 
     try:
@@ -417,6 +512,7 @@ def stats(cache_dir: str | None) -> None:
 
         enabled = stats.get("enabled", False)
         if not enabled:
+            record_command_used("cache_stats", duration=time.time() - start_time, success=True, enabled=False)
             click.echo(style_text("Cache is disabled", fg="yellow"))
             return
 
@@ -436,8 +532,19 @@ def stats(cache_dir: str | None) -> None:
             avg_size_kb = (total_size_mb * 1024) / total_entries
             click.echo(f"Average entry size: {avg_size_kb:.1f}KB")
 
+        record_command_used(
+            "cache_stats",
+            duration=time.time() - start_time,
+            success=True,
+            enabled=True,
+            entries=total_entries,
+        )
+
     except Exception as e:
         error_msg = f"Failed to get cache stats: {e}"
+        record_command_used(
+            "cache_stats", duration=time.time() - start_time, success=False, error_type=type(e).__name__
+        )
         click.echo(style_text(error_msg, fg="red"), err=True)
         sys.exit(1)
 
@@ -606,7 +713,7 @@ def scan_command(
     telemetry_options = {
         "format": format,
         "timeout": timeout,
-        "max_size": max_size,
+        "max_file_size": max_size,
         "has_blacklist": bool(blacklist),
         "num_blacklist_patterns": len(blacklist) if blacklist else 0,
         "progress": progress,
@@ -689,6 +796,8 @@ def scan_command(
             user_overrides["max_total_size"] = parse_size_string(max_size)
         except ValueError as e:
             click.echo(f"Error parsing --max-size: {e}", err=True)
+            record_scan_failed(time.time() - scan_start_time, f"Invalid max-size: {e}")
+            flush_telemetry()
             import sys as sys_module
 
             sys_module.exit(2)
@@ -995,7 +1104,7 @@ def scan_command(
 
                             # Record download/scan completion for streaming mode
                             download_duration = time.time() - download_start
-                            record_download_completed("huggingface", download_duration, 0)
+                            record_download_completed("huggingface", download_duration, 0, path)
 
                             if show_styled_output:
                                 click.echo(style_text("✅ Streaming scan complete", fg="green", bold=True))
@@ -1024,9 +1133,9 @@ def scan_command(
                                 download_size = sum(
                                     f.stat().st_size for f in Path(download_path).rglob("*") if f.is_file()
                                 )
-                                record_download_completed("huggingface", download_duration, download_size)
+                                record_download_completed("huggingface", download_duration, download_size, path)
                             except Exception:
-                                record_download_completed("huggingface", download_duration, 0)
+                                record_download_completed("huggingface", download_duration, 0, path)
 
                             if download_spinner:
                                 download_spinner.ok(style_text("✅ Downloaded", fg="green", bold=True))
@@ -1099,7 +1208,7 @@ def scan_command(
 
                             # Record download/scan completion for streaming mode
                             download_duration = time.time() - download_start
-                            record_download_completed("pytorch_hub", download_duration, 0)
+                            record_download_completed("pytorch_hub", download_duration, 0, path)
 
                             if show_styled_output:
                                 click.echo(style_text("✅ Streaming scan complete", fg="green", bold=True))
@@ -1130,9 +1239,9 @@ def scan_command(
                                 download_size = sum(
                                     f.stat().st_size for f in Path(download_path).rglob("*") if f.is_file()
                                 )
-                                record_download_completed("pytorch_hub", download_duration, download_size)
+                                record_download_completed("pytorch_hub", download_duration, download_size, path)
                             except Exception:
-                                record_download_completed("pytorch_hub", download_duration, 0)
+                                record_download_completed("pytorch_hub", download_duration, 0, path)
 
                             if download_spinner:
                                 download_spinner.ok(style_text("✅ Downloaded", fg="green", bold=True))
@@ -1210,6 +1319,11 @@ def scan_command(
                     # Normal download mode
                     download_spinner = None  # Initialize for error handling
                     try:
+                        # Record download start and feature usage
+                        record_download_started("cloud_storage", path)
+                        record_feature_used("cloud_storage_download", cache_enabled=final_cache)
+                        download_start = time.time()
+
                         if final_scan_and_delete:
                             # STREAMING MODE: Download files one-by-one, scan, delete
                             from .core import scan_model_streaming
@@ -1245,6 +1359,10 @@ def scan_command(
                             # Merge streaming results
                             audit_result.aggregate_scan_result(streaming_result.model_dump())
 
+                            # Record download/scan completion for streaming mode
+                            download_duration = time.time() - download_start
+                            record_download_completed("cloud_storage", download_duration, 0, path)
+
                             if show_styled_output:
                                 click.echo(style_text("✅ Streaming scan complete", fg="green", bold=True))
 
@@ -1275,6 +1393,16 @@ def scan_command(
                             )
                             actual_path = str(download_path)
                             temp_dir = str(download_path) if not final_cache else None  # Don't clean up cached files
+
+                            # Record download completion
+                            download_duration = time.time() - download_start
+                            try:
+                                download_size = sum(
+                                    f.stat().st_size for f in Path(download_path).rglob("*") if f.is_file()
+                                )
+                                record_download_completed("cloud_storage", download_duration, download_size, path)
+                            except Exception:
+                                record_download_completed("cloud_storage", download_duration, 0, path)
 
                             if download_spinner:
                                 download_spinner.ok(style_text("✅ Downloaded", fg="green", bold=True))
@@ -1318,6 +1446,11 @@ def scan_command(
                         click.echo(f"Downloading from {path}...")
 
                     try:
+                        # Record download start and feature usage
+                        record_download_started("mlflow", path)
+                        record_feature_used("mlflow_download")
+                        download_start = time.time()
+
                         from .integrations.mlflow import scan_mlflow_model
 
                         # Use scan_mlflow_model to download and get scan results directly
@@ -1337,6 +1470,7 @@ def scan_command(
 
                         # Aggregate results directly from MLflow scan using Pydantic model
                         audit_result.aggregate_scan_result(results.model_dump())
+                        record_download_completed("mlflow", time.time() - download_start, results.bytes_scanned, path)
 
                         # Skip the normal scanning logic since we already have results
                         continue
@@ -1364,6 +1498,11 @@ def scan_command(
                         click.echo(f"Downloading and scanning from {path}...")
 
                     try:
+                        # Record download start and feature usage
+                        record_download_started("jfrog", path)
+                        record_feature_used("jfrog_download")
+                        download_start = time.time()
+
                         # Use the integrated JFrog scanning function
                         jfrog_results: ModelAuditResultModel = scan_jfrog_artifact(
                             path,
@@ -1384,6 +1523,9 @@ def scan_command(
 
                         # Aggregate results using Pydantic model
                         audit_result.aggregate_scan_result(jfrog_results.model_dump())
+                        record_download_completed(
+                            "jfrog", time.time() - download_start, jfrog_results.bytes_scanned, path
+                        )
 
                         continue  # Skip the regular scanning flow
 
@@ -2263,6 +2405,9 @@ def _display_failure_details(summary: dict[str, Any]) -> None:
 )
 def metadata(path: str, output_format: str, output: str | None, security_only: bool, trust_loaders: bool) -> None:
     """Extract and display model metadata."""
+    import time
+
+    start_time = time.time()
     from .metadata_extractor import ModelMetadataExtractor
 
     try:
@@ -2289,7 +2434,24 @@ def metadata(path: str, output_format: str, output: str | None, security_only: b
         else:
             click.echo(output_text)
 
+        record_command_used(
+            "metadata",
+            duration=time.time() - start_time,
+            success=True,
+            format=output_format,
+            security_only=security_only,
+            trust_loaders=trust_loaders,
+            output_file=bool(output),
+        )
+
     except Exception as e:
+        record_command_used(
+            "metadata",
+            duration=time.time() - start_time,
+            success=False,
+            format=output_format,
+            error_type=type(e).__name__,
+        )
         click.secho(f"Error extracting metadata: {e}", fg="red")
         sys.exit(1)
 
@@ -2340,9 +2502,11 @@ def _format_metadata_table(metadata: dict[str, Any]) -> str:
 def doctor(show_failed: bool) -> None:
     """Diagnose scanner availability and dependencies"""
     import sys
+    import time
 
     from .scanners import _registry
 
+    start_time = time.time()
     click.echo("ModelAudit Scanner Diagnostic Report")
     click.echo("=" * 40)
 
@@ -2405,6 +2569,14 @@ def doctor(show_failed: bool) -> None:
         click.echo("• Run 'modelaudit doctor --show-failed' for detailed error messages")
     else:
         click.secho("\n✓ All scanners loaded successfully!", fg="green")
+
+    record_command_used(
+        "doctor",
+        duration=time.time() - start_time,
+        success=True,
+        show_failed=show_failed,
+        failed_scanners=summary["failed_scanners"],
+    )
 
 
 def display_rules(rules: dict[str, Rule], output_format: str) -> None:
@@ -2874,6 +3046,9 @@ def debug(output_json: bool, verbose: bool) -> None:
         modelaudit debug --json             # Raw JSON for scripting
         modelaudit debug --verbose          # Include detailed scanner errors
     """
+    import time
+
+    start_time = time.time()
     # Build debug info dictionary
     debug_info: dict[str, Any] = {
         "version": __version__,
@@ -2893,6 +3068,10 @@ def debug(output_json: bool, verbose: bool) -> None:
     else:
         # Pretty-printed output with quick diagnosis
         click.echo(_format_debug_output(debug_info, verbose))
+
+    record_command_used(
+        "debug", duration=time.time() - start_time, success=True, output_json=output_json, verbose=verbose
+    )
 
 
 def main() -> None:
