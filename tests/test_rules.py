@@ -3,6 +3,8 @@
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from modelaudit.config import ModelAuditConfig, reset_config, set_config
 from modelaudit.rules import RuleRegistry, Severity
 from modelaudit.scanners.base import Issue, IssueSeverity, ScanResult
@@ -150,6 +152,19 @@ S701 = "CRITICAL"
         assert "S801" in config.suppress
         assert config.severity["S301"] == Severity.HIGH
         assert config.severity["S701"] == Severity.CRITICAL
+
+    def test_from_cli_args_rejects_unknown_rule_codes(self):
+        """Unknown CLI rule codes should fail fast."""
+        with pytest.raises(ValueError, match="Unknown rule code"):
+            ModelAuditConfig.from_cli_args(suppress=["S9999"])
+
+        with pytest.raises(ValueError, match="Unknown rule code"):
+            ModelAuditConfig.from_cli_args(severity={"S9999": "CRITICAL"})
+
+    def test_from_cli_args_rejects_invalid_severity(self):
+        """Invalid CLI severity values should fail fast."""
+        with pytest.raises(ValueError, match="Invalid severity"):
+            ModelAuditConfig.from_cli_args(severity={"S301": "SEVERE"})
 
     def test_ignore_range_expansion(self):
         """Test that ignore ranges expand correctly."""

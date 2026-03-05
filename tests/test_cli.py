@@ -105,6 +105,45 @@ def test_scan_command_help():
     assert "Defaults:" in result.output or "Automatic defaults:" in result.output
 
 
+def test_scan_invalid_severity_level_option(tmp_path):
+    """Invalid severity override values should fail fast."""
+    test_file = tmp_path / "test_file.dat"
+    test_file.write_bytes(b"test content")
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", str(test_file), "--severity", "S101=SEVERE"])
+
+    assert result.exit_code == 2
+    assert "Invalid severity level" in result.output
+    assert "CRITICAL" in result.output
+
+
+def test_scan_unknown_rule_code_in_severity_option(tmp_path):
+    """Unknown rule codes in --severity should fail fast."""
+    test_file = tmp_path / "test_file.dat"
+    test_file.write_bytes(b"test content")
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", str(test_file), "--severity", "S9999=CRITICAL"])
+
+    assert result.exit_code == 2
+    assert "Unknown rule code" in result.output
+    assert "S9999" in result.output
+
+
+def test_scan_unknown_rule_code_in_suppress_option(tmp_path):
+    """Unknown rule codes in --suppress should fail fast."""
+    test_file = tmp_path / "test_file.dat"
+    test_file.write_bytes(b"test content")
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", str(test_file), "--suppress", "S9999"])
+
+    assert result.exit_code == 2
+    assert "Unknown rule code" in result.output
+    assert "S9999" in result.output
+
+
 def test_scan_nonexistent_file():
     """Test scanning a nonexistent file."""
     runner = CliRunner()

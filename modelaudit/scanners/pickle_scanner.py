@@ -3903,16 +3903,25 @@ class PickleScanner(BaseScanner):
             context=self.current_file_path,
         )
 
-        # Create single aggregated checks for the file (only if checks are enabled)
+        # Emit explicit checks for the file (only if checks are enabled)
         check_jit = self._get_bool_config("check_jit_script", True)
         if check_jit:
-            self.summarize_jit_script_findings(jit_findings, result, context=self.current_file_path)
+            self.add_jit_script_findings(
+                jit_findings,
+                result,
+                model_type="pytorch",
+                context=self.current_file_path,
+            )
         else:
             result.metadata.setdefault("disabled_checks", []).append("JIT/Script Code Execution Detection")
 
         check_net = self._get_bool_config("check_network_comm", True)
         if check_net:
-            self.summarize_network_communication_findings(network_findings, result, context=self.current_file_path)
+            self.add_network_communication_findings(
+                network_findings,
+                result,
+                context=self.current_file_path,
+            )
         else:
             result.metadata.setdefault("disabled_checks", []).append("Network Communication Detection")
 

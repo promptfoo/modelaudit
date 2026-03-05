@@ -28,7 +28,7 @@ from .core import determine_exit_code, scan_model_directory_or_file
 from .integrations.jfrog import scan_jfrog_artifact
 from .integrations.sarif_formatter import format_sarif_output
 from .models import ModelAuditResultModel
-from .rules import Rule, RuleRegistry
+from .rules import Rule, RuleRegistry, Severity
 from .scanners.base import IssueSeverity
 from .telemetry import (
     flush_telemetry,
@@ -102,6 +102,7 @@ def expand_paths(paths: tuple[str, ...]) -> tuple[list[str], list[str]]:
 def parse_severity_overrides(values: tuple[str, ...]) -> dict[str, str]:
     """Parse CLI severity override arguments of the form CODE=LEVEL."""
     overrides: dict[str, str] = {}
+    valid_levels = {severity.value for severity in Severity}
     for entry in values:
         if "=" not in entry:
             raise click.BadParameter("Severity overrides must use CODE=LEVEL format (e.g., S101=CRITICAL)")
@@ -110,6 +111,11 @@ def parse_severity_overrides(values: tuple[str, ...]) -> dict[str, str]:
         level = level.strip().upper()
         if not code or not level:
             raise click.BadParameter("Severity overrides must include both a rule code and a severity level")
+        if RuleRegistry.get_rule(code) is None:
+            raise click.BadParameter(f"Unknown rule code '{code}' in --severity override")
+        if level not in valid_levels:
+            allowed = ", ".join(sorted(valid_levels))
+            raise click.BadParameter(f"Invalid severity level '{level}'. Allowed values: {allowed}")
         overrides[code] = level
     return overrides
 
@@ -659,10 +665,13 @@ def scan_command(
 
     # Apply rule configuration from CLI and config files
     severity_overrides = parse_severity_overrides(severity)
-    cli_config = ModelAuditConfig.from_cli_args(
-        suppress=list(suppress) if suppress else None,
-        severity=severity_overrides if severity_overrides else None,
-    )
+    try:
+        cli_config = ModelAuditConfig.from_cli_args(
+            suppress=list(suppress) if suppress else None,
+            severity=severity_overrides if severity_overrides else None,
+        )
+    except ValueError as exc:
+        raise click.BadParameter(str(exc)) from exc
     set_config(cli_config)
 
     # Generate defaults based on input analysis

@@ -855,64 +855,7 @@ class BaseScanner(ABC):
 
             detector = JITScriptDetector(self.config.get("jit_script_config"))
             findings = detector.scan_model(data, model_type, context)
-
-            for finding in findings:
-                severity_map = {
-                    "CRITICAL": IssueSeverity.CRITICAL,
-                    "WARNING": IssueSeverity.WARNING,
-                    "INFO": IssueSeverity.INFO,
-                }
-                # Handle both dict and Pydantic model findings
-                if hasattr(finding, "model_dump"):
-                    # Pydantic model (JITScriptFinding)
-                    severity_value = finding.severity if isinstance(finding.severity, str) else finding.severity.value
-                    severity = severity_map.get(severity_value, IssueSeverity.WARNING)
-                    message = finding.message
-                    location = finding.context
-                    recommendation = finding.recommendation or "Review JIT/Script code for security"
-                    details = finding.model_dump()
-                elif hasattr(finding, "get"):
-                    # Dict format (backward compatibility)
-                    severity = severity_map.get(finding.get("severity", "WARNING"), IssueSeverity.WARNING)
-                    message = finding.get("message", "JIT/Script code risk detected")
-                    location = finding.get("context", context)
-                    recommendation = finding.get("recommendation", "Review JIT/Script code for security")
-                    details = dict(finding)  # Ensure it's a dict
-                else:
-                    # Object with attributes but not Pydantic
-                    severity_value = getattr(finding, "severity", "WARNING")
-                    severity = severity_map.get(severity_value, IssueSeverity.WARNING)
-                    message = getattr(finding, "message", "JIT/Script code risk detected")
-                    location = getattr(finding, "context", context)
-                    recommendation = getattr(finding, "recommendation", "Review JIT/Script code for security")
-                    details = finding.__dict__ if hasattr(finding, "__dict__") else {"object": str(finding)}
-                jit_indicator = f"{details.get('type', '')} {message} {model_type}".strip()
-                jit_rule_code = get_embedded_code_rule_code(jit_indicator)
-                if not jit_rule_code:
-                    # JIT detector findings should consistently map to the JIT/TorchScript rule family.
-                    jit_rule_code = get_embedded_code_rule_code("jit")
-
-                result.add_check(
-                    name="JIT/Script Code Execution Detection",
-                    passed=False,
-                    message=message,
-                    rule_code=jit_rule_code,
-                    severity=severity,
-                    location=location,
-                    details=details,
-                    why=recommendation,
-                )
-
-            # Add a passing check if no risks were found
-            if not findings and context:
-                result.add_check(
-                    name="JIT/Script Code Execution Detection",
-                    passed=True,
-                    message="No JIT/Script code execution risks detected",
-                    location=context,
-                )
-
-            return len(findings)
+            return self.add_jit_script_findings(findings, result, model_type=model_type, context=context)
 
         except ImportError:
             # JITScriptDetector not available, log as debug
@@ -921,6 +864,70 @@ class BaseScanner(ABC):
         except Exception as e:
             logger.warning(f"Error checking for JIT/Script code: {e}")
             return 0
+
+    def add_jit_script_findings(
+        self,
+        findings: list[Any],
+        result: ScanResult,
+        model_type: str = "unknown",
+        context: str = "",
+    ) -> int:
+        """Emit explicit JIT/Script checks from detector findings and return the count."""
+        severity_map = {
+            "CRITICAL": IssueSeverity.CRITICAL,
+            "WARNING": IssueSeverity.WARNING,
+            "INFO": IssueSeverity.INFO,
+        }
+
+        for finding in findings:
+            # Handle both dict and Pydantic model findings.
+            if hasattr(finding, "model_dump"):
+                severity_value = finding.severity if isinstance(finding.severity, str) else finding.severity.value
+                severity = severity_map.get(severity_value, IssueSeverity.WARNING)
+                message = finding.message
+                location = finding.context
+                recommendation = finding.recommendation or "Review JIT/Script code for security"
+                details = finding.model_dump()
+            elif hasattr(finding, "get"):
+                severity = severity_map.get(finding.get("severity", "WARNING"), IssueSeverity.WARNING)
+                message = finding.get("message", "JIT/Script code risk detected")
+                location = finding.get("context", context)
+                recommendation = finding.get("recommendation", "Review JIT/Script code for security")
+                details = dict(finding)
+            else:
+                severity_value = getattr(finding, "severity", "WARNING")
+                severity = severity_map.get(severity_value, IssueSeverity.WARNING)
+                message = getattr(finding, "message", "JIT/Script code risk detected")
+                location = getattr(finding, "context", context)
+                recommendation = getattr(finding, "recommendation", "Review JIT/Script code for security")
+                details = finding.__dict__ if hasattr(finding, "__dict__") else {"object": str(finding)}
+
+            jit_indicator = f"{details.get('type', '')} {message} {model_type}".strip()
+            jit_rule_code = get_embedded_code_rule_code(jit_indicator)
+            if not jit_rule_code:
+                # JIT detector findings should consistently map to the JIT/TorchScript rule family.
+                jit_rule_code = get_embedded_code_rule_code("jit")
+
+            result.add_check(
+                name="JIT/Script Code Execution Detection",
+                passed=False,
+                message=message,
+                rule_code=jit_rule_code,
+                severity=severity,
+                location=location,
+                details=details,
+                why=recommendation,
+            )
+
+        if not findings and context:
+            result.add_check(
+                name="JIT/Script Code Execution Detection",
+                passed=True,
+                message="No JIT/Script code execution risks detected",
+                location=context,
+            )
+
+        return len(findings)
 
     def collect_network_communication_findings(
         self,
@@ -1064,50 +1071,7 @@ class BaseScanner(ABC):
 
             detector = NetworkCommDetector(self.config.get("network_comm_config"))
             findings = detector.scan(data, context)
-
-            for finding in findings:
-                severity_map = {
-                    "CRITICAL": IssueSeverity.CRITICAL,
-                    "HIGH": IssueSeverity.CRITICAL,
-                    "MEDIUM": IssueSeverity.WARNING,
-                    "LOW": IssueSeverity.INFO,
-                }
-                severity = severity_map.get(finding.get("severity", "WARNING"), IssueSeverity.WARNING)
-                network_indicator = " ".join(
-                    str(part)
-                    for part in [
-                        finding.get("type", ""),
-                        finding.get("message", ""),
-                        finding.get("pattern", ""),
-                        finding.get("pattern_type", ""),
-                        finding.get("domain", ""),
-                        finding.get("url", ""),
-                    ]
-                    if part
-                )
-                network_rule_code = get_network_rule_code(network_indicator)
-
-                result.add_check(
-                    name="Network Communication Detection",
-                    passed=False,
-                    message=finding.get("message", "Network communication pattern detected"),
-                    rule_code=network_rule_code,
-                    severity=severity,
-                    location=finding.get("context", context),
-                    details=finding,
-                    why="Models should not contain network communication capabilities",
-                )
-
-            # Add a passing check if no patterns were found
-            if not findings and context:
-                result.add_check(
-                    name="Network Communication Detection",
-                    passed=True,
-                    message="No network communication patterns detected",
-                    location=context,
-                )
-
-            return len(findings)
+            return self.add_network_communication_findings(findings, result, context=context)
 
         except ImportError:
             # NetworkCommDetector not available, log as debug
@@ -1116,6 +1080,56 @@ class BaseScanner(ABC):
         except Exception as e:
             logger.warning(f"Error checking for network communication: {e}")
             return 0
+
+    def add_network_communication_findings(
+        self,
+        findings: list[dict[str, Any]],
+        result: ScanResult,
+        context: str = "",
+    ) -> int:
+        """Emit explicit network communication checks from detector findings and return the count."""
+        for finding in findings:
+            severity_map = {
+                "CRITICAL": IssueSeverity.CRITICAL,
+                "HIGH": IssueSeverity.CRITICAL,
+                "MEDIUM": IssueSeverity.WARNING,
+                "LOW": IssueSeverity.INFO,
+            }
+            severity = severity_map.get(finding.get("severity", "WARNING"), IssueSeverity.WARNING)
+            network_indicator = " ".join(
+                str(part)
+                for part in [
+                    finding.get("type", ""),
+                    finding.get("message", ""),
+                    finding.get("pattern", ""),
+                    finding.get("pattern_type", ""),
+                    finding.get("domain", ""),
+                    finding.get("url", ""),
+                ]
+                if part
+            )
+            network_rule_code = get_network_rule_code(network_indicator)
+
+            result.add_check(
+                name="Network Communication Detection",
+                passed=False,
+                message=finding.get("message", "Network communication pattern detected"),
+                rule_code=network_rule_code,
+                severity=severity,
+                location=finding.get("context", context),
+                details=finding,
+                why="Models should not contain network communication capabilities",
+            )
+
+        if not findings and context:
+            result.add_check(
+                name="Network Communication Detection",
+                passed=True,
+                message="No network communication patterns detected",
+                location=context,
+            )
+
+        return len(findings)
 
     def _check_path(self, path: str) -> ScanResult | None:
         """Common path checks and validation

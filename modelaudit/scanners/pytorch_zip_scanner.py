@@ -963,17 +963,26 @@ class PyTorchZipScanner(BaseScanner):
                 # Skip files that can't be read
                 logger.debug(f"Exception reading {name}: {e}")
 
-        # Create single aggregated checks for the entire ZIP file
+        # Emit explicit checks for the entire ZIP file
         if safe_entries:  # Only create checks if we processed files
             check_jit = self._get_bool_config("check_jit_script", True)
             if check_jit:
-                self.summarize_jit_script_findings(all_jit_findings, result, context=path)
+                self.add_jit_script_findings(
+                    all_jit_findings,
+                    result,
+                    model_type="pytorch",
+                    context=path,
+                )
             else:
                 result.metadata.setdefault("disabled_checks", []).append("JIT/Script Code Execution Detection")
 
             check_net = self._get_bool_config("check_network_comm", True)
             if check_net:
-                self.summarize_network_communication_findings(all_network_findings, result, context=path)
+                self.add_network_communication_findings(
+                    all_network_findings,
+                    result,
+                    context=path,
+                )
             else:
                 result.metadata.setdefault("disabled_checks", []).append("Network Communication Detection")
 

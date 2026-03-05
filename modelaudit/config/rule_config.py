@@ -17,7 +17,7 @@ try:
 except ImportError:  # Python < 3.11
     import tomli as tomllib  # type: ignore
 
-from ..rules import Severity
+from ..rules import RuleRegistry, Severity
 
 logger = logging.getLogger(__name__)
 
@@ -154,14 +154,28 @@ class ModelAuditConfig:
         Create config from CLI arguments merged with file config.
         """
         config = cls.load()
+        valid_rule_codes = set(RuleRegistry.get_all_rules().keys())
 
         if suppress:
-            config.suppress.update(_expand_rule_codes(list(suppress)))
+            expanded_suppress = _expand_rule_codes(list(suppress))
+            unknown_suppress = sorted({code for code in expanded_suppress if code not in valid_rule_codes})
+            if unknown_suppress:
+                unknown = ", ".join(unknown_suppress)
+                raise ValueError(f"Unknown rule code(s) in --suppress: {unknown}")
+            config.suppress.update(expanded_suppress)
 
         if severity:
             for rule_code, severity_str in severity.items():
-                with contextlib.suppress(ValueError, AttributeError):
-                    config.severity[rule_code] = Severity(severity_str.upper())
+                normalized_code = rule_code.upper()
+                if normalized_code not in valid_rule_codes:
+                    raise ValueError(f"Unknown rule code in --severity: {normalized_code}")
+                try:
+                    config.severity[normalized_code] = Severity(severity_str.upper())
+                except (ValueError, AttributeError) as exc:
+                    raise ValueError(
+                        f"Invalid severity '{severity_str}' for rule {normalized_code}. "
+                        "Use one of: CRITICAL, HIGH, MEDIUM, LOW, INFO."
+                    ) from exc
 
         return config
 
