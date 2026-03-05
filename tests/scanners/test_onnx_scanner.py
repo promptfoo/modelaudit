@@ -112,7 +112,7 @@ def test_onnx_scanner_external_data_exists(tmp_path: Path) -> None:
         f"Should report resolved external data. Checks: {[c.message for c in result.checks]}"
     )
     assert resolved_checks[0].severity == IssueSeverity.INFO
-    assert resolved_checks[0].passed is True
+    assert resolved_checks[0].status.value == "passed"
 
 
 def test_onnx_scanner_corrupted(tmp_path):

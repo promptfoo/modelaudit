@@ -349,14 +349,7 @@ class OnnxScanner(BaseScanner):
                         ),
                     )
                 elif not external_path.exists():
-                    result.add_check(
-                        name="External Data File Existence",
-                        passed=False,
-                        message=f"External data file not found for tensor '{tensor.name}'",
-                        severity=IssueSeverity.CRITICAL,
-                        location=str(external_path),
-                        details={"tensor": tensor.name, "file": location},
-                    )
+                    missing_files.setdefault(location, []).append(tensor.name)
                 else:
                     if location not in safe_files:
                         safe_files.add(location)
