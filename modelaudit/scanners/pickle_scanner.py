@@ -4895,8 +4895,18 @@ class PickleScanner(BaseScanner):
                 and (has_pytorch_advanced_global or has_ordereddict_global)
                 and not has_dangerous_advanced_global
             )
+            # For joblib content, require positive evidence of legitimate
+            # serialization globals (not just absence of dangerous ones)
+            # to prevent empty-globals bypass on malicious payloads.
+            has_legitimate_serialization_globals = (
+                bool(advanced_globals) and has_joblib_globals and not has_dangerous_advanced_global
+            )
             passes_global_gate = (
-                has_legitimate_pytorch_globals if file_ext == ".bin" else not has_dangerous_advanced_global
+                has_legitimate_pytorch_globals
+                if file_ext == ".bin"
+                else has_legitimate_serialization_globals
+                if is_joblib_content
+                else not has_dangerous_advanced_global
             )
 
             has_non_info_findings = any(
