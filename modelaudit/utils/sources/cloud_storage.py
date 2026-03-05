@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -19,6 +20,7 @@ from modelaudit.utils.helpers.retry import retry_with_backoff
 
 from ..helpers.disk_space import check_disk_space
 
+logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
 
 
@@ -337,6 +339,12 @@ class GCSCache:
             cached_path = Path(cached["path"])
 
             if not _is_within_directory(self.cache_dir, cached_path):
+                logger.warning(
+                    "Dropping cache entry for %s because cached path %s is outside cache dir %s",
+                    url,
+                    cached_path,
+                    self.cache_dir,
+                )
                 del self.metadata[cache_key]
                 self._save_metadata()
                 return None
@@ -407,11 +415,18 @@ class GCSCache:
             if now - last_accessed > timedelta(days=max_age_days):
                 # Remove cached file
                 cached_path = Path(cached["path"])
-                if _is_within_directory(self.cache_dir, cached_path) and cached_path.exists():
-                    if cached_path.is_file():
-                        cached_path.unlink()
-                    else:
-                        shutil.rmtree(cached_path)
+                if _is_within_directory(self.cache_dir, cached_path):
+                    if cached_path.exists():
+                        if cached_path.is_file():
+                            cached_path.unlink()
+                        else:
+                            shutil.rmtree(cached_path)
+                else:
+                    logger.warning(
+                        "Skipping deletion for cache metadata path %s because it is outside cache dir %s",
+                        cached_path,
+                        self.cache_dir,
+                    )
                 keys_to_remove.append(key)
 
         # Update metadata

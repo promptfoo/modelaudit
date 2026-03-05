@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -6,6 +7,7 @@ import pytest
 
 from modelaudit.utils.sources.cloud_storage import (
     GCSCache,
+    _run_coroutine_sync,
     analyze_cloud_target,
     download_from_cloud,
     download_from_cloud_streaming,
@@ -20,6 +22,16 @@ def make_fs_mock() -> MagicMock:
     fs.__enter__.return_value = fs
     fs.__exit__.side_effect = lambda exc_type, exc, tb: fs.close()
     return fs
+
+
+def test_run_coroutine_sync_without_running_loop() -> None:
+    """_run_coroutine_sync should use asyncio.run() when no loop is active."""
+
+    async def return_value() -> str:
+        return "ok"
+
+    result = _run_coroutine_sync(lambda: return_value())
+    assert result == "ok"
 
 
 class TestCloudURLDetection:
@@ -472,8 +484,11 @@ class TestCloudCacheSafety:
         cached_path.resolve().relative_to(cache.cache_dir.resolve())
         assert source_file.exists()
 
-    def test_clean_old_cache_does_not_delete_outside_cache(self, tmp_path: Path) -> None:
+    def test_clean_old_cache_does_not_delete_outside_cache(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
         """Cleanup must not delete files that are outside cache_dir."""
+        caplog.set_level(logging.WARNING, logger="modelaudit.utils.sources.cloud_storage")
         cache = GCSCache(cache_dir=tmp_path / "cache")
         outside_file = tmp_path / "outside" / "artifact.bin"
         outside_file.parent.mkdir(parents=True, exist_ok=True)
@@ -495,6 +510,7 @@ class TestCloudCacheSafety:
 
         assert outside_file.exists()
         assert poisoned_key not in cache.metadata
+        assert "outside cache dir" in caplog.text
 
 
 class TestCloudDownloadCleanup:
