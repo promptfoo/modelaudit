@@ -1,6 +1,7 @@
 import json
 import tarfile
 from pathlib import Path
+from unittest.mock import patch
 
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.oci_layer_scanner import OciLayerScanner
@@ -174,7 +175,7 @@ class TestOciLayerScanner:
         assert result.success is True
 
     def test_scan_manifest_with_absolute_layer_path(self, tmp_path):
-        """Test scanning manifest with absolute layer paths."""
+        """Absolute layer paths must be rejected instead of opened from the host."""
         safe_file = tmp_path / "safe.txt"
         safe_file.write_text("Safe content")
 
@@ -188,9 +189,13 @@ class TestOciLayerScanner:
         manifest_path.write_text(json.dumps(manifest))
 
         scanner = OciLayerScanner()
-        result = scanner.scan(str(manifest_path))
+        with patch("modelaudit.scanners.oci_layer_scanner.tarfile.open") as mock_tar_open:
+            result = scanner.scan(str(manifest_path))
 
+        mock_tar_open.assert_not_called()
         assert result.success is True
+        assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+        assert any("path traversal" in issue.message.lower() for issue in result.issues)
 
     def test_scan_manifest_with_traversal_layer_path(self, tmp_path):
         """Test detection of path traversal in layer references."""

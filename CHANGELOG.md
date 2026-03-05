@@ -128,6 +128,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **fix**: tighten metadata scanner suspicious URL matching to use exact hostname/subdomain checks and add focused regression coverage
 - **fix**: treat `.nemo` files as tar-compatible during file-type validation to avoid false extension/magic mismatch alerts
 - **fix**: pass XGBoost load-test file paths via subprocess argv instead of interpolating shell-quoted paths into `python -c`, preventing backslash escape corruption on Windows-style paths
+- **security**: reject absolute OCI layer references so `.manifest` files cannot scan host tarballs outside the OCI layout
 
 ### Documentation
 

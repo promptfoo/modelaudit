@@ -93,11 +93,7 @@ class OciLayerScanner(BaseScanner):
         manifest_dir = os.path.dirname(path)
 
         for layer_ref in layer_paths:
-            if os.path.isabs(layer_ref):
-                layer_path = layer_ref
-                is_safe = True
-            else:
-                layer_path, is_safe = sanitize_archive_path(layer_ref, manifest_dir)
+            layer_path, is_safe = sanitize_archive_path(layer_ref, manifest_dir)
 
             if not is_safe:
                 result.add_check(
@@ -106,7 +102,7 @@ class OciLayerScanner(BaseScanner):
                     message=f"Layer reference {layer_ref} attempted path traversal outside manifest directory",
                     severity=IssueSeverity.CRITICAL,
                     location=f"{path}:{layer_ref}",
-                    details={"layer": layer_ref},
+                    details={"layer": layer_ref, "resolved_path": layer_path},
                     rule_code="S405",
                 )
                 continue
