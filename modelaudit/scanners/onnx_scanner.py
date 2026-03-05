@@ -349,21 +349,15 @@ class OnnxScanner(BaseScanner):
                         ),
                     )
                 elif not external_path.exists():
-                    result.add_check(
-                        name="External Data File Existence",
-                        passed=False,
-                        message=f"External data file not found for tensor '{tensor.name}'",
-                        severity=IssueSeverity.CRITICAL,
-                        location=str(external_path),
-                        details={"tensor": tensor.name, "file": location},
-                    )
+                    missing_files.setdefault(location, []).append(tensor.name)
                 else:
                     if location not in safe_files:
                         safe_files.add(location)
                         result.add_check(
-                            name="External Data Path Traversal Check",
+                            name="External Data Reference Check",
                             passed=True,
-                            message=f"External data file path is safe: {location}",
+                            message=f"External data reference resolved successfully: {location}",
+                            severity=IssueSeverity.INFO,
                             location=str(external_path),
                             details={"file": location},
                         )
@@ -373,12 +367,11 @@ class OnnxScanner(BaseScanner):
         for location, tensors in missing_files.items():
             external_path = (model_dir / location).resolve()
             result.add_check(
-                name="External Data File Existence",
+                name="External Data Reference Check",
                 passed=False,
                 message=(
-                    f"External data file '{location}' not found "
-                    f"({len(tensors)} tensor{'s' if len(tensors) != 1 else ''} affected). "
-                    "This is common for HuggingFace models downloaded without companion data files."
+                    f"External data reference found (file may not be present): '{location}' "
+                    f"({len(tensors)} tensor{'s' if len(tensors) != 1 else ''} affected)"
                 ),
                 severity=IssueSeverity.WARNING,
                 location=str(external_path),
