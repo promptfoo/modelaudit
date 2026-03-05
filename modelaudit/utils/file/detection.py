@@ -182,7 +182,6 @@ def _detect_compression_format(prefix: bytes) -> str | None:
     return None
 
 
-
 def detect_format_from_magic_bytes(magic4: MagicBytes, magic8: MagicBytes, magic16: MagicBytes) -> FileFormat:
     """Detect file format using Python 3.10+ pattern matching on magic bytes."""
     compression_format = _detect_compression_format(magic16)
@@ -884,7 +883,6 @@ def validate_file_type(path: str) -> bool:
             if header_format == "r_serialized":
                 return True
             return True
-
 
         # If header format is unknown but extension is known, this might be suspicious
         # unless the file is very small or empty (checked after format-specific rules)
