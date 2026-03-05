@@ -1103,6 +1103,11 @@ def test_scan_legitimate_pytorch_pickle_memory_error_is_non_failing(
         raise MemoryError("simulated parser memory limit")
 
     monkeypatch.setattr("modelaudit.scanners.pickle_scanner.pickletools.genops", _raise_memory_error)
+    monkeypatch.setattr(
+        PickleScanner,
+        "_extract_globals_advanced",
+        lambda self, file_obj: {("torch", "OrderedDict")},
+    )
 
     result = PickleScanner().scan(str(model_path))
 
@@ -1128,6 +1133,70 @@ def test_scan_legitimate_pytorch_pickle_memory_error_is_non_failing(
         and "Unable to parse pickle file" in issue.message
         for issue in result.issues
     )
+
+
+def test_scan_legitimate_pytorch_bin_memory_error_is_informational(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Memory limits on legitimate pytorch_model.bin should be informational only."""
+    model_path = tmp_path / "pytorch_model.bin"
+    header = b"\x80\x02ctorch\nOrderedDict\nq\x00."
+    model_path.write_bytes(header + b"state_dict" + b"\x00" * (256 * 1024))
+
+    def _raise_memory_error(*args: object, **kwargs: object) -> object:
+        raise MemoryError("simulated parser memory limit")
+
+    monkeypatch.setattr("modelaudit.scanners.pickle_scanner.pickletools.genops", _raise_memory_error)
+    monkeypatch.setattr(
+        PickleScanner,
+        "_extract_globals_advanced",
+        lambda self, file_obj: {("torch._utils", "_rebuild_tensor_v2"), ("collections", "OrderedDict")},
+    )
+
+    result = PickleScanner().scan(str(model_path))
+
+    resource_limit_checks = [check for check in result.checks if check.name == "Pickle Parse Resource Limit"]
+    assert len(resource_limit_checks) == 1
+    resource_limit_check = resource_limit_checks[0]
+    assert resource_limit_check.status == CheckStatus.FAILED
+    assert resource_limit_check.severity == IssueSeverity.INFO
+    assert resource_limit_check.details["reason"] == "memory_limit_on_legitimate_model"
+    assert resource_limit_check.details["exception_type"] == "MemoryError"
+    assert resource_limit_check.details["analysis_incomplete"] is True
+    assert resource_limit_check.details["scanner_limitation"] is True
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+def test_scan_memory_error_with_dangerous_globals_not_downgraded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Dangerous globals must keep MemoryError path as warning, not limitation-info downgrade."""
+    model_path = tmp_path / "pytorch_model.bin"
+    model_path.write_bytes(b"\x80\x02cbuiltins\neval\nq\x00." + b"\x00" * (256 * 1024))
+
+    def _raise_memory_error(*args: object, **kwargs: object) -> object:
+        raise MemoryError("simulated parser memory limit")
+
+    monkeypatch.setattr("modelaudit.scanners.pickle_scanner.pickletools.genops", _raise_memory_error)
+    monkeypatch.setattr(
+        PickleScanner,
+        "_is_legitimate_pytorch_model",
+        lambda self, path: True,  # force heuristic pass; dangerous-global gate must still block downgrade
+    )
+    monkeypatch.setattr(
+        PickleScanner,
+        "_extract_globals_advanced",
+        lambda self, file_obj: {("builtins", "eval")},
+    )
+
+    result = PickleScanner().scan(str(model_path))
+
+    assert not any(check.name == "Pickle Parse Resource Limit" for check in result.checks)
+    format_validation_checks = [check for check in result.checks if check.name == "Pickle Format Validation"]
+    assert len(format_validation_checks) == 1
+    assert format_validation_checks[0].status == CheckStatus.FAILED
+    assert format_validation_checks[0].severity == IssueSeverity.WARNING
+    assert format_validation_checks[0].details["exception_type"] == "MemoryError"
 
 
 if __name__ == "__main__":

@@ -4839,9 +4839,7 @@ class PickleScanner(BaseScanner):
         except Exception as e:
             # Handle known issues with legitimate serialization files
             file_ext = os.path.splitext(self.current_file_path)[1].lower()
-            # Keep this downgrade narrow: only canonical PyTorch checkpoint extensions.
-            # `.bin` is intentionally excluded due to spoofing risk.
-            is_pytorch_like_ext = file_ext in {".pt", ".pth", ".ckpt"}
+            is_pytorch_like_ext = file_ext in {".bin", ".pt", ".pth", ".ckpt"}
 
             # Check for recursion errors on legitimate ML model files
             is_recursion_error = isinstance(e, RecursionError)
@@ -4863,11 +4861,39 @@ class PickleScanner(BaseScanner):
                     # If validation itself fails, treat as non-legitimate
                     is_legitimate_file = False
 
+            # Tighten MemoryError downgrade: only allow when parsed globals look like
+            # legitimate PyTorch structures and no dangerous global references appear.
+            global_validation_context = {"is_ml_content": False, "overall_confidence": 0.0, "frameworks": {}}
+            has_dangerous_advanced_global = any(
+                _is_actually_dangerous_global(mod, func, global_validation_context) for mod, func in advanced_globals
+            )
+            has_pytorch_advanced_global = any(
+                mod == "torch" or mod.startswith("torch.") for mod, _func in advanced_globals
+            )
+            has_ordereddict_global = ("collections", "OrderedDict") in advanced_globals or (
+                "torch",
+                "OrderedDict",
+            ) in advanced_globals
+            has_legitimate_pytorch_globals = (
+                bool(advanced_globals)
+                and (has_pytorch_advanced_global or has_ordereddict_global)
+                and not has_dangerous_advanced_global
+            )
+            passes_global_gate = (
+                has_legitimate_pytorch_globals if file_ext == ".bin" else not has_dangerous_advanced_global
+            )
+
             has_non_info_findings = any(
                 issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues
             )
+            has_minimum_bin_size = file_ext != ".bin" or file_size >= 128 * 1024
             is_memory_limit_on_legitimate_model = (
-                isinstance(e, MemoryError) and is_pytorch_like_ext and is_legitimate_file and not has_non_info_findings
+                isinstance(e, MemoryError)
+                and is_pytorch_like_ext
+                and is_legitimate_file
+                and passes_global_gate
+                and has_minimum_bin_size
+                and not has_non_info_findings
             )
 
             # Check if this is a known benign error in legitimate serialization files
@@ -5124,11 +5150,15 @@ class PickleScanner(BaseScanner):
                 # Check if it contains PyTorch indicators
                 has_pytorch_patterns = any(indicator in header for indicator in pytorch_indicators)
 
-                # For large files with PyTorch patterns, likely legitimate
+                # For large-enough files with multiple PyTorch indicators, likely legitimate.
+                # Keep lower bound modest so small public checkpoints (e.g., tiny HF models)
+                # do not trigger parser-limit false positives.
                 file_size = os.path.getsize(path)
-                is_reasonable_size = 1024 * 1024 < file_size < 1024 * 1024 * 1024 * 1024  # 1MB to 1TB
+                is_reasonable_size = 128 * 1024 <= file_size < 1024 * 1024 * 1024 * 1024  # 128KB to 1TB
+                indicator_count = sum(1 for indicator in pytorch_indicators if indicator in header)
+                has_strong_pytorch_signature = indicator_count >= 2
 
-                return has_pytorch_patterns and is_reasonable_size
+                return has_pytorch_patterns and has_strong_pytorch_signature and is_reasonable_size
 
         except Exception:
             return False
