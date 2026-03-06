@@ -104,6 +104,8 @@ def pytest_runtest_setup(item):
             "test_telemetry.py",  # telemetry payload and availability tests
             "test_telemetry_decoupling.py",  # telemetry failure-isolation tests
             "test_debug_command.py",  # debug output telemetry flags
+            "test_auth_config.py",  # auth config path and secret-storage hardening tests
+            "test_utils.py",  # archive path sanitization regression coverage
             "test_oci_layer_scanner.py",  # OCI layer path safety regression tests
         ]
 
