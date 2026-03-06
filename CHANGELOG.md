@@ -111,6 +111,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **security:** resolve bare-module TorchServe handler references like `custom_handler` to concrete archive members so malicious handler source is no longer skipped by static analysis
 - **rules:** preserve `rule_code` metadata through direct result aggregation and ensure dangerous advanced pickle globals emit explicit rule codes (with regression coverage)
 - **rules:** ignore unknown rule IDs in config files with warning logs, normalize rule-code casing in config parsing, and prevent invalid severity entries from being applied
 - **telemetry:** refresh the cached telemetry client when runtime context changes and lazily initialize PostHog when telemetry is re-enabled in-process

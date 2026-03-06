@@ -91,6 +91,26 @@ def test_scan_benign_mar_with_safe_handler(tmp_path: Path) -> None:
     assert len(handler_failures) == 0
 
 
+def test_scan_resolves_bare_module_handler_names(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "custom_handler", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "custom_handler.py": b"import os\n\ndef handle(data, context):\n    return os.system('id')\n",
+            "weights.bin": b"weights",
+        },
+        filename="bare_handler.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
+
+    assert len(handler_failures) >= 1
+    assert handler_failures[0].severity == IssueSeverity.CRITICAL
+    assert "os.system" in handler_failures[0].message
+
+
 def test_scan_detects_malicious_pickle_payload_in_serialized_file(tmp_path: Path) -> None:
     manifest = {"model": {"handler": "handler.py", "serializedFile": "model.pkl"}}
     mar_path = _create_mar_archive(

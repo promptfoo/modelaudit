@@ -449,6 +449,25 @@ class TorchServeMarScanner(BaseScanner):
 
         return bool(suffix) or "/" in normalized or "\\" in value
 
+    def _resolve_handler_member_candidates(self, handler_reference: str) -> list[str]:
+        """Resolve handler references to concrete archive member candidates."""
+        normalized = handler_reference.replace("\\", "/").strip()
+        if not normalized:
+            return []
+
+        reference_base = normalized.split(":", 1)[0].strip()
+        if not reference_base:
+            return []
+
+        if self._is_path_like_reference("handler", reference_base):
+            return [self._normalize_member_name(reference_base)]
+
+        module_path = reference_base.replace(".", "/")
+        return [
+            self._normalize_member_name(f"{module_path}.py"),
+            self._normalize_member_name(f"{module_path}/__init__.py"),
+        ]
+
     def _validate_manifest_paths(
         self,
         archive_path: str,
@@ -478,10 +497,18 @@ class TorchServeMarScanner(BaseScanner):
                 invalid_paths.append({"field": field, "value": value, "reason": "path_traversal"})
                 continue
 
-            if self._is_path_like_reference(field, value):
-                normalized_member = self._normalize_member_name(value)
-                if normalized_member not in member_set:
-                    missing_members.append({"field": field, "value": value})
+            candidate_members = (
+                self._resolve_handler_member_candidates(value)
+                if field == "handler"
+                else [self._normalize_member_name(value)]
+                if self._is_path_like_reference(field, value)
+                else []
+            )
+            if candidate_members and not any(candidate in member_set for candidate in candidate_members):
+                missing_record = {"field": field, "value": value}
+                if field == "handler":
+                    missing_record["candidates"] = ", ".join(candidate_members)
+                missing_members.append(missing_record)
 
         if invalid_paths:
             for invalid in invalid_paths:
@@ -552,14 +579,9 @@ class TorchServeMarScanner(BaseScanner):
         }
 
         for handler_path in handler_paths:
-            if not self._is_path_like_reference("handler", handler_path):
-                continue
-
-            normalized_handler = self._normalize_member_name(handler_path)
-            if normalized_handler not in member_set:
-                continue
-
-            if not normalized_handler.endswith(".py"):
+            resolved_candidates = self._resolve_handler_member_candidates(handler_path)
+            normalized_handler = next((candidate for candidate in resolved_candidates if candidate in member_set), None)
+            if normalized_handler is None or not normalized_handler.endswith(".py"):
                 continue
 
             analyzed_handler = True
