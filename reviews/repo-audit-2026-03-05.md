@@ -5,7 +5,7 @@ Review scope: bugs, correctness issues, and security weaknesses found during a r
 ## Findings
 
 1. Critical: `modelaudit/scanners/oci_layer_scanner.py`
-   Absolute OCI layer references are treated as trusted and opened directly. A malicious manifest can point to arbitrary readable host tarballs outside the OCI layout.
+   Absolute OCI layer references were treated as trusted and opened directly. This was resolved by PR `#659`, which rejects absolute layer paths so manifests cannot point to arbitrary readable host tarballs outside the OCI layout.
 
 2. High: `modelaudit/telemetry.py`
    Telemetry payloads include raw local paths, issue locations, and full download URLs in addition to hashed identifiers. This can leak private filesystem structure and presigned query strings.
