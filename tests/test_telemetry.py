@@ -2,6 +2,7 @@
 Comprehensive tests for ModelAudit telemetry system.
 """
 
+import json
 import os
 import tempfile
 from pathlib import Path
@@ -13,6 +14,7 @@ from modelaudit.telemetry import (
     TelemetryClient,
     TelemetryEvent,
     UserConfig,
+    enable_telemetry,
     get_telemetry_client,
     is_telemetry_available,
     record_event,
@@ -434,6 +436,39 @@ class TestTelemetryClient:
             mock_home.return_value = Path(temp_dir)
             assert is_telemetry_available() is False
 
+    def test_enable_telemetry_initializes_transport_for_existing_client(self, tmp_path: Path) -> None:
+        """Enabling telemetry should lazily initialize PostHog for an existing client."""
+        mock_posthog = MagicMock()
+
+        with (
+            patch("modelaudit.telemetry.Path.home") as mock_home,
+            patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
+            patch("modelaudit.telemetry.POSTHOG_AVAILABLE", True),
+            patch("modelaudit.telemetry.Posthog", return_value=mock_posthog),
+            patch("modelaudit.telemetry._telemetry_client", None),
+            patch.dict(
+                os.environ,
+                {"CI": "", "IS_TESTING": "", "PROMPTFOO_DISABLE_TELEMETRY": "", "NO_ANALYTICS": ""},
+                clear=False,
+            ),
+        ):
+            mock_home.return_value = tmp_path
+            config_dir = tmp_path / ".modelaudit"
+            config_dir.mkdir()
+            (config_dir / "user_config.json").write_text(json.dumps({"telemetry_enabled": False}))
+
+            client = get_telemetry_client()
+            assert client is not None
+            assert client._posthog_client is None
+
+            enable_telemetry()
+            refreshed_client = get_telemetry_client()
+
+            assert refreshed_client is not None
+            assert refreshed_client._user_config.telemetry_enabled is True
+            assert refreshed_client._posthog_client is mock_posthog
+            assert is_telemetry_available() is True
+
 
 class TestDataHandling:
     """Test data handling and sanitization."""
@@ -531,6 +566,40 @@ class TestTelemetryIntegration:
         client2 = get_telemetry_client()
 
         assert client1 is client2
+
+    def test_global_client_refreshes_when_runtime_changes(self, tmp_path: Path) -> None:
+        """Runtime-sensitive singleton state should refresh between different environments."""
+        mock_posthog = MagicMock()
+        first_home = tmp_path / "first-home"
+        second_home = tmp_path / "second-home"
+        first_home.mkdir()
+        second_home.mkdir()
+
+        with patch("modelaudit.telemetry._telemetry_client", None):
+            with (
+                patch("modelaudit.telemetry.Path.home") as mock_home,
+                patch.dict(os.environ, {"PROMPTFOO_DISABLE_TELEMETRY": "1"}, clear=False),
+            ):
+                mock_home.return_value = first_home
+                first_client = get_telemetry_client()
+
+            with (
+                patch("modelaudit.telemetry.Path.home") as mock_home,
+                patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
+                patch("modelaudit.telemetry.POSTHOG_AVAILABLE", True),
+                patch("modelaudit.telemetry.Posthog", return_value=mock_posthog),
+                patch.dict(
+                    os.environ,
+                    {"CI": "", "IS_TESTING": "", "PROMPTFOO_DISABLE_TELEMETRY": "", "NO_ANALYTICS": ""},
+                    clear=False,
+                ),
+            ):
+                mock_home.return_value = second_home
+                refreshed_client = get_telemetry_client()
+
+            assert refreshed_client is not None
+            assert refreshed_client is not first_client
+            assert refreshed_client._posthog_client is mock_posthog
 
     def test_posthog_import_failure_handling(self):
         """Test that missing PostHog dependency is handled gracefully."""
