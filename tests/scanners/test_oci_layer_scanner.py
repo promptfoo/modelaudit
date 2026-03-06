@@ -3,7 +3,7 @@ import tarfile
 from pathlib import Path
 from unittest.mock import patch
 
-from modelaudit.scanners.base import IssueSeverity
+from modelaudit.scanners.base import IssueSeverity, ScanResult
 from modelaudit.scanners.oci_layer_scanner import OciLayerScanner
 
 
@@ -267,6 +267,29 @@ class TestOciLayerScanner:
 
         assert result.success is True
         # Should have no issues since the file doesn't match any scanner
+
+    def test_scan_layer_dispatches_scannable_member_using_extracted_path(self, tmp_path):
+        """Members with registered extensions should be extracted and scanned."""
+        onnx_file = tmp_path / "model.onnx"
+        onnx_file.write_bytes(b"fake onnx payload")
+
+        layer_path = tmp_path / "layer.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            tar.add(onnx_file, arcname="models/model.onnx")
+
+        manifest = {"layers": ["layer.tar.gz"]}
+        manifest_path = tmp_path / "dispatch.manifest"
+        manifest_path.write_text(json.dumps(manifest))
+
+        mocked_result = ScanResult(scanner_name="onnx")
+        with patch("modelaudit.core.scan_file", return_value=mocked_result) as mock_scan:
+            result = OciLayerScanner().scan(str(manifest_path))
+
+        assert result.success is True
+        mock_scan.assert_called_once()
+        scanned_path = mock_scan.call_args.args[0]
+        assert scanned_path != "models/model.onnx"
+        assert scanned_path.endswith(".onnx")
 
     def test_scan_layer_with_directory_entries(self, tmp_path):
         """Test scanning layer with directory entries (should be skipped)."""

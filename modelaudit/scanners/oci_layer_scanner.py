@@ -4,9 +4,11 @@ import json
 import os
 import tarfile
 import tempfile
+from pathlib import Path
 from typing import Any, ClassVar
 
 from ..utils import sanitize_archive_path
+from ..utils.model_extensions import get_model_extensions
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 # Try to import yaml for YAML manifests
@@ -24,6 +26,15 @@ class OciLayerScanner(BaseScanner):
     name = "oci_layer"
     description = "Scans container manifests and embedded layers for model files"
     supported_extensions: ClassVar[list[str]] = [".manifest"]
+
+    @staticmethod
+    def _has_scannable_extension(member_name: str) -> bool:
+        suffixes = [suffix.lower() for suffix in Path(member_name).suffixes]
+        if not suffixes:
+            return False
+
+        scannable_extensions = get_model_extensions()
+        return any("".join(suffixes[-index:]) in scannable_extensions for index in range(1, len(suffixes) + 1))
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -118,15 +129,13 @@ class OciLayerScanner(BaseScanner):
                 )
                 continue
             try:
-                from . import SCANNER_REGISTRY
-
                 with tarfile.open(layer_path, "r:gz") as tar:
                     for member in tar:
                         if not member.isfile():
                             continue
                         name = member.name
                         _, ext = os.path.splitext(name)
-                        if not any(s.can_handle(name) for s in SCANNER_REGISTRY):
+                        if not self._has_scannable_extension(name):
                             continue
                         fileobj = tar.extractfile(member)
                         if fileobj is None:
