@@ -10,14 +10,10 @@ from urllib.parse import urlparse
 
 import click
 import requests
-from dotenv import load_dotenv
 
 from ...config.constants import SCANNABLE_MODEL_EXTENSIONS
 
 logger = logging.getLogger(__name__)
-
-# Load environment variables from .env file if it exists
-load_dotenv()
 
 # Constants
 MAX_RECURSION_DEPTH = 10  # Prevent infinite recursion in folder traversal
