@@ -1,7 +1,8 @@
 """Configuration management for ModelAudit authentication."""
 
 import os
-import tempfile
+from contextlib import suppress
+from pathlib import Path
 from typing import Any, cast
 from uuid import uuid4
 
@@ -97,28 +98,127 @@ class CloudConfig:
         }
 
 
+def _home_fallback_config_dir() -> Path:
+    """Return a user-private fallback config directory."""
+    return Path.home() / ".promptfoo"
+
+
+def _config_dir_candidates() -> list[Path]:
+    """Return config directory candidates in preference order."""
+    candidates = [Path(user_config_dir("promptfoo")), _home_fallback_config_dir()]
+    unique_candidates: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        unique_candidates.append(candidate)
+        seen.add(key)
+    return unique_candidates
+
+
+def _tighten_permissions(path: Path, mode: int) -> None:
+    """Best-effort permission hardening for sensitive config paths."""
+    if os.name == "nt":
+        return
+
+    with suppress(OSError):
+        path.chmod(mode)
+
+
+def _is_secure_directory(path: Path) -> bool:
+    """Return True when the path is a usable non-symlink directory."""
+    try:
+        return path.exists() and path.is_dir() and not path.is_symlink()
+    except OSError:
+        return False
+
+
+def _ensure_secure_directory(path: Path) -> bool:
+    """Create a directory when possible and reject symlinked targets."""
+    try:
+        path.mkdir(parents=True, mode=0o700, exist_ok=True)
+    except OSError:
+        return False
+
+    if not _is_secure_directory(path):
+        return False
+
+    _tighten_permissions(path, 0o700)
+    return True
+
+
+def _select_config_directory(create_if_not_exists: bool = False) -> Path:
+    """Pick the best available configuration directory."""
+    candidates = _config_dir_candidates()
+    for candidate in candidates:
+        if create_if_not_exists:
+            if _ensure_secure_directory(candidate):
+                return candidate
+            continue
+
+        if _is_secure_directory(candidate):
+            return candidate
+
+    return candidates[0]
+
+
+def _get_config_file_path(create_if_not_exists: bool = False) -> Path:
+    """Return the shared Promptfoo config file path."""
+    if not create_if_not_exists:
+        for config_dir in _config_dir_candidates():
+            config_file = config_dir / "promptfoo.yaml"
+            try:
+                if config_file.exists() and config_file.is_file() and not config_file.is_symlink():
+                    return config_file
+            except OSError:
+                continue
+
+    config_dir = _select_config_directory(create_if_not_exists=create_if_not_exists)
+    return config_dir / "promptfoo.yaml"
+
+
+def _write_yaml_atomic(config_file_path: Path, data: dict[str, Any]) -> None:
+    """Write config atomically with private permissions."""
+    config_dir = config_file_path.parent
+    if not _ensure_secure_directory(config_dir):
+        raise OSError(f"Unable to create secure config directory: {config_dir}")
+
+    payload = yaml.safe_dump(data, sort_keys=False)
+    temp_path = config_dir / f".promptfoo.{uuid4().hex}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+
+    try:
+        fd = os.open(temp_path, flags, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            handle.write(payload)
+        _tighten_permissions(temp_path, 0o600)
+        os.replace(temp_path, config_file_path)
+        _tighten_permissions(config_file_path, 0o600)
+    except Exception:
+        with suppress(OSError):
+            temp_path.unlink()
+        raise
+
+
 def get_config_directory_path(create_if_not_exists: bool = False) -> str:
     """Get configuration directory path."""
-    config_dir = user_config_dir("promptfoo")
-    if create_if_not_exists:
-        try:
-            os.makedirs(config_dir, exist_ok=True)
-        except (OSError, PermissionError):
-            # In Docker or restricted environments, use a temporary directory
-            config_dir = os.path.join(tempfile.gettempdir(), "promptfoo")
-            os.makedirs(config_dir, exist_ok=True)
-    return config_dir
+    config_dir = _select_config_directory(create_if_not_exists=create_if_not_exists)
+    return str(config_dir)
 
 
 def read_global_config() -> GlobalConfig:
     """Read global configuration from file."""
-    config_dir = get_config_directory_path()
-    config_file_path = os.path.join(config_dir, "promptfoo.yaml")
-
     global_config_data = {"id": str(uuid4())}
+    config_file_path = _get_config_file_path()
 
-    if os.path.exists(config_file_path):
+    if config_file_path.exists():
         try:
+            if config_file_path.is_symlink():
+                raise OSError("Refusing to read symlinked config file")
+
             with open(config_file_path) as f:
                 loaded_config = yaml.safe_load(f) or {}
                 global_config_data = loaded_config
@@ -129,13 +229,8 @@ def read_global_config() -> GlobalConfig:
             global_config_data["id"] = str(uuid4())
             write_global_config(GlobalConfig(global_config_data))
     else:
-        try:
-            os.makedirs(config_dir, exist_ok=True)
-            with open(config_file_path, "w") as f:
-                yaml.dump(global_config_data, f)
-        except (OSError, PermissionError):
-            # In Docker/restricted environments, skip file creation
-            pass
+        with suppress(OSError, PermissionError):
+            write_global_config(GlobalConfig(global_config_data))
 
     return GlobalConfig(global_config_data)
 
@@ -143,13 +238,10 @@ def read_global_config() -> GlobalConfig:
 def write_global_config(config: GlobalConfig) -> None:
     """Write global configuration to file."""
     try:
-        config_dir = get_config_directory_path(create_if_not_exists=True)
-        config_file_path = os.path.join(config_dir, "promptfoo.yaml")
-
-        with open(config_file_path, "w") as f:
-            yaml.dump(config.to_dict(), f)
+        config_file_path = _get_config_file_path(create_if_not_exists=True)
+        _write_yaml_atomic(config_file_path, config.to_dict())
     except (OSError, PermissionError):
-        # In Docker/restricted environments, skip file writing
+        # In restricted environments, skip file writing
         pass
 
 

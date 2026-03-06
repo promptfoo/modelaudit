@@ -113,6 +113,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **rules:** preserve `rule_code` metadata through direct result aggregation and ensure dangerous advanced pickle globals emit explicit rule codes (with regression coverage)
 - **rules:** ignore unknown rule IDs in config files with warning logs, normalize rule-code casing in config parsing, and prevent invalid severity entries from being applied
+- **security:** harden shared auth config storage and archive path sanitization to avoid insecure temp fallbacks, symlink overwrite abuse, and temp-root symlink traversal bypasses
+- **security:** stop archive path sanitization from resolving attacker-controlled extraction-root symlinks, preventing symlinked temp directories from weakening traversal checks
 - **telemetry:** refresh the cached telemetry client when runtime context changes and lazily initialize PostHog when telemetry is re-enabled in-process
 - **tests:** add scanner literal `rule_code` registry-consistency coverage to catch unknown rule identifiers early
 - **cloud:** harden cache path handling to prevent sibling-prefix bypasses from escaping cache boundaries, avoid deleting out-of-cache metadata paths during cleanup, and clean temporary cloud download directories on failure
