@@ -1,5 +1,6 @@
 """Utilities for handling JFrog Artifactory downloads and folder operations."""
 
+import ipaddress
 import logging
 import os
 import shutil
@@ -47,7 +48,43 @@ def is_jfrog_url(url: str) -> bool:
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"}:
         return False
-    return parsed.netloc.endswith(".jfrog.io") or "/artifactory/" in parsed.path
+    hostname = (parsed.hostname or "").lower()
+    if "/artifactory/" not in parsed.path:
+        return False
+    return _is_trusted_jfrog_host(hostname)
+
+
+def _get_trusted_jfrog_hosts() -> set[str]:
+    """Return explicitly allowlisted JFrog hosts.
+
+    MODELAUDIT_JFROG_ALLOWED_HOSTS accepts a comma-separated list of hostnames.
+    This keeps automatic credential forwarding opt-in for self-hosted JFrog
+    instances while rejecting arbitrary lookalike URLs.
+    """
+    raw_hosts = os.getenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "")
+    return {host.strip().lower() for host in raw_hosts.split(",") if host.strip()}
+
+
+def _is_trusted_jfrog_host(hostname: str) -> bool:
+    """Return True when a hostname is trusted for JFrog authentication."""
+    if not hostname:
+        return False
+
+    if hostname == "jfrog.io" or hostname.endswith(".jfrog.io"):
+        return True
+
+    if hostname == "localhost":
+        return True
+
+    try:
+        parsed_ip = ipaddress.ip_address(hostname)
+    except ValueError:
+        parsed_ip = None
+
+    if parsed_ip is not None and parsed_ip.is_loopback:
+        return True
+
+    return hostname in _get_trusted_jfrog_hosts()
 
 
 def download_artifact(

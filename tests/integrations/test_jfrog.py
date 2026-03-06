@@ -21,7 +21,8 @@ class TestJFrogURLDetection:
     def test_valid_jfrog_urls(self):
         valid_urls = [
             "https://company.jfrog.io/artifactory/repo/model.bin",
-            "http://my-jfrog.com/artifactory/libs-release/model.pt",
+            "http://localhost/artifactory/libs-release/model.pt",
+            "http://127.0.0.1/artifactory/libs-release/model.pt",
         ]
         for url in valid_urls:
             assert is_jfrog_url(url)
@@ -29,11 +30,19 @@ class TestJFrogURLDetection:
     def test_invalid_jfrog_urls(self):
         invalid_urls = [
             "https://example.com/model",
+            "https://evil.example/artifactory/repo/model.bin",
+            "https://my-jfrog.com/artifactory/libs-release/model.pt",
             "hf://model",
             "",
         ]
         for url in invalid_urls:
             assert not is_jfrog_url(url)
+
+    def test_allowlisted_self_hosted_jfrog_urls(self, monkeypatch):
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "my-jfrog.com,artifacts.internal")
+
+        assert is_jfrog_url("https://my-jfrog.com/artifactory/libs-release/model.pt")
+        assert is_jfrog_url("https://artifacts.internal/artifactory/ml/model.pkl")
 
 
 class TestJFrogDownload:
