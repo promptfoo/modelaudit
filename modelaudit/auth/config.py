@@ -167,6 +167,8 @@ def _get_config_file_path(create_if_not_exists: bool = False) -> Path:
     """Return the shared Promptfoo config file path."""
     if not create_if_not_exists:
         for config_dir in _config_dir_candidates():
+            if not _is_secure_directory(config_dir):
+                continue
             config_file = config_dir / "promptfoo.yaml"
             try:
                 if config_file.exists() and config_file.is_file() and not config_file.is_symlink():
