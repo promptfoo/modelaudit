@@ -110,6 +110,49 @@ class TarScanner(BaseScanner):
         result.metadata["contents"] = scan_result.metadata.get("contents", [])
         return result
 
+    def _get_max_entry_size(self) -> int:
+        """Return the per-entry extraction limit used for TAR members."""
+        max_entry_size = self.config.get("max_file_size", self.config.get("max_entry_size", 10 * 1024 * 1024 * 1024))
+        if max_entry_size == 0:
+            return 1024 * 1024 * 1024 * 1024
+        return int(max_entry_size)
+
+    def _extract_member_to_tempfile(
+        self,
+        tar: tarfile.TarFile,
+        member: tarfile.TarInfo,
+        *,
+        suffix: str,
+    ) -> tuple[str, int]:
+        """Stream a TAR member to disk while enforcing the configured size limit."""
+        max_entry_size = self._get_max_entry_size()
+        fileobj = tar.extractfile(member)
+        if fileobj is None:
+            raise ValueError(f"Unable to extract TAR entry: {member.name}")
+
+        total_size = 0
+        tmp_path: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                tmp_path = tmp.name
+                while True:
+                    chunk = fileobj.read(4096)
+                    if not chunk:
+                        break
+                    total_size += len(chunk)
+                    if total_size > max_entry_size:
+                        raise ValueError(f"TAR entry {member.name} exceeds maximum size of {max_entry_size} bytes")
+                    tmp.write(chunk)
+        except Exception:
+            if tmp_path and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            raise
+        finally:
+            fileobj.close()
+
+        assert tmp_path is not None
+        return tmp_path, total_size
+
     def _scan_tar_file(self, path: str, depth: int = 0) -> ScanResult:
         result = ScanResult(scanner_name=self.name)
         contents: list[dict[str, Any]] = []
@@ -217,25 +260,6 @@ class TarScanner(BaseScanner):
                 if member.isdir():
                     continue
 
-                # Use max_file_size from CLI, fallback to max_entry_size, then default
-                max_entry_size = self.config.get(
-                    "max_file_size", self.config.get("max_entry_size", 10 * 1024 * 1024 * 1024)
-                )  # Use CLI max_file_size, then max_entry_size, then 10GB default
-                # If max_file_size is 0 (unlimited), use a reasonable default for safety
-                if max_entry_size == 0:
-                    max_entry_size = 1024 * 1024 * 1024 * 1024  # 1TB for unlimited case
-                data = b""
-                fileobj = tar.extractfile(member)
-                if fileobj is None:
-                    continue
-                while True:
-                    chunk = fileobj.read(4096)
-                    if not chunk:
-                        break
-                    data += chunk
-                    if len(data) > max_entry_size:
-                        raise ValueError(f"TAR entry {name} exceeds maximum size of {max_entry_size} bytes")
-
                 # Check for compound extensions like .tar.gz
                 name_lower = name.lower()
                 is_tar_extension = any(name_lower.endswith(ext) for ext in self.supported_extensions)
@@ -247,9 +271,7 @@ class TarScanner(BaseScanner):
                             break
                     else:
                         suffix = ".tar"  # fallback
-                    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-                        tmp.write(data)
-                        tmp_path = tmp.name
+                    tmp_path, total_size = self._extract_member_to_tempfile(tar, member, suffix=suffix)
                     try:
                         if tarfile.is_tarfile(tmp_path):
                             nested_result = self._scan_tar_file(tmp_path, depth + 1)
@@ -283,15 +305,12 @@ class TarScanner(BaseScanner):
                             contents.append(asset_entry)
 
                             if file_result.scanner_name == "unknown":
-                                result.bytes_scanned += len(data)
+                                result.bytes_scanned += total_size
                     finally:
                         os.unlink(tmp_path)
                 else:
-                    _, ext = os.path.splitext(name)
                     safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", os.path.basename(name))
-                    with tempfile.NamedTemporaryFile(suffix=f"_{safe_name}", delete=False) as tmp:
-                        tmp.write(data)
-                        tmp_path = tmp.name
+                    tmp_path, total_size = self._extract_member_to_tempfile(tar, member, suffix=f"_{safe_name}")
                     try:
                         file_result = core.scan_file(tmp_path, self.config)
                         for issue in file_result.issues:
@@ -315,7 +334,7 @@ class TarScanner(BaseScanner):
                         contents.append(asset_entry)
 
                         if file_result.scanner_name == "unknown":
-                            result.bytes_scanned += len(data)
+                            result.bytes_scanned += total_size
                     finally:
                         os.unlink(tmp_path)
 

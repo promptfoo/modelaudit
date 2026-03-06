@@ -1,6 +1,7 @@
 import os
 import tarfile
 import tempfile
+from pathlib import Path
 
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.tar_scanner import TarScanner
@@ -290,3 +291,53 @@ class TestTarScanner:
             assert result.bytes_scanned == expected
         finally:
             os.unlink(tmp_path)
+
+    def test_extract_member_to_tempfile_streams_in_chunks(self, tmp_path, monkeypatch):
+        """Large TAR entries should be copied in bounded chunks instead of buffered in memory."""
+        content = b"A" * 10_000
+        archive_path = tmp_path / "payload.tar"
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("payload.bin")
+            info.size = len(content)
+            archive.addfile(info, tarfile.io.BytesIO(content))  # type: ignore[attr-defined]
+
+        read_sizes: list[int | None] = []
+        original_read = tarfile.ExFileObject.read
+
+        def tracked_read(self, size=None):
+            read_sizes.append(size)
+            return original_read(self, size)
+
+        monkeypatch.setattr(tarfile.ExFileObject, "read", tracked_read)
+
+        with tarfile.open(archive_path, "r") as archive:
+            member = archive.getmember("payload.bin")
+            extracted_path, total_size = self.scanner._extract_member_to_tempfile(
+                archive,
+                member,
+                suffix="_payload.bin",
+            )
+
+        try:
+            assert total_size == len(content)
+            assert Path(extracted_path).read_bytes() == content
+            assert len(read_sizes) > 1
+            assert set(read_sizes) == {4096}
+        finally:
+            os.unlink(extracted_path)
+
+    def test_scan_rejects_oversized_tar_member(self, tmp_path):
+        """Entries exceeding the configured limit should fail the scan before full extraction."""
+        scanner = TarScanner(config={"max_file_size": 64})
+        archive_path = tmp_path / "oversized.tar"
+        payload = b"B" * 128
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("payload.bin")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = scanner.scan(str(archive_path))
+
+        assert result.success is False
+        assert any("exceeds maximum size" in issue.message.lower() for issue in result.issues)
