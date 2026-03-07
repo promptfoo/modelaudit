@@ -107,8 +107,33 @@ def test_scan_resolves_bare_module_handler_names(tmp_path: Path) -> None:
     handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
 
     assert len(handler_failures) >= 1
-    assert handler_failures[0].severity == IssueSeverity.CRITICAL
-    assert "os.system" in handler_failures[0].message
+    assert any(
+        failure.severity == IssueSeverity.CRITICAL and "os.system" in failure.message for failure in handler_failures
+    )
+
+
+def test_scan_analyzes_all_resolved_handler_candidates(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "custom_handler", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "custom_handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
+            "custom_handler/__init__.py": b"import os\n\ndef handle(data, context):\n    return os.system('id')\n",
+            "weights.bin": b"weights",
+        },
+        filename="bare_handler_with_package.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
+
+    assert any(
+        failure.severity == IssueSeverity.CRITICAL
+        and failure.location == f"{mar_path}:custom_handler/__init__.py"
+        and "os.system" in failure.message
+        for failure in handler_failures
+    )
 
 
 def test_scan_detects_malicious_pickle_payload_in_serialized_file(tmp_path: Path) -> None:

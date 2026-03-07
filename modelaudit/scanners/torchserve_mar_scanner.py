@@ -580,55 +580,60 @@ class TorchServeMarScanner(BaseScanner):
 
         for handler_path in handler_paths:
             resolved_candidates = self._resolve_handler_member_candidates(handler_path)
-            normalized_handler = next((candidate for candidate in resolved_candidates if candidate in member_set), None)
-            if normalized_handler is None or not normalized_handler.endswith(".py"):
+            normalized_handlers = [
+                candidate
+                for candidate in dict.fromkeys(resolved_candidates)
+                if candidate in member_set and candidate.endswith(".py")
+            ]
+            if not normalized_handlers:
                 continue
 
-            analyzed_handler = True
-            handler_info = member_lookup.get(normalized_handler)
-            if handler_info is None:
-                continue
-            try:
-                handler_bytes = self._read_member_bounded(archive, handler_info, self.max_member_bytes)
-            except ValueError as exc:
-                result.add_check(
-                    name="TorchServe Handler Static Analysis",
-                    passed=False,
-                    message=str(exc),
-                    severity=IssueSeverity.WARNING,
-                    location=f"{archive_path}:{normalized_handler}",
-                )
-                continue
+            for normalized_handler in normalized_handlers:
+                analyzed_handler = True
+                handler_info = member_lookup.get(normalized_handler)
+                if handler_info is None:
+                    continue
+                try:
+                    handler_bytes = self._read_member_bounded(archive, handler_info, self.max_member_bytes)
+                except ValueError as exc:
+                    result.add_check(
+                        name="TorchServe Handler Static Analysis",
+                        passed=False,
+                        message=str(exc),
+                        severity=IssueSeverity.WARNING,
+                        location=f"{archive_path}:{normalized_handler}",
+                    )
+                    continue
 
-            risky_calls, parse_error = self._find_high_risk_calls(handler_bytes)
-            if parse_error is not None:
-                result.add_check(
-                    name="TorchServe Handler Static Analysis",
-                    passed=False,
-                    message=f"Unable to parse handler source for static analysis: {parse_error}",
-                    severity=IssueSeverity.WARNING,
-                    location=f"{archive_path}:{normalized_handler}",
-                    details={"handler": normalized_handler},
-                )
-                continue
+                risky_calls, parse_error = self._find_high_risk_calls(handler_bytes)
+                if parse_error is not None:
+                    result.add_check(
+                        name="TorchServe Handler Static Analysis",
+                        passed=False,
+                        message=f"Unable to parse handler source for static analysis: {parse_error}",
+                        severity=IssueSeverity.WARNING,
+                        location=f"{archive_path}:{normalized_handler}",
+                        details={"handler": normalized_handler},
+                    )
+                    continue
 
-            if risky_calls:
-                result.add_check(
-                    name="TorchServe Handler Static Analysis",
-                    passed=False,
-                    message=(f"Handler contains high-risk execution primitives: {', '.join(sorted(risky_calls))}"),
-                    severity=IssueSeverity.CRITICAL,
-                    location=f"{archive_path}:{normalized_handler}",
-                    details={"handler": normalized_handler, "risky_calls": sorted(risky_calls)},
-                )
-            else:
-                result.add_check(
-                    name="TorchServe Handler Static Analysis",
-                    passed=True,
-                    message="Handler source does not contain high-risk execution primitives",
-                    location=f"{archive_path}:{normalized_handler}",
-                    details={"handler": normalized_handler},
-                )
+                if risky_calls:
+                    result.add_check(
+                        name="TorchServe Handler Static Analysis",
+                        passed=False,
+                        message=(f"Handler contains high-risk execution primitives: {', '.join(sorted(risky_calls))}"),
+                        severity=IssueSeverity.CRITICAL,
+                        location=f"{archive_path}:{normalized_handler}",
+                        details={"handler": normalized_handler, "risky_calls": sorted(risky_calls)},
+                    )
+                else:
+                    result.add_check(
+                        name="TorchServe Handler Static Analysis",
+                        passed=True,
+                        message="Handler source does not contain high-risk execution primitives",
+                        location=f"{archive_path}:{normalized_handler}",
+                        details={"handler": normalized_handler},
+                    )
 
         if not analyzed_handler and handler_paths:
             result.add_check(
