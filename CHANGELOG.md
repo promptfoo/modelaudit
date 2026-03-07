@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.28](https://github.com/promptfoo/modelaudit/compare/v0.2.27...v0.2.28) (2026-03-07)
+
+### Features
+
+- add rule codes to all security checks ([#255](https://github.com/promptfoo/modelaudit/issues/255)) ([330e7df](https://github.com/promptfoo/modelaudit/commit/330e7df66407de9c8717d2c1d2ae33075c195d8b))
+
+### Bug Fixes
+
+- **ci:** reorder provenance job steps to prevent SBOM generation failure ([#646](https://github.com/promptfoo/modelaudit/issues/646)) ([d4ab381](https://github.com/promptfoo/modelaudit/commit/d4ab38162ed82f1aa13b1c8cef6892c764b386a8))
+- handle Windows backslashes in XGBoost subprocess loader ([#656](https://github.com/promptfoo/modelaudit/issues/656)) ([ba30b81](https://github.com/promptfoo/modelaudit/commit/ba30b8111f0f31e4b235eb250120d9875cf522f5))
+- harden cloud download async/cache safety and cleanup ([#655](https://github.com/promptfoo/modelaudit/issues/655)) ([e14ea61](https://github.com/promptfoo/modelaudit/commit/e14ea61ce9a97dabe8992faa3b6f1b9a268ed757))
+- harden rule config parsing and debug path privacy ([#648](https://github.com/promptfoo/modelaudit/issues/648)) ([a073187](https://github.com/promptfoo/modelaudit/commit/a073187c9d84b57b6422f8ec0b00fc9ecf5e4080))
+- preserve rule codes through scan aggregation ([#650](https://github.com/promptfoo/modelaudit/issues/650)) ([d71a219](https://github.com/promptfoo/modelaudit/commit/d71a219d02ec1e82302efa5bd5990707e7d10231))
+- refresh telemetry client state ([#658](https://github.com/promptfoo/modelaudit/issues/658)) ([7b6ea2f](https://github.com/promptfoo/modelaudit/commit/7b6ea2f3a90749ec8e21b2d47b1d0b2e644502d4))
+- reject absolute OCI layer references ([#659](https://github.com/promptfoo/modelaudit/issues/659)) ([722131a](https://github.com/promptfoo/modelaudit/commit/722131a554e1e149c1a996a43acdafbb0fce66f1))
+- restore raw telemetry fields and harden model_name extraction ([#649](https://github.com/promptfoo/modelaudit/issues/649)) ([275f087](https://github.com/promptfoo/modelaudit/commit/275f087eb28860b88b8494fa11fcea9472121d9e))
+- restrict trusted jfrog hosts for auth ([#661](https://github.com/promptfoo/modelaudit/issues/661)) ([d959a0d](https://github.com/promptfoo/modelaudit/commit/d959a0d49f0a463ec4ea8165a8e434c89c4222b8))
+- stop importing dotenv in jfrog helper ([#662](https://github.com/promptfoo/modelaudit/issues/662)) ([d20fda3](https://github.com/promptfoo/modelaudit/commit/d20fda315a8e05106d25d212d026b2b602b4a586))
+
 ## [0.2.27](https://github.com/promptfoo/modelaudit/compare/v0.2.26...v0.2.27) (2026-03-05)
 
 ### Features
