@@ -3,7 +3,7 @@ from pathlib import Path
 from modelaudit.utils import is_within_directory, sanitize_archive_path
 
 
-def test_is_within_directory_simple(tmp_path):
+def test_is_within_directory_simple(tmp_path: Path) -> None:
     base_dir = tmp_path / "base"
     base_dir.mkdir()
     inside = base_dir / "file.txt"
@@ -11,7 +11,7 @@ def test_is_within_directory_simple(tmp_path):
     assert is_within_directory(str(base_dir), str(inside)) is True
 
 
-def test_is_within_directory_outside(tmp_path):
+def test_is_within_directory_outside(tmp_path: Path) -> None:
     base_dir = tmp_path / "base"
     base_dir.mkdir()
     outside = tmp_path / "outside.txt"
@@ -19,7 +19,7 @@ def test_is_within_directory_outside(tmp_path):
     assert is_within_directory(str(base_dir), str(outside)) is False
 
 
-def test_is_within_directory_symlink_inside_to_outside(tmp_path, requires_symlinks):
+def test_is_within_directory_symlink_inside_to_outside(tmp_path: Path, requires_symlinks: None) -> None:
     base_dir = tmp_path / "base"
     base_dir.mkdir()
     outside_dir = tmp_path / "outside"
@@ -31,7 +31,7 @@ def test_is_within_directory_symlink_inside_to_outside(tmp_path, requires_symlin
     assert is_within_directory(str(base_dir), str(link)) is False
 
 
-def test_is_within_directory_symlink_outside_to_inside(tmp_path, requires_symlinks):
+def test_is_within_directory_symlink_outside_to_inside(tmp_path: Path, requires_symlinks: None) -> None:
     base_dir = tmp_path / "base"
     base_dir.mkdir()
     inside_file = base_dir / "inside.txt"
@@ -41,7 +41,7 @@ def test_is_within_directory_symlink_outside_to_inside(tmp_path, requires_symlin
     assert is_within_directory(str(base_dir), str(link)) is True
 
 
-def test_sanitize_archive_path_rejects_traversal_from_symlinked_base(tmp_path: Path, requires_symlinks) -> None:
+def test_sanitize_archive_path_rejects_traversal_from_symlinked_base(tmp_path: Path, requires_symlinks: None) -> None:
     container = tmp_path / "container"
     container.mkdir()
     real_root = container / "real-root"
@@ -55,7 +55,7 @@ def test_sanitize_archive_path_rejects_traversal_from_symlinked_base(tmp_path: P
     assert is_safe is False
 
 
-def test_sanitize_archive_path_keeps_safe_entry_within_symlinked_base(tmp_path: Path, requires_symlinks) -> None:
+def test_sanitize_archive_path_keeps_safe_entry_within_symlinked_base(tmp_path: Path, requires_symlinks: None) -> None:
     container = tmp_path / "container"
     container.mkdir()
     real_root = container / "real-root"
@@ -67,3 +67,13 @@ def test_sanitize_archive_path_keeps_safe_entry_within_symlinked_base(tmp_path: 
 
     assert resolved == str(symlinked_base / "nested" / "model.bin")
     assert is_safe is True
+
+
+def test_sanitize_archive_path_rejects_drive_qualified_absolute_entry(tmp_path: Path) -> None:
+    base_dir = tmp_path / "extract"
+    base_dir.mkdir()
+
+    resolved, is_safe = sanitize_archive_path("C:/Windows/System32/drivers/etc/hosts", str(base_dir))
+
+    assert resolved == str(base_dir / "C:" / "Windows" / "System32" / "drivers" / "etc" / "hosts")
+    assert is_safe is False
