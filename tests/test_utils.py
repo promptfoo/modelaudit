@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 from modelaudit.utils import is_within_directory, sanitize_archive_path
@@ -75,5 +76,6 @@ def test_sanitize_archive_path_rejects_drive_qualified_absolute_entry(tmp_path: 
 
     resolved, is_safe = sanitize_archive_path("C:/Windows/System32/drivers/etc/hosts", str(base_dir))
 
-    assert resolved == str(base_dir / "C:" / "Windows" / "System32" / "drivers" / "etc" / "hosts")
+    expected = f"{base_dir}{os.sep}C:{os.sep}Windows{os.sep}System32{os.sep}drivers{os.sep}etc{os.sep}hosts"
+    assert os.path.normpath(resolved) == os.path.normpath(expected)
     assert is_safe is False
