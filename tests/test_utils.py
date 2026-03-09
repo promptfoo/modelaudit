@@ -79,3 +79,13 @@ def test_sanitize_archive_path_rejects_drive_qualified_absolute_entry(tmp_path: 
     expected = f"{base_dir}{os.sep}C:{os.sep}Windows{os.sep}System32{os.sep}drivers{os.sep}etc{os.sep}hosts"
     assert os.path.normpath(resolved) == os.path.normpath(expected)
     assert is_safe is False
+
+
+def test_sanitize_archive_path_normalizes_unsafe_absolute_like_entry(tmp_path: Path) -> None:
+    base_dir = tmp_path / "extract"
+    base_dir.mkdir()
+
+    resolved, is_safe = sanitize_archive_path("/../secret.txt", str(base_dir))
+
+    assert resolved == os.path.normpath(str(base_dir / ".." / "secret.txt"))
+    assert is_safe is False
