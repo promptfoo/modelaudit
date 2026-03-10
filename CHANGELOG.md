@@ -81,6 +81,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **cli:** include streamed artifacts as SBOM components when `scan --stream --sbom` is used
+- **cli:** exclude HuggingFace download cache bookkeeping files from remote SBOMs and asset lists
 - **security:** require official or explicitly allowlisted JFrog hosts before treating `/artifactory/` URLs as authenticated JFrog endpoints
 - **security:** detect CVE-2024-5480 PyTorch torch.distributed.rpc arbitrary function execution via PythonUDF (CVSS 10.0)
 - **security:** detect CVE-2024-48063 PyTorch torch.distributed.rpc.RemoteModule deserialization RCE via pickle (CVSS 9.8)

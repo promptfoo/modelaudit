@@ -1880,9 +1880,19 @@ def scan_command(
     if sbom:
         from .integrations.sbom_generator import generate_sbom_pydantic
 
-        # Use scanned_paths (actual file paths) instead of expanded_paths (original URLs)
-        # to prevent FileNotFoundError when generating SBOM for downloaded content
-        paths_for_sbom = scanned_paths if scanned_paths else expanded_paths
+        # Remote downloads may leave cache internals under the downloaded directory,
+        # and streamed scans may delete files before SBOM generation runs. Reuse the
+        # scanned asset list for those cases so the SBOM reflects actual scanned model
+        # artifacts rather than the raw cache directory contents.
+        asset_paths = list(
+            dict.fromkeys(asset.path for asset in audit_result.assets if asset.path and asset.type != "skipped")
+        )
+        if asset_paths and final_scan_and_delete:
+            paths_for_sbom = asset_paths
+        else:
+            # Use scanned_paths (actual file paths) instead of expanded_paths (original URLs)
+            # to prevent FileNotFoundError when generating SBOM for downloaded content
+            paths_for_sbom = scanned_paths if scanned_paths else expanded_paths
         sbom_text = generate_sbom_pydantic(paths_for_sbom, audit_result)
         with open(sbom, "w", encoding="utf-8") as f:
             f.write(sbom_text)
