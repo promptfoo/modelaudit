@@ -803,7 +803,11 @@ def test_scan_huggingface_streaming_sbom_contains_all_components(
             "size": 456,
         },
     ]
-    mock_scan_streaming.return_value = create_mock_scan_result(bytes_scanned=579, files_scanned=2, assets=streamed_assets)
+    mock_scan_streaming.return_value = create_mock_scan_result(
+        bytes_scanned=579,
+        files_scanned=2,
+        assets=streamed_assets,
+    )
 
     sbom_file = tmp_path / "streaming_sbom.json"
     runner = CliRunner()
