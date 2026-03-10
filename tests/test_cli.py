@@ -845,7 +845,6 @@ def test_scan_huggingface_streaming_sbom_includes_streamed_assets(
 
     assert result.exit_code == 0
     assert sbom_file.exists()
-
     sbom_data = json.loads(sbom_file.read_text())
     components = {component["name"]: component for component in sbom_data["components"]}
 
