@@ -4,6 +4,8 @@ import time
 import zipfile
 from pathlib import Path
 
+import pytest
+
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.pytorch_zip_scanner import PyTorchZipScanner
 from tests.helpers import create_mock_pytorch_zip
@@ -141,6 +143,7 @@ def test_pytorch_zip_scanner_closes_bytesio(tmp_path, monkeypatch):
     assert closed.get("closed") is True
 
 
+@pytest.mark.performance
 def test_pytorch_zip_skips_numeric_data_files(tmp_path):
     """Test that numeric tensor data files in archive/data/ are skipped during JIT scanning."""
     zip_path = tmp_path / "model.pt"

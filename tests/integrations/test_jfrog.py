@@ -1,4 +1,7 @@
 import logging
+import os
+import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -21,7 +24,8 @@ class TestJFrogURLDetection:
     def test_valid_jfrog_urls(self):
         valid_urls = [
             "https://company.jfrog.io/artifactory/repo/model.bin",
-            "http://my-jfrog.com/artifactory/libs-release/model.pt",
+            "http://localhost/artifactory/libs-release/model.pt",
+            "http://127.0.0.1/artifactory/libs-release/model.pt",
         ]
         for url in valid_urls:
             assert is_jfrog_url(url)
@@ -29,11 +33,19 @@ class TestJFrogURLDetection:
     def test_invalid_jfrog_urls(self):
         invalid_urls = [
             "https://example.com/model",
+            "https://evil.example/artifactory/repo/model.bin",
+            "https://my-jfrog.com/artifactory/libs-release/model.pt",
             "hf://model",
             "",
         ]
         for url in invalid_urls:
             assert not is_jfrog_url(url)
+
+    def test_allowlisted_self_hosted_jfrog_urls(self, monkeypatch):
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "my-jfrog.com,artifacts.internal")
+
+        assert is_jfrog_url("https://my-jfrog.com/artifactory/libs-release/model.pt")
+        assert is_jfrog_url("https://artifacts.internal/artifactory/ml/model.pkl")
 
 
 class TestJFrogDownload:
@@ -128,20 +140,37 @@ class TestJFrogDownload:
         assert not call_args[1]["headers"]  # Empty headers dict
 
     @patch("modelaudit.utils.sources.jfrog.requests.get")
-    def test_dotenv_file_support(self, mock_get, tmp_path, monkeypatch):
-        """Test that .env file variables are loaded via python-dotenv."""
-        # This test verifies that dotenv is loaded, but since we can't easily mock
-        # the dotenv loading in tests, we verify the environment variable fallback works
+    def test_import_does_not_load_dotenv_from_cwd(self, mock_get, tmp_path):
+        """Importing the JFrog helper must not mutate env from an untrusted cwd."""
         mock_response = mock_get.return_value
         mock_response.raise_for_status.return_value = None
         mock_response.iter_content.return_value = [b"data"]
 
-        # Simulate .env file loaded environment variable
-        monkeypatch.setenv("JFROG_API_TOKEN", "dotenv-token")
-        download_artifact("https://company.jfrog.io/artifactory/repo/model.bin", cache_dir=tmp_path)
+        repo_root = Path(__file__).resolve().parents[2]
+        dotenv_dir = tmp_path / "dotenv-cwd"
+        dotenv_dir.mkdir()
+        (dotenv_dir / ".env").write_text("HTTP_PROXY=http://attacker.invalid:8080\n", encoding="utf-8")
 
-        call_args = mock_get.call_args
-        assert call_args[1]["headers"]["X-JFrog-Art-Api"] == "dotenv-token"
+        env = os.environ.copy()
+        env.pop("HTTP_PROXY", None)
+        env.pop("HTTPS_PROXY", None)
+        pythonpath = env.get("PYTHONPATH")
+        env["PYTHONPATH"] = str(repo_root) if not pythonpath else f"{repo_root}{os.pathsep}{pythonpath}"
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                ("import os; import modelaudit.utils.sources.jfrog; print(os.environ.get('HTTP_PROXY'))"),
+            ],
+            cwd=dotenv_dir,
+            capture_output=True,
+            check=True,
+            env=env,
+            text=True,
+        )
+
+        assert completed.stdout.strip() == "None"
 
 
 class TestJFrogStorageAPI:
