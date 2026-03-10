@@ -1218,6 +1218,9 @@ def scan_command(
                                 cache_dir=final_cache_dir,
                             )
 
+                            # Track streamed artifact paths so SBOM includes all components.
+                            _track_streaming_paths_for_sbom(streaming_result, path)
+
                             # Merge streaming results
                             audit_result.aggregate_scan_result(streaming_result.model_dump())
 
@@ -1370,6 +1373,9 @@ def scan_command(
                                 cache_enabled=final_cache,
                                 cache_dir=final_cache_dir,
                             )
+
+                            # Track streamed artifact paths so SBOM includes all components.
+                            _track_streaming_paths_for_sbom(streaming_result, path)
 
                             # Merge streaming results
                             audit_result.aggregate_scan_result(streaming_result.model_dump())

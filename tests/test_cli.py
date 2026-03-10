@@ -1,7 +1,8 @@
 import json
 import os
 import re
-from unittest.mock import patch
+from pathlib import Path
+from unittest.mock import Mock, patch
 
 import pytest
 from click.testing import CliRunner
@@ -779,8 +780,8 @@ def test_scan_huggingface_streaming_success(mock_scan_streaming, mock_download_s
 @patch("modelaudit.utils.sources.huggingface.download_model_streaming")
 @patch("modelaudit.core.scan_model_streaming")
 def test_scan_huggingface_streaming_sbom_contains_all_components(
-    mock_scan_streaming, mock_download_streaming, mock_is_hf_url, tmp_path
-):
+    mock_scan_streaming: Mock, mock_download_streaming: Mock, mock_is_hf_url: Mock, tmp_path: Path
+) -> None:
     """Regression test for issue #671: --stream should still produce full SBOM components."""
     mock_is_hf_url.return_value = True
 
@@ -818,7 +819,7 @@ def test_scan_huggingface_streaming_sbom_contains_all_components(
             "--stream",
             "--sbom",
             str(sbom_file),
-            "hf://openai-community/gpt2",
+            "https://huggingface.co/test/model",
         ],
     )
 
