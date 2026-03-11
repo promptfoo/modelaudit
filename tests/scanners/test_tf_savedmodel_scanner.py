@@ -309,6 +309,30 @@ def test_function_definition_ops_are_counted_in_metadata(tmp_path: Path) -> None
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_safe_function_definition_ops_do_not_trigger_findings(tmp_path: Path) -> None:
+    model_path = _create_test_savedmodel_with_scoped_nodes(
+        tmp_path,
+        graph_nodes=[{"op": "Placeholder", "name": "input_node"}],
+        function_nodes={
+            "__inference_safe_signature_wrapper_1": [
+                {"op": "Const", "name": "const_value"},
+                {"op": "AddV2", "name": "add_value"},
+                {"op": "Identity", "name": "identity_value"},
+            ]
+        },
+        model_name="safe_function_def",
+    )
+
+    result = TensorFlowSavedModelScanner().scan(model_path)
+
+    assert result.issues == []
+    assert result.metadata["op_counts"]["Const"] == 1
+    assert result.metadata["op_counts"]["AddV2"] == 1
+    assert result.metadata["op_counts"]["Identity"] == 1
+    assert result.metadata["suspicious_op_found"] is False
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 def test_tf_savedmodel_scanner_with_blacklist(tmp_path: Path) -> None:
     """Test TensorFlow SavedModel scanner with custom blacklist patterns."""
     model_dir = create_tf_savedmodel(tmp_path)
