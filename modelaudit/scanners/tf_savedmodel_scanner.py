@@ -3,6 +3,7 @@
 import contextlib
 import logging
 import os
+import re
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -387,8 +388,6 @@ class TensorFlowSavedModelScanner(BaseScanner):
 
     def _analyze_saved_model(self, saved_model: Any, result: ScanResult) -> None:
         """Analyze the saved model for suspicious operations"""
-        import re
-
         suspicious_op_found = False
         op_counts: dict[str, int] = {}
 
@@ -448,66 +447,56 @@ class TensorFlowSavedModelScanner(BaseScanner):
                     # naming (e.g. "__inference_lambda_layer_call_fn_123").
                     # Lambda layers are already detected separately via
                     # _scan_keras_metadata.
-                    suspicious_func_patterns = [
-                        "eval",
-                        "exec",
-                        "compile",
-                        "__import__",
-                        "system",
-                        "popen",
-                        "subprocess",
-                        "pickle",
-                        "marshal",
-                    ]
+                    matched_pattern = self._match_suspicious_function_name(func_name)
+                    if matched_pattern is not None:
+                        result.add_check(
+                            name="StatefulPartitionedCall Security Check",
+                            passed=False,
+                            message=f"StatefulPartitionedCall with suspicious function: {func_name}",
+                            severity=IssueSeverity.WARNING,
+                            location=self._build_node_location(node_context),
+                            details=self._build_node_details(
+                                node_context,
+                                {
+                                    "op_type": node.op,
+                                    "stateful_call_target": func_name,
+                                    "suspicious_pattern": matched_pattern,
+                                },
+                            ),
+                            why=(
+                                "StatefulPartitionedCall can execute custom functions "
+                                "that may contain arbitrary code."
+                            ),
+                        )
 
-                    for pattern in suspicious_func_patterns:
-                        if pattern in func_name.lower():
-                            result.add_check(
-                                name="StatefulPartitionedCall Security Check",
-                                passed=False,
-                                message=f"StatefulPartitionedCall with suspicious function: {func_name}",
-                                severity=IssueSeverity.WARNING,
-                                location=self._build_node_location(node_context),
-                                details=self._build_node_details(
-                                    node_context,
-                                    {
-                                        "op_type": node.op,
-                                        "stateful_call_target": func_name,
-                                        "suspicious_pattern": pattern,
-                                    },
-                                ),
-                                why=(
-                                    "StatefulPartitionedCall can execute custom functions "
-                                    "that may contain arbitrary code."
-                                ),
-                            )
-                            break
-
-            # Detect Lambda layers by node name. This catches Lambda layers
-            # even when scanning a standalone saved_model.pb file.
-            m = _lambda_node_re.match(node.name)
-            if m:
-                layer_prefix = m.group(0).rstrip("/")
-                if layer_prefix not in _reported_lambda_layers:
-                    _reported_lambda_layers.add(layer_prefix)
-                    result.add_check(
-                        name="Lambda Layer Detection",
-                        passed=False,
-                        message="Lambda layer detected in graph",
-                        severity=IssueSeverity.WARNING,
-                        location=self._build_node_location(node_context),
-                        details=self._build_node_details(
-                            node_context,
-                            {
-                                "op_type": node.op,
-                                "layer_prefix": layer_prefix,
-                            },
-                        ),
-                        why=(
-                            "Lambda layers can execute arbitrary Python code during "
-                            "model inference, which poses a security risk."
-                        ),
-                    )
+            # Detect Lambda layers by node name at the top-level graph only.
+            # FunctionDef node names are internal graph implementation details
+            # and can legitimately reuse "lambda/<op>"-like prefixes without
+            # representing a user-authored Keras Lambda layer.
+            if node_context.node_scope == "graph_def":
+                m = _lambda_node_re.match(node.name)
+                if m:
+                    layer_prefix = m.group(0).rstrip("/")
+                    if layer_prefix not in _reported_lambda_layers:
+                        _reported_lambda_layers.add(layer_prefix)
+                        result.add_check(
+                            name="Lambda Layer Detection",
+                            passed=False,
+                            message="Lambda layer detected in graph",
+                            severity=IssueSeverity.WARNING,
+                            location=self._build_node_location(node_context),
+                            details=self._build_node_details(
+                                node_context,
+                                {
+                                    "op_type": node.op,
+                                    "layer_prefix": layer_prefix,
+                                },
+                            ),
+                            why=(
+                                "Lambda layers can execute arbitrary Python code during "
+                                "model inference, which poses a security risk."
+                            ),
+                        )
 
         # Add operation counts to metadata
         result.metadata["op_counts"] = op_counts
@@ -515,6 +504,27 @@ class TensorFlowSavedModelScanner(BaseScanner):
 
         # Enhanced protobuf vulnerability scanning
         self._scan_protobuf_vulnerabilities(saved_model, result)
+
+    @staticmethod
+    def _match_suspicious_function_name(func_name: str) -> str | None:
+        """Return the suspicious token matched in a function name, if any."""
+        suspicious_patterns = (
+            ("eval", re.compile(r"(?:^|[^a-z0-9])eval(?:[^a-z0-9]|$)")),
+            ("exec", re.compile(r"(?:^|[^a-z0-9])exec(?:[^a-z0-9]|$)")),
+            ("compile", re.compile(r"(?:^|[^a-z0-9])compile(?:[^a-z0-9]|$)")),
+            ("__import__", re.compile(r"(?:^|[^a-z0-9])__import__(?:[^a-z0-9]|$)")),
+            ("system", re.compile(r"(?:^|[^a-z0-9])system(?:[^a-z0-9]|$)")),
+            ("popen", re.compile(r"(?:^|[^a-z0-9])popen(?:[^a-z0-9]|$)")),
+            ("subprocess", re.compile(r"(?:^|[^a-z0-9])subprocess(?:[^a-z0-9]|$)")),
+            ("pickle", re.compile(r"(?:^|[^a-z0-9])pickle(?:[^a-z0-9]|$)")),
+            ("marshal", re.compile(r"(?:^|[^a-z0-9])marshal(?:[^a-z0-9]|$)")),
+        )
+
+        lowered_func_name = func_name.lower()
+        for pattern_name, pattern in suspicious_patterns:
+            if pattern.search(lowered_func_name):
+                return pattern_name
+        return None
 
     def _check_python_op(self, node_context: SavedModelNodeContext, result: ScanResult) -> None:
         """Check PyFunc/PyCall operations for embedded Python code"""

@@ -13,10 +13,14 @@ class _NodeCollection(Protocol):
         """Append a protobuf node and return the mutable node object."""
 
 
-class _NodeSpec(TypedDict, total=False):
+class _RequiredNodeSpec(TypedDict):
     op: str
+
+
+class _NodeSpec(_RequiredNodeSpec, total=False):
     name: str
     string_attrs: dict[str, str]
+    function_ref: str
 
 
 # Defer TensorFlow check to avoid module-level imports
@@ -37,7 +41,7 @@ def has_tf_protos() -> bool:
     return modelaudit.protos._check_vendored_protos()
 
 
-def test_tf_savedmodel_scanner_can_handle(tmp_path):
+def test_tf_savedmodel_scanner_can_handle(tmp_path: Path) -> None:
     """Test the can_handle method of TensorFlowSavedModelScanner."""
     # Create a directory with saved_model.pb
     tf_dir = tmp_path / "tf_model"
@@ -270,6 +274,101 @@ def test_detect_suspicious_ops_in_function_definitions(
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_stateful_partitioned_call_detected_in_function_definition(tmp_path: Path) -> None:
+    function_name = "__inference_stateful_partitioned_call_1"
+    target_name = "__inference_eval_fn_123"
+    model_path = _create_test_savedmodel_with_scoped_nodes(
+        tmp_path,
+        function_nodes={
+            function_name: [
+                {
+                    "op": "StatefulPartitionedCall",
+                    "name": "partitioned_call",
+                    "function_ref": target_name,
+                }
+            ]
+        },
+        model_name="function_def_stateful_partitioned_call",
+    )
+
+    result = TensorFlowSavedModelScanner().scan(model_path)
+    matching_issues = [
+        issue
+        for issue in result.issues
+        if issue.message and "StatefulPartitionedCall with suspicious function" in issue.message
+    ]
+
+    assert matching_issues, "Expected StatefulPartitionedCall warning inside a function definition"
+    assert all(issue.severity == IssueSeverity.WARNING for issue in matching_issues)
+    assert any(issue.details.get("stateful_call_target") == target_name for issue in matching_issues)
+    assert any(issue.details.get("node_scope") == "function_def" for issue in matching_issues)
+    assert any(issue.details.get("function_name") == function_name for issue in matching_issues)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_stateful_partitioned_call_ignores_evaluate_like_function_names(tmp_path: Path) -> None:
+    model_path = _create_test_savedmodel_with_scoped_nodes(
+        tmp_path,
+        function_nodes={
+            "__inference_stateful_partitioned_call_1": [
+                {
+                    "op": "StatefulPartitionedCall",
+                    "name": "partitioned_call",
+                    "function_ref": "__inference_evaluate_123",
+                }
+            ]
+        },
+        model_name="function_def_stateful_partitioned_call_evaluate",
+    )
+
+    result = TensorFlowSavedModelScanner().scan(model_path)
+
+    assert not any(
+        issue.message and "StatefulPartitionedCall with suspicious function" in issue.message for issue in result.issues
+    )
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_lambda_named_function_definition_nodes_do_not_trigger_lambda_layer_warning(tmp_path: Path) -> None:
+    model_path = _create_test_savedmodel_with_scoped_nodes(
+        tmp_path,
+        function_nodes={
+            "__inference_safe_lambdaish_1": [
+                {
+                    "op": "Identity",
+                    "name": "lambda/Identity",
+                }
+            ]
+        },
+        model_name="function_def_lambda_named_node",
+    )
+
+    result = TensorFlowSavedModelScanner().scan(model_path)
+
+    assert not any(issue.message == "Lambda layer detected in graph" for issue in result.issues)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_graph_lambda_named_nodes_still_trigger_lambda_layer_warning(tmp_path: Path) -> None:
+    model_path = _create_test_savedmodel_with_scoped_nodes(
+        tmp_path,
+        graph_nodes=[
+            {
+                "op": "Identity",
+                "name": "lambda/Identity",
+            }
+        ],
+        model_name="graph_lambda_named_node",
+    )
+
+    result = TensorFlowSavedModelScanner().scan(model_path)
+    lambda_issues = [issue for issue in result.issues if issue.message == "Lambda layer detected in graph"]
+
+    assert lambda_issues, "Expected Lambda layer warning for top-level graph nodes"
+    assert any(issue.details.get("node_scope") == "graph_def" for issue in lambda_issues)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 def test_protobuf_string_injection_detected_in_function_definition(tmp_path: Path) -> None:
     function_name = "__inference_payload_attack_1"
     model_path = _create_test_savedmodel_with_scoped_nodes(
@@ -440,6 +539,10 @@ def _create_test_savedmodel_with_scoped_nodes(
 
         for attr_name, attr_value in spec.get("string_attrs", {}).items():
             node.attr[attr_name].s = attr_value.encode("utf-8")
+
+        function_ref = spec.get("function_ref")
+        if function_ref is not None:
+            node.attr["f"].func.name = function_ref
 
     for index, spec in enumerate(graph_nodes or []):
         add_node(graph_def.node, spec, f"graph_node_{index}_{str(spec['op']).lower()}")
