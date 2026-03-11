@@ -1,10 +1,22 @@
 import pickle
 from pathlib import Path
+from typing import Any, Protocol, TypedDict
 
 import pytest
 
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.tf_savedmodel_scanner import TensorFlowSavedModelScanner
+
+
+class _NodeCollection(Protocol):
+    def add(self) -> Any:
+        """Append a protobuf node and return the mutable node object."""
+
+
+class _NodeSpec(TypedDict, total=False):
+    op: str
+    name: str
+    string_attrs: dict[str, str]
 
 
 # Defer TensorFlow check to avoid module-level imports
@@ -254,7 +266,7 @@ def test_detect_suspicious_ops_in_function_definitions(
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in matching_issues)
     assert any(issue.details.get("node_scope") == "function_def" for issue in matching_issues)
     assert any(issue.details.get("function_name") == function_name for issue in matching_issues)
-    assert any(function_name in issue.location for issue in matching_issues)
+    assert any(function_name in (issue.location or "") for issue in matching_issues)
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
@@ -374,7 +386,7 @@ def test_tf_savedmodel_scanner_not_a_directory(tmp_path):
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
-def test_tf_savedmodel_scanner_unreadable_file(tmp_path: Path, requires_symlinks) -> None:
+def test_tf_savedmodel_scanner_unreadable_file(tmp_path: Path, requires_symlinks: None) -> None:
     """Scanner should report unreadable files instead of silently skipping."""
     model_dir = create_tf_savedmodel(tmp_path)
 
@@ -398,8 +410,8 @@ def _create_test_savedmodel_with_op(tmp_path: Path, op_name: str, model_name: st
 def _create_test_savedmodel_with_scoped_nodes(
     tmp_path: Path,
     *,
-    graph_nodes: list[dict[str, object]] | None = None,
-    function_nodes: dict[str, list[dict[str, object]]] | None = None,
+    graph_nodes: list[_NodeSpec] | None = None,
+    function_nodes: dict[str, list[_NodeSpec]] | None = None,
     model_name: str | None = None,
 ) -> str:
     """Create a SavedModel with top-level and function-definition graph nodes."""
@@ -421,13 +433,13 @@ def _create_test_savedmodel_with_scoped_nodes(
 
     graph_def = meta_graph.graph_def
 
-    def add_node(node_collection: object, spec: dict[str, object], default_name: str) -> None:
+    def add_node(node_collection: _NodeCollection, spec: _NodeSpec, default_name: str) -> None:
         node = node_collection.add()
-        node.name = str(spec.get("name", default_name))
-        node.op = str(spec["op"])
+        node.name = spec.get("name", default_name)
+        node.op = spec["op"]
 
-        for attr_name, attr_value in dict(spec.get("string_attrs", {})).items():
-            node.attr[attr_name].s = str(attr_value).encode("utf-8")
+        for attr_name, attr_value in spec.get("string_attrs", {}).items():
+            node.attr[attr_name].s = attr_value.encode("utf-8")
 
     for index, spec in enumerate(graph_nodes or []):
         add_node(graph_def.node, spec, f"graph_node_{index}_{str(spec['op']).lower()}")
@@ -458,7 +470,7 @@ def _create_test_savedmodel_with_ops(
     if model_name is None:
         model_name = f"test_model_{'_'.join(op.lower() for op in op_names[:2])}"
 
-    graph_nodes = [{"op": op_name} for op_name in op_names]
+    graph_nodes: list[_NodeSpec] = [{"op": op_name} for op_name in op_names]
     return _create_test_savedmodel_with_scoped_nodes(
         tmp_path,
         graph_nodes=graph_nodes,
