@@ -464,8 +464,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                                 },
                             ),
                             why=(
-                                "StatefulPartitionedCall can execute custom functions "
-                                "that may contain arbitrary code."
+                                "StatefulPartitionedCall can execute custom functions that may contain arbitrary code."
                             ),
                         )
 
