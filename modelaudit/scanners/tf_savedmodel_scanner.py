@@ -820,6 +820,11 @@ class TensorFlowSavedModelScanner(BaseScanner):
 
         # Check for malicious string data in protobuf fields
         self._check_protobuf_string_injection(saved_model, result)
+        # NOTE: _check_protobuf_buffer_overflow() and
+        # _check_protobuf_field_bomb() are intentionally not enabled yet.
+        # Their thresholds are heuristic and currently lack regression
+        # coverage, so wiring them in would expand SavedModel findings beyond
+        # the narrowly-scoped function-definition fix until they are validated.
 
     def _check_protobuf_string_injection(self, saved_model: Any, result: ScanResult) -> None:
         """Check for string injection attacks in protobuf fields"""
