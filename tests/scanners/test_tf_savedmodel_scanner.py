@@ -226,6 +226,7 @@ def test_detect_writefile_operation(tmp_path: Path) -> None:
     [
         ("WriteFile", "__inference_writefile_attack_1"),
         ("PyFunc", "__inference_pyfunc_attack_1"),
+        ("ParseTensor", "__inference_parse_tensor_attack_1"),
     ],
 )
 def test_detect_suspicious_ops_in_function_definitions(
