@@ -182,6 +182,12 @@ def test_tf_op_explanation_function():
     assert "arbitrary files" in explanation
     assert "exfiltrate secrets" in explanation
 
+    # Test deserialization operation
+    explanation = get_tf_op_explanation("ParseTensor")
+    assert explanation is not None
+    assert "deserializes serialized tensor payloads" in explanation
+    assert "unsafe parsing" in explanation
+
     # Test invalid operation
     explanation = get_tf_op_explanation("NonExistentOp")
     assert explanation is None

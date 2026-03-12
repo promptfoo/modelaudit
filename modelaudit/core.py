@@ -662,6 +662,13 @@ def scan_model_directory_or_file(
             for root, _, files in os.walk(path, followlinks=False):
                 for file in files:
                     file_path = os.path.join(root, file)
+
+                    # HuggingFace cache bookkeeping files should never surface as
+                    # scan assets or SBOM components for downloaded models.
+                    if _is_huggingface_cache_file(file_path):
+                        logger.debug(f"Skipping HuggingFace cache file: {file_path}")
+                        continue
+
                     resolved_file = Path(file_path).resolve()
 
                     # Check if this is a HuggingFace cache symlink scenario
@@ -1583,6 +1590,15 @@ def scan_model_streaming(
 
                 # Merge results
                 if scan_result:
+                    metadata_dict = dict(scan_result.metadata or {})
+                    metadata_dict.setdefault("file_size", file_path.stat().st_size)
+
+                    existing_hashes = metadata_dict.get("file_hashes")
+                    if isinstance(existing_hashes, dict):
+                        existing_hashes.setdefault("sha256", file_hash)
+                    else:
+                        metadata_dict["file_hashes"] = {"sha256": file_hash}
+
                     # Use dict-based aggregation to avoid import issues
                     scan_result_dict = {
                         "bytes_scanned": scan_result.bytes_scanned,
@@ -1592,6 +1608,7 @@ def scan_model_streaming(
                         "issues": [issue.__dict__ for issue in (scan_result.issues or [])],
                         "checks": [check.__dict__ for check in (scan_result.checks or [])],
                         "scanners": [scan_result.scanner_name] if scan_result.scanner_name else [],
+                        "file_metadata": {str(file_path): metadata_dict},
                     }
                     results.aggregate_scan_result(scan_result_dict)
 
