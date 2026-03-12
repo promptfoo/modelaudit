@@ -63,6 +63,7 @@ LLAMAFILE_RUNTIME_SAFE_PATTERNS = (
     "%'18T socket",
     "llama_new_context_with_model",
 )
+LLAMAFILE_RUNTIME_SAFE_PATTERNS_LOWER = {pattern.lower() for pattern in LLAMAFILE_RUNTIME_SAFE_PATTERNS}
 
 
 class LlamafileScanner(BaseScanner):
@@ -184,8 +185,7 @@ class LlamafileScanner(BaseScanner):
     @staticmethod
     def _is_known_runtime_string(text: str) -> bool:
         """Return True if the string matches a known-safe llamafile runtime pattern."""
-        lowered = text.lower()
-        return any(pattern.lower() in lowered for pattern in LLAMAFILE_RUNTIME_SAFE_PATTERNS)
+        return text.lower() in LLAMAFILE_RUNTIME_SAFE_PATTERNS_LOWER
 
     def _scan_runtime_strings(self, path: str, blob: bytes, result: ScanResult) -> None:
         command_hits: set[str] = set()
