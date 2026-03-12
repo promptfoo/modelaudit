@@ -105,6 +105,8 @@ def pytest_runtest_setup(item):
             "test_telemetry_decoupling.py",  # telemetry failure-isolation tests
             "test_debug_command.py",  # debug output telemetry flags
             "test_oci_layer_scanner.py",  # OCI layer path safety regression tests
+            "test_jfrog.py",  # JFrog utility tests
+            "test_jfrog_integration.py",  # JFrog integration tests
         ]
 
         # Check if this is an allowed test file
