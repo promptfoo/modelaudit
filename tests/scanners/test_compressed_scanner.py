@@ -1,5 +1,6 @@
 import bz2
 import gzip
+import io
 import lzma
 import pickle
 import zlib
@@ -126,6 +127,39 @@ def test_compressed_scanner_false_positive_control_high_ratio_within_policy(tmp_
         if c.name == "Compressed Wrapper Decompression Limits" and c.status == CheckStatus.FAILED
     ]
     assert len(ratio_failures) == 0
+
+
+def test_read_zlib_stream_uses_bounded_decompression(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _FakeDecompressor:
+        def __init__(self) -> None:
+            self.unconsumed_tail = b""
+            self.max_lengths: list[int] = []
+
+        def decompress(self, _chunk: bytes, max_length: int = 0) -> bytes:
+            self.max_lengths.append(max_length)
+            return b""
+
+        def flush(self, _length: int = 0) -> bytes:
+            return b""
+
+    fake_decompressor = _FakeDecompressor()
+
+    monkeypatch.setattr(
+        "modelaudit.scanners.compressed_scanner.zlib.decompressobj",
+        lambda: fake_decompressor,
+    )
+
+    CompressedScanner._read_zlib_stream_with_limits(
+        source=io.BytesIO(b"compressed"),
+        destination=io.BytesIO(),
+        max_decompressed_bytes=1024,
+        max_ratio=100.0,
+        compressed_size=10,
+        chunk_size=4,
+    )
+
+    assert fake_decompressor.max_lengths
+    assert all(length == 1024 for length in fake_decompressor.max_lengths)
 
 
 def test_compressed_scanner_missing_lz4_dependency_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
