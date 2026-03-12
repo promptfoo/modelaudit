@@ -19,48 +19,26 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Validate semantic PR title
+      - uses: amannn/action-semantic-pull-request@v6
         env:
-          PR_TITLE: ${{ github.event.pull_request.title }}
-        run: |
-          python3 - <<'PY'
-          import os
-          import re
-          import sys
-
-          title = os.environ["PR_TITLE"].strip()
-          allowed_types = [
-              "feat",
-              "fix",
-              "docs",
-              "style",
-              "refactor",
-              "perf",
-              "test",
-              "build",
-              "ci",
-              "chore",
-              "revert",
-          ]
-          pattern = re.compile(
-              rf"^(?P<type>{'|'.join(allowed_types)})(?:\([^)]+\))?(?P<breaking>!)?: (?P<subject>.+)$"
-          )
-          match = pattern.match(title)
-          if not match:
-              allowed = ", ".join(allowed_types)
-              print(
-                  "PR title must follow Conventional Commits format: "
-                  "<type>(optional-scope)!: <subject>"
-              )
-              print(f"Allowed types: {allowed}")
-              print(f"Actual title: {title}")
-              sys.exit(1)
-
-          subject = match.group("subject")
-          if re.match(r"^[A-Z]", subject):
-              print(
-                  f'The subject "{subject}" found in the pull request title "{title}" '
-                  "must not start with an uppercase character."
-              )
-              sys.exit(1)
-          PY
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # Configure which types are allowed
+          types: |
+            feat
+            fix
+            docs
+            style
+            refactor
+            perf
+            test
+            build
+            ci
+            chore
+            revert
+          # Ensure the subject doesn't start with uppercase
+          subjectPattern: ^(?![A-Z]).+$
+          subjectPatternError: |
+            The subject "{subject}" found in the pull request title "{title}"
+            didn't match the configured pattern. Please ensure that the subject
+            doesn't start with an uppercase character.
