@@ -586,16 +586,18 @@ class KerasZipScanner(BaseScanner):
         for context, node in self._iter_dict_nodes(model_config):
             if self._is_primarily_documentation(context, node):
                 continue
-            string_values: list[str] = []
+            direct_string_values: list[str] = []
+            all_string_values: list[str] = []
             for value in node.values():
-                string_values.extend(self._extract_string_literals(value))
+                direct_string_values.extend(self._extract_string_literals(value))
+                all_string_values.extend(self._extract_string_literals(value, include_dict_values=True))
             has_get_file = any(
                 _GET_FILE_PATTERN.fullmatch(value.strip()) is not None
                 or value.strip().lower().endswith(".get_file")
                 or "keras.utils.get_file" in value.strip().lower()
-                for value in string_values
+                for value in direct_string_values
             )
-            has_url = any(_URL_PATTERN.search(value) is not None for value in string_values)
+            has_url = any(_URL_PATTERN.search(value) is not None for value in all_string_values)
             if not (has_get_file and has_url):
                 continue
             result.add_check(
@@ -764,15 +766,20 @@ class KerasZipScanner(BaseScanner):
         return any(issue.details.get("cve_id") == "CVE-2025-9906" for issue in result.issues)
 
     @staticmethod
-    def _extract_string_literals(value: Any) -> list[str]:
+    def _extract_string_literals(value: Any, *, include_dict_values: bool = False) -> list[str]:
         """Extract string literals from simple container values."""
         if isinstance(value, str):
             return [value]
         if isinstance(value, (list, tuple, set)):
             values: list[str] = []
             for item in value:
-                values.extend(KerasZipScanner._extract_string_literals(item))
+                values.extend(KerasZipScanner._extract_string_literals(item, include_dict_values=include_dict_values))
             return values
+        if include_dict_values and isinstance(value, dict):
+            dict_values: list[str] = []
+            for item in value.values():
+                dict_values.extend(KerasZipScanner._extract_string_literals(item, include_dict_values=True))
+            return dict_values
         return []
 
     @staticmethod
