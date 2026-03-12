@@ -55,8 +55,10 @@ class OciLayerScanner(BaseScanner):
                 if candidate not in scannable_extensions:
                     continue
                 candidate_width = end - start
-                if best_candidate is None or candidate_width > best_candidate[0] or (
-                    candidate_width == best_candidate[0] and start < best_candidate[1]
+                if (
+                    best_candidate is None
+                    or candidate_width > best_candidate[0]
+                    or (candidate_width == best_candidate[0] and start < best_candidate[1])
                 ):
                     best_candidate = (candidate_width, start, candidate)
 
@@ -93,7 +95,7 @@ class OciLayerScanner(BaseScanner):
         if location == extracted_path:
             return member_location
         if location.startswith(extracted_path):
-            return f"{member_location}{location[len(extracted_path):]}"
+            return f"{member_location}{location[len(extracted_path) :]}"
         return f"{member_location} {location}"
 
     @classmethod
@@ -206,8 +208,10 @@ class OciLayerScanner(BaseScanner):
 
                             file_result = core.scan_file(tmp_path, self.config)
                             detected_suffix = self._get_detected_format_suffix(tmp_path)
-                            if file_result.scanner_name == "unknown" and detected_suffix and not tmp_path.endswith(
-                                detected_suffix
+                            if (
+                                file_result.scanner_name == "unknown"
+                                and detected_suffix
+                                and not tmp_path.endswith(detected_suffix)
                             ):
                                 retargeted_path = f"{tmp_path}{detected_suffix}"
                                 os.replace(tmp_path, retargeted_path)

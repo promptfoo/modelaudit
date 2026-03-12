@@ -366,8 +366,7 @@ class TestOciLayerScanner:
         assert result.success is True
         assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
         assert any(
-            "trailing-space.manifest:layer.tar.gz:malicious.pkl " in (issue.location or "")
-            for issue in result.issues
+            "trailing-space.manifest:layer.tar.gz:malicious.pkl " in (issue.location or "") for issue in result.issues
         )
 
     def test_scan_layer_prefers_model_extension_over_trailing_generic_suffix(self, tmp_path: Path) -> None:
