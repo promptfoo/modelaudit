@@ -77,6 +77,49 @@ def _get_component_type(path: str, metadata: dict[str, Any] | None) -> Component
     return ComponentType.FILE
 
 
+def _resolve_component_size_and_sha256(
+    path: str,
+    metadata: FileMetadataModel | dict[str, Any] | None,
+) -> tuple[int, str]:
+    """Resolve component size/hash from disk, falling back to recorded metadata."""
+    if os.path.exists(path):
+        return os.path.getsize(path), _file_sha256(path)
+
+    file_size = 0
+    sha256 = ""
+
+    if isinstance(metadata, FileMetadataModel):
+        if metadata.file_size is not None:
+            file_size = metadata.file_size
+        if metadata.file_hashes and metadata.file_hashes.sha256:
+            sha256 = metadata.file_hashes.sha256
+    elif isinstance(metadata, dict):
+        raw_size = metadata.get("file_size")
+        if isinstance(raw_size, int):
+            file_size = raw_size
+        raw_hashes = metadata.get("file_hashes")
+        if isinstance(raw_hashes, dict):
+            raw_sha256 = raw_hashes.get("sha256")
+            if isinstance(raw_sha256, str):
+                sha256 = raw_sha256
+
+    return file_size, sha256
+
+
+def _should_skip_sbom_file(path: str) -> bool:
+    """Skip cache bookkeeping files that are not model artifacts."""
+    filename = os.path.basename(path)
+
+    if filename.endswith(".metadata") or filename.endswith(".lock"):
+        return True
+
+    if filename in {".gitignore", ".gitattributes", "main", "HEAD"}:
+        return True
+
+    normalized_path = path.replace("\\", "/")
+    return "/refs/" in normalized_path and filename in {"main", "HEAD"}
+
+
 def _calculate_risk_score(path: str, issues: list[Issue]) -> int:
     """Calculate risk score for a file based on associated issues."""
     score = 0
@@ -179,8 +222,7 @@ def _component_for_file_pydantic(
     issues: list[Issue],
 ) -> Component:
     """Create a CycloneDX component from Pydantic models (type-safe version)."""
-    size = os.path.getsize(path) if os.path.exists(path) else 0
-    sha256 = _file_sha256(path) if os.path.exists(path) else ""
+    size, sha256 = _resolve_component_size_and_sha256(path, metadata)
 
     # Start with basic properties
     props = [Property(name="size", value=str(size))]
@@ -219,8 +261,7 @@ def _component_for_file(
     metadata: dict[str, Any],
     issues: Iterable[dict[str, Any]],
 ) -> Component:
-    size = os.path.getsize(path)
-    sha256 = _file_sha256(path)
+    size, sha256 = _resolve_component_size_and_sha256(path, metadata)
     props = [Property(name="size", value=str(size))]
 
     # Compute risk score based on issues related to this file
@@ -321,7 +362,7 @@ def _component_for_file(
         name=os.path.basename(path),
         bom_ref=path,
         type=component_type,
-        hashes=[HashType.from_hashlib_alg("sha256", sha256)],
+        hashes=[HashType.from_hashlib_alg("sha256", sha256)] if sha256 else [],
         properties=props,
     )
 
@@ -350,6 +391,8 @@ def generate_sbom(paths: Iterable[str], results: dict[str, Any] | Any) -> str:
             for root, _, files in os.walk(input_path):
                 for f in files:
                     fp = os.path.join(root, f)
+                    if _should_skip_sbom_file(fp):
+                        continue
                     meta_model = file_meta.get(fp)
                     # Convert Pydantic model to dict if needed
                     if meta_model is not None and hasattr(meta_model, "model_dump"):
@@ -390,6 +433,8 @@ def generate_sbom_pydantic(paths: Iterable[str], results: ModelAuditResultModel)
             for root, _, files in os.walk(input_path):
                 for f in files:
                     fp = os.path.join(root, f)
+                    if _should_skip_sbom_file(fp):
+                        continue
                     metadata = file_metadata.get(fp)
                     component = _component_for_file_pydantic(fp, metadata, issues)
                     bom.components.add(component)
