@@ -81,7 +81,7 @@ DTYPE_MAP: dict[int, np.dtype[Any]] = {
 }
 
 
-def tensor_proto_to_ndarray(tensor_proto: Any) -> np.ndarray[Any, Any]:
+def tensor_proto_to_ndarray(tensor_proto: Any, *, max_tensor_bytes: int | None = None) -> np.ndarray[Any, Any]:
     """
     Convert a TensorProto to a numpy ndarray.
 
@@ -96,6 +96,8 @@ def tensor_proto_to_ndarray(tensor_proto: Any) -> np.ndarray[Any, Any]:
 
     Args:
         tensor_proto: A TensorProto message (from tensorflow.core.framework.tensor_pb2)
+        max_tensor_bytes: Optional upper bound for materialized tensor size in bytes.
+            If exceeded, conversion fails before allocating large arrays.
 
     Returns:
         numpy ndarray containing the tensor data
@@ -109,6 +111,9 @@ def tensor_proto_to_ndarray(tensor_proto: Any) -> np.ndarray[Any, Any]:
     else:
         shape = ()
 
+    if any(dim < 0 for dim in shape):
+        raise ValueError(f"Invalid tensor shape with negative dimensions: {shape}")
+
     num_elements = int(np.prod(shape)) if shape else 1
 
     # Get dtype
@@ -117,6 +122,13 @@ def tensor_proto_to_ndarray(tensor_proto: Any) -> np.ndarray[Any, Any]:
         raise ValueError(f"Unsupported TensorFlow dtype: {dtype_enum}")
 
     dtype = DTYPE_MAP[dtype_enum]
+
+    if max_tensor_bytes and max_tensor_bytes > 0 and dtype != np.dtype(object):
+        estimated_bytes = num_elements * dtype.itemsize
+        if estimated_bytes > max_tensor_bytes:
+            raise ValueError(
+                f"Tensor materialization size {estimated_bytes} exceeds configured limit {max_tensor_bytes}"
+            )
 
     # Fast path: binary content (most common for large tensors)
     if tensor_proto.tensor_content:

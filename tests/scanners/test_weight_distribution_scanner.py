@@ -9,6 +9,44 @@ from typing import Any
 import pytest
 
 from modelaudit.scanners.weight_distribution_scanner import WeightDistributionScanner
+from modelaudit.utils.tensorflow_compat import DataType, tensor_proto_to_ndarray
+
+
+def _make_mock_tensor_proto(*, shape: list[int], dtype: int, float_values: list[float]) -> Any:
+    dims = [types.SimpleNamespace(size=size) for size in shape]
+    return types.SimpleNamespace(
+        tensor_shape=types.SimpleNamespace(dim=dims),
+        dtype=dtype,
+        tensor_content=b"",
+        string_val=[],
+        float_val=float_values,
+        double_val=[],
+        int_val=[],
+        int64_val=[],
+        uint32_val=[],
+        uint64_val=[],
+        bool_val=[],
+        scomplex_val=[],
+        dcomplex_val=[],
+        half_val=[],
+        float8_val=[],
+    )
+
+
+def test_tensor_proto_to_ndarray_rejects_large_materialization_before_padding() -> None:
+    tensor_proto = _make_mock_tensor_proto(shape=[1024, 1024], dtype=DataType.DT_FLOAT, float_values=[1.0])
+
+    with pytest.raises(ValueError, match="exceeds configured limit"):
+        tensor_proto_to_ndarray(tensor_proto, max_tensor_bytes=1024)
+
+
+def test_tensor_proto_to_ndarray_small_tensor_still_broadcasts() -> None:
+    tensor_proto = _make_mock_tensor_proto(shape=[2, 2], dtype=DataType.DT_FLOAT, float_values=[1.0])
+
+    array = tensor_proto_to_ndarray(tensor_proto, max_tensor_bytes=1024)
+
+    assert array.shape == (2, 2)
+    assert array.tolist() == [[1.0, 1.0], [1.0, 1.0]]
 
 
 # Skip tests if required libraries are not available

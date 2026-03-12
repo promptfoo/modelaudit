@@ -449,7 +449,10 @@ class WeightDistributionScanner(BaseScanner):
                 for node in nodes:
                     if node.op == "Const" and "value" in node.attr:
                         tensor_proto = node.attr["value"].tensor
-                        array = tensor_proto_to_ndarray(tensor_proto)
+                        array = tensor_proto_to_ndarray(
+                            tensor_proto,
+                            max_tensor_bytes=self.max_array_size,
+                        )
                         if self.max_array_size and self.max_array_size > 0 and array.nbytes > self.max_array_size:
                             continue
                         if ("weight" in node.name.lower() or "kernel" in node.name.lower()) and len(array.shape) >= 2:
