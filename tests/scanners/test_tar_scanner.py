@@ -303,6 +303,11 @@ class TestTarScanner:
         scanner = TarScanner(config={"max_file_size": 4096, "max_entry_size": 128})
         assert scanner._get_max_entry_size() == 128
 
+    def test_get_max_entry_size_uses_bounded_default_when_max_file_size_is_unlimited(self) -> None:
+        """A top-level unlimited file-size config should not disable TAR member extraction limits."""
+        scanner = TarScanner(config={"max_file_size": 0})
+        assert scanner._get_max_entry_size() == DEFAULT_MAX_TAR_ENTRY_SIZE
+
     def test_extract_member_to_tempfile_streams_in_chunks(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

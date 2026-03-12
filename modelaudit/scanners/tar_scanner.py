@@ -116,12 +116,15 @@ class TarScanner(BaseScanner):
         """Return the per-entry extraction limit used for TAR members."""
         configured_entry_limit = self.config.get("max_entry_size")
         if configured_entry_limit is not None:
-            max_entry_size = configured_entry_limit
-        else:
-            max_entry_size = self.config.get("max_file_size", DEFAULT_MAX_TAR_ENTRY_SIZE)
-        if max_entry_size == 0:
-            return 1024 * 1024 * 1024 * 1024
-        return int(max_entry_size)
+            if configured_entry_limit == 0:
+                return 1024 * 1024 * 1024 * 1024
+            return int(configured_entry_limit)
+
+        configured_file_limit = self.config.get("max_file_size")
+        if configured_file_limit is None or configured_file_limit == 0:
+            return DEFAULT_MAX_TAR_ENTRY_SIZE
+
+        return int(configured_file_limit)
 
     def _extract_member_to_tempfile(
         self,
