@@ -114,17 +114,23 @@ class TarScanner(BaseScanner):
 
     def _get_max_entry_size(self) -> int:
         """Return the per-entry extraction limit used for TAR members."""
+        configured_file_limit = self.config.get("max_file_size")
         configured_entry_limit = self.config.get("max_entry_size")
+
+        # The top-level scan cap is the operator-facing hard stop (for example
+        # CLI --max-size), so it must win when explicitly set.
+        if configured_file_limit is not None and configured_file_limit != 0:
+            return int(configured_file_limit)
+
         if configured_entry_limit is not None:
             if configured_entry_limit == 0:
                 return 1024 * 1024 * 1024 * 1024
             return int(configured_entry_limit)
 
-        configured_file_limit = self.config.get("max_file_size")
-        if configured_file_limit is None or configured_file_limit == 0:
+        if configured_file_limit == 0:
             return DEFAULT_MAX_TAR_ENTRY_SIZE
 
-        return int(configured_file_limit)
+        return DEFAULT_MAX_TAR_ENTRY_SIZE
 
     def _extract_member_to_tempfile(
         self,
@@ -269,6 +275,9 @@ class TarScanner(BaseScanner):
                     continue
 
                 if member.isdir():
+                    continue
+
+                if not member.isfile():
                     continue
 
                 # Check for compound extensions like .tar.gz

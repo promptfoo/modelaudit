@@ -298,9 +298,14 @@ class TestTarScanner:
         """Unconfigured TAR entry extraction should still have a bounded default."""
         assert TarScanner()._get_max_entry_size() == DEFAULT_MAX_TAR_ENTRY_SIZE
 
-    def test_get_max_entry_size_prefers_explicit_entry_limit(self) -> None:
-        """The dedicated per-entry limit should override the top-level file-size setting."""
+    def test_get_max_entry_size_prefers_explicit_file_size_limit(self) -> None:
+        """The top-level file-size limit should remain the hard extraction cap."""
         scanner = TarScanner(config={"max_file_size": 4096, "max_entry_size": 128})
+        assert scanner._get_max_entry_size() == 4096
+
+    def test_get_max_entry_size_uses_entry_limit_when_file_size_is_unlimited(self) -> None:
+        """An explicit TAR-entry limit should apply when the top-level file size is unlimited."""
+        scanner = TarScanner(config={"max_file_size": 0, "max_entry_size": 128})
         assert scanner._get_max_entry_size() == 128
 
     def test_get_max_entry_size_uses_bounded_default_when_max_file_size_is_unlimited(self) -> None:
@@ -361,3 +366,41 @@ class TestTarScanner:
         oversize_checks = [check for check in result.checks if check.name == "TAR File Scan"]
         assert len(oversize_checks) == 1
         assert "tar entry payload.bin exceeds maximum size of 64 bytes" in oversize_checks[0].message.lower()
+
+    def test_scan_respects_max_file_size_over_entry_limit(self, tmp_path: Path) -> None:
+        """A stricter top-level size limit should still fail TAR extraction before scan_file runs."""
+        scanner = TarScanner(config={"max_file_size": 64, "max_entry_size": 1024})
+        archive_path = tmp_path / "precedence.tar"
+        payload = b"C" * 128
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("payload.bin")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = scanner.scan(str(archive_path))
+
+        assert result.success is False
+        oversize_checks = [check for check in result.checks if check.name == "TAR File Scan"]
+        assert len(oversize_checks) == 1
+        assert "tar entry payload.bin exceeds maximum size of 64 bytes" in oversize_checks[0].message.lower()
+
+    def test_scan_skips_non_regular_tar_members(self, tmp_path: Path) -> None:
+        """Valid non-file TAR members should not abort scanning later regular files."""
+        archive_path = tmp_path / "fifo-first.tar"
+        payload = b"payload"
+
+        with tarfile.open(archive_path, "w") as archive:
+            fifo = tarfile.TarInfo("named_pipe")
+            fifo.type = tarfile.FIFOTYPE
+            archive.addfile(fifo)
+
+            info = tarfile.TarInfo("data.bin")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert result.success is True
+        assert result.bytes_scanned == len(payload)
+        assert all("named_pipe" not in issue.message for issue in result.issues)
