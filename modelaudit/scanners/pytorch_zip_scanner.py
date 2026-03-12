@@ -1410,12 +1410,29 @@ class PyTorchZipScanner(BaseScanner):
         return text.strip().startswith(("1.", "2."))
 
     def _get_detected_pytorch_version(self, version_info: dict[str, Any]) -> tuple[str | None, str | None]:
-        """Get framework version detected from artifact metadata."""
+        """Get PyTorch version, preferring local runtime over artifact metadata."""
+        installed_version = self._get_installed_pytorch_version()
+        if installed_version:
+            return installed_version, "local_environment"
+
         version = version_info.get("pytorch_framework_version")
         source = version_info.get("pytorch_version_source")
         if isinstance(version, str) and version.strip():
             return version.strip(), source if isinstance(source, str) else None
         return None, source if isinstance(source, str) else None
+
+    def _get_installed_pytorch_version(self) -> str | None:
+        """Get locally installed PyTorch version when available."""
+        try:
+            import torch
+
+            version = getattr(torch, "__version__", None)
+            if isinstance(version, str) and version.strip():
+                return version.strip()
+        except Exception:
+            return None
+
+        return None
 
     def _check_cve_2025_32434_vulnerability(self, version_info: dict[str, Any], result: ScanResult, path: str) -> None:
         """Check for CVE-2025-32434 using PyTorch version from model metadata."""
