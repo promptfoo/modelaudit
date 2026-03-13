@@ -81,6 +81,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **security:** harden TensorFlow weight extraction limits to bound actual tensor payload materialization, including malformed `tensor_content` and string-backed tensors, and continue scanning past oversized `Const` nodes
 - **cli:** include streamed artifacts as SBOM components when `scan --stream --sbom` is used
 - **cli:** exclude HuggingFace download cache bookkeeping files from remote SBOMs and asset lists
 - **security:** require official or explicitly allowlisted JFrog hosts before treating `/artifactory/` URLs as authenticated JFrog endpoints
