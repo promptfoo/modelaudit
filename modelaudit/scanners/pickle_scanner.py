@@ -560,6 +560,16 @@ RISKY_ML_EXACT_REFS: set[tuple[str, str]] = {
 }
 
 
+def _split_parent_child_ref(prefix: str) -> tuple[str, str]:
+    parent, _separator, child = prefix.rpartition(".")
+    return parent, child
+
+
+RISKY_ML_PARENT_CHILD_REFS: frozenset[tuple[str, str]] = frozenset(
+    _split_parent_child_ref(prefix) for prefix in RISKY_ML_MODULE_PREFIXES
+)
+
+
 def _is_dangerous_module(mod: str) -> bool:
     """Check if module is in ALWAYS_DANGEROUS_MODULES (exact or prefix match).
 
@@ -1812,6 +1822,8 @@ def _is_safe_ml_global(mod: str, func: str) -> bool:
 def _is_risky_ml_import(mod: str, func: str) -> bool:
     """Return True when module/function matches risky ML import policy."""
     if (mod, func) in RISKY_ML_EXACT_REFS:
+        return True
+    if (mod, func) in RISKY_ML_PARENT_CHILD_REFS:
         return True
     return any(mod == prefix or mod.startswith(f"{prefix}.") for prefix in RISKY_ML_MODULE_PREFIXES)
 

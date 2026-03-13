@@ -72,9 +72,17 @@ def test_explanations_for_dangerous_imports():
 
 def test_explanations_for_specific_risky_ml_imports() -> None:
     """Dotted risky ML references should resolve to a specific explanation."""
-    assert get_import_explanation("torch.compile") is not None
-    assert get_import_explanation("torch._dynamo.optimize") is not None
-    assert get_import_explanation("torch.storage._load_from_bytes") is not None
+    compile_explanation = get_import_explanation("torch.compile")
+    assert compile_explanation is not None
+    assert "compile" in compile_explanation.lower()
+
+    dynamo_explanation = get_import_explanation("torch._dynamo.optimize")
+    assert dynamo_explanation is not None
+    assert "dynamo" in dynamo_explanation.lower()
+
+    storage_explanation = get_import_explanation("torch.storage._load_from_bytes")
+    assert storage_explanation is not None
+    assert "_load_from_bytes" in storage_explanation
 
 
 def test_explanations_for_opcodes():
