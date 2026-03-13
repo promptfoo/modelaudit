@@ -235,10 +235,9 @@ def _extract_primary_asset_from_location(location: str) -> str:
     if not location or not isinstance(location, str):
         return "unknown"
 
-    # Duplicate file locations are encoded one-per-line so paths containing
-    # spaces stay intact during consolidation.
-    locations = [entry.strip() for entry in location.splitlines() if entry.strip()]
-    primary_location = locations[0] if locations else location.strip()
+    # Locations are single paths. Duplicate copies are tracked separately in
+    # details["duplicate_files"] to avoid ambiguous delimiter encoding.
+    primary_location = location.strip()
 
     if not primary_location:
         return "unknown"
@@ -826,11 +825,10 @@ def scan_model_directory_or_file(
                                     scanner=file_result.scanner_name,
                                     file_path=representative_file,
                                 )
-                                # Update location to include all file paths with this content
+                                if not issue_dict.get("location"):
+                                    issue_dict["location"] = representative_file
+
                                 if len(file_paths) > 1:
-                                    all_locations = "\n".join(file_paths)
-                                    issue_dict["location"] = all_locations
-                                    # Add details about duplicate files
                                     if "details" not in issue_dict:
                                         issue_dict["details"] = {}
                                     issue_dict["details"]["duplicate_files"] = file_paths
@@ -849,12 +847,10 @@ def scan_model_directory_or_file(
                             for check in file_result.checks:
                                 check_dict = check.to_dict() if hasattr(check, "to_dict") else check
                                 if isinstance(check_dict, dict):
-                                    # Update location to include all file paths with this content
+                                    if not check_dict.get("location"):
+                                        check_dict["location"] = representative_file
+
                                     if len(file_paths) > 1:
-                                        # Encode duplicates one-per-line so later parsing does
-                                        # not confuse spaces inside a single filesystem path.
-                                        check_dict["location"] = "\n".join(file_paths)
-                                        # Add details about duplicate files
                                         if "details" not in check_dict:
                                             check_dict["details"] = {}
                                         check_dict["details"]["duplicate_files"] = file_paths

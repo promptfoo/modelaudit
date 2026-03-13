@@ -18,8 +18,8 @@ def test_extract_primary_asset_windows_path_without_archive() -> None:
         assert _extract_primary_asset_from_location(location) == r"C:\\Users\\test\\file.txt"
 
 
-def test_extract_primary_asset_preserves_spaces_in_duplicate_locations() -> None:
-    location = "/tmp/group one/model a.pkl\n/tmp/group one/model b.pkl"
+def test_extract_primary_asset_preserves_spaces_in_path() -> None:
+    location = "/tmp/group one/model a.pkl"
     assert _extract_primary_asset_from_location(location) == "/tmp/group one/model a.pkl"
 
 
@@ -41,7 +41,30 @@ def test_check_consolidation_keeps_distinct_duplicate_groups_with_spaces(tmp_pat
     path_exists_checks = [check for check in result.checks if check.name == "Path Exists"]
 
     assert len(path_exists_checks) == 2
-    assert {frozenset((check.location or "").splitlines()) for check in path_exists_checks} == {
+    duplicate_groups = {frozenset(check.details["duplicate_files"]) for check in path_exists_checks}
+    assert duplicate_groups == {
         frozenset({str(group_one / "dup a.pkl"), str(group_one / "dup b.pkl")}),
         frozenset({str(group_two / "other a.pkl"), str(group_two / "other b.pkl")}),
     }
+
+    for check in path_exists_checks:
+        assert check.location in check.details["duplicate_files"]
+        assert "\n" not in (check.location or "")
+
+
+def test_check_consolidation_handles_newlines_in_file_paths(tmp_path: Path) -> None:
+    group = tmp_path / "group\nnewline"
+    group.mkdir()
+
+    for path in (group / "dup a.pkl", group / "dup b.pkl"):
+        with path.open("wb") as handle:
+            pickle.dump({"group": "newline"}, handle)
+
+    result = scan_model_directory_or_file(str(tmp_path))
+    path_exists_checks = [check for check in result.checks if check.name == "Path Exists"]
+
+    assert len(path_exists_checks) == 1
+    check = path_exists_checks[0]
+    expected_paths = {str(group / "dup a.pkl"), str(group / "dup b.pkl")}
+    assert set(check.details["duplicate_files"]) == expected_paths
+    assert check.location in expected_paths
