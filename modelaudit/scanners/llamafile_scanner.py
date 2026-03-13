@@ -25,6 +25,14 @@ MACHO_MAGICS = {
 }
 
 PRINTABLE_TEXT_RE = re.compile(rb"[ -~]{8,}")
+SAFE_LOCALHOST_URL_RE = re.compile(
+    r"https?://(?:localhost|127(?:\.\d{1,3}){3}|0\.0\.0\.0|\[::1\]|::1)(?::\d+)?(?:/[^\s]*)?",
+    re.IGNORECASE,
+)
+SAFE_JSON_SCHEMA_URL_RE = re.compile(
+    r"https?://(?:www\.)?json-schema\.org(?::\d+)?(?:/[^\s]*)?",
+    re.IGNORECASE,
+)
 
 COMMAND_TOKENS = (
     "bash -c",
@@ -50,7 +58,7 @@ NETWORK_TOKENS = (
 # Patterns found in the legitimate llamafile/cosmopolitan runtime that are
 # NOT indicators of compromise.  These appear in error messages, debug format
 # strings, and server status output.
-LLAMAFILE_RUNTIME_SAFE_EXACT_PATTERNS = (
+LLAMAFILE_RUNTIME_SAFE_EXACT_PATTERNS: tuple[str, ...] = (
     "llamafile",
     "llama.cpp",
     "cosmopolitan",
@@ -59,15 +67,19 @@ LLAMAFILE_RUNTIME_SAFE_EXACT_PATTERNS = (
     "llama_new_context_with_model",
 )
 
-LLAMAFILE_RUNTIME_SAFE_FRAGMENT_PATTERNS = (
+LLAMAFILE_RUNTIME_SAFE_FRAGMENT_PATTERNS: tuple[str, ...] = (
     "llama server listening",
     "APE is running on WIN32 inside WSL",
     "json-schema.org",
     "%'18T connect",
     "%'18T socket",
 )
-LLAMAFILE_RUNTIME_SAFE_EXACT_LOWER = {pattern.lower() for pattern in LLAMAFILE_RUNTIME_SAFE_EXACT_PATTERNS}
-LLAMAFILE_RUNTIME_SAFE_FRAGMENT_LOWER = {pattern.lower() for pattern in LLAMAFILE_RUNTIME_SAFE_FRAGMENT_PATTERNS}
+LLAMAFILE_RUNTIME_SAFE_EXACT_LOWER: set[str] = {
+    pattern.lower() for pattern in LLAMAFILE_RUNTIME_SAFE_EXACT_PATTERNS
+}
+LLAMAFILE_RUNTIME_SAFE_FRAGMENT_LOWER: set[str] = {
+    pattern.lower() for pattern in LLAMAFILE_RUNTIME_SAFE_FRAGMENT_PATTERNS
+}
 
 
 class LlamafileScanner(BaseScanner):
@@ -192,9 +204,21 @@ class LlamafileScanner(BaseScanner):
         lowered = text.lower()
         if any(token in lowered for token in COMMAND_TOKENS):
             return False
-        return lowered in LLAMAFILE_RUNTIME_SAFE_EXACT_LOWER or any(
-            fragment in lowered for fragment in LLAMAFILE_RUNTIME_SAFE_FRAGMENT_LOWER
-        )
+        if lowered in LLAMAFILE_RUNTIME_SAFE_EXACT_LOWER:
+            return True
+
+        normalized = SAFE_LOCALHOST_URL_RE.sub("", lowered)
+        normalized = SAFE_JSON_SCHEMA_URL_RE.sub("json-schema.org", normalized)
+
+        for fragment in LLAMAFILE_RUNTIME_SAFE_FRAGMENT_LOWER:
+            if fragment not in normalized:
+                continue
+            candidate = normalized.replace(fragment, "", 1)
+            if fragment == "%'18t connect" and candidate.lstrip().startswith("("):
+                continue
+            if not any(token in candidate for token in NETWORK_TOKENS):
+                return True
+        return False
 
     def _scan_runtime_strings(self, path: str, blob: bytes, result: ScanResult) -> None:
         command_hits: set[str] = set()

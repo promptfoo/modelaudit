@@ -3,6 +3,8 @@ from __future__ import annotations
 import struct
 from pathlib import Path
 
+import pytest
+
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.llamafile_scanner import LlamafileScanner
 
@@ -114,6 +116,29 @@ def test_llamafile_scanner_flags_mixed_safe_fragment_and_command_tokens(tmp_path
     runtime_issues = [issue for issue in result.issues if "Executable runtime contains" in issue.message]
     assert runtime_issues
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in runtime_issues)
+
+
+@pytest.mark.parametrize(
+    "runtime_line",
+    [
+        "INFO llama server listening on http://evil.example/payload.sh",
+        "%'18T connect http://evil.example/payload.sh",
+        "%'18T socket http://evil.example/payload.sh",
+    ],
+)
+def test_llamafile_scanner_flags_safe_fragments_with_remote_network_targets(
+    tmp_path: Path, runtime_line: str
+) -> None:
+    binary = tmp_path / "remote-network-fragment.llamafile"
+    binary.write_bytes(_build_llamafile_blob(runtime_lines=[runtime_line]))
+
+    result = LlamafileScanner().scan(str(binary))
+
+    runtime_issues = [
+        issue for issue in result.issues if "Executable runtime contains network indicators" in issue.message
+    ]
+    assert runtime_issues
+    assert all(issue.severity == IssueSeverity.INFO for issue in runtime_issues)
 
 
 def test_llamafile_scanner_handles_truncated_binary(tmp_path: Path) -> None:
