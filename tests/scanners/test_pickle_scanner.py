@@ -258,6 +258,80 @@ class TestPickleScannerAdvanced(unittest.TestCase):
             f"Expected subprocess issues, but found: {[i.message for i in result.issues]}"
         )
 
+
+class TestDillLoadersRegression:
+    def test_global_dill_loads_is_flagged(self, tmp_path: Path) -> None:
+        payload = tmp_path / "global_dill_loads.pkl"
+        payload.write_bytes(b"cdill\nloads\n.")
+
+        result = PickleScanner().scan(str(payload))
+
+        failed_global_checks = [
+            check
+            for check in result.checks
+            if check.name == "Global Module Reference Check"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+        ]
+        assert any("dill.loads" in check.message for check in failed_global_checks)
+
+    def test_global_dill_load_is_flagged(self, tmp_path: Path) -> None:
+        payload = tmp_path / "global_dill_load.pkl"
+        payload.write_bytes(b"cdill\nload\n.")
+
+        result = PickleScanner().scan(str(payload))
+
+        failed_global_checks = [
+            check
+            for check in result.checks
+            if check.name == "Global Module Reference Check"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+        ]
+        assert any("dill.load" in check.message for check in failed_global_checks)
+
+    def test_stack_global_dill_loads_is_flagged(self, tmp_path: Path) -> None:
+        payload = tmp_path / "stack_global_dill_loads.pkl"
+        payload.write_bytes(b"\x80\x04\x95\x13\x00\x00\x00\x00\x00\x00\x00\x8c\x04dill\x94\x8c\x05loads\x94\x93\x94.")
+
+        result = PickleScanner().scan(str(payload))
+
+        failed_stack_checks = [
+            check
+            for check in result.checks
+            if check.name == "STACK_GLOBAL Module Check"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+        ]
+        assert any("dill.loads" in check.message for check in failed_stack_checks)
+
+    def test_benign_pickle_with_dill_string_is_not_flagged(self, tmp_path: Path) -> None:
+        payload = tmp_path / "benign_dill_string.pkl"
+        with payload.open("wb") as handle:
+            pickle.dump({"serializer": "dill", "metadata": "safe"}, handle)
+
+        result = PickleScanner().scan(str(payload))
+
+        assert result.success
+        assert not any("dill." in issue.message for issue in result.issues)
+
+    def test_existing_safe_pickle_fixture_unaffected(self) -> None:
+        fixture = Path(__file__).parent.parent / "assets" / "samples" / "pickles" / "safe_data.pkl"
+
+        result = PickleScanner().scan(str(fixture))
+
+        assert result.success
+        assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+    def test_dill_dump_remains_non_failing(self, tmp_path: Path) -> None:
+        payload = tmp_path / "reduce_dill_dump.pkl"
+        payload.write_bytes(b"\x80\x02cdill\ndump\n(tR.")
+
+        result = PickleScanner().scan(str(payload))
+
+        assert result.success
+        assert not result.has_errors
+
     def test_multiple_pickle_streams(self) -> None:
         scanner = PickleScanner()
         result = scanner.scan(str(Path(__file__).parent.parent / "assets" / "pickles" / "multiple_stream_attack.pkl"))

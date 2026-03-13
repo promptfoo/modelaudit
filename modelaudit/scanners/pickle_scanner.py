@@ -1520,7 +1520,9 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
     "dtype": [
         "dtype",  # numpy.dtype().dtype pattern
     ],
-    "dill": ["dump", "dumps", "load", "loads", "copy"],
+    # dill.load/dill.loads recursively deserialize attacker-controlled byte streams
+    # and must be treated as dangerous pickle entry points.
+    "dill": ["dump", "dumps", "copy"],
     "tensorflow": [
         "Tensor",
         "Variable",
