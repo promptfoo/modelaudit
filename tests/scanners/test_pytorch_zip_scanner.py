@@ -1,6 +1,5 @@
 import json
 import pickle
-import sys
 import time
 import zipfile
 from pathlib import Path
@@ -491,37 +490,90 @@ def test_pytorch_zip_scanner_combined_security_controls(tmp_path):
     assert symlink_issues[0].severity == IssueSeverity.WARNING
 
 
-def test_pytorch_zip_version_detection_prefers_local_torch(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Local torch version must take precedence over attacker-controlled metadata."""
+def test_pytorch_zip_version_detection_reads_metadata() -> None:
+    """Metadata helper should return the artifact version without consulting local torch."""
     scanner = PyTorchZipScanner()
-
-    class _MockTorch:
-        __version__ = "2.5.1"
-
-    monkeypatch.setitem(sys.modules, "torch", _MockTorch())
 
     detected_version, source = scanner._get_detected_pytorch_version(
         {"pytorch_framework_version": "2.10.0", "pytorch_version_source": "metadata:config.json:pytorch_version"}
+    )
+
+    assert detected_version == "2.10.0"
+    assert source == "metadata:config.json:pytorch_version"
+
+
+def test_pytorch_zip_version_selection_prefers_local_vulnerable_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A vulnerable local runtime must override fixed artifact metadata."""
+    scanner = PyTorchZipScanner()
+
+    monkeypatch.setattr(scanner, "_get_installed_pytorch_version", lambda: "2.5.1")
+
+    detected_version, source = scanner._select_pytorch_version_for_check(
+        {"pytorch_framework_version": "2.10.0", "pytorch_version_source": "metadata:config.json:pytorch_version"},
+        scanner._is_vulnerable_pytorch_version,
     )
 
     assert detected_version == "2.5.1"
     assert source == "local_environment"
 
 
-def test_pytorch_zip_version_detection_uses_metadata_when_torch_unavailable(
+def test_pytorch_zip_version_selection_prefers_metadata_when_local_is_fixed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fixed local runtime must not hide vulnerable artifact metadata."""
+    scanner = PyTorchZipScanner()
+
+    monkeypatch.setattr(scanner, "_get_installed_pytorch_version", lambda: "2.10.0")
+
+    detected_version, source = scanner._select_pytorch_version_for_check(
+        {"pytorch_framework_version": "2.9.0", "pytorch_version_source": "metadata:config.json:pytorch_version"},
+        scanner._is_vulnerable_pytorch_version_2026,
+    )
+
+    assert detected_version == "2.9.0"
+    assert source == "metadata:config.json:pytorch_version"
+
+
+def test_pytorch_zip_version_selection_uses_metadata_when_torch_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Metadata fallback should still work when local torch isn't importable."""
     scanner = PyTorchZipScanner()
 
-    monkeypatch.delitem(sys.modules, "torch", raising=False)
+    monkeypatch.setattr(scanner, "_get_installed_pytorch_version", lambda: None)
 
-    detected_version, source = scanner._get_detected_pytorch_version(
-        {"pytorch_framework_version": "2.5.1", "pytorch_version_source": "metadata:config.json:pytorch_version"}
+    detected_version, source = scanner._select_pytorch_version_for_check(
+        {"pytorch_framework_version": "2.5.1", "pytorch_version_source": "metadata:config.json:pytorch_version"},
+        scanner._is_vulnerable_pytorch_version,
     )
 
     assert detected_version == "2.5.1"
     assert source == "metadata:config.json:pytorch_version"
+
+
+def test_get_installed_pytorch_version_handles_import_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Broken torch imports should degrade to None instead of aborting the scan."""
+    import builtins
+
+    scanner = PyTorchZipScanner()
+    real_import = builtins.__import__
+
+    def fail_torch_import(
+        name: str,
+        globals: dict[str, object] | None = None,
+        locals: dict[str, object] | None = None,
+        fromlist: tuple[str, ...] = (),
+        level: int = 0,
+    ) -> object:
+        if name == "torch":
+            raise RuntimeError("broken torch import")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", fail_torch_import)
+
+    assert scanner._get_installed_pytorch_version() is None
 
 
 # CVE-2026-24747 Tests
@@ -683,6 +735,7 @@ def test_pytorch_zip_cve_2022_45907_version_check(tmp_path: Path) -> None:
         f"Checks: {[(c.name, c.status) for c in result.checks]}"
     )
     assert failed_checks[0].details.get("detected_pytorch_version") == "1.13.0"
+    assert failed_checks[0].details.get("pytorch_version_source") == "metadata:config.json:pytorch_version"
 
 
 def test_pytorch_zip_cve_2022_45907_fixed_version(tmp_path: Path) -> None:
@@ -713,6 +766,7 @@ def test_pytorch_zip_cve_2024_5480_version_check(tmp_path: Path) -> None:
         f"Checks: {[(c.name, c.status) for c in result.checks]}"
     )
     assert failed_checks[0].details.get("detected_pytorch_version") == "2.2.2"
+    assert failed_checks[0].details.get("pytorch_version_source") == "metadata:config.json:pytorch_version"
 
 
 def test_pytorch_zip_cve_2024_5480_fixed_version(tmp_path: Path) -> None:
@@ -743,6 +797,7 @@ def test_pytorch_zip_cve_2024_48063_version_check(tmp_path: Path) -> None:
         f"Checks: {[(c.name, c.status) for c in result.checks]}"
     )
     assert failed_checks[0].details.get("detected_pytorch_version") == "2.4.1"
+    assert failed_checks[0].details.get("pytorch_version_source") == "metadata:config.json:pytorch_version"
 
 
 def test_pytorch_zip_cve_2024_48063_fixed_version(tmp_path: Path) -> None:
