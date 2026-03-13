@@ -4,11 +4,122 @@ import sys
 import tempfile
 import types
 import zipfile
+from pathlib import Path
 from typing import Any
 
 import pytest
 
 from modelaudit.scanners.weight_distribution_scanner import WeightDistributionScanner
+from modelaudit.utils.tensorflow_compat import DataType, tensor_proto_to_ndarray
+
+
+def _make_mock_tensor_proto(
+    *,
+    shape: list[int],
+    dtype: int,
+    float_values: list[float] | None = None,
+    string_values: list[bytes] | None = None,
+    tensor_content: bytes = b"",
+) -> Any:
+    dims = [types.SimpleNamespace(size=size) for size in shape]
+    return types.SimpleNamespace(
+        tensor_shape=types.SimpleNamespace(dim=dims),
+        dtype=dtype,
+        tensor_content=tensor_content,
+        string_val=string_values or [],
+        float_val=float_values or [],
+        double_val=[],
+        int_val=[],
+        int64_val=[],
+        uint32_val=[],
+        uint64_val=[],
+        bool_val=[],
+        scomplex_val=[],
+        dcomplex_val=[],
+        half_val=[],
+        float8_val=[],
+    )
+
+
+def test_tensor_proto_to_ndarray_rejects_large_materialization_before_padding() -> None:
+    tensor_proto = _make_mock_tensor_proto(shape=[1024, 1024], dtype=DataType.DT_FLOAT, float_values=[1.0])
+
+    with pytest.raises(ValueError, match="exceeds configured limit"):
+        tensor_proto_to_ndarray(tensor_proto, max_tensor_bytes=1024)
+
+
+def test_tensor_proto_to_ndarray_small_tensor_still_broadcasts() -> None:
+    tensor_proto = _make_mock_tensor_proto(shape=[2, 2], dtype=DataType.DT_FLOAT, float_values=[1.0])
+
+    array = tensor_proto_to_ndarray(tensor_proto, max_tensor_bytes=1024)
+
+    assert array.shape == (2, 2)
+    assert array.tolist() == [[1.0, 1.0], [1.0, 1.0]]
+
+
+def test_tensor_proto_to_ndarray_rejects_large_tensor_content_before_copy() -> None:
+    tensor_proto = _make_mock_tensor_proto(
+        shape=[1],
+        dtype=DataType.DT_FLOAT,
+        tensor_content=b"\x00\x00\x80?" * 1024,
+    )
+
+    with pytest.raises(ValueError, match="exceeds configured limit"):
+        tensor_proto_to_ndarray(tensor_proto, max_tensor_bytes=16)
+
+
+def test_tensor_proto_to_ndarray_rejects_large_string_materialization() -> None:
+    tensor_proto = _make_mock_tensor_proto(
+        shape=[1024, 1024],
+        dtype=DataType.DT_STRING,
+        string_values=[b"x"],
+    )
+
+    with pytest.raises(ValueError, match="exceeds configured limit"):
+        tensor_proto_to_ndarray(tensor_proto, max_tensor_bytes=1024)
+
+
+def test_extract_tensorflow_weights_skips_invalid_oversized_const(tmp_path: Path) -> None:
+    import importlib
+
+    import modelaudit.protos
+
+    assert modelaudit.protos._check_vendored_protos()
+
+    attr_value_pb2 = importlib.import_module("tensorflow.core.framework.attr_value_pb2")
+    graph_pb2 = importlib.import_module("tensorflow.core.framework.graph_pb2")
+    node_def_pb2 = importlib.import_module("tensorflow.core.framework.node_def_pb2")
+    tensor_pb2 = importlib.import_module("tensorflow.core.framework.tensor_pb2")
+    types_pb2 = importlib.import_module("tensorflow.core.framework.types_pb2")
+
+    def make_const_node(name: str, shape: list[int], float_values: list[float]) -> Any:
+        tensor = tensor_pb2.TensorProto(dtype=types_pb2.DT_FLOAT)
+        for size in shape:
+            tensor.tensor_shape.dim.add(size=size)
+        tensor.float_val.extend(float_values)
+
+        node = node_def_pb2.NodeDef(name=name, op="Const")
+        node.attr["value"].CopyFrom(attr_value_pb2.AttrValue(tensor=tensor))
+        node.attr["dtype"].CopyFrom(attr_value_pb2.AttrValue(type=types_pb2.DT_FLOAT))
+        return node
+
+    graph = graph_pb2.GraphDef()
+    graph.node.extend(
+        [
+            make_const_node("dummy_const", [1024, 1024], [1.0]),
+            make_const_node("dense/kernel", [2, 2], [1.0]),
+        ]
+    )
+
+    model_path = tmp_path / "model.pb"
+    model_path.write_bytes(graph.SerializeToString())
+
+    scanner = WeightDistributionScanner({"max_array_size": 1024})
+    weights = scanner._extract_tensorflow_weights(str(model_path))
+
+    assert list(weights) == ["dense/kernel"]
+    assert weights["dense/kernel"].shape == (2, 2)
+    assert weights["dense/kernel"].tolist() == [[1.0, 1.0], [1.0, 1.0]]
 
 
 # Skip tests if required libraries are not available
