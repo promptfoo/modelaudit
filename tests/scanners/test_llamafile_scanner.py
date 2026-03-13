@@ -145,6 +145,9 @@ def test_llamafile_scanner_allows_local_endpoint_runtime_fragments(tmp_path: Pat
         "%'18T socket http://evil.example/payload.sh",
         "%'18T connect(evil.example:8080)",
         "%'18T socket evil.example:8080",
+        "%'18T connect(10.0.0.8:8080)",
+        "%'18T socket 192.168.1.10:8080",
+        "%'18T connect(172.16.0.5:8080)",
     ],
 )
 def test_llamafile_scanner_flags_safe_fragments_with_remote_network_targets(tmp_path: Path, runtime_line: str) -> None:

@@ -103,7 +103,7 @@ def _is_local_endpoint_token(token: str) -> bool:
         ip = ipaddress.ip_address(host)
     except ValueError:
         return False
-    return ip.is_loopback or ip.is_private or ip.is_unspecified
+    return ip.is_loopback or ip.is_unspecified
 
 
 class LlamafileScanner(BaseScanner):
