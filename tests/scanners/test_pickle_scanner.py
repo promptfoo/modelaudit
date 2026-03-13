@@ -1210,5 +1210,189 @@ def test_scan_memory_error_with_dangerous_globals_not_downgraded(
     assert format_validation_checks[0].details["exception_type"] == "MemoryError"
 
 
+@pytest.mark.parametrize(
+    ("module_name", "func_name", "payload"),
+    [
+        ("torch.jit", "load", b"\x80\x02ctorch.jit\nload\n."),
+        ("torch._dynamo", "optimize", b"\x80\x02ctorch._dynamo\noptimize\n."),
+        ("torch", "compile", b"\x80\x02ctorch\ncompile\n."),
+        ("numpy.f2py", "compile", b"\x80\x02cnumpy.f2py\ncompile\n."),
+        ("numpy.distutils.core", "setup", b"\x80\x02cnumpy.distutils.core\nsetup\n."),
+        (
+            "torch.storage",
+            "_load_from_bytes",
+            b"\x80\x02ctorch.storage\n_load_from_bytes\n.",
+        ),
+    ],
+)
+def test_risky_ml_import_only_globals_are_detected(
+    tmp_path: Path, module_name: str, func_name: str, payload: bytes
+) -> None:
+    """Import-only risky ML GLOBAL refs should be flagged even without REDUCE."""
+    path = tmp_path / f"{module_name.replace('.', '_')}_{func_name}.pkl"
+    path.write_bytes(payload)
+
+    result = PickleScanner().scan(str(path))
+    full_ref = f"{module_name}.{func_name}"
+    failing_checks = [
+        check
+        for check in result.checks
+        if check.name == "Global Module Reference Check"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("import_reference") == full_ref
+    ]
+    matching_issues = [issue for issue in result.issues if full_ref in issue.message]
+
+    assert failing_checks, f"Expected failed GLOBAL check for {full_ref}, got: {result.checks}"
+    assert all(check.severity == IssueSeverity.CRITICAL for check in failing_checks), (
+        f"Expected CRITICAL GLOBAL finding for {full_ref}, got: "
+        f"{[(check.severity.name, check.message) for check in failing_checks]}"
+    )
+    assert matching_issues, f"Expected issue for risky ML import {full_ref}, got: {result.issues}"
+    assert any(issue.why for issue in matching_issues), f"Expected explanation for risky ML import {full_ref}"
+
+
+def test_risky_ml_reduce_target_is_detected(tmp_path: Path) -> None:
+    """Risky ML globals should remain CRITICAL when later consumed by REDUCE."""
+    path = tmp_path / "torch_jit_reduce.pkl"
+    path.write_bytes(b"\x80\x02ctorch.jit\nload\n(tR.")
+
+    result = PickleScanner().scan(str(path))
+    reduce_checks = [
+        check
+        for check in result.checks
+        if check.name == "REDUCE Opcode Safety Check"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("associated_global") == "torch.jit.load"
+    ]
+
+    assert reduce_checks, f"Expected REDUCE finding for torch.jit.load, got: {result.checks}"
+    assert all(check.severity == IssueSeverity.CRITICAL for check in reduce_checks), (
+        f"Expected CRITICAL REDUCE finding for torch.jit.load, got: "
+        f"{[(check.severity.name, check.message) for check in reduce_checks]}"
+    )
+
+
+def test_risky_ml_stack_global_detection(tmp_path: Path) -> None:
+    """Risky ML imports hidden behind STACK_GLOBAL should be detected."""
+
+    def _short_binunicode(value: bytes) -> bytes:
+        return b"\x8c" + bytes([len(value)]) + value
+
+    payload = bytearray(b"\x80\x04")
+    payload += _short_binunicode(b"torch.jit")
+    payload += _short_binunicode(b"load")
+    payload += b"\x93"  # STACK_GLOBAL
+    payload += b"."  # STOP
+
+    path = tmp_path / "torch_jit_stack_global.pkl"
+    path.write_bytes(payload)
+
+    result = PickleScanner().scan(str(path))
+    failing_checks = [
+        check
+        for check in result.checks
+        if check.name == "STACK_GLOBAL Module Check"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("module") == "torch.jit"
+        and check.details.get("function") == "load"
+    ]
+
+    assert failing_checks, f"Expected STACK_GLOBAL torch.jit.load detection. Checks: {result.checks}"
+    assert all(check.severity == IssueSeverity.CRITICAL for check in failing_checks), (
+        f"Expected CRITICAL STACK_GLOBAL finding for torch.jit.load, got: "
+        f"{[(check.severity.name, check.message) for check in failing_checks]}"
+    )
+    assert any(issue.why for issue in result.issues if "torch.jit.load" in issue.message)
+
+
+def test_risky_ml_memoized_stack_global_reuse_is_detected(tmp_path: Path) -> None:
+    """Memoized risky STACK_GLOBAL references should remain detectable on recall."""
+
+    def _short_binunicode(value: bytes) -> bytes:
+        return b"\x8c" + bytes([len(value)]) + value
+
+    payload = bytearray(b"\x80\x04")
+    payload += _short_binunicode(b"torch._dynamo")
+    payload += _short_binunicode(b"optimize")
+    payload += b"\x93"  # STACK_GLOBAL
+    payload += b"\x94"  # MEMOIZE index 0
+    payload += b"0"  # POP
+    payload += b"h\x00"  # BINGET 0
+    payload += b"."  # STOP
+
+    path = tmp_path / "torch_dynamo_memo.pkl"
+    path.write_bytes(payload)
+
+    result = PickleScanner().scan(str(path))
+    assert any("torch._dynamo.optimize" in issue.message for issue in result.issues), (
+        f"Expected memoized risky import detection. Issues: {[i.message for i in result.issues]}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("payload", "safe_ref"),
+    [
+        (b"\x80\x02ctorch\nTensor\n.", "torch.Tensor"),
+        (b"\x80\x02ctorch._utils\n_rebuild_tensor\n.", "torch._utils._rebuild_tensor"),
+        (b"\x80\x02cnumpy.core.multiarray\n_reconstruct\n.", "numpy.core.multiarray._reconstruct"),
+    ],
+)
+def test_safe_ml_reconstruction_globals_remain_non_failing(tmp_path: Path, payload: bytes, safe_ref: str) -> None:
+    """Known safe ML reconstruction globals should not become noisy."""
+    path = tmp_path / f"{safe_ref.replace('.', '_')}.pkl"
+    path.write_bytes(payload)
+
+    result = PickleScanner().scan(str(path))
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues), (
+        f"Safe reconstruction ref {safe_ref} should not fail. Issues: "
+        f"{[(i.severity.name, i.message) for i in result.issues]}"
+    )
+
+
+def test_safe_pytorch_state_dict_pickle_remains_non_failing(tmp_path: Path) -> None:
+    """State-dict-style payloads should not start failing under the risky-ML policy."""
+    import collections
+
+    safe_state_dict = collections.OrderedDict(
+        [
+            ("layer1.weight", [1.0, 2.0, 3.0]),
+            ("layer1.bias", [0.1, 0.2, 0.3]),
+            ("layer2.weight", [4.0, 5.0, 6.0]),
+        ]
+    )
+    payload = {
+        "state_dict": safe_state_dict,
+        "_metadata": collections.OrderedDict([("", {"version": 1})]),
+    }
+    path = tmp_path / "safe_state_dict.pth"
+    with path.open("wb") as handle:
+        pickle.dump(payload, handle, protocol=2)
+
+    result = PickleScanner().scan(str(path))
+
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues), (
+        "Safe state-dict payload should not be noisy. Issues: "
+        f"{[(issue.severity.name, issue.message) for issue in result.issues]}"
+    )
+
+
+def test_safe_then_risky_ml_stream_still_flags_risky_import(tmp_path: Path) -> None:
+    """Risky imports in later streams must be detected after safe ML globals."""
+    safe_stream = b"\x80\x02ctorch._utils\n_rebuild_tensor\n."
+    risky_stream = b"\x80\x02ctorch._inductor\ncompile_fx\n."
+
+    path = tmp_path / "safe_then_risky.pkl"
+    path.write_bytes(safe_stream + risky_stream)
+
+    result = PickleScanner().scan(str(path))
+    assert any("torch._inductor.compile_fx" in issue.message for issue in result.issues), (
+        f"Expected detection from later stream. Issues: {[i.message for i in result.issues]}"
+    )
+    assert not any("torch._utils._rebuild_tensor" in issue.message for issue in result.issues), (
+        f"Safe global should not be flagged. Issues: {[i.message for i in result.issues]}"
+    )
+
+
 if __name__ == "__main__":
     unittest.main()

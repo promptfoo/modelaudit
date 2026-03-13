@@ -544,6 +544,21 @@ WARNING_SEVERITY_MODULES: set[str] = {
     "glob",
 }
 
+# Risky ML-specific import surfaces that must be flagged even when they appear
+# as import-only GLOBAL/STACK_GLOBAL references (without immediate REDUCE).
+RISKY_ML_MODULE_PREFIXES: tuple[str, ...] = (
+    "torch.jit",
+    "torch._dynamo",
+    "torch._inductor",
+    "numpy.f2py",
+    "numpy.distutils",
+)
+
+RISKY_ML_EXACT_REFS: set[tuple[str, str]] = {
+    ("torch", "compile"),
+    ("torch.storage", "_load_from_bytes"),
+}
+
 
 def _is_dangerous_module(mod: str) -> bool:
     """Check if module is in ALWAYS_DANGEROUS_MODULES (exact or prefix match).
@@ -1794,6 +1809,13 @@ def _is_safe_ml_global(mod: str, func: str) -> bool:
     return False
 
 
+def _is_risky_ml_import(mod: str, func: str) -> bool:
+    """Return True when module/function matches risky ML import policy."""
+    if (mod, func) in RISKY_ML_EXACT_REFS:
+        return True
+    return any(mod == prefix or mod.startswith(f"{prefix}.") for prefix in RISKY_ML_MODULE_PREFIXES)
+
+
 def _is_copyreg_extension_ref(mod: str) -> bool:
     """Return True when a reference came from an EXT opcode extension lookup."""
     return mod == COPYREG_EXTENSION_MODULE
@@ -1841,6 +1863,13 @@ def _is_actually_dangerous_global(mod: str, func: str, ml_context: dict) -> bool
     # explicit GLOBAL/STACK_GLOBAL references.
     if _is_copyreg_extension_ref(mod):
         logger.warning(f"Extension-registry callable detected via EXT opcode: {full_ref}")
+        return True
+
+    # STEP 0.5: Risky ML imports should be flagged even in import-only payloads.
+    # These are intentionally separate from the broad ML safe allowlist because
+    # they map to runtime loading/compilation pathways with elevated risk.
+    if _is_risky_ml_import(mod, func):
+        logger.warning(f"Risky ML import detected: {full_ref}")
         return True
 
     # STEP 1: ALWAYS flag dangerous functions first (no exceptions, no allowlist override)
@@ -2477,6 +2506,10 @@ def is_suspicious_global(mod: str, func: str) -> bool:
     First checks against ML_SAFE_GLOBALS allowlist to reduce false positives
     for legitimate ML framework operations.
     """
+    # STEP 0: Always flag risky ML imports before any allowlist checks.
+    if _is_risky_ml_import(mod, func):
+        return True
+
     # STEP 1: Check ML_SAFE_GLOBALS allowlist first
     # If the module.function is in the safe list, it's not suspicious
     if mod in ML_SAFE_GLOBALS:
@@ -4262,7 +4295,7 @@ class PickleScanner(BaseScanner):
                                 0,
                             ),
                         },
-                        why=get_import_explanation(mod),
+                        why=get_import_explanation(f"{mod}.{func}"),
                     )
 
             # Record successful ML context validation if content appears safe
@@ -4318,7 +4351,7 @@ class PickleScanner(BaseScanner):
                                         0,
                                     ),
                                 },
-                                why=get_import_explanation(mod),
+                                why=get_import_explanation(f"{mod}.{func}"),
                             )
                         else:
                             # Record successful validation of safe global
@@ -4808,7 +4841,7 @@ class PickleScanner(BaseScanner):
                                         0,
                                     ),
                                 },
-                                why=get_import_explanation(mod),
+                                why=get_import_explanation(f"{mod}.{func}"),
                             )
                         else:
                             # Record successful validation of safe STACK_GLOBAL
@@ -4892,7 +4925,7 @@ class PickleScanner(BaseScanner):
                             0,
                         ),
                     },
-                    why=get_import_explanation(module_name)
+                    why=get_import_explanation(f"{module_name}.{func_name}")
                     if module_name
                     else "A dangerous pattern was detected that could execute arbitrary code during unpickling.",
                 )

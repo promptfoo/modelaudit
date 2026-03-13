@@ -70,6 +70,13 @@ def test_explanations_for_dangerous_imports():
     assert eval_explanation is not None and "arbitrary" in eval_explanation.lower()
 
 
+def test_explanations_for_specific_risky_ml_imports() -> None:
+    """Dotted risky ML references should resolve to a specific explanation."""
+    assert get_import_explanation("torch.compile") is not None
+    assert get_import_explanation("torch._dynamo.optimize") is not None
+    assert get_import_explanation("torch.storage._load_from_bytes") is not None
+
+
 def test_explanations_for_opcodes():
     """Test that we have explanations for dangerous opcodes."""
     assert get_opcode_explanation("REDUCE") is not None
