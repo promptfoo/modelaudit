@@ -6,9 +6,6 @@ import re
 from typing import Any, ClassVar
 
 from modelaudit.detectors.suspicious_symbols import (
-    KNOWN_SAFE_KERAS_LAYER_CLASSES,
-    KNOWN_SAFE_KERAS_LOSSES,
-    KNOWN_SAFE_KERAS_METRICS,
     SUSPICIOUS_CONFIG_PROPERTIES,
     SUSPICIOUS_LAYER_TYPES,
 )
@@ -19,7 +16,14 @@ from modelaudit.utils.helpers.code_validation import (
 
 from ..config.explanations import get_cve_2024_3660_explanation, get_cve_2025_9905_explanation, get_pattern_explanation
 from .base import BaseScanner, IssueSeverity, ScanResult
-from .keras_utils import check_lambda_dict_function, check_subclassed_model
+from .keras_utils import (
+    check_lambda_dict_function,
+    check_subclassed_model,
+    is_known_safe_keras_layer_class,
+    is_known_safe_keras_loss,
+    is_known_safe_keras_metric,
+    iter_keras_serialized_identifiers,
+)
 
 # Try to import h5py, but handle the case where it's not installed
 try:
@@ -181,64 +185,7 @@ class KerasH5Scanner(BaseScanner):
 
                 # Check for custom metrics and custom loss
                 if "training_config" in f.attrs:
-                    training_config = json.loads(f.attrs["training_config"])
-                    if "metrics" in training_config and training_config["metrics"] is not None:
-                        metrics_list = training_config["metrics"]
-                        if not isinstance(metrics_list, list | tuple):
-                            metrics_list = []
-                        for metric in metrics_list:
-                            if isinstance(metric, str):
-                                if metric not in KNOWN_SAFE_KERAS_METRICS:
-                                    result.add_check(
-                                        name="Custom Metric Detection",
-                                        passed=False,
-                                        message=f"Model contains custom metric: {metric}",
-                                        severity=IssueSeverity.WARNING,
-                                        location=f"{self.current_file_path} (metrics)",
-                                        details={"metric": metric},
-                                        rule_code="S305",
-                                    )
-                            elif (
-                                isinstance(metric, dict)
-                                and metric.get(
-                                    "class_name",
-                                )
-                                not in KNOWN_SAFE_KERAS_METRICS
-                            ):
-                                result.add_check(
-                                    name="Custom Metric Detection",
-                                    passed=False,
-                                    message=f"Model contains custom metric: {metric.get('class_name', 'unknown')}",
-                                    severity=IssueSeverity.WARNING,
-                                    location=f"{self.current_file_path} (metrics)",
-                                    details={"metric": metric},
-                                    rule_code="S305",
-                                )
-
-                    # Check for custom loss functions
-                    loss_value = training_config.get("loss")
-                    if isinstance(loss_value, str) and loss_value and loss_value not in KNOWN_SAFE_KERAS_LOSSES:
-                        result.add_check(
-                            name="Custom Loss Detection",
-                            passed=False,
-                            message=f"Model contains custom loss function: {loss_value}",
-                            severity=IssueSeverity.WARNING,
-                            location=f"{self.current_file_path} (training_config)",
-                            details={"loss": loss_value},
-                            rule_code="S305",
-                        )
-                    elif isinstance(loss_value, dict):
-                        loss_class = loss_value.get("class_name", "")
-                        if loss_class and loss_class not in KNOWN_SAFE_KERAS_LOSSES:
-                            result.add_check(
-                                name="Custom Loss Detection",
-                                passed=False,
-                                message=f"Model contains custom loss class: {loss_class}",
-                                severity=IssueSeverity.WARNING,
-                                location=f"{self.current_file_path} (training_config)",
-                                details={"loss": loss_value},
-                                rule_code="S305",
-                            )
+                    self._scan_training_config(json.loads(f.attrs["training_config"]), result)
 
         except Exception as e:
             result.add_check(
@@ -255,6 +202,63 @@ class KerasH5Scanner(BaseScanner):
 
         result.finish(success=True)
         return result
+
+    def _scan_training_config(self, training_config: Any, result: ScanResult) -> None:
+        """Inspect training_config for custom metrics and losses."""
+        if not isinstance(training_config, dict):
+            return
+
+        self._check_custom_metric_config(training_config.get("metrics"), result, "training_config.metrics")
+        self._check_custom_metric_config(
+            training_config.get("weighted_metrics"),
+            result,
+            "training_config.weighted_metrics",
+        )
+        self._check_custom_loss_config(training_config.get("loss"), result, "training_config.loss")
+
+    def _check_custom_metric_config(self, metrics_config: Any, result: ScanResult, context: str) -> None:
+        """Flag custom metrics embedded anywhere in a serialized metric tree."""
+        seen_metrics: set[str] = set()
+
+        for identifier, raw_metric in iter_keras_serialized_identifiers(metrics_config):
+            normalized_identifier = identifier.strip().lower()
+            if not normalized_identifier or is_known_safe_keras_metric(identifier):
+                continue
+            if normalized_identifier in seen_metrics:
+                continue
+            seen_metrics.add(normalized_identifier)
+
+            result.add_check(
+                name="Custom Metric Detection",
+                passed=False,
+                message=f"Model contains custom metric: {identifier}",
+                severity=IssueSeverity.WARNING,
+                location=f"{self.current_file_path} ({context})",
+                details={"metric": raw_metric, "identifier": identifier},
+                rule_code="S305",
+            )
+
+    def _check_custom_loss_config(self, loss_config: Any, result: ScanResult, context: str) -> None:
+        """Flag custom losses embedded anywhere in a serialized loss tree."""
+        seen_losses: set[str] = set()
+
+        for identifier, raw_loss in iter_keras_serialized_identifiers(loss_config):
+            normalized_identifier = identifier.strip().lower()
+            if not normalized_identifier or is_known_safe_keras_loss(identifier):
+                continue
+            if normalized_identifier in seen_losses:
+                continue
+            seen_losses.add(normalized_identifier)
+
+            result.add_check(
+                name="Custom Loss Detection",
+                passed=False,
+                message=f"Model contains custom loss: {identifier}",
+                severity=IssueSeverity.WARNING,
+                location=f"{self.current_file_path} ({context})",
+                details={"loss": raw_loss, "identifier": identifier},
+                rule_code="S305",
+            )
 
     def _scan_model_config(
         self,
@@ -438,7 +442,7 @@ class KerasH5Scanner(BaseScanner):
                     )
 
             # Detect unknown/custom layer classes not in the standard Keras set
-            elif layer_class and layer_class not in KNOWN_SAFE_KERAS_LAYER_CLASSES:
+            elif layer_class and not is_known_safe_keras_layer_class(layer_class):
                 result.add_check(
                     name="Custom Layer Class Detection",
                     passed=False,
@@ -461,7 +465,12 @@ class KerasH5Scanner(BaseScanner):
             )
 
             # If there are nested models, scan them recursively
-            if layer_class == "Model" and "config" in layer and "layers" in layer["config"] and isinstance(layer, dict):
+            if (
+                layer_class in {"Model", "Functional", "Sequential"}
+                and isinstance(layer, dict)
+                and "config" in layer
+                and "layers" in layer["config"]
+            ):
                 self._scan_model_config(layer, result)
 
         # Add layer counts to metadata

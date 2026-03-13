@@ -25,7 +25,14 @@ from ..config.explanations import (
     get_pattern_explanation,
 )
 from .base import BaseScanner, IssueSeverity, ScanResult
-from .keras_utils import check_lambda_dict_function, check_subclassed_model
+from .keras_utils import (
+    check_lambda_dict_function,
+    check_subclassed_model,
+    is_known_safe_keras_layer_class,
+    is_known_safe_keras_loss,
+    is_known_safe_keras_metric,
+    iter_keras_serialized_identifiers,
+)
 
 # CVE-2025-1550: Keras safe_mode bypass via arbitrary module references in config.json
 # Allowlist of top-level module names that are safe in Keras model configs.
@@ -253,6 +260,8 @@ class KerasZipScanner(BaseScanner):
                 },
             )
 
+        self._scan_compile_config(model_config.get("compile_config"), result)
+
         # Get layers from config
         layers = []
         if "config" in model_config and isinstance(model_config["config"], dict):
@@ -350,6 +359,21 @@ class KerasZipScanner(BaseScanner):
                         "description": self.suspicious_layer_types[layer_class],
                     },
                 )
+            elif layer_class and not is_known_safe_keras_layer_class(layer_class):
+                result.add_check(
+                    name="Custom Layer Class Detection",
+                    passed=False,
+                    message=f"Unknown/custom layer class detected: {layer_class}",
+                    severity=IssueSeverity.WARNING,
+                    location=f"{self.current_file_path} (layer: {layer_name})",
+                    details={
+                        "layer_class": layer_class,
+                        "layer_name": layer_name,
+                        "layer_config": layer.get("config", {}),
+                        "risk": "Custom layer classes require external code to load and may execute arbitrary logic",
+                    },
+                    rule_code="S810",
+                )
 
             # Check for custom objects
             if layer.get("registered_name"):
@@ -375,6 +399,63 @@ class KerasZipScanner(BaseScanner):
 
         # Add layer counts to metadata
         result.metadata["layer_counts"] = layer_counts
+
+    def _scan_compile_config(self, compile_config: Any, result: ScanResult) -> None:
+        """Inspect compile_config for custom metrics and losses."""
+        if not isinstance(compile_config, dict):
+            return
+
+        self._check_custom_metric_config(compile_config.get("metrics"), result, "compile_config.metrics")
+        self._check_custom_metric_config(
+            compile_config.get("weighted_metrics"),
+            result,
+            "compile_config.weighted_metrics",
+        )
+        self._check_custom_loss_config(compile_config.get("loss"), result, "compile_config.loss")
+
+    def _check_custom_metric_config(self, metrics_config: Any, result: ScanResult, context: str) -> None:
+        """Flag custom metrics embedded anywhere in a serialized metric tree."""
+        seen_metrics: set[str] = set()
+
+        for identifier, raw_metric in iter_keras_serialized_identifiers(metrics_config):
+            normalized_identifier = identifier.strip().lower()
+            if not normalized_identifier or is_known_safe_keras_metric(identifier):
+                continue
+            if normalized_identifier in seen_metrics:
+                continue
+            seen_metrics.add(normalized_identifier)
+
+            result.add_check(
+                name="Custom Metric Detection",
+                passed=False,
+                message=f"Model contains custom metric: {identifier}",
+                severity=IssueSeverity.WARNING,
+                location=f"{self.current_file_path} ({context})",
+                details={"metric": raw_metric, "identifier": identifier},
+                rule_code="S305",
+            )
+
+    def _check_custom_loss_config(self, loss_config: Any, result: ScanResult, context: str) -> None:
+        """Flag custom losses embedded anywhere in a serialized loss tree."""
+        seen_losses: set[str] = set()
+
+        for identifier, raw_loss in iter_keras_serialized_identifiers(loss_config):
+            normalized_identifier = identifier.strip().lower()
+            if not normalized_identifier or is_known_safe_keras_loss(identifier):
+                continue
+            if normalized_identifier in seen_losses:
+                continue
+            seen_losses.add(normalized_identifier)
+
+            result.add_check(
+                name="Custom Loss Detection",
+                passed=False,
+                message=f"Model contains custom loss: {identifier}",
+                severity=IssueSeverity.WARNING,
+                location=f"{self.current_file_path} ({context})",
+                details={"loss": raw_loss, "identifier": identifier},
+                rule_code="S305",
+            )
 
     def _check_torch_module_wrapper(self, result: ScanResult, layer_name: str) -> None:
         """Check for CVE-2025-49655: TorchModuleWrapper deserialization RCE.
