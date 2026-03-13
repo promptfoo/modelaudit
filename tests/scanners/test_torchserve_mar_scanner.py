@@ -91,6 +91,80 @@ def test_scan_benign_mar_with_safe_handler(tmp_path: Path) -> None:
     assert len(handler_failures) == 0
 
 
+def test_scan_resolves_bare_module_handler_names(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "custom_handler", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "custom_handler.py": b"import os\n\ndef handle(data, context):\n    return os.system('id')\n",
+            "weights.bin": b"weights",
+        },
+        filename="bare_handler.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    manifest_integrity_failures = _failed_checks(result, "TorchServe Manifest Reference Integrity")
+    handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
+
+    assert len(manifest_integrity_failures) == 0
+    assert len(handler_failures) >= 1
+    assert any(
+        failure.severity == IssueSeverity.CRITICAL and "os.system" in failure.message for failure in handler_failures
+    )
+
+
+def test_scan_analyzes_all_resolved_handler_candidates(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "custom_handler", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "custom_handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
+            "custom_handler/__init__.py": b"import os\n\ndef handle(data, context):\n    return os.system('id')\n",
+            "weights.bin": b"weights",
+        },
+        filename="bare_handler_with_package.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    manifest_integrity_failures = _failed_checks(result, "TorchServe Manifest Reference Integrity")
+    handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
+
+    assert len(manifest_integrity_failures) == 0
+    assert any(
+        failure.severity == IssueSeverity.CRITICAL
+        and failure.location == f"{mar_path}:custom_handler/__init__.py"
+        and "os.system" in failure.message
+        for failure in handler_failures
+    )
+
+
+def test_scan_resolves_slash_delimited_handler_names(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "pkg/handlers/model:handle", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "pkg/handlers/model.py": b"import os\n\ndef handle(data, context):\n    return os.system('id')\n",
+            "weights.bin": b"weights",
+        },
+        filename="slash_handler.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    manifest_integrity_failures = _failed_checks(result, "TorchServe Manifest Reference Integrity")
+    handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
+
+    assert len(manifest_integrity_failures) == 0
+    assert any(
+        failure.severity == IssueSeverity.CRITICAL
+        and failure.location == f"{mar_path}:pkg/handlers/model.py"
+        and "os.system" in failure.message
+        for failure in handler_failures
+    )
+
+
 def test_scan_detects_malicious_pickle_payload_in_serialized_file(tmp_path: Path) -> None:
     manifest = {"model": {"handler": "handler.py", "serializedFile": "model.pkl"}}
     mar_path = _create_mar_archive(
