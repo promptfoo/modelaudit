@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 
 from modelaudit.core import _extract_primary_asset_from_location, scan_model_directory_or_file
@@ -72,3 +73,23 @@ def test_check_consolidation_handles_newlines_in_file_paths(tmp_path: Path) -> N
     expected_paths = {str(group / "dup a.pkl"), str(group / "dup b.pkl")}
     assert set(check.details["duplicate_files"]) == expected_paths
     assert check.location in expected_paths
+
+
+def test_check_consolidation_keeps_distinct_npz_member_findings(tmp_path: Path) -> None:
+    class ExecPayload:
+        def __reduce__(self):
+            return (exec, ("print('owned')",))
+
+    archive_path = tmp_path / "payload.npz"
+    np.savez(archive_path, safe=np.arange(3), payload=np.array([ExecPayload()], dtype=object))
+
+    result = scan_model_directory_or_file(str(archive_path))
+    data_type_checks = [
+        check
+        for check in result.checks
+        if check.name == "Data Type Safety Check" and check.status.value == "failed"
+    ]
+
+    assert len(data_type_checks) == 1
+    assert data_type_checks[0].location == f"{archive_path}:payload.npy"
+    assert data_type_checks[0].details.get("zip_entry") == "payload.npy"

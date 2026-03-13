@@ -272,8 +272,12 @@ def _group_checks_by_asset(checks_list: list[Any]) -> dict[tuple[str, str], list
         check_name = check.get("name", "Unknown Check")
         location = check.get("location", "")
         primary_asset = _extract_primary_asset_from_location(location)
+        details = check.get("details")
+        zip_entry = details.get("zip_entry") if isinstance(details, dict) else None
 
-        group_key = (check_name, primary_asset)
+        asset_group = f"{primary_asset}:{zip_entry}" if isinstance(zip_entry, str) and zip_entry else primary_asset
+
+        group_key = (check_name, asset_group)
         check_groups[group_key].append(check)
 
     return check_groups
