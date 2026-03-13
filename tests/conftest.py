@@ -107,6 +107,9 @@ def pytest_runtest_setup(item):
             "test_oci_layer_scanner.py",  # OCI layer path safety regression tests
             "test_jfrog.py",  # JFrog utility tests
             "test_jfrog_integration.py",  # JFrog integration tests
+            "test_tar_scanner.py",  # TAR archive scanner tests
+            "test_zip_scanner.py",  # ZIP archive scanner tests
+            "test_sevenzip_scanner.py",  # 7-Zip archive scanner tests
         ]
 
         # Check if this is an allowed test file
