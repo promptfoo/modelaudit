@@ -240,8 +240,7 @@ class TestTarScanner:
         assert result.has_errors is True
         critical_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL]
         assert any(
-            "os.system" in issue.message.lower() or "posix.system" in issue.message.lower()
-            for issue in critical_issues
+            "os.system" in issue.message.lower() or "posix.system" in issue.message.lower() for issue in critical_issues
         )
         assert any(issue.location == f"{archive_path}:payload.txt" for issue in critical_issues)
 
