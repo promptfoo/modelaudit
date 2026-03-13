@@ -190,6 +190,8 @@ class LlamafileScanner(BaseScanner):
     def _is_known_runtime_string(text: str) -> bool:
         """Return True if the string matches a known-safe llamafile runtime pattern."""
         lowered = text.lower()
+        if any(token in lowered for token in COMMAND_TOKENS):
+            return False
         return lowered in LLAMAFILE_RUNTIME_SAFE_EXACT_LOWER or any(
             fragment in lowered for fragment in LLAMAFILE_RUNTIME_SAFE_FRAGMENT_LOWER
         )

