@@ -490,8 +490,8 @@ def test_pytorch_zip_scanner_combined_security_controls(tmp_path):
     assert symlink_issues[0].severity == IssueSeverity.WARNING
 
 
-def test_pytorch_zip_version_detection_prefers_metadata_over_local_torch(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Artifact metadata should win when both sources are present."""
+def test_pytorch_zip_version_extraction_returns_metadata_when_present(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The raw extractor should preserve metadata when both sources are present."""
     scanner = PyTorchZipScanner()
     monkeypatch.setattr(scanner, "_get_installed_pytorch_version", lambda: "2.5.1")
 

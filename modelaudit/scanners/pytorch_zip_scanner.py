@@ -15,6 +15,7 @@ from .base import BaseScanner, IssueSeverity, ScanResult
 from .pickle_scanner import PickleScanner
 
 logger = logging.getLogger(__name__)
+_INSTALLED_PYTORCH_VERSION_UNSET = object()
 
 
 class PyTorchZipScanner(BaseScanner):
@@ -1410,15 +1411,25 @@ class PyTorchZipScanner(BaseScanner):
         # PyTorch versions typically start with 1.x or 2.x
         return text.strip().startswith(("1.", "2."))
 
-    def _get_detected_pytorch_version(self, version_info: dict[str, Any]) -> tuple[str | None, str | None]:
-        """Get PyTorch version from artifact metadata, falling back to local runtime."""
+    def _get_detected_pytorch_version(
+        self,
+        version_info: dict[str, Any],
+        *,
+        installed_version: str | None | object = _INSTALLED_PYTORCH_VERSION_UNSET,
+    ) -> tuple[str | None, str | None]:
+        """Return raw PyTorch version evidence, preferring artifact metadata when present.
+
+        Security-sensitive CVE gating should use _select_pytorch_version_for_check(),
+        which flags any vulnerable source conservatively.
+        """
         version = version_info.get("pytorch_framework_version")
         source = version_info.get("pytorch_version_source")
         if isinstance(version, str) and version.strip():
             return version.strip(), source if isinstance(source, str) else None
 
-        installed_version = self._get_installed_pytorch_version()
-        if installed_version:
+        if installed_version is _INSTALLED_PYTORCH_VERSION_UNSET:
+            installed_version = self._get_installed_pytorch_version()
+        if isinstance(installed_version, str) and installed_version:
             return installed_version, "local_environment"
 
         return None, source if isinstance(source, str) else None
@@ -1441,9 +1452,12 @@ class PyTorchZipScanner(BaseScanner):
         version_info: dict[str, Any],
         is_vulnerable: Callable[[str], bool],
     ) -> tuple[str | None, str | None]:
-        """Select the most conservative PyTorch version source for a CVE check."""
+        """Select the most conservative PyTorch version source for CVE gating."""
         installed_version = self._get_installed_pytorch_version()
-        metadata_version, metadata_source = self._get_detected_pytorch_version(version_info)
+        metadata_version, metadata_source = self._get_detected_pytorch_version(
+            version_info,
+            installed_version=installed_version,
+        )
 
         if installed_version and is_vulnerable(installed_version):
             return installed_version, "local_environment"
