@@ -3790,15 +3790,41 @@ class PickleScanner(BaseScanner):
             ),
         )
 
-    def _extract_globals_advanced(self, data: IO[bytes], multiple_pickles: bool = True) -> set[tuple[str, str]]:
+    def _extract_globals_advanced(
+        self,
+        data: IO[bytes],
+        multiple_pickles: bool = True,
+        scan_start_time: float | None = None,
+    ) -> set[tuple[str, str]]:
         """Advanced pickle global extraction with STACK_GLOBAL and memo support."""
         globals_found: set[tuple[str, str]] = set()
         memo: dict[int | str, str] = {}
+        extracted_opcodes = 0
+        effective_scan_start_time = scan_start_time if scan_start_time is not None else self.scan_start_time
 
         last_byte = b"dummy"
         while last_byte != b"":
+            extraction_truncated = False
             try:
-                ops: list[tuple[Any, Any, int | None]] = list(pickletools.genops(data))
+                ops: list[tuple[Any, Any, int | None]] = []
+                for op in pickletools.genops(data):
+                    ops.append(op)
+                    extracted_opcodes += 1
+
+                    if extracted_opcodes > self.max_opcodes:
+                        logger.warning(
+                            f"Advanced global extraction stopped after exceeding max_opcodes ({self.max_opcodes})"
+                        )
+                        extraction_truncated = True
+                        break
+
+                    if (
+                        effective_scan_start_time is not None
+                        and (time.time() - effective_scan_start_time) > self.timeout
+                    ):
+                        logger.warning(f"Advanced global extraction stopped after exceeding timeout ({self.timeout}s)")
+                        extraction_truncated = True
+                        break
             except Exception as e:
                 if globals_found:
                     logger.warning(f"Pickle parsing failed, but found {len(globals_found)} globals: {e}")
@@ -3835,6 +3861,8 @@ class PickleScanner(BaseScanner):
                         globals_found.add(("unknown", "unknown"))
 
             if not multiple_pickles:
+                break
+            if extraction_truncated:
                 break
         return globals_found
 

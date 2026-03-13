@@ -1210,5 +1210,41 @@ def test_scan_memory_error_with_dangerous_globals_not_downgraded(
     assert format_validation_checks[0].details["exception_type"] == "MemoryError"
 
 
+def test_extract_globals_advanced_respects_max_opcodes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Advanced extraction should stop after max_opcodes instead of parsing everything."""
+    scanner = PickleScanner({"max_opcodes": 3})
+
+    def _fake_genops(_data: object):
+        for i in range(10):
+            yield (type("Op", (), {"name": "NOP"})(), i, i)
+
+    monkeypatch.setattr("modelaudit.scanners.pickle_scanner.pickletools.genops", _fake_genops)
+
+    from io import BytesIO
+
+    globals_found = scanner._extract_globals_advanced(data=BytesIO(b"x"), multiple_pickles=False)
+
+    assert globals_found == set()
+
+
+def test_extract_globals_advanced_respects_scan_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Advanced extraction should honor active scan timeout budget."""
+    scanner = PickleScanner({"timeout": 1})
+    scanner.scan_start_time = 100.0
+
+    def _fake_genops(_data: object):
+        for i in range(10):
+            yield (type("Op", (), {"name": "NOP"})(), i, i)
+
+    monkeypatch.setattr("modelaudit.scanners.pickle_scanner.pickletools.genops", _fake_genops)
+    monkeypatch.setattr("modelaudit.scanners.pickle_scanner.time.time", lambda: 102.0)
+
+    from io import BytesIO
+
+    globals_found = scanner._extract_globals_advanced(data=BytesIO(b"x"), multiple_pickles=False)
+
+    assert globals_found == set()
+
+
 if __name__ == "__main__":
     unittest.main()
