@@ -659,6 +659,10 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
         finally:
             os.unlink(path)
 
+    @staticmethod
+    def _structural_tamper_checks(result: ScanResult) -> list:
+        return [issue for issue in result.issues if issue.details.get("tamper_type") is not None]
+
     # ------------------------------------------------------------------
     # Fix 1: pkgutil trampoline — must be CRITICAL
     # ------------------------------------------------------------------
@@ -758,6 +762,120 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
         assert os_issues, (
             f"Expected CRITICAL os issue from stream 2 after malformed stream 1, "
             f"got: {[i.message for i in result.issues]}"
+        )
+
+    def test_duplicate_proto_same_version_reports_structural_tamper(self) -> None:
+        """Duplicate PROTO in one stream should be reported as structural tampering."""
+        payload = b"\x80\x02\x80\x02K\x01."
+
+        result = self._scan_bytes(payload)
+        structural_checks = self._structural_tamper_checks(result)
+
+        assert structural_checks, "Expected structural tamper finding for duplicate PROTO"
+        assert any(issue.details.get("tamper_type") == "duplicate_proto" for issue in structural_checks), (
+            f"Expected duplicate_proto finding, got: {[i.details for i in structural_checks]}"
+        )
+        assert any(issue.details.get("tamper_type") == "misplaced_proto" for issue in structural_checks), (
+            f"Expected misplaced_proto finding, got: {[i.details for i in structural_checks]}"
+        )
+        assert any(issue.details.get("position") == 2 for issue in structural_checks), (
+            f"Expected duplicate/misplaced PROTO position to be recorded, got: {[i.details for i in structural_checks]}"
+        )
+
+    def test_duplicate_proto_mixed_versions_reports_structural_tamper(self) -> None:
+        """Mixed protocol redeclaration should include both protocol numbers in details."""
+        payload = b"\x80\x02\x80\x04K\x01."
+
+        result = self._scan_bytes(payload)
+        structural_checks = self._structural_tamper_checks(result)
+        duplicate = [issue for issue in structural_checks if issue.details.get("tamper_type") == "duplicate_proto"]
+
+        assert duplicate, f"Expected duplicate_proto finding, got: {[i.details for i in structural_checks]}"
+        assert any(
+            issue.details.get("previous_protocol") == 2 and issue.details.get("protocol") == 4 for issue in duplicate
+        ), f"Expected previous/current protocol details, got: {[i.details for i in duplicate]}"
+
+    def test_misplaced_proto_reports_structural_tamper(self) -> None:
+        """PROTO appearing after another opcode should be flagged as misplaced."""
+        payload = b"K\x01\x80\x02."
+
+        result = self._scan_bytes(payload)
+        structural_checks = self._structural_tamper_checks(result)
+
+        assert any(issue.details.get("tamper_type") == "misplaced_proto" for issue in structural_checks), (
+            f"Expected misplaced_proto finding, got: {[i.details for i in structural_checks]}"
+        )
+
+    def test_valid_single_and_multi_stream_proto_stays_clean(self) -> None:
+        """Normal stream boundaries with one PROTO each should not produce structural findings."""
+        import io
+
+        single = pickle.dumps({"safe": True}, protocol=4)
+        single_result = self._scan_bytes(single)
+        assert not self._structural_tamper_checks(single_result)
+
+        buf = io.BytesIO()
+        pickle.dump({"a": 1}, buf, protocol=2)
+        buf.write(b"\x00")
+        pickle.dump({"b": 2}, buf, protocol=4)
+        multi_result = self._scan_bytes(buf.getvalue())
+
+        assert not self._structural_tamper_checks(multi_result)
+
+    def test_structural_tamper_in_second_stream_is_detected(self) -> None:
+        """Tamper in a later stream should still be reported after a valid first stream."""
+        import io
+
+        buf = io.BytesIO()
+        pickle.dump({"safe": True}, buf, protocol=2)
+        buf.write(b"\x00")
+        buf.write(b"\x80\x02\x80\x02K\x01.")
+
+        result = self._scan_bytes(buf.getvalue())
+        structural_checks = self._structural_tamper_checks(result)
+
+        assert any(issue.details.get("tamper_type") == "duplicate_proto" for issue in structural_checks), (
+            f"Expected duplicate_proto finding in later stream, got: {[i.details for i in structural_checks]}"
+        )
+        assert any(issue.details.get("stream_offset", 0) > 0 for issue in structural_checks), (
+            f"Expected later-stream offset to be recorded, got: {[i.details for i in structural_checks]}"
+        )
+
+    def test_structural_tamper_and_malicious_import_both_reported(self) -> None:
+        """Structural tamper findings must not hide direct code-execution findings."""
+        payload = b"\x80\x02\x80\x02" + self._craft_global_reduce_pickle("os", "system")
+
+        result = self._scan_bytes(payload)
+
+        structural_checks = self._structural_tamper_checks(result)
+        critical_os = [
+            issue
+            for issue in result.issues
+            if issue.severity == IssueSeverity.CRITICAL
+            and ("os" in issue.message.lower() or "posix" in issue.message.lower())
+        ]
+        assert structural_checks, "Expected structural tamper findings"
+        assert critical_os, f"Expected CRITICAL os/posix finding, got: {[i.message for i in result.issues]}"
+
+    def test_structural_tamper_with_safe_ml_payload_only_info_severity(self) -> None:
+        """Structural findings should remain low severity when payload is otherwise benign."""
+        safe_payload = pickle.dumps({"layer": "linear", "shape": [4, 8]}, protocol=2)
+        payload = b"\x80\x02" + safe_payload
+
+        result = self._scan_bytes(payload)
+
+        structural_checks = self._structural_tamper_checks(result)
+        assert structural_checks, "Expected structural tamper finding for duplicate/misplaced PROTO"
+        assert all(issue.severity == IssueSeverity.INFO for issue in structural_checks)
+
+    def test_binary_tail_after_valid_pickle_does_not_report_structural_tamper(self) -> None:
+        """Binary tail data after a valid pickle should not create structural findings."""
+        payload = pickle.dumps({"safe": True}, protocol=2) + (b"XYZNmore-binary-data" * 20)
+
+        result = self._scan_bytes(payload)
+
+        assert not self._structural_tamper_checks(result), (
+            f"Unexpected structural findings for benign binary tail: {[i.details for i in result.issues]}"
         )
 
     # ------------------------------------------------------------------
