@@ -81,6 +81,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **security:** treat legacy `httplib` pickle globals the same as `http.client`, including import-only and `REDUCE` findings in standalone and archived payloads
+- **security:** harden TensorFlow weight extraction limits to bound actual tensor payload materialization, including malformed `tensor_content` and string-backed tensors, and continue scanning past oversized `Const` nodes
+- **security:** stream TAR members to temp files under size limits instead of buffering whole entries in memory during scan
+- **security:** inspect TensorFlow SavedModel function definitions when scanning for dangerous ops and protobuf string abuse, with function-aware finding locations
 - **cli:** include streamed artifacts as SBOM components when `scan --stream --sbom` is used
 - **cli:** exclude HuggingFace download cache bookkeeping files from remote SBOMs and asset lists
 - **security:** require official or explicitly allowlisted JFrog hosts before treating `/artifactory/` URLs as authenticated JFrog endpoints
@@ -107,6 +111,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **security:** detect CVE-2025-8747 Keras get_file gadget safe_mode bypass
 - **keras:** detect CVE-2025-9905 H5 safe_mode bypass for Lambda layers (CVSS 7.3)
 - **keras:** add CVE-2024-3660 attribution to Lambda layer detection in .keras and .h5 scanners (CVSS 9.8)
+- **keras:** recursively inspect H5 `training_config` and `.keras` `compile_config` for custom losses and metrics, while allowlisting standard aliases and built-in preprocessing layers to reduce false positives
 - **security:** detect CVE-2025-10155 pickle protocol 0/1 payloads disguised as `.bin` files by extending `detect_file_format()` to recognize GLOBAL opcode patterns and adding `posix`/`nt` internal module names to binary code pattern blocklist
 - **security:** detect CVE-2022-25882 ONNX external_data path traversal with CVE attribution, CVSS score, and CWE classification in scan results
 - **security:** detect CVE-2024-27318 ONNX nested external_data path traversal bypass via path segment sanitization evasion
@@ -117,6 +122,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **security:** scan OCI layer members based on registered file extensions so embedded ONNX, Keras H5, and other real-path scanners are no longer skipped inside tar layers
+- **security:** resolve bare-module TorchServe handler references like `custom_handler` to concrete archive members so malicious handler source is no longer skipped by static analysis
 - **security:** compare archive entry paths against the intended extraction root without following base-directory symlinks
 - **security:** stop loading `.env` files implicitly during JFrog helper import so untrusted working directories cannot rewrite proxy or auth-related environment variables
 - **rules:** preserve `rule_code` metadata through direct result aggregation and ensure dangerous advanced pickle globals emit explicit rule codes (with regression coverage)

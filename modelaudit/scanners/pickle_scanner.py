@@ -436,6 +436,7 @@ ALWAYS_DANGEROUS_MODULES: set[str] = {
     "urllib",
     "urllib2",
     "http",
+    "httplib",
     "ftplib",
     "telnetlib",
     "pty",

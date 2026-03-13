@@ -295,6 +295,10 @@ TF_OP_EXPLANATIONS = {
         "RestoreV2 restores checkpoint data from files, enabling file system access that could be used "
         "to read sensitive data or load malicious parameters."
     ),
+    "ParseTensor": (
+        "ParseTensor deserializes serialized tensor payloads from strings, which attackers could abuse to "
+        "feed malicious data into downstream graph logic or unsafe parsing paths."
+    ),
     "LookupTableImport": (
         "LookupTableImport imports data from external files into lookup tables, which could be used to "
         "read sensitive files or inject malicious data."

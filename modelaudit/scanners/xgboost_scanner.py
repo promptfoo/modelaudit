@@ -18,11 +18,13 @@ Security Focus:
 - Known CVE patterns and exploit signatures
 """
 
+import importlib.util
 import json
 import os
 import re
 import subprocess
 import sys
+import tempfile
 from typing import Any, ClassVar
 
 from .base import BaseScanner, IssueSeverity, ScanResult
@@ -42,12 +44,7 @@ SUSPICIOUS_JSON_PATTERNS = [
 
 def _check_xgboost_available() -> bool:
     """Check if XGBoost package is available."""
-    try:
-        import xgboost  # noqa: F401
-
-        return True
-    except ImportError:
-        return False
+    return importlib.util.find_spec("xgboost") is not None
 
 
 def _check_ubjson_available() -> bool:
@@ -610,7 +607,19 @@ except Exception as e:
                 path,
             ]
 
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=os.getcwd())
+            cmd.insert(1, "-I")
+            env = os.environ.copy()
+            env.pop("PYTHONPATH", None)
+
+            with tempfile.TemporaryDirectory(prefix="modelaudit-xgb-") as safe_cwd:
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    cwd=safe_cwd,
+                    env=env,
+                )
 
             if proc.returncode == 0 and "SUCCESS" in proc.stdout:
                 result.add_check(

@@ -367,3 +367,74 @@ class TestZipScanner:
             assert any("not a valid zip" in issue.message.lower() for issue in result.issues)
         finally:
             os.unlink(tmp_path)
+
+    def test_scan_empty_zip(self, tmp_path: Path) -> None:
+        """An empty ZIP archive should scan successfully with no critical issues."""
+        archive_path = tmp_path / "empty.zip"
+        with zipfile.ZipFile(archive_path, "w"):
+            pass  # empty archive
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert result.success is True
+        assert result.bytes_scanned == 0
+        critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
+        assert len(critical_issues) == 0
+
+    def test_scan_zip_with_multiple_model_formats(self, tmp_path: Path) -> None:
+        """ZIP containing multiple model-format files should scan all of them."""
+        import pickle
+
+        archive_path = tmp_path / "multi_format.zip"
+
+        pkl_data = pickle.dumps({"weights": [1, 2, 3]})
+        json_data = b'{"model_type": "linear", "version": "1.0"}'
+        pt_data = pickle.dumps({"state_dict": {}})  # .pt files are pickle-based
+
+        with zipfile.ZipFile(archive_path, "w") as z:
+            z.writestr("model.pkl", pkl_data)
+            z.writestr("config.json", json_data)
+            z.writestr("weights.pt", pt_data)
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert result.success is True
+        # All three file payloads should have been scanned
+        assert result.bytes_scanned == len(pkl_data) + len(json_data) + len(pt_data)
+        contents_paths = {c.get("path", "") for c in result.metadata.get("contents", [])}
+        assert any("model.pkl" in p for p in contents_paths)
+        assert any("config.json" in p for p in contents_paths)
+        assert any("weights.pt" in p for p in contents_paths)
+
+    def test_scan_zip_with_very_long_filename(self, tmp_path: Path) -> None:
+        """ZIP entries with very long filenames should be handled without crashing."""
+        import pickle
+
+        archive_path = tmp_path / "long_name.zip"
+        long_name = "a" * 200 + ".pkl"  # 204-character filename
+        payload = pickle.dumps({"key": "value"})
+
+        with zipfile.ZipFile(archive_path, "w") as z:
+            z.writestr(long_name, payload)
+
+        result = self.scanner.scan(str(archive_path))
+
+        # Scan must not crash; success is expected for a benign payload
+        assert result.success is True
+        assert result.bytes_scanned == len(payload)
+
+    def test_scan_truncated_zip(self, tmp_path: Path) -> None:
+        """A truncated (corrupted) ZIP file should fail gracefully."""
+        archive_path = tmp_path / "valid.zip"
+        with zipfile.ZipFile(archive_path, "w") as z:
+            z.writestr("file.txt", "some content")
+
+        full_data = archive_path.read_bytes()
+        truncated_path = tmp_path / "truncated.zip"
+        truncated_path.write_bytes(full_data[: len(full_data) // 2])
+
+        result = self.scanner.scan(str(truncated_path))
+
+        # A truncated archive is invalid — scan must not raise an unhandled exception
+        assert result.success is False
+        assert len(result.issues) > 0

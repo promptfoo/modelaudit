@@ -25,7 +25,14 @@ from ..config.explanations import (
     get_pattern_explanation,
 )
 from .base import BaseScanner, IssueSeverity, ScanResult
-from .keras_utils import check_subclassed_model
+from .keras_utils import (
+    check_lambda_dict_function,
+    check_subclassed_model,
+    is_known_safe_keras_layer_class,
+    is_known_safe_keras_loss,
+    is_known_safe_keras_metric,
+    iter_keras_serialized_identifiers,
+)
 
 # CVE-2025-1550: Keras safe_mode bypass via arbitrary module references in config.json
 # Allowlist of top-level module names that are safe in Keras model configs.
@@ -253,6 +260,8 @@ class KerasZipScanner(BaseScanner):
                 },
             )
 
+        self._scan_compile_config(model_config.get("compile_config"), result)
+
         # Get layers from config
         layers = []
         if "config" in model_config and isinstance(model_config["config"], dict):
@@ -350,6 +359,21 @@ class KerasZipScanner(BaseScanner):
                         "description": self.suspicious_layer_types[layer_class],
                     },
                 )
+            elif layer_class and not is_known_safe_keras_layer_class(layer_class):
+                result.add_check(
+                    name="Custom Layer Class Detection",
+                    passed=False,
+                    message=f"Unknown/custom layer class detected: {layer_class}",
+                    severity=IssueSeverity.WARNING,
+                    location=f"{self.current_file_path} (layer: {layer_name})",
+                    details={
+                        "layer_class": layer_class,
+                        "layer_name": layer_name,
+                        "layer_config": layer.get("config", {}),
+                        "risk": "Custom layer classes require external code to load and may execute arbitrary logic",
+                    },
+                    rule_code="S810",
+                )
 
             # Check for custom objects
             if layer.get("registered_name"):
@@ -375,6 +399,63 @@ class KerasZipScanner(BaseScanner):
 
         # Add layer counts to metadata
         result.metadata["layer_counts"] = layer_counts
+
+    def _scan_compile_config(self, compile_config: Any, result: ScanResult) -> None:
+        """Inspect compile_config for custom metrics and losses."""
+        if not isinstance(compile_config, dict):
+            return
+
+        self._check_custom_metric_config(compile_config.get("metrics"), result, "compile_config.metrics")
+        self._check_custom_metric_config(
+            compile_config.get("weighted_metrics"),
+            result,
+            "compile_config.weighted_metrics",
+        )
+        self._check_custom_loss_config(compile_config.get("loss"), result, "compile_config.loss")
+
+    def _check_custom_metric_config(self, metrics_config: Any, result: ScanResult, context: str) -> None:
+        """Flag custom metrics embedded anywhere in a serialized metric tree."""
+        seen_metrics: set[str] = set()
+
+        for identifier, raw_metric in iter_keras_serialized_identifiers(metrics_config):
+            normalized_identifier = identifier.strip().lower()
+            if not normalized_identifier or is_known_safe_keras_metric(identifier):
+                continue
+            if normalized_identifier in seen_metrics:
+                continue
+            seen_metrics.add(normalized_identifier)
+
+            result.add_check(
+                name="Custom Metric Detection",
+                passed=False,
+                message=f"Model contains custom metric: {identifier}",
+                severity=IssueSeverity.WARNING,
+                location=f"{self.current_file_path} ({context})",
+                details={"metric": raw_metric, "identifier": identifier},
+                rule_code="S305",
+            )
+
+    def _check_custom_loss_config(self, loss_config: Any, result: ScanResult, context: str) -> None:
+        """Flag custom losses embedded anywhere in a serialized loss tree."""
+        seen_losses: set[str] = set()
+
+        for identifier, raw_loss in iter_keras_serialized_identifiers(loss_config):
+            normalized_identifier = identifier.strip().lower()
+            if not normalized_identifier or is_known_safe_keras_loss(identifier):
+                continue
+            if normalized_identifier in seen_losses:
+                continue
+            seen_losses.add(normalized_identifier)
+
+            result.add_check(
+                name="Custom Loss Detection",
+                passed=False,
+                message=f"Model contains custom loss: {identifier}",
+                severity=IssueSeverity.WARNING,
+                location=f"{self.current_file_path} ({context})",
+                details={"loss": raw_loss, "identifier": identifier},
+                rule_code="S305",
+            )
 
     def _check_torch_module_wrapper(self, result: ScanResult, layer_name: str) -> None:
         """Check for CVE-2025-49655: TorchModuleWrapper deserialization RCE.
@@ -586,16 +667,20 @@ class KerasZipScanner(BaseScanner):
         for context, node in self._iter_dict_nodes(model_config):
             if self._is_primarily_documentation(context, node):
                 continue
-            string_values: list[str] = []
-            for value in node.values():
-                string_values.extend(self._extract_string_literals(value))
+            direct_string_values: list[str] = []
+            url_candidate_values: list[str] = []
+            for key, value in node.items():
+                direct_string_values.extend(self._extract_string_literals(value))
+                key_lower = str(key).lower()
+                if key_lower in {"url", "origin", "args", "kwargs"}:
+                    url_candidate_values.extend(self._extract_string_literals(value, include_dict_values=True))
             has_get_file = any(
                 _GET_FILE_PATTERN.fullmatch(value.strip()) is not None
                 or value.strip().lower().endswith(".get_file")
                 or "keras.utils.get_file" in value.strip().lower()
-                for value in string_values
+                for value in direct_string_values
             )
-            has_url = any(_URL_PATTERN.search(value) is not None for value in string_values)
+            has_url = any(_URL_PATTERN.search(value) is not None for value in url_candidate_values)
             if not (has_get_file and has_url):
                 continue
             result.add_check(
@@ -764,15 +849,20 @@ class KerasZipScanner(BaseScanner):
         return any(issue.details.get("cve_id") == "CVE-2025-9906" for issue in result.issues)
 
     @staticmethod
-    def _extract_string_literals(value: Any) -> list[str]:
+    def _extract_string_literals(value: Any, *, include_dict_values: bool = False) -> list[str]:
         """Extract string literals from simple container values."""
         if isinstance(value, str):
             return [value]
         if isinstance(value, (list, tuple, set)):
             values: list[str] = []
             for item in value:
-                values.extend(KerasZipScanner._extract_string_literals(item))
+                values.extend(KerasZipScanner._extract_string_literals(item, include_dict_values=include_dict_values))
             return values
+        if include_dict_values and isinstance(value, dict):
+            dict_values: list[str] = []
+            for item in value.values():
+                dict_values.extend(KerasZipScanner._extract_string_literals(item, include_dict_values=True))
+            return dict_values
         return []
 
     @staticmethod
@@ -945,6 +1035,11 @@ class KerasZipScanner(BaseScanner):
                             "error": str(e),
                         },
                     )
+        elif isinstance(function_data, dict):
+            # Keras 3.x dict-format Lambda: {"class_name": "__lambda__", "config": {"code": ...}}
+            check_lambda_dict_function(
+                function_data, result, f"{self.current_file_path} (layer: {layer_name})", layer_name
+            )
         else:
             # Lambda layer without encoded function - check other fields
             module_name = layer_config.get("module")
