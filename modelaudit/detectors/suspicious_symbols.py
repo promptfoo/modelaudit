@@ -580,6 +580,7 @@ SUSPICIOUS_OPS = {
     "SaveV2",  # SaveV2 operations
     "LoadAndRemapMatrix",  # Load matrix from files with arbitrary paths
     "RestoreV2",  # Restore checkpoint data (file access)
+    "ParseTensor",  # Deserialize serialized tensor payloads
     # External data loading - HIGH RISK
     "LookupTableImport",  # Import data from external files
     "InitializeTable",  # Initialize lookup tables from files
@@ -622,6 +623,7 @@ TENSORFLOW_DANGEROUS_OPS: dict[str, str] = {
     "SaveV2": "Can save data to arbitrary locations",
     "LoadAndRemapMatrix": "Can load matrix data from arbitrary file paths",
     "RestoreV2": "Can restore checkpoint data, enabling file system access",
+    "ParseTensor": "Can deserialize attacker-controlled tensor payloads",
     # External data loading - HIGH RISK
     "LookupTableImport": "Can import data from external files",
     "InitializeTable": "Can initialize lookup tables from external files",
