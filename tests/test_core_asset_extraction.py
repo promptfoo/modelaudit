@@ -1,7 +1,10 @@
 import ntpath
 import pickle
+import sys
 from pathlib import Path
 from unittest.mock import patch
+
+import pytest
 
 from modelaudit.core import _extract_primary_asset_from_location, scan_model_directory_or_file
 
@@ -52,6 +55,7 @@ def test_check_consolidation_keeps_distinct_duplicate_groups_with_spaces(tmp_pat
         assert "\n" not in (check.location or "")
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows paths cannot contain newline characters")
 def test_check_consolidation_handles_newlines_in_file_paths(tmp_path: Path) -> None:
     group = tmp_path / "group\nnewline"
     group.mkdir()
