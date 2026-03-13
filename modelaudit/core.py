@@ -235,12 +235,14 @@ def _extract_primary_asset_from_location(location: str) -> str:
     if not location or not isinstance(location, str):
         return "unknown"
 
-    # Split on spaces first to handle duplicate file listings
-    locations = location.strip().split()
-    if not locations:
+    # Duplicate file locations are encoded one-per-line so paths containing
+    # spaces stay intact during consolidation.
+    locations = [entry.strip() for entry in location.splitlines() if entry.strip()]
+    primary_location = locations[0] if locations else location.strip()
+
+    if not primary_location:
         return "unknown"
 
-    primary_location = locations[0]
     # Extract main file path (before any ':' separator for archive contents)
     drive, tail = os.path.splitdrive(primary_location)
     if ":" in tail:
@@ -826,7 +828,7 @@ def scan_model_directory_or_file(
                                 )
                                 # Update location to include all file paths with this content
                                 if len(file_paths) > 1:
-                                    all_locations = " ".join(file_paths)
+                                    all_locations = "\n".join(file_paths)
                                     issue_dict["location"] = all_locations
                                     # Add details about duplicate files
                                     if "details" not in issue_dict:
@@ -849,8 +851,9 @@ def scan_model_directory_or_file(
                                 if isinstance(check_dict, dict):
                                     # Update location to include all file paths with this content
                                     if len(file_paths) > 1:
-                                        # For checks, we want to show all file locations affected
-                                        check_dict["location"] = " ".join(file_paths)
+                                        # Encode duplicates one-per-line so later parsing does
+                                        # not confuse spaces inside a single filesystem path.
+                                        check_dict["location"] = "\n".join(file_paths)
                                         # Add details about duplicate files
                                         if "details" not in check_dict:
                                             check_dict["details"] = {}

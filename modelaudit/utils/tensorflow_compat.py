@@ -121,6 +121,7 @@ def tensor_proto_to_ndarray(tensor_proto: Any) -> np.ndarray[Any, Any]:
     # Fast path: binary content (most common for large tensors)
     if tensor_proto.tensor_content:
         # Handle special dtypes that need reinterpretation
+        arr: np.ndarray[Any, Any]
         if dtype_enum == DataType.DT_BFLOAT16:
             # bfloat16 is stored as bytes, interpret as uint16 then view as bfloat16
             arr = np.frombuffer(tensor_proto.tensor_content, dtype=np.uint16).copy()

@@ -74,6 +74,7 @@ def pytest_runtest_setup(item):
             "test_secure_hasher.py",  # Aggregate hash computation tests
             "test_huggingface_extensions.py",  # HuggingFace MODEL_EXTENSIONS tests
             "test_regular_scan_hash.py",  # Regular scan mode hash generation tests
+            "test_core_asset_extraction.py",  # Check consolidation and location parsing regressions
             "test_manifest_scanner.py",  # Manifest scanner tests
             "test_weak_hash_detection.py",  # Weak hash detection tests
             "test_cloud_url_detection.py",  # Cloud storage URL detection tests
