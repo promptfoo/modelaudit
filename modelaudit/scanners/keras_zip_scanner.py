@@ -587,17 +587,19 @@ class KerasZipScanner(BaseScanner):
             if self._is_primarily_documentation(context, node):
                 continue
             direct_string_values: list[str] = []
-            all_string_values: list[str] = []
-            for value in node.values():
+            url_candidate_values: list[str] = []
+            for key, value in node.items():
                 direct_string_values.extend(self._extract_string_literals(value))
-                all_string_values.extend(self._extract_string_literals(value, include_dict_values=True))
+                key_lower = str(key).lower()
+                if key_lower in {"url", "origin", "args", "kwargs"}:
+                    url_candidate_values.extend(self._extract_string_literals(value, include_dict_values=True))
             has_get_file = any(
                 _GET_FILE_PATTERN.fullmatch(value.strip()) is not None
                 or value.strip().lower().endswith(".get_file")
                 or "keras.utils.get_file" in value.strip().lower()
                 for value in direct_string_values
             )
-            has_url = any(_URL_PATTERN.search(value) is not None for value in all_string_values)
+            has_url = any(_URL_PATTERN.search(value) is not None for value in url_candidate_values)
             if not (has_get_file and has_url):
                 continue
             result.add_check(
