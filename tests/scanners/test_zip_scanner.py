@@ -314,6 +314,23 @@ class TestZipScanner:
             f"Expected critical os/posix.system issue, got: {critical_messages}"
         )
 
+    def test_scan_npz_with_object_member_recurses_into_pickle(self, tmp_path: Path) -> None:
+        import numpy as np
+
+        class _ExecPayload:
+            def __reduce__(self):
+                return (exec, ("print('owned')",))
+
+        archive_path = tmp_path / "payload.npz"
+        np.savez(archive_path, safe=np.arange(3), payload=np.array([_ExecPayload()], dtype=object))
+
+        result = self.scanner.scan(str(archive_path))
+        assert result.success is True
+
+        failed_checks = [c for c in result.checks if c.status.value == "failed"]
+        assert any("cve-2019-6446" in (c.name + c.message).lower() for c in failed_checks)
+        assert any("exec" in i.message.lower() and i.details.get("zip_entry") == "payload.npy" for i in result.issues)
+
     def test_scan_zip_with_plain_text_global_prefix_not_treated_as_pickle(self, tmp_path: Path) -> None:
         """Plain text entries that start with GLOBAL-like bytes should not trigger pickle parse warnings."""
         archive_path = tmp_path / "plain_text_payload.zip"

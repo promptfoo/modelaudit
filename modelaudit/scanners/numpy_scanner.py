@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import sys
 import warnings
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, BinaryIO, ClassVar
 
 from .base import BaseScanner, IssueSeverity, ScanResult
+from .pickle_scanner import PickleScanner
 
 # Import NumPy with compatibility handling
 try:
@@ -87,6 +88,17 @@ class NumPyScanner(BaseScanner):
     CVE_2019_6446_ID = "CVE-2019-6446"
     CVE_2019_6446_CVSS = 9.8
     CVE_2019_6446_CWE = "CWE-502"
+
+    def _scan_embedded_pickle_payload(
+        self,
+        file_obj: BinaryIO,
+        payload_size: int,
+        context_path: str,
+    ) -> ScanResult:
+        """Reuse PickleScanner analysis for object-dtype NumPy payloads."""
+        pickle_scanner = PickleScanner(config=self.config)
+        pickle_scanner.current_file_path = context_path
+        return pickle_scanner._scan_pickle_bytes(file_obj, payload_size)
 
     def _validate_dtype(self, dtype: Any) -> None:
         """Validate numpy dtype for security"""
@@ -298,6 +310,15 @@ class NumPyScanner(BaseScanner):
                                     f"({self.CVE_2019_6446_ID}, CVSS 9.8)."
                                 ),
                             )
+
+                            f.seek(data_offset)
+                            embedded_result = self._scan_embedded_pickle_payload(
+                                f,
+                                file_size - data_offset,
+                                path,
+                            )
+                            result.issues.extend(embedded_result.issues)
+                            result.checks.extend(embedded_result.checks)
 
                         self._validate_dtype(dtype)
                         result.add_check(
