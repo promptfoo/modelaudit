@@ -1,6 +1,5 @@
 import json
 import pickle
-import sys
 import time
 import zipfile
 from pathlib import Path
@@ -491,21 +490,17 @@ def test_pytorch_zip_scanner_combined_security_controls(tmp_path):
     assert symlink_issues[0].severity == IssueSeverity.WARNING
 
 
-def test_pytorch_zip_version_detection_prefers_local_torch(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Local torch version must take precedence over attacker-controlled metadata."""
+def test_pytorch_zip_version_detection_prefers_metadata_over_local_torch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Artifact metadata should win when both sources are present."""
     scanner = PyTorchZipScanner()
-
-    class _MockTorch:
-        __version__ = "2.5.1"
-
-    monkeypatch.setitem(sys.modules, "torch", _MockTorch())
+    monkeypatch.setattr(scanner, "_get_installed_pytorch_version", lambda: "2.5.1")
 
     detected_version, source = scanner._get_detected_pytorch_version(
         {"pytorch_framework_version": "2.10.0", "pytorch_version_source": "metadata:config.json:pytorch_version"}
     )
 
-    assert detected_version == "2.5.1"
-    assert source == "local_environment"
+    assert detected_version == "2.10.0"
+    assert source == "metadata:config.json:pytorch_version"
 
 
 def test_pytorch_zip_version_detection_uses_metadata_when_torch_unavailable(
@@ -513,8 +508,7 @@ def test_pytorch_zip_version_detection_uses_metadata_when_torch_unavailable(
 ) -> None:
     """Metadata fallback should still work when local torch isn't importable."""
     scanner = PyTorchZipScanner()
-
-    monkeypatch.delitem(sys.modules, "torch", raising=False)
+    monkeypatch.setattr(scanner, "_get_installed_pytorch_version", lambda: None)
 
     detected_version, source = scanner._get_detected_pytorch_version(
         {"pytorch_framework_version": "2.5.1", "pytorch_version_source": "metadata:config.json:pytorch_version"}
@@ -522,6 +516,19 @@ def test_pytorch_zip_version_detection_uses_metadata_when_torch_unavailable(
 
     assert detected_version == "2.5.1"
     assert source == "metadata:config.json:pytorch_version"
+
+
+def test_pytorch_zip_version_detection_uses_local_torch_when_metadata_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Local torch version should be used only as a fallback when metadata is absent."""
+    scanner = PyTorchZipScanner()
+    monkeypatch.setattr(scanner, "_get_installed_pytorch_version", lambda: "2.5.1")
+
+    detected_version, source = scanner._get_detected_pytorch_version({})
+
+    assert detected_version == "2.5.1"
+    assert source == "local_environment"
 
 
 # CVE-2026-24747 Tests
@@ -547,6 +554,26 @@ def test_pytorch_zip_cve_2026_24747_version_check(tmp_path: Path) -> None:
         f"Checks: {[(c.name, c.status) for c in result.checks]}"
     )
     assert failed_checks[0].details.get("detected_pytorch_version") == "2.9.0"
+    assert failed_checks[0].details.get("pytorch_version_source") == "metadata:config.json:pytorch_version"
+
+
+def test_pytorch_zip_cve_2025_32434_metadata_not_suppressed_by_local_torch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fixed local torch install must not hide vulnerable artifact metadata."""
+    model_path = _create_pytorch_zip_with_framework_version(tmp_path / "model.pt", "2.5.1")
+    scanner = PyTorchZipScanner()
+    monkeypatch.setattr(scanner, "_get_installed_pytorch_version", lambda: "2.6.0")
+
+    result = scanner.scan(str(model_path))
+
+    failed_checks = [
+        c
+        for c in result.checks
+        if c.name == "CVE-2025-32434 PyTorch Version Check" and c.status == CheckStatus.FAILED
+    ]
+    assert len(failed_checks) > 0
+    assert failed_checks[0].details.get("detected_pytorch_version") == "2.5.1"
     assert failed_checks[0].details.get("pytorch_version_source") == "metadata:config.json:pytorch_version"
 
 
