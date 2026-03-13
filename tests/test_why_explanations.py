@@ -70,6 +70,17 @@ def test_explanations_for_dangerous_imports():
     assert eval_explanation is not None and "arbitrary" in eval_explanation.lower()
 
 
+def test_explanations_for_exact_dangerous_imports() -> None:
+    """Exact dotted dangerous imports should prefer their specific explanation over the base module."""
+    numpy_load_explanation = get_import_explanation("numpy.load")
+    assert numpy_load_explanation is not None
+    assert "object arrays" in numpy_load_explanation.lower()
+
+    torch_loader_explanation = get_import_explanation("torch.serialization.load")
+    assert torch_loader_explanation is not None
+    assert "nested pytorch" in torch_loader_explanation.lower()
+
+
 def test_explanations_for_opcodes():
     """Test that we have explanations for dangerous opcodes."""
     assert get_opcode_explanation("REDUCE") is not None

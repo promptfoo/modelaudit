@@ -379,6 +379,7 @@ ALWAYS_DANGEROUS_FUNCTIONS: set[str] = {
     "torch.distributed.rpc.RemoteModule",
     # NumPy dangerous functions (Fickling)
     "numpy.testing._private.utils.runstring",
+    "numpy.load",
     # pip as callable (CVE-2025-1716: picklescan bypass via pip.main)
     "pip.main",
     "pip._internal.main",
@@ -418,6 +419,15 @@ ALWAYS_DANGEROUS_FUNCTIONS: set[str] = {
     "ctypes.cast",
     "ctypes.CFUNCTYPE",
     "ctypes.WINFUNCTYPE",
+    # Expanded exact dangerous primitives validated against PickleScan
+    "site.main",
+    "_io.FileIO",
+    "test.support.script_helper.assert_python_ok",
+    "_osx_support._read_output",
+    "_aix_support._read_cmd_output",
+    "_pyrepl.pager.pipe_pager",
+    "torch.serialization.load",
+    "torch._inductor.codecache.compile_file",
 }
 
 # Module prefixes that are always dangerous (Fickling-based + additional)
@@ -4263,7 +4273,7 @@ class PickleScanner(BaseScanner):
                                 0,
                             ),
                         },
-                        why=get_import_explanation(mod),
+                        why=get_import_explanation(f"{mod}.{func}"),
                     )
 
             # Record successful ML context validation if content appears safe
@@ -4301,6 +4311,8 @@ class PickleScanner(BaseScanner):
                             )
                             # Get rule code for this import/module
                             rule_code = get_import_rule_code(mod, func)
+                            if not rule_code:
+                                rule_code = "S206"  # GLOBAL fallback
                             result.add_check(
                                 name="Global Module Reference Check",
                                 passed=False,
@@ -4319,7 +4331,7 @@ class PickleScanner(BaseScanner):
                                         0,
                                     ),
                                 },
-                                why=get_import_explanation(mod),
+                                why=get_import_explanation(f"{mod}.{func}"),
                             )
                         else:
                             # Record successful validation of safe global
@@ -4433,40 +4445,52 @@ class PickleScanner(BaseScanner):
                                         ml_context,
                                     )
 
-                                # CVE-2025-32434 is specific to torch.load() and
-                                # should only be referenced for PyTorch file formats
-                                _ext = os.path.splitext(self.current_file_path)[1].lower()
-                                _is_pytorch_file = _ext in {".pt", ".pth"} or (
-                                    _ext == ".bin" and "pytorch" in ml_context.get("frameworks", {})
-                                )
-                                if _is_pytorch_file:
-                                    _reduce_msg = (
-                                        f"Found REDUCE opcode with non-allowlisted global: {associated_global}. "
-                                        f"This may indicate CVE-2025-32434 exploitation (RCE via torch.load)"
-                                    )
+                                if is_actually_dangerous:
+                                    _reduce_msg = f"Found REDUCE opcode invoking dangerous global: {associated_global}"
                                     _reduce_details: dict[str, Any] = {
                                         "position": pos,
                                         "opcode": opcode.name,
                                         "associated_global": associated_global,
-                                        "cve_id": "CVE-2025-32434",
                                         "ml_context_confidence": ml_context.get(
                                             "overall_confidence",
                                             0,
                                         ),
                                     }
                                 else:
-                                    _reduce_msg = (
-                                        f"Found REDUCE opcode with non-allowlisted global: {associated_global}"
+                                    # CVE-2025-32434 is specific to torch.load() and
+                                    # should only be referenced for PyTorch file formats
+                                    _ext = os.path.splitext(self.current_file_path)[1].lower()
+                                    _is_pytorch_file = _ext in {".pt", ".pth"} or (
+                                        _ext == ".bin" and "pytorch" in ml_context.get("frameworks", {})
                                     )
-                                    _reduce_details = {
-                                        "position": pos,
-                                        "opcode": opcode.name,
-                                        "associated_global": associated_global,
-                                        "ml_context_confidence": ml_context.get(
-                                            "overall_confidence",
-                                            0,
-                                        ),
-                                    }
+                                    if _is_pytorch_file:
+                                        _reduce_msg = (
+                                            f"Found REDUCE opcode with non-allowlisted global: {associated_global}. "
+                                            f"This may indicate CVE-2025-32434 exploitation (RCE via torch.load)"
+                                        )
+                                        _reduce_details = {
+                                            "position": pos,
+                                            "opcode": opcode.name,
+                                            "associated_global": associated_global,
+                                            "cve_id": "CVE-2025-32434",
+                                            "ml_context_confidence": ml_context.get(
+                                                "overall_confidence",
+                                                0,
+                                            ),
+                                        }
+                                    else:
+                                        _reduce_msg = (
+                                            f"Found REDUCE opcode with non-allowlisted global: {associated_global}"
+                                        )
+                                        _reduce_details = {
+                                            "position": pos,
+                                            "opcode": opcode.name,
+                                            "associated_global": associated_global,
+                                            "ml_context_confidence": ml_context.get(
+                                                "overall_confidence",
+                                                0,
+                                            ),
+                                        }
 
                                 result.add_check(
                                     name="REDUCE Opcode Safety Check",
@@ -4809,7 +4833,7 @@ class PickleScanner(BaseScanner):
                                         0,
                                     ),
                                 },
-                                why=get_import_explanation(mod),
+                                why=get_import_explanation(f"{mod}.{func}"),
                             )
                         else:
                             # Record successful validation of safe STACK_GLOBAL
