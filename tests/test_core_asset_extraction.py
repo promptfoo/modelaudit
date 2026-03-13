@@ -85,9 +85,7 @@ def test_check_consolidation_keeps_distinct_npz_member_findings(tmp_path: Path) 
 
     result = scan_model_directory_or_file(str(archive_path))
     data_type_checks = [
-        check
-        for check in result.checks
-        if check.name == "Data Type Safety Check" and check.status.value == "failed"
+        check for check in result.checks if check.name == "Data Type Safety Check" and check.status.value == "failed"
     ]
 
     assert len(data_type_checks) == 1
