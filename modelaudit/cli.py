@@ -952,6 +952,18 @@ def scan_command(
     # This prevents FileNotFoundError when URLs are downloaded to local paths
     scanned_paths: list[str] = []
 
+    def _track_streaming_paths_for_sbom(streaming_result: ModelAuditResultModel, fallback_path: str) -> None:
+        """Track concrete streamed artifact paths so SBOM includes all scanned components."""
+        added_path = False
+        for asset in streaming_result.assets:
+            if asset.path:
+                scanned_paths.append(asset.path)
+                added_path = True
+
+        # Fallback keeps previous behavior if no assets were recorded.
+        if not added_path:
+            scanned_paths.append(fallback_path)
+
     # Track temporary directories to clean up after SBOM generation
     temp_dirs_to_cleanup: list[str] = []
 
@@ -1102,6 +1114,9 @@ def scan_command(
                             # Merge streaming results into audit_result
                             audit_result.aggregate_scan_result(streaming_result.model_dump())
 
+                            # Track streamed artifact paths so SBOM includes all components.
+                            _track_streaming_paths_for_sbom(streaming_result, path)
+
                             # Record download/scan completion for streaming mode
                             download_duration = time.time() - download_start
                             record_download_completed("huggingface", download_duration, 0, path)
@@ -1202,6 +1217,9 @@ def scan_command(
                                 cache_enabled=final_cache,
                                 cache_dir=final_cache_dir,
                             )
+
+                            # Track streamed artifact paths so SBOM includes all components.
+                            _track_streaming_paths_for_sbom(streaming_result, path)
 
                             # Merge streaming results
                             audit_result.aggregate_scan_result(streaming_result.model_dump())
@@ -1355,6 +1373,9 @@ def scan_command(
                                 cache_enabled=final_cache,
                                 cache_dir=final_cache_dir,
                             )
+
+                            # Track streamed artifact paths so SBOM includes all components.
+                            _track_streaming_paths_for_sbom(streaming_result, path)
 
                             # Merge streaming results
                             audit_result.aggregate_scan_result(streaming_result.model_dump())
@@ -1685,8 +1706,8 @@ def scan_command(
                         elif show_styled_output:
                             click.echo(style_text("✅ Streaming scan complete", fg="green", bold=True))
 
-                        # Track the scanned path for SBOM
-                        scanned_paths.append(actual_path)
+                        # Track streamed artifact paths so SBOM includes all components.
+                        _track_streaming_paths_for_sbom(streaming_result, actual_path)
 
                         # Skip normal scanning flow - continue to next path
                         continue
@@ -1880,9 +1901,19 @@ def scan_command(
     if sbom:
         from .integrations.sbom_generator import generate_sbom_pydantic
 
-        # Use scanned_paths (actual file paths) instead of expanded_paths (original URLs)
-        # to prevent FileNotFoundError when generating SBOM for downloaded content
-        paths_for_sbom = scanned_paths if scanned_paths else expanded_paths
+        # Remote downloads may leave cache internals under the downloaded directory,
+        # and streamed scans may delete files before SBOM generation runs. Reuse the
+        # scanned asset list for those cases so the SBOM reflects actual scanned model
+        # artifacts rather than the raw cache directory contents.
+        asset_paths = list(
+            dict.fromkeys(asset.path for asset in audit_result.assets if asset.path and asset.type != "skipped")
+        )
+        if asset_paths and final_scan_and_delete:
+            paths_for_sbom = asset_paths
+        else:
+            # Use scanned_paths (actual file paths) instead of expanded_paths (original URLs)
+            # to prevent FileNotFoundError when generating SBOM for downloaded content
+            paths_for_sbom = scanned_paths if scanned_paths else expanded_paths
         sbom_text = generate_sbom_pydantic(paths_for_sbom, audit_result)
         with open(sbom, "w", encoding="utf-8") as f:
             f.write(sbom_text)

@@ -442,3 +442,27 @@ class TestJFrogFolderDownload:
 
         with pytest.raises(ValueError, match="No scannable model files found"):
             download_jfrog_folder("https://company.jfrog.io/artifactory/repo/empty-folder/")
+
+    @patch("modelaudit.utils.sources.jfrog.download_artifact")
+    @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
+    def test_download_jfrog_folder_rejects_traversal_paths(self, mock_list, mock_download, tmp_path):
+        """Test that traversal paths from JFrog metadata are rejected."""
+        mock_list.return_value = [
+            {
+                "name": "../../escape.pkl",
+                "path": "https://company.jfrog.io/artifactory/repo/models/../../escape.pkl",
+                "size": 1024,
+                "human_size": "1.0 KB",
+            }
+        ]
+
+        with pytest.raises(Exception, match="All downloads failed"):
+            download_jfrog_folder(
+                "https://company.jfrog.io/artifactory/repo/models/",
+                cache_dir=tmp_path,
+                api_token="test-token",
+                show_progress=False,
+            )
+
+        assert not any(tmp_path.iterdir())
+        mock_download.assert_not_called()

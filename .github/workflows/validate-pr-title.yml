@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: amannn/action-semantic-pull-request@48f256284bd46cdaab1048c3721360e808335d50 # v6
+      - uses: amannn/action-semantic-pull-request@v6
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -39,6 +39,6 @@ jobs:
           # Ensure the subject doesn't start with uppercase
           subjectPattern: ^(?![A-Z]).+$
           subjectPatternError: |
-            The subject "{subject}" found in the pull request title "{title}" 
-            didn't match the configured pattern. Please ensure that the subject 
+            The subject "{subject}" found in the pull request title "{title}"
+            didn't match the configured pattern. Please ensure that the subject
             doesn't start with an uppercase character.

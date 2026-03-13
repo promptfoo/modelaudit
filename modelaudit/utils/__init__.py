@@ -77,14 +77,17 @@ def sanitize_archive_path(entry_name: str, base_dir: str) -> tuple[str, bool]:
         (resolved_path, is_safe) where ``is_safe`` is ``False`` if the entry
         would escape ``base_dir`` when extracted.
     """
-    base_path = Path(base_dir).resolve()
+    base_path = Path(os.path.abspath(base_dir))
     # Normalize separators
     entry = entry_name.replace("\\", "/")
-    if entry.startswith("/") or (len(entry) > 1 and entry[1] == ":"):
+    is_absolute = is_absolute_archive_path(entry)
+    if is_absolute:
         # Absolute paths are not allowed
-        return str((base_path / entry.lstrip("/")).resolve()), False
+        archive_suffix = entry.lstrip("/").replace("/", os.sep)
+        unsafe_resolved = os.path.normpath(f"{base_path}{os.sep}{archive_suffix}")
+        return unsafe_resolved, False
     entry = entry.lstrip("/")
-    resolved = (base_path / entry).resolve()
+    resolved = Path(os.path.abspath(os.path.join(str(base_path), entry)))
     try:
         is_safe = resolved.is_relative_to(base_path)
     except AttributeError:  # Python < 3.9

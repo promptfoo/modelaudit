@@ -8,6 +8,7 @@ from click.testing import CliRunner
 
 from modelaudit import __version__
 from modelaudit.cli import cli, expand_paths, format_text_output
+from modelaudit.core import scan_model_directory_or_file
 from modelaudit.models import create_initial_audit_result
 
 
@@ -66,6 +67,15 @@ def create_mock_scan_result(**kwargs):
     # Add scanners if provided
     if "scanners" in kwargs:
         result.scanner_names = kwargs["scanners"]
+
+    # Add file metadata if provided
+    if "file_metadata" in kwargs:
+        from modelaudit.models import FileMetadataModel
+
+        result.file_metadata = {
+            path: metadata if isinstance(metadata, FileMetadataModel) else FileMetadataModel(**metadata)
+            for path, metadata in kwargs["file_metadata"].items()
+        }
 
     result.finalize_statistics()
     return result
@@ -773,6 +783,157 @@ def test_scan_huggingface_streaming_success(mock_scan_streaming, mock_download_s
         assert output_json["files_scanned"] == 3
     except json.JSONDecodeError:
         pytest.fail("Output is not valid JSON")
+
+
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+@patch("modelaudit.core.scan_model_streaming")
+def test_scan_huggingface_streaming_sbom_includes_streamed_assets(
+    mock_scan_streaming, mock_download_streaming, mock_is_hf_url, tmp_path
+):
+    """Streaming scans should build SBOM components from discovered artifacts."""
+    mock_is_hf_url.return_value = True
+
+    streamed_files = []
+    file_hashes = {}
+    file_sizes = {}
+    for name in ("config.json", "model.safetensors", "tokenizer.json"):
+        file_path = tmp_path / name
+        content = f"streamed content for {name}".encode()
+        file_path.write_bytes(content)
+        streamed_files.append(file_path)
+        import hashlib
+
+        file_hashes[str(file_path)] = hashlib.sha256(content).hexdigest()
+        file_sizes[str(file_path)] = len(content)
+
+    def file_generator():
+        for index, file_path in enumerate(streamed_files):
+            yield (file_path, index == len(streamed_files) - 1)
+
+    mock_download_streaming.return_value = file_generator()
+
+    mock_result = create_mock_scan_result(
+        bytes_scanned=sum(file_path.stat().st_size for file_path in streamed_files),
+        files_scanned=len(streamed_files),
+        has_errors=False,
+        assets=[
+            {
+                "path": str(file_path),
+                "type": "streamed",
+                "size": file_sizes[str(file_path)],
+            }
+            for file_path in streamed_files
+        ],
+        file_metadata={
+            str(file_path): {
+                "file_size": file_sizes[str(file_path)],
+                "file_hashes": {"sha256": file_hashes[str(file_path)]},
+            }
+            for file_path in streamed_files
+        },
+    )
+    mock_scan_streaming.return_value = mock_result
+
+    for file_path in streamed_files:
+        file_path.unlink()
+
+    sbom_file = tmp_path / "streamed.sbom.json"
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "--stream", "--quiet", "--sbom", str(sbom_file), "hf://test/model"])
+
+    assert result.exit_code == 0
+    assert sbom_file.exists()
+    sbom_data = json.loads(sbom_file.read_text())
+    components = {component["name"]: component for component in sbom_data["components"]}
+
+    assert set(components) == {file_path.name for file_path in streamed_files}
+    assert "model" not in components
+
+    for file_path in streamed_files:
+        component = components[file_path.name]
+        properties = {prop["name"]: prop["value"] for prop in component["properties"]}
+
+        assert properties["size"] == str(file_sizes[str(file_path)])
+        assert component["hashes"][0]["alg"] == "SHA-256"
+        assert component["hashes"][0]["content"] == file_hashes[str(file_path)]
+
+
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.cli.is_huggingface_file_url", return_value=False)
+@patch("modelaudit.cli.download_model")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+def test_scan_huggingface_sbom_excludes_download_cache_files(
+    mock_scan, mock_download, mock_is_hf_file_url, mock_is_hf_url, tmp_path
+):
+    """Remote SBOM generation should ignore HuggingFace cache bookkeeping files."""
+    mock_is_hf_url.return_value = True
+
+    downloaded_dir = tmp_path / "gpt2"
+    downloaded_dir.mkdir()
+    real_files = {
+        downloaded_dir / "config.json": b'{"model_type":"gpt2"}',
+        downloaded_dir / "merges.txt": b"merge rules",
+        downloaded_dir / "model.safetensors": b"weights",
+    }
+    for file_path, content in real_files.items():
+        file_path.write_bytes(content)
+
+    cache_dir = downloaded_dir / ".cache" / "huggingface" / "download"
+    cache_dir.mkdir(parents=True)
+    (cache_dir / "config.json.metadata").write_text("{}")
+    (cache_dir / ".gitignore").write_text("*\n")
+
+    mock_download.return_value = downloaded_dir
+    mock_scan.return_value = create_mock_scan_result(
+        bytes_scanned=sum(len(content) for content in real_files.values()),
+        files_scanned=len(real_files),
+        has_errors=False,
+        assets=[
+            {
+                "path": str(file_path),
+                "type": "streamed",
+                "size": len(content),
+            }
+            for file_path, content in real_files.items()
+        ],
+    )
+
+    sbom_file = tmp_path / "downloaded.sbom.json"
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "--quiet", "--sbom", str(sbom_file), "hf://test/model"])
+
+    assert result.exit_code == 0
+
+    sbom_data = json.loads(sbom_file.read_text())
+    component_names = {component["name"] for component in sbom_data["components"]}
+
+    assert component_names == {file_path.name for file_path in real_files}
+    assert "config.json.metadata" not in component_names
+    assert ".gitignore" not in component_names
+
+
+def test_scan_directory_skips_huggingface_cache_bookkeeping(tmp_path):
+    """Directory scans should not surface HuggingFace cache bookkeeping files as assets."""
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text('{"model_type":"gpt2"}')
+    (model_dir / "model.safetensors").write_bytes(b"weights")
+
+    cache_dir = model_dir / ".cache" / "huggingface" / "download"
+    cache_dir.mkdir(parents=True)
+    (cache_dir / "config.json.metadata").write_text("{}")
+    (cache_dir / ".gitignore").write_text("*\n")
+
+    result = scan_model_directory_or_file(str(model_dir))
+
+    asset_names = {os.path.basename(asset.path) for asset in result.assets}
+    assert "config.json" in asset_names
+    assert "model.safetensors" in asset_names
+    assert "config.json.metadata" not in asset_names
+    assert ".gitignore" not in asset_names
 
 
 @patch("modelaudit.cli.is_huggingface_url")
