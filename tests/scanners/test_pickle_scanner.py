@@ -1298,5 +1298,184 @@ def test_scan_memory_error_with_dangerous_globals_not_downgraded(
     assert format_validation_checks[0].details["exception_type"] == "MemoryError"
 
 
+class TestPickleImportOnlyGlobalFindings:
+    def test_import_only_global_malicious_is_flagged(self, tmp_path: Path) -> None:
+        scanner = PickleScanner()
+        payload_path = tmp_path / "import_only_global.pkl"
+        payload_path.write_bytes(b"cevilpkg\nthing\n.")
+
+        result = scanner.scan(str(payload_path))
+
+        failed_checks = [
+            c for c in result.checks if c.name == "Global Module Reference Check" and c.status == CheckStatus.FAILED
+        ]
+        assert failed_checks
+        assert any("evilpkg.thing" in c.message for c in failed_checks)
+
+    def test_import_only_global_mixed_case_module_is_flagged(self, tmp_path: Path) -> None:
+        scanner = PickleScanner()
+        payload_path = tmp_path / "import_only_global_mixed_case.pkl"
+        payload_path.write_bytes(b"cEvilPkg\nthing\n.")
+
+        result = scanner.scan(str(payload_path))
+
+        failed_checks = [
+            c for c in result.checks if c.name == "Global Module Reference Check" and c.status == CheckStatus.FAILED
+        ]
+        assert failed_checks
+        assert any("EvilPkg.thing" in c.message for c in failed_checks)
+
+    def test_import_only_stack_global_is_flagged(self, tmp_path: Path) -> None:
+        scanner = PickleScanner()
+        payload_path = tmp_path / "import_only_stack_global.pkl"
+        payload_path.write_bytes(b"\x80\x04\x8c\x07evilpkg\x8c\x05thing\x93.")
+
+        result = scanner.scan(str(payload_path))
+
+        failed_checks = [
+            c for c in result.checks if c.name == "STACK_GLOBAL Module Check" and c.status == CheckStatus.FAILED
+        ]
+        assert failed_checks
+        assert any("evilpkg.thing" in c.message for c in failed_checks)
+
+    @pytest.mark.parametrize(
+        "payload,ref",
+        [
+            (b"cbuiltins\nset\n.", "builtins.set"),
+            (b"ccollections\nOrderedDict\n.", "collections.OrderedDict"),
+            (b"cnumpy.core.multiarray\n_reconstruct\n.", "numpy.core.multiarray._reconstruct"),
+            (b"csklearn.pipeline\nPipeline\n.", "sklearn.pipeline.Pipeline"),
+        ],
+    )
+    def test_import_only_safe_globals_remain_non_failing(self, tmp_path: Path, payload: bytes, ref: str) -> None:
+        scanner = PickleScanner()
+        payload_path = tmp_path / f"safe_{ref.replace('.', '_')}.pkl"
+        payload_path.write_bytes(payload)
+
+        result = scanner.scan(str(payload_path))
+
+        failed_checks = [
+            c
+            for c in result.checks
+            if c.status == CheckStatus.FAILED
+            and ref in c.message
+            and c.name in {"Global Module Reference Check", "STACK_GLOBAL Module Check"}
+        ]
+        assert not failed_checks, [c.message for c in failed_checks]
+
+    def test_import_only_stdlib_constructor_remains_non_failing(self, tmp_path: Path) -> None:
+        scanner = PickleScanner()
+        payload_path = tmp_path / "import_only_datetime.pkl"
+        payload_path.write_bytes(b"cdatetime\ndatetime\n.")
+
+        result = scanner.scan(str(payload_path))
+
+        failed_checks = [
+            c
+            for c in result.checks
+            if c.status == CheckStatus.FAILED
+            and c.name == "Global Module Reference Check"
+            and "datetime.datetime" in c.message
+        ]
+        assert not failed_checks, [c.message for c in failed_checks]
+
+    def test_import_only_data_label_like_module_is_ignored(self, tmp_path: Path) -> None:
+        scanner = PickleScanner()
+        payload_path = tmp_path / "import_only_data_label.pkl"
+        payload_path.write_bytes(b"cPEDRA_2020\nthing\n.")
+
+        result = scanner.scan(str(payload_path))
+
+        failed_checks = [
+            c
+            for c in result.checks
+            if c.status == CheckStatus.FAILED
+            and c.name == "Global Module Reference Check"
+            and "PEDRA_2020.thing" in c.message
+        ]
+        assert not failed_checks, [c.message for c in failed_checks]
+
+    def test_import_only_malicious_in_second_stream_is_flagged(self, tmp_path: Path) -> None:
+        scanner = PickleScanner()
+        payload_path = tmp_path / "second_stream_import_only.pkl"
+        payload_path.write_bytes(b"cbuiltins\nset\n." + b"cevilpkg\nthing\n.")
+
+        result = scanner.scan(str(payload_path))
+
+        failed_checks = [
+            c for c in result.checks if c.name == "Global Module Reference Check" and c.status == CheckStatus.FAILED
+        ]
+        assert any("evilpkg.thing" in c.message for c in failed_checks)
+
+    def test_import_only_malicious_first_stream_with_benign_second_stream_is_flagged(self, tmp_path: Path) -> None:
+        scanner = PickleScanner()
+        payload_path = tmp_path / "first_stream_import_only.pkl"
+        payload_path.write_bytes(b"cevilpkg\nthing\n." + b"cbuiltins\nset\n.")
+
+        result = scanner.scan(str(payload_path))
+
+        failed_checks = [
+            c for c in result.checks if c.name == "Global Module Reference Check" and c.status == CheckStatus.FAILED
+        ]
+        assert any("evilpkg.thing" in c.message for c in failed_checks)
+
+    def test_reduce_backed_global_does_not_emit_import_only_failure(self, tmp_path: Path) -> None:
+        scanner = PickleScanner()
+        payload_path = tmp_path / "reduce_global.pkl"
+        payload_path.write_bytes(b"cos\nsystem\n(Vecho hi\ntR.")
+
+        result = scanner.scan(str(payload_path))
+
+        import_only_failures = [
+            c
+            for c in result.checks
+            if c.name == "Global Module Reference Check"
+            and c.status == CheckStatus.FAILED
+            and c.details.get("import_only") is True
+        ]
+        assert not import_only_failures, [c.message for c in import_only_failures]
+        assert any(c.name == "REDUCE Opcode Safety Check" and c.status == CheckStatus.FAILED for c in result.checks)
+
+    def test_reduce_backed_stack_global_does_not_emit_import_only_failure(self, tmp_path: Path) -> None:
+        scanner = PickleScanner()
+        payload_path = tmp_path / "reduce_stack_global.pkl"
+        payload_path.write_bytes(b"\x80\x04\x8c\x02os\x8c\x06system\x93\x8c\x07echo hi\x85R.")
+
+        result = scanner.scan(str(payload_path))
+
+        import_only_failures = [
+            c
+            for c in result.checks
+            if c.name == "STACK_GLOBAL Module Check"
+            and c.status == CheckStatus.FAILED
+            and c.details.get("import_only") is True
+        ]
+        assert not import_only_failures, [c.message for c in import_only_failures]
+        assert any(c.name == "REDUCE Opcode Safety Check" and c.status == CheckStatus.FAILED for c in result.checks)
+
+    def test_same_reference_import_only_origin_is_not_suppressed_by_later_reduce(self, tmp_path: Path) -> None:
+        scanner = PickleScanner()
+        payload_path = tmp_path / "import_only_then_reduce.pkl"
+        payload_path.write_bytes(b"cevilpkg\nthing\ncevilpkg\nthing\n(tR.")
+
+        result = scanner.scan(str(payload_path))
+
+        import_only_failures = [
+            c
+            for c in result.checks
+            if c.name == "Global Module Reference Check"
+            and c.status == CheckStatus.FAILED
+            and c.details.get("import_only") is True
+            and c.details.get("import_reference") == "evilpkg.thing"
+        ]
+        assert len(import_only_failures) == 1
+        assert any(
+            c.name == "REDUCE Opcode Safety Check"
+            and c.status == CheckStatus.FAILED
+            and c.details.get("associated_global") == "evilpkg.thing"
+            for c in result.checks
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
