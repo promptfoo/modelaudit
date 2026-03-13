@@ -1,9 +1,12 @@
 import os
 import tarfile
 import tempfile
+from pathlib import Path
+
+import pytest
 
 from modelaudit.scanners.base import IssueSeverity
-from modelaudit.scanners.tar_scanner import TarScanner
+from modelaudit.scanners.tar_scanner import DEFAULT_MAX_TAR_ENTRY_SIZE, TarScanner
 
 
 class TestTarScanner:
@@ -290,3 +293,114 @@ class TestTarScanner:
             assert result.bytes_scanned == expected
         finally:
             os.unlink(tmp_path)
+
+    def test_get_max_entry_size_uses_bounded_default(self) -> None:
+        """Unconfigured TAR entry extraction should still have a bounded default."""
+        assert TarScanner()._get_max_entry_size() == DEFAULT_MAX_TAR_ENTRY_SIZE
+
+    def test_get_max_entry_size_prefers_explicit_file_size_limit(self) -> None:
+        """The top-level file-size limit should remain the hard extraction cap."""
+        scanner = TarScanner(config={"max_file_size": 4096, "max_entry_size": 128})
+        assert scanner._get_max_entry_size() == 4096
+
+    def test_get_max_entry_size_uses_entry_limit_when_file_size_is_unlimited(self) -> None:
+        """An explicit TAR-entry limit should apply when the top-level file size is unlimited."""
+        scanner = TarScanner(config={"max_file_size": 0, "max_entry_size": 128})
+        assert scanner._get_max_entry_size() == 128
+
+    def test_get_max_entry_size_uses_bounded_default_when_max_file_size_is_unlimited(self) -> None:
+        """A top-level unlimited file-size config should not disable TAR member extraction limits."""
+        scanner = TarScanner(config={"max_file_size": 0})
+        assert scanner._get_max_entry_size() == DEFAULT_MAX_TAR_ENTRY_SIZE
+
+    def test_extract_member_to_tempfile_streams_in_chunks(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Large TAR entries should be copied in bounded chunks instead of buffered in memory."""
+        content = b"A" * 10_000
+        archive_path = tmp_path / "payload.tar"
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("payload.bin")
+            info.size = len(content)
+            archive.addfile(info, tarfile.io.BytesIO(content))  # type: ignore[attr-defined]
+
+        read_sizes: list[int | None] = []
+        original_read = tarfile.ExFileObject.read
+
+        def tracked_read(self: tarfile.ExFileObject, size: int | None = None) -> bytes:
+            read_sizes.append(size)
+            return original_read(self, size)
+
+        monkeypatch.setattr(tarfile.ExFileObject, "read", tracked_read)
+
+        with tarfile.open(archive_path, "r") as archive:
+            member = archive.getmember("payload.bin")
+            extracted_path, total_size = self.scanner._extract_member_to_tempfile(
+                archive,
+                member,
+                suffix="_payload.bin",
+            )
+
+        try:
+            assert total_size == len(content)
+            assert Path(extracted_path).read_bytes() == content
+            assert len(read_sizes) > 1
+            assert set(read_sizes) == {4096}
+        finally:
+            os.unlink(extracted_path)
+
+    def test_scan_rejects_oversized_tar_member(self, tmp_path: Path) -> None:
+        """Entries exceeding the configured limit should fail the scan before full extraction."""
+        scanner = TarScanner(config={"max_entry_size": 64})
+        archive_path = tmp_path / "oversized.tar"
+        payload = b"B" * 128
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("payload.bin")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = scanner.scan(str(archive_path))
+
+        assert result.success is False
+        oversize_checks = [check for check in result.checks if check.name == "TAR File Scan"]
+        assert len(oversize_checks) == 1
+        assert "tar entry payload.bin exceeds maximum size of 64 bytes" in oversize_checks[0].message.lower()
+
+    def test_scan_respects_max_file_size_over_entry_limit(self, tmp_path: Path) -> None:
+        """A stricter top-level size limit should still fail TAR extraction before scan_file runs."""
+        scanner = TarScanner(config={"max_file_size": 64, "max_entry_size": 1024})
+        archive_path = tmp_path / "precedence.tar"
+        payload = b"C" * 128
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("payload.bin")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = scanner.scan(str(archive_path))
+
+        assert result.success is False
+        oversize_checks = [check for check in result.checks if check.name == "TAR File Scan"]
+        assert len(oversize_checks) == 1
+        assert "tar entry payload.bin exceeds maximum size of 64 bytes" in oversize_checks[0].message.lower()
+
+    def test_scan_skips_non_regular_tar_members(self, tmp_path: Path) -> None:
+        """Valid non-file TAR members should not abort scanning later regular files."""
+        archive_path = tmp_path / "fifo-first.tar"
+        payload = b"payload"
+
+        with tarfile.open(archive_path, "w") as archive:
+            fifo = tarfile.TarInfo("named_pipe")
+            fifo.type = tarfile.FIFOTYPE
+            archive.addfile(fifo)
+
+            info = tarfile.TarInfo("data.bin")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert result.success is True
+        assert result.bytes_scanned == len(payload)
+        assert all("named_pipe" not in issue.message for issue in result.issues)

@@ -3,6 +3,9 @@
 import contextlib
 import logging
 import os
+import re
+from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -49,6 +52,16 @@ class SavedModel:  # type: ignore[no-redef]
 
 
 SavedModelType = SavedModel
+
+
+@dataclass(frozen=True)
+class SavedModelNodeContext:
+    """Context for a node stored in a graph body or function definition."""
+
+    node: Any
+    meta_graph_tag: str
+    node_scope: str
+    function_name: str | None = None
 
 
 class TensorFlowSavedModelScanner(BaseScanner):
@@ -165,12 +178,8 @@ class TensorFlowSavedModelScanner(BaseScanner):
                         passed=False,
                         message=f"Dangerous TensorFlow operation: {op_info['operation']}",
                         severity=op_info["severity"],
-                        location=f"{self.current_file_path} (node: {op_info['node_name']})",
-                        details={
-                            "op_type": op_info["operation"],
-                            "node_name": op_info["node_name"],
-                            "meta_graph": op_info.get("meta_graph", "unknown"),
-                        },
+                        location=op_info["location"],
+                        details=op_info["details"],
                         why=get_tf_op_explanation(op_info["operation"]),
                     )
 
@@ -285,35 +294,100 @@ class TensorFlowSavedModelScanner(BaseScanner):
         result.finish(success=True)
         return result
 
+    def _get_meta_graph_tag(self, meta_graph: Any) -> str:
+        """Return a stable label for a MetaGraphDef."""
+        return meta_graph.meta_info_def.tags[0] if meta_graph.meta_info_def.tags else "unknown"
+
+    def _iter_meta_graph_node_contexts(self, meta_graph: Any) -> Iterator[SavedModelNodeContext]:
+        """Yield node contexts for top-level graph nodes and nested functions."""
+        graph_def = meta_graph.graph_def
+        meta_graph_tag = self._get_meta_graph_tag(meta_graph)
+
+        for node in graph_def.node:
+            yield SavedModelNodeContext(
+                node=node,
+                meta_graph_tag=meta_graph_tag,
+                node_scope="graph_def",
+            )
+
+        function_library = getattr(graph_def, "library", None)
+        if function_library is None:
+            return
+
+        for function_def in getattr(function_library, "function", []):
+            function_name = function_def.signature.name or "unknown"
+            for node in function_def.node_def:
+                yield SavedModelNodeContext(
+                    node=node,
+                    meta_graph_tag=meta_graph_tag,
+                    node_scope="function_def",
+                    function_name=function_name,
+                )
+
+    def _iter_saved_model_node_contexts(self, saved_model: Any) -> Iterator[SavedModelNodeContext]:
+        """Yield node contexts across every MetaGraphDef in the SavedModel."""
+        for meta_graph in saved_model.meta_graphs:
+            yield from self._iter_meta_graph_node_contexts(meta_graph)
+
+    def _build_node_location(
+        self,
+        node_context: SavedModelNodeContext,
+        *,
+        attr_name: str | None = None,
+    ) -> str:
+        """Format a finding location for a graph node."""
+        location_parts = []
+        if node_context.function_name:
+            location_parts.append(f"function: {node_context.function_name}")
+        location_parts.append(f"node: {node_context.node.name}")
+        if attr_name:
+            location_parts.append(f"attr: {attr_name}")
+        return f"{self.current_file_path} ({', '.join(location_parts)})"
+
+    def _build_node_details(
+        self,
+        node_context: SavedModelNodeContext,
+        extra_details: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Build consistent finding details for a graph node."""
+        details: dict[str, Any] = {
+            "node_name": node_context.node.name,
+            "meta_graph": node_context.meta_graph_tag,
+            "node_scope": node_context.node_scope,
+        }
+        if node_context.function_name:
+            details["function_name"] = node_context.function_name
+        if extra_details:
+            details.update(extra_details)
+        return details
+
     def _scan_tf_operations(self, saved_model: Any) -> list[dict[str, Any]]:
         """Scan TensorFlow graph for dangerous operations (generic pass)"""
         dangerous_ops: list[dict[str, Any]] = []
         try:
-            for meta_graph in saved_model.meta_graphs:
-                graph_def = meta_graph.graph_def
-                for node in graph_def.node:
-                    # Skip Python ops here; they are handled by _check_python_op
-                    if node.op in PYTHON_OPS:
-                        continue
-                    if node.op in DANGEROUS_TF_OPERATIONS:
-                        dangerous_ops.append(
-                            {
-                                "operation": node.op,
-                                "node_name": node.name,
-                                "severity": DANGEROUS_TF_OPERATIONS[node.op],
-                                "meta_graph": (
-                                    meta_graph.meta_info_def.tags[0] if meta_graph.meta_info_def.tags else "unknown"
-                                ),
-                            }
-                        )
+            for node_context in self._iter_saved_model_node_contexts(saved_model):
+                node = node_context.node
+                # Skip Python ops here; they are handled by _check_python_op
+                if node.op in PYTHON_OPS:
+                    continue
+                if node.op in DANGEROUS_TF_OPERATIONS:
+                    dangerous_ops.append(
+                        {
+                            "operation": node.op,
+                            "severity": DANGEROUS_TF_OPERATIONS[node.op],
+                            "location": self._build_node_location(node_context),
+                            "details": self._build_node_details(
+                                node_context,
+                                {"op_type": node.op},
+                            ),
+                        }
+                    )
         except Exception as e:  # pragma: no cover
             logger.warning(f"Failed to iterate TensorFlow graph: {e}")
         return dangerous_ops
 
     def _analyze_saved_model(self, saved_model: Any, result: ScanResult) -> None:
         """Analyze the saved model for suspicious operations"""
-        import re
-
         suspicious_op_found = False
         op_counts: dict[str, int] = {}
 
@@ -329,94 +403,76 @@ class TensorFlowSavedModelScanner(BaseScanner):
         _lambda_node_re = re.compile(r"^(?:lambda(?:_\d+)?)(?:/|$)", re.IGNORECASE)
         _reported_lambda_layers: set[str] = set()
 
-        for meta_graph in saved_model.meta_graphs:
-            graph_def = meta_graph.graph_def
+        for node_context in self._iter_saved_model_node_contexts(saved_model):
+            node = node_context.node
 
-            # Scan all nodes in the graph for suspicious operations
-            for node in graph_def.node:
-                # Count all operation types
-                op_counts[node.op] = op_counts.get(node.op, 0) + 1
+            # Count all operation types
+            op_counts[node.op] = op_counts.get(node.op, 0) + 1
 
-                if node.op in self.suspicious_ops:
-                    suspicious_op_found = True
+            if node.op in self.suspicious_ops:
+                suspicious_op_found = True
 
-                    # Special handling for PyFunc/PyCall - try to extract and validate Python code
-                    if node.op in PYTHON_OPS:
-                        self._check_python_op(node, result, meta_graph)
-                    elif node.op not in DANGEROUS_TF_OPERATIONS:
+                # Special handling for PyFunc/PyCall - try to extract and validate Python code
+                if node.op in PYTHON_OPS:
+                    self._check_python_op(node_context, result)
+                elif node.op not in DANGEROUS_TF_OPERATIONS:
+                    result.add_check(
+                        name="TensorFlow Operation Security Check",
+                        passed=False,
+                        message=f"Suspicious TensorFlow operation: {node.op}",
+                        severity=IssueSeverity.CRITICAL,
+                        location=self._build_node_location(node_context),
+                        rule_code="S703",
+                        details=self._build_node_details(
+                            node_context,
+                            {"op_type": node.op},
+                        ),
+                        why=get_tf_op_explanation(node.op),
+                    )
+                # else: already reported by generic dangerous-op pass
+
+            # Check for StatefulPartitionedCall which can contain custom functions
+            if node.op == "StatefulPartitionedCall" and hasattr(node, "attr") and "f" in node.attr:
+                # These operations can contain arbitrary functions
+                # Check the function name for suspicious patterns
+                func_attr = node.attr["f"]
+                if hasattr(func_attr, "func") and hasattr(func_attr.func, "name"):
+                    func_name = func_attr.func.name
+
+                    # Check for suspicious function names.
+                    # NOTE: "lambda" is intentionally excluded because
+                    # standard Keras preprocessing layers generate
+                    # StatefulPartitionedCall nodes whose function names
+                    # contain "lambda" as part of normal TF internal
+                    # naming (e.g. "__inference_lambda_layer_call_fn_123").
+                    # Lambda layers are already detected separately via
+                    # _scan_keras_metadata.
+                    matched_pattern = self._match_suspicious_function_name(func_name)
+                    if matched_pattern is not None:
                         result.add_check(
-                            name="TensorFlow Operation Security Check",
+                            name="StatefulPartitionedCall Security Check",
                             passed=False,
-                            message=f"Suspicious TensorFlow operation: {node.op}",
-                            severity=IssueSeverity.CRITICAL,
-                            location=f"{self.current_file_path} (node: {node.name})",
-                            rule_code="S703",
-                            details={
-                                "op_type": node.op,
-                                "node_name": node.name,
-                                "meta_graph": (
-                                    meta_graph.meta_info_def.tags[0] if meta_graph.meta_info_def.tags else "unknown"
-                                ),
-                            },
-                            why=get_tf_op_explanation(node.op),
+                            message=f"StatefulPartitionedCall with suspicious function: {func_name}",
+                            severity=IssueSeverity.WARNING,
+                            location=self._build_node_location(node_context),
+                            details=self._build_node_details(
+                                node_context,
+                                {
+                                    "op_type": node.op,
+                                    "stateful_call_target": func_name,
+                                    "suspicious_pattern": matched_pattern,
+                                },
+                            ),
+                            why=(
+                                "StatefulPartitionedCall can execute custom functions that may contain arbitrary code."
+                            ),
                         )
-                    # else: already reported by generic dangerous-op pass
 
-                # Check for StatefulPartitionedCall which can contain custom functions
-                if node.op == "StatefulPartitionedCall" and hasattr(node, "attr") and "f" in node.attr:
-                    # These operations can contain arbitrary functions
-                    # Check the function name for suspicious patterns
-                    func_attr = node.attr["f"]
-                    if hasattr(func_attr, "func") and hasattr(func_attr.func, "name"):
-                        func_name = func_attr.func.name
-
-                        # Check for suspicious function names.
-                        # NOTE: "lambda" is intentionally excluded because
-                        # standard Keras preprocessing layers generate
-                        # StatefulPartitionedCall nodes whose function names
-                        # contain "lambda" as part of normal TF internal
-                        # naming (e.g. "__inference_lambda_layer_call_fn_123").
-                        # Lambda layers are already detected separately via
-                        # _scan_keras_metadata.
-                        suspicious_func_patterns = [
-                            "eval",
-                            "exec",
-                            "compile",
-                            "__import__",
-                            "system",
-                            "popen",
-                            "subprocess",
-                            "pickle",
-                            "marshal",
-                        ]
-
-                        for pattern in suspicious_func_patterns:
-                            if pattern in func_name.lower():
-                                result.add_check(
-                                    name="StatefulPartitionedCall Security Check",
-                                    passed=False,
-                                    message=f"StatefulPartitionedCall with suspicious function: {func_name}",
-                                    severity=IssueSeverity.WARNING,
-                                    location=f"{self.current_file_path} (node: {node.name})",
-                                    details={
-                                        "op_type": node.op,
-                                        "node_name": node.name,
-                                        "function_name": func_name,
-                                        "suspicious_pattern": pattern,
-                                    },
-                                    why=(
-                                        "StatefulPartitionedCall can execute custom functions "
-                                        "that may contain arbitrary code."
-                                    ),
-                                )
-                                break
-
-                # Detect Lambda layers by node name.  This catches Lambda
-                # layers even when scanning a standalone saved_model.pb
-                # file (where _scan_keras_metadata is not invoked).
-                # Only report each distinct layer prefix once to avoid
-                # flooding the results (a single Lambda layer produces
-                # many graph nodes under the same prefix).
+            # Detect Lambda layers by node name at the top-level graph only.
+            # FunctionDef node names are internal graph implementation details
+            # and can legitimately reuse "lambda/<op>"-like prefixes without
+            # representing a user-authored Keras Lambda layer.
+            if node_context.node_scope == "graph_def":
                 m = _lambda_node_re.match(node.name)
                 if m:
                     layer_prefix = m.group(0).rstrip("/")
@@ -427,15 +483,14 @@ class TensorFlowSavedModelScanner(BaseScanner):
                             passed=False,
                             message="Lambda layer detected in graph",
                             severity=IssueSeverity.WARNING,
-                            location=f"{self.current_file_path} (node: {node.name})",
-                            details={
-                                "node_name": node.name,
-                                "op_type": node.op,
-                                "layer_prefix": layer_prefix,
-                                "meta_graph": (
-                                    meta_graph.meta_info_def.tags[0] if meta_graph.meta_info_def.tags else "unknown"
-                                ),
-                            },
+                            location=self._build_node_location(node_context),
+                            details=self._build_node_details(
+                                node_context,
+                                {
+                                    "op_type": node.op,
+                                    "layer_prefix": layer_prefix,
+                                },
+                            ),
                             why=(
                                 "Lambda layers can execute arbitrary Python code during "
                                 "model inference, which poses a security risk."
@@ -449,8 +504,30 @@ class TensorFlowSavedModelScanner(BaseScanner):
         # Enhanced protobuf vulnerability scanning
         self._scan_protobuf_vulnerabilities(saved_model, result)
 
-    def _check_python_op(self, node: Any, result: ScanResult, meta_graph: Any) -> None:
+    @staticmethod
+    def _match_suspicious_function_name(func_name: str) -> str | None:
+        """Return the suspicious token matched in a function name, if any."""
+        suspicious_patterns = (
+            ("eval", re.compile(r"(?:^|[^a-z0-9])eval(?:[^a-z0-9]|$)")),
+            ("exec", re.compile(r"(?:^|[^a-z0-9])exec(?:[^a-z0-9]|$)")),
+            ("compile", re.compile(r"(?:^|[^a-z0-9])compile(?:[^a-z0-9]|$)")),
+            ("__import__", re.compile(r"(?:^|[^a-z0-9])__import__(?:[^a-z0-9]|$)")),
+            ("system", re.compile(r"(?:^|[^a-z0-9])system(?:[^a-z0-9]|$)")),
+            ("popen", re.compile(r"(?:^|[^a-z0-9])popen(?:[^a-z0-9]|$)")),
+            ("subprocess", re.compile(r"(?:^|[^a-z0-9])subprocess(?:[^a-z0-9]|$)")),
+            ("pickle", re.compile(r"(?:^|[^a-z0-9])pickle(?:[^a-z0-9]|$)")),
+            ("marshal", re.compile(r"(?:^|[^a-z0-9])marshal(?:[^a-z0-9]|$)")),
+        )
+
+        lowered_func_name = func_name.lower()
+        for pattern_name, pattern in suspicious_patterns:
+            if pattern.search(lowered_func_name):
+                return pattern_name
+        return None
+
+    def _check_python_op(self, node_context: SavedModelNodeContext, result: ScanResult) -> None:
         """Check PyFunc/PyCall operations for embedded Python code"""
+        node = node_context.node
         # PyFunc and PyCall can embed Python code in various ways:
         # 1. As a string attribute containing Python code
         # 2. As a reference to a Python function
@@ -491,18 +568,15 @@ class TensorFlowSavedModelScanner(BaseScanner):
                                     passed=False,
                                     message=f"{node.op} operation references dangerous function: {func_name}",
                                     severity=IssueSeverity.CRITICAL,
-                                    location=f"{self.current_file_path} (node: {node.name})",
+                                    location=self._build_node_location(node_context),
                                     rule_code="S902",
-                                    details={
-                                        "op_type": node.op,
-                                        "node_name": node.name,
-                                        "function_reference": func_name,
-                                        "meta_graph": (
-                                            meta_graph.meta_info_def.tags[0]
-                                            if meta_graph.meta_info_def.tags
-                                            else "unknown"
-                                        ),
-                                    },
+                                    details=self._build_node_details(
+                                        node_context,
+                                        {
+                                            "op_type": node.op,
+                                            "function_reference": func_name,
+                                        },
+                                    ),
                                     why=get_tf_op_explanation(node.op),
                                 )
                                 return
@@ -523,18 +597,17 @@ class TensorFlowSavedModelScanner(BaseScanner):
                     passed=False,
                     message=issue_msg,
                     severity=severity,
-                    location=f"{self.current_file_path} (node: {node.name})",
+                    location=self._build_node_location(node_context),
                     rule_code="S902",
-                    details={
-                        "op_type": node.op,
-                        "node_name": node.name,
-                        "code_analysis": risk_desc if is_dangerous else "Contains executable code",
-                        "code_preview": python_code[:200] + "..." if len(python_code) > 200 else python_code,
-                        "validation_status": "valid_python",
-                        "meta_graph": (
-                            meta_graph.meta_info_def.tags[0] if meta_graph.meta_info_def.tags else "unknown"
-                        ),
-                    },
+                    details=self._build_node_details(
+                        node_context,
+                        {
+                            "op_type": node.op,
+                            "code_analysis": risk_desc if is_dangerous else "Contains executable code",
+                            "code_preview": python_code[:200] + "..." if len(python_code) > 200 else python_code,
+                            "validation_status": "valid_python",
+                        },
+                    ),
                     why=get_tf_op_explanation(node.op),
                 )
             else:
@@ -545,16 +618,15 @@ class TensorFlowSavedModelScanner(BaseScanner):
                     message=f"{node.op} operation contains suspicious data (possibly obfuscated code)",
                     rule_code="S902",
                     severity=IssueSeverity.CRITICAL,
-                    location=f"{self.current_file_path} (node: {node.name})",
-                    details={
-                        "op_type": node.op,
-                        "node_name": node.name,
-                        "validation_error": error,
-                        "data_preview": python_code[:100] + "..." if len(python_code) > 100 else python_code,
-                        "meta_graph": (
-                            meta_graph.meta_info_def.tags[0] if meta_graph.meta_info_def.tags else "unknown"
-                        ),
-                    },
+                    location=self._build_node_location(node_context),
+                    details=self._build_node_details(
+                        node_context,
+                        {
+                            "op_type": node.op,
+                            "validation_error": error,
+                            "data_preview": python_code[:100] + "..." if len(python_code) > 100 else python_code,
+                        },
+                    ),
                     why=get_tf_op_explanation(node.op),
                 )
         else:
@@ -565,12 +637,11 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 message=f"{node.op} operation detected (unable to extract Python code)",
                 rule_code="S902",
                 severity=IssueSeverity.CRITICAL,
-                location=f"{self.current_file_path} (node: {node.name})",
-                details={
-                    "op_type": node.op,
-                    "node_name": node.name,
-                    "meta_graph": (meta_graph.meta_info_def.tags[0] if meta_graph.meta_info_def.tags else "unknown"),
-                },
+                location=self._build_node_location(node_context),
+                details=self._build_node_details(
+                    node_context,
+                    {"op_type": node.op},
+                ),
                 why=get_tf_op_explanation(node.op),
             )
 
@@ -748,6 +819,11 @@ class TensorFlowSavedModelScanner(BaseScanner):
 
         # Check for malicious string data in protobuf fields
         self._check_protobuf_string_injection(saved_model, result)
+        # NOTE: _check_protobuf_buffer_overflow() and
+        # _check_protobuf_field_bomb() are intentionally not enabled yet.
+        # Their thresholds are heuristic and currently lack regression
+        # coverage, so wiring them in would expand SavedModel findings beyond
+        # the narrowly-scoped function-definition fix until they are validated.
 
     def _check_protobuf_string_injection(self, saved_model: Any, result: ScanResult) -> None:
         """Check for string injection attacks in protobuf fields"""
@@ -783,60 +859,62 @@ class TensorFlowSavedModelScanner(BaseScanner):
 
         import re
 
-        for meta_graph in saved_model.meta_graphs:
-            graph_def = meta_graph.graph_def
+        for node_context in self._iter_saved_model_node_contexts(saved_model):
+            node = node_context.node
 
-            for node in graph_def.node:
-                # Check string values in node attributes
-                if hasattr(node, "attr"):
-                    for attr_name, attr_value in node.attr.items():
-                        string_vals_to_check = []
+            # Check string values in node attributes
+            if hasattr(node, "attr"):
+                for attr_name, attr_value in node.attr.items():
+                    string_vals_to_check = []
 
-                        # Extract string values from different attribute types
-                        if hasattr(attr_value, "s"):  # String attribute
+                    # Extract string values from different attribute types
+                    if hasattr(attr_value, "s"):  # String attribute
+                        try:
+                            string_vals_to_check.append(attr_value.s.decode("utf-8", errors="ignore"))
+                        except (UnicodeDecodeError, AttributeError):
+                            continue
+
+                    elif hasattr(attr_value, "list") and hasattr(attr_value.list, "s"):  # String list
+                        for s_val in attr_value.list.s:
                             try:
-                                string_vals_to_check.append(attr_value.s.decode("utf-8", errors="ignore"))
+                                string_vals_to_check.append(s_val.decode("utf-8", errors="ignore"))
                             except (UnicodeDecodeError, AttributeError):
                                 continue
 
-                        elif hasattr(attr_value, "list") and hasattr(attr_value.list, "s"):  # String list
-                            for s_val in attr_value.list.s:
-                                try:
-                                    string_vals_to_check.append(s_val.decode("utf-8", errors="ignore"))
-                                except (UnicodeDecodeError, AttributeError):
-                                    continue
-
-                        # Check each string value against injection patterns
-                        for string_val in string_vals_to_check:
-                            if len(string_val) > 10000:  # Skip extremely long strings to avoid performance issues
-                                result.add_check(
-                                    name="Protobuf String Length Check",
-                                    passed=False,
-                                    message=f"Abnormally long string in node attribute (length: {len(string_val)})",
-                                    severity=IssueSeverity.INFO,
-                                    location=f"{self.current_file_path} (node: {node.name}, attr: {attr_name})",
-                                    details={
-                                        "node_name": node.name,
+                    # Check each string value against injection patterns
+                    for string_val in string_vals_to_check:
+                        if len(string_val) > 10000:  # Skip extremely long strings to avoid performance issues
+                            result.add_check(
+                                name="Protobuf String Length Check",
+                                passed=False,
+                                message=f"Abnormally long string in node attribute (length: {len(string_val)})",
+                                severity=IssueSeverity.INFO,
+                                location=self._build_node_location(node_context, attr_name=attr_name),
+                                details=self._build_node_details(
+                                    node_context,
+                                    {
                                         "attribute_name": attr_name,
                                         "string_length": len(string_val),
                                         "attack_type": "protobuf_string_bomb",
                                     },
-                                )
-                                continue
+                                ),
+                            )
+                            continue
 
-                            for pattern, attack_type, description in injection_patterns:
-                                matches = re.findall(pattern, string_val, re.IGNORECASE)
-                                if matches:
-                                    result.add_check(
-                                        name="Protobuf String Injection Check",
-                                        passed=False,
-                                        message=f"Potential {description} detected in protobuf string",
-                                        severity=IssueSeverity.CRITICAL
-                                        if attack_type in ["code_injection", "system_command"]
-                                        else IssueSeverity.WARNING,
-                                        location=f"{self.current_file_path} (node: {node.name}, attr: {attr_name})",
-                                        details={
-                                            "node_name": node.name,
+                        for pattern, attack_type, description in injection_patterns:
+                            matches = re.findall(pattern, string_val, re.IGNORECASE)
+                            if matches:
+                                result.add_check(
+                                    name="Protobuf String Injection Check",
+                                    passed=False,
+                                    message=f"Potential {description} detected in protobuf string",
+                                    severity=IssueSeverity.CRITICAL
+                                    if attack_type in ["code_injection", "system_command"]
+                                    else IssueSeverity.WARNING,
+                                    location=self._build_node_location(node_context, attr_name=attr_name),
+                                    details=self._build_node_details(
+                                        node_context,
+                                        {
                                             "attribute_name": attr_name,
                                             "pattern_matched": pattern,
                                             "matches": matches[:5],  # Limit to first 5 matches
@@ -844,50 +922,53 @@ class TensorFlowSavedModelScanner(BaseScanner):
                                             "description": description,
                                             "total_matches": len(matches),
                                         },
-                                    )
-                                    break  # Only report first match per string to avoid spam
+                                    ),
+                                )
+                                break  # Only report first match per string to avoid spam
 
     def _check_protobuf_buffer_overflow(self, saved_model: Any, result: ScanResult) -> None:
         """Check for potential buffer overflow patterns in protobuf data"""
 
-        for meta_graph in saved_model.meta_graphs:
-            graph_def = meta_graph.graph_def
-
-            # Check for nodes with extremely long names (potential buffer overflow)
-            for node in graph_def.node:
-                if len(node.name) > 2048:  # 2KB threshold for node names
-                    result.add_check(
-                        name="Protobuf Node Name Length Check",
-                        passed=False,
-                        message=(
-                            f"Abnormally long node name (length: {len(node.name)}) may indicate buffer overflow attempt"
-                        ),
-                        severity=IssueSeverity.WARNING,
-                        location=f"{self.current_file_path} (node: {node.name[:100]}...)",
-                        details={
+        for node_context in self._iter_saved_model_node_contexts(saved_model):
+            node = node_context.node
+            if len(node.name) > 2048:  # 2KB threshold for node names
+                result.add_check(
+                    name="Protobuf Node Name Length Check",
+                    passed=False,
+                    message=(
+                        f"Abnormally long node name (length: {len(node.name)}) may indicate buffer overflow attempt"
+                    ),
+                    severity=IssueSeverity.WARNING,
+                    location=self._build_node_location(node_context),
+                    details=self._build_node_details(
+                        node_context,
+                        {
                             "node_name_length": len(node.name),
                             "name_threshold": 2048,
                             "attack_type": "protobuf_buffer_overflow",
                             "node_name_preview": node.name[:200],  # First 200 chars
                         },
-                    )
+                    ),
+                )
 
-                # Check input names for excessive length
-                for input_name in node.input:
-                    if len(input_name) > 2048:
-                        result.add_check(
-                            name="Protobuf Input Name Length Check",
-                            passed=False,
-                            message=f"Abnormally long input name (length: {len(input_name)}) in node {node.name}",
-                            severity=IssueSeverity.WARNING,
-                            location=f"{self.current_file_path} (node: {node.name})",
-                            details={
-                                "node_name": node.name,
+            # Check input names for excessive length
+            for input_name in node.input:
+                if len(input_name) > 2048:
+                    result.add_check(
+                        name="Protobuf Input Name Length Check",
+                        passed=False,
+                        message=f"Abnormally long input name (length: {len(input_name)}) in node {node.name}",
+                        severity=IssueSeverity.WARNING,
+                        location=self._build_node_location(node_context),
+                        details=self._build_node_details(
+                            node_context,
+                            {
                                 "input_name_length": len(input_name),
                                 "name_threshold": 2048,
                                 "attack_type": "protobuf_buffer_overflow",
                             },
-                        )
+                        ),
+                    )
 
     def _check_protobuf_field_bomb(self, saved_model: Any, result: ScanResult) -> None:
         """Check for protobuf field bombs (DoS via excessive fields)"""
@@ -896,12 +977,15 @@ class TensorFlowSavedModelScanner(BaseScanner):
         total_attrs = 0
 
         for meta_graph in saved_model.meta_graphs:
-            graph_def = meta_graph.graph_def
-            meta_graph_nodes = len(graph_def.node)
-            total_nodes += meta_graph_nodes
+            meta_graph_nodes = 0
+            meta_graph_attrs = 0
 
-            # Count total attributes across all nodes
-            meta_graph_attrs = sum(len(node.attr) if hasattr(node, "attr") else 0 for node in graph_def.node)
+            for node_context in self._iter_meta_graph_node_contexts(meta_graph):
+                meta_graph_nodes += 1
+                node = node_context.node
+                meta_graph_attrs += len(node.attr) if hasattr(node, "attr") else 0
+
+            total_nodes += meta_graph_nodes
             total_attrs += meta_graph_attrs
 
             # Check for excessive nodes in single meta graph
