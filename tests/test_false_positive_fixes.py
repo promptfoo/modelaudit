@@ -17,6 +17,18 @@ from modelaudit.cli import main as cli_main
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.weight_distribution_scanner import WeightDistributionScanner
 
+GPT2_TEST_VOCAB_SIZE = 12_000
+GPT2_TEST_EMBED_DIM = 64
+GPT2_TEST_FF_DIM = 256
+GPT2_TEST_ATTN_DIM = 192
+
+
+def _scaled_random_array(shape: tuple[int, ...], *, scale: float = 0.02, seed: int = 42) -> np.ndarray:
+    """Create deterministic float32 test weights without full-size model tensors."""
+    rng = np.random.default_rng(seed)
+    return rng.standard_normal(shape).astype(np.float32) * scale
+
+
 # Skip tests if required libraries are not available
 try:
     import torch
@@ -51,12 +63,14 @@ class TestFalsePositiveFixes:
         # 1. Create SafeTensors file with GPT-2 layer patterns
         if HAS_SAFETENSORS:
             safetensors_path = tmp_path / "model.safetensors"
+            # Use representative GPT-style tensors rather than full GPT-2 weights
+            # so the regression stays fast in the default CI suite.
             gpt2_weights = {
-                "h.0.mlp.c_fc.weight": np.random.randn(768, 3072).astype(np.float32) * 0.02,
-                "h.0.mlp.c_proj.weight": np.random.randn(3072, 768).astype(np.float32) * 0.02,
-                "h.1.attn.c_attn.weight": np.random.randn(768, 2304).astype(np.float32) * 0.02,
-                "h.1.attn.c_proj.weight": np.random.randn(768, 768).astype(np.float32) * 0.02,
-                "wte.weight": np.random.randn(50257, 768).astype(np.float32) * 0.02,  # Token embeddings
+                "h.0.mlp.c_fc.weight": _scaled_random_array((GPT2_TEST_EMBED_DIM, GPT2_TEST_FF_DIM), seed=1),
+                "h.0.mlp.c_proj.weight": _scaled_random_array((GPT2_TEST_FF_DIM, GPT2_TEST_EMBED_DIM), seed=2),
+                "h.1.attn.c_attn.weight": _scaled_random_array((GPT2_TEST_EMBED_DIM, GPT2_TEST_ATTN_DIM), seed=3),
+                "h.1.attn.c_proj.weight": _scaled_random_array((GPT2_TEST_EMBED_DIM, GPT2_TEST_EMBED_DIM), seed=4),
+                "wte.weight": _scaled_random_array((GPT2_TEST_VOCAB_SIZE, GPT2_TEST_EMBED_DIM), seed=5),
             }
             save_file(gpt2_weights, safetensors_path)
             test_files.append(safetensors_path)
@@ -67,11 +81,11 @@ class TestFalsePositiveFixes:
             "_name_or_path": "openai-community/gpt2",
             "model_type": "gpt2",
             "architectures": ["GPT2LMHeadModel"],
-            "vocab_size": 50257,
-            "n_positions": 1024,
-            "n_embd": 768,
-            "n_layer": 12,
-            "n_head": 12,
+            "vocab_size": GPT2_TEST_VOCAB_SIZE,
+            "n_positions": 128,
+            "n_embd": GPT2_TEST_EMBED_DIM,
+            "n_layer": 4,
+            "n_head": 4,
             "transformers_version": "4.35.0",
             "torch_dtype": "float32",
         }
@@ -87,11 +101,11 @@ class TestFalsePositiveFixes:
                 layer_group = model_weights.create_group("transformer/h_0/mlp/c_fc")
                 layer_group.create_dataset(
                     "kernel:0",
-                    data=np.random.randn(768, 3072).astype(np.float32) * 0.02,
+                    data=_scaled_random_array((GPT2_TEST_EMBED_DIM, GPT2_TEST_FF_DIM), seed=6),
                 )
                 layer_group.create_dataset(
                     "bias:0",
-                    data=np.random.randn(3072).astype(np.float32) * 0.01,
+                    data=_scaled_random_array((GPT2_TEST_FF_DIM,), scale=0.01, seed=7),
                 )
 
                 # Add optimizer weights to make it clearly a TensorFlow file
@@ -421,11 +435,11 @@ class TestFalsePositiveFixes:
             "_name_or_path": "openai-community/gpt2",
             "model_type": "gpt2",
             "architectures": ["GPT2LMHeadModel"],
-            "vocab_size": 50257,
-            "n_positions": 1024,
-            "n_embd": 768,
-            "n_layer": 12,
-            "n_head": 12,
+            "vocab_size": GPT2_TEST_VOCAB_SIZE,
+            "n_positions": 128,
+            "n_embd": GPT2_TEST_EMBED_DIM,
+            "n_layer": 4,
+            "n_head": 4,
             "transformers_version": "4.35.0",
             "torch_dtype": "float32",
         }
@@ -443,20 +457,28 @@ class TestFalsePositiveFixes:
 
         # SafeTensors model weights
         if HAS_SAFETENSORS:
+            # Keep the layer names and file mix realistic without creating
+            # hundreds of megabytes of test data.
             gpt2_weights = {
-                "h.0.mlp.c_fc.weight": np.random.randn(768, 3072).astype(np.float32) * 0.02,
-                "h.0.mlp.c_proj.weight": np.random.randn(3072, 768).astype(np.float32) * 0.02,
-                "h.1.attn.c_attn.weight": np.random.randn(768, 2304).astype(np.float32) * 0.02,
-                "wte.weight": np.random.randn(50257, 768).astype(np.float32) * 0.02,
+                "h.0.mlp.c_fc.weight": _scaled_random_array((GPT2_TEST_EMBED_DIM, GPT2_TEST_FF_DIM), seed=11),
+                "h.0.mlp.c_proj.weight": _scaled_random_array((GPT2_TEST_FF_DIM, GPT2_TEST_EMBED_DIM), seed=12),
+                "h.1.attn.c_attn.weight": _scaled_random_array((GPT2_TEST_EMBED_DIM, GPT2_TEST_ATTN_DIM), seed=13),
+                "wte.weight": _scaled_random_array((GPT2_TEST_VOCAB_SIZE, GPT2_TEST_EMBED_DIM), seed=14),
             }
             save_file(gpt2_weights, model_dir / "model.safetensors")
 
         # PyTorch binary weights
         if HAS_TORCH:
             torch_weights = {
-                "h.0.mlp.c_fc.weight": torch.randn(3072, 768) * 0.02,
-                "h.0.mlp.c_proj.weight": torch.randn(768, 3072) * 0.02,
-                "wte.weight": torch.randn(50257, 768) * 0.02,
+                "h.0.mlp.c_fc.weight": torch.from_numpy(
+                    _scaled_random_array((GPT2_TEST_FF_DIM, GPT2_TEST_EMBED_DIM), seed=21)
+                ),
+                "h.0.mlp.c_proj.weight": torch.from_numpy(
+                    _scaled_random_array((GPT2_TEST_EMBED_DIM, GPT2_TEST_FF_DIM), seed=22)
+                ),
+                "wte.weight": torch.from_numpy(
+                    _scaled_random_array((GPT2_TEST_VOCAB_SIZE, GPT2_TEST_EMBED_DIM), seed=23)
+                ),
             }
             torch.save(torch_weights, model_dir / "pytorch_model.bin")
 
@@ -467,7 +489,7 @@ class TestFalsePositiveFixes:
                 layer_group = model_weights.create_group("h_0_mlp_c_fc")
                 layer_group.create_dataset(
                     "kernel:0",
-                    data=np.random.randn(768, 3072).astype(np.float32) * 0.02,
+                    data=_scaled_random_array((GPT2_TEST_EMBED_DIM, GPT2_TEST_FF_DIM), seed=31),
                 )
 
                 # Add optimizer to make it clearly TensorFlow
