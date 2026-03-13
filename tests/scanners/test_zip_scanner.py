@@ -401,6 +401,10 @@ class TestZipScanner:
         assert result.success is True
         # All three file payloads should have been scanned
         assert result.bytes_scanned == len(pkl_data) + len(json_data) + len(pt_data)
+        contents_paths = {c.get("path", "") for c in result.metadata.get("contents", [])}
+        assert any("model.pkl" in p for p in contents_paths)
+        assert any("config.json" in p for p in contents_paths)
+        assert any("weights.pt" in p for p in contents_paths)
 
     def test_scan_zip_with_very_long_filename(self, tmp_path: Path) -> None:
         """ZIP entries with very long filenames should be handled without crashing."""

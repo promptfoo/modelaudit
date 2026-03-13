@@ -224,6 +224,27 @@ class TestTarScanner:
         finally:
             os.unlink(tmp_path)
 
+    def test_scan_tar_with_proto0_pickle_preserves_archive_context(self, tmp_path: Path) -> None:
+        """Malicious TAR members should surface critical findings with archive-qualified locations."""
+        archive_path = tmp_path / "proto0_payload.tar"
+        payload = b'cos\nsystem\n(S"echo pwned"\ntR.'
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("payload.txt")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert result.success is True
+        assert result.has_errors is True
+        critical_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL]
+        assert any(
+            "os.system" in issue.message.lower() or "posix.system" in issue.message.lower()
+            for issue in critical_issues
+        )
+        assert any(issue.location == f"{archive_path}:payload.txt" for issue in critical_issues)
+
     def test_invalid_tar_file(self):
         """Test handling of invalid TAR files"""
         with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as tmp:
