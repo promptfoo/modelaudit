@@ -1,9 +1,26 @@
 import pickle
+from pathlib import Path
+from typing import Any, Protocol, TypedDict
 
 import pytest
 
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.tf_savedmodel_scanner import TensorFlowSavedModelScanner
+
+
+class _NodeCollection(Protocol):
+    def add(self) -> Any:
+        """Append a protobuf node and return the mutable node object."""
+
+
+class _RequiredNodeSpec(TypedDict):
+    op: str
+
+
+class _NodeSpec(_RequiredNodeSpec, total=False):
+    name: str
+    string_attrs: dict[str, str]
+    function_ref: str
 
 
 # Defer TensorFlow check to avoid module-level imports
@@ -24,7 +41,7 @@ def has_tf_protos() -> bool:
     return modelaudit.protos._check_vendored_protos()
 
 
-def test_tf_savedmodel_scanner_can_handle(tmp_path):
+def test_tf_savedmodel_scanner_can_handle(tmp_path: Path) -> None:
     """Test the can_handle method of TensorFlowSavedModelScanner."""
     # Create a directory with saved_model.pb
     tf_dir = tmp_path / "tf_model"
@@ -51,8 +68,11 @@ def test_tf_savedmodel_scanner_can_handle(tmp_path):
         assert TensorFlowSavedModelScanner.can_handle(str(test_file)) is False
 
 
-def create_tf_savedmodel(tmp_path, *, malicious=False):
+def create_tf_savedmodel(tmp_path: Path, *, malicious: bool = False) -> Path:
     """Create a mock TensorFlow SavedModel directory for testing."""
+    import importlib
+
+    importlib.import_module("modelaudit.protos")
     from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
 
     # Create a directory that mimics a TensorFlow SavedModel
@@ -111,8 +131,8 @@ def create_tf_savedmodel(tmp_path, *, malicious=False):
     return model_dir
 
 
-@pytest.mark.skipif(not has_tensorflow(), reason="TensorFlow not installed")
-def test_tf_savedmodel_scanner_safe_model(tmp_path):
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_tf_savedmodel_scanner_safe_model(tmp_path: Path) -> None:
     """Test scanning a safe TensorFlow SavedModel."""
     model_dir = create_tf_savedmodel(tmp_path)
 
@@ -127,8 +147,8 @@ def test_tf_savedmodel_scanner_safe_model(tmp_path):
     assert len(error_issues) == 0
 
 
-@pytest.mark.skipif(not has_tensorflow(), reason="TensorFlow not installed")
-def test_tf_savedmodel_scanner_malicious_model(tmp_path):
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_tf_savedmodel_scanner_malicious_model(tmp_path: Path) -> None:
     """Test scanning a malicious TensorFlow SavedModel."""
     model_dir = create_tf_savedmodel(tmp_path, malicious=True)
 
@@ -176,8 +196,8 @@ def test_tf_savedmodel_scanner_invalid_model(tmp_path):
     )
 
 
-@pytest.mark.skipif(not has_tensorflow(), reason="TensorFlow not installed")
-def test_detect_readfile_operation(tmp_path):
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_detect_readfile_operation(tmp_path: Path) -> None:
     # Synthesize a SavedModel containing a ReadFile node
     model_path = _create_test_savedmodel_with_op(tmp_path, "ReadFile", "readfile_test")
     scanner = TensorFlowSavedModelScanner()
@@ -190,8 +210,8 @@ def test_detect_readfile_operation(tmp_path):
     assert any(i.why for i in readfile_issues), "Missing explanation for ReadFile detection"
 
 
-@pytest.mark.skipif(not has_tensorflow(), reason="TensorFlow not installed")
-def test_detect_pyfunc_operation(tmp_path):
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_detect_pyfunc_operation(tmp_path: Path) -> None:
     model_path = _create_test_savedmodel_with_op(tmp_path, "PyFunc", "pyfunc_test")
     scanner = TensorFlowSavedModelScanner()
     result = scanner.scan(model_path)
@@ -202,8 +222,8 @@ def test_detect_pyfunc_operation(tmp_path):
     assert any(i.why for i in pyfunc_issues), "Missing explanation for PyFunc detection"
 
 
-@pytest.mark.skipif(not has_tensorflow(), reason="TensorFlow not installed")
-def test_detect_writefile_operation(tmp_path):
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_detect_writefile_operation(tmp_path: Path) -> None:
     # Synthesize a SavedModel containing a WriteFile node
     model_path = _create_test_savedmodel_with_op(tmp_path, "WriteFile", "writefile_test")
     scanner = TensorFlowSavedModelScanner()
@@ -216,8 +236,215 @@ def test_detect_writefile_operation(tmp_path):
     assert any(i.why for i in writefile_issues), "Missing explanation for WriteFile detection"
 
 
-@pytest.mark.skipif(not has_tensorflow(), reason="TensorFlow not installed")
-def test_tf_savedmodel_scanner_with_blacklist(tmp_path):
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+@pytest.mark.parametrize(
+    ("op_name", "function_name"),
+    [
+        ("WriteFile", "__inference_writefile_attack_1"),
+        ("PyFunc", "__inference_pyfunc_attack_1"),
+        ("ParseTensor", "__inference_parse_tensor_attack_1"),
+    ],
+)
+def test_detect_suspicious_ops_in_function_definitions(
+    tmp_path: Path,
+    op_name: str,
+    function_name: str,
+) -> None:
+    model_path = _create_test_savedmodel_with_scoped_nodes(
+        tmp_path,
+        function_nodes={
+            function_name: [
+                {
+                    "op": op_name,
+                    "name": f"function_{op_name.lower()}_node",
+                }
+            ]
+        },
+        model_name=f"function_def_{op_name.lower()}",
+    )
+
+    result = TensorFlowSavedModelScanner().scan(model_path)
+    matching_issues = [issue for issue in result.issues if issue.message and op_name in issue.message]
+
+    assert matching_issues, f"Expected detection for {op_name} inside a function definition"
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in matching_issues)
+    assert any(issue.details.get("node_scope") == "function_def" for issue in matching_issues)
+    assert any(issue.details.get("function_name") == function_name for issue in matching_issues)
+    assert any(function_name in (issue.location or "") for issue in matching_issues)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_stateful_partitioned_call_detected_in_function_definition(tmp_path: Path) -> None:
+    function_name = "__inference_stateful_partitioned_call_1"
+    target_name = "__inference_eval_fn_123"
+    model_path = _create_test_savedmodel_with_scoped_nodes(
+        tmp_path,
+        function_nodes={
+            function_name: [
+                {
+                    "op": "StatefulPartitionedCall",
+                    "name": "partitioned_call",
+                    "function_ref": target_name,
+                }
+            ]
+        },
+        model_name="function_def_stateful_partitioned_call",
+    )
+
+    result = TensorFlowSavedModelScanner().scan(model_path)
+    matching_issues = [
+        issue
+        for issue in result.issues
+        if issue.message and "StatefulPartitionedCall with suspicious function" in issue.message
+    ]
+
+    assert matching_issues, "Expected StatefulPartitionedCall warning inside a function definition"
+    assert all(issue.severity == IssueSeverity.WARNING for issue in matching_issues)
+    assert any(issue.details.get("stateful_call_target") == target_name for issue in matching_issues)
+    assert any(issue.details.get("node_scope") == "function_def" for issue in matching_issues)
+    assert any(issue.details.get("function_name") == function_name for issue in matching_issues)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_stateful_partitioned_call_ignores_evaluate_like_function_names(tmp_path: Path) -> None:
+    model_path = _create_test_savedmodel_with_scoped_nodes(
+        tmp_path,
+        function_nodes={
+            "__inference_stateful_partitioned_call_1": [
+                {
+                    "op": "StatefulPartitionedCall",
+                    "name": "partitioned_call",
+                    "function_ref": "__inference_evaluate_123",
+                }
+            ]
+        },
+        model_name="function_def_stateful_partitioned_call_evaluate",
+    )
+
+    result = TensorFlowSavedModelScanner().scan(model_path)
+
+    assert not any(
+        issue.message and "StatefulPartitionedCall with suspicious function" in issue.message for issue in result.issues
+    )
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_lambda_named_function_definition_nodes_do_not_trigger_lambda_layer_warning(tmp_path: Path) -> None:
+    model_path = _create_test_savedmodel_with_scoped_nodes(
+        tmp_path,
+        function_nodes={
+            "__inference_safe_lambdaish_1": [
+                {
+                    "op": "Identity",
+                    "name": "lambda/Identity",
+                }
+            ]
+        },
+        model_name="function_def_lambda_named_node",
+    )
+
+    result = TensorFlowSavedModelScanner().scan(model_path)
+
+    assert not any(issue.message == "Lambda layer detected in graph" for issue in result.issues)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_graph_lambda_named_nodes_still_trigger_lambda_layer_warning(tmp_path: Path) -> None:
+    model_path = _create_test_savedmodel_with_scoped_nodes(
+        tmp_path,
+        graph_nodes=[
+            {
+                "op": "Identity",
+                "name": "lambda/Identity",
+            }
+        ],
+        model_name="graph_lambda_named_node",
+    )
+
+    result = TensorFlowSavedModelScanner().scan(model_path)
+    lambda_issues = [issue for issue in result.issues if issue.message == "Lambda layer detected in graph"]
+
+    assert lambda_issues, "Expected Lambda layer warning for top-level graph nodes"
+    assert any(issue.details.get("node_scope") == "graph_def" for issue in lambda_issues)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_protobuf_string_injection_detected_in_function_definition(tmp_path: Path) -> None:
+    function_name = "__inference_payload_attack_1"
+    model_path = _create_test_savedmodel_with_scoped_nodes(
+        tmp_path,
+        function_nodes={
+            function_name: [
+                {
+                    "op": "Const",
+                    "name": "payload_node",
+                    "string_attrs": {
+                        "payload": "os.system('/bin/echo exploit')",
+                    },
+                }
+            ]
+        },
+        model_name="function_def_string_injection",
+    )
+
+    result = TensorFlowSavedModelScanner().scan(model_path)
+    injection_issues = [
+        issue
+        for issue in result.issues
+        if "protobuf string" in issue.message.lower() and issue.details.get("attack_type") == "system_command"
+    ]
+
+    assert injection_issues, "Expected protobuf string injection detection inside a function definition"
+    assert any(issue.details.get("node_scope") == "function_def" for issue in injection_issues)
+    assert any(issue.details.get("function_name") == function_name for issue in injection_issues)
+    assert any(issue.details.get("attribute_name") == "payload" for issue in injection_issues)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_function_definition_ops_are_counted_in_metadata(tmp_path: Path) -> None:
+    model_path = _create_test_savedmodel_with_scoped_nodes(
+        tmp_path,
+        graph_nodes=[{"op": "WriteFile", "name": "top_level_write"}],
+        function_nodes={
+            "__inference_writefile_attack_1": [
+                {"op": "WriteFile", "name": "function_write"},
+            ]
+        },
+        model_name="count_function_ops",
+    )
+
+    result = TensorFlowSavedModelScanner().scan(model_path)
+
+    assert result.metadata["op_counts"]["WriteFile"] == 2
+    assert result.metadata["suspicious_op_found"] is True
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_safe_function_definition_ops_do_not_trigger_findings(tmp_path: Path) -> None:
+    model_path = _create_test_savedmodel_with_scoped_nodes(
+        tmp_path,
+        graph_nodes=[{"op": "Placeholder", "name": "input_node"}],
+        function_nodes={
+            "__inference_safe_signature_wrapper_1": [
+                {"op": "Const", "name": "const_value"},
+                {"op": "AddV2", "name": "add_value"},
+                {"op": "Identity", "name": "identity_value"},
+            ]
+        },
+        model_name="safe_function_def",
+    )
+
+    result = TensorFlowSavedModelScanner().scan(model_path)
+
+    assert result.issues == []
+    assert result.metadata["op_counts"]["Const"] == 1
+    assert result.metadata["op_counts"]["AddV2"] == 1
+    assert result.metadata["op_counts"]["Identity"] == 1
+    assert result.metadata["suspicious_op_found"] is False
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_tf_savedmodel_scanner_with_blacklist(tmp_path: Path) -> None:
     """Test TensorFlow SavedModel scanner with custom blacklist patterns."""
     model_dir = create_tf_savedmodel(tmp_path)
 
@@ -257,8 +484,8 @@ def test_tf_savedmodel_scanner_not_a_directory(tmp_path):
     )
 
 
-@pytest.mark.skipif(not has_tensorflow(), reason="TensorFlow not installed")
-def test_tf_savedmodel_scanner_unreadable_file(tmp_path, requires_symlinks):
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_tf_savedmodel_scanner_unreadable_file(tmp_path: Path, requires_symlinks: None) -> None:
     """Scanner should report unreadable files instead of silently skipping."""
     model_dir = create_tf_savedmodel(tmp_path)
 
@@ -274,17 +501,26 @@ def test_tf_savedmodel_scanner_unreadable_file(tmp_path, requires_symlinks):
     assert any("error reading file" in issue.message.lower() for issue in result.issues)
 
 
-def _create_test_savedmodel_with_op(tmp_path, op_name, model_name=None):
+def _create_test_savedmodel_with_op(tmp_path: Path, op_name: str, model_name: str | None = None) -> str:
     """Helper function to create a test SavedModel with a specific TensorFlow operation."""
     return _create_test_savedmodel_with_ops(tmp_path, [op_name], model_name)
 
 
-def _create_test_savedmodel_with_ops(tmp_path, op_names, model_name=None):
-    """Helper function to create a test SavedModel with multiple TensorFlow operations."""
+def _create_test_savedmodel_with_scoped_nodes(
+    tmp_path: Path,
+    *,
+    graph_nodes: list[_NodeSpec] | None = None,
+    function_nodes: dict[str, list[_NodeSpec]] | None = None,
+    model_name: str | None = None,
+) -> str:
+    """Create a SavedModel with top-level and function-definition graph nodes."""
+    import importlib
+
+    importlib.import_module("modelaudit.protos")
     from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
 
     if model_name is None:
-        model_name = f"test_model_{'_'.join(op.lower() for op in op_names[:2])}"
+        model_name = "test_model_scoped_nodes"
 
     model_dir = tmp_path / model_name
     model_dir.mkdir()
@@ -294,12 +530,28 @@ def _create_test_savedmodel_with_ops(tmp_path, op_names, model_name=None):
     meta_graph = saved_model.meta_graphs.add()
     meta_graph.meta_info_def.tags.append("serve")
 
-    # Add nodes with the specified operations
     graph_def = meta_graph.graph_def
-    for i, op_name in enumerate(op_names):
-        node = graph_def.node.add()
-        node.name = f"test_node_{i}_{op_name.lower()}"
-        node.op = op_name
+
+    def add_node(node_collection: _NodeCollection, spec: _NodeSpec, default_name: str) -> None:
+        node = node_collection.add()
+        node.name = spec.get("name", default_name)
+        node.op = spec["op"]
+
+        for attr_name, attr_value in spec.get("string_attrs", {}).items():
+            node.attr[attr_name].s = attr_value.encode("utf-8")
+
+        function_ref = spec.get("function_ref")
+        if function_ref is not None:
+            node.attr["f"].func.name = function_ref
+
+    for index, spec in enumerate(graph_nodes or []):
+        add_node(graph_def.node, spec, f"graph_node_{index}_{str(spec['op']).lower()}")
+
+    for function_name, node_specs in (function_nodes or {}).items():
+        function_def = graph_def.library.function.add()
+        function_def.signature.name = function_name
+        for index, spec in enumerate(node_specs):
+            add_node(function_def.node_def, spec, f"function_node_{index}_{str(spec['op']).lower()}")
 
     # Save the model
     saved_model_path = model_dir / "saved_model.pb"
@@ -312,8 +564,25 @@ def _create_test_savedmodel_with_ops(tmp_path, op_names, model_name=None):
     return str(model_dir)
 
 
-@pytest.mark.skipif(not has_tensorflow(), reason="TensorFlow not installed")
-def test_tf_scanner_explanations_for_all_suspicious_ops(tmp_path):
+def _create_test_savedmodel_with_ops(
+    tmp_path: Path,
+    op_names: list[str],
+    model_name: str | None = None,
+) -> str:
+    """Helper function to create a test SavedModel with multiple TensorFlow operations."""
+    if model_name is None:
+        model_name = f"test_model_{'_'.join(op.lower() for op in op_names[:2])}"
+
+    graph_nodes: list[_NodeSpec] = [{"op": op_name} for op_name in op_names]
+    return _create_test_savedmodel_with_scoped_nodes(
+        tmp_path,
+        graph_nodes=graph_nodes,
+        model_name=model_name,
+    )
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_tf_scanner_explanations_for_all_suspicious_ops(tmp_path: Path) -> None:
     """Test that all suspicious TensorFlow operations generate explanations."""
     from modelaudit.config.explanations import get_tf_op_explanation
     from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_OPS
@@ -350,12 +619,12 @@ def test_tf_scanner_explanations_for_all_suspicious_ops(tmp_path):
             assert len(issue.why) > 20, f"Explanation too short for {op_name}: {issue.why}"
             assert any(
                 keyword in issue.why.lower()
-                for keyword in ["attack", "malicious", "abuse", "exploit", "dangerous", "risk"]
+                for keyword in ["attack", "malicious", "abuse", "exploit", "dangerous", "risk", "exfiltration"]
             ), f"Explanation for {op_name} should mention security risks: {issue.why}"
 
 
-@pytest.mark.skipif(not has_tensorflow(), reason="TensorFlow not installed")
-def test_tf_scanner_explanation_categories(tmp_path):
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_tf_scanner_explanation_categories(tmp_path: Path) -> None:
     """Test that TensorFlow scanner provides appropriate explanations by operation category."""
     # Test critical risk operations (code execution)
     critical_ops = ["PyFunc", "PyCall", "ExecuteOp", "ShellExecute"]
@@ -378,8 +647,8 @@ def test_tf_scanner_explanation_categories(tmp_path):
                 )
 
 
-@pytest.mark.skipif(not has_tensorflow(), reason="TensorFlow not installed")
-def test_tf_scanner_no_explanation_for_safe_ops(tmp_path):
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_tf_scanner_no_explanation_for_safe_ops(tmp_path: Path) -> None:
     """Test that safe TensorFlow operations don't generate unnecessary explanations."""
     # Create a model with only safe operations
     safe_ops = ["MatMul", "Add", "Relu", "Conv2D", "MaxPool"]

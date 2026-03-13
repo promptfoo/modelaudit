@@ -449,6 +449,29 @@ class TorchServeMarScanner(BaseScanner):
 
         return bool(suffix) or "/" in normalized or "\\" in value
 
+    def _resolve_handler_member_candidates(self, handler_reference: str) -> list[str]:
+        """Resolve handler references to concrete archive member candidates."""
+        normalized = handler_reference.replace("\\", "/").strip()
+        if not normalized:
+            return []
+
+        reference_base = normalized.split(":", 1)[0].strip()
+        if not reference_base:
+            return []
+
+        normalized_member = self._normalize_member_name(reference_base)
+        if PurePosixPath(normalized_member).suffix:
+            return [normalized_member]
+
+        module_path = normalized_member.replace(".", "/").rstrip("/")
+        if not module_path:
+            return []
+
+        return [
+            self._normalize_member_name(f"{module_path}.py"),
+            self._normalize_member_name(f"{module_path}/__init__.py"),
+        ]
+
     def _validate_manifest_paths(
         self,
         archive_path: str,
@@ -478,10 +501,18 @@ class TorchServeMarScanner(BaseScanner):
                 invalid_paths.append({"field": field, "value": value, "reason": "path_traversal"})
                 continue
 
-            if self._is_path_like_reference(field, value):
-                normalized_member = self._normalize_member_name(value)
-                if normalized_member not in member_set:
-                    missing_members.append({"field": field, "value": value})
+            candidate_members = (
+                self._resolve_handler_member_candidates(value)
+                if field == "handler"
+                else [self._normalize_member_name(value)]
+                if self._is_path_like_reference(field, value)
+                else []
+            )
+            if candidate_members and not any(candidate in member_set for candidate in candidate_members):
+                missing_record = {"field": field, "value": value}
+                if field == "handler":
+                    missing_record["candidates"] = ", ".join(candidate_members)
+                missing_members.append(missing_record)
 
         if invalid_paths:
             for invalid in invalid_paths:
@@ -552,61 +583,61 @@ class TorchServeMarScanner(BaseScanner):
         }
 
         for handler_path in handler_paths:
-            if not self._is_path_like_reference("handler", handler_path):
+            resolved_candidates = self._resolve_handler_member_candidates(handler_path)
+            normalized_handlers = [
+                candidate
+                for candidate in dict.fromkeys(resolved_candidates)
+                if candidate in member_set and candidate.endswith(".py")
+            ]
+            if not normalized_handlers:
                 continue
 
-            normalized_handler = self._normalize_member_name(handler_path)
-            if normalized_handler not in member_set:
-                continue
+            for normalized_handler in normalized_handlers:
+                analyzed_handler = True
+                handler_info = member_lookup.get(normalized_handler)
+                if handler_info is None:
+                    continue
+                try:
+                    handler_bytes = self._read_member_bounded(archive, handler_info, self.max_member_bytes)
+                except ValueError as exc:
+                    result.add_check(
+                        name="TorchServe Handler Static Analysis",
+                        passed=False,
+                        message=str(exc),
+                        severity=IssueSeverity.WARNING,
+                        location=f"{archive_path}:{normalized_handler}",
+                    )
+                    continue
 
-            if not normalized_handler.endswith(".py"):
-                continue
+                risky_calls, parse_error = self._find_high_risk_calls(handler_bytes)
+                if parse_error is not None:
+                    result.add_check(
+                        name="TorchServe Handler Static Analysis",
+                        passed=False,
+                        message=f"Unable to parse handler source for static analysis: {parse_error}",
+                        severity=IssueSeverity.WARNING,
+                        location=f"{archive_path}:{normalized_handler}",
+                        details={"handler": normalized_handler},
+                    )
+                    continue
 
-            analyzed_handler = True
-            handler_info = member_lookup.get(normalized_handler)
-            if handler_info is None:
-                continue
-            try:
-                handler_bytes = self._read_member_bounded(archive, handler_info, self.max_member_bytes)
-            except ValueError as exc:
-                result.add_check(
-                    name="TorchServe Handler Static Analysis",
-                    passed=False,
-                    message=str(exc),
-                    severity=IssueSeverity.WARNING,
-                    location=f"{archive_path}:{normalized_handler}",
-                )
-                continue
-
-            risky_calls, parse_error = self._find_high_risk_calls(handler_bytes)
-            if parse_error is not None:
-                result.add_check(
-                    name="TorchServe Handler Static Analysis",
-                    passed=False,
-                    message=f"Unable to parse handler source for static analysis: {parse_error}",
-                    severity=IssueSeverity.WARNING,
-                    location=f"{archive_path}:{normalized_handler}",
-                    details={"handler": normalized_handler},
-                )
-                continue
-
-            if risky_calls:
-                result.add_check(
-                    name="TorchServe Handler Static Analysis",
-                    passed=False,
-                    message=(f"Handler contains high-risk execution primitives: {', '.join(sorted(risky_calls))}"),
-                    severity=IssueSeverity.CRITICAL,
-                    location=f"{archive_path}:{normalized_handler}",
-                    details={"handler": normalized_handler, "risky_calls": sorted(risky_calls)},
-                )
-            else:
-                result.add_check(
-                    name="TorchServe Handler Static Analysis",
-                    passed=True,
-                    message="Handler source does not contain high-risk execution primitives",
-                    location=f"{archive_path}:{normalized_handler}",
-                    details={"handler": normalized_handler},
-                )
+                if risky_calls:
+                    result.add_check(
+                        name="TorchServe Handler Static Analysis",
+                        passed=False,
+                        message=(f"Handler contains high-risk execution primitives: {', '.join(sorted(risky_calls))}"),
+                        severity=IssueSeverity.CRITICAL,
+                        location=f"{archive_path}:{normalized_handler}",
+                        details={"handler": normalized_handler, "risky_calls": sorted(risky_calls)},
+                    )
+                else:
+                    result.add_check(
+                        name="TorchServe Handler Static Analysis",
+                        passed=True,
+                        message="Handler source does not contain high-risk execution primitives",
+                        location=f"{archive_path}:{normalized_handler}",
+                        details={"handler": normalized_handler},
+                    )
 
         if not analyzed_handler and handler_paths:
             result.add_check(
