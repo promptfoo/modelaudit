@@ -1,6 +1,10 @@
+import ntpath
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
+import pytest
+
+from modelaudit import utils
 from modelaudit.utils import is_within_directory, sanitize_archive_path
 
 
@@ -102,6 +106,17 @@ def test_sanitize_archive_path_rejects_drive_qualified_absolute_entry(tmp_path: 
 
     expected = f"{base_dir}{os.sep}C:{os.sep}Windows{os.sep}System32{os.sep}drivers{os.sep}etc{os.sep}hosts"
     assert os.path.normpath(resolved) == os.path.normpath(expected)
+    assert is_safe is False
+
+
+def test_sanitize_archive_path_keeps_windows_drive_entry_under_base(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(utils.os, "path", ntpath)
+    monkeypatch.setattr(utils.os, "sep", "\\")
+    monkeypatch.setattr(utils, "_absolute_without_resolving", lambda path: PureWindowsPath(os.fspath(path)))
+
+    resolved, is_safe = sanitize_archive_path("C:/Windows/System32/drivers/etc/hosts", "C:/extract")
+
+    assert resolved == r"C:\extract\C:\Windows\System32\drivers\etc\hosts"
     assert is_safe is False
 
 

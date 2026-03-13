@@ -88,8 +88,9 @@ def sanitize_archive_path(entry_name: str, base_dir: str) -> tuple[str, bool]:
     is_absolute = is_absolute_archive_path(entry)
     if is_absolute:
         # Absolute paths are not allowed
-        resolved = _absolute_without_resolving(base_path / entry.lstrip("/"))
-        return str(resolved), False
+        archive_suffix = entry.lstrip("/").replace("/", os.sep)
+        unsafe_resolved = os.path.normpath(f"{base_path}{os.sep}{archive_suffix}")
+        return unsafe_resolved, False
     entry = entry.lstrip("/")
     resolved = _absolute_without_resolving(base_path / entry)
     base_str = os.path.normpath(str(base_path))
