@@ -79,9 +79,7 @@ LLAMAFILE_RUNTIME_SAFE_FRAGMENT_PATTERNS: tuple[str, ...] = (
     "%'18T connect",
     "%'18T socket",
 )
-LLAMAFILE_RUNTIME_SAFE_EXACT_LOWER: set[str] = {
-    pattern.lower() for pattern in LLAMAFILE_RUNTIME_SAFE_EXACT_PATTERNS
-}
+LLAMAFILE_RUNTIME_SAFE_EXACT_LOWER: set[str] = {pattern.lower() for pattern in LLAMAFILE_RUNTIME_SAFE_EXACT_PATTERNS}
 LLAMAFILE_RUNTIME_SAFE_FRAGMENT_LOWER: set[str] = {
     pattern.lower() for pattern in LLAMAFILE_RUNTIME_SAFE_FRAGMENT_PATTERNS
 }

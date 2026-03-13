@@ -147,9 +147,7 @@ def test_llamafile_scanner_allows_local_endpoint_runtime_fragments(tmp_path: Pat
         "%'18T socket evil.example:8080",
     ],
 )
-def test_llamafile_scanner_flags_safe_fragments_with_remote_network_targets(
-    tmp_path: Path, runtime_line: str
-) -> None:
+def test_llamafile_scanner_flags_safe_fragments_with_remote_network_targets(tmp_path: Path, runtime_line: str) -> None:
     binary = tmp_path / "remote-network-fragment.llamafile"
     binary.write_bytes(_build_llamafile_blob(runtime_lines=[runtime_line]))
 
