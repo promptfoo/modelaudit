@@ -50,20 +50,24 @@ NETWORK_TOKENS = (
 # Patterns found in the legitimate llamafile/cosmopolitan runtime that are
 # NOT indicators of compromise.  These appear in error messages, debug format
 # strings, and server status output.
-LLAMAFILE_RUNTIME_SAFE_PATTERNS = (
+LLAMAFILE_RUNTIME_SAFE_EXACT_PATTERNS = (
     "llamafile",
-    "llama server listening",
     "llama.cpp",
     "cosmopolitan",
-    "APE is running on WIN32 inside WSL",
     "binfmt_misc",
     "%rSYS",
+    "llama_new_context_with_model",
+)
+
+LLAMAFILE_RUNTIME_SAFE_FRAGMENT_PATTERNS = (
+    "llama server listening",
+    "APE is running on WIN32 inside WSL",
     "json-schema.org",
     "%'18T connect",
     "%'18T socket",
-    "llama_new_context_with_model",
 )
-LLAMAFILE_RUNTIME_SAFE_PATTERNS_LOWER = {pattern.lower() for pattern in LLAMAFILE_RUNTIME_SAFE_PATTERNS}
+LLAMAFILE_RUNTIME_SAFE_EXACT_LOWER = {pattern.lower() for pattern in LLAMAFILE_RUNTIME_SAFE_EXACT_PATTERNS}
+LLAMAFILE_RUNTIME_SAFE_FRAGMENT_LOWER = {pattern.lower() for pattern in LLAMAFILE_RUNTIME_SAFE_FRAGMENT_PATTERNS}
 
 
 class LlamafileScanner(BaseScanner):
@@ -185,7 +189,10 @@ class LlamafileScanner(BaseScanner):
     @staticmethod
     def _is_known_runtime_string(text: str) -> bool:
         """Return True if the string matches a known-safe llamafile runtime pattern."""
-        return text.lower() in LLAMAFILE_RUNTIME_SAFE_PATTERNS_LOWER
+        lowered = text.lower()
+        return lowered in LLAMAFILE_RUNTIME_SAFE_EXACT_LOWER or any(
+            fragment in lowered for fragment in LLAMAFILE_RUNTIME_SAFE_FRAGMENT_LOWER
+        )
 
     def _scan_runtime_strings(self, path: str, blob: bytes, result: ScanResult) -> None:
         command_hits: set[str] = set()
