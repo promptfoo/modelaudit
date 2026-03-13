@@ -176,19 +176,17 @@ class CompressedScanner(BaseScanner):
         def _remaining_decompressed_budget() -> int:
             return max(max_decompressed_bytes - total_out, 0)
 
+        def _probe_limit() -> int:
+            remaining_budget = _remaining_decompressed_budget()
+            return remaining_budget + 1 if remaining_budget > 0 else 1
+
         while True:
             chunk = source.read(chunk_size)
             if not chunk:
                 break
 
-            remaining_budget = _remaining_decompressed_budget()
-            if remaining_budget <= 0:
-                raise _DecompressionLimitExceeded(
-                    f"Decompressed size exceeded limit ({total_out} > {max_decompressed_bytes})",
-                )
-
             try:
-                out = decompressor.decompress(chunk, max_length=remaining_budget)
+                out = decompressor.decompress(chunk, max_length=_probe_limit())
             except zlib.error as exc:
                 raise _CorruptStreamError(f"Invalid zlib stream: {exc}") from exc
 
@@ -204,13 +202,8 @@ class CompressedScanner(BaseScanner):
                     )
                 destination.write(out)
 
-            if decompressor.unconsumed_tail:
-                raise _DecompressionLimitExceeded(
-                    f"Decompressed size exceeded limit ({total_out} > {max_decompressed_bytes})",
-                )
-
         try:
-            final = decompressor.flush(_remaining_decompressed_budget())
+            final = decompressor.flush(_probe_limit())
         except zlib.error as exc:
             raise _CorruptStreamError(f"Invalid zlib stream flush: {exc}") from exc
 
@@ -225,11 +218,6 @@ class CompressedScanner(BaseScanner):
                     f"Decompression ratio exceeded limit ({total_out / compressed_size:.1f}x > {max_ratio:.1f}x)",
                 )
             destination.write(final)
-
-        if _remaining_decompressed_budget() == 0 and decompressor.flush(1):
-            raise _DecompressionLimitExceeded(
-                f"Decompressed size exceeded limit ({total_out} > {max_decompressed_bytes})",
-            )
 
         return total_out
 
