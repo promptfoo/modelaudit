@@ -1411,11 +1411,16 @@ class PyTorchZipScanner(BaseScanner):
         return text.strip().startswith(("1.", "2."))
 
     def _get_detected_pytorch_version(self, version_info: dict[str, Any]) -> tuple[str | None, str | None]:
-        """Get PyTorch version detected from artifact metadata."""
+        """Get PyTorch version from artifact metadata, falling back to local runtime."""
         version = version_info.get("pytorch_framework_version")
         source = version_info.get("pytorch_version_source")
         if isinstance(version, str) and version.strip():
             return version.strip(), source if isinstance(source, str) else None
+
+        installed_version = self._get_installed_pytorch_version()
+        if installed_version:
+            return installed_version, "local_environment"
+
         return None, source if isinstance(source, str) else None
 
     def _get_installed_pytorch_version(self) -> str | None:
