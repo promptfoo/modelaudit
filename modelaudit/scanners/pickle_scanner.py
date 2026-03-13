@@ -1903,7 +1903,11 @@ def _parse_module_function(arg: str) -> tuple[str, str] | None:
 
 def _build_symbolic_reference_maps(
     opcodes: list[tuple],
-) -> tuple[dict[int, tuple[str, str]], dict[int, tuple[str, str]]]:
+) -> tuple[
+    dict[int, tuple[str, str]],
+    dict[int, tuple[str, str]],
+    dict[int, dict[str, str]],
+]:
     """
     Build symbolic maps of callable references in an opcode stream.
 
@@ -1911,12 +1915,15 @@ def _build_symbolic_reference_maps(
         Tuple of:
         - stack_global_refs: opcode index -> (module, function) for STACK_GLOBAL
         - callable_refs: opcode index -> (module, function) for REDUCE/NEWOBJ/OBJ/INST call targets
+        - malformed_stack_globals: opcode index -> malformed STACK_GLOBAL operand details
     """
     stack_global_refs: dict[int, tuple[str, str]] = {}
     callable_refs: dict[int, tuple[str, str]] = {}
+    malformed_stack_globals: dict[int, dict[str, str]] = {}
 
     marker = object()
     unknown = object()
+    missing_memo = object()
     stack: list[Any] = []
     memo: dict[int | str, Any] = {}
     next_memo_index = 0
@@ -1938,6 +1945,15 @@ def _build_symbolic_reference_maps(
 
     def _is_ref(value: Any) -> TypeGuard[tuple[str, str]]:
         return isinstance(value, tuple) and len(value) == 2 and isinstance(value[0], str) and isinstance(value[1], str)
+
+    def _classify_stack_global_operand(value: Any) -> tuple[str, str]:
+        if isinstance(value, str):
+            return "string", value
+        if value is missing_memo:
+            return "missing_memo", "unknown"
+        if value is unknown:
+            return "unknown", "unknown"
+        return "non_string", f"{type(value).__name__}:{value!r}"
 
     for i, (opcode, arg, _pos) in enumerate(opcodes):
         name = opcode.name
@@ -1972,6 +1988,20 @@ def _build_symbolic_reference_maps(
                 stack_global_refs[i] = ref
                 stack.append(ref)
             else:
+                module_kind, module_value = _classify_stack_global_operand(mod_name)
+                function_kind, function_value = _classify_stack_global_operand(func_name)
+                reason = "insufficient_context"
+                if "missing_memo" in {module_kind, function_kind}:
+                    reason = "missing_memo"
+                elif "non_string" in {module_kind, function_kind}:
+                    reason = "mixed_or_non_string"
+                malformed_stack_globals[i] = {
+                    "module_kind": module_kind,
+                    "module": module_value,
+                    "function_kind": function_kind,
+                    "function": function_value,
+                    "reason": reason,
+                }
                 stack.append(unknown)
             continue
 
@@ -1994,7 +2024,7 @@ def _build_symbolic_reference_maps(
             continue
 
         if name in {"GET", "BINGET", "LONG_BINGET"}:
-            stack.append(memo.get(arg, unknown))
+            stack.append(memo.get(arg, missing_memo))
             continue
 
         if name == "MARK":
@@ -2095,20 +2125,12 @@ def _build_symbolic_reference_maps(
             stack.append(unknown)
             continue
 
-        if name == "STOP":
-            # Clear memo at stream boundaries so that a safe memo entry from
-            # stream 1 cannot be inherited by a dangerous callable in stream 2
-            # (cross-stream memo contamination).
-            memo.clear()
-            next_memo_index = 0
-            stack.clear()
+        if name in {"NONE", "NEWTRUE", "NEWFALSE"}:
+            stack.append(None if name == "NONE" else name == "NEWTRUE")
             continue
 
         if name in {
             "PERSID",
-            "NONE",
-            "NEWTRUE",
-            "NEWFALSE",
             "INT",
             "BININT",
             "BININT1",
@@ -2127,7 +2149,7 @@ def _build_symbolic_reference_maps(
             "BINUNICODE",
             "BINUNICODE8",
         }:
-            stack.append(unknown)
+            stack.append(arg)
 
         if name == "STOP":
             # Reset memo and stack at pickle stream boundaries so that
@@ -2137,7 +2159,7 @@ def _build_symbolic_reference_maps(
             stack.clear()
             next_memo_index = 0
 
-    return stack_global_refs, callable_refs
+    return stack_global_refs, callable_refs, malformed_stack_globals
 
 
 def _find_stack_global_strings(
@@ -2585,7 +2607,7 @@ def is_dangerous_reduce_pattern(
         return is_suspicious_global(mod, func)
 
     if stack_global_refs is None or callable_refs is None:
-        computed_stack_refs, computed_callable_refs = _build_symbolic_reference_maps(opcodes)
+        computed_stack_refs, computed_callable_refs, _ = _build_symbolic_reference_maps(opcodes)
     else:
         computed_stack_refs, computed_callable_refs = stack_global_refs, callable_refs
 
@@ -2732,7 +2754,7 @@ def check_opcode_sequence(
         return suspicious_patterns  # Return empty list for legitimate ML content
 
     if stack_global_refs is None or callable_refs is None:
-        computed_stack_refs, computed_callable_refs = _build_symbolic_reference_maps(opcodes)
+        computed_stack_refs, computed_callable_refs, _ = _build_symbolic_reference_maps(opcodes)
     else:
         computed_stack_refs, computed_callable_refs = stack_global_refs, callable_refs
 
@@ -3809,7 +3831,7 @@ class PickleScanner(BaseScanner):
                 logger.debug(f"Pickle parsing failed with no globals found: {e}")
                 return set()
 
-            stack_global_refs, _callable_refs = _build_symbolic_reference_maps(ops)
+            stack_global_refs, _callable_refs, _ = _build_symbolic_reference_maps(ops)
 
             last_byte = data.read(1)
             if last_byte:
@@ -4108,7 +4130,7 @@ class PickleScanner(BaseScanner):
 
             # ML CONTEXT FILTERING: Analyze ML context once for the entire pickle
             ml_context = _detect_ml_context(opcodes)
-            stack_global_refs, callable_refs = _build_symbolic_reference_maps(opcodes)
+            stack_global_refs, callable_refs, malformed_stack_globals = _build_symbolic_reference_maps(opcodes)
 
             # CVE-2025-32434 specific opcode sequence analysis - REMOVED
             # Now only show CVE info in REDUCE opcode detection messages
@@ -4831,8 +4853,55 @@ class PickleScanner(BaseScanner):
                                 rule_code=None,  # Passing check
                             )
                     else:
-                        # Only warn about insufficient context if not ML content
-                        if not ml_context.get("is_ml_content", False):
+                        malformed = malformed_stack_globals.get(i)
+                        if malformed and malformed.get("reason") != "insufficient_context":
+                            suspicious_count += 1
+                            module_hint = malformed.get("module", "unknown")
+                            function_hint = malformed.get("function", "unknown")
+                            module_kind = malformed.get("module_kind", "unknown")
+                            function_kind = malformed.get("function_kind", "unknown")
+                            reason = malformed.get("reason", "mixed_or_non_string")
+                            module_looks_dangerous = (
+                                module_kind == "string"
+                                and module_hint not in {"", "unknown"}
+                                and _is_dangerous_module(module_hint)
+                            )
+                            severity = IssueSeverity.CRITICAL if module_looks_dangerous else IssueSeverity.WARNING
+                            if reason == "missing_memo":
+                                message = (
+                                    "STACK_GLOBAL references missing or invalid memoized operand(s): "
+                                    f"module={module_hint} ({module_kind}), function={function_hint} ({function_kind})"
+                                )
+                            else:
+                                message = (
+                                    "Malformed STACK_GLOBAL operand types can hide dangerous imports: "
+                                    f"module={module_hint} ({module_kind}), function={function_hint} ({function_kind})"
+                                )
+
+                            result.add_check(
+                                name="STACK_GLOBAL Context Check",
+                                passed=False,
+                                message=message,
+                                severity=severity,
+                                location=f"{self.current_file_path} (pos {pos})",
+                                rule_code="S205",
+                                details={
+                                    "position": pos,
+                                    "opcode": opcode.name,
+                                    "module": module_hint,
+                                    "function": function_hint,
+                                    "module_kind": module_kind,
+                                    "function_kind": function_kind,
+                                    "reason": reason,
+                                    "ml_context_confidence": ml_context.get("overall_confidence", 0),
+                                },
+                                why=(
+                                    "STACK_GLOBAL should be formed from two string operands. Non-string operands "
+                                    "or missing memoized values indicate a malformed-by-design payload and are "
+                                    "treated as a security finding under fail-closed handling."
+                                ),
+                            )
+                        elif not ml_context.get("is_ml_content", False):
                             result.add_check(
                                 name="STACK_GLOBAL Context Check",
                                 passed=False,
@@ -5908,7 +5977,7 @@ class PickleScanner(BaseScanner):
         # Pre-compute symbolic references for STACK_GLOBAL resolution.
         # This handles BINUNICODE8, memoized strings (BINGET/LONG_BINGET),
         # and indirect stack flows that a narrow lookback would miss.
-        stack_global_refs, _ = _build_symbolic_reference_maps(opcodes)
+        stack_global_refs, _, _ = _build_symbolic_reference_maps(opcodes)
 
         for i, (opcode, _arg, pos) in enumerate(opcodes):
             if opcode.name not in ("SETITEM", "SETITEMS"):
