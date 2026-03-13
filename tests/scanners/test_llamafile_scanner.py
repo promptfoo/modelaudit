@@ -121,9 +121,30 @@ def test_llamafile_scanner_flags_mixed_safe_fragment_and_command_tokens(tmp_path
 @pytest.mark.parametrize(
     "runtime_line",
     [
+        "%'18T connect(127.0.0.1:8080)",
+        "%'18T connect(localhost)",
+        "%'18T socket 127.0.0.1:8080",
+        "%'18T socket 0.0.0.0:8080",
+    ],
+)
+def test_llamafile_scanner_allows_local_endpoint_runtime_fragments(tmp_path: Path, runtime_line: str) -> None:
+    binary = tmp_path / "local-endpoint-fragment.llamafile"
+    binary.write_bytes(_build_llamafile_blob(runtime_lines=[runtime_line]))
+
+    result = LlamafileScanner().scan(str(binary))
+
+    runtime_issues = [issue for issue in result.issues if "Executable runtime contains" in issue.message]
+    assert runtime_issues == []
+
+
+@pytest.mark.parametrize(
+    "runtime_line",
+    [
         "INFO llama server listening on http://evil.example/payload.sh",
         "%'18T connect http://evil.example/payload.sh",
         "%'18T socket http://evil.example/payload.sh",
+        "%'18T connect(evil.example:8080)",
+        "%'18T socket evil.example:8080",
     ],
 )
 def test_llamafile_scanner_flags_safe_fragments_with_remote_network_targets(

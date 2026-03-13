@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
 import tempfile
@@ -31,6 +32,10 @@ SAFE_LOCALHOST_URL_RE = re.compile(
 )
 SAFE_JSON_SCHEMA_URL_RE = re.compile(
     r"https?://(?:www\.)?json-schema\.org(?::\d+)?(?:/[^\s]*)?",
+    re.IGNORECASE,
+)
+ENDPOINT_TOKEN_RE = re.compile(
+    r"(?:localhost|\[::1\]|::1|0\.0\.0\.0|\d{1,3}(?:\.\d{1,3}){3}|(?:[a-z0-9-]+\.)+[a-z]{2,})(?::\d+)?",
     re.IGNORECASE,
 )
 
@@ -80,6 +85,27 @@ LLAMAFILE_RUNTIME_SAFE_EXACT_LOWER: set[str] = {
 LLAMAFILE_RUNTIME_SAFE_FRAGMENT_LOWER: set[str] = {
     pattern.lower() for pattern in LLAMAFILE_RUNTIME_SAFE_FRAGMENT_PATTERNS
 }
+
+
+def _is_local_endpoint_token(token: str) -> bool:
+    """Return True when an extracted endpoint token resolves to a local-only address."""
+    host = token.strip().lower()
+    if host == "localhost":
+        return True
+
+    if host.startswith("[") and "]" in host:
+        host = host[1 : host.index("]")]
+    elif host.count(":") == 1 and "." in host and host.rsplit(":", 1)[1].isdigit():
+        host = host.rsplit(":", 1)[0]
+
+    if host in {"::1", "0.0.0.0"}:
+        return True
+
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return ip.is_loopback or ip.is_private or ip.is_unspecified
 
 
 class LlamafileScanner(BaseScanner):
@@ -214,9 +240,11 @@ class LlamafileScanner(BaseScanner):
             if fragment not in normalized:
                 continue
             candidate = normalized.replace(fragment, "", 1)
-            if fragment == "%'18t connect" and candidate.lstrip().startswith("("):
-                continue
             if not any(token in candidate for token in NETWORK_TOKENS):
+                if fragment in {"%'18t connect", "%'18t socket"}:
+                    endpoints = [match.group(0) for match in ENDPOINT_TOKEN_RE.finditer(candidate)]
+                    if endpoints and not all(_is_local_endpoint_token(endpoint) for endpoint in endpoints):
+                        continue
                 return True
         return False
 
