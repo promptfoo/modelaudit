@@ -13,6 +13,7 @@ avoiding exposure to Keras CVEs while maintaining full scanning functionality.
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any
 
 import numpy as np
@@ -80,8 +81,43 @@ DTYPE_MAP: dict[int, np.dtype[Any]] = {
     DataType.DT_FLOAT8_E4M3FN: np.dtype(np.uint8),  # float8 stored as uint8
 }
 
+OBJECT_POINTER_SIZE = np.dtype(object).itemsize
 
-def tensor_proto_to_ndarray(tensor_proto: Any) -> np.ndarray[Any, Any]:
+
+def _get_tensor_field_materialization_bytes(tensor_proto: Any, dtype_enum: int) -> int:
+    """Estimate bytes allocated when materializing typed TensorProto fields."""
+    if dtype_enum == DataType.DT_STRING:
+        return len(tensor_proto.string_val) * OBJECT_POINTER_SIZE
+    if dtype_enum == DataType.DT_FLOAT:
+        return len(tensor_proto.float_val) * np.dtype(np.float32).itemsize
+    if dtype_enum == DataType.DT_DOUBLE:
+        return len(tensor_proto.double_val) * np.dtype(np.float64).itemsize
+    if dtype_enum in (DataType.DT_INT32, DataType.DT_INT16, DataType.DT_INT8):
+        return len(tensor_proto.int_val) * DTYPE_MAP[dtype_enum].itemsize
+    if dtype_enum == DataType.DT_INT64:
+        return len(tensor_proto.int64_val) * np.dtype(np.int64).itemsize
+    if dtype_enum in (DataType.DT_UINT8, DataType.DT_QUINT8):
+        return len(tensor_proto.int_val) * np.dtype(np.uint8).itemsize
+    if dtype_enum in (DataType.DT_UINT16, DataType.DT_QUINT16):
+        return len(tensor_proto.int_val) * np.dtype(np.uint16).itemsize
+    if dtype_enum == DataType.DT_UINT32:
+        return len(tensor_proto.uint32_val) * np.dtype(np.uint32).itemsize
+    if dtype_enum == DataType.DT_UINT64:
+        return len(tensor_proto.uint64_val) * np.dtype(np.uint64).itemsize
+    if dtype_enum == DataType.DT_BOOL:
+        return len(tensor_proto.bool_val) * np.dtype(np.bool_).itemsize
+    if dtype_enum == DataType.DT_COMPLEX64:
+        return len(tensor_proto.scomplex_val) * np.dtype(np.float32).itemsize
+    if dtype_enum == DataType.DT_COMPLEX128:
+        return len(tensor_proto.dcomplex_val) * np.dtype(np.float64).itemsize
+    if dtype_enum in (DataType.DT_HALF, DataType.DT_BFLOAT16):
+        return len(tensor_proto.half_val) * np.dtype(np.uint16).itemsize
+    if dtype_enum in (DataType.DT_FLOAT8_E5M2, DataType.DT_FLOAT8_E4M3FN):
+        return len(tensor_proto.float8_val) * np.dtype(np.uint8).itemsize
+    return 0
+
+
+def tensor_proto_to_ndarray(tensor_proto: Any, *, max_tensor_bytes: int | None = None) -> np.ndarray[Any, Any]:
     """
     Convert a TensorProto to a numpy ndarray.
 
@@ -96,6 +132,8 @@ def tensor_proto_to_ndarray(tensor_proto: Any) -> np.ndarray[Any, Any]:
 
     Args:
         tensor_proto: A TensorProto message (from tensorflow.core.framework.tensor_pb2)
+        max_tensor_bytes: Optional upper bound for materialized tensor size in bytes.
+            If exceeded, conversion fails before allocating large arrays.
 
     Returns:
         numpy ndarray containing the tensor data
@@ -109,7 +147,10 @@ def tensor_proto_to_ndarray(tensor_proto: Any) -> np.ndarray[Any, Any]:
     else:
         shape = ()
 
-    num_elements = int(np.prod(shape)) if shape else 1
+    if any(dim < 0 for dim in shape):
+        raise ValueError(f"Invalid tensor shape with negative dimensions: {shape}")
+
+    num_elements = math.prod(shape) if shape else 1
 
     # Get dtype
     dtype_enum = tensor_proto.dtype
@@ -118,8 +159,27 @@ def tensor_proto_to_ndarray(tensor_proto: Any) -> np.ndarray[Any, Any]:
 
     dtype = DTYPE_MAP[dtype_enum]
 
+    materialized_itemsize = OBJECT_POINTER_SIZE if dtype == np.dtype(object) else dtype.itemsize
+
+    if max_tensor_bytes and max_tensor_bytes > 0:
+        estimated_bytes = num_elements * materialized_itemsize
+        if estimated_bytes > max_tensor_bytes:
+            raise ValueError(
+                f"Tensor materialization size {estimated_bytes} exceeds configured limit {max_tensor_bytes}"
+            )
+
     # Fast path: binary content (most common for large tensors)
     if tensor_proto.tensor_content:
+        actual_bytes = len(tensor_proto.tensor_content)
+        expected_bytes = num_elements * dtype.itemsize
+
+        if max_tensor_bytes and max_tensor_bytes > 0 and actual_bytes > max_tensor_bytes:
+            raise ValueError(f"Tensor materialization size {actual_bytes} exceeds configured limit {max_tensor_bytes}")
+        if actual_bytes != expected_bytes:
+            raise ValueError(
+                f"Tensor content size {actual_bytes} does not match expected size {expected_bytes} for shape {shape}"
+            )
+
         # Handle special dtypes that need reinterpretation
         if dtype_enum == DataType.DT_BFLOAT16:
             # bfloat16 is stored as bytes, interpret as uint16 then view as bfloat16
@@ -137,6 +197,11 @@ def tensor_proto_to_ndarray(tensor_proto: Any) -> np.ndarray[Any, Any]:
 
     # Slow path: extract from typed fields
     values: np.ndarray[Any, Any]
+
+    if max_tensor_bytes and max_tensor_bytes > 0:
+        source_bytes = _get_tensor_field_materialization_bytes(tensor_proto, dtype_enum)
+        if source_bytes > max_tensor_bytes:
+            raise ValueError(f"Tensor materialization size {source_bytes} exceeds configured limit {max_tensor_bytes}")
 
     if dtype_enum == DataType.DT_STRING:
         # String tensors use string_val field
