@@ -489,6 +489,7 @@ def test_pytorch_zip_scanner_combined_security_controls(tmp_path):
     assert len(symlink_issues) > 0
     assert symlink_issues[0].severity == IssueSeverity.WARNING
 
+
 def test_pytorch_zip_version_detection_prefers_metadata_over_local_torch(monkeypatch: pytest.MonkeyPatch) -> None:
     """Artifact metadata should win when both sources are present."""
     scanner = PyTorchZipScanner()
@@ -625,9 +626,7 @@ def test_pytorch_zip_cve_2025_32434_metadata_not_suppressed_by_local_torch(
     result = scanner.scan(str(model_path))
 
     failed_checks = [
-        c
-        for c in result.checks
-        if c.name == "CVE-2025-32434 PyTorch Version Check" and c.status == CheckStatus.FAILED
+        c for c in result.checks if c.name == "CVE-2025-32434 PyTorch Version Check" and c.status == CheckStatus.FAILED
     ]
     assert len(failed_checks) > 0
     assert failed_checks[0].details.get("detected_pytorch_version") == "2.5.1"
