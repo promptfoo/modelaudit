@@ -482,10 +482,12 @@ class TestTarScanner:
 
         full_data = archive_path.read_bytes()
         truncated_path = tmp_path / "truncated_cut.tar"
-        truncated_path.write_bytes(full_data[: len(full_data) // 2])
+        truncated_path.write_bytes(full_data[:520])
 
         result = self.scanner.scan(str(truncated_path))
 
-        # A truncated archive may or may not open; either a failure or
-        # a successful (empty) scan is acceptable — but it must not raise.
-        assert isinstance(result.success, bool)
+        assert result.success is False
+        format_checks = [check for check in result.checks if check.name == "TAR File Format Validation"]
+        assert len(format_checks) == 1
+        assert "not a valid tar file" in format_checks[0].message.lower()
+        assert any("not a valid tar file" in issue.message.lower() for issue in result.issues)
