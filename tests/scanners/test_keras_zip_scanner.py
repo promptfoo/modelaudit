@@ -19,6 +19,21 @@ from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.keras_zip_scanner import KerasZipScanner
 
 
+def create_configured_keras_zip(
+    tmp_path: Path,
+    config: dict[str, Any],
+    *,
+    keras_version: str = "3.13.2",
+    file_name: str = "model.keras",
+) -> Path:
+    """Create a configurable .keras archive for regression tests."""
+    keras_path = tmp_path / file_name
+    with zipfile.ZipFile(keras_path, "w") as zf:
+        zf.writestr("config.json", json.dumps(config))
+        zf.writestr("metadata.json", json.dumps({"keras_version": keras_version}))
+    return keras_path
+
+
 class TestKerasZipScanner:
     """Test the Keras ZIP scanner functionality."""
 
@@ -419,6 +434,108 @@ __import__('pickle').loads(data)
         assert len(subclass_checks) > 0
         assert subclass_checks[0].status != CheckStatus.PASSED
         assert subclass_checks[0].severity == IssueSeverity.INFO
+
+    def test_compile_config_detects_custom_layer_loss_and_metric(self, tmp_path: Path) -> None:
+        """ZIP scanner should inspect compile_config and custom layer classes."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "InputLayer",
+                        "name": "input_1",
+                        "config": {"batch_shape": [None, 4]},
+                    },
+                    {
+                        "class_name": "MaliciousLayer",
+                        "name": "malicious_layer",
+                        "config": {"units": 4},
+                    },
+                ]
+            },
+            "compile_config": {
+                "loss": "malicious_loss",
+                "metrics": [{"class_name": "MaliciousMetric", "config": {"name": "malicious_metric"}}],
+            },
+        }
+
+        result = scanner.scan(str(create_configured_keras_zip(tmp_path, config, file_name="custom_objects.keras")))
+
+        custom_layer_checks = [check for check in result.checks if check.name == "Custom Layer Class Detection"]
+        custom_metric_checks = [check for check in result.checks if check.name == "Custom Metric Detection"]
+        custom_loss_checks = [check for check in result.checks if check.name == "Custom Loss Detection"]
+
+        assert any(check.details.get("layer_class") == "MaliciousLayer" for check in custom_layer_checks)
+        assert any(check.details.get("identifier") == "MaliciousMetric" for check in custom_metric_checks)
+        assert any(check.details.get("identifier") == "malicious_loss" for check in custom_loss_checks)
+
+    def test_compile_config_detects_nested_metric_and_loss_mappings(self, tmp_path: Path) -> None:
+        """Nested compile_config structures should not bypass custom-object detection."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "InputLayer",
+                        "name": "input_1",
+                        "config": {"batch_shape": [None, 4]},
+                    },
+                    {
+                        "class_name": "Dense",
+                        "name": "dense_1",
+                        "config": {"units": 4},
+                    },
+                ]
+            },
+            "compile_config": {
+                "loss": {"output_1": "malicious_loss"},
+                "metrics": [["accuracy", {"class_name": "MaliciousMetric", "config": {"name": "metric"}}]],
+                "weighted_metrics": {"output_1": ["Precision", "WeightedBackdoorMetric"]},
+            },
+        }
+
+        result = scanner.scan(str(create_configured_keras_zip(tmp_path, config, file_name="nested_compile.keras")))
+
+        custom_metric_checks = [check for check in result.checks if check.name == "Custom Metric Detection"]
+        custom_loss_checks = [check for check in result.checks if check.name == "Custom Loss Detection"]
+
+        assert any(check.details.get("identifier") == "MaliciousMetric" for check in custom_metric_checks)
+        assert any(check.details.get("identifier") == "WeightedBackdoorMetric" for check in custom_metric_checks)
+        assert any(check.details.get("identifier") == "malicious_loss" for check in custom_loss_checks)
+
+    def test_compile_config_safe_aliases_and_builtin_layers_do_not_false_positive(self, tmp_path: Path) -> None:
+        """Safe aliases and built-in preprocessing layers should remain clean."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "InputLayer",
+                        "name": "input_1",
+                        "config": {"batch_shape": [None, 32, 32, 3]},
+                    },
+                    {
+                        "class_name": "RandomWidth",
+                        "name": "random_width",
+                        "config": {"factor": 0.1},
+                    },
+                ]
+            },
+            "compile_config": {
+                "loss": {"output_1": "mae", "output_2": "mse"},
+                "metrics": [["accuracy", "AUC"], [{"class_name": "MeanSquaredError", "config": {}}]],
+                "weighted_metrics": {"output_1": ["Precision", "Recall"]},
+            },
+        }
+
+        result = scanner.scan(str(create_configured_keras_zip(tmp_path, config, file_name="safe_compile.keras")))
+
+        assert all(check.name != "Custom Layer Class Detection" for check in result.checks)
+        assert all(check.name != "Custom Metric Detection" for check in result.checks)
+        assert all(check.name != "Custom Loss Detection" for check in result.checks)
 
 
 class TestCVE202549655TorchModuleWrapper:

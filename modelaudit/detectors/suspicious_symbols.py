@@ -786,6 +786,8 @@ KNOWN_SAFE_KERAS_LAYER_CLASSES: frozenset[str] = frozenset(
         "RandomTranslation",
         "RandomContrast",
         "RandomBrightness",
+        "RandomHeight",
+        "RandomWidth",
         "Normalization",
         "Discretization",
         "CategoryEncoding",
@@ -856,6 +858,7 @@ KNOWN_SAFE_KERAS_LOSSES: frozenset[str] = frozenset(
         "Dice",
         "Tversky",
         "CTC",
+        "LossFunctionWrapper",
     }
 )
 
@@ -892,6 +895,8 @@ KNOWN_SAFE_KERAS_METRICS: frozenset[str] = frozenset(
         "SpecificityAtSensitivity",
         "F1Score",
         "FBetaScore",
+        "MeanMetricWrapper",
+        "CompileMetrics",
         # Segmentation
         "IoU",
         "BinaryIoU",

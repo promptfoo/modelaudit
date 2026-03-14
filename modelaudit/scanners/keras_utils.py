@@ -1,9 +1,16 @@
 """Shared utilities for Keras scanners."""
 
 import base64
+import re
+from collections.abc import Iterator
 from typing import Any
 
-from modelaudit.detectors.suspicious_symbols import KNOWN_SAFE_MODEL_CLASSES
+from modelaudit.detectors.suspicious_symbols import (
+    KNOWN_SAFE_KERAS_LAYER_CLASSES,
+    KNOWN_SAFE_KERAS_LOSSES,
+    KNOWN_SAFE_KERAS_METRICS,
+    KNOWN_SAFE_MODEL_CLASSES,
+)
 
 from .base import IssueSeverity, ScanResult
 
@@ -28,6 +35,137 @@ _LAMBDA_DANGEROUS_PATTERNS: list[str] = [
     "shutil",
     "ctypes",
 ]
+
+_EXTRA_SAFE_KERAS_LOSS_IDENTIFIERS: frozenset[str] = frozenset(
+    {
+        "bce",
+        "cce",
+        "scce",
+    }
+)
+
+_EXTRA_SAFE_KERAS_METRIC_IDENTIFIERS: frozenset[str] = frozenset(
+    {
+        "acc",
+        "accuracy",
+        "auc",
+        "bce",
+        "cce",
+        "fn",
+        "fp",
+        "iou",
+        "kld",
+        "mae",
+        "mape",
+        "mean_metric_wrapper",
+        "mse",
+        "msle",
+        "rmse",
+        "scce",
+        "tn",
+        "tp",
+    }
+)
+
+
+def _normalize_keras_identifier(value: str) -> str:
+    """Normalize serialized Keras identifiers for allowlist lookups."""
+    return value.strip().lower()
+
+
+def _camel_to_snake(value: str) -> str:
+    """Convert CamelCase Keras class names to snake_case identifiers."""
+    compact = value.strip()
+    if not compact:
+        return ""
+
+    first_pass = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", compact)
+    return re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", first_pass).replace("-", "_").lower()
+
+
+def _build_safe_identifier_index(
+    identifiers: frozenset[str],
+    extra_aliases: frozenset[str] = frozenset(),
+) -> frozenset[str]:
+    """Build a normalized lookup index for class names and string aliases."""
+    safe_identifiers: set[str] = {_normalize_keras_identifier(alias) for alias in extra_aliases if alias.strip()}
+
+    for identifier in identifiers:
+        cleaned_identifier = identifier.strip()
+        if not cleaned_identifier:
+            continue
+
+        safe_identifiers.add(_normalize_keras_identifier(cleaned_identifier))
+        safe_identifiers.add(_camel_to_snake(cleaned_identifier))
+
+    return frozenset(filter(None, safe_identifiers))
+
+
+_SAFE_KERAS_LAYER_CLASSES = frozenset(
+    _normalize_keras_identifier(layer_class) for layer_class in KNOWN_SAFE_KERAS_LAYER_CLASSES if layer_class.strip()
+)
+_SAFE_KERAS_LOSS_IDENTIFIERS = _build_safe_identifier_index(
+    KNOWN_SAFE_KERAS_LOSSES,
+    _EXTRA_SAFE_KERAS_LOSS_IDENTIFIERS,
+)
+_SAFE_KERAS_METRIC_IDENTIFIERS = _build_safe_identifier_index(
+    KNOWN_SAFE_KERAS_METRICS,
+    _EXTRA_SAFE_KERAS_METRIC_IDENTIFIERS,
+)
+
+
+def is_known_safe_keras_layer_class(layer_class: Any) -> bool:
+    """Return True when a serialized Keras layer class is known-safe."""
+    return isinstance(layer_class, str) and _normalize_keras_identifier(layer_class) in _SAFE_KERAS_LAYER_CLASSES
+
+
+def is_known_safe_keras_loss(identifier: Any) -> bool:
+    """Return True when a serialized Keras loss identifier is known-safe."""
+    return isinstance(identifier, str) and _normalize_keras_identifier(identifier) in _SAFE_KERAS_LOSS_IDENTIFIERS
+
+
+def is_known_safe_keras_metric(identifier: Any) -> bool:
+    """Return True when a serialized Keras metric identifier is known-safe."""
+    return isinstance(identifier, str) and _normalize_keras_identifier(identifier) in _SAFE_KERAS_METRIC_IDENTIFIERS
+
+
+def iter_keras_serialized_identifiers(value: Any) -> Iterator[tuple[str, Any]]:
+    """Yield meaningful serialized Keras identifiers from nested configs.
+
+    This walks nested `loss`, `metrics`, and related config trees while avoiding
+    unrelated fields such as `name`, `dtype`, and other bookkeeping entries that
+    would otherwise create noisy false positives.
+    """
+    if isinstance(value, str):
+        identifier = value.strip()
+        if identifier:
+            yield identifier, value
+        return
+
+    if isinstance(value, dict):
+        class_name = value.get("class_name")
+        if isinstance(class_name, str) and class_name.strip():
+            yield class_name.strip(), value
+
+        registered_name = value.get("registered_name")
+        if isinstance(registered_name, str) and registered_name.strip():
+            yield registered_name.strip(), value
+
+        config = value.get("config")
+        if isinstance(config, dict):
+            for key in ("fn", "function", "loss", "losses", "metric", "metrics", "weighted_metrics"):
+                if key in config:
+                    yield from iter_keras_serialized_identifiers(config[key])
+
+        for key, nested_value in value.items():
+            if key in {"class_name", "config", "module", "name", "registered_name"}:
+                continue
+            yield from iter_keras_serialized_identifiers(nested_value)
+        return
+
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            yield from iter_keras_serialized_identifiers(item)
 
 
 def check_lambda_dict_function(

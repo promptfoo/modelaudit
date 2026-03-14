@@ -127,6 +127,42 @@ DANGEROUS_IMPORTS: dict[str, str] = {
         "The 'numpy.distutils' build utilities are tied to extension module compilation and setup workflows. "
         "Importing them from serialized model payloads is suspicious and may indicate unsafe behavior."
     ),
+    "numpy.load": (
+        "The 'numpy.load' function can recursively deserialize object arrays via pickle support, enabling "
+        "second-stage payload loading from attacker-controlled files."
+    ),
+    "site.main": (
+        "The 'site.main' function executes Python startup path initialization and can trigger module-level "
+        "execution side effects in attacker-influenced environments."
+    ),
+    "_io.FileIO": (
+        "The '_io.FileIO' constructor performs direct file reads and writes, enabling arbitrary local file access "
+        "without using higher-level safety wrappers."
+    ),
+    "test.support.script_helper.assert_python_ok": (
+        "The 'assert_python_ok' helper launches a Python subprocess. In untrusted pickle payloads this is command "
+        "execution behavior, not benign test plumbing."
+    ),
+    "_osx_support._read_output": (
+        "The '_osx_support._read_output' helper executes shell commands to capture output, enabling command "
+        "execution from deserialization payloads."
+    ),
+    "_aix_support._read_cmd_output": (
+        "The '_aix_support._read_cmd_output' helper executes commands and captures process output, creating direct "
+        "command-execution risk."
+    ),
+    "_pyrepl.pager.pipe_pager": (
+        "The '_pyrepl.pager.pipe_pager' helper invokes pager subprocess flows and can be abused for process "
+        "execution during model loading."
+    ),
+    "torch.serialization.load": (
+        "The 'torch.serialization.load' loader performs nested PyTorch and pickle deserialization, which can invoke "
+        "attacker-controlled reconstruction callables."
+    ),
+    "torch._inductor.codecache.compile_file": (
+        "The 'torch._inductor.codecache.compile_file' path compiles and loads generated code artifacts, enabling "
+        "arbitrary code execution when attacker-controlled."
+    ),
 }
 
 # Explanations for dangerous pickle opcodes

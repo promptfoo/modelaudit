@@ -181,6 +181,7 @@ def tensor_proto_to_ndarray(tensor_proto: Any, *, max_tensor_bytes: int | None =
             )
 
         # Handle special dtypes that need reinterpretation
+        arr: np.ndarray[Any, Any]
         if dtype_enum == DataType.DT_BFLOAT16:
             # bfloat16 is stored as bytes, interpret as uint16 then view as bfloat16
             arr = np.frombuffer(tensor_proto.tensor_content, dtype=np.uint16).copy()

@@ -224,6 +224,26 @@ class TestTarScanner:
         finally:
             os.unlink(tmp_path)
 
+    def test_scan_tar_with_proto0_pickle_preserves_archive_context(self, tmp_path: Path) -> None:
+        """Malicious TAR members should surface critical findings with archive-qualified locations."""
+        archive_path = tmp_path / "proto0_payload.tar"
+        payload = b'cos\nsystem\n(S"echo pwned"\ntR.'
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("payload.txt")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert result.success is True
+        assert result.has_errors is True
+        critical_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL]
+        assert any(
+            "os.system" in issue.message.lower() or "posix.system" in issue.message.lower() for issue in critical_issues
+        )
+        assert any(issue.location == f"{archive_path}:payload.txt" for issue in critical_issues)
+
     def test_invalid_tar_file(self):
         """Test handling of invalid TAR files"""
         with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as tmp:
@@ -404,3 +424,90 @@ class TestTarScanner:
         assert result.success is True
         assert result.bytes_scanned == len(payload)
         assert all("named_pipe" not in issue.message for issue in result.issues)
+
+    def test_scan_empty_tar(self, tmp_path: Path) -> None:
+        """An empty TAR archive should scan successfully with no critical issues."""
+        archive_path = tmp_path / "empty.tar"
+        with tarfile.open(archive_path, "w"):
+            pass  # create empty archive
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert result.success is True
+        assert result.bytes_scanned == 0
+        # No CRITICAL issues expected for an empty archive
+        critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
+        assert len(critical_issues) == 0
+
+    def test_scan_tar_with_multiple_model_formats(self, tmp_path: Path) -> None:
+        """TAR containing multiple model-format files should scan all of them."""
+        import pickle
+
+        archive_path = tmp_path / "multi_format.tar"
+
+        pkl_data = pickle.dumps({"weights": [1, 2, 3]})
+        json_data = b'{"model_type": "linear", "version": "1.0"}'
+        pt_data = pickle.dumps({"state_dict": {}})  # .pt files are pickle-based
+
+        with tarfile.open(archive_path, "w") as t:
+            for name, data in [
+                ("model.pkl", pkl_data),
+                ("config.json", json_data),
+                ("weights.pt", pt_data),
+            ]:
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                t.addfile(info, tarfile.io.BytesIO(data))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert result.success is True
+        # All three files were scanned
+        assert result.bytes_scanned == len(pkl_data) + len(json_data) + len(pt_data)
+        # Each file should appear in the contents metadata
+        contents_paths = {c.get("path", "") for c in result.metadata.get("contents", [])}
+        assert any("model.pkl" in p for p in contents_paths)
+        assert any("config.json" in p for p in contents_paths)
+        assert any("weights.pt" in p for p in contents_paths)
+
+    def test_scan_tar_with_very_long_filename(self, tmp_path: Path) -> None:
+        """TAR members with very long filenames should be handled without crashing."""
+        archive_path = tmp_path / "long_name.tar"
+        long_name = "a" * 200 + ".pkl"  # 204-character filename
+        import pickle
+
+        payload = pickle.dumps({"key": "value"})
+
+        with tarfile.open(archive_path, "w") as t:
+            info = tarfile.TarInfo(long_name)
+            info.size = len(payload)
+            t.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        # Scan must not crash; success is expected for a benign payload
+        assert result.success is True
+        assert result.bytes_scanned == len(payload)
+
+    def test_scan_truncated_tar(self, tmp_path: Path) -> None:
+        """A truncated (corrupted) TAR file should fail gracefully."""
+        # Build a real archive, then truncate it
+        archive_path = tmp_path / "truncated.tar"
+        content = b"some content"
+
+        with tarfile.open(archive_path, "w") as t:
+            info = tarfile.TarInfo("file.txt")
+            info.size = len(content)
+            t.addfile(info, tarfile.io.BytesIO(content))  # type: ignore[attr-defined]
+
+        full_data = archive_path.read_bytes()
+        truncated_path = tmp_path / "truncated_cut.tar"
+        truncated_path.write_bytes(full_data[:520])
+
+        result = self.scanner.scan(str(truncated_path))
+
+        assert result.success is False
+        format_checks = [check for check in result.checks if check.name == "TAR File Format Validation"]
+        assert len(format_checks) == 1
+        assert "not a valid tar file" in format_checks[0].message.lower()
+        assert any("not a valid tar file" in issue.message.lower() for issue in result.issues)

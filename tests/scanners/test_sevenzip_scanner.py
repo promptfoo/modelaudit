@@ -420,6 +420,128 @@ class TestSevenZipScanner:
             assert check.status == CheckStatus.FAILED
             assert "Failed during archive extraction" in check.message
 
+    def test_very_long_filename_in_archive_mocked_scannable_entry(self, scanner, temp_7z_file):
+        """Mocked long-filename entries should remain scannable without raising."""
+        long_name = "a" * 200 + ".pkl"  # 204-character entry name
+
+        with (
+            patch("modelaudit.scanners.sevenzip_scanner.HAS_PY7ZR", True),
+            patch("modelaudit.scanners.sevenzip_scanner.py7zr") as mock_py7zr,
+            patch.object(scanner, "_scan_extracted_file"),
+            patch("os.path.isfile", return_value=True),
+            patch("os.path.getsize", return_value=32),
+        ):
+            mock_archive = MagicMock()
+            mock_archive.getnames.return_value = [long_name]
+            mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
+
+            result = scanner.scan(temp_7z_file)
+
+            # Scan must complete without raising; the long-named file is scannable
+            assert result.metadata["total_files"] == 1
+            assert result.metadata["scannable_files"] == 1
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_very_long_filename_in_archive_real_extraction(self, scanner, temp_7z_file):
+        """Real 7z extraction should handle long entry names end to end."""
+        import py7zr  # type: ignore[import-untyped]
+
+        long_name = "a" * 200 + ".pkl"
+        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as temp_pickle:
+            pickle.dump({"safe": True}, temp_pickle)
+            temp_pickle_path = temp_pickle.name
+
+        try:
+            with py7zr.SevenZipFile(temp_7z_file, "w") as archive:
+                archive.write(temp_pickle_path, long_name)
+
+            with patch("modelaudit.scanners.get_scanner_for_file") as mock_get_scanner:
+                mock_scanner = MagicMock()
+                mock_result = MagicMock()
+                mock_result.issues = []
+                mock_result.checks = []
+                mock_result.metadata = {}
+                mock_scanner.scan.return_value = mock_result
+                mock_get_scanner.return_value = mock_scanner
+
+                result = scanner.scan(temp_7z_file)
+
+            assert result.success
+            assert result.metadata["total_files"] == 1
+            assert result.metadata["scannable_files"] == 1
+            mock_scanner.scan.assert_called_once()
+            extracted_path = mock_scanner.scan.call_args.args[0]
+            assert os.path.basename(extracted_path) == long_name
+        finally:
+            if os.path.exists(temp_pickle_path):
+                os.unlink(temp_pickle_path)
+
+    def test_truncated_archive_handled_gracefully_mocked_bad7zfile(self, scanner, temp_7z_file):
+        """A mocked Bad7zFile should be reported as a clear format failure."""
+        with open(temp_7z_file, "wb") as f:
+            # Write valid magic bytes but then truncated/garbage body
+            f.write(b"7z\xbc\xaf\x27\x1c" + b"\x00" * 10)
+
+        with (
+            patch("modelaudit.scanners.sevenzip_scanner.HAS_PY7ZR", True),
+            patch("modelaudit.scanners.sevenzip_scanner.py7zr") as mock_py7zr,
+        ):
+
+            class MockBad7zFile(Exception):
+                pass
+
+            mock_py7zr.Bad7zFile = MockBad7zFile
+            mock_py7zr.SevenZipFile.side_effect = MockBad7zFile("Truncated archive")
+
+            result = scanner.scan(temp_7z_file)
+
+            assert not result.success
+            format_checks = [c for c in result.checks if "Format Validation" in c.name]
+            assert len(format_checks) > 0
+            assert format_checks[0].status == CheckStatus.FAILED
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_truncated_archive_handled_gracefully_real_archive(self, scanner, temp_7z_file):
+        """A genuinely truncated 7z archive should fail format validation without crashing."""
+        import py7zr  # type: ignore[import-untyped]
+
+        source_path = Path(temp_7z_file).with_suffix(".pkl")
+        source_path.write_bytes(b"safe pickle content")
+
+        with py7zr.SevenZipFile(temp_7z_file, "w") as archive:
+            archive.write(str(source_path), "payload.pkl")
+
+        full_data = Path(temp_7z_file).read_bytes()
+        Path(temp_7z_file).write_bytes(full_data[: len(full_data) // 2])
+
+        result = scanner.scan(temp_7z_file)
+
+        assert not result.success
+        format_checks = [c for c in result.checks if c.name == "7z File Format Validation"]
+        assert len(format_checks) == 1
+        assert format_checks[0].status == CheckStatus.FAILED
+        assert "invalid 7z file format" in format_checks[0].message.lower()
+
+    def test_multiple_model_formats_identified(self, scanner):
+        """Archives containing diverse model-format files scan all scannable entries."""
+        entries = [
+            "model.pkl",
+            "weights.pt",
+            "model.onnx",
+            "config.json",
+            "tokenizer.bin",
+            "readme.txt",  # not scannable
+            "image.png",  # not scannable
+        ]
+
+        scannable = scanner._identify_scannable_files(entries)
+
+        expected = {"model.pkl", "weights.pt", "model.onnx", "config.json", "tokenizer.bin"}
+        assert set(scannable) == expected
+        # Non-model files must be excluded
+        assert "readme.txt" not in scannable
+        assert "image.png" not in scannable
+
 
 class TestSevenZipScannerConfiguration:
     """Test configuration options for SevenZipScanner"""
