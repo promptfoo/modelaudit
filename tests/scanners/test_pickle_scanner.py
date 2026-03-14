@@ -1230,6 +1230,48 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
                 f"got: {[i.message for i in result.issues]}"
             )
 
+    def test_ext_resolved_to_safe_global_still_fails_due_to_ext_origin(self) -> None:
+        """Resolved copyreg EXT targets must stay dangerous even when the target looks safe."""
+        import copyreg
+        from contextlib import suppress
+
+        inverted_registry = getattr(copyreg, "_inverted_registry", {})
+        extension_registry = getattr(copyreg, "_extension_registry", {})
+        existing_code = extension_registry.get(("builtins", "set"))
+
+        ext_code = next((candidate for candidate in range(1, 256) if candidate not in inverted_registry), None)
+        if ext_code is None:
+            pytest.skip("No free copyreg extension code available in range 1-255")
+
+        try:
+            if isinstance(existing_code, int):
+                with suppress(ValueError):
+                    copyreg.remove_extension("builtins", "set", existing_code)
+
+            copyreg.add_extension("builtins", "set", ext_code)
+            try:
+                payload = b"\x80\x02\x82" + bytes([ext_code]) + b")R."
+                result = self._scan_bytes(payload)
+
+                assert result.success
+                assert result.has_errors
+                reduce_checks = [
+                    c
+                    for c in result.checks
+                    if c.name == "REDUCE Opcode Safety Check"
+                    and c.status == CheckStatus.FAILED
+                    and c.details.get("associated_global") == "builtins.set"
+                    and c.details.get("origin_is_ext") is True
+                ]
+                assert reduce_checks, [c.details for c in result.checks if c.name == "REDUCE Opcode Safety Check"]
+            finally:
+                with suppress(ValueError):
+                    copyreg.remove_extension("builtins", "set", ext_code)
+        finally:
+            if isinstance(existing_code, int):
+                with suppress(ValueError):
+                    copyreg.add_extension("builtins", "set", existing_code)
+
     # ------------------------------------------------------------------
     # Fix 3b: ZIP proto0/1 extension bypass
     # ------------------------------------------------------------------
@@ -2106,6 +2148,41 @@ class TestPickleImportOnlyGlobalFindings:
         assert matched, [c.details for c in failed_checks]
 
     @pytest.mark.parametrize(
+        ("payload", "check_name"),
+        [
+            (b"\x80\x04cjoblib\n_pickle_load\n\x8c\x0bpayload.pkl\x85R.", "Global Module Reference Check"),
+            (
+                b"\x80\x04\x8c\x06joblib\x8c\x0c_pickle_load\x93\x8c\x0bpayload.pkl\x85R.",
+                "STACK_GLOBAL Module Check",
+            ),
+        ],
+    )
+    def test_executed_joblib_pickle_load_payloads_are_not_allowlisted(
+        self, tmp_path: Path, payload: bytes, check_name: str
+    ) -> None:
+        scanner = PickleScanner()
+        payload_path = tmp_path / f"{check_name.replace(' ', '_').lower()}_joblib_pickle_load.pkl"
+        payload_path.write_bytes(payload)
+
+        result = scanner.scan(str(payload_path))
+
+        import_only_failures = [
+            c
+            for c in result.checks
+            if c.name == check_name
+            and c.status == CheckStatus.FAILED
+            and c.details.get("import_only") is True
+            and c.details.get("import_reference") == "joblib._pickle_load"
+        ]
+        assert not import_only_failures, [c.details for c in result.checks if c.name == check_name]
+        assert any(
+            c.name == "REDUCE Opcode Safety Check"
+            and c.status == CheckStatus.FAILED
+            and c.details.get("associated_global") == "joblib._pickle_load"
+            for c in result.checks
+        )
+
+    @pytest.mark.parametrize(
         ("payload", "check_name", "ref"),
         [
             (b"cTorch\nload\n.", "Global Module Reference Check", "Torch.load"),
@@ -2207,6 +2284,38 @@ class TestPickleImportOnlyGlobalFindings:
         ]
         assert not failed_checks, [c.message for c in failed_checks]
 
+    def test_import_only_safe_stack_global_parity_remains_non_failing(self, tmp_path: Path) -> None:
+        scanner = PickleScanner()
+        payload_path = tmp_path / "safe_stack_global_builtins_set.pkl"
+        payload_path.write_bytes(b"\x80\x04\x8c\x08builtins\x8c\x03set\x93.")
+
+        result = scanner.scan(str(payload_path))
+
+        failed_checks = [
+            c
+            for c in result.checks
+            if c.status == CheckStatus.FAILED
+            and c.name in {"Global Module Reference Check", "STACK_GLOBAL Module Check"}
+            and "builtins.set" in c.message
+        ]
+        assert not failed_checks, [c.message for c in failed_checks]
+
+    def test_import_only_stdlib_constructor_stack_global_parity_remains_non_failing(self, tmp_path: Path) -> None:
+        scanner = PickleScanner()
+        payload_path = tmp_path / "import_only_datetime_stack_global.pkl"
+        payload_path.write_bytes(b"\x80\x04\x8c\x08datetime\x8c\x08datetime\x93.")
+
+        result = scanner.scan(str(payload_path))
+
+        failed_checks = [
+            c
+            for c in result.checks
+            if c.status == CheckStatus.FAILED
+            and c.name in {"Global Module Reference Check", "STACK_GLOBAL Module Check"}
+            and "datetime.datetime" in c.message
+        ]
+        assert not failed_checks, [c.message for c in failed_checks]
+
     def test_executed_import_only_allowlist_ref_is_not_marked_safe_allowlisted(self, tmp_path: Path) -> None:
         scanner = PickleScanner()
         payload_path = tmp_path / "executed_datetime_reduce.pkl"
@@ -2243,6 +2352,22 @@ class TestPickleImportOnlyGlobalFindings:
             for c in result.checks
             if c.status == CheckStatus.FAILED
             and c.name == "Global Module Reference Check"
+            and "PEDRA_2020.thing" in c.message
+        ]
+        assert not failed_checks, [c.message for c in failed_checks]
+
+    def test_import_only_data_label_like_stack_global_module_is_ignored(self, tmp_path: Path) -> None:
+        scanner = PickleScanner()
+        payload_path = tmp_path / "import_only_data_label_stack_global.pkl"
+        payload_path.write_bytes(b"\x80\x04\x8c\nPEDRA_2020\x8c\x05thing\x93.")
+
+        result = scanner.scan(str(payload_path))
+
+        failed_checks = [
+            c
+            for c in result.checks
+            if c.status == CheckStatus.FAILED
+            and c.name in {"Global Module Reference Check", "STACK_GLOBAL Module Check"}
             and "PEDRA_2020.thing" in c.message
         ]
         assert not failed_checks, [c.message for c in failed_checks]
@@ -2338,6 +2463,70 @@ class TestPickleImportOnlyGlobalFindings:
             for c in result.checks
         )
 
+    def test_same_stack_global_reference_import_only_origin_is_not_suppressed_by_later_reduce(
+        self, tmp_path: Path
+    ) -> None:
+        scanner = PickleScanner()
+        payload_path = tmp_path / "stack_global_import_only_then_reduce.pkl"
+        payload_path.write_bytes(
+            b"\x80\x04"
+            + _short_binunicode(b"evilpkg")
+            + _short_binunicode(b"thing")
+            + b"\x93"
+            + _short_binunicode(b"evilpkg")
+            + _short_binunicode(b"thing")
+            + b"\x93)R."
+        )
+
+        result = scanner.scan(str(payload_path))
+
+        import_only_failures = [
+            c
+            for c in result.checks
+            if c.name == "STACK_GLOBAL Module Check"
+            and c.status == CheckStatus.FAILED
+            and c.details.get("import_only") is True
+            and c.details.get("import_reference") == "evilpkg.thing"
+        ]
+        assert len(import_only_failures) == 1
+        assert any(
+            c.name == "REDUCE Opcode Safety Check"
+            and c.status == CheckStatus.FAILED
+            and c.details.get("associated_global") == "evilpkg.thing"
+            for c in result.checks
+        )
+
+    @pytest.mark.parametrize(
+        ("payload", "check_name"),
+        [
+            (b"\x80\x02cos\nsystem\n)\x81.", "Global Module Reference Check"),
+            (b"\x80\x04\x8c\x02os\x8c\x06system\x93)\x81.", "STACK_GLOBAL Module Check"),
+            (b"\x80\x04cos\nsystem\n)}\x92.", "Global Module Reference Check"),
+            (b"\x80\x04\x8c\x02os\x8c\x06system\x93)}\x92.", "STACK_GLOBAL Module Check"),
+            (b"(cos\nsystem\no.", "Global Module Reference Check"),
+            (b"\x80\x04(\x8c\x02os\x8c\x06system\x93o.", "STACK_GLOBAL Module Check"),
+        ],
+    )
+    def test_constructor_backed_refs_do_not_emit_import_only_failures(
+        self, tmp_path: Path, payload: bytes, check_name: str
+    ) -> None:
+        scanner = PickleScanner()
+        payload_path = tmp_path / f"{check_name.replace(' ', '_').lower()}_constructor.pkl"
+        payload_path.write_bytes(payload)
+
+        result = scanner.scan(str(payload_path))
+
+        import_only_failures = [
+            c
+            for c in result.checks
+            if c.name == check_name and c.status == CheckStatus.FAILED and c.details.get("import_only") is True
+        ]
+        assert not import_only_failures, [c.details for c in result.checks if c.name == check_name]
+        assert any(
+            c.name == "INST/OBJ/NEWOBJ/NEWOBJ_EX Opcode Safety Check" and c.status == CheckStatus.FAILED
+            for c in result.checks
+        )
+
     def test_symbolic_simulation_inst_clears_marked_arguments(self) -> None:
         opcodes = [
             (type("Op", (), {"name": "MARK"})(), None, 0),
@@ -2348,10 +2537,16 @@ class TestPickleImportOnlyGlobalFindings:
             (type("Op", (), {"name": "STACK_GLOBAL"})(), None, 5),
         ]
 
-        stack_global_refs, callable_refs, callable_origin_refs = _simulate_symbolic_reference_maps(opcodes)
+        (
+            stack_global_refs,
+            callable_refs,
+            callable_origin_refs,
+            callable_origin_is_ext,
+        ) = _simulate_symbolic_reference_maps(opcodes)
 
         assert callable_refs[2] == ("collections", "OrderedDict")
         assert callable_origin_refs[2] == 2
+        assert callable_origin_is_ext == {}
         assert 5 not in stack_global_refs
 
     def test_symbolic_simulation_protocol_five_buffers_preserve_stack_alignment(self) -> None:
@@ -2365,11 +2560,17 @@ class TestPickleImportOnlyGlobalFindings:
             (type("Op", (), {"name": "STACK_GLOBAL"})(), None, 6),
         ]
 
-        stack_global_refs, callable_refs, callable_origin_refs = _simulate_symbolic_reference_maps(opcodes)
+        (
+            stack_global_refs,
+            callable_refs,
+            callable_origin_refs,
+            callable_origin_is_ext,
+        ) = _simulate_symbolic_reference_maps(opcodes)
 
         assert stack_global_refs[6] == ("evilpkg", "thing")
         assert callable_refs == {}
         assert callable_origin_refs == {}
+        assert callable_origin_is_ext == {}
 
 
 @pytest.mark.parametrize(
