@@ -704,6 +704,15 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
             assert not result.has_errors, (
                 f"Expected builtins.{safe_builtin} to remain non-failing, got: {[i.message for i in result.issues]}"
             )
+            safe_global_checks = [check for check in result.checks if check.name == "Global Module Reference Check"]
+            assert any(
+                check.status == CheckStatus.PASSED and f"builtins.{safe_builtin}" in check.message
+                for check in safe_global_checks
+            ), f"Expected passed Global Module Reference Check for builtins.{safe_builtin}"
+            assert not any(check.status == CheckStatus.FAILED for check in safe_global_checks), (
+                f"Unexpected failed Global Module Reference Check for builtins.{safe_builtin}: "
+                f"{[check.message for check in safe_global_checks]}"
+            )
 
     def test_dangerous_builtins_still_fail(self) -> None:
         """Dangerous builtins must continue to fail after allowlist tightening."""
