@@ -1,10 +1,12 @@
 """Scanner for Python pickle serialized files (.pkl, .pickle)."""
 
+import io
 import os
 import pickletools
 import struct
 import time
-from typing import IO, Any, BinaryIO, ClassVar, TypeGuard
+from dataclasses import dataclass
+from typing import Any, BinaryIO, ClassVar, TypeGuard
 
 from modelaudit.analysis.enhanced_pattern_detector import EnhancedPatternDetector, PatternMatch
 from modelaudit.analysis.entropy_analyzer import EntropyAnalyzer
@@ -46,7 +48,112 @@ COPYREG_EXTENSION_MODULE = "__copyreg_extension__"
 COPYREG_EXTENSION_PREFIX = "code_"
 
 
-def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> Any:
+def _scan_structural_tamper_findings(file_data: bytes) -> list[dict[str, Any]]:
+    """Detect structurally suspicious pickle stream patterns.
+
+    This scanner intentionally focuses on true pickle-structure violations and keeps
+    severity low so malformed/truncated payloads are visible without overshadowing
+    direct code-execution signals.
+    """
+
+    findings: list[dict[str, Any]] = []
+    if not file_data:
+        return findings
+
+    offset = 0
+    max_separator_skip = 256
+
+    while offset < len(file_data):
+        stream = file_data[offset:]
+        bio = io.BytesIO(stream)
+        stream_opcode_count = 0
+        stream_had_stop = False
+        seen_proto_version: int | None = None
+
+        try:
+            for opcode, arg, pos in pickletools.genops(bio):
+                stream_opcode_count += 1
+                opcode_pos = int(pos) if pos is not None else 0
+                absolute_pos = offset + opcode_pos
+
+                if opcode.name == "PROTO":
+                    if stream_opcode_count > 1:
+                        findings.append(
+                            {
+                                "kind": "misplaced_proto",
+                                "stream_offset": offset,
+                                "position": absolute_pos,
+                                "protocol": arg,
+                            }
+                        )
+
+                    if seen_proto_version is not None:
+                        findings.append(
+                            {
+                                "kind": "duplicate_proto",
+                                "stream_offset": offset,
+                                "position": absolute_pos,
+                                "protocol": arg,
+                                "previous_protocol": seen_proto_version,
+                            }
+                        )
+                    seen_proto_version = int(arg) if isinstance(arg, int) else None
+
+                if opcode.name == "STOP":
+                    stream_had_stop = True
+                    offset = absolute_pos + 1
+                    break
+        except ValueError:
+            # Do not emit standalone invalid-opcode findings here. Legitimate
+            # pickle-adjacent formats can contain binary tails or protocol/
+            # opcode mismatches that trigger parser errors after a valid
+            # prefix, and surfacing those as tamper findings is too noisy.
+            # Instead, resync to the next likely binary pickle stream and
+            # continue looking for true structural violations.
+            probe_start = min(offset + 1, len(file_data))
+            probe_end = min(offset + _RESYNC_BUDGET, len(file_data))
+            next_offset = -1
+            for idx in range(probe_start, probe_end - 1):
+                if file_data[idx] == 0x80 and file_data[idx + 1] in (2, 3, 4, 5):
+                    next_offset = idx
+                    break
+
+            if next_offset >= 0:
+                offset = next_offset
+                continue
+
+            # If there is no next stream candidate, treat remaining bytes as non-pickle tail.
+            break
+        except Exception:
+            # Structural tamper detection is opportunistic and must not change
+            # the scanner's existing error-handling behavior for parse limits
+            # or framework-specific edge cases.
+            break
+
+        if stream_had_stop:
+            skipped = 0
+            while offset < len(file_data) and skipped < max_separator_skip:
+                if file_data[offset] == 0x80 and offset + 1 < len(file_data) and file_data[offset + 1] in (2, 3, 4, 5):
+                    break
+                offset += 1
+                skipped += 1
+            if skipped >= max_separator_skip and offset < len(file_data):
+                break
+            continue
+
+        # No STOP and no exception means empty parse; advance to avoid infinite loop.
+        offset += 1
+
+    return findings
+
+
+def _genops_with_fallback(
+    file_obj: BinaryIO,
+    *,
+    multi_stream: bool = False,
+    max_items: int | None = None,
+    deadline: float | None = None,
+) -> Any:
     """
     Wrapper around pickletools.genops that handles protocol mismatches.
 
@@ -67,6 +174,12 @@ def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> 
     resync_skipped = 0
     # Track whether we've successfully parsed at least one complete stream
     parsed_any_stream = False
+    yielded_items = 0
+
+    def _budget_exceeded(*, pending_items: int = 0) -> bool:
+        if max_items is not None and (yielded_items + pending_items) >= max_items:
+            return True
+        return deadline is not None and time.time() > deadline
 
     while True:
         stream_start = file_obj.tell()
@@ -76,9 +189,17 @@ def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> 
         if not parsed_any_stream:
             # First stream: yield opcodes directly (no buffering needed)
             try:
-                for item in pickletools.genops(file_obj):
+                op_iter = pickletools.genops(file_obj)
+                while True:
+                    if _budget_exceeded():
+                        return
+                    try:
+                        item = next(op_iter)
+                    except StopIteration:
+                        break
                     had_opcodes = True
                     yield item
+                    yielded_items += 1
             except ValueError as e:
                 error_str = str(e).lower()
                 is_unknown_opcode = "opcode" in error_str and "unknown" in error_str
@@ -113,7 +234,17 @@ def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> 
             # produce false positives.
             buffered: list[Any] = []
             try:
-                for item in pickletools.genops(file_obj):
+                op_iter = pickletools.genops(file_obj)
+                while True:
+                    if _budget_exceeded(pending_items=len(buffered)):
+                        for buffered_item in buffered:
+                            yield buffered_item
+                            yielded_items += 1
+                        return
+                    try:
+                        item = next(op_iter)
+                    except StopIteration:
+                        break
                     had_opcodes = True
                     buffered.append(item)
             except ValueError:
@@ -131,7 +262,11 @@ def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> 
 
             if not stream_error:
                 # Stream completed successfully — yield buffered opcodes
-                yield from buffered
+                for buffered_item in buffered:
+                    if _budget_exceeded():
+                        return
+                    yield buffered_item
+                    yielded_items += 1
 
         if stream_error and had_opcodes:
             # First stream parse interruption after yielding some opcodes.
@@ -365,6 +500,7 @@ ALWAYS_DANGEROUS_FUNCTIONS: set[str] = {
     "pickle.loads",
     "pickle.load",
     "joblib.load",
+    "joblib._pickle_load",
     "marshal.loads",
     "marshal.load",
     # Torch dangerous functions (Fickling)
@@ -379,6 +515,7 @@ ALWAYS_DANGEROUS_FUNCTIONS: set[str] = {
     "torch.distributed.rpc.RemoteModule",
     # NumPy dangerous functions (Fickling)
     "numpy.testing._private.utils.runstring",
+    "numpy.load",
     # pip as callable (CVE-2025-1716: picklescan bypass via pip.main)
     "pip.main",
     "pip._internal.main",
@@ -418,6 +555,15 @@ ALWAYS_DANGEROUS_FUNCTIONS: set[str] = {
     "ctypes.cast",
     "ctypes.CFUNCTYPE",
     "ctypes.WINFUNCTYPE",
+    # Expanded exact dangerous primitives validated against PickleScan
+    "site.main",
+    "_io.FileIO",
+    "test.support.script_helper.assert_python_ok",
+    "_osx_support._read_output",
+    "_aix_support._read_cmd_output",
+    "_pyrepl.pager.pipe_pager",
+    "torch.serialization.load",
+    "torch._inductor.codecache.compile_file",
 }
 
 # Module prefixes that are always dangerous (Fickling-based + additional)
@@ -544,6 +690,32 @@ WARNING_SEVERITY_MODULES: set[str] = {
     # cannot directly execute code.
     "glob",
 }
+
+# Risky ML-specific import surfaces that must be flagged even when they appear
+# as import-only GLOBAL/STACK_GLOBAL references (without immediate REDUCE).
+RISKY_ML_MODULE_PREFIXES: tuple[str, ...] = (
+    "torch.jit",
+    "torch._dynamo",
+    "torch._inductor",
+    "numpy.f2py",
+    "numpy.distutils",
+)
+
+RISKY_ML_EXACT_REFS: set[tuple[str, str]] = {
+    ("torch", "compile"),
+    ("torch.storage", "_load_from_bytes"),
+}
+RISKY_ML_EXACT_FULL_REFS: frozenset[str] = frozenset(f"{module}.{name}" for module, name in RISKY_ML_EXACT_REFS)
+
+
+def _split_parent_child_ref(prefix: str) -> tuple[str, str]:
+    parent, _separator, child = prefix.rpartition(".")
+    return parent, child
+
+
+RISKY_ML_PARENT_CHILD_REFS: frozenset[tuple[str, str]] = frozenset(
+    _split_parent_child_ref(prefix) for prefix in RISKY_ML_MODULE_PREFIXES
+)
 
 
 def _is_dangerous_module(mod: str) -> bool:
@@ -716,7 +888,8 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
     ],
     # Python builtins - safe built-in types and functions
     # NOTE: eval, exec, compile, __import__, open, file are NOT in this list (they remain dangerous)
-    # NOTE: getattr, setattr, delattr are also NOT in this list (in ALWAYS_DANGEROUS_FUNCTIONS)
+    # NOTE: getattr, setattr, delattr, hasattr are NOT in this list
+    # because attribute-access primitives must never be allowlisted.
     "__builtin__": [  # Python 2 builtins
         "set",
         "frozenset",
@@ -751,7 +924,6 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "id",
         "isinstance",
         "issubclass",
-        "hasattr",
         "callable",
         "repr",
         "ascii",
@@ -811,7 +983,6 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "id",
         "isinstance",
         "issubclass",
-        "hasattr",
         "callable",
         "repr",
         "ascii",
@@ -1509,7 +1680,6 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "Memory",
         "hash",
         "_pickle_dump",
-        "_pickle_load",
     ],
     "joblib.numpy_pickle": [
         "NumpyArrayWrapper",
@@ -1521,7 +1691,9 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
     "dtype": [
         "dtype",  # numpy.dtype().dtype pattern
     ],
-    "dill": ["dump", "dumps", "load", "loads", "copy"],
+    # dill.load/dill.loads recursively deserialize attacker-controlled byte streams
+    # and must be treated as dangerous pickle entry points.
+    "dill": ["dump", "dumps", "copy"],
     "tensorflow": [
         "Tensor",
         "Variable",
@@ -1777,6 +1949,29 @@ def _is_plausible_python_module(name: str) -> bool:
     return all(_MODULE_SEGMENT_RE.match(seg) for seg in segments)
 
 
+_CASE_SENSITIVE_IMPORT_SEGMENTS = frozenset({"PIL", "Cython"})
+IMPORT_ONLY_ALWAYS_DANGEROUS_GLOBALS = frozenset(
+    {
+        ("dill", "load"),
+        ("dill", "loads"),
+        ("joblib", "load"),
+        ("joblib", "_pickle_load"),
+    }
+)
+IMPORT_ONLY_SAFE_GLOBALS: dict[str, frozenset[str]] = {
+    "__builtin__": frozenset({"set", "slice", "tuple"}),
+    "builtins": frozenset({"set", "slice", "tuple"}),
+    "datetime": frozenset({"date", "datetime", "time", "timedelta", "timezone"}),
+    "_io": frozenset({"BytesIO"}),
+    "site": frozenset({"addsitedir"}),
+    "numpy.f2py.crackfortran": frozenset({"markinnerspaces"}),
+    "torch.fx.experimental.symbolic_shapes.ShapeEnv": frozenset({"create_symbol"}),
+    "torch.utils._config_module": frozenset({"install_config_module"}),
+    "torch.utils.collect_env": frozenset({"get_env_info"}),
+    "torch.utils.data.datapipes.utils.decoder": frozenset({"handle_extension"}),
+}
+
+
 def _is_safe_ml_global(mod: str, func: str) -> bool:
     """
     Check if a module.function is in the ML_SAFE_GLOBALS allowlist.
@@ -1795,12 +1990,119 @@ def _is_safe_ml_global(mod: str, func: str) -> bool:
     return False
 
 
+def _is_safe_import_only_global(mod: str, func: str, ml_context: dict[str, Any] | None = None) -> bool:
+    """Return True when an import-only target is explicitly safe to treat as benign."""
+    if _is_actually_dangerous_global(mod, func, ml_context or {}):
+        return False
+
+    if not _is_dangerous_module(mod) and _is_safe_ml_global(mod, func):
+        return True
+
+    return func in IMPORT_ONLY_SAFE_GLOBALS.get(mod, frozenset())
+
+
+def _normalize_import_reference(mod: str, func: str) -> tuple[str, str]:
+    """Normalize import references for denylist checks without changing reporting."""
+    return mod.strip().lower(), func.strip().lower()
+
+
+def _is_resolved_import_target(mod: str, func: str) -> bool:
+    """Return True when module/function look like concrete Python import targets."""
+    if not mod or not func:
+        return False
+
+    module_parts = mod.split(".")
+    if not all(part.isidentifier() for part in module_parts):
+        return False
+
+    return func.isidentifier()
+
+
+def _is_plausible_import_only_module(mod: str) -> bool:
+    """Return True when a module path looks importable without matching common data labels."""
+    if not mod:
+        return False
+
+    segments = mod.split(".")
+    if not segments or any(segment == "" or not segment.isidentifier() for segment in segments):
+        return False
+
+    return all(
+        any(char.islower() for char in segment) or segment in _CASE_SENSITIVE_IMPORT_SEGMENTS for segment in segments
+    )
+
+
+def _classify_import_reference(
+    mod: str, func: str, ml_context: dict[str, Any], *, is_import_only: bool
+) -> tuple[bool, IssueSeverity | None, str]:
+    """Classify a resolved GLOBAL/STACK_GLOBAL import target.
+
+    Returns (is_failure, severity, classification) where classification is one of
+    safe_allowlisted, dangerous, unknown_third_party, or unresolved.
+    """
+    if not _is_resolved_import_target(mod, func):
+        return False, None, "unresolved"
+
+    normalized_mod, normalized_func = _normalize_import_reference(mod, func)
+    if is_import_only and (normalized_mod, normalized_func) in IMPORT_ONLY_ALWAYS_DANGEROUS_GLOBALS:
+        base_sev = IssueSeverity.WARNING if normalized_mod in WARNING_SEVERITY_MODULES else IssueSeverity.CRITICAL
+        return True, base_sev, "dangerous"
+
+    if _is_actually_dangerous_global(mod, func, ml_context):
+        base_sev = IssueSeverity.WARNING if normalized_mod in WARNING_SEVERITY_MODULES else IssueSeverity.CRITICAL
+        return True, base_sev, "dangerous"
+
+    if _is_safe_ml_global(mod, func):
+        return False, None, "safe_allowlisted"
+
+    if is_import_only and _is_safe_import_only_global(mod, func, ml_context):
+        return False, None, "safe_allowlisted"
+
+    if not _is_plausible_import_only_module(mod):
+        return False, None, "implausible"
+
+    return True, IssueSeverity.WARNING, "unknown_third_party"
+
+
+def _is_risky_ml_import(mod: str, func: str) -> bool:
+    """Return True when module/function matches risky ML import policy."""
+    full_ref = f"{mod}.{func}" if func else mod
+    parts = full_ref.split(".")
+
+    for i in range(1, len(parts) + 1):
+        candidate_full_ref = ".".join(parts[:i])
+        if candidate_full_ref in RISKY_ML_EXACT_FULL_REFS:
+            return True
+
+    for i in range(1, len(parts)):
+        candidate_mod = ".".join(parts[:i])
+        candidate_func = ".".join(parts[i:])
+        if (candidate_mod, candidate_func) in RISKY_ML_EXACT_REFS:
+            return True
+        if (candidate_mod, candidate_func) in RISKY_ML_PARENT_CHILD_REFS:
+            return True
+        if any(
+            candidate_mod == prefix or candidate_mod.startswith(f"{prefix}.") for prefix in RISKY_ML_MODULE_PREFIXES
+        ):
+            return True
+
+    return False
+
+
 def _is_copyreg_extension_ref(mod: str) -> bool:
     """Return True when a reference came from an EXT opcode extension lookup."""
     return mod == COPYREG_EXTENSION_MODULE
 
 
-def _resolve_copyreg_extension(code: Any) -> tuple[str, str]:
+@dataclass(frozen=True)
+class _ResolvedImportRef:
+    module: str
+    function: str
+    origin_index: int
+    origin_is_ext: bool = False
+
+
+def _resolve_copyreg_extension(code: Any, origin_index: int) -> _ResolvedImportRef:
     """
     Resolve EXT opcode codes through copyreg when available.
 
@@ -1820,11 +2122,16 @@ def _resolve_copyreg_extension(code: Any) -> tuple[str, str]:
                     and isinstance(resolved[0], str)
                     and isinstance(resolved[1], str)
                 ):
-                    return resolved
+                    return _ResolvedImportRef(resolved[0], resolved[1], origin_index, origin_is_ext=True)
         except Exception:
             pass
 
-    return COPYREG_EXTENSION_MODULE, f"{COPYREG_EXTENSION_PREFIX}{code}"
+    return _ResolvedImportRef(
+        COPYREG_EXTENSION_MODULE,
+        f"{COPYREG_EXTENSION_PREFIX}{code}",
+        origin_index,
+        origin_is_ext=True,
+    )
 
 
 def _is_actually_dangerous_global(mod: str, func: str, ml_context: dict) -> bool:
@@ -1835,20 +2142,38 @@ def _is_actually_dangerous_global(mod: str, func: str, ml_context: dict) -> bool
     Security-first approach: Always flag dangerous functions, then check ML context
     for less critical operations.
     """
+    normalized_mod, normalized_func = _normalize_import_reference(mod, func)
     full_ref = f"{mod}.{func}"
+    normalized_full_ref = f"{normalized_mod}.{normalized_func}"
 
     # STEP 0: EXT opcodes (copyreg extension registry) are always suspicious.
     # They resolve callables indirectly via process-global state and can bypass
     # explicit GLOBAL/STACK_GLOBAL references.
-    if _is_copyreg_extension_ref(mod):
+    if _is_copyreg_extension_ref(mod) or (
+        (normalized_mod, normalized_func) != (mod, func) and _is_copyreg_extension_ref(normalized_mod)
+    ):
         logger.warning(f"Extension-registry callable detected via EXT opcode: {full_ref}")
+        return True
+
+    # STEP 0.5: Risky ML imports should be flagged even in import-only payloads.
+    # These are intentionally separate from the broad ML safe allowlist because
+    # they map to runtime loading/compilation pathways with elevated risk.
+    if _is_risky_ml_import(mod, func) or (
+        (normalized_mod, normalized_func) != (mod, func) and _is_risky_ml_import(normalized_mod, normalized_func)
+    ):
+        logger.warning(f"Risky ML import detected: {full_ref}")
         return True
 
     # STEP 1: ALWAYS flag dangerous functions first (no exceptions, no allowlist override)
     # This MUST come before the ML_SAFE_GLOBALS check to prevent bypass attacks
     # where an attacker places dangerous functions (e.g., operator.attrgetter) in a
     # pickle stream alongside ML references to trick the allowlist.
-    if full_ref in ALWAYS_DANGEROUS_FUNCTIONS or func in ALWAYS_DANGEROUS_FUNCTIONS:
+    if (
+        full_ref in ALWAYS_DANGEROUS_FUNCTIONS
+        or func in ALWAYS_DANGEROUS_FUNCTIONS
+        or normalized_full_ref in ALWAYS_DANGEROUS_FUNCTIONS
+        or normalized_func in ALWAYS_DANGEROUS_FUNCTIONS
+    ):
         logger.warning(
             f"Always-dangerous function detected: {full_ref} "
             f"(flagged regardless of ML context confidence={ml_context.get('overall_confidence', 0):.2f})"
@@ -1860,7 +2185,9 @@ def _is_actually_dangerous_global(mod: str, func: str, ml_context: dict) -> bool
     # setattr, delattr, __import__, compile, etc.) are already caught in STEP 1 via
     # ALWAYS_DANGEROUS_FUNCTIONS, so any function reaching this point that is in the
     # ML_SAFE_GLOBALS allowlist (e.g., builtins.slice, builtins.set) is genuinely safe.
-    if _is_dangerous_module(mod):
+    if _is_dangerous_module(mod) or (
+        (normalized_mod, normalized_func) != (mod, func) and _is_dangerous_module(normalized_mod)
+    ):
         if _is_safe_ml_global(mod, func):
             logger.debug(
                 f"Safe function from dangerous module: {mod}.{func} (explicitly allowlisted in ML_SAFE_GLOBALS)"
@@ -1880,7 +2207,13 @@ def _is_actually_dangerous_global(mod: str, func: str, ml_context: dict) -> bool
 
     # STEP 4: Use original suspicious global check for all other cases
     # Removed ML confidence-based whitelisting to prevent bypass attacks
-    return is_suspicious_global(mod, func)
+    if is_suspicious_global(mod, func):
+        return True
+
+    if (normalized_mod, normalized_func) != (mod, func):
+        return is_suspicious_global(normalized_mod, normalized_func)
+
+    return False
 
 
 def _parse_module_function(arg: str) -> tuple[str, str] | None:
@@ -1901,19 +2234,14 @@ def _parse_module_function(arg: str) -> tuple[str, str] | None:
     return None
 
 
-def _build_symbolic_reference_maps(
+def _simulate_symbolic_reference_maps(
     opcodes: list[tuple],
-) -> tuple[dict[int, tuple[str, str]], dict[int, tuple[str, str]]]:
-    """
-    Build symbolic maps of callable references in an opcode stream.
-
-    Returns:
-        Tuple of:
-        - stack_global_refs: opcode index -> (module, function) for STACK_GLOBAL
-        - callable_refs: opcode index -> (module, function) for REDUCE/NEWOBJ/OBJ/INST call targets
-    """
+) -> tuple[dict[int, tuple[str, str]], dict[int, tuple[str, str]], dict[int, int], dict[int, bool]]:
+    """Simulate callable resolution and retain the opcode index for each originating import."""
     stack_global_refs: dict[int, tuple[str, str]] = {}
     callable_refs: dict[int, tuple[str, str]] = {}
+    callable_origin_refs: dict[int, int] = {}
+    callable_origin_is_ext: dict[int, bool] = {}
 
     marker = object()
     unknown = object()
@@ -1936,15 +2264,12 @@ def _build_symbolic_reference_maps(
             popped.append(item)
         return popped
 
-    def _is_ref(value: Any) -> TypeGuard[tuple[str, str]]:
-        return isinstance(value, tuple) and len(value) == 2 and isinstance(value[0], str) and isinstance(value[1], str)
+    def _is_ref(value: Any) -> TypeGuard[_ResolvedImportRef]:
+        return isinstance(value, _ResolvedImportRef)
 
     for i, (opcode, arg, _pos) in enumerate(opcodes):
         name = opcode.name
 
-        # Reset stack and memo at stream boundaries (STOP) so that stale
-        # references from a previous pickle stream do not leak into the
-        # symbolic simulation of the next stream.
         if name == "STOP":
             stack.clear()
             memo.clear()
@@ -1957,19 +2282,22 @@ def _build_symbolic_reference_maps(
 
         if name == "GLOBAL" and isinstance(arg, str):
             parsed = _parse_module_function(arg)
-            stack.append(parsed if parsed else unknown)
+            if parsed:
+                stack.append(_ResolvedImportRef(parsed[0], parsed[1], i))
+            else:
+                stack.append(unknown)
             continue
 
         if name in {"EXT1", "EXT2", "EXT4"}:
-            stack.append(_resolve_copyreg_extension(arg))
+            stack.append(_resolve_copyreg_extension(arg, i))
             continue
 
         if name == "STACK_GLOBAL":
             func_name = _pop()
             mod_name = _pop()
             if isinstance(mod_name, str) and isinstance(func_name, str):
-                ref = (mod_name, func_name)
-                stack_global_refs[i] = ref
+                ref = _ResolvedImportRef(mod_name, func_name, i)
+                stack_global_refs[i] = (mod_name, func_name)
                 stack.append(ref)
             else:
                 stack.append(unknown)
@@ -1979,6 +2307,8 @@ def _build_symbolic_reference_maps(
             parsed = _parse_module_function(arg)
             if parsed:
                 callable_refs[i] = parsed
+                callable_origin_refs[i] = i
+            _pop_to_mark()
             stack.append(unknown)
             continue
 
@@ -2030,7 +2360,6 @@ def _build_symbolic_reference_maps(
             continue
 
         if name in {"APPEND", "SETITEM"}:
-            # Pop appended item / key-value while keeping container on stack
             _pop()
             if name == "SETITEM":
                 _pop()
@@ -2041,7 +2370,6 @@ def _build_symbolic_reference_maps(
             continue
 
         if name == "BUILD":
-            # BUILD consumes state and mutates object in-place
             _pop()
             continue
 
@@ -2050,7 +2378,10 @@ def _build_symbolic_reference_maps(
             callable_item = _pop()
             del reduce_args
             if _is_ref(callable_item):
-                callable_refs[i] = callable_item
+                callable_refs[i] = (callable_item.module, callable_item.function)
+                callable_origin_refs[i] = callable_item.origin_index
+                if callable_item.origin_is_ext:
+                    callable_origin_is_ext[i] = True
             stack.append(unknown)
             continue
 
@@ -2059,7 +2390,10 @@ def _build_symbolic_reference_maps(
             class_item = _pop()
             del newobj_args
             if _is_ref(class_item):
-                callable_refs[i] = class_item
+                callable_refs[i] = (class_item.module, class_item.function)
+                callable_origin_refs[i] = class_item.origin_index
+                if class_item.origin_is_ext:
+                    callable_origin_is_ext[i] = True
             stack.append(unknown)
             continue
 
@@ -2069,7 +2403,10 @@ def _build_symbolic_reference_maps(
             class_item = _pop()
             del kwargs, args
             if _is_ref(class_item):
-                callable_refs[i] = class_item
+                callable_refs[i] = (class_item.module, class_item.function)
+                callable_origin_refs[i] = class_item.origin_index
+                if class_item.origin_is_ext:
+                    callable_origin_is_ext[i] = True
             stack.append(unknown)
             continue
 
@@ -2077,31 +2414,16 @@ def _build_symbolic_reference_maps(
             items = _pop_to_mark()
             class_item = items[-1] if items else unknown
             if _is_ref(class_item):
-                callable_refs[i] = class_item
+                callable_refs[i] = (class_item.module, class_item.function)
+                callable_origin_refs[i] = class_item.origin_index
+                if class_item.origin_is_ext:
+                    callable_origin_is_ext[i] = True
             stack.append(unknown)
-            continue
-
-        if name == "STOP":
-            # Reset stack and memo at pickle stream boundaries so that
-            # references from a previous stream cannot leak into the next
-            # one (multi-stream / appended-pickle scenarios).
-            stack.clear()
-            memo.clear()
-            next_memo_index = 0
             continue
 
         if name in {"BINPERSID"}:
             _pop()
             stack.append(unknown)
-            continue
-
-        if name == "STOP":
-            # Clear memo at stream boundaries so that a safe memo entry from
-            # stream 1 cannot be inherited by a dangerous callable in stream 2
-            # (cross-stream memo contamination).
-            memo.clear()
-            next_memo_index = 0
-            stack.clear()
             continue
 
         if name in {
@@ -2128,15 +2450,35 @@ def _build_symbolic_reference_maps(
             "BINUNICODE8",
         }:
             stack.append(unknown)
+            continue
 
-        if name == "STOP":
-            # Reset memo and stack at pickle stream boundaries so that
-            # references from one stream don't leak into the next in
-            # multi-pickle files (e.g. PyTorch .pt containers).
-            memo.clear()
-            stack.clear()
-            next_memo_index = 0
+        if name == "NEXT_BUFFER":
+            stack.append(unknown)
+            continue
 
+        if name == "READONLY_BUFFER":
+            continue
+
+    return stack_global_refs, callable_refs, callable_origin_refs, callable_origin_is_ext
+
+
+def _build_symbolic_reference_maps(
+    opcodes: list[tuple],
+) -> tuple[dict[int, tuple[str, str]], dict[int, tuple[str, str]]]:
+    """
+    Build symbolic maps of callable references in an opcode stream.
+
+    Returns:
+        Tuple of:
+        - stack_global_refs: opcode index -> (module, function) for STACK_GLOBAL
+        - callable_refs: opcode index -> (module, function) for REDUCE/NEWOBJ/OBJ/INST call targets
+    """
+    (
+        stack_global_refs,
+        callable_refs,
+        _callable_origin_refs,
+        _callable_origin_is_ext,
+    ) = _simulate_symbolic_reference_maps(opcodes)
     return stack_global_refs, callable_refs
 
 
@@ -2478,6 +2820,10 @@ def is_suspicious_global(mod: str, func: str) -> bool:
     First checks against ML_SAFE_GLOBALS allowlist to reduce false positives
     for legitimate ML framework operations.
     """
+    # STEP 0: Always flag risky ML imports before any allowlist checks.
+    if _is_risky_ml_import(mod, func):
+        return True
+
     # STEP 1: Check ML_SAFE_GLOBALS allowlist first
     # If the module.function is in the safe list, it's not suspicious
     if mod in ML_SAFE_GLOBALS:
@@ -2555,6 +2901,7 @@ def is_dangerous_reduce_pattern(
     opcodes: list[tuple],
     stack_global_refs: dict[int, tuple[str, str]] | None = None,
     callable_refs: dict[int, tuple[str, str]] | None = None,
+    callable_origin_is_ext: dict[int, bool] | None = None,
 ) -> dict[str, Any] | None:
     """
     Check for patterns that indicate a dangerous __reduce__ method.
@@ -2565,9 +2912,12 @@ def is_dangerous_reduce_pattern(
     modules are handled by the individual GLOBAL/REDUCE checks in the main loop.
     """
 
-    def _is_dangerous_ref(mod: str, func: str) -> bool:
+    def _is_dangerous_ref(mod: str, func: str, *, origin_is_ext: bool = False) -> bool:
         """Check if a module.function reference is dangerous enough to flag."""
-        if _is_copyreg_extension_ref(mod):
+        if origin_is_ext or _is_copyreg_extension_ref(mod):
+            return True
+
+        if _is_risky_ml_import(mod, func):
             return True
 
         full_ref = f"{mod}.{func}"
@@ -2584,13 +2934,25 @@ def is_dangerous_reduce_pattern(
         # Check SUSPICIOUS_GLOBALS (the fallback)
         return is_suspicious_global(mod, func)
 
-    if stack_global_refs is None or callable_refs is None:
-        computed_stack_refs, computed_callable_refs = _build_symbolic_reference_maps(opcodes)
+    if stack_global_refs is None or callable_refs is None or callable_origin_is_ext is None:
+        (
+            computed_stack_refs,
+            computed_callable_refs,
+            _computed_callable_origin_refs,
+            computed_callable_origin_is_ext,
+        ) = _simulate_symbolic_reference_maps(opcodes)
     else:
-        computed_stack_refs, computed_callable_refs = stack_global_refs, callable_refs
+        computed_stack_refs, computed_callable_refs, computed_callable_origin_is_ext = (
+            stack_global_refs,
+            callable_refs,
+            callable_origin_is_ext,
+        )
 
     resolved_stack_globals = stack_global_refs if stack_global_refs is not None else computed_stack_refs
     resolved_callables = callable_refs if callable_refs is not None else computed_callable_refs
+    resolved_callable_origin_is_ext = (
+        callable_origin_is_ext if callable_origin_is_ext is not None else computed_callable_origin_is_ext
+    )
 
     # Look for common patterns in __reduce__ exploits
     for i, (opcode, arg, pos) in enumerate(opcodes):
@@ -2599,7 +2961,7 @@ def is_dangerous_reduce_pattern(
             reduce_ref = resolved_callables.get(i)
             if reduce_ref:
                 mod, func = reduce_ref
-                if _is_dangerous_ref(mod, func):
+                if _is_dangerous_ref(mod, func, origin_is_ext=resolved_callable_origin_is_ext.get(i, False)):
                     return {
                         "pattern": "RESOLVED_REDUCE_CALL_TARGET",
                         "module": mod,
@@ -2682,7 +3044,7 @@ def is_dangerous_reduce_pattern(
             ref = resolved_callables.get(i)
             if ref:
                 mod, func = ref
-                if _is_dangerous_ref(mod, func):
+                if _is_dangerous_ref(mod, func, origin_is_ext=resolved_callable_origin_is_ext.get(i, False)):
                     return {
                         "pattern": f"{opcode.name}_EXECUTION",
                         "argument": f"{mod}.{func}",
@@ -2719,6 +3081,7 @@ def check_opcode_sequence(
     ml_context: dict,
     stack_global_refs: dict[int, tuple[str, str]] | None = None,
     callable_refs: dict[int, tuple[str, str]] | None = None,
+    callable_origin_is_ext: dict[int, bool] | None = None,
 ) -> list[dict[str, Any]]:
     """
     Analyze the full sequence of opcodes for suspicious patterns
@@ -2731,13 +3094,25 @@ def check_opcode_sequence(
     if _should_ignore_opcode_sequence(opcodes, ml_context):
         return suspicious_patterns  # Return empty list for legitimate ML content
 
-    if stack_global_refs is None or callable_refs is None:
-        computed_stack_refs, computed_callable_refs = _build_symbolic_reference_maps(opcodes)
+    if stack_global_refs is None or callable_refs is None or callable_origin_is_ext is None:
+        (
+            computed_stack_refs,
+            computed_callable_refs,
+            _computed_callable_origin_refs,
+            computed_callable_origin_is_ext,
+        ) = _simulate_symbolic_reference_maps(opcodes)
     else:
-        computed_stack_refs, computed_callable_refs = stack_global_refs, callable_refs
+        computed_stack_refs, computed_callable_refs, computed_callable_origin_is_ext = (
+            stack_global_refs,
+            callable_refs,
+            callable_origin_is_ext,
+        )
 
     resolved_stack_globals = stack_global_refs if stack_global_refs is not None else computed_stack_refs
     resolved_callables = callable_refs if callable_refs is not None else computed_callable_refs
+    resolved_callable_origin_is_ext = (
+        callable_origin_is_ext if callable_origin_is_ext is not None else computed_callable_origin_is_ext
+    )
 
     # Memo and framing opcodes are structural (data storage/retrieval, not code
     # execution).  They appear in every non-trivial pickle stream and counting
@@ -2884,7 +3259,7 @@ def check_opcode_sequence(
                 if associated_ref:
                     mod, func = associated_ref
                     # Only skip if in safe globals
-                    if _is_safe_ml_global(mod, func):
+                    if _is_safe_ml_global(mod, func) and not resolved_callable_origin_is_ext.get(i, False):
                         is_dangerous_opcode = False
                         last_construction_safe = True
 
@@ -2895,7 +3270,7 @@ def check_opcode_sequence(
                 associated_ref = resolved_callables.get(i)
                 if associated_ref:
                     mod, func = associated_ref
-                    if _is_safe_ml_global(mod, func):
+                    if _is_safe_ml_global(mod, func) and not resolved_callable_origin_is_ext.get(i, False):
                         is_dangerous_opcode = False
                         last_construction_safe = True
 
@@ -2936,7 +3311,7 @@ def check_opcode_sequence(
                 associated_ref = resolved_callables.get(i)
                 if associated_ref:
                     mod, func = associated_ref
-                    if _is_safe_ml_global(mod, func):
+                    if _is_safe_ml_global(mod, func) and not resolved_callable_origin_is_ext.get(i, False):
                         is_dangerous_opcode = False
 
             else:
@@ -3793,84 +4168,51 @@ class PickleScanner(BaseScanner):
 
     def _extract_globals_advanced(
         self,
-        data: IO[bytes],
+        data: BinaryIO,
         multiple_pickles: bool = True,
         scan_start_time: float | None = None,
-    ) -> set[tuple[str, str]]:
+    ) -> set[tuple[str, str, str]]:
         """Advanced pickle global extraction with STACK_GLOBAL and memo support."""
-        globals_found: set[tuple[str, str]] = set()
-        memo: dict[int | str, str] = {}
-        extracted_opcodes = 0
+        globals_found: set[tuple[str, str, str]] = set()
         effective_scan_start_time = scan_start_time if scan_start_time is not None else self.scan_start_time
+        deadline = effective_scan_start_time + self.timeout if effective_scan_start_time is not None else None
 
-        last_byte = b"dummy"
-        while last_byte != b"":
-            extraction_truncated = False
-            try:
-                ops: list[tuple[Any, Any, int | None]] = []
-                op_iter = pickletools.genops(data)
-                while True:
-                    if extracted_opcodes >= self.max_opcodes:
-                        logger.warning(
-                            f"Advanced global extraction stopped after reaching max_opcodes ({self.max_opcodes})"
-                        )
-                        extraction_truncated = True
-                        break
+        try:
+            ops = list(
+                _genops_with_fallback(
+                    data,
+                    multi_stream=multiple_pickles,
+                    max_items=self.max_opcodes,
+                    deadline=deadline,
+                )
+            )
+        except Exception as e:
+            if globals_found:
+                logger.warning(f"Pickle parsing failed, but found {len(globals_found)} globals: {e}")
+                return globals_found
+            logger.debug(f"Pickle parsing failed during advanced global extraction: {e}")
+            return set()
 
-                    if (
-                        effective_scan_start_time is not None
-                        and (time.time() - effective_scan_start_time) > self.timeout
-                    ):
-                        logger.warning(f"Advanced global extraction stopped after exceeding timeout ({self.timeout}s)")
-                        extraction_truncated = True
-                        break
+        if len(ops) >= self.max_opcodes:
+            logger.warning(f"Advanced global extraction stopped after reaching max_opcodes ({self.max_opcodes})")
+        elif deadline is not None and time.time() > deadline:
+            logger.warning(f"Advanced global extraction stopped after exceeding timeout ({self.timeout}s)")
 
-                    try:
-                        op = next(op_iter)
-                    except StopIteration:
-                        break
+        stack_global_refs, _callable_refs = _build_symbolic_reference_maps(ops)
 
-                    ops.append(op)
-                    extracted_opcodes += 1
-            except Exception as e:
-                if globals_found:
-                    logger.warning(f"Pickle parsing failed, but found {len(globals_found)} globals: {e}")
-                    return globals_found
-                # For internal scanner calls (like joblib), don't fail the entire scan
-                # Just log the issue and return empty set
-                logger.debug(f"Pickle parsing failed with no globals found: {e}")
-                return set()
-
-            stack_global_refs, _callable_refs = _build_symbolic_reference_maps(ops)
-
-            last_byte = data.read(1)
-            if last_byte:
-                data.seek(-1, 1)
-
-            for n, (opcode, arg, _pos) in enumerate(ops):
-                op_name = opcode.name
-                if op_name == "MEMOIZE" and n > 0:
-                    memo[len(memo)] = ops[n - 1][1]
-                elif op_name in {"PUT", "BINPUT", "LONG_BINPUT"} and n > 0:
-                    memo[arg] = ops[n - 1][1]
-                elif op_name in {"GLOBAL", "INST"}:
-                    parts = str(arg).split(" ", 1)
-                    if len(parts) == 2:
-                        globals_found.add((parts[0], parts[1]))
-                    elif parts:
-                        globals_found.add((parts[0], ""))
-                elif op_name == "STACK_GLOBAL":
-                    resolved = stack_global_refs.get(n)
-                    if resolved:
-                        globals_found.add(resolved)
-                    else:
-                        logger.debug(f"STACK_GLOBAL parsing failed at position {n}")
-                        globals_found.add(("unknown", "unknown"))
-
-            if not multiple_pickles:
-                break
-            if extraction_truncated:
-                break
+        for n, (opcode, arg, _pos) in enumerate(ops):
+            op_name = opcode.name
+            if op_name in {"GLOBAL", "INST"} and isinstance(arg, str):
+                parsed = _parse_module_function(arg)
+                if parsed is not None:
+                    globals_found.add((*parsed, op_name))
+            elif op_name == "STACK_GLOBAL":
+                resolved = stack_global_refs.get(n)
+                if resolved:
+                    globals_found.add((*resolved, op_name))
+                else:
+                    logger.debug(f"STACK_GLOBAL parsing failed at position {n}")
+                    globals_found.add(("unknown", "unknown", op_name))
         return globals_found
 
     def _extract_stack_global_values(
@@ -3960,6 +4302,55 @@ class PickleScanner(BaseScanner):
         else:
             result.metadata.setdefault("disabled_checks", []).append("Network Communication Detection")
 
+        structural_findings = _scan_structural_tamper_findings(file_data)
+        for finding in structural_findings:
+            kind = finding["kind"]
+            position = finding.get("position")
+            stream_offset = finding.get("stream_offset")
+            if kind == "duplicate_proto":
+                prev_protocol = finding.get("previous_protocol")
+                protocol = finding.get("protocol")
+                result.add_check(
+                    name="Pickle Structural Tamper Check",
+                    passed=False,
+                    message=(
+                        "Duplicate PROTO opcode in pickle stream "
+                        f"at byte position {position} (previous={prev_protocol}, current={protocol})"
+                    ),
+                    severity=IssueSeverity.INFO,
+                    location=f"{self.current_file_path} (pos {position})",
+                    details={
+                        "tamper_type": kind,
+                        "position": position,
+                        "stream_offset": stream_offset,
+                        "protocol": protocol,
+                        "previous_protocol": prev_protocol,
+                    },
+                    why=(
+                        "Multiple protocol declarations inside one pickle stream are structurally unusual and can be "
+                        "used to probe parser differences between tools."
+                    ),
+                    rule_code="S902",
+                )
+            elif kind == "misplaced_proto":
+                result.add_check(
+                    name="Pickle Structural Tamper Check",
+                    passed=False,
+                    message=f"Misplaced PROTO opcode in pickle stream at byte position {position}",
+                    severity=IssueSeverity.INFO,
+                    location=f"{self.current_file_path} (pos {position})",
+                    details={
+                        "tamper_type": kind,
+                        "position": position,
+                        "stream_offset": stream_offset,
+                        "protocol": finding.get("protocol"),
+                    },
+                    why=(
+                        "Binary protocol declarations are expected at the beginning of a stream. A later PROTO opcode "
+                        "indicates structural tampering or malformed serialization."
+                    ),
+                    rule_code="S902",
+                )
         # Check pickle protocol version
         if file_data and len(file_data) >= 2:
             if file_data[0] == 0x80:  # Protocol 2+
@@ -4023,7 +4414,12 @@ class PickleScanner(BaseScanner):
             # Store warnings for ML-context-aware processing
             stack_depth_warnings: list[dict[str, int | str]] = []
 
-            for opcode, arg, pos in _genops_with_fallback(file_obj, multi_stream=True):
+            for opcode, arg, pos in _genops_with_fallback(
+                file_obj,
+                multi_stream=True,
+                max_items=self.max_opcodes + 1,
+                deadline=result.start_time + self.timeout,
+            ):
                 # Check for interrupts periodically during opcode processing
                 if opcode_count % 1000 == 0:  # Check every 1000 opcodes
                     self.check_interrupted()
@@ -4126,6 +4522,23 @@ class PickleScanner(BaseScanner):
                     )
                     break
 
+            if time.time() - result.start_time > self.timeout and not any(
+                check.name == "Scan Timeout Check" and check.status == CheckStatus.FAILED for check in result.checks
+            ):
+                result.add_check(
+                    name="Scan Timeout Check",
+                    passed=False,
+                    message=f"Scanning timed out after {self.timeout} seconds",
+                    severity=IssueSeverity.INFO,
+                    location=self.current_file_path,
+                    details={"opcode_count": opcode_count, "timeout": self.timeout},
+                    why=(
+                        "The scan exceeded the configured time limit. Large or complex pickle files may take "
+                        "longer to analyze due to the number of opcodes that need to be processed."
+                    ),
+                    rule_code="S902",
+                )
+
             # Add successful opcode count check if within limits
             if opcode_count <= self.max_opcodes:
                 result.add_check(
@@ -4142,7 +4555,13 @@ class PickleScanner(BaseScanner):
 
             # ML CONTEXT FILTERING: Analyze ML context once for the entire pickle
             ml_context = _detect_ml_context(opcodes)
-            stack_global_refs, callable_refs = _build_symbolic_reference_maps(opcodes)
+            (
+                stack_global_refs,
+                callable_refs,
+                callable_origin_refs,
+                callable_origin_is_ext,
+            ) = _simulate_symbolic_reference_maps(opcodes)
+            executed_import_origins = set(callable_origin_refs.values())
 
             # CVE-2025-32434 specific opcode sequence analysis - REMOVED
             # Now only show CVE info in REDUCE opcode detection messages
@@ -4269,7 +4688,7 @@ class PickleScanner(BaseScanner):
                 result.metadata["first_pickle_end_pos"] = first_pickle_end_pos
 
             # Analyze globals extracted from all pickle streams
-            for mod, func in advanced_globals:
+            for mod, func, opcode_name in advanced_globals:
                 if _is_actually_dangerous_global(mod, func, ml_context):
                     suspicious_count += 1
                     base_sev = IssueSeverity.WARNING if mod in WARNING_SEVERITY_MODULES else IssueSeverity.CRITICAL
@@ -4280,7 +4699,7 @@ class PickleScanner(BaseScanner):
                     )
                     rule_code = get_import_rule_code(mod, func)
                     if not rule_code:
-                        rule_code = "S205"  # STACK_GLOBAL/GLOBAL fallback
+                        rule_code = get_pickle_opcode_rule_code(opcode_name) or "S206"
                     result.add_check(
                         name="Advanced Global Reference Check",
                         passed=False,
@@ -4291,13 +4710,13 @@ class PickleScanner(BaseScanner):
                         details={
                             "module": mod,
                             "function": func,
-                            "opcode": "STACK_GLOBAL",
+                            "opcode": opcode_name,
                             "ml_context_confidence": ml_context.get(
                                 "overall_confidence",
                                 0,
                             ),
                         },
-                        why=get_import_explanation(mod),
+                        why=get_import_explanation(f"{mod}.{func}"),
                     )
 
             # Record successful ML context validation if content appears safe
@@ -4318,27 +4737,34 @@ class PickleScanner(BaseScanner):
             for i, (opcode, arg, pos) in enumerate(opcodes):
                 # Check for GLOBAL opcodes that might reference suspicious modules
                 if opcode.name == "GLOBAL" and isinstance(arg, str):
-                    # Handle both "module function" and "module.function" formats
-                    parts = arg.split(" ", 1) if " " in arg else arg.rsplit(".", 1) if "." in arg else [arg, ""]
-
-                    if len(parts) == 2:
-                        mod, func = parts
-                        if _is_actually_dangerous_global(mod, func, ml_context):
+                    parsed = _parse_module_function(arg)
+                    if parsed:
+                        is_import_only = i not in executed_import_origins
+                        mod, func = parsed
+                        is_failure, base_sev_global, classification = _classify_import_reference(
+                            mod,
+                            func,
+                            ml_context,
+                            is_import_only=is_import_only,
+                        )
+                        if is_failure and base_sev_global is not None:
                             suspicious_count += 1
-                            base_sev = (
-                                IssueSeverity.WARNING if mod in WARNING_SEVERITY_MODULES else IssueSeverity.CRITICAL
-                            )
+                            severity_level_global: IssueSeverity = base_sev_global
                             severity = _get_context_aware_severity(
-                                base_sev,
+                                severity_level_global,
                                 ml_context,
                                 issue_type="dangerous_global",
                             )
-                            # Get rule code for this import/module
-                            rule_code = get_import_rule_code(mod, func)
+                            rule_code = get_import_rule_code(mod, func) or "S206"
+                            message = (
+                                f"Suspicious import-only reference {mod}.{func}"
+                                if classification == "unknown_third_party" and is_import_only
+                                else f"Suspicious reference {mod}.{func}"
+                            )
                             result.add_check(
                                 name="Global Module Reference Check",
                                 passed=False,
-                                message=f"Suspicious reference {mod}.{func}",
+                                message=message,
                                 severity=severity,
                                 location=f"{self.current_file_path} (pos {pos})",
                                 rule_code=rule_code,
@@ -4348,15 +4774,13 @@ class PickleScanner(BaseScanner):
                                     "position": pos,
                                     "opcode": opcode.name,
                                     "import_reference": f"{mod}.{func}",
-                                    "ml_context_confidence": ml_context.get(
-                                        "overall_confidence",
-                                        0,
-                                    ),
+                                    "import_only": is_import_only,
+                                    "classification": classification,
+                                    "ml_context_confidence": ml_context.get("overall_confidence", 0),
                                 },
-                                why=get_import_explanation(mod),
+                                why=get_import_explanation(f"{mod}.{func}"),
                             )
-                        else:
-                            # Record successful validation of safe global
+                        elif classification == "safe_allowlisted":
                             result.add_check(
                                 name="Global Module Reference Check",
                                 passed=True,
@@ -4368,12 +4792,11 @@ class PickleScanner(BaseScanner):
                                     "import_reference": f"{mod}.{func}",
                                     "position": pos,
                                     "opcode": opcode.name,
-                                    "ml_context_confidence": ml_context.get(
-                                        "overall_confidence",
-                                        0,
-                                    ),
+                                    "import_only": is_import_only,
+                                    "classification": classification,
+                                    "ml_context_confidence": ml_context.get("overall_confidence", 0),
                                 },
-                                rule_code=None,  # Passing check
+                                rule_code=None,
                             )
 
                 # Check REDUCE opcodes for potential security issues
@@ -4386,8 +4809,11 @@ class PickleScanner(BaseScanner):
                         stack_global_refs=stack_global_refs,
                         callable_refs=callable_refs,
                     )
+                    reduce_origin_is_ext = callable_origin_is_ext.get(i, False)
                     is_safe_global = (
-                        _is_safe_ml_global(reduce_mod, reduce_func) if reduce_mod and reduce_func else False
+                        _is_safe_ml_global(reduce_mod, reduce_func)
+                        if reduce_mod and reduce_func and not reduce_origin_is_ext
+                        else False
                     )
 
                     # Report REDUCE based on safe globals check
@@ -4420,7 +4846,7 @@ class PickleScanner(BaseScanner):
                             # NOT in safe globals - check if it's actually dangerous
                             # Use _is_actually_dangerous_global to determine severity (CRITICAL vs WARNING)
                             if reduce_mod and reduce_func:
-                                is_actually_dangerous = _is_actually_dangerous_global(
+                                is_actually_dangerous = reduce_origin_is_ext or _is_actually_dangerous_global(
                                     reduce_mod, reduce_func, ml_context
                                 )
                                 if is_actually_dangerous:
@@ -4467,40 +4893,64 @@ class PickleScanner(BaseScanner):
                                         ml_context,
                                     )
 
-                                # CVE-2025-32434 is specific to torch.load() and
-                                # should only be referenced for PyTorch file formats
-                                _ext = os.path.splitext(self.current_file_path)[1].lower()
-                                _is_pytorch_file = _ext in {".pt", ".pth"} or (
-                                    _ext == ".bin" and "pytorch" in ml_context.get("frameworks", {})
-                                )
-                                if _is_pytorch_file:
-                                    _reduce_msg = (
-                                        f"Found REDUCE opcode with non-allowlisted global: {associated_global}. "
-                                        f"This may indicate CVE-2025-32434 exploitation (RCE via torch.load)"
-                                    )
+                                if is_actually_dangerous:
+                                    _reduce_msg = f"Found REDUCE opcode invoking dangerous global: {associated_global}"
                                     _reduce_details: dict[str, Any] = {
                                         "position": pos,
                                         "opcode": opcode.name,
                                         "associated_global": associated_global,
-                                        "cve_id": "CVE-2025-32434",
+                                        "origin_is_ext": reduce_origin_is_ext,
                                         "ml_context_confidence": ml_context.get(
                                             "overall_confidence",
                                             0,
                                         ),
                                     }
                                 else:
-                                    _reduce_msg = (
-                                        f"Found REDUCE opcode with non-allowlisted global: {associated_global}"
+                                    # CVE-2025-32434 is specific to torch.load() and
+                                    # should only be referenced for PyTorch file formats
+                                    _ext = os.path.splitext(self.current_file_path)[1].lower()
+                                    _is_pytorch_file = _ext in {".pt", ".pth"} or (
+                                        _ext == ".bin" and "pytorch" in ml_context.get("frameworks", {})
                                     )
-                                    _reduce_details = {
-                                        "position": pos,
-                                        "opcode": opcode.name,
-                                        "associated_global": associated_global,
-                                        "ml_context_confidence": ml_context.get(
-                                            "overall_confidence",
-                                            0,
-                                        ),
-                                    }
+                                    if _is_pytorch_file:
+                                        _reduce_msg = (
+                                            f"Found REDUCE opcode with non-allowlisted global: {associated_global}. "
+                                            f"This may indicate CVE-2025-32434 exploitation (RCE via torch.load)"
+                                        )
+                                        _reduce_details = {
+                                            "position": pos,
+                                            "opcode": opcode.name,
+                                            "associated_global": associated_global,
+                                            "origin_is_ext": reduce_origin_is_ext,
+                                            "cve_id": "CVE-2025-32434",
+                                            "cvss": 9.8,
+                                            "cwe": "CWE-502",
+                                            "description": (
+                                                "RCE when loading models with torch.load(weights_only=True)"
+                                            ),
+                                            "remediation": (
+                                                "Upgrade to PyTorch 2.6.0 or later, and avoid "
+                                                "torch.load(weights_only=True) with untrusted models."
+                                            ),
+                                            "ml_context_confidence": ml_context.get(
+                                                "overall_confidence",
+                                                0,
+                                            ),
+                                        }
+                                    else:
+                                        _reduce_msg = (
+                                            f"Found REDUCE opcode with non-allowlisted global: {associated_global}"
+                                        )
+                                        _reduce_details = {
+                                            "position": pos,
+                                            "opcode": opcode.name,
+                                            "associated_global": associated_global,
+                                            "origin_is_ext": reduce_origin_is_ext,
+                                            "ml_context_confidence": ml_context.get(
+                                                "overall_confidence",
+                                                0,
+                                            ),
+                                        }
 
                                 result.add_check(
                                     name="REDUCE Opcode Safety Check",
@@ -4522,7 +4972,12 @@ class PickleScanner(BaseScanner):
                         stack_global_refs=stack_global_refs,
                         callable_refs=callable_refs,
                     )
-                    is_safe_class = _is_safe_ml_global(class_mod, class_name) if class_mod and class_name else False
+                    class_origin_is_ext = callable_origin_is_ext.get(i, False)
+                    is_safe_class = (
+                        _is_safe_ml_global(class_mod, class_name)
+                        if class_mod and class_name and not class_origin_is_ext
+                        else False
+                    )
 
                     # Report based on safe class check (same logic as REDUCE)
                     if associated_class is not None:
@@ -4551,7 +5006,9 @@ class PickleScanner(BaseScanner):
                         else:
                             # NOT in safe classes - check if actually dangerous
                             if class_mod and class_name:
-                                is_actually_dangerous = _is_actually_dangerous_global(class_mod, class_name, ml_context)
+                                is_actually_dangerous = class_origin_is_ext or _is_actually_dangerous_global(
+                                    class_mod, class_name, ml_context
+                                )
                                 if is_actually_dangerous:
                                     # Dangerous class (e.g., os.system wrapper) - CRITICAL
                                     severity = _get_context_aware_severity(
@@ -4603,6 +5060,7 @@ class PickleScanner(BaseScanner):
                                         "position": pos,
                                         "opcode": opcode.name,
                                         "associated_class": associated_class,
+                                        "origin_is_ext": class_origin_is_ext,
                                         "ml_context_confidence": ml_context.get(
                                             "overall_confidence",
                                             0,
@@ -4811,25 +5269,32 @@ class PickleScanner(BaseScanner):
                 if opcode.name == "STACK_GLOBAL":
                     resolved = stack_global_refs.get(i)
                     if resolved:
+                        is_import_only = i not in executed_import_origins
                         mod, func = resolved
-                        if _is_actually_dangerous_global(mod, func, ml_context):
+                        is_failure, base_sev_stack, classification = _classify_import_reference(
+                            mod,
+                            func,
+                            ml_context,
+                            is_import_only=is_import_only,
+                        )
+                        if is_failure and base_sev_stack is not None:
                             suspicious_count += 1
-                            base_sev = (
-                                IssueSeverity.WARNING if mod in WARNING_SEVERITY_MODULES else IssueSeverity.CRITICAL
-                            )
+                            severity_level_stack: IssueSeverity = base_sev_stack
                             severity = _get_context_aware_severity(
-                                base_sev,
+                                severity_level_stack,
                                 ml_context,
                                 issue_type="dangerous_global",
                             )
-                            # Get rule code for this import/module
-                            rule_code = get_import_rule_code(mod, func)
-                            if not rule_code:
-                                rule_code = "S205"  # STACK_GLOBAL
+                            rule_code = get_import_rule_code(mod, func) or "S205"
+                            message = (
+                                f"Suspicious import-only module reference found: {mod}.{func}"
+                                if classification == "unknown_third_party" and is_import_only
+                                else f"Suspicious module reference found: {mod}.{func}"
+                            )
                             result.add_check(
                                 name="STACK_GLOBAL Module Check",
                                 passed=False,
-                                message=f"Suspicious module reference found: {mod}.{func}",
+                                message=message,
                                 severity=severity,
                                 location=f"{self.current_file_path} (pos {pos})",
                                 rule_code=rule_code,
@@ -4838,15 +5303,14 @@ class PickleScanner(BaseScanner):
                                     "function": func,
                                     "position": pos,
                                     "opcode": opcode.name,
-                                    "ml_context_confidence": ml_context.get(
-                                        "overall_confidence",
-                                        0,
-                                    ),
+                                    "import_reference": f"{mod}.{func}",
+                                    "import_only": is_import_only,
+                                    "classification": classification,
+                                    "ml_context_confidence": ml_context.get("overall_confidence", 0),
                                 },
-                                why=get_import_explanation(mod),
+                                why=get_import_explanation(f"{mod}.{func}"),
                             )
-                        else:
-                            # Record successful validation of safe STACK_GLOBAL
+                        elif classification == "safe_allowlisted":
                             result.add_check(
                                 name="STACK_GLOBAL Module Check",
                                 passed=True,
@@ -4855,17 +5319,16 @@ class PickleScanner(BaseScanner):
                                 details={
                                     "module": mod,
                                     "function": func,
+                                    "import_reference": f"{mod}.{func}",
                                     "position": pos,
                                     "opcode": opcode.name,
-                                    "ml_context_confidence": ml_context.get(
-                                        "overall_confidence",
-                                        0,
-                                    ),
+                                    "import_only": is_import_only,
+                                    "classification": classification,
+                                    "ml_context_confidence": ml_context.get("overall_confidence", 0),
                                 },
-                                rule_code=None,  # Passing check
+                                rule_code=None,
                             )
                     else:
-                        # Only warn about insufficient context if not ML content
                         if not ml_context.get("is_ml_content", False):
                             result.add_check(
                                 name="STACK_GLOBAL Context Check",
@@ -4878,10 +5341,7 @@ class PickleScanner(BaseScanner):
                                     "position": pos,
                                     "opcode": opcode.name,
                                     "stack_size": "unknown",
-                                    "ml_context_confidence": ml_context.get(
-                                        "overall_confidence",
-                                        0,
-                                    ),
+                                    "ml_context_confidence": ml_context.get("overall_confidence", 0),
                                 },
                                 why=(
                                     "STACK_GLOBAL requires two strings on the stack (module and function name) to "
@@ -4897,6 +5357,7 @@ class PickleScanner(BaseScanner):
                 opcodes,
                 stack_global_refs=stack_global_refs,
                 callable_refs=callable_refs,
+                callable_origin_is_ext=callable_origin_is_ext,
             )
             if dangerous_pattern:
                 suspicious_count += 1
@@ -4927,7 +5388,7 @@ class PickleScanner(BaseScanner):
                             0,
                         ),
                     },
-                    why=get_import_explanation(module_name)
+                    why=get_import_explanation(f"{module_name}.{func_name}")
                     if module_name
                     else "A dangerous pattern was detected that could execute arbitrary code during unpickling.",
                 )
@@ -4950,6 +5411,7 @@ class PickleScanner(BaseScanner):
                 ml_context,
                 stack_global_refs=stack_global_refs,
                 callable_refs=callable_refs,
+                callable_origin_is_ext=callable_origin_is_ext,
             )
             if suspicious_sequences:
                 for sequence in suspicious_sequences:
@@ -5008,7 +5470,7 @@ class PickleScanner(BaseScanner):
             # (e.g. HuggingFace cache stores files as hash blobs without extensions)
             has_joblib_globals = any(
                 mod in {"joblib", "sklearn", "numpy"} or mod.startswith(("joblib.", "sklearn.", "numpy."))
-                for mod, _func in advanced_globals
+                for mod, _func, _opcode in advanced_globals
             )
             is_joblib_content = is_serialization_ext or (not file_ext and has_joblib_globals)
 
@@ -5036,15 +5498,15 @@ class PickleScanner(BaseScanner):
             # legitimate PyTorch structures and no dangerous global references appear.
             global_validation_context = {"is_ml_content": False, "overall_confidence": 0.0, "frameworks": {}}
             has_dangerous_advanced_global = any(
-                _is_actually_dangerous_global(mod, func, global_validation_context) for mod, func in advanced_globals
+                _is_actually_dangerous_global(mod, func, global_validation_context)
+                for mod, func, _opcode in advanced_globals
             )
             has_pytorch_advanced_global = any(
-                mod == "torch" or mod.startswith("torch.") for mod, _func in advanced_globals
+                mod == "torch" or mod.startswith("torch.") for mod, _func, _opcode in advanced_globals
             )
-            has_ordereddict_global = ("collections", "OrderedDict") in advanced_globals or (
-                "torch",
-                "OrderedDict",
-            ) in advanced_globals
+            has_ordereddict_global = any(
+                mod == "collections" and func == "OrderedDict" for mod, func, _opcode in advanced_globals
+            ) or any(mod == "torch" and func == "OrderedDict" for mod, func, _opcode in advanced_globals)
             has_legitimate_pytorch_globals = (
                 bool(advanced_globals)
                 and (has_pytorch_advanced_global or has_ordereddict_global)
