@@ -69,12 +69,13 @@ def _format_stack_global_operand_preview(value: Any) -> str:
     if len(preview) > _STACK_GLOBAL_OPERAND_PREVIEW_MAX:
         preview = preview[:_STACK_GLOBAL_OPERAND_PREVIEW_MAX] + "...<truncated>"
 
+    preview_value_len: int | None
     try:
-        value_len = len(value)
+        preview_value_len = len(value)
     except Exception:
-        value_len = None
+        preview_value_len = None
 
-    length_suffix = f" (len={value_len})" if value_len is not None else ""
+    length_suffix = f" (len={preview_value_len})" if preview_value_len is not None else ""
     return f"{type(value).__name__}:{preview}{length_suffix}"
 
 
