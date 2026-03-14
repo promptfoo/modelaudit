@@ -42,10 +42,14 @@ class TestCVE20196446ObjectDtype:
         scanner = NumPyScanner()
         result = scanner.scan(str(path))
 
+        assert result.success is True
         cve_checks = [c for c in result.checks if "CVE-2019-6446" in c.name or "CVE-2019-6446" in c.message]
         assert len(cve_checks) > 0, f"Should detect CVE-2019-6446. Checks: {[c.message for c in result.checks]}"
         assert cve_checks[0].severity == IssueSeverity.WARNING
         assert cve_checks[0].details.get("cve_id") == "CVE-2019-6446"
+        assert not any(c.name == "Data Type Safety Check" and c.status.value == "failed" for c in result.checks), (
+            f"Object dtype should not be treated as a scan failure: {[c.message for c in result.checks]}"
+        )
 
     def test_numeric_dtype_no_cve(self, tmp_path):
         """Numeric dtype arrays should not trigger CVE-2019-6446."""
@@ -98,6 +102,7 @@ class TestCVE20196446ObjectDtype:
         scanner = NumPyScanner()
         result = scanner.scan(str(path))
 
+        assert result.success is True
         cve_checks = [c for c in result.checks if "CVE-2019-6446" in (c.name + c.message)]
         assert len(cve_checks) > 0, "Structured dtype with object field should trigger CVE"
 
@@ -126,6 +131,8 @@ def test_object_dtype_numpy_recurses_into_pickle_exec(tmp_path) -> None:
     scanner = NumPyScanner()
     result = scanner.scan(str(path))
 
+    assert result.success is True
+    assert result.has_errors is True
     failed = _failed_checks(result)
     assert any("CVE-2019-6446" in (c.name + c.message) for c in failed)
     assert any("exec" in (c.message.lower()) for c in failed)
@@ -139,6 +146,8 @@ def test_object_dtype_numpy_recurses_into_pickle_ssl(tmp_path) -> None:
     scanner = NumPyScanner()
     result = scanner.scan(str(path))
 
+    assert result.success is True
+    assert result.has_errors is True
     failed = _failed_checks(result)
     assert any("CVE-2019-6446" in (c.name + c.message) for c in failed)
     assert any("ssl.get_server_certificate" in c.message for c in failed)
@@ -179,6 +188,8 @@ def test_benign_object_dtype_numpy_no_nested_critical(tmp_path) -> None:
     scanner = NumPyScanner()
     result = scanner.scan(str(path))
 
+    assert result.success is True
+    assert result.has_errors is False
     assert any("CVE-2019-6446" in (c.name + c.message) for c in result.checks)
     assert not any(i.severity == IssueSeverity.CRITICAL for i in result.issues if "CVE-2019-6446" not in i.message)
 
@@ -204,7 +215,30 @@ def test_truncated_npy_fails_safely(tmp_path) -> None:
     scanner = NumPyScanner()
     result = scanner.scan(str(path))
 
-    assert any(i.severity == IssueSeverity.INFO for i in result.issues)
+    assert result.success is True
+    assert result.has_errors is False
+    assert any(
+        i.severity in {IssueSeverity.INFO, IssueSeverity.WARNING} and "corrupted pickle" in i.message.lower()
+        for i in result.issues
+    ), f"Expected a non-critical corruption finding, got: {[i.message for i in result.issues]}"
+
+
+def test_object_dtype_numpy_trailing_bytes_fail_integrity(tmp_path) -> None:
+    arr = np.array([{"k": "v"}], dtype=object)
+    path = tmp_path / "trailing.npy"
+    np.save(path, arr, allow_pickle=True)
+    path.write_bytes(path.read_bytes() + b"TRAILINGJUNK")
+
+    scanner = NumPyScanner()
+    result = scanner.scan(str(path))
+
+    assert result.success is False
+    assert any(
+        check.name == "File Integrity Check"
+        and check.status.value == "failed"
+        and "trailing bytes" in check.message.lower()
+        for check in result.checks
+    ), f"Expected trailing-byte integrity failure, got: {[c.message for c in result.checks]}"
 
 
 def test_corrupted_npz_fails_safely(tmp_path) -> None:

@@ -99,6 +99,75 @@ DANGEROUS_IMPORTS: dict[str, str] = {
         "The 'dill' module extends pickle's capabilities to serialize almost any Python object, including lambda "
         "functions and code objects. This significantly increases the attack surface for code execution."
     ),
+    "numpy.load": (
+        "The 'numpy.load' function can recursively deserialize object arrays via pickle support, enabling "
+        "second-stage payload loading from attacker-controlled files."
+    ),
+    "site.main": (
+        "The 'site.main' function executes Python startup path initialization and can trigger module-level "
+        "execution side effects in attacker-influenced environments."
+    ),
+    "_io.FileIO": (
+        "The '_io.FileIO' constructor performs direct file reads and writes, enabling arbitrary local file access "
+        "without using higher-level safety wrappers."
+    ),
+    "test.support.script_helper.assert_python_ok": (
+        "The 'assert_python_ok' helper launches a Python subprocess. In untrusted pickle payloads this is command "
+        "execution behavior, not benign test plumbing."
+    ),
+    "_osx_support._read_output": (
+        "The '_osx_support._read_output' helper executes shell commands to capture output, enabling command "
+        "execution from deserialization payloads."
+    ),
+    "_aix_support._read_cmd_output": (
+        "The '_aix_support._read_cmd_output' helper executes commands and captures process output, creating direct "
+        "command-execution risk."
+    ),
+    "_pyrepl.pager.pipe_pager": (
+        "The '_pyrepl.pager.pipe_pager' helper invokes pager subprocess flows and can be abused for process "
+        "execution during model loading."
+    ),
+    "torch.serialization.load": (
+        "The 'torch.serialization.load' loader performs nested PyTorch and pickle deserialization, which can invoke "
+        "attacker-controlled reconstruction callables."
+    ),
+    "torch._inductor.codecache.compile_file": (
+        "The 'torch._inductor.codecache.compile_file' path compiles and loads generated code artifacts, enabling "
+        "arbitrary code execution when attacker-controlled."
+    ),
+    "numpy.f2py.crackfortran.getlincoef": (
+        "The 'numpy.f2py.crackfortran.getlincoef' helper belongs to NumPy's f2py Fortran parsing and code-"
+        "generation pipeline. It is tooling code, not benign tensor reconstruction logic, so invoking it from a "
+        "pickle indicates a path into attacker-controlled parser behavior."
+    ),
+    "torch._dynamo.guards.GuardBuilder.get": (
+        "The 'torch._dynamo.guards.GuardBuilder.get' helper resolves TorchDynamo guard logic over live runtime "
+        "objects. In an untrusted pickle this is execution-oriented helper code, not safe model reconstruction."
+    ),
+    "torch.fx.experimental.symbolic_shapes.ShapeEnv.evaluate_guards_expression": (
+        "The 'ShapeEnv.evaluate_guards_expression' helper evaluates symbolic-shape guard expressions, turning "
+        "deserialization into runtime expression evaluation."
+    ),
+    "torch.utils.collect_env.run": (
+        "The 'torch.utils.collect_env.run' helper launches subprocesses to collect environment details. In a "
+        "pickle payload this is process-execution behavior, not benign model loading."
+    ),
+    "torch.utils._config_module.ConfigModule.load_config": (
+        "The 'ConfigModule.load_config' helper loads Python-driven runtime configuration into a live module. "
+        "Triggering it from deserialization opens an attacker-controlled configuration path."
+    ),
+    "torch.utils.bottleneck.__main__.run_cprofile": (
+        "The 'run_cprofile' bottleneck entrypoint executes target code under the profiler, so using it during "
+        "unpickling is an execution path rather than safe tensor reconstruction."
+    ),
+    "torch.utils.bottleneck.__main__.run_autograd_prof": (
+        "The 'run_autograd_prof' bottleneck entrypoint runs target code under autograd profiling, which is "
+        "execution-oriented helper behavior rather than benign model loading."
+    ),
+    "torch.utils.data.datapipes.utils.decoder.basichandlers": (
+        "The 'basichandlers' helper dispatches DataPipes decode handlers for external content types. In an "
+        "untrusted pickle it opens a non-reconstruction processing path that should be treated as dangerous."
+    ),
 }
 
 # Explanations for dangerous pickle opcodes
@@ -390,6 +459,8 @@ def get_explanation(category: str, specific_item: str | None = None) -> str | No
 # Convenience functions for common use cases
 def get_import_explanation(module_name: str) -> str | None:
     """Get explanation for a dangerous import/module."""
+    if module_name in DANGEROUS_IMPORTS:
+        return get_explanation("import", module_name)
     # Handle module.function format (e.g., "os.system")
     base_module = module_name.split(".")[0]
     return get_explanation("import", base_module)

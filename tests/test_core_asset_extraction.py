@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 
 from modelaudit.core import _extract_primary_asset_from_location, scan_model_directory_or_file
@@ -72,3 +73,28 @@ def test_check_consolidation_handles_newlines_in_file_paths(tmp_path: Path) -> N
     expected_paths = {str(group / "dup a.pkl"), str(group / "dup b.pkl")}
     assert set(check.details["duplicate_files"]) == expected_paths
     assert check.location in expected_paths
+
+
+def test_npz_member_checks_keep_archive_member_locations(tmp_path: Path) -> None:
+    class _ExecPayload:
+        def __reduce__(self):
+            return (exec, ("print('owned')",))
+
+    archive_path = tmp_path / "payload.npz"
+    np.savez(archive_path, safe=np.arange(3), payload=np.array([_ExecPayload()], dtype=object))
+
+    result = scan_model_directory_or_file(str(archive_path))
+    payload_checks = [
+        check
+        for check in result.checks
+        if check.status.value == "failed"
+        and (check.details.get("zip_entry") == "payload.npy" or ":payload.npy" in (check.location or ""))
+    ]
+
+    assert any(
+        check.location == f"{archive_path}:payload.npy" and check.details.get("zip_entry") == "payload.npy"
+        for check in payload_checks
+    ), f"Expected archive-member check location, got: {[(c.location, c.details) for c in payload_checks]}"
+    assert not any(check.location and not check.location.startswith(f"{archive_path}:") for check in payload_checks), (
+        f"Unexpected non-archive check locations: {[c.location for c in payload_checks]}"
+    )

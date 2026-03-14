@@ -60,6 +60,41 @@ class ZipScanner(BaseScanner):
         except Exception:
             return False
 
+    @staticmethod
+    def _rewrite_nested_result_context(
+        scan_result: ScanResult, temp_path: str, archive_path: str, entry_name: str
+    ) -> None:
+        """Rewrite nested issue/check locations from temp files back to archive member paths."""
+        nested_location = f"{archive_path}:{entry_name}"
+
+        for issue in scan_result.issues:
+            if issue.location:
+                if issue.location.startswith(temp_path):
+                    issue.location = issue.location.replace(temp_path, nested_location, 1)
+                else:
+                    issue.location = f"{nested_location} {issue.location}"
+            else:
+                issue.location = nested_location
+
+            if issue.details:
+                issue.details["zip_entry"] = entry_name
+            else:
+                issue.details = {"zip_entry": entry_name}
+
+        for check in scan_result.checks:
+            if check.location:
+                if check.location.startswith(temp_path):
+                    check.location = check.location.replace(temp_path, nested_location, 1)
+                else:
+                    check.location = f"{nested_location} {check.location}"
+            else:
+                check.location = nested_location
+
+            if check.details:
+                check.details["zip_entry"] = entry_name
+            else:
+                check.details = {"zip_entry": entry_name}
+
     def scan(self, path: str) -> ScanResult:
         """Scan a ZIP file and its contents"""
         # Check if path is valid
@@ -317,16 +352,7 @@ class ZipScanner(BaseScanner):
                     if name.lower().endswith(".zip"):
                         try:
                             nested_result = self._scan_zip_file(tmp_path, depth + 1)
-                            # Update locations in nested results
-                            for issue in nested_result.issues:
-                                if issue.location and issue.location.startswith(
-                                    tmp_path,
-                                ):
-                                    issue.location = issue.location.replace(
-                                        tmp_path,
-                                        f"{path}:{name}",
-                                        1,
-                                    )
+                            self._rewrite_nested_result_context(nested_result, tmp_path, path, name)
                             result.merge(nested_result)
 
                             asset_entry = asset_from_scan_result(
@@ -348,26 +374,7 @@ class ZipScanner(BaseScanner):
 
                             # Use core.scan_file to scan with appropriate scanner
                             file_result = core.scan_file(tmp_path, self.config)
-
-                            # Update locations in file results
-                            for issue in file_result.issues:
-                                if issue.location:
-                                    if issue.location.startswith(tmp_path):
-                                        issue.location = issue.location.replace(
-                                            tmp_path,
-                                            f"{path}:{name}",
-                                            1,
-                                        )
-                                    else:
-                                        issue.location = f"{path}:{name} {issue.location}"
-                                else:
-                                    issue.location = f"{path}:{name}"
-
-                                # Add zip entry name to details
-                                if issue.details:
-                                    issue.details["zip_entry"] = name
-                                else:
-                                    issue.details = {"zip_entry": name}
+                            self._rewrite_nested_result_context(file_result, tmp_path, path, name)
 
                             result.merge(file_result)
 

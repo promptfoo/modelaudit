@@ -329,6 +329,10 @@ class TestZipScanner:
 
         failed_checks = [c for c in result.checks if c.status.value == "failed"]
         assert any("cve-2019-6446" in (c.name + c.message).lower() for c in failed_checks)
+        assert any(
+            c.details.get("zip_entry") == "payload.npy" and c.location == f"{archive_path}:payload.npy"
+            for c in failed_checks
+        ), f"Expected rewritten check context for payload.npy, got: {[(c.location, c.details) for c in failed_checks]}"
         assert any("exec" in i.message.lower() and i.details.get("zip_entry") == "payload.npy" for i in result.issues)
 
     def test_scan_zip_with_plain_text_global_prefix_not_treated_as_pickle(self, tmp_path: Path) -> None:
