@@ -669,6 +669,7 @@ RISKY_ML_EXACT_REFS: set[tuple[str, str]] = {
     ("torch", "compile"),
     ("torch.storage", "_load_from_bytes"),
 }
+RISKY_ML_EXACT_FULL_REFS: frozenset[str] = frozenset(f"{module}.{name}" for module, name in RISKY_ML_EXACT_REFS)
 
 
 def _split_parent_child_ref(prefix: str) -> tuple[str, str]:
@@ -1936,6 +1937,11 @@ def _is_risky_ml_import(mod: str, func: str) -> bool:
     full_ref = f"{mod}.{func}" if func else mod
     parts = full_ref.split(".")
 
+    for i in range(1, len(parts) + 1):
+        candidate_full_ref = ".".join(parts[:i])
+        if candidate_full_ref in RISKY_ML_EXACT_FULL_REFS:
+            return True
+
     for i in range(1, len(parts)):
         candidate_mod = ".".join(parts[:i])
         candidate_func = ".".join(parts[i:])
@@ -2735,6 +2741,9 @@ def is_dangerous_reduce_pattern(
     def _is_dangerous_ref(mod: str, func: str) -> bool:
         """Check if a module.function reference is dangerous enough to flag."""
         if _is_copyreg_extension_ref(mod):
+            return True
+
+        if _is_risky_ml_import(mod, func):
             return True
 
         full_ref = f"{mod}.{func}"

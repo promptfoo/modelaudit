@@ -1496,9 +1496,9 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
             ), f"Unexpected failed check for safe ref {full_ref}: {[c.message for c in result.checks]}"
 
     def test_safe_nearby_helper_refs_remain_non_failing(self) -> None:
-        """Exact helper coverage must not widen to safe neighbors in the same modules."""
+        """Exact helper coverage must not widen to safe neighbors outside risky-ML prefixes."""
         safe_neighbor_refs = (
-            ("numpy.f2py.crackfortran", "markinnerspaces"),
+            ("torch.fx.experimental.symbolic_shapes.ShapeEnv", "create_symbol"),
             ("torch.utils.collect_env", "get_env_info"),
             ("torch.utils._config_module", "install_config_module"),
             ("torch.utils.data.datapipes.utils.decoder", "handle_extension"),
@@ -1985,9 +1985,15 @@ def test_risky_ml_import_only_globals_are_detected(
         ("torch", "_inductor", b"\x80\x02ctorch\n_inductor\n."),
         ("numpy", "f2py", b"\x80\x02cnumpy\nf2py\n."),
         ("numpy", "distutils", b"\x80\x02cnumpy\ndistutils\n."),
+        ("torch", "compile.__globals__", b"\x80\x02ctorch\ncompile.__globals__\n."),
         ("torch", "jit.script", b"\x80\x02ctorch\njit.script\n."),
         ("torch", "_dynamo.optimize", b"\x80\x02ctorch\n_dynamo.optimize\n."),
         ("torch", "storage._load_from_bytes", b"\x80\x02ctorch\nstorage._load_from_bytes\n."),
+        (
+            "torch.storage",
+            "_load_from_bytes.__code__",
+            b"\x80\x02ctorch.storage\n_load_from_bytes.__code__\n.",
+        ),
         ("numpy", "distutils.core.setup", b"\x80\x02cnumpy\ndistutils.core.setup\n."),
     ],
 )
@@ -2018,6 +2024,26 @@ def test_risky_ml_parent_attribute_globals_are_detected(
     )
 
 
+def test_comment_token_does_not_bypass_risky_ml_import_detection(tmp_path: Path) -> None:
+    """A comment-like string must not suppress risky ML import-only detection."""
+    comment_token = b"# benign comment token"
+    comment_prefix = b"\x8c" + bytes([len(comment_token)]) + comment_token + b"0"
+    payload = b"\x80\x02" + comment_prefix + b"ctorch\ncompile.__globals__\n."
+
+    path = tmp_path / "torch_compile_comment.pkl"
+    path.write_bytes(payload)
+
+    result = PickleScanner().scan(str(path))
+
+    assert any(
+        check.name == "Global Module Reference Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("import_reference") == "torch.compile.__globals__"
+        for check in result.checks
+    ), f"Expected torch.compile.__globals__ detection despite comment token, checks: {result.checks}"
+
+
 def test_risky_ml_reduce_target_is_detected(tmp_path: Path) -> None:
     """Risky ML globals should remain CRITICAL when later consumed by REDUCE."""
     path = tmp_path / "torch_jit_reduce.pkl"
@@ -2037,6 +2063,42 @@ def test_risky_ml_reduce_target_is_detected(tmp_path: Path) -> None:
         f"Expected CRITICAL REDUCE finding for torch.jit.load, got: "
         f"{[(check.severity, check.message) for check in reduce_checks]}"
     )
+    assert any(
+        check.name == "Reduce Pattern Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("module") == "torch.jit"
+        and check.details.get("function") == "load"
+        for check in result.checks
+    ), f"Expected failed Reduce Pattern Analysis for torch.jit.load, got: {result.checks}"
+
+
+def test_comment_token_does_not_bypass_risky_ml_reduce_detection(tmp_path: Path) -> None:
+    """A comment-like string must not suppress risky ML REDUCE detection."""
+    comment_token = b"# not a real comment"
+    comment_prefix = b"\x8c" + bytes([len(comment_token)]) + comment_token + b"0"
+    payload = b"\x80\x02" + comment_prefix + b"ctorch.jit\nload\n)R."
+
+    path = tmp_path / "torch_jit_comment_reduce.pkl"
+    path.write_bytes(payload)
+
+    result = PickleScanner().scan(str(path))
+
+    assert any(
+        check.name == "REDUCE Opcode Safety Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("associated_global") == "torch.jit.load"
+        for check in result.checks
+    ), f"Expected torch.jit.load REDUCE detection despite comment token, checks: {result.checks}"
+    assert any(
+        check.name == "Reduce Pattern Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("module") == "torch.jit"
+        and check.details.get("function") == "load"
+        for check in result.checks
+    ), f"Expected Reduce Pattern Analysis failure despite comment token, checks: {result.checks}"
 
 
 def test_risky_ml_stack_global_detection(tmp_path: Path) -> None:
@@ -2131,14 +2193,14 @@ def test_risky_ml_memoized_stack_global_reuse_is_detected(tmp_path: Path) -> Non
     """Memoized risky STACK_GLOBAL references should remain detectable when recalled by REDUCE."""
 
     payload = bytearray(b"\x80\x04")
-    payload += _short_binunicode(b"torch")
-    payload += _short_binunicode(b"nn")
-    payload += b"\x93"  # STACK_GLOBAL (benign)
-    payload += b"0"  # POP
     payload += _short_binunicode(b"torch._dynamo")
     payload += _short_binunicode(b"optimize")
     payload += b"\x93"  # STACK_GLOBAL
     payload += b"\x94"  # MEMOIZE index 0
+    payload += b"0"  # POP
+    payload += _short_binunicode(b"torch")
+    payload += _short_binunicode(b"nn")
+    payload += b"\x93"  # STACK_GLOBAL (benign concrete callable)
     payload += b"0"  # POP
     payload += b"h\x00"  # BINGET 0
     payload += b")"  # EMPTY_TUPLE
@@ -2175,6 +2237,13 @@ def test_safe_ml_parent_attribute_global_remains_non_failing(tmp_path: Path) -> 
         result = PickleScanner().scan(str(path))
 
         issue_summaries = [(issue.severity, issue.message) for issue in result.issues]
+        full_ref = f"{module_name}.{func_name}"
+        assert not any(
+            check.name == "Global Module Reference Check"
+            and check.status == CheckStatus.FAILED
+            and check.details.get("import_reference") == full_ref
+            for check in result.checks
+        ), f"Unexpected failing GLOBAL check for safe ref {full_ref}: {result.checks}"
         assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues), (
             f"Safe {module_name}.{func_name} import should not be flagged. Issues: {issue_summaries}"
         )
@@ -2194,6 +2263,12 @@ def test_safe_ml_reconstruction_globals_remain_non_failing(tmp_path: Path, paylo
     path.write_bytes(payload)
 
     result = PickleScanner().scan(str(path))
+    assert not any(
+        check.name == "Global Module Reference Check"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("import_reference") == safe_ref
+        for check in result.checks
+    ), f"Unexpected failing GLOBAL check for safe reconstruction ref {safe_ref}: {result.checks}"
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues), (
         f"Safe reconstruction ref {safe_ref} should not fail. Issues: "
         f"{[(i.severity, i.message) for i in result.issues]}"
@@ -2221,6 +2296,15 @@ def test_safe_pytorch_state_dict_pickle_remains_non_failing(tmp_path: Path) -> N
 
     result = PickleScanner().scan(str(path))
 
+    assert not any(
+        check.name in {"Global Module Reference Check", "REDUCE Opcode Safety Check"}
+        and check.status == CheckStatus.FAILED
+        and (
+            check.details.get("import_reference") == "collections.OrderedDict"
+            or check.details.get("associated_global") == "collections.OrderedDict"
+        )
+        for check in result.checks
+    ), f"Safe state_dict payload should not fail OrderedDict checks. Checks: {result.checks}"
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues), (
         "Safe state-dict payload should not be noisy. Issues: "
         f"{[(issue.severity, issue.message) for issue in result.issues]}"
@@ -2236,9 +2320,23 @@ def test_safe_then_risky_ml_stream_still_flags_risky_import(tmp_path: Path) -> N
     path.write_bytes(safe_stream + risky_stream)
 
     result = PickleScanner().scan(str(path))
-    assert any("torch._inductor.compile_fx" in issue.message for issue in result.issues), (
-        f"Expected detection from later stream. Issues: {[i.message for i in result.issues]}"
-    )
+    assert any(
+        check.name == "Global Module Reference Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("import_reference") == "torch._inductor.compile_fx"
+        for check in result.checks
+    ), f"Expected CRITICAL later-stream GLOBAL check, got: {result.checks}"
+    assert not any(
+        check.name == "Global Module Reference Check"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("import_reference") == "torch._utils._rebuild_tensor"
+        for check in result.checks
+    ), f"Safe first-stream ref should not fail GLOBAL checks. Checks: {result.checks}"
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and "torch._inductor.compile_fx" in issue.message
+        for issue in result.issues
+    ), f"Expected critical later-stream issue. Issues: {[i.message for i in result.issues]}"
     assert not any("torch._utils._rebuild_tensor" in issue.message for issue in result.issues), (
         f"Safe global should not be flagged. Issues: {[i.message for i in result.issues]}"
     )

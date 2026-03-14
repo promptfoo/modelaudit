@@ -76,6 +76,10 @@ def test_explanations_for_specific_risky_ml_imports() -> None:
     assert compile_explanation is not None
     assert "compile" in compile_explanation.lower()
 
+    compile_descendant_explanation = get_import_explanation("torch.compile.__globals__")
+    assert compile_descendant_explanation is not None
+    assert "compile" in compile_descendant_explanation.lower()
+
     dynamo_explanation = get_import_explanation("torch._dynamo.optimize")
     assert dynamo_explanation is not None
     assert "dynamo" in dynamo_explanation.lower()
