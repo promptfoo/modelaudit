@@ -341,6 +341,35 @@ class TestSkopsScannerEdgeCases:
         assert len(bomb_checks) > 0
         assert bomb_checks[0].status == CheckStatus.FAILED
 
+    def test_rejects_archive_exceeding_uncompressed_size_limit(self, tmp_path: Path) -> None:
+        """Archive should fail when total uncompressed bytes exceed max_skops_file_size."""
+        skops_file = tmp_path / "size_limit.skops"
+        with zipfile.ZipFile(skops_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("README.md", "A" * 4096)
+            zf.writestr("schema.json", '{"version": "1.0"}')
+
+        scanner = SkopsScanner(config={"max_skops_file_size": 2048})
+        result = scanner.scan(str(skops_file))
+
+        assert result.success is False
+        size_checks = [c for c in result.checks if "Archive Uncompressed Size Limit" in c.name]
+        assert len(size_checks) > 0
+        assert size_checks[0].status == CheckStatus.FAILED
+
+    def test_skips_oversized_readme_entry_without_crashing(self, tmp_path: Path) -> None:
+        """Oversized archive entries should be skipped by bounded reads."""
+        skops_file = tmp_path / "oversized_readme.skops"
+        with zipfile.ZipFile(skops_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("README.md", "get_model via joblib.load" * 512)
+            zf.writestr("schema.json", '{"version": "1.0"}')
+
+        scanner = SkopsScanner(config={"max_zip_entry_read_size": 128, "max_skops_file_size": 10 * 1024 * 1024})
+        result = scanner.scan(str(skops_file))
+
+        assert result.success is True
+        cve_checks = [c for c in result.checks if "CVE-2025-54886" in c.name and c.status == CheckStatus.FAILED]
+        assert len(cve_checks) == 0
+
 
 class TestSkopsScannerMultipleCVEs:
     """Test detection of multiple CVEs in a single file."""
