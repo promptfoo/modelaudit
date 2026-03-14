@@ -3801,52 +3801,36 @@ class PickleScanner(BaseScanner):
             ),
         )
 
-    def _extract_globals_advanced(self, data: IO[bytes], multiple_pickles: bool = True) -> set[tuple[str, str]]:
+    def _extract_globals_advanced(
+        self, data: IO[bytes], multiple_pickles: bool = True
+    ) -> set[tuple[str, str, str]]:
         """Advanced pickle global extraction with STACK_GLOBAL and memo support."""
-        globals_found: set[tuple[str, str]] = set()
-        memo: dict[int | str, str] = {}
+        globals_found: set[tuple[str, str, str]] = set()
 
-        last_byte = b"dummy"
-        while last_byte != b"":
-            try:
-                ops: list[tuple[Any, Any, int | None]] = list(pickletools.genops(data))
-            except Exception as e:
-                if globals_found:
-                    logger.warning(f"Pickle parsing failed, but found {len(globals_found)} globals: {e}")
-                    return globals_found
-                # For internal scanner calls (like joblib), don't fail the entire scan
-                # Just log the issue and return empty set
-                logger.debug(f"Pickle parsing failed with no globals found: {e}")
-                return set()
+        try:
+            ops: list[tuple[Any, Any, int | None]] = list(
+                _genops_with_fallback(data, multi_stream=multiple_pickles)
+            )
+        except Exception as e:
+            logger.debug(f"Pickle parsing failed during advanced global extraction: {e}")
+            return set()
 
-            stack_global_refs, _callable_refs = _build_symbolic_reference_maps(ops)
+        stack_global_refs, _callable_refs = _build_symbolic_reference_maps(ops)
 
-            last_byte = data.read(1)
-            if last_byte:
-                data.seek(-1, 1)
+        for n, (opcode, arg, _pos) in enumerate(ops):
+            op_name = opcode.name
+            if op_name in {"GLOBAL", "INST"} and isinstance(arg, str):
+                parsed = _parse_module_function(arg)
+                if parsed is not None:
+                    globals_found.add((*parsed, op_name))
+            elif op_name == "STACK_GLOBAL":
+                resolved = stack_global_refs.get(n)
+                if resolved:
+                    globals_found.add((*resolved, op_name))
+                else:
+                    logger.debug(f"STACK_GLOBAL parsing failed at position {n}")
+                    globals_found.add(("unknown", "unknown", op_name))
 
-            for n, (opcode, arg, _pos) in enumerate(ops):
-                op_name = opcode.name
-                if op_name == "MEMOIZE" and n > 0:
-                    memo[len(memo)] = ops[n - 1][1]
-                elif op_name in {"PUT", "BINPUT", "LONG_BINPUT"} and n > 0:
-                    memo[arg] = ops[n - 1][1]
-                elif op_name in {"GLOBAL", "INST"}:
-                    parts = str(arg).split(" ", 1)
-                    if len(parts) == 2:
-                        globals_found.add((parts[0], parts[1]))
-                    elif parts:
-                        globals_found.add((parts[0], ""))
-                elif op_name == "STACK_GLOBAL":
-                    resolved = stack_global_refs.get(n)
-                    if resolved:
-                        globals_found.add(resolved)
-                    else:
-                        logger.debug(f"STACK_GLOBAL parsing failed at position {n}")
-                        globals_found.add(("unknown", "unknown"))
-
-            if not multiple_pickles:
-                break
         return globals_found
 
     def _extract_stack_global_values(
@@ -4245,7 +4229,7 @@ class PickleScanner(BaseScanner):
                 result.metadata["first_pickle_end_pos"] = first_pickle_end_pos
 
             # Analyze globals extracted from all pickle streams
-            for mod, func in advanced_globals:
+            for mod, func, opcode_name in advanced_globals:
                 if _is_actually_dangerous_global(mod, func, ml_context):
                     suspicious_count += 1
                     base_sev = IssueSeverity.WARNING if mod in WARNING_SEVERITY_MODULES else IssueSeverity.CRITICAL
@@ -4256,7 +4240,7 @@ class PickleScanner(BaseScanner):
                     )
                     rule_code = get_import_rule_code(mod, func)
                     if not rule_code:
-                        rule_code = "S205"  # STACK_GLOBAL/GLOBAL fallback
+                        rule_code = get_pickle_opcode_rule_code(opcode_name) or "S206"
                     result.add_check(
                         name="Advanced Global Reference Check",
                         passed=False,
@@ -4267,7 +4251,7 @@ class PickleScanner(BaseScanner):
                         details={
                             "module": mod,
                             "function": func,
-                            "opcode": "STACK_GLOBAL",
+                            "opcode": opcode_name,
                             "ml_context_confidence": ml_context.get(
                                 "overall_confidence",
                                 0,
@@ -4473,6 +4457,15 @@ class PickleScanner(BaseScanner):
                                             "opcode": opcode.name,
                                             "associated_global": associated_global,
                                             "cve_id": "CVE-2025-32434",
+                                            "cvss": 9.8,
+                                            "cwe": "CWE-502",
+                                            "description": (
+                                                "RCE when loading models with torch.load(weights_only=True)"
+                                            ),
+                                            "remediation": (
+                                                "Upgrade to PyTorch 2.6.0 or later, and avoid "
+                                                "torch.load(weights_only=True) with untrusted models."
+                                            ),
                                             "ml_context_confidence": ml_context.get(
                                                 "overall_confidence",
                                                 0,
