@@ -235,12 +235,13 @@ def _extract_primary_asset_from_location(location: str) -> str:
     if not location or not isinstance(location, str):
         return "unknown"
 
-    # Split on spaces first to handle duplicate file listings
-    locations = location.strip().split()
-    if not locations:
+    # Locations are single paths. Duplicate copies are tracked separately in
+    # details["duplicate_files"] to avoid ambiguous delimiter encoding.
+    primary_location = location.strip()
+
+    if not primary_location:
         return "unknown"
 
-    primary_location = locations[0]
     # Extract main file path (before any ':' separator for archive contents)
     drive, tail = os.path.splitdrive(primary_location)
     if ":" in tail:
@@ -824,11 +825,10 @@ def scan_model_directory_or_file(
                                     scanner=file_result.scanner_name,
                                     file_path=representative_file,
                                 )
-                                # Update location to include all file paths with this content
+                                if not issue_dict.get("location"):
+                                    issue_dict["location"] = representative_file
+
                                 if len(file_paths) > 1:
-                                    all_locations = " ".join(file_paths)
-                                    issue_dict["location"] = all_locations
-                                    # Add details about duplicate files
                                     if "details" not in issue_dict:
                                         issue_dict["details"] = {}
                                     issue_dict["details"]["duplicate_files"] = file_paths
@@ -847,11 +847,10 @@ def scan_model_directory_or_file(
                             for check in file_result.checks:
                                 check_dict = check.to_dict() if hasattr(check, "to_dict") else check
                                 if isinstance(check_dict, dict):
-                                    # Update location to include all file paths with this content
+                                    if not check_dict.get("location"):
+                                        check_dict["location"] = representative_file
+
                                     if len(file_paths) > 1:
-                                        # For checks, we want to show all file locations affected
-                                        check_dict["location"] = " ".join(file_paths)
-                                        # Add details about duplicate files
                                         if "details" not in check_dict:
                                             check_dict["details"] = {}
                                         check_dict["details"]["duplicate_files"] = file_paths

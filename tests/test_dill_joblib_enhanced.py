@@ -310,7 +310,7 @@ class TestIntegration:
         result = PickleScanner().scan(str(fixture))
 
         assert result.success is True
-        assert len(result.issues) > 0
+        assert any("dill._dill" in issue.message for issue in result.issues)
 
     def test_multiple_exception_types_handling(self, tmp_path):
         """Test handling of different exception types."""

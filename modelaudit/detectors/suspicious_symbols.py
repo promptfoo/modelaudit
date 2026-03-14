@@ -190,6 +190,14 @@ SUSPICIOUS_GLOBALS = {
     # Code execution / compilation
     "codeop": "*",
     "marshal": ["loads", "load", "dumps", "dump"],
+    # Additional torch / NumPy helper primitives validated as dangerous import-level refs
+    "numpy.f2py.crackfortran": ["getlincoef"],
+    "torch._dynamo.guards.GuardBuilder": ["get"],
+    "torch.fx.experimental.symbolic_shapes.ShapeEnv": ["evaluate_guards_expression"],
+    "torch.utils.collect_env": ["run"],
+    "torch.utils._config_module.ConfigModule": ["load_config"],
+    "torch.utils.bottleneck.__main__": ["run_cprofile", "run_autograd_prof"],
+    "torch.utils.data.datapipes.utils.decoder": ["basichandlers"],
     "compileall": "*",
     "py_compile": "*",
     # FFI / native code
@@ -786,6 +794,8 @@ KNOWN_SAFE_KERAS_LAYER_CLASSES: frozenset[str] = frozenset(
         "RandomTranslation",
         "RandomContrast",
         "RandomBrightness",
+        "RandomHeight",
+        "RandomWidth",
         "Normalization",
         "Discretization",
         "CategoryEncoding",
@@ -856,6 +866,7 @@ KNOWN_SAFE_KERAS_LOSSES: frozenset[str] = frozenset(
         "Dice",
         "Tversky",
         "CTC",
+        "LossFunctionWrapper",
     }
 )
 
@@ -892,6 +903,8 @@ KNOWN_SAFE_KERAS_METRICS: frozenset[str] = frozenset(
         "SpecificityAtSensitivity",
         "F1Score",
         "FBetaScore",
+        "MeanMetricWrapper",
+        "CompileMetrics",
         # Segmentation
         "IoU",
         "BinaryIoU",
