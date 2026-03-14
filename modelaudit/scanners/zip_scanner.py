@@ -60,41 +60,6 @@ class ZipScanner(BaseScanner):
         except Exception:
             return False
 
-    @staticmethod
-    def _rewrite_nested_result_context(
-        scan_result: ScanResult, temp_path: str, archive_path: str, entry_name: str
-    ) -> None:
-        """Rewrite nested issue/check locations from temp files back to archive member paths."""
-        nested_location = f"{archive_path}:{entry_name}"
-
-        for issue in scan_result.issues:
-            if issue.location:
-                if issue.location.startswith(temp_path):
-                    issue.location = issue.location.replace(temp_path, nested_location, 1)
-                else:
-                    issue.location = f"{nested_location} {issue.location}"
-            else:
-                issue.location = nested_location
-
-            if issue.details:
-                issue.details["zip_entry"] = entry_name
-            else:
-                issue.details = {"zip_entry": entry_name}
-
-        for check in scan_result.checks:
-            if check.location:
-                if check.location.startswith(temp_path):
-                    check.location = check.location.replace(temp_path, nested_location, 1)
-                else:
-                    check.location = f"{nested_location} {check.location}"
-            else:
-                check.location = nested_location
-
-            if check.details:
-                check.details["zip_entry"] = entry_name
-            else:
-                check.details = {"zip_entry": entry_name}
-
     def scan(self, path: str) -> ScanResult:
         """Scan a ZIP file and its contents"""
         # Check if path is valid
@@ -150,6 +115,44 @@ class ZipScanner(BaseScanner):
         result.metadata["contents"] = scan_result.metadata.get("contents", [])
         result.metadata["file_size"] = os.path.getsize(path)
         return result
+
+    def _rewrite_nested_result_context(
+        self, scan_result: ScanResult, tmp_path: str, archive_path: str, entry_name: str
+    ) -> None:
+        """Rewrite nested result locations so archive members, not temp files, are reported."""
+        archive_location = f"{archive_path}:{entry_name}"
+
+        for issue in scan_result.issues:
+            if issue.location:
+                if issue.location.startswith(tmp_path):
+                    issue.location = issue.location.replace(tmp_path, archive_location, 1)
+                else:
+                    issue.location = f"{archive_location} {issue.location}"
+            else:
+                issue.location = archive_location
+
+            existing_issue_entry = issue.details.get("zip_entry")
+            issue.details["zip_entry"] = (
+                f"{entry_name}:{existing_issue_entry}"
+                if isinstance(existing_issue_entry, str) and existing_issue_entry
+                else entry_name
+            )
+
+        for check in scan_result.checks:
+            if check.location:
+                if check.location.startswith(tmp_path):
+                    check.location = check.location.replace(tmp_path, archive_location, 1)
+                else:
+                    check.location = f"{archive_location} {check.location}"
+            else:
+                check.location = archive_location
+
+            existing_check_entry = check.details.get("zip_entry")
+            check.details["zip_entry"] = (
+                f"{entry_name}:{existing_check_entry}"
+                if isinstance(existing_check_entry, str) and existing_check_entry
+                else entry_name
+            )
 
     def _scan_zip_file(self, path: str, depth: int = 0) -> ScanResult:
         """Recursively scan a ZIP file and its contents"""
