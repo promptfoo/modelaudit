@@ -1239,9 +1239,9 @@ def test_picklescan_gap_detected_inside_zip_entry(tmp_path: Path) -> None:
 
     assert result.success
     assert result.has_errors
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and "numpy.load" in issue.message for issue in result.issues
-    ), f"Expected CRITICAL numpy.load issue in zip entry, got: {[i.message for i in result.issues]}"
+    assert any(issue.severity == IssueSeverity.CRITICAL and "numpy.load" in issue.message for issue in result.issues), (
+        f"Expected CRITICAL numpy.load issue in zip entry, got: {[i.message for i in result.issues]}"
+    )
 
 
 class TestCVE20251716PipMainBlocklist(unittest.TestCase):
@@ -1367,7 +1367,7 @@ def test_scan_legitimate_pytorch_pickle_memory_error_is_non_failing(
     monkeypatch.setattr(
         PickleScanner,
         "_extract_globals_advanced",
-        lambda self, file_obj: {("torch", "OrderedDict")},
+        lambda self, file_obj, multiple_pickles=True: {("torch", "OrderedDict", "GLOBAL")},
     )
 
     result = PickleScanner().scan(str(model_path))
@@ -1411,7 +1411,10 @@ def test_scan_legitimate_pytorch_bin_memory_error_is_informational(
     monkeypatch.setattr(
         PickleScanner,
         "_extract_globals_advanced",
-        lambda self, file_obj: {("torch._utils", "_rebuild_tensor_v2"), ("collections", "OrderedDict")},
+        lambda self, file_obj, multiple_pickles=True: {
+            ("torch._utils", "_rebuild_tensor_v2", "GLOBAL"),
+            ("collections", "OrderedDict", "GLOBAL"),
+        },
     )
 
     result = PickleScanner().scan(str(model_path))
@@ -1447,7 +1450,7 @@ def test_scan_memory_error_with_dangerous_globals_not_downgraded(
     monkeypatch.setattr(
         PickleScanner,
         "_extract_globals_advanced",
-        lambda self, file_obj: {("builtins", "eval")},
+        lambda self, file_obj, multiple_pickles=True: {("builtins", "eval", "GLOBAL")},
     )
 
     result = PickleScanner().scan(str(model_path))

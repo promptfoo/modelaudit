@@ -4,7 +4,7 @@ import os
 import pickletools
 import struct
 import time
-from typing import IO, Any, BinaryIO, ClassVar, TypeGuard
+from typing import Any, BinaryIO, ClassVar, TypeGuard
 
 from modelaudit.analysis.enhanced_pattern_detector import EnhancedPatternDetector, PatternMatch
 from modelaudit.analysis.entropy_analyzer import EntropyAnalyzer
@@ -3801,16 +3801,12 @@ class PickleScanner(BaseScanner):
             ),
         )
 
-    def _extract_globals_advanced(
-        self, data: IO[bytes], multiple_pickles: bool = True
-    ) -> set[tuple[str, str, str]]:
+    def _extract_globals_advanced(self, data: BinaryIO, multiple_pickles: bool = True) -> set[tuple[str, str, str]]:
         """Advanced pickle global extraction with STACK_GLOBAL and memo support."""
         globals_found: set[tuple[str, str, str]] = set()
 
         try:
-            ops: list[tuple[Any, Any, int | None]] = list(
-                _genops_with_fallback(data, multi_stream=multiple_pickles)
-            )
+            ops: list[tuple[Any, Any, int | None]] = list(_genops_with_fallback(data, multi_stream=multiple_pickles))
         except Exception as e:
             logger.debug(f"Pickle parsing failed during advanced global extraction: {e}")
             return set()
@@ -4991,7 +4987,7 @@ class PickleScanner(BaseScanner):
             # (e.g. HuggingFace cache stores files as hash blobs without extensions)
             has_joblib_globals = any(
                 mod in {"joblib", "sklearn", "numpy"} or mod.startswith(("joblib.", "sklearn.", "numpy."))
-                for mod, _func in advanced_globals
+                for mod, _func, _opcode in advanced_globals
             )
             is_joblib_content = is_serialization_ext or (not file_ext and has_joblib_globals)
 
@@ -5019,15 +5015,15 @@ class PickleScanner(BaseScanner):
             # legitimate PyTorch structures and no dangerous global references appear.
             global_validation_context = {"is_ml_content": False, "overall_confidence": 0.0, "frameworks": {}}
             has_dangerous_advanced_global = any(
-                _is_actually_dangerous_global(mod, func, global_validation_context) for mod, func in advanced_globals
+                _is_actually_dangerous_global(mod, func, global_validation_context)
+                for mod, func, _opcode in advanced_globals
             )
             has_pytorch_advanced_global = any(
-                mod == "torch" or mod.startswith("torch.") for mod, _func in advanced_globals
+                mod == "torch" or mod.startswith("torch.") for mod, _func, _opcode in advanced_globals
             )
-            has_ordereddict_global = ("collections", "OrderedDict") in advanced_globals or (
-                "torch",
-                "OrderedDict",
-            ) in advanced_globals
+            has_ordereddict_global = any(
+                mod == "collections" and func == "OrderedDict" for mod, func, _opcode in advanced_globals
+            ) or any(mod == "torch" and func == "OrderedDict" for mod, func, _opcode in advanced_globals)
             has_legitimate_pytorch_globals = (
                 bool(advanced_globals)
                 and (has_pytorch_advanced_global or has_ordereddict_global)
