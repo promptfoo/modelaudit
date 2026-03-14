@@ -96,6 +96,19 @@ def test_explanations_for_exact_dangerous_imports() -> None:
     assert "nested pytorch" in torch_loader_explanation.lower()
 
 
+def test_explanations_for_exact_helper_imports() -> None:
+    """Exact helper refs should carry a specific explanation instead of falling back to the base module."""
+    collect_env_explanation = get_import_explanation("torch.utils.collect_env.run")
+    assert collect_env_explanation is not None
+    assert "subprocess" in collect_env_explanation.lower()
+
+    shape_env_explanation = get_import_explanation(
+        "torch.fx.experimental.symbolic_shapes.ShapeEnv.evaluate_guards_expression"
+    )
+    assert shape_env_explanation is not None
+    assert "guard expressions" in shape_env_explanation.lower()
+
+
 def test_explanations_for_opcodes():
     """Test that we have explanations for dangerous opcodes."""
     assert get_opcode_explanation("REDUCE") is not None

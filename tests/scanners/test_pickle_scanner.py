@@ -263,6 +263,83 @@ class TestPickleScannerAdvanced(unittest.TestCase):
             f"Expected subprocess issues, but found: {[i.message for i in result.issues]}"
         )
 
+
+class TestDillLoadersRegression:
+    def test_global_dill_loads_is_flagged(self, tmp_path: Path) -> None:
+        payload = tmp_path / "global_dill_loads.pkl"
+        payload.write_bytes(b"cdill\nloads\n.")
+
+        result = PickleScanner().scan(str(payload))
+
+        failed_global_checks = [
+            check
+            for check in result.checks
+            if check.name == "Global Module Reference Check"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+        ]
+        assert any(check.details.get("import_reference") == "dill.loads" for check in failed_global_checks)
+
+    def test_global_dill_load_is_flagged(self, tmp_path: Path) -> None:
+        payload = tmp_path / "global_dill_load.pkl"
+        payload.write_bytes(b"cdill\nload\n.")
+
+        result = PickleScanner().scan(str(payload))
+
+        failed_global_checks = [
+            check
+            for check in result.checks
+            if check.name == "Global Module Reference Check"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+        ]
+        assert any(check.details.get("import_reference") == "dill.load" for check in failed_global_checks)
+
+    def test_stack_global_dill_loads_is_flagged(self, tmp_path: Path) -> None:
+        payload = tmp_path / "stack_global_dill_loads.pkl"
+        payload.write_bytes(b"\x80\x04\x95\x13\x00\x00\x00\x00\x00\x00\x00\x8c\x04dill\x94\x8c\x05loads\x94\x93\x94.")
+
+        result = PickleScanner().scan(str(payload))
+
+        failed_stack_checks = [
+            check
+            for check in result.checks
+            if check.name == "STACK_GLOBAL Module Check"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+        ]
+        assert any(
+            check.details.get("module") == "dill" and check.details.get("function") == "loads"
+            for check in failed_stack_checks
+        )
+
+    def test_benign_pickle_with_dill_string_is_not_flagged(self, tmp_path: Path) -> None:
+        payload = tmp_path / "benign_dill_string.pkl"
+        with payload.open("wb") as handle:
+            pickle.dump({"serializer": "dill", "metadata": "safe"}, handle)
+
+        result = PickleScanner().scan(str(payload))
+
+        assert result.success
+        assert not any("dill." in issue.message for issue in result.issues)
+
+    def test_existing_safe_pickle_fixture_unaffected(self) -> None:
+        fixture = Path(__file__).parent.parent / "assets" / "samples" / "pickles" / "safe_data.pkl"
+
+        result = PickleScanner().scan(str(fixture))
+
+        assert result.success
+        assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+    def test_dill_dump_remains_non_failing(self, tmp_path: Path) -> None:
+        payload = tmp_path / "reduce_dill_dump.pkl"
+        payload.write_bytes(b"\x80\x02cdill\ndump\n(tR.")
+
+        result = PickleScanner().scan(str(payload))
+
+        assert result.success
+        assert not result.has_errors
+
     def test_multiple_pickle_streams(self) -> None:
         scanner = PickleScanner()
         result = scanner.scan(str(Path(__file__).parent.parent / "assets" / "pickles" / "multiple_stream_attack.pkl"))
@@ -632,6 +709,17 @@ class TestPickleScannerAdvanced(unittest.TestCase):
 
 class TestPickleScannerBlocklistHardening(unittest.TestCase):
     """Regression tests for fickling/picklescan bypass hardening."""
+
+    HELPER_REFS: ClassVar[tuple[tuple[str, str], ...]] = (
+        ("numpy.f2py.crackfortran", "getlincoef"),
+        ("torch._dynamo.guards.GuardBuilder", "get"),
+        ("torch.fx.experimental.symbolic_shapes.ShapeEnv", "evaluate_guards_expression"),
+        ("torch.utils.collect_env", "run"),
+        ("torch.utils._config_module.ConfigModule", "load_config"),
+        ("torch.utils.bottleneck.__main__", "run_cprofile"),
+        ("torch.utils.bottleneck.__main__", "run_autograd_prof"),
+        ("torch.utils.data.datapipes.utils.decoder", "basichandlers"),
+    )
 
     PICKLESCAN_GAP_REFS: ClassVar[tuple[tuple[str, str], ...]] = (
         ("numpy", "load"),
@@ -1332,11 +1420,127 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
             f"Expected CRITICAL webbrowser issue, got: {[i.message for i in result.issues]}"
         )
 
+    def test_helper_import_only_refs_are_critical(self) -> None:
+        """Validated helper refs should never scan clean as bare GLOBAL payloads."""
+        for module, func in self.HELPER_REFS:
+            result = self._scan_bytes(self._craft_global_only_pickle(module, func))
+            full_ref = f"{module}.{func}"
+
+            assert result.success, f"Scan failed for {full_ref}"
+            assert result.has_errors, f"Expected failing result for {full_ref}"
+            assert any(check.status == CheckStatus.FAILED and full_ref in check.message for check in result.checks), (
+                f"Expected failed helper-global check for {full_ref}, checks: {[c.message for c in result.checks]}"
+            )
+
+    def test_helper_reduce_payloads_by_subgroup_are_critical(self) -> None:
+        """At least one executable REDUCE payload per helper subgroup should be critical."""
+        subgroup_refs = (
+            ("numpy.f2py.crackfortran", "getlincoef"),
+            ("torch._dynamo.guards.GuardBuilder", "get"),
+            ("torch.utils.collect_env", "run"),
+        )
+
+        for module, func in subgroup_refs:
+            result = self._scan_bytes(self._craft_global_reduce_pickle(module, func))
+            full_ref = f"{module}.{func}"
+
+            assert result.success, f"Scan failed for {full_ref}"
+            assert result.has_errors, f"Expected failing result for {full_ref}"
+            assert any(
+                check.name == "REDUCE Opcode Safety Check"
+                and check.status == CheckStatus.FAILED
+                and check.severity == IssueSeverity.CRITICAL
+                and full_ref in check.message
+                for check in result.checks
+            ), f"Expected CRITICAL REDUCE check for {full_ref}, checks: {[c.message for c in result.checks]}"
+
+    def test_memoized_stack_global_helper_ref_is_critical(self) -> None:
+        """Memoized STACK_GLOBAL helper refs should resolve and fail."""
+        module = b"torch.fx.experimental.symbolic_shapes.ShapeEnv"
+        func = b"evaluate_guards_expression"
+        payload = (
+            b"\x80\x04"
+            + b"\x8c"
+            + bytes([len(module)])
+            + module
+            + b"\x94"
+            + b"\x8c"
+            + bytes([len(func)])
+            + func
+            + b"\x94"
+            + b"\x93."
+        )
+        result = self._scan_bytes(payload)
+
+        assert result.success
+        assert result.has_errors
+        target = "torch.fx.experimental.symbolic_shapes.ShapeEnv.evaluate_guards_expression"
+        assert any(check.status == CheckStatus.FAILED and target in check.message for check in result.checks), (
+            f"Expected failed STACK_GLOBAL helper detection, checks: {[c.message for c in result.checks]}"
+        )
+
+    def test_safe_torch_and_numpy_reconstruction_helpers_remain_non_failing(self) -> None:
+        """Safe reconstruction helpers should continue to stay clean."""
+        safe_refs = (
+            ("torch._utils", "_rebuild_tensor_v2"),
+            ("numpy.core.multiarray", "_reconstruct"),
+        )
+
+        for module, func in safe_refs:
+            result = self._scan_bytes(self._craft_global_only_pickle(module, func))
+            full_ref = f"{module}.{func}"
+
+            assert result.success, f"Scan failed for safe ref {full_ref}"
+            assert not any(
+                check.status == CheckStatus.FAILED and full_ref in check.message for check in result.checks
+            ), f"Unexpected failed check for safe ref {full_ref}: {[c.message for c in result.checks]}"
+
+    def test_safe_nearby_helper_refs_remain_non_failing(self) -> None:
+        """Exact helper coverage must not widen to safe neighbors in the same modules."""
+        safe_neighbor_refs = (
+            ("numpy.f2py.crackfortran", "markinnerspaces"),
+            ("torch.utils.collect_env", "get_env_info"),
+            ("torch.utils._config_module", "install_config_module"),
+            ("torch.utils.data.datapipes.utils.decoder", "handle_extension"),
+        )
+
+        for module, func in safe_neighbor_refs:
+            result = self._scan_bytes(self._craft_global_only_pickle(module, func))
+            full_ref = f"{module}.{func}"
+
+            assert result.success, f"Scan failed for safe neighbor {full_ref}"
+            assert not any(
+                check.status == CheckStatus.FAILED and full_ref in check.message for check in result.checks
+            ), f"Unexpected failed check for safe neighbor {full_ref}: {[c.message for c in result.checks]}"
+
+    def test_helper_ref_with_legacy_code_string_reports_both_signals(self) -> None:
+        """Dangerous-global detection should coexist with legacy string-pattern alerts."""
+        payload = b"\x80\x04\x8c\x0a__import__\x940ctorch.utils.collect_env\nrun\n."
+        result = self._scan_bytes(payload)
+
+        assert result.success
+        assert result.has_errors
+        messages = [issue.message for issue in result.issues]
+        assert any("torch.utils.collect_env.run" in msg for msg in messages), (
+            f"Expected helper dangerous-global message, got: {messages}"
+        )
+        assert any("legacy dangerous pattern detected: __import__" in msg.lower() for msg in messages), (
+            f"Expected legacy dangerous-string signal, got: {messages}"
+        )
+
+    def test_helper_imports_use_exact_why_explanations(self) -> None:
+        """Exact helper refs should populate a specific why explanation, not fall back to None."""
+        result = self._scan_bytes(self._craft_global_only_pickle("torch.utils.collect_env", "run"))
+
+        why_texts = [issue.why or "" for issue in result.issues if "torch.utils.collect_env.run" in issue.message]
+        assert any("subprocess" in why.lower() and "benign model loading" in why.lower() for why in why_texts), (
+            f"Expected exact why explanation for torch.utils.collect_env.run, got: {why_texts}"
+        )
+
     def test_multi_stream_httplib_detected_in_second_stream(self) -> None:
         """Scanner should detect httplib payload hidden in a second pickle stream."""
         benign_stream = pickle.dumps({"safe": True}, protocol=2)
         payload = benign_stream + b"\x80\x02chttplib\nHTTPSConnection\n."
-
         result = self._scan_bytes(payload)
 
         assert result.success
