@@ -273,7 +273,7 @@ def test_truncated_npy_fails_safely(tmp_path: Path) -> None:
     ), f"Expected a non-critical corruption finding, got: {[i.message for i in result.issues]}"
 
 
-def test_object_dtype_numpy_trailing_bytes_fail_integrity(tmp_path) -> None:
+def test_object_dtype_numpy_trailing_bytes_fail_integrity(tmp_path: Path) -> None:
     arr = np.array([{"k": "v"}], dtype=object)
     path = tmp_path / "trailing.npy"
     np.save(path, arr, allow_pickle=True)
