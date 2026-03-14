@@ -645,6 +645,12 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
         call_ops = b"(" + b"t" + b"R" + b"."
         return proto + global_op + call_ops
 
+    @staticmethod
+    def _craft_global_only_pickle(module: str, func: str) -> bytes:
+        """Craft a minimal pickle with a bare GLOBAL reference and STOP."""
+
+        return b"\x80\x02" + b"c" + f"{module}\n{func}\n".encode() + b"."
+
     def _scan_bytes(self, data: bytes) -> ScanResult:
         import os
         import tempfile
@@ -658,6 +664,42 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
             return scanner.scan(path)
         finally:
             os.unlink(path)
+
+    def test_builtins_hasattr_import_only_is_critical(self) -> None:
+        """Import-only builtins.hasattr must not be allowlisted as safe."""
+        result = self._scan_bytes(self._craft_global_only_pickle("builtins", "hasattr"))
+
+        assert result.success
+        assert result.has_errors
+        failed_global_checks = [
+            check
+            for check in result.checks
+            if check.name == "Global Module Reference Check"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+        ]
+        assert any("builtins.hasattr" in check.message for check in failed_global_checks), (
+            f"Expected CRITICAL import-only builtins.hasattr finding, "
+            f"got: {[check.message for check in failed_global_checks]}"
+        )
+
+    def test_dunder_builtin_hasattr_import_only_is_critical(self) -> None:
+        """Import-only __builtin__.hasattr must not be allowlisted as safe."""
+        result = self._scan_bytes(self._craft_global_only_pickle("__builtin__", "hasattr"))
+
+        assert result.success
+        assert result.has_errors
+        failed_global_checks = [
+            check
+            for check in result.checks
+            if check.name == "Global Module Reference Check"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+        ]
+        assert any("__builtin__.hasattr" in check.message for check in failed_global_checks), (
+            f"Expected CRITICAL import-only __builtin__.hasattr finding, "
+            f"got: {[check.message for check in failed_global_checks]}"
+        )
 
     def test_builtins_hasattr_is_critical(self) -> None:
         """builtins.hasattr must not be allowlisted as safe."""
@@ -711,6 +753,26 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
             ), f"Expected passed Global Module Reference Check for builtins.{safe_builtin}"
             assert not any(check.status == CheckStatus.FAILED for check in safe_global_checks), (
                 f"Unexpected failed Global Module Reference Check for builtins.{safe_builtin}: "
+                f"{[check.message for check in safe_global_checks]}"
+            )
+
+    def test_safe_import_only_builtins_remain_allowlisted(self) -> None:
+        """Safe builtins must remain non-failing for import-only GLOBAL payloads."""
+        for safe_builtin in ["set", "slice", "tuple"]:
+            result = self._scan_bytes(self._craft_global_only_pickle("builtins", safe_builtin))
+
+            assert result.success
+            assert not result.has_errors, (
+                f"Expected import-only builtins.{safe_builtin} to remain non-failing, "
+                f"got: {[i.message for i in result.issues]}"
+            )
+            safe_global_checks = [check for check in result.checks if check.name == "Global Module Reference Check"]
+            assert any(
+                check.status == CheckStatus.PASSED and f"builtins.{safe_builtin}" in check.message
+                for check in safe_global_checks
+            ), f"Expected passed import-only Global Module Reference Check for builtins.{safe_builtin}"
+            assert not any(check.status == CheckStatus.FAILED for check in safe_global_checks), (
+                f"Unexpected failed import-only Global Module Reference Check for builtins.{safe_builtin}: "
                 f"{[check.message for check in safe_global_checks]}"
             )
 
@@ -793,6 +855,30 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
         assert any(check.details.get("associated_global") == "builtins.hasattr" for check in failed_reduce_checks), (
             f"Expected CRITICAL REDUCE finding for builtins.hasattr after benign stream, "
             f"got: {[check.details for check in failed_reduce_checks]}"
+        )
+
+    def test_import_only_builtins_hasattr_detected_after_benign_stream(self) -> None:
+        """Import-only builtins.hasattr must be detected after a benign warm-up stream."""
+        import io
+
+        buf = io.BytesIO()
+        pickle.dump({"safe": True}, buf, protocol=2)
+        buf.write(self._craft_global_only_pickle("builtins", "hasattr"))
+
+        result = self._scan_bytes(buf.getvalue())
+
+        assert result.success
+        assert result.has_errors
+        failed_global_checks = [
+            check
+            for check in result.checks
+            if check.name == "Global Module Reference Check"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+        ]
+        assert any("builtins.hasattr" in check.message for check in failed_global_checks), (
+            f"Expected CRITICAL import-only builtins.hasattr finding after benign stream, "
+            f"got: {[check.message for check in failed_global_checks]}"
         )
 
     # ------------------------------------------------------------------
