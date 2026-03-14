@@ -798,6 +798,34 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
             for c in context_checks
         ), f"Expected CRITICAL malformed STACK_GLOBAL check, got: {[(c.severity, c.message) for c in context_checks]}"
 
+    def test_stack_global_large_bytes_operand_preview_is_bounded(self) -> None:
+        """Large malformed operands should not expand finding payloads."""
+        large_bytes = b"x" * 200_000
+        payload = b"\x80\x04\x8c\x02osB" + struct.pack("<I", len(large_bytes)) + large_bytes + b"\x93."
+
+        result = self._scan_bytes(payload)
+        assert result.success
+
+        context_checks = [c for c in result.checks if c.name == "STACK_GLOBAL Context Check"]
+        matching_checks = [
+            c
+            for c in context_checks
+            if c.status == CheckStatus.FAILED
+            and c.severity == IssueSeverity.CRITICAL
+            and c.details.get("module") == "os"
+            and c.details.get("reason") == "mixed_or_non_string"
+        ]
+        assert matching_checks, (
+            f"Expected bounded CRITICAL malformed STACK_GLOBAL check, got: "
+            f"{[(c.severity, c.message) for c in context_checks]}"
+        )
+
+        check = matching_checks[0]
+        function_hint = check.details.get("function", "")
+        assert function_hint.startswith("bytes(len=200000, hex=0x7878787878787878"), function_hint
+        assert len(function_hint) < 80, f"Expected bounded operand preview, got len={len(function_hint)}"
+        assert len(check.message) < 220, f"Expected bounded context-check message, got len={len(check.message)}"
+
     def test_stack_global_missing_memo_preserves_unknown_sentinel(self) -> None:
         """Missing memo operands should fail closed and keep unknown sentinel details."""
         payload = b"\x80\x04\x8c\x02osh\x7f\x93."

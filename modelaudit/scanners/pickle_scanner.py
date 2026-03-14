@@ -2,6 +2,7 @@
 
 import os
 import pickletools
+import reprlib
 import struct
 import time
 from typing import IO, Any, BinaryIO, ClassVar, TypeGuard
@@ -44,6 +45,37 @@ from .rule_mapper import (
 _RESYNC_BUDGET = 8192  # Max bytes to scan forward when resyncing after an unknown opcode
 COPYREG_EXTENSION_MODULE = "__copyreg_extension__"
 COPYREG_EXTENSION_PREFIX = "code_"
+_STACK_GLOBAL_OPERAND_PREVIEW_MAX = 128
+_STACK_GLOBAL_BINARY_PREVIEW_BYTES = 8
+_STACK_GLOBAL_OPERAND_PREVIEWER = reprlib.Repr()
+_STACK_GLOBAL_OPERAND_PREVIEWER.maxstring = _STACK_GLOBAL_OPERAND_PREVIEW_MAX
+_STACK_GLOBAL_OPERAND_PREVIEWER.maxother = _STACK_GLOBAL_OPERAND_PREVIEW_MAX
+_STACK_GLOBAL_OPERAND_PREVIEWER.maxlist = 4
+_STACK_GLOBAL_OPERAND_PREVIEWER.maxtuple = 4
+_STACK_GLOBAL_OPERAND_PREVIEWER.maxset = 4
+_STACK_GLOBAL_OPERAND_PREVIEWER.maxfrozenset = 4
+_STACK_GLOBAL_OPERAND_PREVIEWER.maxdict = 4
+
+
+def _format_stack_global_operand_preview(value: Any) -> str:
+    """Return a bounded diagnostic preview for malformed STACK_GLOBAL operands."""
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        value_len = value.nbytes if isinstance(value, memoryview) else len(value)
+        prefix_bytes = bytes(value[:_STACK_GLOBAL_BINARY_PREVIEW_BYTES])
+        suffix = "..." if value_len > _STACK_GLOBAL_BINARY_PREVIEW_BYTES else ""
+        return f"{type(value).__name__}(len={value_len}, hex=0x{prefix_bytes.hex()}{suffix})"
+
+    preview = _STACK_GLOBAL_OPERAND_PREVIEWER.repr(value)
+    if len(preview) > _STACK_GLOBAL_OPERAND_PREVIEW_MAX:
+        preview = preview[:_STACK_GLOBAL_OPERAND_PREVIEW_MAX] + "...<truncated>"
+
+    try:
+        value_len = len(value)
+    except Exception:
+        value_len = None
+
+    length_suffix = f" (len={value_len})" if value_len is not None else ""
+    return f"{type(value).__name__}:{preview}{length_suffix}"
 
 
 def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> Any:
@@ -1953,7 +1985,7 @@ def _build_symbolic_reference_maps(
             return "missing_memo", "unknown"
         if value is unknown:
             return "unknown", "unknown"
-        return "non_string", f"{type(value).__name__}:{value!r}"
+        return "non_string", _format_stack_global_operand_preview(value)
 
     for i, (opcode, arg, _pos) in enumerate(opcodes):
         name = opcode.name
