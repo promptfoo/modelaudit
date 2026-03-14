@@ -4,6 +4,8 @@ import struct
 import sys
 import tempfile
 import unittest
+from collections.abc import Iterator
+from io import BytesIO
 from pathlib import Path
 
 import pytest
@@ -1301,36 +1303,38 @@ def test_scan_memory_error_with_dangerous_globals_not_downgraded(
 def test_extract_globals_advanced_respects_max_opcodes(monkeypatch: pytest.MonkeyPatch) -> None:
     """Advanced extraction should stop after max_opcodes instead of parsing everything."""
     scanner = PickleScanner({"max_opcodes": 3})
+    consumed: list[int] = []
 
-    def _fake_genops(_data: object):
+    def _fake_genops(_data: object) -> Iterator[tuple[object, object, int]]:
         for i in range(10):
-            yield (type("Op", (), {"name": "NOP"})(), i, i)
+            consumed.append(i)
+            yield (type("Op", (), {"name": "GLOBAL"})(), f"mod{i} func{i}", i)
 
     monkeypatch.setattr("modelaudit.scanners.pickle_scanner.pickletools.genops", _fake_genops)
 
-    from io import BytesIO
-
     globals_found = scanner._extract_globals_advanced(data=BytesIO(b"x"), multiple_pickles=False)
 
-    assert globals_found == set()
+    assert consumed == [0, 1, 2]
+    assert globals_found == {("mod0", "func0"), ("mod1", "func1"), ("mod2", "func2")}
 
 
 def test_extract_globals_advanced_respects_scan_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     """Advanced extraction should honor active scan timeout budget."""
     scanner = PickleScanner({"timeout": 1})
     scanner.scan_start_time = 100.0
+    consumed: list[int] = []
 
-    def _fake_genops(_data: object):
+    def _fake_genops(_data: object) -> Iterator[tuple[object, object, int]]:
         for i in range(10):
-            yield (type("Op", (), {"name": "NOP"})(), i, i)
+            consumed.append(i)
+            yield (type("Op", (), {"name": "GLOBAL"})(), f"timeout{i} func{i}", i)
 
     monkeypatch.setattr("modelaudit.scanners.pickle_scanner.pickletools.genops", _fake_genops)
     monkeypatch.setattr("modelaudit.scanners.pickle_scanner.time.time", lambda: 102.0)
 
-    from io import BytesIO
-
     globals_found = scanner._extract_globals_advanced(data=BytesIO(b"x"), multiple_pickles=False)
 
+    assert consumed == []
     assert globals_found == set()
 
 

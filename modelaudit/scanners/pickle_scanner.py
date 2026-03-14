@@ -3808,13 +3808,11 @@ class PickleScanner(BaseScanner):
             extraction_truncated = False
             try:
                 ops: list[tuple[Any, Any, int | None]] = []
-                for op in pickletools.genops(data):
-                    ops.append(op)
-                    extracted_opcodes += 1
-
-                    if extracted_opcodes > self.max_opcodes:
+                op_iter = pickletools.genops(data)
+                while True:
+                    if extracted_opcodes >= self.max_opcodes:
                         logger.warning(
-                            f"Advanced global extraction stopped after exceeding max_opcodes ({self.max_opcodes})"
+                            f"Advanced global extraction stopped after reaching max_opcodes ({self.max_opcodes})"
                         )
                         extraction_truncated = True
                         break
@@ -3826,6 +3824,14 @@ class PickleScanner(BaseScanner):
                         logger.warning(f"Advanced global extraction stopped after exceeding timeout ({self.timeout}s)")
                         extraction_truncated = True
                         break
+
+                    try:
+                        op = next(op_iter)
+                    except StopIteration:
+                        break
+
+                    ops.append(op)
+                    extracted_opcodes += 1
             except Exception as e:
                 if globals_found:
                     logger.warning(f"Pickle parsing failed, but found {len(globals_found)} globals: {e}")
