@@ -1,7 +1,10 @@
 import ntpath
 import pickle
 import sys
+import zipfile
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import numpy as np
@@ -77,7 +80,7 @@ def test_check_consolidation_handles_newlines_in_file_paths(tmp_path: Path) -> N
 
 def test_check_consolidation_keeps_distinct_npz_member_findings(tmp_path: Path) -> None:
     class ExecPayload:
-        def __reduce__(self):
+        def __reduce__(self) -> tuple[Callable[..., Any], tuple[Any, ...]]:
             return (exec, ("print('owned')",))
 
     archive_path = tmp_path / "payload.npz"
@@ -85,11 +88,37 @@ def test_check_consolidation_keeps_distinct_npz_member_findings(tmp_path: Path) 
 
     result = scan_model_directory_or_file(str(archive_path))
     data_type_checks = [
-        check
-        for check in result.checks
-        if check.name == "Data Type Safety Check" and check.status.value == "failed"
+        check for check in result.checks if check.name == "Data Type Safety Check" and check.status.value == "failed"
     ]
 
     assert len(data_type_checks) == 1
     assert data_type_checks[0].location == f"{archive_path}:payload.npy"
     assert data_type_checks[0].details.get("zip_entry") == "payload.npy"
+
+
+def test_check_consolidation_keeps_nested_npz_member_findings_distinct(tmp_path: Path) -> None:
+    class ExecPayload:
+        def __reduce__(self) -> tuple[Callable[..., Any], tuple[Any, ...]]:
+            return (exec, ("print('owned')",))
+
+    inner_npz = tmp_path / "inner.npz"
+    np.savez(
+        inner_npz,
+        payload_a=np.array([ExecPayload()], dtype=object),
+        payload_b=np.array([ExecPayload()], dtype=object),
+    )
+
+    outer_zip = tmp_path / "outer.zip"
+    with zipfile.ZipFile(outer_zip, "w") as zf:
+        zf.write(inner_npz, arcname="inner.npz")
+
+    result = scan_model_directory_or_file(str(outer_zip))
+    data_type_checks = [
+        check for check in result.checks if check.name == "Data Type Safety Check" and check.status.value == "failed"
+    ]
+
+    assert len(data_type_checks) == 2
+    assert {check.details.get("zip_entry") for check in data_type_checks} == {
+        "inner.npz:payload_a.npy",
+        "inner.npz:payload_b.npy",
+    }

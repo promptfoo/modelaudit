@@ -1,7 +1,9 @@
 import os
 import tempfile
 import zipfile
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.zip_scanner import ZipScanner
@@ -258,7 +260,7 @@ class TestZipScanner:
                 import pickle
 
                 class DangerousClass:
-                    def __reduce__(self):
+                    def __reduce__(self) -> tuple[Callable[..., Any], tuple[Any, ...]]:
                         return (os_module.system, ("echo pwned",))
 
                 dangerous_obj = DangerousClass()
@@ -318,7 +320,7 @@ class TestZipScanner:
         import numpy as np
 
         class _ExecPayload:
-            def __reduce__(self):
+            def __reduce__(self) -> tuple[Callable[..., Any], tuple[Any, ...]]:
                 return (exec, ("print('owned')",))
 
         archive_path = tmp_path / "payload.npz"
@@ -334,6 +336,40 @@ class TestZipScanner:
             for c in failed_checks
         )
         assert any("exec" in i.message.lower() and i.details.get("zip_entry") == "payload.npy" for i in result.issues)
+
+    def test_scan_outer_zip_preserves_nested_npz_member_context(self, tmp_path: Path) -> None:
+        import numpy as np
+
+        class _ExecPayload:
+            def __reduce__(self) -> tuple[Callable[..., Any], tuple[Any, ...]]:
+                return (exec, ("print('owned')",))
+
+        inner_npz = tmp_path / "inner.npz"
+        np.savez(
+            inner_npz,
+            payload_a=np.array([_ExecPayload()], dtype=object),
+            payload_b=np.array([_ExecPayload()], dtype=object),
+        )
+
+        archive_path = tmp_path / "outer.zip"
+        with zipfile.ZipFile(archive_path, "w") as zf:
+            zf.write(inner_npz, arcname="inner.npz")
+
+        result = self.scanner.scan(str(archive_path))
+        failed_checks = [c for c in result.checks if c.status.value == "failed"]
+
+        assert any(
+            c.details.get("zip_entry") == "inner.npz:payload_a.npy"
+            and c.location
+            and f"{archive_path}:inner.npz:payload_a.npy" in c.location
+            for c in failed_checks
+        )
+        assert any(
+            c.details.get("zip_entry") == "inner.npz:payload_b.npy"
+            and c.location
+            and f"{archive_path}:inner.npz:payload_b.npy" in c.location
+            for c in failed_checks
+        )
 
     def test_scan_zip_with_plain_text_global_prefix_not_treated_as_pickle(self, tmp_path: Path) -> None:
         """Plain text entries that start with GLOBAL-like bytes should not trigger pickle parse warnings."""

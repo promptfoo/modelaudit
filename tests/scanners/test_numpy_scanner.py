@@ -1,4 +1,6 @@
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -105,12 +107,12 @@ class TestCVE20196446ObjectDtype:
 
 
 class _ExecPayload:
-    def __reduce__(self):
+    def __reduce__(self) -> tuple[Callable[..., Any], tuple[Any, ...]]:
         return (exec, ("print('owned')",))
 
 
 class _SSLPayload:
-    def __reduce__(self):
+    def __reduce__(self) -> tuple[Callable[..., Any], tuple[Any, ...]]:
         import ssl
 
         return (ssl.get_server_certificate, (("example.com", 443),))
@@ -118,6 +120,36 @@ class _SSLPayload:
 
 def _failed_checks(result: ScanResult) -> list[Check]:
     return [c for c in result.checks if c.status.value == "failed"]
+
+
+def _inject_comment_token_into_npy_payload(path: Path) -> None:
+    with path.open("rb") as handle:
+        major, minor = np.lib.format.read_magic(handle)
+        if (major, minor) == (1, 0):
+            np.lib.format.read_array_header_1_0(handle)
+        elif (major, minor) == (2, 0):
+            np.lib.format.read_array_header_2_0(handle)
+        else:
+            read_array_header = getattr(np.lib.format, "_read_array_header", None)
+            if read_array_header is None:
+                raise AssertionError(f"Unsupported NumPy header version: {(major, minor)}")
+            read_array_header(handle, version=(major, minor))
+        data_offset = handle.tell()
+        payload = handle.read()
+
+    if len(payload) < 2 or payload[0] != 0x80:
+        raise AssertionError(f"Unexpected pickle payload header: {payload[:4]!r}")
+
+    protocol = payload[1]
+    comment = b"# harmless note"
+    if protocol >= 4:
+        comment_op = b"\x8c" + bytes([len(comment)]) + comment
+    else:
+        comment_op = b"X" + len(comment).to_bytes(4, "little") + comment
+
+    patched = payload[:2] + comment_op + b"0" + payload[2:]
+    original = path.read_bytes()
+    path.write_bytes(original[:data_offset] + patched)
 
 
 def test_object_dtype_numpy_recurses_into_pickle_exec(tmp_path: Path) -> None:
@@ -156,6 +188,8 @@ def test_numeric_npz_has_no_pickle_recursion_findings(tmp_path: Path) -> None:
 
     assert not any("CVE-2019-6446" in (c.name + c.message) for c in result.checks)
     assert not any("exec" in c.message.lower() for c in result.checks)
+    assert not any(i.details.get("cve_id") == "CVE-2019-6446" for i in result.issues)
+    assert not any("exec" in i.message.lower() for i in result.issues)
 
 
 def test_object_npz_member_recurses_into_pickle_exec_with_member_context(tmp_path: Path) -> None:
@@ -171,6 +205,20 @@ def test_object_npz_member_recurses_into_pickle_exec_with_member_context(tmp_pat
     failed = _failed_checks(result)
     assert any("CVE-2019-6446" in (c.name + c.message) and "payload.npy" in str(c.location) for c in failed)
     assert any("exec" in i.message.lower() and i.details.get("zip_entry") == "payload.npy" for i in result.issues)
+
+
+def test_object_dtype_numpy_comment_token_bypass_still_detected(tmp_path: Path) -> None:
+    arr = np.array([_ExecPayload()], dtype=object)
+    path = tmp_path / "comment_token.npy"
+    np.save(path, arr, allow_pickle=True)
+    _inject_comment_token_into_npy_payload(path)
+
+    scanner = NumPyScanner()
+    result = scanner.scan(str(path))
+
+    failed = _failed_checks(result)
+    assert any("CVE-2019-6446" in (c.name + c.message) for c in failed)
+    assert any("exec" in c.message.lower() for c in failed)
 
 
 def test_benign_object_dtype_numpy_no_nested_critical(tmp_path: Path) -> None:

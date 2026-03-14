@@ -379,12 +379,15 @@ class TestXGBoostBinaryScanning:
 
         loading_scanner._safe_xgboost_load(windows_path, result)
 
-        run_args, _ = mock_subprocess.run.call_args
+        run_args, run_kwargs = mock_subprocess.run.call_args
         cmd = run_args[0]
-        script = cmd[2]
+        script = cmd[3]
+        assert cmd[1] == "-I"
         assert "sys.argv[1]" in script
         assert windows_path not in script
-        assert cmd[3] == windows_path
+        assert cmd[4] == windows_path
+        assert run_kwargs["cwd"] != str(Path.cwd())
+        assert "PYTHONPATH" not in run_kwargs["env"]
         assert any("loaded successfully" in str(check.message) for check in result.checks)
 
     @patch("modelaudit.scanners.xgboost_scanner._check_xgboost_available")

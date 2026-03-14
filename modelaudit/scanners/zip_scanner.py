@@ -131,10 +131,12 @@ class ZipScanner(BaseScanner):
             else:
                 issue.location = archive_location
 
-            if issue.details:
-                issue.details["zip_entry"] = entry_name
-            else:
-                issue.details = {"zip_entry": entry_name}
+            existing_issue_entry = issue.details.get("zip_entry")
+            issue.details["zip_entry"] = (
+                f"{entry_name}:{existing_issue_entry}"
+                if isinstance(existing_issue_entry, str) and existing_issue_entry
+                else entry_name
+            )
 
         for check in scan_result.checks:
             if check.location:
@@ -145,7 +147,12 @@ class ZipScanner(BaseScanner):
             else:
                 check.location = archive_location
 
-            check.details["zip_entry"] = entry_name
+            existing_check_entry = check.details.get("zip_entry")
+            check.details["zip_entry"] = (
+                f"{entry_name}:{existing_check_entry}"
+                if isinstance(existing_check_entry, str) and existing_check_entry
+                else entry_name
+            )
 
     def _scan_zip_file(self, path: str, depth: int = 0) -> ScanResult:
         """Recursively scan a ZIP file and its contents"""
