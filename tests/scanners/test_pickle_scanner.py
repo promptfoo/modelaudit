@@ -682,6 +682,152 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
         finally:
             os.unlink(path)
 
+    def test_builtins_hasattr_is_critical(self) -> None:
+        """builtins.hasattr must not be allowlisted as safe."""
+        result = self._scan_bytes(self._craft_global_reduce_pickle("builtins", "hasattr"))
+
+        assert result.success
+        assert result.has_errors
+        failed_global_checks = [
+            check
+            for check in result.checks
+            if check.name == "Global Module Reference Check"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+        ]
+        assert any("builtins.hasattr" in check.message for check in failed_global_checks), (
+            f"Expected CRITICAL Global Module Reference Check for builtins.hasattr, "
+            f"got: {[check.message for check in failed_global_checks]}"
+        )
+
+    def test_dunder_builtin_hasattr_is_critical(self) -> None:
+        """__builtin__.hasattr must not be allowlisted as safe."""
+        result = self._scan_bytes(self._craft_global_reduce_pickle("__builtin__", "hasattr"))
+
+        assert result.success
+        assert result.has_errors
+        failed_global_checks = [
+            check
+            for check in result.checks
+            if check.name == "Global Module Reference Check"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+        ]
+        assert any("__builtin__.hasattr" in check.message for check in failed_global_checks), (
+            f"Expected CRITICAL Global Module Reference Check for __builtin__.hasattr, "
+            f"got: {[check.message for check in failed_global_checks]}"
+        )
+
+    def test_safe_builtins_remain_allowlisted(self) -> None:
+        """Safe reconstruction builtins must remain non-failing."""
+        for safe_builtin in ["set", "slice", "tuple"]:
+            result = self._scan_bytes(self._craft_global_reduce_pickle("builtins", safe_builtin))
+
+            assert result.success
+            assert not result.has_errors, (
+                f"Expected builtins.{safe_builtin} to remain non-failing, got: {[i.message for i in result.issues]}"
+            )
+            safe_global_checks = [check for check in result.checks if check.name == "Global Module Reference Check"]
+            failed_builtin_checks = [
+                check
+                for check in result.checks
+                if check.status == CheckStatus.FAILED and f"builtins.{safe_builtin}" in check.message
+            ]
+            assert any(
+                check.status == CheckStatus.PASSED and f"builtins.{safe_builtin}" in check.message
+                for check in safe_global_checks
+            ), f"Expected passed Global Module Reference Check for builtins.{safe_builtin}"
+            assert not any(check.status == CheckStatus.FAILED for check in safe_global_checks), (
+                f"Unexpected failed Global Module Reference Check for builtins.{safe_builtin}: "
+                f"{[check.message for check in safe_global_checks]}"
+            )
+            assert not failed_builtin_checks, (
+                f"Expected builtins.{safe_builtin} to stay non-failing across all checks, "
+                f"got: {[check.message for check in failed_builtin_checks]}"
+            )
+
+    def test_dangerous_builtins_still_fail(self) -> None:
+        """Dangerous builtins must continue to fail after allowlist tightening."""
+        for dangerous_builtin in ["eval", "open"]:
+            result = self._scan_bytes(self._craft_global_reduce_pickle("builtins", dangerous_builtin))
+
+            assert result.success
+            assert result.has_errors
+            failed_checks = [
+                check
+                for check in result.checks
+                if check.status == CheckStatus.FAILED and check.severity == IssueSeverity.CRITICAL
+            ]
+            assert any(f"builtins.{dangerous_builtin}" in check.message for check in failed_checks), (
+                f"Expected CRITICAL builtins.{dangerous_builtin} finding, "
+                f"got: {[check.message for check in failed_checks]}"
+            )
+
+    def test_builtins_hasattr_stack_global_is_critical(self) -> None:
+        """STACK_GLOBAL resolution for builtins.hasattr must be flagged."""
+        payload = b"\x80\x04\x8c\x08builtins\x8c\x07hasattr\x93)R."
+
+        result = self._scan_bytes(payload)
+
+        assert result.success
+        assert result.has_errors
+        failed_stack_global_checks = [
+            check
+            for check in result.checks
+            if check.name == "STACK_GLOBAL Module Check"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+        ]
+        assert any("builtins.hasattr" in check.message for check in failed_stack_global_checks), (
+            f"Expected CRITICAL STACK_GLOBAL Module Check for builtins.hasattr, "
+            f"got: {[check.message for check in failed_stack_global_checks]}"
+        )
+
+    def test_builtins_hasattr_binput_binget_recall_is_critical(self) -> None:
+        """Memoized callable recall via BINPUT/BINGET must keep builtins.hasattr dangerous."""
+        # Memoize the callable, drop the original stack reference, then recall it.
+        payload = b"\x80\x02cbuiltins\nhasattr\nq\x010h\x01(tR."
+
+        result = self._scan_bytes(payload)
+
+        assert result.success
+        assert result.has_errors
+        failed_reduce_checks = [
+            check
+            for check in result.checks
+            if check.name == "REDUCE Opcode Safety Check"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+        ]
+        assert any(check.details.get("associated_global") == "builtins.hasattr" for check in failed_reduce_checks), (
+            f"Expected CRITICAL REDUCE finding for builtins.hasattr memo recall, "
+            f"got: {[check.details for check in failed_reduce_checks]}"
+        )
+
+    def test_builtins_hasattr_detected_after_benign_stream(self) -> None:
+        """Malicious builtins.hasattr stream should be detected after benign warm-up stream."""
+        import io
+
+        buf = io.BytesIO()
+        pickle.dump({"safe": True}, buf, protocol=2)
+        buf.write(self._craft_global_reduce_pickle("builtins", "hasattr"))
+
+        result = self._scan_bytes(buf.getvalue())
+
+        assert result.success
+        assert result.has_errors
+        failed_reduce_checks = [
+            check
+            for check in result.checks
+            if check.name == "REDUCE Opcode Safety Check"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+        ]
+        assert any(check.details.get("associated_global") == "builtins.hasattr" for check in failed_reduce_checks), (
+            f"Expected CRITICAL REDUCE finding for builtins.hasattr after benign stream, "
+            f"got: {[check.details for check in failed_reduce_checks]}"
+        )
+
     @staticmethod
     def _structural_tamper_checks(result: ScanResult) -> list:
         return [issue for issue in result.issues if issue.details.get("tamper_type") is not None]
