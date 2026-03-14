@@ -1993,6 +1993,24 @@ class TestPickleImportOnlyGlobalFindings:
         assert matched, [c.details for c in failed_checks]
         assert any("EvilPkg.thing" in c.message for c in matched)
 
+    def test_import_only_global_comment_token_bypass_still_fails(self, tmp_path: Path) -> None:
+        scanner = PickleScanner()
+        payload_path = tmp_path / "import_only_global_comment_token.pkl"
+        payload_path.write_bytes(b"\x80\x04" + _short_binunicode(b"# benign comment token") + b"0cevilpkg\nthing\n.")
+
+        result = scanner.scan(str(payload_path))
+
+        failed_checks = [
+            c for c in result.checks if c.name == "Global Module Reference Check" and c.status == CheckStatus.FAILED
+        ]
+        matched = [
+            c
+            for c in failed_checks
+            if c.details.get("import_reference") == "evilpkg.thing" and c.details.get("import_only") is True
+        ]
+        assert matched, [c.details for c in failed_checks]
+        assert any("evilpkg.thing" in c.message for c in matched)
+
     def test_import_only_stack_global_is_flagged(self, tmp_path: Path) -> None:
         scanner = PickleScanner()
         payload_path = tmp_path / "import_only_stack_global.pkl"
@@ -2004,6 +2022,31 @@ class TestPickleImportOnlyGlobalFindings:
             c for c in result.checks if c.name == "STACK_GLOBAL Module Check" and c.status == CheckStatus.FAILED
         ]
         assert failed_checks
+        matched = [
+            c
+            for c in failed_checks
+            if c.details.get("import_reference") == "evilpkg.thing" and c.details.get("import_only") is True
+        ]
+        assert matched, [c.details for c in failed_checks]
+        assert any("evilpkg.thing" in c.message for c in matched)
+
+    def test_import_only_stack_global_comment_token_bypass_still_fails(self, tmp_path: Path) -> None:
+        scanner = PickleScanner()
+        payload_path = tmp_path / "import_only_stack_global_comment_token.pkl"
+        payload_path.write_bytes(
+            b"\x80\x04"
+            + _short_binunicode(b"# benign comment token")
+            + b"0"
+            + _short_binunicode(b"evilpkg")
+            + _short_binunicode(b"thing")
+            + b"\x93."
+        )
+
+        result = scanner.scan(str(payload_path))
+
+        failed_checks = [
+            c for c in result.checks if c.name == "STACK_GLOBAL Module Check" and c.status == CheckStatus.FAILED
+        ]
         matched = [
             c
             for c in failed_checks
@@ -2164,6 +2207,30 @@ class TestPickleImportOnlyGlobalFindings:
         ]
         assert not failed_checks, [c.message for c in failed_checks]
 
+    def test_executed_import_only_allowlist_ref_is_not_marked_safe_allowlisted(self, tmp_path: Path) -> None:
+        scanner = PickleScanner()
+        payload_path = tmp_path / "executed_datetime_reduce.pkl"
+        payload_path.write_bytes(b"cdatetime\ndatetime\n)R.")
+
+        result = scanner.scan(str(payload_path))
+
+        passed_checks = [
+            c
+            for c in result.checks
+            if c.name == "Global Module Reference Check"
+            and c.status == CheckStatus.PASSED
+            and c.details.get("import_reference") == "datetime.datetime"
+            and c.details.get("classification") == "safe_allowlisted"
+            and c.details.get("import_only") is False
+        ]
+        assert not passed_checks, [c.details for c in result.checks if c.name == "Global Module Reference Check"]
+        assert any(
+            c.name == "REDUCE Opcode Safety Check"
+            and c.status == CheckStatus.FAILED
+            and c.details.get("associated_global") == "datetime.datetime"
+            for c in result.checks
+        )
+
     def test_import_only_data_label_like_module_is_ignored(self, tmp_path: Path) -> None:
         scanner = PickleScanner()
         payload_path = tmp_path / "import_only_data_label.pkl"
@@ -2286,6 +2353,23 @@ class TestPickleImportOnlyGlobalFindings:
         assert callable_refs[2] == ("collections", "OrderedDict")
         assert callable_origin_refs[2] == 2
         assert 5 not in stack_global_refs
+
+    def test_symbolic_simulation_protocol_five_buffers_preserve_stack_alignment(self) -> None:
+        opcodes = [
+            (type("Op", (), {"name": "UNICODE"})(), "evilpkg", 0),
+            (type("Op", (), {"name": "NEXT_BUFFER"})(), None, 1),
+            (type("Op", (), {"name": "READONLY_BUFFER"})(), None, 2),
+            (type("Op", (), {"name": "BINPUT"})(), 0, 3),
+            (type("Op", (), {"name": "POP"})(), None, 4),
+            (type("Op", (), {"name": "UNICODE"})(), "thing", 5),
+            (type("Op", (), {"name": "STACK_GLOBAL"})(), None, 6),
+        ]
+
+        stack_global_refs, callable_refs, callable_origin_refs = _simulate_symbolic_reference_maps(opcodes)
+
+        assert stack_global_refs[6] == ("evilpkg", "thing")
+        assert callable_refs == {}
+        assert callable_origin_refs == {}
 
 
 @pytest.mark.parametrize(

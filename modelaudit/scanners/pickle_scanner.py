@@ -2019,9 +2019,9 @@ def _classify_import_reference(
         return True, base_sev, "dangerous"
 
     if _is_safe_ml_global(mod, func):
-        if not is_import_only or _is_safe_import_only_global(mod, func, ml_context):
-            return False, None, "safe_allowlisted"
-    elif _is_safe_import_only_global(mod, func, ml_context):
+        return False, None, "safe_allowlisted"
+
+    if is_import_only and _is_safe_import_only_global(mod, func, ml_context):
         return False, None, "safe_allowlisted"
 
     if not _is_plausible_import_only_module(mod):
@@ -2402,6 +2402,14 @@ def _simulate_symbolic_reference_maps(
             "BINUNICODE8",
         }:
             stack.append(unknown)
+            continue
+
+        if name == "NEXT_BUFFER":
+            stack.append(unknown)
+            continue
+
+        if name == "READONLY_BUFFER":
+            continue
 
     return stack_global_refs, callable_refs, callable_origin_refs
 
