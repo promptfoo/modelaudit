@@ -70,6 +70,25 @@ def test_explanations_for_dangerous_imports():
     assert eval_explanation is not None and "arbitrary" in eval_explanation.lower()
 
 
+def test_explanations_for_specific_risky_ml_imports() -> None:
+    """Dotted risky ML references should resolve to a specific explanation."""
+    compile_explanation = get_import_explanation("torch.compile")
+    assert compile_explanation is not None
+    assert "compile" in compile_explanation.lower()
+
+    compile_descendant_explanation = get_import_explanation("torch.compile.__globals__")
+    assert compile_descendant_explanation is not None
+    assert "compile" in compile_descendant_explanation.lower()
+
+    dynamo_explanation = get_import_explanation("torch._dynamo.optimize")
+    assert dynamo_explanation is not None
+    assert "dynamo" in dynamo_explanation.lower()
+
+    storage_explanation = get_import_explanation("torch.storage._load_from_bytes")
+    assert storage_explanation is not None
+    assert "_load_from_bytes" in storage_explanation
+
+
 def test_explanations_for_exact_dangerous_imports() -> None:
     """Exact dotted dangerous imports should prefer their specific explanation over the base module."""
     numpy_load_explanation = get_import_explanation("numpy.load")

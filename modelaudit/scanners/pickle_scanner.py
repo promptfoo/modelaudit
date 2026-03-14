@@ -4,7 +4,6 @@ import io
 import os
 import pickletools
 import struct
-import sys
 import time
 from dataclasses import dataclass
 from typing import Any, BinaryIO, ClassVar, TypeGuard
@@ -656,6 +655,32 @@ WARNING_SEVERITY_MODULES: set[str] = {
     # cannot directly execute code.
     "glob",
 }
+
+# Risky ML-specific import surfaces that must be flagged even when they appear
+# as import-only GLOBAL/STACK_GLOBAL references (without immediate REDUCE).
+RISKY_ML_MODULE_PREFIXES: tuple[str, ...] = (
+    "torch.jit",
+    "torch._dynamo",
+    "torch._inductor",
+    "numpy.f2py",
+    "numpy.distutils",
+)
+
+RISKY_ML_EXACT_REFS: set[tuple[str, str]] = {
+    ("torch", "compile"),
+    ("torch.storage", "_load_from_bytes"),
+}
+RISKY_ML_EXACT_FULL_REFS: frozenset[str] = frozenset(f"{module}.{name}" for module, name in RISKY_ML_EXACT_REFS)
+
+
+def _split_parent_child_ref(prefix: str) -> tuple[str, str]:
+    parent, _separator, child = prefix.rpartition(".")
+    return parent, child
+
+
+RISKY_ML_PARENT_CHILD_REFS: frozenset[tuple[str, str]] = frozenset(
+    _split_parent_child_ref(prefix) for prefix in RISKY_ML_MODULE_PREFIXES
+)
 
 
 def _is_dangerous_module(mod: str) -> bool:
@@ -1903,8 +1928,14 @@ IMPORT_ONLY_SAFE_GLOBALS: dict[str, frozenset[str]] = {
     "__builtin__": frozenset({"set", "slice", "tuple"}),
     "builtins": frozenset({"set", "slice", "tuple"}),
     "datetime": frozenset({"date", "datetime", "time", "timedelta", "timezone"}),
+    "_io": frozenset({"BytesIO"}),
+    "site": frozenset({"addsitedir"}),
+    "numpy.f2py.crackfortran": frozenset({"markinnerspaces"}),
+    "torch.fx.experimental.symbolic_shapes.ShapeEnv": frozenset({"create_symbol"}),
+    "torch.utils._config_module": frozenset({"install_config_module"}),
+    "torch.utils.collect_env": frozenset({"get_env_info"}),
+    "torch.utils.data.datapipes.utils.decoder": frozenset({"handle_extension"}),
 }
-SAFE_IMPORT_ONLY_NAMESPACE_ROOTS = frozenset(module.split(".", 1)[0] for module in ML_SAFE_GLOBALS)
 
 
 def _is_safe_ml_global(mod: str, func: str) -> bool:
@@ -1941,21 +1972,6 @@ def _normalize_import_reference(mod: str, func: str) -> tuple[str, str]:
     return mod.strip().lower(), func.strip().lower()
 
 
-def _is_case_normalized_dangerous_reference(mod: str, func: str) -> bool:
-    """Check mixed-case refs against exact danger lists without widening safe-module matches."""
-    normalized_mod, normalized_func = _normalize_import_reference(mod, func)
-    if (normalized_mod, normalized_func) == (mod, func):
-        return False
-
-    full_ref = f"{normalized_mod}.{normalized_func}"
-    return (
-        _is_copyreg_extension_ref(normalized_mod)
-        or full_ref in ALWAYS_DANGEROUS_FUNCTIONS
-        or normalized_func in ALWAYS_DANGEROUS_FUNCTIONS
-        or is_suspicious_global(normalized_mod, normalized_func)
-    )
-
-
 def _is_resolved_import_target(mod: str, func: str) -> bool:
     """Return True when module/function look like concrete Python import targets."""
     if not mod or not func:
@@ -1982,14 +1998,6 @@ def _is_plausible_import_only_module(mod: str) -> bool:
     )
 
 
-def _is_known_safe_import_only_namespace(mod: str) -> bool:
-    """Return True for stdlib and known ML namespaces that should not warn by default."""
-    root = mod.split(".", 1)[0]
-    if root in getattr(sys, "stdlib_module_names", frozenset()):
-        return True
-    return root in SAFE_IMPORT_ONLY_NAMESPACE_ROOTS
-
-
 def _classify_import_reference(
     mod: str, func: str, ml_context: dict[str, Any], *, is_import_only: bool
 ) -> tuple[bool, IssueSeverity | None, str]:
@@ -2007,10 +2015,6 @@ def _classify_import_reference(
         return True, base_sev, "dangerous"
 
     if _is_actually_dangerous_global(mod, func, ml_context):
-        base_sev = IssueSeverity.WARNING if mod in WARNING_SEVERITY_MODULES else IssueSeverity.CRITICAL
-        return True, base_sev, "dangerous"
-
-    if _is_case_normalized_dangerous_reference(mod, func):
         base_sev = IssueSeverity.WARNING if normalized_mod in WARNING_SEVERITY_MODULES else IssueSeverity.CRITICAL
         return True, base_sev, "dangerous"
 
@@ -2023,10 +2027,32 @@ def _classify_import_reference(
     if not _is_plausible_import_only_module(mod):
         return False, None, "implausible"
 
-    if _is_known_safe_import_only_namespace(mod):
-        return False, None, "known_safe_namespace"
-
     return True, IssueSeverity.WARNING, "unknown_third_party"
+
+
+def _is_risky_ml_import(mod: str, func: str) -> bool:
+    """Return True when module/function matches risky ML import policy."""
+    full_ref = f"{mod}.{func}" if func else mod
+    parts = full_ref.split(".")
+
+    for i in range(1, len(parts) + 1):
+        candidate_full_ref = ".".join(parts[:i])
+        if candidate_full_ref in RISKY_ML_EXACT_FULL_REFS:
+            return True
+
+    for i in range(1, len(parts)):
+        candidate_mod = ".".join(parts[:i])
+        candidate_func = ".".join(parts[i:])
+        if (candidate_mod, candidate_func) in RISKY_ML_EXACT_REFS:
+            return True
+        if (candidate_mod, candidate_func) in RISKY_ML_PARENT_CHILD_REFS:
+            return True
+        if any(
+            candidate_mod == prefix or candidate_mod.startswith(f"{prefix}.") for prefix in RISKY_ML_MODULE_PREFIXES
+        ):
+            return True
+
+    return False
 
 
 def _is_copyreg_extension_ref(mod: str) -> bool:
@@ -2069,20 +2095,38 @@ def _is_actually_dangerous_global(mod: str, func: str, ml_context: dict) -> bool
     Security-first approach: Always flag dangerous functions, then check ML context
     for less critical operations.
     """
+    normalized_mod, normalized_func = _normalize_import_reference(mod, func)
     full_ref = f"{mod}.{func}"
+    normalized_full_ref = f"{normalized_mod}.{normalized_func}"
 
     # STEP 0: EXT opcodes (copyreg extension registry) are always suspicious.
     # They resolve callables indirectly via process-global state and can bypass
     # explicit GLOBAL/STACK_GLOBAL references.
-    if _is_copyreg_extension_ref(mod):
+    if _is_copyreg_extension_ref(mod) or (
+        (normalized_mod, normalized_func) != (mod, func) and _is_copyreg_extension_ref(normalized_mod)
+    ):
         logger.warning(f"Extension-registry callable detected via EXT opcode: {full_ref}")
+        return True
+
+    # STEP 0.5: Risky ML imports should be flagged even in import-only payloads.
+    # These are intentionally separate from the broad ML safe allowlist because
+    # they map to runtime loading/compilation pathways with elevated risk.
+    if _is_risky_ml_import(mod, func) or (
+        (normalized_mod, normalized_func) != (mod, func) and _is_risky_ml_import(normalized_mod, normalized_func)
+    ):
+        logger.warning(f"Risky ML import detected: {full_ref}")
         return True
 
     # STEP 1: ALWAYS flag dangerous functions first (no exceptions, no allowlist override)
     # This MUST come before the ML_SAFE_GLOBALS check to prevent bypass attacks
     # where an attacker places dangerous functions (e.g., operator.attrgetter) in a
     # pickle stream alongside ML references to trick the allowlist.
-    if full_ref in ALWAYS_DANGEROUS_FUNCTIONS or func in ALWAYS_DANGEROUS_FUNCTIONS:
+    if (
+        full_ref in ALWAYS_DANGEROUS_FUNCTIONS
+        or func in ALWAYS_DANGEROUS_FUNCTIONS
+        or normalized_full_ref in ALWAYS_DANGEROUS_FUNCTIONS
+        or normalized_func in ALWAYS_DANGEROUS_FUNCTIONS
+    ):
         logger.warning(
             f"Always-dangerous function detected: {full_ref} "
             f"(flagged regardless of ML context confidence={ml_context.get('overall_confidence', 0):.2f})"
@@ -2094,7 +2138,9 @@ def _is_actually_dangerous_global(mod: str, func: str, ml_context: dict) -> bool
     # setattr, delattr, __import__, compile, etc.) are already caught in STEP 1 via
     # ALWAYS_DANGEROUS_FUNCTIONS, so any function reaching this point that is in the
     # ML_SAFE_GLOBALS allowlist (e.g., builtins.slice, builtins.set) is genuinely safe.
-    if _is_dangerous_module(mod):
+    if _is_dangerous_module(mod) or (
+        (normalized_mod, normalized_func) != (mod, func) and _is_dangerous_module(normalized_mod)
+    ):
         if _is_safe_ml_global(mod, func):
             logger.debug(
                 f"Safe function from dangerous module: {mod}.{func} (explicitly allowlisted in ML_SAFE_GLOBALS)"
@@ -2114,7 +2160,13 @@ def _is_actually_dangerous_global(mod: str, func: str, ml_context: dict) -> bool
 
     # STEP 4: Use original suspicious global check for all other cases
     # Removed ML confidence-based whitelisting to prevent bypass attacks
-    return is_suspicious_global(mod, func)
+    if is_suspicious_global(mod, func):
+        return True
+
+    if (normalized_mod, normalized_func) != (mod, func):
+        return is_suspicious_global(normalized_mod, normalized_func)
+
+    return False
 
 
 def _parse_module_function(arg: str) -> tuple[str, str] | None:
@@ -2707,6 +2759,10 @@ def is_suspicious_global(mod: str, func: str) -> bool:
     First checks against ML_SAFE_GLOBALS allowlist to reduce false positives
     for legitimate ML framework operations.
     """
+    # STEP 0: Always flag risky ML imports before any allowlist checks.
+    if _is_risky_ml_import(mod, func):
+        return True
+
     # STEP 1: Check ML_SAFE_GLOBALS allowlist first
     # If the module.function is in the safe list, it's not suspicious
     if mod in ML_SAFE_GLOBALS:
@@ -2797,6 +2853,9 @@ def is_dangerous_reduce_pattern(
     def _is_dangerous_ref(mod: str, func: str) -> bool:
         """Check if a module.function reference is dangerous enough to flag."""
         if _is_copyreg_extension_ref(mod):
+            return True
+
+        if _is_risky_ml_import(mod, func):
             return True
 
         full_ref = f"{mod}.{func}"
@@ -5179,7 +5238,7 @@ class PickleScanner(BaseScanner):
                             0,
                         ),
                     },
-                    why=get_import_explanation(module_name)
+                    why=get_import_explanation(f"{module_name}.{func_name}")
                     if module_name
                     else "A dangerous pattern was detected that could execute arbitrary code during unpickling.",
                 )
