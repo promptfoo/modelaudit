@@ -120,7 +120,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **security:** detect CVE-2025-10155 pickle protocol 0/1 payloads disguised as `.bin` files by extending `detect_file_format()` to recognize GLOBAL opcode patterns and adding `posix`/`nt` internal module names to binary code pattern blocklist
 - **security:** detect CVE-2022-25882 ONNX external_data path traversal with CVE attribution, CVSS score, and CWE classification in scan results
 - **security:** detect CVE-2024-27318 ONNX nested external_data path traversal bypass via path segment sanitization evasion
-
 - **security:** flag risky import-only pickle references for `torch.jit`, `torch._dynamo`, `torch._inductor`, `torch.compile`, `torch.storage._load_from_bytes`, `numpy.f2py`, and `numpy.distutils` while preserving safe state-dict reconstruction paths
 - **security:** add low-severity pickle structural tamper findings for duplicate or misplaced `PROTO` opcodes while avoiding benign binary-tail false positives
 - **security:** stop treating mixed-case valid pickle module names as implausible, so import and reduce checks no longer bypass on names like `PIL` or attacker-chosen `EvilPkg`

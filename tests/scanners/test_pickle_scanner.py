@@ -760,23 +760,15 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
     def _craft_stack_global_reduce_pickle(module: str, func: str) -> bytes:
         """Craft protocol-4 payload with STACK_GLOBAL + REDUCE."""
 
-        def short_binunicode(value: str) -> bytes:
-            encoded = value.encode()
-            return b"\x8c" + bytes([len(encoded)]) + encoded
-
-        return b"\x80\x04" + short_binunicode(module) + short_binunicode(func) + b"\x93(tR."
+        return b"\x80\x04" + _short_binunicode(module.encode()) + _short_binunicode(func.encode()) + b"\x93(tR."
 
     @staticmethod
     def _craft_memoized_stack_global_reduce_pickle(module: str, func: str) -> bytes:
         """Craft protocol-4 payload that recalls a memoized STACK_GLOBAL before REDUCE."""
 
-        def short_binunicode(value: str) -> bytes:
-            encoded = value.encode()
-            return b"\x8c" + bytes([len(encoded)]) + encoded
-
         payload = bytearray(b"\x80\x04")
-        payload += short_binunicode(module)
-        payload += short_binunicode(func)
+        payload += _short_binunicode(module.encode())
+        payload += _short_binunicode(func.encode())
         payload += b"\x93"  # STACK_GLOBAL
         payload += b"\x94"  # MEMOIZE index 0
         payload += b"0"  # POP
@@ -916,7 +908,6 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
 
     def test_builtins_hasattr_binput_binget_recall_is_critical(self) -> None:
         """Memoized callable recall via BINPUT/BINGET must keep builtins.hasattr dangerous."""
-        # Memoize the callable, drop the original stack reference, then recall it.
         payload = b"\x80\x02cbuiltins\nhasattr\nq\x010h\x01(tR."
 
         result = self._scan_bytes(payload)
@@ -1019,6 +1010,30 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
             "Expected suspicious import-only detection for mixed-case dangerous global, "
             f"got: {[i.message for i in result.issues]}"
         )
+
+    def test_mixed_case_unknown_import_only_is_flagged(self) -> None:
+        """Mixed-case unknown import-only refs should now reach the import-only warning path."""
+        result = self._scan_bytes(self._craft_global_import_only_pickle("EvilPkg", "thing"))
+
+        failing_checks = [
+            check
+            for check in result.checks
+            if check.name == "Global Module Reference Check"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.WARNING
+            and check.details.get("import_reference") == "EvilPkg.thing"
+            and check.details.get("import_only") is True
+            and check.details.get("classification") == "unknown_third_party"
+        ]
+        assert failing_checks, f"Expected import-only warning for EvilPkg.thing: {result.checks}"
+        assert not any(
+            "implausible module name 'EvilPkg'" in check.message
+            for check in result.checks
+            if check.name == "Global Module Reference Check"
+        ), f"Mixed-case import-only path should not be suppressed as implausible: {result.checks}"
+        assert any(
+            issue.severity == IssueSeverity.WARNING and "EvilPkg.thing" in issue.message for issue in result.issues
+        ), f"Expected warning issue for EvilPkg.thing: {result.issues}"
 
     def test_mixed_case_reduce_in_later_stream_is_not_suppressed(self) -> None:
         import io
