@@ -6,7 +6,7 @@ import pickletools
 import reprlib
 import struct
 import time
-from typing import Any, BinaryIO, ClassVar, TypeGuard
+from typing import Any, BinaryIO, ClassVar, Literal, TypedDict, TypeGuard
 
 from modelaudit.analysis.enhanced_pattern_detector import EnhancedPatternDetector, PatternMatch
 from modelaudit.analysis.entropy_analyzer import EntropyAnalyzer
@@ -56,6 +56,18 @@ _STACK_GLOBAL_OPERAND_PREVIEWER.maxtuple = 4
 _STACK_GLOBAL_OPERAND_PREVIEWER.maxset = 4
 _STACK_GLOBAL_OPERAND_PREVIEWER.maxfrozenset = 4
 _STACK_GLOBAL_OPERAND_PREVIEWER.maxdict = 4
+
+
+StackGlobalOperandKind = Literal["string", "missing_memo", "unknown", "non_string"]
+MalformedStackGlobalReason = Literal["insufficient_context", "missing_memo", "mixed_or_non_string"]
+
+
+class MalformedStackGlobalDetails(TypedDict):
+    module_kind: StackGlobalOperandKind
+    module: str
+    function_kind: StackGlobalOperandKind
+    function: str
+    reason: MalformedStackGlobalReason
 
 
 def _format_stack_global_operand_preview(value: Any) -> str:
@@ -2048,7 +2060,7 @@ def _build_symbolic_reference_maps(
 ) -> tuple[
     dict[int, tuple[str, str]],
     dict[int, tuple[str, str]],
-    dict[int, dict[str, str]],
+    dict[int, MalformedStackGlobalDetails],
 ]:
     """
     Build symbolic maps of callable references in an opcode stream.
@@ -2061,7 +2073,7 @@ def _build_symbolic_reference_maps(
     """
     stack_global_refs: dict[int, tuple[str, str]] = {}
     callable_refs: dict[int, tuple[str, str]] = {}
-    malformed_stack_globals: dict[int, dict[str, str]] = {}
+    malformed_stack_globals: dict[int, MalformedStackGlobalDetails] = {}
 
     marker = object()
     unknown = object()
@@ -2088,7 +2100,7 @@ def _build_symbolic_reference_maps(
     def _is_ref(value: Any) -> TypeGuard[tuple[str, str]]:
         return isinstance(value, tuple) and len(value) == 2 and isinstance(value[0], str) and isinstance(value[1], str)
 
-    def _classify_stack_global_operand(value: Any) -> tuple[str, str]:
+    def _classify_stack_global_operand(value: Any) -> tuple[StackGlobalOperandKind, str]:
         if isinstance(value, str):
             return "string", value
         if value is missing_memo:
@@ -2132,7 +2144,7 @@ def _build_symbolic_reference_maps(
             else:
                 module_kind, module_value = _classify_stack_global_operand(mod_name)
                 function_kind, function_value = _classify_stack_global_operand(func_name)
-                reason = "insufficient_context"
+                reason: MalformedStackGlobalReason = "insufficient_context"
                 if "missing_memo" in {module_kind, function_kind}:
                     reason = "missing_memo"
                 elif "non_string" in {module_kind, function_kind}:
@@ -5031,13 +5043,13 @@ class PickleScanner(BaseScanner):
                             )
                     else:
                         malformed = malformed_stack_globals.get(i)
-                        if malformed and malformed.get("reason") != "insufficient_context":
+                        if malformed and malformed["reason"] != "insufficient_context":
                             suspicious_count += 1
-                            module_hint = malformed.get("module", "unknown")
-                            function_hint = malformed.get("function", "unknown")
-                            module_kind = malformed.get("module_kind", "unknown")
-                            function_kind = malformed.get("function_kind", "unknown")
-                            reason = malformed.get("reason", "mixed_or_non_string")
+                            module_hint = malformed["module"]
+                            function_hint = malformed["function"]
+                            module_kind = malformed["module_kind"]
+                            function_kind = malformed["function_kind"]
+                            reason = malformed["reason"]
                             module_looks_dangerous = (
                                 module_kind == "string"
                                 and module_hint not in {"", "unknown"}
