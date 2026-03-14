@@ -1802,10 +1802,14 @@ def _is_safe_ml_global(mod: str, func: str) -> bool:
     return False
 
 
-def _is_safe_import_only_global(mod: str, func: str) -> bool:
+def _is_safe_import_only_global(mod: str, func: str, ml_context: dict[str, Any] | None = None) -> bool:
     """Return True when an import-only target is explicitly safe to treat as benign."""
+    if _is_actually_dangerous_global(mod, func, ml_context or {}):
+        return False
+
     if _is_safe_ml_global(mod, func):
         return True
+
     return func in IMPORT_ONLY_SAFE_GLOBALS.get(mod, frozenset())
 
 
@@ -1846,12 +1850,12 @@ def _classify_import_reference(
     if not _is_resolved_import_target(mod, func):
         return False, None, "unresolved"
 
-    if _is_safe_import_only_global(mod, func):
-        return False, None, "safe_allowlisted"
-
     if _is_actually_dangerous_global(mod, func, ml_context):
         base_sev = IssueSeverity.WARNING if mod in WARNING_SEVERITY_MODULES else IssueSeverity.CRITICAL
         return True, base_sev, "dangerous"
+
+    if _is_safe_import_only_global(mod, func, ml_context):
+        return False, None, "safe_allowlisted"
 
     if not _is_plausible_import_only_module(mod):
         return False, None, "implausible"
@@ -4863,6 +4867,7 @@ class PickleScanner(BaseScanner):
                                     "function": func,
                                     "position": pos,
                                     "opcode": opcode.name,
+                                    "import_reference": f"{mod}.{func}",
                                     "import_only": is_import_only,
                                     "classification": classification,
                                     "ml_context_confidence": ml_context.get("overall_confidence", 0),
@@ -4878,6 +4883,7 @@ class PickleScanner(BaseScanner):
                                 details={
                                     "module": mod,
                                     "function": func,
+                                    "import_reference": f"{mod}.{func}",
                                     "position": pos,
                                     "opcode": opcode.name,
                                     "classification": classification,

@@ -18,7 +18,11 @@ from modelaudit.detectors.suspicious_symbols import (
     EXECUTABLE_SIGNATURES,
 )
 from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
-from modelaudit.scanners.pickle_scanner import PickleScanner
+from modelaudit.scanners.pickle_scanner import (
+    PickleScanner,
+    _is_actually_dangerous_global,
+    _is_safe_import_only_global,
+)
 from tests.assets.generators.generate_advanced_pickle_tests import (
     generate_memo_based_attack,
     generate_multiple_pickle_attack,
@@ -1299,6 +1303,13 @@ def test_scan_memory_error_with_dangerous_globals_not_downgraded(
 
 
 class TestPickleImportOnlyGlobalFindings:
+    def test_import_only_safety_helper_keeps_torch_load_unsafe(self) -> None:
+        ml_context: dict[str, object] = {}
+
+        assert _is_actually_dangerous_global("torch", "load", ml_context)
+        assert not _is_safe_import_only_global("torch", "load", ml_context)
+        assert _is_safe_import_only_global("builtins", "set", ml_context)
+
     def test_import_only_global_malicious_is_flagged(self, tmp_path: Path) -> None:
         scanner = PickleScanner()
         payload_path = tmp_path / "import_only_global.pkl"
@@ -1311,6 +1322,8 @@ class TestPickleImportOnlyGlobalFindings:
         ]
         assert failed_checks
         assert any("evilpkg.thing" in c.message for c in failed_checks)
+        assert any(c.details["import_only"] is True for c in failed_checks)
+        assert any(c.details.get("import_reference") == "evilpkg.thing" for c in failed_checks)
 
     def test_import_only_global_mixed_case_module_is_flagged(self, tmp_path: Path) -> None:
         scanner = PickleScanner()
@@ -1324,6 +1337,8 @@ class TestPickleImportOnlyGlobalFindings:
         ]
         assert failed_checks
         assert any("EvilPkg.thing" in c.message for c in failed_checks)
+        assert any(c.details["import_only"] is True for c in failed_checks)
+        assert any(c.details.get("import_reference") == "EvilPkg.thing" for c in failed_checks)
 
     def test_import_only_stack_global_is_flagged(self, tmp_path: Path) -> None:
         scanner = PickleScanner()
@@ -1337,6 +1352,30 @@ class TestPickleImportOnlyGlobalFindings:
         ]
         assert failed_checks
         assert any("evilpkg.thing" in c.message for c in failed_checks)
+        assert any(c.details["import_only"] is True for c in failed_checks)
+        assert any(c.details.get("import_reference") == "evilpkg.thing" for c in failed_checks)
+
+    @pytest.mark.parametrize(
+        ("payload", "check_name", "ref"),
+        [
+            (b"ctorch\nload\n.", "Global Module Reference Check", "torch.load"),
+            (b"\x80\x04\x8c\x05torch\x8c\x04load\x93.", "STACK_GLOBAL Module Check", "torch.load"),
+        ],
+    )
+    def test_import_only_torch_load_payloads_are_flagged(
+        self, tmp_path: Path, payload: bytes, check_name: str, ref: str
+    ) -> None:
+        scanner = PickleScanner()
+        payload_path = tmp_path / f"{check_name.replace(' ', '_').lower()}.pkl"
+        payload_path.write_bytes(payload)
+
+        result = scanner.scan(str(payload_path))
+
+        failed_checks = [c for c in result.checks if c.name == check_name and c.status == CheckStatus.FAILED]
+        assert failed_checks, [c.message for c in result.checks]
+        assert any(ref in c.message for c in failed_checks)
+        assert any(c.details["import_only"] is True for c in failed_checks)
+        assert any(c.details.get("import_reference") == ref for c in failed_checks)
 
     @pytest.mark.parametrize(
         "payload,ref",
