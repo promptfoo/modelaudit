@@ -1,5 +1,6 @@
 import bz2
 import gzip
+import io
 import lzma
 import pickle
 import zlib
@@ -126,6 +127,59 @@ def test_compressed_scanner_false_positive_control_high_ratio_within_policy(tmp_
         if c.name == "Compressed Wrapper Decompression Limits" and c.status == CheckStatus.FAILED
     ]
     assert len(ratio_failures) == 0
+
+
+def test_read_zlib_stream_uses_bounded_decompression(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _FakeDecompressor:
+        def __init__(self) -> None:
+            self.max_lengths: list[int] = []
+            self.flush_lengths: list[int] = []
+
+        def decompress(self, _chunk: bytes, max_length: int = 0) -> bytes:
+            self.max_lengths.append(max_length)
+            return b"x" * min(256, max_length)
+
+        def flush(self, length: int = 0) -> bytes:
+            self.flush_lengths.append(length)
+            return b""
+
+    fake_decompressor = _FakeDecompressor()
+
+    monkeypatch.setattr(
+        "modelaudit.scanners.compressed_scanner.zlib.decompressobj",
+        lambda: fake_decompressor,
+    )
+
+    CompressedScanner._read_zlib_stream_with_limits(
+        source=io.BytesIO(b"compressed"),
+        destination=io.BytesIO(),
+        max_decompressed_bytes=1024,
+        max_ratio=100.0,
+        compressed_size=10,
+        chunk_size=4,
+    )
+
+    assert fake_decompressor.max_lengths
+    assert fake_decompressor.max_lengths == [1025, 769, 513]
+    assert fake_decompressor.flush_lengths == [257]
+
+
+def test_read_zlib_stream_allows_exact_limit_real_stream() -> None:
+    payload = b"A" * 1024
+    compressed = zlib.compress(payload)
+    destination = io.BytesIO()
+
+    total_out = CompressedScanner._read_zlib_stream_with_limits(
+        source=io.BytesIO(compressed),
+        destination=destination,
+        max_decompressed_bytes=len(payload),
+        max_ratio=1000.0,
+        compressed_size=len(compressed),
+        chunk_size=1,
+    )
+
+    assert total_out == len(payload)
+    assert destination.getvalue() == payload
 
 
 def test_compressed_scanner_missing_lz4_dependency_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

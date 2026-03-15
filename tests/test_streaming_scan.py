@@ -8,7 +8,7 @@ from unittest.mock import patch
 import pytest
 
 from modelaudit.core import scan_model_directory_or_file, scan_model_streaming
-from modelaudit.scanners.base import ScanResult
+from modelaudit.scanners.base import IssueSeverity, ScanResult
 from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
 
 
@@ -204,6 +204,37 @@ def test_scan_model_streaming_scan_error_handling(temp_test_files):
         assert result.has_errors is True
         # Should have scanned 2 files (1st and 3rd)
         assert result.files_scanned == 2
+
+
+def test_scan_model_streaming_critical_findings_do_not_set_operational_errors(temp_test_files):
+    """Security findings should preserve exit-code semantics in streaming mode."""
+
+    def file_generator():
+        for i, file_path in enumerate(temp_test_files):
+            is_last = i == len(temp_test_files) - 1
+            yield (file_path, is_last)
+
+    finding = ScanResult(scanner_name="test_scanner")
+    finding.bytes_scanned = 128
+    finding.add_check(
+        name="Dangerous Pickle Check",
+        passed=False,
+        message="Detected malicious payload",
+        severity=IssueSeverity.CRITICAL,
+        location=str(temp_test_files[0]),
+    )
+    finding.finish(success=True)
+
+    with patch("modelaudit.core.scan_file", return_value=finding):
+        result = scan_model_streaming(
+            file_generator=file_generator(),
+            timeout=30,
+            delete_after_scan=False,
+        )
+
+    assert result.success is True
+    assert result.has_errors is False
+    assert result.failed_checks >= 1
 
 
 @pytest.mark.slow

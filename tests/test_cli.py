@@ -1,6 +1,7 @@
 import json
 import os
 import re
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -1417,6 +1418,24 @@ def test_exit_code_security_issues(tmp_path):
     assert "error" in output_lower or "warning" in output_lower or "critical" in output_lower, (
         f"Expected 'error', 'warning', or 'critical' in output, but got: {result.output}"
     )
+
+
+def test_exit_code_security_issues_streaming_local_directory(tmp_path):
+    """Streaming local scans should still exit 1 for real security findings."""
+    sample_dir = Path(__file__).resolve().parent / "assets" / "samples" / "pickles"
+    safe_sample = sample_dir / "safe_data.pkl"
+    malicious_sample = sample_dir / "malicious_system_call.pkl"
+
+    streamed_dir = tmp_path / "streamed"
+    streamed_dir.mkdir()
+    (streamed_dir / safe_sample.name).write_bytes(safe_sample.read_bytes())
+    (streamed_dir / malicious_sample.name).write_bytes(malicious_sample.read_bytes())
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "--stream", str(streamed_dir)])
+
+    assert result.exit_code == 1, f"Expected exit code 1, got {result.exit_code}. Output: {result.output}"
+    assert not any(streamed_dir.iterdir()), "Streaming scan should delete files after scanning"
 
 
 def test_exit_code_scan_errors(tmp_path):
