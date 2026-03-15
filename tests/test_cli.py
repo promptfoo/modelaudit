@@ -1,6 +1,7 @@
 import json
 import os
 import re
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -1419,7 +1420,7 @@ def test_exit_code_security_issues(tmp_path):
     )
 
 
-def test_exit_code_security_issues_streaming_local_directory(tmp_path):
+def test_exit_code_security_issues_streaming_local_directory(tmp_path: Path) -> None:
     """Streaming local-directory scans should keep security findings as exit code 1."""
     import pickle
 
