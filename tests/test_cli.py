@@ -1419,6 +1419,7 @@ def test_exit_code_security_issues(tmp_path):
         f"Expected 'error', 'warning', or 'critical' in output, but got: {result.output}"
     )
 
+
 def test_exit_code_security_issues_streaming_local_directory(tmp_path: Path) -> None:
     """Streaming local-directory scans should keep security findings as exit code 1."""
     import pickle
