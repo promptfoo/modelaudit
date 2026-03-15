@@ -7,12 +7,15 @@ import tarfile
 import zlib
 from collections.abc import Callable
 from pathlib import Path
+from typing import Literal
 
 import pytest
 
 from modelaudit.scanners import get_scanner_for_file
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.compressed_scanner import CompressedScanner, _MissingOptionalDependencyError
+
+TarWriteMode = Literal["w:gz", "w:bz2", "w:xz"]
 
 
 class _MaliciousPayload:
@@ -39,7 +42,11 @@ def test_compressed_scanner_can_handle_requires_matching_signature(tmp_path: Pat
         ("model.tar.xz", "w:xz"),
     ],
 )
-def test_compound_tar_wrappers_route_to_tar_scanner(tmp_path: Path, filename: str, mode: str) -> None:
+def test_compound_tar_wrappers_route_to_tar_scanner(
+    tmp_path: Path,
+    filename: str,
+    mode: TarWriteMode,
+) -> None:
     archive_path = tmp_path / filename
     payload = b"weights"
 
