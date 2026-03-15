@@ -1064,6 +1064,26 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
             for c in context_checks
         ), f"Expected CRITICAL malformed STACK_GLOBAL check, got: {[(c.severity, c.message) for c in context_checks]}"
 
+    def test_stack_global_risky_ml_module_prefix_plus_non_string_operand_is_critical(self) -> None:
+        """Risky ML module hints should not downgrade malformed STACK_GLOBAL findings."""
+        payload = b"\x80\x04\x8c\x0dtorch._dynamoK\x01\x93."
+
+        result = self._scan_bytes(payload)
+        assert result.success
+
+        context_checks = [c for c in result.checks if c.name == "STACK_GLOBAL Context Check"]
+        assert any(
+            c.status == CheckStatus.FAILED
+            and c.severity == IssueSeverity.CRITICAL
+            and c.rule_code == "S205"
+            and c.details.get("module") == "torch._dynamo"
+            and c.details.get("reason") == "mixed_or_non_string"
+            for c in context_checks
+        ), (
+            "Expected CRITICAL malformed STACK_GLOBAL finding for risky ML prefix, got: "
+            f"{[(c.severity, c.message) for c in context_checks]}"
+        )
+
     def test_stack_global_large_bytes_operand_preview_is_bounded(self) -> None:
         """Large malformed operands should not expand finding payloads."""
         large_bytes = b"x" * 200_000

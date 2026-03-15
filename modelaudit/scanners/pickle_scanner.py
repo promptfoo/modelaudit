@@ -2108,6 +2108,11 @@ def _is_risky_ml_import(mod: str, func: str) -> bool:
     return False
 
 
+def _is_risky_ml_module_prefix(mod: str) -> bool:
+    """Return True when a module hint falls under a risky ML import prefix."""
+    return any(mod == prefix or mod.startswith(f"{prefix}.") for prefix in RISKY_ML_MODULE_PREFIXES)
+
+
 def _is_copyreg_extension_ref(mod: str) -> bool:
     """Return True when a reference came from an EXT opcode extension lookup."""
     return mod == COPYREG_EXTENSION_MODULE
@@ -5355,12 +5360,12 @@ class PickleScanner(BaseScanner):
                             module_kind = malformed["module_kind"]
                             function_kind = malformed["function_kind"]
                             reason = malformed["reason"]
-                            module_looks_dangerous = (
+                            module_looks_high_risk = (
                                 module_kind == "string"
                                 and module_hint not in {"", "unknown"}
-                                and _is_dangerous_module(module_hint)
+                                and (_is_dangerous_module(module_hint) or _is_risky_ml_module_prefix(module_hint))
                             )
-                            severity = IssueSeverity.CRITICAL if module_looks_dangerous else IssueSeverity.WARNING
+                            severity = IssueSeverity.CRITICAL if module_looks_high_risk else IssueSeverity.WARNING
                             if reason == "missing_memo":
                                 message = (
                                     "STACK_GLOBAL references missing or invalid memoized operand(s): "
