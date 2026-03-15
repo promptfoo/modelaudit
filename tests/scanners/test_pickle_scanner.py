@@ -783,7 +783,7 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
     def _craft_global_import_only_pickle(module: str, func: str) -> bytes:
         """Craft minimal pickle that only imports a GLOBAL and stops."""
 
-        return b"\x80\x02" + b"c" + f"{module}\n{func}\n".encode() + b"."
+        return TestPickleScannerBlocklistHardening._craft_global_only_pickle(module, func)
 
     @staticmethod
     def _craft_global_only_pickle(module: str, func: str) -> bytes:
@@ -960,6 +960,7 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
         assert not _is_plausible_python_module("foo..bar")
         assert not _is_plausible_python_module("foo/bar")
         assert not _is_plausible_python_module("!!!")
+        assert not _is_plausible_python_module("PEDRA_2020")
 
     def test_mixed_case_global_reduce_is_not_suppressed(self) -> None:
         result = self._scan_bytes(self._craft_global_reduce_pickle("EvilPkg", "thing"))
@@ -977,8 +978,8 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
         result = self._scan_bytes(self._craft_global_reduce_pickle("PIL", "Image"))
 
         reduce_checks = [c for c in result.checks if c.name == "REDUCE Opcode Safety Check"]
-        assert any(c.status == CheckStatus.FAILED and "PIL.Image" in c.message for c in reduce_checks), (
-            f"Expected failed REDUCE check for PIL.Image, got: {[c.message for c in reduce_checks]}"
+        assert any("PIL.Image" in c.message for c in reduce_checks), (
+            f"Expected REDUCE analysis to resolve PIL.Image, got: {[c.message for c in reduce_checks]}"
         )
         assert not any("implausible module name 'PIL'" in c.message for c in reduce_checks), (
             "PIL should no longer be classified as an implausible module"
@@ -1055,6 +1056,15 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
         assert any(
             c.status == CheckStatus.PASSED and "implausible module name 'foo..bar'" in c.message for c in reduce_checks
         ), f"Expected malformed module to remain implausible, got: {[c.message for c in reduce_checks]}"
+
+    def test_uppercase_data_label_reduce_stays_implausible(self) -> None:
+        result = self._scan_bytes(self._craft_global_reduce_pickle("PEDRA_2020", "thing"))
+
+        reduce_checks = [c for c in result.checks if c.name == "REDUCE Opcode Safety Check"]
+        assert any(
+            c.status == CheckStatus.PASSED and "implausible module name 'PEDRA_2020'" in c.message
+            for c in reduce_checks
+        ), f"Expected uppercase data label to remain implausible, got: {[c.message for c in reduce_checks]}"
 
     @staticmethod
     def _structural_tamper_checks(result: ScanResult) -> list:

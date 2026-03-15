@@ -1877,12 +1877,13 @@ def _is_plausible_python_module(name: str) -> bool:
     Check whether *name* looks like a real Python module/package path.
 
     Legitimate module names follow Python identifier rules:
-    - Each dotted segment is a valid Python identifier (letters, digits,
-      underscores; cannot start with a digit).
+    - Each dotted segment is an ASCII Python identifier.
+    - Segments normally contain lowercase characters, with a short explicit
+      allowlist for case-sensitive imports such as ``PIL``.
 
     Keep obviously malformed names rejected so arbitrary data strings are less
-    likely to be treated as imports, while allowing valid mixed-case segments
-    such as ``PIL``.
+    likely to be treated as imports, while still allowing valid mixed-case
+    segments such as ``EvilPkg`` and ``MyOrg.InternalPkg``.
 
     Returns:
         True if *name* plausibly refers to a real Python module.
@@ -1894,12 +1895,12 @@ def _is_plausible_python_module(name: str) -> bool:
     if " " in name or "\t" in name:
         return False
 
-    # Split on dots; each segment must be a valid Python identifier.
+    # Split on dots; each segment must be an ASCII Python identifier.
     segments = name.split(".")
-    if not segments or any(s == "" for s in segments):
+    if not segments or any(s == "" or not s.isascii() or not s.isidentifier() for s in segments):
         return False
 
-    return all(seg.isidentifier() for seg in segments)
+    return all(any(char.islower() for char in seg) or seg in _CASE_SENSITIVE_IMPORT_SEGMENTS for seg in segments)
 
 
 _CASE_SENSITIVE_IMPORT_SEGMENTS = frozenset({"PIL", "Cython"})
@@ -1973,16 +1974,7 @@ def _is_resolved_import_target(mod: str, func: str) -> bool:
 
 def _is_plausible_import_only_module(mod: str) -> bool:
     """Return True when a module path looks importable without matching common data labels."""
-    if not mod:
-        return False
-
-    segments = mod.split(".")
-    if not segments or any(segment == "" or not segment.isidentifier() for segment in segments):
-        return False
-
-    return all(
-        any(char.islower() for char in segment) or segment in _CASE_SENSITIVE_IMPORT_SEGMENTS for segment in segments
-    )
+    return _is_plausible_python_module(mod)
 
 
 def _classify_import_reference(
