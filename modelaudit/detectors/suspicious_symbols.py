@@ -190,6 +190,14 @@ SUSPICIOUS_GLOBALS = {
     # Code execution / compilation
     "codeop": "*",
     "marshal": ["loads", "load", "dumps", "dump"],
+    # Additional torch / NumPy helper primitives validated as dangerous import-level refs
+    "numpy.f2py.crackfortran": ["getlincoef"],
+    "torch._dynamo.guards.GuardBuilder": ["get"],
+    "torch.fx.experimental.symbolic_shapes.ShapeEnv": ["evaluate_guards_expression"],
+    "torch.utils.collect_env": ["run"],
+    "torch.utils._config_module.ConfigModule": ["load_config"],
+    "torch.utils.bottleneck.__main__": ["run_cprofile", "run_autograd_prof"],
+    "torch.utils.data.datapipes.utils.decoder": ["basichandlers"],
     "compileall": "*",
     "py_compile": "*",
     # FFI / native code
@@ -660,6 +668,262 @@ TENSORFLOW_DANGEROUS_OPS: dict[str, str] = {
 # Known safe Keras model classes that use declarative layer configurations
 # without custom code execution (Sequential, Functional, Model)
 KNOWN_SAFE_MODEL_CLASSES: set[str] = {"Sequential", "Functional", "Model"}
+
+# Known safe Keras layer class names (standard built-in layers).
+# Any layer class_name NOT in this set or SUSPICIOUS_LAYER_TYPES is treated as
+# a custom/unknown layer that warrants attention.
+KNOWN_SAFE_KERAS_LAYER_CLASSES: frozenset[str] = frozenset(
+    {
+        # Input
+        "InputLayer",
+        "Input",
+        # Core
+        "Dense",
+        "Activation",
+        "Embedding",
+        "Masking",
+        "Flatten",
+        "Reshape",
+        "Permute",
+        "RepeatVector",
+        "Identity",
+        "EinsumDense",
+        # Activations (added)
+        "ReLU",
+        "Softmax",
+        "LeakyReLU",
+        "PReLU",
+        "ELU",
+        # Convolutional
+        "Conv1D",
+        "Conv2D",
+        "Conv3D",
+        "SeparableConv1D",
+        "SeparableConv2D",
+        "DepthwiseConv1D",
+        "DepthwiseConv2D",
+        "Conv1DTranspose",
+        "Conv2DTranspose",
+        "Conv3DTranspose",
+        # Pooling
+        "MaxPooling1D",
+        "MaxPooling2D",
+        "MaxPooling3D",
+        "AveragePooling1D",
+        "AveragePooling2D",
+        "AveragePooling3D",
+        "GlobalMaxPooling1D",
+        "GlobalMaxPooling2D",
+        "GlobalMaxPooling3D",
+        "GlobalAveragePooling1D",
+        "GlobalAveragePooling2D",
+        "GlobalAveragePooling3D",
+        "MaxPool1D",
+        "MaxPool2D",
+        "MaxPool3D",
+        "AvgPool1D",
+        "AvgPool2D",
+        "AvgPool3D",
+        "GlobalMaxPool1D",
+        "GlobalMaxPool2D",
+        "GlobalMaxPool3D",
+        "GlobalAvgPool1D",
+        "GlobalAvgPool2D",
+        "GlobalAvgPool3D",
+        # RNN
+        "SimpleRNN",
+        "LSTM",
+        "GRU",
+        "ConvLSTM1D",
+        "ConvLSTM2D",
+        "ConvLSTM3D",
+        "SimpleRNNCell",
+        "LSTMCell",
+        "GRUCell",
+        "StackedRNNCells",
+        "Bidirectional",
+        "TimeDistributed",
+        "RNN",
+        # Normalization
+        "BatchNormalization",
+        "LayerNormalization",
+        "GroupNormalization",
+        "UnitNormalization",
+        "SpectralNormalization",
+        # Regularization
+        "Dropout",
+        "SpatialDropout1D",
+        "SpatialDropout2D",
+        "SpatialDropout3D",
+        "GaussianNoise",
+        "GaussianDropout",
+        "AlphaDropout",
+        "ActivityRegularization",
+        # Attention
+        "MultiHeadAttention",
+        "Attention",
+        "AdditiveAttention",
+        # Merging
+        "Add",
+        "Subtract",
+        "Multiply",
+        "Average",
+        "Maximum",
+        "Minimum",
+        "Concatenate",
+        "Dot",
+        # Padding/Cropping
+        "ZeroPadding1D",
+        "ZeroPadding2D",
+        "ZeroPadding3D",
+        "Cropping1D",
+        "Cropping2D",
+        "Cropping3D",
+        # Upsampling
+        "UpSampling1D",
+        "UpSampling2D",
+        "UpSampling3D",
+        # Preprocessing
+        "Rescaling",
+        "Resizing",
+        "CenterCrop",
+        "RandomFlip",
+        "RandomRotation",
+        "RandomZoom",
+        "RandomCrop",
+        "RandomTranslation",
+        "RandomContrast",
+        "RandomBrightness",
+        "RandomHeight",
+        "RandomWidth",
+        "Normalization",
+        "Discretization",
+        "CategoryEncoding",
+        "Hashing",
+        "HashedCrossing",
+        "StringLookup",
+        "IntegerLookup",
+        "TextVectorization",
+        # TF-specific
+        "TFSMLayer",
+        # Wrapper
+        "Wrapper",
+        # Model classes (nested models in configs)
+        "Sequential",
+        "Functional",
+        "Model",
+        # Keras DType
+        "DTypePolicy",
+    }
+)
+
+# Known standard Keras loss function names (string identifiers and class names).
+# Used to detect custom/unknown loss functions in training_config.
+KNOWN_SAFE_KERAS_LOSSES: frozenset[str] = frozenset(
+    {
+        # String identifiers
+        "mse",
+        "mae",
+        "mape",
+        "msle",
+        "binary_crossentropy",
+        "categorical_crossentropy",
+        "sparse_categorical_crossentropy",
+        "hinge",
+        "squared_hinge",
+        "categorical_hinge",
+        "huber",
+        "log_cosh",
+        "logcosh",
+        "kl_divergence",
+        "kld",
+        "kullback_leibler_divergence",
+        "poisson",
+        "cosine_similarity",
+        "cosine_proximity",
+        "mean_squared_error",
+        "mean_absolute_error",
+        "mean_absolute_percentage_error",
+        "mean_squared_logarithmic_error",
+        # Class names
+        "MeanSquaredError",
+        "MeanAbsoluteError",
+        "MeanAbsolutePercentageError",
+        "MeanSquaredLogarithmicError",
+        "BinaryCrossentropy",
+        "CategoricalCrossentropy",
+        "SparseCategoricalCrossentropy",
+        "Hinge",
+        "SquaredHinge",
+        "CategoricalHinge",
+        "Huber",
+        "LogCosh",
+        "KLDivergence",
+        "Poisson",
+        "CosineSimilarity",
+        "BinaryFocalCrossentropy",
+        "CategoricalFocalCrossentropy",
+        "Dice",
+        "Tversky",
+        "CTC",
+        "LossFunctionWrapper",
+    }
+)
+
+# Known standard Keras metric class names.
+# Used to detect custom/unknown metrics in training_config.
+KNOWN_SAFE_KERAS_METRICS: frozenset[str] = frozenset(
+    {
+        # Accuracy
+        "Accuracy",
+        "BinaryAccuracy",
+        "CategoricalAccuracy",
+        "SparseCategoricalAccuracy",
+        "TopKCategoricalAccuracy",
+        "SparseTopKCategoricalAccuracy",
+        # Regression
+        "MeanSquaredError",
+        "RootMeanSquaredError",
+        "MeanAbsoluteError",
+        "MeanAbsolutePercentageError",
+        "MeanSquaredLogarithmicError",
+        "LogCoshError",
+        "CosineSimilarity",
+        # Classification
+        "AUC",
+        "Precision",
+        "Recall",
+        "TruePositives",
+        "TrueNegatives",
+        "FalsePositives",
+        "FalseNegatives",
+        "PrecisionAtRecall",
+        "RecallAtPrecision",
+        "SensitivityAtSpecificity",
+        "SpecificityAtSensitivity",
+        "F1Score",
+        "FBetaScore",
+        "MeanMetricWrapper",
+        "CompileMetrics",
+        # Segmentation
+        "IoU",
+        "BinaryIoU",
+        "MeanIoU",
+        "OneHotIoU",
+        "OneHotMeanIoU",
+        # Other
+        "KLDivergence",
+        "Poisson",
+        "Sum",
+        "Mean",
+        "BinaryCrossentropy",
+        "CategoricalCrossentropy",
+        "SparseCategoricalCrossentropy",
+        "Hinge",
+        "SquaredHinge",
+        "CategoricalHinge",
+    }
+)
 
 # Suspicious Keras layer types
 # Layer types that can contain arbitrary code or complex functionality
