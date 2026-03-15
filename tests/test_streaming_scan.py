@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import pytest
 
-from modelaudit.core import scan_model_directory_or_file, scan_model_streaming
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file, scan_model_streaming
 from modelaudit.scanners.base import IssueSeverity, ScanResult
 from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
 
@@ -27,11 +27,13 @@ def temp_test_files():
             file_path.unlink()
 
 
-def create_mock_scan_result(bytes_scanned: int = 1024) -> ScanResult:
+def create_mock_scan_result(bytes_scanned: int = 1024, with_critical_issue: bool = False) -> ScanResult:
     """Create a mock ScanResult for testing."""
     result = ScanResult(scanner_name="test_scanner")
     result.bytes_scanned = bytes_scanned
     result.success = True
+    if with_critical_issue:
+        result.add_issue("Detected malicious behavior", severity=IssueSeverity.CRITICAL, location="test.pkl")
     return result
 
 
@@ -113,9 +115,29 @@ def test_scan_model_streaming_with_deletion(temp_test_files):
         for f in temp_test_files:
             assert not f.exists()
 
-        # Verify scan completed
-        assert result.files_scanned == 3
-        assert result.content_hash is not None
+    # Verify scan completed
+    assert result.files_scanned == 3
+    assert result.content_hash is not None
+
+def test_scan_model_streaming_critical_findings_do_not_set_operational_errors(temp_test_files) -> None:
+    """Security findings in streaming mode should still return the security exit code."""
+
+    def file_generator():
+        yield (temp_test_files[0], True)
+
+    with patch("modelaudit.core.scan_file") as mock_scan:
+        mock_scan.return_value = create_mock_scan_result(with_critical_issue=True)
+
+        result = scan_model_streaming(
+            file_generator=file_generator(),
+            timeout=30,
+            delete_after_scan=False,
+        )
+
+    assert result.files_scanned == 1
+    assert len(result.issues) == 1
+    assert result.has_errors is False
+    assert determine_exit_code(result) == 1
 
 
 def test_scan_model_streaming_content_hash_deterministic():
@@ -204,38 +226,6 @@ def test_scan_model_streaming_scan_error_handling(temp_test_files):
         assert result.has_errors is True
         # Should have scanned 2 files (1st and 3rd)
         assert result.files_scanned == 2
-
-
-def test_scan_model_streaming_critical_findings_do_not_set_operational_errors(temp_test_files):
-    """Security findings should preserve exit-code semantics in streaming mode."""
-
-    def file_generator():
-        for i, file_path in enumerate(temp_test_files):
-            is_last = i == len(temp_test_files) - 1
-            yield (file_path, is_last)
-
-    finding = ScanResult(scanner_name="test_scanner")
-    finding.bytes_scanned = 128
-    finding.add_check(
-        name="Dangerous Pickle Check",
-        passed=False,
-        message="Detected malicious payload",
-        severity=IssueSeverity.CRITICAL,
-        location=str(temp_test_files[0]),
-    )
-    finding.finish(success=True)
-
-    with patch("modelaudit.core.scan_file", return_value=finding):
-        result = scan_model_streaming(
-            file_generator=file_generator(),
-            timeout=30,
-            delete_after_scan=False,
-        )
-
-    assert result.success is True
-    assert result.has_errors is False
-    assert result.failed_checks >= 1
-
 
 @pytest.mark.slow
 def test_scan_model_streaming_timeout():
