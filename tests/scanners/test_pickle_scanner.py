@@ -2059,6 +2059,68 @@ def test_extract_globals_advanced_respects_max_opcodes_in_buffered_second_stream
     }
 
 
+def test_extract_globals_advanced_preserves_partial_globals_when_genops_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Advanced extraction should keep globals parsed before a late generator failure."""
+    scanner = PickleScanner()
+
+    def _fake_genops_with_fallback(
+        _data: BytesIO,
+        *,
+        multi_stream: bool = False,
+        max_items: int | None = None,
+        deadline: float | None = None,
+    ) -> Iterator[tuple[object, object, int]]:
+        del multi_stream, max_items, deadline
+        yield (type("Op", (), {"name": "GLOBAL"})(), "kept func", 0)
+        raise RuntimeError("synthetic failure")
+
+    monkeypatch.setattr("modelaudit.scanners.pickle_scanner._genops_with_fallback", _fake_genops_with_fallback)
+
+    globals_found = scanner._extract_globals_advanced(data=BytesIO(b"x"), multiple_pickles=False)
+
+    assert globals_found == {("kept", "func", "GLOBAL")}
+
+
+def test_extract_globals_advanced_skips_symbolic_post_processing_after_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Timeout exhaustion should return partial direct globals without extra O(n) work."""
+    scanner = PickleScanner({"timeout": 1})
+    scanner.scan_start_time = 100.0
+    build_calls: list[list[tuple[object, object, int | None]]] = []
+
+    def _fake_genops_with_fallback(
+        _data: BytesIO,
+        *,
+        multi_stream: bool = False,
+        max_items: int | None = None,
+        deadline: float | None = None,
+    ) -> Iterator[tuple[object, object, int]]:
+        del multi_stream, max_items, deadline
+        yield (type("Op", (), {"name": "GLOBAL"})(), "early func", 0)
+        yield (type("Op", (), {"name": "STACK_GLOBAL"})(), None, 1)
+
+    def _fake_build_symbolic_reference_maps(
+        opcodes: list[tuple[object, object, int | None]],
+    ) -> tuple[dict[int, tuple[str, str]], dict[int, tuple[str, str]]]:
+        build_calls.append(opcodes)
+        return {}, {}
+
+    monkeypatch.setattr("modelaudit.scanners.pickle_scanner._genops_with_fallback", _fake_genops_with_fallback)
+    monkeypatch.setattr(
+        "modelaudit.scanners.pickle_scanner._build_symbolic_reference_maps",
+        _fake_build_symbolic_reference_maps,
+    )
+    monkeypatch.setattr("modelaudit.scanners.pickle_scanner.time.time", lambda: 102.0)
+
+    globals_found = scanner._extract_globals_advanced(data=BytesIO(b"x"), multiple_pickles=False)
+
+    assert globals_found == {("early", "func", "GLOBAL")}
+    assert build_calls == []
+
+
 class TestPickleImportOnlyGlobalFindings:
     def test_import_only_safety_helper_keeps_torch_load_unsafe(self) -> None:
         ml_context: dict[str, object] = {}

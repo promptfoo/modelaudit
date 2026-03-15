@@ -4176,16 +4176,22 @@ class PickleScanner(BaseScanner):
         globals_found: set[tuple[str, str, str]] = set()
         effective_scan_start_time = scan_start_time if scan_start_time is not None else self.scan_start_time
         deadline = effective_scan_start_time + self.timeout if effective_scan_start_time is not None else None
+        timeout_warning_emitted = False
+        ops: list[tuple[Any, Any, int | None]] = []
 
         try:
-            ops = list(
-                _genops_with_fallback(
-                    data,
-                    multi_stream=multiple_pickles,
-                    max_items=self.max_opcodes,
-                    deadline=deadline,
-                )
-            )
+            for opcode, arg, pos in _genops_with_fallback(
+                data,
+                multi_stream=multiple_pickles,
+                max_items=self.max_opcodes,
+                deadline=deadline,
+            ):
+                ops.append((opcode, arg, pos))
+                op_name = opcode.name
+                if op_name in {"GLOBAL", "INST"} and isinstance(arg, str):
+                    parsed = _parse_module_function(arg)
+                    if parsed is not None:
+                        globals_found.add((*parsed, op_name))
         except Exception as e:
             if globals_found:
                 logger.warning(f"Pickle parsing failed, but found {len(globals_found)} globals: {e}")
@@ -4197,16 +4203,19 @@ class PickleScanner(BaseScanner):
             logger.warning(f"Advanced global extraction stopped after reaching max_opcodes ({self.max_opcodes})")
         elif deadline is not None and time.time() > deadline:
             logger.warning(f"Advanced global extraction stopped after exceeding timeout ({self.timeout}s)")
+            timeout_warning_emitted = True
+            return globals_found
 
         stack_global_refs, _callable_refs = _build_symbolic_reference_maps(ops)
 
-        for n, (opcode, arg, _pos) in enumerate(ops):
+        for n, (opcode, _arg, _pos) in enumerate(ops):
             op_name = opcode.name
-            if op_name in {"GLOBAL", "INST"} and isinstance(arg, str):
-                parsed = _parse_module_function(arg)
-                if parsed is not None:
-                    globals_found.add((*parsed, op_name))
-            elif op_name == "STACK_GLOBAL":
+            if deadline is not None and time.time() > deadline:
+                if not timeout_warning_emitted:
+                    logger.warning(f"Advanced global extraction stopped after exceeding timeout ({self.timeout}s)")
+                break
+
+            if op_name == "STACK_GLOBAL":
                 resolved = stack_global_refs.get(n)
                 if resolved:
                     globals_found.add((*resolved, op_name))

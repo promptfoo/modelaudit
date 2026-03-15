@@ -1419,6 +1419,26 @@ def test_exit_code_security_issues(tmp_path):
     )
 
 
+def test_exit_code_security_issues_streaming_local_directory(tmp_path):
+    """Streaming local-directory scans should keep security findings as exit code 1."""
+    import pickle
+
+    evil_pickle_path = tmp_path / "malicious.pkl"
+
+    class MaliciousClass:
+        def __reduce__(self):
+            return (os.system, ('echo "This is a malicious pickle"',))
+
+    with evil_pickle_path.open("wb") as f:
+        pickle.dump(MaliciousClass(), f)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "--stream", "--format", "text", str(tmp_path)])
+
+    assert result.exit_code == 1, f"Expected exit code 1, got {result.exit_code}. Output: {result.output}"
+    assert not evil_pickle_path.exists()
+
+
 def test_exit_code_scan_errors(tmp_path):
     """Test exit code 2 when errors occur during scanning."""
     runner = CliRunner()
