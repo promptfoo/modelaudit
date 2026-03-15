@@ -99,6 +99,34 @@ DANGEROUS_IMPORTS: dict[str, str] = {
         "The 'dill' module extends pickle's capabilities to serialize almost any Python object, including lambda "
         "functions and code objects. This significantly increases the attack surface for code execution."
     ),
+    "torch.jit": (
+        "The 'torch.jit' module can load and execute serialized TorchScript artifacts. In untrusted model files, "
+        "this can introduce unsafe runtime behavior and should be treated as a high-risk import surface."
+    ),
+    "torch._dynamo": (
+        "The 'torch._dynamo' internals drive dynamic graph capture and compilation. Importing these internals from "
+        "untrusted pickle payloads is suspicious because they enable advanced runtime execution pathways."
+    ),
+    "torch._inductor": (
+        "The 'torch._inductor' compiler backend can generate and execute optimized kernels at runtime. In model "
+        "artifacts, this is a risky import surface that should be reviewed as potentially unsafe."
+    ),
+    "torch.compile": (
+        "The 'torch.compile' API triggers runtime compilation and execution pipelines. In untrusted serialized "
+        "payloads, this can be used to reach risky execution paths and should be flagged."
+    ),
+    "torch.storage._load_from_bytes": (
+        "The 'torch.storage._load_from_bytes' function reconstructs storages from raw bytes and can be abused in "
+        "malicious pickle chains. References from untrusted payloads should be treated as dangerous."
+    ),
+    "numpy.f2py": (
+        "The 'numpy.f2py' toolchain bridges Python and compiled Fortran extensions. References in untrusted "
+        "pickles are risky because they can touch native-code compilation/loading paths."
+    ),
+    "numpy.distutils": (
+        "The 'numpy.distutils' build utilities are tied to extension module compilation and setup workflows. "
+        "Importing them from serialized model payloads is suspicious and may indicate unsafe behavior."
+    ),
     "numpy.load": (
         "The 'numpy.load' function can recursively deserialize object arrays via pickle support, enabling "
         "second-stage payload loading from attacker-controlled files."
@@ -461,8 +489,14 @@ def get_import_explanation(module_name: str) -> str | None:
     """Get explanation for a dangerous import/module."""
     if module_name in DANGEROUS_IMPORTS:
         return get_explanation("import", module_name)
-    # Handle module.function format (e.g., "os.system")
-    base_module = module_name.split(".")[0]
+
+    parts = module_name.split(".")
+    for i in range(len(parts) - 1, 0, -1):
+        parent = ".".join(parts[:i])
+        if parent in DANGEROUS_IMPORTS:
+            return get_explanation("import", parent)
+
+    base_module = parts[0]
     return get_explanation("import", base_module)
 
 
