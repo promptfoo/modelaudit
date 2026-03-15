@@ -1602,6 +1602,9 @@ def scan_model_streaming(
                     scan_result_dict = {
                         "bytes_scanned": scan_result.bytes_scanned,
                         "files_scanned": 1,  # Each scan_result represents one file
+                        # ScanResult.has_errors means "critical findings", but
+                        # ModelAuditResultModel.has_errors is reserved for
+                        # operational scan failures.
                         "has_errors": not scan_result.success,
                         "success": scan_result.success,
                         "issues": [issue.__dict__ for issue in (scan_result.issues or [])],
