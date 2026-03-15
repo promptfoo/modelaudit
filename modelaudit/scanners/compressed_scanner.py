@@ -173,13 +173,20 @@ class CompressedScanner(BaseScanner):
         decompressor = zlib.decompressobj()
         total_out = 0
 
+        def _remaining_decompressed_budget() -> int:
+            return max(max_decompressed_bytes - total_out, 0)
+
+        def _probe_limit() -> int:
+            remaining_budget = _remaining_decompressed_budget()
+            return remaining_budget + 1 if remaining_budget > 0 else 1
+
         while True:
             chunk = source.read(chunk_size)
             if not chunk:
                 break
 
             try:
-                out = decompressor.decompress(chunk)
+                out = decompressor.decompress(chunk, max_length=_probe_limit())
             except zlib.error as exc:
                 raise _CorruptStreamError(f"Invalid zlib stream: {exc}") from exc
 
@@ -196,7 +203,7 @@ class CompressedScanner(BaseScanner):
                 destination.write(out)
 
         try:
-            final = decompressor.flush()
+            final = decompressor.flush(_probe_limit())
         except zlib.error as exc:
             raise _CorruptStreamError(f"Invalid zlib stream flush: {exc}") from exc
 
