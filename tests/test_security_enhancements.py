@@ -6,6 +6,7 @@ import lzma
 import pickle
 import zipfile
 import zlib
+from pathlib import Path
 
 import numpy as np
 
@@ -270,7 +271,7 @@ class TestNumPyScannerSecurity:
         size_issues = [issue for issue in result.issues if "too large" in issue.message.lower()]
         assert len(size_issues) > 0
 
-    def test_dangerous_dtype_reports_cve_warning(self, tmp_path):
+    def test_dangerous_dtype_reports_cve_warning(self, tmp_path: Path) -> None:
         """Object dtype arrays should scan successfully while emitting CVE-2019-6446 warnings."""
         scanner = NumPyScanner()
         npy_file = tmp_path / "object_dtype.npy"

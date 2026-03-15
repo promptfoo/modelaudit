@@ -80,7 +80,7 @@ def test_check_consolidation_handles_newlines_in_file_paths(tmp_path: Path) -> N
 
 def test_npz_member_checks_keep_archive_member_locations(tmp_path: Path) -> None:
     class _ExecPayload:
-        def __reduce__(self):
+        def __reduce__(self) -> tuple[Callable[..., Any], tuple[Any, ...]]:
             return (exec, ("print('owned')",))
 
     archive_path = tmp_path / "payload.npz"
