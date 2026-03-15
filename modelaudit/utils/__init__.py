@@ -16,6 +16,11 @@ from .file.filtering import DEFAULT_SKIP_EXTENSIONS, DEFAULT_SKIP_FILENAMES, sho
 from .sources.dvc import resolve_dvc_file
 
 
+def _absolute_without_resolving(path: str | os.PathLike[str]) -> Path:
+    """Return an absolute path without following filesystem symlinks."""
+    return Path(os.path.abspath(os.fspath(path)))
+
+
 def is_within_directory(base_dir: str, target: str) -> bool:
     """Return True if the target path is within the given base directory."""
     base_path = Path(base_dir).resolve()
@@ -77,7 +82,7 @@ def sanitize_archive_path(entry_name: str, base_dir: str) -> tuple[str, bool]:
         (resolved_path, is_safe) where ``is_safe`` is ``False`` if the entry
         would escape ``base_dir`` when extracted.
     """
-    base_path = Path(os.path.abspath(base_dir))
+    base_path = _absolute_without_resolving(base_dir)
     # Normalize separators
     entry = entry_name.replace("\\", "/")
     is_absolute = is_absolute_archive_path(entry)
@@ -87,12 +92,14 @@ def sanitize_archive_path(entry_name: str, base_dir: str) -> tuple[str, bool]:
         unsafe_resolved = os.path.normpath(f"{base_path}{os.sep}{archive_suffix}")
         return unsafe_resolved, False
     entry = entry.lstrip("/")
-    resolved = Path(os.path.abspath(os.path.join(str(base_path), entry)))
+    resolved = _absolute_without_resolving(base_path / entry)
+    base_str = os.path.normpath(str(base_path))
+    resolved_str = os.path.normpath(str(resolved))
+    if os.name == "nt":
+        base_str = os.path.normcase(base_str)
+        resolved_str = os.path.normcase(resolved_str)
     try:
-        is_safe = resolved.is_relative_to(base_path)
-    except AttributeError:  # Python < 3.9
-        try:
-            is_safe = os.path.commonpath([resolved, base_path]) == str(base_path)
-        except ValueError:  # Windows: different drives
-            is_safe = False
+        is_safe = os.path.commonpath([resolved_str, base_str]) == base_str
+    except ValueError:  # Windows: different drives
+        is_safe = False
     return str(resolved), is_safe
