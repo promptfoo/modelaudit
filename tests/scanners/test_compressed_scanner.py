@@ -1,13 +1,16 @@
 import bz2
 import gzip
+import io
 import lzma
 import pickle
+import tarfile
 import zlib
 from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
+from modelaudit.scanners import get_scanner_for_file
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.compressed_scanner import CompressedScanner, _MissingOptionalDependencyError
 
@@ -26,6 +29,29 @@ def test_compressed_scanner_can_handle_requires_matching_signature(tmp_path: Pat
 
     assert CompressedScanner.can_handle(str(valid_gzip_path)) is True
     assert CompressedScanner.can_handle(str(invalid_gzip_path)) is False
+
+
+@pytest.mark.parametrize(
+    ("filename", "mode"),
+    [
+        ("model.tar.gz", "w:gz"),
+        ("model.tar.bz2", "w:bz2"),
+        ("model.tar.xz", "w:xz"),
+    ],
+)
+def test_compound_tar_wrappers_route_to_tar_scanner(tmp_path: Path, filename: str, mode: str) -> None:
+    archive_path = tmp_path / filename
+    payload = b"weights"
+
+    with tarfile.open(archive_path, mode) as tar:
+        info = tarfile.TarInfo("weights.bin")
+        info.size = len(payload)
+        tar.addfile(info, io.BytesIO(payload))
+
+    scanner = get_scanner_for_file(str(archive_path))
+
+    assert scanner is not None
+    assert scanner.name == "tar"
 
 
 def test_compressed_scanner_routes_benign_inner_payload(tmp_path: Path) -> None:
