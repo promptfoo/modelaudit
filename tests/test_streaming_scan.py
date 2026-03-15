@@ -120,7 +120,9 @@ def test_scan_model_streaming_with_deletion(temp_test_files):
     assert result.content_hash is not None
 
 
-def test_scan_model_streaming_critical_findings_do_not_set_operational_errors(temp_test_files):
+def test_scan_model_streaming_critical_findings_do_not_set_operational_errors(
+    temp_test_files: list[Path],
+) -> None:
     """Security findings in streaming mode should still return the security exit code."""
 
     def file_generator():
