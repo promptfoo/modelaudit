@@ -57,7 +57,7 @@ def test_executorch_scanner_invalid_zip(tmp_path):
     assert any("executorch" in i.message.lower() for i in result.issues)
 
 
-def test_executorch_scanner_accepts_binary_program_header(tmp_path) -> None:
+def test_executorch_scanner_accepts_binary_program_header(tmp_path: Path) -> None:
     file_path = tmp_path / "program.pte"
     file_path.write_bytes(b"\x40\x00\x00\x00ET12eh00\x20\x00\x00\x00\xe8\x8c\x01\x00\x00\x00\x00\x00")
     scanner = ExecuTorchScanner()
