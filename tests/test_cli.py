@@ -205,6 +205,8 @@ def test_scan_can_apply_local_config_once_when_confirmed(tmp_path: Path, monkeyp
     assert "NO ISSUES FOUND" in output
     trust_store = TrustedConfigStore(tmp_path / "cache" / "trusted_local_configs.json")
     assert not trust_store.store_path.exists()
+
+
 def test_scan_can_remember_trusted_local_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Choosing to trust a local config should persist for future interactive runs."""
     import tarfile
