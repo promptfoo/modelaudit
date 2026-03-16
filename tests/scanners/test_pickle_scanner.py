@@ -24,6 +24,7 @@ from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.pickle_scanner import (
     PickleScanner,
     _genops_with_fallback,
+    _GenopsBudgetExceeded,
     _is_actually_dangerous_global,
     _is_safe_import_only_global,
     _simulate_symbolic_reference_maps,
@@ -2287,10 +2288,43 @@ def test_genops_with_fallback_does_not_emit_buffered_partial_second_stream_on_bu
 
     monkeypatch.setattr("modelaudit.scanners.pickle_scanner.pickletools.genops", _fake_genops)
 
-    ops = list(_genops_with_fallback(BytesIO(b"xy"), multi_stream=True, max_items=3))
+    ops = []
+    op_iter = _genops_with_fallback(BytesIO(b"xy"), multi_stream=True, max_items=3)
+    with pytest.raises(_GenopsBudgetExceeded, match="max_items"):
+        while True:
+            ops.append(next(op_iter))
 
     assert second_stream_consumed == [0]
     assert [arg for _opcode, arg, _pos in ops] == ["first0 func0", "first1 func1"]
+
+
+def test_scan_pickle_reports_opcode_budget_truncation_for_buffered_follow_on_stream(tmp_path: Path) -> None:
+    """Budget exhaustion in a later buffered stream should surface analysis truncation."""
+    clean_path = tmp_path / "clean.pkl"
+    clean_path.write_bytes(pickle.dumps({"weights": [1, 2, 3], "name": "safe"}))
+
+    class Evil:
+        def __reduce__(self) -> tuple[object, tuple[str]]:
+            return (os.system, ("echo pr700-budget",))
+
+    evil_path = tmp_path / "evil.pkl"
+    with evil_path.open("wb") as f:
+        pickle.dump(Evil(), f)
+
+    combined_path = tmp_path / "combined.pkl"
+    combined_path.write_bytes(clean_path.read_bytes() + evil_path.read_bytes())
+
+    result = PickleScanner({"max_opcodes": 25}).scan(str(combined_path))
+
+    opcode_checks = [
+        check for check in result.checks if check.name == "Opcode Count Check" and check.status == CheckStatus.FAILED
+    ]
+    assert len(opcode_checks) == 1
+    assert opcode_checks[0].severity == IssueSeverity.INFO
+    assert "opcode budget" in opcode_checks[0].message.lower()
+    assert opcode_checks[0].details["analysis_incomplete"] is True
+    assert result.metadata["analysis_incomplete"] is True
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
 def test_extract_globals_advanced_preserves_partial_globals_when_genops_raises(
