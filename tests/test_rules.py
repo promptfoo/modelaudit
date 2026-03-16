@@ -187,7 +187,7 @@ S301 = "HIGH"
         with pytest.raises(ValueError, match="Invalid severity"):
             ModelAuditConfig.from_cli_args(severity={"S301": "SEVERE"})
 
-    def test_from_cli_args_uses_provided_base_config(self):
+    def test_from_cli_args_uses_provided_base_config(self) -> None:
         """CLI overrides should merge onto an explicitly supplied base config."""
         base_config = ModelAuditConfig()
         base_config.suppress = {"S710"}
@@ -247,12 +247,16 @@ def test_find_local_config_for_paths_uses_shared_ancestor(tmp_path: Path) -> Non
     """All scanned paths under the same config root should resolve one candidate."""
     root = tmp_path / "repo"
     nested = root / "models" / "nested"
+    sibling = root / "models" / "other"
     nested.mkdir(parents=True)
+    sibling.mkdir(parents=True)
     (root / ".modelaudit.toml").write_text('suppress = ["S710"]\n')
-    file_path = nested / "model.pkl"
-    file_path.write_bytes(b"test")
+    first_file = nested / "model.pkl"
+    second_file = sibling / "model.pkl"
+    first_file.write_bytes(b"test")
+    second_file.write_bytes(b"other")
 
-    candidate = find_local_config_for_paths([str(file_path)])
+    candidate = find_local_config_for_paths([str(first_file), str(second_file)])
 
     assert candidate is not None
     assert candidate.config_dir == root
@@ -294,6 +298,25 @@ def test_trusted_config_store_invalidates_when_config_changes(tmp_path: Path) ->
     config_path.write_text('suppress = ["S801"]\n')
 
     assert not store.is_trusted(candidate)
+
+
+def test_trusted_config_store_rejects_broken_symlink_ancestor(tmp_path: Path, requires_symlinks: None) -> None:
+    """Trust records should not be written through broken symlink ancestors."""
+    cache_root = tmp_path / "redirected-cache"
+    cache_root.symlink_to(tmp_path / "missing-cache", target_is_directory=True)
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    config_path = repo_root / ".modelaudit.toml"
+    config_path.write_text('suppress = ["S710"]\n')
+    candidate = find_local_config_for_paths([str(config_path)])
+
+    assert candidate is not None
+
+    store = TrustedConfigStore(cache_root / "trusted_local_configs.json")
+    store.trust(candidate)
+
+    assert not store.store_path.exists()
 
 
 class TestScanResultIntegration:

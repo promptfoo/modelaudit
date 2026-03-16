@@ -144,7 +144,7 @@ def _has_symlink_component(path: Path) -> bool:
     current = path
     while True:
         try:
-            if current.exists() and current.is_symlink():
+            if current.is_symlink():
                 return True
         except OSError:
             return True

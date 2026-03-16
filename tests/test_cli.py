@@ -2,6 +2,7 @@ import json
 import os
 import re
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -11,15 +12,15 @@ from modelaudit import __version__
 from modelaudit.cache.trusted_config_store import TrustedConfigStore
 from modelaudit.cli import cli, expand_paths, format_text_output
 from modelaudit.core import scan_model_directory_or_file
-from modelaudit.models import create_initial_audit_result
+from modelaudit.models import ModelAuditResultModel, create_initial_audit_result
 
 
-def strip_ansi(text):
+def strip_ansi(text: str) -> str:
     """Strip ANSI color codes from text for testing."""
     return re.sub(r"\x1b\[[0-9;]*m", "", text)
 
 
-def create_mock_scan_result(**kwargs):
+def create_mock_scan_result(**kwargs: Any) -> ModelAuditResultModel:
     """Create a mock ModelAuditResultModel for testing."""
     result = create_initial_audit_result()
 
@@ -176,7 +177,7 @@ def test_scan_does_not_auto_load_untrusted_local_config(tmp_path: Path) -> None:
     assert any(issue.get("rule_code") == "S405" for issue in payload.get("issues", []))
 
 
-def test_scan_can_apply_local_config_once_when_confirmed(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_scan_can_apply_local_config_once_when_confirmed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Interactive scans can apply a local config for the current run only."""
     import tarfile
 
@@ -203,8 +204,11 @@ def test_scan_can_apply_local_config_once_when_confirmed(tmp_path, monkeypatch: 
     assert "Using local ModelAudit config" in output
     assert "NO ISSUES FOUND" in output
 
+    trust_store = TrustedConfigStore(tmp_path / "cache" / "trusted_local_configs.json")
+    assert not trust_store.store_path.exists()
 
-def test_scan_can_remember_trusted_local_config(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+
+def test_scan_can_remember_trusted_local_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Choosing to trust a local config should persist for future interactive runs."""
     import tarfile
 
@@ -240,7 +244,7 @@ def test_scan_disables_cache_when_local_config_is_applied(tmp_path: Path, monkey
 
     captured: dict[str, object] = {}
 
-    def fake_scan_model_directory_or_file(path: str, **kwargs):
+    def fake_scan_model_directory_or_file(path: str, **kwargs: Any) -> ModelAuditResultModel:
         captured["path"] = path
         captured.update(kwargs)
         return create_mock_scan_result()
