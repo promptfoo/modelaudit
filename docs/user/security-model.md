@@ -27,6 +27,13 @@ ModelAudit is a static security scanner for model artifacts. It analyzes files a
 - `modelaudit metadata` defaults to non-deserializing extraction for untrusted inputs.
 - `--trust-loaders` may deserialize model content and should only be used on trusted artifacts in isolated environments.
 
+## Local scan policy files
+
+- Local `.modelaudit.toml` or `pyproject.toml` policy files are not applied implicitly during scans.
+- Interactive text scans may offer to trust a detected local policy file for future runs on that same config directory.
+- Remembered trust is stored in the local ModelAudit cache and is invalidated automatically if the config file changes.
+- CI and other non-interactive scans should use explicit configuration rather than relying on remembered local trust.
+
 ## Interpreting scan results
 
 - `CRITICAL`: High-confidence risk indicator. Block release/use by default.
