@@ -39,8 +39,8 @@ class ExecuTorchScanner(BaseScanner):
 
     @staticmethod
     def _is_executorch_binary(header: bytes) -> bool:
-        # Real-world .pte files use a FlatBuffers-style file identifier at bytes 4..7.
-        return len(header) >= 8 and header[4:6] == b"ET"
+        # Real-world .pte files use the FlatBuffers file identifier "ET12" at bytes 4..7.
+        return len(header) >= 8 and header[4:8] == b"ET12"
 
     def scan(self, path: str) -> ScanResult:
         path_check_result = self._check_path(path)
