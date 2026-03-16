@@ -4,6 +4,8 @@ import struct
 import sys
 import tempfile
 import unittest
+from collections.abc import Iterator
+from io import BytesIO
 from pathlib import Path
 from typing import ClassVar
 
@@ -21,6 +23,8 @@ from modelaudit.detectors.suspicious_symbols import (
 from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.pickle_scanner import (
     PickleScanner,
+    _genops_with_fallback,
+    _GenopsBudgetExceeded,
     _is_actually_dangerous_global,
     _is_safe_import_only_global,
     _simulate_symbolic_reference_maps,
@@ -2186,6 +2190,203 @@ def test_scan_memory_error_with_dangerous_globals_not_downgraded(
     assert format_validation_checks[0].status == CheckStatus.FAILED
     assert format_validation_checks[0].severity == IssueSeverity.WARNING
     assert format_validation_checks[0].details["exception_type"] == "MemoryError"
+
+
+def test_extract_globals_advanced_respects_max_opcodes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Advanced extraction should stop after max_opcodes instead of parsing everything."""
+    scanner = PickleScanner({"max_opcodes": 3})
+    consumed: list[int] = []
+
+    def _fake_genops(_data: object) -> Iterator[tuple[object, object, int]]:
+        for i in range(10):
+            consumed.append(i)
+            yield (type("Op", (), {"name": "GLOBAL"})(), f"mod{i} func{i}", i)
+
+    monkeypatch.setattr("modelaudit.scanners.pickle_scanner.pickletools.genops", _fake_genops)
+
+    globals_found = scanner._extract_globals_advanced(data=BytesIO(b"x"), multiple_pickles=False)
+
+    assert consumed == [0, 1, 2]
+    assert globals_found == {
+        ("mod0", "func0", "GLOBAL"),
+        ("mod1", "func1", "GLOBAL"),
+        ("mod2", "func2", "GLOBAL"),
+    }
+
+
+def test_extract_globals_advanced_respects_scan_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Advanced extraction should honor active scan timeout budget."""
+    scanner = PickleScanner({"timeout": 1})
+    scanner.scan_start_time = 100.0
+    consumed: list[int] = []
+
+    def _fake_genops(_data: object) -> Iterator[tuple[object, object, int]]:
+        for i in range(10):
+            consumed.append(i)
+            yield (type("Op", (), {"name": "GLOBAL"})(), f"timeout{i} func{i}", i)
+
+    monkeypatch.setattr("modelaudit.scanners.pickle_scanner.pickletools.genops", _fake_genops)
+    monkeypatch.setattr("modelaudit.scanners.pickle_scanner.time.time", lambda: 102.0)
+
+    globals_found = scanner._extract_globals_advanced(data=BytesIO(b"x"), multiple_pickles=False)
+
+    assert consumed == []
+    assert globals_found == set()
+
+
+def test_extract_globals_advanced_respects_max_opcodes_in_buffered_second_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Advanced extraction should not emit partial buffered opcodes from a later stream."""
+    scanner = PickleScanner({"max_opcodes": 3})
+    call_count = 0
+    second_stream_consumed: list[int] = []
+
+    def _fake_genops(data: BytesIO) -> Iterator[tuple[object, object, int]]:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            for i in range(2):
+                yield (type("Op", (), {"name": "GLOBAL"})(), f"first{i} func{i}", i)
+            data.seek(1)
+            return
+
+        for i in range(10):
+            second_stream_consumed.append(i)
+            yield (type("Op", (), {"name": "GLOBAL"})(), f"second{i} func{i}", i)
+
+    monkeypatch.setattr("modelaudit.scanners.pickle_scanner.pickletools.genops", _fake_genops)
+
+    globals_found = scanner._extract_globals_advanced(data=BytesIO(b"xy"), multiple_pickles=True)
+
+    assert second_stream_consumed == [0]
+    assert globals_found == {
+        ("first0", "func0", "GLOBAL"),
+        ("first1", "func1", "GLOBAL"),
+    }
+
+
+def test_genops_with_fallback_does_not_emit_buffered_partial_second_stream_on_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Buffered follow-on streams should not emit partial opcodes when the budget is exhausted."""
+    call_count = 0
+    second_stream_consumed: list[int] = []
+
+    def _fake_genops(data: BytesIO) -> Iterator[tuple[object, object, int]]:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            for i in range(2):
+                yield (type("Op", (), {"name": "GLOBAL"})(), f"first{i} func{i}", i)
+            data.seek(1)
+            return
+
+        for i in range(10):
+            second_stream_consumed.append(i)
+            yield (type("Op", (), {"name": "GLOBAL"})(), f"second{i} func{i}", i)
+
+    monkeypatch.setattr("modelaudit.scanners.pickle_scanner.pickletools.genops", _fake_genops)
+
+    ops = []
+    op_iter = _genops_with_fallback(BytesIO(b"xy"), multi_stream=True, max_items=3)
+    with pytest.raises(_GenopsBudgetExceeded, match="max_items"):
+        while True:
+            ops.append(next(op_iter))
+
+    assert second_stream_consumed == [0]
+    assert [arg for _opcode, arg, _pos in ops] == ["first0 func0", "first1 func1"]
+
+
+def test_scan_pickle_reports_opcode_budget_truncation_for_buffered_follow_on_stream(tmp_path: Path) -> None:
+    """Budget exhaustion in a later buffered stream should surface analysis truncation."""
+    clean_path = tmp_path / "clean.pkl"
+    clean_path.write_bytes(pickle.dumps({"weights": [1, 2, 3], "name": "safe"}))
+
+    class Evil:
+        def __reduce__(self) -> tuple[object, tuple[str]]:
+            return (os.system, ("echo pr700-budget",))
+
+    evil_path = tmp_path / "evil.pkl"
+    with evil_path.open("wb") as f:
+        pickle.dump(Evil(), f)
+
+    combined_path = tmp_path / "combined.pkl"
+    combined_path.write_bytes(clean_path.read_bytes() + evil_path.read_bytes())
+
+    result = PickleScanner({"max_opcodes": 25}).scan(str(combined_path))
+
+    opcode_checks = [
+        check for check in result.checks if check.name == "Opcode Count Check" and check.status == CheckStatus.FAILED
+    ]
+    assert len(opcode_checks) == 1
+    assert opcode_checks[0].severity == IssueSeverity.INFO
+    assert "opcode budget" in opcode_checks[0].message.lower()
+    assert opcode_checks[0].details["analysis_incomplete"] is True
+    assert result.metadata["analysis_incomplete"] is True
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+def test_extract_globals_advanced_preserves_partial_globals_when_genops_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Advanced extraction should keep globals parsed before a late generator failure."""
+    scanner = PickleScanner()
+
+    def _fake_genops_with_fallback(
+        _data: BytesIO,
+        *,
+        multi_stream: bool = False,
+        max_items: int | None = None,
+        deadline: float | None = None,
+    ) -> Iterator[tuple[object, object, int]]:
+        del multi_stream, max_items, deadline
+        yield (type("Op", (), {"name": "GLOBAL"})(), "kept func", 0)
+        raise RuntimeError("synthetic failure")
+
+    monkeypatch.setattr("modelaudit.scanners.pickle_scanner._genops_with_fallback", _fake_genops_with_fallback)
+
+    globals_found = scanner._extract_globals_advanced(data=BytesIO(b"x"), multiple_pickles=False)
+
+    assert globals_found == {("kept", "func", "GLOBAL")}
+
+
+def test_extract_globals_advanced_skips_symbolic_post_processing_after_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Timeout exhaustion should return partial direct globals without extra O(n) work."""
+    scanner = PickleScanner({"timeout": 1})
+    scanner.scan_start_time = 100.0
+    build_calls: list[list[tuple[object, object, int | None]]] = []
+
+    def _fake_genops_with_fallback(
+        _data: BytesIO,
+        *,
+        multi_stream: bool = False,
+        max_items: int | None = None,
+        deadline: float | None = None,
+    ) -> Iterator[tuple[object, object, int]]:
+        del multi_stream, max_items, deadline
+        yield (type("Op", (), {"name": "GLOBAL"})(), "early func", 0)
+        yield (type("Op", (), {"name": "STACK_GLOBAL"})(), None, 1)
+
+    def _fake_build_symbolic_reference_maps(
+        opcodes: list[tuple[object, object, int | None]],
+    ) -> tuple[dict[int, tuple[str, str]], dict[int, tuple[str, str]]]:
+        build_calls.append(opcodes)
+        return {}, {}
+
+    monkeypatch.setattr("modelaudit.scanners.pickle_scanner._genops_with_fallback", _fake_genops_with_fallback)
+    monkeypatch.setattr(
+        "modelaudit.scanners.pickle_scanner._build_symbolic_reference_maps",
+        _fake_build_symbolic_reference_maps,
+    )
+    monkeypatch.setattr("modelaudit.scanners.pickle_scanner.time.time", lambda: 102.0)
+
+    globals_found = scanner._extract_globals_advanced(data=BytesIO(b"x"), multiple_pickles=False)
+
+    assert globals_found == {("early", "func", "GLOBAL")}
+    assert build_calls == []
 
 
 class TestPickleImportOnlyGlobalFindings:
