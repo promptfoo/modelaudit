@@ -3,6 +3,7 @@ import logging
 import threading
 import warnings
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any, Optional
 
 from .base import BaseScanner, Check, CheckStatus, Issue, IssueSeverity, ScanResult
@@ -633,26 +634,47 @@ class ScannerRegistry:
         # Sort by priority
         sorted_scanners = sorted(self._scanners.items(), key=lambda x: x[1]["priority"])
 
-        # First, try to find scanners based on extension without loading them
-        file_ext = os.path.splitext(path)[1].lower()
         filename = os.path.basename(path).lower()
-
-        for scanner_id, scanner_info in sorted_scanners:
-            extensions = scanner_info.get("extensions", [])
-
-            # Quick extension check before loading scanner
-            extension_match = False
-            if file_ext in extensions or ("" in extensions and os.path.isdir(path)):
-                extension_match = True
-            elif scanner_id == "manifest":
-                # Special handling for manifest scanner - check filename patterns
-                extension_match = self._is_aiml_manifest_file(filename)
-
-            if extension_match:
-                # Only load and check can_handle for scanners that match extension
+        if os.path.isdir(path):
+            for scanner_id, scanner_info in sorted_scanners:
+                if "" not in scanner_info.get("extensions", []):
+                    continue
                 scanner_class = self._load_scanner(scanner_id)
                 if scanner_class and scanner_class.can_handle(path):
                     return scanner_class
+            return None
+
+        # Try the most specific suffixes first so .tar.gz routes to TarScanner
+        # before the generic compressed wrapper scanner can claim the .gz suffix.
+        file_ext = os.path.splitext(path)[1].lower()
+        suffixes = [suffix.lower() for suffix in Path(path).suffixes]
+        candidate_extensions: list[str] = []
+        for i in range(len(suffixes), 0, -1):
+            candidate = "".join(suffixes[-i:])
+            if candidate and candidate not in candidate_extensions:
+                candidate_extensions.append(candidate)
+        if file_ext and file_ext not in candidate_extensions:
+            candidate_extensions.append(file_ext)
+
+        for candidate_extension in candidate_extensions:
+            for scanner_id, scanner_info in sorted_scanners:
+                extensions = scanner_info.get("extensions", [])
+                if candidate_extension not in extensions:
+                    continue
+
+                scanner_class = self._load_scanner(scanner_id)
+                if scanner_class and scanner_class.can_handle(path):
+                    return scanner_class
+
+        # Manifest-like config files sometimes intentionally use generic or
+        # missing extensions, so keep the filename-pattern fallback.
+        for scanner_id, _scanner_info in sorted_scanners:
+            if scanner_id != "manifest" or not self._is_aiml_manifest_file(filename):
+                continue
+
+            scanner_class = self._load_scanner(scanner_id)
+            if scanner_class and scanner_class.can_handle(path):
+                return scanner_class
 
         return None
 

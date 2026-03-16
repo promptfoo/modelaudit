@@ -1,6 +1,7 @@
 import json
 import os
 import re
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -1417,6 +1418,26 @@ def test_exit_code_security_issues(tmp_path):
     assert "error" in output_lower or "warning" in output_lower or "critical" in output_lower, (
         f"Expected 'error', 'warning', or 'critical' in output, but got: {result.output}"
     )
+
+
+def test_exit_code_security_issues_streaming_local_directory(tmp_path: Path) -> None:
+    """Streaming local-directory scans should keep security findings as exit code 1."""
+    import pickle
+
+    evil_pickle_path = tmp_path / "malicious.pkl"
+
+    class MaliciousClass:
+        def __reduce__(self):
+            return (os.system, ('echo "This is a malicious pickle"',))
+
+    with evil_pickle_path.open("wb") as f:
+        pickle.dump(MaliciousClass(), f)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "--stream", "--format", "text", str(tmp_path)])
+
+    assert result.exit_code == 1, f"Expected exit code 1, got {result.exit_code}. Output: {result.output}"
+    assert not evil_pickle_path.exists()
 
 
 def test_exit_code_scan_errors(tmp_path):

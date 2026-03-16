@@ -5,7 +5,7 @@ import logging
 import os
 import shutil
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Literal, TypedDict
 from urllib.parse import urlparse
 
@@ -18,6 +18,22 @@ logger = logging.getLogger(__name__)
 
 # Constants
 MAX_RECURSION_DEPTH = 10  # Prevent infinite recursion in folder traversal
+
+
+def _safe_download_path(download_dir: Path, relative_path: str) -> Path:
+    """Build a safe local path for downloaded JFrog artifacts."""
+    normalized = PurePosixPath(relative_path)
+
+    if normalized.is_absolute() or any(part in {"", ".", ".."} for part in normalized.parts):
+        raise ValueError(f"Unsafe JFrog artifact path: {relative_path}")
+
+    local_file = (download_dir / Path(*normalized.parts)).resolve()
+    download_root = download_dir.resolve()
+
+    if local_file != download_root and download_root not in local_file.parents:
+        raise ValueError(f"Unsafe JFrog artifact path: {relative_path}")
+
+    return local_file
 
 
 # TypedDict definitions for JFrog API responses
@@ -513,7 +529,7 @@ def download_jfrog_folder(
             except (ValueError, IndexError):
                 relative_path = Path(file_info["name"]).name
 
-            local_file = download_dir / relative_path
+            local_file = _safe_download_path(download_dir, relative_path)
             local_file.parent.mkdir(parents=True, exist_ok=True)
 
             # Download the individual file

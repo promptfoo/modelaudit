@@ -4,7 +4,10 @@ import struct
 import sys
 import tempfile
 import unittest
+from collections.abc import Iterator
+from io import BytesIO
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 
@@ -18,7 +21,14 @@ from modelaudit.detectors.suspicious_symbols import (
     EXECUTABLE_SIGNATURES,
 )
 from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
-from modelaudit.scanners.pickle_scanner import PickleScanner
+from modelaudit.scanners.pickle_scanner import (
+    PickleScanner,
+    _genops_with_fallback,
+    _GenopsBudgetExceeded,
+    _is_actually_dangerous_global,
+    _is_safe_import_only_global,
+    _simulate_symbolic_reference_maps,
+)
 from tests.assets.generators.generate_advanced_pickle_tests import (
     generate_memo_based_attack,
     generate_multiple_pickle_attack,
@@ -31,6 +41,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
 # Import only what we need for the pickle scanner test
+
+
+def _short_binunicode(value: bytes) -> bytes:
+    return b"\x8c" + bytes([len(value)]) + value
 
 
 class TestPickleScanner(unittest.TestCase):
@@ -257,6 +271,83 @@ class TestPickleScannerAdvanced(unittest.TestCase):
         assert len(subprocess_issues) > 0, (
             f"Expected subprocess issues, but found: {[i.message for i in result.issues]}"
         )
+
+
+class TestDillLoadersRegression:
+    def test_global_dill_loads_is_flagged(self, tmp_path: Path) -> None:
+        payload = tmp_path / "global_dill_loads.pkl"
+        payload.write_bytes(b"cdill\nloads\n.")
+
+        result = PickleScanner().scan(str(payload))
+
+        failed_global_checks = [
+            check
+            for check in result.checks
+            if check.name == "Global Module Reference Check"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+        ]
+        assert any(check.details.get("import_reference") == "dill.loads" for check in failed_global_checks)
+
+    def test_global_dill_load_is_flagged(self, tmp_path: Path) -> None:
+        payload = tmp_path / "global_dill_load.pkl"
+        payload.write_bytes(b"cdill\nload\n.")
+
+        result = PickleScanner().scan(str(payload))
+
+        failed_global_checks = [
+            check
+            for check in result.checks
+            if check.name == "Global Module Reference Check"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+        ]
+        assert any(check.details.get("import_reference") == "dill.load" for check in failed_global_checks)
+
+    def test_stack_global_dill_loads_is_flagged(self, tmp_path: Path) -> None:
+        payload = tmp_path / "stack_global_dill_loads.pkl"
+        payload.write_bytes(b"\x80\x04\x95\x13\x00\x00\x00\x00\x00\x00\x00\x8c\x04dill\x94\x8c\x05loads\x94\x93\x94.")
+
+        result = PickleScanner().scan(str(payload))
+
+        failed_stack_checks = [
+            check
+            for check in result.checks
+            if check.name == "STACK_GLOBAL Module Check"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+        ]
+        assert any(
+            check.details.get("module") == "dill" and check.details.get("function") == "loads"
+            for check in failed_stack_checks
+        )
+
+    def test_benign_pickle_with_dill_string_is_not_flagged(self, tmp_path: Path) -> None:
+        payload = tmp_path / "benign_dill_string.pkl"
+        with payload.open("wb") as handle:
+            pickle.dump({"serializer": "dill", "metadata": "safe"}, handle)
+
+        result = PickleScanner().scan(str(payload))
+
+        assert result.success
+        assert not any("dill." in issue.message for issue in result.issues)
+
+    def test_existing_safe_pickle_fixture_unaffected(self) -> None:
+        fixture = Path(__file__).parent.parent / "assets" / "samples" / "pickles" / "safe_data.pkl"
+
+        result = PickleScanner().scan(str(fixture))
+
+        assert result.success
+        assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+    def test_dill_dump_remains_non_failing(self, tmp_path: Path) -> None:
+        payload = tmp_path / "reduce_dill_dump.pkl"
+        payload.write_bytes(b"\x80\x02cdill\ndump\n(tR.")
+
+        result = PickleScanner().scan(str(payload))
+
+        assert result.success
+        assert not result.has_errors
 
     def test_multiple_pickle_streams(self) -> None:
         scanner = PickleScanner()
@@ -628,6 +719,29 @@ class TestPickleScannerAdvanced(unittest.TestCase):
 class TestPickleScannerBlocklistHardening(unittest.TestCase):
     """Regression tests for fickling/picklescan bypass hardening."""
 
+    HELPER_REFS: ClassVar[tuple[tuple[str, str], ...]] = (
+        ("numpy.f2py.crackfortran", "getlincoef"),
+        ("torch._dynamo.guards.GuardBuilder", "get"),
+        ("torch.fx.experimental.symbolic_shapes.ShapeEnv", "evaluate_guards_expression"),
+        ("torch.utils.collect_env", "run"),
+        ("torch.utils._config_module.ConfigModule", "load_config"),
+        ("torch.utils.bottleneck.__main__", "run_cprofile"),
+        ("torch.utils.bottleneck.__main__", "run_autograd_prof"),
+        ("torch.utils.data.datapipes.utils.decoder", "basichandlers"),
+    )
+
+    PICKLESCAN_GAP_REFS: ClassVar[tuple[tuple[str, str], ...]] = (
+        ("numpy", "load"),
+        ("site", "main"),
+        ("_io", "FileIO"),
+        ("test.support.script_helper", "assert_python_ok"),
+        ("_osx_support", "_read_output"),
+        ("_aix_support", "_read_cmd_output"),
+        ("_pyrepl.pager", "pipe_pager"),
+        ("torch.serialization", "load"),
+        ("torch._inductor.codecache", "compile_file"),
+    )
+
     @staticmethod
     def _craft_global_reduce_pickle(module: str, func: str) -> bytes:
         """Craft a minimal pickle that uses GLOBAL + REDUCE to call module.func.
@@ -645,11 +759,17 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
         call_ops = b"(" + b"t" + b"R" + b"."
         return proto + global_op + call_ops
 
-    def _scan_bytes(self, data: bytes) -> ScanResult:
+    @staticmethod
+    def _craft_global_only_pickle(module: str, func: str) -> bytes:
+        """Craft a minimal pickle with a bare GLOBAL reference and STOP."""
+
+        return b"\x80\x02" + b"c" + f"{module}\n{func}\n".encode() + b"."
+
+    def _scan_bytes(self, data: bytes, *, suffix: str = ".pkl") -> ScanResult:
         import os
         import tempfile
 
-        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
             f.write(data)
             f.flush()
             path = f.name
@@ -658,6 +778,156 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
             return scanner.scan(path)
         finally:
             os.unlink(path)
+
+    def test_builtins_hasattr_is_critical(self) -> None:
+        """builtins.hasattr must not be allowlisted as safe."""
+        result = self._scan_bytes(self._craft_global_reduce_pickle("builtins", "hasattr"))
+
+        assert result.success
+        assert result.has_errors
+        failed_global_checks = [
+            check
+            for check in result.checks
+            if check.name == "Global Module Reference Check"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+        ]
+        assert any("builtins.hasattr" in check.message for check in failed_global_checks), (
+            f"Expected CRITICAL Global Module Reference Check for builtins.hasattr, "
+            f"got: {[check.message for check in failed_global_checks]}"
+        )
+
+    def test_dunder_builtin_hasattr_is_critical(self) -> None:
+        """__builtin__.hasattr must not be allowlisted as safe."""
+        result = self._scan_bytes(self._craft_global_reduce_pickle("__builtin__", "hasattr"))
+
+        assert result.success
+        assert result.has_errors
+        failed_global_checks = [
+            check
+            for check in result.checks
+            if check.name == "Global Module Reference Check"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+        ]
+        assert any("__builtin__.hasattr" in check.message for check in failed_global_checks), (
+            f"Expected CRITICAL Global Module Reference Check for __builtin__.hasattr, "
+            f"got: {[check.message for check in failed_global_checks]}"
+        )
+
+    def test_safe_builtins_remain_allowlisted(self) -> None:
+        """Safe reconstruction builtins must remain non-failing."""
+        for safe_builtin in ["set", "slice", "tuple"]:
+            result = self._scan_bytes(self._craft_global_reduce_pickle("builtins", safe_builtin))
+
+            assert result.success
+            assert not result.has_errors, (
+                f"Expected builtins.{safe_builtin} to remain non-failing, got: {[i.message for i in result.issues]}"
+            )
+            safe_global_checks = [check for check in result.checks if check.name == "Global Module Reference Check"]
+            failed_builtin_checks = [
+                check
+                for check in result.checks
+                if check.status == CheckStatus.FAILED and f"builtins.{safe_builtin}" in check.message
+            ]
+            assert any(
+                check.status == CheckStatus.PASSED and f"builtins.{safe_builtin}" in check.message
+                for check in safe_global_checks
+            ), f"Expected passed Global Module Reference Check for builtins.{safe_builtin}"
+            assert not any(check.status == CheckStatus.FAILED for check in safe_global_checks), (
+                f"Unexpected failed Global Module Reference Check for builtins.{safe_builtin}: "
+                f"{[check.message for check in safe_global_checks]}"
+            )
+            assert not failed_builtin_checks, (
+                f"Expected builtins.{safe_builtin} to stay non-failing across all checks, "
+                f"got: {[check.message for check in failed_builtin_checks]}"
+            )
+
+    def test_dangerous_builtins_still_fail(self) -> None:
+        """Dangerous builtins must continue to fail after allowlist tightening."""
+        for dangerous_builtin in ["eval", "open"]:
+            result = self._scan_bytes(self._craft_global_reduce_pickle("builtins", dangerous_builtin))
+
+            assert result.success
+            assert result.has_errors
+            failed_checks = [
+                check
+                for check in result.checks
+                if check.status == CheckStatus.FAILED and check.severity == IssueSeverity.CRITICAL
+            ]
+            assert any(f"builtins.{dangerous_builtin}" in check.message for check in failed_checks), (
+                f"Expected CRITICAL builtins.{dangerous_builtin} finding, "
+                f"got: {[check.message for check in failed_checks]}"
+            )
+
+    def test_builtins_hasattr_stack_global_is_critical(self) -> None:
+        """STACK_GLOBAL resolution for builtins.hasattr must be flagged."""
+        payload = b"\x80\x04\x8c\x08builtins\x8c\x07hasattr\x93)R."
+
+        result = self._scan_bytes(payload)
+
+        assert result.success
+        assert result.has_errors
+        failed_stack_global_checks = [
+            check
+            for check in result.checks
+            if check.name == "STACK_GLOBAL Module Check"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+        ]
+        assert any("builtins.hasattr" in check.message for check in failed_stack_global_checks), (
+            f"Expected CRITICAL STACK_GLOBAL Module Check for builtins.hasattr, "
+            f"got: {[check.message for check in failed_stack_global_checks]}"
+        )
+
+    def test_builtins_hasattr_binput_binget_recall_is_critical(self) -> None:
+        """Memoized callable recall via BINPUT/BINGET must keep builtins.hasattr dangerous."""
+        # Memoize the callable, drop the original stack reference, then recall it.
+        payload = b"\x80\x02cbuiltins\nhasattr\nq\x010h\x01(tR."
+
+        result = self._scan_bytes(payload)
+
+        assert result.success
+        assert result.has_errors
+        failed_reduce_checks = [
+            check
+            for check in result.checks
+            if check.name == "REDUCE Opcode Safety Check"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+        ]
+        assert any(check.details.get("associated_global") == "builtins.hasattr" for check in failed_reduce_checks), (
+            f"Expected CRITICAL REDUCE finding for builtins.hasattr memo recall, "
+            f"got: {[check.details for check in failed_reduce_checks]}"
+        )
+
+    def test_builtins_hasattr_detected_after_benign_stream(self) -> None:
+        """Malicious builtins.hasattr stream should be detected after benign warm-up stream."""
+        import io
+
+        buf = io.BytesIO()
+        pickle.dump({"safe": True}, buf, protocol=2)
+        buf.write(self._craft_global_reduce_pickle("builtins", "hasattr"))
+
+        result = self._scan_bytes(buf.getvalue())
+
+        assert result.success
+        assert result.has_errors
+        failed_reduce_checks = [
+            check
+            for check in result.checks
+            if check.name == "REDUCE Opcode Safety Check"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+        ]
+        assert any(check.details.get("associated_global") == "builtins.hasattr" for check in failed_reduce_checks), (
+            f"Expected CRITICAL REDUCE finding for builtins.hasattr after benign stream, "
+            f"got: {[check.details for check in failed_reduce_checks]}"
+        )
+
+    @staticmethod
+    def _structural_tamper_checks(result: ScanResult) -> list:
+        return [issue for issue in result.issues if issue.details.get("tamper_type") is not None]
 
     # ------------------------------------------------------------------
     # Fix 1: pkgutil trampoline — must be CRITICAL
@@ -760,6 +1030,326 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
             f"got: {[i.message for i in result.issues]}"
         )
 
+    def test_stack_global_non_string_operands_fail_closed(self) -> None:
+        """STACK_GLOBAL with two integers should be treated as a malformed warning."""
+        payload = b"\x80\x04K\x01K\x02\x93."
+
+        result = self._scan_bytes(payload)
+        assert result.success
+
+        context_checks = [c for c in result.checks if c.name == "STACK_GLOBAL Context Check"]
+        assert any(c.status == CheckStatus.FAILED for c in context_checks), (
+            f"Expected failed STACK_GLOBAL malformed check, got: {[c.message for c in context_checks]}"
+        )
+        assert any(
+            c.severity == IssueSeverity.WARNING
+            and c.rule_code == "S205"
+            and c.details.get("reason") == "mixed_or_non_string"
+            for c in context_checks
+        ), (
+            "Expected WARNING S205 malformed STACK_GLOBAL check, got: "
+            f"{[(c.severity, c.rule_code) for c in context_checks]}"
+        )
+
+    def test_stack_global_dangerous_module_plus_non_string_operand_is_critical(self) -> None:
+        """A dangerous module string plus a non-string operand should escalate to CRITICAL."""
+        payload = b"\x80\x04\x8c\x02osK\x01\x93."
+
+        result = self._scan_bytes(payload)
+        assert result.success
+
+        context_checks = [c for c in result.checks if c.name == "STACK_GLOBAL Context Check"]
+        assert any(
+            c.status == CheckStatus.FAILED
+            and c.severity == IssueSeverity.CRITICAL
+            and c.rule_code == "S205"
+            and c.details.get("module") == "os"
+            and c.details.get("reason") == "mixed_or_non_string"
+            for c in context_checks
+        ), f"Expected CRITICAL malformed STACK_GLOBAL check, got: {[(c.severity, c.message) for c in context_checks]}"
+
+    def test_stack_global_risky_ml_module_prefix_plus_non_string_operand_is_critical(self) -> None:
+        """Risky ML module hints should not downgrade malformed STACK_GLOBAL findings."""
+        payload = b"\x80\x04\x8c\x0dtorch._dynamoK\x01\x93."
+
+        result = self._scan_bytes(payload)
+        assert result.success
+
+        context_checks = [c for c in result.checks if c.name == "STACK_GLOBAL Context Check"]
+        assert any(
+            c.status == CheckStatus.FAILED
+            and c.severity == IssueSeverity.CRITICAL
+            and c.rule_code == "S205"
+            and c.details.get("module") == "torch._dynamo"
+            and c.details.get("reason") == "mixed_or_non_string"
+            for c in context_checks
+        ), (
+            "Expected CRITICAL malformed STACK_GLOBAL finding for risky ML prefix, got: "
+            f"{[(c.severity, c.message) for c in context_checks]}"
+        )
+
+    def test_stack_global_large_bytes_operand_preview_is_bounded(self) -> None:
+        """Large malformed operands should not expand finding payloads."""
+        large_bytes = b"x" * 200_000
+        payload = b"\x80\x04\x8c\x02osB" + struct.pack("<I", len(large_bytes)) + large_bytes + b"\x93."
+
+        result = self._scan_bytes(payload)
+        assert result.success
+
+        context_checks = [c for c in result.checks if c.name == "STACK_GLOBAL Context Check"]
+        matching_checks = [
+            c
+            for c in context_checks
+            if c.status == CheckStatus.FAILED
+            and c.severity == IssueSeverity.CRITICAL
+            and c.details.get("module") == "os"
+            and c.details.get("reason") == "mixed_or_non_string"
+        ]
+        assert matching_checks, (
+            f"Expected bounded CRITICAL malformed STACK_GLOBAL check, got: "
+            f"{[(c.severity, c.message) for c in context_checks]}"
+        )
+
+        check = matching_checks[0]
+        function_hint = check.details.get("function", "")
+        assert function_hint.startswith("bytes(len=200000, hex=0x7878787878787878"), function_hint
+        assert len(function_hint) < 80, f"Expected bounded operand preview, got len={len(function_hint)}"
+        assert len(check.message) < 220, f"Expected bounded context-check message, got len={len(check.message)}"
+
+    def test_stack_global_large_string_operand_preview_is_bounded(self) -> None:
+        """Large string operands should not bloat malformed STACK_GLOBAL findings."""
+        large_text = b"x" * 200_000
+        payload = b"\x80\x04X" + struct.pack("<I", len(large_text)) + large_text + b"K\x01\x93."
+
+        result = self._scan_bytes(payload)
+        assert result.success
+
+        context_checks = [c for c in result.checks if c.name == "STACK_GLOBAL Context Check"]
+        matching_checks = [
+            c
+            for c in context_checks
+            if c.status == CheckStatus.FAILED
+            and c.severity == IssueSeverity.WARNING
+            and c.details.get("reason") == "mixed_or_non_string"
+        ]
+        assert matching_checks, (
+            f"Expected bounded malformed STACK_GLOBAL check, got: {[(c.severity, c.message) for c in context_checks]}"
+        )
+
+        check = matching_checks[0]
+        module_hint = check.details.get("module", "")
+        assert module_hint.startswith("xxxxxxxx"), module_hint
+        assert len(module_hint) < 160, f"Expected bounded string preview, got len={len(module_hint)}"
+        assert len(check.message) < 260, f"Expected bounded context-check message, got len={len(check.message)}"
+
+    def test_stack_global_missing_memo_preserves_unknown_sentinel(self) -> None:
+        """Missing memo operands should fail closed and keep unknown sentinel details."""
+        payload = b"\x80\x04\x8c\x02osh\x7f\x93."
+
+        result = self._scan_bytes(payload)
+        assert result.success
+
+        context_checks = [c for c in result.checks if c.name == "STACK_GLOBAL Context Check"]
+        assert any(
+            c.status == CheckStatus.FAILED
+            and c.severity == IssueSeverity.CRITICAL
+            and c.rule_code == "S205"
+            and c.details.get("function") == "unknown"
+            and c.details.get("reason") == "missing_memo"
+            for c in context_checks
+        ), f"Expected missing-memo STACK_GLOBAL finding, got: {[(c.severity, c.details) for c in context_checks]}"
+
+    def test_stack_global_safe_memoized_reference_remains_passing(self) -> None:
+        """Fully resolved safe memoized STACK_GLOBAL should stay non-failing."""
+        payload = b"\x80\x04\x8c\x0ctorch._utils\x94\x8c\x12_rebuild_tensor_v2\x94h\x00h\x01\x93."
+
+        result = self._scan_bytes(payload)
+        assert result.success
+
+        module_checks = [c for c in result.checks if c.name == "STACK_GLOBAL Module Check"]
+        assert any(c.status == CheckStatus.PASSED for c in module_checks), (
+            f"Expected passing safe STACK_GLOBAL module check, got: {[c.message for c in module_checks]}"
+        )
+
+    def test_stack_global_dangerous_memoized_reference_remains_failing(self) -> None:
+        """Fully resolved dangerous memoized STACK_GLOBAL should remain failing."""
+        payload = b"\x80\x04\x8c\x02os\x94\x8c\x06system\x94h\x00h\x01\x93."
+
+        result = self._scan_bytes(payload)
+        assert result.success
+
+        module_checks = [c for c in result.checks if c.name == "STACK_GLOBAL Module Check"]
+        assert any(c.status == CheckStatus.FAILED for c in module_checks), (
+            f"Expected failing dangerous STACK_GLOBAL module check, got: {[c.message for c in module_checks]}"
+        )
+
+    def test_truncated_stack_global_context_remains_informational(self) -> None:
+        """Simple stack-underflow context should remain informational, not fail-closed."""
+        payload = b"\x80\x04\x8c\x02os\x93."
+
+        result = self._scan_bytes(payload)
+        assert result.success
+
+        context_checks = [c for c in result.checks if c.name == "STACK_GLOBAL Context Check"]
+        assert any(
+            c.status == CheckStatus.FAILED
+            and c.severity == IssueSeverity.INFO
+            and c.rule_code == "S902"
+            and c.message == "STACK_GLOBAL opcode found without sufficient string context"
+            for c in context_checks
+        ), (
+            "Expected informational STACK_GLOBAL context check, got: "
+            f"{[(c.severity, c.message) for c in context_checks]}"
+        )
+
+    def test_malformed_stack_global_first_stream_still_allows_benign_second_stream(self) -> None:
+        """Malformed first stream should not taint benign second-stream behavior."""
+        import io
+
+        buf = io.BytesIO()
+        buf.write(b"\x80\x04K\x01K\x02\x93.")
+        pickle.dump({"safe": True}, buf, protocol=2)
+
+        result = self._scan_bytes(buf.getvalue())
+        assert result.success
+
+        critical_messages = [i.message.lower() for i in result.issues if i.severity == IssueSeverity.CRITICAL]
+        assert not critical_messages, f"Unexpected CRITICAL issues: {critical_messages}"
+        assert any(c.name == "STACK_GLOBAL Context Check" and c.status == CheckStatus.FAILED for c in result.checks), (
+            "Expected malformed STACK_GLOBAL finding in first stream"
+        )
+
+    def test_malformed_stack_global_plus_explicit_reduce_still_flags_reduce(self) -> None:
+        """Malformed STACK_GLOBAL should not suppress explicit dangerous REDUCE detection."""
+        import io
+
+        buf = io.BytesIO()
+        buf.write(b"\x80\x04K\x01K\x02\x93.")
+        buf.write(self._craft_global_reduce_pickle("os", "system"))
+
+        result = self._scan_bytes(buf.getvalue())
+        assert result.success
+        assert result.has_errors
+
+        reduce_messages = [i.message.lower() for i in result.issues if "reduce" in i.message.lower()]
+        assert any("os.system" in msg or "posix.system" in msg for msg in reduce_messages), (
+            f"Expected dangerous REDUCE detection alongside malformed STACK_GLOBAL, got: {reduce_messages}"
+        )
+
+    def test_duplicate_proto_same_version_reports_structural_tamper(self) -> None:
+        """Duplicate PROTO in one stream should be reported as structural tampering."""
+        payload = b"\x80\x02\x80\x02K\x01."
+
+        result = self._scan_bytes(payload)
+        structural_checks = self._structural_tamper_checks(result)
+
+        assert structural_checks, "Expected structural tamper finding for duplicate PROTO"
+        assert any(issue.details.get("tamper_type") == "duplicate_proto" for issue in structural_checks), (
+            f"Expected duplicate_proto finding, got: {[i.details for i in structural_checks]}"
+        )
+        assert any(issue.details.get("tamper_type") == "misplaced_proto" for issue in structural_checks), (
+            f"Expected misplaced_proto finding, got: {[i.details for i in structural_checks]}"
+        )
+        assert any(issue.details.get("position") == 2 for issue in structural_checks), (
+            f"Expected duplicate/misplaced PROTO position to be recorded, got: {[i.details for i in structural_checks]}"
+        )
+
+    def test_duplicate_proto_mixed_versions_reports_structural_tamper(self) -> None:
+        """Mixed protocol redeclaration should include both protocol numbers in details."""
+        payload = b"\x80\x02\x80\x04K\x01."
+
+        result = self._scan_bytes(payload)
+        structural_checks = self._structural_tamper_checks(result)
+        duplicate = [issue for issue in structural_checks if issue.details.get("tamper_type") == "duplicate_proto"]
+
+        assert duplicate, f"Expected duplicate_proto finding, got: {[i.details for i in structural_checks]}"
+        assert any(
+            issue.details.get("previous_protocol") == 2 and issue.details.get("protocol") == 4 for issue in duplicate
+        ), f"Expected previous/current protocol details, got: {[i.details for i in duplicate]}"
+
+    def test_misplaced_proto_reports_structural_tamper(self) -> None:
+        """PROTO appearing after another opcode should be flagged as misplaced."""
+        payload = b"K\x01\x80\x02."
+
+        result = self._scan_bytes(payload)
+        structural_checks = self._structural_tamper_checks(result)
+
+        assert any(issue.details.get("tamper_type") == "misplaced_proto" for issue in structural_checks), (
+            f"Expected misplaced_proto finding, got: {[i.details for i in structural_checks]}"
+        )
+
+    def test_valid_single_and_multi_stream_proto_stays_clean(self) -> None:
+        """Normal stream boundaries with one PROTO each should not produce structural findings."""
+        import io
+
+        single = pickle.dumps({"safe": True}, protocol=4)
+        single_result = self._scan_bytes(single)
+        assert not self._structural_tamper_checks(single_result)
+
+        buf = io.BytesIO()
+        pickle.dump({"a": 1}, buf, protocol=2)
+        buf.write(b"\x00")
+        pickle.dump({"b": 2}, buf, protocol=4)
+        multi_result = self._scan_bytes(buf.getvalue())
+
+        assert not self._structural_tamper_checks(multi_result)
+
+    def test_structural_tamper_in_second_stream_is_detected(self) -> None:
+        """Tamper in a later stream should still be reported after a valid first stream."""
+        import io
+
+        buf = io.BytesIO()
+        pickle.dump({"safe": True}, buf, protocol=2)
+        buf.write(b"\x00")
+        buf.write(b"\x80\x02\x80\x02K\x01.")
+
+        result = self._scan_bytes(buf.getvalue())
+        structural_checks = self._structural_tamper_checks(result)
+
+        assert any(issue.details.get("tamper_type") == "duplicate_proto" for issue in structural_checks), (
+            f"Expected duplicate_proto finding in later stream, got: {[i.details for i in structural_checks]}"
+        )
+        assert any(issue.details.get("stream_offset", 0) > 0 for issue in structural_checks), (
+            f"Expected later-stream offset to be recorded, got: {[i.details for i in structural_checks]}"
+        )
+
+    def test_structural_tamper_and_malicious_import_both_reported(self) -> None:
+        """Structural tamper findings must not hide direct code-execution findings."""
+        payload = b"\x80\x02\x80\x02" + self._craft_global_reduce_pickle("os", "system")
+
+        result = self._scan_bytes(payload)
+
+        structural_checks = self._structural_tamper_checks(result)
+        critical_os = [
+            issue
+            for issue in result.issues
+            if issue.severity == IssueSeverity.CRITICAL
+            and ("os" in issue.message.lower() or "posix" in issue.message.lower())
+        ]
+        assert structural_checks, "Expected structural tamper findings"
+        assert critical_os, f"Expected CRITICAL os/posix finding, got: {[i.message for i in result.issues]}"
+
+    def test_structural_tamper_with_safe_ml_payload_only_info_severity(self) -> None:
+        """Structural findings should remain low severity when payload is otherwise benign."""
+        safe_payload = pickle.dumps({"layer": "linear", "shape": [4, 8]}, protocol=2)
+        payload = b"\x80\x02" + safe_payload
+
+        result = self._scan_bytes(payload)
+
+        structural_checks = self._structural_tamper_checks(result)
+        assert structural_checks, "Expected structural tamper finding for duplicate/misplaced PROTO"
+        assert all(issue.severity == IssueSeverity.INFO for issue in structural_checks)
+
+    def test_binary_tail_after_valid_pickle_does_not_report_structural_tamper(self) -> None:
+        """Binary tail data after a valid pickle should not create structural findings."""
+        payload = pickle.dumps({"safe": True}, protocol=2) + (b"XYZNmore-binary-data" * 20)
+
+        result = self._scan_bytes(payload)
+
+        assert not self._structural_tamper_checks(result), (
+            f"Unexpected structural findings for benign binary tail: {[i.details for i in result.issues]}"
+        )
+
     # ------------------------------------------------------------------
     # Fix 3: EXT opcode registry bypass
     # ------------------------------------------------------------------
@@ -849,6 +1439,48 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
                 f"{opcode_name}: expected CRITICAL issue for unresolved EXT code {ext_code}, "
                 f"got: {[i.message for i in result.issues]}"
             )
+
+    def test_ext_resolved_to_safe_global_still_fails_due_to_ext_origin(self) -> None:
+        """Resolved copyreg EXT targets must stay dangerous even when the target looks safe."""
+        import copyreg
+        from contextlib import suppress
+
+        inverted_registry = getattr(copyreg, "_inverted_registry", {})
+        extension_registry = getattr(copyreg, "_extension_registry", {})
+        existing_code = extension_registry.get(("builtins", "set"))
+
+        ext_code = next((candidate for candidate in range(1, 256) if candidate not in inverted_registry), None)
+        if ext_code is None:
+            pytest.skip("No free copyreg extension code available in range 1-255")
+
+        try:
+            if isinstance(existing_code, int):
+                with suppress(ValueError):
+                    copyreg.remove_extension("builtins", "set", existing_code)
+
+            copyreg.add_extension("builtins", "set", ext_code)
+            try:
+                payload = b"\x80\x02\x82" + bytes([ext_code]) + b")R."
+                result = self._scan_bytes(payload)
+
+                assert result.success
+                assert result.has_errors
+                reduce_checks = [
+                    c
+                    for c in result.checks
+                    if c.name == "REDUCE Opcode Safety Check"
+                    and c.status == CheckStatus.FAILED
+                    and c.details.get("associated_global") == "builtins.set"
+                    and c.details.get("origin_is_ext") is True
+                ]
+                assert reduce_checks, [c.details for c in result.checks if c.name == "REDUCE Opcode Safety Check"]
+            finally:
+                with suppress(ValueError):
+                    copyreg.remove_extension("builtins", "set", ext_code)
+        finally:
+            if isinstance(existing_code, int):
+                with suppress(ValueError):
+                    copyreg.add_extension("builtins", "set", existing_code)
 
     # ------------------------------------------------------------------
     # Fix 3b: ZIP proto0/1 extension bypass
@@ -951,6 +1583,58 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
             f"Expected CRITICAL smtplib issue, got: {[i.message for i in result.issues]}"
         )
 
+    def test_httplib_import_only_global_blocked(self) -> None:
+        """Python 2 httplib alias GLOBAL imports should match http.client danger handling."""
+        payload = b"\x80\x02chttplib\nHTTPSConnection\n."
+        result = self._scan_bytes(payload)
+
+        assert result.success
+        assert result.has_errors
+        failed_checks = [check for check in result.checks if check.status == CheckStatus.FAILED]
+        assert any(
+            check.severity == IssueSeverity.CRITICAL
+            and check.rule_code == "S303"
+            and "httplib.HTTPSConnection" in check.message
+            for check in failed_checks
+        ), f"Expected S303 CRITICAL httplib import finding, got: {[c.message for c in failed_checks]}"
+
+    def test_httplib_reduce_blocked(self) -> None:
+        """Python 2 httplib alias REDUCE payloads should be treated as dangerous."""
+        result = self._scan_bytes(self._craft_global_reduce_pickle("httplib", "HTTPSConnection"))
+
+        assert result.success
+        assert result.has_errors
+        failed_checks = [check for check in result.checks if check.status == CheckStatus.FAILED]
+        assert any(
+            check.severity == IssueSeverity.CRITICAL
+            and check.rule_code == "S201"
+            and "httplib.HTTPSConnection" in check.message
+            for check in failed_checks
+        ), f"Expected S201 CRITICAL httplib reduce finding, got: {[c.message for c in failed_checks]}"
+
+    def test_http_client_coverage_unchanged(self) -> None:
+        """Existing http.client dangerous-global coverage should remain stable."""
+        result = self._scan_bytes(self._craft_global_reduce_pickle("http.client", "HTTPSConnection"))
+
+        assert result.success
+        assert result.has_errors
+        failed_checks = [check for check in result.checks if check.status == CheckStatus.FAILED]
+        assert any(
+            check.severity == IssueSeverity.CRITICAL
+            and check.rule_code == "S201"
+            and "http.client.HTTPSConnection" in check.message
+            for check in failed_checks
+        ), f"Expected CRITICAL http.client reduce finding, got: {[c.message for c in failed_checks]}"
+
+    def test_safe_stdlib_import_remains_non_failing(self) -> None:
+        """Benign stdlib import-only globals should stay non-failing."""
+        payload = b"\x80\x02cdatetime\ndatetime\n."
+        result = self._scan_bytes(payload)
+
+        assert result.success
+        assert not result.has_errors
+        assert not [check for check in result.checks if check.status == CheckStatus.FAILED]
+
     def test_sqlite3_blocked(self) -> None:
         """sqlite3 module should be flagged as dangerous."""
         result = self._scan_bytes(self._craft_global_reduce_pickle("sqlite3", "connect"))
@@ -992,6 +1676,301 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
         assert any(i.severity == IssueSeverity.CRITICAL and "webbrowser" in i.message for i in result.issues), (
             f"Expected CRITICAL webbrowser issue, got: {[i.message for i in result.issues]}"
         )
+
+    def test_helper_import_only_refs_are_critical(self) -> None:
+        """Validated helper refs should never scan clean as bare GLOBAL payloads."""
+        for module, func in self.HELPER_REFS:
+            result = self._scan_bytes(self._craft_global_only_pickle(module, func))
+            full_ref = f"{module}.{func}"
+
+            assert result.success, f"Scan failed for {full_ref}"
+            assert result.has_errors, f"Expected failing result for {full_ref}"
+            assert any(check.status == CheckStatus.FAILED and full_ref in check.message for check in result.checks), (
+                f"Expected failed helper-global check for {full_ref}, checks: {[c.message for c in result.checks]}"
+            )
+
+    def test_helper_reduce_payloads_by_subgroup_are_critical(self) -> None:
+        """At least one executable REDUCE payload per helper subgroup should be critical."""
+        subgroup_refs = (
+            ("numpy.f2py.crackfortran", "getlincoef"),
+            ("torch._dynamo.guards.GuardBuilder", "get"),
+            ("torch.utils.collect_env", "run"),
+        )
+
+        for module, func in subgroup_refs:
+            result = self._scan_bytes(self._craft_global_reduce_pickle(module, func))
+            full_ref = f"{module}.{func}"
+
+            assert result.success, f"Scan failed for {full_ref}"
+            assert result.has_errors, f"Expected failing result for {full_ref}"
+            assert any(
+                check.name == "REDUCE Opcode Safety Check"
+                and check.status == CheckStatus.FAILED
+                and check.severity == IssueSeverity.CRITICAL
+                and full_ref in check.message
+                for check in result.checks
+            ), f"Expected CRITICAL REDUCE check for {full_ref}, checks: {[c.message for c in result.checks]}"
+
+    def test_memoized_stack_global_helper_ref_is_critical(self) -> None:
+        """Memoized STACK_GLOBAL helper refs should resolve and fail."""
+        module = b"torch.fx.experimental.symbolic_shapes.ShapeEnv"
+        func = b"evaluate_guards_expression"
+        payload = (
+            b"\x80\x04"
+            + b"\x8c"
+            + bytes([len(module)])
+            + module
+            + b"\x94"
+            + b"\x8c"
+            + bytes([len(func)])
+            + func
+            + b"\x94"
+            + b"\x93."
+        )
+        result = self._scan_bytes(payload)
+
+        assert result.success
+        assert result.has_errors
+        target = "torch.fx.experimental.symbolic_shapes.ShapeEnv.evaluate_guards_expression"
+        assert any(check.status == CheckStatus.FAILED and target in check.message for check in result.checks), (
+            f"Expected failed STACK_GLOBAL helper detection, checks: {[c.message for c in result.checks]}"
+        )
+
+    def test_safe_torch_and_numpy_reconstruction_helpers_remain_non_failing(self) -> None:
+        """Safe reconstruction helpers should continue to stay clean."""
+        safe_refs = (
+            ("torch._utils", "_rebuild_tensor_v2"),
+            ("numpy.core.multiarray", "_reconstruct"),
+        )
+
+        for module, func in safe_refs:
+            result = self._scan_bytes(self._craft_global_only_pickle(module, func))
+            full_ref = f"{module}.{func}"
+
+            assert result.success, f"Scan failed for safe ref {full_ref}"
+            assert not any(
+                check.status == CheckStatus.FAILED and full_ref in check.message for check in result.checks
+            ), f"Unexpected failed check for safe ref {full_ref}: {[c.message for c in result.checks]}"
+
+    def test_safe_nearby_helper_refs_remain_non_failing(self) -> None:
+        """Exact helper coverage must not widen to safe neighbors outside risky-ML prefixes."""
+        safe_neighbor_refs = (
+            ("torch.fx.experimental.symbolic_shapes.ShapeEnv", "create_symbol"),
+            ("torch.utils.collect_env", "get_env_info"),
+            ("torch.utils._config_module", "install_config_module"),
+            ("torch.utils.data.datapipes.utils.decoder", "handle_extension"),
+        )
+
+        for module, func in safe_neighbor_refs:
+            result = self._scan_bytes(self._craft_global_only_pickle(module, func))
+            full_ref = f"{module}.{func}"
+
+            assert result.success, f"Scan failed for safe neighbor {full_ref}"
+            assert not any(
+                check.status == CheckStatus.FAILED and full_ref in check.message for check in result.checks
+            ), f"Unexpected failed check for safe neighbor {full_ref}: {[c.message for c in result.checks]}"
+
+    def test_helper_ref_with_legacy_code_string_reports_both_signals(self) -> None:
+        """Dangerous-global detection should coexist with legacy string-pattern alerts."""
+        payload = b"\x80\x04\x8c\x0a__import__\x940ctorch.utils.collect_env\nrun\n."
+        result = self._scan_bytes(payload)
+
+        assert result.success
+        assert result.has_errors
+        messages = [issue.message for issue in result.issues]
+        assert any("torch.utils.collect_env.run" in msg for msg in messages), (
+            f"Expected helper dangerous-global message, got: {messages}"
+        )
+        assert any("legacy dangerous pattern detected: __import__" in msg.lower() for msg in messages), (
+            f"Expected legacy dangerous-string signal, got: {messages}"
+        )
+
+    def test_helper_imports_use_exact_why_explanations(self) -> None:
+        """Exact helper refs should populate a specific why explanation, not fall back to None."""
+        result = self._scan_bytes(self._craft_global_only_pickle("torch.utils.collect_env", "run"))
+
+        why_texts = [issue.why or "" for issue in result.issues if "torch.utils.collect_env.run" in issue.message]
+        assert any("subprocess" in why.lower() and "benign model loading" in why.lower() for why in why_texts), (
+            f"Expected exact why explanation for torch.utils.collect_env.run, got: {why_texts}"
+        )
+
+    def test_multi_stream_httplib_detected_in_second_stream(self) -> None:
+        """Scanner should detect httplib payload hidden in a second pickle stream."""
+        benign_stream = pickle.dumps({"safe": True}, protocol=2)
+        payload = benign_stream + b"\x80\x02chttplib\nHTTPSConnection\n."
+        result = self._scan_bytes(payload)
+
+        assert result.success
+        assert result.has_errors
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL and "httplib" in issue.message.lower() for issue in result.issues
+        ), f"Expected CRITICAL httplib issue in second stream, got: {[i.message for i in result.issues]}"
+
+    def test_zip_entry_with_httplib_payload_is_detected(self) -> None:
+        """Scanner should detect httplib payload embedded in a zip entry."""
+        import zipfile
+
+        from modelaudit.core import scan_file
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            zip_path = Path(tmp_dir) / "httplib-payload.zip"
+
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr("nested.pkl", self._craft_global_reduce_pickle("httplib", "HTTPSConnection"))
+
+            result = scan_file(str(zip_path))
+
+            assert result.success
+            assert result.has_errors
+            assert any(
+                issue.severity == IssueSeverity.CRITICAL
+                and "httplib.httpsconnection" in issue.message.lower()
+                and issue.details.get("zip_entry") == "nested.pkl"
+                for issue in result.issues
+            ), f"Expected CRITICAL httplib zip issue, got: {[i.message for i in result.issues]}"
+
+    def test_picklescan_gap_globals_are_critical_on_import_only(self) -> None:
+        """Validated PickleScan dangerous globals should fail even without REDUCE."""
+        for module, func in self.PICKLESCAN_GAP_REFS:
+            result = self._scan_bytes(self._craft_global_only_pickle(module, func))
+            assert result.has_errors, f"Expected failing checks for {module}.{func}"
+            assert any(
+                check.name == "Global Module Reference Check"
+                and check.status == CheckStatus.FAILED
+                and check.severity == IssueSeverity.CRITICAL
+                and check.rule_code == "S206"
+                and f"{module}.{func}" in check.message
+                for check in result.checks
+            ), f"Expected CRITICAL global check for {module}.{func}, checks: {[c.message for c in result.checks]}"
+
+    def test_picklescan_gap_globals_are_critical_with_reduce(self) -> None:
+        """Validated PickleScan dangerous globals should fail as CRITICAL in REDUCE flows."""
+        for module, func in self.PICKLESCAN_GAP_REFS:
+            result = self._scan_bytes(self._craft_global_reduce_pickle(module, func))
+            assert result.has_errors, f"Expected failing checks for {module}.{func}"
+            assert any(
+                check.name == "REDUCE Opcode Safety Check"
+                and check.status == CheckStatus.FAILED
+                and check.severity == IssueSeverity.CRITICAL
+                and f"{module}.{func}" in check.message
+                for check in result.checks
+            ), f"Expected CRITICAL REDUCE check for {module}.{func}, checks: {[c.message for c in result.checks]}"
+            assert not any(
+                "non-allowlisted global" in check.message and f"{module}.{func}" in check.message
+                for check in result.checks
+                if check.name == "REDUCE Opcode Safety Check"
+            ), f"Dangerous global should not degrade to a generic warning for {module}.{func}"
+
+    def test_picklescan_gap_imports_use_exact_why_explanations(self) -> None:
+        """Exact dotted-name explanations should be used for new dangerous refs."""
+        result = self._scan_bytes(self._craft_global_only_pickle("numpy", "load"))
+
+        why_texts = [issue.why or "" for issue in result.issues if "numpy.load" in issue.message]
+        assert any("recursively deserialize object arrays" in why.lower() for why in why_texts), (
+            f"Expected exact numpy.load explanation, got: {why_texts}"
+        )
+
+    def test_comment_token_does_not_bypass_picklescan_gap_detection(self) -> None:
+        """A comment-like string literal must not suppress dangerous global detection."""
+        comment_token = b"# not a real comment"
+        comment_prefix = b"\x8c" + bytes([len(comment_token)]) + comment_token + b"0"
+        payload = b"\x80\x02" + comment_prefix + b"cnumpy\nload\n."
+
+        result = self._scan_bytes(payload)
+
+        assert any(
+            check.name == "Global Module Reference Check"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+            and "numpy.load" in check.message
+            for check in result.checks
+        ), f"Expected numpy.load detection despite comment token, checks: {[c.message for c in result.checks]}"
+
+    def test_safe_nearby_imports_remain_non_failing(self) -> None:
+        """Nearby safe imports should remain non-failing to avoid broad module false positives."""
+        for module, func in [("site", "addsitedir"), ("_io", "BytesIO"), ("torch", "Tensor"), ("numpy", "array")]:
+            result = self._scan_bytes(self._craft_global_only_pickle(module, func))
+            assert result.success
+            assert not any(
+                check.name in {"Global Module Reference Check", "Advanced Global Reference Check"}
+                and check.status == CheckStatus.FAILED
+                and f"{module}.{func}" in check.message
+                for check in result.checks
+            ), f"Unexpected failing import check for safe reference {module}.{func}"
+
+    def test_existing_reference_behavior_unchanged(self) -> None:
+        """Existing dangerous references should remain failing after the expansion."""
+        for module, func in [
+            ("joblib", "load"),
+            ("pip", "main"),
+            ("pydoc", "pipepager"),
+            ("venv", "create"),
+        ]:
+            result = self._scan_bytes(self._craft_global_reduce_pickle(module, func))
+            assert any(
+                check.name == "REDUCE Opcode Safety Check"
+                and check.status == CheckStatus.FAILED
+                and f"{module}.{func}" in check.message
+                for check in result.checks
+            ), f"Expected REDUCE detection for {module}.{func}, checks: {[c.message for c in result.checks]}"
+
+    def test_pytorch_reduce_warning_includes_complete_cve_metadata(self) -> None:
+        """PyTorch-specific REDUCE warnings should carry the full CVE metadata bundle."""
+        result = self._scan_bytes(self._craft_global_reduce_pickle("datetime", "datetime"), suffix=".pt")
+
+        matching_checks = [
+            check
+            for check in result.checks
+            if check.name == "REDUCE Opcode Safety Check"
+            and check.status == CheckStatus.FAILED
+            and check.details
+            and check.details.get("cve_id") == "CVE-2025-32434"
+        ]
+        assert matching_checks, f"Expected CVE-tagged REDUCE warning, checks: {[c.message for c in result.checks]}"
+
+        details = matching_checks[0].details or {}
+        assert details["cvss"] == 9.8
+        assert details["cwe"] == "CWE-502"
+        assert "weights_only=True" in details["description"]
+        assert "PyTorch 2.6.0" in details["remediation"]
+
+    def test_picklescan_gap_detected_in_second_pickle_stream(self) -> None:
+        """Dangerous loader hidden in a second stream should still be detected."""
+        import io
+
+        buffer = io.BytesIO()
+        pickle.dump({"safe": True}, buffer, protocol=2)
+        buffer.write(self._craft_global_reduce_pickle("numpy", "load"))
+
+        result = self._scan_bytes(buffer.getvalue())
+        assert any(
+            check.name == "REDUCE Opcode Safety Check"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+            and "numpy.load" in check.message
+            for check in result.checks
+        ), f"Expected numpy.load detection in second stream, checks: {[c.message for c in result.checks]}"
+
+
+def test_picklescan_gap_detected_inside_zip_entry(tmp_path: Path) -> None:
+    """Dangerous primitive inside a ZIP entry should be detected by archive scanning."""
+    import zipfile
+
+    from modelaudit.core import scan_file
+
+    payload = TestPickleScannerBlocklistHardening._craft_global_reduce_pickle("numpy", "load")
+    zip_path = tmp_path / "numpy_loader_payload.zip"
+
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("weights.pkl", payload)
+
+    result = scan_file(str(zip_path))
+
+    assert result.success
+    assert result.has_errors
+    assert any(issue.severity == IssueSeverity.CRITICAL and "numpy.load" in issue.message for issue in result.issues), (
+        f"Expected CRITICAL numpy.load issue in zip entry, got: {[i.message for i in result.issues]}"
+    )
 
 
 class TestCVE20251716PipMainBlocklist(unittest.TestCase):
@@ -1117,7 +2096,7 @@ def test_scan_legitimate_pytorch_pickle_memory_error_is_non_failing(
     monkeypatch.setattr(
         PickleScanner,
         "_extract_globals_advanced",
-        lambda self, file_obj: {("torch", "OrderedDict")},
+        lambda self, file_obj, multiple_pickles=True: {("torch", "OrderedDict", "GLOBAL")},
     )
 
     result = PickleScanner().scan(str(model_path))
@@ -1161,7 +2140,10 @@ def test_scan_legitimate_pytorch_bin_memory_error_is_informational(
     monkeypatch.setattr(
         PickleScanner,
         "_extract_globals_advanced",
-        lambda self, file_obj: {("torch._utils", "_rebuild_tensor_v2"), ("collections", "OrderedDict")},
+        lambda self, file_obj, multiple_pickles=True: {
+            ("torch._utils", "_rebuild_tensor_v2", "GLOBAL"),
+            ("collections", "OrderedDict", "GLOBAL"),
+        },
     )
 
     result = PickleScanner().scan(str(model_path))
@@ -1224,7 +2206,7 @@ def test_scan_memory_error_with_dangerous_globals_not_downgraded(
     monkeypatch.setattr(
         PickleScanner,
         "_extract_globals_advanced",
-        lambda self, file_obj: {("builtins", "eval")},
+        lambda self, file_obj, multiple_pickles=True: {("builtins", "eval", "GLOBAL")},
     )
 
     result = PickleScanner().scan(str(model_path))
@@ -1235,6 +2217,1211 @@ def test_scan_memory_error_with_dangerous_globals_not_downgraded(
     assert format_validation_checks[0].status == CheckStatus.FAILED
     assert format_validation_checks[0].severity == IssueSeverity.WARNING
     assert format_validation_checks[0].details["exception_type"] == "MemoryError"
+
+
+def test_extract_globals_advanced_respects_max_opcodes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Advanced extraction should stop after max_opcodes instead of parsing everything."""
+    scanner = PickleScanner({"max_opcodes": 3})
+    consumed: list[int] = []
+
+    def _fake_genops(_data: object) -> Iterator[tuple[object, object, int]]:
+        for i in range(10):
+            consumed.append(i)
+            yield (type("Op", (), {"name": "GLOBAL"})(), f"mod{i} func{i}", i)
+
+    monkeypatch.setattr("modelaudit.scanners.pickle_scanner.pickletools.genops", _fake_genops)
+
+    globals_found = scanner._extract_globals_advanced(data=BytesIO(b"x"), multiple_pickles=False)
+
+    assert consumed == [0, 1, 2]
+    assert globals_found == {
+        ("mod0", "func0", "GLOBAL"),
+        ("mod1", "func1", "GLOBAL"),
+        ("mod2", "func2", "GLOBAL"),
+    }
+
+
+def test_extract_globals_advanced_respects_scan_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Advanced extraction should honor active scan timeout budget."""
+    scanner = PickleScanner({"timeout": 1})
+    scanner.scan_start_time = 100.0
+    consumed: list[int] = []
+
+    def _fake_genops(_data: object) -> Iterator[tuple[object, object, int]]:
+        for i in range(10):
+            consumed.append(i)
+            yield (type("Op", (), {"name": "GLOBAL"})(), f"timeout{i} func{i}", i)
+
+    monkeypatch.setattr("modelaudit.scanners.pickle_scanner.pickletools.genops", _fake_genops)
+    monkeypatch.setattr("modelaudit.scanners.pickle_scanner.time.time", lambda: 102.0)
+
+    globals_found = scanner._extract_globals_advanced(data=BytesIO(b"x"), multiple_pickles=False)
+
+    assert consumed == []
+    assert globals_found == set()
+
+
+def test_extract_globals_advanced_respects_max_opcodes_in_buffered_second_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Advanced extraction should not emit partial buffered opcodes from a later stream."""
+    scanner = PickleScanner({"max_opcodes": 3})
+    call_count = 0
+    second_stream_consumed: list[int] = []
+
+    def _fake_genops(data: BytesIO) -> Iterator[tuple[object, object, int]]:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            for i in range(2):
+                yield (type("Op", (), {"name": "GLOBAL"})(), f"first{i} func{i}", i)
+            data.seek(1)
+            return
+
+        for i in range(10):
+            second_stream_consumed.append(i)
+            yield (type("Op", (), {"name": "GLOBAL"})(), f"second{i} func{i}", i)
+
+    monkeypatch.setattr("modelaudit.scanners.pickle_scanner.pickletools.genops", _fake_genops)
+
+    globals_found = scanner._extract_globals_advanced(data=BytesIO(b"xy"), multiple_pickles=True)
+
+    assert second_stream_consumed == [0]
+    assert globals_found == {
+        ("first0", "func0", "GLOBAL"),
+        ("first1", "func1", "GLOBAL"),
+    }
+
+
+def test_genops_with_fallback_does_not_emit_buffered_partial_second_stream_on_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Buffered follow-on streams should not emit partial opcodes when the budget is exhausted."""
+    call_count = 0
+    second_stream_consumed: list[int] = []
+
+    def _fake_genops(data: BytesIO) -> Iterator[tuple[object, object, int]]:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            for i in range(2):
+                yield (type("Op", (), {"name": "GLOBAL"})(), f"first{i} func{i}", i)
+            data.seek(1)
+            return
+
+        for i in range(10):
+            second_stream_consumed.append(i)
+            yield (type("Op", (), {"name": "GLOBAL"})(), f"second{i} func{i}", i)
+
+    monkeypatch.setattr("modelaudit.scanners.pickle_scanner.pickletools.genops", _fake_genops)
+
+    ops = []
+    op_iter = _genops_with_fallback(BytesIO(b"xy"), multi_stream=True, max_items=3)
+    with pytest.raises(_GenopsBudgetExceeded, match="max_items"):
+        while True:
+            ops.append(next(op_iter))
+
+    assert second_stream_consumed == [0]
+    assert [arg for _opcode, arg, _pos in ops] == ["first0 func0", "first1 func1"]
+
+
+def test_scan_pickle_reports_opcode_budget_truncation_for_buffered_follow_on_stream(tmp_path: Path) -> None:
+    """Budget exhaustion in a later buffered stream should surface analysis truncation."""
+    clean_path = tmp_path / "clean.pkl"
+    clean_path.write_bytes(pickle.dumps({"weights": [1, 2, 3], "name": "safe"}))
+
+    class Evil:
+        def __reduce__(self) -> tuple[object, tuple[str]]:
+            return (os.system, ("echo pr700-budget",))
+
+    evil_path = tmp_path / "evil.pkl"
+    with evil_path.open("wb") as f:
+        pickle.dump(Evil(), f)
+
+    combined_path = tmp_path / "combined.pkl"
+    combined_path.write_bytes(clean_path.read_bytes() + evil_path.read_bytes())
+
+    result = PickleScanner({"max_opcodes": 25}).scan(str(combined_path))
+
+    opcode_checks = [
+        check for check in result.checks if check.name == "Opcode Count Check" and check.status == CheckStatus.FAILED
+    ]
+    assert len(opcode_checks) == 1
+    assert opcode_checks[0].severity == IssueSeverity.INFO
+    assert "opcode budget" in opcode_checks[0].message.lower()
+    assert opcode_checks[0].details["analysis_incomplete"] is True
+    assert result.metadata["analysis_incomplete"] is True
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+def test_extract_globals_advanced_preserves_partial_globals_when_genops_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Advanced extraction should keep globals parsed before a late generator failure."""
+    scanner = PickleScanner()
+
+    def _fake_genops_with_fallback(
+        _data: BytesIO,
+        *,
+        multi_stream: bool = False,
+        max_items: int | None = None,
+        deadline: float | None = None,
+    ) -> Iterator[tuple[object, object, int]]:
+        del multi_stream, max_items, deadline
+        yield (type("Op", (), {"name": "GLOBAL"})(), "kept func", 0)
+        raise RuntimeError("synthetic failure")
+
+    monkeypatch.setattr("modelaudit.scanners.pickle_scanner._genops_with_fallback", _fake_genops_with_fallback)
+
+    globals_found = scanner._extract_globals_advanced(data=BytesIO(b"x"), multiple_pickles=False)
+
+    assert globals_found == {("kept", "func", "GLOBAL")}
+
+
+def test_extract_globals_advanced_skips_symbolic_post_processing_after_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Timeout exhaustion should return partial direct globals without extra O(n) work."""
+    scanner = PickleScanner({"timeout": 1})
+    scanner.scan_start_time = 100.0
+    build_calls: list[list[tuple[object, object, int | None]]] = []
+
+    def _fake_genops_with_fallback(
+        _data: BytesIO,
+        *,
+        multi_stream: bool = False,
+        max_items: int | None = None,
+        deadline: float | None = None,
+    ) -> Iterator[tuple[object, object, int]]:
+        del multi_stream, max_items, deadline
+        yield (type("Op", (), {"name": "GLOBAL"})(), "early func", 0)
+        yield (type("Op", (), {"name": "STACK_GLOBAL"})(), None, 1)
+
+    def _fake_build_symbolic_reference_maps(
+        opcodes: list[tuple[object, object, int | None]],
+    ) -> tuple[dict[int, tuple[str, str]], dict[int, tuple[str, str]]]:
+        build_calls.append(opcodes)
+        return {}, {}
+
+    monkeypatch.setattr("modelaudit.scanners.pickle_scanner._genops_with_fallback", _fake_genops_with_fallback)
+    monkeypatch.setattr(
+        "modelaudit.scanners.pickle_scanner._build_symbolic_reference_maps",
+        _fake_build_symbolic_reference_maps,
+    )
+    monkeypatch.setattr("modelaudit.scanners.pickle_scanner.time.time", lambda: 102.0)
+
+    globals_found = scanner._extract_globals_advanced(data=BytesIO(b"x"), multiple_pickles=False)
+
+    assert globals_found == {("early", "func", "GLOBAL")}
+    assert build_calls == []
+
+
+class TestPickleImportOnlyGlobalFindings:
+    def test_import_only_safety_helper_keeps_torch_load_unsafe(self) -> None:
+        ml_context: dict[str, object] = {}
+
+        assert _is_actually_dangerous_global("torch", "load", ml_context)
+        assert not _is_safe_import_only_global("torch", "load", ml_context)
+        assert _is_safe_import_only_global("builtins", "set", ml_context)
+
+    def test_import_only_safety_helper_blocks_recursive_loaders(self) -> None:
+        ml_context: dict[str, object] = {}
+
+        assert not _is_safe_import_only_global("dill", "load", ml_context)
+        assert not _is_safe_import_only_global("dill", "loads", ml_context)
+        assert not _is_safe_import_only_global("joblib", "_pickle_load", ml_context)
+
+    def test_import_only_global_malicious_is_flagged(self, tmp_path: Path) -> None:
+        scanner = PickleScanner()
+        payload_path = tmp_path / "import_only_global.pkl"
+        payload_path.write_bytes(b"cevilpkg\nthing\n.")
+
+        result = scanner.scan(str(payload_path))
+
+        failed_checks = [
+            c for c in result.checks if c.name == "Global Module Reference Check" and c.status == CheckStatus.FAILED
+        ]
+        assert failed_checks
+        matched = [
+            c
+            for c in failed_checks
+            if c.details.get("import_reference") == "evilpkg.thing" and c.details.get("import_only") is True
+        ]
+        assert matched, [c.details for c in failed_checks]
+        assert any("evilpkg.thing" in c.message for c in matched)
+
+    def test_import_only_global_mixed_case_module_is_flagged(self, tmp_path: Path) -> None:
+        scanner = PickleScanner()
+        payload_path = tmp_path / "import_only_global_mixed_case.pkl"
+        payload_path.write_bytes(b"cEvilPkg\nthing\n.")
+
+        result = scanner.scan(str(payload_path))
+
+        failed_checks = [
+            c for c in result.checks if c.name == "Global Module Reference Check" and c.status == CheckStatus.FAILED
+        ]
+        assert failed_checks
+        matched = [
+            c
+            for c in failed_checks
+            if c.details.get("import_reference") == "EvilPkg.thing" and c.details.get("import_only") is True
+        ]
+        assert matched, [c.details for c in failed_checks]
+        assert any("EvilPkg.thing" in c.message for c in matched)
+
+    def test_import_only_global_comment_token_bypass_still_fails(self, tmp_path: Path) -> None:
+        scanner = PickleScanner()
+        payload_path = tmp_path / "import_only_global_comment_token.pkl"
+        payload_path.write_bytes(b"\x80\x04" + _short_binunicode(b"# benign comment token") + b"0cevilpkg\nthing\n.")
+
+        result = scanner.scan(str(payload_path))
+
+        failed_checks = [
+            c for c in result.checks if c.name == "Global Module Reference Check" and c.status == CheckStatus.FAILED
+        ]
+        matched = [
+            c
+            for c in failed_checks
+            if c.details.get("import_reference") == "evilpkg.thing" and c.details.get("import_only") is True
+        ]
+        assert matched, [c.details for c in failed_checks]
+        assert any("evilpkg.thing" in c.message for c in matched)
+
+    def test_import_only_stack_global_is_flagged(self, tmp_path: Path) -> None:
+        scanner = PickleScanner()
+        payload_path = tmp_path / "import_only_stack_global.pkl"
+        payload_path.write_bytes(b"\x80\x04\x8c\x07evilpkg\x8c\x05thing\x93.")
+
+        result = scanner.scan(str(payload_path))
+
+        failed_checks = [
+            c for c in result.checks if c.name == "STACK_GLOBAL Module Check" and c.status == CheckStatus.FAILED
+        ]
+        assert failed_checks
+        matched = [
+            c
+            for c in failed_checks
+            if c.details.get("import_reference") == "evilpkg.thing" and c.details.get("import_only") is True
+        ]
+        assert matched, [c.details for c in failed_checks]
+        assert any("evilpkg.thing" in c.message for c in matched)
+
+    def test_import_only_stack_global_comment_token_bypass_still_fails(self, tmp_path: Path) -> None:
+        scanner = PickleScanner()
+        payload_path = tmp_path / "import_only_stack_global_comment_token.pkl"
+        payload_path.write_bytes(
+            b"\x80\x04"
+            + _short_binunicode(b"# benign comment token")
+            + b"0"
+            + _short_binunicode(b"evilpkg")
+            + _short_binunicode(b"thing")
+            + b"\x93."
+        )
+
+        result = scanner.scan(str(payload_path))
+
+        failed_checks = [
+            c for c in result.checks if c.name == "STACK_GLOBAL Module Check" and c.status == CheckStatus.FAILED
+        ]
+        matched = [
+            c
+            for c in failed_checks
+            if c.details.get("import_reference") == "evilpkg.thing" and c.details.get("import_only") is True
+        ]
+        assert matched, [c.details for c in failed_checks]
+        assert any("evilpkg.thing" in c.message for c in matched)
+
+    @pytest.mark.parametrize(
+        ("payload", "check_name", "ref"),
+        [
+            (b"ctorch\nload\n.", "Global Module Reference Check", "torch.load"),
+            (b"\x80\x04\x8c\x05torch\x8c\x04load\x93.", "STACK_GLOBAL Module Check", "torch.load"),
+        ],
+    )
+    def test_import_only_torch_load_payloads_are_flagged(
+        self, tmp_path: Path, payload: bytes, check_name: str, ref: str
+    ) -> None:
+        scanner = PickleScanner()
+        payload_path = tmp_path / f"{check_name.replace(' ', '_').lower()}.pkl"
+        payload_path.write_bytes(payload)
+
+        result = scanner.scan(str(payload_path))
+
+        failed_checks = [c for c in result.checks if c.name == check_name and c.status == CheckStatus.FAILED]
+        assert failed_checks, [c.message for c in result.checks]
+        matched = [
+            c
+            for c in failed_checks
+            if c.details.get("import_reference") == ref and c.details.get("import_only") is True
+        ]
+        assert matched, [c.details for c in failed_checks]
+        assert any(ref in c.message for c in matched)
+
+    def test_import_only_joblib_pickle_load_payload_is_flagged(self, tmp_path: Path) -> None:
+        scanner = PickleScanner()
+        payload_path = tmp_path / "import_only_joblib_pickle_load.pkl"
+        payload_path.write_bytes(b"cjoblib\n_pickle_load\n.")
+
+        result = scanner.scan(str(payload_path))
+
+        failed_checks = [
+            c
+            for c in result.checks
+            if c.name == "Global Module Reference Check"
+            and c.status == CheckStatus.FAILED
+            and c.severity == IssueSeverity.CRITICAL
+        ]
+        assert failed_checks, [c.message for c in result.checks]
+        matched = [
+            c
+            for c in failed_checks
+            if c.details.get("import_reference") == "joblib._pickle_load"
+            and c.details.get("import_only") is True
+            and c.details.get("classification") == "dangerous"
+        ]
+        assert matched, [c.details for c in failed_checks]
+
+    @pytest.mark.parametrize(
+        ("payload", "check_name"),
+        [
+            (b"\x80\x04cjoblib\n_pickle_load\n\x8c\x0bpayload.pkl\x85R.", "Global Module Reference Check"),
+            (
+                b"\x80\x04\x8c\x06joblib\x8c\x0c_pickle_load\x93\x8c\x0bpayload.pkl\x85R.",
+                "STACK_GLOBAL Module Check",
+            ),
+        ],
+    )
+    def test_executed_joblib_pickle_load_payloads_are_not_allowlisted(
+        self, tmp_path: Path, payload: bytes, check_name: str
+    ) -> None:
+        scanner = PickleScanner()
+        payload_path = tmp_path / f"{check_name.replace(' ', '_').lower()}_joblib_pickle_load.pkl"
+        payload_path.write_bytes(payload)
+
+        result = scanner.scan(str(payload_path))
+
+        import_only_failures = [
+            c
+            for c in result.checks
+            if c.name == check_name
+            and c.status == CheckStatus.FAILED
+            and c.details.get("import_only") is True
+            and c.details.get("import_reference") == "joblib._pickle_load"
+        ]
+        assert not import_only_failures, [c.details for c in result.checks if c.name == check_name]
+        assert any(
+            c.name == "REDUCE Opcode Safety Check"
+            and c.status == CheckStatus.FAILED
+            and c.details.get("associated_global") == "joblib._pickle_load"
+            for c in result.checks
+        )
+
+    @pytest.mark.parametrize(
+        ("payload", "check_name", "ref"),
+        [
+            (b"cTorch\nload\n.", "Global Module Reference Check", "Torch.load"),
+            (b"\x80\x04\x8c\x05Torch\x8c\x04load\x93.", "STACK_GLOBAL Module Check", "Torch.load"),
+        ],
+    )
+    def test_import_only_mixed_case_dangerous_refs_stay_critical(
+        self, tmp_path: Path, payload: bytes, check_name: str, ref: str
+    ) -> None:
+        scanner = PickleScanner()
+        payload_path = tmp_path / f"mixed_case_{check_name.replace(' ', '_').lower()}.pkl"
+        payload_path.write_bytes(payload)
+
+        result = scanner.scan(str(payload_path))
+
+        failed_checks = [
+            c
+            for c in result.checks
+            if c.name == check_name and c.status == CheckStatus.FAILED and c.severity == IssueSeverity.CRITICAL
+        ]
+        assert failed_checks, [c.message for c in result.checks]
+        matched = [
+            c
+            for c in failed_checks
+            if c.details.get("classification") == "dangerous"
+            and c.details.get("import_only") is True
+            and c.details.get("import_reference") == ref
+        ]
+        assert matched, [c.details for c in failed_checks]
+
+    @pytest.mark.parametrize(
+        ("payload", "check_name", "ref"),
+        [
+            (b"cImportlib\nresources\n.", "Global Module Reference Check", "Importlib.resources"),
+            (b"\x80\x04\x8c\tImportlib\x8c\tresources\x93.", "STACK_GLOBAL Module Check", "Importlib.resources"),
+        ],
+    )
+    def test_import_only_mixed_case_dangerous_module_refs_stay_critical(
+        self, tmp_path: Path, payload: bytes, check_name: str, ref: str
+    ) -> None:
+        scanner = PickleScanner()
+        payload_path = tmp_path / f"mixed_case_module_{check_name.replace(' ', '_').lower()}.pkl"
+        payload_path.write_bytes(payload)
+
+        result = scanner.scan(str(payload_path))
+
+        failed_checks = [
+            c
+            for c in result.checks
+            if c.name == check_name and c.status == CheckStatus.FAILED and c.severity == IssueSeverity.CRITICAL
+        ]
+        matched = [
+            c
+            for c in failed_checks
+            if c.details.get("classification") == "dangerous"
+            and c.details.get("import_only") is True
+            and c.details.get("import_reference") == ref
+        ]
+        assert matched, [c.details for c in failed_checks]
+
+    @pytest.mark.parametrize(
+        "payload,ref",
+        [
+            (b"cbuiltins\nset\n.", "builtins.set"),
+            (b"ccollections\nOrderedDict\n.", "collections.OrderedDict"),
+            (b"cnumpy.core.multiarray\n_reconstruct\n.", "numpy.core.multiarray._reconstruct"),
+            (b"csklearn.pipeline\nPipeline\n.", "sklearn.pipeline.Pipeline"),
+        ],
+    )
+    def test_import_only_safe_globals_remain_non_failing(self, tmp_path: Path, payload: bytes, ref: str) -> None:
+        scanner = PickleScanner()
+        payload_path = tmp_path / f"safe_{ref.replace('.', '_')}.pkl"
+        payload_path.write_bytes(payload)
+
+        result = scanner.scan(str(payload_path))
+
+        failed_checks = [
+            c
+            for c in result.checks
+            if c.status == CheckStatus.FAILED
+            and ref in c.message
+            and c.name in {"Global Module Reference Check", "STACK_GLOBAL Module Check"}
+        ]
+        assert not failed_checks, [c.message for c in failed_checks]
+
+    def test_import_only_stdlib_constructor_remains_non_failing(self, tmp_path: Path) -> None:
+        scanner = PickleScanner()
+        payload_path = tmp_path / "import_only_datetime.pkl"
+        payload_path.write_bytes(b"cdatetime\ndatetime\n.")
+
+        result = scanner.scan(str(payload_path))
+
+        failed_checks = [
+            c
+            for c in result.checks
+            if c.status == CheckStatus.FAILED
+            and c.name == "Global Module Reference Check"
+            and "datetime.datetime" in c.message
+        ]
+        assert not failed_checks, [c.message for c in failed_checks]
+
+    def test_import_only_safe_stack_global_parity_remains_non_failing(self, tmp_path: Path) -> None:
+        scanner = PickleScanner()
+        payload_path = tmp_path / "safe_stack_global_builtins_set.pkl"
+        payload_path.write_bytes(b"\x80\x04\x8c\x08builtins\x8c\x03set\x93.")
+
+        result = scanner.scan(str(payload_path))
+
+        failed_checks = [
+            c
+            for c in result.checks
+            if c.status == CheckStatus.FAILED
+            and c.name in {"Global Module Reference Check", "STACK_GLOBAL Module Check"}
+            and "builtins.set" in c.message
+        ]
+        assert not failed_checks, [c.message for c in failed_checks]
+
+    def test_import_only_stdlib_constructor_stack_global_parity_remains_non_failing(self, tmp_path: Path) -> None:
+        scanner = PickleScanner()
+        payload_path = tmp_path / "import_only_datetime_stack_global.pkl"
+        payload_path.write_bytes(b"\x80\x04\x8c\x08datetime\x8c\x08datetime\x93.")
+
+        result = scanner.scan(str(payload_path))
+
+        failed_checks = [
+            c
+            for c in result.checks
+            if c.status == CheckStatus.FAILED
+            and c.name in {"Global Module Reference Check", "STACK_GLOBAL Module Check"}
+            and "datetime.datetime" in c.message
+        ]
+        assert not failed_checks, [c.message for c in failed_checks]
+
+    def test_executed_import_only_allowlist_ref_is_not_marked_safe_allowlisted(self, tmp_path: Path) -> None:
+        scanner = PickleScanner()
+        payload_path = tmp_path / "executed_datetime_reduce.pkl"
+        payload_path.write_bytes(b"cdatetime\ndatetime\n)R.")
+
+        result = scanner.scan(str(payload_path))
+
+        passed_checks = [
+            c
+            for c in result.checks
+            if c.name == "Global Module Reference Check"
+            and c.status == CheckStatus.PASSED
+            and c.details.get("import_reference") == "datetime.datetime"
+            and c.details.get("classification") == "safe_allowlisted"
+            and c.details.get("import_only") is False
+        ]
+        assert not passed_checks, [c.details for c in result.checks if c.name == "Global Module Reference Check"]
+        assert any(
+            c.name == "REDUCE Opcode Safety Check"
+            and c.status == CheckStatus.FAILED
+            and c.details.get("associated_global") == "datetime.datetime"
+            for c in result.checks
+        )
+
+    def test_import_only_data_label_like_module_is_ignored(self, tmp_path: Path) -> None:
+        scanner = PickleScanner()
+        payload_path = tmp_path / "import_only_data_label.pkl"
+        payload_path.write_bytes(b"cPEDRA_2020\nthing\n.")
+
+        result = scanner.scan(str(payload_path))
+
+        failed_checks = [
+            c
+            for c in result.checks
+            if c.status == CheckStatus.FAILED
+            and c.name == "Global Module Reference Check"
+            and "PEDRA_2020.thing" in c.message
+        ]
+        assert not failed_checks, [c.message for c in failed_checks]
+
+    def test_import_only_data_label_like_stack_global_module_is_ignored(self, tmp_path: Path) -> None:
+        scanner = PickleScanner()
+        payload_path = tmp_path / "import_only_data_label_stack_global.pkl"
+        payload_path.write_bytes(b"\x80\x04\x8c\nPEDRA_2020\x8c\x05thing\x93.")
+
+        result = scanner.scan(str(payload_path))
+
+        failed_checks = [
+            c
+            for c in result.checks
+            if c.status == CheckStatus.FAILED
+            and c.name in {"Global Module Reference Check", "STACK_GLOBAL Module Check"}
+            and "PEDRA_2020.thing" in c.message
+        ]
+        assert not failed_checks, [c.message for c in failed_checks]
+
+    def test_import_only_malicious_in_second_stream_is_flagged(self, tmp_path: Path) -> None:
+        scanner = PickleScanner()
+        payload_path = tmp_path / "second_stream_import_only.pkl"
+        payload_path.write_bytes(b"cbuiltins\nset\n." + b"cevilpkg\nthing\n.")
+
+        result = scanner.scan(str(payload_path))
+
+        failed_checks = [
+            c for c in result.checks if c.name == "Global Module Reference Check" and c.status == CheckStatus.FAILED
+        ]
+        matched = [
+            c
+            for c in failed_checks
+            if c.details.get("import_reference") == "evilpkg.thing" and c.details.get("import_only") is True
+        ]
+        assert matched, [c.details for c in failed_checks]
+
+    def test_import_only_malicious_first_stream_with_benign_second_stream_is_flagged(self, tmp_path: Path) -> None:
+        scanner = PickleScanner()
+        payload_path = tmp_path / "first_stream_import_only.pkl"
+        payload_path.write_bytes(b"cevilpkg\nthing\n." + b"cbuiltins\nset\n.")
+
+        result = scanner.scan(str(payload_path))
+
+        failed_checks = [
+            c for c in result.checks if c.name == "Global Module Reference Check" and c.status == CheckStatus.FAILED
+        ]
+        matched = [
+            c
+            for c in failed_checks
+            if c.details.get("import_reference") == "evilpkg.thing" and c.details.get("import_only") is True
+        ]
+        assert matched, [c.details for c in failed_checks]
+
+    def test_reduce_backed_global_does_not_emit_import_only_failure(self, tmp_path: Path) -> None:
+        scanner = PickleScanner()
+        payload_path = tmp_path / "reduce_global.pkl"
+        payload_path.write_bytes(b"cos\nsystem\n(Vecho hi\ntR.")
+
+        result = scanner.scan(str(payload_path))
+
+        import_only_failures = [
+            c
+            for c in result.checks
+            if c.name == "Global Module Reference Check"
+            and c.status == CheckStatus.FAILED
+            and c.details.get("import_only") is True
+        ]
+        assert not import_only_failures, [c.message for c in import_only_failures]
+        assert any(c.name == "REDUCE Opcode Safety Check" and c.status == CheckStatus.FAILED for c in result.checks)
+
+    def test_reduce_backed_stack_global_does_not_emit_import_only_failure(self, tmp_path: Path) -> None:
+        scanner = PickleScanner()
+        payload_path = tmp_path / "reduce_stack_global.pkl"
+        payload_path.write_bytes(b"\x80\x04\x8c\x02os\x8c\x06system\x93\x8c\x07echo hi\x85R.")
+
+        result = scanner.scan(str(payload_path))
+
+        import_only_failures = [
+            c
+            for c in result.checks
+            if c.name == "STACK_GLOBAL Module Check"
+            and c.status == CheckStatus.FAILED
+            and c.details.get("import_only") is True
+        ]
+        assert not import_only_failures, [c.message for c in import_only_failures]
+        assert any(c.name == "REDUCE Opcode Safety Check" and c.status == CheckStatus.FAILED for c in result.checks)
+
+    def test_same_reference_import_only_origin_is_not_suppressed_by_later_reduce(self, tmp_path: Path) -> None:
+        scanner = PickleScanner()
+        payload_path = tmp_path / "import_only_then_reduce.pkl"
+        payload_path.write_bytes(b"cevilpkg\nthing\ncevilpkg\nthing\n(tR.")
+
+        result = scanner.scan(str(payload_path))
+
+        import_only_failures = [
+            c
+            for c in result.checks
+            if c.name == "Global Module Reference Check"
+            and c.status == CheckStatus.FAILED
+            and c.details.get("import_only") is True
+            and c.details.get("import_reference") == "evilpkg.thing"
+        ]
+        assert len(import_only_failures) == 1
+        assert any(
+            c.name == "REDUCE Opcode Safety Check"
+            and c.status == CheckStatus.FAILED
+            and c.details.get("associated_global") == "evilpkg.thing"
+            for c in result.checks
+        )
+
+    def test_same_stack_global_reference_import_only_origin_is_not_suppressed_by_later_reduce(
+        self, tmp_path: Path
+    ) -> None:
+        scanner = PickleScanner()
+        payload_path = tmp_path / "stack_global_import_only_then_reduce.pkl"
+        payload_path.write_bytes(
+            b"\x80\x04"
+            + _short_binunicode(b"evilpkg")
+            + _short_binunicode(b"thing")
+            + b"\x93"
+            + _short_binunicode(b"evilpkg")
+            + _short_binunicode(b"thing")
+            + b"\x93)R."
+        )
+
+        result = scanner.scan(str(payload_path))
+
+        import_only_failures = [
+            c
+            for c in result.checks
+            if c.name == "STACK_GLOBAL Module Check"
+            and c.status == CheckStatus.FAILED
+            and c.details.get("import_only") is True
+            and c.details.get("import_reference") == "evilpkg.thing"
+        ]
+        assert len(import_only_failures) == 1
+        assert any(
+            c.name == "REDUCE Opcode Safety Check"
+            and c.status == CheckStatus.FAILED
+            and c.details.get("associated_global") == "evilpkg.thing"
+            for c in result.checks
+        )
+
+    @pytest.mark.parametrize(
+        ("payload", "check_name"),
+        [
+            (b"\x80\x02cos\nsystem\n)\x81.", "Global Module Reference Check"),
+            (b"\x80\x04\x8c\x02os\x8c\x06system\x93)\x81.", "STACK_GLOBAL Module Check"),
+            (b"\x80\x04cos\nsystem\n)}\x92.", "Global Module Reference Check"),
+            (b"\x80\x04\x8c\x02os\x8c\x06system\x93)}\x92.", "STACK_GLOBAL Module Check"),
+            (b"(cos\nsystem\no.", "Global Module Reference Check"),
+            (b"\x80\x04(\x8c\x02os\x8c\x06system\x93o.", "STACK_GLOBAL Module Check"),
+        ],
+    )
+    def test_constructor_backed_refs_do_not_emit_import_only_failures(
+        self, tmp_path: Path, payload: bytes, check_name: str
+    ) -> None:
+        scanner = PickleScanner()
+        payload_path = tmp_path / f"{check_name.replace(' ', '_').lower()}_constructor.pkl"
+        payload_path.write_bytes(payload)
+
+        result = scanner.scan(str(payload_path))
+
+        import_only_failures = [
+            c
+            for c in result.checks
+            if c.name == check_name and c.status == CheckStatus.FAILED and c.details.get("import_only") is True
+        ]
+        assert not import_only_failures, [c.details for c in result.checks if c.name == check_name]
+        assert any(
+            c.name == "INST/OBJ/NEWOBJ/NEWOBJ_EX Opcode Safety Check" and c.status == CheckStatus.FAILED
+            for c in result.checks
+        )
+
+    def test_symbolic_simulation_inst_clears_marked_arguments(self) -> None:
+        opcodes = [
+            (type("Op", (), {"name": "MARK"})(), None, 0),
+            (type("Op", (), {"name": "UNICODE"})(), "evilpkg", 1),
+            (type("Op", (), {"name": "INST"})(), "collections OrderedDict", 2),
+            (type("Op", (), {"name": "BUILD"})(), None, 3),
+            (type("Op", (), {"name": "UNICODE"})(), "thing", 4),
+            (type("Op", (), {"name": "STACK_GLOBAL"})(), None, 5),
+        ]
+
+        (
+            stack_global_refs,
+            callable_refs,
+            callable_origin_refs,
+            callable_origin_is_ext,
+            malformed_stack_globals,
+        ) = _simulate_symbolic_reference_maps(opcodes)
+
+        assert callable_refs[2] == ("collections", "OrderedDict")
+        assert callable_origin_refs[2] == 2
+        assert callable_origin_is_ext == {}
+        assert 5 not in stack_global_refs
+        assert malformed_stack_globals[5]["reason"] == "insufficient_context"
+
+    def test_symbolic_simulation_protocol_five_buffers_preserve_stack_alignment(self) -> None:
+        opcodes = [
+            (type("Op", (), {"name": "UNICODE"})(), "evilpkg", 0),
+            (type("Op", (), {"name": "NEXT_BUFFER"})(), None, 1),
+            (type("Op", (), {"name": "READONLY_BUFFER"})(), None, 2),
+            (type("Op", (), {"name": "BINPUT"})(), 0, 3),
+            (type("Op", (), {"name": "POP"})(), None, 4),
+            (type("Op", (), {"name": "UNICODE"})(), "thing", 5),
+            (type("Op", (), {"name": "STACK_GLOBAL"})(), None, 6),
+        ]
+
+        (
+            stack_global_refs,
+            callable_refs,
+            callable_origin_refs,
+            callable_origin_is_ext,
+            malformed_stack_globals,
+        ) = _simulate_symbolic_reference_maps(opcodes)
+
+        assert stack_global_refs[6] == ("evilpkg", "thing")
+        assert callable_refs == {}
+        assert callable_origin_refs == {}
+        assert callable_origin_is_ext == {}
+        assert malformed_stack_globals == {}
+
+
+@pytest.mark.parametrize(
+    ("module_name", "func_name", "payload"),
+    [
+        ("torch.jit", "load", b"\x80\x02ctorch.jit\nload\n."),
+        ("torch._dynamo", "optimize", b"\x80\x02ctorch._dynamo\noptimize\n."),
+        ("torch", "compile", b"\x80\x02ctorch\ncompile\n."),
+        ("numpy.f2py", "compile", b"\x80\x02cnumpy.f2py\ncompile\n."),
+        ("numpy.distutils.core", "setup", b"\x80\x02cnumpy.distutils.core\nsetup\n."),
+        (
+            "torch.storage",
+            "_load_from_bytes",
+            b"\x80\x02ctorch.storage\n_load_from_bytes\n.",
+        ),
+    ],
+)
+def test_risky_ml_import_only_globals_are_detected(
+    tmp_path: Path, module_name: str, func_name: str, payload: bytes
+) -> None:
+    """Import-only risky ML GLOBAL refs should be flagged even without REDUCE."""
+    path = tmp_path / f"{module_name.replace('.', '_')}_{func_name}.pkl"
+    path.write_bytes(payload)
+
+    result = PickleScanner().scan(str(path))
+    full_ref = f"{module_name}.{func_name}"
+    failing_checks = [
+        check
+        for check in result.checks
+        if check.name == "Global Module Reference Check"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("import_reference") == full_ref
+    ]
+    matching_issues = [issue for issue in result.issues if full_ref in issue.message]
+
+    assert failing_checks, f"Expected failed GLOBAL check for {full_ref}, got: {result.checks}"
+    assert all(check.severity == IssueSeverity.CRITICAL for check in failing_checks), (
+        f"Expected CRITICAL GLOBAL finding for {full_ref}, got: "
+        f"{[(check.severity, check.message) for check in failing_checks]}"
+    )
+    assert matching_issues, f"Expected issue for risky ML import {full_ref}, got: {result.issues}"
+    assert any(issue.why for issue in matching_issues), f"Expected explanation for risky ML import {full_ref}"
+
+
+@pytest.mark.parametrize(
+    ("module_name", "func_name", "payload"),
+    [
+        ("torch", "jit", b"\x80\x02ctorch\njit\n."),
+        ("torch", "_dynamo", b"\x80\x02ctorch\n_dynamo\n."),
+        ("torch", "_inductor", b"\x80\x02ctorch\n_inductor\n."),
+        ("numpy", "f2py", b"\x80\x02cnumpy\nf2py\n."),
+        ("numpy", "distutils", b"\x80\x02cnumpy\ndistutils\n."),
+        ("torch", "compile.__globals__", b"\x80\x02ctorch\ncompile.__globals__\n."),
+        ("torch", "jit.script", b"\x80\x02ctorch\njit.script\n."),
+        ("torch", "_dynamo.optimize", b"\x80\x02ctorch\n_dynamo.optimize\n."),
+        ("torch", "storage._load_from_bytes", b"\x80\x02ctorch\nstorage._load_from_bytes\n."),
+        (
+            "torch.storage",
+            "_load_from_bytes.__code__",
+            b"\x80\x02ctorch.storage\n_load_from_bytes.__code__\n.",
+        ),
+        ("numpy", "distutils.core.setup", b"\x80\x02cnumpy\ndistutils.core.setup\n."),
+    ],
+)
+def test_risky_ml_parent_attribute_globals_are_detected(
+    tmp_path: Path, module_name: str, func_name: str, payload: bytes
+) -> None:
+    """Parent/attribute GLOBAL forms must not bypass risky ML import detection."""
+    path = tmp_path / f"{module_name}_{func_name}.pkl"
+    path.write_bytes(payload)
+
+    result = PickleScanner().scan(str(path))
+    full_ref = f"{module_name}.{func_name}"
+    failing_checks = [
+        check
+        for check in result.checks
+        if check.name in {"Global Module Reference Check", "Advanced Global Reference Check"}
+        and check.status == CheckStatus.FAILED
+        and (
+            check.details.get("import_reference") == full_ref
+            or (check.details.get("module") == module_name and check.details.get("function") == func_name)
+        )
+    ]
+
+    assert failing_checks, f"Expected failed GLOBAL check for {full_ref}, got: {result.checks}"
+    check_summaries = [(check.severity, check.message) for check in failing_checks]
+    assert all(check.severity == IssueSeverity.CRITICAL for check in failing_checks), (
+        f"Expected CRITICAL GLOBAL finding for {full_ref}, got: {check_summaries}"
+    )
+    assert any(full_ref in issue.message for issue in result.issues), (
+        f"Expected issue for risky ML import {full_ref}, got: {[issue.message for issue in result.issues]}"
+    )
+
+
+def test_comment_token_does_not_bypass_risky_ml_import_detection(tmp_path: Path) -> None:
+    """A comment-like string must not suppress risky ML import-only detection."""
+    comment_token = b"# benign comment token"
+    comment_prefix = b"\x8c" + bytes([len(comment_token)]) + comment_token + b"0"
+    payload = b"\x80\x02" + comment_prefix + b"ctorch\ncompile.__globals__\n."
+
+    path = tmp_path / "torch_compile_comment.pkl"
+    path.write_bytes(payload)
+
+    result = PickleScanner().scan(str(path))
+
+    assert any(
+        check.name in {"Global Module Reference Check", "Advanced Global Reference Check"}
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and (
+            check.details.get("import_reference") == "torch.compile.__globals__"
+            or (check.details.get("module") == "torch" and check.details.get("function") == "compile.__globals__")
+        )
+        for check in result.checks
+    ), f"Expected torch.compile.__globals__ detection despite comment token, checks: {result.checks}"
+
+
+def test_risky_ml_reduce_target_is_detected(tmp_path: Path) -> None:
+    """Risky ML globals should remain CRITICAL when later consumed by REDUCE."""
+    path = tmp_path / "torch_jit_reduce.pkl"
+    path.write_bytes(b"\x80\x02ctorch.jit\nload\n(tR.")
+
+    result = PickleScanner().scan(str(path))
+    reduce_checks = [
+        check
+        for check in result.checks
+        if check.name == "REDUCE Opcode Safety Check"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("associated_global") == "torch.jit.load"
+    ]
+
+    assert reduce_checks, f"Expected REDUCE finding for torch.jit.load, got: {result.checks}"
+    assert all(check.severity == IssueSeverity.CRITICAL for check in reduce_checks), (
+        f"Expected CRITICAL REDUCE finding for torch.jit.load, got: "
+        f"{[(check.severity, check.message) for check in reduce_checks]}"
+    )
+    assert any(
+        check.name == "Reduce Pattern Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("module") == "torch.jit"
+        and check.details.get("function") == "load"
+        for check in result.checks
+    ), f"Expected failed Reduce Pattern Analysis for torch.jit.load, got: {result.checks}"
+
+
+def test_comment_token_does_not_bypass_risky_ml_reduce_detection(tmp_path: Path) -> None:
+    """A comment-like string must not suppress risky ML REDUCE detection."""
+    comment_token = b"# not a real comment"
+    comment_prefix = b"\x8c" + bytes([len(comment_token)]) + comment_token + b"0"
+    payload = b"\x80\x02" + comment_prefix + b"ctorch.jit\nload\n)R."
+
+    path = tmp_path / "torch_jit_comment_reduce.pkl"
+    path.write_bytes(payload)
+
+    result = PickleScanner().scan(str(path))
+
+    assert any(
+        check.name == "REDUCE Opcode Safety Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("associated_global") == "torch.jit.load"
+        for check in result.checks
+    ), f"Expected torch.jit.load REDUCE detection despite comment token, checks: {result.checks}"
+    assert any(
+        check.name == "Reduce Pattern Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("module") == "torch.jit"
+        and check.details.get("function") == "load"
+        for check in result.checks
+    ), f"Expected Reduce Pattern Analysis failure despite comment token, checks: {result.checks}"
+
+
+def test_risky_ml_stack_global_detection(tmp_path: Path) -> None:
+    """Risky ML imports hidden behind STACK_GLOBAL should be detected."""
+
+    payload = bytearray(b"\x80\x04")
+    payload += _short_binunicode(b"torch.jit")
+    payload += _short_binunicode(b"load")
+    payload += b"\x93"  # STACK_GLOBAL
+    payload += b"."  # STOP
+
+    path = tmp_path / "torch_jit_stack_global.pkl"
+    path.write_bytes(payload)
+
+    result = PickleScanner().scan(str(path))
+    failing_checks = [
+        check
+        for check in result.checks
+        if check.name == "STACK_GLOBAL Module Check"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("module") == "torch.jit"
+        and check.details.get("function") == "load"
+    ]
+
+    assert failing_checks, f"Expected STACK_GLOBAL torch.jit.load detection. Checks: {result.checks}"
+    assert all(check.severity == IssueSeverity.CRITICAL for check in failing_checks), (
+        f"Expected CRITICAL STACK_GLOBAL finding for torch.jit.load, got: "
+        f"{[(check.severity, check.message) for check in failing_checks]}"
+    )
+    assert any(issue.why for issue in result.issues if "torch.jit.load" in issue.message)
+
+
+def test_risky_ml_parent_attribute_stack_global_detection(tmp_path: Path) -> None:
+    """STACK_GLOBAL parent/attribute refs should trigger the risky ML policy."""
+    payload = bytearray(b"\x80\x04")
+    payload += _short_binunicode(b"numpy")
+    payload += _short_binunicode(b"distutils")
+    payload += b"\x93"  # STACK_GLOBAL
+    payload += b"."  # STOP
+
+    path = tmp_path / "numpy_distutils_stack_global.pkl"
+    path.write_bytes(payload)
+
+    result = PickleScanner().scan(str(path))
+    failing_checks = [
+        check
+        for check in result.checks
+        if check.name == "STACK_GLOBAL Module Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("module") == "numpy"
+        and check.details.get("function") == "distutils"
+    ]
+
+    assert failing_checks, f"Expected STACK_GLOBAL numpy.distutils detection. Checks: {result.checks}"
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and "numpy.distutils" in issue.message for issue in result.issues
+    ), f"Expected CRITICAL numpy.distutils issue. Issues: {[issue.message for issue in result.issues]}"
+
+
+def test_risky_ml_dotted_stack_global_detection(tmp_path: Path) -> None:
+    """STACK_GLOBAL dotted qualnames should not bypass risky ML matching."""
+
+    payload = bytearray(b"\x80\x04")
+    payload += _short_binunicode(b"torch")
+    payload += _short_binunicode(b"storage._load_from_bytes")
+    payload += b"\x93"  # STACK_GLOBAL
+    payload += b"."  # STOP
+
+    path = tmp_path / "torch_storage_stack_global.pkl"
+    path.write_bytes(payload)
+
+    result = PickleScanner().scan(str(path))
+    failing_checks = [
+        check
+        for check in result.checks
+        if check.name in {"STACK_GLOBAL Module Check", "Advanced Global Reference Check"}
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("module") == "torch"
+        and check.details.get("function") == "storage._load_from_bytes"
+    ]
+
+    assert failing_checks, f"Expected STACK_GLOBAL torch.storage._load_from_bytes detection. Checks: {result.checks}"
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and "torch.storage._load_from_bytes" in issue.message
+        for issue in result.issues
+    )
+
+
+def test_risky_ml_memoized_stack_global_reuse_is_detected(tmp_path: Path) -> None:
+    """Memoized risky STACK_GLOBAL references should remain detectable when recalled by REDUCE."""
+
+    payload = bytearray(b"\x80\x04")
+    payload += _short_binunicode(b"torch._dynamo")
+    payload += _short_binunicode(b"optimize")
+    payload += b"\x93"  # STACK_GLOBAL
+    payload += b"\x94"  # MEMOIZE index 0
+    payload += b"0"  # POP
+    payload += _short_binunicode(b"torch")
+    payload += _short_binunicode(b"nn")
+    payload += b"\x93"  # STACK_GLOBAL (benign concrete callable)
+    payload += b"0"  # POP
+    payload += b"h\x00"  # BINGET 0
+    payload += b")"  # EMPTY_TUPLE
+    payload += b"R"  # REDUCE
+    payload += b"."  # STOP
+
+    path = tmp_path / "torch_dynamo_memo.pkl"
+    path.write_bytes(payload)
+
+    result = PickleScanner().scan(str(path))
+    reduce_checks = [
+        check
+        for check in result.checks
+        if check.name == "REDUCE Opcode Safety Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("associated_global") == "torch._dynamo.optimize"
+    ]
+
+    assert reduce_checks, (
+        f"Expected REDUCE detection for memoized torch._dynamo.optimize recall. Checks: {result.checks}"
+    )
+
+
+def test_safe_ml_parent_attribute_global_remains_non_failing(tmp_path: Path) -> None:
+    """Safe parent/attribute ML globals should not be swept up by the risky policy."""
+    for module_name, func_name, payload in [
+        ("torch", "nn", b"\x80\x02ctorch\nnn\n."),
+        ("torch", "nn.functional.relu", b"\x80\x02ctorch\nnn.functional.relu\n."),
+    ]:
+        path = tmp_path / f"{module_name}_{func_name.replace('.', '_')}.pkl"
+        path.write_bytes(payload)
+
+        result = PickleScanner().scan(str(path))
+
+        issue_summaries = [(issue.severity, issue.message) for issue in result.issues]
+        full_ref = f"{module_name}.{func_name}"
+        assert not any(
+            check.name == "Global Module Reference Check"
+            and check.status == CheckStatus.FAILED
+            and check.details.get("import_reference") == full_ref
+            for check in result.checks
+        ), f"Unexpected failing GLOBAL check for safe ref {full_ref}: {result.checks}"
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues), (
+            f"Safe {module_name}.{func_name} import should not be flagged. Issues: {issue_summaries}"
+        )
+
+
+@pytest.mark.parametrize(
+    ("payload", "safe_ref"),
+    [
+        (b"\x80\x02ctorch\nTensor\n.", "torch.Tensor"),
+        (b"\x80\x02ctorch._utils\n_rebuild_tensor\n.", "torch._utils._rebuild_tensor"),
+        (b"\x80\x02cnumpy.core.multiarray\n_reconstruct\n.", "numpy.core.multiarray._reconstruct"),
+    ],
+)
+def test_safe_ml_reconstruction_globals_remain_non_failing(tmp_path: Path, payload: bytes, safe_ref: str) -> None:
+    """Known safe ML reconstruction globals should not become noisy."""
+    path = tmp_path / f"{safe_ref.replace('.', '_')}.pkl"
+    path.write_bytes(payload)
+
+    result = PickleScanner().scan(str(path))
+    assert not any(
+        check.name == "Global Module Reference Check"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("import_reference") == safe_ref
+        for check in result.checks
+    ), f"Unexpected failing GLOBAL check for safe reconstruction ref {safe_ref}: {result.checks}"
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues), (
+        f"Safe reconstruction ref {safe_ref} should not fail. Issues: "
+        f"{[(i.severity, i.message) for i in result.issues]}"
+    )
+
+
+def test_safe_pytorch_state_dict_pickle_remains_non_failing(tmp_path: Path) -> None:
+    """State-dict-style payloads should not start failing under the risky-ML policy."""
+    import collections
+
+    safe_state_dict = collections.OrderedDict(
+        [
+            ("layer1.weight", [1.0, 2.0, 3.0]),
+            ("layer1.bias", [0.1, 0.2, 0.3]),
+            ("layer2.weight", [4.0, 5.0, 6.0]),
+        ]
+    )
+    payload = {
+        "state_dict": safe_state_dict,
+        "_metadata": collections.OrderedDict([("", {"version": 1})]),
+    }
+    path = tmp_path / "safe_state_dict.pth"
+    with path.open("wb") as handle:
+        pickle.dump(payload, handle, protocol=2)
+
+    result = PickleScanner().scan(str(path))
+
+    assert not any(
+        check.name in {"Global Module Reference Check", "REDUCE Opcode Safety Check"}
+        and check.status == CheckStatus.FAILED
+        and (
+            check.details.get("import_reference") == "collections.OrderedDict"
+            or check.details.get("associated_global") == "collections.OrderedDict"
+        )
+        for check in result.checks
+    ), f"Safe state_dict payload should not fail OrderedDict checks. Checks: {result.checks}"
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues), (
+        "Safe state-dict payload should not be noisy. Issues: "
+        f"{[(issue.severity, issue.message) for issue in result.issues]}"
+    )
+
+
+def test_safe_then_risky_ml_stream_still_flags_risky_import(tmp_path: Path) -> None:
+    """Risky imports in later streams must be detected after safe ML globals."""
+    safe_stream = b"\x80\x02ctorch._utils\n_rebuild_tensor\n."
+    risky_stream = b"\x80\x02ctorch._inductor\ncompile_fx\n."
+
+    path = tmp_path / "safe_then_risky.pkl"
+    path.write_bytes(safe_stream + risky_stream)
+
+    result = PickleScanner().scan(str(path))
+    assert any(
+        check.name == "Global Module Reference Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("import_reference") == "torch._inductor.compile_fx"
+        for check in result.checks
+    ), f"Expected CRITICAL later-stream GLOBAL check, got: {result.checks}"
+    assert not any(
+        check.name == "Global Module Reference Check"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("import_reference") == "torch._utils._rebuild_tensor"
+        for check in result.checks
+    ), f"Safe first-stream ref should not fail GLOBAL checks. Checks: {result.checks}"
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and "torch._inductor.compile_fx" in issue.message
+        for issue in result.issues
+    ), f"Expected critical later-stream issue. Issues: {[i.message for i in result.issues]}"
+    assert not any("torch._utils._rebuild_tensor" in issue.message for issue in result.issues), (
+        f"Safe global should not be flagged. Issues: {[i.message for i in result.issues]}"
+    )
 
 
 if __name__ == "__main__":
