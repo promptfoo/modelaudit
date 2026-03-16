@@ -2898,12 +2898,11 @@ def _is_legitimate_serialization_file(path: str) -> bool:
                 if not ext_lower:
                     return False
 
-            # For dill files, require dill-specific markers in the payload.
+            # Dill can serialize plain pickle-compatible objects without
+            # embedding obvious dill markers near the front of the stream, so
+            # the extension remains the legitimacy signal here.
             if ext_lower == ".dill":
-                f.seek(0)
-                sample = f.read(2048)
-                dill_indicators = [b"dill", b"_dill", b"dill._dill"]
-                return any(marker in sample for marker in dill_indicators)
+                return True
 
         return False
     except OSError:
@@ -5664,7 +5663,7 @@ class PickleScanner(BaseScanner):
                 mod in {"joblib", "sklearn", "numpy"} or mod.startswith(("joblib.", "sklearn.", "numpy."))
                 for mod, _func, _opcode in advanced_globals
             )
-            has_dill_globals = any(mod == "dill" or mod.startswith("dill.") for mod, _func in advanced_globals)
+            has_dill_globals = any(mod == "dill" or mod.startswith("dill.") for mod, _func, _opcode in advanced_globals)
             is_joblib_content = is_serialization_ext or (not file_ext and has_joblib_globals)
 
             # Check for recursion errors on legitimate ML model files

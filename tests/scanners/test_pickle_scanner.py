@@ -2187,6 +2187,35 @@ def test_scan_dill_memory_error_without_dill_globals_not_downgraded(
     assert format_validation_checks[0].details["exception_type"] == "MemoryError"
 
 
+def test_scan_dill_memory_error_with_dill_globals_is_informational(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Legitimate dill globals should still allow the scanner-limitation downgrade."""
+    model_path = tmp_path / "legitimate.dill"
+    model_path.write_bytes(b"\x80\x04" + b"\x00" * (256 * 1024))
+
+    def _raise_memory_error(*args: object, **kwargs: object) -> object:
+        raise MemoryError("simulated parser memory limit")
+
+    monkeypatch.setattr("modelaudit.scanners.pickle_scanner.pickletools.genops", _raise_memory_error)
+    monkeypatch.setattr(
+        PickleScanner,
+        "_extract_globals_advanced",
+        lambda self, file_obj, multiple_pickles=True, scan_start_time=None: {("dill", "dump", "GLOBAL")},
+    )
+
+    result = PickleScanner().scan(str(model_path))
+
+    resource_limit_checks = [check for check in result.checks if check.name == "Pickle Parse Resource Limit"]
+    assert len(resource_limit_checks) == 1
+    resource_limit_check = resource_limit_checks[0]
+    assert resource_limit_check.status == CheckStatus.FAILED
+    assert resource_limit_check.severity == IssueSeverity.INFO
+    assert resource_limit_check.details["reason"] == "memory_limit_on_legitimate_model"
+    assert resource_limit_check.details["exception_type"] == "MemoryError"
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
 def test_scan_memory_error_with_dangerous_globals_not_downgraded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
