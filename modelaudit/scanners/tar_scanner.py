@@ -31,7 +31,9 @@ DEFAULT_MAX_TAR_ENTRY_SIZE = 1024 * 1024 * 1024
 DEFAULT_MAX_DECOMPRESSED_BYTES = 512 * 1024 * 1024
 DEFAULT_MAX_DECOMPRESSION_RATIO = 250.0
 
-COMPRESSED_TAR_EXTENSIONS = {".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz"}
+_GZIP_MAGIC = b"\x1f\x8b"
+_BZIP2_MAGIC = b"BZh"
+_XZ_MAGIC = b"\xfd7zXZ\x00"
 
 
 class TarScanner(BaseScanner):
@@ -180,6 +182,32 @@ class TarScanner(BaseScanner):
         assert tmp_path is not None
         return tmp_path, total_size
 
+    @staticmethod
+    def _detect_compressed_tar_wrapper(path: str) -> str | None:
+        """Detect compressed TAR wrappers by content, not by filename suffix."""
+        with open(path, "rb") as file_obj:
+            header = file_obj.read(6)
+
+        if header.startswith(_GZIP_MAGIC):
+            return "gzip"
+        if header.startswith(_BZIP2_MAGIC):
+            return "bzip2"
+        if header.startswith(_XZ_MAGIC):
+            return "xz"
+        return None
+
+    @staticmethod
+    def _estimate_tar_stream_size(members: list[tarfile.TarInfo]) -> int:
+        """Estimate the decompressed TAR wrapper size including headers, padding, and EOF blocks."""
+        total_size = 1024  # Two 512-byte EOF blocks terminate the TAR stream.
+
+        for member in members:
+            total_size += 512  # Each TAR entry has a 512-byte header.
+            if member.isfile():
+                total_size += ((member.size + 511) // 512) * 512
+
+        return total_size
+
     def _scan_tar_file(self, path: str, depth: int = 0) -> ScanResult:
         result = ScanResult(scanner_name=self.name)
         contents: list[dict[str, Any]] = []
@@ -207,7 +235,6 @@ class TarScanner(BaseScanner):
 
         with tarfile.open(path, "r:*") as tar:
             members = tar.getmembers()
-            total_member_size = sum(member.size for member in members if member.isfile())
             if len(members) > self.max_entries:
                 result.add_check(
                     name="Entry Count Limit Check",
@@ -230,8 +257,10 @@ class TarScanner(BaseScanner):
                 )
 
             compressed_size = os.path.getsize(path)
-            lower_path = path.lower()
-            if any(lower_path.endswith(ext) for ext in COMPRESSED_TAR_EXTENSIONS):
+            compression_codec = self._detect_compressed_tar_wrapper(path)
+            if compression_codec is not None:
+                total_member_size = self._estimate_tar_stream_size(members)
+
                 if total_member_size > self.max_decompressed_bytes:
                     result.add_check(
                         name="Compressed Wrapper Decompression Limits",
@@ -245,6 +274,7 @@ class TarScanner(BaseScanner):
                             "decompressed_size": total_member_size,
                             "compressed_size": compressed_size,
                             "max_decompressed_size": self.max_decompressed_bytes,
+                            "compression": compression_codec,
                         },
                         rule_code="S902",
                     )
@@ -266,6 +296,7 @@ class TarScanner(BaseScanner):
                             "compressed_size": compressed_size,
                             "max_ratio": self.max_decompression_ratio,
                             "actual_ratio": total_member_size / compressed_size,
+                            "compression": compression_codec,
                         },
                         rule_code="S902",
                     )
@@ -285,6 +316,7 @@ class TarScanner(BaseScanner):
                         "compressed_size": compressed_size,
                         "max_decompressed_size": self.max_decompressed_bytes,
                         "max_ratio": self.max_decompression_ratio,
+                        "compression": compression_codec,
                     },
                     rule_code=None,
                 )
