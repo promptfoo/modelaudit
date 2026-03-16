@@ -196,18 +196,15 @@ def test_scan_can_apply_local_config_once_when_confirmed(tmp_path: Path, monkeyp
     )
 
     runner = CliRunner()
-    result = runner.invoke(cli, ["scan", str(model_file)], input="y\n", catch_exceptions=False)
+    result = runner.invoke(cli, ["scan", str(model_file), "--format", "text"], input="y\n", catch_exceptions=False)
     output = strip_ansi(result.output)
 
     assert result.exit_code == 0
     assert "Found local ModelAudit config" in output
     assert "Using local ModelAudit config" in output
     assert "NO ISSUES FOUND" in output
-
     trust_store = TrustedConfigStore(tmp_path / "cache" / "trusted_local_configs.json")
     assert not trust_store.store_path.exists()
-
-
 def test_scan_can_remember_trusted_local_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Choosing to trust a local config should persist for future interactive runs."""
     import tarfile
@@ -226,8 +223,13 @@ def test_scan_can_remember_trusted_local_config(tmp_path: Path, monkeypatch: pyt
     monkeypatch.setattr("modelaudit.cli.get_trusted_config_store", lambda: trust_store)
 
     runner = CliRunner()
-    first_result = runner.invoke(cli, ["scan", str(model_file)], input="a\n", catch_exceptions=False)
-    second_result = runner.invoke(cli, ["scan", str(model_file)], catch_exceptions=False)
+    first_result = runner.invoke(
+        cli,
+        ["scan", str(model_file), "--format", "text"],
+        input="a\n",
+        catch_exceptions=False,
+    )
+    second_result = runner.invoke(cli, ["scan", str(model_file), "--format", "text"], catch_exceptions=False)
 
     assert first_result.exit_code == 0
     assert second_result.exit_code == 0
