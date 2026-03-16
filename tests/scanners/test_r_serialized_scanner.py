@@ -182,6 +182,33 @@ def test_scan_xz_memory_limited_stream_is_handled_fail_closed(tmp_path: Path) ->
     assert decompression_checks[0].status == CheckStatus.FAILED
 
 
+def test_scan_benign_xz_stream_passes_decompression_checks(tmp_path: Path) -> None:
+    path = tmp_path / "safe-xz.rds"
+    _write_xz_r_serialized(path, "safe\nmodel\nweights", dict_size=1 << 24)
+
+    assert RSerializedScanner.can_handle(str(path))
+    result = RSerializedScanner().scan(str(path))
+
+    assert result.success is True
+    decompression_checks = _check_by_name(result, "R Serialized Decompression")
+    assert len(decompression_checks) == 1
+    assert decompression_checks[0].status == CheckStatus.PASSED
+
+
+def test_scan_truncated_xz_stream_is_handled_fail_closed(tmp_path: Path) -> None:
+    path = tmp_path / "truncated-xz.rds"
+    _write_xz_r_serialized(path, "safe\nmodel\nweights", dict_size=1 << 20)
+    path.write_bytes(path.read_bytes()[:-16])
+
+    assert RSerializedScanner.can_handle(str(path))
+    result = RSerializedScanner().scan(str(path))
+
+    assert result.success is False
+    decompression_checks = _check_by_name(result, "R Serialized Decompression")
+    assert len(decompression_checks) == 1
+    assert decompression_checks[0].status == CheckStatus.FAILED
+
+
 def test_r_serialized_routes_through_detection_and_registry(tmp_path: Path) -> None:
     path = tmp_path / "model.rdata"
     _write_raw_r_serialized(path, "workspace\nmodel", workspace_header=True)
