@@ -4571,7 +4571,9 @@ class PickleScanner(BaseScanner):
                     elif opcode.name == "STOP":
                         current_stack_depth = 0
                         if first_pickle_end_pos is None:
-                            first_pickle_end_pos = start_pos + pos + 1
+                            # pickletools reports absolute positions even when parsing
+                            # starts from a non-zero file offset.
+                            first_pickle_end_pos = pos + 1
 
                     # Store stack depth warnings for ML-context-aware processing later
                     if current_stack_depth > base_stack_depth_limit:

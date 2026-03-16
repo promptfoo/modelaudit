@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import pickletools
 import sys
 import warnings
 from typing import TYPE_CHECKING, Any, BinaryIO, ClassVar
@@ -100,19 +99,6 @@ class NumPyScanner(BaseScanner):
         pickle_scanner = PickleScanner(config=self.config)
         pickle_scanner.current_file_path = context_path
         return pickle_scanner._scan_pickle_bytes(file_obj, payload_size)
-
-    def _find_embedded_pickle_end(self, file_obj: BinaryIO) -> int | None:
-        """Return the absolute file offset of the first embedded pickle STOP opcode."""
-        start_pos = file_obj.tell()
-        try:
-            for opcode, _arg, _pos in pickletools.genops(file_obj):
-                if opcode.name == "STOP":
-                    return file_obj.tell()
-        except Exception:
-            return None
-        finally:
-            file_obj.seek(start_pos)
-        return None
 
     def _validate_dtype(self, dtype: Any) -> None:
         """Validate numpy dtype for security"""
@@ -284,7 +270,6 @@ class NumPyScanner(BaseScanner):
                         # object fields; kind=="O" catches plain object arrays.
                         has_object_dtype = dtype.kind == "O" or bool(getattr(dtype, "hasobject", False))
                         if has_object_dtype:
-                            pickle_end_offset = self._find_embedded_pickle_end(f)
                             result.add_check(
                                 name=f"{self.CVE_2019_6446_ID}: Object Dtype Pickle Deserialization",
                                 passed=False,
@@ -336,6 +321,7 @@ class NumPyScanner(BaseScanner):
                             result.issues.extend(embedded_result.issues)
                             result.checks.extend(embedded_result.checks)
 
+                            pickle_end_offset = embedded_result.metadata.get("first_pickle_end_pos")
                             if isinstance(pickle_end_offset, int) and pickle_end_offset < file_size:
                                 trailing_bytes = file_size - pickle_end_offset
                                 result.add_check(

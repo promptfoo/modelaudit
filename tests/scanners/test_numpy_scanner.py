@@ -1,3 +1,4 @@
+import zipfile
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -157,6 +158,21 @@ def _inject_comment_token_into_npy_payload(path: Path) -> None:
     path.write_bytes(original[:data_offset] + patched)
 
 
+def _inject_comment_token_into_npz_member(path: Path, member_name: str) -> None:
+    with zipfile.ZipFile(path, "r") as archive:
+        members = {info.filename: archive.read(info.filename) for info in archive.infolist()}
+
+    member_path = path.parent / member_name
+    member_path.write_bytes(members[member_name])
+    _inject_comment_token_into_npy_payload(member_path)
+    members[member_name] = member_path.read_bytes()
+    member_path.unlink()
+
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, content in members.items():
+            archive.writestr(name, content)
+
+
 def test_object_dtype_numpy_recurses_into_pickle_exec(tmp_path: Path) -> None:
     arr = np.array([_ExecPayload()], dtype=object)
     path = tmp_path / "malicious_object.npy"
@@ -228,6 +244,20 @@ def test_object_dtype_numpy_comment_token_bypass_still_detected(tmp_path: Path) 
     failed = _failed_checks(result)
     assert any("CVE-2019-6446" in (c.name + c.message) for c in failed)
     assert any("exec" in c.message.lower() for c in failed)
+
+
+def test_object_npz_member_comment_token_bypass_still_detected(tmp_path: Path) -> None:
+    npz_path = tmp_path / "comment_token.npz"
+    np.savez(npz_path, payload=np.array([_ExecPayload()], dtype=object))
+    _inject_comment_token_into_npz_member(npz_path, "payload.npy")
+
+    from modelaudit.scanners.zip_scanner import ZipScanner
+
+    result = ZipScanner().scan(str(npz_path))
+
+    failed = _failed_checks(result)
+    assert any("CVE-2019-6446" in (c.name + c.message) and "payload.npy" in str(c.location) for c in failed)
+    assert any("exec" in i.message.lower() and i.details.get("zip_entry") == "payload.npy" for i in result.issues)
 
 
 def test_benign_object_dtype_numpy_no_nested_critical(tmp_path: Path) -> None:

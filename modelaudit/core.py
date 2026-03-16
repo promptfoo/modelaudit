@@ -45,6 +45,35 @@ from modelaudit.utils.lfs import check_lfs_pointer, get_lfs_issue_details, get_l
 
 logger = logging.getLogger("modelaudit.core")
 
+OPERATIONAL_ERROR_INDICATORS = (
+    "Error during scan",
+    "Error checking file size",
+    "Error scanning file",
+    "Scanner crashed",
+    "Scan timeout",
+    "Path does not exist",
+    "Path is not readable",
+    "Permission denied",
+    "File not found",
+    "not installed, cannot scan",
+    "Missing dependency",
+    "Import error",
+    "Module not found",
+    "not a valid",
+    "Invalid file format",
+    "Corrupted file",
+    "Bad file signature",
+    "Unable to parse",
+    "Out of memory",
+    "Disk space",
+    "Too many open files",
+)
+
+
+def _has_operational_error_message(message: Any) -> bool:
+    """Return True when an issue message reflects an operational scan failure."""
+    return isinstance(message, str) and any(indicator in message for indicator in OPERATIONAL_ERROR_INDICATORS)
+
 
 def _to_telemetry_severity(severity: Any) -> str:
     """Normalize severity values to stable telemetry strings."""
@@ -1033,39 +1062,10 @@ def scan_model_directory_or_file(
     # Determine if there were operational scan errors vs security findings
     # has_errors should only be True for operational errors (scanner crashes,
     # file not found, etc.) not for security findings detected in models
-    operational_error_indicators = [
-        # Scanner execution errors
-        "Error during scan",
-        "Error checking file size",
-        "Error scanning file",
-        "Scanner crashed",
-        "Scan timeout",
-        # File system errors
-        "Path does not exist",
-        "Path is not readable",
-        "Permission denied",
-        "File not found",
-        # Dependency/environment errors
-        "not installed, cannot scan",
-        "Missing dependency",
-        "Import error",
-        "Module not found",
-        # File format/corruption errors
-        "not a valid",
-        "Invalid file format",
-        "Corrupted file",
-        "Bad file signature",
-        "Unable to parse",
-        # Resource/system errors
-        "Out of memory",
-        "Disk space",
-        "Too many open files",
-    ]
-
     # Check for operational errors in issues
     results.has_errors = (
         any(
-            any(indicator in issue.message for indicator in operational_error_indicators)
+            _has_operational_error_message(issue.message)
             for issue in results.issues
             if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
         )
@@ -1595,6 +1595,9 @@ def scan_model_streaming(
                 if scan_result:
                     metadata_dict = dict(scan_result.metadata or {})
                     metadata_dict.setdefault("file_size", file_path.stat().st_size)
+                    operational_scan_failure = any(
+                        _has_operational_error_message(issue.message) for issue in (scan_result.issues or [])
+                    )
 
                     existing_hashes = metadata_dict.get("file_hashes")
                     if isinstance(existing_hashes, dict):
@@ -1606,10 +1609,10 @@ def scan_model_streaming(
                     scan_result_dict = {
                         "bytes_scanned": scan_result.bytes_scanned,
                         "files_scanned": 1,  # Each scan_result represents one file
-                        # ScanResult.has_errors means "critical findings", but
-                        # ModelAuditResultModel.has_errors is reserved for
-                        # operational scan failures.
-                        "has_errors": not scan_result.success,
+                        # Preserve the main scan semantics: success=False does not
+                        # imply an operational error when the scanner completed
+                        # and only reported informational integrity findings.
+                        "has_errors": operational_scan_failure,
                         "success": scan_result.success,
                         "issues": [issue.__dict__ for issue in (scan_result.issues or [])],
                         "checks": [check.__dict__ for check in (scan_result.checks or [])],
