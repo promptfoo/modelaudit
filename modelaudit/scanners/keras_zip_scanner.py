@@ -98,6 +98,42 @@ class KerasZipScanner(BaseScanner):
         if config and "suspicious_config_properties" in config:
             self.suspicious_config_props.extend(config["suspicious_config_properties"])
 
+    @staticmethod
+    def _is_allowlisted_keras_module(module_value: Any) -> bool:
+        if not isinstance(module_value, str) or not module_value.strip():
+            return False
+        return module_value.strip().split(".")[0] in _SAFE_KERAS_MODULE_ROOTS
+
+    def _layer_uses_allowlisted_module(self, layer: dict[str, Any]) -> bool:
+        layer_config = layer.get("config", {})
+        if not isinstance(layer_config, dict):
+            layer_config = {}
+
+        for key in ("module", "fn_module"):
+            if self._is_allowlisted_keras_module(layer.get(key)):
+                return True
+            if self._is_allowlisted_keras_module(layer_config.get(key)):
+                return True
+        return False
+
+    def _is_known_safe_serialized_layer(self, layer: dict[str, Any]) -> bool:
+        layer_class = layer.get("class_name")
+        return is_known_safe_keras_layer_class(layer_class) or self._layer_uses_allowlisted_module(layer)
+
+    def _should_flag_registered_object(self, layer: dict[str, Any]) -> bool:
+        registered_name = layer.get("registered_name")
+        if not isinstance(registered_name, str) or not registered_name.strip():
+            return False
+
+        if is_known_safe_keras_layer_class(registered_name):
+            return False
+
+        layer_class = layer.get("class_name")
+        if isinstance(layer_class, str) and registered_name.strip() == layer_class.strip():
+            return not self._is_known_safe_serialized_layer(layer)
+
+        return True
+
     @classmethod
     def can_handle(cls, path: str) -> bool:
         """Check if this scanner can handle the given path"""
@@ -359,7 +395,7 @@ class KerasZipScanner(BaseScanner):
                         "description": self.suspicious_layer_types[layer_class],
                     },
                 )
-            elif layer_class and not is_known_safe_keras_layer_class(layer_class):
+            elif layer_class and not self._is_known_safe_serialized_layer(layer):
                 result.add_check(
                     name="Custom Layer Class Detection",
                     passed=False,
@@ -376,7 +412,7 @@ class KerasZipScanner(BaseScanner):
                 )
 
             # Check for custom objects
-            if layer.get("registered_name"):
+            if self._should_flag_registered_object(layer):
                 result.add_check(
                     name="Custom Object Detection",
                     passed=False,
