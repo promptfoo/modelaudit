@@ -5,7 +5,9 @@ from pathlib import Path
 
 import pytest
 
+from modelaudit.cache.trusted_config_store import TrustedConfigStore
 from modelaudit.config import ModelAuditConfig, reset_config, set_config
+from modelaudit.config.local_config import find_local_config_for_paths
 from modelaudit.rules import RuleRegistry, Severity
 from modelaudit.scanners.base import Issue, IssueSeverity, ScanResult
 
@@ -166,6 +168,16 @@ S701 = "CRITICAL"
         with pytest.raises(ValueError, match="Invalid severity"):
             ModelAuditConfig.from_cli_args(severity={"S301": "SEVERE"})
 
+    def test_from_cli_args_uses_provided_base_config(self):
+        """CLI overrides should merge onto an explicitly supplied base config."""
+        base_config = ModelAuditConfig()
+        base_config.suppress = {"S710"}
+
+        config = ModelAuditConfig.from_cli_args(suppress=["S801"], base_config=base_config)
+
+        assert config.suppress == {"S710", "S801"}
+        assert base_config.suppress == {"S710"}
+
     def test_ignore_range_expansion(self):
         """Test that ignore ranges expand correctly."""
         config = ModelAuditConfig()
@@ -190,6 +202,79 @@ S701 = "CRITICAL"
         assert config.suppress == {"S701", "S702", "S710"}
         assert config.severity == {"S301": Severity.HIGH}
         assert set(config.ignore["tests/**"]) == {"S201", "S202", "ALL"}
+
+
+def test_load_does_not_auto_discover_local_config_by_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Local config files should not be auto-loaded unless explicitly enabled."""
+    (tmp_path / ".modelaudit.toml").write_text('suppress = ["S710"]\n')
+    monkeypatch.chdir(tmp_path)
+
+    config = ModelAuditConfig.load()
+
+    assert "S710" not in config.suppress
+
+
+def test_load_can_discover_local_config_when_opted_in(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Local config discovery remains available for explicit trusted flows."""
+    (tmp_path / ".modelaudit.toml").write_text('suppress = ["S710"]\n')
+    monkeypatch.chdir(tmp_path)
+
+    config = ModelAuditConfig.load(discover_local=True)
+
+    assert "S710" in config.suppress
+
+
+def test_find_local_config_for_paths_uses_shared_ancestor(tmp_path: Path) -> None:
+    """All scanned paths under the same config root should resolve one candidate."""
+    root = tmp_path / "repo"
+    nested = root / "models" / "nested"
+    nested.mkdir(parents=True)
+    (root / ".modelaudit.toml").write_text('suppress = ["S710"]\n')
+    file_path = nested / "model.pkl"
+    file_path.write_bytes(b"test")
+
+    candidate = find_local_config_for_paths([str(file_path)])
+
+    assert candidate is not None
+    assert candidate.config_dir == root
+    assert candidate.config_path == root / ".modelaudit.toml"
+
+
+def test_find_local_config_for_paths_returns_none_for_mixed_roots(tmp_path: Path) -> None:
+    """Mixed local config roots should not auto-resolve to any one candidate."""
+    repo_one = tmp_path / "repo-one"
+    repo_two = tmp_path / "repo-two"
+    (repo_one / "models").mkdir(parents=True)
+    (repo_two / "models").mkdir(parents=True)
+    (repo_one / ".modelaudit.toml").write_text('suppress = ["S710"]\n')
+    (repo_two / ".modelaudit.toml").write_text('suppress = ["S801"]\n')
+    first = repo_one / "models" / "model-one.pkl"
+    second = repo_two / "models" / "model-two.pkl"
+    first.write_bytes(b"one")
+    second.write_bytes(b"two")
+
+    candidate = find_local_config_for_paths([str(first), str(second)])
+
+    assert candidate is None
+
+
+def test_trusted_config_store_invalidates_when_config_changes(tmp_path: Path) -> None:
+    """Changing a trusted config should require trust to be re-established."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    config_path = repo_root / ".modelaudit.toml"
+    config_path.write_text('suppress = ["S710"]\n')
+    store = TrustedConfigStore(tmp_path / "cache" / "trusted_local_configs.json")
+
+    candidate = find_local_config_for_paths([str(config_path)])
+    assert candidate is not None
+
+    store.trust(candidate)
+    assert store.is_trusted(candidate)
+
+    config_path.write_text('suppress = ["S801"]\n')
+
+    assert not store.is_trusted(candidate)
 
 
 class TestScanResultIntegration:
