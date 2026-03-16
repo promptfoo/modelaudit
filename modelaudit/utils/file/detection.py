@@ -189,6 +189,11 @@ def _is_lightgbm_signature(prefix: bytes) -> bool:
     return (starts_with_tree or "tree=" in preview) and header_hits >= 3 and tree_hits >= 2 and not xgboost_like
 
 
+def _is_executorch_binary_signature(prefix: bytes) -> bool:
+    """Recognize ExecuTorch FlatBuffers binaries by their file identifier."""
+    return len(prefix) >= 8 and prefix[4:8] == b"ET12"
+
+
 def _is_zlib_header(prefix: bytes) -> bool:
     if len(prefix) < 2:
         return False
@@ -311,6 +316,9 @@ def detect_file_format_from_magic(path: str) -> str:
             magic4 = header[:4]
             magic8 = header[:8]
             magic16 = header[:16]
+
+            if _is_executorch_binary_signature(header):
+                return "executorch"
 
             # Try the new pattern matching approach first
             format_result = detect_format_from_magic_bytes(magic4, magic8, magic16)
@@ -845,7 +853,7 @@ def validate_file_type(path: str) -> bool:
 
         # ExecuTorch files should be zip archives
         if ext_format == "executorch":
-            return header_format == "zip"
+            return header_format == "zip" or _is_executorch_binary_signature(read_magic_bytes(path, 16))
 
         # Keras files can be either ZIP (Keras 3.x) or HDF5 (legacy Keras)
         if ext_format == "keras":

@@ -37,6 +37,11 @@ class ExecuTorchScanner(BaseScanner):
         except Exception:
             return b""
 
+    @staticmethod
+    def _is_executorch_binary(header: bytes) -> bool:
+        # Real-world .pte files use a FlatBuffers-style file identifier at bytes 4..7.
+        return len(header) >= 8 and header[4:6] == b"ET"
+
     def scan(self, path: str) -> ScanResult:
         path_check_result = self._check_path(path)
         if path_check_result:
@@ -50,7 +55,19 @@ class ExecuTorchScanner(BaseScanner):
         file_size = self.get_file_size(path)
         result.metadata["file_size"] = file_size
 
-        header = self._read_header(path)
+        header = self._read_header(path, length=8)
+        if self._is_executorch_binary(header):
+            result.add_check(
+                name="ExecuTorch Binary Format Validation",
+                passed=True,
+                message="Valid ExecuTorch binary program format detected",
+                location=path,
+                details={"path": path, "format": "executorch_binary"},
+            )
+            result.bytes_scanned = file_size
+            result.finish(success=True)
+            return result
+
         if not header.startswith(b"PK"):
             result.add_check(
                 name="ExecuTorch Archive Format Validation",

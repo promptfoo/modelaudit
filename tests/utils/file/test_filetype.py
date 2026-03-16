@@ -523,6 +523,13 @@ def test_validate_file_type(tmp_path):
         mar.writestr("weights.bin", b"weights")
         mar.writestr("handler.py", b"def handle(data, context):\n    return data\n")
     assert validate_file_type(str(mar_path)) is True
+
+    # ExecuTorch binaries use a FlatBuffers identifier at bytes 4..7.
+    executorch_path = tmp_path / "program.pte"
+    executorch_path.write_bytes(b"\x40\x00\x00\x00ET12eh00" + b"\x20\x00\x00\x00" + b"\x00" * 16)
+    assert detect_file_format_from_magic(str(executorch_path)) == "executorch"
+    assert validate_file_type(str(executorch_path)) is True
+
     # Llamafile wrappers validate by extension with scanner-level marker checks.
     llamafile_path = tmp_path / "model.llamafile"
     llamafile_path.write_bytes(b"\x7fELF" + b"\x00" * 32 + b"llamafile")

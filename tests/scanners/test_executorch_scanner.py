@@ -55,3 +55,14 @@ def test_executorch_scanner_invalid_zip(tmp_path):
     result = scanner.scan(str(file_path))
     assert not result.success
     assert any("executorch" in i.message.lower() for i in result.issues)
+
+
+def test_executorch_scanner_accepts_binary_program_header(tmp_path):
+    file_path = tmp_path / "program.pte"
+    file_path.write_bytes(b"\x40\x00\x00\x00ET12eh00\x20\x00\x00\x00\xe8\x8c\x01\x00\x00\x00\x00\x00")
+    scanner = ExecuTorchScanner()
+    result = scanner.scan(str(file_path))
+    assert result.success is True
+    assert result.bytes_scanned == file_path.stat().st_size
+    assert not any("not a valid executorch archive" in issue.message.lower() for issue in result.issues)
+    assert not any("file type validation failed" in issue.message.lower() for issue in result.issues)
