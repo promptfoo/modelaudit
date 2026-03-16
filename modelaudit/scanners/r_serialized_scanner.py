@@ -35,6 +35,8 @@ class RSerializedScanner(BaseScanner):
     _XZ_MAGIC: ClassVar[bytes] = b"\xfd7zXZ\x00"
 
     _CAN_HANDLE_DECOMPRESSED_LIMIT: ClassVar[int] = 128 * 1024
+    _XZ_DECOMPRESS_MEMLIMIT: ClassVar[int] = 128 * 1024 * 1024
+    _XZ_READ_CHUNK_SIZE: ClassVar[int] = 64 * 1024
     _PRINTABLE_RE: ClassVar[re.Pattern[bytes]] = re.compile(rb"[ -~]{3,512}")
     _EXECUTABLE_SYMBOL_RE: ClassVar[re.Pattern[str]] = re.compile(
         r"(?<![\w.])(?:base::|utils::)?"
@@ -141,9 +143,26 @@ class RSerializedScanner(BaseScanner):
             with bz2.open(path, "rb") as stream:
                 return stream.read(read_limit)[:limit]
         if compression == "xz":
-            with lzma.open(path, "rb") as stream:
-                return stream.read(read_limit)[:limit]
+            return cls._read_xz_with_memlimit(path=path, output_limit=limit, memlimit=cls._XZ_DECOMPRESS_MEMLIMIT)
         return b""
+
+    @classmethod
+    def _read_xz_with_memlimit(cls, path: str, output_limit: int, memlimit: int) -> bytes:
+        decompressor = lzma.LZMADecompressor(format=lzma.FORMAT_XZ, memlimit=memlimit)
+        decompressed = bytearray()
+
+        with open(path, "rb") as file_obj:
+            while len(decompressed) < output_limit:
+                chunk = file_obj.read(cls._XZ_READ_CHUNK_SIZE)
+                if not chunk:
+                    break
+
+                decompressed.extend(decompressor.decompress(chunk, max_length=output_limit - len(decompressed)))
+
+                if decompressor.eof:
+                    break
+
+        return bytes(decompressed)
 
     def _read_payload_for_analysis(self, path: str, file_size: int) -> tuple[bytes, str, bool, int]:
         with open(path, "rb") as file_obj:
@@ -163,8 +182,14 @@ class RSerializedScanner(BaseScanner):
             with bz2.open(path, "rb") as stream:
                 payload, truncated, total_decompressed = self._read_decompressed_stream(stream, file_size)
         else:
-            with lzma.open(path, "rb") as stream:
-                payload, truncated, total_decompressed = self._read_decompressed_stream(stream, file_size)
+            payload = self._read_xz_with_memlimit(
+                path=path,
+                output_limit=self.max_scan_bytes + 1,
+                memlimit=self.max_decompressed_bytes,
+            )
+            total_decompressed = len(payload)
+            truncated = total_decompressed > self.max_scan_bytes
+            payload = payload[: self.max_scan_bytes]
 
         return payload, compression, truncated, total_decompressed
 
@@ -474,7 +499,7 @@ class RSerializedScanner(BaseScanner):
 
         try:
             payload, compression, truncated, decompressed_bytes = self._read_payload_for_analysis(path, file_size)
-        except (EOFError, OSError, ValueError, gzip.BadGzipFile, lzma.LZMAError) as exc:
+        except (EOFError, OSError, ValueError, MemoryError, gzip.BadGzipFile, lzma.LZMAError) as exc:
             result.add_check(
                 name="R Serialized Decompression",
                 passed=False,

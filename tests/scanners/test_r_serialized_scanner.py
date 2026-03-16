@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gzip
+import lzma
 from pathlib import Path
 
 from modelaudit.scanners import get_scanner_for_file
@@ -18,6 +19,16 @@ def _write_gzip_r_serialized(path: Path, body: str, *, workspace_header: bool = 
     payload_prefix = "RDX2\nX\n" if workspace_header else "X\n"
     with gzip.open(path, "wb") as stream:
         stream.write((payload_prefix + body).encode("utf-8"))
+
+
+def _write_xz_r_serialized(path: Path, body: str, *, dict_size: int) -> None:
+    payload = ("X\n" + body).encode("utf-8")
+    compressed = lzma.compress(
+        payload,
+        format=lzma.FORMAT_XZ,
+        filters=[{"id": lzma.FILTER_LZMA2, "dict_size": dict_size}],
+    )
+    path.write_bytes(compressed)
 
 
 def _check_by_name(result: ScanResult, name: str) -> list[Check]:
@@ -150,6 +161,20 @@ def test_scan_corrupt_gzip_stream_is_handled_fail_closed(tmp_path: Path) -> None
 
     assert RSerializedScanner.can_handle(str(path))
     result = RSerializedScanner().scan(str(path))
+
+    assert result.success is False
+    decompression_checks = _check_by_name(result, "R Serialized Decompression")
+    assert len(decompression_checks) == 1
+    assert decompression_checks[0].status == CheckStatus.FAILED
+
+
+def test_scan_xz_memory_limited_stream_is_handled_fail_closed(tmp_path: Path) -> None:
+    path = tmp_path / "memlimit.rds"
+    _write_xz_r_serialized(path, "safe", dict_size=1 << 24)
+
+    assert RSerializedScanner.can_handle(str(path))
+    scanner = RSerializedScanner(config={"r_max_decompressed_bytes": 1024})
+    result = scanner.scan(str(path))
 
     assert result.success is False
     decompression_checks = _check_by_name(result, "R Serialized Decompression")
