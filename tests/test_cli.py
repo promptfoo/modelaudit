@@ -8,6 +8,7 @@ import pytest
 from click.testing import CliRunner
 
 from modelaudit import __version__
+from modelaudit.cache.trusted_config_store import TrustedConfigStore
 from modelaudit.cli import cli, expand_paths, format_text_output
 from modelaudit.core import scan_model_directory_or_file
 from modelaudit.models import create_initial_audit_result
@@ -153,6 +154,110 @@ def test_scan_unknown_rule_code_in_suppress_option(tmp_path):
     assert result.exit_code == 2
     assert "Unknown rule code" in result.output
     assert "S9999" in result.output
+
+
+def test_scan_does_not_auto_load_untrusted_local_config(tmp_path: Path) -> None:
+    """Scanning should not auto-apply suppressions from local config files."""
+    import tarfile
+
+    model_file = tmp_path / "evil.tar"
+    with tarfile.open(model_file, "w") as tar:
+        payload = tmp_path / "payload.txt"
+        payload.write_text("content")
+        tar.add(payload, arcname="../evil.txt")
+
+    (tmp_path / ".modelaudit.toml").write_text('suppress = ["S405"]\n')
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", str(model_file), "--format", "json"], catch_exceptions=False)
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert any(issue.get("rule_code") == "S405" for issue in payload.get("issues", []))
+
+
+def test_scan_can_apply_local_config_once_when_confirmed(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Interactive scans can apply a local config for the current run only."""
+    import tarfile
+
+    model_file = tmp_path / "evil.tar"
+    with tarfile.open(model_file, "w") as tar:
+        payload = tmp_path / "payload.txt"
+        payload.write_text("content")
+        tar.add(payload, arcname="../evil.txt")
+
+    (tmp_path / ".modelaudit.toml").write_text('suppress = ["S405"]\n')
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("modelaudit.cli.can_use_trusted_local_config", lambda output_format: output_format == "text")
+    monkeypatch.setattr(
+        "modelaudit.cli.get_trusted_config_store",
+        lambda: TrustedConfigStore(tmp_path / "cache" / "trusted_local_configs.json"),
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", str(model_file)], input="y\n", catch_exceptions=False)
+    output = strip_ansi(result.output)
+
+    assert result.exit_code == 0
+    assert "Found local ModelAudit config" in output
+    assert "Using local ModelAudit config" in output
+    assert "NO ISSUES FOUND" in output
+
+
+def test_scan_can_remember_trusted_local_config(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Choosing to trust a local config should persist for future interactive runs."""
+    import tarfile
+
+    model_file = tmp_path / "evil.tar"
+    with tarfile.open(model_file, "w") as tar:
+        payload = tmp_path / "payload.txt"
+        payload.write_text("content")
+        tar.add(payload, arcname="../evil.txt")
+
+    (tmp_path / ".modelaudit.toml").write_text('suppress = ["S405"]\n')
+    trust_store = TrustedConfigStore(tmp_path / "cache" / "trusted_local_configs.json")
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("modelaudit.cli.can_use_trusted_local_config", lambda output_format: output_format == "text")
+    monkeypatch.setattr("modelaudit.cli.get_trusted_config_store", lambda: trust_store)
+
+    runner = CliRunner()
+    first_result = runner.invoke(cli, ["scan", str(model_file)], input="a\n", catch_exceptions=False)
+    second_result = runner.invoke(cli, ["scan", str(model_file)], catch_exceptions=False)
+
+    assert first_result.exit_code == 0
+    assert second_result.exit_code == 0
+    assert trust_store.store_path.exists()
+    assert "Found local ModelAudit config" in strip_ansi(first_result.output)
+    assert "Found local ModelAudit config" not in strip_ansi(second_result.output)
+
+
+def test_scan_disables_cache_when_local_config_is_applied(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Applying a local config should bypass scan-result caching for safety."""
+    target_file = tmp_path / "model.dat"
+    target_file.write_bytes(b"test content")
+    (tmp_path / ".modelaudit.toml").write_text('suppress = ["S710"]\n')
+
+    captured: dict[str, object] = {}
+
+    def fake_scan_model_directory_or_file(path: str, **kwargs):
+        captured["path"] = path
+        captured.update(kwargs)
+        return create_mock_scan_result()
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("modelaudit.cli.can_use_trusted_local_config", lambda output_format: output_format == "text")
+    monkeypatch.setattr(
+        "modelaudit.cli.get_trusted_config_store",
+        lambda: TrustedConfigStore(tmp_path / "cache" / "trusted_local_configs.json"),
+    )
+    monkeypatch.setattr("modelaudit.cli.scan_model_directory_or_file", fake_scan_model_directory_or_file)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", str(target_file)], input="y\n", catch_exceptions=False)
+
+    assert result.exit_code == 0
+    assert captured["cache_enabled"] is False
 
 
 def test_scan_nonexistent_file():
