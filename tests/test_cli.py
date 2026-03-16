@@ -1425,6 +1425,7 @@ def test_exit_code_security_issues_streaming_local_directory(tmp_path: Path) -> 
     import pickle
 
     evil_pickle_path = tmp_path / "malicious.pkl"
+    expected_global = f"{os.system.__module__}.system"
 
     class MaliciousClass:
         def __reduce__(self):
@@ -1437,7 +1438,7 @@ def test_exit_code_security_issues_streaming_local_directory(tmp_path: Path) -> 
     result = runner.invoke(cli, ["scan", "--stream", "--format", "text", str(tmp_path)])
 
     assert result.exit_code == 1, f"Expected exit code 1, got {result.exit_code}. Output: {result.output}"
-    assert "posix.system" in result.output, f"Expected malicious finding in output, got: {result.output}"
+    assert expected_global in result.output, f"Expected malicious finding in output, got: {result.output}"
     assert not evil_pickle_path.exists()
 
 
