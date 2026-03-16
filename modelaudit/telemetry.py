@@ -7,7 +7,6 @@ Follows privacy-first principles with comprehensive opt-out controls.
 from __future__ import annotations
 
 import atexit
-import hashlib
 import json
 import logging
 import os
@@ -367,24 +366,18 @@ class TelemetryClient:
             # Just mark that we've acknowledged telemetry is disabled - no actual recording
             self._telemetry_disabled_recorded = True
 
-    def _hash_identifier(self, value: str) -> str:
-        """Create a stable, non-reversible identifier hash for paths/URLs."""
-        return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
-
     def _build_path_properties(self, path: str) -> dict[str, Any]:
-        """Build privacy-safe telemetry properties for a file path."""
+        """Build coarse telemetry properties for a file path."""
         return {
             "path_type": self._classify_path(path),
-            "path_identifier": self._hash_identifier(path),
             "file_extension": Path(path).suffix.lower(),
             "model_name": self._extract_model_name(path),
         }
 
     def _build_url_properties(self, url: str) -> dict[str, Any]:
-        """Build privacy-safe telemetry properties for a download URL."""
+        """Build coarse telemetry properties for a download URL."""
         return {
             "domain": self._extract_domain(url),
-            "url_identifier": self._hash_identifier(url),
             "path_type": self._classify_path(url),
             "model_name": self._extract_model_name(url),
         }
@@ -501,7 +494,6 @@ class TelemetryClient:
                 "path_types": path_types,
                 "source_type_counts": self._count_values(source_types),
                 "path_type_counts": self._count_values(path_types),
-                "path_identifiers": [self._hash_identifier(path) for path in paths],
                 "timeout": scan_options.get("timeout"),
                 "max_file_size": scan_options.get("max_file_size"),
                 "format": scan_options.get("format", "text"),
@@ -539,7 +531,7 @@ class TelemetryClient:
             issue_type = str(issue.get("type") or issue.get("message") or "unknown")
             severity = str(issue.get("severity", "unknown"))
             issue_types[issue_type] = issue_types.get(issue_type, 0) + 1
-            # Capture first 50 issues in detail without including raw paths.
+            # Capture first 50 issues in detail without including raw paths or identifiers.
             if len(issue_details) < 50:
                 issue_location = str(issue.get("location", ""))
                 issue_details.append(
@@ -547,7 +539,6 @@ class TelemetryClient:
                         "type": issue_type,
                         "severity": severity,
                         "location_type": self._classify_path(issue_location),
-                        "location_identifier": self._hash_identifier(issue_location) if issue_location else None,
                         "model_name": self._extract_model_name(issue_location) if issue_location else None,
                     }
                 )
@@ -569,11 +560,6 @@ class TelemetryClient:
                 "scanners_used": sorted(set(scanner_names)),
                 "issue_types": issue_types,
                 "issue_details": issue_details,
-                "file_identifiers": [
-                    self._hash_identifier(asset_path)
-                    for asset in assets
-                    if (asset_path := str(asset.get("path", "")))
-                ],
             },
         )
 
