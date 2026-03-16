@@ -2452,11 +2452,12 @@ def _is_legitimate_serialization_file(path: str) -> bool:
                 if not ext_lower:
                     return False
 
-            # For dill files, they're usually just enhanced pickle
+            # For dill files, require dill-specific markers in the payload.
             if ext_lower == ".dill":
-                # Dill files should contain standard pickle format
-                # Additional validation could check for dill-specific patterns
-                return True
+                f.seek(0)
+                sample = f.read(2048)
+                dill_indicators = [b"dill", b"_dill", b"dill._dill"]
+                return any(marker in sample for marker in dill_indicators)
 
         return False
     except OSError:
@@ -4975,6 +4976,7 @@ class PickleScanner(BaseScanner):
                 mod in {"joblib", "sklearn", "numpy"} or mod.startswith(("joblib.", "sklearn.", "numpy."))
                 for mod, _func in advanced_globals
             )
+            has_dill_globals = any(mod == "dill" or mod.startswith("dill.") for mod, _func in advanced_globals)
             is_joblib_content = is_serialization_ext or (not file_ext and has_joblib_globals)
 
             # Check for recursion errors on legitimate ML model files
@@ -5019,9 +5021,13 @@ class PickleScanner(BaseScanner):
             # Extension-validated files (.joblib/.dill) rely on extension +
             # _is_legitimate_serialization_file() + no dangerous globals.
             # Extensionless blobs require positive joblib/sklearn/numpy globals.
-            has_legitimate_serialization_globals = (is_serialization_ext and not has_dangerous_advanced_global) or (
-                not file_ext and bool(advanced_globals) and has_joblib_globals and not has_dangerous_advanced_global
+            has_extension_based_serialization_globals = bool(advanced_globals) and (
+                (file_ext == ".joblib" and has_joblib_globals) or (file_ext == ".dill" and has_dill_globals)
             )
+            has_legitimate_serialization_globals = (
+                has_extension_based_serialization_globals
+                or (not file_ext and bool(advanced_globals) and has_joblib_globals)
+            ) and not has_dangerous_advanced_global
             passes_global_gate = (
                 has_legitimate_pytorch_globals
                 if file_ext == ".bin"

@@ -1178,6 +1178,33 @@ def test_scan_legitimate_pytorch_bin_memory_error_is_informational(
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
+def test_scan_dill_memory_error_without_dill_globals_not_downgraded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Dill MemoryError requires positive dill globals to qualify for INFO downgrade."""
+    model_path = tmp_path / "suspicious.dill"
+    model_path.write_bytes(b"\x80\x04cdill\nloads\nq\x00." + b"dill" + b"\x00" * (256 * 1024))
+
+    def _raise_memory_error(*args: object, **kwargs: object) -> object:
+        raise MemoryError("simulated parser memory limit")
+
+    monkeypatch.setattr("modelaudit.scanners.pickle_scanner.pickletools.genops", _raise_memory_error)
+    monkeypatch.setattr(
+        PickleScanner,
+        "_extract_globals_advanced",
+        lambda self, file_obj: set(),
+    )
+
+    result = PickleScanner().scan(str(model_path))
+
+    assert not any(check.name == "Pickle Parse Resource Limit" for check in result.checks)
+    format_validation_checks = [check for check in result.checks if check.name == "Pickle Format Validation"]
+    assert len(format_validation_checks) == 1
+    assert format_validation_checks[0].status == CheckStatus.FAILED
+    assert format_validation_checks[0].severity == IssueSeverity.WARNING
+    assert format_validation_checks[0].details["exception_type"] == "MemoryError"
+
+
 def test_scan_memory_error_with_dangerous_globals_not_downgraded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
