@@ -28,6 +28,10 @@ CRITICAL_SYSTEM_PATHS = [
 ]
 
 DEFAULT_MAX_TAR_ENTRY_SIZE = 1024 * 1024 * 1024
+DEFAULT_MAX_DECOMPRESSED_BYTES = 512 * 1024 * 1024
+DEFAULT_MAX_DECOMPRESSION_RATIO = 250.0
+
+COMPRESSED_TAR_EXTENSIONS = {".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz"}
 
 
 class TarScanner(BaseScanner):
@@ -49,6 +53,12 @@ class TarScanner(BaseScanner):
         super().__init__(config)
         self.max_depth = self.config.get("max_tar_depth", 5)
         self.max_entries = self.config.get("max_tar_entries", 10000)
+        self.max_decompressed_bytes = int(
+            self.config.get("compressed_max_decompressed_bytes", DEFAULT_MAX_DECOMPRESSED_BYTES),
+        )
+        self.max_decompression_ratio = float(
+            self.config.get("compressed_max_decompression_ratio", DEFAULT_MAX_DECOMPRESSION_RATIO),
+        )
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -197,6 +207,7 @@ class TarScanner(BaseScanner):
 
         with tarfile.open(path, "r:*") as tar:
             members = tar.getmembers()
+            total_member_size = sum(member.size for member in members if member.isfile())
             if len(members) > self.max_entries:
                 result.add_check(
                     name="Entry Count Limit Check",
@@ -216,6 +227,66 @@ class TarScanner(BaseScanner):
                     location=path,
                     details={"entries": len(members), "max_entries": self.max_entries},
                     rule_code=None,  # Passing check
+                )
+
+            compressed_size = os.path.getsize(path)
+            lower_path = path.lower()
+            if any(lower_path.endswith(ext) for ext in COMPRESSED_TAR_EXTENSIONS):
+                if total_member_size > self.max_decompressed_bytes:
+                    result.add_check(
+                        name="Compressed Wrapper Decompression Limits",
+                        passed=False,
+                        message=(
+                            f"Decompressed size exceeded limit ({total_member_size} > {self.max_decompressed_bytes})"
+                        ),
+                        severity=IssueSeverity.WARNING,
+                        location=path,
+                        details={
+                            "decompressed_size": total_member_size,
+                            "compressed_size": compressed_size,
+                            "max_decompressed_size": self.max_decompressed_bytes,
+                        },
+                        rule_code="S902",
+                    )
+                    return result
+
+                if compressed_size > 0 and (total_member_size / compressed_size) > self.max_decompression_ratio:
+                    result.add_check(
+                        name="Compressed Wrapper Decompression Limits",
+                        passed=False,
+                        message=(
+                            "Decompression ratio exceeded limit "
+                            f"({total_member_size / compressed_size:.1f}x > "
+                            f"{self.max_decompression_ratio:.1f}x)"
+                        ),
+                        severity=IssueSeverity.WARNING,
+                        location=path,
+                        details={
+                            "decompressed_size": total_member_size,
+                            "compressed_size": compressed_size,
+                            "max_ratio": self.max_decompression_ratio,
+                            "actual_ratio": total_member_size / compressed_size,
+                        },
+                        rule_code="S902",
+                    )
+                    return result
+
+                result.add_check(
+                    name="Compressed Wrapper Decompression Limits",
+                    passed=True,
+                    message=(
+                        "Decompressed size/ratio are within limits "
+                        f"({total_member_size} bytes, "
+                        f"{(total_member_size / compressed_size) if compressed_size else 0:.1f}x)"
+                    ),
+                    location=path,
+                    details={
+                        "decompressed_size": total_member_size,
+                        "compressed_size": compressed_size,
+                        "max_decompressed_size": self.max_decompressed_bytes,
+                        "max_ratio": self.max_decompression_ratio,
+                    },
+                    rule_code=None,
                 )
 
             for member in members:

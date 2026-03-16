@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from modelaudit.scanners.base import IssueSeverity
+from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.tar_scanner import DEFAULT_MAX_TAR_ENTRY_SIZE, TarScanner
 
 
@@ -511,3 +511,39 @@ class TestTarScanner:
         assert len(format_checks) == 1
         assert "not a valid tar file" in format_checks[0].message.lower()
         assert any("not a valid tar file" in issue.message.lower() for issue in result.issues)
+
+    def test_scan_tar_gz_enforces_decompression_ratio_limit(self, tmp_path: Path) -> None:
+        """Compressed TAR wrappers should enforce decompression ratio limits."""
+        archive_path = tmp_path / "ratio_limit.tar.gz"
+        payload = b"A" * 1_000_000
+
+        with tarfile.open(archive_path, "w:gz") as archive:
+            info = tarfile.TarInfo("payload.bin")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        scanner = TarScanner(config={"compressed_max_decompression_ratio": 2.0})
+        result = scanner.scan(str(archive_path))
+
+        limit_checks = [check for check in result.checks if check.name == "Compressed Wrapper Decompression Limits"]
+        assert len(limit_checks) == 1
+        assert limit_checks[0].status == CheckStatus.FAILED
+        assert "decompression ratio exceeded" in limit_checks[0].message.lower()
+
+    def test_scan_tar_gz_enforces_decompressed_size_limit(self, tmp_path: Path) -> None:
+        """Compressed TAR wrappers should enforce decompressed size limits."""
+        archive_path = tmp_path / "size_limit.tar.gz"
+        payload = b"B" * 10_000
+
+        with tarfile.open(archive_path, "w:gz") as archive:
+            info = tarfile.TarInfo("payload.bin")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        scanner = TarScanner(config={"compressed_max_decompressed_bytes": 1024})
+        result = scanner.scan(str(archive_path))
+
+        limit_checks = [check for check in result.checks if check.name == "Compressed Wrapper Decompression Limits"]
+        assert len(limit_checks) == 1
+        assert limit_checks[0].status == CheckStatus.FAILED
+        assert "decompressed size exceeded" in limit_checks[0].message.lower()
