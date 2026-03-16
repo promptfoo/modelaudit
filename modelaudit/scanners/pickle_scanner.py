@@ -290,9 +290,9 @@ def _genops_with_fallback(
                 op_iter = pickletools.genops(file_obj)
                 while True:
                     if _budget_exceeded(pending_items=len(buffered)):
-                        for buffered_item in buffered:
-                            yield buffered_item
-                            yielded_items += 1
+                        # Do not emit buffered follow-on stream opcodes until
+                        # the stream has completed successfully. Returning here
+                        # preserves the false-positive guard for partial tails.
                         return
                     try:
                         item = next(op_iter)

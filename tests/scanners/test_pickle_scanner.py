@@ -23,6 +23,7 @@ from modelaudit.detectors.suspicious_symbols import (
 from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.pickle_scanner import (
     PickleScanner,
+    _genops_with_fallback,
     _is_actually_dangerous_global,
     _is_safe_import_only_global,
     _simulate_symbolic_reference_maps,
@@ -2235,7 +2236,7 @@ def test_extract_globals_advanced_respects_scan_timeout(monkeypatch: pytest.Monk
 def test_extract_globals_advanced_respects_max_opcodes_in_buffered_second_stream(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Advanced extraction should stop before buffering an entire second stream."""
+    """Advanced extraction should not emit partial buffered opcodes from a later stream."""
     scanner = PickleScanner({"max_opcodes": 3})
     call_count = 0
     second_stream_consumed: list[int] = []
@@ -2261,8 +2262,35 @@ def test_extract_globals_advanced_respects_max_opcodes_in_buffered_second_stream
     assert globals_found == {
         ("first0", "func0", "GLOBAL"),
         ("first1", "func1", "GLOBAL"),
-        ("second0", "func0", "GLOBAL"),
     }
+
+
+def test_genops_with_fallback_does_not_emit_buffered_partial_second_stream_on_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Buffered follow-on streams should not emit partial opcodes when the budget is exhausted."""
+    call_count = 0
+    second_stream_consumed: list[int] = []
+
+    def _fake_genops(data: BytesIO) -> Iterator[tuple[object, object, int]]:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            for i in range(2):
+                yield (type("Op", (), {"name": "GLOBAL"})(), f"first{i} func{i}", i)
+            data.seek(1)
+            return
+
+        for i in range(10):
+            second_stream_consumed.append(i)
+            yield (type("Op", (), {"name": "GLOBAL"})(), f"second{i} func{i}", i)
+
+    monkeypatch.setattr("modelaudit.scanners.pickle_scanner.pickletools.genops", _fake_genops)
+
+    ops = list(_genops_with_fallback(BytesIO(b"xy"), multi_stream=True, max_items=3))
+
+    assert second_stream_consumed == [0]
+    assert [arg for _opcode, arg, _pos in ops] == ["first0 func0", "first1 func1"]
 
 
 def test_extract_globals_advanced_preserves_partial_globals_when_genops_raises(
