@@ -518,9 +518,14 @@ __import__('pickle').loads(data)
                         "config": {"batch_shape": [None, 32, 32, 3]},
                     },
                     {
-                        "class_name": "RandomWidth",
-                        "name": "random_width",
+                        "class_name": "RandomShear",
+                        "name": "random_shear",
                         "config": {"factor": 0.1},
+                    },
+                    {
+                        "class_name": "RandomColorJitter",
+                        "name": "random_color_jitter",
+                        "config": {"value_range": [0, 255], "brightness_factor": 0.1},
                     },
                 ]
             },

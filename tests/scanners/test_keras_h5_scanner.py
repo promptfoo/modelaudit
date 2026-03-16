@@ -522,15 +522,15 @@ def test_training_config_safe_aliases_do_not_trigger_custom_object_checks(tmp_pa
 
 
 def test_builtin_random_preprocessing_layers_do_not_trigger_custom_layer_warning(tmp_path: Path) -> None:
-    """Built-in RandomWidth/RandomHeight preprocessing layers should stay allowlisted."""
+    """Built-in preprocessing layers should not be mislabeled as custom layers."""
     model_config = {
         "class_name": "Sequential",
         "config": {
             "name": "preprocessing_model",
             "layers": [
                 {"class_name": "InputLayer", "config": {"batch_shape": [None, 32, 32, 3], "name": "input"}},
-                {"class_name": "RandomWidth", "config": {"factor": 0.1}},
-                {"class_name": "RandomHeight", "config": {"factor": 0.1}},
+                {"class_name": "RandomShear", "config": {"factor": 0.1}},
+                {"class_name": "RandomColorJitter", "config": {"value_range": [0, 255], "brightness_factor": 0.1}},
             ],
         },
     }
