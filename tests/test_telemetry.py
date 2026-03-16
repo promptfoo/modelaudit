@@ -271,7 +271,7 @@ class TestTelemetryClient:
             mock_posthog.capture.assert_not_called()
 
     def test_scan_completed_uses_top_level_results_schema(self):
-        """Test that scan completion telemetry aggregates from top-level issues/assets."""
+        """Test that scan completion telemetry aggregates without leaking raw paths."""
         mock_posthog = MagicMock()
 
         with (
@@ -323,15 +323,20 @@ class TestTelemetryClient:
             assert properties["file_types"]["pickle"] == 1
             assert properties["file_types"]["zip"] == 1
             assert sorted(properties["scanners_used"]) == ["pickle", "zip"]
-            assert properties["files_scanned"] == ["/tmp/a.pkl", "/tmp/b.zip"]
+            assert "files_scanned" not in properties
+            assert properties["file_identifiers"] == [
+                client._hash_identifier("/tmp/a.pkl"),
+                client._hash_identifier("/tmp/b.zip"),
+            ]
             canonical_issue = next(
                 detail for detail in properties["issue_details"] if detail["type"] == "pickle_dangerous_global"
             )
-            assert canonical_issue["file_path"] == "/tmp/a.pkl"
+            assert canonical_issue["location_identifier"] == client._hash_identifier("/tmp/a.pkl")
             assert canonical_issue["model_name"] == "a.pkl"
+            assert "/tmp/a.pkl" not in json.dumps(properties)
 
     def test_scan_started_includes_per_path_fields(self):
-        """Scan started events include per-path arrays and model names."""
+        """Scan started events include hashed identifiers instead of raw paths."""
         mock_posthog = MagicMock()
 
         with (
@@ -353,15 +358,17 @@ class TestTelemetryClient:
             client.record_scan_started(paths, {"format": "json"})
 
             properties = mock_posthog.capture.call_args.kwargs["properties"]
-            assert properties["paths"] == paths
+            assert "paths" not in properties
             assert properties["model_names"][0] == "model.pkl"
             assert properties["model_names"][1] == "meta-llama/Llama-2-7b"
             assert properties["source_types"] == ["local", "huggingface"]
             assert properties["path_types"][0] in {"file", "unknown"}
             assert properties["path_types"][1] == "huggingface_shorthand"
+            assert properties["path_identifiers"] == [client._hash_identifier(path) for path in paths]
+            assert "/tmp/model.pkl" not in json.dumps(properties)
 
-    def test_path_and_url_fields_include_raw_and_hashed_values(self):
-        """Raw path/URL fields are present along with hashed identifiers."""
+    def test_path_and_url_fields_use_hashed_identifiers_only(self):
+        """Path and URL fields should not include raw sensitive values."""
         mock_posthog = MagicMock()
 
         with (
@@ -384,27 +391,31 @@ class TestTelemetryClient:
 
             client.record_file_type_detected(sensitive_path, "pickle")
             file_props = mock_posthog.capture.call_args.kwargs["properties"]
-            assert file_props["file_path"] == sensitive_path
+            assert "file_path" not in file_props
             assert file_props["model_name"] == "model.pkl"
-            assert "path_identifier" in file_props
+            assert file_props["path_identifier"] == client._hash_identifier(sensitive_path)
+            assert sensitive_path not in json.dumps(file_props)
 
             client.record_issue_found("dangerous pattern", "critical", "pickle", sensitive_path)
             issue_props = mock_posthog.capture.call_args.kwargs["properties"]
-            assert issue_props["file_path"] == sensitive_path
+            assert "file_path" not in issue_props
             assert issue_props["model_name"] == "model.pkl"
-            assert "path_identifier" in issue_props
+            assert issue_props["path_identifier"] == client._hash_identifier(sensitive_path)
+            assert sensitive_path not in json.dumps(issue_props)
 
             client.record_download_started("http", sensitive_url)
             download_props = mock_posthog.capture.call_args.kwargs["properties"]
-            assert download_props["url"] == sensitive_url
+            assert "url" not in download_props
             assert download_props["model_name"] == "model.bin"
-            assert "url_identifier" in download_props
+            assert download_props["url_identifier"] == client._hash_identifier(sensitive_url)
+            assert sensitive_url not in json.dumps(download_props)
 
             client.record_download_completed("http", 2.0, 2048, sensitive_url)
             completed_props = mock_posthog.capture.call_args.kwargs["properties"]
-            assert completed_props["url"] == sensitive_url
+            assert "url" not in completed_props
             assert completed_props["model_name"] == "model.bin"
-            assert "url_identifier" in completed_props
+            assert completed_props["url_identifier"] == client._hash_identifier(sensitive_url)
+            assert sensitive_url not in json.dumps(completed_props)
 
     def test_extract_model_name_strips_query_string_for_http_urls(self):
         """Model name extraction should not include URL query parameters."""

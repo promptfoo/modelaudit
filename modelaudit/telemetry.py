@@ -371,6 +371,24 @@ class TelemetryClient:
         """Create a stable, non-reversible identifier hash for paths/URLs."""
         return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
 
+    def _build_path_properties(self, path: str) -> dict[str, Any]:
+        """Build privacy-safe telemetry properties for a file path."""
+        return {
+            "path_type": self._classify_path(path),
+            "path_identifier": self._hash_identifier(path),
+            "file_extension": Path(path).suffix.lower(),
+            "model_name": self._extract_model_name(path),
+        }
+
+    def _build_url_properties(self, url: str) -> dict[str, Any]:
+        """Build privacy-safe telemetry properties for a download URL."""
+        return {
+            "domain": self._extract_domain(url),
+            "url_identifier": self._hash_identifier(url),
+            "path_type": self._classify_path(url),
+            "model_name": self._extract_model_name(url),
+        }
+
     def _iter_result_issues(self, results: dict[str, Any]) -> list[dict[str, Any]]:
         """Normalize top-level issue records from scan results."""
         normalized: list[dict[str, Any]] = []
@@ -478,7 +496,6 @@ class TelemetryClient:
             TelemetryEvent.SCAN_STARTED,
             {
                 "num_paths": len(paths),
-                "paths": paths,
                 "model_names": [self._extract_model_name(path) for path in paths],
                 "source_types": source_types,
                 "path_types": path_types,
@@ -522,7 +539,7 @@ class TelemetryClient:
             issue_type = str(issue.get("type") or issue.get("message") or "unknown")
             severity = str(issue.get("severity", "unknown"))
             issue_types[issue_type] = issue_types.get(issue_type, 0) + 1
-            # Capture first 50 issues in detail (including raw paths when available)
+            # Capture first 50 issues in detail without including raw paths.
             if len(issue_details) < 50:
                 issue_location = str(issue.get("location", ""))
                 issue_details.append(
@@ -530,7 +547,7 @@ class TelemetryClient:
                         "type": issue_type,
                         "severity": severity,
                         "location_type": self._classify_path(issue_location),
-                        "file_path": issue_location,
+                        "location_identifier": self._hash_identifier(issue_location) if issue_location else None,
                         "model_name": self._extract_model_name(issue_location) if issue_location else None,
                     }
                 )
@@ -552,7 +569,11 @@ class TelemetryClient:
                 "scanners_used": sorted(set(scanner_names)),
                 "issue_types": issue_types,
                 "issue_details": issue_details,
-                "files_scanned": [str(asset.get("path", "")) for asset in assets],
+                "file_identifiers": [
+                    self._hash_identifier(asset_path)
+                    for asset in assets
+                    if (asset_path := str(asset.get("path", "")))
+                ],
             },
         )
 
@@ -585,11 +606,7 @@ class TelemetryClient:
             {
                 "file_type": detected_type,
                 "confidence": confidence,
-                "file_extension": Path(file_path).suffix.lower(),
-                "path_type": self._classify_path(file_path),
-                "path_identifier": self._hash_identifier(file_path),
-                "file_path": file_path,
-                "model_name": self._extract_model_name(file_path),
+                **self._build_path_properties(file_path),
             },
         )
 
@@ -609,11 +626,7 @@ class TelemetryClient:
         }
 
         if file_path:
-            properties["path_identifier"] = self._hash_identifier(file_path)
-            properties["path_type"] = self._classify_path(file_path)
-            properties["file_extension"] = Path(file_path).suffix.lower()
-            properties["file_path"] = file_path
-            properties["model_name"] = self._extract_model_name(file_path)
+            properties.update(self._build_path_properties(file_path))
 
         self.record_event(TelemetryEvent.ISSUE_FOUND, properties)
 
@@ -657,12 +670,8 @@ class TelemetryClient:
             TelemetryEvent.DOWNLOAD_STARTED,
             {
                 "source_type": source_type,
-                "domain": self._extract_domain(url),
                 "size_bytes": size_bytes,
-                "url_identifier": self._hash_identifier(url),
-                "path_type": self._classify_path(url),
-                "url": url,
-                "model_name": self._extract_model_name(url),
+                **self._build_url_properties(url),
             },
         )
 
@@ -678,11 +687,7 @@ class TelemetryClient:
         }
 
         if url:
-            properties["url_identifier"] = self._hash_identifier(url)
-            properties["domain"] = self._extract_domain(url)
-            properties["path_type"] = self._classify_path(url)
-            properties["url"] = url
-            properties["model_name"] = self._extract_model_name(url)
+            properties.update(self._build_url_properties(url))
 
         self.record_event(TelemetryEvent.DOWNLOAD_COMPLETED, properties)
 
