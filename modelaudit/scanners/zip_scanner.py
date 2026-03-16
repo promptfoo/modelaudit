@@ -29,7 +29,8 @@ class ZipScanner(BaseScanner):
 
     name = "zip"
     description = "Scans ZIP archive files and their contents recursively"
-    supported_extensions: ClassVar[list[str]] = [".zip", ".npz"]
+    # Include .mar so non-TorchServe archives still receive generic ZIP scanning.
+    supported_extensions: ClassVar[list[str]] = [".zip", ".npz", ".mar"]
 
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)

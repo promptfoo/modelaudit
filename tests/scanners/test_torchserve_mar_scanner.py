@@ -191,6 +191,19 @@ def test_core_routes_mar_to_dedicated_scanner(tmp_path: Path) -> None:
     assert result.scanner_name != "unknown"
 
 
+def test_core_falls_back_to_zip_scanner_for_non_torchserve_mar(tmp_path: Path) -> None:
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=None,
+        entries={"../evil.txt": b"malicious"},
+        filename="invalid.mar",
+    )
+
+    result = core.scan_file(str(mar_path))
+    assert result.scanner_name == "zip"
+    assert any("path traversal" in issue.why.lower() for issue in result.issues)
+
+
 def test_false_positive_reduction_comments_and_strings_only(tmp_path: Path) -> None:
     handler_code = b"""
 def handle(data, context):

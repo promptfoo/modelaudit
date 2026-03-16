@@ -97,7 +97,7 @@ def test_detect_file_format_by_extension(tmp_path):
         ".h5": "hdf5",
         ".pb": "protobuf",
         ".tflite": "tflite",
-        ".mar": "torchserve_mar",
+        ".mar": "unknown",
         ".cbm": "catboost",
         ".mlmodel": "coreml",
         ".llamafile": "llamafile",

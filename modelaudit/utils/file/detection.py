@@ -437,10 +437,6 @@ def detect_file_format(path: str) -> str:
         if compression_format == expected_codec:
             return "compressed"
         return "unknown"
-    # TorchServe .mar archives are ZIP-based and route to a dedicated scanner.
-    if ext == ".mar":
-        return "torchserve_mar"
-
     # Check ZIP magic first (for .pt/.pth files that are actually zips)
     if magic4.startswith(b"PK"):
         return "zip"
