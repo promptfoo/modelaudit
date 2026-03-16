@@ -466,18 +466,26 @@ class TestPickleDangerousOpcodes:
         assert "REDUCE" in metadata.get("dangerous_opcodes", [])
         assert metadata.get("has_dangerous_opcodes") is True
 
-    def test_pickle_metadata_enforces_read_limit(self, tmp_path: Path) -> None:
-        """Ensure pickle metadata extraction rejects files over the metadata read limit."""
+    @pytest.mark.parametrize(
+        ("limit", "expected_error"),
+        [
+            (64, "read limit exceeded"),
+            (0, "must be greater than 0"),
+            (-1, "must be greater than 0"),
+        ],
+    )
+    def test_pickle_metadata_enforces_read_limit(self, tmp_path: Path, limit: int, expected_error: str) -> None:
+        """Ensure pickle metadata extraction rejects oversized and invalid read limits."""
         from modelaudit.scanners.pickle_scanner import PickleScanner
 
         pkl_file = tmp_path / "oversized.pkl"
         pkl_file.write_bytes(b"x" * 128)
 
-        scanner = PickleScanner({"max_metadata_pickle_read_size": 64})
+        scanner = PickleScanner({"max_metadata_pickle_read_size": limit})
         metadata = scanner.extract_metadata(str(pkl_file))
 
         assert "extraction_error" in metadata
-        assert "read limit exceeded" in metadata["extraction_error"]
+        assert expected_error in metadata["extraction_error"]
 
     def test_pickle_safe_data_no_dangerous_opcodes(self, tmp_path: Path) -> None:
         """Ensure simple data structures don't trigger dangerous opcode detection."""

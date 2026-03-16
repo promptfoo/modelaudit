@@ -6133,16 +6133,21 @@ class PickleScanner(BaseScanner):
             import pickletools
             from io import BytesIO
 
+            if max_metadata_read_size <= 0:
+                raise ValueError(
+                    f"Invalid pickle metadata read limit: {max_metadata_read_size} (must be greater than 0)"
+                )
+
             file_size = self.get_file_size(file_path)
-            if max_metadata_read_size > 0 and file_size > max_metadata_read_size:
+            if file_size > max_metadata_read_size:
                 raise ValueError(
                     f"Pickle metadata read limit exceeded: {file_size} bytes (max: {max_metadata_read_size})"
                 )
 
             with open(file_path, "rb") as f:
-                pickle_data = f.read(max_metadata_read_size + 1 if max_metadata_read_size > 0 else -1)
+                pickle_data = f.read(max_metadata_read_size + 1)
 
-            if max_metadata_read_size > 0 and len(pickle_data) > max_metadata_read_size:
+            if len(pickle_data) > max_metadata_read_size:
                 raise ValueError(
                     f"Pickle metadata read limit exceeded: {len(pickle_data)} bytes (max: {max_metadata_read_size})"
                 )
