@@ -111,6 +111,25 @@ S701 = "CRITICAL"
         finally:
             config_path.unlink()
 
+    def test_load_from_pyproject(self, tmp_path: Path) -> None:
+        """Explicit pyproject paths should load the [tool.modelaudit] section."""
+        config_path = tmp_path / "pyproject.toml"
+        config_path.write_text(
+            """
+[tool.modelaudit]
+suppress = ["S710"]
+
+[tool.modelaudit.severity]
+S301 = "HIGH"
+""".strip()
+            + "\n"
+        )
+
+        config = ModelAuditConfig.load(config_path)
+
+        assert config.suppress == {"S710"}
+        assert config.severity["S301"] == Severity.HIGH
+
     def test_is_suppressed(self):
         """Test rule suppression checking."""
         config = ModelAuditConfig()

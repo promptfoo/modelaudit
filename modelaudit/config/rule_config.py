@@ -81,7 +81,10 @@ class ModelAuditConfig:
         config = cls()
 
         if path and path.exists():
-            config._load_from_file(path)
+            if path.name == "pyproject.toml":
+                config._load_from_pyproject(path)
+            else:
+                config._load_from_file(path)
             return config
 
         if discover_local:
