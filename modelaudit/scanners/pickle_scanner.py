@@ -71,6 +71,14 @@ class MalformedStackGlobalDetails(TypedDict):
     reason: MalformedStackGlobalReason
 
 
+class _GenopsBudgetExceeded(Exception):
+    """Signal that opcode iteration stopped due to an explicit resource budget."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 def _format_stack_global_string_preview(value: str) -> str:
     """Return a bounded preview for malformed STACK_GLOBAL string operands."""
     preview = _STACK_GLOBAL_OPERAND_PREVIEWER.repr(value)
@@ -200,7 +208,13 @@ def _scan_structural_tamper_findings(file_data: bytes) -> list[dict[str, Any]]:
     return findings
 
 
-def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> Any:
+def _genops_with_fallback(
+    file_obj: BinaryIO,
+    *,
+    multi_stream: bool = False,
+    max_items: int | None = None,
+    deadline: float | None = None,
+) -> Any:
     """
     Wrapper around pickletools.genops that handles protocol mismatches.
 
@@ -221,6 +235,13 @@ def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> 
     resync_skipped = 0
     # Track whether we've successfully parsed at least one complete stream
     parsed_any_stream = False
+    yielded_items = 0
+
+    def _check_budget(*, pending_items: int = 0) -> None:
+        if max_items is not None and (yielded_items + pending_items) >= max_items:
+            raise _GenopsBudgetExceeded("max_items")
+        if deadline is not None and time.time() > deadline:
+            raise _GenopsBudgetExceeded("deadline")
 
     while True:
         stream_start = file_obj.tell()
@@ -230,9 +251,16 @@ def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> 
         if not parsed_any_stream:
             # First stream: yield opcodes directly (no buffering needed)
             try:
-                for item in pickletools.genops(file_obj):
+                op_iter = pickletools.genops(file_obj)
+                while True:
+                    _check_budget()
+                    try:
+                        item = next(op_iter)
+                    except StopIteration:
+                        break
                     had_opcodes = True
                     yield item
+                    yielded_items += 1
             except ValueError as e:
                 error_str = str(e).lower()
                 is_unknown_opcode = "opcode" in error_str and "unknown" in error_str
@@ -267,7 +295,16 @@ def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> 
             # produce false positives.
             buffered: list[Any] = []
             try:
-                for item in pickletools.genops(file_obj):
+                op_iter = pickletools.genops(file_obj)
+                while True:
+                    # Do not emit buffered follow-on stream opcodes until the
+                    # stream has completed successfully. If the budget expires
+                    # here, let the caller surface the analysis truncation.
+                    _check_budget(pending_items=len(buffered))
+                    try:
+                        item = next(op_iter)
+                    except StopIteration:
+                        break
                     had_opcodes = True
                     buffered.append(item)
             except ValueError:
@@ -285,7 +322,10 @@ def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> 
 
             if not stream_error:
                 # Stream completed successfully — yield buffered opcodes
-                yield from buffered
+                for buffered_item in buffered:
+                    _check_budget()
+                    yield buffered_item
+                    yielded_items += 1
 
         if stream_error and had_opcodes:
             # First stream parse interruption after yielding some opcodes.
@@ -4231,32 +4271,68 @@ class PickleScanner(BaseScanner):
             ),
         )
 
-    def _extract_globals_advanced(self, data: BinaryIO, multiple_pickles: bool = True) -> set[tuple[str, str, str]]:
+    def _extract_globals_advanced(
+        self,
+        data: BinaryIO,
+        multiple_pickles: bool = True,
+        scan_start_time: float | None = None,
+    ) -> set[tuple[str, str, str]]:
         """Advanced pickle global extraction with STACK_GLOBAL and memo support."""
         globals_found: set[tuple[str, str, str]] = set()
+        effective_scan_start_time = scan_start_time if scan_start_time is not None else self.scan_start_time
+        deadline = effective_scan_start_time + self.timeout if effective_scan_start_time is not None else None
+        timeout_warning_emitted = False
+        ops: list[tuple[Any, Any, int | None]] = []
 
         try:
-            ops: list[tuple[Any, Any, int | None]] = list(_genops_with_fallback(data, multi_stream=multiple_pickles))
+            for opcode, arg, pos in _genops_with_fallback(
+                data,
+                multi_stream=multiple_pickles,
+                max_items=self.max_opcodes,
+                deadline=deadline,
+            ):
+                ops.append((opcode, arg, pos))
+                op_name = opcode.name
+                if op_name in {"GLOBAL", "INST"} and isinstance(arg, str):
+                    parsed = _parse_module_function(arg)
+                    if parsed is not None:
+                        globals_found.add((*parsed, op_name))
+        except _GenopsBudgetExceeded as e:
+            if e.reason == "max_items":
+                logger.warning(f"Advanced global extraction stopped after reaching max_opcodes ({self.max_opcodes})")
+            else:
+                logger.warning(f"Advanced global extraction stopped after exceeding timeout ({self.timeout}s)")
+            return globals_found
         except Exception as e:
+            if globals_found:
+                logger.warning(f"Pickle parsing failed, but found {len(globals_found)} globals: {e}")
+                return globals_found
             logger.debug(f"Pickle parsing failed during advanced global extraction: {e}")
             return set()
 
+        if len(ops) >= self.max_opcodes:
+            logger.warning(f"Advanced global extraction stopped after reaching max_opcodes ({self.max_opcodes})")
+        elif deadline is not None and time.time() > deadline:
+            logger.warning(f"Advanced global extraction stopped after exceeding timeout ({self.timeout}s)")
+            timeout_warning_emitted = True
+            return globals_found
+
         stack_global_refs, _callable_refs, _malformed_stack_globals = _build_symbolic_reference_maps(ops)
 
-        for n, (opcode, arg, _pos) in enumerate(ops):
+        for n, (opcode, _arg, _pos) in enumerate(ops):
             op_name = opcode.name
-            if op_name in {"GLOBAL", "INST"} and isinstance(arg, str):
-                parsed = _parse_module_function(arg)
-                if parsed is not None:
-                    globals_found.add((*parsed, op_name))
-            elif op_name == "STACK_GLOBAL":
+            if deadline is not None and time.time() > deadline:
+                if not timeout_warning_emitted:
+                    logger.warning(f"Advanced global extraction stopped after exceeding timeout ({self.timeout}s)")
+                break
+
+            if op_name == "STACK_GLOBAL":
                 resolved = stack_global_refs.get(n)
                 if resolved:
                     globals_found.add((*resolved, op_name))
                 else:
                     logger.debug(f"STACK_GLOBAL parsing failed at position {n}")
                     globals_found.add(("unknown", "unknown", op_name))
-
         return globals_found
 
     def _extract_stack_global_values(
@@ -4457,112 +4533,156 @@ class PickleScanner(BaseScanner):
             warning_stack_depth_limit = 5000
             # Store warnings for ML-context-aware processing
             stack_depth_warnings: list[dict[str, int | str]] = []
+            opcode_budget_exceeded = False
 
-            for opcode, arg, pos in _genops_with_fallback(file_obj, multi_stream=True):
-                # Check for interrupts periodically during opcode processing
-                if opcode_count % 1000 == 0:  # Check every 1000 opcodes
-                    self.check_interrupted()
+            try:
+                for opcode, arg, pos in _genops_with_fallback(
+                    file_obj,
+                    multi_stream=True,
+                    max_items=self.max_opcodes + 1,
+                    deadline=result.start_time + self.timeout,
+                ):
+                    # Check for interrupts periodically during opcode processing
+                    if opcode_count % 1000 == 0:  # Check every 1000 opcodes
+                        self.check_interrupted()
 
-                opcodes.append((opcode, arg, pos))
-                opcode_count += 1
+                    opcodes.append((opcode, arg, pos))
+                    opcode_count += 1
 
-                # Enhanced opcode sequence analysis
-                sequence_results = self.opcode_sequence_analyzer.analyze_opcode(opcode.name, arg, pos)
+                    # Enhanced opcode sequence analysis
+                    sequence_results = self.opcode_sequence_analyzer.analyze_opcode(opcode.name, arg, pos)
 
-                # Process any detected dangerous sequences
-                if sequence_results:
-                    for seq_result in sequence_results:
-                        self._create_opcode_sequence_check(seq_result, result)
+                    # Process any detected dangerous sequences
+                    if sequence_results:
+                        for seq_result in sequence_results:
+                            self._create_opcode_sequence_check(seq_result, result)
 
-                # Track stack depth based on opcode type
-                # Stack-building opcodes
-                if opcode.name in ["MARK", "TUPLE", "LIST", "DICT", "FROZENSET", "INST", "OBJ", "BUILD"]:
-                    current_stack_depth += 1
-                    max_stack_depth = max(max_stack_depth, current_stack_depth)
-                # Stack-consuming opcodes
-                elif opcode.name in ["POP", "POP_MARK", "SETITEM", "SETITEMS", "APPEND", "APPENDS"]:
-                    current_stack_depth = max(0, current_stack_depth - 1)
-                # STOP resets the stack
-                elif opcode.name == "STOP":
-                    current_stack_depth = 0
-                    if first_pickle_end_pos is None:
-                        first_pickle_end_pos = start_pos + pos + 1
+                    # Track stack depth based on opcode type
+                    # Stack-building opcodes
+                    if opcode.name in ["MARK", "TUPLE", "LIST", "DICT", "FROZENSET", "INST", "OBJ", "BUILD"]:
+                        current_stack_depth += 1
+                        max_stack_depth = max(max_stack_depth, current_stack_depth)
+                    # Stack-consuming opcodes
+                    elif opcode.name in ["POP", "POP_MARK", "SETITEM", "SETITEMS", "APPEND", "APPENDS"]:
+                        current_stack_depth = max(0, current_stack_depth - 1)
+                    # STOP resets the stack
+                    elif opcode.name == "STOP":
+                        current_stack_depth = 0
+                        if first_pickle_end_pos is None:
+                            first_pickle_end_pos = start_pos + pos + 1
 
-                # Store stack depth warnings for ML-context-aware processing later
-                if current_stack_depth > base_stack_depth_limit:
-                    # Don't break immediately - store the warning for context-aware processing
-                    stack_depth_warnings.append(
-                        {
-                            "current_depth": int(current_stack_depth),
-                            "position": int(pos) if pos is not None else 0,
-                            "opcode": str(opcode.name),
-                        }
-                    )
-                    # Only break if stack depth becomes extremely high (10x base limit)
-                    # to prevent actual resource exhaustion attacks
-                    if current_stack_depth > base_stack_depth_limit * 10:
+                    # Store stack depth warnings for ML-context-aware processing later
+                    if current_stack_depth > base_stack_depth_limit:
+                        # Don't break immediately - store the warning for context-aware processing
+                        stack_depth_warnings.append(
+                            {
+                                "current_depth": int(current_stack_depth),
+                                "position": int(pos) if pos is not None else 0,
+                                "opcode": str(opcode.name),
+                            }
+                        )
+                        # Only break if stack depth becomes extremely high (10x base limit)
+                        # to prevent actual resource exhaustion attacks
+                        if current_stack_depth > base_stack_depth_limit * 10:
+                            result.add_check(
+                                name="Stack Depth Safety Check",
+                                passed=False,
+                                message=f"Extreme stack depth ({current_stack_depth}) - stopping scan for safety",
+                                severity=IssueSeverity.CRITICAL,
+                                location=f"{self.current_file_path} (pos {pos})",
+                                details={
+                                    "current_depth": current_stack_depth,
+                                    "max_allowed": base_stack_depth_limit * 10,
+                                    "position": pos,
+                                    "opcode": opcode.name,
+                                },
+                                why=(
+                                    "Stack depth is extremely high and could indicate a maliciously crafted pickle "
+                                    "designed to cause resource exhaustion."
+                                ),
+                            )
+                            break
+
+                    # Track strings for STACK_GLOBAL analysis
+                    if opcode.name in STRING_OPCODES and isinstance(arg, str):
+                        string_stack.append(arg)
+                        # Keep only the last 10 strings to avoid memory issues
+                        if len(string_stack) > 10:
+                            string_stack.pop(0)
+
+                    # Check for too many opcodes
+                    if opcode_count > self.max_opcodes:
                         result.add_check(
-                            name="Stack Depth Safety Check",
+                            name="Opcode Count Check",
                             passed=False,
-                            message=f"Extreme stack depth ({current_stack_depth}) - stopping scan for safety",
-                            severity=IssueSeverity.CRITICAL,
-                            location=f"{self.current_file_path} (pos {pos})",
+                            message=f"Too many opcodes in pickle (> {self.max_opcodes})",
+                            severity=IssueSeverity.INFO,
+                            location=self.current_file_path,
                             details={
-                                "current_depth": current_stack_depth,
-                                "max_allowed": base_stack_depth_limit * 10,
-                                "position": pos,
-                                "opcode": opcode.name,
+                                "opcode_count": opcode_count,
+                                "max_opcodes": self.max_opcodes,
                             },
-                            why=(
-                                "Stack depth is extremely high and could indicate a maliciously crafted pickle "
-                                "designed to cause resource exhaustion."
-                            ),
+                            why=get_pattern_explanation("pickle_size_limit"),
+                            rule_code="S902",
                         )
                         break
 
-                # Track strings for STACK_GLOBAL analysis
-                if opcode.name in STRING_OPCODES and isinstance(arg, str):
-                    string_stack.append(arg)
-                    # Keep only the last 10 strings to avoid memory issues
-                    if len(string_stack) > 10:
-                        string_stack.pop(0)
+                    # Check for timeout
+                    if time.time() - result.start_time > self.timeout:
+                        result.add_check(
+                            name="Scan Timeout Check",
+                            passed=False,
+                            message=f"Scanning timed out after {self.timeout} seconds",
+                            severity=IssueSeverity.INFO,
+                            location=self.current_file_path,
+                            details={"opcode_count": opcode_count, "timeout": self.timeout},
+                            why=(
+                                "The scan exceeded the configured time limit. Large or complex pickle files may take "
+                                "longer to analyze due to the number of opcodes that need to be processed."
+                            ),
+                            rule_code="S902",
+                        )
+                        break
+            except _GenopsBudgetExceeded as e:
+                if e.reason == "max_items":
+                    opcode_budget_exceeded = True
 
-                # Check for too many opcodes
-                if opcode_count > self.max_opcodes:
-                    result.add_check(
-                        name="Opcode Count Check",
-                        passed=False,
-                        message=f"Too many opcodes in pickle (> {self.max_opcodes})",
-                        severity=IssueSeverity.INFO,
-                        location=self.current_file_path,
-                        details={
-                            "opcode_count": opcode_count,
-                            "max_opcodes": self.max_opcodes,
-                        },
-                        why=get_pattern_explanation("pickle_size_limit"),
-                        rule_code="S902",
-                    )
-                    break
+            if opcode_budget_exceeded:
+                result.metadata["analysis_incomplete"] = True
+                result.add_check(
+                    name="Opcode Count Check",
+                    passed=False,
+                    message=f"Scanning stopped after reaching opcode budget ({self.max_opcodes})",
+                    severity=IssueSeverity.INFO,
+                    location=self.current_file_path,
+                    details={
+                        "opcode_count": opcode_count,
+                        "max_opcodes": self.max_opcodes,
+                        "analysis_incomplete": True,
+                    },
+                    why=get_pattern_explanation("pickle_size_limit"),
+                    rule_code="S902",
+                )
 
-                # Check for timeout
-                if time.time() - result.start_time > self.timeout:
-                    result.add_check(
-                        name="Scan Timeout Check",
-                        passed=False,
-                        message=f"Scanning timed out after {self.timeout} seconds",
-                        severity=IssueSeverity.INFO,
-                        location=self.current_file_path,
-                        details={"opcode_count": opcode_count, "timeout": self.timeout},
-                        why=(
-                            "The scan exceeded the configured time limit. Large or complex pickle files may take "
-                            "longer to analyze due to the number of opcodes that need to be processed."
-                        ),
-                        rule_code="S902",
-                    )
-                    break
+            if time.time() - result.start_time > self.timeout and not any(
+                check.name == "Scan Timeout Check" and check.status == CheckStatus.FAILED for check in result.checks
+            ):
+                result.add_check(
+                    name="Scan Timeout Check",
+                    passed=False,
+                    message=f"Scanning timed out after {self.timeout} seconds",
+                    severity=IssueSeverity.INFO,
+                    location=self.current_file_path,
+                    details={"opcode_count": opcode_count, "timeout": self.timeout},
+                    why=(
+                        "The scan exceeded the configured time limit. Large or complex pickle files may take "
+                        "longer to analyze due to the number of opcodes that need to be processed."
+                    ),
+                    rule_code="S902",
+                )
 
             # Add successful opcode count check if within limits
-            if opcode_count <= self.max_opcodes:
+            if opcode_count <= self.max_opcodes and not opcode_budget_exceeded:
                 result.add_check(
                     name="Opcode Count Check",
                     passed=True,
