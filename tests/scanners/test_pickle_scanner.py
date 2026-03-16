@@ -997,6 +997,9 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
             "Expected failed REDUCE check for STACK_GLOBAL mixed-case module, "
             f"got: {[c.message for c in reduce_checks]}"
         )
+        assert not any("implausible module name 'EvilPkg'" in c.message for c in reduce_checks), (
+            "Mixed-case STACK_GLOBAL paths should not be suppressed as implausible"
+        )
 
     def test_mixed_case_memoized_stack_global_reduce_is_not_suppressed(self) -> None:
         result = self._scan_bytes(self._craft_memoized_stack_global_reduce_pickle("EvilPkg", "thing"))
@@ -1005,6 +1008,9 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
         assert any(c.status == CheckStatus.FAILED and "EvilPkg.thing" in c.message for c in reduce_checks), (
             "Expected failed REDUCE check for memoized mixed-case STACK_GLOBAL, "
             f"got: {[c.message for c in reduce_checks]}"
+        )
+        assert not any("implausible module name 'EvilPkg'" in c.message for c in reduce_checks), (
+            "Memoized mixed-case STACK_GLOBAL paths should not be suppressed as implausible"
         )
 
     def test_mixed_case_import_only_payload_still_flags_import(self) -> None:
@@ -1015,6 +1021,26 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
             "Expected suspicious import-only detection for mixed-case dangerous global, "
             f"got: {[i.message for i in result.issues]}"
         )
+
+        benign_result = self._scan_bytes(self._craft_global_import_only_pickle("EvilPkg", "thing"))
+        benign_checks = [
+            check
+            for check in benign_result.checks
+            if check.name == "Global Module Reference Check"
+            and check.details.get("import_reference") == "EvilPkg.thing"
+            and check.details.get("import_only") is True
+        ]
+        assert benign_checks, f"Expected import-only analysis for EvilPkg.thing: {benign_result.checks}"
+        assert all(check.severity == IssueSeverity.WARNING for check in benign_checks), (
+            f"Mixed-case unknown imports should not be escalated as dangerous: {benign_checks}"
+        )
+        assert all(check.details.get("classification") == "unknown_third_party" for check in benign_checks), (
+            f"Expected mixed-case benign counterpart to stay unknown_third_party: {benign_checks}"
+        )
+        assert not any(
+            check.severity == IssueSeverity.CRITICAL and check.details.get("import_reference") == "EvilPkg.thing"
+            for check in benign_result.checks
+        ), f"Unexpected critical mixed-case import finding for EvilPkg.thing: {benign_result.checks}"
 
     def test_mixed_case_unknown_import_only_is_flagged(self) -> None:
         """Mixed-case unknown import-only refs should now reach the import-only warning path."""

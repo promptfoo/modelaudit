@@ -1996,7 +1996,7 @@ def _is_plausible_python_module(name: str) -> bool:
     return all(any(char.islower() for char in seg) or seg in _CASE_SENSITIVE_IMPORT_SEGMENTS for seg in segments)
 
 
-_CASE_SENSITIVE_IMPORT_SEGMENTS = frozenset({"PIL", "Cython"})
+_CASE_SENSITIVE_IMPORT_SEGMENTS: frozenset[str] = frozenset({"PIL", "Cython"})
 IMPORT_ONLY_ALWAYS_DANGEROUS_GLOBALS = frozenset(
     {
         ("dill", "load"),

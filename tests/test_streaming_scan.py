@@ -128,8 +128,17 @@ def test_scan_model_streaming_critical_findings_do_not_set_operational_errors(
     def file_generator():
         yield (temp_test_files[0], True)
 
+    finding = ScanResult(scanner_name="test_scanner")
+    finding.bytes_scanned = 1024
+    finding.success = True
+    finding.add_issue(
+        "Detected malicious payload",
+        severity=IssueSeverity.CRITICAL,
+        location=str(temp_test_files[0]),
+    )
+
     with patch("modelaudit.core.scan_file") as mock_scan:
-        mock_scan.return_value = create_mock_scan_result(with_critical_issue=True)
+        mock_scan.return_value = finding
 
         result = scan_model_streaming(
             file_generator=file_generator(),
@@ -139,7 +148,11 @@ def test_scan_model_streaming_critical_findings_do_not_set_operational_errors(
 
     assert result.files_scanned == 1
     assert len(result.issues) == 1
+    assert result.issues[0].message == "Detected malicious payload"
+    assert result.issues[0].severity == IssueSeverity.CRITICAL
+    assert result.issues[0].location == str(temp_test_files[0])
     assert result.has_errors is False
+    assert result.success is True
     assert determine_exit_code(result) == 1
 
 
