@@ -1026,6 +1026,212 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
             f"got: {[i.message for i in result.issues]}"
         )
 
+    def test_stack_global_non_string_operands_fail_closed(self) -> None:
+        """STACK_GLOBAL with two integers should be treated as a malformed warning."""
+        payload = b"\x80\x04K\x01K\x02\x93."
+
+        result = self._scan_bytes(payload)
+        assert result.success
+
+        context_checks = [c for c in result.checks if c.name == "STACK_GLOBAL Context Check"]
+        assert any(c.status == CheckStatus.FAILED for c in context_checks), (
+            f"Expected failed STACK_GLOBAL malformed check, got: {[c.message for c in context_checks]}"
+        )
+        assert any(
+            c.severity == IssueSeverity.WARNING
+            and c.rule_code == "S205"
+            and c.details.get("reason") == "mixed_or_non_string"
+            for c in context_checks
+        ), (
+            "Expected WARNING S205 malformed STACK_GLOBAL check, got: "
+            f"{[(c.severity, c.rule_code) for c in context_checks]}"
+        )
+
+    def test_stack_global_dangerous_module_plus_non_string_operand_is_critical(self) -> None:
+        """A dangerous module string plus a non-string operand should escalate to CRITICAL."""
+        payload = b"\x80\x04\x8c\x02osK\x01\x93."
+
+        result = self._scan_bytes(payload)
+        assert result.success
+
+        context_checks = [c for c in result.checks if c.name == "STACK_GLOBAL Context Check"]
+        assert any(
+            c.status == CheckStatus.FAILED
+            and c.severity == IssueSeverity.CRITICAL
+            and c.rule_code == "S205"
+            and c.details.get("module") == "os"
+            and c.details.get("reason") == "mixed_or_non_string"
+            for c in context_checks
+        ), f"Expected CRITICAL malformed STACK_GLOBAL check, got: {[(c.severity, c.message) for c in context_checks]}"
+
+    def test_stack_global_risky_ml_module_prefix_plus_non_string_operand_is_critical(self) -> None:
+        """Risky ML module hints should not downgrade malformed STACK_GLOBAL findings."""
+        payload = b"\x80\x04\x8c\x0dtorch._dynamoK\x01\x93."
+
+        result = self._scan_bytes(payload)
+        assert result.success
+
+        context_checks = [c for c in result.checks if c.name == "STACK_GLOBAL Context Check"]
+        assert any(
+            c.status == CheckStatus.FAILED
+            and c.severity == IssueSeverity.CRITICAL
+            and c.rule_code == "S205"
+            and c.details.get("module") == "torch._dynamo"
+            and c.details.get("reason") == "mixed_or_non_string"
+            for c in context_checks
+        ), (
+            "Expected CRITICAL malformed STACK_GLOBAL finding for risky ML prefix, got: "
+            f"{[(c.severity, c.message) for c in context_checks]}"
+        )
+
+    def test_stack_global_large_bytes_operand_preview_is_bounded(self) -> None:
+        """Large malformed operands should not expand finding payloads."""
+        large_bytes = b"x" * 200_000
+        payload = b"\x80\x04\x8c\x02osB" + struct.pack("<I", len(large_bytes)) + large_bytes + b"\x93."
+
+        result = self._scan_bytes(payload)
+        assert result.success
+
+        context_checks = [c for c in result.checks if c.name == "STACK_GLOBAL Context Check"]
+        matching_checks = [
+            c
+            for c in context_checks
+            if c.status == CheckStatus.FAILED
+            and c.severity == IssueSeverity.CRITICAL
+            and c.details.get("module") == "os"
+            and c.details.get("reason") == "mixed_or_non_string"
+        ]
+        assert matching_checks, (
+            f"Expected bounded CRITICAL malformed STACK_GLOBAL check, got: "
+            f"{[(c.severity, c.message) for c in context_checks]}"
+        )
+
+        check = matching_checks[0]
+        function_hint = check.details.get("function", "")
+        assert function_hint.startswith("bytes(len=200000, hex=0x7878787878787878"), function_hint
+        assert len(function_hint) < 80, f"Expected bounded operand preview, got len={len(function_hint)}"
+        assert len(check.message) < 220, f"Expected bounded context-check message, got len={len(check.message)}"
+
+    def test_stack_global_large_string_operand_preview_is_bounded(self) -> None:
+        """Large string operands should not bloat malformed STACK_GLOBAL findings."""
+        large_text = b"x" * 200_000
+        payload = b"\x80\x04X" + struct.pack("<I", len(large_text)) + large_text + b"K\x01\x93."
+
+        result = self._scan_bytes(payload)
+        assert result.success
+
+        context_checks = [c for c in result.checks if c.name == "STACK_GLOBAL Context Check"]
+        matching_checks = [
+            c
+            for c in context_checks
+            if c.status == CheckStatus.FAILED
+            and c.severity == IssueSeverity.WARNING
+            and c.details.get("reason") == "mixed_or_non_string"
+        ]
+        assert matching_checks, (
+            f"Expected bounded malformed STACK_GLOBAL check, got: {[(c.severity, c.message) for c in context_checks]}"
+        )
+
+        check = matching_checks[0]
+        module_hint = check.details.get("module", "")
+        assert module_hint.startswith("xxxxxxxx"), module_hint
+        assert len(module_hint) < 160, f"Expected bounded string preview, got len={len(module_hint)}"
+        assert len(check.message) < 260, f"Expected bounded context-check message, got len={len(check.message)}"
+
+    def test_stack_global_missing_memo_preserves_unknown_sentinel(self) -> None:
+        """Missing memo operands should fail closed and keep unknown sentinel details."""
+        payload = b"\x80\x04\x8c\x02osh\x7f\x93."
+
+        result = self._scan_bytes(payload)
+        assert result.success
+
+        context_checks = [c for c in result.checks if c.name == "STACK_GLOBAL Context Check"]
+        assert any(
+            c.status == CheckStatus.FAILED
+            and c.severity == IssueSeverity.CRITICAL
+            and c.rule_code == "S205"
+            and c.details.get("function") == "unknown"
+            and c.details.get("reason") == "missing_memo"
+            for c in context_checks
+        ), f"Expected missing-memo STACK_GLOBAL finding, got: {[(c.severity, c.details) for c in context_checks]}"
+
+    def test_stack_global_safe_memoized_reference_remains_passing(self) -> None:
+        """Fully resolved safe memoized STACK_GLOBAL should stay non-failing."""
+        payload = b"\x80\x04\x8c\x0ctorch._utils\x94\x8c\x12_rebuild_tensor_v2\x94h\x00h\x01\x93."
+
+        result = self._scan_bytes(payload)
+        assert result.success
+
+        module_checks = [c for c in result.checks if c.name == "STACK_GLOBAL Module Check"]
+        assert any(c.status == CheckStatus.PASSED for c in module_checks), (
+            f"Expected passing safe STACK_GLOBAL module check, got: {[c.message for c in module_checks]}"
+        )
+
+    def test_stack_global_dangerous_memoized_reference_remains_failing(self) -> None:
+        """Fully resolved dangerous memoized STACK_GLOBAL should remain failing."""
+        payload = b"\x80\x04\x8c\x02os\x94\x8c\x06system\x94h\x00h\x01\x93."
+
+        result = self._scan_bytes(payload)
+        assert result.success
+
+        module_checks = [c for c in result.checks if c.name == "STACK_GLOBAL Module Check"]
+        assert any(c.status == CheckStatus.FAILED for c in module_checks), (
+            f"Expected failing dangerous STACK_GLOBAL module check, got: {[c.message for c in module_checks]}"
+        )
+
+    def test_truncated_stack_global_context_remains_informational(self) -> None:
+        """Simple stack-underflow context should remain informational, not fail-closed."""
+        payload = b"\x80\x04\x8c\x02os\x93."
+
+        result = self._scan_bytes(payload)
+        assert result.success
+
+        context_checks = [c for c in result.checks if c.name == "STACK_GLOBAL Context Check"]
+        assert any(
+            c.status == CheckStatus.FAILED
+            and c.severity == IssueSeverity.INFO
+            and c.rule_code == "S902"
+            and c.message == "STACK_GLOBAL opcode found without sufficient string context"
+            for c in context_checks
+        ), (
+            "Expected informational STACK_GLOBAL context check, got: "
+            f"{[(c.severity, c.message) for c in context_checks]}"
+        )
+
+    def test_malformed_stack_global_first_stream_still_allows_benign_second_stream(self) -> None:
+        """Malformed first stream should not taint benign second-stream behavior."""
+        import io
+
+        buf = io.BytesIO()
+        buf.write(b"\x80\x04K\x01K\x02\x93.")
+        pickle.dump({"safe": True}, buf, protocol=2)
+
+        result = self._scan_bytes(buf.getvalue())
+        assert result.success
+
+        critical_messages = [i.message.lower() for i in result.issues if i.severity == IssueSeverity.CRITICAL]
+        assert not critical_messages, f"Unexpected CRITICAL issues: {critical_messages}"
+        assert any(c.name == "STACK_GLOBAL Context Check" and c.status == CheckStatus.FAILED for c in result.checks), (
+            "Expected malformed STACK_GLOBAL finding in first stream"
+        )
+
+    def test_malformed_stack_global_plus_explicit_reduce_still_flags_reduce(self) -> None:
+        """Malformed STACK_GLOBAL should not suppress explicit dangerous REDUCE detection."""
+        import io
+
+        buf = io.BytesIO()
+        buf.write(b"\x80\x04K\x01K\x02\x93.")
+        buf.write(self._craft_global_reduce_pickle("os", "system"))
+
+        result = self._scan_bytes(buf.getvalue())
+        assert result.success
+        assert result.has_errors
+
+        reduce_messages = [i.message.lower() for i in result.issues if "reduce" in i.message.lower()]
+        assert any("os.system" in msg or "posix.system" in msg for msg in reduce_messages), (
+            f"Expected dangerous REDUCE detection alongside malformed STACK_GLOBAL, got: {reduce_messages}"
+        )
+
     def test_duplicate_proto_same_version_reports_structural_tamper(self) -> None:
         """Duplicate PROTO in one stream should be reported as structural tampering."""
         payload = b"\x80\x02\x80\x02K\x01."
@@ -2542,12 +2748,14 @@ class TestPickleImportOnlyGlobalFindings:
             callable_refs,
             callable_origin_refs,
             callable_origin_is_ext,
+            malformed_stack_globals,
         ) = _simulate_symbolic_reference_maps(opcodes)
 
         assert callable_refs[2] == ("collections", "OrderedDict")
         assert callable_origin_refs[2] == 2
         assert callable_origin_is_ext == {}
         assert 5 not in stack_global_refs
+        assert malformed_stack_globals[5]["reason"] == "insufficient_context"
 
     def test_symbolic_simulation_protocol_five_buffers_preserve_stack_alignment(self) -> None:
         opcodes = [
@@ -2565,12 +2773,14 @@ class TestPickleImportOnlyGlobalFindings:
             callable_refs,
             callable_origin_refs,
             callable_origin_is_ext,
+            malformed_stack_globals,
         ) = _simulate_symbolic_reference_maps(opcodes)
 
         assert stack_global_refs[6] == ("evilpkg", "thing")
         assert callable_refs == {}
         assert callable_origin_refs == {}
         assert callable_origin_is_ext == {}
+        assert malformed_stack_globals == {}
 
 
 @pytest.mark.parametrize(

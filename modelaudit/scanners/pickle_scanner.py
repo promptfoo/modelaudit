@@ -3,10 +3,11 @@
 import io
 import os
 import pickletools
+import reprlib
 import struct
 import time
 from dataclasses import dataclass
-from typing import Any, BinaryIO, ClassVar, TypeGuard
+from typing import Any, BinaryIO, ClassVar, Literal, TypedDict, TypeGuard
 
 from modelaudit.analysis.enhanced_pattern_detector import EnhancedPatternDetector, PatternMatch
 from modelaudit.analysis.entropy_analyzer import EntropyAnalyzer
@@ -46,6 +47,58 @@ from .rule_mapper import (
 _RESYNC_BUDGET = 8192  # Max bytes to scan forward when resyncing after an unknown opcode
 COPYREG_EXTENSION_MODULE = "__copyreg_extension__"
 COPYREG_EXTENSION_PREFIX = "code_"
+_STACK_GLOBAL_OPERAND_PREVIEW_MAX = 128
+_STACK_GLOBAL_BINARY_PREVIEW_BYTES = 8
+_STACK_GLOBAL_OPERAND_PREVIEWER = reprlib.Repr()
+_STACK_GLOBAL_OPERAND_PREVIEWER.maxstring = _STACK_GLOBAL_OPERAND_PREVIEW_MAX
+_STACK_GLOBAL_OPERAND_PREVIEWER.maxother = _STACK_GLOBAL_OPERAND_PREVIEW_MAX
+_STACK_GLOBAL_OPERAND_PREVIEWER.maxlist = 4
+_STACK_GLOBAL_OPERAND_PREVIEWER.maxtuple = 4
+_STACK_GLOBAL_OPERAND_PREVIEWER.maxset = 4
+_STACK_GLOBAL_OPERAND_PREVIEWER.maxfrozenset = 4
+_STACK_GLOBAL_OPERAND_PREVIEWER.maxdict = 4
+
+
+StackGlobalOperandKind = Literal["string", "missing_memo", "unknown", "non_string"]
+MalformedStackGlobalReason = Literal["insufficient_context", "missing_memo", "mixed_or_non_string"]
+
+
+class MalformedStackGlobalDetails(TypedDict):
+    module_kind: StackGlobalOperandKind
+    module: str
+    function_kind: StackGlobalOperandKind
+    function: str
+    reason: MalformedStackGlobalReason
+
+
+def _format_stack_global_string_preview(value: str) -> str:
+    """Return a bounded preview for malformed STACK_GLOBAL string operands."""
+    preview = _STACK_GLOBAL_OPERAND_PREVIEWER.repr(value)
+    if len(preview) >= 2 and preview[0] == preview[-1] and preview[0] in {"'", '"'}:
+        preview = preview[1:-1]
+    return preview
+
+
+def _format_stack_global_operand_preview(value: Any) -> str:
+    """Return a bounded diagnostic preview for malformed STACK_GLOBAL operands."""
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        value_len = value.nbytes if isinstance(value, memoryview) else len(value)
+        prefix_bytes = bytes(value[:_STACK_GLOBAL_BINARY_PREVIEW_BYTES])
+        suffix = "..." if value_len > _STACK_GLOBAL_BINARY_PREVIEW_BYTES else ""
+        return f"{type(value).__name__}(len={value_len}, hex=0x{prefix_bytes.hex()}{suffix})"
+
+    preview = _STACK_GLOBAL_OPERAND_PREVIEWER.repr(value)
+    if len(preview) > _STACK_GLOBAL_OPERAND_PREVIEW_MAX:
+        preview = preview[:_STACK_GLOBAL_OPERAND_PREVIEW_MAX] + "...<truncated>"
+
+    preview_value_len: int | None
+    try:
+        preview_value_len = len(value)
+    except Exception:
+        preview_value_len = None
+
+    length_suffix = f" (len={preview_value_len})" if preview_value_len is not None else ""
+    return f"{type(value).__name__}:{preview}{length_suffix}"
 
 
 def _scan_structural_tamper_findings(file_data: bytes) -> list[dict[str, Any]]:
@@ -2055,6 +2108,11 @@ def _is_risky_ml_import(mod: str, func: str) -> bool:
     return False
 
 
+def _is_risky_ml_module_prefix(mod: str) -> bool:
+    """Return True when a module hint falls under a risky ML import prefix."""
+    return any(mod == prefix or mod.startswith(f"{prefix}.") for prefix in RISKY_ML_MODULE_PREFIXES)
+
+
 def _is_copyreg_extension_ref(mod: str) -> bool:
     """Return True when a reference came from an EXT opcode extension lookup."""
     return mod == COPYREG_EXTENSION_MODULE
@@ -2202,15 +2260,23 @@ def _parse_module_function(arg: str) -> tuple[str, str] | None:
 
 def _simulate_symbolic_reference_maps(
     opcodes: list[tuple],
-) -> tuple[dict[int, tuple[str, str]], dict[int, tuple[str, str]], dict[int, int], dict[int, bool]]:
-    """Simulate callable resolution and retain the opcode index for each originating import."""
+) -> tuple[
+    dict[int, tuple[str, str]],
+    dict[int, tuple[str, str]],
+    dict[int, int],
+    dict[int, bool],
+    dict[int, MalformedStackGlobalDetails],
+]:
+    """Simulate callable resolution and retain import origins plus malformed STACK_GLOBAL details."""
     stack_global_refs: dict[int, tuple[str, str]] = {}
     callable_refs: dict[int, tuple[str, str]] = {}
     callable_origin_refs: dict[int, int] = {}
     callable_origin_is_ext: dict[int, bool] = {}
+    malformed_stack_globals: dict[int, MalformedStackGlobalDetails] = {}
 
     marker = object()
     unknown = object()
+    missing_memo = object()
     stack: list[Any] = []
     memo: dict[int | str, Any] = {}
     next_memo_index = 0
@@ -2232,6 +2298,15 @@ def _simulate_symbolic_reference_maps(
 
     def _is_ref(value: Any) -> TypeGuard[_ResolvedImportRef]:
         return isinstance(value, _ResolvedImportRef)
+
+    def _classify_stack_global_operand(value: Any) -> tuple[StackGlobalOperandKind, str]:
+        if isinstance(value, str):
+            return "string", _format_stack_global_string_preview(value)
+        if value is missing_memo:
+            return "missing_memo", "unknown"
+        if value is unknown:
+            return "unknown", "unknown"
+        return "non_string", _format_stack_global_operand_preview(value)
 
     for i, (opcode, arg, _pos) in enumerate(opcodes):
         name = opcode.name
@@ -2266,6 +2341,20 @@ def _simulate_symbolic_reference_maps(
                 stack_global_refs[i] = (mod_name, func_name)
                 stack.append(ref)
             else:
+                module_kind, module_value = _classify_stack_global_operand(mod_name)
+                function_kind, function_value = _classify_stack_global_operand(func_name)
+                reason: MalformedStackGlobalReason = "insufficient_context"
+                if "missing_memo" in {module_kind, function_kind}:
+                    reason = "missing_memo"
+                elif "non_string" in {module_kind, function_kind}:
+                    reason = "mixed_or_non_string"
+                malformed_stack_globals[i] = {
+                    "module_kind": module_kind,
+                    "module": module_value,
+                    "function_kind": function_kind,
+                    "function": function_value,
+                    "reason": reason,
+                }
                 stack.append(unknown)
             continue
 
@@ -2290,7 +2379,7 @@ def _simulate_symbolic_reference_maps(
             continue
 
         if name in {"GET", "BINGET", "LONG_BINGET"}:
-            stack.append(memo.get(arg, unknown))
+            stack.append(memo.get(arg, missing_memo))
             continue
 
         if name == "MARK":
@@ -2392,11 +2481,12 @@ def _simulate_symbolic_reference_maps(
             stack.append(unknown)
             continue
 
+        if name in {"NONE", "NEWTRUE", "NEWFALSE"}:
+            stack.append(None if name == "NONE" else name == "NEWTRUE")
+            continue
+
         if name in {
             "PERSID",
-            "NONE",
-            "NEWTRUE",
-            "NEWFALSE",
             "INT",
             "BININT",
             "BININT1",
@@ -2415,7 +2505,7 @@ def _simulate_symbolic_reference_maps(
             "BINUNICODE",
             "BINUNICODE8",
         }:
-            stack.append(unknown)
+            stack.append(arg)
             continue
 
         if name == "NEXT_BUFFER":
@@ -2425,12 +2515,18 @@ def _simulate_symbolic_reference_maps(
         if name == "READONLY_BUFFER":
             continue
 
-    return stack_global_refs, callable_refs, callable_origin_refs, callable_origin_is_ext
+    return (
+        stack_global_refs,
+        callable_refs,
+        callable_origin_refs,
+        callable_origin_is_ext,
+        malformed_stack_globals,
+    )
 
 
 def _build_symbolic_reference_maps(
     opcodes: list[tuple],
-) -> tuple[dict[int, tuple[str, str]], dict[int, tuple[str, str]]]:
+) -> tuple[dict[int, tuple[str, str]], dict[int, tuple[str, str]], dict[int, MalformedStackGlobalDetails]]:
     """
     Build symbolic maps of callable references in an opcode stream.
 
@@ -2444,8 +2540,9 @@ def _build_symbolic_reference_maps(
         callable_refs,
         _callable_origin_refs,
         _callable_origin_is_ext,
+        malformed_stack_globals,
     ) = _simulate_symbolic_reference_maps(opcodes)
-    return stack_global_refs, callable_refs
+    return stack_global_refs, callable_refs, malformed_stack_globals
 
 
 def _find_stack_global_strings(
@@ -2906,6 +3003,7 @@ def is_dangerous_reduce_pattern(
             computed_callable_refs,
             _computed_callable_origin_refs,
             computed_callable_origin_is_ext,
+            _computed_malformed_stack_globals,
         ) = _simulate_symbolic_reference_maps(opcodes)
     else:
         computed_stack_refs, computed_callable_refs, computed_callable_origin_is_ext = (
@@ -3066,6 +3164,7 @@ def check_opcode_sequence(
             computed_callable_refs,
             _computed_callable_origin_refs,
             computed_callable_origin_is_ext,
+            _computed_malformed_stack_globals,
         ) = _simulate_symbolic_reference_maps(opcodes)
     else:
         computed_stack_refs, computed_callable_refs, computed_callable_origin_is_ext = (
@@ -4142,7 +4241,7 @@ class PickleScanner(BaseScanner):
             logger.debug(f"Pickle parsing failed during advanced global extraction: {e}")
             return set()
 
-        stack_global_refs, _callable_refs = _build_symbolic_reference_maps(ops)
+        stack_global_refs, _callable_refs, _malformed_stack_globals = _build_symbolic_reference_maps(ops)
 
         for n, (opcode, arg, _pos) in enumerate(ops):
             op_name = opcode.name
@@ -4483,6 +4582,7 @@ class PickleScanner(BaseScanner):
                 callable_refs,
                 callable_origin_refs,
                 callable_origin_is_ext,
+                malformed_stack_globals,
             ) = _simulate_symbolic_reference_maps(opcodes)
             executed_import_origins = set(callable_origin_refs.values())
 
@@ -5252,7 +5352,55 @@ class PickleScanner(BaseScanner):
                                 rule_code=None,
                             )
                     else:
-                        if not ml_context.get("is_ml_content", False):
+                        malformed = malformed_stack_globals.get(i)
+                        if malformed and malformed["reason"] != "insufficient_context":
+                            suspicious_count += 1
+                            module_hint = malformed["module"]
+                            function_hint = malformed["function"]
+                            module_kind = malformed["module_kind"]
+                            function_kind = malformed["function_kind"]
+                            reason = malformed["reason"]
+                            module_looks_high_risk = (
+                                module_kind == "string"
+                                and module_hint not in {"", "unknown"}
+                                and (_is_dangerous_module(module_hint) or _is_risky_ml_module_prefix(module_hint))
+                            )
+                            severity = IssueSeverity.CRITICAL if module_looks_high_risk else IssueSeverity.WARNING
+                            if reason == "missing_memo":
+                                message = (
+                                    "STACK_GLOBAL references missing or invalid memoized operand(s): "
+                                    f"module={module_hint} ({module_kind}), function={function_hint} ({function_kind})"
+                                )
+                            else:
+                                message = (
+                                    "Malformed STACK_GLOBAL operand types can hide dangerous imports: "
+                                    f"module={module_hint} ({module_kind}), function={function_hint} ({function_kind})"
+                                )
+
+                            result.add_check(
+                                name="STACK_GLOBAL Context Check",
+                                passed=False,
+                                message=message,
+                                severity=severity,
+                                location=f"{self.current_file_path} (pos {pos})",
+                                rule_code="S205",
+                                details={
+                                    "position": pos,
+                                    "opcode": opcode.name,
+                                    "module": module_hint,
+                                    "function": function_hint,
+                                    "module_kind": module_kind,
+                                    "function_kind": function_kind,
+                                    "reason": reason,
+                                    "ml_context_confidence": ml_context.get("overall_confidence", 0),
+                                },
+                                why=(
+                                    "STACK_GLOBAL should be formed from two string operands. Non-string operands "
+                                    "or missing memoized values indicate a malformed-by-design payload and are "
+                                    "treated as a security finding under fail-closed handling."
+                                ),
+                            )
+                        elif not ml_context.get("is_ml_content", False):
                             result.add_check(
                                 name="STACK_GLOBAL Context Check",
                                 passed=False,
@@ -6327,7 +6475,7 @@ class PickleScanner(BaseScanner):
         # Pre-compute symbolic references for STACK_GLOBAL resolution.
         # This handles BINUNICODE8, memoized strings (BINGET/LONG_BINGET),
         # and indirect stack flows that a narrow lookback would miss.
-        stack_global_refs, _ = _build_symbolic_reference_maps(opcodes)
+        stack_global_refs, _, _ = _build_symbolic_reference_maps(opcodes)
 
         for i, (opcode, _arg, pos) in enumerate(opcodes):
             if opcode.name not in ("SETITEM", "SETITEMS"):
