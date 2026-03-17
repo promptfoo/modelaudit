@@ -3,10 +3,11 @@
 import io
 import os
 import pickletools
+import reprlib
 import struct
 import time
 from dataclasses import dataclass
-from typing import Any, BinaryIO, ClassVar, TypeGuard
+from typing import Any, BinaryIO, ClassVar, Literal, TypedDict, TypeGuard
 
 from modelaudit.analysis.enhanced_pattern_detector import EnhancedPatternDetector, PatternMatch
 from modelaudit.analysis.entropy_analyzer import EntropyAnalyzer
@@ -46,6 +47,66 @@ from .rule_mapper import (
 _RESYNC_BUDGET = 8192  # Max bytes to scan forward when resyncing after an unknown opcode
 COPYREG_EXTENSION_MODULE = "__copyreg_extension__"
 COPYREG_EXTENSION_PREFIX = "code_"
+_STACK_GLOBAL_OPERAND_PREVIEW_MAX = 128
+_STACK_GLOBAL_BINARY_PREVIEW_BYTES = 8
+_STACK_GLOBAL_OPERAND_PREVIEWER = reprlib.Repr()
+_STACK_GLOBAL_OPERAND_PREVIEWER.maxstring = _STACK_GLOBAL_OPERAND_PREVIEW_MAX
+_STACK_GLOBAL_OPERAND_PREVIEWER.maxother = _STACK_GLOBAL_OPERAND_PREVIEW_MAX
+_STACK_GLOBAL_OPERAND_PREVIEWER.maxlist = 4
+_STACK_GLOBAL_OPERAND_PREVIEWER.maxtuple = 4
+_STACK_GLOBAL_OPERAND_PREVIEWER.maxset = 4
+_STACK_GLOBAL_OPERAND_PREVIEWER.maxfrozenset = 4
+_STACK_GLOBAL_OPERAND_PREVIEWER.maxdict = 4
+
+
+StackGlobalOperandKind = Literal["string", "missing_memo", "unknown", "non_string"]
+MalformedStackGlobalReason = Literal["insufficient_context", "missing_memo", "mixed_or_non_string"]
+
+
+class MalformedStackGlobalDetails(TypedDict):
+    module_kind: StackGlobalOperandKind
+    module: str
+    function_kind: StackGlobalOperandKind
+    function: str
+    reason: MalformedStackGlobalReason
+
+
+class _GenopsBudgetExceeded(Exception):
+    """Signal that opcode iteration stopped due to an explicit resource budget."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _format_stack_global_string_preview(value: str) -> str:
+    """Return a bounded preview for malformed STACK_GLOBAL string operands."""
+    preview = _STACK_GLOBAL_OPERAND_PREVIEWER.repr(value)
+    if len(preview) >= 2 and preview[0] == preview[-1] and preview[0] in {"'", '"'}:
+        preview = preview[1:-1]
+    return preview
+
+
+def _format_stack_global_operand_preview(value: Any) -> str:
+    """Return a bounded diagnostic preview for malformed STACK_GLOBAL operands."""
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        value_len = value.nbytes if isinstance(value, memoryview) else len(value)
+        prefix_bytes = bytes(value[:_STACK_GLOBAL_BINARY_PREVIEW_BYTES])
+        suffix = "..." if value_len > _STACK_GLOBAL_BINARY_PREVIEW_BYTES else ""
+        return f"{type(value).__name__}(len={value_len}, hex=0x{prefix_bytes.hex()}{suffix})"
+
+    preview = _STACK_GLOBAL_OPERAND_PREVIEWER.repr(value)
+    if len(preview) > _STACK_GLOBAL_OPERAND_PREVIEW_MAX:
+        preview = preview[:_STACK_GLOBAL_OPERAND_PREVIEW_MAX] + "...<truncated>"
+
+    preview_value_len: int | None
+    try:
+        preview_value_len = len(value)
+    except Exception:
+        preview_value_len = None
+
+    length_suffix = f" (len={preview_value_len})" if preview_value_len is not None else ""
+    return f"{type(value).__name__}:{preview}{length_suffix}"
 
 
 def _scan_structural_tamper_findings(file_data: bytes) -> list[dict[str, Any]]:
@@ -147,7 +208,13 @@ def _scan_structural_tamper_findings(file_data: bytes) -> list[dict[str, Any]]:
     return findings
 
 
-def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> Any:
+def _genops_with_fallback(
+    file_obj: BinaryIO,
+    *,
+    multi_stream: bool = False,
+    max_items: int | None = None,
+    deadline: float | None = None,
+) -> Any:
     """
     Wrapper around pickletools.genops that handles protocol mismatches.
 
@@ -168,6 +235,13 @@ def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> 
     resync_skipped = 0
     # Track whether we've successfully parsed at least one complete stream
     parsed_any_stream = False
+    yielded_items = 0
+
+    def _check_budget(*, pending_items: int = 0) -> None:
+        if max_items is not None and (yielded_items + pending_items) >= max_items:
+            raise _GenopsBudgetExceeded("max_items")
+        if deadline is not None and time.time() > deadline:
+            raise _GenopsBudgetExceeded("deadline")
 
     while True:
         stream_start = file_obj.tell()
@@ -177,9 +251,16 @@ def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> 
         if not parsed_any_stream:
             # First stream: yield opcodes directly (no buffering needed)
             try:
-                for item in pickletools.genops(file_obj):
+                op_iter = pickletools.genops(file_obj)
+                while True:
+                    _check_budget()
+                    try:
+                        item = next(op_iter)
+                    except StopIteration:
+                        break
                     had_opcodes = True
                     yield item
+                    yielded_items += 1
             except ValueError as e:
                 error_str = str(e).lower()
                 is_unknown_opcode = "opcode" in error_str and "unknown" in error_str
@@ -214,7 +295,16 @@ def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> 
             # produce false positives.
             buffered: list[Any] = []
             try:
-                for item in pickletools.genops(file_obj):
+                op_iter = pickletools.genops(file_obj)
+                while True:
+                    # Do not emit buffered follow-on stream opcodes until the
+                    # stream has completed successfully. If the budget expires
+                    # here, let the caller surface the analysis truncation.
+                    _check_budget(pending_items=len(buffered))
+                    try:
+                        item = next(op_iter)
+                    except StopIteration:
+                        break
                     had_opcodes = True
                     buffered.append(item)
             except ValueError:
@@ -232,7 +322,10 @@ def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> 
 
             if not stream_error:
                 # Stream completed successfully — yield buffered opcodes
-                yield from buffered
+                for buffered_item in buffered:
+                    _check_budget()
+                    yield buffered_item
+                    yielded_items += 1
 
         if stream_error and had_opcodes:
             # First stream parse interruption after yielding some opcodes.
@@ -2055,6 +2148,11 @@ def _is_risky_ml_import(mod: str, func: str) -> bool:
     return False
 
 
+def _is_risky_ml_module_prefix(mod: str) -> bool:
+    """Return True when a module hint falls under a risky ML import prefix."""
+    return any(mod == prefix or mod.startswith(f"{prefix}.") for prefix in RISKY_ML_MODULE_PREFIXES)
+
+
 def _is_copyreg_extension_ref(mod: str) -> bool:
     """Return True when a reference came from an EXT opcode extension lookup."""
     return mod == COPYREG_EXTENSION_MODULE
@@ -2202,15 +2300,23 @@ def _parse_module_function(arg: str) -> tuple[str, str] | None:
 
 def _simulate_symbolic_reference_maps(
     opcodes: list[tuple],
-) -> tuple[dict[int, tuple[str, str]], dict[int, tuple[str, str]], dict[int, int], dict[int, bool]]:
-    """Simulate callable resolution and retain the opcode index for each originating import."""
+) -> tuple[
+    dict[int, tuple[str, str]],
+    dict[int, tuple[str, str]],
+    dict[int, int],
+    dict[int, bool],
+    dict[int, MalformedStackGlobalDetails],
+]:
+    """Simulate callable resolution and retain import origins plus malformed STACK_GLOBAL details."""
     stack_global_refs: dict[int, tuple[str, str]] = {}
     callable_refs: dict[int, tuple[str, str]] = {}
     callable_origin_refs: dict[int, int] = {}
     callable_origin_is_ext: dict[int, bool] = {}
+    malformed_stack_globals: dict[int, MalformedStackGlobalDetails] = {}
 
     marker = object()
     unknown = object()
+    missing_memo = object()
     stack: list[Any] = []
     memo: dict[int | str, Any] = {}
     next_memo_index = 0
@@ -2232,6 +2338,15 @@ def _simulate_symbolic_reference_maps(
 
     def _is_ref(value: Any) -> TypeGuard[_ResolvedImportRef]:
         return isinstance(value, _ResolvedImportRef)
+
+    def _classify_stack_global_operand(value: Any) -> tuple[StackGlobalOperandKind, str]:
+        if isinstance(value, str):
+            return "string", _format_stack_global_string_preview(value)
+        if value is missing_memo:
+            return "missing_memo", "unknown"
+        if value is unknown:
+            return "unknown", "unknown"
+        return "non_string", _format_stack_global_operand_preview(value)
 
     for i, (opcode, arg, _pos) in enumerate(opcodes):
         name = opcode.name
@@ -2266,6 +2381,20 @@ def _simulate_symbolic_reference_maps(
                 stack_global_refs[i] = (mod_name, func_name)
                 stack.append(ref)
             else:
+                module_kind, module_value = _classify_stack_global_operand(mod_name)
+                function_kind, function_value = _classify_stack_global_operand(func_name)
+                reason: MalformedStackGlobalReason = "insufficient_context"
+                if "missing_memo" in {module_kind, function_kind}:
+                    reason = "missing_memo"
+                elif "non_string" in {module_kind, function_kind}:
+                    reason = "mixed_or_non_string"
+                malformed_stack_globals[i] = {
+                    "module_kind": module_kind,
+                    "module": module_value,
+                    "function_kind": function_kind,
+                    "function": function_value,
+                    "reason": reason,
+                }
                 stack.append(unknown)
             continue
 
@@ -2290,7 +2419,7 @@ def _simulate_symbolic_reference_maps(
             continue
 
         if name in {"GET", "BINGET", "LONG_BINGET"}:
-            stack.append(memo.get(arg, unknown))
+            stack.append(memo.get(arg, missing_memo))
             continue
 
         if name == "MARK":
@@ -2392,11 +2521,12 @@ def _simulate_symbolic_reference_maps(
             stack.append(unknown)
             continue
 
+        if name in {"NONE", "NEWTRUE", "NEWFALSE"}:
+            stack.append(None if name == "NONE" else name == "NEWTRUE")
+            continue
+
         if name in {
             "PERSID",
-            "NONE",
-            "NEWTRUE",
-            "NEWFALSE",
             "INT",
             "BININT",
             "BININT1",
@@ -2415,7 +2545,7 @@ def _simulate_symbolic_reference_maps(
             "BINUNICODE",
             "BINUNICODE8",
         }:
-            stack.append(unknown)
+            stack.append(arg)
             continue
 
         if name == "NEXT_BUFFER":
@@ -2425,12 +2555,18 @@ def _simulate_symbolic_reference_maps(
         if name == "READONLY_BUFFER":
             continue
 
-    return stack_global_refs, callable_refs, callable_origin_refs, callable_origin_is_ext
+    return (
+        stack_global_refs,
+        callable_refs,
+        callable_origin_refs,
+        callable_origin_is_ext,
+        malformed_stack_globals,
+    )
 
 
 def _build_symbolic_reference_maps(
     opcodes: list[tuple],
-) -> tuple[dict[int, tuple[str, str]], dict[int, tuple[str, str]]]:
+) -> tuple[dict[int, tuple[str, str]], dict[int, tuple[str, str]], dict[int, MalformedStackGlobalDetails]]:
     """
     Build symbolic maps of callable references in an opcode stream.
 
@@ -2444,8 +2580,9 @@ def _build_symbolic_reference_maps(
         callable_refs,
         _callable_origin_refs,
         _callable_origin_is_ext,
+        malformed_stack_globals,
     ) = _simulate_symbolic_reference_maps(opcodes)
-    return stack_global_refs, callable_refs
+    return stack_global_refs, callable_refs, malformed_stack_globals
 
 
 def _find_stack_global_strings(
@@ -2906,6 +3043,7 @@ def is_dangerous_reduce_pattern(
             computed_callable_refs,
             _computed_callable_origin_refs,
             computed_callable_origin_is_ext,
+            _computed_malformed_stack_globals,
         ) = _simulate_symbolic_reference_maps(opcodes)
     else:
         computed_stack_refs, computed_callable_refs, computed_callable_origin_is_ext = (
@@ -3066,6 +3204,7 @@ def check_opcode_sequence(
             computed_callable_refs,
             _computed_callable_origin_refs,
             computed_callable_origin_is_ext,
+            _computed_malformed_stack_globals,
         ) = _simulate_symbolic_reference_maps(opcodes)
     else:
         computed_stack_refs, computed_callable_refs, computed_callable_origin_is_ext = (
@@ -4132,32 +4271,68 @@ class PickleScanner(BaseScanner):
             ),
         )
 
-    def _extract_globals_advanced(self, data: BinaryIO, multiple_pickles: bool = True) -> set[tuple[str, str, str]]:
+    def _extract_globals_advanced(
+        self,
+        data: BinaryIO,
+        multiple_pickles: bool = True,
+        scan_start_time: float | None = None,
+    ) -> set[tuple[str, str, str]]:
         """Advanced pickle global extraction with STACK_GLOBAL and memo support."""
         globals_found: set[tuple[str, str, str]] = set()
+        effective_scan_start_time = scan_start_time if scan_start_time is not None else self.scan_start_time
+        deadline = effective_scan_start_time + self.timeout if effective_scan_start_time is not None else None
+        timeout_warning_emitted = False
+        ops: list[tuple[Any, Any, int | None]] = []
 
         try:
-            ops: list[tuple[Any, Any, int | None]] = list(_genops_with_fallback(data, multi_stream=multiple_pickles))
+            for opcode, arg, pos in _genops_with_fallback(
+                data,
+                multi_stream=multiple_pickles,
+                max_items=self.max_opcodes,
+                deadline=deadline,
+            ):
+                ops.append((opcode, arg, pos))
+                op_name = opcode.name
+                if op_name in {"GLOBAL", "INST"} and isinstance(arg, str):
+                    parsed = _parse_module_function(arg)
+                    if parsed is not None:
+                        globals_found.add((*parsed, op_name))
+        except _GenopsBudgetExceeded as e:
+            if e.reason == "max_items":
+                logger.warning(f"Advanced global extraction stopped after reaching max_opcodes ({self.max_opcodes})")
+            else:
+                logger.warning(f"Advanced global extraction stopped after exceeding timeout ({self.timeout}s)")
+            return globals_found
         except Exception as e:
+            if globals_found:
+                logger.warning(f"Pickle parsing failed, but found {len(globals_found)} globals: {e}")
+                return globals_found
             logger.debug(f"Pickle parsing failed during advanced global extraction: {e}")
             return set()
 
-        stack_global_refs, _callable_refs = _build_symbolic_reference_maps(ops)
+        if len(ops) >= self.max_opcodes:
+            logger.warning(f"Advanced global extraction stopped after reaching max_opcodes ({self.max_opcodes})")
+        elif deadline is not None and time.time() > deadline:
+            logger.warning(f"Advanced global extraction stopped after exceeding timeout ({self.timeout}s)")
+            timeout_warning_emitted = True
+            return globals_found
 
-        for n, (opcode, arg, _pos) in enumerate(ops):
+        stack_global_refs, _callable_refs, _malformed_stack_globals = _build_symbolic_reference_maps(ops)
+
+        for n, (opcode, _arg, _pos) in enumerate(ops):
             op_name = opcode.name
-            if op_name in {"GLOBAL", "INST"} and isinstance(arg, str):
-                parsed = _parse_module_function(arg)
-                if parsed is not None:
-                    globals_found.add((*parsed, op_name))
-            elif op_name == "STACK_GLOBAL":
+            if deadline is not None and time.time() > deadline:
+                if not timeout_warning_emitted:
+                    logger.warning(f"Advanced global extraction stopped after exceeding timeout ({self.timeout}s)")
+                break
+
+            if op_name == "STACK_GLOBAL":
                 resolved = stack_global_refs.get(n)
                 if resolved:
                     globals_found.add((*resolved, op_name))
                 else:
                     logger.debug(f"STACK_GLOBAL parsing failed at position {n}")
                     globals_found.add(("unknown", "unknown", op_name))
-
         return globals_found
 
     def _extract_stack_global_values(
@@ -4358,112 +4533,156 @@ class PickleScanner(BaseScanner):
             warning_stack_depth_limit = 5000
             # Store warnings for ML-context-aware processing
             stack_depth_warnings: list[dict[str, int | str]] = []
+            opcode_budget_exceeded = False
 
-            for opcode, arg, pos in _genops_with_fallback(file_obj, multi_stream=True):
-                # Check for interrupts periodically during opcode processing
-                if opcode_count % 1000 == 0:  # Check every 1000 opcodes
-                    self.check_interrupted()
+            try:
+                for opcode, arg, pos in _genops_with_fallback(
+                    file_obj,
+                    multi_stream=True,
+                    max_items=self.max_opcodes + 1,
+                    deadline=result.start_time + self.timeout,
+                ):
+                    # Check for interrupts periodically during opcode processing
+                    if opcode_count % 1000 == 0:  # Check every 1000 opcodes
+                        self.check_interrupted()
 
-                opcodes.append((opcode, arg, pos))
-                opcode_count += 1
+                    opcodes.append((opcode, arg, pos))
+                    opcode_count += 1
 
-                # Enhanced opcode sequence analysis
-                sequence_results = self.opcode_sequence_analyzer.analyze_opcode(opcode.name, arg, pos)
+                    # Enhanced opcode sequence analysis
+                    sequence_results = self.opcode_sequence_analyzer.analyze_opcode(opcode.name, arg, pos)
 
-                # Process any detected dangerous sequences
-                if sequence_results:
-                    for seq_result in sequence_results:
-                        self._create_opcode_sequence_check(seq_result, result)
+                    # Process any detected dangerous sequences
+                    if sequence_results:
+                        for seq_result in sequence_results:
+                            self._create_opcode_sequence_check(seq_result, result)
 
-                # Track stack depth based on opcode type
-                # Stack-building opcodes
-                if opcode.name in ["MARK", "TUPLE", "LIST", "DICT", "FROZENSET", "INST", "OBJ", "BUILD"]:
-                    current_stack_depth += 1
-                    max_stack_depth = max(max_stack_depth, current_stack_depth)
-                # Stack-consuming opcodes
-                elif opcode.name in ["POP", "POP_MARK", "SETITEM", "SETITEMS", "APPEND", "APPENDS"]:
-                    current_stack_depth = max(0, current_stack_depth - 1)
-                # STOP resets the stack
-                elif opcode.name == "STOP":
-                    current_stack_depth = 0
-                    if first_pickle_end_pos is None:
-                        first_pickle_end_pos = start_pos + pos + 1
+                    # Track stack depth based on opcode type
+                    # Stack-building opcodes
+                    if opcode.name in ["MARK", "TUPLE", "LIST", "DICT", "FROZENSET", "INST", "OBJ", "BUILD"]:
+                        current_stack_depth += 1
+                        max_stack_depth = max(max_stack_depth, current_stack_depth)
+                    # Stack-consuming opcodes
+                    elif opcode.name in ["POP", "POP_MARK", "SETITEM", "SETITEMS", "APPEND", "APPENDS"]:
+                        current_stack_depth = max(0, current_stack_depth - 1)
+                    # STOP resets the stack
+                    elif opcode.name == "STOP":
+                        current_stack_depth = 0
+                        if first_pickle_end_pos is None:
+                            first_pickle_end_pos = start_pos + pos + 1
 
-                # Store stack depth warnings for ML-context-aware processing later
-                if current_stack_depth > base_stack_depth_limit:
-                    # Don't break immediately - store the warning for context-aware processing
-                    stack_depth_warnings.append(
-                        {
-                            "current_depth": int(current_stack_depth),
-                            "position": int(pos) if pos is not None else 0,
-                            "opcode": str(opcode.name),
-                        }
-                    )
-                    # Only break if stack depth becomes extremely high (10x base limit)
-                    # to prevent actual resource exhaustion attacks
-                    if current_stack_depth > base_stack_depth_limit * 10:
+                    # Store stack depth warnings for ML-context-aware processing later
+                    if current_stack_depth > base_stack_depth_limit:
+                        # Don't break immediately - store the warning for context-aware processing
+                        stack_depth_warnings.append(
+                            {
+                                "current_depth": int(current_stack_depth),
+                                "position": int(pos) if pos is not None else 0,
+                                "opcode": str(opcode.name),
+                            }
+                        )
+                        # Only break if stack depth becomes extremely high (10x base limit)
+                        # to prevent actual resource exhaustion attacks
+                        if current_stack_depth > base_stack_depth_limit * 10:
+                            result.add_check(
+                                name="Stack Depth Safety Check",
+                                passed=False,
+                                message=f"Extreme stack depth ({current_stack_depth}) - stopping scan for safety",
+                                severity=IssueSeverity.CRITICAL,
+                                location=f"{self.current_file_path} (pos {pos})",
+                                details={
+                                    "current_depth": current_stack_depth,
+                                    "max_allowed": base_stack_depth_limit * 10,
+                                    "position": pos,
+                                    "opcode": opcode.name,
+                                },
+                                why=(
+                                    "Stack depth is extremely high and could indicate a maliciously crafted pickle "
+                                    "designed to cause resource exhaustion."
+                                ),
+                            )
+                            break
+
+                    # Track strings for STACK_GLOBAL analysis
+                    if opcode.name in STRING_OPCODES and isinstance(arg, str):
+                        string_stack.append(arg)
+                        # Keep only the last 10 strings to avoid memory issues
+                        if len(string_stack) > 10:
+                            string_stack.pop(0)
+
+                    # Check for too many opcodes
+                    if opcode_count > self.max_opcodes:
                         result.add_check(
-                            name="Stack Depth Safety Check",
+                            name="Opcode Count Check",
                             passed=False,
-                            message=f"Extreme stack depth ({current_stack_depth}) - stopping scan for safety",
-                            severity=IssueSeverity.CRITICAL,
-                            location=f"{self.current_file_path} (pos {pos})",
+                            message=f"Too many opcodes in pickle (> {self.max_opcodes})",
+                            severity=IssueSeverity.INFO,
+                            location=self.current_file_path,
                             details={
-                                "current_depth": current_stack_depth,
-                                "max_allowed": base_stack_depth_limit * 10,
-                                "position": pos,
-                                "opcode": opcode.name,
+                                "opcode_count": opcode_count,
+                                "max_opcodes": self.max_opcodes,
                             },
-                            why=(
-                                "Stack depth is extremely high and could indicate a maliciously crafted pickle "
-                                "designed to cause resource exhaustion."
-                            ),
+                            why=get_pattern_explanation("pickle_size_limit"),
+                            rule_code="S902",
                         )
                         break
 
-                # Track strings for STACK_GLOBAL analysis
-                if opcode.name in STRING_OPCODES and isinstance(arg, str):
-                    string_stack.append(arg)
-                    # Keep only the last 10 strings to avoid memory issues
-                    if len(string_stack) > 10:
-                        string_stack.pop(0)
+                    # Check for timeout
+                    if time.time() - result.start_time > self.timeout:
+                        result.add_check(
+                            name="Scan Timeout Check",
+                            passed=False,
+                            message=f"Scanning timed out after {self.timeout} seconds",
+                            severity=IssueSeverity.INFO,
+                            location=self.current_file_path,
+                            details={"opcode_count": opcode_count, "timeout": self.timeout},
+                            why=(
+                                "The scan exceeded the configured time limit. Large or complex pickle files may take "
+                                "longer to analyze due to the number of opcodes that need to be processed."
+                            ),
+                            rule_code="S902",
+                        )
+                        break
+            except _GenopsBudgetExceeded as e:
+                if e.reason == "max_items":
+                    opcode_budget_exceeded = True
 
-                # Check for too many opcodes
-                if opcode_count > self.max_opcodes:
-                    result.add_check(
-                        name="Opcode Count Check",
-                        passed=False,
-                        message=f"Too many opcodes in pickle (> {self.max_opcodes})",
-                        severity=IssueSeverity.INFO,
-                        location=self.current_file_path,
-                        details={
-                            "opcode_count": opcode_count,
-                            "max_opcodes": self.max_opcodes,
-                        },
-                        why=get_pattern_explanation("pickle_size_limit"),
-                        rule_code="S902",
-                    )
-                    break
+            if opcode_budget_exceeded:
+                result.metadata["analysis_incomplete"] = True
+                result.add_check(
+                    name="Opcode Count Check",
+                    passed=False,
+                    message=f"Scanning stopped after reaching opcode budget ({self.max_opcodes})",
+                    severity=IssueSeverity.INFO,
+                    location=self.current_file_path,
+                    details={
+                        "opcode_count": opcode_count,
+                        "max_opcodes": self.max_opcodes,
+                        "analysis_incomplete": True,
+                    },
+                    why=get_pattern_explanation("pickle_size_limit"),
+                    rule_code="S902",
+                )
 
-                # Check for timeout
-                if time.time() - result.start_time > self.timeout:
-                    result.add_check(
-                        name="Scan Timeout Check",
-                        passed=False,
-                        message=f"Scanning timed out after {self.timeout} seconds",
-                        severity=IssueSeverity.INFO,
-                        location=self.current_file_path,
-                        details={"opcode_count": opcode_count, "timeout": self.timeout},
-                        why=(
-                            "The scan exceeded the configured time limit. Large or complex pickle files may take "
-                            "longer to analyze due to the number of opcodes that need to be processed."
-                        ),
-                        rule_code="S902",
-                    )
-                    break
+            if time.time() - result.start_time > self.timeout and not any(
+                check.name == "Scan Timeout Check" and check.status == CheckStatus.FAILED for check in result.checks
+            ):
+                result.add_check(
+                    name="Scan Timeout Check",
+                    passed=False,
+                    message=f"Scanning timed out after {self.timeout} seconds",
+                    severity=IssueSeverity.INFO,
+                    location=self.current_file_path,
+                    details={"opcode_count": opcode_count, "timeout": self.timeout},
+                    why=(
+                        "The scan exceeded the configured time limit. Large or complex pickle files may take "
+                        "longer to analyze due to the number of opcodes that need to be processed."
+                    ),
+                    rule_code="S902",
+                )
 
             # Add successful opcode count check if within limits
-            if opcode_count <= self.max_opcodes:
+            if opcode_count <= self.max_opcodes and not opcode_budget_exceeded:
                 result.add_check(
                     name="Opcode Count Check",
                     passed=True,
@@ -4483,6 +4702,7 @@ class PickleScanner(BaseScanner):
                 callable_refs,
                 callable_origin_refs,
                 callable_origin_is_ext,
+                malformed_stack_globals,
             ) = _simulate_symbolic_reference_maps(opcodes)
             executed_import_origins = set(callable_origin_refs.values())
 
@@ -5252,7 +5472,55 @@ class PickleScanner(BaseScanner):
                                 rule_code=None,
                             )
                     else:
-                        if not ml_context.get("is_ml_content", False):
+                        malformed = malformed_stack_globals.get(i)
+                        if malformed and malformed["reason"] != "insufficient_context":
+                            suspicious_count += 1
+                            module_hint = malformed["module"]
+                            function_hint = malformed["function"]
+                            module_kind = malformed["module_kind"]
+                            function_kind = malformed["function_kind"]
+                            reason = malformed["reason"]
+                            module_looks_high_risk = (
+                                module_kind == "string"
+                                and module_hint not in {"", "unknown"}
+                                and (_is_dangerous_module(module_hint) or _is_risky_ml_module_prefix(module_hint))
+                            )
+                            severity = IssueSeverity.CRITICAL if module_looks_high_risk else IssueSeverity.WARNING
+                            if reason == "missing_memo":
+                                message = (
+                                    "STACK_GLOBAL references missing or invalid memoized operand(s): "
+                                    f"module={module_hint} ({module_kind}), function={function_hint} ({function_kind})"
+                                )
+                            else:
+                                message = (
+                                    "Malformed STACK_GLOBAL operand types can hide dangerous imports: "
+                                    f"module={module_hint} ({module_kind}), function={function_hint} ({function_kind})"
+                                )
+
+                            result.add_check(
+                                name="STACK_GLOBAL Context Check",
+                                passed=False,
+                                message=message,
+                                severity=severity,
+                                location=f"{self.current_file_path} (pos {pos})",
+                                rule_code="S205",
+                                details={
+                                    "position": pos,
+                                    "opcode": opcode.name,
+                                    "module": module_hint,
+                                    "function": function_hint,
+                                    "module_kind": module_kind,
+                                    "function_kind": function_kind,
+                                    "reason": reason,
+                                    "ml_context_confidence": ml_context.get("overall_confidence", 0),
+                                },
+                                why=(
+                                    "STACK_GLOBAL should be formed from two string operands. Non-string operands "
+                                    "or missing memoized values indicate a malformed-by-design payload and are "
+                                    "treated as a security finding under fail-closed handling."
+                                ),
+                            )
+                        elif not ml_context.get("is_ml_content", False):
                             result.add_check(
                                 name="STACK_GLOBAL Context Check",
                                 passed=False,
@@ -6327,7 +6595,7 @@ class PickleScanner(BaseScanner):
         # Pre-compute symbolic references for STACK_GLOBAL resolution.
         # This handles BINUNICODE8, memoized strings (BINGET/LONG_BINGET),
         # and indirect stack flows that a narrow lookback would miss.
-        stack_global_refs, _ = _build_symbolic_reference_maps(opcodes)
+        stack_global_refs, _, _ = _build_symbolic_reference_maps(opcodes)
 
         for i, (opcode, _arg, pos) in enumerate(opcodes):
             if opcode.name not in ("SETITEM", "SETITEMS"):

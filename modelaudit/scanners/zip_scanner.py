@@ -29,7 +29,8 @@ class ZipScanner(BaseScanner):
 
     name = "zip"
     description = "Scans ZIP archive files and their contents recursively"
-    supported_extensions: ClassVar[list[str]] = [".zip", ".npz"]
+    # Include .mar so non-TorchServe archives still receive generic ZIP scanning.
+    supported_extensions: ClassVar[list[str]] = [".zip", ".npz", ".mar"]
 
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
@@ -120,6 +121,7 @@ class ZipScanner(BaseScanner):
         """Recursively scan a ZIP file and its contents"""
         result = ScanResult(scanner_name=self.name)
         contents: list[dict[str, Any]] = []
+        archive_ext = os.path.splitext(path)[1].lower()
 
         # Check depth to prevent zip bomb attacks
         if depth >= self.max_depth:
@@ -343,6 +345,11 @@ class ZipScanner(BaseScanner):
                         # This preserves the original filename for scanners that need it (like ManifestScanner)
 
                         try:
+                            if archive_ext == ".mar" and name.lower().endswith(".py"):
+                                mar_python_result = self._scan_mar_python_entry(path, name, tmp_path)
+                                if mar_python_result is not None:
+                                    result.merge(mar_python_result)
+
                             # Import core here to avoid circular import
                             from .. import core
 
@@ -398,6 +405,53 @@ class ZipScanner(BaseScanner):
         result.metadata["contents"] = contents
         result.metadata["file_size"] = os.path.getsize(path)
         result.finish(success=not result.has_errors)
+        return result
+
+    def _scan_mar_python_entry(self, archive_path: str, entry_name: str, extracted_path: str) -> ScanResult | None:
+        """Apply TorchServe-style Python handler analysis for manifest-less `.mar` fallback."""
+        try:
+            with open(extracted_path, "rb") as source_file:
+                source_bytes = source_file.read()
+        except OSError as exc:
+            result = ScanResult(scanner_name=self.name)
+            result.add_check(
+                name="TorchServe Handler Static Analysis",
+                passed=False,
+                message=f"Unable to read Python entry for static analysis: {exc}",
+                severity=IssueSeverity.WARNING,
+                location=f"{archive_path}:{entry_name}",
+                details={"entry": entry_name, "exception_type": type(exc).__name__},
+            )
+            result.finish(success=False)
+            return result
+
+        from .torchserve_mar_scanner import TorchServeMarScanner
+
+        mar_scanner = TorchServeMarScanner(config=self.config)
+        risky_calls, parse_error = mar_scanner._find_high_risk_calls(source_bytes)
+        if parse_error is None and not risky_calls:
+            return None
+
+        result = ScanResult(scanner_name=self.name)
+        if parse_error is not None:
+            result.add_check(
+                name="TorchServe Handler Static Analysis",
+                passed=False,
+                message=f"Unable to parse Python entry for static analysis: {parse_error}",
+                severity=IssueSeverity.WARNING,
+                location=f"{archive_path}:{entry_name}",
+                details={"entry": entry_name},
+            )
+        else:
+            result.add_check(
+                name="TorchServe Handler Static Analysis",
+                passed=False,
+                message=f"Handler contains high-risk execution primitives: {', '.join(sorted(risky_calls))}",
+                severity=IssueSeverity.CRITICAL,
+                location=f"{archive_path}:{entry_name}",
+                details={"entry": entry_name, "risky_calls": sorted(risky_calls)},
+            )
+        result.finish(success=False)
         return result
 
     def extract_metadata(self, file_path: str) -> dict[str, Any]:

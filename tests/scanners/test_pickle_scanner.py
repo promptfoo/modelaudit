@@ -4,6 +4,8 @@ import struct
 import sys
 import tempfile
 import unittest
+from collections.abc import Iterator
+from io import BytesIO
 from pathlib import Path
 from typing import ClassVar
 
@@ -21,6 +23,8 @@ from modelaudit.detectors.suspicious_symbols import (
 from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.pickle_scanner import (
     PickleScanner,
+    _genops_with_fallback,
+    _GenopsBudgetExceeded,
     _is_actually_dangerous_global,
     _is_safe_import_only_global,
     _simulate_symbolic_reference_maps,
@@ -1026,6 +1030,212 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
             f"got: {[i.message for i in result.issues]}"
         )
 
+    def test_stack_global_non_string_operands_fail_closed(self) -> None:
+        """STACK_GLOBAL with two integers should be treated as a malformed warning."""
+        payload = b"\x80\x04K\x01K\x02\x93."
+
+        result = self._scan_bytes(payload)
+        assert result.success
+
+        context_checks = [c for c in result.checks if c.name == "STACK_GLOBAL Context Check"]
+        assert any(c.status == CheckStatus.FAILED for c in context_checks), (
+            f"Expected failed STACK_GLOBAL malformed check, got: {[c.message for c in context_checks]}"
+        )
+        assert any(
+            c.severity == IssueSeverity.WARNING
+            and c.rule_code == "S205"
+            and c.details.get("reason") == "mixed_or_non_string"
+            for c in context_checks
+        ), (
+            "Expected WARNING S205 malformed STACK_GLOBAL check, got: "
+            f"{[(c.severity, c.rule_code) for c in context_checks]}"
+        )
+
+    def test_stack_global_dangerous_module_plus_non_string_operand_is_critical(self) -> None:
+        """A dangerous module string plus a non-string operand should escalate to CRITICAL."""
+        payload = b"\x80\x04\x8c\x02osK\x01\x93."
+
+        result = self._scan_bytes(payload)
+        assert result.success
+
+        context_checks = [c for c in result.checks if c.name == "STACK_GLOBAL Context Check"]
+        assert any(
+            c.status == CheckStatus.FAILED
+            and c.severity == IssueSeverity.CRITICAL
+            and c.rule_code == "S205"
+            and c.details.get("module") == "os"
+            and c.details.get("reason") == "mixed_or_non_string"
+            for c in context_checks
+        ), f"Expected CRITICAL malformed STACK_GLOBAL check, got: {[(c.severity, c.message) for c in context_checks]}"
+
+    def test_stack_global_risky_ml_module_prefix_plus_non_string_operand_is_critical(self) -> None:
+        """Risky ML module hints should not downgrade malformed STACK_GLOBAL findings."""
+        payload = b"\x80\x04\x8c\x0dtorch._dynamoK\x01\x93."
+
+        result = self._scan_bytes(payload)
+        assert result.success
+
+        context_checks = [c for c in result.checks if c.name == "STACK_GLOBAL Context Check"]
+        assert any(
+            c.status == CheckStatus.FAILED
+            and c.severity == IssueSeverity.CRITICAL
+            and c.rule_code == "S205"
+            and c.details.get("module") == "torch._dynamo"
+            and c.details.get("reason") == "mixed_or_non_string"
+            for c in context_checks
+        ), (
+            "Expected CRITICAL malformed STACK_GLOBAL finding for risky ML prefix, got: "
+            f"{[(c.severity, c.message) for c in context_checks]}"
+        )
+
+    def test_stack_global_large_bytes_operand_preview_is_bounded(self) -> None:
+        """Large malformed operands should not expand finding payloads."""
+        large_bytes = b"x" * 200_000
+        payload = b"\x80\x04\x8c\x02osB" + struct.pack("<I", len(large_bytes)) + large_bytes + b"\x93."
+
+        result = self._scan_bytes(payload)
+        assert result.success
+
+        context_checks = [c for c in result.checks if c.name == "STACK_GLOBAL Context Check"]
+        matching_checks = [
+            c
+            for c in context_checks
+            if c.status == CheckStatus.FAILED
+            and c.severity == IssueSeverity.CRITICAL
+            and c.details.get("module") == "os"
+            and c.details.get("reason") == "mixed_or_non_string"
+        ]
+        assert matching_checks, (
+            f"Expected bounded CRITICAL malformed STACK_GLOBAL check, got: "
+            f"{[(c.severity, c.message) for c in context_checks]}"
+        )
+
+        check = matching_checks[0]
+        function_hint = check.details.get("function", "")
+        assert function_hint.startswith("bytes(len=200000, hex=0x7878787878787878"), function_hint
+        assert len(function_hint) < 80, f"Expected bounded operand preview, got len={len(function_hint)}"
+        assert len(check.message) < 220, f"Expected bounded context-check message, got len={len(check.message)}"
+
+    def test_stack_global_large_string_operand_preview_is_bounded(self) -> None:
+        """Large string operands should not bloat malformed STACK_GLOBAL findings."""
+        large_text = b"x" * 200_000
+        payload = b"\x80\x04X" + struct.pack("<I", len(large_text)) + large_text + b"K\x01\x93."
+
+        result = self._scan_bytes(payload)
+        assert result.success
+
+        context_checks = [c for c in result.checks if c.name == "STACK_GLOBAL Context Check"]
+        matching_checks = [
+            c
+            for c in context_checks
+            if c.status == CheckStatus.FAILED
+            and c.severity == IssueSeverity.WARNING
+            and c.details.get("reason") == "mixed_or_non_string"
+        ]
+        assert matching_checks, (
+            f"Expected bounded malformed STACK_GLOBAL check, got: {[(c.severity, c.message) for c in context_checks]}"
+        )
+
+        check = matching_checks[0]
+        module_hint = check.details.get("module", "")
+        assert module_hint.startswith("xxxxxxxx"), module_hint
+        assert len(module_hint) < 160, f"Expected bounded string preview, got len={len(module_hint)}"
+        assert len(check.message) < 260, f"Expected bounded context-check message, got len={len(check.message)}"
+
+    def test_stack_global_missing_memo_preserves_unknown_sentinel(self) -> None:
+        """Missing memo operands should fail closed and keep unknown sentinel details."""
+        payload = b"\x80\x04\x8c\x02osh\x7f\x93."
+
+        result = self._scan_bytes(payload)
+        assert result.success
+
+        context_checks = [c for c in result.checks if c.name == "STACK_GLOBAL Context Check"]
+        assert any(
+            c.status == CheckStatus.FAILED
+            and c.severity == IssueSeverity.CRITICAL
+            and c.rule_code == "S205"
+            and c.details.get("function") == "unknown"
+            and c.details.get("reason") == "missing_memo"
+            for c in context_checks
+        ), f"Expected missing-memo STACK_GLOBAL finding, got: {[(c.severity, c.details) for c in context_checks]}"
+
+    def test_stack_global_safe_memoized_reference_remains_passing(self) -> None:
+        """Fully resolved safe memoized STACK_GLOBAL should stay non-failing."""
+        payload = b"\x80\x04\x8c\x0ctorch._utils\x94\x8c\x12_rebuild_tensor_v2\x94h\x00h\x01\x93."
+
+        result = self._scan_bytes(payload)
+        assert result.success
+
+        module_checks = [c for c in result.checks if c.name == "STACK_GLOBAL Module Check"]
+        assert any(c.status == CheckStatus.PASSED for c in module_checks), (
+            f"Expected passing safe STACK_GLOBAL module check, got: {[c.message for c in module_checks]}"
+        )
+
+    def test_stack_global_dangerous_memoized_reference_remains_failing(self) -> None:
+        """Fully resolved dangerous memoized STACK_GLOBAL should remain failing."""
+        payload = b"\x80\x04\x8c\x02os\x94\x8c\x06system\x94h\x00h\x01\x93."
+
+        result = self._scan_bytes(payload)
+        assert result.success
+
+        module_checks = [c for c in result.checks if c.name == "STACK_GLOBAL Module Check"]
+        assert any(c.status == CheckStatus.FAILED for c in module_checks), (
+            f"Expected failing dangerous STACK_GLOBAL module check, got: {[c.message for c in module_checks]}"
+        )
+
+    def test_truncated_stack_global_context_remains_informational(self) -> None:
+        """Simple stack-underflow context should remain informational, not fail-closed."""
+        payload = b"\x80\x04\x8c\x02os\x93."
+
+        result = self._scan_bytes(payload)
+        assert result.success
+
+        context_checks = [c for c in result.checks if c.name == "STACK_GLOBAL Context Check"]
+        assert any(
+            c.status == CheckStatus.FAILED
+            and c.severity == IssueSeverity.INFO
+            and c.rule_code == "S902"
+            and c.message == "STACK_GLOBAL opcode found without sufficient string context"
+            for c in context_checks
+        ), (
+            "Expected informational STACK_GLOBAL context check, got: "
+            f"{[(c.severity, c.message) for c in context_checks]}"
+        )
+
+    def test_malformed_stack_global_first_stream_still_allows_benign_second_stream(self) -> None:
+        """Malformed first stream should not taint benign second-stream behavior."""
+        import io
+
+        buf = io.BytesIO()
+        buf.write(b"\x80\x04K\x01K\x02\x93.")
+        pickle.dump({"safe": True}, buf, protocol=2)
+
+        result = self._scan_bytes(buf.getvalue())
+        assert result.success
+
+        critical_messages = [i.message.lower() for i in result.issues if i.severity == IssueSeverity.CRITICAL]
+        assert not critical_messages, f"Unexpected CRITICAL issues: {critical_messages}"
+        assert any(c.name == "STACK_GLOBAL Context Check" and c.status == CheckStatus.FAILED for c in result.checks), (
+            "Expected malformed STACK_GLOBAL finding in first stream"
+        )
+
+    def test_malformed_stack_global_plus_explicit_reduce_still_flags_reduce(self) -> None:
+        """Malformed STACK_GLOBAL should not suppress explicit dangerous REDUCE detection."""
+        import io
+
+        buf = io.BytesIO()
+        buf.write(b"\x80\x04K\x01K\x02\x93.")
+        buf.write(self._craft_global_reduce_pickle("os", "system"))
+
+        result = self._scan_bytes(buf.getvalue())
+        assert result.success
+        assert result.has_errors
+
+        reduce_messages = [i.message.lower() for i in result.issues if "reduce" in i.message.lower()]
+        assert any("os.system" in msg or "posix.system" in msg for msg in reduce_messages), (
+            f"Expected dangerous REDUCE detection alongside malformed STACK_GLOBAL, got: {reduce_messages}"
+        )
+
     def test_duplicate_proto_same_version_reports_structural_tamper(self) -> None:
         """Duplicate PROTO in one stream should be reported as structural tampering."""
         payload = b"\x80\x02\x80\x02K\x01."
@@ -1982,6 +2192,203 @@ def test_scan_memory_error_with_dangerous_globals_not_downgraded(
     assert format_validation_checks[0].details["exception_type"] == "MemoryError"
 
 
+def test_extract_globals_advanced_respects_max_opcodes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Advanced extraction should stop after max_opcodes instead of parsing everything."""
+    scanner = PickleScanner({"max_opcodes": 3})
+    consumed: list[int] = []
+
+    def _fake_genops(_data: object) -> Iterator[tuple[object, object, int]]:
+        for i in range(10):
+            consumed.append(i)
+            yield (type("Op", (), {"name": "GLOBAL"})(), f"mod{i} func{i}", i)
+
+    monkeypatch.setattr("modelaudit.scanners.pickle_scanner.pickletools.genops", _fake_genops)
+
+    globals_found = scanner._extract_globals_advanced(data=BytesIO(b"x"), multiple_pickles=False)
+
+    assert consumed == [0, 1, 2]
+    assert globals_found == {
+        ("mod0", "func0", "GLOBAL"),
+        ("mod1", "func1", "GLOBAL"),
+        ("mod2", "func2", "GLOBAL"),
+    }
+
+
+def test_extract_globals_advanced_respects_scan_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Advanced extraction should honor active scan timeout budget."""
+    scanner = PickleScanner({"timeout": 1})
+    scanner.scan_start_time = 100.0
+    consumed: list[int] = []
+
+    def _fake_genops(_data: object) -> Iterator[tuple[object, object, int]]:
+        for i in range(10):
+            consumed.append(i)
+            yield (type("Op", (), {"name": "GLOBAL"})(), f"timeout{i} func{i}", i)
+
+    monkeypatch.setattr("modelaudit.scanners.pickle_scanner.pickletools.genops", _fake_genops)
+    monkeypatch.setattr("modelaudit.scanners.pickle_scanner.time.time", lambda: 102.0)
+
+    globals_found = scanner._extract_globals_advanced(data=BytesIO(b"x"), multiple_pickles=False)
+
+    assert consumed == []
+    assert globals_found == set()
+
+
+def test_extract_globals_advanced_respects_max_opcodes_in_buffered_second_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Advanced extraction should not emit partial buffered opcodes from a later stream."""
+    scanner = PickleScanner({"max_opcodes": 3})
+    call_count = 0
+    second_stream_consumed: list[int] = []
+
+    def _fake_genops(data: BytesIO) -> Iterator[tuple[object, object, int]]:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            for i in range(2):
+                yield (type("Op", (), {"name": "GLOBAL"})(), f"first{i} func{i}", i)
+            data.seek(1)
+            return
+
+        for i in range(10):
+            second_stream_consumed.append(i)
+            yield (type("Op", (), {"name": "GLOBAL"})(), f"second{i} func{i}", i)
+
+    monkeypatch.setattr("modelaudit.scanners.pickle_scanner.pickletools.genops", _fake_genops)
+
+    globals_found = scanner._extract_globals_advanced(data=BytesIO(b"xy"), multiple_pickles=True)
+
+    assert second_stream_consumed == [0]
+    assert globals_found == {
+        ("first0", "func0", "GLOBAL"),
+        ("first1", "func1", "GLOBAL"),
+    }
+
+
+def test_genops_with_fallback_does_not_emit_buffered_partial_second_stream_on_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Buffered follow-on streams should not emit partial opcodes when the budget is exhausted."""
+    call_count = 0
+    second_stream_consumed: list[int] = []
+
+    def _fake_genops(data: BytesIO) -> Iterator[tuple[object, object, int]]:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            for i in range(2):
+                yield (type("Op", (), {"name": "GLOBAL"})(), f"first{i} func{i}", i)
+            data.seek(1)
+            return
+
+        for i in range(10):
+            second_stream_consumed.append(i)
+            yield (type("Op", (), {"name": "GLOBAL"})(), f"second{i} func{i}", i)
+
+    monkeypatch.setattr("modelaudit.scanners.pickle_scanner.pickletools.genops", _fake_genops)
+
+    ops = []
+    op_iter = _genops_with_fallback(BytesIO(b"xy"), multi_stream=True, max_items=3)
+    with pytest.raises(_GenopsBudgetExceeded, match="max_items"):
+        while True:
+            ops.append(next(op_iter))
+
+    assert second_stream_consumed == [0]
+    assert [arg for _opcode, arg, _pos in ops] == ["first0 func0", "first1 func1"]
+
+
+def test_scan_pickle_reports_opcode_budget_truncation_for_buffered_follow_on_stream(tmp_path: Path) -> None:
+    """Budget exhaustion in a later buffered stream should surface analysis truncation."""
+    clean_path = tmp_path / "clean.pkl"
+    clean_path.write_bytes(pickle.dumps({"weights": [1, 2, 3], "name": "safe"}))
+
+    class Evil:
+        def __reduce__(self) -> tuple[object, tuple[str]]:
+            return (os.system, ("echo pr700-budget",))
+
+    evil_path = tmp_path / "evil.pkl"
+    with evil_path.open("wb") as f:
+        pickle.dump(Evil(), f)
+
+    combined_path = tmp_path / "combined.pkl"
+    combined_path.write_bytes(clean_path.read_bytes() + evil_path.read_bytes())
+
+    result = PickleScanner({"max_opcodes": 25}).scan(str(combined_path))
+
+    opcode_checks = [
+        check for check in result.checks if check.name == "Opcode Count Check" and check.status == CheckStatus.FAILED
+    ]
+    assert len(opcode_checks) == 1
+    assert opcode_checks[0].severity == IssueSeverity.INFO
+    assert "opcode budget" in opcode_checks[0].message.lower()
+    assert opcode_checks[0].details["analysis_incomplete"] is True
+    assert result.metadata["analysis_incomplete"] is True
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+def test_extract_globals_advanced_preserves_partial_globals_when_genops_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Advanced extraction should keep globals parsed before a late generator failure."""
+    scanner = PickleScanner()
+
+    def _fake_genops_with_fallback(
+        _data: BytesIO,
+        *,
+        multi_stream: bool = False,
+        max_items: int | None = None,
+        deadline: float | None = None,
+    ) -> Iterator[tuple[object, object, int]]:
+        del multi_stream, max_items, deadline
+        yield (type("Op", (), {"name": "GLOBAL"})(), "kept func", 0)
+        raise RuntimeError("synthetic failure")
+
+    monkeypatch.setattr("modelaudit.scanners.pickle_scanner._genops_with_fallback", _fake_genops_with_fallback)
+
+    globals_found = scanner._extract_globals_advanced(data=BytesIO(b"x"), multiple_pickles=False)
+
+    assert globals_found == {("kept", "func", "GLOBAL")}
+
+
+def test_extract_globals_advanced_skips_symbolic_post_processing_after_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Timeout exhaustion should return partial direct globals without extra O(n) work."""
+    scanner = PickleScanner({"timeout": 1})
+    scanner.scan_start_time = 100.0
+    build_calls: list[list[tuple[object, object, int | None]]] = []
+
+    def _fake_genops_with_fallback(
+        _data: BytesIO,
+        *,
+        multi_stream: bool = False,
+        max_items: int | None = None,
+        deadline: float | None = None,
+    ) -> Iterator[tuple[object, object, int]]:
+        del multi_stream, max_items, deadline
+        yield (type("Op", (), {"name": "GLOBAL"})(), "early func", 0)
+        yield (type("Op", (), {"name": "STACK_GLOBAL"})(), None, 1)
+
+    def _fake_build_symbolic_reference_maps(
+        opcodes: list[tuple[object, object, int | None]],
+    ) -> tuple[dict[int, tuple[str, str]], dict[int, tuple[str, str]]]:
+        build_calls.append(opcodes)
+        return {}, {}
+
+    monkeypatch.setattr("modelaudit.scanners.pickle_scanner._genops_with_fallback", _fake_genops_with_fallback)
+    monkeypatch.setattr(
+        "modelaudit.scanners.pickle_scanner._build_symbolic_reference_maps",
+        _fake_build_symbolic_reference_maps,
+    )
+    monkeypatch.setattr("modelaudit.scanners.pickle_scanner.time.time", lambda: 102.0)
+
+    globals_found = scanner._extract_globals_advanced(data=BytesIO(b"x"), multiple_pickles=False)
+
+    assert globals_found == {("early", "func", "GLOBAL")}
+    assert build_calls == []
+
+
 class TestPickleImportOnlyGlobalFindings:
     def test_import_only_safety_helper_keeps_torch_load_unsafe(self) -> None:
         ml_context: dict[str, object] = {}
@@ -2542,12 +2949,14 @@ class TestPickleImportOnlyGlobalFindings:
             callable_refs,
             callable_origin_refs,
             callable_origin_is_ext,
+            malformed_stack_globals,
         ) = _simulate_symbolic_reference_maps(opcodes)
 
         assert callable_refs[2] == ("collections", "OrderedDict")
         assert callable_origin_refs[2] == 2
         assert callable_origin_is_ext == {}
         assert 5 not in stack_global_refs
+        assert malformed_stack_globals[5]["reason"] == "insufficient_context"
 
     def test_symbolic_simulation_protocol_five_buffers_preserve_stack_alignment(self) -> None:
         opcodes = [
@@ -2565,12 +2974,14 @@ class TestPickleImportOnlyGlobalFindings:
             callable_refs,
             callable_origin_refs,
             callable_origin_is_ext,
+            malformed_stack_globals,
         ) = _simulate_symbolic_reference_maps(opcodes)
 
         assert stack_global_refs[6] == ("evilpkg", "thing")
         assert callable_refs == {}
         assert callable_origin_refs == {}
         assert callable_origin_is_ext == {}
+        assert malformed_stack_globals == {}
 
 
 @pytest.mark.parametrize(
