@@ -1,9 +1,11 @@
 import json
+import shutil
 import tarfile
+import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
-from modelaudit.scanners.base import IssueSeverity
+from modelaudit.scanners.base import IssueSeverity, ScanResult
 from modelaudit.scanners.oci_layer_scanner import OciLayerScanner
 
 
@@ -218,6 +220,37 @@ class TestOciLayerScanner:
 
         assert any("path traversal" in i.message.lower() for i in result.issues)
 
+    def test_scan_manifest_with_symlinked_layer_path_outside_base(
+        self,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        """Symlinked layer references must not escape the manifest directory."""
+        manifest_dir = tmp_path / "manifest"
+        manifest_dir.mkdir()
+        outside_dir = tmp_path / "outside"
+        outside_dir.mkdir()
+
+        safe_file = tmp_path / "safe.txt"
+        safe_file.write_text("Safe content")
+
+        layer_path = outside_dir / "outside-layer.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            tar.add(safe_file, arcname="safe.txt")
+
+        (manifest_dir / "layers").symlink_to(outside_dir, target_is_directory=True)
+
+        manifest = {"layers": ["layers/outside-layer.tar.gz"]}
+        manifest_path = manifest_dir / "symlinked.manifest"
+        manifest_path.write_text(json.dumps(manifest))
+
+        scanner = OciLayerScanner()
+        with patch("modelaudit.scanners.oci_layer_scanner.tarfile.open") as mock_tar_open:
+            result = scanner.scan(str(manifest_path))
+
+        mock_tar_open.assert_not_called()
+        assert any("path traversal" in issue.message.lower() for issue in result.issues)
+
     def test_scan_manifest_with_nested_layer_references(self, tmp_path):
         """Test scanning manifest with nested layer references."""
         safe_file = tmp_path / "safe.txt"
@@ -267,6 +300,208 @@ class TestOciLayerScanner:
 
         assert result.success is True
         # Should have no issues since the file doesn't match any scanner
+
+    def test_scan_layer_dispatches_scannable_member_using_extracted_path(self, tmp_path: Path) -> None:
+        """Members with registered extensions should be extracted and scanned."""
+        onnx_file = tmp_path / "model.onnx"
+        onnx_file.write_bytes(b"fake onnx payload")
+
+        layer_path = tmp_path / "layer.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            tar.add(onnx_file, arcname="models/model.onnx")
+
+        manifest = {"layers": ["layer.tar.gz"]}
+        manifest_path = tmp_path / "dispatch.manifest"
+        manifest_path.write_text(json.dumps(manifest))
+
+        mocked_result = ScanResult(scanner_name="onnx")
+        with (
+            patch("modelaudit.core.scan_file", return_value=mocked_result) as mock_scan,
+            patch(
+                "modelaudit.scanners.oci_layer_scanner.shutil.copyfileobj",
+                wraps=shutil.copyfileobj,
+            ) as mock_copy,
+        ):
+            result = OciLayerScanner().scan(str(manifest_path))
+
+        assert result.success is True
+        mock_copy.assert_called_once()
+        mock_scan.assert_called_once()
+        scanned_path = mock_scan.call_args.args[0]
+        assert scanned_path != "models/model.onnx"
+        assert scanned_path.endswith(".onnx")
+
+    def test_scan_layer_detects_extensionless_pickle_member(self, tmp_path: Path) -> None:
+        """Extensionless pickle members should still be dispatched by content."""
+        evil_pickle = Path(__file__).parent.parent / "assets/samples/pickles/evil.pickle"
+
+        layer_path = tmp_path / "layer.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            tar.add(evil_pickle, arcname="payload")
+
+        manifest = {"layers": ["layer.tar.gz"]}
+        manifest_path = tmp_path / "extensionless.manifest"
+        manifest_path.write_text(json.dumps(manifest))
+
+        result = OciLayerScanner().scan(str(manifest_path))
+
+        assert result.success is True
+        assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+        assert any("extensionless.manifest:layer.tar.gz:payload" in (issue.location or "") for issue in result.issues)
+
+    def test_scan_layer_detects_member_with_trailing_space_extension(self, tmp_path: Path) -> None:
+        """Trailing whitespace after a scannable extension should not bypass dispatch."""
+        evil_pickle = Path(__file__).parent.parent / "assets/samples/pickles/evil.pickle"
+
+        layer_path = tmp_path / "layer.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            tar.add(evil_pickle, arcname="malicious.pkl ")
+
+        manifest = {"layers": ["layer.tar.gz"]}
+        manifest_path = tmp_path / "trailing-space.manifest"
+        manifest_path.write_text(json.dumps(manifest))
+
+        result = OciLayerScanner().scan(str(manifest_path))
+
+        assert result.success is True
+        assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+        assert any(
+            "trailing-space.manifest:layer.tar.gz:malicious.pkl " in (issue.location or "") for issue in result.issues
+        )
+
+    def test_scan_layer_prefers_model_extension_over_trailing_generic_suffix(self, tmp_path: Path) -> None:
+        """Multi-suffix names like model.onnx.exe should preserve the model extension."""
+        fake_member = tmp_path / "fake.bin"
+        fake_member.write_bytes(b"fake onnx payload")
+
+        layer_path = tmp_path / "layer.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            tar.add(fake_member, arcname="models/model.onnx.exe")
+
+        manifest = {"layers": ["layer.tar.gz"]}
+        manifest_path = tmp_path / "suffix-choice.manifest"
+        manifest_path.write_text(json.dumps(manifest))
+
+        mocked_result = ScanResult(scanner_name="onnx")
+        with patch("modelaudit.core.scan_file", return_value=mocked_result) as mock_scan:
+            result = OciLayerScanner().scan(str(manifest_path))
+
+        assert result.success is True
+        mock_scan.assert_called_once()
+        assert mock_scan.call_args.args[0].endswith(".onnx")
+
+    def test_scan_layer_preserves_multipart_extension_for_dispatch(self, tmp_path: Path) -> None:
+        """Multipart extensions should survive extraction so nested scanners can dispatch correctly."""
+        nested_archive = tmp_path / "nested.tar.gz"
+        nested_archive.write_bytes(b"fake nested tar payload")
+
+        layer_path = tmp_path / "layer.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            tar.add(nested_archive, arcname="models/nested.tar.gz")
+
+        manifest = {"layers": ["layer.tar.gz"]}
+        manifest_path = tmp_path / "dispatch-multipart.manifest"
+        manifest_path.write_text(json.dumps(manifest))
+
+        mocked_result = ScanResult(scanner_name="tar")
+        with patch("modelaudit.core.scan_file", return_value=mocked_result) as mock_scan:
+            result = OciLayerScanner().scan(str(manifest_path))
+
+        assert result.success is True
+        mock_scan.assert_called_once()
+        scanned_path = mock_scan.call_args.args[0]
+        assert scanned_path != "models/nested.tar.gz"
+        assert scanned_path.endswith(".tar.gz")
+
+    def test_scan_layer_rewrites_embedded_issue_and_check_locations(self, tmp_path: Path) -> None:
+        """Embedded scan results should reference the OCI member, not temp extraction paths."""
+        onnx_file = tmp_path / "model.onnx"
+        onnx_file.write_bytes(b"fake onnx payload")
+
+        layer_path = tmp_path / "layer.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            tar.add(onnx_file, arcname="models/model.onnx")
+
+        manifest = {"layers": ["layer.tar.gz"]}
+        manifest_path = tmp_path / "location-rewrite.manifest"
+        manifest_path.write_text(json.dumps(manifest))
+
+        def _mock_scan_file(scanned_path: str, _config: dict | None = None) -> ScanResult:
+            result = ScanResult(scanner_name="onnx")
+            result.add_check(
+                name="Mock Failure",
+                passed=False,
+                message="Mock embedded finding",
+                severity=IssueSeverity.WARNING,
+                location=scanned_path,
+            )
+            result.add_check(
+                name="Mock Positional Failure",
+                passed=False,
+                message="Mock positional finding",
+                severity=IssueSeverity.WARNING,
+                location=f"{scanned_path} (pos 52)",
+            )
+            result.finish(success=True)
+            return result
+
+        with patch("modelaudit.core.scan_file", side_effect=_mock_scan_file) as mock_scan:
+            result = OciLayerScanner().scan(str(manifest_path))
+
+        assert result.success is True
+        mock_scan.assert_called_once()
+        scanned_path = mock_scan.call_args.args[0]
+        member_prefix = f"{manifest_path}:layer.tar.gz:models/model.onnx"
+        embedded_checks = [
+            check for check in result.checks if check.name in {"Mock Failure", "Mock Positional Failure"}
+        ]
+        embedded_issues = [issue for issue in result.issues if "Mock" in issue.message]
+
+        assert embedded_checks
+        assert embedded_issues
+        assert all((check.location or "").startswith(member_prefix) for check in embedded_checks)
+        assert all((issue.location or "").startswith(member_prefix) for issue in embedded_issues)
+        assert all(scanned_path not in (check.location or "") for check in embedded_checks)
+        assert all(scanned_path not in (issue.location or "") for issue in embedded_issues)
+        assert any((check.location or "").endswith("(pos 52)") for check in embedded_checks)
+
+    def test_scan_layer_cleans_up_temp_file_when_copy_fails(self, tmp_path: Path) -> None:
+        """Failed member extraction should not leave temp files behind."""
+        onnx_file = tmp_path / "model.onnx"
+        onnx_file.write_bytes(b"fake onnx payload")
+
+        layer_path = tmp_path / "layer.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            tar.add(onnx_file, arcname="models/model.onnx")
+
+        manifest = {"layers": ["layer.tar.gz"]}
+        manifest_path = tmp_path / "copy-failure.manifest"
+        manifest_path.write_text(json.dumps(manifest))
+
+        created_paths: list[str] = []
+        real_named_temporary_file = tempfile.NamedTemporaryFile
+
+        def _capture_named_temporary_file(*args, **kwargs):
+            tmp = real_named_temporary_file(*args, **kwargs)
+            created_paths.append(tmp.name)
+            return tmp
+
+        with (
+            patch(
+                "modelaudit.scanners.oci_layer_scanner.tempfile.NamedTemporaryFile",
+                side_effect=_capture_named_temporary_file,
+            ),
+            patch(
+                "modelaudit.scanners.oci_layer_scanner.shutil.copyfileobj",
+                side_effect=RuntimeError("copy failed"),
+            ),
+        ):
+            result = OciLayerScanner().scan(str(manifest_path))
+
+        assert result.success is True
+        assert created_paths
+        assert all(not Path(path).exists() for path in created_paths)
+        assert any("Error processing layer" in issue.message for issue in result.issues)
 
     def test_scan_layer_with_directory_entries(self, tmp_path):
         """Test scanning layer with directory entries (should be skipped)."""

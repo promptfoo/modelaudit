@@ -3,6 +3,7 @@
 import pickle
 import struct
 import time
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -78,7 +79,9 @@ class TestDillJoblibSecurity:
         # joblib.load is explicitly treated as dangerous (loader trampoline bypass)
         assert "load" not in joblib_perms
         assert "dump" in dill_perms
-        assert "loads" in dill_perms
+        # dill.load/dill.loads recursively deserialize and are intentionally blocked
+        assert "load" not in dill_perms
+        assert "loads" not in dill_perms
 
         # Should not have dangerous functions if they exist
         dangerous_funcs = ["eval", "exec", "compile", "__import__"]
@@ -299,6 +302,15 @@ class TestIntegration:
         # Should work normally
         assert result.success is True
         assert len([i for i in result.issues if i.severity == IssueSeverity.CRITICAL]) == 0
+
+    def test_existing_dill_fixture_still_scans_without_crash(self) -> None:
+        """Real-world dill fixture should still scan and produce stable findings."""
+        fixture = Path(__file__).parent / "assets" / "samples" / "pickles" / "dill_func.pkl"
+
+        result = PickleScanner().scan(str(fixture))
+
+        assert result.success is True
+        assert any("dill._dill" in issue.message for issue in result.issues)
 
     def test_multiple_exception_types_handling(self, tmp_path):
         """Test handling of different exception types."""

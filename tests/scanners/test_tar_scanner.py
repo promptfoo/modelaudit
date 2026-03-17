@@ -1,9 +1,12 @@
 import os
 import tarfile
 import tempfile
+from pathlib import Path
+
+import pytest
 
 from modelaudit.scanners.base import IssueSeverity
-from modelaudit.scanners.tar_scanner import TarScanner
+from modelaudit.scanners.tar_scanner import DEFAULT_MAX_TAR_ENTRY_SIZE, TarScanner
 
 
 class TestTarScanner:
@@ -221,6 +224,26 @@ class TestTarScanner:
         finally:
             os.unlink(tmp_path)
 
+    def test_scan_tar_with_proto0_pickle_preserves_archive_context(self, tmp_path: Path) -> None:
+        """Malicious TAR members should surface critical findings with archive-qualified locations."""
+        archive_path = tmp_path / "proto0_payload.tar"
+        payload = b'cos\nsystem\n(S"echo pwned"\ntR.'
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("payload.txt")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert result.success is True
+        assert result.has_errors is True
+        critical_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL]
+        assert any(
+            "os.system" in issue.message.lower() or "posix.system" in issue.message.lower() for issue in critical_issues
+        )
+        assert any(issue.location == f"{archive_path}:payload.txt" for issue in critical_issues)
+
     def test_invalid_tar_file(self):
         """Test handling of invalid TAR files"""
         with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as tmp:
@@ -290,3 +313,201 @@ class TestTarScanner:
             assert result.bytes_scanned == expected
         finally:
             os.unlink(tmp_path)
+
+    def test_get_max_entry_size_uses_bounded_default(self) -> None:
+        """Unconfigured TAR entry extraction should still have a bounded default."""
+        assert TarScanner()._get_max_entry_size() == DEFAULT_MAX_TAR_ENTRY_SIZE
+
+    def test_get_max_entry_size_prefers_explicit_file_size_limit(self) -> None:
+        """The top-level file-size limit should remain the hard extraction cap."""
+        scanner = TarScanner(config={"max_file_size": 4096, "max_entry_size": 128})
+        assert scanner._get_max_entry_size() == 4096
+
+    def test_get_max_entry_size_uses_entry_limit_when_file_size_is_unlimited(self) -> None:
+        """An explicit TAR-entry limit should apply when the top-level file size is unlimited."""
+        scanner = TarScanner(config={"max_file_size": 0, "max_entry_size": 128})
+        assert scanner._get_max_entry_size() == 128
+
+    def test_get_max_entry_size_uses_bounded_default_when_max_file_size_is_unlimited(self) -> None:
+        """A top-level unlimited file-size config should not disable TAR member extraction limits."""
+        scanner = TarScanner(config={"max_file_size": 0})
+        assert scanner._get_max_entry_size() == DEFAULT_MAX_TAR_ENTRY_SIZE
+
+    def test_extract_member_to_tempfile_streams_in_chunks(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Large TAR entries should be copied in bounded chunks instead of buffered in memory."""
+        content = b"A" * 10_000
+        archive_path = tmp_path / "payload.tar"
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("payload.bin")
+            info.size = len(content)
+            archive.addfile(info, tarfile.io.BytesIO(content))  # type: ignore[attr-defined]
+
+        read_sizes: list[int | None] = []
+        original_read = tarfile.ExFileObject.read
+
+        def tracked_read(self: tarfile.ExFileObject, size: int | None = None) -> bytes:
+            read_sizes.append(size)
+            return original_read(self, size)
+
+        monkeypatch.setattr(tarfile.ExFileObject, "read", tracked_read)
+
+        with tarfile.open(archive_path, "r") as archive:
+            member = archive.getmember("payload.bin")
+            extracted_path, total_size = self.scanner._extract_member_to_tempfile(
+                archive,
+                member,
+                suffix="_payload.bin",
+            )
+
+        try:
+            assert total_size == len(content)
+            assert Path(extracted_path).read_bytes() == content
+            assert len(read_sizes) > 1
+            assert set(read_sizes) == {4096}
+        finally:
+            os.unlink(extracted_path)
+
+    def test_scan_rejects_oversized_tar_member(self, tmp_path: Path) -> None:
+        """Entries exceeding the configured limit should fail the scan before full extraction."""
+        scanner = TarScanner(config={"max_entry_size": 64})
+        archive_path = tmp_path / "oversized.tar"
+        payload = b"B" * 128
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("payload.bin")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = scanner.scan(str(archive_path))
+
+        assert result.success is False
+        oversize_checks = [check for check in result.checks if check.name == "TAR File Scan"]
+        assert len(oversize_checks) == 1
+        assert "tar entry payload.bin exceeds maximum size of 64 bytes" in oversize_checks[0].message.lower()
+
+    def test_scan_respects_max_file_size_over_entry_limit(self, tmp_path: Path) -> None:
+        """A stricter top-level size limit should still fail TAR extraction before scan_file runs."""
+        scanner = TarScanner(config={"max_file_size": 64, "max_entry_size": 1024})
+        archive_path = tmp_path / "precedence.tar"
+        payload = b"C" * 128
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("payload.bin")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = scanner.scan(str(archive_path))
+
+        assert result.success is False
+        oversize_checks = [check for check in result.checks if check.name == "TAR File Scan"]
+        assert len(oversize_checks) == 1
+        assert "tar entry payload.bin exceeds maximum size of 64 bytes" in oversize_checks[0].message.lower()
+
+    def test_scan_skips_non_regular_tar_members(self, tmp_path: Path) -> None:
+        """Valid non-file TAR members should not abort scanning later regular files."""
+        archive_path = tmp_path / "fifo-first.tar"
+        payload = b"payload"
+
+        with tarfile.open(archive_path, "w") as archive:
+            fifo = tarfile.TarInfo("named_pipe")
+            fifo.type = tarfile.FIFOTYPE
+            archive.addfile(fifo)
+
+            info = tarfile.TarInfo("data.bin")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert result.success is True
+        assert result.bytes_scanned == len(payload)
+        assert all("named_pipe" not in issue.message for issue in result.issues)
+
+    def test_scan_empty_tar(self, tmp_path: Path) -> None:
+        """An empty TAR archive should scan successfully with no critical issues."""
+        archive_path = tmp_path / "empty.tar"
+        with tarfile.open(archive_path, "w"):
+            pass  # create empty archive
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert result.success is True
+        assert result.bytes_scanned == 0
+        # No CRITICAL issues expected for an empty archive
+        critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
+        assert len(critical_issues) == 0
+
+    def test_scan_tar_with_multiple_model_formats(self, tmp_path: Path) -> None:
+        """TAR containing multiple model-format files should scan all of them."""
+        import pickle
+
+        archive_path = tmp_path / "multi_format.tar"
+
+        pkl_data = pickle.dumps({"weights": [1, 2, 3]})
+        json_data = b'{"model_type": "linear", "version": "1.0"}'
+        pt_data = pickle.dumps({"state_dict": {}})  # .pt files are pickle-based
+
+        with tarfile.open(archive_path, "w") as t:
+            for name, data in [
+                ("model.pkl", pkl_data),
+                ("config.json", json_data),
+                ("weights.pt", pt_data),
+            ]:
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                t.addfile(info, tarfile.io.BytesIO(data))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert result.success is True
+        # All three files were scanned
+        assert result.bytes_scanned == len(pkl_data) + len(json_data) + len(pt_data)
+        # Each file should appear in the contents metadata
+        contents_paths = {c.get("path", "") for c in result.metadata.get("contents", [])}
+        assert any("model.pkl" in p for p in contents_paths)
+        assert any("config.json" in p for p in contents_paths)
+        assert any("weights.pt" in p for p in contents_paths)
+
+    def test_scan_tar_with_very_long_filename(self, tmp_path: Path) -> None:
+        """TAR members with very long filenames should be handled without crashing."""
+        archive_path = tmp_path / "long_name.tar"
+        long_name = "a" * 200 + ".pkl"  # 204-character filename
+        import pickle
+
+        payload = pickle.dumps({"key": "value"})
+
+        with tarfile.open(archive_path, "w") as t:
+            info = tarfile.TarInfo(long_name)
+            info.size = len(payload)
+            t.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        # Scan must not crash; success is expected for a benign payload
+        assert result.success is True
+        assert result.bytes_scanned == len(payload)
+
+    def test_scan_truncated_tar(self, tmp_path: Path) -> None:
+        """A truncated (corrupted) TAR file should fail gracefully."""
+        # Build a real archive, then truncate it
+        archive_path = tmp_path / "truncated.tar"
+        content = b"some content"
+
+        with tarfile.open(archive_path, "w") as t:
+            info = tarfile.TarInfo("file.txt")
+            info.size = len(content)
+            t.addfile(info, tarfile.io.BytesIO(content))  # type: ignore[attr-defined]
+
+        full_data = archive_path.read_bytes()
+        truncated_path = tmp_path / "truncated_cut.tar"
+        truncated_path.write_bytes(full_data[:520])
+
+        result = self.scanner.scan(str(truncated_path))
+
+        assert result.success is False
+        format_checks = [check for check in result.checks if check.name == "TAR File Format Validation"]
+        assert len(format_checks) == 1
+        assert "not a valid tar file" in format_checks[0].message.lower()
+        assert any("not a valid tar file" in issue.message.lower() for issue in result.issues)

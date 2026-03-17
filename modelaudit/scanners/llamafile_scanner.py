@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
 import tempfile
@@ -25,6 +26,18 @@ MACHO_MAGICS = {
 }
 
 PRINTABLE_TEXT_RE = re.compile(rb"[ -~]{8,}")
+SAFE_LOCALHOST_URL_RE = re.compile(
+    r"https?://(?:localhost|127(?:\.\d{1,3}){3}|0\.0\.0\.0|\[::1\]|::1)(?::\d+)?(?:/[^\s]*)?",
+    re.IGNORECASE,
+)
+SAFE_JSON_SCHEMA_URL_RE = re.compile(
+    r"https?://(?:www\.)?json-schema\.org(?::\d+)?(?:/[^\s]*)?",
+    re.IGNORECASE,
+)
+ENDPOINT_TOKEN_RE = re.compile(
+    r"(?:localhost|\[::1\]|::1|0\.0\.0\.0|\d{1,3}(?:\.\d{1,3}){3}|(?:[a-z0-9-]+\.)+[a-z]{2,})(?::\d+)?",
+    re.IGNORECASE,
+)
 
 COMMAND_TOKENS = (
     "bash -c",
@@ -50,19 +63,47 @@ NETWORK_TOKENS = (
 # Patterns found in the legitimate llamafile/cosmopolitan runtime that are
 # NOT indicators of compromise.  These appear in error messages, debug format
 # strings, and server status output.
-LLAMAFILE_RUNTIME_SAFE_PATTERNS = (
+LLAMAFILE_RUNTIME_SAFE_EXACT_PATTERNS: tuple[str, ...] = (
     "llamafile",
-    "llama server listening",
     "llama.cpp",
     "cosmopolitan",
-    "APE is running on WIN32 inside WSL",
     "binfmt_misc",
     "%rSYS",
+    "llama_new_context_with_model",
+)
+
+LLAMAFILE_RUNTIME_SAFE_FRAGMENT_PATTERNS: tuple[str, ...] = (
+    "llama server listening",
+    "APE is running on WIN32 inside WSL",
     "json-schema.org",
     "%'18T connect",
     "%'18T socket",
-    "llama_new_context_with_model",
 )
+LLAMAFILE_RUNTIME_SAFE_EXACT_LOWER: set[str] = {pattern.lower() for pattern in LLAMAFILE_RUNTIME_SAFE_EXACT_PATTERNS}
+LLAMAFILE_RUNTIME_SAFE_FRAGMENT_LOWER: set[str] = {
+    pattern.lower() for pattern in LLAMAFILE_RUNTIME_SAFE_FRAGMENT_PATTERNS
+}
+
+
+def _is_local_endpoint_token(token: str) -> bool:
+    """Return True when an extracted endpoint token resolves to a local-only address."""
+    host = token.strip().lower()
+    if host == "localhost":
+        return True
+
+    if host.startswith("[") and "]" in host:
+        host = host[1 : host.index("]")]
+    elif host.count(":") == 1 and "." in host and host.rsplit(":", 1)[1].isdigit():
+        host = host.rsplit(":", 1)[0]
+
+    if host in {"::1", "0.0.0.0"}:
+        return True
+
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return ip.is_loopback or ip.is_unspecified
 
 
 class LlamafileScanner(BaseScanner):
@@ -185,7 +226,25 @@ class LlamafileScanner(BaseScanner):
     def _is_known_runtime_string(text: str) -> bool:
         """Return True if the string matches a known-safe llamafile runtime pattern."""
         lowered = text.lower()
-        return any(pattern.lower() in lowered for pattern in LLAMAFILE_RUNTIME_SAFE_PATTERNS)
+        if any(token in lowered for token in COMMAND_TOKENS):
+            return False
+        if lowered in LLAMAFILE_RUNTIME_SAFE_EXACT_LOWER:
+            return True
+
+        normalized = SAFE_LOCALHOST_URL_RE.sub("", lowered)
+        normalized = SAFE_JSON_SCHEMA_URL_RE.sub("json-schema.org", normalized)
+
+        for fragment in LLAMAFILE_RUNTIME_SAFE_FRAGMENT_LOWER:
+            if fragment not in normalized:
+                continue
+            candidate = normalized.replace(fragment, "", 1)
+            if not any(token in candidate for token in NETWORK_TOKENS):
+                if fragment in {"%'18t connect", "%'18t socket"}:
+                    endpoints = [match.group(0) for match in ENDPOINT_TOKEN_RE.finditer(candidate)]
+                    if endpoints and not all(_is_local_endpoint_token(endpoint) for endpoint in endpoints):
+                        continue
+                return True
+        return False
 
     def _scan_runtime_strings(self, path: str, blob: bytes, result: ScanResult) -> None:
         command_hits: set[str] = set()

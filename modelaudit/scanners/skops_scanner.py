@@ -26,6 +26,20 @@ class SkopsScanner(BaseScanner):
         # Security limits for decompression bomb protection
         self.max_file_size = self.config.get("max_skops_file_size", 500 * 1024 * 1024)  # 500MB
         self.max_files_in_archive = self.config.get("max_files_in_archive", 10000)
+        self.max_zip_entry_read_size = self.config.get("max_zip_entry_read_size", 10 * 1024 * 1024)
+
+    def _read_zip_entry_safely(self, zip_file: zipfile.ZipFile, file_info: zipfile.ZipInfo) -> bytes | None:
+        """Read a ZIP entry with a bounded memory limit."""
+        if file_info.file_size > self.max_zip_entry_read_size:
+            return None
+
+        with zip_file.open(file_info, "r") as entry:
+            content = entry.read(self.max_zip_entry_read_size + 1)
+
+        if len(content) > self.max_zip_entry_read_size:
+            return None
+
+        return content
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -84,7 +98,9 @@ class SkopsScanner(BaseScanner):
         # Scan file contents for suspicious patterns
         for file_info in zip_file.filelist:
             try:
-                content = zip_file.read(file_info)
+                content = self._read_zip_entry_safely(zip_file, file_info)
+                if content is None:
+                    continue
                 for binary_pattern in suspicious_binary_patterns:
                     if binary_pattern in content:
                         found_patterns.append(
@@ -149,7 +165,9 @@ class SkopsScanner(BaseScanner):
         # Scan file contents for suspicious patterns
         for file_info in zip_file.filelist:
             try:
-                content = zip_file.read(file_info)
+                content = self._read_zip_entry_safely(zip_file, file_info)
+                if content is None:
+                    continue
                 for binary_pattern in suspicious_binary_patterns:
                     if binary_pattern in content:
                         found_patterns.append(
@@ -194,7 +212,11 @@ class SkopsScanner(BaseScanner):
             # Check for Card/model card files
             if "card" in file_name or "model_card" in file_name or "readme" in file_name:
                 try:
-                    content = zip_file.read(file_info).decode("utf-8", errors="ignore")
+                    raw_content = self._read_zip_entry_safely(zip_file, file_info)
+                    if raw_content is None:
+                        continue
+
+                    content = raw_content.decode("utf-8", errors="ignore")
                     # Check for get_model or joblib references
                     if "get_model" in content or "joblib" in content or "load" in content:
                         suspicious_files.append(file_info.filename)
@@ -231,7 +253,12 @@ class SkopsScanner(BaseScanner):
             # Check for schema or version files
             for file_name in zip_file.namelist():
                 if "schema" in file_name.lower() or "version" in file_name.lower() or "protocol" in file_name.lower():
-                    content = zip_file.read(file_name).decode("utf-8", errors="ignore")
+                    file_info = zip_file.getinfo(file_name)
+                    raw_content = self._read_zip_entry_safely(zip_file, file_info)
+                    if raw_content is None:
+                        continue
+
+                    content = raw_content.decode("utf-8", errors="ignore")
 
                     # Check for protocol version indicators
                     if "PROTOCOL" in content or "version" in content.lower():
@@ -293,7 +320,9 @@ class SkopsScanner(BaseScanner):
             is_metadata = self._is_skops_metadata(file_info.filename)
 
             try:
-                content = zip_file.read(file_info)
+                content = self._read_zip_entry_safely(zip_file, file_info)
+                if content is None:
+                    continue
                 for pattern in joblib_patterns:
                     # Only suppress the broad `sklearn` heuristic for metadata
                     # files; explicit signals like `joblib.load` / `pickle.load`
@@ -387,6 +416,31 @@ class SkopsScanner(BaseScanner):
 
                 result.metadata["file_count"] = len(file_list)
                 result.metadata["files"] = file_list[:100]  # Store first 100 files
+
+                total_uncompressed_size = sum(file_info.file_size for file_info in zip_file.filelist)
+                result.metadata["archive_uncompressed_size"] = total_uncompressed_size
+
+                if total_uncompressed_size > self.max_file_size:
+                    result.add_check(
+                        name="Archive Uncompressed Size Limit",
+                        passed=False,
+                        message=(
+                            "Suspicious: Archive uncompressed content exceeds configured skops size limit "
+                            f"({total_uncompressed_size} bytes > {self.max_file_size} bytes)"
+                        ),
+                        severity=IssueSeverity.INFO,
+                        location=path,
+                        details={
+                            "archive_uncompressed_size": total_uncompressed_size,
+                            "max_skops_file_size": self.max_file_size,
+                        },
+                        why=(
+                            "Large uncompressed archive content may indicate a decompression bomb that can "
+                            "exhaust memory during scanning."
+                        ),
+                    )
+                    result.finish(success=False)
+                    return result
 
                 # Run CVE detection checks (with content analysis)
                 self._detect_cve_2025_54412(zip_file, result, path, file_list)
