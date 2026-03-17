@@ -169,16 +169,20 @@ class RSerializedScanner(BaseScanner):
         decompressed = bytearray()
         total_decompressed = 0
         truncated = False
+        pending = b""
 
         with open(path, "rb") as file_obj:
             while True:
-                chunk = file_obj.read(cls._XZ_READ_CHUNK_SIZE)
-                if not chunk:
+                if not pending:
+                    pending = file_obj.read(cls._XZ_READ_CHUNK_SIZE)
+
+                if not pending:
                     if not truncated and not decompressor.eof:
                         raise EOFError("Incomplete XZ stream ended before EOF marker")
                     break
 
-                piece = decompressor.decompress(chunk, max_length=cls._XZ_READ_CHUNK_SIZE)
+                piece = decompressor.decompress(pending, max_length=cls._XZ_READ_CHUNK_SIZE)
+                pending = decompressor.unused_data
                 while True:
                     if piece:
                         total_decompressed += len(piece)
@@ -201,8 +205,18 @@ class RSerializedScanner(BaseScanner):
 
                     piece = decompressor.decompress(b"", max_length=cls._XZ_READ_CHUNK_SIZE)
 
-                if truncated or decompressor.eof:
+                if truncated:
                     break
+
+                if decompressor.eof:
+                    if not pending:
+                        pending = file_obj.read(cls._XZ_READ_CHUNK_SIZE)
+                        if not pending:
+                            break
+                    decompressor = lzma.LZMADecompressor(format=lzma.FORMAT_XZ, memlimit=memlimit)
+                    continue
+
+                pending = b""
 
         return bytes(decompressed), truncated, total_decompressed
 
