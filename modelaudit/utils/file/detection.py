@@ -2,6 +2,7 @@ import json
 import pickletools
 import re
 import struct
+import tarfile
 import zipfile
 from pathlib import Path, PurePosixPath
 
@@ -212,6 +213,14 @@ def is_torchserve_mar_archive(path: str) -> bool:
         zipfile.BadZipFile,
         zipfile.LargeZipFile,
     ):
+        return False
+
+
+def _is_tar_archive(path: str) -> bool:
+    """Return whether a path is a TAR archive, including compressed wrappers."""
+    try:
+        return tarfile.is_tarfile(path)
+    except Exception:
         return False
 
 
@@ -539,10 +548,14 @@ def detect_file_format(path: str) -> str:
 
     compression_format = _detect_compression_format(header)
     if ext in _COMPRESSED_EXTENSION_CODECS:
+        if _is_tar_archive(path):
+            return "tar"
         expected_codec = _COMPRESSED_EXTENSION_CODECS[ext]
         if compression_format == expected_codec:
             return "compressed"
         return "unknown"
+    if _is_tar_archive(path):
+        return "tar"
     # Check ZIP magic first (for .pt/.pth files that are actually zips)
     if magic4.startswith(b"PK"):
         if ext == ".mar" and is_torchserve_mar_archive(path):

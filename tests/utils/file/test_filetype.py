@@ -379,6 +379,19 @@ def test_detect_file_format_tar_wrappers_preserve_tar_routing(tmp_path: Path) ->
     assert validate_file_type(str(tar_gz)) is True
 
 
+def test_detect_file_format_disguised_compressed_tar_by_content(tmp_path: Path) -> None:
+    archive_path = tmp_path / "archive.bin"
+    with tarfile.open(archive_path, "w:gz") as archive:
+        info = tarfile.TarInfo("payload.bin")
+        payload = b"payload"
+        info.size = len(payload)
+        archive.addfile(info, io.BytesIO(payload))
+
+    assert detect_file_format(str(archive_path)) == "tar"
+    assert detect_file_format_from_magic(str(archive_path)) == "gzip"
+    assert validate_file_type(str(archive_path)) is False
+
+
 def test_zip_magic_variants(tmp_path):
     """Ensure alternate PK signatures are detected as ZIP."""
     for sig in (b"PK\x06\x06", b"PK\x06\x07"):
