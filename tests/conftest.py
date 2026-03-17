@@ -74,6 +74,7 @@ def pytest_runtest_setup(item):
             "test_secure_hasher.py",  # Aggregate hash computation tests
             "test_huggingface_extensions.py",  # HuggingFace MODEL_EXTENSIONS tests
             "test_regular_scan_hash.py",  # Regular scan mode hash generation tests
+            "test_core_asset_extraction.py",  # Check consolidation and location parsing regressions
             "test_manifest_scanner.py",  # Manifest scanner tests
             "test_weak_hash_detection.py",  # Weak hash detection tests
             "test_cloud_url_detection.py",  # Cloud storage URL detection tests
@@ -104,7 +105,14 @@ def pytest_runtest_setup(item):
             "test_telemetry.py",  # telemetry payload and availability tests
             "test_telemetry_decoupling.py",  # telemetry failure-isolation tests
             "test_debug_command.py",  # debug output telemetry flags
+            "test_auth_config.py",  # auth config path and secret-storage hardening tests
+            "test_utils.py",  # archive path sanitization regression coverage
             "test_oci_layer_scanner.py",  # OCI layer path safety regression tests
+            "test_jfrog.py",  # JFrog utility tests
+            "test_jfrog_integration.py",  # JFrog integration tests
+            "test_tar_scanner.py",  # TAR archive scanner tests
+            "test_zip_scanner.py",  # ZIP archive scanner tests
+            "test_sevenzip_scanner.py",  # 7-Zip archive scanner tests
         ]
 
         # Check if this is an allowed test file
