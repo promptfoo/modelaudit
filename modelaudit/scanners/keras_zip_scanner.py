@@ -39,6 +39,7 @@ from .keras_utils import (
 # Any module outside this list in a layer's "module" or "fn_module" key is suspicious.
 # Uses exact root matching: "math" matches "math" and "math.ops" but NOT "mathutils".
 _SAFE_KERAS_MODULE_ROOTS: frozenset[str] = frozenset({"keras", "tensorflow", "tf_keras", "tf", "numpy", "math"})
+_SAFE_ALLOWLISTED_REGISTERED_OBJECTS: frozenset[str] = frozenset({"notequal"})
 
 # Modules that are explicitly dangerous when referenced in config.json
 _DANGEROUS_CONFIG_MODULES = frozenset(
@@ -116,9 +117,13 @@ class KerasZipScanner(BaseScanner):
                 return True
         return False
 
+    @staticmethod
+    def _is_known_safe_allowlisted_registered_object(identifier: Any) -> bool:
+        return isinstance(identifier, str) and identifier.strip().lower() in _SAFE_ALLOWLISTED_REGISTERED_OBJECTS
+
     def _is_known_safe_serialized_layer(self, layer: dict[str, Any]) -> bool:
         layer_class = layer.get("class_name")
-        return is_known_safe_keras_layer_class(layer_class) or self._layer_uses_allowlisted_module(layer)
+        return is_known_safe_keras_layer_class(layer_class)
 
     def _should_flag_registered_object(self, layer: dict[str, Any]) -> bool:
         registered_name = layer.get("registered_name")
@@ -130,7 +135,12 @@ class KerasZipScanner(BaseScanner):
 
         layer_class = layer.get("class_name")
         if isinstance(layer_class, str) and registered_name.strip() == layer_class.strip():
-            return not self._is_known_safe_serialized_layer(layer)
+            if self._is_known_safe_serialized_layer(layer):
+                return False
+            return not (
+                self._layer_uses_allowlisted_module(layer)
+                and self._is_known_safe_allowlisted_registered_object(layer_class)
+            )
 
         return True
 
