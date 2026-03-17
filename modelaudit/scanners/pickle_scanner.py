@@ -5704,12 +5704,13 @@ class PickleScanner(BaseScanner):
                 and (has_pytorch_advanced_global or has_ordereddict_global)
                 and not has_dangerous_advanced_global
             )
-            # For serialization content, require positive evidence of legitimacy.
-            # Extension-validated files (.joblib/.dill) rely on extension +
-            # _is_legitimate_serialization_file() + no dangerous globals.
-            # Extensionless blobs require positive joblib/sklearn/numpy globals.
-            has_extension_based_serialization_globals = bool(advanced_globals) and (
-                (file_ext == ".joblib" and has_joblib_globals) or (file_ext == ".dill" and has_dill_globals)
+            # For serialization content, keep extension-validated .joblib files
+            # on the legacy downgrade path once _is_legitimate_serialization_file()
+            # has accepted them. Dill remains stricter: a .dill file must also
+            # surface positive dill globals before MemoryError is downgraded.
+            # Extensionless blobs still require positive joblib/sklearn/numpy globals.
+            has_extension_based_serialization_globals = file_ext == ".joblib" or (
+                bool(advanced_globals) and file_ext == ".dill" and has_dill_globals
             )
             has_legitimate_serialization_globals = (
                 has_extension_based_serialization_globals
