@@ -108,15 +108,9 @@ class TorchServeMarScanner(BaseScanner):
             return False
 
         try:
-            with open(path, "rb") as handle:
-                if not handle.read(4).startswith(b"PK"):
-                    return False
+            from ..utils.file.detection import is_torchserve_mar_archive
 
-            with zipfile.ZipFile(path, "r") as archive:
-                member_names = cls._member_name_set(archive)
-                return cls._normalize_member_name(MANIFEST_ENTRY_PATH) in member_names
-        except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile):
-            return False
+            return is_torchserve_mar_archive(path)
         except Exception:
             return False
 
@@ -772,6 +766,26 @@ class TorchServeMarScanner(BaseScanner):
                     },
                 )
                 break
+
+            if member_info.compress_size > 0:
+                compression_ratio = member_info.file_size / member_info.compress_size
+                if compression_ratio > 100:
+                    result.add_check(
+                        name="TorchServe MAR Compression Ratio Check",
+                        passed=False,
+                        message=(
+                            f"Suspicious compression ratio ({compression_ratio:.1f}x) in archive entry: {member_name}"
+                        ),
+                        severity=IssueSeverity.WARNING,
+                        location=f"{archive_path}:{member_name}",
+                        details={
+                            "entry": member_name,
+                            "compressed_size": member_info.compress_size,
+                            "uncompressed_size": member_info.file_size,
+                            "ratio": compression_ratio,
+                            "threshold": 100,
+                        },
+                    )
 
             temp_base = os.path.join(tempfile.gettempdir(), "extract_mar")
             resolved_member, is_safe_path = sanitize_archive_path(member_name, temp_base)
