@@ -7,6 +7,7 @@ import zipfile
 from typing import Any, ClassVar
 
 from ..utils import sanitize_archive_path
+from ..utils.file.detection import _is_valid_executorch_binary
 from .base import BaseScanner, IssueSeverity, ScanResult
 from .pickle_scanner import PickleScanner
 
@@ -37,11 +38,6 @@ class ExecuTorchScanner(BaseScanner):
         except Exception:
             return b""
 
-    @staticmethod
-    def _is_executorch_binary(header: bytes) -> bool:
-        # Real-world .pte files use the FlatBuffers file identifier "ET12" at bytes 4..7.
-        return len(header) >= 8 and header[4:8] == b"ET12"
-
     def scan(self, path: str) -> ScanResult:
         path_check_result = self._check_path(path)
         if path_check_result:
@@ -56,7 +52,7 @@ class ExecuTorchScanner(BaseScanner):
         result.metadata["file_size"] = file_size
 
         header = self._read_header(path, length=8)
-        if self._is_executorch_binary(header):
+        if _is_valid_executorch_binary(path):
             result.add_check(
                 name="ExecuTorch Binary Format Validation",
                 passed=True,
