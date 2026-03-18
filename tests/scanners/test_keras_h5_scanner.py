@@ -9,8 +9,10 @@ pytest.importorskip("h5py")
 
 import h5py
 
-from modelaudit.scanners.base import IssueSeverity
+from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.keras_h5_scanner import KerasH5Scanner
+
+ASSETS_DIR = Path(__file__).parent.parent / "assets" / "samples" / "keras"
 
 
 def test_keras_h5_scanner_can_handle(tmp_path):
@@ -68,6 +70,26 @@ def create_mock_h5_file(tmp_path, *, malicious=False):
         # Add weights group
         weights_group = f.create_group("model_weights")
         weights_group.create_dataset("dense_1/kernel:0", data=[[1.0, 2.0]])
+
+    return h5_path
+
+
+def create_custom_h5_file(
+    tmp_path: Path,
+    model_config: dict[str, Any],
+    *,
+    training_config: dict[str, Any] | None = None,
+    keras_version: str = "3.13.2",
+    file_name: str = "model.h5",
+) -> Path:
+    """Create a configurable Keras H5 file for regression tests."""
+    h5_path = tmp_path / file_name
+
+    with h5py.File(h5_path, "w") as f:
+        f.attrs["model_config"] = json.dumps(model_config)
+        f.attrs["keras_version"] = keras_version
+        if training_config is not None:
+            f.attrs["training_config"] = json.dumps(training_config)
 
     return h5_path
 
@@ -421,6 +443,131 @@ def test_keras_h5_scanner_allows_known_safe_classes(tmp_path):
         subclass_checks = [c for c in result.checks if "subclassed" in c.name.lower()]
         assert len(subclass_checks) > 0
         assert all(c.status == CheckStatus.PASSED for c in subclass_checks)
+
+
+def test_keras_h5_sample_attack_assets_trigger_expected_checks() -> None:
+    """Repo Keras attack samples should be covered by scanner assertions."""
+    scanner = KerasH5Scanner()
+    expected_checks = {
+        "custom_layer_attack.h5": "Custom Layer Class Detection",
+        "loss_injection.h5": "Custom Loss Detection",
+        "metric_injection.h5": "Custom Metric Detection",
+    }
+
+    for file_name, check_name in expected_checks.items():
+        result = scanner.scan(str(ASSETS_DIR / file_name))
+        matching_checks = [check for check in result.checks if check.name == check_name]
+
+        assert len(matching_checks) >= 1, f"Expected {check_name} in sample {file_name}"
+        assert any(check.status == CheckStatus.FAILED for check in matching_checks)
+
+
+def test_training_config_detects_nested_custom_metrics_and_loss_mappings(tmp_path: Path) -> None:
+    """Nested training_config metric/loss trees should not bypass custom-object detection."""
+    model_config = {
+        "class_name": "Sequential",
+        "config": {
+            "name": "nested_training_config",
+            "layers": [
+                {"class_name": "InputLayer", "config": {"batch_shape": [None, 4], "name": "input"}},
+                {"class_name": "Dense", "config": {"units": 4}},
+            ],
+        },
+    }
+    training_config = {
+        "loss": {"output_1": "malicious_loss"},
+        "metrics": [["accuracy", {"class_name": "MaliciousMetric", "config": {"name": "malicious_metric"}}]],
+        "weighted_metrics": {"output_1": ["Precision", "WeightedBackdoorMetric"]},
+    }
+    model_path = create_custom_h5_file(tmp_path, model_config, training_config=training_config)
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    custom_metric_checks = [check for check in result.checks if check.name == "Custom Metric Detection"]
+    custom_loss_checks = [check for check in result.checks if check.name == "Custom Loss Detection"]
+
+    assert any(check.details.get("identifier") == "MaliciousMetric" for check in custom_metric_checks)
+    assert any(check.details.get("identifier") == "WeightedBackdoorMetric" for check in custom_metric_checks)
+    assert any(check.details.get("identifier") == "malicious_loss" for check in custom_loss_checks)
+
+
+def test_training_config_safe_aliases_do_not_trigger_custom_object_checks(tmp_path: Path) -> None:
+    """Standard Keras aliases should not be treated as custom metrics or losses."""
+    model_config = {
+        "class_name": "Sequential",
+        "config": {
+            "name": "safe_aliases",
+            "layers": [
+                {"class_name": "InputLayer", "config": {"batch_shape": [None, 4], "name": "input"}},
+                {"class_name": "Dense", "config": {"units": 4}},
+            ],
+        },
+    }
+    training_config = {
+        "loss": {"output_1": "mae", "output_2": "mse"},
+        "metrics": [["accuracy", "AUC"], [{"class_name": "MeanSquaredError", "config": {}}]],
+        "weighted_metrics": {"output_1": ["Precision", "Recall"]},
+    }
+    model_path = create_custom_h5_file(
+        tmp_path,
+        model_config,
+        training_config=training_config,
+        file_name="safe_aliases.h5",
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert all(check.name != "Custom Metric Detection" for check in result.checks)
+    assert all(check.name != "Custom Loss Detection" for check in result.checks)
+
+
+def test_builtin_random_preprocessing_layers_do_not_trigger_custom_layer_warning(tmp_path: Path) -> None:
+    """Built-in RandomWidth/RandomHeight preprocessing layers should stay allowlisted."""
+    model_config = {
+        "class_name": "Sequential",
+        "config": {
+            "name": "preprocessing_model",
+            "layers": [
+                {"class_name": "InputLayer", "config": {"batch_shape": [None, 32, 32, 3], "name": "input"}},
+                {"class_name": "RandomWidth", "config": {"factor": 0.1}},
+                {"class_name": "RandomHeight", "config": {"factor": 0.1}},
+            ],
+        },
+    }
+    model_path = create_custom_h5_file(tmp_path, model_config, file_name="preprocessing.h5")
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert all(check.name != "Custom Layer Class Detection" for check in result.checks)
+
+
+def test_nested_functional_submodels_are_scanned_for_custom_layers(tmp_path: Path) -> None:
+    """Nested Functional/Sequential models should not hide custom layer classes."""
+    model_config = {
+        "class_name": "Sequential",
+        "config": {
+            "name": "outer",
+            "layers": [
+                {"class_name": "InputLayer", "config": {"batch_shape": [None, 4], "name": "input"}},
+                {
+                    "class_name": "Functional",
+                    "name": "nested_functional",
+                    "config": {
+                        "layers": [
+                            {"class_name": "InputLayer", "config": {"batch_shape": [None, 4], "name": "nested_input"}},
+                            {"class_name": "MaliciousLayer", "config": {"name": "nested_malicious"}},
+                        ]
+                    },
+                },
+            ],
+        },
+    }
+    model_path = create_custom_h5_file(tmp_path, model_config, file_name="nested_custom_layer.h5")
+
+    result = KerasH5Scanner().scan(str(model_path))
+    custom_layer_checks = [check for check in result.checks if check.name == "Custom Layer Class Detection"]
+
+    assert any(check.details.get("layer_class") == "MaliciousLayer" for check in custom_layer_checks)
 
 
 class TestCVE20259905H5SafeMode:

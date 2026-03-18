@@ -447,13 +447,27 @@ class WeightDistributionScanner(BaseScanner):
                     nodes = list(graph_def.node)
 
                 for node in nodes:
-                    if node.op == "Const" and "value" in node.attr:
-                        tensor_proto = node.attr["value"].tensor
-                        array = tensor_proto_to_ndarray(tensor_proto)
-                        if self.max_array_size and self.max_array_size > 0 and array.nbytes > self.max_array_size:
-                            continue
-                        if ("weight" in node.name.lower() or "kernel" in node.name.lower()) and len(array.shape) >= 2:
-                            weights_info[node.name] = array
+                    if node.op != "Const" or "value" not in node.attr:
+                        continue
+
+                    node_name = node.name.lower()
+                    if "weight" not in node_name and "kernel" not in node_name:
+                        continue
+
+                    tensor_proto = node.attr["value"].tensor
+                    try:
+                        array = tensor_proto_to_ndarray(
+                            tensor_proto,
+                            max_tensor_bytes=self.max_array_size,
+                        )
+                    except Exception as exc:
+                        logger.debug("Skipping TensorFlow weight tensor %s: %s", node.name, exc)
+                        continue
+
+                    if self.max_array_size and self.max_array_size > 0 and array.nbytes > self.max_array_size:
+                        continue
+                    if len(array.shape) >= 2:
+                        weights_info[node.name] = array
         except Exception as e:
             logger.warning(f"Weight analysis incomplete for {path}: {e}")
 

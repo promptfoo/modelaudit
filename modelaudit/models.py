@@ -460,7 +460,7 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
         self.bytes_scanned += scan_result.bytes_scanned
         self.files_scanned += 1  # Each ScanResult represents one file scan
 
-        if scan_result.has_errors:
+        if not scan_result.success:
             self.has_errors = True
 
         # Update success status - only set to False for operational errors
