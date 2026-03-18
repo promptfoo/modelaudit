@@ -1,7 +1,9 @@
+import json
 import pickletools
 import re
 import struct
-from pathlib import Path
+import zipfile
+from pathlib import Path, PurePosixPath
 
 from ..helpers.types import FileExtension, FileFormat, FilePath, MagicBytes
 
@@ -52,6 +54,8 @@ _GZIP_MAGIC = b"\x1f\x8b"
 _BZIP2_MAGIC = b"BZh"
 _XZ_MAGIC = b"\xfd7zXZ\x00"
 _LZ4_FRAME_MAGIC = b"\x04\x22\x4d\x18"
+_TORCHSERVE_MANIFEST_PATH = "MAR-INF/MANIFEST.json"
+_TORCHSERVE_MANIFEST_MAX_BYTES = 1 * 1024 * 1024
 _COMPRESSED_EXTENSION_CODECS = {
     ".gz": "gzip",
     ".bz2": "bzip2",
@@ -109,6 +113,106 @@ def _read_pickle_probe_sample(path: Path, size: int, header16: bytes) -> bytes:
         return header16
     with path.open("rb") as f:
         return f.read(min(size, PROTO0_1_MAX_PROBE_BYTES))
+
+
+def _normalize_archive_member_name(member_name: str) -> str:
+    """Normalize ZIP entry names for stable path comparisons."""
+    normalized = member_name.replace("\\", "/").strip()
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    normalized = normalized.lstrip("/")
+    normalized = re.sub(r"/+", "/", normalized)
+    return str(PurePosixPath(normalized))
+
+
+def _read_zip_member_bounded(
+    archive: zipfile.ZipFile,
+    member_info: zipfile.ZipInfo,
+    max_bytes: int,
+) -> bytes:
+    """Read a ZIP member with a strict size cap."""
+    if member_info.file_size > max_bytes:
+        raise ValueError("ZIP member exceeds bounded read size")
+
+    data = bytearray()
+    with archive.open(member_info, "r") as handle:
+        while True:
+            chunk = handle.read(64 * 1024)
+            if not chunk:
+                break
+            data.extend(chunk)
+            if len(data) > max_bytes:
+                raise ValueError("ZIP member exceeded bounded read limit")
+    return bytes(data)
+
+
+def _coerce_manifest_string_list(value: object) -> list[str]:
+    """Collect non-empty string values from manifest fields."""
+    if isinstance(value, str):
+        stripped = value.strip()
+        return [stripped] if stripped else []
+    if isinstance(value, list):
+        collected: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                stripped = item.strip()
+                if stripped:
+                    collected.append(stripped)
+        return collected
+    return []
+
+
+def _looks_like_torchserve_manifest(manifest_data: object) -> bool:
+    """Require enough manifest structure to justify TorchServe-specific routing."""
+    if not isinstance(manifest_data, dict):
+        return False
+
+    model_section = manifest_data.get("model")
+    model_dict = model_section if isinstance(model_section, dict) else {}
+
+    handler_candidates: list[str] = []
+    serialized_candidates: list[str] = []
+
+    if isinstance(model_dict, dict):
+        handler_candidates.extend(_coerce_manifest_string_list(model_dict.get("handler")))
+        serialized_candidates.extend(_coerce_manifest_string_list(model_dict.get("serializedFile")))
+
+    handler_candidates.extend(_coerce_manifest_string_list(manifest_data.get("handler")))
+    serialized_candidates.extend(_coerce_manifest_string_list(manifest_data.get("serializedFile")))
+
+    return bool(handler_candidates) and bool(serialized_candidates)
+
+
+def is_torchserve_mar_archive(path: str) -> bool:
+    """Return whether a ZIP-backed `.mar` looks like a real TorchServe archive."""
+    file_path = Path(path)
+    if not file_path.is_file():
+        return False
+
+    try:
+        with zipfile.ZipFile(file_path, "r") as archive:
+            manifest_info = None
+            manifest_name = _normalize_archive_member_name(_TORCHSERVE_MANIFEST_PATH)
+            for info in archive.infolist():
+                if _normalize_archive_member_name(info.filename) == manifest_name:
+                    manifest_info = info
+                    break
+
+            if manifest_info is None:
+                return False
+
+            manifest_bytes = _read_zip_member_bounded(archive, manifest_info, _TORCHSERVE_MANIFEST_MAX_BYTES)
+            manifest_data = json.loads(manifest_bytes.decode("utf-8"))
+            return _looks_like_torchserve_manifest(manifest_data)
+    except (
+        OSError,
+        ValueError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        zipfile.BadZipFile,
+        zipfile.LargeZipFile,
+    ):
+        return False
 
 
 def is_zipfile(path: str) -> bool:
@@ -314,6 +418,8 @@ def detect_file_format_from_magic(path: str) -> str:
 
             # Try the new pattern matching approach first
             format_result = detect_format_from_magic_bytes(magic4, magic8, magic16)
+            if format_result == "zip" and file_path.suffix.lower() == ".mar" and is_torchserve_mar_archive(path):
+                return "torchserve_mar"
             if format_result != "unknown":
                 return format_result
 
@@ -437,12 +543,10 @@ def detect_file_format(path: str) -> str:
         if compression_format == expected_codec:
             return "compressed"
         return "unknown"
-    # TorchServe .mar archives are ZIP-based and route to a dedicated scanner.
-    if ext == ".mar":
-        return "torchserve_mar"
-
     # Check ZIP magic first (for .pt/.pth files that are actually zips)
     if magic4.startswith(b"PK"):
+        if ext == ".mar" and is_torchserve_mar_archive(path):
+            return "torchserve_mar"
         return "zip"
 
     # Check pickle magic patterns
@@ -810,13 +914,15 @@ def validate_file_type(path: str) -> bool:
         if ext_format == "pmml" and header_format == "pmml":
             return True
 
+        if ext_format == "torchserve_mar":
+            return header_format == "torchserve_mar"
+
         # ZIP files can have various extensions (.zip, .pt, .pth, .ckpt, .ptl, .pte)
         if header_format == "zip" and ext_format in {
             "zip",
             "pickle",
             "pytorch_binary",
             "executorch",
-            "torchserve_mar",
         }:
             return True
 
