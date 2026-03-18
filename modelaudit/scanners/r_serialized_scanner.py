@@ -35,6 +35,7 @@ class RSerializedScanner(BaseScanner):
     _XZ_MAGIC: ClassVar[bytes] = b"\xfd7zXZ\x00"
 
     _CAN_HANDLE_DECOMPRESSED_LIMIT: ClassVar[int] = 128 * 1024
+    _SIGNATURE_PROBE_BYTES: ClassVar[int] = 7
     _XZ_DECOMPRESS_MEMLIMIT: ClassVar[int] = 128 * 1024 * 1024
     _XZ_READ_CHUNK_SIZE: ClassVar[int] = 64 * 1024
     _PRINTABLE_RE: ClassVar[re.Pattern[bytes]] = re.compile(rb"[ -~]{3,512}")
@@ -104,7 +105,7 @@ class RSerializedScanner(BaseScanner):
 
         try:
             prefix = cls._read_decompressed_prefix(path, compression, cls._CAN_HANDLE_DECOMPRESSED_LIMIT)
-        except (EOFError, OSError, ValueError, gzip.BadGzipFile, lzma.LZMAError):
+        except (EOFError, OSError, gzip.BadGzipFile, lzma.LZMAError):
             # Corrupt compressed wrappers should still route to this scanner.
             return True
 
@@ -143,16 +144,57 @@ class RSerializedScanner(BaseScanner):
             with bz2.open(path, "rb") as stream:
                 return stream.read(read_limit)[:limit]
         if compression == "xz":
-            prefix, _truncated, _total_decompressed = cls._read_xz_with_memlimit(
+            return cls._read_xz_signature_prefix(
                 path=path,
-                output_limit=limit,
+                limit=min(limit, cls._SIGNATURE_PROBE_BYTES),
                 memlimit=cls._XZ_DECOMPRESS_MEMLIMIT,
-                compressed_size=os.path.getsize(path),
-                max_decompressed_bytes=limit + cls._XZ_READ_CHUNK_SIZE,
-                max_decompression_ratio=250.0,
             )
-            return prefix
         return b""
+
+    @classmethod
+    def _read_xz_signature_prefix(cls, path: str, limit: int, memlimit: int) -> bytes:
+        if limit <= 0:
+            return b""
+
+        decompressor = lzma.LZMADecompressor(format=lzma.FORMAT_XZ, memlimit=memlimit)
+        prefix = bytearray()
+        pending = b""
+
+        with open(path, "rb") as file_obj:
+            while len(prefix) < limit:
+                if not pending:
+                    pending = file_obj.read(cls._XZ_READ_CHUNK_SIZE)
+
+                if not pending:
+                    if not decompressor.eof:
+                        raise EOFError("Incomplete XZ stream ended before EOF marker")
+                    break
+
+                piece = decompressor.decompress(pending, max_length=limit - len(prefix))
+                pending = decompressor.unused_data
+
+                while True:
+                    if piece:
+                        prefix.extend(piece)
+                        if len(prefix) >= limit:
+                            return bytes(prefix)
+
+                    if decompressor.eof or decompressor.needs_input:
+                        break
+
+                    piece = decompressor.decompress(b"", max_length=limit - len(prefix))
+
+                if decompressor.eof:
+                    if not pending:
+                        pending = file_obj.read(cls._XZ_READ_CHUNK_SIZE)
+                        if not pending:
+                            break
+                    decompressor = lzma.LZMADecompressor(format=lzma.FORMAT_XZ, memlimit=memlimit)
+                    continue
+
+                pending = b""
+
+        return bytes(prefix)
 
     @classmethod
     def _read_xz_with_memlimit(

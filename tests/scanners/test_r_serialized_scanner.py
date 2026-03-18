@@ -4,6 +4,7 @@ import gzip
 import lzma
 from pathlib import Path
 
+from modelaudit import core
 from modelaudit.scanners import get_scanner_for_file
 from modelaudit.scanners.base import Check, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.r_serialized_scanner import RSerializedScanner
@@ -246,6 +247,25 @@ def test_scan_concatenated_xz_streams_preserve_later_malicious_payloads(tmp_path
     assert len(payload_checks) == 1
     assert payload_checks[0].status == CheckStatus.FAILED
     assert payload_checks[0].severity == IssueSeverity.CRITICAL
+
+
+def test_large_non_r_xz_payload_is_not_claimed_by_r_scanner(tmp_path: Path) -> None:
+    path = tmp_path / "not-r-bomb.rds"
+    payload = b"NOT_R_FORMAT\n" + (b"A" * 250_000)
+    path.write_bytes(
+        lzma.compress(
+            payload,
+            format=lzma.FORMAT_XZ,
+            filters=[{"id": lzma.FILTER_LZMA2, "dict_size": 1 << 20}],
+        )
+    )
+
+    assert not RSerializedScanner.can_handle(str(path))
+    assert get_scanner_for_file(str(path)) is None
+
+    result = core.scan_file(str(path))
+    assert result.scanner_name == "unknown"
+    assert _check_by_name(result, "R Serialized Decompression") == []
 
 
 def test_r_serialized_routes_through_detection_and_registry(tmp_path: Path) -> None:
