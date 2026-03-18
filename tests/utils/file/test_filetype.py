@@ -22,6 +22,21 @@ from modelaudit.utils.file.detection import (
 )
 
 
+def _create_mar_archive(
+    tmp_path: Path,
+    manifest_bytes: bytes | None,
+    *,
+    filename: str = "model.mar",
+) -> Path:
+    mar_path = tmp_path / filename
+    with zipfile.ZipFile(mar_path, "w") as archive:
+        if manifest_bytes is not None:
+            archive.writestr("MAR-INF/MANIFEST.json", manifest_bytes)
+        archive.writestr("handler.py", b"def handle(data, context):\n    return data\n")
+        archive.writestr("weights.bin", b"weights")
+    return mar_path
+
+
 def _has_tf_protos() -> bool:
     import modelaudit.protos
 
@@ -79,6 +94,29 @@ def test_detect_file_format_zip(tmp_path):
     assert detect_file_format(str(zip_path)) == "zip"
 
 
+def test_detect_valid_torchserve_mar_by_magic_and_validation(tmp_path: Path) -> None:
+    mar_path = _create_mar_archive(
+        tmp_path,
+        b'{"model":{"handler":"handler.py","serializedFile":"weights.bin"}}',
+    )
+
+    assert detect_file_format(str(mar_path)) == "torchserve_mar"
+    assert detect_file_format_from_magic(str(mar_path)) == "torchserve_mar"
+    assert validate_file_type(str(mar_path)) is True
+
+
+def test_detect_non_torchserve_mar_falls_back_to_zip_validation(tmp_path: Path) -> None:
+    mar_path = _create_mar_archive(
+        tmp_path,
+        b'{"model":{"handler":"handler.py","serializedFile":"weights.bin"',
+        filename="invalid_manifest.mar",
+    )
+
+    assert detect_file_format(str(mar_path)) == "zip"
+    assert detect_file_format_from_magic(str(mar_path)) == "zip"
+    assert validate_file_type(str(mar_path)) is False
+
+
 def test_detect_file_format_by_extension(tmp_path):
     """Test detecting file format by extension."""
     extensions = {
@@ -97,7 +135,7 @@ def test_detect_file_format_by_extension(tmp_path):
         ".h5": "hdf5",
         ".pb": "protobuf",
         ".tflite": "tflite",
-        ".mar": "torchserve_mar",
+        ".mar": "unknown",
         ".cbm": "catboost",
         ".mlmodel": "coreml",
         ".llamafile": "llamafile",
