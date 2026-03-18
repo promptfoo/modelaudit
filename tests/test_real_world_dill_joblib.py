@@ -293,11 +293,7 @@ class TestPerformanceBenchmarks:
         """Test performance impact of file validation."""
         test_file = tmp_path / "validation_test.joblib"
 
-        with open(test_file, "wb") as f:
-            f.write(b"joblib" * 200)  # Larger content
-            import pickle
-
-            pickle.dump({"test": "data"}, f)
+        test_file.write_bytes(b"\x80\x04cjoblib.numpy_pickle\nNumpyArrayWrapper\nq\x00." + b"\x00" * 4096)
 
         # Benchmark validation time
         import os
@@ -312,7 +308,7 @@ class TestPerformanceBenchmarks:
 
         # Validation should be very fast
         avg_validation_time = validation_duration / iters
-        assert avg_validation_time < 0.001  # Under 1ms average
+        assert avg_validation_time < 0.003  # Under 3ms average on bounded opcode scan
 
         print(f"Average validation time: {avg_validation_time:.6f}s")
 
