@@ -29,7 +29,7 @@ def create_executorch_archive(tmp_path: Path, *, malicious: bool = False) -> Pat
     return zip_path
 
 
-def test_executorch_scanner_can_handle(tmp_path):
+def test_executorch_scanner_can_handle(tmp_path: Path) -> None:
     path = create_executorch_archive(tmp_path)
     assert ExecuTorchScanner.can_handle(str(path))
     other = tmp_path / "model.h5"
@@ -37,7 +37,7 @@ def test_executorch_scanner_can_handle(tmp_path):
     assert not ExecuTorchScanner.can_handle(str(other))
 
 
-def test_executorch_scanner_safe_model(tmp_path):
+def test_executorch_scanner_safe_model(tmp_path: Path) -> None:
     path = create_executorch_archive(tmp_path)
     scanner = ExecuTorchScanner()
     result = scanner.scan(str(path))
@@ -47,7 +47,7 @@ def test_executorch_scanner_safe_model(tmp_path):
     assert not critical
 
 
-def test_executorch_scanner_malicious(tmp_path):
+def test_executorch_scanner_malicious(tmp_path: Path) -> None:
     path = create_executorch_archive(tmp_path, malicious=True)
     scanner = ExecuTorchScanner()
     result = scanner.scan(str(path))
@@ -55,7 +55,7 @@ def test_executorch_scanner_malicious(tmp_path):
     assert any("eval" in i.message.lower() for i in result.issues)
 
 
-def test_executorch_scanner_invalid_zip(tmp_path):
+def test_executorch_scanner_invalid_zip(tmp_path: Path) -> None:
     file_path = tmp_path / "bad.ptl"
     file_path.write_bytes(b"not zip")
     scanner = ExecuTorchScanner()

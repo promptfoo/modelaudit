@@ -35,6 +35,9 @@ class RSerializedScanner(BaseScanner):
     _XZ_MAGIC: ClassVar[bytes] = b"\xfd7zXZ\x00"
 
     _CAN_HANDLE_DECOMPRESSED_LIMIT: ClassVar[int] = 128 * 1024
+    _SIGNATURE_PROBE_BYTES: ClassVar[int] = 7
+    _XZ_DECOMPRESS_MEMLIMIT: ClassVar[int] = 128 * 1024 * 1024
+    _XZ_READ_CHUNK_SIZE: ClassVar[int] = 64 * 1024
     _PRINTABLE_RE: ClassVar[re.Pattern[bytes]] = re.compile(rb"[ -~]{3,512}")
     _EXECUTABLE_SYMBOL_RE: ClassVar[re.Pattern[str]] = re.compile(
         r"(?<![\w.])(?:base::|utils::)?"
@@ -102,7 +105,7 @@ class RSerializedScanner(BaseScanner):
 
         try:
             prefix = cls._read_decompressed_prefix(path, compression, cls._CAN_HANDLE_DECOMPRESSED_LIMIT)
-        except (EOFError, OSError, ValueError, gzip.BadGzipFile, lzma.LZMAError):
+        except (EOFError, OSError, gzip.BadGzipFile, lzma.LZMAError):
             # Corrupt compressed wrappers should still route to this scanner.
             return True
 
@@ -141,9 +144,123 @@ class RSerializedScanner(BaseScanner):
             with bz2.open(path, "rb") as stream:
                 return stream.read(read_limit)[:limit]
         if compression == "xz":
-            with lzma.open(path, "rb") as stream:
-                return stream.read(read_limit)[:limit]
+            return cls._read_xz_signature_prefix(
+                path=path,
+                limit=min(limit, cls._SIGNATURE_PROBE_BYTES),
+                memlimit=cls._XZ_DECOMPRESS_MEMLIMIT,
+            )
         return b""
+
+    @classmethod
+    def _read_xz_signature_prefix(cls, path: str, limit: int, memlimit: int) -> bytes:
+        if limit <= 0:
+            return b""
+
+        decompressor = lzma.LZMADecompressor(format=lzma.FORMAT_XZ, memlimit=memlimit)
+        prefix = bytearray()
+        pending = b""
+
+        with open(path, "rb") as file_obj:
+            while len(prefix) < limit:
+                if not pending:
+                    pending = file_obj.read(cls._XZ_READ_CHUNK_SIZE)
+
+                if not pending:
+                    if not decompressor.eof:
+                        raise EOFError("Incomplete XZ stream ended before EOF marker")
+                    break
+
+                piece = decompressor.decompress(pending, max_length=limit - len(prefix))
+                pending = decompressor.unused_data
+
+                while True:
+                    if piece:
+                        prefix.extend(piece)
+                        if len(prefix) >= limit:
+                            return bytes(prefix)
+
+                    if decompressor.eof or decompressor.needs_input:
+                        break
+
+                    piece = decompressor.decompress(b"", max_length=limit - len(prefix))
+
+                if decompressor.eof:
+                    if not pending:
+                        pending = file_obj.read(cls._XZ_READ_CHUNK_SIZE)
+                        if not pending:
+                            break
+                    decompressor = lzma.LZMADecompressor(format=lzma.FORMAT_XZ, memlimit=memlimit)
+                    continue
+
+                pending = b""
+
+        return bytes(prefix)
+
+    @classmethod
+    def _read_xz_with_memlimit(
+        cls,
+        path: str,
+        output_limit: int,
+        memlimit: int,
+        *,
+        compressed_size: int,
+        max_decompressed_bytes: int,
+        max_decompression_ratio: float,
+    ) -> tuple[bytes, bool, int]:
+        decompressor = lzma.LZMADecompressor(format=lzma.FORMAT_XZ, memlimit=memlimit)
+        decompressed = bytearray()
+        total_decompressed = 0
+        truncated = False
+        pending = b""
+
+        with open(path, "rb") as file_obj:
+            while True:
+                if not pending:
+                    pending = file_obj.read(cls._XZ_READ_CHUNK_SIZE)
+
+                if not pending:
+                    if not truncated and not decompressor.eof:
+                        raise EOFError("Incomplete XZ stream ended before EOF marker")
+                    break
+
+                piece = decompressor.decompress(pending, max_length=cls._XZ_READ_CHUNK_SIZE)
+                pending = decompressor.unused_data
+                while True:
+                    if piece:
+                        total_decompressed += len(piece)
+                        if total_decompressed > max_decompressed_bytes:
+                            raise ValueError(f"Decompressed stream exceeded limit ({max_decompressed_bytes} bytes)")
+
+                        if compressed_size > 0 and total_decompressed / compressed_size > max_decompression_ratio:
+                            raise ValueError(
+                                f"Suspicious decompression ratio ({total_decompressed / compressed_size:.1f}x > "
+                                f"{max_decompression_ratio:.1f}x)"
+                            )
+
+                        remaining = max(output_limit - len(decompressed), 0)
+                        decompressed.extend(piece[:remaining])
+                        if len(piece) > remaining:
+                            truncated = True
+
+                    if truncated or decompressor.eof or decompressor.needs_input:
+                        break
+
+                    piece = decompressor.decompress(b"", max_length=cls._XZ_READ_CHUNK_SIZE)
+
+                if truncated:
+                    break
+
+                if decompressor.eof:
+                    if not pending:
+                        pending = file_obj.read(cls._XZ_READ_CHUNK_SIZE)
+                        if not pending:
+                            break
+                    decompressor = lzma.LZMADecompressor(format=lzma.FORMAT_XZ, memlimit=memlimit)
+                    continue
+
+                pending = b""
+
+        return bytes(decompressed), truncated, total_decompressed
 
     def _read_payload_for_analysis(self, path: str, file_size: int) -> tuple[bytes, str, bool, int]:
         with open(path, "rb") as file_obj:
@@ -163,8 +280,14 @@ class RSerializedScanner(BaseScanner):
             with bz2.open(path, "rb") as stream:
                 payload, truncated, total_decompressed = self._read_decompressed_stream(stream, file_size)
         else:
-            with lzma.open(path, "rb") as stream:
-                payload, truncated, total_decompressed = self._read_decompressed_stream(stream, file_size)
+            payload, truncated, total_decompressed = self._read_xz_with_memlimit(
+                path=path,
+                output_limit=self.max_scan_bytes,
+                memlimit=self.max_decompressed_bytes,
+                compressed_size=file_size,
+                max_decompressed_bytes=self.max_decompressed_bytes,
+                max_decompression_ratio=self.max_decompression_ratio,
+            )
 
         return payload, compression, truncated, total_decompressed
 
@@ -474,7 +597,7 @@ class RSerializedScanner(BaseScanner):
 
         try:
             payload, compression, truncated, decompressed_bytes = self._read_payload_for_analysis(path, file_size)
-        except (EOFError, OSError, ValueError, gzip.BadGzipFile, lzma.LZMAError) as exc:
+        except (EOFError, OSError, ValueError, MemoryError, gzip.BadGzipFile, lzma.LZMAError) as exc:
             result.add_check(
                 name="R Serialized Decompression",
                 passed=False,
@@ -489,6 +612,18 @@ class RSerializedScanner(BaseScanner):
             )
             result.finish(success=False)
             return result
+
+        result.add_check(
+            name="R Serialized Decompression",
+            passed=True,
+            message="Safely decoded R serialized payload for analysis",
+            location=path,
+            details={
+                "compression": compression,
+                "compressed_bytes": file_size,
+                "decompressed_bytes": decompressed_bytes,
+            },
+        )
 
         if not payload:
             result.add_check(

@@ -472,7 +472,7 @@ def detect_file_format_from_magic(path: str) -> str:
             magic8 = header[:8]
             magic16 = header[:16]
 
-            if _is_valid_executorch_binary(file_path):
+            if _is_executorch_binary_signature(magic8) and _is_valid_executorch_binary(file_path):
                 return "executorch"
 
             # Try the new pattern matching approach first
@@ -1008,7 +1008,7 @@ def validate_file_type(path: str) -> bool:
         if ext_format == "nemo" and header_format == "tar":
             return True
 
-        # ExecuTorch files should be zip archives
+        # ExecuTorch files may be ZIP archives or valid FlatBuffers binaries.
         if ext_format == "executorch":
             return header_format == "zip" or _is_valid_executorch_binary(path)
 
