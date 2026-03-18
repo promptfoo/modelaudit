@@ -16,6 +16,11 @@ from modelaudit.scanners.pickle_scanner import (
 )
 
 
+def _write_joblib_like_pickle(path: Path, *, padding: int = 0) -> None:
+    """Write a minimal pickle stream with opcode-level joblib evidence."""
+    path.write_bytes(b"\x80\x04cjoblib.numpy_pickle\nNumpyArrayWrapper\nq\x00." + b"\x00" * padding)
+
+
 class TestDillJoblibSecurity:
     """Security-focused tests for dill/joblib support."""
 
@@ -56,7 +61,7 @@ class TestDillJoblibSecurity:
 
         # Validation should fail since this doesn't look like real dill
         is_valid = _is_legitimate_serialization_file(str(malicious_file))
-        assert is_valid is True  # Dill validation is permissive for pickle format
+        assert is_valid is False
 
         # But scanner should still detect the suspicious content
         scanner = PickleScanner()
@@ -96,13 +101,7 @@ class TestFileValidation:
     def test_legitimate_joblib_file_validation(self, tmp_path):
         """Test validation of legitimate joblib files."""
         joblib_file = tmp_path / "model.joblib"
-
-        # Create mock joblib file with proper markers
-        with open(joblib_file, "wb") as f:
-            f.write(b"\x80\x03")  # Pickle protocol
-            f.write(b"joblib")  # Joblib marker
-            f.write(b"sklearn")  # Additional marker
-            pickle.dump({"model": "data", "sklearn_version": "1.0"}, f)
+        _write_joblib_like_pickle(joblib_file)
 
         is_valid = _is_legitimate_serialization_file(str(joblib_file))
         assert is_valid is True
@@ -185,13 +184,7 @@ class TestErrorHandling:
         caplog.set_level(logging.WARNING)
 
         joblib_file = tmp_path / "logged.joblib"
-
-        # Create valid joblib file that will pass validation
-        with open(joblib_file, "wb") as f:
-            f.write(b"\x80\x03")  # Pickle protocol 3
-            f.write(b"joblib")  # Joblib marker
-            f.write(b"sklearn")  # Additional marker to help validation
-            pickle.dump({"test": "data"}, f)
+        _write_joblib_like_pickle(joblib_file)
 
         scanner = PickleScanner()
 
@@ -223,18 +216,13 @@ class TestPerformanceAndEdgeCases:
     def test_large_file_validation_performance(self, tmp_path):
         """Test that file validation is performant on large files."""
         large_file = tmp_path / "large.joblib"
-
-        # Create a file larger than 1KB but with joblib marker early
-        with open(large_file, "wb") as f:
-            f.write(b"\x80\x03")  # Pickle protocol
-            f.write(b"joblib" * 100)  # Repeat marker
-            f.write(b"X" * 10000)  # Large content
+        _write_joblib_like_pickle(large_file, padding=10000)
 
         start_time = time.perf_counter()
         is_valid = _is_legitimate_serialization_file(str(large_file))
         duration = time.perf_counter() - start_time
 
-        # Should complete quickly (under 10ms) since it only reads 1KB
+        # Should complete quickly on a bounded prefix scan.
         assert duration < 0.01
         assert is_valid is True
 
@@ -315,11 +303,7 @@ class TestIntegration:
     def test_multiple_exception_types_handling(self, tmp_path):
         """Test handling of different exception types."""
         test_file = tmp_path / "multi.joblib"
-
-        with open(test_file, "wb") as f:
-            f.write(b"\x80\x03")  # Pickle protocol
-            f.write(b"joblib")  # Joblib marker to pass validation
-            pickle.dump({"test": "data"}, f)
+        _write_joblib_like_pickle(test_file)
 
         scanner = PickleScanner()
 
