@@ -2854,6 +2854,76 @@ def _is_legitimate_serialization_file(path: str) -> bool:
     Validate that a file is a legitimate joblib or dill serialization file.
     This helps prevent security bypass by simply renaming malicious files.
     """
+
+    def _analyze_sample_globals(sample: bytes) -> tuple[bool, bool]:
+        if not sample:
+            return False, False
+
+        validation_context = {"is_ml_content": False, "overall_confidence": 0.0, "frameworks": {}}
+        has_dangerous_global = False
+        has_joblib_like_global = False
+
+        def _record_global(mod: str, func: str) -> None:
+            nonlocal has_dangerous_global, has_joblib_like_global
+            if mod in {"joblib", "sklearn", "numpy"} or mod.startswith(("joblib.", "sklearn.", "numpy.")):
+                has_joblib_like_global = True
+            if _is_actually_dangerous_global(mod, func, validation_context):
+                has_dangerous_global = True
+
+        # Raw protocol 0/1 GLOBAL parsing keeps this heuristic usable even when
+        # pickletools itself is the code path that hits MemoryError.
+        cursor = 0
+        max_global_len = 256
+        while cursor < len(sample):
+            global_pos = sample.find(b"c", cursor)
+            if global_pos == -1:
+                break
+
+            module_end = sample.find(b"\n", global_pos + 1, global_pos + 1 + max_global_len)
+            if module_end == -1:
+                cursor = global_pos + 1
+                continue
+
+            function_end = sample.find(b"\n", module_end + 1, module_end + 1 + max_global_len)
+            if function_end == -1:
+                cursor = global_pos + 1
+                continue
+
+            try:
+                module = sample[global_pos + 1 : module_end].decode("utf-8")
+                function = sample[module_end + 1 : function_end].decode("utf-8")
+            except UnicodeDecodeError:
+                cursor = global_pos + 1
+                continue
+
+            if module and function:
+                _record_global(module, function)
+            cursor = function_end + 1
+
+        try:
+            opcodes = list(_genops_with_fallback(io.BytesIO(sample), max_items=128))
+        except (_GenopsBudgetExceeded, ValueError, struct.error, UnicodeDecodeError, EOFError):
+            return has_dangerous_global, has_joblib_like_global
+        except Exception:
+            return has_dangerous_global, has_joblib_like_global
+
+        stack_global_refs, _callable_refs, _origin_refs, _origin_is_ext, _malformed = _simulate_symbolic_reference_maps(
+            opcodes
+        )
+
+        for idx, (opcode, arg, _pos) in enumerate(opcodes):
+            op_name = getattr(opcode, "name", "")
+            if op_name in {"GLOBAL", "INST"} and isinstance(arg, str):
+                parsed = _parse_module_function(arg)
+                if parsed:
+                    _record_global(parsed[0], parsed[1])
+            elif op_name == "STACK_GLOBAL":
+                stack_ref = stack_global_refs.get(idx)
+                if stack_ref:
+                    _record_global(stack_ref[0], stack_ref[1])
+
+        return has_dangerous_global, has_joblib_like_global
+
     try:
         with open(path, "rb") as f:
             # Read first few bytes to check for pickle magic
@@ -2874,34 +2944,24 @@ def _is_legitimate_serialization_file(path: str) -> bool:
                 # Common pickle opcode starts for protocols 0-1
                 return False
 
-            # For joblib files, look for joblib-specific patterns
-            # Also check extensionless files (e.g. HuggingFace cache blob hashes)
+            f.seek(0)
+            sample = f.read(64 * 1024)
+            has_dangerous_global, has_joblib_like_global = _analyze_sample_globals(sample)
+            if has_dangerous_global:
+                return False
+
+            # For joblib files and extensionless cache blobs, require opcode-level
+            # framework evidence instead of marker strings. Extension/substring
+            # checks alone are too easy to spoof.
             ext_lower = os.path.splitext(path)[1].lower()
             if ext_lower == ".joblib" or not ext_lower:
-                f.seek(0)
-                # Try to find joblib-specific markers in first 2KB
-                sample = f.read(2048)
-                # Look for joblib-specific indicators
-                joblib_indicators = [
-                    b"joblib",
-                    b"sklearn",
-                    b"numpy",
-                    b"_joblib",
-                    b"__main__",
-                    b"_pickle",
-                    b"NumpyArrayWrapper",
-                ]
-                if any(marker in sample for marker in joblib_indicators):
-                    return True
-                # For extensionless files, only return False if no indicators found
-                # (don't fall through to dill check)
-                if not ext_lower:
-                    return False
+                return bool(has_joblib_like_global)
 
-            # For dill files, they're usually just enhanced pickle
+            # Dill can serialize plain pickle-compatible objects without
+            # embedding obvious dill globals near the front of the stream, so
+            # a .dill extension remains a legitimacy signal after bounded
+            # dangerous-global rejection above.
             if ext_lower == ".dill":
-                # Dill files should contain standard pickle format
-                # Additional validation could check for dill-specific patterns
                 return True
 
         return False
@@ -5663,6 +5723,10 @@ class PickleScanner(BaseScanner):
                 mod in {"joblib", "sklearn", "numpy"} or mod.startswith(("joblib.", "sklearn.", "numpy."))
                 for mod, _func, _opcode in advanced_globals
             )
+            has_dill_globals = any(
+                mod in {"dill", "_dill"} or mod.startswith(("dill.", "_dill.", "dill._dill"))
+                for mod, _func, _opcode in advanced_globals
+            )
             is_joblib_content = is_serialization_ext or (not file_ext and has_joblib_globals)
 
             # Check for recursion errors on legitimate ML model files
@@ -5703,13 +5767,17 @@ class PickleScanner(BaseScanner):
                 and (has_pytorch_advanced_global or has_ordereddict_global)
                 and not has_dangerous_advanced_global
             )
-            # For serialization content, require positive evidence of legitimacy.
-            # Extension-validated files (.joblib/.dill) rely on extension +
-            # _is_legitimate_serialization_file() + no dangerous globals.
-            # Extensionless blobs require positive joblib/sklearn/numpy globals.
-            has_legitimate_serialization_globals = (is_serialization_ext and not has_dangerous_advanced_global) or (
-                not file_ext and bool(advanced_globals) and has_joblib_globals and not has_dangerous_advanced_global
-            )
+            # Require positive opcode-level framework globals for .joblib files;
+            # marker bytes and extensions alone are too weak. Dill stays more
+            # permissive because legitimate plain-object dill payloads may not
+            # expose dill globals before a resource limit hits.
+            has_extension_based_serialization_globals = (
+                file_ext == ".joblib" and bool(advanced_globals) and has_joblib_globals
+            ) or (file_ext == ".dill" and (has_dill_globals or not advanced_globals))
+            has_legitimate_serialization_globals = (
+                has_extension_based_serialization_globals
+                or (not file_ext and bool(advanced_globals) and has_joblib_globals)
+            ) and not has_dangerous_advanced_global
             passes_global_gate = (
                 has_legitimate_pytorch_globals
                 if file_ext == ".bin"
