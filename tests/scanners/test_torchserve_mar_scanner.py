@@ -18,9 +18,10 @@ def _create_mar_archive(
     manifest: dict[str, Any] | str | None,
     entries: dict[str, bytes],
     filename: str = "model.mar",
+    compression: int = zipfile.ZIP_STORED,
 ) -> Path:
     mar_path = tmp_path / filename
-    with zipfile.ZipFile(mar_path, "w") as archive:
+    with zipfile.ZipFile(mar_path, "w", compression=compression) as archive:
         if manifest is not None:
             manifest_bytes = (
                 manifest.encode("utf-8")
@@ -72,6 +73,16 @@ def test_can_handle_rejects_non_zip_and_missing_manifest(tmp_path: Path) -> None
 
     missing_manifest_mar = _create_mar_archive(tmp_path, manifest=None, entries={"weights.bin": b"weights"})
     assert not TorchServeMarScanner.can_handle(str(missing_manifest_mar))
+
+
+def test_can_handle_rejects_invalid_manifest_json(tmp_path: Path) -> None:
+    invalid_manifest_mar = _create_mar_archive(
+        tmp_path,
+        manifest='{"model": {"handler": "handler.py", "serializedFile": "weights.bin"',
+        entries={"handler.py": b"def handle(data, context):\n    return data\n", "weights.bin": b"weights"},
+    )
+
+    assert not TorchServeMarScanner.can_handle(str(invalid_manifest_mar))
 
 
 def test_scan_benign_mar_with_safe_handler(tmp_path: Path) -> None:
@@ -265,6 +276,50 @@ def test_core_routes_mar_to_dedicated_scanner(tmp_path: Path) -> None:
     assert result.scanner_name != "unknown"
 
 
+def test_core_falls_back_to_zip_scanner_for_non_torchserve_mar(tmp_path: Path) -> None:
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=None,
+        entries={"../evil.txt": b"malicious"},
+        filename="invalid.mar",
+    )
+
+    result = core.scan_file(str(mar_path))
+    assert result.scanner_name == "zip"
+    assert any("path traversal" in f"{issue.message} {issue.why or ''}".lower() for issue in result.issues)
+
+
+def test_core_falls_back_to_zip_scanner_for_invalid_manifest_json(tmp_path: Path) -> None:
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest='{"model": {"handler": "handler.py", "serializedFile": "weights.bin"',
+        entries={"handler.py": b"def handle(data, context):\n    return data\n", "../evil.txt": b"malicious"},
+        filename="invalid_manifest.mar",
+    )
+
+    result = core.scan_file(str(mar_path))
+    assert result.scanner_name == "zip"
+    assert any("path traversal" in f"{issue.message} {issue.why or ''}".lower() for issue in result.issues)
+
+
+def test_core_detects_high_risk_handler_in_non_torchserve_mar(tmp_path: Path) -> None:
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=None,
+        entries={
+            "handler.py": b"import os\n\ndef handle(data, context):\n    return os.system('echo owned')\n",
+        },
+        filename="handler_only.mar",
+    )
+
+    result = core.scan_file(str(mar_path))
+    handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
+    assert result.scanner_name == "zip"
+    assert len(handler_failures) >= 1
+    assert handler_failures[0].severity == IssueSeverity.CRITICAL
+    assert "os.system" in handler_failures[0].message
+
+
 def test_false_positive_reduction_comments_and_strings_only(tmp_path: Path) -> None:
     handler_code = b"""
 def handle(data, context):
@@ -327,3 +382,22 @@ def test_manifest_read_is_bounded(tmp_path: Path) -> None:
     result = TorchServeMarScanner().scan(str(mar_path))
     manifest_size_failures = _failed_checks(result, "TorchServe Manifest Size Limit")
     assert len(manifest_size_failures) == 1
+
+
+def test_scan_detects_suspicious_compression_ratio_in_valid_mar(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"def handle(data, context):\n    return data\n",
+            "weights.bin": b"A" * (512 * 1024),
+        },
+        filename="compressed.mar",
+        compression=zipfile.ZIP_DEFLATED,
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    ratio_failures = _failed_checks(result, "TorchServe MAR Compression Ratio Check")
+    assert len(ratio_failures) >= 1
+    assert any(check.details.get("entry") == "weights.bin" for check in ratio_failures)

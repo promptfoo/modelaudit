@@ -512,7 +512,7 @@ class ScannerRegistry:
                 "module": "modelaudit.scanners.zip_scanner",
                 "class": "ZipScanner",
                 "description": "Scans ZIP archive files",
-                "extensions": [".zip", ".npz"],
+                "extensions": [".zip", ".npz", ".mar"],
                 "priority": 99,  # Generic zip scanner should be last
                 "dependencies": [],  # No heavy dependencies
                 "numpy_sensitive": False,
