@@ -2688,9 +2688,16 @@ def _is_actually_dangerous_string(s: str, ml_context: dict) -> str | None:
         and re.search(r"[A-Z]", s)
         and re.search(r"[a-z]", s)
         and re.search(r"[0-9]", s)
-        and any(ch in s for ch in "+/=")
     ):
-        return "potential_base64"
+        if any(ch in s for ch in "+/="):
+            return "potential_base64"
+
+        # Preserve padding-stripped base64 blobs that are otherwise well-formed.
+        padding_needed = (-len(s)) % 4
+        if padding_needed in (0, 1, 2) and len(s) <= 10000:
+            padded = s + ("=" * padding_needed)
+            if any(encoding == "base64" for encoding, _decoded in _decode_string_to_bytes(padded)):
+                return "potential_base64"
 
     return None
 
@@ -2699,11 +2706,13 @@ def _is_short_period_repetition(s: str, max_period: int = 16) -> bool:
     """Return True for strings made by repeating a short token like ``ABCD1234``."""
     if len(s) < max_period * 2:
         return False
+    if len(s) > 10 * 1024 * 1024:
+        return False
 
     for period in range(2, min(max_period, len(s) // 2) + 1):
         if len(s) % period == 0:
             unit = s[:period]
-            if unit * (len(s) // period) == s:
+            if all(s[i : i + period] == unit for i in range(0, len(s), period)):
                 return True
 
     return False
