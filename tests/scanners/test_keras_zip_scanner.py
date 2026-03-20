@@ -307,11 +307,7 @@ __import__('pickle').loads(data)
         model_path = create_configured_keras_zip(tmp_path, config, keras_version="3.12.0")
         result = scanner.scan(str(model_path))
 
-        cve_checks = [
-            check
-            for check in result.checks
-            if check.details.get("cve_id") == "CVE-2025-12058"
-        ]
+        cve_checks = [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-12058"]
         assert len(cve_checks) == 1
         assert cve_checks[0].name == "StringLookup External Vocabulary Metadata Check"
         assert cve_checks[0].status == CheckStatus.FAILED
