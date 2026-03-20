@@ -7,7 +7,6 @@ Follows privacy-first principles with comprehensive opt-out controls.
 from __future__ import annotations
 
 import atexit
-import hashlib
 import json
 import logging
 import os
@@ -367,9 +366,23 @@ class TelemetryClient:
             # Just mark that we've acknowledged telemetry is disabled - no actual recording
             self._telemetry_disabled_recorded = True
 
-    def _hash_identifier(self, value: str) -> str:
-        """Create a stable, non-reversible identifier hash for paths/URLs."""
-        return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+    def _build_path_properties(self, path: str) -> dict[str, Any]:
+        """Build coarse telemetry properties for a file path."""
+        return {
+            "path_type": self._classify_path(path),
+            "file_extension": Path(path).suffix.lower(),
+            "model_name": self._extract_model_name(path),
+            "model_reference": self._extract_model_reference(path),
+        }
+
+    def _build_url_properties(self, url: str) -> dict[str, Any]:
+        """Build coarse telemetry properties for a download URL."""
+        return {
+            "domain": self._extract_domain(url),
+            "path_type": self._classify_path(url),
+            "model_name": self._extract_model_name(url),
+            "model_reference": self._extract_model_reference(url),
+        }
 
     def _iter_result_issues(self, results: dict[str, Any]) -> list[dict[str, Any]]:
         """Normalize top-level issue records from scan results."""
@@ -425,13 +438,19 @@ class TelemetryClient:
         is_http_url = path.startswith(("http://", "https://"))
         is_hf_shorthand = path.startswith("hf://")
         parsed = urlparse(path) if (is_http_url or is_hf_shorthand) else None
+        url_host = self._extract_url_host(path) if parsed else None
 
         # HuggingFace format: hf://org/model or https://huggingface.co/org/model
         if is_hf_shorthand and parsed:
-            parts = [part for part in [parsed.netloc, *parsed.path.lstrip("/").split("/")] if part]
+            parts = [part for part in [url_host, *parsed.path.lstrip("/").split("/")] if part]
             if len(parts) >= 2:
                 return f"{parts[0]}/{parts[1]}"
-        if is_http_url and parsed and (parsed.netloc == "huggingface.co" or parsed.netloc.endswith(".huggingface.co")):
+        if (
+            is_http_url
+            and parsed
+            and url_host
+            and (url_host == "huggingface.co" or url_host.endswith(".huggingface.co"))
+        ):
             parts = [part for part in parsed.path.lstrip("/").split("/") if part]
             if len(parts) >= 2:
                 return f"{parts[0]}/{parts[1]}"
@@ -448,10 +467,25 @@ class TelemetryClient:
             if model_name:
                 return model_name
 
-        if is_http_url and parsed and parsed.netloc:
-            return parsed.netloc
+        if is_http_url and url_host and url_host != "unknown":
+            return url_host
 
         return name_source
+
+    def _extract_model_reference(self, path: str) -> str | None:
+        """Extract a secret-scrubbed model reference while preserving model identity."""
+        if "://" not in path:
+            return self._extract_model_name(path)
+
+        try:
+            parsed = urlparse(path)
+            host = self._extract_url_host(path)
+            if not parsed.scheme or host == "unknown":
+                return self._extract_model_name(path)
+
+            return parsed._replace(netloc=host, params="", query="", fragment="").geturl()
+        except Exception:
+            return self._extract_model_name(path)
 
     def record_event(self, event: TelemetryEvent, properties: dict[str, Any] | None = None) -> None:
         """Record a telemetry event."""
@@ -478,13 +512,12 @@ class TelemetryClient:
             TelemetryEvent.SCAN_STARTED,
             {
                 "num_paths": len(paths),
-                "paths": paths,
                 "model_names": [self._extract_model_name(path) for path in paths],
+                "model_references": [self._extract_model_reference(path) for path in paths],
                 "source_types": source_types,
                 "path_types": path_types,
                 "source_type_counts": self._count_values(source_types),
                 "path_type_counts": self._count_values(path_types),
-                "path_identifiers": [self._hash_identifier(path) for path in paths],
                 "timeout": scan_options.get("timeout"),
                 "max_file_size": scan_options.get("max_file_size"),
                 "format": scan_options.get("format", "text"),
@@ -522,16 +555,17 @@ class TelemetryClient:
             issue_type = str(issue.get("type") or issue.get("message") or "unknown")
             severity = str(issue.get("severity", "unknown"))
             issue_types[issue_type] = issue_types.get(issue_type, 0) + 1
-            # Capture first 50 issues in detail (including raw paths when available)
+            # Capture first 50 issues in detail without including raw paths or identifiers.
             if len(issue_details) < 50:
-                issue_location = str(issue.get("location", ""))
+                raw_issue_location = issue.get("location")
+                issue_location = raw_issue_location if isinstance(raw_issue_location, str) else ""
                 issue_details.append(
                     {
                         "type": issue_type,
                         "severity": severity,
-                        "location_type": self._classify_path(issue_location),
-                        "file_path": issue_location,
+                        "location_type": self._classify_path(issue_location) if issue_location else "unknown",
                         "model_name": self._extract_model_name(issue_location) if issue_location else None,
+                        "model_reference": self._extract_model_reference(issue_location) if issue_location else None,
                     }
                 )
 
@@ -552,7 +586,11 @@ class TelemetryClient:
                 "scanners_used": sorted(set(scanner_names)),
                 "issue_types": issue_types,
                 "issue_details": issue_details,
-                "files_scanned": [str(asset.get("path", "")) for asset in assets],
+                "model_references": [
+                    self._extract_model_reference(str(asset.get("path", "")))
+                    for asset in assets
+                    if isinstance(asset.get("path", ""), str) and asset.get("path")
+                ],
             },
         )
 
@@ -585,11 +623,7 @@ class TelemetryClient:
             {
                 "file_type": detected_type,
                 "confidence": confidence,
-                "file_extension": Path(file_path).suffix.lower(),
-                "path_type": self._classify_path(file_path),
-                "path_identifier": self._hash_identifier(file_path),
-                "file_path": file_path,
-                "model_name": self._extract_model_name(file_path),
+                **self._build_path_properties(file_path),
             },
         )
 
@@ -609,11 +643,7 @@ class TelemetryClient:
         }
 
         if file_path:
-            properties["path_identifier"] = self._hash_identifier(file_path)
-            properties["path_type"] = self._classify_path(file_path)
-            properties["file_extension"] = Path(file_path).suffix.lower()
-            properties["file_path"] = file_path
-            properties["model_name"] = self._extract_model_name(file_path)
+            properties.update(self._build_path_properties(file_path))
 
         self.record_event(TelemetryEvent.ISSUE_FOUND, properties)
 
@@ -657,12 +687,8 @@ class TelemetryClient:
             TelemetryEvent.DOWNLOAD_STARTED,
             {
                 "source_type": source_type,
-                "domain": self._extract_domain(url),
                 "size_bytes": size_bytes,
-                "url_identifier": self._hash_identifier(url),
-                "path_type": self._classify_path(url),
-                "url": url,
-                "model_name": self._extract_model_name(url),
+                **self._build_url_properties(url),
             },
         )
 
@@ -678,11 +704,7 @@ class TelemetryClient:
         }
 
         if url:
-            properties["url_identifier"] = self._hash_identifier(url)
-            properties["domain"] = self._extract_domain(url)
-            properties["path_type"] = self._classify_path(url)
-            properties["url"] = url
-            properties["model_name"] = self._extract_model_name(url)
+            properties.update(self._build_url_properties(url))
 
         self.record_event(TelemetryEvent.DOWNLOAD_COMPLETED, properties)
 
@@ -723,8 +745,15 @@ class TelemetryClient:
 
     def _extract_domain(self, url: str) -> str:
         """Extract domain from URL for analytics."""
+        return self._extract_url_host(url)
+
+    def _extract_url_host(self, url: str) -> str:
+        """Extract a sanitized URL host without userinfo for analytics."""
         try:
-            return urlparse(url).netloc
+            parsed = urlparse(url)
+            if not parsed.hostname:
+                return "unknown"
+            return f"{parsed.hostname}:{parsed.port}" if parsed.port is not None else parsed.hostname
         except Exception:
             return "unknown"
 
