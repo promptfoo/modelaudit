@@ -79,7 +79,10 @@ def test_safe_nested_like_pickle_fixtures_do_not_emit_security_findings(fixture_
 
 def test_padding_stripped_base64_candidate_still_flags_potential_base64() -> None:
     """Padding-stripped base64 should stay detectable if it is otherwise well-formed."""
-    padding_stripped = "PL25iLsbINGVuY8DRvqrcGgm2bElUlp3LZLCHbZu7GfvNOJks6CuDNk2ocfYv3pDv8DGkGBqI8BqXWIYrMEgNRe6TlS37NStmZSk2lfnRu1H0bSiPg9KtqZo"
+    padding_stripped = (
+        "PL25iLsbINGVuY8DRvqrcGgm2bElUlp3LZLCHbZu7GfvNOJks6CuDNk2ocfYv3pDv8DGkG"
+        "BqI8BqXWIYrMEgNRe6TlS37NStmZSk2lfnRu1H0bSiPg9KtqZo"
+    )
 
     assert _is_actually_dangerous_string(padding_stripped, {}) == "potential_base64"
 

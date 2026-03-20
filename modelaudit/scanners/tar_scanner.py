@@ -201,13 +201,17 @@ class TarScanner(BaseScanner):
     @staticmethod
     def _is_empty_tar_archive(path: str) -> bool:
         """Detect standard empty TAR archives that some Python 3.10 builds reject on ``next()``."""
+        max_read_size = 10 * 1024 * 1024
         try:
             file_size = os.path.getsize(path)
             if file_size < 2 * tarfile.BLOCKSIZE or file_size % tarfile.BLOCKSIZE != 0:
                 return False
+            if file_size > max_read_size:
+                return False
 
             with open(path, "rb") as file_obj:
-                return file_obj.read() == b"\0" * file_size
+                empty_data = file_obj.read(file_size)
+                return len(empty_data) == file_size and empty_data == b"\0" * file_size
         except OSError:
             return False
 
