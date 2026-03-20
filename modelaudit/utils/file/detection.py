@@ -302,6 +302,62 @@ def _is_lightgbm_signature(prefix: bytes) -> bool:
     return (starts_with_tree or "tree=" in preview) and header_hits >= 3 and tree_hits >= 2 and not xgboost_like
 
 
+def _is_executorch_binary_signature(prefix: bytes) -> bool:
+    """Recognize versioned ExecuTorch FlatBuffers binaries by their file identifier."""
+    return len(prefix) >= 8 and prefix[4:6] == b"ET" and prefix[6:8].isdigit()
+
+
+def _is_valid_executorch_binary(path: str | Path) -> bool:
+    """Validate the minimal FlatBuffers structure for ExecuTorch binaries."""
+    file_path = Path(path)
+    if not file_path.is_file():
+        return False
+
+    try:
+        file_size = file_path.stat().st_size
+        if file_size < 16:
+            return False
+
+        with file_path.open("rb") as f:
+            header = f.read(8)
+            if not _is_executorch_binary_signature(header):
+                return False
+
+            root_table_offset = struct.unpack("<I", header[:4])[0]
+            if root_table_offset < 12 or root_table_offset + 4 > file_size:
+                return False
+
+            f.seek(root_table_offset)
+            table_header = f.read(4)
+            if len(table_header) != 4:
+                return False
+
+            vtable_back_offset = struct.unpack("<i", table_header)[0]
+            if vtable_back_offset <= 0 or vtable_back_offset > root_table_offset:
+                return False
+
+            vtable_offset = root_table_offset - vtable_back_offset
+            if vtable_offset < 8 or vtable_offset + 4 > file_size:
+                return False
+
+            f.seek(vtable_offset)
+            vtable_header = f.read(4)
+            if len(vtable_header) != 4:
+                return False
+
+            vtable_size, object_size = struct.unpack("<HH", vtable_header)
+            if vtable_size < 4 or object_size < 4:
+                return False
+            if vtable_offset + vtable_size > file_size:
+                return False
+            if root_table_offset + object_size > file_size:
+                return False
+    except (OSError, struct.error):
+        return False
+
+    return True
+
+
 def _is_zlib_header(prefix: bytes) -> bool:
     if len(prefix) < 2:
         return False
@@ -424,6 +480,9 @@ def detect_file_format_from_magic(path: str) -> str:
             magic4 = header[:4]
             magic8 = header[:8]
             magic16 = header[:16]
+
+            if _is_executorch_binary_signature(magic8) and _is_valid_executorch_binary(file_path):
+                return "executorch"
 
             # Try the new pattern matching approach first
             format_result = detect_format_from_magic_bytes(magic4, magic8, magic16)
@@ -962,9 +1021,9 @@ def validate_file_type(path: str) -> bool:
         if ext_format == "nemo" and header_format == "tar":
             return True
 
-        # ExecuTorch files should be zip archives
+        # ExecuTorch files may be ZIP archives or valid FlatBuffers binaries.
         if ext_format == "executorch":
-            return header_format == "zip"
+            return header_format == "zip" or _is_valid_executorch_binary(path)
 
         # Keras files can be either ZIP (Keras 3.x) or HDF5 (legacy Keras)
         if ext_format == "keras":
