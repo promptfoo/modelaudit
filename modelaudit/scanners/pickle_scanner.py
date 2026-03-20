@@ -6882,17 +6882,20 @@ class PickleScanner(BaseScanner):
         metadata = super().extract_metadata(file_path)
 
         allow_deserialization = bool(self.config.get("allow_metadata_deserialization"))
-        max_metadata_read_size = int(self.config.get("max_metadata_pickle_read_size", 10 * 1024 * 1024))
+        metadata_read_cap = 10 * 1024 * 1024
 
         try:
             import pickle
             import pickletools
             from io import BytesIO
 
+            max_metadata_read_size = int(self.config.get("max_metadata_pickle_read_size", metadata_read_cap))
+
             if max_metadata_read_size <= 0:
                 raise ValueError(
                     f"Invalid pickle metadata read limit: {max_metadata_read_size} (must be greater than 0)"
                 )
+            max_metadata_read_size = min(max_metadata_read_size, metadata_read_cap)
 
             file_size = self.get_file_size(file_path)
             if file_size > max_metadata_read_size:
