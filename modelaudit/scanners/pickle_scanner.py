@@ -1970,27 +1970,17 @@ def _is_plausible_python_module(name: str) -> bool:
     Check whether *name* looks like a real Python module/package path.
 
     Legitimate module names follow Python identifier rules:
-    - Each dotted segment is a valid Python identifier (letters, digits,
-      underscores; cannot start with a digit).
-    - Conventionally all-lowercase, though private/internal modules may use
-      a leading underscore.
+    - Each dotted segment is an ASCII Python identifier.
+    - Segments normally contain lowercase characters, with a short explicit
+      allowlist for case-sensitive imports such as ``PIL``.
 
-    Names that contain uppercase letters, start with digits, or include
-    characters outside ``[a-z0-9_.]`` are almost certainly **not** real
-    modules -- they are more likely DataFrame column names, user labels,
-    or other data strings that ended up as pickle GLOBAL arguments
-    (e.g. ``PEDRA_2020``).
-
-    The check is intentionally conservative: a handful of legitimate but
-    unusual module names (e.g. ``PIL``, ``Cython``) are covered by
-    ``ML_SAFE_GLOBALS`` and will pass the allowlist before this function
-    is ever consulted.
+    Keep obviously malformed names rejected so arbitrary data strings are less
+    likely to be treated as imports, while still allowing valid mixed-case
+    segments such as ``EvilPkg`` and ``MyOrg.InternalPkg``.
 
     Returns:
         True if *name* plausibly refers to a real Python module.
     """
-    import re
-
     if not name:
         return False
 
@@ -1998,17 +1988,15 @@ def _is_plausible_python_module(name: str) -> bool:
     if " " in name or "\t" in name:
         return False
 
-    # Split on dots; each segment must be a valid Python identifier that
-    # looks like a conventional module name (lowercase + digits + _).
+    # Split on dots; each segment must be an ASCII Python identifier.
     segments = name.split(".")
-    if not segments or any(s == "" for s in segments):
+    if not segments or any(s == "" or not s.isascii() or not s.isidentifier() for s in segments):
         return False
 
-    _MODULE_SEGMENT_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
-    return all(_MODULE_SEGMENT_RE.match(seg) for seg in segments)
+    return all(any(char.islower() for char in seg) or seg in _CASE_SENSITIVE_IMPORT_SEGMENTS for seg in segments)
 
 
-_CASE_SENSITIVE_IMPORT_SEGMENTS = frozenset({"PIL", "Cython"})
+_CASE_SENSITIVE_IMPORT_SEGMENTS: frozenset[str] = frozenset({"PIL", "Cython"})
 IMPORT_ONLY_ALWAYS_DANGEROUS_GLOBALS = frozenset(
     {
         ("dill", "load"),
@@ -2079,16 +2067,7 @@ def _is_resolved_import_target(mod: str, func: str) -> bool:
 
 def _is_plausible_import_only_module(mod: str) -> bool:
     """Return True when a module path looks importable without matching common data labels."""
-    if not mod:
-        return False
-
-    segments = mod.split(".")
-    if not segments or any(segment == "" or not segment.isidentifier() for segment in segments):
-        return False
-
-    return all(
-        any(char.islower() for char in segment) or segment in _CASE_SENSITIVE_IMPORT_SEGMENTS for segment in segments
-    )
+    return _is_plausible_python_module(mod)
 
 
 def _classify_import_reference(
@@ -2696,16 +2675,47 @@ def _is_actually_dangerous_string(s: str, ml_context: dict) -> str | None:
                 # Otherwise, likely a false positive
                 continue
 
-    # Check for base64-like strings (still suspicious), but avoid repeating patterns
+    # Check for base64-like strings, but avoid common benign model metadata such
+    # as repeated tokens and hex digests. Encoded nested payloads are handled
+    # separately by decoding and validating the content.
     if (
         len(s) > 100
         and re.match(r"^[A-Za-z0-9+/=]+$", s)
         and not re.match(r"^(.)\1*$", s)  # Not all same character (e.g., "===...")
         and len(set(s)) > 4  # Must have some character diversity
+        and not re.fullmatch(r"[0-9a-fA-F]+", s)
+        and not _is_short_period_repetition(s)
+        and re.search(r"[A-Z]", s)
+        and re.search(r"[a-z]", s)
+        and re.search(r"[0-9]", s)
     ):
-        return "potential_base64"
+        if any(ch in s for ch in "+/="):
+            return "potential_base64"
+
+        # Preserve padding-stripped base64 blobs that are otherwise well-formed.
+        padding_needed = (-len(s)) % 4
+        if padding_needed in (0, 1, 2) and len(s) <= 10000:
+            padded = s + ("=" * padding_needed)
+            if any(encoding == "base64" for encoding, _decoded in _decode_string_to_bytes(padded)):
+                return "potential_base64"
 
     return None
+
+
+def _is_short_period_repetition(s: str, max_period: int = 16) -> bool:
+    """Return True for strings made by repeating a short token like ``ABCD1234``."""
+    if len(s) < max_period * 2:
+        return False
+    if len(s) > 10 * 1024 * 1024:
+        return False
+
+    for period in range(2, min(max_period, len(s) // 2) + 1):
+        if len(s) % period == 0:
+            unit = s[:period]
+            if all(s[i : i + period] == unit for i in range(0, len(s), period)):
+                return True
+
+    return False
 
 
 def _looks_like_pickle(data: bytes) -> bool:
@@ -3224,18 +3234,6 @@ def is_dangerous_reduce_pattern(
                 "position": pos,
                 "opcode": opcode.name,
             }
-
-        # Check for suspicious strings in all string opcodes
-        if opcode.name in STRING_OPCODES and isinstance(arg, str):
-            suspicious_pattern = is_suspicious_string(arg)
-            if suspicious_pattern:
-                return {
-                    "pattern": "SUSPICIOUS_STRING",
-                    "string_pattern": suspicious_pattern,
-                    "string_preview": arg[:50] + ("..." if len(arg) > 50 else ""),
-                    "position": pos,
-                    "opcode": opcode.name,
-                }
 
     return None
 
@@ -4428,12 +4426,14 @@ class PickleScanner(BaseScanner):
         suspicious_count = 0
 
         # For large files, use chunked reading to avoid memory issues
-        MAX_MEMORY_READ = 50 * 1024 * 1024  # 50MB max in memory at once
+        MAX_MEMORY_READ = 10 * 1024 * 1024  # 10MB max in memory at once
 
         current_pos = file_obj.tell()
 
-        # Read file data - either all at once for small files or first chunk for large files
-        # For large files, read first 50MB for pattern analysis (critical malicious code is usually at the beginning)
+        # Read file data - either all at once for small files or first chunk for large files.
+        # For large files, read only the first 10MB for pattern analysis to cap
+        # embedded-pickle memory usage while still inspecting the most security-
+        # relevant prefix.
         file_data = file_obj.read() if file_size <= MAX_MEMORY_READ else file_obj.read(MAX_MEMORY_READ)
 
         file_obj.seek(current_pos)  # Reset position
@@ -4629,7 +4629,9 @@ class PickleScanner(BaseScanner):
                     elif opcode.name == "STOP":
                         current_stack_depth = 0
                         if first_pickle_end_pos is None:
-                            first_pickle_end_pos = start_pos + pos + 1
+                            # pickletools reports absolute positions even when parsing
+                            # starts from a non-zero file offset.
+                            first_pickle_end_pos = pos + 1
 
                     # Store stack depth warnings for ML-context-aware processing later
                     if current_stack_depth > base_stack_depth_limit:
@@ -5338,9 +5340,13 @@ class PickleScanner(BaseScanner):
                 if opcode.name in STRING_OPCODES and isinstance(arg, str):
                     suspicious_pattern = _is_actually_dangerous_string(arg, ml_context)
                     if suspicious_pattern:
-                        severity = _get_context_aware_severity(
-                            IssueSeverity.WARNING,
-                            ml_context,
+                        severity = (
+                            IssueSeverity.INFO
+                            if suspicious_pattern == "potential_base64"
+                            else _get_context_aware_severity(
+                                IssueSeverity.WARNING,
+                                ml_context,
+                            )
                         )
                         # Determine rule code based on pattern
                         rule_code = None
@@ -6882,14 +6888,34 @@ class PickleScanner(BaseScanner):
         metadata = super().extract_metadata(file_path)
 
         allow_deserialization = bool(self.config.get("allow_metadata_deserialization"))
+        metadata_read_cap = 10 * 1024 * 1024
 
         try:
             import pickle
             import pickletools
             from io import BytesIO
 
+            max_metadata_read_size = int(self.config.get("max_metadata_pickle_read_size", metadata_read_cap))
+
+            if max_metadata_read_size <= 0:
+                raise ValueError(
+                    f"Invalid pickle metadata read limit: {max_metadata_read_size} (must be greater than 0)"
+                )
+            max_metadata_read_size = min(max_metadata_read_size, metadata_read_cap)
+
+            file_size = self.get_file_size(file_path)
+            if file_size > max_metadata_read_size:
+                raise ValueError(
+                    f"Pickle metadata read limit exceeded: {file_size} bytes (max: {max_metadata_read_size})"
+                )
+
             with open(file_path, "rb") as f:
-                pickle_data = f.read()
+                pickle_data = f.read(max_metadata_read_size + 1)
+
+            if len(pickle_data) > max_metadata_read_size:
+                raise ValueError(
+                    f"Pickle metadata read limit exceeded: {len(pickle_data)} bytes (max: {max_metadata_read_size})"
+                )
 
             # Analyze pickle structure
             metadata.update(

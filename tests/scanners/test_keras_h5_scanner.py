@@ -522,15 +522,15 @@ def test_training_config_safe_aliases_do_not_trigger_custom_object_checks(tmp_pa
 
 
 def test_builtin_random_preprocessing_layers_do_not_trigger_custom_layer_warning(tmp_path: Path) -> None:
-    """Built-in RandomWidth/RandomHeight preprocessing layers should stay allowlisted."""
+    """Built-in preprocessing layers should not be mislabeled as custom layers."""
     model_config = {
         "class_name": "Sequential",
         "config": {
             "name": "preprocessing_model",
             "layers": [
                 {"class_name": "InputLayer", "config": {"batch_shape": [None, 32, 32, 3], "name": "input"}},
-                {"class_name": "RandomWidth", "config": {"factor": 0.1}},
-                {"class_name": "RandomHeight", "config": {"factor": 0.1}},
+                {"class_name": "RandomShear", "config": {"factor": 0.1}},
+                {"class_name": "RandomColorJitter", "config": {"value_range": [0, 255], "brightness_factor": 0.1}},
             ],
         },
     }
@@ -568,6 +568,25 @@ def test_nested_functional_submodels_are_scanned_for_custom_layers(tmp_path: Pat
     custom_layer_checks = [check for check in result.checks if check.name == "Custom Layer Class Detection"]
 
     assert any(check.details.get("layer_class") == "MaliciousLayer" for check in custom_layer_checks)
+
+
+def test_generic_base_layer_class_still_triggers_custom_layer_warning(tmp_path: Path) -> None:
+    """The abstract Keras base Layer export should still require custom-layer review in H5 models."""
+    model_config = {
+        "class_name": "Sequential",
+        "config": {
+            "name": "generic_layer_model",
+            "layers": [
+                {"class_name": "InputLayer", "config": {"batch_shape": [None, 4], "name": "input"}},
+                {"class_name": "Layer", "config": {"name": "generic_layer"}},
+            ],
+        },
+    }
+    model_path = create_custom_h5_file(tmp_path, model_config, file_name="generic_layer.h5")
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert any(check.name == "Custom Layer Class Detection" for check in result.checks)
 
 
 class TestCVE20259905H5SafeMode:

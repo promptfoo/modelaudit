@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import sys
 import warnings
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, BinaryIO, ClassVar
 
 from .base import BaseScanner, IssueSeverity, ScanResult
+from .pickle_scanner import PickleScanner
 
 # Import NumPy with compatibility handling
 try:
@@ -87,6 +88,17 @@ class NumPyScanner(BaseScanner):
     CVE_2019_6446_ID = "CVE-2019-6446"
     CVE_2019_6446_CVSS = 9.8
     CVE_2019_6446_CWE = "CWE-502"
+
+    def _scan_embedded_pickle_payload(
+        self,
+        file_obj: BinaryIO,
+        payload_size: int,
+        context_path: str,
+    ) -> ScanResult:
+        """Reuse PickleScanner analysis for object-dtype NumPy payloads."""
+        pickle_scanner = PickleScanner(config=self.config)
+        pickle_scanner.current_file_path = context_path
+        return pickle_scanner._scan_pickle_bytes(file_obj, payload_size)
 
     def _validate_dtype(self, dtype: Any) -> None:
         """Validate numpy dtype for security"""
@@ -256,7 +268,8 @@ class NumPyScanner(BaseScanner):
                         # enabling arbitrary code execution.
                         # dtype.hasobject catches structured dtypes with
                         # object fields; kind=="O" catches plain object arrays.
-                        if dtype.kind == "O" or bool(getattr(dtype, "hasobject", False)):
+                        has_object_dtype = dtype.kind == "O" or bool(getattr(dtype, "hasobject", False))
+                        if has_object_dtype:
                             result.add_check(
                                 name=f"{self.CVE_2019_6446_ID}: Object Dtype Pickle Deserialization",
                                 passed=False,
@@ -266,7 +279,7 @@ class NumPyScanner(BaseScanner):
                                     "pickle deserialization. This is a potential RCE vector "
                                     "when consumer code loads with allow_pickle=True."
                                 ),
-                                severity=IssueSeverity.WARNING,
+                                severity=IssueSeverity.INFO,
                                 location=path,
                                 details={
                                     "dtype": str(dtype),
@@ -298,6 +311,60 @@ class NumPyScanner(BaseScanner):
                                     f"({self.CVE_2019_6446_ID}, CVSS 9.8)."
                                 ),
                             )
+
+                            f.seek(data_offset)
+                            embedded_result = self._scan_embedded_pickle_payload(
+                                f,
+                                file_size - data_offset,
+                                path,
+                            )
+                            result.issues.extend(embedded_result.issues)
+                            result.checks.extend(embedded_result.checks)
+
+                            pickle_end_offset = embedded_result.metadata.get("first_pickle_end_pos")
+                            if isinstance(pickle_end_offset, int) and pickle_end_offset < file_size:
+                                trailing_bytes = file_size - pickle_end_offset
+                                result.add_check(
+                                    name="File Integrity Check",
+                                    passed=False,
+                                    message=(
+                                        "Object-dtype payload contains trailing bytes after the embedded pickle stream"
+                                    ),
+                                    severity=IssueSeverity.INFO,
+                                    location=path,
+                                    rule_code="S902",
+                                    details={
+                                        "expected_pickle_end": pickle_end_offset,
+                                        "actual_size": file_size,
+                                        "trailing_bytes": trailing_bytes,
+                                        "dtype": str(dtype),
+                                    },
+                                )
+                                result.finish(success=False)
+                                return result
+
+                            # Object-dtype .npy payloads are stored as a pickle stream rather than
+                            # fixed-width element data, so the numeric dtype/size validation path
+                            # is not applicable after we recurse into the embedded pickle payload.
+                            result.add_check(
+                                name="Data Type Safety Check",
+                                passed=True,
+                                message=f"Object dtype '{dtype}' handled via recursive pickle analysis",
+                                location=path,
+                                rule_code=None,
+                                details={
+                                    "dtype": str(dtype),
+                                    "dtype_kind": dtype.kind,
+                                    "handled_via": "embedded_pickle_scan",
+                                    "cve_id": self.CVE_2019_6446_ID,
+                                },
+                            )
+                            result.bytes_scanned = file_size
+                            result.metadata.update(
+                                {"shape": shape, "dtype": str(dtype), "fortran_order": fortran},
+                            )
+                            result.finish(success=True)
+                            return result
 
                         self._validate_dtype(dtype)
                         result.add_check(

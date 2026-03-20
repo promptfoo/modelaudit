@@ -281,9 +281,10 @@ class SecretsDetector:
             "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",  # JWT.io example signature
         ]
         if any(example in text for example in example_secrets):
-            # These are well-known example secrets - still report but lower severity
-            # Set confidence to exactly 0.6 so it passes threshold but gets WARNING severity
-            confidence = 0.6  # Exactly at threshold - will be WARNING level, not CRITICAL
+            # The JWT.io sample appears in benign fixtures and documentation, so
+            # suppress that one by default. Keep other canned examples at the
+            # minimum warning threshold because they are useful test signals.
+            confidence = 0.4 if pattern_desc == "JWT Token" else 0.6
         elif any(indicator in text_lower for indicator in test_indicators):
             # Check if it's JUST a test indicator or part of real data
             # If the entire string is "test" or "example", it's definitely fake
