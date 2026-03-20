@@ -3,6 +3,7 @@ import pickle
 import time
 import zipfile
 from pathlib import Path
+from typing import IO
 
 import pytest
 
@@ -157,11 +158,22 @@ def test_pytorch_zip_initialize_scan_does_not_read_archive_members(
 
     archive_reads: list[str] = []
 
-    def fail_read(self: zipfile.ZipFile, name, *args, **kwargs):
+    def fail_read(
+        self: zipfile.ZipFile,
+        name: str | zipfile.ZipInfo,
+        pwd: bytes | None = None,
+    ) -> bytes:
         archive_reads.append(name.filename if isinstance(name, zipfile.ZipInfo) else str(name))
         raise AssertionError("_initialize_scan() should not read archive member payloads")
 
-    def fail_open(self: zipfile.ZipFile, name, *args, **kwargs):
+    def fail_open(
+        self: zipfile.ZipFile,
+        name: str | zipfile.ZipInfo,
+        mode: str = "r",
+        pwd: bytes | None = None,
+        *,
+        force_zip64: bool = False,
+    ) -> IO[bytes]:
         archive_reads.append(name.filename if isinstance(name, zipfile.ZipInfo) else str(name))
         raise AssertionError("_initialize_scan() should not open archive member payloads")
 
@@ -192,9 +204,16 @@ def test_pytorch_zip_scan_does_not_open_numeric_tensor_data_files(
     opened_members: list[str] = []
     original_open = zipfile.ZipFile.open
 
-    def track_open(self: zipfile.ZipFile, name, *args, **kwargs):
+    def track_open(
+        self: zipfile.ZipFile,
+        name: str | zipfile.ZipInfo,
+        mode: str = "r",
+        pwd: bytes | None = None,
+        *,
+        force_zip64: bool = False,
+    ) -> IO[bytes]:
         opened_members.append(name.filename if isinstance(name, zipfile.ZipInfo) else str(name))
-        return original_open(self, name, *args, **kwargs)
+        return original_open(self, name, mode, pwd, force_zip64=force_zip64)
 
     monkeypatch.setattr(zipfile.ZipFile, "open", track_open)
 
@@ -214,7 +233,7 @@ def test_pytorch_zip_scanner_handles_zip_metadata_oserror(
     """Non-BadZipFile metadata failures should return a structured scan error."""
     model_path = create_mock_pytorch_zip(tmp_path / "model.pt")
 
-    def fail_namelist(self: zipfile.ZipFile):
+    def fail_namelist(self: zipfile.ZipFile) -> list[str]:
         raise OSError("zip metadata unavailable")
 
     monkeypatch.setattr(zipfile.ZipFile, "namelist", fail_namelist)
