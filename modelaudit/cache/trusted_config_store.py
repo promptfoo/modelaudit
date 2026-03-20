@@ -26,7 +26,7 @@ class TrustedConfigRecord:
 class TrustedConfigStore:
     """Read and write trusted local config state under the cache directory."""
 
-    def __init__(self, store_path: Path | None = None):
+    def __init__(self, store_path: Path | None = None) -> None:
         self.store_path = store_path or (Path.home() / ".modelaudit" / "cache" / "trusted_local_configs.json")
 
     def is_trusted(self, candidate: LocalConfigCandidate) -> bool:

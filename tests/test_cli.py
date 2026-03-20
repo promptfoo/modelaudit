@@ -240,6 +240,47 @@ def test_scan_can_remember_trusted_local_config(tmp_path: Path, monkeypatch: pyt
     assert "Found local ModelAudit config" not in strip_ansi(second_result.output)
 
 
+def test_scan_reprompts_when_trusted_local_config_changes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Remembered trust should be invalidated when the local config file changes."""
+    import tarfile
+
+    model_file = tmp_path / "evil.tar"
+    with tarfile.open(model_file, "w") as tar:
+        payload = tmp_path / "payload.txt"
+        payload.write_text("content")
+        tar.add(payload, arcname="../evil.txt")
+
+    config_path = tmp_path / ".modelaudit.toml"
+    config_path.write_text('suppress = ["S405"]\n')
+    trust_store = TrustedConfigStore(tmp_path / "cache" / "trusted_local_configs.json")
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("modelaudit.cli.can_use_trusted_local_config", lambda output_format: output_format == "text")
+    monkeypatch.setattr("modelaudit.cli.get_trusted_config_store", lambda: trust_store)
+
+    runner = CliRunner()
+    first_result = runner.invoke(
+        cli,
+        ["scan", str(model_file), "--format", "text"],
+        input="a\n",
+        catch_exceptions=False,
+    )
+
+    config_path.write_text("suppress = []\n")
+    second_result = runner.invoke(
+        cli,
+        ["scan", str(model_file), "--format", "text"],
+        input="n\n",
+        catch_exceptions=False,
+    )
+
+    assert first_result.exit_code == 0
+    assert second_result.exit_code == 1
+    assert trust_store.store_path.exists()
+    assert "Found local ModelAudit config" in strip_ansi(first_result.output)
+    assert "Found local ModelAudit config" in strip_ansi(second_result.output)
+
+
 def test_scan_disables_cache_when_local_config_is_applied(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Applying a local config should bypass scan-result caching for safety."""
     target_file = tmp_path / "model.dat"
@@ -262,7 +303,7 @@ def test_scan_disables_cache_when_local_config_is_applied(tmp_path: Path, monkey
     monkeypatch.setattr("modelaudit.cli.scan_model_directory_or_file", fake_scan_model_directory_or_file)
 
     runner = CliRunner()
-    result = runner.invoke(cli, ["scan", str(target_file)], input="y\n", catch_exceptions=False)
+    result = runner.invoke(cli, ["scan", str(target_file), "--format", "text"], input="y\n", catch_exceptions=False)
 
     assert result.exit_code == 0
     assert captured["cache_enabled"] is False
