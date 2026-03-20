@@ -1,6 +1,8 @@
 import json
 import os
 import re
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -13,6 +15,7 @@ from modelaudit.cache.trusted_config_store import TrustedConfigStore
 from modelaudit.cli import cli, expand_paths, format_text_output
 from modelaudit.core import scan_model_directory_or_file
 from modelaudit.models import ModelAuditResultModel, create_initial_audit_result
+from tests.cli_output import parse_click_json_output
 
 
 def strip_ansi(text: str) -> str:
@@ -173,8 +176,32 @@ def test_scan_does_not_auto_load_untrusted_local_config(tmp_path: Path) -> None:
     result = runner.invoke(cli, ["scan", str(model_file), "--format", "json"], catch_exceptions=False)
 
     assert result.exit_code == 1
-    payload = json.loads(result.output)
+    payload = parse_click_json_output(result.output)
     assert any(issue.get("rule_code") == "S405" for issue in payload.get("issues", []))
+
+
+def test_scan_json_subprocess_separates_logs_from_stdout_for_findings(tmp_path: Path) -> None:
+    """Real process execution should keep JSON stdout parseable even when findings are logged."""
+    import tarfile
+
+    model_file = tmp_path / "evil.tar"
+    with tarfile.open(model_file, "w") as tar:
+        payload = tmp_path / "payload.txt"
+        payload.write_text("content")
+        tar.add(payload, arcname="../evil.txt")
+
+    completed = subprocess.run(
+        [sys.executable, "-m", "modelaudit", "scan", str(model_file), "--format", "json"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 1
+    assert completed.stdout.lstrip().startswith("{")
+    payload = json.loads(completed.stdout)
+    assert any(issue.get("rule_code") == "S405" for issue in payload.get("issues", []))
+    assert "[S405]" in completed.stderr
 
 
 def test_scan_can_apply_local_config_once_when_confirmed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -409,7 +436,7 @@ def test_scan_json_output(tmp_path):
     # For JSON output, we should be able to parse the output as JSON
     # regardless of the exit code
     try:
-        output_json = json.loads(result.output)
+        output_json = parse_click_json_output(result.output)
         assert "files_scanned" in output_json
         assert "issues" in output_json
         assert output_json["files_scanned"] == 1
@@ -469,7 +496,7 @@ def test_scan_json_to_stdout_no_progress_interference(tmp_path):
 
     # Output should be valid JSON when going to stdout (no progress interference)
     try:
-        output_json = json.loads(result.output)
+        output_json = parse_click_json_output(result.output)
         assert "files_scanned" in output_json
         assert "issues" in output_json
     except json.JSONDecodeError:
@@ -932,7 +959,7 @@ def test_scan_huggingface_streaming_success(mock_scan_streaming, mock_download_s
 
     # Verify content_hash is in JSON output
     try:
-        output_json = json.loads(result.output)
+        output_json = parse_click_json_output(result.output)
         assert "content_hash" in output_json
         assert output_json["content_hash"] == "a" * 64
         assert output_json["files_scanned"] == 3

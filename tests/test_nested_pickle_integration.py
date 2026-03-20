@@ -5,7 +5,6 @@ Comprehensive integration tests for the enhanced nested pickle detection
 capabilities, testing both malicious detection and false positive prevention.
 """
 
-import json
 import os
 import tempfile
 from pathlib import Path
@@ -17,6 +16,7 @@ from modelaudit.cli import cli
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.pickle_scanner import PickleScanner
+from tests.cli_output import parse_click_json_output
 
 
 class TestNestedPickleIntegration:
@@ -197,7 +197,7 @@ class TestNestedPickleIntegration:
         json_result = runner.invoke(cli, ["scan", str(malicious_file), "--format", "json"])
         assert json_result.exit_code == 1, f"JSON format should detect malicious file. Output: {json_result.output}"
 
-        output_data = json.loads(json_result.output)
+        output_data = parse_click_json_output(json_result.output)
         nested_issues = [
             issue
             for issue in output_data["issues"]
