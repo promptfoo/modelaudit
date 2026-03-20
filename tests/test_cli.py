@@ -186,9 +186,9 @@ def test_scan_json_subprocess_separates_logs_from_stdout_for_findings(tmp_path: 
 
     model_file = tmp_path / "evil.tar"
     with tarfile.open(model_file, "w") as tar:
-        payload = tmp_path / "payload.txt"
-        payload.write_text("content")
-        tar.add(payload, arcname="../evil.txt")
+        payload_file = tmp_path / "payload.txt"
+        payload_file.write_text("content")
+        tar.add(payload_file, arcname="../evil.txt")
 
     completed = subprocess.run(
         [sys.executable, "-m", "modelaudit", "scan", str(model_file), "--format", "json"],
@@ -199,8 +199,8 @@ def test_scan_json_subprocess_separates_logs_from_stdout_for_findings(tmp_path: 
 
     assert completed.returncode == 1
     assert completed.stdout.lstrip().startswith("{")
-    payload = json.loads(completed.stdout)
-    assert any(issue.get("rule_code") == "S405" for issue in payload.get("issues", []))
+    output_payload = json.loads(completed.stdout)
+    assert any(issue.get("rule_code") == "S405" for issue in output_payload.get("issues", []))
     assert "[S405]" in completed.stderr
 
 
