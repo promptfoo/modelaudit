@@ -658,6 +658,7 @@ def test_pytorch_zip_version_selection_uses_metadata_when_torch_unavailable(
 def test_get_installed_pytorch_version_does_not_import_torch(monkeypatch: pytest.MonkeyPatch) -> None:
     """Scanner should not import torch while collecting version context."""
     import builtins
+    import sys
 
     scanner = PyTorchZipScanner()
     real_import = builtins.__import__
@@ -675,6 +676,7 @@ def test_get_installed_pytorch_version_does_not_import_torch(monkeypatch: pytest
             raise RuntimeError("broken torch import")
         return real_import(name, globals, locals, fromlist, level)
 
+    monkeypatch.delitem(sys.modules, "torch", raising=False)
     monkeypatch.setattr(builtins, "__import__", fail_torch_import)
 
     assert scanner._get_installed_pytorch_version() is None
