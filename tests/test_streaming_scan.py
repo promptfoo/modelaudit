@@ -128,8 +128,17 @@ def test_scan_model_streaming_critical_findings_do_not_set_operational_errors(
     def file_generator():
         yield (temp_test_files[0], True)
 
+    finding = ScanResult(scanner_name="test_scanner")
+    finding.bytes_scanned = 1024
+    finding.success = True
+    finding.add_issue(
+        "Detected malicious payload",
+        severity=IssueSeverity.CRITICAL,
+        location=str(temp_test_files[0]),
+    )
+
     with patch("modelaudit.core.scan_file") as mock_scan:
-        mock_scan.return_value = create_mock_scan_result(with_critical_issue=True)
+        mock_scan.return_value = finding
 
         result = scan_model_streaming(
             file_generator=file_generator(),
@@ -139,6 +148,42 @@ def test_scan_model_streaming_critical_findings_do_not_set_operational_errors(
 
     assert result.files_scanned == 1
     assert len(result.issues) == 1
+    assert result.issues[0].message == "Detected malicious payload"
+    assert result.issues[0].severity == IssueSeverity.CRITICAL
+    assert result.issues[0].location == str(temp_test_files[0])
+    assert result.has_errors is False
+    assert result.success is True
+    assert determine_exit_code(result) == 1
+
+
+def test_scan_model_streaming_informational_failed_scan_does_not_set_operational_errors(
+    temp_test_files: list[Path],
+) -> None:
+    """Informational failed scans should not override security findings with exit code 2."""
+
+    def file_generator():
+        yield (temp_test_files[0], False)
+        yield (temp_test_files[1], True)
+
+    info_result = ScanResult(scanner_name="numpy")
+    info_result.add_issue(
+        "Object-dtype payload contains trailing bytes after the embedded pickle stream",
+        severity=IssueSeverity.INFO,
+        location="trailing.npy",
+    )
+    info_result.finish(success=False)
+
+    with patch("modelaudit.core.scan_file") as mock_scan:
+        mock_scan.side_effect = [info_result, create_mock_scan_result(with_critical_issue=True)]
+
+        result = scan_model_streaming(
+            file_generator=file_generator(),
+            timeout=30,
+            delete_after_scan=False,
+        )
+
+    assert result.files_scanned == 2
+    assert result.success is True
     assert result.has_errors is False
     assert determine_exit_code(result) == 1
 

@@ -1575,10 +1575,11 @@ def test_exit_code_security_issues(tmp_path):
 
 
 def test_exit_code_security_issues_streaming_local_directory(tmp_path: Path) -> None:
-    """Streaming local-directory scans should keep security findings as exit code 1."""
+    """Streaming local-directory scans should keep security findings as exit code 1 without deleting originals."""
     import pickle
 
     evil_pickle_path = tmp_path / "malicious.pkl"
+    expected_global = f"{os.system.__module__}.system"
 
     class MaliciousClass:
         def __reduce__(self):
@@ -1591,7 +1592,8 @@ def test_exit_code_security_issues_streaming_local_directory(tmp_path: Path) -> 
     result = runner.invoke(cli, ["scan", "--stream", "--format", "text", str(tmp_path)])
 
     assert result.exit_code == 1, f"Expected exit code 1, got {result.exit_code}. Output: {result.output}"
-    assert not evil_pickle_path.exists()
+    assert expected_global in result.output, f"Expected malicious finding in output, got: {result.output}"
+    assert evil_pickle_path.exists()
 
 
 def test_exit_code_scan_errors(tmp_path):

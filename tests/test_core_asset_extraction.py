@@ -1,9 +1,13 @@
 import ntpath
 import pickle
 import sys
+import zipfile
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 
 from modelaudit.core import _extract_primary_asset_from_location, scan_model_directory_or_file
@@ -72,3 +76,74 @@ def test_check_consolidation_handles_newlines_in_file_paths(tmp_path: Path) -> N
     expected_paths = {str(group / "dup a.pkl"), str(group / "dup b.pkl")}
     assert set(check.details["duplicate_files"]) == expected_paths
     assert check.location in expected_paths
+
+
+def test_npz_member_checks_keep_archive_member_locations(tmp_path: Path) -> None:
+    class _ExecPayload:
+        def __reduce__(self) -> tuple[Callable[..., Any], tuple[Any, ...]]:
+            return (exec, ("print('owned')",))
+
+    archive_path = tmp_path / "payload.npz"
+    np.savez(archive_path, safe=np.arange(3), payload=np.array([_ExecPayload()], dtype=object))
+
+    result = scan_model_directory_or_file(str(archive_path))
+    payload_checks = [
+        check
+        for check in result.checks
+        if check.status.value == "failed"
+        and (check.details.get("zip_entry") == "payload.npy" or ":payload.npy" in (check.location or ""))
+    ]
+
+    assert any(
+        check.location == f"{archive_path}:payload.npy" and check.details.get("zip_entry") == "payload.npy"
+        for check in payload_checks
+    ), f"Expected archive-member check location, got: {[(c.location, c.details) for c in payload_checks]}"
+    assert not any(check.location and not check.location.startswith(f"{archive_path}:") for check in payload_checks), (
+        f"Unexpected non-archive check locations: {[c.location for c in payload_checks]}"
+    )
+
+
+def test_check_consolidation_keeps_distinct_npz_member_findings(tmp_path: Path) -> None:
+    class ExecPayload:
+        def __reduce__(self) -> tuple[Callable[..., Any], tuple[Any, ...]]:
+            return (exec, ("print('owned')",))
+
+    archive_path = tmp_path / "payload.npz"
+    np.savez(archive_path, safe=np.arange(3), payload=np.array([ExecPayload()], dtype=object))
+
+    result = scan_model_directory_or_file(str(archive_path))
+    cve_checks = [
+        check for check in result.checks if check.name.startswith("CVE-2019-6446") and check.status.value == "failed"
+    ]
+
+    assert len(cve_checks) == 1
+    assert cve_checks[0].location == f"{archive_path}:payload.npy"
+    assert cve_checks[0].details.get("zip_entry") == "payload.npy"
+
+
+def test_check_consolidation_keeps_nested_npz_member_findings_distinct(tmp_path: Path) -> None:
+    class ExecPayload:
+        def __reduce__(self) -> tuple[Callable[..., Any], tuple[Any, ...]]:
+            return (exec, ("print('owned')",))
+
+    inner_npz = tmp_path / "inner.npz"
+    np.savez(
+        inner_npz,
+        payload_a=np.array([ExecPayload()], dtype=object),
+        payload_b=np.array([ExecPayload()], dtype=object),
+    )
+
+    outer_zip = tmp_path / "outer.zip"
+    with zipfile.ZipFile(outer_zip, "w") as zf:
+        zf.write(inner_npz, arcname="inner.npz")
+
+    result = scan_model_directory_or_file(str(outer_zip))
+    cve_checks = [
+        check for check in result.checks if check.name.startswith("CVE-2019-6446") and check.status.value == "failed"
+    ]
+
+    assert len(cve_checks) == 2
+    assert {check.details.get("zip_entry") for check in cve_checks} == {
+        "inner.npz:payload_a.npy",
+        "inner.npz:payload_b.npy",
+    }
