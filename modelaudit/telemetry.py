@@ -533,12 +533,13 @@ class TelemetryClient:
             issue_types[issue_type] = issue_types.get(issue_type, 0) + 1
             # Capture first 50 issues in detail without including raw paths or identifiers.
             if len(issue_details) < 50:
-                issue_location = str(issue.get("location", ""))
+                raw_issue_location = issue.get("location")
+                issue_location = raw_issue_location if isinstance(raw_issue_location, str) else ""
                 issue_details.append(
                     {
                         "type": issue_type,
                         "severity": severity,
-                        "location_type": self._classify_path(issue_location),
+                        "location_type": self._classify_path(issue_location) if issue_location else "unknown",
                         "model_name": self._extract_model_name(issue_location) if issue_location else None,
                     }
                 )

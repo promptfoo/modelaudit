@@ -270,7 +270,7 @@ class TestTelemetryClient:
             # Should not call PostHog
             mock_posthog.capture.assert_not_called()
 
-    def test_scan_completed_uses_top_level_results_schema(self):
+    def test_scan_completed_uses_top_level_results_schema(self) -> None:
         """Test that scan completion telemetry aggregates without file identifiers."""
         mock_posthog = MagicMock()
 
@@ -305,6 +305,11 @@ class TestTelemetryClient:
                         "severity": "info",
                         "location": "/tmp/a.pkl",
                     },
+                    {
+                        "message": "Issue with no location",
+                        "severity": "warning",
+                        "location": None,
+                    },
                 ],
             }
 
@@ -312,13 +317,14 @@ class TestTelemetryClient:
             properties = mock_posthog.capture.call_args.kwargs["properties"]
 
             assert properties["total_files"] == 2
-            assert properties["total_issues"] == 3
+            assert properties["total_issues"] == 4
             assert properties["issue_types"]["Issue A"] == 1
             assert properties["issue_types"]["Issue B"] == 1
             assert properties["issue_types"]["pickle_dangerous_global"] == 1
+            assert properties["issue_types"]["Issue with no location"] == 1
             assert "Legacy message should not be used when type exists" not in properties["issue_types"]
             assert properties["issue_severities"]["critical"] == 1
-            assert properties["issue_severities"]["warning"] == 1
+            assert properties["issue_severities"]["warning"] == 2
             assert properties["issue_severities"]["info"] == 1
             assert properties["file_types"]["pickle"] == 1
             assert properties["file_types"]["zip"] == 1
@@ -329,10 +335,16 @@ class TestTelemetryClient:
                 detail for detail in properties["issue_details"] if detail["type"] == "pickle_dangerous_global"
             )
             assert canonical_issue["model_name"] == "a.pkl"
+            missing_location_issue = next(
+                detail for detail in properties["issue_details"] if detail["type"] == "Issue with no location"
+            )
+            assert missing_location_issue["location_type"] == "unknown"
+            assert missing_location_issue["model_name"] is None
             assert "location_identifier" not in canonical_issue
             assert "/tmp/a.pkl" not in json.dumps(properties)
+            assert '"None"' not in json.dumps(properties)
 
-    def test_scan_started_includes_per_path_fields(self):
+    def test_scan_started_includes_per_path_fields(self) -> None:
         """Scan started events include coarse path metadata but no identifiers."""
         mock_posthog = MagicMock()
 
@@ -364,7 +376,7 @@ class TestTelemetryClient:
             assert "path_identifiers" not in properties
             assert "/tmp/model.pkl" not in json.dumps(properties)
 
-    def test_path_and_url_fields_omit_identifiers(self):
+    def test_path_and_url_fields_omit_identifiers(self) -> None:
         """Path and URL fields should not include raw sensitive values or identifiers."""
         mock_posthog = MagicMock()
 
