@@ -770,6 +770,7 @@ KNOWN_SAFE_KERAS_LAYER_CLASSES: frozenset[str] = frozenset(
         "Average",
         "Maximum",
         "Minimum",
+        "NotEqual",
         "Concatenate",
         "Dot",
         # Padding/Cropping
