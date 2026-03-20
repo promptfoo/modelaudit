@@ -21,6 +21,7 @@ from ..config.explanations import (
     get_cve_2025_1550_explanation,
     get_cve_2025_8747_explanation,
     get_cve_2025_9906_explanation,
+    get_cve_2025_12058_explanation,
     get_cve_2025_49655_explanation,
     get_pattern_explanation,
 )
@@ -79,6 +80,8 @@ _DANGEROUS_CONFIG_MODULES = frozenset(
 # CVE-2025-8747: keras.utils.get_file used as gadget to download + execute files
 _GET_FILE_PATTERN = re.compile(r"get_file", re.IGNORECASE)
 _URL_PATTERN = re.compile(r"https?://", re.IGNORECASE)
+_URL_SCHEME_PATTERN = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
+_WINDOWS_ABSOLUTE_PATH_PATTERN = re.compile(r"^(?:[a-zA-Z]:[\\/]|\\\\)")
 
 
 class KerasZipScanner(BaseScanner):
@@ -341,6 +344,9 @@ class KerasZipScanner(BaseScanner):
                 self._check_torch_module_wrapper(result, layer_name)
             # CVE-2025-1550: Check ALL layers for dangerous module references
             self._check_layer_module_references(layer, result, layer_name)
+            # CVE-2025-12058: StringLookup can load external vocabulary paths even with safe_mode=True
+            if layer_class == "StringLookup":
+                self._check_stringlookup_vocabulary_path(layer, result, layer_name)
 
             # Check for Lambda layers
             if layer_class == "Lambda":
@@ -899,6 +905,94 @@ class KerasZipScanner(BaseScanner):
         """Avoid duplicate CVE-2025-9906 checks from raw + structured paths."""
         return any(issue.details.get("cve_id") == "CVE-2025-9906" for issue in result.issues)
 
+    def _check_stringlookup_vocabulary_path(self, layer: dict[str, Any], result: ScanResult, layer_name: str) -> None:
+        """Check for CVE-2025-12058: external StringLookup vocabulary paths in .keras configs."""
+        layer_config = layer.get("config")
+        if not isinstance(layer_config, dict):
+            return
+
+        vocabulary = layer_config.get("vocabulary")
+        if not self._is_external_stringlookup_vocabulary(vocabulary):
+            return
+
+        keras_version = result.metadata.get("keras_version")
+        location = f"{self.current_file_path} (layer: {layer_name})"
+        details = {
+            "layer_name": layer_name,
+            "layer_class": "StringLookup",
+            "vocabulary": vocabulary,
+            "cve_id": "CVE-2025-12058",
+            "cvss": 5.9,
+            "cwe": "CWE-502, CWE-918",
+            "description": (
+                "StringLookup vocabulary paths can trigger arbitrary local file loading or SSRF when a crafted "
+                ".keras archive is loaded."
+            ),
+            "remediation": "Upgrade Keras to >= 3.12.0 and avoid loading models with external vocabulary paths.",
+        }
+
+        if isinstance(keras_version, str) and self._is_vulnerable_to_cve_2025_12058(keras_version):
+            details["keras_version"] = keras_version
+            result.add_check(
+                name="CVE-2025-12058: StringLookup External Vocabulary Path",
+                passed=False,
+                message=(
+                    f"CVE-2025-12058: StringLookup layer '{layer_name}' in Keras {keras_version} references "
+                    f"external vocabulary path '{vocabulary}', which can expose local files or trigger SSRF "
+                    "during model loading"
+                ),
+                severity=IssueSeverity.WARNING,
+                location=location,
+                details=details,
+                why=get_cve_2025_12058_explanation("stringlookup_external_vocabulary"),
+            )
+            return
+
+        if isinstance(keras_version, str):
+            result.add_check(
+                name="StringLookup External Vocabulary Version Check",
+                passed=True,
+                message=(
+                    f"StringLookup layer '{layer_name}' references external vocabulary path '{vocabulary}', "
+                    f"but Keras {keras_version} is outside the known CVE-2025-12058 vulnerable range (<3.12.0)"
+                ),
+                location=location,
+                details={"layer_name": layer_name, "layer_class": "StringLookup", "keras_version": keras_version},
+            )
+            return
+
+        result.add_check(
+            name="StringLookup External Vocabulary Risk (Version Unknown)",
+            passed=False,
+            message=(
+                f"StringLookup layer '{layer_name}' references external vocabulary path '{vocabulary}', but "
+                "keras_version is unavailable; cannot confidently attribute CVE-2025-12058 without version context"
+            ),
+            severity=IssueSeverity.WARNING,
+            location=location,
+            details=details | {"affected_versions": "Keras < 3.12.0"},
+        )
+
+    @staticmethod
+    def _is_external_stringlookup_vocabulary(vocabulary: Any) -> bool:
+        """Return True only for scalar vocabulary strings that clearly point outside the archive."""
+        if not isinstance(vocabulary, str):
+            return False
+
+        candidate = vocabulary.strip()
+        if not candidate:
+            return False
+
+        normalized = candidate.replace("\\", "/")
+        return (
+            bool(_URL_SCHEME_PATTERN.match(candidate))
+            or candidate.startswith("/")
+            or candidate.startswith("~/")
+            or bool(_WINDOWS_ABSOLUTE_PATH_PATTERN.match(candidate))
+            or normalized.startswith("../")
+            or "/../" in normalized
+        )
+
     @staticmethod
     def _extract_string_literals(value: Any, *, include_dict_values: bool = False) -> list[str]:
         """Extract string literals from simple container values."""
@@ -1132,5 +1226,23 @@ class KerasZipScanner(BaseScanner):
                 if patch_digits:
                     patch = int(patch_digits)
             return (major, minor, patch) < (2, 13, 0)
+        except ValueError:
+            return False
+
+    @staticmethod
+    def _is_vulnerable_to_cve_2025_12058(version: str) -> bool:
+        """Return True for Keras versions lower than 3.12.0."""
+        parts = version.split(".", 2)
+        if len(parts) < 2:
+            return False
+        try:
+            major = int(parts[0])
+            minor = int(parts[1])
+            patch = 0
+            if len(parts) == 3:
+                patch_digits = "".join(ch for ch in parts[2] if ch.isdigit())
+                if patch_digits:
+                    patch = int(patch_digits)
+            return (major, minor, patch) < (3, 12, 0)
         except ValueError:
             return False

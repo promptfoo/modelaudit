@@ -985,6 +985,31 @@ def get_cve_2025_49655_explanation(issue_type: str) -> str:
     )
 
 
+def get_cve_2025_12058_explanation(issue_type: str) -> str:
+    """Get explanation for CVE-2025-12058: Keras StringLookup vocabulary path loading.
+
+    CVE-2025-12058 (CVSS 5.9 MODERATE): A crafted .keras archive can configure
+    StringLookup with a local or remote vocabulary path. During model loading,
+    Keras may read arbitrary local files or make remote requests even with
+    safe_mode=True. Fixed in Keras 3.12.0.
+    """
+    explanations = {
+        "stringlookup_external_vocabulary": (
+            "CVE-2025-12058: This .keras archive configures a StringLookup layer with a "
+            "vocabulary value that points to an external path or URL. In affected Keras "
+            "versions, Model.load_model may read arbitrary local files or make server-side "
+            "requests while loading the model, even when safe_mode=True is enabled. "
+            "Upgrade to Keras >= 3.12.0 and avoid models that rely on external vocabulary paths."
+        ),
+    }
+
+    return explanations.get(
+        issue_type,
+        "CVE-2025-12058: StringLookup vocabulary paths can load local files or remote URLs. "
+        "Upgrade to Keras >= 3.12.0.",
+    )
+
+
 def get_cve_2025_1550_explanation(issue_type: str) -> str:
     """Get explanation for CVE-2025-1550: Keras safe_mode bypass via config.json module references.
 
