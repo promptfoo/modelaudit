@@ -7,6 +7,17 @@ import ast
 import importlib.util
 from pathlib import Path
 
+# Exclude public exports that are not ordinary safe built-in layers. Some are
+# abstract/support classes, and some have dedicated security handling.
+EXCLUDED_GENERATED_KERAS_LAYER_EXPORTS: frozenset[str] = frozenset(
+    {
+        "InputSpec",
+        "Lambda",
+        "Layer",
+        "TorchModuleWrapper",
+    }
+)
+
 
 def find_keras_source_root() -> Path:
     """Locate the installed Keras source tree without importing Keras."""
@@ -63,7 +74,7 @@ def exported_keras_layer_classes(source_root: Path) -> list[str]:
                         if value.startswith("keras.layers."):
                             exported_names.add(value.split(".")[-1])
 
-    return sorted(exported_names)
+    return sorted(exported_names - EXCLUDED_GENERATED_KERAS_LAYER_EXPORTS)
 
 
 def render_module(layer_names: list[str]) -> str:

@@ -570,6 +570,25 @@ def test_nested_functional_submodels_are_scanned_for_custom_layers(tmp_path: Pat
     assert any(check.details.get("layer_class") == "MaliciousLayer" for check in custom_layer_checks)
 
 
+def test_generic_base_layer_class_still_triggers_custom_layer_warning(tmp_path: Path) -> None:
+    """The abstract Keras base Layer export should still require custom-layer review in H5 models."""
+    model_config = {
+        "class_name": "Sequential",
+        "config": {
+            "name": "generic_layer_model",
+            "layers": [
+                {"class_name": "InputLayer", "config": {"batch_shape": [None, 4], "name": "input"}},
+                {"class_name": "Layer", "config": {"name": "generic_layer"}},
+            ],
+        },
+    }
+    model_path = create_custom_h5_file(tmp_path, model_config, file_name="generic_layer.h5")
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert any(check.name == "Custom Layer Class Detection" for check in result.checks)
+
+
 class TestCVE20259905H5SafeMode:
     """Test CVE-2025-9905: Keras H5 safe_mode ignored for Lambda layers."""
 

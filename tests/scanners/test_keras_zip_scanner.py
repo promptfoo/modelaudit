@@ -626,6 +626,32 @@ __import__('pickle').loads(data)
         assert any(check.name == "Custom Layer Class Detection" for check in result.checks)
         assert any(check.name == "Custom Object Detection" for check in result.checks)
 
+    def test_generic_base_layer_class_still_flags_custom_layer(self, tmp_path: Path) -> None:
+        """The abstract Keras base Layer export should not suppress custom-layer review."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Functional",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "InputLayer",
+                        "name": "input_1",
+                        "config": {"batch_shape": [None, 4]},
+                    },
+                    {
+                        "class_name": "Layer",
+                        "name": "generic_layer",
+                        "module": "keras.layers",
+                        "config": {},
+                    },
+                ]
+            },
+        }
+
+        result = scanner.scan(str(create_configured_keras_zip(tmp_path, config, file_name="generic_layer.keras")))
+
+        assert any(check.name == "Custom Layer Class Detection" for check in result.checks)
+
 
 class TestCVE202549655TorchModuleWrapper:
     """Test CVE-2025-49655: TorchModuleWrapper deserialization RCE detection."""
