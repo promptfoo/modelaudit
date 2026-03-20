@@ -112,12 +112,12 @@ class PyTorchZipScanner(BaseScanner):
         # Start timeout tracking
         self._start_scan_timer()
 
-        # Initial validation and setup
-        result = self._initialize_scan(path)
-        if result.success is False:  # Early return for validation failures
-            return result
-
         try:
+            # Initial validation and setup
+            result = self._initialize_scan(path)
+            if result.success is False:  # Early return for validation failures
+                return result
+
             # Store the file path for use in issue locations
             self.current_file_path = path
 

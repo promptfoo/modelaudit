@@ -660,9 +660,8 @@ def scan_model_directory_or_file(
 
             # First pass: collect all file paths that need scanning
             files_to_scan: list[str] = []
-            for root, dirs, files in os.walk(path, followlinks=False):
-                dirs.sort()
-                for file in sorted(files):
+            for root, _, files in os.walk(path, followlinks=False):
+                for file in files:
                     file_path = os.path.join(root, file)
 
                     # HuggingFace cache bookkeeping files should never surface as
