@@ -27,6 +27,7 @@ from modelaudit.scanners.pickle_scanner import (
     _genops_with_fallback,
     _GenopsBudgetExceeded,
     _is_actually_dangerous_global,
+    _is_actually_dangerous_string,
     _is_plausible_python_module,
     _is_safe_import_only_global,
     _simulate_symbolic_reference_maps,
@@ -74,6 +75,15 @@ def test_safe_nested_like_pickle_fixtures_do_not_emit_security_findings(fixture_
     assert not any("Detected dangerous __reduce__ pattern with ." in check.message for check in result.checks), (
         f"{fixture_name} should not emit placeholder reduce-pattern messages"
     )
+
+
+def test_padding_stripped_base64_candidate_still_flags_potential_base64() -> None:
+    """Padding-stripped base64 should stay detectable if it is otherwise well-formed."""
+    padding_stripped = (
+        "PL25iLsbINGVuY8DRvqrcGgm2bElUlp3LZLCHbZu7GfvNOJks6CuDNk2ocfYv3pDv8DGkGBqI8BqXWIYrMEgNRe6TlS37NStmZSk2lfnRu1H0bSiPg9KtqZo"
+    )
+
+    assert _is_actually_dangerous_string(padding_stripped, {}) == "potential_base64"
 
 
 class TestPickleScanner(unittest.TestCase):

@@ -59,7 +59,7 @@ class TestSecretsDetector:
         assert len(findings) > 0
         assert any("JWT" in f["secret_type"] for f in findings)
 
-    def test_known_example_jwt_is_suppressed_by_default(self):
+    def test_known_example_jwt_is_suppressed_by_default(self) -> None:
         """The JWT.io example token should not produce warning-level noise."""
         detector = SecretsDetector()
 
@@ -72,6 +72,20 @@ class TestSecretsDetector:
         findings = detector.scan_text(text)
 
         assert not any(finding["secret_type"] == "JWT Token" for finding in findings)
+
+    def test_modified_jwt_with_comment_prefix_is_still_detected(self) -> None:
+        """A changed JWT must still be detected even with a leading comment token."""
+        detector = SecretsDetector()
+
+        text = (
+            "# token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+            "eyJzdWIiOiJ1c2VyMTIzIiwic2NvcGUiOiJhZG1pbiIsImlhdCI6MTcwMDAwMDAwMH0."
+            "q1w2e3r4t5y6u7i8o9p0asdfghjklzxcvbnmQWERty"
+        )
+
+        findings = detector.scan_text(text)
+
+        assert any(finding["secret_type"] == "JWT Token" for finding in findings)
 
     def test_detect_database_connections(self):
         """Test detection of database connection strings."""
