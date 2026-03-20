@@ -102,6 +102,7 @@ def pytest_runtest_setup(item):
             "test_mxnet_scanner.py",  # MXNet scanner tests
             "test_tf_metagraph_scanner.py",  # TensorFlow MetaGraph scanner tests
             "test_torchserve_mar_scanner.py",  # TorchServe .mar scanner tests
+            "test_executorch_scanner.py",  # ExecuTorch scanner tests
             "test_telemetry.py",  # telemetry payload and availability tests
             "test_telemetry_decoupling.py",  # telemetry failure-isolation tests
             "test_debug_command.py",  # debug output telemetry flags
@@ -113,6 +114,8 @@ def pytest_runtest_setup(item):
             "test_tar_scanner.py",  # TAR archive scanner tests
             "test_zip_scanner.py",  # ZIP archive scanner tests
             "test_sevenzip_scanner.py",  # 7-Zip archive scanner tests
+            "test_regression_corpus.py",  # malicious/safe fixture regression gate
+            "test_nested_pickle_integration.py",  # nested pickle false-positive/true-positive integration tests
         ]
 
         # Check if this is an allowed test file

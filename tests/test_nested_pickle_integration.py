@@ -97,7 +97,7 @@ class TestNestedPickleIntegration:
             for issue in nested_issues:
                 print(f"    - {issue.severity.name}: {issue.message}")
 
-    def test_safe_nested_pickle_no_false_positives(self, pickles_dir):
+    def test_safe_nested_pickle_no_false_positives(self, pickles_dir: Path) -> None:
         """Test that safe files with nested-like patterns don't trigger false positives."""
         safe_files = self.get_safe_nested_pickles(pickles_dir)
 
@@ -107,9 +107,11 @@ class TestNestedPickleIntegration:
         for safe_file in safe_files:
             print(f"\nTesting safe file: {safe_file.name}")
 
-            # Scan the safe file
+            # Scan the safe file through the aggregate path so exit-code regressions
+            # are caught, not just nested-pickle issue wording.
             scanner = PickleScanner()
             result = scanner.scan(str(safe_file))
+            aggregate_result = scan_model_directory_or_file(str(safe_file))
 
             # Should complete successfully
             assert result.success, f"Scan failed for {safe_file.name}"
@@ -123,6 +125,20 @@ class TestNestedPickleIntegration:
 
             assert len(nested_issues) == 0, (
                 f"False positive nested pickle detection in {safe_file.name}: {[i.message for i in nested_issues]}"
+            )
+
+            noisy_issues = [
+                issue
+                for issue in aggregate_result.issues
+                if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+            ]
+            assert determine_exit_code(aggregate_result) == 0, (
+                f"Safe nested-like pickle produced non-zero exit code: {safe_file.name} — "
+                f"issues: {[(issue.severity.value, issue.message) for issue in aggregate_result.issues]}"
+            )
+            assert not noisy_issues, (
+                f"Safe nested-like pickle emitted warning/critical findings: {safe_file.name} — "
+                f"{[(issue.severity.value, issue.message) for issue in noisy_issues]}"
             )
 
             print("  ✅ No false positives - clean scan")

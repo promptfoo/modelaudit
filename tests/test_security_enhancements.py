@@ -6,6 +6,7 @@ import lzma
 import pickle
 import zipfile
 import zlib
+from pathlib import Path
 
 import numpy as np
 
@@ -270,28 +271,21 @@ class TestNumPyScannerSecurity:
         size_issues = [issue for issue in result.issues if "too large" in issue.message.lower()]
         assert len(size_issues) > 0
 
-    def test_dangerous_dtype_rejection(self, tmp_path):
-        """Test rejection of dangerous data types."""
+    def test_dangerous_dtype_reports_cve_info(self, tmp_path: Path) -> None:
+        """Object dtype arrays should scan successfully while emitting CVE-2019-6446 info."""
         scanner = NumPyScanner()
-
-        # Create numpy file with object dtype manually
         npy_file = tmp_path / "object_dtype.npy"
-
-        with open(npy_file, "wb") as f:
-            f.write(b"\x93NUMPY")  # Magic
-            f.write(b"\x01\x00")  # Version 1.0
-            header = "{'descr': '|O', 'fortran_order': False, 'shape': (10,), }"
-            header_len = len(header)
-            f.write(header_len.to_bytes(2, "little"))
-            f.write(header.encode("latin1"))
-            # Add some dummy data
-            f.write(b"\x00" * 80)  # 10 * 8 bytes per object pointer
+        np.save(npy_file, np.array([{"key": "value"}], dtype=object), allow_pickle=True)
 
         result = scanner.scan(str(npy_file))
 
-        assert result.success is False
-        dtype_issues = [issue for issue in result.issues if "dangerous dtype" in issue.message.lower()]
-        assert len(dtype_issues) > 0
+        assert result.success is True
+        cve_issues = [issue for issue in result.issues if "CVE-2019-6446" in issue.message]
+        assert len(cve_issues) > 0
+        assert all(issue.severity == IssueSeverity.INFO for issue in cve_issues)
+        assert not any(
+            check.name == "Data Type Safety Check" and check.status.value == "failed" for check in result.checks
+        )
 
     def test_array_size_overflow_protection(self, tmp_path):
         """Test protection against integer overflow in size calculation."""

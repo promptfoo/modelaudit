@@ -117,6 +117,44 @@ class ZipScanner(BaseScanner):
         result.metadata["file_size"] = os.path.getsize(path)
         return result
 
+    def _rewrite_nested_result_context(
+        self, scan_result: ScanResult, tmp_path: str, archive_path: str, entry_name: str
+    ) -> None:
+        """Rewrite nested result locations so archive members, not temp files, are reported."""
+        archive_location = f"{archive_path}:{entry_name}"
+
+        for issue in scan_result.issues:
+            if issue.location:
+                if issue.location.startswith(tmp_path):
+                    issue.location = issue.location.replace(tmp_path, archive_location, 1)
+                else:
+                    issue.location = f"{archive_location} {issue.location}"
+            else:
+                issue.location = archive_location
+
+            existing_issue_entry = issue.details.get("zip_entry")
+            issue.details["zip_entry"] = (
+                f"{entry_name}:{existing_issue_entry}"
+                if isinstance(existing_issue_entry, str) and existing_issue_entry
+                else entry_name
+            )
+
+        for check in scan_result.checks:
+            if check.location:
+                if check.location.startswith(tmp_path):
+                    check.location = check.location.replace(tmp_path, archive_location, 1)
+                else:
+                    check.location = f"{archive_location} {check.location}"
+            else:
+                check.location = archive_location
+
+            existing_check_entry = check.details.get("zip_entry")
+            check.details["zip_entry"] = (
+                f"{entry_name}:{existing_check_entry}"
+                if isinstance(existing_check_entry, str) and existing_check_entry
+                else entry_name
+            )
+
     def _scan_zip_file(self, path: str, depth: int = 0) -> ScanResult:
         """Recursively scan a ZIP file and its contents"""
         result = ScanResult(scanner_name=self.name)
@@ -319,16 +357,7 @@ class ZipScanner(BaseScanner):
                     if name.lower().endswith(".zip"):
                         try:
                             nested_result = self._scan_zip_file(tmp_path, depth + 1)
-                            # Update locations in nested results
-                            for issue in nested_result.issues:
-                                if issue.location and issue.location.startswith(
-                                    tmp_path,
-                                ):
-                                    issue.location = issue.location.replace(
-                                        tmp_path,
-                                        f"{path}:{name}",
-                                        1,
-                                    )
+                            self._rewrite_nested_result_context(nested_result, tmp_path, path, name)
                             result.merge(nested_result)
 
                             asset_entry = asset_from_scan_result(
@@ -355,26 +384,7 @@ class ZipScanner(BaseScanner):
 
                             # Use core.scan_file to scan with appropriate scanner
                             file_result = core.scan_file(tmp_path, self.config)
-
-                            # Update locations in file results
-                            for issue in file_result.issues:
-                                if issue.location:
-                                    if issue.location.startswith(tmp_path):
-                                        issue.location = issue.location.replace(
-                                            tmp_path,
-                                            f"{path}:{name}",
-                                            1,
-                                        )
-                                    else:
-                                        issue.location = f"{path}:{name} {issue.location}"
-                                else:
-                                    issue.location = f"{path}:{name}"
-
-                                # Add zip entry name to details
-                                if issue.details:
-                                    issue.details["zip_entry"] = name
-                                else:
-                                    issue.details = {"zip_entry": name}
+                            self._rewrite_nested_result_context(file_result, tmp_path, path, name)
 
                             result.merge(file_result)
 
