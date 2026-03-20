@@ -15,8 +15,15 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.keras_zip_scanner import KerasZipScanner
+
+try:
+    import h5py
+except ImportError:  # pragma: no cover - optional dependency in some environments
+    h5py = None
 
 
 def create_configured_keras_zip(
@@ -25,13 +32,43 @@ def create_configured_keras_zip(
     *,
     keras_version: str = "3.13.2",
     file_name: str = "model.keras",
+    weights_h5_path: Path | None = None,
 ) -> Path:
     """Create a configurable .keras archive for regression tests."""
     keras_path = tmp_path / file_name
     with zipfile.ZipFile(keras_path, "w") as zf:
         zf.writestr("config.json", json.dumps(config))
         zf.writestr("metadata.json", json.dumps({"keras_version": keras_version}))
+        if weights_h5_path is not None:
+            zf.write(weights_h5_path, "model.weights.h5")
     return keras_path
+
+
+def create_external_link_weights_h5(tmp_path: Path) -> Path:
+    """Create a weights H5 file containing an ExternalLink to a local fixture."""
+    if h5py is None:
+        pytest.skip("h5py not available")
+
+    external_source = tmp_path / "external_source.h5"
+    with h5py.File(external_source, "w") as f:
+        f.create_dataset("payload", data=[1.0, 2.0])
+
+    weights_path = tmp_path / "model.weights.h5"
+    with h5py.File(weights_path, "w") as f:
+        f["linked_kernel"] = h5py.ExternalLink(external_source.name, "/payload")
+
+    return weights_path
+
+
+def create_regular_weights_h5(tmp_path: Path) -> Path:
+    """Create a benign embedded weights H5 file."""
+    if h5py is None:
+        pytest.skip("h5py not available")
+
+    weights_path = tmp_path / "model.weights.h5"
+    with h5py.File(weights_path, "w") as f:
+        f.create_dataset("kernel", data=[1.0, 2.0])
+    return weights_path
 
 
 class TestKerasZipScanner:
@@ -42,6 +79,64 @@ class TestKerasZipScanner:
         scanner = KerasZipScanner()
         assert scanner is not None
         assert scanner.name == "keras_zip"
+
+    def test_detects_cve_2026_1669_in_embedded_weights(self, tmp_path: Path) -> None:
+        """Vulnerable .keras archives should warn on embedded HDF5 ExternalLink weights."""
+        scanner = KerasZipScanner()
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            keras_version="3.12.0",
+            weights_h5_path=create_external_link_weights_h5(tmp_path),
+        )
+
+        result = scanner.scan(str(keras_path))
+
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+        assert len(cve_issues) == 1
+        assert cve_issues[0].severity == IssueSeverity.WARNING
+        assert cve_issues[0].details["keras_version"] == "3.12.0"
+        assert cve_issues[0].details["external_references"] == [
+            {
+                "kind": "ExternalLink",
+                "hdf5_path": "/linked_kernel",
+                "filename": "external_source.h5",
+                "path": "/payload",
+            },
+        ]
+
+    def test_embedded_hdf5_external_references_are_not_warnings_on_fixed_version(self, tmp_path: Path) -> None:
+        """Fixed Keras versions should not fail for embedded external references."""
+        scanner = KerasZipScanner()
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            keras_version="3.12.1",
+            weights_h5_path=create_external_link_weights_h5(tmp_path),
+        )
+
+        result = scanner.scan(str(keras_path))
+
+        assert not any(issue.details.get("cve_id") == "CVE-2026-1669" for issue in result.issues)
+        assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+        assert any(
+            check.name == "HDF5 External Weight Reference Version Check" and check.status == CheckStatus.PASSED
+            for check in result.checks
+        )
+
+    def test_benign_embedded_weights_do_not_emit_warning_noise(self, tmp_path: Path) -> None:
+        """Benign embedded weights should not produce warning or critical noise."""
+        scanner = KerasZipScanner()
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            keras_version="3.13.2",
+            weights_h5_path=create_regular_weights_h5(tmp_path),
+        )
+
+        result = scanner.scan(str(keras_path))
+
+        assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
 
     def test_can_handle_keras_zip(self):
         """Test that scanner can identify ZIP-based .keras files."""

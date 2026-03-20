@@ -988,11 +988,14 @@ class PyTorchZipScanner(BaseScanner):
         return None, source if isinstance(source, str) else None
 
     def _get_installed_pytorch_version(self) -> str | None:
-        """Get locally installed PyTorch version when available."""
+        """Get PyTorch version from an already-imported module without importing torch."""
         try:
-            import torch
+            import sys
 
-            version = getattr(torch, "__version__", None)
+            torch_module = sys.modules.get("torch")
+            if torch_module is None:
+                return None
+            version = getattr(torch_module, "__version__", None)
             if isinstance(version, str) and version.strip():
                 return version.strip()
         except Exception:

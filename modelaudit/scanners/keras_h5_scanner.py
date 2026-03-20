@@ -14,7 +14,12 @@ from modelaudit.utils.helpers.code_validation import (
     validate_python_syntax,
 )
 
-from ..config.explanations import get_cve_2024_3660_explanation, get_cve_2025_9905_explanation, get_pattern_explanation
+from ..config.explanations import (
+    get_cve_2024_3660_explanation,
+    get_cve_2025_9905_explanation,
+    get_cve_2026_1669_explanation,
+    get_pattern_explanation,
+)
 from .base import BaseScanner, IssueSeverity, ScanResult
 from .keras_utils import (
     check_lambda_dict_function,
@@ -120,6 +125,11 @@ class KerasH5Scanner(BaseScanner):
                 if isinstance(keras_version_attr, str) and keras_version_attr.strip():
                     result.metadata["keras_version"] = keras_version_attr.strip()
 
+                # CVE-2026-1669 only applies to Keras weight loading. Skip generic HDF5
+                # files to avoid warning on benign non-Keras artifacts.
+                if "model_config" in f.attrs or "keras_version" in result.metadata:
+                    self._check_hdf5_external_references(f, result, path)
+
                 # Check if this is a Keras model file
                 if "model_config" not in f.attrs:
                     # Check if this might be a TensorFlow SavedModel H5 file instead
@@ -202,6 +212,103 @@ class KerasH5Scanner(BaseScanner):
 
         result.finish(success=True)
         return result
+
+    def _check_hdf5_external_references(self, h5_file: Any, result: ScanResult, source_path: str) -> None:
+        """Detect HDF5 external links/storage before any Keras-specific parsing short-circuits."""
+        findings: list[dict[str, Any]] = []
+
+        def visit(name: str, link: Any) -> None:
+            if isinstance(link, h5py.ExternalLink):
+                findings.append(
+                    {
+                        "kind": "ExternalLink",
+                        "hdf5_path": f"/{name}".replace("//", "/"),
+                        "filename": link.filename,
+                        "path": link.path,
+                    },
+                )
+                return
+
+            obj = h5_file.get(name, getlink=False)
+            if isinstance(obj, h5py.Dataset):
+                external_storage = obj.external
+                if external_storage:
+                    findings.append(
+                        {
+                            "kind": "external_storage",
+                            "hdf5_path": f"/{name}".replace("//", "/"),
+                            "segments": [
+                                {"filename": filename, "offset": int(offset), "size": int(size)}
+                                for filename, offset, size in external_storage
+                            ],
+                        },
+                    )
+
+        if hasattr(h5_file, "visititems_links"):
+            h5_file.visititems_links(visit)
+        else:  # pragma: no cover - compatibility fallback for older h5py
+            h5_file.visititems(lambda name, _obj: visit(name, h5_file.get(name, getlink=True)))
+
+        if not findings:
+            return
+
+        keras_version = result.metadata.get("keras_version")
+        location = f"{source_path} (weights)"
+        details = {
+            "cve_id": "CVE-2026-1669",
+            "cvss": 8.1,
+            "cwe": "CWE-200, CWE-73",
+            "description": (
+                "HDF5 external storage or ExternalLink entries can cause Keras weight loading to read arbitrary "
+                "host files into model tensors."
+            ),
+            "remediation": "Upgrade to Keras >= 3.12.1 or >= 3.13.2 and reject weights using HDF5 external references.",
+            "external_references": findings,
+        }
+
+        if isinstance(keras_version, str) and self._is_vulnerable_to_cve_2026_1669(keras_version):
+            details["keras_version"] = keras_version
+            result.add_check(
+                name="CVE-2026-1669: HDF5 External Weight Reference",
+                passed=False,
+                message=(
+                    f"CVE-2026-1669: Keras {keras_version} weight file uses HDF5 external references that can "
+                    "disclose arbitrary local file contents during model loading"
+                ),
+                severity=IssueSeverity.WARNING,
+                location=location,
+                details=details,
+                why=get_cve_2026_1669_explanation("hdf5_external_reference"),
+            )
+            return
+
+        if isinstance(keras_version, str):
+            result.add_check(
+                name="HDF5 External Weight Reference Version Check",
+                passed=True,
+                message=(
+                    f"HDF5 external references detected in weights, but Keras {keras_version} is outside the known "
+                    "CVE-2026-1669 vulnerable ranges"
+                ),
+                location=location,
+                details={"keras_version": keras_version, "external_references": findings},
+            )
+            return
+
+        result.add_check(
+            name="HDF5 External Weight Reference Risk (Version Unknown)",
+            passed=False,
+            message=(
+                "HDF5 external references detected in weights, but keras_version is unavailable; cannot "
+                "confidently attribute CVE-2026-1669 without version context"
+            ),
+            severity=IssueSeverity.WARNING,
+            location=location,
+            details=details
+            | {
+                "affected_versions": "Keras >= 3.0.0, < 3.12.1 and >= 3.13.0, < 3.13.2",
+            },
+        )
 
     def _scan_training_config(self, training_config: Any, result: ScanResult) -> None:
         """Inspect training_config for custom metrics and losses."""
@@ -629,6 +736,27 @@ class KerasH5Scanner(BaseScanner):
             return (major, minor, patch) < (2, 13, 0)
         except ValueError:
             return False
+
+    @staticmethod
+    def _is_vulnerable_to_cve_2026_1669(version: str) -> bool:
+        """Return True for Keras versions in the known CVE-2026-1669 affected ranges."""
+        parts = version.split(".", 2)
+        if len(parts) < 2:
+            return False
+
+        try:
+            major = int(parts[0])
+            minor = int(parts[1])
+            patch = 0
+            if len(parts) == 3:
+                patch_digits = "".join(ch for ch in parts[2] if ch.isdigit())
+                if patch_digits:
+                    patch = int(patch_digits)
+        except ValueError:
+            return False
+
+        parsed = (major, minor, patch)
+        return (3, 0, 0) <= parsed < (3, 12, 1) or (3, 13, 0) <= parsed < (3, 13, 2)
 
     @staticmethod
     def _is_vulnerable_to_cve_2025_9905(version: str) -> bool | None:
