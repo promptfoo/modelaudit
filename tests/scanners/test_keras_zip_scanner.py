@@ -287,7 +287,7 @@ __import__('pickle').loads(data)
         assert noisy_issues == []
 
     def test_stringlookup_external_vocabulary_path_is_passing_on_fixed_keras(self, tmp_path: Path) -> None:
-        """Fixed Keras versions should not produce a failed CVE-2025-12058 finding."""
+        """Fixed-version metadata from the archive is inconclusive, but should not emit warning noise."""
         scanner = KerasZipScanner()
         external_vocab_path = tmp_path / "vocab.txt"
         external_vocab_path.write_text("token\n", encoding="utf-8")
@@ -307,14 +307,39 @@ __import__('pickle').loads(data)
         model_path = create_configured_keras_zip(tmp_path, config, keras_version="3.12.0")
         result = scanner.scan(str(model_path))
 
-        failed_cve_checks = [
+        cve_checks = [
             check
             for check in result.checks
-            if check.details.get("cve_id") == "CVE-2025-12058" and check.status == CheckStatus.FAILED
+            if check.details.get("cve_id") == "CVE-2025-12058"
         ]
-        assert failed_cve_checks == []
+        assert len(cve_checks) == 1
+        assert cve_checks[0].name == "StringLookup External Vocabulary Metadata Check"
+        assert cve_checks[0].status == CheckStatus.FAILED
+        assert cve_checks[0].severity == IssueSeverity.INFO
+        assert "metadata-only assessment is inconclusive" in cve_checks[0].message
+        assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+
+    def test_stringlookup_windows_home_relative_path_is_detected(self, tmp_path: Path) -> None:
+        """Windows-style home-relative vocabulary paths should be normalized and detected."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "StringLookup",
+                        "name": "string_lookup",
+                        "config": {"vocabulary": "~\\vocab.txt"},
+                    },
+                ],
+            },
+        }
+
+        model_path = create_configured_keras_zip(tmp_path, config, keras_version="3.11.3")
+        result = scanner.scan(str(model_path))
+
         assert any(
-            check.name == "StringLookup External Vocabulary Version Check" and check.status == CheckStatus.PASSED
+            check.details.get("cve_id") == "CVE-2025-12058" and check.status == CheckStatus.FAILED
             for check in result.checks
         )
 

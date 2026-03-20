@@ -949,15 +949,19 @@ class KerasZipScanner(BaseScanner):
             return
 
         if isinstance(keras_version, str):
+            details["keras_version"] = keras_version
             result.add_check(
-                name="StringLookup External Vocabulary Version Check",
-                passed=True,
+                name="StringLookup External Vocabulary Metadata Check",
+                passed=False,
                 message=(
                     f"StringLookup layer '{layer_name}' references external vocabulary path '{vocabulary}', "
-                    f"but Keras {keras_version} is outside the known CVE-2025-12058 vulnerable range (<3.12.0)"
+                    f"and archive metadata reports Keras {keras_version} outside the known CVE-2025-12058 "
+                    "vulnerable range (<3.12.0), but metadata-only assessment is inconclusive without runtime "
+                    "verification"
                 ),
+                severity=IssueSeverity.INFO,
                 location=location,
-                details={"layer_name": layer_name, "layer_class": "StringLookup", "keras_version": keras_version},
+                details=details,
             )
             return
 
@@ -987,7 +991,7 @@ class KerasZipScanner(BaseScanner):
         return (
             bool(_URL_SCHEME_PATTERN.match(candidate))
             or candidate.startswith("/")
-            or candidate.startswith("~/")
+            or normalized.startswith("~/")
             or bool(_WINDOWS_ABSOLUTE_PATH_PATTERN.match(candidate))
             or normalized.startswith("../")
             or "/../" in normalized
