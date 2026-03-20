@@ -16,6 +16,7 @@ pytest.importorskip("dill")
 
 import dill
 
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.detectors.suspicious_symbols import (
     BINARY_CODE_PATTERNS,
     EXECUTABLE_SIGNATURES,
@@ -26,6 +27,7 @@ from modelaudit.scanners.pickle_scanner import (
     _genops_with_fallback,
     _GenopsBudgetExceeded,
     _is_actually_dangerous_global,
+    _is_actually_dangerous_string,
     _is_plausible_python_module,
     _is_safe_import_only_global,
     _simulate_symbolic_reference_maps,
@@ -46,6 +48,43 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 def _short_binunicode(value: bytes) -> bytes:
     return b"\x8c" + bytes([len(value)]) + value
+
+
+@pytest.mark.parametrize(
+    "fixture_name",
+    [
+        "safe_large_model.pkl",
+        "safe_model_with_encoding.pkl",
+        "safe_model_with_tokens.pkl",
+    ],
+)
+def test_safe_nested_like_pickle_fixtures_do_not_emit_security_findings(fixture_name: str) -> None:
+    """Committed safe pickle fixtures should not produce warning/critical findings."""
+    fixture_path = Path(__file__).resolve().parent.parent / "assets" / "samples" / "pickles" / fixture_name
+
+    result = scan_model_directory_or_file(str(fixture_path))
+
+    assert determine_exit_code(result) == 0, (
+        f"{fixture_name} should not trigger security exit code 1. Issues: "
+        f"{[(issue.severity.value, issue.message) for issue in result.issues]}"
+    )
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues), (
+        f"{fixture_name} should not emit warning/critical findings: "
+        f"{[(issue.severity.value, issue.message) for issue in result.issues]}"
+    )
+    assert not any("Detected dangerous __reduce__ pattern with ." in check.message for check in result.checks), (
+        f"{fixture_name} should not emit placeholder reduce-pattern messages"
+    )
+
+
+def test_padding_stripped_base64_candidate_still_flags_potential_base64() -> None:
+    """Padding-stripped base64 should stay detectable if it is otherwise well-formed."""
+    padding_stripped = (
+        "PL25iLsbINGVuY8DRvqrcGgm2bElUlp3LZLCHbZu7GfvNOJks6CuDNk2ocfYv3pDv8DGkG"
+        "BqI8BqXWIYrMEgNRe6TlS37NStmZSk2lfnRu1H0bSiPg9KtqZo"
+    )
+
+    assert _is_actually_dangerous_string(padding_stripped, {}) == "potential_base64"
 
 
 class TestPickleScanner(unittest.TestCase):

@@ -2675,16 +2675,47 @@ def _is_actually_dangerous_string(s: str, ml_context: dict) -> str | None:
                 # Otherwise, likely a false positive
                 continue
 
-    # Check for base64-like strings (still suspicious), but avoid repeating patterns
+    # Check for base64-like strings, but avoid common benign model metadata such
+    # as repeated tokens and hex digests. Encoded nested payloads are handled
+    # separately by decoding and validating the content.
     if (
         len(s) > 100
         and re.match(r"^[A-Za-z0-9+/=]+$", s)
         and not re.match(r"^(.)\1*$", s)  # Not all same character (e.g., "===...")
         and len(set(s)) > 4  # Must have some character diversity
+        and not re.fullmatch(r"[0-9a-fA-F]+", s)
+        and not _is_short_period_repetition(s)
+        and re.search(r"[A-Z]", s)
+        and re.search(r"[a-z]", s)
+        and re.search(r"[0-9]", s)
     ):
-        return "potential_base64"
+        if any(ch in s for ch in "+/="):
+            return "potential_base64"
+
+        # Preserve padding-stripped base64 blobs that are otherwise well-formed.
+        padding_needed = (-len(s)) % 4
+        if padding_needed in (0, 1, 2) and len(s) <= 10000:
+            padded = s + ("=" * padding_needed)
+            if any(encoding == "base64" for encoding, _decoded in _decode_string_to_bytes(padded)):
+                return "potential_base64"
 
     return None
+
+
+def _is_short_period_repetition(s: str, max_period: int = 16) -> bool:
+    """Return True for strings made by repeating a short token like ``ABCD1234``."""
+    if len(s) < max_period * 2:
+        return False
+    if len(s) > 10 * 1024 * 1024:
+        return False
+
+    for period in range(2, min(max_period, len(s) // 2) + 1):
+        if len(s) % period == 0:
+            unit = s[:period]
+            if all(s[i : i + period] == unit for i in range(0, len(s), period)):
+                return True
+
+    return False
 
 
 def _looks_like_pickle(data: bytes) -> bool:
@@ -3203,18 +3234,6 @@ def is_dangerous_reduce_pattern(
                 "position": pos,
                 "opcode": opcode.name,
             }
-
-        # Check for suspicious strings in all string opcodes
-        if opcode.name in STRING_OPCODES and isinstance(arg, str):
-            suspicious_pattern = is_suspicious_string(arg)
-            if suspicious_pattern:
-                return {
-                    "pattern": "SUSPICIOUS_STRING",
-                    "string_pattern": suspicious_pattern,
-                    "string_preview": arg[:50] + ("..." if len(arg) > 50 else ""),
-                    "position": pos,
-                    "opcode": opcode.name,
-                }
 
     return None
 
@@ -5321,9 +5340,13 @@ class PickleScanner(BaseScanner):
                 if opcode.name in STRING_OPCODES and isinstance(arg, str):
                     suspicious_pattern = _is_actually_dangerous_string(arg, ml_context)
                     if suspicious_pattern:
-                        severity = _get_context_aware_severity(
-                            IssueSeverity.WARNING,
-                            ml_context,
+                        severity = (
+                            IssueSeverity.INFO
+                            if suspicious_pattern == "potential_base64"
+                            else _get_context_aware_severity(
+                                IssueSeverity.WARNING,
+                                ml_context,
+                            )
                         )
                         # Determine rule code based on pattern
                         rule_code = None

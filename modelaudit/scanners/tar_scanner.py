@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import re
 import tarfile
@@ -197,6 +198,23 @@ class TarScanner(BaseScanner):
         total_size = max(consumed_size + (2 * tarfile.BLOCKSIZE), tarfile.RECORDSIZE)
         return ((total_size + tarfile.RECORDSIZE - 1) // tarfile.RECORDSIZE) * tarfile.RECORDSIZE
 
+    @staticmethod
+    def _is_empty_tar_archive(path: str) -> bool:
+        """Detect standard empty TAR archives that some Python 3.10 builds reject on ``next()``."""
+        max_read_size = 10 * 1024 * 1024
+        try:
+            file_size = os.path.getsize(path)
+            if file_size < 2 * tarfile.BLOCKSIZE or file_size % tarfile.BLOCKSIZE != 0:
+                return False
+            if file_size > max_read_size:
+                return False
+
+            with open(path, "rb") as file_obj:
+                empty_data = file_obj.read(file_size)
+                return len(empty_data) == file_size and empty_data == b"\0" * file_size
+        except OSError:
+            return False
+
     def _add_compressed_wrapper_limit_check(
         self,
         result: ScanResult,
@@ -239,7 +257,13 @@ class TarScanner(BaseScanner):
 
         with tarfile.open(path, "r:*") as tar:
             while True:
-                member = tar.next()
+                try:
+                    member = tar.next()
+                except OSError as exc:
+                    if entry_count == 0 and exc.errno == errno.EINVAL and self._is_empty_tar_archive(path):
+                        break
+                    raise
+
                 if member is None:
                     break
 
@@ -385,7 +409,13 @@ class TarScanner(BaseScanner):
 
         with tarfile.open(path, "r:*") as tar:
             while True:
-                member = tar.next()
+                try:
+                    member = tar.next()
+                except OSError as exc:
+                    if not contents and exc.errno == errno.EINVAL and self._is_empty_tar_archive(path):
+                        break
+                    raise
+
                 if member is None:
                     break
 

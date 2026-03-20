@@ -2,7 +2,8 @@
 
 Runs the scanner against committed malicious and benign test fixtures to ensure
 detection accuracy does not regress. Every malicious fixture must produce at
-least one issue. Every safe fixture must scan clean (success=True).
+least one issue. Every safe fixture must scan without warning/critical findings
+and return security exit code 0.
 
 Marked as ``regression`` so CI can run this as a dedicated gate.
 """
@@ -13,7 +14,8 @@ from pathlib import Path
 
 import pytest
 
-from modelaudit.core import scan_file
+from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
+from modelaudit.scanners.base import IssueSeverity
 
 ASSETS = Path(__file__).parent / "assets"
 EXPLOITS_DIR = ASSETS / "exploits"
@@ -101,5 +103,17 @@ class TestSafeCorpus:
 
     @pytest.mark.parametrize("path", ALL_SAFE, ids=[_file_id(p) for p in ALL_SAFE])
     def test_safe_file_clean(self, path: Path) -> None:
-        result = scan_file(str(path))
+        result = scan_model_directory_or_file(str(path))
+        noisy_issues = [
+            issue for issue in result.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        ]
+
         assert result.success, f"Safe file failed scan: {path.name} — issues: {result.issues}"
+        assert determine_exit_code(result) == 0, (
+            f"Safe file produced non-zero security exit code: {path.name} — "
+            f"issues: {[(issue.severity.value, issue.message) for issue in result.issues]}"
+        )
+        assert not noisy_issues, (
+            f"Safe file emitted warning/critical findings: {path.name} — "
+            f"{[(issue.severity.value, issue.message) for issue in noisy_issues]}"
+        )
