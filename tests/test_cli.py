@@ -166,9 +166,9 @@ def test_scan_does_not_auto_load_untrusted_local_config(tmp_path: Path) -> None:
 
     model_file = tmp_path / "evil.tar"
     with tarfile.open(model_file, "w") as tar:
-        payload = tmp_path / "payload.txt"
-        payload.write_text("content")
-        tar.add(payload, arcname="../evil.txt")
+        payload_file = tmp_path / "payload.txt"
+        payload_file.write_text("content")
+        tar.add(payload_file, arcname="../evil.txt")
 
     (tmp_path / ".modelaudit.toml").write_text('suppress = ["S405"]\n')
 
@@ -176,8 +176,8 @@ def test_scan_does_not_auto_load_untrusted_local_config(tmp_path: Path) -> None:
     result = runner.invoke(cli, ["scan", str(model_file), "--format", "json"], catch_exceptions=False)
 
     assert result.exit_code == 1
-    payload = parse_click_json_output(result.output)
-    assert any(issue.get("rule_code") == "S405" for issue in payload.get("issues", []))
+    output_payload = parse_click_json_output(result.output)
+    assert any(issue.get("rule_code") == "S405" for issue in output_payload.get("issues", []))
 
 
 def test_scan_json_subprocess_separates_logs_from_stdout_for_findings(tmp_path: Path) -> None:
