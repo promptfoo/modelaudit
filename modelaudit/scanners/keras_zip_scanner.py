@@ -1235,18 +1235,23 @@ class KerasZipScanner(BaseScanner):
 
     @staticmethod
     def _is_vulnerable_to_cve_2025_12058(version: str) -> bool:
-        """Return True for Keras versions lower than 3.12.0."""
-        parts = version.split(".", 2)
-        if len(parts) < 2:
+        """Return True for Keras versions lower than 3.12.0, including prereleases of 3.12.0."""
+        version_match = re.match(r"^(\d+)\.(\d+)(?:\.(\d+))?([A-Za-z0-9.+-]*)$", version.strip())
+        if not version_match:
             return False
+
         try:
-            major = int(parts[0])
-            minor = int(parts[1])
-            patch = 0
-            if len(parts) == 3:
-                patch_digits = "".join(ch for ch in parts[2] if ch.isdigit())
-                if patch_digits:
-                    patch = int(patch_digits)
-            return (major, minor, patch) < (3, 12, 0)
+            major = int(version_match.group(1))
+            minor = int(version_match.group(2))
+            patch = int(version_match.group(3) or 0)
+            suffix = (version_match.group(4) or "").strip().lower()
+
+            parsed = (major, minor, patch)
+            if parsed < (3, 12, 0):
+                return True
+            if parsed > (3, 12, 0):
+                return False
+
+            return bool(re.search(r"(?:^|[.\-])(dev|rc|a|b|alpha|beta|pre|preview)\d*", suffix))
         except ValueError:
             return False

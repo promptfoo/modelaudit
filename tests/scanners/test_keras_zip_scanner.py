@@ -339,6 +339,33 @@ __import__('pickle').loads(data)
             for check in result.checks
         )
 
+    def test_stringlookup_prerelease_versions_treated_as_vulnerable(self, tmp_path: Path) -> None:
+        """Prereleases of the fixed Keras version are still vulnerable."""
+        scanner = KerasZipScanner()
+        external_vocab_path = tmp_path / "vocab.txt"
+        external_vocab_path.write_text("token\n", encoding="utf-8")
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "StringLookup",
+                        "name": "string_lookup",
+                        "config": {"vocabulary": str(external_vocab_path)},
+                    },
+                ],
+            },
+        }
+
+        for keras_version in ("3.12.0a0", "3.12.0rc1", "3.12.0.dev0"):
+            model_path = create_configured_keras_zip(tmp_path, config, keras_version=keras_version)
+            result = scanner.scan(str(model_path))
+
+            cve_checks = [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-12058"]
+            assert len(cve_checks) == 1
+            assert cve_checks[0].status == CheckStatus.FAILED
+            assert cve_checks[0].severity == IssueSeverity.WARNING
+
     def test_custom_registered_objects(self):
         """Test detection of custom registered objects."""
         scanner = KerasZipScanner()
