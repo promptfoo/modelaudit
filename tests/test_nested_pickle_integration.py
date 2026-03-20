@@ -97,7 +97,7 @@ class TestNestedPickleIntegration:
             for issue in nested_issues:
                 print(f"    - {issue.severity.name}: {issue.message}")
 
-    def test_safe_nested_pickle_no_false_positives(self, pickles_dir) -> None:
+    def test_safe_nested_pickle_no_false_positives(self, pickles_dir: Path) -> None:
         """Test that safe files with nested-like patterns don't trigger false positives."""
         safe_files = self.get_safe_nested_pickles(pickles_dir)
 
