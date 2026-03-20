@@ -82,7 +82,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **cli:** preserve original local files during `--stream` directory scans instead of unlinking them after analysis
-- **security:** recurse into object-dtype `.npy` payloads and `.npz` object members with the pickle scanner while preserving CVE-2019-6446 warnings and archive-member context
+- **security:** recurse into object-dtype `.npy` payloads and `.npz` object members with the pickle scanner while preserving CVE-2019-6446 attribution and archive-member context
 - eliminate false positives for valid ExecuTorch FlatBuffers binaries and file-type validation on public `.pte` models
 - eliminate Keras ZIP false positives for safe built-in and allowlisted serialized objects such as `Add` and `NotEqual`
 - **security:** remove `dill.load` / `dill.loads` from the pickle safe-global allowlist so recursive dill deserializers stay flagged as dangerous loader entry points
@@ -100,7 +100,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **security:** require official or explicitly allowlisted JFrog hosts before treating `/artifactory/` URLs as authenticated JFrog endpoints
 - **security:** detect CVE-2024-5480 PyTorch torch.distributed.rpc arbitrary function execution via PythonUDF (CVSS 10.0)
 - **security:** detect CVE-2024-48063 PyTorch torch.distributed.rpc.RemoteModule deserialization RCE via pickle (CVSS 9.8)
-- **security:** detect CVE-2019-6446 in NumPy scanner when object-dtype arrays are found, with warning-level attribution (CVSS 9.8) due potential pickle deserialization via `allow_pickle=True`
+- **security:** detect CVE-2019-6446 in NumPy scanner when object-dtype arrays are found, with informational attribution (CVSS 9.8) due potential pickle deserialization via `allow_pickle=True`
 - **security:** new NeMo scanner detecting CVE-2025-23304 Hydra `_target_` injection in `.nemo` model files (CVSS 7.6), with recursive config inspection and dangerous callable blocklist
 - **security:** detect CVE-2025-51480 ONNX `save_external_data` arbitrary file overwrite via external_data path traversal (CVSS 8.8)
 - **security:** detect CVE-2025-49655 TorchModuleWrapper deserialization RCE (CVSS 9.8).

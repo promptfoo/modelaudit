@@ -279,7 +279,7 @@ class NumPyScanner(BaseScanner):
                                     "pickle deserialization. This is a potential RCE vector "
                                     "when consumer code loads with allow_pickle=True."
                                 ),
-                                severity=IssueSeverity.WARNING,
+                                severity=IssueSeverity.INFO,
                                 location=path,
                                 details={
                                     "dtype": str(dtype),

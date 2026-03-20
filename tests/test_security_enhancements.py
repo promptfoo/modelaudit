@@ -271,8 +271,8 @@ class TestNumPyScannerSecurity:
         size_issues = [issue for issue in result.issues if "too large" in issue.message.lower()]
         assert len(size_issues) > 0
 
-    def test_dangerous_dtype_reports_cve_warning(self, tmp_path: Path) -> None:
-        """Object dtype arrays should scan successfully while emitting CVE-2019-6446 warnings."""
+    def test_dangerous_dtype_reports_cve_info(self, tmp_path: Path) -> None:
+        """Object dtype arrays should scan successfully while emitting CVE-2019-6446 info."""
         scanner = NumPyScanner()
         npy_file = tmp_path / "object_dtype.npy"
         np.save(npy_file, np.array([{"key": "value"}], dtype=object), allow_pickle=True)
@@ -282,6 +282,7 @@ class TestNumPyScannerSecurity:
         assert result.success is True
         cve_issues = [issue for issue in result.issues if "CVE-2019-6446" in issue.message]
         assert len(cve_issues) > 0
+        assert all(issue.severity == IssueSeverity.INFO for issue in cve_issues)
         assert not any(
             check.name == "Data Type Safety Check" and check.status.value == "failed" for check in result.checks
         )
