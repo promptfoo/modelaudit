@@ -94,6 +94,70 @@ def create_custom_h5_file(
     return h5_path
 
 
+def create_h5_with_external_link(
+    tmp_path: Path,
+    *,
+    keras_version: str = "3.13.1",
+) -> Path:
+    """Create a Keras H5 file with an HDF5 ExternalLink to a local test fixture."""
+    external_source = tmp_path / "external_source.h5"
+    with h5py.File(external_source, "w") as f:
+        f.create_dataset("payload", data=[1.0, 2.0])
+
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "sequential",
+                "layers": [{"class_name": "Dense", "config": {"units": 1}}],
+            },
+        },
+        keras_version=keras_version,
+        file_name="external_link_model.h5",
+    )
+
+    with h5py.File(model_path, "a") as f:
+        weights_group = f.require_group("model_weights")
+        weights_group["linked_kernel"] = h5py.ExternalLink(external_source.name, "/payload")
+
+    return model_path
+
+
+def create_h5_with_external_storage(
+    tmp_path: Path,
+    *,
+    keras_version: str = "3.12.0",
+) -> Path:
+    """Create a Keras H5 file with a dataset backed by HDF5 external storage."""
+    raw_storage = tmp_path / "weights.raw"
+    raw_storage.write_bytes(b"\x00" * 8)
+
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "sequential",
+                "layers": [{"class_name": "Dense", "config": {"units": 1}}],
+            },
+        },
+        keras_version=keras_version,
+        file_name="external_storage_model.h5",
+    )
+
+    with h5py.File(model_path, "a") as f:
+        weights_group = f.require_group("model_weights")
+        weights_group.create_dataset(
+            "external_kernel",
+            shape=(2,),
+            dtype="float32",
+            external=[(raw_storage.name, 0, 8)],
+        )
+
+    return model_path
+
+
 def test_keras_h5_scanner_safe_model(tmp_path):
     """Test scanning a safe Keras H5 model."""
     model_path = create_mock_h5_file(tmp_path)
@@ -107,6 +171,94 @@ def test_keras_h5_scanner_safe_model(tmp_path):
     # Check for issues - a safe model might still have some informational issues
     error_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.INFO]
     assert len(error_issues) == 0
+
+
+def test_keras_h5_scanner_detects_cve_2026_1669_external_link(tmp_path: Path) -> None:
+    """Vulnerable Keras versions should warn on HDF5 ExternalLink weights."""
+    model_path = create_h5_with_external_link(tmp_path, keras_version="3.13.1")
+
+    scanner = KerasH5Scanner()
+    result = scanner.scan(str(model_path))
+
+    cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+    assert len(cve_issues) == 1
+    assert cve_issues[0].severity == IssueSeverity.WARNING
+    assert cve_issues[0].details["keras_version"] == "3.13.1"
+    assert cve_issues[0].details["external_references"] == [
+        {
+            "kind": "ExternalLink",
+            "hdf5_path": "/model_weights/linked_kernel",
+            "filename": "external_source.h5",
+            "path": "/payload",
+        },
+    ]
+
+
+def test_keras_h5_scanner_detects_cve_2026_1669_external_storage(tmp_path: Path) -> None:
+    """External storage segments should also be attributed to CVE-2026-1669."""
+    model_path = create_h5_with_external_storage(tmp_path, keras_version="3.12.0")
+
+    scanner = KerasH5Scanner()
+    result = scanner.scan(str(model_path))
+
+    cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+    assert len(cve_issues) == 1
+    assert cve_issues[0].severity == IssueSeverity.WARNING
+    assert cve_issues[0].details["external_references"] == [
+        {
+            "kind": "external_storage",
+            "hdf5_path": "/model_weights/external_kernel",
+            "segments": [{"filename": "weights.raw", "offset": 0, "size": 8}],
+        },
+    ]
+
+
+def test_keras_h5_scanner_skips_cve_2026_1669_on_fixed_version(tmp_path: Path) -> None:
+    """Fixed Keras versions should not emit warning-level CVE-2026-1669 findings."""
+    model_path = create_h5_with_external_link(tmp_path, keras_version="3.13.2")
+
+    scanner = KerasH5Scanner()
+    result = scanner.scan(str(model_path))
+
+    assert not any(issue.details.get("cve_id") == "CVE-2026-1669" for issue in result.issues)
+    assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+    assert any(
+        check.name == "HDF5 External Weight Reference Version Check" and check.status == CheckStatus.PASSED
+        for check in result.checks
+    )
+
+
+def test_keras_h5_scanner_benign_model_has_no_warning_noise(tmp_path: Path) -> None:
+    """Benign H5 models should not produce warning or critical noise."""
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "sequential",
+                "layers": [{"class_name": "Dense", "config": {"units": 1}}],
+            },
+        },
+    )
+
+    scanner = KerasH5Scanner()
+    result = scanner.scan(str(model_path))
+
+    assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+
+
+def test_keras_h5_scanner_skips_generic_hdf5_external_links_without_keras_metadata(tmp_path: Path) -> None:
+    """Generic non-Keras HDF5 files with external links should not be labeled as Keras CVE risk."""
+    generic_path = tmp_path / "generic.h5"
+    with h5py.File(generic_path, "w") as f:
+        f["linked"] = h5py.ExternalLink("external_source.h5", "/payload")
+
+    scanner = KerasH5Scanner()
+    result = scanner.scan(str(generic_path))
+
+    assert result.success is True
+    assert not any(issue.details.get("cve_id") == "CVE-2026-1669" for issue in result.issues)
+    assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
 
 
 def test_keras_h5_scanner_malicious_model(tmp_path):

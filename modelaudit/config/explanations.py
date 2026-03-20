@@ -1207,3 +1207,30 @@ def get_cve_2025_23304_explanation(vulnerability_type: str) -> str:
         "CVE-2025-23304: NeMo Hydra _target_ injection enables RCE via malicious "
         "model metadata. Update to NeMo >= 2.3.2.",
     )
+
+
+def get_cve_2026_1669_explanation(vulnerability_type: str) -> str:
+    """Get specific explanation for CVE-2026-1669 (Keras HDF5 external reference disclosure)."""
+    explanations = {
+        "hdf5_external_reference": (
+            "CVE-2026-1669 (CVSS 8.1): Keras weight loading can follow HDF5 "
+            "ExternalLink entries or external storage segments embedded in an "
+            "HDF5 weight file, causing bytes from attacker-chosen host paths "
+            "to be read into model tensors during deserialization. A crafted "
+            ".h5 or .keras model can therefore disclose local files to the "
+            "loaded model. Upgrade to Keras >= 3.12.1 or >= 3.13.2 and reject "
+            "weights that use HDF5 external references."
+        ),
+        "keras_version": (
+            "CVE-2026-1669 affects Keras versions >= 3.0.0, < 3.12.1 and >= "
+            "3.13.0, < 3.13.2. Fixed releases harden loading against HDF5 "
+            "external references in model weights. Update to Keras >= 3.12.1 "
+            "or >= 3.13.2 and avoid loading untrusted HDF5 weights."
+        ),
+    }
+
+    return explanations.get(
+        vulnerability_type,
+        "CVE-2026-1669: Keras HDF5 weight loading can follow external references "
+        "and disclose host file contents. Upgrade to Keras >= 3.12.1 or >= 3.13.2.",
+    )

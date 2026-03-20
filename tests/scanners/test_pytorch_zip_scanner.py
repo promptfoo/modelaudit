@@ -655,12 +655,14 @@ def test_pytorch_zip_version_selection_uses_metadata_when_torch_unavailable(
     assert source == "metadata:config.json:pytorch_version"
 
 
-def test_get_installed_pytorch_version_handles_import_errors(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Broken torch imports should degrade to None instead of aborting the scan."""
+def test_get_installed_pytorch_version_does_not_import_torch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Scanner should not import torch while collecting version context."""
     import builtins
+    import sys
 
     scanner = PyTorchZipScanner()
     real_import = builtins.__import__
+    import_calls: list[str] = []
 
     def fail_torch_import(
         name: str,
@@ -669,13 +671,16 @@ def test_get_installed_pytorch_version_handles_import_errors(monkeypatch: pytest
         fromlist: tuple[str, ...] = (),
         level: int = 0,
     ) -> object:
+        import_calls.append(name)
         if name == "torch":
             raise RuntimeError("broken torch import")
         return real_import(name, globals, locals, fromlist, level)
 
+    monkeypatch.delitem(sys.modules, "torch", raising=False)
     monkeypatch.setattr(builtins, "__import__", fail_torch_import)
 
     assert scanner._get_installed_pytorch_version() is None
+    assert "torch" not in import_calls
 
 
 def test_pytorch_zip_version_detection_uses_local_torch_when_metadata_missing(
