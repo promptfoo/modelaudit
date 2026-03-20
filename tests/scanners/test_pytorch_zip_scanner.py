@@ -143,6 +143,89 @@ def test_pytorch_zip_scanner_closes_bytesio(tmp_path, monkeypatch):
     assert closed.get("closed") is True
 
 
+def test_pytorch_zip_initialize_scan_does_not_read_archive_members(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test for stale duplicate scan logic in _initialize_scan()."""
+    zip_path = tmp_path / "model.pt"
+
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/0", b"\x00" * 1024)
+
+    archive_reads: list[str] = []
+
+    def fail_read(self: zipfile.ZipFile, name, *args, **kwargs):
+        archive_reads.append(name.filename if isinstance(name, zipfile.ZipInfo) else str(name))
+        raise AssertionError("_initialize_scan() should not read archive member payloads")
+
+    def fail_open(self: zipfile.ZipFile, name, *args, **kwargs):
+        archive_reads.append(name.filename if isinstance(name, zipfile.ZipInfo) else str(name))
+        raise AssertionError("_initialize_scan() should not open archive member payloads")
+
+    monkeypatch.setattr(zipfile.ZipFile, "read", fail_read)
+    monkeypatch.setattr(zipfile.ZipFile, "open", fail_open)
+
+    scanner = PyTorchZipScanner()
+    result = scanner._initialize_scan(str(zip_path))
+
+    assert result.success is True
+    assert archive_reads == []
+    assert "pickle_files" not in result.metadata
+
+
+def test_pytorch_zip_scan_does_not_open_numeric_tensor_data_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Numeric tensor payloads should not be opened anywhere in the ZIP scan."""
+    zip_path = tmp_path / "model.pt"
+
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/0", b"\x00" * 1024)
+        zipf.writestr("archive/data/1", b"\x00" * 1024)
+
+    opened_members: list[str] = []
+    original_open = zipfile.ZipFile.open
+
+    def track_open(self: zipfile.ZipFile, name, *args, **kwargs):
+        opened_members.append(name.filename if isinstance(name, zipfile.ZipInfo) else str(name))
+        return original_open(self, name, *args, **kwargs)
+
+    monkeypatch.setattr(zipfile.ZipFile, "open", track_open)
+
+    scanner = PyTorchZipScanner()
+    result = scanner.scan(str(zip_path))
+
+    assert result.success is True
+    assert "archive/data.pkl" in opened_members
+    assert "archive/data/0" not in opened_members
+    assert "archive/data/1" not in opened_members
+
+
+def test_pytorch_zip_scanner_handles_zip_metadata_oserror(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-BadZipFile metadata failures should return a structured scan error."""
+    model_path = create_mock_pytorch_zip(tmp_path / "model.pt")
+
+    def fail_namelist(self: zipfile.ZipFile):
+        raise OSError("zip metadata unavailable")
+
+    monkeypatch.setattr(zipfile.ZipFile, "namelist", fail_namelist)
+
+    scanner = PyTorchZipScanner()
+    result = scanner.scan(str(model_path))
+
+    assert result.success is False
+    assert any("zip metadata unavailable" in check.message for check in result.checks)
+
+
 @pytest.mark.performance
 def test_pytorch_zip_skips_numeric_data_files(tmp_path):
     """Test that numeric tensor data files in archive/data/ are skipped during JIT scanning."""

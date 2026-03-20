@@ -102,6 +102,7 @@ def pytest_runtest_setup(item):
             "test_mxnet_scanner.py",  # MXNet scanner tests
             "test_tf_metagraph_scanner.py",  # TensorFlow MetaGraph scanner tests
             "test_torchserve_mar_scanner.py",  # TorchServe .mar scanner tests
+            "test_executorch_scanner.py",  # ExecuTorch scanner tests
             "test_telemetry.py",  # telemetry payload and availability tests
             "test_telemetry_decoupling.py",  # telemetry failure-isolation tests
             "test_debug_command.py",  # debug output telemetry flags
