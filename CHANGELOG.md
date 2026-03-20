@@ -79,9 +79,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **security:** detect CVE-2026-1669 Keras HDF5 external weight references in standalone `.h5` and embedded `.keras` weights
 - **security:** detect CVE-2026-24747 PyTorch weights_only=True bypass via SETITEM/SETITEMS abuse and tensor metadata mismatch detection
 - **security:** detect CVE-2022-45907 PyTorch torch.jit.annotations.parse_type_line unsafe eval() injection (CVSS 9.8)
+- **keras:** detect CVE-2025-12058 StringLookup external vocabulary path loading in `.keras` configs (local file read / SSRF)
+
+### Changed
+
+- **security:** temporarily bump the optional ONNX dependency to `1.21.0rc3`, which removes the vulnerable `onnx.hub` module flagged by CVE-2026-28500.
 
 ### Fixed
 
+- **security:** stop auto-applying local `.modelaudit.toml` and `pyproject.toml` rule config during scans unless a human explicitly trusts that config in an interactive scan; remembered trust is stored securely under the local ModelAudit cache and invalidated when the config changes
 - **telemetry:** preserve secret-scrubbed model references in telemetry payloads while omitting raw credentials, query strings, and local directory paths
 - **cli:** preserve original local files during `--stream` directory scans instead of unlinking them after analysis
 - **security:** reduce benign pickle scanner noise by suppressing placeholder `__reduce__` findings, narrowing generic base64-like string heuristics, and applying default suppression for the JWT.io example token

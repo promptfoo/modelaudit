@@ -306,6 +306,161 @@ __import__('pickle').loads(data)
         finally:
             os.unlink(temp_path)
 
+    def test_stringlookup_external_vocabulary_path_triggers_cve_2025_12058(self, tmp_path: Path) -> None:
+        """Absolute StringLookup vocabulary paths should be attributed to CVE-2025-12058 on vulnerable Keras."""
+        scanner = KerasZipScanner()
+        external_vocab_path = tmp_path / "leaked-vocab.txt"
+        external_vocab_path.write_text("secret-token\n", encoding="utf-8")
+
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "StringLookup",
+                        "name": "string_lookup",
+                        "config": {"vocabulary": str(external_vocab_path)},
+                    },
+                ],
+            },
+        }
+
+        model_path = create_configured_keras_zip(tmp_path, config, keras_version="3.11.3")
+        result = scanner.scan(str(model_path))
+
+        cve_checks = [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-12058"]
+        assert len(cve_checks) == 1
+        assert cve_checks[0].status == CheckStatus.FAILED
+        assert cve_checks[0].severity == IssueSeverity.WARNING
+        assert cve_checks[0].details["layer_name"] == "string_lookup"
+        assert cve_checks[0].details["cwe"] == "CWE-502, CWE-918"
+
+    def test_stringlookup_remote_vocabulary_url_triggers_cve_2025_12058(self, tmp_path: Path) -> None:
+        """Remote StringLookup vocabulary URLs should also be attributed to CVE-2025-12058."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "StringLookup",
+                        "name": "string_lookup",
+                        "config": {"vocabulary": "https://example.com/vocab.txt"},
+                    },
+                ],
+            },
+        }
+
+        model_path = create_configured_keras_zip(tmp_path, config, keras_version="3.11.3")
+        result = scanner.scan(str(model_path))
+
+        assert any(check.details.get("cve_id") == "CVE-2025-12058" for check in result.checks)
+
+    def test_stringlookup_inline_vocabulary_list_stays_clean(self, tmp_path: Path) -> None:
+        """Inline StringLookup vocabularies are benign and should not emit warnings."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "StringLookup",
+                        "name": "string_lookup",
+                        "config": {"vocabulary": ["red", "green", "blue"]},
+                    },
+                ],
+            },
+        }
+
+        model_path = create_configured_keras_zip(tmp_path, config, keras_version="3.11.3")
+        result = scanner.scan(str(model_path))
+
+        assert all(check.details.get("cve_id") != "CVE-2025-12058" for check in result.checks)
+        noisy_issues = [
+            issue for issue in result.issues if issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL)
+        ]
+        assert noisy_issues == []
+
+    def test_stringlookup_external_vocabulary_path_is_passing_on_fixed_keras(self, tmp_path: Path) -> None:
+        """Fixed-version metadata from the archive is inconclusive, but should not emit warning noise."""
+        scanner = KerasZipScanner()
+        external_vocab_path = tmp_path / "vocab.txt"
+        external_vocab_path.write_text("token\n", encoding="utf-8")
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "StringLookup",
+                        "name": "string_lookup",
+                        "config": {"vocabulary": str(external_vocab_path)},
+                    },
+                ],
+            },
+        }
+
+        model_path = create_configured_keras_zip(tmp_path, config, keras_version="3.12.0")
+        result = scanner.scan(str(model_path))
+
+        cve_checks = [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-12058"]
+        assert len(cve_checks) == 1
+        assert cve_checks[0].name == "StringLookup External Vocabulary Metadata Check"
+        assert cve_checks[0].status == CheckStatus.FAILED
+        assert cve_checks[0].severity == IssueSeverity.INFO
+        assert "metadata-only assessment is inconclusive" in cve_checks[0].message
+        assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+
+    def test_stringlookup_windows_home_relative_path_is_detected(self, tmp_path: Path) -> None:
+        """Windows-style home-relative vocabulary paths should be normalized and detected."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "StringLookup",
+                        "name": "string_lookup",
+                        "config": {"vocabulary": "~\\vocab.txt"},
+                    },
+                ],
+            },
+        }
+
+        model_path = create_configured_keras_zip(tmp_path, config, keras_version="3.11.3")
+        result = scanner.scan(str(model_path))
+
+        assert any(
+            check.details.get("cve_id") == "CVE-2025-12058" and check.status == CheckStatus.FAILED
+            for check in result.checks
+        )
+
+    def test_stringlookup_prerelease_versions_treated_as_vulnerable(self, tmp_path: Path) -> None:
+        """Prereleases of the fixed Keras version are still vulnerable."""
+        scanner = KerasZipScanner()
+        external_vocab_path = tmp_path / "vocab.txt"
+        external_vocab_path.write_text("token\n", encoding="utf-8")
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "StringLookup",
+                        "name": "string_lookup",
+                        "config": {"vocabulary": str(external_vocab_path)},
+                    },
+                ],
+            },
+        }
+
+        for keras_version in ("3.12.0a0", "3.12.0rc1", "3.12.0.dev0"):
+            model_path = create_configured_keras_zip(tmp_path, config, keras_version=keras_version)
+            result = scanner.scan(str(model_path))
+
+            cve_checks = [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-12058"]
+            assert len(cve_checks) == 1
+            assert cve_checks[0].status == CheckStatus.FAILED
+            assert cve_checks[0].severity == IssueSeverity.WARNING
+
     def test_custom_registered_objects(self):
         """Test detection of custom registered objects."""
         scanner = KerasZipScanner()

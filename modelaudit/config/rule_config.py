@@ -58,32 +58,45 @@ class ModelAuditConfig:
     ignore: dict[str, list[str]] = field(default_factory=dict)
     options: dict[str, Any] = field(default_factory=dict)
 
+    def copy(self) -> ModelAuditConfig:
+        """Return a shallow copy of this configuration."""
+        return ModelAuditConfig(
+            suppress=set(self.suppress),
+            severity=dict(self.severity),
+            ignore={pattern: list(rules) for pattern, rules in self.ignore.items()},
+            options=dict(self.options),
+        )
+
     @classmethod
-    def load(cls, path: Path | None = None) -> ModelAuditConfig:
+    def load(cls, path: Path | None = None, *, discover_local: bool = False) -> ModelAuditConfig:
         """
         Load configuration from file or use defaults.
 
         Search order:
         1. Specified path (if provided)
-        2. .modelaudit.toml in current directory
-        3. pyproject.toml [tool.modelaudit] section
+        2. .modelaudit.toml in current directory (when discover_local=True)
+        3. pyproject.toml [tool.modelaudit] section (when discover_local=True)
         4. Default empty config
         """
         config = cls()
 
         if path and path.exists():
-            config._load_from_file(path)
+            if path.name == "pyproject.toml":
+                config._load_from_pyproject(path)
+            else:
+                config._load_from_file(path)
             return config
 
-        modelaudit_toml = Path(".modelaudit.toml")
-        if modelaudit_toml.exists():
-            config._load_from_file(modelaudit_toml)
-            return config
+        if discover_local:
+            modelaudit_toml = Path(".modelaudit.toml")
+            if modelaudit_toml.exists():
+                config._load_from_file(modelaudit_toml)
+                return config
 
-        pyproject_toml = Path("pyproject.toml")
-        if pyproject_toml.exists():
-            config._load_from_pyproject(pyproject_toml)
-            return config
+            pyproject_toml = Path("pyproject.toml")
+            if pyproject_toml.exists():
+                config._load_from_pyproject(pyproject_toml)
+                return config
 
         return config
 
@@ -195,12 +208,16 @@ class ModelAuditConfig:
 
     @classmethod
     def from_cli_args(
-        cls, suppress: list[str] | None = None, severity: dict[str, str] | None = None
+        cls,
+        suppress: list[str] | None = None,
+        severity: dict[str, str] | None = None,
+        *,
+        base_config: ModelAuditConfig | None = None,
     ) -> ModelAuditConfig:
         """
         Create config from CLI arguments merged with file config.
         """
-        config = cls.load()
+        config = base_config.copy() if base_config is not None else cls.load(discover_local=False)
         valid_rule_codes = set(RuleRegistry.get_all_rules().keys())
 
         if suppress:
@@ -234,7 +251,7 @@ def get_config() -> ModelAuditConfig:
     """Get the global configuration instance."""
     global _global_config
     if _global_config is None:
-        _global_config = ModelAuditConfig.load()
+        _global_config = ModelAuditConfig.load(discover_local=False)
     return _global_config
 
 

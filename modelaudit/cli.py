@@ -23,7 +23,9 @@ from .auth.config import (
     is_delegated_from_promptfoo,
     set_user_email,
 )
+from .cache.trusted_config_store import TrustedConfigStore
 from .config import ModelAuditConfig, set_config
+from .config.local_config import find_local_config_for_paths
 from .core import determine_exit_code, scan_model_directory_or_file
 from .integrations.jfrog import scan_jfrog_artifact
 from .integrations.sarif_formatter import format_sarif_output
@@ -41,7 +43,12 @@ from .telemetry import (
     record_scan_started,
 )
 from .utils import resolve_dvc_file
-from .utils.helpers.auto_defaults import apply_auto_overrides, generate_auto_defaults, parse_size_string
+from .utils.helpers.auto_defaults import (
+    apply_auto_overrides,
+    detect_ci_environment,
+    generate_auto_defaults,
+    parse_size_string,
+)
 from .utils.helpers.interrupt_handler import interruptible_scan
 from .utils.sources.cloud_storage import download_from_cloud, is_cloud_url
 from .utils.sources.huggingface import (
@@ -76,6 +83,83 @@ def style_text(text: str, **kwargs: Any) -> str:
     if should_use_color():
         return click.style(text, **kwargs)
     return text
+
+
+def get_trusted_config_store() -> TrustedConfigStore:
+    """Return the persistent store used for trusted local configs."""
+    return TrustedConfigStore()
+
+
+def can_use_trusted_local_config(output_format: str) -> bool:
+    """Return True when the current scan mode supports trusted local configs."""
+    return (
+        output_format == "text"
+        and sys.stdin.isatty()
+        and sys.stdout.isatty()
+        and not detect_ci_environment()
+        and not is_delegated_from_promptfoo()
+    )
+
+
+def maybe_load_trusted_local_config(
+    paths: list[str],
+    output_format: str,
+    *,
+    quiet: bool,
+) -> tuple[ModelAuditConfig | None, bool, Path | None]:
+    """Load a trusted local config for interactive text scans when available."""
+    if not can_use_trusted_local_config(output_format):
+        return None, False, None
+
+    candidate = find_local_config_for_paths(paths)
+    if candidate is None:
+        return None, False, None
+
+    store = get_trusted_config_store()
+    if store.is_trusted(candidate):
+        return ModelAuditConfig.load(candidate.config_path), True, candidate.config_path
+
+    if quiet:
+        return None, False, None
+
+    click.echo(style_text(f"Found local ModelAudit config at {candidate.config_path}", fg="cyan"))
+    click.echo("It can suppress findings or change severities.")
+    choice = click.prompt(
+        "Use it? [y] once, [a] always, [n] no",
+        type=click.Choice(["y", "a", "n"], case_sensitive=False),
+        default="n",
+        show_choices=False,
+    ).lower()
+
+    if choice == "n":
+        return None, False, None
+
+    if choice == "a":
+        store.trust(candidate)
+
+    return ModelAuditConfig.load(candidate.config_path), True, candidate.config_path
+
+
+def build_scan_rule_config(
+    paths: list[str],
+    suppress: tuple[str, ...],
+    severity_overrides: dict[str, str],
+    *,
+    output_format: str,
+    quiet: bool,
+) -> tuple[ModelAuditConfig, bool, Path | None]:
+    """Build the effective scan rule config, including trusted local policy when enabled."""
+    base_config, local_config_applied, local_config_path = maybe_load_trusted_local_config(
+        paths,
+        output_format,
+        quiet=quiet,
+    )
+    cli_config = ModelAuditConfig.from_cli_args(
+        suppress=list(suppress) if suppress else None,
+        severity=severity_overrides if severity_overrides else None,
+        base_config=base_config,
+    )
+    return cli_config, local_config_applied, local_config_path
 
 
 def expand_paths(paths: tuple[str, ...]) -> tuple[list[str], list[str]]:
@@ -770,17 +854,6 @@ def scan_command(
         flush_telemetry()
         sys.exit(2)
 
-    # Apply rule configuration from CLI and config files
-    severity_overrides = parse_severity_overrides(severity)
-    try:
-        cli_config = ModelAuditConfig.from_cli_args(
-            suppress=list(suppress) if suppress else None,
-            severity=severity_overrides if severity_overrides else None,
-        )
-    except ValueError as exc:
-        raise click.BadParameter(str(exc)) from exc
-    set_config(cli_config)
-
     # Generate defaults based on input analysis
     auto_defaults = generate_auto_defaults(expanded_paths)
 
@@ -845,6 +918,27 @@ def scan_command(
     final_max_total_size = config.get("max_total_size", 0)
     final_skip_files = config.get("skip_non_model_files", True)
     final_strict_license = config.get("strict_license", False)
+
+    # Apply rule configuration from CLI and any trusted local config for this scan mode.
+    severity_overrides = parse_severity_overrides(severity)
+    try:
+        cli_config, local_config_applied, local_config_path = build_scan_rule_config(
+            expanded_paths,
+            suppress,
+            severity_overrides,
+            output_format=final_format,
+            quiet=quiet,
+        )
+    except ValueError as exc:
+        raise click.BadParameter(str(exc)) from exc
+    set_config(cli_config)
+
+    if local_config_applied:
+        if final_cache:
+            final_cache = False
+        if not quiet and show_styled_output and local_config_path is not None:
+            click.echo(style_text(f"Using local ModelAudit config: {local_config_path}", fg="cyan"))
+            click.echo(style_text("Scan result cache disabled for this run.", fg="yellow"))
 
     # Handle max download size from automatic defaults or max_size override
     max_download_bytes = None
