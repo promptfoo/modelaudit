@@ -1347,6 +1347,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             "safetensors": "safetensors",
             "tensorflow_directory": "tf_savedmodel",
             "protobuf": "tf_savedmodel",
+            "tar": "tar",
             "zip": "zip",
             "onnx": "onnx",
             "gguf": "gguf",

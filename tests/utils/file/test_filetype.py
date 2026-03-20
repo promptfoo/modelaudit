@@ -256,6 +256,22 @@ def test_detect_torch7_formats_by_signature(tmp_path: Path) -> None:
     assert detect_file_format_from_magic(str(torch7_path)) == "torch7"
     assert validate_file_type(str(torch7_path)) is True
 
+
+def test_detect_executorch_binary_requires_valid_flatbuffer_structure(tmp_path: Path) -> None:
+    executorch_path = tmp_path / "program.pte"
+    executorch_path.write_bytes(b"\x0c\x00\x00\x00ET13\x04\x00\x04\x00\x04\x00\x00\x00")
+
+    assert detect_file_format(str(executorch_path)) == "executorch"
+    assert detect_file_format_from_magic(str(executorch_path)) == "executorch"
+    assert validate_file_type(str(executorch_path)) is True
+
+    fake_executorch_path = tmp_path / "fake-program.pte"
+    fake_executorch_path.write_bytes(b"JUNKET12notflatbufferatall")
+
+    assert detect_file_format(str(fake_executorch_path)) == "executorch"
+    assert detect_file_format_from_magic(str(fake_executorch_path)) == "unknown"
+    assert validate_file_type(str(fake_executorch_path)) is False
+
     fake_torch7 = tmp_path / "fake.t7"
     fake_torch7.write_text("not torch7")
     assert detect_file_format(str(fake_torch7)) == "unknown"
@@ -377,6 +393,19 @@ def test_detect_file_format_tar_wrappers_preserve_tar_routing(tmp_path: Path) ->
     assert detect_file_format_from_magic(str(tar_gz)) == "gzip"
     assert detect_format_from_extension(str(tar_gz)) == "tar"
     assert validate_file_type(str(tar_gz)) is True
+
+
+def test_detect_file_format_disguised_compressed_tar_by_content(tmp_path: Path) -> None:
+    archive_path = tmp_path / "archive.bin"
+    with tarfile.open(archive_path, "w:gz") as archive:
+        info = tarfile.TarInfo("payload.bin")
+        payload = b"payload"
+        info.size = len(payload)
+        archive.addfile(info, io.BytesIO(payload))
+
+    assert detect_file_format(str(archive_path)) == "tar"
+    assert detect_file_format_from_magic(str(archive_path)) == "gzip"
+    assert validate_file_type(str(archive_path)) is False
 
 
 def test_zip_magic_variants(tmp_path):
@@ -561,6 +590,18 @@ def test_validate_file_type(tmp_path):
         mar.writestr("weights.bin", b"weights")
         mar.writestr("handler.py", b"def handle(data, context):\n    return data\n")
     assert validate_file_type(str(mar_path)) is True
+
+    # ExecuTorch binaries require a valid FlatBuffers layout in addition to the file identifier.
+    executorch_path = tmp_path / "program.pte"
+    executorch_path.write_bytes(b"\x0c\x00\x00\x00ET13\x04\x00\x04\x00\x04\x00\x00\x00")
+    assert detect_file_format_from_magic(str(executorch_path)) == "executorch"
+    assert validate_file_type(str(executorch_path)) is True
+
+    invalid_executorch_path = tmp_path / "invalid-program.pte"
+    invalid_executorch_path.write_bytes(b"\x0c\x00\x00\x00ETAA\x04\x00\x04\x00\x04\x00\x00\x00")
+    assert detect_file_format_from_magic(str(invalid_executorch_path)) == "unknown"
+    assert validate_file_type(str(invalid_executorch_path)) is False
+
     # Llamafile wrappers validate by extension with scanner-level marker checks.
     llamafile_path = tmp_path / "model.llamafile"
     llamafile_path.write_bytes(b"\x7fELF" + b"\x00" * 32 + b"llamafile")
