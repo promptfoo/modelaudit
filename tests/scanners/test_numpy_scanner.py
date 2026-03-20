@@ -5,6 +5,7 @@ from typing import Any
 
 import numpy as np
 
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners.base import Check, IssueSeverity, ScanResult
 from modelaudit.scanners.numpy_scanner import NumPyScanner
 
@@ -275,6 +276,29 @@ def test_benign_object_dtype_numpy_no_nested_critical(tmp_path: Path) -> None:
     assert result.has_errors is False
     assert any("CVE-2019-6446" in (c.name + c.message) for c in result.checks)
     assert not any(i.severity == IssueSeverity.CRITICAL for i in result.issues if "CVE-2019-6446" not in i.message)
+
+
+def test_numpy_object_dtype_benign_exit0(tmp_path: Path) -> None:
+    arr = np.array([{"k": "v"}, [1, 2, 3]], dtype=object)
+    path = tmp_path / "benign_object.npy"
+    np.save(path, arr, allow_pickle=True)
+
+    result = scan_model_directory_or_file(str(path))
+
+    assert determine_exit_code(result) == 0
+    assert not any(issue.severity == IssueSeverity.WARNING for issue in result.issues)
+    assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def test_numpy_object_dtype_malicious_exit1(tmp_path: Path) -> None:
+    arr = np.array([_ExecPayload()], dtype=object)
+    path = tmp_path / "malicious_object.npy"
+    np.save(path, arr, allow_pickle=True)
+
+    result = scan_model_directory_or_file(str(path))
+
+    assert determine_exit_code(result) == 1
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
 def test_benign_object_dtype_npz_no_nested_critical(tmp_path: Path) -> None:
