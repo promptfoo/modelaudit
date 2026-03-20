@@ -335,15 +335,18 @@ class TestTelemetryClient:
             assert sorted(properties["scanners_used"]) == ["pickle", "zip"]
             assert "files_scanned" not in properties
             assert "file_identifiers" not in properties
+            assert properties["model_references"] == ["a.pkl", "b.zip"]
             canonical_issue = next(
                 detail for detail in properties["issue_details"] if detail["type"] == "pickle_dangerous_global"
             )
             assert canonical_issue["model_name"] == "a.pkl"
+            assert canonical_issue["model_reference"] == "a.pkl"
             missing_location_issue = next(
                 detail for detail in properties["issue_details"] if detail["type"] == "Issue with no location"
             )
             assert missing_location_issue["location_type"] == "unknown"
             assert missing_location_issue["model_name"] is None
+            assert missing_location_issue["model_reference"] is None
             assert "location_identifier" not in canonical_issue
             assert str(first_model) not in json.dumps(properties)
             assert '"None"' not in json.dumps(properties)
@@ -376,6 +379,8 @@ class TestTelemetryClient:
             assert "paths" not in properties
             assert properties["model_names"][0] == "model.pkl"
             assert properties["model_names"][1] == "meta-llama/Llama-2-7b"
+            assert properties["model_references"][0] == "model.pkl"
+            assert properties["model_references"][1] == "hf://meta-llama/Llama-2-7b"
             assert properties["source_types"] == ["local", "huggingface"]
             assert properties["path_types"][0] == "file"
             assert properties["path_types"][1] == "huggingface_shorthand"
@@ -410,6 +415,7 @@ class TestTelemetryClient:
             file_props = mock_posthog.capture.call_args.kwargs["properties"]
             assert "file_path" not in file_props
             assert file_props["model_name"] == "model.pkl"
+            assert file_props["model_reference"] == "model.pkl"
             assert "path_identifier" not in file_props
             assert str(sensitive_path) not in json.dumps(file_props)
 
@@ -417,6 +423,7 @@ class TestTelemetryClient:
             issue_props = mock_posthog.capture.call_args.kwargs["properties"]
             assert "file_path" not in issue_props
             assert issue_props["model_name"] == "model.pkl"
+            assert issue_props["model_reference"] == "model.pkl"
             assert "path_identifier" not in issue_props
             assert str(sensitive_path) not in json.dumps(issue_props)
 
@@ -425,6 +432,7 @@ class TestTelemetryClient:
             assert "url" not in download_props
             assert download_props["domain"] == "example.com"
             assert download_props["model_name"] == "model.bin"
+            assert download_props["model_reference"] == "https://example.com/model.bin"
             assert "url_identifier" not in download_props
             assert sensitive_url not in json.dumps(download_props)
             assert "user:pass@" not in json.dumps(download_props)
@@ -434,6 +442,7 @@ class TestTelemetryClient:
             assert "url" not in completed_props
             assert completed_props["domain"] == "example.com"
             assert completed_props["model_name"] == "model.bin"
+            assert completed_props["model_reference"] == "https://example.com/model.bin"
             assert "url_identifier" not in completed_props
             assert sensitive_url not in json.dumps(completed_props)
             assert "user:pass@" not in json.dumps(completed_props)
@@ -452,6 +461,10 @@ class TestTelemetryClient:
             assert client._extract_model_name("https://example.com/model.bin#fragment") == "model.bin"
             assert client._extract_domain("https://user:pass@example.com:8443") == "example.com:8443"
             assert client._extract_model_name("https://user:pass@example.com") == "example.com"
+            assert client._extract_model_reference("https://user:pass@example.com/model.bin?token=secret") == (
+                "https://example.com/model.bin"
+            )
+            assert client._extract_model_reference("https://user:pass@example.com") == "https://example.com"
 
     def test_telemetry_available_false_when_posthog_unavailable(self):
         """Telemetry should be unavailable when transport client is missing."""

@@ -372,6 +372,7 @@ class TelemetryClient:
             "path_type": self._classify_path(path),
             "file_extension": Path(path).suffix.lower(),
             "model_name": self._extract_model_name(path),
+            "model_reference": self._extract_model_reference(path),
         }
 
     def _build_url_properties(self, url: str) -> dict[str, Any]:
@@ -380,6 +381,7 @@ class TelemetryClient:
             "domain": self._extract_domain(url),
             "path_type": self._classify_path(url),
             "model_name": self._extract_model_name(url),
+            "model_reference": self._extract_model_reference(url),
         }
 
     def _iter_result_issues(self, results: dict[str, Any]) -> list[dict[str, Any]]:
@@ -470,6 +472,21 @@ class TelemetryClient:
 
         return name_source
 
+    def _extract_model_reference(self, path: str) -> str | None:
+        """Extract a secret-scrubbed model reference while preserving model identity."""
+        if "://" not in path:
+            return self._extract_model_name(path)
+
+        try:
+            parsed = urlparse(path)
+            host = self._extract_url_host(path)
+            if not parsed.scheme or host == "unknown":
+                return self._extract_model_name(path)
+
+            return parsed._replace(netloc=host, params="", query="", fragment="").geturl()
+        except Exception:
+            return self._extract_model_name(path)
+
     def record_event(self, event: TelemetryEvent, properties: dict[str, Any] | None = None) -> None:
         """Record a telemetry event."""
         if properties is None:
@@ -496,6 +513,7 @@ class TelemetryClient:
             {
                 "num_paths": len(paths),
                 "model_names": [self._extract_model_name(path) for path in paths],
+                "model_references": [self._extract_model_reference(path) for path in paths],
                 "source_types": source_types,
                 "path_types": path_types,
                 "source_type_counts": self._count_values(source_types),
@@ -547,6 +565,7 @@ class TelemetryClient:
                         "severity": severity,
                         "location_type": self._classify_path(issue_location) if issue_location else "unknown",
                         "model_name": self._extract_model_name(issue_location) if issue_location else None,
+                        "model_reference": self._extract_model_reference(issue_location) if issue_location else None,
                     }
                 )
 
@@ -567,6 +586,11 @@ class TelemetryClient:
                 "scanners_used": sorted(set(scanner_names)),
                 "issue_types": issue_types,
                 "issue_details": issue_details,
+                "model_references": [
+                    self._extract_model_reference(str(asset.get("path", "")))
+                    for asset in assets
+                    if isinstance(asset.get("path", ""), str) and asset.get("path")
+                ],
             },
         )
 
