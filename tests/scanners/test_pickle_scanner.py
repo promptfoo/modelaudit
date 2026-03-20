@@ -26,6 +26,7 @@ from modelaudit.scanners.pickle_scanner import (
     _genops_with_fallback,
     _GenopsBudgetExceeded,
     _is_actually_dangerous_global,
+    _is_plausible_python_module,
     _is_safe_import_only_global,
     _simulate_symbolic_reference_maps,
 )
@@ -760,6 +761,35 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
         return proto + global_op + call_ops
 
     @staticmethod
+    def _craft_stack_global_reduce_pickle(module: str, func: str) -> bytes:
+        """Craft protocol-4 payload with STACK_GLOBAL + REDUCE."""
+
+        return b"\x80\x04" + _short_binunicode(module.encode()) + _short_binunicode(func.encode()) + b"\x93(tR."
+
+    @staticmethod
+    def _craft_memoized_stack_global_reduce_pickle(module: str, func: str) -> bytes:
+        """Craft protocol-4 payload that recalls a memoized STACK_GLOBAL before REDUCE."""
+
+        payload = bytearray(b"\x80\x04")
+        payload += _short_binunicode(module.encode())
+        payload += _short_binunicode(func.encode())
+        payload += b"\x93"  # STACK_GLOBAL
+        payload += b"\x94"  # MEMOIZE index 0
+        payload += b"0"  # POP
+        payload += b"h\x00"  # BINGET 0
+        payload += b"("  # MARK
+        payload += b"t"  # TUPLE
+        payload += b"R"  # REDUCE
+        payload += b"."
+        return bytes(payload)
+
+    @staticmethod
+    def _craft_global_import_only_pickle(module: str, func: str) -> bytes:
+        """Craft minimal pickle that only imports a GLOBAL and stops."""
+
+        return TestPickleScannerBlocklistHardening._craft_global_only_pickle(module, func)
+
+    @staticmethod
     def _craft_global_only_pickle(module: str, func: str) -> bytes:
         """Craft a minimal pickle with a bare GLOBAL reference and STOP."""
 
@@ -882,7 +912,6 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
 
     def test_builtins_hasattr_binput_binget_recall_is_critical(self) -> None:
         """Memoized callable recall via BINPUT/BINGET must keep builtins.hasattr dangerous."""
-        # Memoize the callable, drop the original stack reference, then recall it.
         payload = b"\x80\x02cbuiltins\nhasattr\nq\x010h\x01(tR."
 
         result = self._scan_bytes(payload)
@@ -924,6 +953,148 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
             f"Expected CRITICAL REDUCE finding for builtins.hasattr after benign stream, "
             f"got: {[check.details for check in failed_reduce_checks]}"
         )
+
+    def test_plausible_module_allows_mixed_case_identifiers(self) -> None:
+        assert _is_plausible_python_module("EvilPkg")
+        assert _is_plausible_python_module("PIL")
+        assert _is_plausible_python_module("MyOrg.InternalPkg")
+
+    def test_plausible_module_rejects_malformed_names(self) -> None:
+        assert not _is_plausible_python_module("foo bar")
+        assert not _is_plausible_python_module("foo..bar")
+        assert not _is_plausible_python_module("foo/bar")
+        assert not _is_plausible_python_module("!!!")
+        assert not _is_plausible_python_module("PEDRA_2020")
+
+    def test_mixed_case_global_reduce_is_not_suppressed(self) -> None:
+        result = self._scan_bytes(self._craft_global_reduce_pickle("EvilPkg", "thing"))
+
+        reduce_checks = [c for c in result.checks if c.name == "REDUCE Opcode Safety Check"]
+        assert any(c.status == CheckStatus.FAILED and "EvilPkg.thing" in c.message for c in reduce_checks), (
+            f"Expected failed REDUCE check for mixed-case module, got: {[c.message for c in reduce_checks]}"
+        )
+        assert not any("implausible module name 'EvilPkg'" in c.message for c in reduce_checks), (
+            "Mixed-case module names should not be classified as implausible"
+        )
+
+    def test_pil_global_reduce_is_not_suppressed(self) -> None:
+        """Legitimate mixed-case modules like PIL should no longer be treated as implausible."""
+        result = self._scan_bytes(self._craft_global_reduce_pickle("PIL", "Image"))
+
+        reduce_checks = [c for c in result.checks if c.name == "REDUCE Opcode Safety Check"]
+        assert any("PIL.Image" in c.message for c in reduce_checks), (
+            f"Expected REDUCE analysis to resolve PIL.Image, got: {[c.message for c in reduce_checks]}"
+        )
+        assert not any("implausible module name 'PIL'" in c.message for c in reduce_checks), (
+            "PIL should no longer be classified as an implausible module"
+        )
+
+    def test_mixed_case_stack_global_reduce_is_not_suppressed(self) -> None:
+        result = self._scan_bytes(self._craft_stack_global_reduce_pickle("EvilPkg", "thing"))
+
+        reduce_checks = [c for c in result.checks if c.name == "REDUCE Opcode Safety Check"]
+        assert any(c.status == CheckStatus.FAILED and "EvilPkg.thing" in c.message for c in reduce_checks), (
+            "Expected failed REDUCE check for STACK_GLOBAL mixed-case module, "
+            f"got: {[c.message for c in reduce_checks]}"
+        )
+        assert not any("implausible module name 'EvilPkg'" in c.message for c in reduce_checks), (
+            "Mixed-case STACK_GLOBAL paths should not be suppressed as implausible"
+        )
+
+    def test_mixed_case_memoized_stack_global_reduce_is_not_suppressed(self) -> None:
+        result = self._scan_bytes(self._craft_memoized_stack_global_reduce_pickle("EvilPkg", "thing"))
+
+        reduce_checks = [c for c in result.checks if c.name == "REDUCE Opcode Safety Check"]
+        assert any(c.status == CheckStatus.FAILED and "EvilPkg.thing" in c.message for c in reduce_checks), (
+            "Expected failed REDUCE check for memoized mixed-case STACK_GLOBAL, "
+            f"got: {[c.message for c in reduce_checks]}"
+        )
+        assert not any("implausible module name 'EvilPkg'" in c.message for c in reduce_checks), (
+            "Memoized mixed-case STACK_GLOBAL paths should not be suppressed as implausible"
+        )
+
+    def test_mixed_case_import_only_payload_still_flags_import(self) -> None:
+        result = self._scan_bytes(self._craft_global_import_only_pickle("Builtins", "eval"))
+
+        import_issues = [issue for issue in result.issues if "Suspicious reference Builtins.eval" in issue.message]
+        assert import_issues, (
+            "Expected suspicious import-only detection for mixed-case dangerous global, "
+            f"got: {[i.message for i in result.issues]}"
+        )
+
+        benign_result = self._scan_bytes(self._craft_global_import_only_pickle("EvilPkg", "thing"))
+        benign_checks = [
+            check
+            for check in benign_result.checks
+            if check.name == "Global Module Reference Check"
+            and check.details.get("import_reference") == "EvilPkg.thing"
+            and check.details.get("import_only") is True
+        ]
+        assert benign_checks, f"Expected import-only analysis for EvilPkg.thing: {benign_result.checks}"
+        assert all(check.severity == IssueSeverity.WARNING for check in benign_checks), (
+            f"Mixed-case unknown imports should not be escalated as dangerous: {benign_checks}"
+        )
+        assert all(check.details.get("classification") == "unknown_third_party" for check in benign_checks), (
+            f"Expected mixed-case benign counterpart to stay unknown_third_party: {benign_checks}"
+        )
+        assert not any(
+            check.severity == IssueSeverity.CRITICAL and check.details.get("import_reference") == "EvilPkg.thing"
+            for check in benign_result.checks
+        ), f"Unexpected critical mixed-case import finding for EvilPkg.thing: {benign_result.checks}"
+
+    def test_mixed_case_unknown_import_only_is_flagged(self) -> None:
+        """Mixed-case unknown import-only refs should now reach the import-only warning path."""
+        result = self._scan_bytes(self._craft_global_import_only_pickle("EvilPkg", "thing"))
+
+        failing_checks = [
+            check
+            for check in result.checks
+            if check.name == "Global Module Reference Check"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.WARNING
+            and check.details.get("import_reference") == "EvilPkg.thing"
+            and check.details.get("import_only") is True
+            and check.details.get("classification") == "unknown_third_party"
+        ]
+        assert failing_checks, f"Expected import-only warning for EvilPkg.thing: {result.checks}"
+        assert not any(
+            "implausible module name 'EvilPkg'" in check.message
+            for check in result.checks
+            if check.name == "Global Module Reference Check"
+        ), f"Mixed-case import-only path should not be suppressed as implausible: {result.checks}"
+        assert any(
+            issue.severity == IssueSeverity.WARNING and "EvilPkg.thing" in issue.message for issue in result.issues
+        ), f"Expected warning issue for EvilPkg.thing: {result.issues}"
+
+    def test_mixed_case_reduce_in_later_stream_is_not_suppressed(self) -> None:
+        import io
+
+        buf = io.BytesIO()
+        pickle.dump({"safe": True}, buf, protocol=2)
+        buf.write(self._craft_global_reduce_pickle("EvilPkg", "thing"))
+
+        result = self._scan_bytes(buf.getvalue())
+        reduce_checks = [c for c in result.checks if c.name == "REDUCE Opcode Safety Check"]
+        assert any(c.status == CheckStatus.FAILED and "EvilPkg.thing" in c.message for c in reduce_checks), (
+            f"Expected later-stream REDUCE check for mixed-case module, got: {[c.message for c in reduce_checks]}"
+        )
+
+    def test_malformed_module_reduce_stays_implausible(self) -> None:
+        result = self._scan_bytes(self._craft_global_reduce_pickle("foo..bar", "thing"))
+
+        reduce_checks = [c for c in result.checks if c.name == "REDUCE Opcode Safety Check"]
+        assert any(
+            c.status == CheckStatus.PASSED and "implausible module name 'foo..bar'" in c.message for c in reduce_checks
+        ), f"Expected malformed module to remain implausible, got: {[c.message for c in reduce_checks]}"
+
+    def test_uppercase_data_label_reduce_stays_implausible(self) -> None:
+        result = self._scan_bytes(self._craft_global_reduce_pickle("PEDRA_2020", "thing"))
+
+        reduce_checks = [c for c in result.checks if c.name == "REDUCE Opcode Safety Check"]
+        assert any(
+            c.status == CheckStatus.PASSED and "implausible module name 'PEDRA_2020'" in c.message
+            for c in reduce_checks
+        ), f"Expected uppercase data label to remain implausible, got: {[c.message for c in reduce_checks]}"
 
     @staticmethod
     def _structural_tamper_checks(result: ScanResult) -> list:

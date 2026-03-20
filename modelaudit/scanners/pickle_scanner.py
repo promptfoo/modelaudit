@@ -1970,27 +1970,17 @@ def _is_plausible_python_module(name: str) -> bool:
     Check whether *name* looks like a real Python module/package path.
 
     Legitimate module names follow Python identifier rules:
-    - Each dotted segment is a valid Python identifier (letters, digits,
-      underscores; cannot start with a digit).
-    - Conventionally all-lowercase, though private/internal modules may use
-      a leading underscore.
+    - Each dotted segment is an ASCII Python identifier.
+    - Segments normally contain lowercase characters, with a short explicit
+      allowlist for case-sensitive imports such as ``PIL``.
 
-    Names that contain uppercase letters, start with digits, or include
-    characters outside ``[a-z0-9_.]`` are almost certainly **not** real
-    modules -- they are more likely DataFrame column names, user labels,
-    or other data strings that ended up as pickle GLOBAL arguments
-    (e.g. ``PEDRA_2020``).
-
-    The check is intentionally conservative: a handful of legitimate but
-    unusual module names (e.g. ``PIL``, ``Cython``) are covered by
-    ``ML_SAFE_GLOBALS`` and will pass the allowlist before this function
-    is ever consulted.
+    Keep obviously malformed names rejected so arbitrary data strings are less
+    likely to be treated as imports, while still allowing valid mixed-case
+    segments such as ``EvilPkg`` and ``MyOrg.InternalPkg``.
 
     Returns:
         True if *name* plausibly refers to a real Python module.
     """
-    import re
-
     if not name:
         return False
 
@@ -1998,17 +1988,15 @@ def _is_plausible_python_module(name: str) -> bool:
     if " " in name or "\t" in name:
         return False
 
-    # Split on dots; each segment must be a valid Python identifier that
-    # looks like a conventional module name (lowercase + digits + _).
+    # Split on dots; each segment must be an ASCII Python identifier.
     segments = name.split(".")
-    if not segments or any(s == "" for s in segments):
+    if not segments or any(s == "" or not s.isascii() or not s.isidentifier() for s in segments):
         return False
 
-    _MODULE_SEGMENT_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
-    return all(_MODULE_SEGMENT_RE.match(seg) for seg in segments)
+    return all(any(char.islower() for char in seg) or seg in _CASE_SENSITIVE_IMPORT_SEGMENTS for seg in segments)
 
 
-_CASE_SENSITIVE_IMPORT_SEGMENTS = frozenset({"PIL", "Cython"})
+_CASE_SENSITIVE_IMPORT_SEGMENTS: frozenset[str] = frozenset({"PIL", "Cython"})
 IMPORT_ONLY_ALWAYS_DANGEROUS_GLOBALS = frozenset(
     {
         ("dill", "load"),
@@ -2079,16 +2067,7 @@ def _is_resolved_import_target(mod: str, func: str) -> bool:
 
 def _is_plausible_import_only_module(mod: str) -> bool:
     """Return True when a module path looks importable without matching common data labels."""
-    if not mod:
-        return False
-
-    segments = mod.split(".")
-    if not segments or any(segment == "" or not segment.isidentifier() for segment in segments):
-        return False
-
-    return all(
-        any(char.islower() for char in segment) or segment in _CASE_SENSITIVE_IMPORT_SEGMENTS for segment in segments
-    )
+    return _is_plausible_python_module(mod)
 
 
 def _classify_import_reference(
@@ -6886,14 +6865,34 @@ class PickleScanner(BaseScanner):
         metadata = super().extract_metadata(file_path)
 
         allow_deserialization = bool(self.config.get("allow_metadata_deserialization"))
+        metadata_read_cap = 10 * 1024 * 1024
 
         try:
             import pickle
             import pickletools
             from io import BytesIO
 
+            max_metadata_read_size = int(self.config.get("max_metadata_pickle_read_size", metadata_read_cap))
+
+            if max_metadata_read_size <= 0:
+                raise ValueError(
+                    f"Invalid pickle metadata read limit: {max_metadata_read_size} (must be greater than 0)"
+                )
+            max_metadata_read_size = min(max_metadata_read_size, metadata_read_cap)
+
+            file_size = self.get_file_size(file_path)
+            if file_size > max_metadata_read_size:
+                raise ValueError(
+                    f"Pickle metadata read limit exceeded: {file_size} bytes (max: {max_metadata_read_size})"
+                )
+
             with open(file_path, "rb") as f:
-                pickle_data = f.read()
+                pickle_data = f.read(max_metadata_read_size + 1)
+
+            if len(pickle_data) > max_metadata_read_size:
+                raise ValueError(
+                    f"Pickle metadata read limit exceeded: {len(pickle_data)} bytes (max: {max_metadata_read_size})"
+                )
 
             # Analyze pickle structure
             metadata.update(
