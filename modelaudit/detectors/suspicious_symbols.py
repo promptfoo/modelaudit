@@ -55,6 +55,8 @@ Version History:
 
 from typing import Any
 
+from modelaudit.config.generated_keras_layers import GENERATED_KNOWN_SAFE_KERAS_LAYER_CLASSES
+
 from ..config.explanations import DANGEROUS_OPCODES as _EXPLAIN_OPCODES
 
 # OS module aliases that provide system access similar to the 'os' module
@@ -669,154 +671,10 @@ TENSORFLOW_DANGEROUS_OPS: dict[str, str] = {
 # without custom code execution (Sequential, Functional, Model)
 KNOWN_SAFE_MODEL_CLASSES: set[str] = {"Sequential", "Functional", "Model"}
 
-# Known safe Keras layer class names (standard built-in layers).
-# Any layer class_name NOT in this set or SUSPICIOUS_LAYER_TYPES is treated as
-# a custom/unknown layer that warrants attention.
-KNOWN_SAFE_KERAS_LAYER_CLASSES: frozenset[str] = frozenset(
-    {
-        # Input
-        "InputLayer",
-        "Input",
-        # Core
-        "Dense",
-        "Activation",
-        "Embedding",
-        "Masking",
-        "Flatten",
-        "Reshape",
-        "Permute",
-        "RepeatVector",
-        "Identity",
-        "EinsumDense",
-        # Activations (added)
-        "ReLU",
-        "Softmax",
-        "LeakyReLU",
-        "PReLU",
-        "ELU",
-        # Convolutional
-        "Conv1D",
-        "Conv2D",
-        "Conv3D",
-        "SeparableConv1D",
-        "SeparableConv2D",
-        "DepthwiseConv1D",
-        "DepthwiseConv2D",
-        "Conv1DTranspose",
-        "Conv2DTranspose",
-        "Conv3DTranspose",
-        # Pooling
-        "MaxPooling1D",
-        "MaxPooling2D",
-        "MaxPooling3D",
-        "AveragePooling1D",
-        "AveragePooling2D",
-        "AveragePooling3D",
-        "GlobalMaxPooling1D",
-        "GlobalMaxPooling2D",
-        "GlobalMaxPooling3D",
-        "GlobalAveragePooling1D",
-        "GlobalAveragePooling2D",
-        "GlobalAveragePooling3D",
-        "MaxPool1D",
-        "MaxPool2D",
-        "MaxPool3D",
-        "AvgPool1D",
-        "AvgPool2D",
-        "AvgPool3D",
-        "GlobalMaxPool1D",
-        "GlobalMaxPool2D",
-        "GlobalMaxPool3D",
-        "GlobalAvgPool1D",
-        "GlobalAvgPool2D",
-        "GlobalAvgPool3D",
-        # RNN
-        "SimpleRNN",
-        "LSTM",
-        "GRU",
-        "ConvLSTM1D",
-        "ConvLSTM2D",
-        "ConvLSTM3D",
-        "SimpleRNNCell",
-        "LSTMCell",
-        "GRUCell",
-        "StackedRNNCells",
-        "Bidirectional",
-        "TimeDistributed",
-        "RNN",
-        # Normalization
-        "BatchNormalization",
-        "LayerNormalization",
-        "GroupNormalization",
-        "UnitNormalization",
-        "SpectralNormalization",
-        # Regularization
-        "Dropout",
-        "SpatialDropout1D",
-        "SpatialDropout2D",
-        "SpatialDropout3D",
-        "GaussianNoise",
-        "GaussianDropout",
-        "AlphaDropout",
-        "ActivityRegularization",
-        # Attention
-        "MultiHeadAttention",
-        "Attention",
-        "AdditiveAttention",
-        # Merging
-        "Add",
-        "Subtract",
-        "Multiply",
-        "Average",
-        "Maximum",
-        "Minimum",
-        "NotEqual",
-        "Concatenate",
-        "Dot",
-        # Padding/Cropping
-        "ZeroPadding1D",
-        "ZeroPadding2D",
-        "ZeroPadding3D",
-        "Cropping1D",
-        "Cropping2D",
-        "Cropping3D",
-        # Upsampling
-        "UpSampling1D",
-        "UpSampling2D",
-        "UpSampling3D",
-        # Preprocessing
-        "Rescaling",
-        "Resizing",
-        "CenterCrop",
-        "RandomFlip",
-        "RandomRotation",
-        "RandomZoom",
-        "RandomCrop",
-        "RandomTranslation",
-        "RandomContrast",
-        "RandomBrightness",
-        "RandomHeight",
-        "RandomWidth",
-        "Normalization",
-        "Discretization",
-        "CategoryEncoding",
-        "Hashing",
-        "HashedCrossing",
-        "StringLookup",
-        "IntegerLookup",
-        "TextVectorization",
-        # TF-specific
-        "TFSMLayer",
-        # Wrapper
-        "Wrapper",
-        # Model classes (nested models in configs)
-        "Sequential",
-        "Functional",
-        "Model",
-        # Keras DType
-        "DTypePolicy",
-    }
-)
+# Known safe Keras layer class names derived from Keras public `keras.layers.*`
+# exports. Refresh the generated inventory with
+# `scripts/generate_keras_layer_inventory.py` when Keras adds new public layers.
+KNOWN_SAFE_KERAS_LAYER_CLASSES: frozenset[str] = GENERATED_KNOWN_SAFE_KERAS_LAYER_CLASSES
 
 # Known standard Keras loss function names (string identifiers and class names).
 # Used to detect custom/unknown loss functions in training_config.

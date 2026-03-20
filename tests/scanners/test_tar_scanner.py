@@ -2,10 +2,12 @@ import os
 import tarfile
 import tempfile
 from pathlib import Path
+from typing import Literal
 
 import pytest
 
-from modelaudit.scanners.base import IssueSeverity
+from modelaudit import core
+from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.tar_scanner import DEFAULT_MAX_TAR_ENTRY_SIZE, TarScanner
 
 
@@ -511,3 +513,173 @@ class TestTarScanner:
         assert len(format_checks) == 1
         assert "not a valid tar file" in format_checks[0].message.lower()
         assert any("not a valid tar file" in issue.message.lower() for issue in result.issues)
+
+    @pytest.mark.parametrize(
+        ("suffix", "mode"),
+        [
+            (".tar.gz", "w:gz"),
+            (".tar.bz2", "w:bz2"),
+            (".tar.xz", "w:xz"),
+        ],
+    )
+    def test_scan_compressed_tar_enforces_decompression_ratio_limit(
+        self, tmp_path: Path, suffix: str, mode: Literal["w:gz", "w:bz2", "w:xz"]
+    ) -> None:
+        """Compressed TAR wrappers should enforce decompression ratio limits across supported codecs."""
+        archive_path = tmp_path / f"ratio_limit{suffix}"
+        payload = b"A" * 1_000_000
+
+        with tarfile.open(archive_path, mode) as archive:
+            info = tarfile.TarInfo("payload.bin")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        scanner = TarScanner(config={"compressed_max_decompression_ratio": 2.0})
+        result = scanner.scan(str(archive_path))
+
+        limit_checks = [check for check in result.checks if check.name == "Compressed Wrapper Decompression Limits"]
+        assert len(limit_checks) == 1
+        assert limit_checks[0].status == CheckStatus.FAILED
+        assert "decompression ratio exceeded" in limit_checks[0].message.lower()
+
+    @pytest.mark.parametrize(
+        ("suffix", "mode"),
+        [
+            (".tar.gz", "w:gz"),
+            (".tar.bz2", "w:bz2"),
+            (".tar.xz", "w:xz"),
+        ],
+    )
+    def test_scan_compressed_tar_enforces_decompressed_size_limit(
+        self, tmp_path: Path, suffix: str, mode: Literal["w:gz", "w:bz2", "w:xz"]
+    ) -> None:
+        """Compressed TAR wrappers should enforce size limits across supported codecs."""
+        archive_path = tmp_path / f"size_limit{suffix}"
+        payload = b"B" * 10_000
+
+        with tarfile.open(archive_path, mode) as archive:
+            info = tarfile.TarInfo("payload.bin")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        scanner = TarScanner(config={"compressed_max_decompressed_bytes": 1024})
+        result = scanner.scan(str(archive_path))
+
+        limit_checks = [check for check in result.checks if check.name == "Compressed Wrapper Decompression Limits"]
+        assert len(limit_checks) == 1
+        assert limit_checks[0].status == CheckStatus.FAILED
+        assert "decompressed size exceeded" in limit_checks[0].message.lower()
+
+    @pytest.mark.parametrize(
+        ("suffix", "mode"),
+        [
+            (".tar.gz", "w:gz"),
+            (".tar.bz2", "w:bz2"),
+            (".tar.xz", "w:xz"),
+        ],
+    )
+    def test_scan_compressed_tar_within_limits_passes_decompression_checks(
+        self, tmp_path: Path, suffix: str, mode: Literal["w:gz", "w:bz2", "w:xz"]
+    ) -> None:
+        """Compressed TAR wrappers within safe bounds should produce a passing decompression check."""
+        archive_path = tmp_path / f"within_limit{suffix}"
+        payload = b"safe-payload"
+
+        with tarfile.open(archive_path, mode) as archive:
+            info = tarfile.TarInfo("payload.bin")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        scanner = TarScanner(
+            config={
+                "compressed_max_decompression_ratio": 1_000.0,
+                "compressed_max_decompressed_bytes": 20_000,
+            }
+        )
+        result = scanner.scan(str(archive_path))
+
+        limit_checks = [check for check in result.checks if check.name == "Compressed Wrapper Decompression Limits"]
+        assert len(limit_checks) == 1
+        assert limit_checks[0].status == CheckStatus.PASSED
+
+    def test_scan_compressed_tar_accounts_for_tar_record_padding(self, tmp_path: Path) -> None:
+        """Wrapper limits should account for TAR record padding, even on tiny archives."""
+        archive_path = tmp_path / "tiny.tar.gz"
+
+        with tarfile.open(archive_path, "w:gz") as archive:
+            info = tarfile.TarInfo("payload.bin")
+            payload = b"tiny"
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        scanner = TarScanner(config={"compressed_max_decompressed_bytes": 4_096})
+        result = scanner.scan(str(archive_path))
+
+        limit_checks = [check for check in result.checks if check.name == "Compressed Wrapper Decompression Limits"]
+        assert len(limit_checks) == 1
+        assert limit_checks[0].status == CheckStatus.FAILED
+        assert "decompressed size exceeded" in limit_checks[0].message.lower()
+
+    def test_scan_tar_preflight_streams_members_without_getmembers(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Preflight should stream TAR members instead of materializing them with getmembers()."""
+        archive_path = tmp_path / "streamed.tar.gz"
+
+        with tarfile.open(archive_path, "w:gz") as archive:
+            for index in range(3):
+                info = tarfile.TarInfo(f"payload-{index}.bin")
+                payload = f"payload-{index}".encode()
+                info.size = len(payload)
+                archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        def fail_getmembers(self: tarfile.TarFile) -> list[tarfile.TarInfo]:
+            raise AssertionError("TarScanner should not call getmembers() during preflight")
+
+        monkeypatch.setattr(tarfile.TarFile, "getmembers", fail_getmembers)
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert result.success is True
+        entry_checks = [check for check in result.checks if check.name == "Entry Count Limit Check"]
+        assert len(entry_checks) == 1
+        assert entry_checks[0].status == CheckStatus.PASSED
+
+    def test_scan_compressed_tar_detects_wrapper_by_content_not_suffix(self, tmp_path: Path) -> None:
+        """Compressed TARs with plain .tar suffix should still enforce wrapper limits by magic bytes."""
+        archive_path = tmp_path / "disguised_compressed.tar"
+        payload = b"C" * 1_000_000
+
+        with tarfile.open(archive_path, "w:gz") as archive:
+            info = tarfile.TarInfo("payload.bin")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        scanner = TarScanner(config={"compressed_max_decompression_ratio": 2.0})
+        result = scanner.scan(str(archive_path))
+
+        limit_checks = [check for check in result.checks if check.name == "Compressed Wrapper Decompression Limits"]
+        assert len(limit_checks) == 1
+        assert limit_checks[0].status == CheckStatus.FAILED
+        assert "decompression ratio exceeded" in limit_checks[0].message.lower()
+
+    def test_core_routes_disguised_compressed_tar_without_tar_suffix(self, tmp_path: Path) -> None:
+        """Compressed TAR wrappers renamed to generic suffixes should still route to TarScanner."""
+        archive_path = tmp_path / "disguised_payload.bin"
+        payload = b"D" * 1_000_000
+
+        with tarfile.open(archive_path, "w:gz") as archive:
+            info = tarfile.TarInfo("payload.bin")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = core.scan_file(
+            str(archive_path),
+            config={"compressed_max_decompression_ratio": 2.0},
+        )
+
+        limit_checks = [check for check in result.checks if check.name == "Compressed Wrapper Decompression Limits"]
+        assert result.scanner_name == "tar"
+        assert len(limit_checks) == 1
+        assert limit_checks[0].status == CheckStatus.FAILED
+        assert "decompression ratio exceeded" in limit_checks[0].message.lower()

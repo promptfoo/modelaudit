@@ -270,9 +270,13 @@ class TestTelemetryClient:
             # Should not call PostHog
             mock_posthog.capture.assert_not_called()
 
-    def test_scan_completed_uses_top_level_results_schema(self) -> None:
+    def test_scan_completed_uses_top_level_results_schema(self, tmp_path: Path) -> None:
         """Test that scan completion telemetry aggregates without file identifiers."""
         mock_posthog = MagicMock()
+        first_model = tmp_path / "a.pkl"
+        second_model = tmp_path / "b.zip"
+        first_model.write_bytes(b"pickle")
+        second_model.write_bytes(b"zip")
 
         with (
             tempfile.TemporaryDirectory() as temp_dir,
@@ -293,17 +297,17 @@ class TestTelemetryClient:
                 "files_scanned": 2,
                 "scanner_names": ["pickle", "zip"],
                 "assets": [
-                    {"path": "/tmp/a.pkl", "type": "pickle"},
-                    {"path": "/tmp/b.zip", "type": "zip"},
+                    {"path": str(first_model), "type": "pickle"},
+                    {"path": str(second_model), "type": "zip"},
                 ],
                 "issues": [
-                    {"message": "Issue A", "severity": "critical", "location": "/tmp/a.pkl"},
-                    {"message": "Issue B", "severity": "warning", "location": "/tmp/b.zip"},
+                    {"message": "Issue A", "severity": "critical", "location": str(first_model)},
+                    {"message": "Issue B", "severity": "warning", "location": str(second_model)},
                     {
                         "type": "pickle_dangerous_global",
                         "message": "Legacy message should not be used when type exists",
                         "severity": "info",
-                        "location": "/tmp/a.pkl",
+                        "location": str(first_model),
                     },
                     {
                         "message": "Issue with no location",
@@ -341,12 +345,14 @@ class TestTelemetryClient:
             assert missing_location_issue["location_type"] == "unknown"
             assert missing_location_issue["model_name"] is None
             assert "location_identifier" not in canonical_issue
-            assert "/tmp/a.pkl" not in json.dumps(properties)
+            assert str(first_model) not in json.dumps(properties)
             assert '"None"' not in json.dumps(properties)
 
-    def test_scan_started_includes_per_path_fields(self) -> None:
+    def test_scan_started_includes_per_path_fields(self, tmp_path: Path) -> None:
         """Scan started events include coarse path metadata but no identifiers."""
         mock_posthog = MagicMock()
+        model_path = tmp_path / "model.pkl"
+        model_path.write_bytes(b"pickle")
 
         with (
             tempfile.TemporaryDirectory() as temp_dir,
@@ -363,7 +369,7 @@ class TestTelemetryClient:
             client._posthog_client = mock_posthog
             client._user_config.telemetry_enabled = True
 
-            paths = ["/tmp/model.pkl", "hf://meta-llama/Llama-2-7b"]
+            paths = [str(model_path), "hf://meta-llama/Llama-2-7b"]
             client.record_scan_started(paths, {"format": "json"})
 
             properties = mock_posthog.capture.call_args.kwargs["properties"]
@@ -371,14 +377,17 @@ class TestTelemetryClient:
             assert properties["model_names"][0] == "model.pkl"
             assert properties["model_names"][1] == "meta-llama/Llama-2-7b"
             assert properties["source_types"] == ["local", "huggingface"]
-            assert properties["path_types"][0] in {"file", "unknown"}
+            assert properties["path_types"][0] == "file"
             assert properties["path_types"][1] == "huggingface_shorthand"
             assert "path_identifiers" not in properties
-            assert "/tmp/model.pkl" not in json.dumps(properties)
+            assert str(model_path) not in json.dumps(properties)
 
-    def test_path_and_url_fields_omit_identifiers(self) -> None:
+    def test_path_and_url_fields_omit_identifiers(self, tmp_path: Path) -> None:
         """Path and URL fields should not include raw sensitive values or identifiers."""
         mock_posthog = MagicMock()
+        sensitive_path = tmp_path / "private" / "model.pkl"
+        sensitive_path.parent.mkdir()
+        sensitive_path.write_bytes(b"pickle")
 
         with (
             tempfile.TemporaryDirectory() as temp_dir,
@@ -395,38 +404,41 @@ class TestTelemetryClient:
             client._posthog_client = mock_posthog
             client._user_config.telemetry_enabled = True
 
-            sensitive_path = "/home/user/private/model.pkl"
-            sensitive_url = "https://example.com/model.bin?token=secret"
+            sensitive_url = "https://user:pass@example.com/model.bin?token=secret"
 
-            client.record_file_type_detected(sensitive_path, "pickle")
+            client.record_file_type_detected(str(sensitive_path), "pickle")
             file_props = mock_posthog.capture.call_args.kwargs["properties"]
             assert "file_path" not in file_props
             assert file_props["model_name"] == "model.pkl"
             assert "path_identifier" not in file_props
-            assert sensitive_path not in json.dumps(file_props)
+            assert str(sensitive_path) not in json.dumps(file_props)
 
-            client.record_issue_found("dangerous pattern", "critical", "pickle", sensitive_path)
+            client.record_issue_found("dangerous pattern", "critical", "pickle", str(sensitive_path))
             issue_props = mock_posthog.capture.call_args.kwargs["properties"]
             assert "file_path" not in issue_props
             assert issue_props["model_name"] == "model.pkl"
             assert "path_identifier" not in issue_props
-            assert sensitive_path not in json.dumps(issue_props)
+            assert str(sensitive_path) not in json.dumps(issue_props)
 
             client.record_download_started("http", sensitive_url)
             download_props = mock_posthog.capture.call_args.kwargs["properties"]
             assert "url" not in download_props
+            assert download_props["domain"] == "example.com"
             assert download_props["model_name"] == "model.bin"
             assert "url_identifier" not in download_props
             assert sensitive_url not in json.dumps(download_props)
+            assert "user:pass@" not in json.dumps(download_props)
 
             client.record_download_completed("http", 2.0, 2048, sensitive_url)
             completed_props = mock_posthog.capture.call_args.kwargs["properties"]
             assert "url" not in completed_props
+            assert completed_props["domain"] == "example.com"
             assert completed_props["model_name"] == "model.bin"
             assert "url_identifier" not in completed_props
             assert sensitive_url not in json.dumps(completed_props)
+            assert "user:pass@" not in json.dumps(completed_props)
 
-    def test_extract_model_name_strips_query_string_for_http_urls(self):
+    def test_extract_model_name_strips_query_string_for_http_urls(self) -> None:
         """Model name extraction should not include URL query parameters."""
         with (
             tempfile.TemporaryDirectory() as temp_dir,
@@ -438,6 +450,8 @@ class TestTelemetryClient:
 
             assert client._extract_model_name("https://example.com/model.bin?token=secret") == "model.bin"
             assert client._extract_model_name("https://example.com/model.bin#fragment") == "model.bin"
+            assert client._extract_domain("https://user:pass@example.com:8443") == "example.com:8443"
+            assert client._extract_model_name("https://user:pass@example.com") == "example.com"
 
     def test_telemetry_available_false_when_posthog_unavailable(self):
         """Telemetry should be unavailable when transport client is missing."""

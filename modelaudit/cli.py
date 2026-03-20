@@ -1683,11 +1683,12 @@ def scan_command(
                         # Create file iterator
                         file_generator = iterate_files_streaming(actual_path)
 
-                        # Scan with streaming mode - propagate all config
+                        # Scan with streaming mode - propagate all config.
+                        # Local files already live on disk, so preserve the originals.
                         streaming_result = scan_model_streaming(
                             file_generator=file_generator,
                             timeout=final_timeout,
-                            delete_after_scan=True,  # Delete files after scanning in streaming mode
+                            delete_after_scan=False,
                             progress_callback=progress_callback,
                             blacklist_patterns=list(blacklist) if blacklist else None,
                             max_file_size=final_max_file_size,

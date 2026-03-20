@@ -7,6 +7,7 @@ import zipfile
 from typing import Any, ClassVar
 
 from ..utils import sanitize_archive_path
+from ..utils.file.detection import _is_executorch_binary_signature, _is_valid_executorch_binary
 from .base import BaseScanner, IssueSeverity, ScanResult
 from .pickle_scanner import PickleScanner
 
@@ -50,7 +51,19 @@ class ExecuTorchScanner(BaseScanner):
         file_size = self.get_file_size(path)
         result.metadata["file_size"] = file_size
 
-        header = self._read_header(path)
+        header = self._read_header(path, length=8)
+        if _is_executorch_binary_signature(header) and _is_valid_executorch_binary(path):
+            result.add_check(
+                name="ExecuTorch Binary Format Validation",
+                passed=True,
+                message="Valid ExecuTorch binary program format detected",
+                location=path,
+                details={"path": path, "format": "executorch_binary"},
+            )
+            result.bytes_scanned = file_size
+            result.finish(success=True)
+            return result
+
         if not header.startswith(b"PK"):
             result.add_check(
                 name="ExecuTorch Archive Format Validation",

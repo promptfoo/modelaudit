@@ -436,13 +436,19 @@ class TelemetryClient:
         is_http_url = path.startswith(("http://", "https://"))
         is_hf_shorthand = path.startswith("hf://")
         parsed = urlparse(path) if (is_http_url or is_hf_shorthand) else None
+        url_host = self._extract_url_host(path) if parsed else None
 
         # HuggingFace format: hf://org/model or https://huggingface.co/org/model
         if is_hf_shorthand and parsed:
-            parts = [part for part in [parsed.netloc, *parsed.path.lstrip("/").split("/")] if part]
+            parts = [part for part in [url_host, *parsed.path.lstrip("/").split("/")] if part]
             if len(parts) >= 2:
                 return f"{parts[0]}/{parts[1]}"
-        if is_http_url and parsed and (parsed.netloc == "huggingface.co" or parsed.netloc.endswith(".huggingface.co")):
+        if (
+            is_http_url
+            and parsed
+            and url_host
+            and (url_host == "huggingface.co" or url_host.endswith(".huggingface.co"))
+        ):
             parts = [part for part in parsed.path.lstrip("/").split("/") if part]
             if len(parts) >= 2:
                 return f"{parts[0]}/{parts[1]}"
@@ -459,8 +465,8 @@ class TelemetryClient:
             if model_name:
                 return model_name
 
-        if is_http_url and parsed and parsed.netloc:
-            return parsed.netloc
+        if is_http_url and url_host and url_host != "unknown":
+            return url_host
 
         return name_source
 
@@ -715,8 +721,15 @@ class TelemetryClient:
 
     def _extract_domain(self, url: str) -> str:
         """Extract domain from URL for analytics."""
+        return self._extract_url_host(url)
+
+    def _extract_url_host(self, url: str) -> str:
+        """Extract a sanitized URL host without userinfo for analytics."""
         try:
-            return urlparse(url).netloc
+            parsed = urlparse(url)
+            if not parsed.hostname:
+                return "unknown"
+            return f"{parsed.hostname}:{parsed.port}" if parsed.port is not None else parsed.hostname
         except Exception:
             return "unknown"
 

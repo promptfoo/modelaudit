@@ -123,7 +123,12 @@ class KerasZipScanner(BaseScanner):
 
     def _is_known_safe_serialized_layer(self, layer: dict[str, Any]) -> bool:
         layer_class = layer.get("class_name")
-        return is_known_safe_keras_layer_class(layer_class)
+        if is_known_safe_keras_layer_class(layer_class):
+            return True
+
+        return self._layer_uses_allowlisted_module(layer) and self._is_known_safe_allowlisted_registered_object(
+            layer_class
+        )
 
     def _should_flag_registered_object(self, layer: dict[str, Any]) -> bool:
         registered_name = layer.get("registered_name")

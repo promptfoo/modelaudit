@@ -518,9 +518,14 @@ __import__('pickle').loads(data)
                         "config": {"batch_shape": [None, 32, 32, 3]},
                     },
                     {
-                        "class_name": "RandomWidth",
-                        "name": "random_width",
+                        "class_name": "RandomShear",
+                        "name": "random_shear",
                         "config": {"factor": 0.1},
+                    },
+                    {
+                        "class_name": "RandomColorJitter",
+                        "name": "random_color_jitter",
+                        "config": {"value_range": [0, 255], "brightness_factor": 0.1},
                     },
                 ]
             },
@@ -620,6 +625,32 @@ __import__('pickle').loads(data)
 
         assert any(check.name == "Custom Layer Class Detection" for check in result.checks)
         assert any(check.name == "Custom Object Detection" for check in result.checks)
+
+    def test_generic_base_layer_class_still_flags_custom_layer(self, tmp_path: Path) -> None:
+        """The abstract Keras base Layer export should not suppress custom-layer review."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Functional",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "InputLayer",
+                        "name": "input_1",
+                        "config": {"batch_shape": [None, 4]},
+                    },
+                    {
+                        "class_name": "Layer",
+                        "name": "generic_layer",
+                        "module": "keras.layers",
+                        "config": {},
+                    },
+                ]
+            },
+        }
+
+        result = scanner.scan(str(create_configured_keras_zip(tmp_path, config, file_name="generic_layer.keras")))
+
+        assert any(check.name == "Custom Layer Class Detection" for check in result.checks)
 
 
 class TestCVE202549655TorchModuleWrapper:
