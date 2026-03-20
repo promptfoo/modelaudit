@@ -64,6 +64,8 @@ tensorflow = [
 h5 = ["h5py>=3.1,<4.0"]
 pytorch = ["torch>=2.6.0,<3.0"]
 safetensors = ["safetensors>=0.4.0"]
+# Temporary RC pin for CVE-2026-28500: the advisory targets onnx.hub.load(),
+# which ModelAudit does not call.
 onnx = ["onnx>=1.21.0rc3,<2.0; python_version < '3.13'"]
 dill = ["dill>=0.3.0,<1.0"]
 joblib = ["joblib>=1.0.0,<2.0", "scikit-learn>=1.0.0,<2.0"]
@@ -82,6 +84,8 @@ numpy1 = [
     "torch>=2.6.0,<3.0",
     "pyyaml>=6.0,<7.0",
     "safetensors>=0.4.0",
+    # Temporary RC pin for CVE-2026-28500: the advisory targets onnx.hub.load(),
+    # which ModelAudit does not call.
     "onnx>=1.21.0rc3,<2.0; python_version < '3.13'",
     "dill>=0.3.0,<1.0",
     "joblib>=1.0.0,<2.0",
@@ -97,6 +101,8 @@ all-ci = [
     "torch>=2.6.0,<3.0",
     "pyyaml>=6.0,<7.0",
     "safetensors>=0.4.0",
+    # Temporary RC pin for CVE-2026-28500: the advisory targets onnx.hub.load(),
+    # which ModelAudit does not call.
     "onnx>=1.21.0rc3,<2.0; python_version < '3.13'",
     "dill>=0.3.0,<1.0",
     "joblib>=1.0.0,<2.0",
@@ -121,6 +127,8 @@ all = [
     "torch>=2.6.0,<3.0",
     "pyyaml>=6.0,<7.0",
     "safetensors>=0.4.0",
+    # Temporary RC pin for CVE-2026-28500: the advisory targets onnx.hub.load(),
+    # which ModelAudit does not call.
     "onnx>=1.21.0rc3,<2.0; python_version < '3.13'",
     "dill>=0.3.0,<1.0",
     "joblib>=1.0.0,<2.0",
