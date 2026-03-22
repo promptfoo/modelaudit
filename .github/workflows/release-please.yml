@@ -386,14 +386,16 @@ jobs:
       id-token: write
       attestations: write
     steps:
+      - uses: actions/checkout@v6
+        with:
+          sparse-checkout: |
+            pyproject.toml
+            uv.lock
+
       - name: Install uv
         uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
-
-      - uses: actions/checkout@v6
-        with:
-          sparse-checkout: pyproject.toml
 
       - name: Download build artifacts
         uses: actions/download-artifact@v8
@@ -408,11 +410,13 @@ jobs:
 
       - name: Generate SBOM
         run: |
-          uv tool install cyclonedx-bom
-          uv tool run cyclonedx-py requirements \
-            --pyproject pyproject.toml \
-            --output-format json \
-            --output-file dist/modelaudit-${{ needs.release-please.outputs.version }}.cdx.json
+          uv export \
+            --frozen \
+            --no-dev \
+            --preview-features sbom-export \
+            --format cyclonedx1.5 \
+            --output-file dist/modelaudit-${{ needs.release-please.outputs.version }}.cdx.json \
+            > /dev/null
           echo "SBOM generated:"
           ls -la dist/*.cdx.json
 
