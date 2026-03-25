@@ -4,7 +4,6 @@ import base64
 import json
 import os
 import re
-import shutil
 import tempfile
 import zipfile
 from typing import Any, ClassVar
@@ -94,8 +93,18 @@ except ImportError:  # pragma: no cover - optional dependency
     HAS_H5PY = False
 
 
+class _EmbeddedWeightsLimitExceeded(Exception):
+    """Raised when embedded weights exceed the configured extraction limit."""
+
+    def __init__(self, message: str, extracted_bytes: int) -> None:
+        super().__init__(message)
+        self.extracted_bytes = extracted_bytes
+
+
 class KerasZipScanner(BaseScanner):
     """Scanner for ZIP-based Keras .keras model files"""
+
+    MAX_EMBEDDED_WEIGHTS_BYTES: ClassVar[int] = 100 * 1024 * 1024
 
     name = "keras_zip"
     description = "Scans ZIP-based Keras model files for suspicious configurations and Lambda layers"
@@ -111,6 +120,14 @@ class KerasZipScanner(BaseScanner):
         self.suspicious_config_props = list(SUSPICIOUS_CONFIG_PROPERTIES)
         if config and "suspicious_config_properties" in config:
             self.suspicious_config_props.extend(config["suspicious_config_properties"])
+
+        configured_embedded_limit = self._normalize_positive_int_config(
+            self.config.get("max_embedded_weights_bytes"),
+            self.MAX_EMBEDDED_WEIGHTS_BYTES,
+        )
+        if self.max_file_read_size > 0:
+            configured_embedded_limit = min(configured_embedded_limit, self.max_file_read_size)
+        self.max_embedded_weights_bytes = configured_embedded_limit
 
     @staticmethod
     def _is_allowlisted_keras_module(module_value: Any) -> bool:
@@ -1027,20 +1044,72 @@ class KerasZipScanner(BaseScanner):
         if not HAS_H5PY or "model.weights.h5" not in archive.namelist():
             return
 
+        weights_info = archive.getinfo("model.weights.h5")
+        if weights_info.file_size > self.max_embedded_weights_bytes:
+            result.add_check(
+                name="Embedded Weights Size Limit",
+                passed=False,
+                message=(
+                    "Skipping embedded model.weights.h5 inspection because the uncompressed weights entry "
+                    f"exceeds the configured size limit ({weights_info.file_size} > {self.max_embedded_weights_bytes})"
+                ),
+                severity=IssueSeverity.INFO,
+                location=f"{self.current_file_path}:model.weights.h5",
+                details={
+                    "entry": "model.weights.h5",
+                    "uncompressed_size": weights_info.file_size,
+                    "compressed_size": weights_info.compress_size,
+                    "max_embedded_weights_bytes": self.max_embedded_weights_bytes,
+                },
+                why=(
+                    "Large embedded archive members can consume excessive disk space or processing time when "
+                    "extracted for inspection."
+                ),
+            )
+            return
+
         temp_path = None
+        findings: list[dict[str, Any]] = []
         try:
-            with (
-                archive.open("model.weights.h5", "r") as source,
-                tempfile.NamedTemporaryFile(
-                    suffix=".h5",
-                    delete=False,
-                ) as temp_file,
-            ):
-                shutil.copyfileobj(source, temp_file)
+            with tempfile.NamedTemporaryFile(suffix=".h5", delete=False) as temp_file:
                 temp_path = temp_file.name
+                extracted_bytes = 0
+                with archive.open(weights_info, "r") as source:
+                    while True:
+                        chunk = source.read(64 * 1024)
+                        if not chunk:
+                            break
+                        extracted_bytes += len(chunk)
+                        if extracted_bytes > self.max_embedded_weights_bytes:
+                            raise _EmbeddedWeightsLimitExceeded(
+                                "Embedded model.weights.h5 exceeded the configured extraction limit "
+                                f"({self.max_embedded_weights_bytes} bytes) after reading {extracted_bytes} bytes",
+                                extracted_bytes,
+                            )
+                        temp_file.write(chunk)
 
             with h5py.File(temp_path, "r") as h5_file:
                 findings = self._collect_hdf5_external_references(h5_file)
+        except _EmbeddedWeightsLimitExceeded as exc:
+            result.add_check(
+                name="Embedded Weights Size Limit",
+                passed=False,
+                message=str(exc),
+                severity=IssueSeverity.INFO,
+                location=f"{self.current_file_path}:model.weights.h5",
+                details={
+                    "entry": "model.weights.h5",
+                    "extracted_bytes": exc.extracted_bytes,
+                    "uncompressed_size": weights_info.file_size,
+                    "compressed_size": weights_info.compress_size,
+                    "max_embedded_weights_bytes": self.max_embedded_weights_bytes,
+                },
+                why=(
+                    "Large embedded archive members can consume excessive disk space or processing time when "
+                    "extracted for inspection."
+                ),
+            )
+            return
         finally:
             if temp_path and os.path.exists(temp_path):
                 os.unlink(temp_path)

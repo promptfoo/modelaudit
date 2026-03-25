@@ -393,8 +393,8 @@ class BaseScanner(ABC):
             "chunk_size",
             10 * 1024 * 1024 * 1024,
         )  # Default: 10GB chunks
-        self.max_file_read_size = self.config.get(
-            "max_file_read_size",
+        self.max_file_read_size = self._normalize_positive_int_config(
+            self.config.get("max_file_read_size", 0),
             0,
         )  # Default unlimited
         self._path_validation_result: ScanResult | None = None
@@ -404,6 +404,13 @@ class BaseScanner(ABC):
         # Progress tracking setup
         self.progress_tracker: Any | None = None
         self._enable_progress = self.config.get("enable_progress", False) and PROGRESS_AVAILABLE
+
+    @staticmethod
+    def _normalize_positive_int_config(value: Any, default: int) -> int:
+        """Return a positive integer config value, or default for invalid input."""
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            return default
+        return value
 
     def _get_bool_config(self, key: str, default: bool = True) -> bool:
         """

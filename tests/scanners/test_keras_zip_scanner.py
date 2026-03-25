@@ -17,6 +17,7 @@ from typing import Any
 
 import pytest
 
+from modelaudit.scanners import keras_zip_scanner as keras_zip_scanner_module
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.keras_zip_scanner import KerasZipScanner
 
@@ -137,6 +138,60 @@ class TestKerasZipScanner:
         result = scanner.scan(str(keras_path))
 
         assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+
+    def test_embedded_weights_size_limit_prevents_unbounded_extraction(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Oversized embedded weights should be skipped before extraction to a temp file."""
+        monkeypatch.setattr(keras_zip_scanner_module, "HAS_H5PY", True)
+
+        scanner = KerasZipScanner({"max_embedded_weights_bytes": 1024})
+        keras_path = tmp_path / "oversized_weights.keras"
+        with zipfile.ZipFile(keras_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
+            zf.writestr("metadata.json", json.dumps({"keras_version": "3.12.0"}))
+            zf.writestr("model.weights.h5", b"0" * 4096)
+
+        result = scanner.scan(str(keras_path))
+
+        limit_checks = [check for check in result.checks if check.name == "Embedded Weights Size Limit"]
+        assert len(limit_checks) == 1
+        assert limit_checks[0].status == CheckStatus.FAILED
+        assert limit_checks[0].details["uncompressed_size"] == 4096
+        assert limit_checks[0].details["max_embedded_weights_bytes"] == 1024
+        assert not any(issue.details.get("cve_id") == "CVE-2026-1669" for issue in result.issues)
+
+    @pytest.mark.parametrize(
+        "scanner_config",
+        [
+            {"max_embedded_weights_bytes": "1024"},
+            {"max_embedded_weights_bytes": None},
+            {"max_embedded_weights_bytes": True},
+            {"max_file_read_size": "2048"},
+        ],
+    )
+    def test_invalid_embedded_weight_limit_config_uses_default(
+        self,
+        tmp_path: Path,
+        scanner_config: dict[str, Any],
+    ) -> None:
+        """Invalid size-limit config values should not crash scans or force bogus 1-byte limits."""
+        scanner = KerasZipScanner(scanner_config)
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            keras_version="3.13.2",
+            weights_h5_path=create_regular_weights_h5(tmp_path),
+        )
+
+        result = scanner.scan(str(keras_path))
+
+        assert scanner.max_embedded_weights_bytes == KerasZipScanner.MAX_EMBEDDED_WEIGHTS_BYTES
+        assert result.success
+        assert all(check.name != "Embedded Weights Size Limit" for check in result.checks)
+        assert not any(check.name == "Keras ZIP File Scan" for check in result.checks)
 
     def test_can_handle_keras_zip(self):
         """Test that scanner can identify ZIP-based .keras files."""
