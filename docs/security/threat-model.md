@@ -23,12 +23,12 @@ ModelAudit performs static analysis on model files before they are loaded into a
 
 ## Trust Boundaries
 
-| Boundary                             | Trust Level           | Notes                                                                    |
-| ------------------------------------ | --------------------- | ------------------------------------------------------------------------ |
-| Model files on local disk            | Untrusted             | Primary attack surface; treat all model files as potentially hostile     |
-| HuggingFace Hub / S3 / GCS downloads | Untrusted             | Supply chain risk; provenance is caller's responsibility                 |
-| ModelAudit process itself            | Trusted               | Runs with the invoking user's privileges                                 |
-| ModelAudit dependencies              | Conditionally trusted | Monitored via GitHub dependency alerts, Renovate security PRs, and Trivy |
+| Boundary                             | Trust Level           | Notes                                                                                 |
+| ------------------------------------ | --------------------- | ------------------------------------------------------------------------------------- |
+| Model files on local disk            | Untrusted             | Primary attack surface; treat all model files as potentially hostile                  |
+| HuggingFace Hub / S3 / GCS downloads | Untrusted             | Supply chain risk; provenance is caller's responsibility                              |
+| ModelAudit process itself            | Trusted               | Runs with the invoking user's privileges                                              |
+| ModelAudit dependencies              | Conditionally trusted | Monitored via PR CI audit, GitHub dependency alerts, Renovate security PRs, and Trivy |
 
 The scanning engine makes no outbound network requests. The CLI may download model files from remote sources (e.g., HuggingFace Hub) before invoking the scanner.
 
@@ -68,7 +68,7 @@ The scanning engine makes no outbound network requests. The CLI may download mod
 
 **Vendored protobuf stubs.** TensorFlow SavedModel scanning uses vendored `.proto` stubs rather than requiring the ~2 GB TensorFlow package. This reduces the dependency surface and eliminates the TF runtime as an attack vector.
 
-**Dependency monitoring.** GitHub dependency alerts provide the vulnerability inventory for pinned dependencies, and Renovate raises security PRs when fixes are available. Trivy scans container images. Dependencies are pinned and reviewed on update.
+**Dependency monitoring.** Pull requests that change dependencies run `pip-audit` before merge. GitHub dependency alerts provide the continuous vulnerability inventory for pinned dependencies, and Renovate raises security PRs when fixes are available. Trivy scans container images. Dependencies are pinned and reviewed on update.
 
 **CodeQL static analysis.** Automated code scanning in CI detects common vulnerability patterns in ModelAudit's own Python source.
 
@@ -90,11 +90,11 @@ The scanning engine makes no outbound network requests. The CLI may download mod
 
 ## Security Controls Summary
 
-| Control                             | Tool                                | Frequency    |
-| ----------------------------------- | ----------------------------------- | ------------ |
-| Dependency vulnerability monitoring | GitHub dependency alerts + Renovate | Continuous   |
-| Container image scanning            | Trivy                               | Every CI run |
-| Static code analysis                | CodeQL                              | Every CI run |
-| Type safety                         | mypy                                | Every CI run |
-| Test coverage (unit + integration)  | pytest                              | Every CI run |
-| Format/lint                         | ruff                                | Every CI run |
+| Control                             | Tool                                                      | Frequency        |
+| ----------------------------------- | --------------------------------------------------------- | ---------------- |
+| Dependency vulnerability monitoring | PR CI (`pip-audit`) + GitHub dependency alerts + Renovate | PRs + Continuous |
+| Container image scanning            | Trivy                                                     | Every CI run     |
+| Static code analysis                | CodeQL                                                    | Every CI run     |
+| Type safety                         | mypy                                                      | Every CI run     |
+| Test coverage (unit + integration)  | pytest                                                    | Every CI run     |
+| Format/lint                         | ruff                                                      | Every CI run     |

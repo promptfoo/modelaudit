@@ -98,6 +98,34 @@ jobs:
         run: |
           uv run ruff format --check modelaudit/ tests/
 
+  dependency-audit:
+    name: Dependency Audit
+    needs: changes
+    if: github.event_name == 'pull_request' && (needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Pin Python version
+        run: |
+          uv python pin 3.12
+
+      - name: Sync dependencies
+        run: |
+          uv sync --extra all-ci
+
+      - name: Audit dependencies for vulnerabilities
+        run: |
+          # CVE-2026-4539 currently has no upstream Pygments fix release.
+          uvx pip-audit --strict --desc --ignore-vuln CVE-2026-4539 -r <(uv export --no-hashes --no-emit-project)
+
   license-check:
     name: License Compliance
     needs: changes
@@ -735,6 +763,7 @@ jobs:
         changes,
         quick-feedback,
         lint,
+        dependency-audit,
         license-check,
         uv-lock-check,
         type-check,
@@ -755,6 +784,7 @@ jobs:
           # (skipped means the job's conditions weren't met, which is fine)
           QUICK_FEEDBACK_RESULT="${{ needs.quick-feedback.result }}"
           LINT_RESULT="${{ needs.lint.result }}"
+          DEPENDENCY_AUDIT_RESULT="${{ needs.dependency-audit.result }}"
           LICENSE_RESULT="${{ needs.license-check.result }}"
           UV_LOCK_RESULT="${{ needs.uv-lock-check.result }}"
           TYPE_CHECK_RESULT="${{ needs.type-check.result }}"
@@ -774,6 +804,7 @@ jobs:
           echo "Job results:"
           echo "  quick-feedback: $QUICK_FEEDBACK_RESULT"
           echo "  lint: $LINT_RESULT"
+          echo "  dependency-audit: $DEPENDENCY_AUDIT_RESULT"
           echo "  license-check: $LICENSE_RESULT"
           echo "  uv-lock-check: $UV_LOCK_RESULT"
           echo "  type-check: $TYPE_CHECK_RESULT"
@@ -792,6 +823,7 @@ jobs:
           [[ "$CHANGES_RESULT" == "failure" || "$CHANGES_RESULT" == "cancelled" ]] && FAILED=true
           [[ "$QUICK_FEEDBACK_RESULT" == "failure" || "$QUICK_FEEDBACK_RESULT" == "cancelled" ]] && FAILED=true
           [[ "$LINT_RESULT" == "failure" || "$LINT_RESULT" == "cancelled" ]] && FAILED=true
+          [[ "$DEPENDENCY_AUDIT_RESULT" == "failure" || "$DEPENDENCY_AUDIT_RESULT" == "cancelled" ]] && FAILED=true
           [[ "$TYPE_CHECK_RESULT" == "failure" || "$TYPE_CHECK_RESULT" == "cancelled" ]] && FAILED=true
           [[ "$WINDOWS_RESULT" == "failure" || "$WINDOWS_RESULT" == "cancelled" ]] && FAILED=true
           [[ "$TEST_RESULT" == "failure" || "$TEST_RESULT" == "cancelled" ]] && FAILED=true
