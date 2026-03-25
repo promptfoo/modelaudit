@@ -96,6 +96,10 @@ except ImportError:  # pragma: no cover - optional dependency
 class _EmbeddedWeightsLimitExceeded(Exception):
     """Raised when embedded weights exceed the configured extraction limit."""
 
+    def __init__(self, message: str, extracted_bytes: int) -> None:
+        super().__init__(message)
+        self.extracted_bytes = extracted_bytes
+
 
 class KerasZipScanner(BaseScanner):
     """Scanner for ZIP-based Keras .keras model files"""
@@ -1066,7 +1070,8 @@ class KerasZipScanner(BaseScanner):
                         if extracted_bytes > self.max_embedded_weights_bytes:
                             raise _EmbeddedWeightsLimitExceeded(
                                 "Embedded model.weights.h5 exceeded the configured extraction limit "
-                                f"({self.max_embedded_weights_bytes} bytes)"
+                                f"({self.max_embedded_weights_bytes} bytes) after reading {extracted_bytes} bytes",
+                                extracted_bytes,
                             )
                         temp_file.write(chunk)
 
@@ -1081,6 +1086,7 @@ class KerasZipScanner(BaseScanner):
                 location=f"{self.current_file_path}:model.weights.h5",
                 details={
                     "entry": "model.weights.h5",
+                    "extracted_bytes": exc.extracted_bytes,
                     "uncompressed_size": weights_info.file_size,
                     "compressed_size": weights_info.compress_size,
                     "max_embedded_weights_bytes": self.max_embedded_weights_bytes,
