@@ -163,6 +163,36 @@ class TestKerasZipScanner:
         assert limit_checks[0].details["max_embedded_weights_bytes"] == 1024
         assert not any(issue.details.get("cve_id") == "CVE-2026-1669" for issue in result.issues)
 
+    @pytest.mark.parametrize(
+        "scanner_config",
+        [
+            {"max_embedded_weights_bytes": "1024"},
+            {"max_embedded_weights_bytes": None},
+            {"max_embedded_weights_bytes": True},
+            {"max_file_read_size": "2048"},
+        ],
+    )
+    def test_invalid_embedded_weight_limit_config_uses_default(
+        self,
+        tmp_path: Path,
+        scanner_config: dict[str, Any],
+    ) -> None:
+        """Invalid size-limit config values should not crash scans or force bogus 1-byte limits."""
+        scanner = KerasZipScanner(scanner_config)
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            keras_version="3.13.2",
+            weights_h5_path=create_regular_weights_h5(tmp_path),
+        )
+
+        result = scanner.scan(str(keras_path))
+
+        assert scanner.max_embedded_weights_bytes == KerasZipScanner.MAX_EMBEDDED_WEIGHTS_BYTES
+        assert result.success
+        assert all(check.name != "Embedded Weights Size Limit" for check in result.checks)
+        assert not any(check.name == "Keras ZIP File Scan" for check in result.checks)
+
     def test_can_handle_keras_zip(self):
         """Test that scanner can identify ZIP-based .keras files."""
         scanner = KerasZipScanner()

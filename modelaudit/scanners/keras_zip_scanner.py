@@ -117,8 +117,11 @@ class KerasZipScanner(BaseScanner):
         if config and "suspicious_config_properties" in config:
             self.suspicious_config_props.extend(config["suspicious_config_properties"])
 
-        configured_embedded_limit = self.config.get("max_embedded_weights_bytes", self.MAX_EMBEDDED_WEIGHTS_BYTES)
-        if self.max_file_read_size and self.max_file_read_size > 0:
+        configured_embedded_limit = self._normalize_positive_int_config(
+            self.config.get("max_embedded_weights_bytes"),
+            self.MAX_EMBEDDED_WEIGHTS_BYTES,
+        )
+        if self.max_file_read_size > 0:
             configured_embedded_limit = min(configured_embedded_limit, self.max_file_read_size)
         self.max_embedded_weights_bytes = configured_embedded_limit
 
