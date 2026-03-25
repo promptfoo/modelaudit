@@ -52,7 +52,8 @@ class ExecuTorchScanner(BaseScanner):
         result.metadata["file_size"] = file_size
 
         header = self._read_header(path, length=8)
-        if _is_executorch_binary_signature(header) and _is_valid_executorch_binary(path):
+        valid_binary_program = _is_executorch_binary_signature(header) and _is_valid_executorch_binary(path)
+        if valid_binary_program:
             result.add_check(
                 name="ExecuTorch Binary Format Validation",
                 passed=True,
@@ -60,11 +61,20 @@ class ExecuTorchScanner(BaseScanner):
                 location=path,
                 details={"path": path, "format": "executorch_binary"},
             )
+
+        should_scan_archive = header.startswith(b"PK")
+        if valid_binary_program and not should_scan_archive:
+            try:
+                should_scan_archive = zipfile.is_zipfile(path)
+            except OSError:
+                should_scan_archive = False
+
+        if valid_binary_program and not should_scan_archive:
             result.bytes_scanned = file_size
             result.finish(success=True)
             return result
 
-        if not header.startswith(b"PK"):
+        if not should_scan_archive:
             result.add_check(
                 name="ExecuTorch Archive Format Validation",
                 passed=False,

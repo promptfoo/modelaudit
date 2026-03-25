@@ -279,6 +279,17 @@ def test_detect_executorch_binary_requires_valid_flatbuffer_structure(tmp_path: 
     assert validate_file_type(str(fake_torch7)) is False
 
 
+def test_validate_executorch_rejects_polyglot_binary_zip(tmp_path: Path) -> None:
+    polyglot_path = tmp_path / "polyglot.pte"
+    polyglot_path.write_bytes(b"\x0c\x00\x00\x00ET13\x04\x00\x04\x00\x04\x00\x00\x00")
+    with zipfile.ZipFile(polyglot_path, "a") as archive:
+        archive.writestr("payload.py", "print('evil')")
+
+    assert detect_file_format(str(polyglot_path)) == "executorch"
+    assert detect_file_format_from_magic(str(polyglot_path)) == "executorch"
+    assert validate_file_type(str(polyglot_path)) is False
+
+
 def test_detect_file_format_proto0_pickle_with_text_extension(tmp_path: Path) -> None:
     """Protocol 0 pickle payloads should be detected even with non-model extensions."""
     payload = tmp_path / "payload.txt"

@@ -93,3 +93,16 @@ def test_executorch_scanner_rejects_invalid_binary_signature_match(tmp_path: Pat
 
     assert result.success is False
     assert any(issue.rule_code == "S104" for issue in result.issues)
+
+
+def test_executorch_scanner_scans_polyglot_binary_zip_payload(tmp_path: Path) -> None:
+    file_path = create_executorch_binary(tmp_path)
+    with zipfile.ZipFile(file_path, "a") as archive:
+        archive.writestr("evil.py", "print('evil')")
+
+    scanner = ExecuTorchScanner()
+    result = scanner.scan(str(file_path))
+
+    assert any(check.name == "ExecuTorch Binary Format Validation" for check in result.checks)
+    assert any(issue.rule_code == "S507" for issue in result.issues)
+    assert any(issue.rule_code == "S104" for issue in result.issues)
