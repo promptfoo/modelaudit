@@ -5,12 +5,6 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
-### Bug Fixes
-
-- prevent ExecuTorch binary ZIP polyglots from bypassing archive scanning
-
 ## [0.2.28](https://github.com/promptfoo/modelaudit/compare/v0.2.27...v0.2.28) (2026-03-20)
 
 ### Features
@@ -153,6 +147,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - bound embedded `.keras` weight extraction before temporary-file inspection to reduce zip-bomb denial-of-service risk
+- prevent ExecuTorch binary ZIP polyglots from bypassing archive scanning
 
 ### Added
 
