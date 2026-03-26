@@ -3971,36 +3971,37 @@ class PickleScanner(BaseScanner):
                         return result
 
                 elif file_ext in [".pkl", ".pickle", ".joblib", ".dill"]:
-                    # Pickle-like file with parsing issues - handle as format complexity
-                    logger.debug(f"Pickle file {path} truncated due to format complexity: {e}")
+                    # Pickle-like files must fail closed when parsing aborts on unknown opcodes.
+                    logger.warning(f"Pickle parse failed for {path}: {e}")
                     result.add_check(
-                        name="Pickle Format Complexity",
-                        passed=True,  # Not a failure, just complex format
-                        message="Scan truncated due to format complexity",
-                        severity=IssueSeverity.INFO,
+                        name="Pickle Format Check",
+                        passed=False,
+                        message="Pickle parsing failed before full scan completion",
+                        severity=IssueSeverity.CRITICAL,
                         location=path,
                         details={
-                            "file_type": "pickle_complex",
+                            "file_type": "pickle",
                             "parse_error": str(e),
                             "early_detection_successful": early_detection_successful,
-                            "truncation_reason": "format_complexity",
+                            "parsing_failed": True,
+                            "failure_reason": "unknown_opcode_or_format_error",
                         },
                         why=(
-                            "This pickle file contains complex structures that could not be fully parsed. "
-                            "Early security pattern analysis was performed."
+                            "The scanner could not fully parse this pickle file due to an opcode/format error. "
+                            "Because full opcode analysis did not complete, the file is treated as unsafe."
                         ),
                     )
 
-                    # Always update metadata for complex pickle files
+                    # Fail closed metadata for parse failures on pickle-like files.
                     result.metadata.update(
                         {
-                            "file_type": "pickle_complex",
-                            "parsing_truncated": True,
-                            "truncation_reason": "format_complexity",
+                            "file_type": "pickle",
+                            "parsing_failed": True,
+                            "failure_reason": "unknown_opcode_or_format_error",
                         }
                     )
 
-                    result.finish(success=True)
+                    result.finish(success=False)
                     return result
 
             # Handle as critical error for truly suspicious cases

@@ -87,6 +87,56 @@ def test_padding_stripped_base64_candidate_still_flags_potential_base64() -> Non
     assert _is_actually_dangerous_string(padding_stripped, {}) == "potential_base64"
 
 
+def test_unknown_opcode_pickle_parse_failure_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unknown opcode parse failures in pickle-like files must fail closed."""
+    pickle_path = tmp_path / "unknown_opcode.pkl"
+    pickle_path.write_bytes(b"\x80\x04K\x01." + (b"A" * 9000) + b"os.system")
+
+    def _raise_unknown_opcode(self: PickleScanner, file_obj, file_size: int) -> ScanResult:
+        raise ValueError("at position 2, opcode b'\\xff' unknown")
+
+    monkeypatch.setattr(PickleScanner, "_scan_pickle_bytes", _raise_unknown_opcode)
+
+    result = PickleScanner().scan(str(pickle_path))
+
+    assert result.success is False
+    assert result.metadata["file_type"] == "pickle"
+    assert result.metadata["parsing_failed"] is True
+    assert result.metadata["failure_reason"] == "unknown_opcode_or_format_error"
+    assert any(
+        check.name == "Pickle Format Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    ), f"Expected fail-closed format check, got: {[(c.name, c.status, c.severity) for c in result.checks]}"
+
+
+def test_unknown_opcode_bin_parse_failure_still_scans_full_binary_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unknown opcode parse failures in .bin files should still fall back to full binary scanning."""
+    bin_path = tmp_path / "unknown_opcode.bin"
+    bin_path.write_bytes(b"\x80\x04K\x01." + (b"A" * 9000) + BINARY_CODE_PATTERNS[0])
+
+    def _raise_unknown_opcode(self: PickleScanner, file_obj, file_size: int) -> ScanResult:
+        raise ValueError("at position 2, opcode b'\\xff' unknown")
+
+    monkeypatch.setattr(PickleScanner, "_scan_pickle_bytes", _raise_unknown_opcode)
+
+    result = PickleScanner().scan(str(bin_path))
+
+    assert result.success is True
+    assert result.metadata["file_type"] == "binary"
+    assert result.metadata["pickle_parsing_failed"] is True
+    assert result.metadata["binary_scan_completed"] is True
+    assert any(check.name == "Pickle Format Check" and check.status == CheckStatus.PASSED for check in result.checks), (
+        f"Expected passing .bin format check, got: {[(c.name, c.status) for c in result.checks]}"
+    )
+    assert any(
+        check.name == "Binary Content Check" and check.status == CheckStatus.FAILED for check in result.checks
+    ), f"Expected binary fallback finding, got: {[(c.name, c.status) for c in result.checks]}"
+
+
 class TestPickleScanner(unittest.TestCase):
     def setUp(self):
         # Path to assets/samples/pickles/evil.pickle sample
