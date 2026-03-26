@@ -81,14 +81,10 @@ def should_ignore_executable_signature(
     """
     # Handle specific signatures with custom logic first
     if signature == b"MZ":
-        # MZ signatures in the middle of files are often false positives in weight data
-        # Be more permissive for MZ patterns not at file start
-        if offset > 100:  # Not at very beginning (allow for small headers)
-            return (
-                ml_context.get("weight_confidence", 0) > 0.3  # Lower threshold for MZ
-                or pattern_density < 5  # Very sparse patterns likely coincidental
-            )
-        return False  # Always flag MZ at file start
+        # Never suppress validated PE findings. PickleScanner only routes MZ
+        # signatures here after confirming a DOS stub, so ML-context filtering
+        # would hide real embedded executables.
+        return False
 
     # Shell script shebangs are the most common false positive in weight data
     if signature == b"#!/":

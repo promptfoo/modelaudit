@@ -1023,7 +1023,9 @@ def validate_file_type(path: str) -> bool:
 
         # ExecuTorch files may be ZIP archives or valid FlatBuffers binaries.
         if ext_format == "executorch":
-            return header_format == "zip" or _is_valid_executorch_binary(path)
+            if header_format == "zip":
+                return True
+            return _is_valid_executorch_binary(path) and not zipfile.is_zipfile(path)
 
         # Keras files can be either ZIP (Keras 3.x) or HDF5 (legacy Keras)
         if ext_format == "keras":

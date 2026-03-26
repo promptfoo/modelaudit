@@ -88,6 +88,19 @@ class TestMLContextDetection(unittest.TestCase):
         )
         self.assertFalse(should_ignore)
 
+    def test_should_not_ignore_validated_mz_signature(self) -> None:
+        """Test that validated PE signatures are never ignored in ML weight data."""
+        ml_context = {
+            "appears_to_be_weights": True,
+            "weight_confidence": 0.95,
+        }
+
+        should_ignore = should_ignore_executable_signature(
+            b"MZ", 50000, ml_context, pattern_density=0.1, total_patterns=1
+        )
+
+        self.assertFalse(should_ignore)
+
     def test_get_ml_context_explanation(self):
         """Test ML context explanation generation."""
         ml_context = {
