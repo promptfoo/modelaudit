@@ -133,8 +133,14 @@ class LargeFileHandler:
                     chunk_result.finish(success=not chunk_result.has_errors)
                 return chunk_result
 
-            # For other scanners, fall back to normal scanning
-            # but with progress updates
+            # Fall back to the scanner's full-file implementation when no chunk
+            # analyzer exists so large-file routing cannot bypass detection.
+            if not hasattr(self.scanner, "_analyze_chunk"):
+                return self._scan_normal()
+
+            analyze_chunk = self.scanner._analyze_chunk
+
+            # For chunk-capable scanners, scan incrementally with progress updates.
             with open(self.file_path, "rb") as f:
                 while True:
                     if self._check_timeout():
@@ -163,16 +169,8 @@ class LargeFileHandler:
                     )
 
                     # Analyze chunk for patterns
-                    if hasattr(self.scanner, "_analyze_chunk"):
-                        chunk_result = self.scanner._analyze_chunk(chunk, bytes_processed)
-                        result.merge(chunk_result)
-
-            # If scanner doesn't support chunking, fall back to normal scan
-            if bytes_processed == 0:
-                normal_result = self._scan_normal()
-                if normal_result.end_time is None:
-                    normal_result.finish(success=not normal_result.has_errors)
-                return normal_result
+                    chunk_result = analyze_chunk(chunk, bytes_processed)
+                    result.merge(chunk_result)
 
         except Exception as e:
             logger.error(f"Error during chunked scanning: {e}")

@@ -158,6 +158,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **security:** preserve full scanner execution for large files when scanners do not implement chunk analyzers
 - **security:** bound embedded `.keras` weight extraction before temporary-file inspection to reduce zip-bomb denial-of-service risk
 - **security:** keep spoofed built-in Keras `registered_name` values from hiding non-allowlisted custom modules in `.keras` ZIP scans
 - **keras:** suppress duplicate custom-object warnings for allowlisted registered objects when module metadata is absent
