@@ -92,7 +92,7 @@ def test_unknown_opcode_pickle_parse_failure_fails_closed(tmp_path: Path, monkey
     pickle_path = tmp_path / "unknown_opcode.pkl"
     pickle_path.write_bytes(b"\x80\x04K\x01." + (b"A" * 9000) + b"os.system")
 
-    def _raise_unknown_opcode(self: PickleScanner, file_obj, file_size: int) -> ScanResult:
+    def _raise_unknown_opcode(self: PickleScanner, _file_obj: object, _file_size: int) -> ScanResult:
         raise ValueError("at position 2, opcode b'\\xff' unknown")
 
     monkeypatch.setattr(PickleScanner, "_scan_pickle_bytes", _raise_unknown_opcode)
@@ -118,7 +118,7 @@ def test_unknown_opcode_bin_parse_failure_still_scans_full_binary_content(
     bin_path = tmp_path / "unknown_opcode.bin"
     bin_path.write_bytes(b"\x80\x04K\x01." + (b"A" * 9000) + BINARY_CODE_PATTERNS[0])
 
-    def _raise_unknown_opcode(self: PickleScanner, file_obj, file_size: int) -> ScanResult:
+    def _raise_unknown_opcode(self: PickleScanner, _file_obj: object, _file_size: int) -> ScanResult:
         raise ValueError("at position 2, opcode b'\\xff' unknown")
 
     monkeypatch.setattr(PickleScanner, "_scan_pickle_bytes", _raise_unknown_opcode)
