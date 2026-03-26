@@ -720,6 +720,46 @@ class TestDillLoadersRegression:
             finally:
                 os.unlink(f.name)
 
+    def test_pe_file_detection_with_dos_stub_after_offset_100(self) -> None:
+        """PE signatures with a valid DOS stub should be detected even after offset 100."""
+        scanner = PickleScanner()
+
+        import os
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as f:
+            try:
+                simple_data = {"test": "data"}
+                pickle.dump(simple_data, f)
+
+                # Force MZ well past 100 bytes with only a single PE signature.
+                f.write(b"A" * 256)
+                f.write(b"MZ")
+                f.write(b"dos_header_data" * 5)
+                f.write(b"This program cannot be run in DOS mode")
+                f.write(b"tail_data")
+                f.flush()
+                f.close()  # Close file before scanning (required on Windows to allow deletion)
+
+                result = scanner.scan(f.name)
+
+                assert result.success
+
+                pe_issues = [issue for issue in result.issues if "windows executable (pe)" in issue.message.lower()]
+                assert len(pe_issues) >= 1, "Should detect embedded PE after offset 100"
+                assert any(issue.severity == IssueSeverity.CRITICAL for issue in pe_issues), (
+                    "Embedded PE detection should remain CRITICAL"
+                )
+
+                ignored_pe_issues = [
+                    issue
+                    for issue in result.issues
+                    if "ignored" in issue.message.lower() and "pe executable patterns" in issue.message.lower()
+                ]
+                assert len(ignored_pe_issues) == 0, "Validated PE signatures should not be suppressed"
+            finally:
+                os.unlink(f.name)
+
     def test_nested_pickle_detection(self):
         """Scanner should detect nested pickle bytes and encoded payloads"""
         scanner = PickleScanner()
