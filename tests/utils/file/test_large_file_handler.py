@@ -16,6 +16,7 @@ class DummyScanner:
     name = "dummy"
 
     def _analyze_chunk(self, chunk: bytes, bytes_processed: int) -> ScanResult:
+        """Return a successful chunk scan result."""
         result = ScanResult(scanner_name=self.name)
         result.bytes_scanned = len(chunk)
         result.finish(success=True)
@@ -28,9 +29,11 @@ class DummyNonChunkScanner:
     name = "dummy_non_chunk"
 
     def __init__(self) -> None:
+        """Track calls to the full scan method."""
         self.scan_calls = 0
 
     def scan(self, file_path: str) -> ScanResult:
+        """Return a successful full-file scan result."""
         self.scan_calls += 1
         result = ScanResult(scanner_name=self.name)
         result.bytes_scanned = Path(file_path).stat().st_size
