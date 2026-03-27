@@ -166,6 +166,8 @@ def test_configuration_extractor_rebuilds_cached_config_after_mutation() -> None
     config["timeout"] = 5
     second, _ = extractor.extract_fast(("file.bin", config), {})
 
+    assert first is not None
+    assert second is not None
     assert first is not second
     assert first.get_version_context() != second.get_version_context()
 
