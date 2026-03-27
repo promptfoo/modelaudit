@@ -1,6 +1,7 @@
 """File filtering utilities for ModelAudit."""
 
 import os
+import zipfile
 from pathlib import Path
 
 # Default extensions to skip when scanning directories
@@ -106,6 +107,31 @@ DEFAULT_SCANNABLE_SKIP_OVERRIDES = {
     ".7z",
 }
 
+_ARCHIVE_SIGNAL_EXTENSION_EXCLUSIONS = frozenset(
+    {
+        ".json",
+        ".xml",
+        ".txt",
+        ".md",
+        ".markdown",
+        ".rst",
+        ".yaml",
+        ".yml",
+        ".cfg",
+        ".conf",
+        ".ini",
+        ".toml",
+        ".py",
+        ".js",
+        ".ts",
+        ".css",
+        ".scss",
+        ".sass",
+        ".less",
+        ".html",
+    }
+)
+
 
 def _get_scannable_extensions() -> set[str]:
     """Lazy-load scannable extensions to avoid circular imports."""
@@ -123,6 +149,52 @@ def _get_candidate_extensions(filename: str) -> list[str]:
         if candidate not in candidates:
             candidates.append(candidate)
     return candidates
+
+
+def _has_scannable_content(path: str) -> bool:
+    """Return whether on-disk file contents map to a supported format."""
+    if not os.path.isfile(path):
+        return False
+
+    try:
+        from .detection import detect_file_format
+
+        detected_format = detect_file_format(path)
+        if detected_format == "unknown":
+            return False
+
+        if detected_format != "zip":
+            return True
+
+        with zipfile.ZipFile(path, "r") as archive:
+            member_names = {
+                member.filename.replace("\\", "/").strip("/")
+                for member in archive.infolist()
+                if member.filename and not member.is_dir()
+            }
+
+            # Preserve Keras, TorchServe, and PyTorch ZIP containers even when
+            # the outer filename uses a skipped suffix.
+            if "MAR-INF/MANIFEST.json" in member_names:
+                return True
+            if "config.json" in member_names and any(
+                marker in member_names for marker in {"metadata.json", "model.weights.h5", "variables.h5"}
+            ):
+                return True
+            if any(name == "data.pkl" or name.endswith("/data.pkl") for name in member_names):
+                return True
+
+            scannable_extensions = _get_scannable_extensions() - _ARCHIVE_SIGNAL_EXTENSION_EXCLUSIONS
+            for member_name in member_names:
+                candidate_extensions = _get_candidate_extensions(member_name)
+                if any(candidate in scannable_extensions for candidate in candidate_extensions):
+                    return True
+
+        return False
+    except OSError:
+        return False
+    except zipfile.BadZipFile:
+        return False
 
 
 def should_skip_file(
@@ -176,6 +248,9 @@ def should_skip_file(
         candidate in DEFAULT_SCANNABLE_SKIP_OVERRIDES and candidate in scannable_extensions
         for candidate in candidate_extensions
     ):
+        return False
+
+    if ext in skip_extensions and _has_scannable_content(path):
         return False
 
     # Skip based on extension

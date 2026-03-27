@@ -1,5 +1,9 @@
 """Tests for file filtering functionality."""
 
+import pickle
+import zipfile
+from pathlib import Path
+
 from modelaudit.utils.file.filtering import (
     should_skip_file,
 )
@@ -132,3 +136,28 @@ class TestFileFilter:
         # Model extensions should work regardless of case
         assert not should_skip_file("MODEL.PKL")
         assert not should_skip_file("WEIGHTS.PT")
+
+    def test_content_recognized_payloads_bypass_extension_skip(self, tmp_path: Path) -> None:
+        """Disguised model/archive files should survive directory prefiltering."""
+        disguised_pickle = tmp_path / "payload.jpg"
+        disguised_pickle.write_bytes(pickle.dumps({"safe": True}))
+
+        disguised_zip = tmp_path / "archive.jpg"
+        with zipfile.ZipFile(disguised_zip, "w") as archive:
+            archive.writestr("payload.pkl", pickle.dumps({"safe": True}))
+
+        real_image = tmp_path / "cover.jpg"
+        real_image.write_bytes(b"\xff\xd8\xff\xe0" + b"jpeg")
+
+        assert not should_skip_file(str(disguised_pickle))
+        assert not should_skip_file(str(disguised_zip))
+        assert should_skip_file(str(real_image))
+
+    def test_docx_like_zip_remains_skipped(self, tmp_path: Path) -> None:
+        """Common document ZIP containers should not be promoted into the scan set."""
+        docx_path = tmp_path / "spec.docx"
+        with zipfile.ZipFile(docx_path, "w") as archive:
+            archive.writestr("[Content_Types].xml", "<Types></Types>")
+            archive.writestr("word/document.xml", "<w:document></w:document>")
+
+        assert should_skip_file(str(docx_path))

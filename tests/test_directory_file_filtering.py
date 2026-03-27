@@ -3,6 +3,7 @@
 import bz2
 import gzip
 import lzma
+import pickle
 import tarfile
 import tempfile
 import zipfile
@@ -166,6 +167,43 @@ class TestDirectoryFileFiltering:
         assert results["files_scanned"] == 1
         asset_names = {Path(asset.path).name for asset in results.assets}
         assert asset_names == {".artifact"}
+
+    def test_disguised_pickle_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
+        """Directory scans should not skip payloads whose content is a supported format."""
+        disguised_payload = tmp_path / "payload.jpg"
+
+        class DangerousPayload:
+            def __reduce__(self) -> tuple[object, tuple[str]]:
+                import os as os_module
+
+                return (os_module.system, ("echo directory-prefilter-test",))
+
+        disguised_payload.write_bytes(pickle.dumps(DangerousPayload()))
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        assert any("payload.jpg" in (issue.location or "") for issue in results.issues)
+
+    def test_real_images_remain_skipped(self, tmp_path: Path) -> None:
+        """Content sniffing should not promote ordinary media files into the scan set."""
+        image_path = tmp_path / "cover.jpg"
+        image_path.write_bytes(b"\xff\xd8\xff\xe0" + b"jpeg")
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 0
+
+    def test_docx_like_zip_remains_skipped(self, tmp_path: Path) -> None:
+        """Common document containers should not be treated as model archives."""
+        docx_path = tmp_path / "report.docx"
+        with zipfile.ZipFile(docx_path, "w") as archive:
+            archive.writestr("[Content_Types].xml", "<Types></Types>")
+            archive.writestr("word/document.xml", "<w:document></w:document>")
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 0
 
     def test_only_huggingface_bookkeeping_metadata_is_skipped(self, tmp_path: Path) -> None:
         """Local .metadata files should be scanned unless they are in HuggingFace cache layouts."""
