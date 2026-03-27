@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from ..utils.helpers.secure_hasher import SecureFileHasher
+from .optimized_config import build_cache_version_context
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +52,11 @@ class ScanResultsCache:
 
         self._ensure_metadata_exists()
 
-    def get_cached_result(self, file_path: str) -> dict[str, Any] | None:
+    def get_cached_result(
+        self,
+        file_path: str,
+        version_context: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
         """
         Get cached scan result if available and valid with optimized file system calls.
 
@@ -66,7 +71,7 @@ class ScanResultsCache:
             file_stat = os.stat(file_path)
 
             # Generate cache key with stat reuse
-            cache_key = self._generate_cache_key(file_path, file_stat=file_stat)
+            cache_key = self._generate_cache_key(file_path, file_stat=file_stat, version_context=version_context)
             if not cache_key:
                 return None
 
@@ -93,6 +98,56 @@ class ScanResultsCache:
             cache_entry["cache_metadata"]["last_access"] = time.time()
 
             # Write back updated entry
+            with open(cache_file_path, "w", encoding="utf-8") as f:
+                json.dump(cache_entry, f, indent=2)
+
+            self._record_cache_hit()
+            logger.debug(f"Cache hit for {os.path.basename(file_path)}")
+            return cache_entry["scan_result"]  # type: ignore[no-any-return]
+
+        except Exception as e:
+            logger.debug(f"Cache lookup failed for {file_path}: {e}")
+            self._record_cache_miss("error")
+            return None
+
+    def get_cached_result_with_stat(
+        self,
+        file_path: str,
+        file_stat: os.stat_result,
+        version_context: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """
+        Get a cached scan result while reusing an existing stat result.
+
+        Args:
+            file_path: Path to file to check cache for
+            file_stat: Pre-computed os.stat_result to reuse
+            version_context: Optional cache version context for config-sensitive invalidation
+
+        Returns:
+            Cached scan result dictionary if found and valid, None otherwise
+        """
+        try:
+            cache_key = self._generate_cache_key(file_path, file_stat=file_stat, version_context=version_context)
+            if not cache_key:
+                return None
+
+            cache_file_path = self._get_cache_file_path(cache_key)
+            if not cache_file_path.exists():
+                self._record_cache_miss("not_found")
+                return None
+
+            with open(cache_file_path, encoding="utf-8") as f:
+                cache_entry = json.load(f)
+
+            if not self._is_cache_entry_valid_with_stat(cache_entry, file_path, file_stat):
+                cache_file_path.unlink()
+                self._record_cache_miss("invalid")
+                return None
+
+            cache_entry["cache_metadata"]["access_count"] += 1
+            cache_entry["cache_metadata"]["last_access"] = time.time()
+
             with open(cache_file_path, "w", encoding="utf-8") as f:
                 json.dump(cache_entry, f, indent=2)
 
@@ -143,7 +198,13 @@ class ScanResultsCache:
             self._record_cache_miss("error")
             return None
 
-    def store_result(self, file_path: str, scan_result: dict[str, Any], scan_duration_ms: int | None = None) -> None:
+    def store_result(
+        self,
+        file_path: str,
+        scan_result: dict[str, Any],
+        scan_duration_ms: int | None = None,
+        version_context: dict[str, Any] | None = None,
+    ) -> None:
         """
         Store scan result in cache with optimized file system calls.
 
@@ -157,7 +218,7 @@ class ScanResultsCache:
             file_stat = os.stat(file_path)
 
             # Pass file_stat to avoid redundant calls
-            cache_key = self._generate_cache_key(file_path, file_stat=file_stat)
+            cache_key = self._generate_cache_key(file_path, file_stat=file_stat, version_context=version_context)
             if not cache_key:
                 return
 
@@ -172,7 +233,7 @@ class ScanResultsCache:
                     "original_name": os.path.basename(file_path),
                     "mtime": file_stat.st_mtime,
                 },
-                version_info=self._get_version_info(),
+                version_info=self._get_version_info(version_context),
                 scan_result=scan_result,
                 cache_metadata={
                     "scanned_at": time.time(),
@@ -195,7 +256,21 @@ class ScanResultsCache:
         except Exception as e:
             logger.debug(f"Failed to cache result for {file_path}: {e}")
 
-    def _generate_cache_key(self, file_path: str, file_stat: os.stat_result | None = None) -> str | None:
+    def generate_cache_key(
+        self,
+        file_path: str,
+        file_stat: os.stat_result | None = None,
+        version_context: dict[str, Any] | None = None,
+    ) -> str | None:
+        """Public wrapper for cache key generation used by higher-level cache callers."""
+        return self._generate_cache_key(file_path, file_stat=file_stat, version_context=version_context)
+
+    def _generate_cache_key(
+        self,
+        file_path: str,
+        file_stat: os.stat_result | None = None,
+        version_context: dict[str, Any] | None = None,
+    ) -> str | None:
         """
         Generate cache key from file hash and version info.
 
@@ -211,7 +286,7 @@ class ScanResultsCache:
             file_hash = self.hasher.hash_file_with_stat(file_path, file_stat)
 
             # Get version information
-            version_info = self._get_version_info()
+            version_info = self._get_version_info(version_context)
 
             # Create version fingerprint
             version_str = json.dumps(version_info, sort_keys=True)
@@ -242,7 +317,7 @@ class ScanResultsCache:
         # This prevents too many files in a single directory
         return self.cache_dir / cache_key[:2] / cache_key[2:4] / f"{cache_key}.json"
 
-    def _get_version_info(self) -> dict[str, Any]:
+    def _get_version_info(self, version_context: dict[str, Any] | None = None) -> dict[str, Any]:
         """Get current version information for cache invalidation."""
         try:
             # Try to import ModelAudit version
@@ -254,11 +329,17 @@ class ScanResultsCache:
             return {
                 "modelaudit_version": modelaudit_version,
                 "scanner_versions": self._get_scanner_versions(),
-                "config_hash": self._get_config_hash(),
+                "config_hash": self._get_config_hash(version_context),
+                "version_context": version_context or build_cache_version_context(),
             }
         except Exception as e:
             logger.debug(f"Failed to get version info: {e}")
-            return {"modelaudit_version": "unknown", "scanner_versions": {}, "config_hash": "unknown"}
+            return {
+                "modelaudit_version": "unknown",
+                "scanner_versions": {},
+                "config_hash": "unknown",
+                "version_context": version_context or build_cache_version_context(),
+            }
 
     def _get_scanner_versions(self) -> dict[str, str]:
         """Get version fingerprint for all scanners."""
@@ -276,11 +357,9 @@ class ScanResultsCache:
             logger.debug("Could not import scanner registry for version info")
             return {}
 
-    def _get_config_hash(self) -> str:
+    def _get_config_hash(self, version_context: dict[str, Any] | None = None) -> str:
         """Hash of current scanning configuration that affects results."""
-        # For now, return a simple constant
-        # In the future, this could include settings that affect scanning
-        config_data = {"cache_version": "1.0"}
+        config_data = version_context or build_cache_version_context()
 
         config_str = json.dumps(config_data, sort_keys=True)
         return hashlib.blake2b(config_str.encode(), digest_size=8).hexdigest()

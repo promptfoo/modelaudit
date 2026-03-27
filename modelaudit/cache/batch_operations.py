@@ -19,7 +19,12 @@ class BatchCacheOperations:
         self.cache_manager = cache_manager
         self.key_generator = cache_manager.key_generator or AdaptiveCacheKeyGenerator()
 
-    def batch_lookup(self, file_paths: list[str], max_workers: int = 4) -> dict[str, dict[str, Any] | None]:
+    def batch_lookup(
+        self,
+        file_paths: list[str],
+        max_workers: int = 4,
+        version_context: dict[str, Any] | None = None,
+    ) -> dict[str, dict[str, Any] | None]:
         """
         Perform batch cache lookups with I/O optimization.
 
@@ -43,7 +48,14 @@ class BatchCacheOperations:
         for file_path in file_paths:
             try:
                 stat_result = os.stat(file_path)
-                cache_key = self.key_generator.generate_key_with_stat_reuse(file_path, stat_result)
+                cache_key = self.cache_manager.cache.generate_cache_key(
+                    file_path,
+                    file_stat=stat_result,
+                    version_context=version_context,
+                )
+                if not cache_key:
+                    results[file_path] = None
+                    continue
                 cache_lookups.append((file_path, cache_key, stat_result))
             except OSError as e:
                 logger.debug(f"Failed to stat {file_path}: {e}")
@@ -124,7 +136,12 @@ class BatchCacheOperations:
 
         return results
 
-    def batch_store(self, scan_results: list[tuple[str, dict[str, Any], int | None]], max_workers: int = 2) -> int:
+    def batch_store(
+        self,
+        scan_results: list[tuple[str, dict[str, Any], int | None]],
+        max_workers: int = 2,
+        version_context: dict[str, Any] | None = None,
+    ) -> int:
         """
         Store multiple scan results in cache with batch optimization.
 
@@ -143,7 +160,13 @@ class BatchCacheOperations:
         # Use moderate concurrency for write operations (less than reads)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_path = {
-                executor.submit(self._store_single_result, file_path, scan_result, scan_duration_ms): file_path
+                executor.submit(
+                    self._store_single_result,
+                    file_path,
+                    scan_result,
+                    scan_duration_ms,
+                    version_context,
+                ): file_path
                 for file_path, scan_result, scan_duration_ms in scan_results
             }
 
@@ -162,10 +185,21 @@ class BatchCacheOperations:
         logger.debug(f"Batch store complete: {stored_count}/{len(scan_results)} results stored")
         return stored_count
 
-    def _store_single_result(self, file_path: str, scan_result: dict[str, Any], scan_duration_ms: int | None) -> bool:
+    def _store_single_result(
+        self,
+        file_path: str,
+        scan_result: dict[str, Any],
+        scan_duration_ms: int | None,
+        version_context: dict[str, Any] | None,
+    ) -> bool:
         """Store a single result and return success status."""
         try:
-            self.cache_manager.store_result(file_path, scan_result, scan_duration_ms)
+            self.cache_manager.store_result(
+                file_path,
+                scan_result,
+                scan_duration_ms,
+                version_context=version_context,
+            )
             return True
         except Exception as e:
             logger.debug(f"Failed to store result for {file_path}: {e}")

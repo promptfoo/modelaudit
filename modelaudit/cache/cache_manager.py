@@ -28,10 +28,15 @@ class CacheManager:
             enabled: Whether caching is enabled
         """
         self.enabled = enabled
-        self.cache = ScanResultsCache(cache_dir) if enabled else None
+        self.cache_dir = str(Path(cache_dir).expanduser()) if cache_dir else None
+        self.cache = ScanResultsCache(self.cache_dir) if enabled else None
         self.key_generator = AdaptiveCacheKeyGenerator() if enabled else None
 
-    def get_cached_result(self, file_path: str) -> dict[str, Any] | None:
+    def get_cached_result(
+        self,
+        file_path: str,
+        version_context: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
         """
         Get cached scan result if available.
 
@@ -44,9 +49,14 @@ class CacheManager:
         if not self.enabled or not self.cache:
             return None
 
-        return self.cache.get_cached_result(file_path)
+        return self.cache.get_cached_result(file_path, version_context=version_context)
 
-    def get_cached_result_with_stat(self, file_path: str, stat_result: os.stat_result) -> dict[str, Any] | None:
+    def get_cached_result_with_stat(
+        self,
+        file_path: str,
+        stat_result: os.stat_result,
+        version_context: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
         """
         Get cached scan result using existing stat result for optimized performance.
 
@@ -57,14 +67,18 @@ class CacheManager:
         Returns:
             Cached scan result or None if not found/disabled
         """
-        if not self.enabled or not self.cache or not self.key_generator:
+        if not self.enabled or not self.cache:
             return None
 
-        # Use optimized key generation with stat reuse
-        cache_key = self.key_generator.generate_key_with_stat_reuse(file_path, stat_result)
-        return self.cache.get_cached_result_by_key(cache_key)
+        return self.cache.get_cached_result_with_stat(file_path, stat_result, version_context=version_context)
 
-    def store_result(self, file_path: str, scan_result: dict[str, Any], scan_duration_ms: int | None = None) -> None:
+    def store_result(
+        self,
+        file_path: str,
+        scan_result: dict[str, Any],
+        scan_duration_ms: int | None = None,
+        version_context: dict[str, Any] | None = None,
+    ) -> None:
         """
         Store scan result in cache.
 
@@ -76,9 +90,16 @@ class CacheManager:
         if not self.enabled or not self.cache:
             return
 
-        self.cache.store_result(file_path, scan_result, scan_duration_ms)
+        self.cache.store_result(file_path, scan_result, scan_duration_ms, version_context=version_context)
 
-    def cached_scan(self, file_path: str, scanner_func: Any, *args: Any, **kwargs: Any) -> dict[str, Any]:
+    def cached_scan(
+        self,
+        file_path: str,
+        scanner_func: Any,
+        *args: Any,
+        version_context: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
         """
         Perform a cache-aware scan operation.
 
@@ -93,7 +114,7 @@ class CacheManager:
         """
         # Try cache first
         start_time = time.time()
-        cached_result = self.get_cached_result(file_path)
+        cached_result = self.get_cached_result(file_path, version_context=version_context)
 
         if cached_result is not None:
             cache_lookup_time = (time.time() - start_time) * 1000
@@ -121,7 +142,7 @@ class CacheManager:
                 scan_result["_cache_info"] = {"cache_hit": False, "scan_duration_ms": scan_duration}
 
             # Store result in cache
-            self.store_result(file_path, scan_result, int(scan_duration))
+            self.store_result(file_path, scan_result, int(scan_duration), version_context=version_context)
 
             return scan_result  # type: ignore[no-any-return]
 
@@ -160,8 +181,9 @@ class CacheManager:
     def enable(self, cache_dir: str | None = None) -> None:
         """Enable caching."""
         self.enabled = True
+        self.cache_dir = str(Path(cache_dir).expanduser()) if cache_dir else None
         if not self.cache:
-            self.cache = ScanResultsCache(cache_dir)
+            self.cache = ScanResultsCache(self.cache_dir)
         logger.debug("Cache enabled")
 
 
@@ -181,9 +203,14 @@ def get_cache_manager(cache_dir: str | None = None, enabled: bool = True) -> Cac
         Global cache manager instance
     """
     global _global_cache_manager
+    normalized_cache_dir = str(Path(cache_dir).expanduser()) if cache_dir else None
 
-    if _global_cache_manager is None:
-        _global_cache_manager = CacheManager(cache_dir, enabled)
+    if _global_cache_manager is None or _global_cache_manager.cache_dir != normalized_cache_dir:
+        _global_cache_manager = CacheManager(normalized_cache_dir, enabled)
+    elif enabled and not _global_cache_manager.enabled:
+        _global_cache_manager.enable(normalized_cache_dir)
+    elif not enabled and _global_cache_manager.enabled:
+        _global_cache_manager.disable()
 
     return _global_cache_manager
 

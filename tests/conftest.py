@@ -124,6 +124,10 @@ def pytest_runtest_setup(item):
             "test_nested_pickle_integration.py",  # nested pickle false-positive/true-positive integration tests
             "test_ml_context_false_positives.py",  # ML-context executable filtering regression tests
             "test_cli_output.py",  # CliRunner JSON parsing helper regression tests
+            "test_cache_cli.py",  # cache CLI command regression tests
+            "test_cache_correctness.py",  # cache invalidation and persistence correctness tests
+            "test_cache_optimizations.py",  # cache optimization correctness tests
+            "test_optimized_config.py",  # optimized cache config regression tests
             "test_large_file_handler.py",  # Large file handler regression tests
         ]
 
