@@ -968,6 +968,41 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
                     for check in result.checks
                 ), f"Unexpected nested pickle detection: {[(c.name, c.status, c.details) for c in result.checks]}"
 
+    def test_nested_pickle_detection_binstring_legacy(self) -> None:
+        """BINSTRING/SHORT_BINSTRING carry raw bytes as latin-1 strings; nested pickles must be detected."""
+        inner_bytes = pickle.dumps({"ab": 1}, protocol=2)
+
+        # SHORT_BINSTRING: opcode 'U', 1-byte length, protocol 2
+        short_binstring_payload = b"\x80\x02U" + bytes([len(inner_bytes)]) + inner_bytes + b"."
+        result = self._scan_bytes(short_binstring_payload)
+        nested_checks = [
+            c for c in result.checks if c.name == "Nested Pickle Detection" and c.status == CheckStatus.FAILED
+        ]
+        assert any(c.details.get("opcode") == "SHORT_BINSTRING" for c in nested_checks), (
+            f"Expected nested pickle detection for SHORT_BINSTRING, got: "
+            f"{[(c.name, c.status, c.details) for c in result.checks]}"
+        )
+
+        # BINSTRING: opcode 'T', 4-byte little-endian length, protocol 1
+        binstring_payload = b"\x80\x02T" + struct.pack("<i", len(inner_bytes)) + inner_bytes + b"."
+        result = self._scan_bytes(binstring_payload)
+        nested_checks = [
+            c for c in result.checks if c.name == "Nested Pickle Detection" and c.status == CheckStatus.FAILED
+        ]
+        assert any(c.details.get("opcode") == "BINSTRING" for c in nested_checks), (
+            f"Expected nested pickle detection for BINSTRING, got: "
+            f"{[(c.name, c.status, c.details) for c in result.checks]}"
+        )
+
+    def test_non_pickle_binstring_does_not_trigger_nested_detection(self) -> None:
+        """Non-pickle BINSTRING payloads should not trigger nested pickle findings."""
+        benign = b"just a plain string"
+        payload = b"\x80\x02U" + bytes([len(benign)]) + benign + b"."
+        result = self._scan_bytes(payload)
+        assert not any(c.name == "Nested Pickle Detection" and c.status == CheckStatus.FAILED for c in result.checks), (
+            f"Unexpected nested pickle detection: {[(c.name, c.status, c.details) for c in result.checks]}"
+        )
+
     def test_builtins_hasattr_is_critical(self) -> None:
         """builtins.hasattr must not be allowlisted as safe."""
         result = self._scan_bytes(self._craft_global_reduce_pickle("builtins", "hasattr"))

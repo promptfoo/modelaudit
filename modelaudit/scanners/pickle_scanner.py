@@ -5393,7 +5393,7 @@ class PickleScanner(BaseScanner):
                 if opcode.name in ["BINBYTES", "SHORT_BINBYTES", "BINBYTES8", "BYTEARRAY8"] and isinstance(
                     arg, bytes | bytearray
                 ):
-                    sample = bytes(arg[:1024])  # limit
+                    sample = bytes(arg[:1024])  # limit to first 1024 bytes
                     if _looks_like_pickle(sample):
                         severity = _get_context_aware_severity(IssueSeverity.CRITICAL, ml_context)
                         result.add_check(
@@ -5410,6 +5410,32 @@ class PickleScanner(BaseScanner):
                             },
                             why=get_pattern_explanation("nested_pickle"),
                         )
+
+                # Legacy BINSTRING/SHORT_BINSTRING (protocols 0-2) carry raw
+                # bytes decoded as latin-1 strings by pickletools.  Re-encode
+                # to recover the original bytes and check for nested pickles.
+                if opcode.name in ["BINSTRING", "SHORT_BINSTRING"] and isinstance(arg, str):
+                    try:
+                        raw = arg.encode("latin-1")
+                        sample = raw[:1024]
+                        if _looks_like_pickle(sample):
+                            severity = _get_context_aware_severity(IssueSeverity.CRITICAL, ml_context)
+                            result.add_check(
+                                name="Nested Pickle Detection",
+                                passed=False,
+                                message="Nested pickle payload detected in legacy string opcode",
+                                severity=severity,
+                                location=f"{self.current_file_path} (pos {pos})",
+                                rule_code="S213",
+                                details={
+                                    "position": pos,
+                                    "opcode": opcode.name,
+                                    "sample_size": len(sample),
+                                },
+                                why=get_pattern_explanation("nested_pickle"),
+                            )
+                    except (UnicodeEncodeError, UnicodeDecodeError):
+                        pass
 
                 # Detect encoded nested pickle strings
                 if opcode.name in STRING_OPCODES and isinstance(arg, str):
