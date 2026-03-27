@@ -345,6 +345,29 @@ class TestSevenZipScanner:
                 if archive_path.exists():
                     archive_path.unlink()
 
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_extensionless_non_7z_member_is_not_reported_as_unsupported(self, scanner, temp_7z_file) -> None:
+        """Extensionless non-7z members should not emit noisy unsupported-file checks."""
+        import py7zr  # type: ignore[import-untyped]
+
+        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+            temp_file.write(b"plain text")
+            temp_file_path = temp_file.name
+
+        try:
+            with py7zr.SevenZipFile(temp_7z_file, "w") as archive:
+                archive.write(temp_file_path, "README")
+
+            result = scanner.scan(temp_7z_file)
+
+            assert result.success
+            unsupported_checks = [check for check in result.checks if check.name == "File Type Support: README"]
+            assert len(unsupported_checks) == 0
+
+        finally:
+            if os.path.exists(temp_file_path):
+                os.unlink(temp_file_path)
+
     def test_identify_scannable_files(self, scanner):
         """Test identification of scannable files"""
         test_files = [

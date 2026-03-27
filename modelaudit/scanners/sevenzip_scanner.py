@@ -408,11 +408,15 @@ class SevenZipScanner(BaseScanner):
             if original_name.lower().endswith(".7z") or self._has_7z_magic(extracted_path):
                 file_result = self._scan_7z_file(extracted_path, depth + 1)
             else:
+                _, original_ext = os.path.splitext(original_name.lower())
                 # Import scanner registry to find appropriate scanner
                 from . import get_scanner_for_file
 
                 file_scanner = get_scanner_for_file(extracted_path, config=self.config)
                 if not file_scanner:
+                    if original_ext == "":
+                        return
+
                     # No scanner available for this file type
                     result.add_check(
                         name=f"File Type Support: {original_name}",
