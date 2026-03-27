@@ -1,5 +1,10 @@
 """Tests for file iterator utility."""
 
+from collections.abc import Iterator
+from pathlib import Path
+
+import pytest
+
 from modelaudit.utils.helpers.file_iterator import iterate_files_streaming
 
 
@@ -130,3 +135,40 @@ class TestIterateFilesStreaming:
         # Should be an iterator/generator
         assert hasattr(result, "__iter__")
         assert hasattr(result, "__next__")
+
+    def test_directory_iteration_is_lazy(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test that directory traversal does not exhaust the full file list up front."""
+        files = [tmp_path / f"file{i}.txt" for i in range(5)]
+        for file_path in files:
+            file_path.write_text("content")
+
+        iterated = 0
+        original_glob = Path.glob
+
+        def fake_glob(self: Path, pattern: str) -> Iterator[Path]:
+            nonlocal iterated
+            if self == tmp_path and pattern == "**/*":
+
+                def glob_iter() -> Iterator[Path]:
+                    nonlocal iterated
+                    for file_path in files:
+                        iterated += 1
+                        yield file_path
+
+                return glob_iter()
+
+            return original_glob(self, pattern)
+
+        monkeypatch.setattr(Path, "glob", fake_glob)
+
+        result = iterate_files_streaming(tmp_path)
+
+        first_item = next(result)
+
+        assert first_item == (files[0], False)
+        assert iterated == 2
+
+        remaining = list(result)
+
+        assert iterated == len(files)
+        assert remaining[-1] == (files[-1], True)

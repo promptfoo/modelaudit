@@ -125,6 +125,7 @@ def pytest_runtest_setup(item):
             "test_ml_context_false_positives.py",  # ML-context executable filtering regression tests
             "test_cli_output.py",  # CliRunner JSON parsing helper regression tests
             "test_large_file_handler.py",  # Large file handler regression tests
+            "test_file_iterator.py",  # Streaming file iterator memory regression tests
         ]
 
         # Check if this is an allowed test file
