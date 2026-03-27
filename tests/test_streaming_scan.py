@@ -37,7 +37,7 @@ def create_mock_scan_result(bytes_scanned: int = 1024, with_critical_issue: bool
     return result
 
 
-def test_scan_model_directory_or_file_streaming_path():
+def test_scan_model_directory_or_file_streaming_path() -> None:
     """Ensure stream:// paths route to streaming analysis."""
     stream_url = "s3://bucket/model.pkl"
     scan_result = ScanResult(scanner_name="streaming")
@@ -58,7 +58,9 @@ def test_scan_model_directory_or_file_streaming_path():
         assert args[0] == stream_url
         assert "config" in kwargs
         mock_stream.assert_called_once_with(stream_url, dummy_scanner)
+        assert result.files_scanned == 1
         assert result.bytes_scanned == 123
+        assert determine_exit_code(result) == 0
 
 
 def test_scan_model_streaming_basic(temp_test_files):

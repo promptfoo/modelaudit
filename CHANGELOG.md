@@ -158,6 +158,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- count successful `stream://` scans in `files_scanned` so clean streaming scans return exit code 0 instead of 2
 - **security:** fail closed on pickle opcode parse errors for `.pkl` / `.pickle` / `.joblib` / `.dill` files instead of returning a successful INFO-only scan
 - **security:** preserve full scanner execution for large files when scanners do not implement chunk analyzers
 - preserve validated PE detections in pickle binary ML-context filtering
