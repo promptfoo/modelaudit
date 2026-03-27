@@ -85,7 +85,12 @@ class ZipScanner(BaseScanner):
             self.current_file_path = path
 
             # Scan the zip file recursively
-            scan_result = self._scan_zip_file(path, depth=0)
+            try:
+                archive_depth = int(self.config.get("_archive_depth", 0))
+            except (TypeError, ValueError):
+                archive_depth = 0
+
+            scan_result = self._scan_zip_file(path, depth=max(archive_depth, 0))
             result.merge(scan_result)
 
         except zipfile.BadZipFile:
@@ -383,8 +388,11 @@ class ZipScanner(BaseScanner):
                             # Import core here to avoid circular import
                             from .. import core
 
+                            nested_config = dict(self.config)
+                            nested_config["_archive_depth"] = depth + 1
+
                             # Use core.scan_file to scan with appropriate scanner
-                            file_result = core.scan_file(tmp_path, self.config)
+                            file_result = core.scan_file(tmp_path, nested_config)
                             self._rewrite_nested_result_context(file_result, tmp_path, path, name)
 
                             result.merge(file_result)

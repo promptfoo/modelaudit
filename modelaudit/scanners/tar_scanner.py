@@ -90,7 +90,12 @@ class TarScanner(BaseScanner):
 
         try:
             self.current_file_path = path
-            scan_result = self._scan_tar_file(path, depth=0)
+            try:
+                archive_depth = int(self.config.get("_archive_depth", 0))
+            except (TypeError, ValueError):
+                archive_depth = 0
+
+            scan_result = self._scan_tar_file(path, depth=max(archive_depth, 0))
             result.merge(scan_result)
         except tarfile.TarError:
             result.add_check(
@@ -139,6 +144,48 @@ class TarScanner(BaseScanner):
             return DEFAULT_MAX_TAR_ENTRY_SIZE
 
         return DEFAULT_MAX_TAR_ENTRY_SIZE
+
+    def _rewrite_nested_result_context(
+        self,
+        scan_result: ScanResult,
+        tmp_path: str,
+        archive_path: str,
+        entry_name: str,
+    ) -> None:
+        """Rewrite nested result locations so archive members, not temp files, are reported."""
+        archive_location = f"{archive_path}:{entry_name}"
+
+        for issue in scan_result.issues:
+            if issue.location:
+                if issue.location.startswith(tmp_path):
+                    issue.location = issue.location.replace(tmp_path, archive_location, 1)
+                else:
+                    issue.location = f"{archive_location} {issue.location}"
+            else:
+                issue.location = archive_location
+
+            existing_issue_entry = issue.details.get("tar_entry")
+            issue.details["tar_entry"] = (
+                f"{entry_name}:{existing_issue_entry}"
+                if isinstance(existing_issue_entry, str) and existing_issue_entry
+                else entry_name
+            )
+
+        for check in scan_result.checks:
+            if check.location:
+                if check.location.startswith(tmp_path):
+                    check.location = check.location.replace(tmp_path, archive_location, 1)
+                else:
+                    check.location = f"{archive_location} {check.location}"
+            else:
+                check.location = archive_location
+
+            existing_check_entry = check.details.get("tar_entry")
+            check.details["tar_entry"] = (
+                f"{entry_name}:{existing_check_entry}"
+                if isinstance(existing_check_entry, str) and existing_check_entry
+                else entry_name
+            )
 
     def _extract_member_to_tempfile(
         self,
@@ -495,28 +542,16 @@ class TarScanner(BaseScanner):
                     try:
                         if tarfile.is_tarfile(tmp_path):
                             nested_result = self._scan_tar_file(tmp_path, depth + 1)
-                            for issue in nested_result.issues:
-                                if issue.location and issue.location.startswith(tmp_path):
-                                    issue.location = issue.location.replace(tmp_path, f"{path}:{name}", 1)
+                            self._rewrite_nested_result_context(nested_result, tmp_path, path, name)
                             result.merge(nested_result)
                             asset_entry = asset_from_scan_result(f"{path}:{name}", nested_result)
                             asset_entry.setdefault("size", member.size)
                             contents.append(asset_entry)
                         else:
-                            file_result = core.scan_file(tmp_path, self.config)
-                            for issue in file_result.issues:
-                                if issue.location:
-                                    if issue.location.startswith(tmp_path):
-                                        issue.location = issue.location.replace(tmp_path, f"{path}:{name}", 1)
-                                    else:
-                                        issue.location = f"{path}:{name} {issue.location}"
-                                else:
-                                    issue.location = f"{path}:{name}"
-
-                                if issue.details:
-                                    issue.details["tar_entry"] = name
-                                else:
-                                    issue.details = {"tar_entry": name}
+                            nested_config = dict(self.config)
+                            nested_config["_archive_depth"] = depth + 1
+                            file_result = core.scan_file(tmp_path, nested_config)
+                            self._rewrite_nested_result_context(file_result, tmp_path, path, name)
 
                             result.merge(file_result)
 
@@ -532,20 +567,10 @@ class TarScanner(BaseScanner):
                     safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", os.path.basename(name))
                     tmp_path, total_size = self._extract_member_to_tempfile(tar, member, suffix=f"_{safe_name}")
                     try:
-                        file_result = core.scan_file(tmp_path, self.config)
-                        for issue in file_result.issues:
-                            if issue.location:
-                                if issue.location.startswith(tmp_path):
-                                    issue.location = issue.location.replace(tmp_path, f"{path}:{name}", 1)
-                                else:
-                                    issue.location = f"{path}:{name} {issue.location}"
-                            else:
-                                issue.location = f"{path}:{name}"
-
-                            if issue.details:
-                                issue.details["tar_entry"] = name
-                            else:
-                                issue.details = {"tar_entry": name}
+                        nested_config = dict(self.config)
+                        nested_config["_archive_depth"] = depth + 1
+                        file_result = core.scan_file(tmp_path, nested_config)
+                        self._rewrite_nested_result_context(file_result, tmp_path, path, name)
 
                         result.merge(file_result)
 

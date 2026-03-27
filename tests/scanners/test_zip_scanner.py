@@ -1,11 +1,12 @@
 import os
+import tarfile
 import tempfile
 import zipfile
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from modelaudit.scanners.base import IssueSeverity
+from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.zip_scanner import ZipScanner
 
 
@@ -153,6 +154,59 @@ class TestZipScanner:
         finally:
             os.unlink(inner_path)
             os.unlink(outer_path)
+
+    def test_scan_alternating_zip_tar_enforces_shared_depth_limit(self, tmp_path: Path) -> None:
+        """Archive depth should not reset when recursion alternates between ZIP and TAR."""
+        inner_zip = tmp_path / "inner.zip"
+        with zipfile.ZipFile(inner_zip, "w") as archive:
+            archive.writestr("payload.txt", "deep content")
+
+        middle_tar = tmp_path / "middle.tar"
+        with tarfile.open(middle_tar, "w") as archive:
+            archive.add(inner_zip, arcname="inner.zip")
+
+        outer_zip = tmp_path / "outer.zip"
+        with zipfile.ZipFile(outer_zip, "w") as archive:
+            archive.write(middle_tar, arcname="middle.tar")
+
+        scanner = ZipScanner(config={"max_zip_depth": 2, "max_tar_depth": 2})
+        result = scanner.scan(str(outer_zip))
+
+        depth_checks = [
+            check
+            for check in result.checks
+            if check.name == "ZIP Depth Bomb Protection" and check.status == CheckStatus.FAILED
+        ]
+        assert len(depth_checks) == 1
+        assert "maximum zip nesting depth (2) exceeded" in depth_checks[0].message.lower()
+        assert depth_checks[0].location == f"{outer_zip}:middle.tar:inner.zip"
+
+    def test_scan_nested_mar_enforces_shared_depth_limit(self, tmp_path: Path) -> None:
+        """Archive depth should not reset when ZIP recursion enters TorchServe MAR files."""
+        nested_mar = tmp_path / "model.mar"
+        with zipfile.ZipFile(nested_mar, "w") as archive:
+            archive.writestr(
+                "MAR-INF/MANIFEST.json",
+                '{"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}',
+            )
+            archive.writestr("handler.py", "def handle(data, context):\n    return data\n")
+            archive.writestr("weights.bin", "weights")
+
+        outer_zip = tmp_path / "outer.zip"
+        with zipfile.ZipFile(outer_zip, "w") as archive:
+            archive.write(nested_mar, arcname="model.mar")
+
+        scanner = ZipScanner(config={"max_mar_depth": 1})
+        result = scanner.scan(str(outer_zip))
+
+        depth_checks = [
+            check
+            for check in result.checks
+            if check.name == "TorchServe MAR Depth Limit" and check.status == CheckStatus.FAILED
+        ]
+        assert len(depth_checks) == 1
+        assert "maximum .mar recursion depth (1) exceeded" in depth_checks[0].message.lower()
+        assert depth_checks[0].location == f"{outer_zip}:model.mar"
 
     def test_directory_traversal_detection(self):
         """Test detection of directory traversal attempts in ZIP files"""
