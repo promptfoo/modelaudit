@@ -77,6 +77,7 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
             # Use cache manager for cache-enabled operations
             try:
                 from ...cache import get_cache_manager
+                from ...cache.cache_policy import should_cache_scan_result
 
                 cache_manager = get_cache_manager(cache_config.cache_dir, enabled=True)
                 version_context = cache_config.get_version_context()
@@ -113,13 +114,16 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
                     logger.debug(f"Cache miss for {os.path.basename(file_path)}, performing scan")
                     scan_start = time.perf_counter()
                     result_dict = cached_func_wrapper(file_path)
-                    scan_duration_ms = int((time.perf_counter() - scan_start) * 1000)
-                    cache_manager.store_result(
-                        file_path,
-                        result_dict,
-                        scan_duration_ms,
-                        version_context=version_context,
-                    )
+                    if should_cache_scan_result(result_dict):
+                        scan_duration_ms = int((time.perf_counter() - scan_start) * 1000)
+                        cache_manager.store_result(
+                            file_path,
+                            result_dict,
+                            scan_duration_ms,
+                            version_context=version_context,
+                        )
+                    else:
+                        logger.debug(f"Skipping cache store for operational result from {os.path.basename(file_path)}")
 
                 # Convert back to original type if needed
                 if isinstance(result_dict, dict) and "scanner" in result_dict:

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .adaptive_cache_keys import AdaptiveCacheKeyGenerator
+from .cache_policy import should_cache_scan_result
 from .scan_results_cache import ScanResultsCache
 
 logger = logging.getLogger(__name__)
@@ -141,8 +142,10 @@ class CacheManager:
             if isinstance(scan_result, dict):
                 scan_result["_cache_info"] = {"cache_hit": False, "scan_duration_ms": scan_duration}
 
-            # Store result in cache
-            self.store_result(file_path, scan_result, int(scan_duration), version_context=version_context)
+            if should_cache_scan_result(scan_result):
+                self.store_result(file_path, scan_result, int(scan_duration), version_context=version_context)
+            else:
+                logger.debug(f"Skipping cache store for operational result from {Path(file_path).name}")
 
             return scan_result  # type: ignore[no-any-return]
 
