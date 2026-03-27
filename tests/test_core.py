@@ -93,7 +93,7 @@ def test_scan_file_routes_config_only_keras_by_suffix(tmp_path: Path) -> None:
     result = scan_file(str(keras_model))
 
     assert result.scanner_name == "keras_zip"
-    assert any(check.name == "Keras ZIP Format Check" for check in result.checks)
+    assert result.success
 
 
 def test_scan_file_routes_misnamed_pytorch_zip_by_content(tmp_path: Path) -> None:
