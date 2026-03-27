@@ -12,6 +12,7 @@ Tests the 7-Zip archive scanning functionality including:
 import os
 import pickle
 import tempfile
+from collections.abc import Generator
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -305,13 +306,17 @@ class TestSevenZipScanner:
 
             result = scanner.scan(temp_7z_file)
 
+            system_symbols = {
+                "os.system",
+                f"{os.system.__module__}.system",
+            }
             assert result.success
             nested_issues = [
                 issue
                 for issue in result.issues
                 if issue.location
                 and f"{temp_7z_file}:nested_archive:payload.pkl" in issue.location
-                and ("os.system" in issue.message.lower() or "posix.system" in issue.message.lower())
+                and any(symbol in issue.message.lower() for symbol in system_symbols)
             ]
             assert len(nested_issues) > 0
             assert any(issue.severity == IssueSeverity.CRITICAL for issue in nested_issues)
@@ -492,23 +497,39 @@ class TestSevenZipScanner:
         with (
             patch("modelaudit.scanners.sevenzip_scanner.HAS_PY7ZR", True),
             patch("modelaudit.scanners.sevenzip_scanner.py7zr") as mock_py7zr,
-            patch.object(scanner, "_member_has_7z_magic") as mock_member_has_7z_magic,
             patch.object(scanner, "_scan_extracted_file") as mock_scan_extracted_file,
             patch("os.path.isfile", return_value=True),
             patch("os.path.getsize", return_value=32),
         ):
+
+            def fake_extract(*_args: Any, **kwargs: Any) -> None:
+                factory = kwargs.get("factory")
+                targets = kwargs["targets"]
+                if factory is None:
+                    return
+
+                for target in targets:
+                    probe = factory.create(target)
+                    header = scanner._SEVENZIP_MAGIC if target == "nested_archive" else b"not7z!"
+                    probe.write(header)
+
             mock_archive = MagicMock()
             mock_archive.getnames.return_value = ["safe.pkl", "nested_archive", *extensionless_members]
             mock_archive.getinfo.side_effect = lambda _name: MagicMock(uncompressed=16, is_directory=False)
+            mock_archive.extract.side_effect = fake_extract
             mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
-            mock_member_has_7z_magic.side_effect = lambda _archive, name: name == "nested_archive"
 
             result = scanner.scan(temp_7z_file)
 
             assert result.success
-            assert mock_member_has_7z_magic.call_count == len(extensionless_members) + 1
-            mock_archive.extract.assert_called_once()
-            assert mock_archive.extract.call_args.kwargs["targets"] == ["safe.pkl", "nested_archive"]
+            assert mock_archive.reset.call_count == 1
+            assert mock_archive.extract.call_count == 2
+            assert mock_archive.extract.call_args_list[0].kwargs["targets"] == [
+                "nested_archive",
+                *extensionless_members,
+            ]
+            assert "factory" in mock_archive.extract.call_args_list[0].kwargs
+            assert mock_archive.extract.call_args_list[1].kwargs["targets"] == ["safe.pkl", "nested_archive"]
             assert mock_scan_extracted_file.call_count == 2
 
     def test_max_entries_protection(self, scanner, temp_7z_file):
@@ -862,11 +883,11 @@ class TestSevenZipScannerHardening:
     """Red-team tests for security hardening introduced in the review."""
 
     @pytest.fixture
-    def temp_7z_file(self) -> str:  # type: ignore[return]
+    def temp_7z_file(self) -> Generator[str, None, None]:
         """Create a temporary file with .7z extension for testing"""
         with tempfile.NamedTemporaryFile(suffix=".7z", delete=False) as f:
             temp_path = f.name
-        yield temp_path  # type: ignore[misc]
+        yield temp_path
         if os.path.exists(temp_path):
             os.unlink(temp_path)
 
@@ -979,7 +1000,11 @@ class TestSevenZipScannerHardening:
         with (
             patch("modelaudit.scanners.sevenzip_scanner.HAS_PY7ZR", True),
             patch("modelaudit.scanners.sevenzip_scanner.py7zr") as mock_py7zr,
-            patch.object(scanner, "_member_has_7z_magic", return_value=False) as mock_probe,
+            patch.object(
+                scanner,
+                "_probe_extensionless_members",
+                return_value=dict.fromkeys(extensionless_members[:3], False),
+            ) as mock_probe,
             patch("os.path.getsize", return_value=32),
         ):
             mock_archive = MagicMock()
@@ -989,7 +1014,8 @@ class TestSevenZipScannerHardening:
 
             result = scanner.scan(temp_7z_file)
 
-            assert mock_probe.call_count == 3
+            assert mock_probe.call_count == 1
+            assert mock_probe.call_args.args[1] == extensionless_members[:3]
             limit_checks = [c for c in result.checks if "Probe Limit" in c.name]
             assert len(limit_checks) == 1
             assert limit_checks[0].status == CheckStatus.FAILED

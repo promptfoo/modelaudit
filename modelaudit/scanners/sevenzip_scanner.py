@@ -30,8 +30,9 @@ class _HeaderProbeComplete(Exception):
 
 
 class _HeaderProbeBuffer:
-    def __init__(self, limit: int) -> None:
+    def __init__(self, limit: int, *, raise_on_limit: bool = True) -> None:
         self._limit = limit
+        self._raise_on_limit = raise_on_limit
         self._buffer = io.BytesIO()
 
     def write(self, data: bytes | bytearray) -> int:
@@ -40,7 +41,7 @@ class _HeaderProbeBuffer:
         remaining = self._limit - self.size()
         if remaining > 0:
             self._buffer.write(data[:remaining])
-        if self.size() >= self._limit:
+        if self.size() >= self._limit and self._raise_on_limit:
             raise _HeaderProbeComplete
         return len(data)
 
@@ -58,12 +59,13 @@ class _HeaderProbeBuffer:
 
 
 class _HeaderProbeFactory:
-    def __init__(self, limit: int) -> None:
+    def __init__(self, limit: int, *, raise_on_limit: bool = True) -> None:
         self._limit = limit
+        self._raise_on_limit = raise_on_limit
         self.products: dict[str, _HeaderProbeBuffer] = {}
 
     def create(self, filename: str) -> _HeaderProbeBuffer:
-        probe = _HeaderProbeBuffer(self._limit)
+        probe = _HeaderProbeBuffer(self._limit, raise_on_limit=self._raise_on_limit)
         self.products[filename] = probe
         return probe
 
@@ -367,6 +369,7 @@ class SevenZipScanner(BaseScanner):
     ) -> list[str]:
         """Inspect extensionless members and keep only confirmed nested 7z archives."""
         nested_archives: list[str] = []
+        probe_targets: list[str] = []
         probes_remaining = self.max_extensionless_probes
         for file_name in file_names:
             _, ext = os.path.splitext(file_name.lower())
@@ -395,6 +398,23 @@ class SevenZipScanner(BaseScanner):
                 continue
 
             probes_remaining -= 1
+            probe_targets.append(file_name)
+
+        if not probe_targets:
+            return nested_archives
+
+        try:
+            probe_results = self._probe_extensionless_members(archive, probe_targets)
+            for file_name in probe_targets:
+                if probe_results.get(file_name, False):
+                    nested_archives.append(file_name)
+            return nested_archives
+        except Exception:
+            # Fall back to per-member probing if the fast path fails against a
+            # particular archive layout or py7zr behavior.
+            pass
+
+        for file_name in probe_targets:
             try:
                 if self._member_has_7z_magic(archive, file_name):
                     nested_archives.append(file_name)
@@ -409,6 +429,30 @@ class SevenZipScanner(BaseScanner):
                 )
 
         return nested_archives
+
+    def _probe_extensionless_members(self, archive: Any, file_names: list[str]) -> dict[str, bool]:
+        """Batch probe extensionless members in one pass to avoid repeated archive resets."""
+        probe_factory = _HeaderProbeFactory(
+            limit=len(self._SEVENZIP_MAGIC),
+            raise_on_limit=False,
+        )
+
+        try:
+            archive.extract(targets=file_names, factory=probe_factory)
+        finally:
+            with suppress(Exception):
+                archive.reset()
+
+        return {file_name: self._probe_has_7z_magic(probe_factory.get(file_name)) for file_name in file_names}
+
+    @classmethod
+    def _probe_has_7z_magic(cls, probe: _HeaderProbeBuffer | None) -> bool:
+        """Return True when a probe buffer captured the 7z magic header."""
+        if probe is None:
+            return False
+
+        probe.seek(0)
+        return probe.read(len(cls._SEVENZIP_MAGIC)) == cls._SEVENZIP_MAGIC
 
     def _member_has_7z_magic(self, archive: Any, file_name: str) -> bool:
         """Read only enough bytes to confirm whether an extensionless member is a nested 7z archive."""
@@ -425,11 +469,7 @@ class SevenZipScanner(BaseScanner):
         probe = probe_factory.get(file_name)
         if probe is None:
             probe = next(iter(probe_factory.products.values()), None)
-        if probe is None:
-            return False
-
-        probe.seek(0)
-        return probe.read(len(self._SEVENZIP_MAGIC)) == self._SEVENZIP_MAGIC
+        return self._probe_has_7z_magic(probe)
 
     def _check_path_traversal(self, file_names: list[str], archive_path: str, result: ScanResult) -> list[str]:
         """Check for path traversal vulnerabilities and return only safe entries."""
