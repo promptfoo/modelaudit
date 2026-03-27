@@ -1,5 +1,6 @@
 import json
 import logging
+from pathlib import Path
 
 import pytest
 
@@ -441,7 +442,10 @@ def test_manifest_scanner_enforces_size_limit(tmp_path):
     assert result.metadata["file_size"] == test_file.stat().st_size
 
 
-def test_manifest_scanner_enforces_timeout(tmp_path, monkeypatch: pytest.MonkeyPatch):
+def test_manifest_scanner_enforces_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Manifest scans should stop when the scanner timeout is exceeded."""
     test_file = tmp_path / "config.json"
     test_file.write_text(json.dumps({"model_type": "bert"}))
@@ -462,7 +466,10 @@ def test_manifest_scanner_enforces_timeout(tmp_path, monkeypatch: pytest.MonkeyP
     assert timeout_checks[0].severity == IssueSeverity.WARNING
 
 
-def test_manifest_scanner_blacklist_timeout_reports_only_timeout(tmp_path, monkeypatch: pytest.MonkeyPatch):
+def test_manifest_scanner_blacklist_timeout_reports_only_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Timeouts in blacklist checks should not be converted to blacklist errors."""
     test_file = tmp_path / "config.json"
     test_file.write_text(json.dumps({"model_type": "bert"}))
@@ -485,7 +492,10 @@ def test_manifest_scanner_blacklist_timeout_reports_only_timeout(tmp_path, monke
     assert [check.name for check in result.checks if check.status == CheckStatus.FAILED] == ["Manifest Scan Timeout"]
 
 
-def test_manifest_scanner_parse_timeout_reports_only_timeout(tmp_path, monkeypatch: pytest.MonkeyPatch):
+def test_manifest_scanner_parse_timeout_reports_only_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Timeouts in manifest parsing should not be converted to parse errors."""
     test_file = tmp_path / "config.json"
     test_file.write_text(json.dumps({"model_type": "bert"}))
@@ -507,7 +517,10 @@ def test_manifest_scanner_parse_timeout_reports_only_timeout(tmp_path, monkeypat
     assert not any(check.name == "Manifest Parse Attempt" for check in result.checks)
 
 
-def test_manifest_scanner_cloud_url_timeout_reports_only_timeout(tmp_path, monkeypatch: pytest.MonkeyPatch):
+def test_manifest_scanner_cloud_url_timeout_reports_only_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Timeouts in cloud URL checks should not be swallowed."""
     test_file = tmp_path / "config.json"
     test_file.write_text(json.dumps({"model_type": "bert"}))
@@ -532,7 +545,10 @@ def test_manifest_scanner_cloud_url_timeout_reports_only_timeout(tmp_path, monke
     assert not any(check.name == "Manifest File Scan" for check in result.checks)
 
 
-def test_manifest_scanner_weak_hash_timeout_reports_only_timeout(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_manifest_scanner_weak_hash_timeout_reports_only_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Timeout overruns after weak-hash analysis should still report a manifest timeout."""
     test_file = tmp_path / "config.json"
     test_file.write_text(json.dumps({"model_type": "bert", "checksum": "e3b0c44298fc1c149afbf4c8996fb924"}))
