@@ -354,8 +354,9 @@ class ZipScanner(BaseScanner):
                                     )
                                 tmp.write(chunk)
 
-                    # Check if it's another zip file
-                    if name.lower().endswith(".zip"):
+                    # Recurse through ZipScanner for ZIP content so nested depth is preserved,
+                    # even when the member itself has no .zip extension.
+                    if name.lower().endswith(".zip") or zipfile.is_zipfile(tmp_path):
                         try:
                             nested_result = self._scan_zip_file(tmp_path, depth + 1)
                             self._rewrite_nested_result_context(nested_result, tmp_path, path, name)
