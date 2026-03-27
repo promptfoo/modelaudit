@@ -1679,7 +1679,8 @@ def scan_command(
                     ):
                         if verbose:
                             logger.debug(f"Skipped: {scan_path} (non-model file)")
-                        click.echo(f"Skipping non-model file: {scan_path}")
+                        if show_styled_output:
+                            click.echo(f"Skipping non-model file: {scan_path}")
                         continue
                     if ext == ".txt":
                         # .txt may be a LightGBM native text-format model.
@@ -1689,7 +1690,8 @@ def scan_command(
                         if not any(cls().can_handle(scan_path) for cls in SCANNER_REGISTRY):
                             if verbose:
                                 logger.debug(f"Skipped: {scan_path} (non-model .txt file)")
-                            click.echo(f"Skipping non-model file: {scan_path}")
+                            if show_styled_output:
+                                click.echo(f"Skipping non-model file: {scan_path}")
                             continue
 
                 # Show progress indicator if in text mode and not writing to a file

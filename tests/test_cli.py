@@ -204,6 +204,52 @@ def test_scan_json_subprocess_separates_logs_from_stdout_for_findings(tmp_path: 
     assert "[S405]" in completed.stderr
 
 
+def test_scan_json_subprocess_single_skipped_file_keeps_stdout_parseable(tmp_path: Path) -> None:
+    """Single-file skips should not prepend human text ahead of JSON stdout."""
+    skipped_file = tmp_path / "skip.py"
+    skipped_file.write_text("print('hello')\n")
+
+    completed = subprocess.run(
+        [sys.executable, "-m", "modelaudit", "scan", str(skipped_file), "--format", "json"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 2
+    assert "Skipping non-model file:" not in completed.stdout
+    assert completed.stdout.lstrip().startswith("{")
+
+    output_payload = json.loads(completed.stdout)
+    assert output_payload["files_scanned"] == 0
+    assert output_payload["issues"] == []
+
+
+def test_scan_json_subprocess_mixed_directory_keeps_stdout_parseable(tmp_path: Path) -> None:
+    """Directory scans should remain valid JSON when non-model files are skipped."""
+    import pickle
+
+    skipped_file = tmp_path / "skip.py"
+    skipped_file.write_text("print('hello')\n")
+    model_file = tmp_path / "safe.pkl"
+    model_file.write_bytes(pickle.dumps({"ok": 1}))
+
+    completed = subprocess.run(
+        [sys.executable, "-m", "modelaudit", "scan", str(tmp_path), "--format", "json"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0
+    assert "Skipping non-model file:" not in completed.stdout
+    assert completed.stdout.lstrip().startswith("{")
+
+    output_payload = json.loads(completed.stdout)
+    assert output_payload["files_scanned"] >= 1
+    assert any(asset.get("path") == str(model_file) for asset in output_payload.get("assets", []))
+
+
 def test_scan_can_apply_local_config_once_when_confirmed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Interactive scans can apply a local config for the current run only."""
     import tarfile
