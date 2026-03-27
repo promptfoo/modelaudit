@@ -273,10 +273,83 @@ class TestSevenZipScanner:
             if inner_7z_path.exists():
                 inner_7z_path.unlink()
 
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_scan_extensionless_nested_7z_archive(self, scanner, temp_7z_file) -> None:
+        """Extensionless nested 7z archives should recurse based on file content."""
+        import py7zr  # type: ignore[import-untyped]
+
+        class MaliciousClass:
+            def __reduce__(self):
+                import os as os_module
+
+                return (os_module.system, ("echo extensionless_7z_nested",))
+
+        inner_7z_path = Path(temp_7z_file).with_name("extensionless_inner.7z")
+        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as temp_pickle:
+            pickle.dump(MaliciousClass(), temp_pickle)
+            temp_pickle_path = temp_pickle.name
+
+        try:
+            with py7zr.SevenZipFile(inner_7z_path, "w") as archive:
+                archive.write(temp_pickle_path, "payload.pkl")
+
+            with py7zr.SevenZipFile(temp_7z_file, "w") as archive:
+                archive.write(str(inner_7z_path), "nested_archive")
+
+            result = scanner.scan(temp_7z_file)
+
+            assert result.success
+            nested_issues = [
+                issue
+                for issue in result.issues
+                if issue.location
+                and f"{temp_7z_file}:nested_archive:payload.pkl" in issue.location
+                and ("os.system" in issue.message.lower() or "posix.system" in issue.message.lower())
+            ]
+            assert len(nested_issues) > 0
+            assert any(issue.severity == IssueSeverity.CRITICAL for issue in nested_issues)
+
+        finally:
+            if os.path.exists(temp_pickle_path):
+                os.unlink(temp_pickle_path)
+            if inner_7z_path.exists():
+                inner_7z_path.unlink()
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_max_depth_limit(self, temp_7z_file) -> None:
+        """Nested 7z archives should enforce the configured maximum depth."""
+        import py7zr  # type: ignore[import-untyped]
+
+        archive_paths: list[Path] = []
+        try:
+            deepest_path = Path(temp_7z_file).with_name("depth_0.7z")
+            with py7zr.SevenZipFile(deepest_path, "w") as archive:
+                archive.writestr(b"payload", "payload.txt")
+            archive_paths.append(deepest_path)
+
+            for depth in range(1, 4):
+                next_path = Path(temp_7z_file).with_name(f"depth_{depth}.7z")
+                with py7zr.SevenZipFile(next_path, "w") as archive:
+                    archive.write(str(archive_paths[-1]), f"nested_{depth}.7z")
+                archive_paths.append(next_path)
+
+            scanner = SevenZipScanner(config={"max_7z_depth": 2})
+            result = scanner.scan(str(archive_paths[-1]))
+
+            depth_issues = [issue for issue in result.issues if "maximum 7z nesting depth" in issue.message.lower()]
+            assert len(depth_issues) == 1
+            assert depth_issues[0].severity == IssueSeverity.WARNING
+
+        finally:
+            for archive_path in archive_paths:
+                if archive_path.exists():
+                    archive_path.unlink()
+
     def test_identify_scannable_files(self, scanner):
         """Test identification of scannable files"""
         test_files = [
             "nested.7z",  # Scannable
+            "nested_archive",  # Extensionless nested archives are scanned by content
             "model.pkl",  # Scannable
             "weights.pt",  # Scannable
             "model.bin",  # Scannable
@@ -288,7 +361,7 @@ class TestSevenZipScanner:
 
         scannable = scanner._identify_scannable_files(test_files)
 
-        expected_scannable = ["nested.7z", "model.pkl", "weights.pt", "model.bin", "config.json"]
+        expected_scannable = ["nested.7z", "nested_archive", "model.pkl", "weights.pt", "model.bin", "config.json"]
         assert set(scannable) == set(expected_scannable)
 
     @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")

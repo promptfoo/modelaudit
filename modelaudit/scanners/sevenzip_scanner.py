@@ -2,6 +2,7 @@
 
 import os
 import tempfile
+from contextlib import suppress
 from typing import TYPE_CHECKING, Any, ClassVar
 
 if TYPE_CHECKING:
@@ -32,6 +33,7 @@ class SevenZipScanner(BaseScanner):
     name = "sevenzip"
     description = "Scans 7-Zip archives for malicious model files"
     supported_extensions: ClassVar[list[str]] = [".7z"]
+    _SEVENZIP_MAGIC: ClassVar[bytes] = b"7z\xbc\xaf\x27\x1c"
 
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
@@ -52,11 +54,15 @@ class SevenZipScanner(BaseScanner):
         if not path.lower().endswith(".7z"):
             return False
 
-        # Check 7z magic bytes: "7z\xBC\xAF\x27\x1C"
+        return cls._has_7z_magic(path)
+
+    @classmethod
+    def _has_7z_magic(cls, path: str) -> bool:
+        """Check whether a file starts with the 7z magic bytes."""
         try:
             with open(path, "rb") as f:
                 magic = f.read(6)
-                return magic == b"7z\xbc\xaf\x27\x1c"
+                return magic == cls._SEVENZIP_MAGIC
         except Exception:
             return False
 
@@ -203,7 +209,7 @@ class SevenZipScanner(BaseScanner):
             result.metadata["unsafe_entries"] = len(file_names) - len(safe_file_names)
             result.metadata["file_size"] = os.path.getsize(path)
 
-        result.finish(success=not result.has_errors)
+        result.finish(success=True)
         return result
 
     def _identify_scannable_files(self, file_names: list[str]) -> list[str]:
@@ -227,7 +233,7 @@ class SevenZipScanner(BaseScanner):
         for file_name in file_names:
             # Get file extension
             _, ext = os.path.splitext(file_name.lower())
-            if ext in scannable_extensions:
+            if ext in scannable_extensions or ext == "":
                 scannable_files.append(file_name)
 
         return scannable_files
@@ -269,6 +275,13 @@ class SevenZipScanner(BaseScanner):
         """Extract scannable files and run appropriate scanners on them"""
         extractable_files = []
         for file_name in scannable_files:
+            member_info = None
+            with suppress(Exception):
+                member_info = archive.getinfo(file_name)
+
+            if getattr(member_info, "is_directory", False) is True:
+                continue
+
             member_size = self._get_archive_member_size(archive, file_name)
             if member_size is not None and member_size > self.max_extract_size:
                 result.add_check(
@@ -392,7 +405,7 @@ class SevenZipScanner(BaseScanner):
     ) -> None:
         """Scan an individual extracted file using the appropriate scanner"""
         try:
-            if original_name.lower().endswith(".7z"):
+            if original_name.lower().endswith(".7z") or self._has_7z_magic(extracted_path):
                 file_result = self._scan_7z_file(extracted_path, depth + 1)
             else:
                 # Import scanner registry to find appropriate scanner
