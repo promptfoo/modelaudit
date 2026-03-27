@@ -2,7 +2,7 @@
 
 import logging
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from .base import BaseScanner, Issue, IssueSeverity, ScanResult
 
@@ -196,7 +196,7 @@ class MetadataScanner(BaseScanner):
     @staticmethod
     def _match_suspicious_domain(candidate: str) -> str | None:
         """Return the matching suspicious domain for a URL component, if any."""
-        normalized = candidate.lower().rstrip(".")
+        normalized = unquote(candidate).lower().rstrip(".")
         if not normalized:
             return None
 
