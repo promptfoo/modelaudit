@@ -346,7 +346,11 @@ class CompressedScanner(BaseScanner):
         result.metadata["file_size"] = self.get_file_size(path)
         self.add_file_integrity_check(path, result)
 
-        depth = int(self.config.get("_compressed_depth", 0))
+        try:
+            archive_depth = int(self.config.get("_archive_depth", 0))
+        except (TypeError, ValueError):
+            archive_depth = 0
+        depth = max(int(self.config.get("_compressed_depth", 0)), archive_depth)
         if depth >= self.max_depth:
             result.add_check(
                 name="Compressed Wrapper Depth Limit",
@@ -442,6 +446,7 @@ class CompressedScanner(BaseScanner):
 
             nested_config = dict(self.config)
             nested_config["_compressed_depth"] = depth + 1
+            nested_config["_archive_depth"] = depth + 1
             inner_result = core.scan_file(temp_path, nested_config)
 
             inner_display = self._derive_inner_display_name(path)
