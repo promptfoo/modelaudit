@@ -33,6 +33,8 @@ except (ImportError, RecursionError):
 # Configure logging
 logger = logging.getLogger("modelaudit.scanners")
 
+TRUSTED_HUGGINGFACE_SOURCES = frozenset({"huggingface", "huggingface_cache"})
+
 
 class IssueSeverity(Enum):
     """Enum for issue severity levels"""
@@ -450,8 +452,9 @@ class BaseScanner(ABC):
         if not use_whitelist:
             return False
 
-        # Only trusted HuggingFace provenance/cache paths are eligible for downgrades.
-        if self.context and self.context.model_id and self.context.model_source == "huggingface":
+        # Only trusted HuggingFace provenance is eligible for downgrades.
+        # Local metadata-derived model IDs do not qualify; validated HF cache layouts do.
+        if self.context and self.context.model_id and self.context.model_source in TRUSTED_HUGGINGFACE_SOURCES:
             from modelaudit.whitelists import is_whitelisted_model
 
             return is_whitelisted_model(self.context.model_id)
