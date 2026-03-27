@@ -3451,11 +3451,13 @@ class TestPickleImportOnlyGlobalFindings:
             callable_origin_refs,
             callable_origin_is_ext,
             malformed_stack_globals,
+            mutation_target_refs,
         ) = _simulate_symbolic_reference_maps(opcodes)
 
         assert callable_refs[2] == ("collections", "OrderedDict")
         assert callable_origin_refs[2] == 2
         assert callable_origin_is_ext == {}
+        assert mutation_target_refs == {}
         assert 5 not in stack_global_refs
         assert malformed_stack_globals[5]["reason"] == "insufficient_context"
 
@@ -3476,6 +3478,7 @@ class TestPickleImportOnlyGlobalFindings:
             callable_origin_refs,
             callable_origin_is_ext,
             malformed_stack_globals,
+            mutation_target_refs,
         ) = _simulate_symbolic_reference_maps(opcodes)
 
         assert stack_global_refs[6] == ("evilpkg", "thing")
@@ -3483,6 +3486,7 @@ class TestPickleImportOnlyGlobalFindings:
         assert callable_origin_refs == {}
         assert callable_origin_is_ext == {}
         assert malformed_stack_globals == {}
+        assert mutation_target_refs == {}
 
 
 @pytest.mark.parametrize(

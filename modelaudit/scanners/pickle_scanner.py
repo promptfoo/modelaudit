@@ -2145,6 +2145,12 @@ class _ResolvedImportRef:
     origin_is_ext: bool = False
 
 
+@dataclass(frozen=True)
+class _MutationTargetRef:
+    kind: Literal["dict", "object"]
+    callable_ref: tuple[str, str] | None = None
+
+
 def _resolve_copyreg_extension(code: Any, origin_index: int) -> _ResolvedImportRef:
     """
     Resolve EXT opcode codes through copyreg when available.
@@ -2285,6 +2291,7 @@ def _simulate_symbolic_reference_maps(
     dict[int, int],
     dict[int, bool],
     dict[int, MalformedStackGlobalDetails],
+    dict[int, _MutationTargetRef],
 ]:
     """Simulate callable resolution and retain import origins plus malformed STACK_GLOBAL details."""
     stack_global_refs: dict[int, tuple[str, str]] = {}
@@ -2292,6 +2299,7 @@ def _simulate_symbolic_reference_maps(
     callable_origin_refs: dict[int, int] = {}
     callable_origin_is_ext: dict[int, bool] = {}
     malformed_stack_globals: dict[int, MalformedStackGlobalDetails] = {}
+    mutation_target_refs: dict[int, _MutationTargetRef] = {}
 
     marker = object()
     unknown = object()
@@ -2305,6 +2313,14 @@ def _simulate_symbolic_reference_maps(
 
     def _peek(default: Any = unknown) -> Any:
         return stack[-1] if stack else default
+
+    def _peek_setitems_target() -> Any:
+        for index in range(len(stack) - 1, -1, -1):
+            if stack[index] is marker:
+                if index > 0:
+                    return stack[index - 1]
+                return unknown
+        return unknown
 
     def _pop_to_mark() -> list[Any]:
         popped: list[Any] = []
@@ -2383,7 +2399,7 @@ def _simulate_symbolic_reference_maps(
                 callable_refs[i] = parsed
                 callable_origin_refs[i] = i
             _pop_to_mark()
-            stack.append(unknown)
+            stack.append(_MutationTargetRef("object", parsed))
             continue
 
         if name in {"PUT", "BINPUT", "LONG_BINPUT"}:
@@ -2419,7 +2435,7 @@ def _simulate_symbolic_reference_maps(
 
         if name in {"TUPLE", "LIST", "DICT", "SET", "FROZENSET"}:
             _pop_to_mark()
-            stack.append(unknown)
+            stack.append(_MutationTargetRef("dict") if name == "DICT" else unknown)
             continue
 
         if name in {"TUPLE1", "TUPLE2", "TUPLE3"}:
@@ -2430,16 +2446,24 @@ def _simulate_symbolic_reference_maps(
             continue
 
         if name in {"EMPTY_TUPLE", "EMPTY_LIST", "EMPTY_DICT", "EMPTY_SET"}:
-            stack.append(unknown)
+            stack.append(_MutationTargetRef("dict") if name == "EMPTY_DICT" else unknown)
             continue
 
         if name in {"APPEND", "SETITEM"}:
+            if name == "SETITEM" and len(stack) >= 3:
+                target = stack[-3]
+                if isinstance(target, _MutationTargetRef):
+                    mutation_target_refs[i] = target
             _pop()
             if name == "SETITEM":
                 _pop()
             continue
 
         if name in {"APPENDS", "SETITEMS", "ADDITEMS"}:
+            if name == "SETITEMS":
+                target = _peek_setitems_target()
+                if isinstance(target, _MutationTargetRef):
+                    mutation_target_refs[i] = target
             _pop_to_mark()
             continue
 
@@ -2456,7 +2480,9 @@ def _simulate_symbolic_reference_maps(
                 callable_origin_refs[i] = callable_item.origin_index
                 if callable_item.origin_is_ext:
                     callable_origin_is_ext[i] = True
-            stack.append(unknown)
+                stack.append(_MutationTargetRef("object", (callable_item.module, callable_item.function)))
+            else:
+                stack.append(_MutationTargetRef("object"))
             continue
 
         if name == "NEWOBJ":
@@ -2468,7 +2494,9 @@ def _simulate_symbolic_reference_maps(
                 callable_origin_refs[i] = class_item.origin_index
                 if class_item.origin_is_ext:
                     callable_origin_is_ext[i] = True
-            stack.append(unknown)
+                stack.append(_MutationTargetRef("object", (class_item.module, class_item.function)))
+            else:
+                stack.append(_MutationTargetRef("object"))
             continue
 
         if name == "NEWOBJ_EX":
@@ -2481,7 +2509,9 @@ def _simulate_symbolic_reference_maps(
                 callable_origin_refs[i] = class_item.origin_index
                 if class_item.origin_is_ext:
                     callable_origin_is_ext[i] = True
-            stack.append(unknown)
+                stack.append(_MutationTargetRef("object", (class_item.module, class_item.function)))
+            else:
+                stack.append(_MutationTargetRef("object"))
             continue
 
         if name == "OBJ":
@@ -2492,7 +2522,9 @@ def _simulate_symbolic_reference_maps(
                 callable_origin_refs[i] = class_item.origin_index
                 if class_item.origin_is_ext:
                     callable_origin_is_ext[i] = True
-            stack.append(unknown)
+                stack.append(_MutationTargetRef("object", (class_item.module, class_item.function)))
+            else:
+                stack.append(_MutationTargetRef("object"))
             continue
 
         if name in {"BINPERSID"}:
@@ -2540,6 +2572,7 @@ def _simulate_symbolic_reference_maps(
         callable_origin_refs,
         callable_origin_is_ext,
         malformed_stack_globals,
+        mutation_target_refs,
     )
 
 
@@ -2560,6 +2593,7 @@ def _build_symbolic_reference_maps(
         _callable_origin_refs,
         _callable_origin_is_ext,
         malformed_stack_globals,
+        _mutation_target_refs,
     ) = _simulate_symbolic_reference_maps(opcodes)
     return stack_global_refs, callable_refs, malformed_stack_globals
 
@@ -2917,9 +2951,14 @@ def _is_legitimate_serialization_file(path: str) -> bool:
         except Exception:
             return has_dangerous_global, has_joblib_like_global
 
-        stack_global_refs, _callable_refs, _origin_refs, _origin_is_ext, _malformed = _simulate_symbolic_reference_maps(
-            opcodes
-        )
+        (
+            stack_global_refs,
+            _callable_refs,
+            _origin_refs,
+            _origin_is_ext,
+            _malformed,
+            _mutation_target_refs,
+        ) = _simulate_symbolic_reference_maps(opcodes)
 
         for idx, (opcode, arg, _pos) in enumerate(opcodes):
             op_name = getattr(opcode, "name", "")
@@ -3114,6 +3153,7 @@ def is_dangerous_reduce_pattern(
             _computed_callable_origin_refs,
             computed_callable_origin_is_ext,
             _computed_malformed_stack_globals,
+            _computed_mutation_target_refs,
         ) = _simulate_symbolic_reference_maps(opcodes)
     else:
         computed_stack_refs, computed_callable_refs, computed_callable_origin_is_ext = (
@@ -3263,6 +3303,7 @@ def check_opcode_sequence(
             _computed_callable_origin_refs,
             computed_callable_origin_is_ext,
             _computed_malformed_stack_globals,
+            _computed_mutation_target_refs,
         ) = _simulate_symbolic_reference_maps(opcodes)
     else:
         computed_stack_refs, computed_callable_refs, computed_callable_origin_is_ext = (
@@ -4766,6 +4807,7 @@ class PickleScanner(BaseScanner):
                 callable_origin_refs,
                 callable_origin_is_ext,
                 malformed_stack_globals,
+                _mutation_target_refs,
             ) = _simulate_symbolic_reference_maps(opcodes)
             executed_import_origins = set(callable_origin_refs.values())
 
@@ -6667,10 +6709,17 @@ class PickleScanner(BaseScanner):
         globals) is flagged.
         """
         patterns: list[dict] = []
-        # Pre-compute symbolic references for STACK_GLOBAL resolution.
+        # Pre-compute symbolic references and mutation targets.
         # This handles BINUNICODE8, memoized strings (BINGET/LONG_BINGET),
         # and indirect stack flows that a narrow lookback would miss.
-        stack_global_refs, _, _ = _build_symbolic_reference_maps(opcodes)
+        (
+            stack_global_refs,
+            _callable_refs,
+            _callable_origin_refs,
+            _callable_origin_is_ext,
+            _malformed_stack_globals,
+            mutation_target_refs,
+        ) = _simulate_symbolic_reference_maps(opcodes)
 
         for i, (opcode, _arg, pos) in enumerate(opcodes):
             if opcode.name not in ("SETITEM", "SETITEMS"):
@@ -6680,6 +6729,32 @@ class PickleScanner(BaseScanner):
             has_rebuild_tensor = False
             has_dangerous_global = False
             context_details: list[str] = []
+
+            target_ref = mutation_target_refs.get(i)
+            if target_ref and target_ref.kind == "dict":
+                continue
+
+            if target_ref and target_ref.callable_ref:
+                target_global = f"{target_ref.callable_ref[0]}.{target_ref.callable_ref[1]}"
+                arg_str = target_global.lower()
+                if "_rebuild_tensor" in arg_str or "_rebuild_parameter" in arg_str:
+                    has_rebuild_tensor = True
+                    context_details.append(f"_rebuild operation: {target_global}")
+                if any(
+                    d in arg_str
+                    for d in [
+                        "os.",
+                        "subprocess",
+                        "eval",
+                        "exec",
+                        "__import__",
+                        "builtins",
+                        "ctypes",
+                        "socket",
+                    ]
+                ):
+                    has_dangerous_global = True
+                    context_details.append(f"dangerous global: {target_global}")
 
             lookback = min(i, 30)
             # Track whether a dict DIRECTLY produces the object that SETITEM targets.
@@ -6730,7 +6805,7 @@ class PickleScanner(BaseScanner):
             # Skip only when the dict is the most recent container-producing op,
             # meaning the SETITEM is directly targeting a dict (legitimate).
             # If a REDUCE/NEWOBJ is more recent, the dict is unrelated.
-            if most_recent_container == "dict":
+            if target_ref is None and most_recent_container == "dict":
                 continue
 
             if has_rebuild_tensor:
