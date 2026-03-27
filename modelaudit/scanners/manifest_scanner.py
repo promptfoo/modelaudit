@@ -212,8 +212,6 @@ TRUSTED_URL_DOMAINS = [
     # ===========================================
     # AWS
     "s3.amazonaws.com",
-    "s3-",  # Regional: s3-us-west-2.amazonaws.com
-    ".s3.",  # Bucket URLs: bucket.s3.region.amazonaws.com
     "cloudfront.net",
     # Google Cloud
     "storage.googleapis.com",
@@ -365,10 +363,26 @@ TRUSTED_URL_DOMAINS = [
 # Broad user-content hosting domains should only trust the exact host, not
 # arbitrary attacker-controlled subdomains.
 TRUSTED_URL_EXACT_DOMAINS = {
+    # CDNs — anyone can provision an endpoint
+    "akamaized.net",
+    "azureedge.net",
     "cloudfront.net",
+    "fastly.net",
+    # User-content hosting — arbitrary subdomains are attacker-controlled
+    "docker.io",
+    "gcr.io",
+    "ghcr.io",
+    "gitbook.io",
     "github.io",
     "gitlab.io",
     "googleusercontent.com",
+    "gradio.app",
+    "nvcr.io",
+    "quay.io",
+    "readthedocs.io",
+    "rtfd.io",
+    "sourceforge.net",
+    "streamlit.io",
 }
 
 # Regex to find URLs in text
@@ -378,6 +392,13 @@ URL_PATTERN = re.compile(r'https?://[^\s<>"\']+[^\s<>"\',.]')
 def _is_trusted_url_domain(url: str) -> bool:
     """Check if a URL host is in the trusted domain allowlist."""
     parsed = urlparse(url)
+
+    # URLs with userinfo (user@host) are inherently suspicious — an attacker
+    # can craft https://evil.com@github.com/payload where urlparse sees the
+    # hostname as github.com while the visual target appears to be evil.com.
+    if parsed.username or parsed.password:
+        return False
+
     host = (parsed.hostname or "").lower().rstrip(".")
     if not host:
         return False
@@ -725,6 +746,7 @@ class ManifestScanner(BaseScanner):
         """Check for blacklisted model names in config values"""
 
         def check_dict(d: Any, prefix: str = "") -> None:
+            self._check_timeout()
             if not isinstance(d, dict):
                 return
 
@@ -971,6 +993,7 @@ class ManifestScanner(BaseScanner):
 
         def traverse_for_hashes(d: Any, prefix: str = "") -> None:
             """Recursively check dictionary for weak hashes."""
+            self._check_timeout()
             if not isinstance(d, dict):
                 return
 

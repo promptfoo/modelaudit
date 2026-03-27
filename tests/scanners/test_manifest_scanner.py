@@ -6,7 +6,7 @@ import pytest
 
 import modelaudit.scanners.manifest_scanner as manifest_scanner_module
 from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
-from modelaudit.scanners.manifest_scanner import ManifestScanner
+from modelaudit.scanners.manifest_scanner import ManifestScanner, _is_trusted_url_domain
 
 
 def test_manifest_scanner_blacklist(tmp_path):
@@ -569,3 +569,99 @@ def test_manifest_scanner_weak_hash_timeout_reports_only_timeout(
     assert result.success is True
     assert [check.name for check in result.checks if check.status == CheckStatus.FAILED] == ["Manifest Scan Timeout"]
     assert not any(check.name == "Manifest File Scan" for check in result.checks)
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for _is_trusted_url_domain
+# ---------------------------------------------------------------------------
+
+
+class TestIsTrustedUrlDomain:
+    """Direct tests for the module-level domain trust function."""
+
+    def test_exact_trusted_domain(self) -> None:
+        assert _is_trusted_url_domain("https://github.com/repo") is True
+        assert _is_trusted_url_domain("https://huggingface.co/model") is True
+
+    def test_subdomain_of_trusted_domain(self) -> None:
+        assert _is_trusted_url_domain("https://raw.githubusercontent.com/f") is True
+        assert _is_trusted_url_domain("https://sub.pytorch.org/w") is True
+
+    def test_exact_match_domains_block_subdomains(self) -> None:
+        """Subdomains of exact-match hosting domains must NOT be trusted."""
+        assert _is_trusted_url_domain("https://attacker.github.io/p") is False
+        assert _is_trusted_url_domain("https://evil.cloudfront.net/p") is False
+        assert _is_trusted_url_domain("https://evil.googleusercontent.com/p") is False
+        assert _is_trusted_url_domain("https://evil.readthedocs.io/p") is False
+        assert _is_trusted_url_domain("https://evil.gitbook.io/p") is False
+        assert _is_trusted_url_domain("https://evil.streamlit.io/p") is False
+        assert _is_trusted_url_domain("https://evil.gradio.app/p") is False
+        assert _is_trusted_url_domain("https://evil.fastly.net/p") is False
+        assert _is_trusted_url_domain("https://evil.azureedge.net/p") is False
+        assert _is_trusted_url_domain("https://evil.sourceforge.net/p") is False
+        assert _is_trusted_url_domain("https://evil.docker.io/p") is False
+        assert _is_trusted_url_domain("https://evil.quay.io/p") is False
+
+    def test_exact_match_domain_itself_trusted(self) -> None:
+        """The bare exact-match domain should still be trusted."""
+        assert _is_trusted_url_domain("https://github.io/page") is True
+        assert _is_trusted_url_domain("https://cloudfront.net/res") is True
+        assert _is_trusted_url_domain("https://readthedocs.io/docs") is True
+
+    def test_userinfo_bypass_blocked(self) -> None:
+        """URLs with userinfo (user@host) must NOT be trusted."""
+        assert _is_trusted_url_domain("https://evil.com@github.com/payload") is False
+        assert _is_trusted_url_domain("https://evil.com@huggingface.co/model") is False
+        assert _is_trusted_url_domain("https://user:pass@pytorch.org/w") is False
+
+    def test_untrusted_domain(self) -> None:
+        assert _is_trusted_url_domain("https://evil-site.com/payload") is False
+        assert _is_trusted_url_domain("https://not-github.com/repo") is False
+
+    def test_empty_and_malformed(self) -> None:
+        assert _is_trusted_url_domain("") is False
+        assert _is_trusted_url_domain("not-a-url") is False
+        assert _is_trusted_url_domain("https://") is False
+
+    def test_trailing_dot_normalization(self) -> None:
+        assert _is_trusted_url_domain("https://github.com./repo") is True
+
+
+def test_manifest_scanner_userinfo_url_flagged(tmp_path: Path) -> None:
+    """URLs with userinfo should be flagged as untrusted even if hostname is trusted."""
+    test_file = tmp_path / "config.json"
+    config = {
+        "model_type": "bert",
+        "download": "https://evil.com@huggingface.co/model.bin",
+    }
+    test_file.write_text(json.dumps(config))
+
+    scanner = ManifestScanner()
+    result = scanner.scan(str(test_file))
+
+    failed_url_checks = [c for c in result.checks if c.name == "Untrusted URL Check" and c.status == CheckStatus.FAILED]
+    assert len(failed_url_checks) >= 1
+    detected_urls = {c.details.get("url", "") for c in failed_url_checks}
+    assert any("evil.com@huggingface.co" in u for u in detected_urls)
+
+
+def test_manifest_scanner_expanded_exact_domains_flagged(tmp_path: Path) -> None:
+    """Newly added exact-match domains should flag attacker subdomains."""
+    test_file = tmp_path / "config.json"
+    config = {
+        "model_type": "bert",
+        "docs": "https://evil.readthedocs.io/payload",
+        "cdn": "https://evil.fastly.net/payload",
+        "app": "https://evil.streamlit.io/payload",
+    }
+    test_file.write_text(json.dumps(config))
+
+    scanner = ManifestScanner()
+    result = scanner.scan(str(test_file))
+
+    failed_url_checks = [c for c in result.checks if c.name == "Untrusted URL Check" and c.status == CheckStatus.FAILED]
+    assert len(failed_url_checks) == 3
+    detected_urls = {c.details.get("url", "") for c in failed_url_checks}
+    assert "https://evil.readthedocs.io/payload" in detected_urls
+    assert "https://evil.fastly.net/payload" in detected_urls
+    assert "https://evil.streamlit.io/payload" in detected_urls
