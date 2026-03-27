@@ -938,6 +938,43 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
         finally:
             os.unlink(path)
 
+    def test_nested_pickle_detection_binbytes8_and_bytearray8(self) -> None:
+        """BINBYTES8/BYTEARRAY8 payloads should be scanned for nested pickles."""
+        inner_bytes = pickle.dumps({"ab": 1}, protocol=4)
+
+        for opcode_name, payload in (
+            ("BINBYTES8", b"\x80\x04\x8e" + struct.pack("<Q", len(inner_bytes)) + inner_bytes + b"."),
+            ("BYTEARRAY8", b"\x80\x05\x96" + struct.pack("<Q", len(inner_bytes)) + inner_bytes + b"."),
+        ):
+            with self.subTest(opcode_name=opcode_name):
+                result = self._scan_bytes(payload)
+
+                nested_checks = [
+                    check
+                    for check in result.checks
+                    if check.name == "Nested Pickle Detection" and check.status == CheckStatus.FAILED
+                ]
+                assert any(check.details.get("opcode") == opcode_name for check in nested_checks), (
+                    f"Expected nested pickle detection for {opcode_name}, got: "
+                    f"{[(c.name, c.status, c.details) for c in result.checks]}"
+                )
+
+    def test_non_pickle_binbytes8_and_bytearray8_do_not_trigger_nested_detection(self) -> None:
+        """Non-pickle BINBYTES8/BYTEARRAY8 payloads should not trigger nested pickle findings."""
+        benign_bytes = b"not a pickle payload"
+
+        for payload in (
+            b"\x80\x04\x8e" + struct.pack("<Q", len(benign_bytes)) + benign_bytes + b".",
+            b"\x80\x05\x96" + struct.pack("<Q", len(benign_bytes)) + benign_bytes + b".",
+        ):
+            with self.subTest(payload=payload[:3]):
+                result = self._scan_bytes(payload)
+
+                assert not any(
+                    check.name == "Nested Pickle Detection" and check.status == CheckStatus.FAILED
+                    for check in result.checks
+                ), f"Unexpected nested pickle detection: {[(c.name, c.status, c.details) for c in result.checks]}"
+
     def test_builtins_hasattr_is_critical(self) -> None:
         """builtins.hasattr must not be allowlisted as safe."""
         result = self._scan_bytes(self._craft_global_reduce_pickle("builtins", "hasattr"))

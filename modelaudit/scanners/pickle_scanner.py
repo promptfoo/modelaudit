@@ -5390,7 +5390,9 @@ class PickleScanner(BaseScanner):
                         )
 
                 # Detect nested pickle bytes
-                if opcode.name in ["BINBYTES", "SHORT_BINBYTES"] and isinstance(arg, bytes | bytearray):
+                if opcode.name in ["BINBYTES", "SHORT_BINBYTES", "BINBYTES8", "BYTEARRAY8"] and isinstance(
+                    arg, bytes | bytearray
+                ):
                     sample = bytes(arg[:1024])  # limit
                     if _looks_like_pickle(sample):
                         severity = _get_context_aware_severity(IssueSeverity.CRITICAL, ml_context)
