@@ -40,6 +40,32 @@ def create_mock_scan_result(bytes_scanned: int = 1024, with_critical_issue: bool
     return result
 
 
+def create_mock_location_scan_result(
+    resolved_path: Path,
+    *,
+    issue_suffix: str = ":payload",
+    check_suffix: str = " (weights)",
+) -> ScanResult:
+    """Create a mock result whose locations are anchored to the resolved target."""
+    result = ScanResult(scanner_name="test_scanner")
+    result.bytes_scanned = 128
+    result.add_check(
+        name="Suspicious Payload",
+        passed=False,
+        message="Detected malicious behavior",
+        severity=IssueSeverity.CRITICAL,
+        location=f"{resolved_path}{issue_suffix}",
+    )
+    result.add_check(
+        name="Layout Inspection",
+        passed=True,
+        message="Model structure inspected",
+        location=f"{resolved_path}{check_suffix}",
+    )
+    result.finish(success=True)
+    return result
+
+
 def test_scan_model_directory_or_file_streaming_path() -> None:
     """Ensure stream:// paths route to streaming analysis."""
     stream_url = "s3://bucket/model.pkl"
@@ -162,6 +188,91 @@ def test_scan_model_streaming_hf_cache_symlink_allowed(
     path_traversal_issues = [i for i in result.issues if "path traversal" in i.message.lower()]
     assert result.files_scanned == 1
     assert len(path_traversal_issues) == 0
+
+
+def test_scan_model_streaming_symlink_reports_source_path_consistently(
+    tmp_path: Path,
+    requires_symlinks: None,
+) -> None:
+    """Streaming scans should report source paths even when scanning a resolved symlink target."""
+    base_dir = tmp_path / "base"
+    nested_dir = base_dir / "nested"
+    nested_dir.mkdir(parents=True)
+
+    resolved_target = nested_dir / "model.pkl"
+    with resolved_target.open("wb") as f:
+        pickle.dump({"data": "safe"}, f)
+
+    source_link = base_dir / "link.pkl"
+    source_link.symlink_to(resolved_target.relative_to(source_link.parent))
+
+    with patch("modelaudit.core.scan_file") as mock_scan:
+        mock_scan.return_value = create_mock_location_scan_result(resolved_target)
+
+        result = scan_model_streaming(
+            file_generator=iter([(source_link, True)]),
+            timeout=30,
+            delete_after_scan=False,
+            scan_root=str(base_dir),
+            cache_enabled=False,
+        )
+
+    assert mock_scan.call_args[0][0] == str(resolved_target)
+    assert result.files_scanned == 1
+    assert result.assets[0].path == str(source_link)
+    assert result.assets[0].size == resolved_target.stat().st_size
+
+    metadata = result.file_metadata[str(source_link)].model_dump()
+    assert metadata["source_path"] == str(source_link)
+    assert metadata["resolved_path"] == str(resolved_target)
+
+    assert result.issues[0].location == f"{source_link}:payload"
+    check_locations = {check.name: check.location for check in result.checks}
+    assert check_locations["Suspicious Payload"] == f"{source_link}:payload"
+    assert check_locations["Layout Inspection"] == f"{source_link} (weights)"
+
+
+def test_scan_model_streaming_hf_cache_symlink_reports_snapshot_path(
+    tmp_path: Path,
+    requires_symlinks: None,
+) -> None:
+    """HuggingFace cache symlinks should keep snapshot paths in streamed results."""
+    cache_dir = tmp_path / ".cache" / "huggingface" / "hub" / "models--test-model"
+    snapshots_dir = cache_dir / "snapshots" / "abc123"
+    blobs_dir = cache_dir / "blobs"
+    snapshots_dir.mkdir(parents=True)
+    blobs_dir.mkdir(parents=True)
+
+    blob_path = blobs_dir / "blob123"
+    with blob_path.open("wb") as f:
+        pickle.dump({"data": "safe"}, f)
+
+    model_link = snapshots_dir / "model.pkl"
+    os.symlink(os.path.relpath(blob_path, model_link.parent), model_link)
+
+    with patch("modelaudit.core.scan_file") as mock_scan:
+        mock_scan.return_value = create_mock_location_scan_result(blob_path, issue_suffix="", check_suffix=":tensor")
+
+        result = scan_model_streaming(
+            file_generator=iterate_files_streaming(snapshots_dir),
+            timeout=30,
+            delete_after_scan=False,
+            scan_root=str(snapshots_dir),
+            cache_enabled=False,
+        )
+
+    assert mock_scan.call_args[0][0] == str(blob_path)
+    assert result.files_scanned == 1
+    assert result.assets[0].path == str(model_link)
+
+    metadata = result.file_metadata[str(model_link)].model_dump()
+    assert metadata["source_path"] == str(model_link)
+    assert metadata["resolved_path"] == str(blob_path)
+
+    assert result.issues[0].location == str(model_link)
+    check_locations = {check.name: check.location for check in result.checks}
+    assert check_locations["Suspicious Payload"] == str(model_link)
+    assert check_locations["Layout Inspection"] == f"{model_link}:tensor"
 
 
 def test_scan_model_streaming_with_deletion(temp_test_files):
