@@ -12,15 +12,15 @@ This document governs how new dependencies are added to ModelAudit.
 
 ### Approved Exceptions
 
-| Package         | License      | Rationale                                                                  |
-| --------------- | ------------ | -------------------------------------------------------------------------- |
-| inflate64       | LGPL-2.1+    | Required transitive dependency of explicit `sevenzip` support              |
-| multivolumefile | LGPL-2.1+    | Required transitive dependency of explicit `sevenzip` support              |
-| py7zr           | LGPL-2.1+    | Optional `sevenzip` extra; explicitly user-initiated install               |
-| pybcj           | LGPL-2.1+    | Required transitive dependency of explicit `sevenzip` support              |
-| pyppmd          | LGPL-2.1+    | Required transitive dependency of explicit `sevenzip` support              |
-| nvidia-\*       | NVIDIA EULA  | Transitive deps of PyTorch CUDA; redistributable under NVIDIA's EULA       |
-| tensorrt        | NVIDIA Prop. | Optional `tensorrt` extra; Linux/Windows only; user-initiated install      |
+| Package         | License      | Rationale                                                             |
+| --------------- | ------------ | --------------------------------------------------------------------- |
+| inflate64       | LGPL-2.1+    | Required transitive dependency of explicit `sevenzip` support         |
+| multivolumefile | LGPL-2.1+    | Required transitive dependency of explicit `sevenzip` support         |
+| py7zr           | LGPL-2.1+    | Optional `sevenzip` extra; explicitly user-initiated install          |
+| pybcj           | LGPL-2.1+    | Required transitive dependency of explicit `sevenzip` support         |
+| pyppmd          | LGPL-2.1+    | Required transitive dependency of explicit `sevenzip` support         |
+| nvidia-\*       | NVIDIA EULA  | Transitive deps of PyTorch CUDA; redistributable under NVIDIA's EULA  |
+| tensorrt        | NVIDIA Prop. | Optional `tensorrt` extra; Linux/Windows only; user-initiated install |
 
 Exceptions are enforced in CI via `APPROVED_LGPL_PACKAGES` and `NVIDIA_PREFIXES` in
 `.github/workflows/test.yml`. Any new LGPL or proprietary dependency requires a PR
