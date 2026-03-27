@@ -31,7 +31,7 @@ from .integrations.jfrog import scan_jfrog_artifact
 from .integrations.sarif_formatter import format_sarif_output
 from .models import ModelAuditResultModel
 from .rules import Rule, RuleRegistry, Severity
-from .scanners.base import IssueSeverity
+from .scanners.base import IssueSeverity, make_trusted_source_provenance
 from .telemetry import (
     flush_telemetry,
     record_command_used,
@@ -1179,6 +1179,12 @@ def scan_command(
                         record_download_started("huggingface", path)
                         record_feature_used("huggingface_download", cache_enabled=final_cache)
                         download_start = time.time()
+                        trusted_source_provenance = None
+                        if source_model_id and source_model_source == "huggingface":
+                            trusted_source_provenance = make_trusted_source_provenance(
+                                source_model_id,
+                                source_model_source,
+                            )
 
                         # Choose between streaming and normal download mode
                         if final_scan_and_delete:
@@ -1197,12 +1203,14 @@ def scan_command(
                             )
 
                             # Scan with streaming mode - propagate all config
+                            streaming_kwargs: dict[str, Any] = {}
+                            if trusted_source_provenance is not None:
+                                streaming_kwargs["_trusted_source_provenance"] = trusted_source_provenance
+
                             streaming_result = scan_model_streaming(
                                 file_generator=file_generator,
                                 timeout=final_timeout,
                                 delete_after_scan=True,  # Always delete in streaming mode
-                                _source_model_id=source_model_id,
-                                _source_model_source=source_model_source,
                                 blacklist_patterns=list(blacklist) if blacklist else None,
                                 max_file_size=final_max_file_size,
                                 max_total_size=final_max_total_size,
@@ -1210,6 +1218,7 @@ def scan_command(
                                 skip_file_types=final_skip_files,
                                 cache_enabled=final_cache,
                                 cache_dir=final_cache_dir,
+                                **streaming_kwargs,
                             )
 
                             # Merge streaming results into audit_result
@@ -1823,8 +1832,10 @@ def scan_command(
                         "cache_dir": final_cache_dir,
                     }
                     if source_model_id and source_model_source == "huggingface":
-                        config_overrides["_source_model_id"] = source_model_id
-                        config_overrides["_source_model_source"] = source_model_source
+                        config_overrides["_trusted_source_provenance"] = make_trusted_source_provenance(
+                            source_model_id,
+                            source_model_source,
+                        )
 
                     # Record feature usage for large model support (based on automatic defaults)
                     # Note: DO NOT send actual path - only track that the feature was used

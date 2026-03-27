@@ -3,7 +3,14 @@ from pathlib import Path
 from typing import ClassVar
 
 from modelaudit.analysis.unified_context import UnifiedMLContext
-from modelaudit.scanners.base import BaseScanner, CheckStatus, Issue, IssueSeverity, ScanResult
+from modelaudit.scanners.base import (
+    BaseScanner,
+    CheckStatus,
+    Issue,
+    IssueSeverity,
+    ScanResult,
+    make_trusted_source_provenance,
+)
 
 
 class MockScanner(BaseScanner):
@@ -564,8 +571,10 @@ def test_whitelist_downgrade_explicit_hf_provenance(tmp_path: Path) -> None:
 
     scanner = MockScanner(
         config={
-            "_source_model_id": whitelisted_model,
-            "_source_model_source": "huggingface",
+            "_trusted_source_provenance": make_trusted_source_provenance(
+                whitelisted_model,
+                "huggingface",
+            ),
         }
     )
     scanner._initialize_context(str(model_path))
@@ -581,6 +590,32 @@ def test_whitelist_downgrade_explicit_hf_provenance(tmp_path: Path) -> None:
     assert result.issues[0].severity == IssueSeverity.INFO
     assert result.issues[0].details.get("whitelist_downgrade") is True
     assert result.issues[0].details.get("original_severity") == "WARNING"
+
+
+def test_whitelist_ignores_raw_config_provenance_override(tmp_path: Path) -> None:
+    """Raw string config overrides must not be enough to trigger downgrades."""
+    whitelisted_model = "Qwen/Qwen2.5-0.5B"
+    model_path = tmp_path / "plain-model.test"
+    model_path.write_bytes(b"test")
+
+    scanner = MockScanner(
+        config={
+            "_source_model_id": whitelisted_model,
+            "_source_model_source": "huggingface",
+        }
+    )
+    scanner._initialize_context(str(model_path))
+
+    assert scanner.context is not None
+    assert scanner.context.model_id is None
+    assert scanner.context.model_source is None
+
+    result = scanner._create_result()
+    result._add_issue("Test warning", severity=IssueSeverity.WARNING)
+
+    assert len(result.issues) == 1
+    assert result.issues[0].severity == IssueSeverity.WARNING
+    assert result.issues[0].details.get("whitelist_downgrade") is None
 
 
 def test_whitelist_no_downgrade_spoofed_hf_cache_layout(tmp_path: Path) -> None:

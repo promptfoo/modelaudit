@@ -6,8 +6,9 @@ import os
 # Progress tracking imports with circular dependency detection
 import time
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from enum import Enum
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Final
 
 from pydantic import BaseModel, ConfigDict, Field, field_serializer
 
@@ -34,6 +35,25 @@ except (ImportError, RecursionError):
 logger = logging.getLogger("modelaudit.scanners")
 
 TRUSTED_HUGGINGFACE_SOURCES = frozenset({"huggingface"})
+_TRUSTED_SOURCE_PROVENANCE_TOKEN: Final[object] = object()
+
+
+@dataclass(frozen=True)
+class _TrustedSourceProvenance:
+    """Internal marker for source provenance derived by trusted call sites."""
+
+    model_id: str
+    model_source: str
+    token: object
+
+
+def make_trusted_source_provenance(model_id: str, model_source: str) -> object:
+    """Create an internal provenance marker for trusted remote downloads."""
+    return _TrustedSourceProvenance(
+        model_id=model_id,
+        model_source=model_source,
+        token=_TRUSTED_SOURCE_PROVENANCE_TOKEN,
+    )
 
 
 class IssueSeverity(Enum):
@@ -534,14 +554,18 @@ class BaseScanner(ABC):
         file_size = self.get_file_size(path)
         file_type = path_obj.suffix.lower()
 
-        # Preserve explicit remote provenance when the caller already resolved a
-        # downloaded artifact to a local path. Fall back to path-based inference.
-        config_model_id = self.config.get("_source_model_id")
-        config_model_source = self.config.get("_source_model_source")
         model_id: str | None
         model_source: str | None
-        if isinstance(config_model_id, str) and isinstance(config_model_source, str):
-            model_id, model_source = config_model_id, config_model_source
+        trusted_provenance = self.config.get("_trusted_source_provenance")
+        if (
+            isinstance(trusted_provenance, _TrustedSourceProvenance)
+            and trusted_provenance.token is _TRUSTED_SOURCE_PROVENANCE_TOKEN
+            and trusted_provenance.model_source in TRUSTED_HUGGINGFACE_SOURCES
+        ):
+            # Preserve explicit remote provenance when a trusted caller already
+            # resolved a downloaded artifact to a local path.
+            model_id = trusted_provenance.model_id
+            model_source = trusted_provenance.model_source
         else:
             model_id, model_source = extract_model_id_from_path(path)
 
