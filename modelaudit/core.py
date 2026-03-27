@@ -1165,9 +1165,6 @@ def _is_huggingface_cache_file(path: str) -> bool:
             if relative_parts and relative_parts[0] in {"snapshots", "blobs", "refs"}:
                 return True
 
-            if any((hf_cache_root / cache_part).exists() for cache_part in ("snapshots", "blobs", "refs")):
-                return True
-
         normalized_parts = [part.lower() for part in path_obj.parent.parts]
         if len(normalized_parts) >= 3 and normalized_parts[-3:] == [".cache", "huggingface", "download"]:
             return True

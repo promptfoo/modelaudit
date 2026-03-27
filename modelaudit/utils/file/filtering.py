@@ -104,7 +104,6 @@ DEFAULT_SCANNABLE_SKIP_OVERRIDES = {
     ".bz2",
     ".xz",
     ".7z",
-    ".metadata",
 }
 
 

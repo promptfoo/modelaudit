@@ -174,6 +174,20 @@ class TestDirectoryFileFiltering:
         assert _is_huggingface_cache_file(str(hf_cache_metadata)) is True
         assert _is_huggingface_cache_file(str(hf_download_metadata)) is True
 
+    def test_hf_cache_layout_spoofing_does_not_suppress_metadata_scan(self, tmp_path: Path) -> None:
+        """An attacker-crafted HF cache layout must not suppress scanning of .metadata files."""
+        # Attacker creates a directory structure mimicking HF cache:
+        #   hub/models--attacker--backdoor/snapshots/  (empty directory)
+        #   hub/models--attacker--backdoor/malicious.metadata
+        spoofed_root = tmp_path / "hub" / "models--attacker--backdoor"
+        (spoofed_root / "snapshots").mkdir(parents=True)
+        malicious_metadata = spoofed_root / "malicious.metadata"
+        malicious_metadata.write_text('{"exploit": true}')
+
+        # The .metadata file is NOT inside snapshots/blobs/refs, so it should NOT
+        # be treated as HuggingFace bookkeeping even though a sibling snapshots/ exists.
+        assert _is_huggingface_cache_file(str(malicious_metadata)) is False
+
     def test_performance_with_many_files(self):
         """Test that file filtering improves performance with many non-model files."""
         with tempfile.TemporaryDirectory() as tmp_dir:
