@@ -182,10 +182,12 @@ def should_skip_file(
     if ext in skip_extensions:
         return True
 
-    # Skip hidden files (starting with .) except for specific model extensions
+    # Preserve hidden DVC pointers so directory scans can expand them before
+    # applying normal scanner selection to their targets.
     if (
         skip_hidden
         and filename.startswith(".")
+        and ext != ".dvc"
         and not any(candidate in scannable_extensions for candidate in candidate_extensions)
     ):
         return True

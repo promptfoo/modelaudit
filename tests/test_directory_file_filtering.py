@@ -5,6 +5,7 @@ import gzip
 import lzma
 import tarfile
 import tempfile
+import zipfile
 from pathlib import Path
 
 from modelaudit.core import _is_huggingface_cache_file, scan_model_directory_or_file
@@ -150,6 +151,21 @@ class TestDirectoryFileFiltering:
         assert "archive.bz2" in asset_names
         assert "archive.xz" in asset_names
         assert "archive.7z" in asset_names
+
+    def test_hidden_dvc_pointer_expands_hidden_artifact(self, tmp_path: Path) -> None:
+        """Hidden DVC pointers should survive prefiltering so their targets are scanned."""
+        hidden_archive = tmp_path / ".artifact"
+        with zipfile.ZipFile(hidden_archive, "w") as archive:
+            archive.writestr("weights.bin", b"payload")
+
+        hidden_pointer = tmp_path / ".artifact.dvc"
+        hidden_pointer.write_text("outs:\n- path: .artifact\n")
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        asset_names = {Path(asset.path).name for asset in results.assets}
+        assert asset_names == {".artifact"}
 
     def test_only_huggingface_bookkeeping_metadata_is_skipped(self, tmp_path: Path) -> None:
         """Local .metadata files should be scanned unless they are in HuggingFace cache layouts."""
