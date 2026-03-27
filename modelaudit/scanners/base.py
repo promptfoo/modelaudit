@@ -33,7 +33,7 @@ except (ImportError, RecursionError):
 # Configure logging
 logger = logging.getLogger("modelaudit.scanners")
 
-TRUSTED_HUGGINGFACE_SOURCES = frozenset({"huggingface", "huggingface_cache"})
+TRUSTED_HUGGINGFACE_SOURCES = frozenset({"huggingface"})
 
 
 class IssueSeverity(Enum):
@@ -534,8 +534,16 @@ class BaseScanner(ABC):
         file_size = self.get_file_size(path)
         file_type = path_obj.suffix.lower()
 
-        # Extract model ID if this is from HuggingFace or contains metadata
-        model_id, model_source = extract_model_id_from_path(path)
+        # Preserve explicit remote provenance when the caller already resolved a
+        # downloaded artifact to a local path. Fall back to path-based inference.
+        config_model_id = self.config.get("_source_model_id")
+        config_model_source = self.config.get("_source_model_source")
+        model_id: str | None
+        model_source: str | None
+        if isinstance(config_model_id, str) and isinstance(config_model_source, str):
+            model_id, model_source = config_model_id, config_model_source
+        else:
+            model_id, model_source = extract_model_id_from_path(path)
 
         self.context = UnifiedMLContext(
             file_path=path_obj,

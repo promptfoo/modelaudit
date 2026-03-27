@@ -537,8 +537,8 @@ def test_whitelist_no_downgrade_local_spoofed_config(tmp_path: Path) -> None:
     assert result.issues[0].details.get("whitelist_downgrade") is None
 
 
-def test_whitelist_downgrade_hf_cache_path(tmp_path: Path) -> None:
-    """Validated HuggingFace cache paths should receive whitelist downgrades."""
+def test_whitelist_no_downgrade_hf_cache_path_without_explicit_provenance(tmp_path: Path) -> None:
+    """Cache-shaped local paths alone should not qualify for whitelist downgrades."""
     whitelisted_model = "Qwen/Qwen2.5-0.5B"
     model_path = _create_hf_cache_model_path(tmp_path, whitelisted_model)
 
@@ -548,6 +548,31 @@ def test_whitelist_downgrade_hf_cache_path(tmp_path: Path) -> None:
     assert scanner.context is not None
     assert scanner.context.model_id == whitelisted_model
     assert scanner.context.model_source == "huggingface_cache"
+
+    result = scanner._create_result()
+    result._add_issue("Test warning", severity=IssueSeverity.WARNING)
+
+    assert len(result.issues) == 1
+    assert result.issues[0].severity == IssueSeverity.WARNING
+    assert result.issues[0].details.get("whitelist_downgrade") is None
+
+
+def test_whitelist_downgrade_explicit_hf_provenance(tmp_path: Path) -> None:
+    """Explicit upstream HuggingFace provenance should still permit downgrades."""
+    whitelisted_model = "Qwen/Qwen2.5-0.5B"
+    model_path = _create_hf_cache_model_path(tmp_path, whitelisted_model)
+
+    scanner = MockScanner(
+        config={
+            "_source_model_id": whitelisted_model,
+            "_source_model_source": "huggingface",
+        }
+    )
+    scanner._initialize_context(str(model_path))
+
+    assert scanner.context is not None
+    assert scanner.context.model_id == whitelisted_model
+    assert scanner.context.model_source == "huggingface"
 
     result = scanner._create_result()
     result._add_issue("Test warning", severity=IssueSeverity.WARNING)

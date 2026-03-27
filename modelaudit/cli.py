@@ -54,6 +54,7 @@ from .utils.sources.cloud_storage import download_from_cloud, is_cloud_url
 from .utils.sources.huggingface import (
     download_file_from_hf,
     download_model,
+    extract_model_id_from_path,
     is_huggingface_file_url,
     is_huggingface_url,
 )
@@ -1069,6 +1070,8 @@ def scan_command(
             actual_path = path
             should_break = False
             url_handled = False  # Track if we handled a URL download
+            source_model_id: str | None = None
+            source_model_source: str | None = None
 
             try:
                 # Check if this is a direct HuggingFace file URL
@@ -1102,6 +1105,7 @@ def scan_command(
                         # Download single file
                         download_path = download_file_from_hf(path, cache_dir=hf_cache_dir)
                         actual_path = str(download_path)
+                        source_model_id, source_model_source = extract_model_id_from_path(path)
                         # Only track for cleanup if we created an ephemeral cache above
                         temp_dir = str(hf_cache_dir) if not final_cache else None
 
@@ -1162,6 +1166,7 @@ def scan_command(
                             pass
 
                     try:
+                        source_model_id, source_model_source = extract_model_id_from_path(path)
                         # Convert cache_dir string to Path if provided
                         hf_cache_dir = None
                         if final_cache and final_cache_dir:
@@ -1196,6 +1201,8 @@ def scan_command(
                                 file_generator=file_generator,
                                 timeout=final_timeout,
                                 delete_after_scan=True,  # Always delete in streaming mode
+                                _source_model_id=source_model_id,
+                                _source_model_source=source_model_source,
                                 blacklist_patterns=list(blacklist) if blacklist else None,
                                 max_file_size=final_max_file_size,
                                 max_total_size=final_max_total_size,
@@ -1815,6 +1822,9 @@ def scan_command(
                         "cache_enabled": final_cache,
                         "cache_dir": final_cache_dir,
                     }
+                    if source_model_id and source_model_source == "huggingface":
+                        config_overrides["_source_model_id"] = source_model_id
+                        config_overrides["_source_model_source"] = source_model_source
 
                     # Record feature usage for large model support (based on automatic defaults)
                     # Note: DO NOT send actual path - only track that the feature was used
