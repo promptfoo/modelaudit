@@ -110,6 +110,39 @@ class TestMetadataScanner:
 
         assert len(result.issues) == 0
 
+    def test_scan_detects_suspicious_domains_hidden_in_userinfo(self, tmp_path: Path) -> None:
+        """Shorteners and tunnel domains in userinfo should still be flagged."""
+        scanner = MetadataScanner()
+        readme_path = tmp_path / "README.md"
+        readme_path.write_text(
+            "# Model Info\n\n"
+            "- Shortener bait: https://bit.ly@github.com/download\n"
+            "- Tunnel bait: https://localtunnel.me:token@huggingface.co/proxy\n"
+            "- Docs: https://example.com/model-card\n"
+        )
+
+        result = scanner.scan(str(readme_path))
+
+        assert len(result.issues) == 2
+        flagged = {
+            (issue.details.get("suspicious_domain"), issue.details.get("url_component")) for issue in result.issues
+        }
+        assert flagged == {("bit.ly", "userinfo"), ("localtunnel.me", "userinfo")}
+        flagged_urls = {issue.details.get("url") for issue in result.issues}
+        assert "https://bit.ly@github.com/download" in flagged_urls
+        assert "https://localtunnel.me:token@huggingface.co/proxy" in flagged_urls
+        assert "https://example.com/model-card" not in flagged_urls
+
+    def test_scan_ignores_non_suspicious_authenticated_url(self, tmp_path: Path) -> None:
+        """Authenticated URLs without suspicious domains should stay quiet."""
+        scanner = MetadataScanner()
+        readme_path = tmp_path / "README.md"
+        readme_path.write_text("Download: https://user:token@example.com/private-model\n")
+
+        result = scanner.scan(str(readme_path))
+
+        assert len(result.issues) == 0
+
     def test_scan_exposed_secrets_in_readme(self):
         """Test detection of exposed secrets in README."""
         scanner = MetadataScanner()
