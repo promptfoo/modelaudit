@@ -931,6 +931,84 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
         finally:
             os.unlink(path)
 
+    def test_nested_pickle_detection_binbytes8_and_bytearray8(self) -> None:
+        """BINBYTES8/BYTEARRAY8 payloads should be scanned for nested pickles."""
+        inner_bytes = pickle.dumps({"ab": 1}, protocol=4)
+
+        for opcode_name, payload in (
+            ("BINBYTES8", b"\x80\x04\x8e" + struct.pack("<Q", len(inner_bytes)) + inner_bytes + b"."),
+            ("BYTEARRAY8", b"\x80\x05\x96" + struct.pack("<Q", len(inner_bytes)) + inner_bytes + b"."),
+        ):
+            with self.subTest(opcode_name=opcode_name):
+                result = self._scan_bytes(payload)
+
+                nested_checks = [
+                    check
+                    for check in result.checks
+                    if check.name == "Nested Pickle Detection" and check.status == CheckStatus.FAILED
+                ]
+                assert any(check.details.get("opcode") == opcode_name for check in nested_checks), (
+                    f"Expected nested pickle detection for {opcode_name}, got: "
+                    f"{[(c.name, c.status, c.details) for c in result.checks]}"
+                )
+
+    def test_non_pickle_binbytes8_and_bytearray8_do_not_trigger_nested_detection(self) -> None:
+        """Non-pickle BINBYTES8/BYTEARRAY8 payloads should not trigger nested pickle findings."""
+        benign_bytes = b"not a pickle payload"
+
+        for payload in (
+            b"\x80\x04\x8e" + struct.pack("<Q", len(benign_bytes)) + benign_bytes + b".",
+            b"\x80\x05\x96" + struct.pack("<Q", len(benign_bytes)) + benign_bytes + b".",
+        ):
+            with self.subTest(payload=payload[:3]):
+                result = self._scan_bytes(payload)
+
+                assert not any(
+                    check.name == "Nested Pickle Detection" and check.status == CheckStatus.FAILED
+                    for check in result.checks
+                ), f"Unexpected nested pickle detection: {[(c.name, c.status, c.details) for c in result.checks]}"
+
+    def test_nested_pickle_detection_binstring_legacy(self) -> None:
+        """BINSTRING/SHORT_BINSTRING carry raw bytes as latin-1 strings; nested pickles must be detected."""
+        inner_bytes = pickle.dumps({"ab": 1}, protocol=2)
+
+        # SHORT_BINSTRING: opcode 'U', 1-byte length, protocol 2
+        short_binstring_payload = b"\x80\x02U" + bytes([len(inner_bytes)]) + inner_bytes + b"."
+        result = self._scan_bytes(short_binstring_payload)
+        nested_checks = [
+            c for c in result.checks if c.name == "Nested Pickle Detection" and c.status == CheckStatus.FAILED
+        ]
+        assert any(c.details.get("opcode") == "SHORT_BINSTRING" for c in nested_checks), (
+            f"Expected nested pickle detection for SHORT_BINSTRING, got: "
+            f"{[(c.name, c.status, c.details) for c in result.checks]}"
+        )
+
+        # BINSTRING: opcode 'T', 4-byte little-endian length, protocol 1
+        binstring_payload = b"\x80\x02T" + struct.pack("<i", len(inner_bytes)) + inner_bytes + b"."
+        result = self._scan_bytes(binstring_payload)
+        nested_checks = [
+            c for c in result.checks if c.name == "Nested Pickle Detection" and c.status == CheckStatus.FAILED
+        ]
+        assert any(c.details.get("opcode") == "BINSTRING" for c in nested_checks), (
+            f"Expected nested pickle detection for BINSTRING, got: "
+            f"{[(c.name, c.status, c.details) for c in result.checks]}"
+        )
+
+    def test_non_pickle_binstring_does_not_trigger_nested_detection(self) -> None:
+        """Non-pickle BINSTRING/SHORT_BINSTRING payloads should not trigger nested pickle findings."""
+        benign = b"just a plain string"
+
+        for opcode, length in (
+            (b"U", bytes([len(benign)])),
+            (b"T", struct.pack("<i", len(benign))),
+        ):
+            with self.subTest(opcode=opcode):
+                payload = b"\x80\x02" + opcode + length + benign + b"."
+                result = self._scan_bytes(payload)
+                assert not any(
+                    c.name == "Nested Pickle Detection" and c.status == CheckStatus.FAILED for c in result.checks
+                ), f"Unexpected nested pickle detection: {[(c.name, c.status, c.details) for c in result.checks]}"
+
     def test_builtins_hasattr_is_critical(self) -> None:
         """builtins.hasattr must not be allowlisted as safe."""
         result = self._scan_bytes(self._craft_global_reduce_pickle("builtins", "hasattr"))
@@ -3476,11 +3554,13 @@ class TestPickleImportOnlyGlobalFindings:
             callable_origin_refs,
             callable_origin_is_ext,
             malformed_stack_globals,
+            mutation_target_refs,
         ) = _simulate_symbolic_reference_maps(opcodes)
 
         assert callable_refs[2] == ("collections", "OrderedDict")
         assert callable_origin_refs[2] == 2
         assert callable_origin_is_ext == {}
+        assert mutation_target_refs == {}
         assert 5 not in stack_global_refs
         assert malformed_stack_globals[5]["reason"] == "insufficient_context"
 
@@ -3501,6 +3581,7 @@ class TestPickleImportOnlyGlobalFindings:
             callable_origin_refs,
             callable_origin_is_ext,
             malformed_stack_globals,
+            mutation_target_refs,
         ) = _simulate_symbolic_reference_maps(opcodes)
 
         assert stack_global_refs[6] == ("evilpkg", "thing")
@@ -3508,6 +3589,7 @@ class TestPickleImportOnlyGlobalFindings:
         assert callable_origin_refs == {}
         assert callable_origin_is_ext == {}
         assert malformed_stack_globals == {}
+        assert mutation_target_refs == {}
 
 
 @pytest.mark.parametrize(

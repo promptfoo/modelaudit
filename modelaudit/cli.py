@@ -1783,6 +1783,7 @@ def scan_command(
                             file_generator=file_generator,
                             timeout=final_timeout,
                             delete_after_scan=False,
+                            scan_root=actual_path,
                             progress_callback=progress_callback,
                             blacklist_patterns=list(blacklist) if blacklist else None,
                             max_file_size=final_max_file_size,
