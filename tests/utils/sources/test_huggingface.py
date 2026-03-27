@@ -9,6 +9,7 @@ import pytest
 from modelaudit.utils.sources.huggingface import (
     download_file_from_hf,
     download_model,
+    extract_model_id_from_path,
     get_model_info,
     get_model_size,
     is_huggingface_file_url,
@@ -95,6 +96,45 @@ class TestHuggingFaceURLParsing:
         for url in invalid_urls:
             with pytest.raises(ValueError):
                 parse_huggingface_url(url)
+
+
+class TestExtractModelIdFromPath:
+    """Test HuggingFace model ID extraction from local paths."""
+
+    def test_extract_model_id_from_local_config(self, tmp_path: Path) -> None:
+        """Local config metadata should still be extracted as local provenance."""
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        model_path = model_dir / "weights.bin"
+        model_path.write_bytes(b"weights")
+        (model_dir / "config.json").write_text('{"_name_or_path": "Qwen/Qwen2.5-0.5B"}')
+
+        assert extract_model_id_from_path(str(model_path)) == ("Qwen/Qwen2.5-0.5B", "local")
+
+    def test_extract_model_id_from_hf_cache_path(self, tmp_path: Path) -> None:
+        """Local HuggingFace cache paths should use distinct cache provenance."""
+        model_path = (
+            tmp_path
+            / ".cache"
+            / "huggingface"
+            / "hub"
+            / "models--Qwen--Qwen2.5-0.5B"
+            / "snapshots"
+            / "abc123"
+            / "weights.bin"
+        )
+        model_path.parent.mkdir(parents=True)
+        model_path.write_bytes(b"weights")
+
+        assert extract_model_id_from_path(str(model_path)) == ("Qwen/Qwen2.5-0.5B", "huggingface_cache")
+
+    def test_extract_model_id_rejects_spoofed_models_directory(self, tmp_path: Path) -> None:
+        """A local models--* directory without HF cache layout should not be treated as HuggingFace."""
+        model_path = tmp_path / "models--Qwen--Qwen2.5-0.5B" / "weights.bin"
+        model_path.parent.mkdir(parents=True)
+        model_path.write_bytes(b"weights")
+
+        assert extract_model_id_from_path(str(model_path)) == (None, None)
 
 
 class TestModelDownload:
