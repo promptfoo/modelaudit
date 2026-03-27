@@ -1,6 +1,8 @@
 """Utilities for handling HuggingFace model downloads."""
 
+import concurrent.futures
 import json
+import logging
 import re
 from collections.abc import Iterator
 from pathlib import Path
@@ -8,6 +10,8 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 
 from ..helpers.disk_space import check_disk_space
+
+logger = logging.getLogger(__name__)
 
 
 def _get_model_extensions() -> set[str]:
@@ -20,6 +24,41 @@ def _get_model_extensions() -> set[str]:
     from ..model_extensions import get_model_extensions
 
     return get_model_extensions()
+
+
+def _build_extension_allow_patterns() -> list[str]:
+    """Build conservative glob patterns for scannable files."""
+    extensions = _get_model_extensions()
+    patterns = {f"*{ext}" for ext in extensions}
+    patterns.update(f"**/*{ext}" for ext in extensions)
+    return sorted(patterns)
+
+
+def _get_hf_cache_root() -> Path:
+    """Return the HuggingFace hub cache root."""
+    try:
+        from huggingface_hub.constants import HF_HUB_CACHE
+
+        return Path(HF_HUB_CACHE)
+    except Exception:
+        return Path.home() / ".cache" / "huggingface" / "hub"
+
+
+def _list_repo_files_with_timeout(repo_id: str, timeout_seconds: int = 30) -> tuple[list[str] | None, str | None]:
+    """Return repository files or a failure reason if listing times out/errors."""
+    from huggingface_hub import list_repo_files
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(list_repo_files, repo_id)
+    try:
+        return future.result(timeout=timeout_seconds), None
+    except concurrent.futures.TimeoutError:
+        future.cancel()
+        return None, f"timed out after {timeout_seconds} seconds"
+    except Exception as exc:
+        return None, str(exc)
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def is_huggingface_url(url: str) -> bool:
@@ -230,6 +269,7 @@ def download_model(url: str, cache_dir: Path | None = None, show_progress: bool 
     # Disk space check and path setup
     model_size = get_model_size(repo_id)
     download_path = None  # Will be set only if cache_dir is provided
+    disk_check_path = None
 
     if cache_dir is not None:
         # Create a structured cache directory
@@ -237,6 +277,7 @@ def download_model(url: str, cache_dir: Path | None = None, show_progress: bool 
         if repo_name:
             download_path = download_path / repo_name
         download_path.mkdir(parents=True, exist_ok=True)
+        disk_check_path = download_path
 
         # Check if model already exists in cache
         if download_path.exists() and any(download_path.iterdir()):
@@ -251,21 +292,19 @@ def download_model(url: str, cache_dir: Path | None = None, show_progress: bool 
             if any((download_path / f).exists() for f in expected_files):
                 return download_path
 
-        # Check available disk space when using custom cache directory
-        if model_size:
-            has_space, message = check_disk_space(download_path, model_size)
-            if not has_space:
-                raise Exception(f"Cannot download model from {url}: {message}")
     else:
-        # When no cache_dir is provided, let HuggingFace handle caching
-        # We skip disk space checks as we don't control where HF stores its cache
-        pass
+        disk_check_path = _get_hf_cache_root()
+        disk_check_path.mkdir(parents=True, exist_ok=True)
+
+    if model_size and disk_check_path is not None:
+        has_space, message = check_disk_space(disk_check_path, model_size)
+        if not has_space:
+            raise Exception(f"Cannot download model from {url}: {message}")
 
     try:
         # Configure progress display based on environment
         import os
 
-        from huggingface_hub import list_repo_files
         from huggingface_hub.utils import disable_progress_bars, enable_progress_bars
 
         # Enable/disable progress bars based on parameter
@@ -277,23 +316,13 @@ def download_model(url: str, cache_dir: Path | None = None, show_progress: bool 
             os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "0"
 
         # List files in the repository to identify model files
-        # Skip for large repos to avoid hanging - download all files instead
-        try:
-            # Add a timeout-like behavior by catching all exceptions
-            # If this fails or hangs, we'll download everything (safer fallback)
-            import concurrent.futures
-
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                future = executor.submit(list_repo_files, repo_id)
-                try:
-                    # Wait up to 30 seconds for file listing
-                    repo_files = future.result(timeout=30)
-                except concurrent.futures.TimeoutError:
-                    # File listing took too long - skip it and download everything
-                    repo_files = []
-        except Exception:
-            # Any error - just download everything
+        repo_files, repo_listing_error = _list_repo_files_with_timeout(repo_id)
+        if repo_files is None:
+            repo_listing_failed = True
+            logger.debug("Hugging Face repo listing failed for %s: %s", repo_id, repo_listing_error)
             repo_files = []
+        else:
+            repo_listing_failed = False
 
         # Find model files in the repository (using centralized model extensions)
         model_extensions = _get_model_extensions()
@@ -319,6 +348,15 @@ def download_model(url: str, cache_dir: Path | None = None, show_progress: bool 
         # If we found specific model files, download them
         if model_files:
             download_kwargs["allow_patterns"] = model_files
+        elif repo_listing_failed:
+            extension_allow_patterns = _build_extension_allow_patterns()
+            if not extension_allow_patterns:
+                raise Exception(
+                    f"Refusing to download full snapshot for {repo_id}: no selective allowlist patterns available"
+                )
+            download_kwargs["allow_patterns"] = extension_allow_patterns
+
+        if "allow_patterns" in download_kwargs:
             local_path = snapshot_download(**download_kwargs)  # type: ignore[call-arg]
         else:
             # Fallback: download everything if no model files identified
