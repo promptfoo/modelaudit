@@ -1982,8 +1982,9 @@ def _is_plausible_python_module(name: str) -> bool:
 
     Legitimate module names follow Python identifier rules:
     - Each dotted segment is an ASCII Python identifier.
-    - Segments normally contain lowercase characters, with a short explicit
-      allowlist for case-sensitive imports such as ``PIL``.
+    - Segments normally contain lowercase characters, may be all-uppercase
+      ASCII names, or appear in a short explicit allowlist for case-sensitive
+      imports such as ``PIL``.
 
     Keep obviously malformed names rejected so arbitrary data strings are less
     likely to be treated as imports, while still allowing valid mixed-case
@@ -2004,7 +2005,12 @@ def _is_plausible_python_module(name: str) -> bool:
     if not segments or any(s == "" or not s.isascii() or not s.isidentifier() for s in segments):
         return False
 
-    return all(any(char.islower() for char in seg) or seg in _CASE_SENSITIVE_IMPORT_SEGMENTS for seg in segments)
+    return all(
+        any(char.islower() for char in seg)
+        or seg in _CASE_SENSITIVE_IMPORT_SEGMENTS
+        or (seg.isupper() and seg.isalpha())
+        for seg in segments
+    )
 
 
 _CASE_SENSITIVE_IMPORT_SEGMENTS: frozenset[str] = frozenset({"PIL", "Cython"})

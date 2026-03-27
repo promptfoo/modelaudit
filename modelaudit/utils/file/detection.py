@@ -54,6 +54,7 @@ _LIGHTGBM_XGBOOST_JSON_MARKERS = ('"learner"', '"gradient_booster"', '"tree_para
 _GZIP_MAGIC = b"\x1f\x8b"
 _BZIP2_MAGIC = b"BZh"
 _XZ_MAGIC = b"\xfd7zXZ\x00"
+_SEVENZIP_MAGIC = b"7z\xbc\xaf\x27\x1c"
 _LZ4_FRAME_MAGIC = b"\x04\x22\x4d\x18"
 _TORCHSERVE_MANIFEST_PATH = "MAR-INF/MANIFEST.json"
 _TORCHSERVE_MANIFEST_MAX_BYTES = 1 * 1024 * 1024
@@ -411,6 +412,8 @@ def detect_format_from_magic_bytes(magic4: MagicBytes, magic8: MagicBytes, magic
 
     # Check longer magic sequences
     match magic8:
+        case magic if magic.startswith(_SEVENZIP_MAGIC):
+            return "sevenzip"
         case magic if magic == _CNTK_LEGACY_MAGIC:
             return "cntk"
         case b"\x89HDF\r\n\x1a\n":  # HDF5 magic
@@ -613,6 +616,8 @@ def detect_file_format(path: str) -> str:
         if compression_format == expected_codec:
             return "compressed"
         return "unknown"
+    if magic8.startswith(_SEVENZIP_MAGIC):
+        return "sevenzip"
     if _is_tar_archive(path):
         return "tar"
     # Check ZIP magic first (for .pt/.pth files that are actually zips)

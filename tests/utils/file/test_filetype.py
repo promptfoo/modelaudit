@@ -374,6 +374,17 @@ def test_detect_file_format_tar(tmp_path):
     assert detect_file_format(str(tar_path)) == "tar"
 
 
+def test_detect_file_format_sevenzip(tmp_path: Path) -> None:
+    """Detect 7z archives by signature and validate .7z extensions."""
+    sevenzip_path = tmp_path / "archive.7z"
+    sevenzip_path.write_bytes(b"7z\xbc\xaf\x27\x1c" + b"\x00" * 32)
+
+    assert detect_file_format_from_magic(str(sevenzip_path)) == "sevenzip"
+    assert detect_file_format(str(sevenzip_path)) == "sevenzip"
+    assert detect_format_from_extension(str(sevenzip_path)) == "sevenzip"
+    assert validate_file_type(str(sevenzip_path)) is True
+
+
 def test_detect_file_format_compressed_wrappers(tmp_path: Path) -> None:
     gzip_path = tmp_path / "model.pkl.gz"
     gzip_path.write_bytes(gzip.compress(b"pickle-payload"))

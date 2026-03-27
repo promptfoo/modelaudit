@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - harden pickle CVE-2026-24747 SETITEM detection against stack-neutral padding
 - count successful `stream://` scans in `files_scanned` so clean streaming scans return exit code 0 instead of 2
+- harden 7z nested archive scanning and pre-extraction size checks
 - scan follow-on pickle streams after large padding blocks
 - **security:** detect nested pickle payloads in BINBYTES8 and BYTEARRAY8 opcodes
 - reject local streaming symlink traversal outside the scan root
@@ -32,6 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - preserve validated PE detections in pickle binary ML-context filtering
 - **security:** fail closed on pickle opcode parse errors for `.pkl` / `.pickle` / `.joblib` / `.dill` files instead of returning a successful INFO-only scan
 - **security:** preserve full scanner execution for large files when scanners do not implement chunk analyzers
+- treat all-uppercase pickle module segments as plausible imports
 - recurse into extensionless nested ZIP members by content
 - **security:** bound embedded `.keras` weight extraction before temporary-file inspection to reduce zip-bomb denial-of-service risk
 - **security:** prevent ExecuTorch binary ZIP polyglots from bypassing archive scanning
@@ -259,6 +261,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - audit and refresh README, user docs, and maintainer guides ([#643](https://github.com/promptfoo/modelaudit/issues/643)) ([015acdc](https://github.com/promptfoo/modelaudit/commit/015acdcbecd86db9e5baeef8db34df4bda5bb81b))
 - rewrite SECURITY.md with comprehensive vulnerability policy ([#594](https://github.com/promptfoo/modelaudit/issues/594)) ([968a2c2](https://github.com/promptfoo/modelaudit/commit/968a2c2362a0e25862bece1ad5bb3fad4ad715fa))
 - update scanner architecture example ([#579](https://github.com/promptfoo/modelaudit/issues/579)) ([20de35d](https://github.com/promptfoo/modelaudit/commit/20de35db738c828f5a29b8904834ecf5ea50e5ae))
+
 ## [0.2.26](https://github.com/promptfoo/modelaudit/compare/v0.2.25...v0.2.26) (2026-02-24)
 
 ### Bug Fixes
