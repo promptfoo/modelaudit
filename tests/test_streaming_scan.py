@@ -115,7 +115,7 @@ def test_scan_model_streaming_symlink_outside_directory_matches_normal_scan(
         file_generator=iterate_files_streaming(base_dir),
         timeout=30,
         delete_after_scan=False,
-        scan_root=base_dir,
+        scan_root=str(base_dir),
         cache_enabled=False,
     )
 
@@ -147,13 +147,13 @@ def test_scan_model_streaming_hf_cache_symlink_allowed(
         pickle.dump({"data": "safe"}, f)
 
     model_link = snapshots_dir / "model.pkl"
-    os.symlink("../../blobs/blob123", model_link)
+    os.symlink(os.path.relpath(blob_path, model_link.parent), model_link)
 
     result = scan_model_streaming(
         file_generator=iterate_files_streaming(snapshots_dir),
         timeout=30,
         delete_after_scan=False,
-        scan_root=snapshots_dir,
+        scan_root=str(snapshots_dir),
         cache_enabled=False,
     )
 
