@@ -938,6 +938,69 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
         finally:
             os.unlink(path)
 
+    def test_nested_pickle_detection_binbytes8_and_bytearray8(self) -> None:
+        """BINBYTES8/BYTEARRAY8 payloads should be scanned for nested pickles."""
+        inner_bytes = pickle.dumps({"ab": 1}, protocol=4)
+
+        for opcode_name, payload in (
+            ("BINBYTES8", b"\x80\x04\x8e" + struct.pack("<Q", len(inner_bytes)) + inner_bytes + b"."),
+            ("BYTEARRAY8", b"\x80\x05\x96" + struct.pack("<Q", len(inner_bytes)) + inner_bytes + b"."),
+        ):
+            with self.subTest(opcode_name=opcode_name):
+                result = self._scan_bytes(payload)
+
+                nested_checks = [
+                    check
+                    for check in result.checks
+                    if check.name == "Nested Pickle Detection" and check.status == CheckStatus.FAILED
+                ]
+                assert any(check.details.get("opcode") == opcode_name for check in nested_checks), (
+                    f"Expected nested pickle detection for {opcode_name}, got: "
+                    f"{[(c.name, c.status, c.details) for c in result.checks]}"
+                )
+
+    def test_non_pickle_binbytes8_and_bytearray8_do_not_trigger_nested_detection(self) -> None:
+        """Non-pickle BINBYTES8/BYTEARRAY8 payloads should not trigger nested pickle findings."""
+        benign_bytes = b"not a pickle payload"
+
+        for payload in (
+            b"\x80\x04\x8e" + struct.pack("<Q", len(benign_bytes)) + benign_bytes + b".",
+            b"\x80\x05\x96" + struct.pack("<Q", len(benign_bytes)) + benign_bytes + b".",
+        ):
+            with self.subTest(payload=payload[:3]):
+                result = self._scan_bytes(payload)
+
+                assert not any(
+                    check.name == "Nested Pickle Detection" and check.status == CheckStatus.FAILED
+                    for check in result.checks
+                ), f"Unexpected nested pickle detection: {[(c.name, c.status, c.details) for c in result.checks]}"
+
+    def test_padding_stripped_base64_nested_pickle_is_detected(self) -> None:
+        """Padding-stripped base64 strings should still be decoded for nested pickle detection."""
+        import base64
+
+        inner_bytes = pickle.dumps({"ab": 1}, protocol=4)
+        encoded = base64.b64encode(inner_bytes).decode("ascii").rstrip("=")
+        result = self._scan_bytes(pickle.dumps({"enc": encoded}, protocol=4))
+
+        encoded_checks = [
+            check
+            for check in result.checks
+            if check.name == "Encoded Pickle Detection" and check.status == CheckStatus.FAILED
+        ]
+        assert encoded_checks, f"Expected encoded pickle detection, got: {[(c.name, c.status) for c in result.checks]}"
+
+    def test_padding_stripped_base64_non_pickle_does_not_trigger_encoded_pickle(self) -> None:
+        """Padding-stripped base64 that decodes to non-pickle bytes should not trigger nested pickle findings."""
+        import base64
+
+        encoded = base64.b64encode(b"not a pickle payload").decode("ascii").rstrip("=")
+        result = self._scan_bytes(pickle.dumps({"enc": encoded}, protocol=4))
+
+        assert not any(
+            check.name == "Encoded Pickle Detection" and check.status == CheckStatus.FAILED for check in result.checks
+        ), f"Unexpected encoded pickle detection: {[(c.name, c.status, c.details) for c in result.checks]}"
+
     def test_builtins_hasattr_is_critical(self) -> None:
         """builtins.hasattr must not be allowlisted as safe."""
         result = self._scan_bytes(self._craft_global_reduce_pickle("builtins", "hasattr"))
@@ -1084,6 +1147,7 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
         )
 
     def test_plausible_module_allows_mixed_case_identifiers(self) -> None:
+        assert _is_plausible_python_module("EVIL")
         assert _is_plausible_python_module("EvilPkg")
         assert _is_plausible_python_module("PIL")
         assert _is_plausible_python_module("MyOrg.InternalPkg")
@@ -1104,6 +1168,17 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
         )
         assert not any("implausible module name 'EvilPkg'" in c.message for c in reduce_checks), (
             "Mixed-case module names should not be classified as implausible"
+        )
+
+    def test_uppercase_global_reduce_is_not_suppressed(self) -> None:
+        result = self._scan_bytes(self._craft_global_reduce_pickle("EVIL", "run"))
+
+        reduce_checks = [c for c in result.checks if c.name == "REDUCE Opcode Safety Check"]
+        assert any(c.status == CheckStatus.FAILED and "EVIL.run" in c.message for c in reduce_checks), (
+            f"Expected failed REDUCE check for uppercase module, got: {[c.message for c in reduce_checks]}"
+        )
+        assert not any("implausible module name 'EVIL'" in c.message for c in reduce_checks), (
+            "All-uppercase module names should not be classified as implausible"
         )
 
     def test_pil_global_reduce_is_not_suppressed(self) -> None:
@@ -1299,6 +1374,38 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
             if i.severity == IssueSeverity.CRITICAL and ("os" in i.message.lower() or "posix" in i.message.lower())
         ]
         assert os_issues, f"Expected CRITICAL os issue after separator byte, got: {[i.message for i in result.issues]}"
+
+    def test_multi_stream_large_padding_resync(self) -> None:
+        """Scanner must detect malicious streams after padding larger than 64KiB."""
+        import io
+
+        buf = io.BytesIO()
+        pickle.dump({"safe": True}, buf, protocol=2)
+        buf.write(b"\x00" * (70 * 1024))
+        buf.write(self._craft_global_reduce_pickle("os", "system"))
+
+        result = self._scan_bytes(buf.getvalue())
+
+        assert result.success
+        assert any(
+            i.severity == IssueSeverity.CRITICAL and ("os" in i.message.lower() or "posix" in i.message.lower())
+            for i in result.issues
+        ), f"Expected CRITICAL os issue after large padding, got: {[i.message for i in result.issues]}"
+
+    def test_multi_stream_large_padding_without_follow_on_stream_is_benign(self) -> None:
+        """Large non-pickle padding after a benign stream should not create security findings."""
+        import io
+
+        buf = io.BytesIO()
+        pickle.dump({"safe": True}, buf, protocol=2)
+        buf.write(b"\x00" * (70 * 1024))
+
+        result = self._scan_bytes(buf.getvalue())
+
+        assert result.success
+        assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues), (
+            f"Unexpected critical issue for benign large padding: {[i.message for i in result.issues]}"
+        )
 
     def test_multi_stream_malformed_first_stream_still_detects_second(self) -> None:
         """Scanner must detect malicious stream 2 even when stream 1 is malformed.
@@ -3451,11 +3558,13 @@ class TestPickleImportOnlyGlobalFindings:
             callable_origin_refs,
             callable_origin_is_ext,
             malformed_stack_globals,
+            mutation_target_refs,
         ) = _simulate_symbolic_reference_maps(opcodes)
 
         assert callable_refs[2] == ("collections", "OrderedDict")
         assert callable_origin_refs[2] == 2
         assert callable_origin_is_ext == {}
+        assert mutation_target_refs == {}
         assert 5 not in stack_global_refs
         assert malformed_stack_globals[5]["reason"] == "insufficient_context"
 
@@ -3476,6 +3585,7 @@ class TestPickleImportOnlyGlobalFindings:
             callable_origin_refs,
             callable_origin_is_ext,
             malformed_stack_globals,
+            mutation_target_refs,
         ) = _simulate_symbolic_reference_maps(opcodes)
 
         assert stack_global_refs[6] == ("evilpkg", "thing")
@@ -3483,6 +3593,7 @@ class TestPickleImportOnlyGlobalFindings:
         assert callable_origin_refs == {}
         assert callable_origin_is_ext == {}
         assert malformed_stack_globals == {}
+        assert mutation_target_refs == {}
 
 
 @pytest.mark.parametrize(
