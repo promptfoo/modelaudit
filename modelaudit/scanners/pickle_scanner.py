@@ -5416,8 +5416,7 @@ class PickleScanner(BaseScanner):
                 # to recover the original bytes and check for nested pickles.
                 if opcode.name in ["BINSTRING", "SHORT_BINSTRING"] and isinstance(arg, str):
                     try:
-                        raw = arg.encode("latin-1")
-                        sample = raw[:1024]
+                        sample = arg[:1024].encode("latin-1")
                         if _looks_like_pickle(sample):
                             severity = _get_context_aware_severity(IssueSeverity.CRITICAL, ml_context)
                             result.add_check(

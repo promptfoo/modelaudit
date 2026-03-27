@@ -995,13 +995,19 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
         )
 
     def test_non_pickle_binstring_does_not_trigger_nested_detection(self) -> None:
-        """Non-pickle BINSTRING payloads should not trigger nested pickle findings."""
+        """Non-pickle BINSTRING/SHORT_BINSTRING payloads should not trigger nested pickle findings."""
         benign = b"just a plain string"
-        payload = b"\x80\x02U" + bytes([len(benign)]) + benign + b"."
-        result = self._scan_bytes(payload)
-        assert not any(c.name == "Nested Pickle Detection" and c.status == CheckStatus.FAILED for c in result.checks), (
-            f"Unexpected nested pickle detection: {[(c.name, c.status, c.details) for c in result.checks]}"
-        )
+
+        for opcode, length in (
+            (b"U", bytes([len(benign)])),
+            (b"T", struct.pack("<i", len(benign))),
+        ):
+            with self.subTest(opcode=opcode):
+                payload = b"\x80\x02" + opcode + length + benign + b"."
+                result = self._scan_bytes(payload)
+                assert not any(
+                    c.name == "Nested Pickle Detection" and c.status == CheckStatus.FAILED for c in result.checks
+                ), f"Unexpected nested pickle detection: {[(c.name, c.status, c.details) for c in result.checks]}"
 
     def test_builtins_hasattr_is_critical(self) -> None:
         """builtins.hasattr must not be allowlisted as safe."""
