@@ -101,6 +101,7 @@ def pytest_runtest_setup(item):
             "test_coreml_scanner.py",  # CoreML scanner tests
             "test_mxnet_scanner.py",  # MXNet scanner tests
             "test_tf_metagraph_scanner.py",  # TensorFlow MetaGraph scanner tests
+            "test_tflite_scanner.py",  # TFLite scanner guardrail tests
             "test_torchserve_mar_scanner.py",  # TorchServe .mar scanner tests
             "test_executorch_scanner.py",  # ExecuTorch scanner tests
             "test_telemetry.py",  # telemetry payload and availability tests

@@ -96,6 +96,8 @@ class TFLiteScanner(BaseScanner):
                 details={"subgraph_count": subgraph_count, "max_allowed": _MAX_COUNT},
                 rule_code="S902",
             )
+            result.finish(success=False)
+            return result
 
         for sg_index in range(subgraph_count):
             subgraph = model.Subgraphs(sg_index)

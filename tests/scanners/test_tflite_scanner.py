@@ -2,7 +2,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from modelaudit.scanners.tflite_scanner import TFLiteScanner
+from modelaudit.scanners.tflite_scanner import _MAX_COUNT, TFLiteScanner
 
 # Try to import tflite to check availability
 try:
@@ -183,3 +183,26 @@ def test_tflite_scanner_metadata_collection(tmp_path):
         scanner = TFLiteScanner()
         result = scanner.scan(str(path))
         assert "file_size" in result.metadata
+
+
+def test_tflite_scanner_excessive_subgraph_count_stops_scan(tmp_path):
+    """Regression: scanner stops before iterating an excessive subgraph count."""
+    path = tmp_path / "model.tflite"
+    valid_header = b"\x00\x00\x00\x00TFL3" + b"\x00" * 100
+    path.write_bytes(valid_header)
+
+    with (
+        patch("modelaudit.scanners.tflite_scanner.HAS_TFLITE", True),
+        patch("modelaudit.scanners.tflite_scanner.tflite", create=True) as mock_tflite,
+    ):
+        mock_model = MagicMock()
+        mock_model.SubgraphsLength.return_value = _MAX_COUNT + 1
+        mock_model.Subgraphs.side_effect = RuntimeError("should not iterate subgraphs")
+        mock_tflite.Model.GetRootAsModel.return_value = mock_model
+
+        scanner = TFLiteScanner()
+        result = scanner.scan(str(path))
+
+        assert not result.success
+        assert any(check.name == "Subgraph Count Validation" for check in result.checks)
+        mock_model.Subgraphs.assert_not_called()
