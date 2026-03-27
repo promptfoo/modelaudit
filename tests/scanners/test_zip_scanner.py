@@ -161,11 +161,9 @@ class TestZipScanner:
 
     def test_scan_extensionless_nested_zip_recurses(self, tmp_path: Path) -> None:
         """Extensionless ZIP members should be recursively scanned by content."""
-        import pickle
-
         inner_zip = io.BytesIO()
         with zipfile.ZipFile(inner_zip, "w") as inner_archive:
-            inner_archive.writestr("payload.pkl", pickle.dumps({"safe": "data"}))
+            inner_archive.writestr("payload.pkl", b'cos\nsystem\n(S"echo pwned"\ntR.')
 
         archive_path = tmp_path / "outer.zip"
         with zipfile.ZipFile(archive_path, "w") as outer_archive:
@@ -174,11 +172,22 @@ class TestZipScanner:
         result = self.scanner.scan(str(archive_path))
 
         assert result.success is True
+        assert result.has_errors is True
         assert any(
             check.details.get("zip_entry") == "nested:payload.pkl"
             and check.location == f"{archive_path}:nested:payload.pkl"
             for check in result.checks
         ), f"Expected nested extensionless ZIP checks, got: {[(c.location, c.details) for c in result.checks]}"
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL
+            and issue.details.get("zip_entry") == "nested:payload.pkl"
+            and issue.location == f"{archive_path}:nested:payload.pkl"
+            and ("os.system" in issue.message.lower() or "posix.system" in issue.message.lower())
+            for issue in result.issues
+        ), (
+            "Expected critical nested pickle finding, got: "
+            f"{[(i.location, i.message, i.details) for i in result.issues]}"
+        )
 
     def test_scan_alternating_zip_tar_enforces_shared_depth_limit(self, tmp_path: Path) -> None:
         """Archive depth should not reset when recursion alternates between ZIP and TAR."""
@@ -304,6 +313,30 @@ class TestZipScanner:
         assert any("outside" in issue.message.lower() for issue in symlink_issues)
         assert read_sizes
         assert set(read_sizes) == {4096}
+
+    def test_scan_zip_fails_closed_on_oversized_symlink_target(self, tmp_path: Path) -> None:
+        """Oversized symlink targets should fail validation instead of being treated as safe."""
+        archive_path = tmp_path / "oversized_symlink.zip"
+        info = zipfile.ZipInfo("link.txt")
+        info.create_system = 3
+        info.external_attr = (stat.S_IFLNK | 0o777) << 16
+
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr(info, "A" * 5000)
+
+        result = self.scanner.scan(str(archive_path))
+
+        symlink_checks = [
+            check
+            for check in result.checks
+            if check.name == "Symlink Safety Validation" and check.location == f"{archive_path}:link.txt"
+        ]
+        assert len(symlink_checks) == 1
+        assert symlink_checks[0].status == CheckStatus.FAILED
+        assert symlink_checks[0].severity == IssueSeverity.CRITICAL
+        assert "unable to validate symlink target" in symlink_checks[0].message.lower()
+        assert symlink_checks[0].details["exception_type"] == "ValueError"
+        assert symlink_checks[0].details["max_target_bytes"] == 4096
 
     def test_scan_zip_skips_high_compression_ratio_entries(
         self,

@@ -267,8 +267,22 @@ class ZipScanner(BaseScanner):
                             "utf-8",
                             "replace",
                         )
-                    except Exception:
-                        target = ""
+                    except Exception as exc:
+                        result.add_check(
+                            name="Symlink Safety Validation",
+                            passed=False,
+                            message=f"Unable to validate symlink target for {name}: {exc!s}",
+                            severity=IssueSeverity.CRITICAL,
+                            rule_code="S406",
+                            location=f"{path}:{name}",
+                            details={
+                                "entry": name,
+                                "exception": str(exc),
+                                "exception_type": type(exc).__name__,
+                                "max_target_bytes": MAX_ZIP_SYMLINK_TARGET_BYTES,
+                            },
+                        )
+                        continue
                     target_base = os.path.dirname(resolved_name)
                     _target_resolved, target_safe = sanitize_archive_path(
                         target,
