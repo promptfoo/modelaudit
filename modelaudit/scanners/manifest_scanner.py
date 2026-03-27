@@ -369,8 +369,6 @@ TRUSTED_URL_EXACT_DOMAINS = {
     "cloudfront.net",
     "fastly.net",
     # User-content hosting — arbitrary subdomains are attacker-controlled
-    "docker.io",
-    "gcr.io",
     "ghcr.io",
     "gitbook.io",
     "github.io",

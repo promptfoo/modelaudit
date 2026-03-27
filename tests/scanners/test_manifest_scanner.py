@@ -294,6 +294,24 @@ def test_manifest_scanner_trusted_urls_not_flagged(tmp_path):
     assert len(untrusted_url_checks) == 0, f"Unexpected untrusted URL checks: {untrusted_url_checks}"
 
 
+def test_manifest_scanner_official_registry_subdomains_not_flagged(tmp_path: Path) -> None:
+    """Official registry service subdomains should remain trusted."""
+    test_file = tmp_path / "config.json"
+    config_with_registry_urls = {
+        "model_type": "bert",
+        "docker_registry": "https://registry-1.docker.io/v2/library/python/manifests/latest",
+        "gcr_registry": "https://us.gcr.io/project/image:latest",
+    }
+
+    test_file.write_text(json.dumps(config_with_registry_urls))
+
+    scanner = ManifestScanner()
+    result = scanner.scan(str(test_file))
+
+    failed_url_checks = [c for c in result.checks if c.name == "Untrusted URL Check" and c.status == CheckStatus.FAILED]
+    assert failed_url_checks == []
+
+
 def test_manifest_scanner_broad_hosting_subdomains_flagged(tmp_path):
     """Attacker-controlled subdomains on broad hosting domains should not be trusted."""
     test_file = tmp_path / "config.json"
@@ -503,11 +521,11 @@ def test_manifest_scanner_parse_timeout_reports_only_timeout(
     scanner = ManifestScanner(config={"timeout": 1})
     monkeypatch.setattr(scanner, "_check_file_for_blacklist", lambda _path, _result: None)
     monkeypatch.setattr(scanner, "_check_cloud_storage_urls", lambda _path, _result: None)
-    monkeypatch.setattr(
-        manifest_scanner_module.json,
-        "loads",
-        lambda _content: (_ for _ in ()).throw(TimeoutError("parse helper timed out")),
-    )
+
+    def raise_timeout(_content: str) -> dict:
+        raise TimeoutError("parse helper timed out")
+
+    monkeypatch.setattr(manifest_scanner_module.json, "loads", raise_timeout)
 
     result = scanner.scan(str(test_file))
 
@@ -599,8 +617,11 @@ class TestIsTrustedUrlDomain:
         assert _is_trusted_url_domain("https://evil.fastly.net/p") is False
         assert _is_trusted_url_domain("https://evil.azureedge.net/p") is False
         assert _is_trusted_url_domain("https://evil.sourceforge.net/p") is False
-        assert _is_trusted_url_domain("https://evil.docker.io/p") is False
         assert _is_trusted_url_domain("https://evil.quay.io/p") is False
+
+    def test_official_registry_subdomains_trusted(self) -> None:
+        assert _is_trusted_url_domain("https://registry-1.docker.io/v2/library/python/manifests/latest") is True
+        assert _is_trusted_url_domain("https://us.gcr.io/project/image:latest") is True
 
     def test_exact_match_domain_itself_trusted(self) -> None:
         """The bare exact-match domain should still be trusted."""

@@ -189,7 +189,7 @@ class TestMetadataScanner:
         readme_path = tmp_path / "README.md"
         readme_path.write_text("# Test README\n")
 
-        def expire_timeout(_content: str, _file_path: str) -> list:
+        def expire_timeout(_content: str, _file_path: str, _result: object) -> None:
             raise TimeoutError("metadata helper timed out")
 
         monkeypatch.setattr(scanner, "_check_suspicious_urls_in_text", expire_timeout)
@@ -203,3 +203,71 @@ class TestMetadataScanner:
         assert timeout_checks[0].severity == IssueSeverity.WARNING
         assert not any(check.name == "Metadata Scan Error" for check in result.checks)
         assert not any(issue.type == "file_error" for issue in result.issues)
+
+    def test_scan_preserves_findings_when_timeout_fires_after_helper_return(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Findings emitted before the final timeout check should remain in the result."""
+        scanner = MetadataScanner(config={"timeout": 1})
+        readme_path = tmp_path / "README.md"
+        readme_path.write_text("Download: https://bit.ly/suspicious-model\n")
+
+        timeout_calls = 0
+
+        def raise_after_helper(*_args: object, **_kwargs: object) -> bool:
+            nonlocal timeout_calls
+            timeout_calls += 1
+            if timeout_calls == 5:
+                raise TimeoutError("metadata scan timed out after helper")
+            return False
+
+        monkeypatch.setattr(scanner, "_check_timeout", raise_after_helper)
+        monkeypatch.setattr(scanner, "_check_exposed_secrets_in_text", lambda _content, _file_path, _result: None)
+
+        result = scanner.scan(str(readme_path))
+
+        timeout_checks = [check for check in result.checks if check.name == "Metadata Scan Timeout"]
+        suspicious_issues = [issue for issue in result.issues if issue.details.get("suspicious_domain") == "bit.ly"]
+
+        assert result.success is True
+        assert len(timeout_checks) == 1
+        assert len(suspicious_issues) == 1
+        assert not any(check.name == "Metadata Scan Error" for check in result.checks)
+
+    def test_scan_preserves_findings_when_timeout_occurs_mid_helper(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Findings produced before a helper timeout should remain in the result."""
+        scanner = MetadataScanner(config={"timeout": 1})
+        readme_path = tmp_path / "README.md"
+        readme_path.write_text(
+            "Download: https://bit.ly/suspicious-model\nEndpoint: https://ngrok.io/malicious-endpoint\n"
+        )
+
+        timeout_calls = 0
+
+        def raise_mid_helper(*_args: object, **_kwargs: object) -> bool:
+            nonlocal timeout_calls
+            timeout_calls += 1
+            if timeout_calls == 4:
+                raise TimeoutError("metadata helper timed out mid-scan")
+            return False
+
+        monkeypatch.setattr(scanner, "_check_timeout", raise_mid_helper)
+        monkeypatch.setattr(scanner, "_check_exposed_secrets_in_text", lambda _content, _file_path, _result: None)
+
+        result = scanner.scan(str(readme_path))
+
+        timeout_checks = [check for check in result.checks if check.name == "Metadata Scan Timeout"]
+        detected_domains = {
+            issue.details["suspicious_domain"] for issue in result.issues if "suspicious_domain" in issue.details
+        }
+
+        assert result.success is True
+        assert len(timeout_checks) == 1
+        assert detected_domains == {"bit.ly"}
+        assert not any(check.name == "Metadata Scan Error" for check in result.checks)
