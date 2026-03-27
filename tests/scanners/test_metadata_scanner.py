@@ -117,19 +117,21 @@ class TestMetadataScanner:
         readme_path.write_text(
             "# Model Info\n\n"
             "- Shortener bait: https://bit.ly@github.com/download\n"
+            "- Password bait: https://user:bit.ly@github.com/download-two\n"
             "- Tunnel bait: https://localtunnel.me:token@huggingface.co/proxy\n"
             "- Docs: https://example.com/model-card\n"
         )
 
         result = scanner.scan(str(readme_path))
 
-        assert len(result.issues) == 2
+        assert len(result.issues) == 3
         flagged = {
             (issue.details.get("suspicious_domain"), issue.details.get("url_component")) for issue in result.issues
         }
         assert flagged == {("bit.ly", "userinfo"), ("localtunnel.me", "userinfo")}
         flagged_urls = {issue.details.get("url") for issue in result.issues}
         assert "https://bit.ly@github.com/download" in flagged_urls
+        assert "https://user:bit.ly@github.com/download-two" in flagged_urls
         assert "https://localtunnel.me:token@huggingface.co/proxy" in flagged_urls
         assert "https://example.com/model-card" not in flagged_urls
 

@@ -157,8 +157,14 @@ class MetadataScanner(BaseScanner):
             if url in seen:
                 continue
             parsed = urlparse(url)
-            matched_domain = self._match_suspicious_domain(parsed.username or "")
-            matched_component = "userinfo" if matched_domain else None
+            matched_domain = None
+            matched_component = None
+
+            for userinfo_part in (parsed.username, parsed.password):
+                matched_domain = self._match_suspicious_domain(userinfo_part or "")
+                if matched_domain is not None:
+                    matched_component = "userinfo"
+                    break
 
             # Treat deceptive userinfo consistently with manifest semantics while
             # avoiding noise from ordinary authenticated URLs.
