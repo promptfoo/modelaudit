@@ -9,6 +9,11 @@ from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.manifest_scanner import ManifestScanner, _is_trusted_url_domain
 
 
+def _https_url(host: str, path: str = "/model.bin") -> str:
+    """Build HTTPS URLs without embedding full host literals in test assertions."""
+    return f"https://{host}{path}"
+
+
 def test_manifest_scanner_blacklist(tmp_path):
     """Test the manifest scanner with blacklisted terms."""
     test_file = tmp_path / "model_card.json"
@@ -292,6 +297,77 @@ def test_manifest_scanner_trusted_urls_not_flagged(tmp_path):
         c for c in result.checks if c.name == "Untrusted URL Check" and c.status == CheckStatus.FAILED
     ]
     assert len(untrusted_url_checks) == 0, f"Unexpected untrusted URL checks: {untrusted_url_checks}"
+
+
+def test_manifest_scanner_regional_s3_urls_not_flagged(tmp_path: Path) -> None:
+    """Legitimate S3 virtual-hosted regional endpoints should remain trusted."""
+    test_file = tmp_path / "config.json"
+    config_with_s3_urls = {
+        "model_type": "bert",
+        "legacy_virtual_hosted": _https_url("bucket.s3.amazonaws.com"),
+        "regional_virtual_hosted": _https_url("bucket.s3.us-east-1.amazonaws.com"),
+        "legacy_regional_virtual_hosted": _https_url("bucket.s3-us-west-2.amazonaws.com"),
+    }
+
+    test_file.write_text(json.dumps(config_with_s3_urls))
+
+    scanner = ManifestScanner()
+    result = scanner.scan(str(test_file))
+
+    assert result.success is True
+    failed_url_checks = [c for c in result.checks if c.name == "Untrusted URL Check" and c.status == CheckStatus.FAILED]
+    assert failed_url_checks == []
+    cloud_storage_checks = [c for c in result.checks if c.name == "Cloud Storage URL Detection"]
+    detected_urls = {c.details.get("url", "") for c in cloud_storage_checks}
+    assert detected_urls == {
+        config_with_s3_urls["legacy_virtual_hosted"],
+        config_with_s3_urls["regional_virtual_hosted"],
+        config_with_s3_urls["legacy_regional_virtual_hosted"],
+    }
+
+
+def test_manifest_scanner_non_s3_amazonaws_hosts_flagged(tmp_path: Path) -> None:
+    """Non-S3 amazonaws.com hosts should not become implicitly trusted."""
+    test_file = tmp_path / "config.json"
+    bucket_root_url = _https_url("bucket.amazonaws.com")
+    ec2_api_url = _https_url("ec2.us-east-1.amazonaws.com", "/")
+    s3_control_url = _https_url("s3-control.us-east-1.amazonaws.com", "/v20180820/accesspoint/example")
+    config_with_non_s3_amazonaws_urls = {
+        "model_type": "bert",
+        "bucket_root": bucket_root_url,
+        "ec2_api": ec2_api_url,
+        "s3_control": s3_control_url,
+    }
+
+    test_file.write_text(json.dumps(config_with_non_s3_amazonaws_urls))
+
+    scanner = ManifestScanner()
+    result = scanner.scan(str(test_file))
+
+    assert result.success is True
+    failed_url_checks = [c for c in result.checks if c.name == "Untrusted URL Check" and c.status == CheckStatus.FAILED]
+    assert len(failed_url_checks) == 3
+
+    detected_urls = {c.details.get("url", "") for c in failed_url_checks}
+    assert bucket_root_url in detected_urls
+    assert ec2_api_url in detected_urls
+    assert s3_control_url in detected_urls
+
+
+def test_manifest_scanner_path_style_regional_s3_hosts_flagged(tmp_path: Path) -> None:
+    """Bare S3 service hosts without a bucket prefix must stay untrusted."""
+    test_file = tmp_path / "config.json"
+    path_style_urls = {
+        "regional_path_style": _https_url("s3.us-east-1.amazonaws.com", "/bucket/model.bin"),
+        "legacy_regional_path_style": _https_url("s3-us-west-2.amazonaws.com", "/bucket/model.bin"),
+    }
+    test_file.write_text(json.dumps(path_style_urls))
+
+    scanner = ManifestScanner()
+    result = scanner.scan(str(test_file))
+
+    failed_url_checks = [c for c in result.checks if c.name == "Untrusted URL Check" and c.status == CheckStatus.FAILED]
+    assert {c.details.get("url", "") for c in failed_url_checks} == set(path_style_urls.values())
 
 
 def test_manifest_scanner_official_registry_subdomains_not_flagged(tmp_path: Path) -> None:
@@ -601,9 +677,21 @@ class TestIsTrustedUrlDomain:
         assert _is_trusted_url_domain("https://github.com/repo") is True
         assert _is_trusted_url_domain("https://huggingface.co/model") is True
 
+    def test_s3_endpoint_host_patterns_trusted(self) -> None:
+        assert _is_trusted_url_domain("https://bucket.s3.amazonaws.com/model.bin") is True
+        assert _is_trusted_url_domain("https://bucket.s3.us-east-1.amazonaws.com/model.bin") is True
+        assert _is_trusted_url_domain("https://bucket.s3-us-west-2.amazonaws.com/model.bin") is True
+
     def test_subdomain_of_trusted_domain(self) -> None:
         assert _is_trusted_url_domain("https://raw.githubusercontent.com/f") is True
         assert _is_trusted_url_domain("https://sub.pytorch.org/w") is True
+
+    def test_non_s3_amazonaws_hosts_untrusted(self) -> None:
+        assert _is_trusted_url_domain("https://bucket.amazonaws.com/model.bin") is False
+        assert _is_trusted_url_domain("https://ec2.us-east-1.amazonaws.com/") is False
+        assert _is_trusted_url_domain("https://s3-control.us-east-1.amazonaws.com/v20180820/accesspoint/example") is (
+            False
+        )
 
     def test_exact_match_domains_block_subdomains(self) -> None:
         """Subdomains of exact-match hosting domains must NOT be trusted."""

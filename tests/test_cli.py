@@ -204,6 +204,52 @@ def test_scan_json_subprocess_separates_logs_from_stdout_for_findings(tmp_path: 
     assert "[S405]" in completed.stderr
 
 
+def test_scan_json_subprocess_single_skipped_file_keeps_stdout_parseable(tmp_path: Path) -> None:
+    """Single-file skips should not prepend human text ahead of JSON stdout."""
+    skipped_file = tmp_path / "skip.py"
+    skipped_file.write_text("print('hello')\n")
+
+    completed = subprocess.run(
+        [sys.executable, "-m", "modelaudit", "scan", str(skipped_file), "--format", "json"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 2
+    assert "Skipping non-model file:" not in completed.stdout
+    assert completed.stdout.lstrip().startswith("{")
+
+    output_payload = json.loads(completed.stdout)
+    assert output_payload["files_scanned"] == 0
+    assert output_payload["issues"] == []
+
+
+def test_scan_json_subprocess_mixed_directory_keeps_stdout_parseable(tmp_path: Path) -> None:
+    """Directory scans should remain valid JSON when non-model files are skipped."""
+    import pickle
+
+    skipped_file = tmp_path / "skip.py"
+    skipped_file.write_text("print('hello')\n")
+    model_file = tmp_path / "safe.pkl"
+    model_file.write_bytes(pickle.dumps({"ok": 1}))
+
+    completed = subprocess.run(
+        [sys.executable, "-m", "modelaudit", "scan", str(tmp_path), "--format", "json"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0
+    assert "Skipping non-model file:" not in completed.stdout
+    assert completed.stdout.lstrip().startswith("{")
+
+    output_payload = json.loads(completed.stdout)
+    assert output_payload["files_scanned"] >= 1
+    assert any(asset.get("path") == str(model_file) for asset in output_payload.get("assets", []))
+
+
 def test_scan_can_apply_local_config_once_when_confirmed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Interactive scans can apply a local config for the current run only."""
     import tarfile
@@ -1621,6 +1667,33 @@ def test_exit_code_security_issues_streaming_local_directory(tmp_path: Path) -> 
     assert result.exit_code == 1, f"Expected exit code 1, got {result.exit_code}. Output: {result.output}"
     assert expected_global in result.output, f"Expected malicious finding in output, got: {result.output}"
     assert evil_pickle_path.exists()
+
+
+def test_exit_code_streaming_symlink_traversal_without_safe_files(tmp_path: Path, requires_symlinks: None) -> None:
+    """Streaming traversal findings should exit 1 even when no files are ultimately scanned."""
+    import pickle
+
+    base_dir = tmp_path / "base"
+    base_dir.mkdir()
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+
+    with (outside_dir / "secret.pkl").open("wb") as f:
+        pickle.dump({"data": "secret"}, f)
+
+    symlink_path = base_dir / "link.pkl"
+    symlink_path.symlink_to(outside_dir / "secret.pkl")
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "--stream", "--format", "text", str(base_dir)])
+
+    output = strip_ansi(result.output)
+
+    assert result.exit_code == 1, f"Expected exit code 1, got {result.exit_code}. Output: {result.output}"
+    assert str(symlink_path) in output
+    assert "Path traversal outside scanned directory" in output
+    assert "CRITICAL SECURITY ISSUES FOUND" in output
+    assert "NO FILES SCANNED" not in output
 
 
 def test_exit_code_scan_errors(tmp_path):

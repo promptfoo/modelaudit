@@ -72,6 +72,16 @@ CLOUD_STORAGE_PATTERNS: list[tuple[re.Pattern[str], str, str]] = [
         "s3",
     ),
     (
+        re.compile(r"https?://[a-zA-Z0-9.-]+\.s3\.[a-z0-9-]+\.amazonaws\.com(?:/[^\s\"'<>]*)?", re.IGNORECASE),
+        "AWS S3 Regional URL",
+        "s3",
+    ),
+    (
+        re.compile(r"https?://[a-zA-Z0-9.-]+\.s3-[a-z0-9-]+\.amazonaws\.com(?:/[^\s\"'<>]*)?", re.IGNORECASE),
+        "AWS S3 Regional URL",
+        "s3",
+    ),
+    (
         re.compile(r"https?://s3\.amazonaws\.com/[a-zA-Z0-9.\-_]+(?:/[^\s\"'<>]*)?", re.IGNORECASE),
         "AWS S3 URL",
         "s3",
@@ -385,6 +395,19 @@ TRUSTED_URL_EXACT_DOMAINS = {
 
 # Regex to find URLs in text
 URL_PATTERN = re.compile(r'https?://[^\s<>"\']+[^\s<>"\',.]')
+_AWS_S3_REGION_PATTERN = r"[a-z]{2}(?:-[a-z0-9]+)+-\d"
+_S3_HOST_LABEL_PATTERN = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+_S3_BUCKET_HOST_PREFIX_PATTERN = rf"{_S3_HOST_LABEL_PATTERN}(?:\.{_S3_HOST_LABEL_PATTERN})*"
+_TRUSTED_S3_ENDPOINT_HOST_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(rf"^{_S3_BUCKET_HOST_PREFIX_PATTERN}\.s3\.amazonaws\.com$"),
+    re.compile(rf"^{_S3_BUCKET_HOST_PREFIX_PATTERN}\.s3\.{_AWS_S3_REGION_PATTERN}\.amazonaws\.com$"),
+    re.compile(rf"^{_S3_BUCKET_HOST_PREFIX_PATTERN}\.s3-{_AWS_S3_REGION_PATTERN}\.amazonaws\.com$"),
+)
+
+
+def _is_trusted_s3_endpoint_host(host: str) -> bool:
+    """Return True for supported S3 endpoint host layouts only."""
+    return any(pattern.match(host) for pattern in _TRUSTED_S3_ENDPOINT_HOST_PATTERNS)
 
 
 def _is_trusted_url_domain(url: str) -> bool:
@@ -400,6 +423,9 @@ def _is_trusted_url_domain(url: str) -> bool:
     host = (parsed.hostname or "").lower().rstrip(".")
     if not host:
         return False
+
+    if _is_trusted_s3_endpoint_host(host):
+        return True
 
     for domain in TRUSTED_URL_DOMAINS:
         trusted = domain.lower().rstrip(".")

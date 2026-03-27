@@ -23,6 +23,7 @@ from modelaudit.detectors.suspicious_symbols import (
 )
 from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.pickle_scanner import (
+    _RAW_PATTERN_SCAN_LIMIT_BYTES,
     PickleScanner,
     _genops_with_fallback,
     _GenopsBudgetExceeded,
@@ -48,6 +49,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 def _short_binunicode(value: bytes) -> bytes:
     return b"\x8c" + bytes([len(value)]) + value
+
+
+def _write_pickle_with_tail(path: Path, tail: bytes, *, pad_to_bytes: int | None = None) -> None:
+    payload = pickle.dumps({"weights": [1, 2, 3]})
+    if pad_to_bytes is not None and len(payload) < pad_to_bytes:
+        payload += b"\x00" * (pad_to_bytes - len(payload))
+    path.write_bytes(payload + tail)
 
 
 @pytest.mark.parametrize(
@@ -135,6 +143,71 @@ def test_unknown_opcode_bin_parse_failure_still_scans_full_binary_content(
     assert any(
         check.name == "Binary Content Check" and check.status == CheckStatus.FAILED for check in result.checks
     ), f"Expected binary fallback finding, got: {[(c.name, c.status) for c in result.checks]}"
+
+
+def test_small_pickle_tail_pattern_is_detected_without_raw_pattern_limit(tmp_path: Path) -> None:
+    """Small pickle files should still fully analyze raw patterns without a coverage warning."""
+    pickle_path = tmp_path / "small-tail.pkl"
+    _write_pickle_with_tail(pickle_path, b"os.system")
+
+    result = PickleScanner().scan(str(pickle_path))
+
+    assert not any(check.name == "Raw Pattern Coverage Check" for check in result.checks)
+    assert any("os.system" in issue.message for issue in result.issues)
+
+
+def test_large_pickle_tail_pattern_surfaces_raw_pattern_limit(tmp_path: Path) -> None:
+    """Large pickle files should explicitly report the bounded raw-pattern coverage."""
+    pickle_path = tmp_path / "large-tail.pkl"
+    _write_pickle_with_tail(
+        pickle_path,
+        b"os.system",
+        pad_to_bytes=_RAW_PATTERN_SCAN_LIMIT_BYTES + 128,
+    )
+
+    result = PickleScanner().scan(str(pickle_path))
+
+    raw_pattern_checks = [check for check in result.checks if check.name == "Raw Pattern Coverage Check"]
+    assert len(raw_pattern_checks) == 1
+    raw_pattern_check = raw_pattern_checks[0]
+    assert raw_pattern_check.status == CheckStatus.FAILED
+    assert raw_pattern_check.severity == IssueSeverity.INFO
+    assert raw_pattern_check.details["reason"] == "raw_pattern_prefix_limit"
+    assert raw_pattern_check.details["raw_pattern_analysis_limited"] is True
+    assert raw_pattern_check.details["raw_pattern_scan_bytes"] == _RAW_PATTERN_SCAN_LIMIT_BYTES
+    assert raw_pattern_check.details["raw_pattern_scan_limit_bytes"] == _RAW_PATTERN_SCAN_LIMIT_BYTES
+    assert raw_pattern_check.details["raw_pattern_total_bytes"] == pickle_path.stat().st_size
+    assert result.metadata["raw_pattern_scan_complete"] is False
+    assert result.metadata["raw_pattern_scan_bytes"] == _RAW_PATTERN_SCAN_LIMIT_BYTES
+    assert result.metadata["raw_pattern_total_bytes"] == pickle_path.stat().st_size
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert not any(
+        "os.system" in issue.message for issue in result.issues if issue.message != raw_pattern_check.message
+    )
+
+
+def test_large_pickle_raw_pattern_limit_with_opcode_budget_truncation(tmp_path: Path) -> None:
+    """Large files should surface both the raw-pattern prefix limit and opcode truncation."""
+    pickle_path = tmp_path / "large-multistream.pkl"
+    large_prefix_stream = pickle.dumps(b"A" * (_RAW_PATTERN_SCAN_LIMIT_BYTES + 128), protocol=4)
+    follow_on_streams = b"".join(
+        pickle.dumps({"stream": index, "weights": [1, 2, 3]}, protocol=4) for index in range(32)
+    )
+    pickle_path.write_bytes(large_prefix_stream + follow_on_streams)
+
+    result = PickleScanner({"max_opcodes": 10}).scan(str(pickle_path))
+
+    raw_pattern_checks = [check for check in result.checks if check.name == "Raw Pattern Coverage Check"]
+    assert len(raw_pattern_checks) == 1
+    assert "may still stop early" in raw_pattern_checks[0].message.lower()
+    assert result.metadata["raw_pattern_scan_complete"] is False
+
+    opcode_checks = [
+        check for check in result.checks if check.name == "Opcode Count Check" and check.status == CheckStatus.FAILED
+    ]
+    assert len(opcode_checks) == 1
+    assert opcode_checks[0].details["analysis_incomplete"] is True
+    assert result.metadata["analysis_incomplete"] is True
 
 
 class TestPickleScanner(unittest.TestCase):

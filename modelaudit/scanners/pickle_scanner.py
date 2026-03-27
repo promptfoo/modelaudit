@@ -57,6 +57,7 @@ _STACK_GLOBAL_OPERAND_PREVIEWER.maxtuple = 4
 _STACK_GLOBAL_OPERAND_PREVIEWER.maxset = 4
 _STACK_GLOBAL_OPERAND_PREVIEWER.maxfrozenset = 4
 _STACK_GLOBAL_OPERAND_PREVIEWER.maxdict = 4
+_RAW_PATTERN_SCAN_LIMIT_BYTES = 10 * 1024 * 1024
 
 
 StackGlobalOperandKind = Literal["string", "missing_memo", "unknown", "non_string"]
@@ -4484,21 +4485,58 @@ class PickleScanner(BaseScanner):
         opcode_count = 0
         suspicious_count = 0
 
-        # For large files, use chunked reading to avoid memory issues
-        MAX_MEMORY_READ = 10 * 1024 * 1024  # 10MB max in memory at once
-
         current_pos = file_obj.tell()
 
         # Read file data - either all at once for small files or first chunk for large files.
-        # For large files, read only the first 10MB for pattern analysis to cap
+        # For large files, read only the first 10MB for in-memory string/pattern analysis to cap
         # embedded-pickle memory usage while still inspecting the most security-
         # relevant prefix.
-        file_data = file_obj.read() if file_size <= MAX_MEMORY_READ else file_obj.read(MAX_MEMORY_READ)
+        file_data = (
+            file_obj.read()
+            if file_size <= _RAW_PATTERN_SCAN_LIMIT_BYTES
+            else file_obj.read(_RAW_PATTERN_SCAN_LIMIT_BYTES)
+        )
 
         file_obj.seek(current_pos)  # Reset position
         # Extract global references across all pickle streams
         advanced_globals = self._extract_globals_advanced(file_obj)
         file_obj.seek(current_pos)  # Reset again after extraction
+
+        raw_pattern_scan_complete = file_size <= _RAW_PATTERN_SCAN_LIMIT_BYTES
+        result.metadata.update(
+            {
+                "raw_pattern_scan_complete": raw_pattern_scan_complete,
+                "raw_pattern_scan_bytes": len(file_data),
+                "raw_pattern_total_bytes": file_size,
+            }
+        )
+        if not raw_pattern_scan_complete:
+            result.add_check(
+                name="Raw Pattern Coverage Check",
+                passed=False,
+                message=(
+                    "Raw byte-pattern analysis covered only the first 10 MB of this pickle; "
+                    "opcode analysis continued beyond that prefix but may still stop early if timeout "
+                    "or opcode-budget limits are reached; heuristic string matches beyond that prefix "
+                    "were not evaluated"
+                ),
+                severity=IssueSeverity.INFO,
+                location=self.current_file_path,
+                details={
+                    "reason": "raw_pattern_prefix_limit",
+                    "raw_pattern_analysis_limited": True,
+                    "raw_pattern_scan_bytes": len(file_data),
+                    "raw_pattern_scan_limit_bytes": _RAW_PATTERN_SCAN_LIMIT_BYTES,
+                    "raw_pattern_total_bytes": file_size,
+                },
+                why=(
+                    "To bound memory usage, raw byte/string heuristic checks analyze only a leading prefix of large "
+                    "pickle files. Opcode-level analysis proceeds separately and may itself stop early due to "
+                    "timeout or opcode budgets, but suspicious strings located entirely beyond the scanned prefix "
+                    "are not evaluated by this heuristic layer."
+                ),
+                rule_code="S902",
+            )
 
         # CRITICAL FIX: Scan for dangerous patterns in embedded pickles
         # This was missing and allowed malicious PyTorch models to pass undetected

@@ -5,6 +5,7 @@ import os
 import tempfile
 from contextlib import suppress
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
 if TYPE_CHECKING:
@@ -109,6 +110,9 @@ class SevenZipScanner(BaseScanner):
     _MAX_EXTENSIONLESS_PROBES: ClassVar[int] = 100
     _MAX_TOTAL_EXTRACT_SIZE: ClassVar[int] = 5 * 1024 * 1024 * 1024  # 5 GB
     _MAX_CUMULATIVE_ENTRIES: ClassVar[int] = 50000
+    _NESTED_CORE_EXTENSION_EXCLUSIONS: ClassVar[frozenset[str]] = frozenset(
+        {".txt", ".md", ".markdown", ".rst", ".j2", ".jinja", ".template"},
+    )
 
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
@@ -133,6 +137,45 @@ class SevenZipScanner(BaseScanner):
             return False
 
         return cls._has_7z_magic(path)
+
+    def _get_archive_depth(self) -> int:
+        """Return the current shared archive depth from config."""
+        raw_depth = self.config.get("_archive_depth", 0)
+        try:
+            depth = int(raw_depth)
+        except (TypeError, ValueError):
+            return 0
+        return max(depth, 0)
+
+    @classmethod
+    def _supported_nested_core_extensions(cls) -> frozenset[str]:
+        """Return supported nested member suffixes routed through shared core scanning."""
+        from . import _registry
+
+        extensions: set[str] = set()
+        for scanner_id in _registry.get_available_scanners():
+            scanner_info = _registry.get_scanner_info(scanner_id)
+            if scanner_info is None:
+                continue
+
+            for extension in scanner_info.get("extensions", []):
+                extension_lower = extension.lower()
+                if not extension_lower or extension_lower in cls._NESTED_CORE_EXTENSION_EXCLUSIONS:
+                    continue
+                extensions.add(extension_lower)
+
+        return frozenset(extensions)
+
+    @staticmethod
+    def _candidate_archive_extensions(file_name: str) -> list[str]:
+        """Return candidate suffixes for an archive member, longest-first."""
+        suffixes = [suffix.lower() for suffix in Path(file_name).suffixes]
+        candidates: list[str] = []
+        for i in range(len(suffixes), 0, -1):
+            candidate = "".join(suffixes[-i:])
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
+        return candidates
 
     @classmethod
     def _has_7z_magic(cls, path: str) -> bool:
@@ -185,7 +228,7 @@ class SevenZipScanner(BaseScanner):
         self.add_file_integrity_check(path, result)
 
         try:
-            scan_result = self._scan_7z_file(path, depth=0)
+            scan_result = self._scan_7z_file(path, depth=self._get_archive_depth())
             result.merge(scan_result)
 
         except py7zr.Bad7zFile as e:
@@ -242,7 +285,7 @@ class SevenZipScanner(BaseScanner):
                 location=path,
                 details={"depth": depth, "max_depth": self.max_depth},
             )
-            result.finish(success=True)
+            result.finish(success=False)
             return result
 
         result.add_check(
@@ -340,26 +383,11 @@ class SevenZipScanner(BaseScanner):
 
     def _identify_scannable_files(self, file_names: list[str]) -> list[str]:
         """Identify files that can be scanned for security issues"""
-        scannable_extensions = {
-            ".7z",  # Nested 7z archives
-            ".pkl",
-            ".pickle",  # Pickle files
-            ".pt",
-            ".pth",  # PyTorch files
-            ".bin",  # Binary model files
-            ".h5",  # HDF5/Keras files
-            ".onnx",  # ONNX files
-            ".json",  # JSON configuration files
-            ".yaml",
-            ".yml",  # YAML configuration files
-            ".pb",  # TensorFlow protobuf files
-        }
-
-        scannable_files = []
+        supported_extensions = self._supported_nested_core_extensions()
+        scannable_files: list[str] = []
         for file_name in file_names:
-            # Get file extension
-            _, ext = os.path.splitext(file_name.lower())
-            if ext in scannable_extensions:
+            candidate_extensions = self._candidate_archive_extensions(file_name)
+            if any(extension in supported_extensions for extension in candidate_extensions):
                 scannable_files.append(file_name)
 
         return scannable_files
@@ -694,27 +722,11 @@ class SevenZipScanner(BaseScanner):
                     budget=budget,
                 )
             else:
-                _, original_ext = os.path.splitext(original_name.lower())
-                # Import scanner registry to find appropriate scanner
-                from . import get_scanner_for_file
+                from .. import core
 
-                file_scanner = get_scanner_for_file(extracted_path, config=self.config)
-                if not file_scanner:
-                    if original_ext == "":
-                        return
-
-                    # No scanner available for this file type
-                    result.add_check(
-                        name=f"File Type Support: {original_name}",
-                        passed=True,
-                        message=f"No scanner available for file type: {original_name}",
-                        location=f"{archive_path}:{original_name}",
-                        details={"file_type": "unsupported"},
-                    )
-                    return
-
-                # Scan the extracted file
-                file_result = file_scanner.scan(extracted_path)
+                nested_config = dict(self.config)
+                nested_config["_archive_depth"] = depth + 1
+                file_result = core.scan_file(extracted_path, nested_config)
 
             self._rewrite_nested_result_context(file_result, extracted_path, archive_path, original_name)
             result.merge(file_result)

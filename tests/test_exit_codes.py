@@ -205,14 +205,32 @@ def test_exit_code_no_files_scanned():
 
 
 def test_exit_code_no_files_scanned_with_issues():
-    """Test exit code 2 when no files are scanned even with issues."""
+    """Security findings should still return exit code 1 even with zero scanned files."""
     results = _create_result_model(
         files_scanned=0,
         issues=[
             Issue(
-                message="Some issue",
-                severity=IssueSeverity.WARNING,
-                location="test.pkl",
+                message="Path traversal outside scanned directory",
+                severity=IssueSeverity.CRITICAL,
+                location="link.pkl",
+                timestamp=0.0,
+                why=None,
+                type=None,
+            ),
+        ],
+    )
+    assert determine_exit_code(results) == 1
+
+
+def test_exit_code_no_files_scanned_with_info_only_issues():
+    """Benign zero-file scans should keep exit code 2 when only informational issues exist."""
+    results = _create_result_model(
+        files_scanned=0,
+        issues=[
+            Issue(
+                message="No supported model files found",
+                severity=IssueSeverity.INFO,
+                location="",
                 timestamp=0.0,
                 why=None,
                 type=None,

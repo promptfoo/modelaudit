@@ -193,6 +193,42 @@ def _add_issue_to_model(
     results.issues.append(issue)
 
 
+def _normalize_streamed_location(location: str | None, report_path: str, resolved_path: str) -> str | None:
+    """Rewrite streamed result locations to the original source path when needed."""
+    if not location or report_path == resolved_path:
+        return location
+
+    if location == resolved_path:
+        return report_path
+
+    if not location.startswith(resolved_path):
+        return location
+
+    suffix = location[len(resolved_path) :]
+    if suffix and suffix[0] not in {":", " ", "(", "[", "/", "\\"}:
+        return location
+
+    return f"{report_path}{suffix}"
+
+
+def _serialize_streamed_records(records: list[Any], report_path: str, resolved_path: str) -> list[dict[str, Any]]:
+    """Convert streamed issues/checks into dicts with source-path locations."""
+    serialized: list[dict[str, Any]] = []
+    for record in records:
+        record_dict = record.to_dict() if hasattr(record, "to_dict") else record
+        if not isinstance(record_dict, dict):
+            continue
+
+        normalized_record = dict(record_dict)
+        location = normalized_record.get("location")
+        if isinstance(location, str):
+            normalized_record["location"] = _normalize_streamed_location(location, report_path, resolved_path)
+
+        serialized.append(normalized_record)
+
+    return serialized
+
+
 def _calculate_file_hash(file_path: str) -> str:
     """Calculate SHA256 hash of a file for deduplication purposes.
 
@@ -1123,7 +1159,8 @@ def determine_exit_code(results: ModelAuditResultModel) -> int:
     Exit codes:
     - 0: Success, no security issues found
     - 1: Security issues found (scan completed successfully)
-    - 2: Operational errors occurred during scanning or no files scanned
+    - 2: Operational errors occurred during scanning, or no files were scanned
+         and no security issues were found
 
     Args:
         results: ModelAuditResultModel with scan results
@@ -1135,13 +1172,10 @@ def determine_exit_code(results: ModelAuditResultModel) -> int:
     if getattr(results, "has_errors", False):
         return 2
 
-    # Check if no files were scanned
-    files_scanned = results.files_scanned
-    if files_scanned == 0:
-        return 2
-
-    # Check for any security findings (warnings, errors, or critical issues)
-    issues = results.issues
+    # Check for any security findings before treating zero scanned files as
+    # an operational-style outcome. Path traversal and similar safeguards can
+    # report a finding before any file is scanned.
+    issues = results.issues or []
     if issues:
         # Filter out DEBUG and INFO level issues for exit code determination
         # Only WARNING, ERROR (legacy), and CRITICAL issues should trigger exit code 1
@@ -1154,6 +1188,11 @@ def determine_exit_code(results: ModelAuditResultModel) -> int:
         ]
         if security_issues:
             return 1
+
+    # Check if no files were scanned
+    files_scanned = results.files_scanned
+    if files_scanned == 0:
+        return 2
 
     # No issues found
     return 0
@@ -1611,6 +1650,7 @@ def scan_model_streaming(
         for file_path, _is_last in file_generator:
             source_path = Path(file_path)
             scan_path = source_path
+            report_path = str(source_path)
 
             # Check for interruption
             check_interrupted()
@@ -1658,8 +1698,12 @@ def scan_model_streaming(
 
                 # Merge results
                 if scan_result:
+                    resolved_report_path = str(scan_path)
                     metadata_dict = dict(scan_result.metadata or {})
                     metadata_dict.setdefault("file_size", scan_path.stat().st_size)
+                    if report_path != resolved_report_path:
+                        metadata_dict.setdefault("source_path", report_path)
+                        metadata_dict.setdefault("resolved_path", resolved_report_path)
                     operational_scan_failure = any(
                         _has_operational_error_message(issue.message) for issue in (scan_result.issues or [])
                     )
@@ -1679,15 +1723,23 @@ def scan_model_streaming(
                         # and only reported informational integrity findings.
                         "has_errors": operational_scan_failure,
                         "success": scan_result.success,
-                        "issues": [issue.__dict__ for issue in (scan_result.issues or [])],
-                        "checks": [check.__dict__ for check in (scan_result.checks or [])],
+                        "issues": _serialize_streamed_records(
+                            list(scan_result.issues or []),
+                            report_path,
+                            resolved_report_path,
+                        ),
+                        "checks": _serialize_streamed_records(
+                            list(scan_result.checks or []),
+                            report_path,
+                            resolved_report_path,
+                        ),
                         "scanners": [scan_result.scanner_name] if scan_result.scanner_name else [],
-                        "file_metadata": {str(source_path): metadata_dict},
+                        "file_metadata": {report_path: metadata_dict},
                     }
                     results.aggregate_scan_result(scan_result_dict)
 
                     # Add asset
-                    asset = asset_from_scan_result(str(source_path), scan_result)
+                    asset = asset_from_scan_result(report_path, scan_result, metadata=metadata_dict)
                     if asset:
                         results.assets.extend(convert_assets_to_models([asset]))
 

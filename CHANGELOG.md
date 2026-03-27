@@ -32,9 +32,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - tighten Hugging Face cache-root matching so only real `.cache/huggingface/hub` layouts get cache-specific filtering and provenance handling
 - preserve validated PE detections in pickle binary ML-context filtering
 - **security:** fail closed on pickle opcode parse errors for `.pkl` / `.pickle` / `.joblib` / `.dill` files instead of returning a successful INFO-only scan
+- **security:** surface an explicit INFO limitation when large pickle raw byte-pattern heuristics cover only the first 10 MB of the file
 - **security:** preserve full scanner execution for large files when scanners do not implement chunk analyzers
 - harden manifest URL trust checks and enforce metadata/manifest scan limits
 - harden metadata scanner URL handling so shorteners/tunnels hidden in userinfo are flagged without treating ordinary authenticated URLs as suspicious
+- trust legitimate AWS S3 virtual-hosted regional and legacy manifest URLs without broadening other `amazonaws.com` hosts
 - treat all-uppercase pickle module segments as plausible imports
 - recurse into extensionless nested ZIP members by content
 - preserve mixed ZIP/TAR/MAR archive depth limits
