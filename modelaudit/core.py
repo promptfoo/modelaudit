@@ -625,6 +625,8 @@ def scan_model_directory_or_file(
             if scanner:
                 scan_result, was_complete = stream_analyze_file(stream_url, scanner)
                 if scan_result:
+                    results.files_scanned += 1
+
                     # Use helper function to add scan result to Pydantic model
                     _add_scan_result_to_model(results, scan_metadata, scan_result, stream_url)
 
