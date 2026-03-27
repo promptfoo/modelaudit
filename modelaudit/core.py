@@ -168,7 +168,7 @@ def _select_preferred_scanner_id(path: str, header_format: str, ext: str) -> str
     if header_format == "zip":
         if is_torchserve_mar_archive(path):
             return "torchserve_mar"
-        if is_keras_zip_archive(path):
+        if is_keras_zip_archive(path, allow_config_only=ext == ".keras"):
             return "keras_zip"
         if is_pytorch_zip_archive(path):
             return "pytorch_zip"

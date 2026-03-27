@@ -219,7 +219,7 @@ def is_torchserve_mar_archive(path: str) -> bool:
         return False
 
 
-def is_keras_zip_archive(path: str) -> bool:
+def is_keras_zip_archive(path: str, *, allow_config_only: bool = False) -> bool:
     """Return whether a ZIP-backed file has the minimal Keras archive structure."""
     file_path = Path(path)
     if not file_path.is_file():
@@ -237,6 +237,9 @@ def is_keras_zip_archive(path: str) -> bool:
 
     if _KERAS_ZIP_REQUIRED_ENTRY not in member_names:
         return False
+
+    if allow_config_only:
+        return True
 
     return any(marker in member_names for marker in _KERAS_ZIP_MARKERS)
 

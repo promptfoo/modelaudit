@@ -81,6 +81,21 @@ def test_scan_file_routes_misnamed_keras_zip_by_content(tmp_path: Path) -> None:
     assert any("lambda" in issue.message.lower() for issue in result.issues)
 
 
+def test_scan_file_routes_config_only_keras_by_suffix(tmp_path: Path) -> None:
+    keras_model = tmp_path / "model.keras"
+    _create_misnamed_zip(
+        keras_model,
+        {
+            "config.json": json.dumps({"class_name": "Sequential", "config": {"layers": []}}).encode("utf-8"),
+        },
+    )
+
+    result = scan_file(str(keras_model))
+
+    assert result.scanner_name == "keras_zip"
+    assert any(check.name == "Keras ZIP Format Check" for check in result.checks)
+
+
 def test_scan_file_routes_misnamed_pytorch_zip_by_content(tmp_path: Path) -> None:
     disguised_torch = tmp_path / "model.jpg"
     _create_misnamed_zip(

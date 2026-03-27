@@ -6,6 +6,7 @@ import os
 import re
 import tempfile
 import zipfile
+from pathlib import Path
 from typing import Any, ClassVar
 
 from modelaudit.detectors.suspicious_symbols import (
@@ -202,7 +203,7 @@ class KerasZipScanner(BaseScanner):
         try:
             from ..utils.file.detection import is_keras_zip_archive
 
-            return is_keras_zip_archive(path)
+            return is_keras_zip_archive(path, allow_config_only=Path(path).suffix.lower() == ".keras")
         except Exception:
             return False
 

@@ -213,6 +213,21 @@ class TestKerasZipScanner:
         finally:
             os.unlink(temp_path)
 
+    def test_can_handle_keras_zip_with_only_config_json(self):
+        """A real .keras suffix should still route to the Keras scanner with only config.json."""
+        scanner = KerasZipScanner()
+
+        with tempfile.NamedTemporaryFile(suffix=".keras", delete=False) as f:
+            with zipfile.ZipFile(f, "w") as zf:
+                config = {"class_name": "Sequential", "config": {"layers": []}}
+                zf.writestr("config.json", json.dumps(config))
+            temp_path = f.name
+
+        try:
+            assert scanner.can_handle(temp_path)
+        finally:
+            os.unlink(temp_path)
+
     def test_lambda_layer_with_exec(self):
         """Test detection of Lambda layer with exec() call."""
         scanner = KerasZipScanner()
