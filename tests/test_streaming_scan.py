@@ -1,5 +1,7 @@
 """Tests for streaming scan-and-delete functionality."""
 
+import os
+import pickle
 import tempfile
 import time
 from pathlib import Path
@@ -9,6 +11,7 @@ import pytest
 
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file, scan_model_streaming
 from modelaudit.scanners.base import IssueSeverity, ScanResult
+from modelaudit.utils.helpers.file_iterator import iterate_files_streaming
 from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
 
 
@@ -87,6 +90,99 @@ def test_scan_model_streaming_basic(temp_test_files):
         assert result.has_errors is False
         assert result.content_hash is not None
         assert len(result.content_hash) == 64  # SHA256 hex string
+
+
+def test_scan_model_streaming_symlink_outside_directory_matches_normal_scan(
+    tmp_path: Path,
+    requires_symlinks: None,
+) -> None:
+    """Local streaming scans should reject symlinks that escape the requested directory."""
+    base_dir = tmp_path / "base"
+    base_dir.mkdir()
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+
+    with (base_dir / "safe.pkl").open("wb") as f:
+        pickle.dump({"data": "safe"}, f)
+    with (outside_dir / "secret.pkl").open("wb") as f:
+        pickle.dump({"data": "secret"}, f)
+
+    symlink_path = base_dir / "link.pkl"
+    symlink_path.symlink_to(outside_dir / "secret.pkl")
+
+    normal_result = scan_model_directory_or_file(str(base_dir), cache_enabled=False)
+    streaming_result = scan_model_streaming(
+        file_generator=iterate_files_streaming(base_dir),
+        timeout=30,
+        delete_after_scan=False,
+        scan_root=base_dir,
+        cache_enabled=False,
+    )
+
+    normal_traversal_issues = [i for i in normal_result.issues if "path traversal" in i.message.lower()]
+    streaming_traversal_issues = [i for i in streaming_result.issues if "path traversal" in i.message.lower()]
+
+    assert len(normal_traversal_issues) == 1
+    assert len(streaming_traversal_issues) == 1
+    assert normal_traversal_issues[0].location == str(symlink_path)
+    assert streaming_traversal_issues[0].location == str(symlink_path)
+    assert streaming_traversal_issues[0].severity == IssueSeverity.CRITICAL
+    assert normal_result.files_scanned == 1
+    assert streaming_result.files_scanned == 1
+
+
+def test_scan_model_streaming_hf_cache_symlink_allowed(
+    tmp_path: Path,
+    requires_symlinks: None,
+) -> None:
+    """Local streaming scans should preserve HuggingFace cache symlink handling."""
+    cache_dir = tmp_path / ".cache" / "huggingface" / "hub" / "models--test-model"
+    snapshots_dir = cache_dir / "snapshots" / "abc123"
+    blobs_dir = cache_dir / "blobs"
+    snapshots_dir.mkdir(parents=True)
+    blobs_dir.mkdir(parents=True)
+
+    blob_path = blobs_dir / "blob123"
+    with blob_path.open("wb") as f:
+        pickle.dump({"data": "safe"}, f)
+
+    model_link = snapshots_dir / "model.pkl"
+    os.symlink("../../blobs/blob123", model_link)
+
+    result = scan_model_streaming(
+        file_generator=iterate_files_streaming(snapshots_dir),
+        timeout=30,
+        delete_after_scan=False,
+        scan_root=snapshots_dir,
+        cache_enabled=False,
+    )
+
+    path_traversal_issues = [i for i in result.issues if "path traversal" in i.message.lower()]
+    assert result.files_scanned == 1
+    assert len(path_traversal_issues) == 0
+
+
+def test_scan_model_streaming_max_total_size(tmp_path: Path) -> None:
+    """Streaming scans should stop once the cumulative size limit is exceeded."""
+    for name, value in [("a.pkl", "x" * 100), ("b.pkl", "y" * 100), ("c.pkl", "z" * 100)]:
+        with (tmp_path / name).open("wb") as f:
+            pickle.dump({"data": value}, f)
+
+    result = scan_model_streaming(
+        file_generator=iterate_files_streaming(tmp_path),
+        timeout=30,
+        delete_after_scan=False,
+        max_total_size=150,
+        cache_enabled=False,
+    )
+
+    limit_issues = [i for i in result.issues if "Total scan size limit exceeded" in i.message]
+    termination_issues = [i for i in result.issues if "Scan terminated early due to total size limit" in i.message]
+
+    assert result.success is True
+    assert result.files_scanned == 2
+    assert len(limit_issues) == 1
+    assert len(termination_issues) == 1
 
 
 def test_scan_model_streaming_with_deletion(temp_test_files):
