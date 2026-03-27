@@ -372,7 +372,7 @@ class TestSevenZipScanner:
         """Test identification of scannable files"""
         test_files = [
             "nested.7z",  # Scannable
-            "nested_archive",  # Extensionless nested archives are scanned by content
+            "nested_archive",  # Extensionless members are probed separately
             "model.pkl",  # Scannable
             "weights.pt",  # Scannable
             "model.bin",  # Scannable
@@ -384,7 +384,7 @@ class TestSevenZipScanner:
 
         scannable = scanner._identify_scannable_files(test_files)
 
-        expected_scannable = ["nested.7z", "nested_archive", "model.pkl", "weights.pt", "model.bin", "config.json"]
+        expected_scannable = ["nested.7z", "model.pkl", "weights.pt", "model.bin", "config.json"]
         assert set(scannable) == set(expected_scannable)
 
     @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
@@ -465,6 +465,32 @@ class TestSevenZipScanner:
             mock_archive.extract.assert_called_once()
             assert mock_archive.extract.call_args.kwargs["targets"] == ["safe.pkl"]
             mock_scan_extracted_file.assert_called_once()
+
+    def test_extensionless_non_7z_members_are_filtered_before_full_extraction(self, scanner, temp_7z_file) -> None:
+        """Only header-confirmed extensionless members should reach the full extraction pass."""
+        extensionless_members = [f"asset_{index:03d}" for index in range(32)]
+
+        with (
+            patch("modelaudit.scanners.sevenzip_scanner.HAS_PY7ZR", True),
+            patch("modelaudit.scanners.sevenzip_scanner.py7zr") as mock_py7zr,
+            patch.object(scanner, "_member_has_7z_magic") as mock_member_has_7z_magic,
+            patch.object(scanner, "_scan_extracted_file") as mock_scan_extracted_file,
+            patch("os.path.isfile", return_value=True),
+            patch("os.path.getsize", return_value=32),
+        ):
+            mock_archive = MagicMock()
+            mock_archive.getnames.return_value = ["safe.pkl", "nested_archive", *extensionless_members]
+            mock_archive.getinfo.side_effect = lambda _name: MagicMock(uncompressed=16, is_directory=False)
+            mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
+            mock_member_has_7z_magic.side_effect = lambda _archive, name: name == "nested_archive"
+
+            result = scanner.scan(temp_7z_file)
+
+            assert result.success
+            assert mock_member_has_7z_magic.call_count == len(extensionless_members) + 1
+            mock_archive.extract.assert_called_once()
+            assert mock_archive.extract.call_args.kwargs["targets"] == ["safe.pkl", "nested_archive"]
+            assert mock_scan_extracted_file.call_count == 2
 
     def test_max_entries_protection(self, scanner, temp_7z_file):
         """Test protection against archives with too many entries"""
