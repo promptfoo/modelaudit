@@ -5,8 +5,9 @@ import zipfile
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
-from modelaudit.scanners.base import IssueSeverity
+from modelaudit.scanners.base import IssueSeverity, ScanResult
 from modelaudit.scanners.zip_scanner import ZipScanner
 
 
@@ -184,6 +185,38 @@ class TestZipScanner:
             "Expected critical nested pickle finding, got: "
             f"{[(i.location, i.message, i.details) for i in result.issues]}"
         )
+
+    def test_nested_keras_member_routes_through_core_dispatch(self, tmp_path: Path) -> None:
+        """Nested ZIP-based model members should keep ZIP depth and use core dispatch."""
+        nested_keras = io.BytesIO()
+        with zipfile.ZipFile(nested_keras, "w"):
+            pass
+
+        archive_path = tmp_path / "outer.zip"
+        with zipfile.ZipFile(archive_path, "w") as outer_archive:
+            outer_archive.writestr("nested_model.keras", nested_keras.getvalue())
+
+        dispatched_result = ScanResult(scanner_name="keras_zip")
+        dispatched_result.metadata["file_size"] = len(nested_keras.getvalue())
+        dispatched_result.finish(success=True)
+
+        with patch("modelaudit.core.scan_file", return_value=dispatched_result) as mock_scan_file:
+            result = self.scanner.scan(str(archive_path))
+
+        assert result.success is True
+        assert mock_scan_file.call_count == 1
+
+        scan_path, scan_config = mock_scan_file.call_args.args
+        assert scan_path.endswith(".keras")
+        assert scan_config["_zip_depth"] == 1
+
+        assert result.metadata["contents"] == [
+            {
+                "path": f"{archive_path}:nested_model.keras",
+                "type": "keras_zip",
+                "size": len(nested_keras.getvalue()),
+            }
+        ]
 
     def test_max_depth_limit_on_extensionless_nested_zip_chain(self, tmp_path: Path) -> None:
         """Extensionless nested ZIP chains should still honor max_zip_depth."""
