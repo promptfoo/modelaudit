@@ -132,6 +132,32 @@ def test_cached_scan_skips_persisting_operational_failures(tmp_path: Path) -> No
     assert cache_manager.get_stats()["total_entries"] == 0
 
 
+def test_cached_scan_skips_persisting_operational_failures_from_checks(tmp_path: Path) -> None:
+    file_path = _make_cacheable_file(tmp_path)
+    cache_dir = tmp_path / "cache"
+    config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
+    calls = {"count": 0}
+
+    @cached_scan()
+    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
+        calls["count"] += 1
+        return {
+            "checks": [{"message": "Scan timeout after 1 seconds", "status": "failed"}],
+            "issues": [],
+            "timeout_count": calls["count"],
+        }
+
+    first = scan(str(file_path), config)
+    second = scan(str(file_path), config)
+
+    assert first["timeout_count"] == 1
+    assert second["timeout_count"] == 2
+    assert calls["count"] == 2
+
+    cache_manager = get_cache_manager(str(cache_dir), enabled=True)
+    assert cache_manager.get_stats()["total_entries"] == 0
+
+
 def test_configuration_extractor_rebuilds_cached_config_after_mutation() -> None:
     extractor = ConfigurationExtractor()
     config = {"cache_enabled": True, "timeout": 30}

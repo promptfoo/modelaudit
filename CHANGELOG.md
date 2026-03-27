@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- harden scan-cache invalidation and skip caching operational scan failures
 - harden pickle CVE-2026-24747 SETITEM detection against stack-neutral padding
 - count successful `stream://` scans in `files_scanned` so clean streaming scans return exit code 0 instead of 2
 - harden 7z nested archive scanning and pre-extraction size checks
