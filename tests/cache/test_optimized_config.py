@@ -155,7 +155,8 @@ class TestConfigurationExtractor:
             extractor.extract_fast((f"/file{i}.pkl", config_dict), {})
 
         # Trigger cleanup
-        extractor._cleanup_config_cache()
+        newest_timestamp = max(timestamp for _, timestamp in extractor._config_cache.values())
+        extractor._cleanup_config_cache(current_time=newest_timestamp + 1.0)
 
         # Cache should be cleaned
         assert len(extractor._config_cache) <= 20
