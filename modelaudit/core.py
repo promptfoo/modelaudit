@@ -42,6 +42,7 @@ from modelaudit.utils.helpers.types import (
     ProgressCallback,
 )
 from modelaudit.utils.lfs import check_lfs_pointer, get_lfs_issue_details, get_lfs_remediation_steps
+from modelaudit.utils.sources.huggingface import is_huggingface_cache_path
 
 logger = logging.getLogger("modelaudit.core")
 
@@ -1147,16 +1148,18 @@ def _is_huggingface_cache_file(path: str) -> bool:
     import os
 
     filename = os.path.basename(path)
+    path_obj = Path(path)
 
-    # HuggingFace cache file patterns - be more specific
-    hf_cache_patterns = [
-        ".lock",  # Download lock files
-        ".metadata",  # HuggingFace metadata files
-    ]
+    # Download lock files are HuggingFace bookkeeping files regardless of cache layout.
+    if filename.endswith(".lock"):
+        return True
 
-    # Check if file ends with cache patterns
-    for pattern in hf_cache_patterns:
-        if filename.endswith(pattern):
+    # Only skip HuggingFace .metadata files in known cache/download layouts.
+    if filename.endswith(".metadata"):
+        if is_huggingface_cache_path(path_obj):
+            return True
+        normalized_parts = [part.lower() for part in path_obj.parent.parts]
+        if len(normalized_parts) >= 3 and normalized_parts[-3:] == [".cache", "huggingface", "download"]:
             return True
 
     # Check for specific HuggingFace cache metadata files

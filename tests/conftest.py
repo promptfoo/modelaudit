@@ -66,6 +66,7 @@ def pytest_runtest_setup(item):
             "test_base_scanner.py",
             "test_core.py",
             "test_cli.py",
+            "test_directory_file_filtering.py",  # Directory prefilter regression tests
             "test_bug1_confidence_exploit.py",  # Security bug test
             "test_gguf_scanner.py",  # GGUF scanner tests
             "test_shebang_context.py",  # Shebang context verification tests
@@ -108,6 +109,9 @@ def pytest_runtest_setup(item):
             "test_debug_command.py",  # debug output telemetry flags
             "test_auth_config.py",  # auth config path and secret-storage hardening tests
             "test_utils.py",  # archive path sanitization regression coverage
+            "test_file_filter.py",  # Directory file prefilter tests
+            "test_huggingface.py",  # HuggingFace provenance and cache path tests
+            "test_huggingface_symlinks.py",  # HuggingFace cache symlink handling tests
             "test_oci_layer_scanner.py",  # OCI layer path safety regression tests
             "test_jfrog.py",  # JFrog utility tests
             "test_jfrog_integration.py",  # JFrog integration tests
