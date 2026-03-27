@@ -395,13 +395,14 @@ class SevenZipScanner(BaseScanner):
     def _identify_extensionless_nested_7z_files(
         self, archive: Any, file_names: list[str], archive_path: str, result: ScanResult
     ) -> list[str]:
-        """Inspect extensionless members and keep only confirmed nested 7z archives."""
+        """Inspect unsupported members and keep only confirmed nested 7z archives."""
         nested_archives: list[str] = []
         probe_targets: list[str] = []
         probes_remaining = self.max_extensionless_probes
+        supported_extensions = self._supported_nested_core_extensions()
         for file_name in file_names:
-            _, ext = os.path.splitext(file_name.lower())
-            if ext:
+            candidate_extensions = self._candidate_archive_extensions(file_name)
+            if any(extension in supported_extensions for extension in candidate_extensions):
                 continue
 
             if probes_remaining <= 0:
@@ -409,8 +410,8 @@ class SevenZipScanner(BaseScanner):
                     name="Extensionless Probe Limit",
                     passed=False,
                     message=(
-                        f"Extensionless member probe limit ({self.max_extensionless_probes}) "
-                        f"reached; remaining extensionless members were not inspected"
+                        f"Nested member probe limit ({self.max_extensionless_probes}) "
+                        f"reached; remaining unsupported members were not inspected"
                     ),
                     severity=IssueSeverity.WARNING,
                     location=archive_path,
