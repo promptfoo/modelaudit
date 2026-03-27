@@ -285,7 +285,7 @@ class SevenZipScanner(BaseScanner):
                 location=path,
                 details={"depth": depth, "max_depth": self.max_depth},
             )
-            result.finish(success=True)
+            result.finish(success=False)
             return result
 
         result.add_check(

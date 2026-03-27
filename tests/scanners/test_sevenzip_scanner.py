@@ -355,6 +355,7 @@ class TestSevenZipScanner:
             result = scanner.scan(temp_7z_file)
 
         depth_checks = [check for check in result.checks if check.name == "7z Depth Bomb Protection"]
+        assert not result.success
         assert len(depth_checks) == 1
         assert depth_checks[0].status == CheckStatus.FAILED
         assert "maximum 7z nesting depth (1) exceeded" in depth_checks[0].message.lower()
