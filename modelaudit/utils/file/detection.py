@@ -58,6 +58,8 @@ _SEVENZIP_MAGIC = b"7z\xbc\xaf\x27\x1c"
 _LZ4_FRAME_MAGIC = b"\x04\x22\x4d\x18"
 _TORCHSERVE_MANIFEST_PATH = "MAR-INF/MANIFEST.json"
 _TORCHSERVE_MANIFEST_MAX_BYTES = 1 * 1024 * 1024
+_KERAS_ZIP_REQUIRED_ENTRY = "config.json"
+_KERAS_ZIP_MARKERS = frozenset({"metadata.json", "model.weights.h5", "variables.h5"})
 _COMPRESSED_EXTENSION_CODECS = {
     ".gz": "gzip",
     ".bz2": "bzip2",
@@ -215,6 +217,47 @@ def is_torchserve_mar_archive(path: str) -> bool:
         zipfile.LargeZipFile,
     ):
         return False
+
+
+def is_keras_zip_archive(path: str) -> bool:
+    """Return whether a ZIP-backed file has the minimal Keras archive structure."""
+    file_path = Path(path)
+    if not file_path.is_file():
+        return False
+
+    try:
+        with zipfile.ZipFile(file_path, "r") as archive:
+            member_names = {
+                _normalize_archive_member_name(info.filename)
+                for info in archive.infolist()
+                if info.filename and not info.is_dir()
+            }
+    except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile):
+        return False
+
+    if _KERAS_ZIP_REQUIRED_ENTRY not in member_names:
+        return False
+
+    return any(marker in member_names for marker in _KERAS_ZIP_MARKERS)
+
+
+def is_pytorch_zip_archive(path: str) -> bool:
+    """Return whether a ZIP-backed file has a conservative PyTorch archive signature."""
+    file_path = Path(path)
+    if not file_path.is_file():
+        return False
+
+    try:
+        with zipfile.ZipFile(file_path, "r") as archive:
+            member_names = {
+                _normalize_archive_member_name(info.filename)
+                for info in archive.infolist()
+                if info.filename and not info.is_dir()
+            }
+    except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile):
+        return False
+
+    return any(name == "data.pkl" or name.endswith("/data.pkl") for name in member_names)
 
 
 def _is_tar_archive(path: str) -> bool:

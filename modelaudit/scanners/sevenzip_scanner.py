@@ -132,10 +132,6 @@ class SevenZipScanner(BaseScanner):
         if not os.path.isfile(path):
             return False
 
-        # Check extension
-        if not path.lower().endswith(".7z"):
-            return False
-
         return cls._has_7z_magic(path)
 
     def _get_archive_depth(self) -> int:

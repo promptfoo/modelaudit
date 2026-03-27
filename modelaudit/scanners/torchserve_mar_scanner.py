@@ -104,8 +104,6 @@ class TorchServeMarScanner(BaseScanner):
     def can_handle(cls, path: str) -> bool:
         if not os.path.isfile(path):
             return False
-        if os.path.splitext(path)[1].lower() not in cls.supported_extensions:
-            return False
 
         try:
             from ..utils.file.detection import is_torchserve_mar_archive

@@ -23,6 +23,9 @@ from modelaudit.utils.file.detection import (
     detect_file_format,
     detect_file_format_from_magic,
     detect_format_from_extension,
+    is_keras_zip_archive,
+    is_pytorch_zip_archive,
+    is_torchserve_mar_archive,
     validate_file_type,
 )
 from modelaudit.utils.file.handlers import (
@@ -158,6 +161,41 @@ def _add_scan_result_to_model(
 
             metadata_dict["ml_context"] = MLContextModel(**metadata_dict["ml_context"])
         results.file_metadata[file_path] = FileMetadataModel(**metadata_dict)
+
+
+def _select_preferred_scanner_id(path: str, header_format: str, ext: str) -> str | None:
+    """Select a scanner by trusted file structure, not just suffix."""
+    if header_format == "zip":
+        if is_torchserve_mar_archive(path):
+            return "torchserve_mar"
+        if is_keras_zip_archive(path):
+            return "keras_zip"
+        if is_pytorch_zip_archive(path):
+            return "pytorch_zip"
+
+        if ext == ".bin":
+            # ZIP-backed torch.save() .bin files are routed through the pickle scanner,
+            # which already understands the ZIP serialization used by PyTorch.
+            return "pickle"
+        return "zip"
+
+    if header_format == "hdf5":
+        return "keras_h5"
+
+    format_to_scanner = {
+        "pickle": "pickle",
+        "pytorch_binary": "pytorch_binary",
+        "safetensors": "safetensors",
+        "tensorflow_directory": "tf_savedmodel",
+        "protobuf": "tf_savedmodel",
+        "tar": "tar",
+        "sevenzip": "sevenzip",
+        "onnx": "onnx",
+        "gguf": "gguf",
+        "ggml": "gguf",
+        "numpy": "numpy",
+    }
+    return format_to_scanner.get(header_format)
 
 
 def _add_issue_to_model(
@@ -1402,42 +1440,11 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             discrepancy_msg = f"File extension indicates {ext_format} but header indicates {header_format}."
             logger.debug(discrepancy_msg)
 
-    # Prefer scanner based on header format using lazy loading
+    # Prefer scanners based on trusted structure rather than the filename alone.
     preferred_scanner: type[BaseScanner] | None = None
-
-    # Special handling for PyTorch files that are ZIP-based
-    # PyTorch's torch.save() uses ZIP format by default since v1.6 (_use_new_zipfile_serialization=True)
-    # This applies to .pt, .pth, and .pkl files saved with torch.save()
-    if header_format == "zip" and ext == ".keras":
-        # Keras 3.x .keras files are ZIP archives - use the dedicated Keras ZIP scanner
-        preferred_scanner = _registry.load_scanner_by_id("keras_zip")
-    elif header_format == "zip" and ext in [".pt", ".pth", ".pkl"]:
-        preferred_scanner = _registry.load_scanner_by_id("pytorch_zip")
-    elif header_format == "zip" and ext == ".bin":
-        # PyTorch .bin files saved with torch.save() are ZIP format internally
-        # Use PickleScanner which can handle both pickle and ZIP-based PyTorch files
-        preferred_scanner = _registry.load_scanner_by_id("pickle")
-    elif header_format == "zip" and ext == ".mar":
-        # TorchServe .mar model archives are ZIP-based - use dedicated MAR scanner
-        preferred_scanner = _registry.load_scanner_by_id("torchserve_mar")
-    else:
-        format_to_scanner = {
-            "pickle": "pickle",
-            "pytorch_binary": "pytorch_binary",
-            "hdf5": "keras_h5",
-            "safetensors": "safetensors",
-            "tensorflow_directory": "tf_savedmodel",
-            "protobuf": "tf_savedmodel",
-            "tar": "tar",
-            "zip": "zip",
-            "onnx": "onnx",
-            "gguf": "gguf",
-            "ggml": "gguf",
-            "numpy": "numpy",
-        }
-        scanner_id = format_to_scanner.get(header_format)
-        if scanner_id:
-            preferred_scanner = _registry.load_scanner_by_id(scanner_id)
+    scanner_id = _select_preferred_scanner_id(path, header_format, ext)
+    if scanner_id:
+        preferred_scanner = _registry.load_scanner_by_id(scanner_id)
 
     result: ScanResult | None
 

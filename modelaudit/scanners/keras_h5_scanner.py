@@ -63,12 +63,12 @@ class KerasH5Scanner(BaseScanner):
         if not os.path.isfile(path):
             return False
 
-        ext = os.path.splitext(path)[1].lower()
-        if ext not in cls.supported_extensions:
-            return False
-
         if not HAS_H5PY:
-            return True  # Let scan() handle the missing dep with a proper message
+            try:
+                with open(path, "rb") as handle:
+                    return handle.read(8) == b"\x89HDF\r\n\x1a\n"
+            except OSError:
+                return False
 
         # Try to open as HDF5 file
         try:
