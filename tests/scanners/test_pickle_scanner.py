@@ -208,6 +208,7 @@ def test_large_pickle_raw_pattern_limit_with_opcode_budget_truncation(tmp_path: 
     assert len(opcode_checks) == 1
     assert opcode_checks[0].details["analysis_incomplete"] is True
     assert result.metadata["analysis_incomplete"] is True
+    assert result.success is False
 
 
 class TestPickleScanner(unittest.TestCase):
@@ -3013,6 +3014,7 @@ def test_scan_pickle_reports_opcode_budget_truncation_for_buffered_follow_on_str
     assert "opcode budget" in opcode_checks[0].message.lower()
     assert opcode_checks[0].details["analysis_incomplete"] is True
     assert result.metadata["analysis_incomplete"] is True
+    assert result.success is False
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 

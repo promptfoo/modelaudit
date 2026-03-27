@@ -4075,7 +4075,7 @@ class PickleScanner(BaseScanner):
             result.finish(success=False)
             return result
 
-        result.finish(success=True)
+        result.finish(success=scan_result.success)
         return result
 
     def _scan_for_dangerous_patterns(self, data: bytes, result: ScanResult, context_path: str) -> None:
@@ -4691,6 +4691,7 @@ class PickleScanner(BaseScanner):
             # Store warnings for ML-context-aware processing
             stack_depth_warnings: list[dict[str, int | str]] = []
             opcode_budget_exceeded = False
+            timed_out = False
 
             try:
                 for opcode, arg, pos in _genops_with_fallback(
@@ -4771,23 +4772,12 @@ class PickleScanner(BaseScanner):
 
                     # Check for too many opcodes
                     if opcode_count > self.max_opcodes:
-                        result.add_check(
-                            name="Opcode Count Check",
-                            passed=False,
-                            message=f"Too many opcodes in pickle (> {self.max_opcodes})",
-                            severity=IssueSeverity.INFO,
-                            location=self.current_file_path,
-                            details={
-                                "opcode_count": opcode_count,
-                                "max_opcodes": self.max_opcodes,
-                            },
-                            why=get_pattern_explanation("pickle_size_limit"),
-                            rule_code="S902",
-                        )
+                        opcode_budget_exceeded = True
                         break
 
                     # Check for timeout
                     if time.time() - result.start_time > self.timeout:
+                        timed_out = True
                         result.add_check(
                             name="Scan Timeout Check",
                             passed=False,
@@ -4826,6 +4816,7 @@ class PickleScanner(BaseScanner):
             if time.time() - result.start_time > self.timeout and not any(
                 check.name == "Scan Timeout Check" and check.status == CheckStatus.FAILED for check in result.checks
             ):
+                timed_out = True
                 result.add_check(
                     name="Scan Timeout Check",
                     passed=False,
@@ -6159,6 +6150,7 @@ class PickleScanner(BaseScanner):
             with contextlib.suppress(NameError):
                 sys.setrecursionlimit(original_recursion_limit)  # type: ignore[possibly-unresolved-reference]
 
+        result.finish(success=not (opcode_budget_exceeded or timed_out))
         return result
 
     def _is_legitimate_pytorch_model(self, path: str) -> bool:
