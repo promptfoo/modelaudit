@@ -112,7 +112,7 @@ class TestExtractModelIdFromPath:
         assert extract_model_id_from_path(str(model_path)) == ("Qwen/Qwen2.5-0.5B", "local")
 
     def test_extract_model_id_from_hf_cache_path(self, tmp_path: Path) -> None:
-        """Real HuggingFace cache paths should be identified as HuggingFace provenance."""
+        """Local HuggingFace cache paths should use distinct cache provenance."""
         model_path = (
             tmp_path
             / ".cache"
@@ -126,7 +126,7 @@ class TestExtractModelIdFromPath:
         model_path.parent.mkdir(parents=True)
         model_path.write_bytes(b"weights")
 
-        assert extract_model_id_from_path(str(model_path)) == ("Qwen/Qwen2.5-0.5B", "huggingface")
+        assert extract_model_id_from_path(str(model_path)) == ("Qwen/Qwen2.5-0.5B", "huggingface_cache")
 
     def test_extract_model_id_rejects_spoofed_models_directory(self, tmp_path: Path) -> None:
         """A local models--* directory without HF cache layout should not be treated as HuggingFace."""

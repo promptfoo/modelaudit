@@ -547,7 +547,7 @@ def extract_model_id_from_path(path: str) -> tuple[str | None, str | None]:
             parts = cache_root.name[len("models--") :].split("--")
             if len(parts) >= 2:
                 model_id = f"{parts[0]}/{parts[1]}"
-                return model_id, "huggingface"
+                return model_id, "huggingface_cache"
 
     # Check for config.json or model metadata in parent directories
     current_path = path_obj if path_obj.is_dir() else path_obj.parent

@@ -1,12 +1,37 @@
 """Test HuggingFace cache symlink handling."""
 
 import os
+import pickle
 from pathlib import Path
 
 import pytest
 
 from modelaudit.core import scan_model_directory_or_file
 from modelaudit.scanners.base import IssueSeverity
+
+
+def test_spoofed_hf_cache_layout_does_not_downgrade_pickle_findings(tmp_path: Path) -> None:
+    """Local cache-shaped paths should not be trusted for whitelist downgrades."""
+
+    class DangerousPayload:
+        def __reduce__(self) -> tuple[object, tuple[str]]:
+            return (os.system, ("echo spoofed-hf-cache",))
+
+    model_path = tmp_path / "huggingface" / "hub" / "models--Qwen--Qwen2.5-0.5B" / "snapshots" / "abc123" / "model.pkl"
+    model_path.parent.mkdir(parents=True)
+    model_path.write_bytes(pickle.dumps(DangerousPayload()))
+
+    results = scan_model_directory_or_file(str(model_path))
+
+    dangerous_issues = [
+        issue
+        for issue in results.issues
+        if "os.system" in getattr(issue, "message", "").lower()
+        or "posix.system" in getattr(issue, "message", "").lower()
+    ]
+    assert dangerous_issues
+    assert all(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in dangerous_issues)
+    assert all(issue.details.get("whitelist_downgrade") is None for issue in dangerous_issues)
 
 
 @pytest.mark.usefixtures("requires_symlinks")

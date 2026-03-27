@@ -527,8 +527,8 @@ def test_whitelist_no_downgrade_local_spoofed_config(tmp_path: Path) -> None:
     assert result.issues[0].details.get("whitelist_downgrade") is None
 
 
-def test_whitelist_downgrade_real_hf_cache_path(tmp_path: Path) -> None:
-    """Real HuggingFace cache paths should remain eligible for whitelist downgrades."""
+def test_whitelist_no_downgrade_hf_cache_path(tmp_path: Path) -> None:
+    """Local HuggingFace cache paths should not be eligible for whitelist downgrades."""
     model_path = (
         tmp_path
         / ".cache"
@@ -547,14 +547,14 @@ def test_whitelist_downgrade_real_hf_cache_path(tmp_path: Path) -> None:
 
     assert scanner.context is not None
     assert scanner.context.model_id == "Qwen/Qwen2.5-0.5B"
-    assert scanner.context.model_source == "huggingface"
+    assert scanner.context.model_source == "huggingface_cache"
 
     result = scanner._create_result()
     result._add_issue("Test warning", severity=IssueSeverity.WARNING)
 
     assert len(result.issues) == 1
-    assert result.issues[0].severity == IssueSeverity.INFO
-    assert result.issues[0].details.get("whitelist_downgrade") is True
+    assert result.issues[0].severity == IssueSeverity.WARNING
+    assert result.issues[0].details.get("whitelist_downgrade") is None
 
 
 def test_whitelist_downgrade_check_critical():
