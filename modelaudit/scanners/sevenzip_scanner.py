@@ -4,6 +4,7 @@ import io
 import os
 import tempfile
 from contextlib import suppress
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar
 
 if TYPE_CHECKING:
@@ -68,6 +69,27 @@ class _HeaderProbeFactory:
 
     def get(self, filename: str) -> _HeaderProbeBuffer | None:
         return self.products.get(filename)
+
+
+@dataclass
+class _RecursiveScanBudget:
+    cumulative_entries: int = 0
+    cumulative_extract_bytes: int = 0
+    limit_exceeded: bool = False
+
+    def record_entries(self, entry_count: int) -> int:
+        self.cumulative_entries += entry_count
+        return self.cumulative_entries
+
+    def record_extract_bytes(self, extracted_size: int) -> int:
+        self.cumulative_extract_bytes += extracted_size
+        return self.cumulative_extract_bytes
+
+    def abort_due_to_limit(self) -> None:
+        self.limit_exceeded = True
+
+    def should_stop(self) -> bool:
+        return self.limit_exceeded
 
 
 class SevenZipScanner(BaseScanner):
@@ -197,11 +219,17 @@ class SevenZipScanner(BaseScanner):
         self,
         path: str,
         depth: int = 0,
-        cumulative_entries: int = 0,
-        cumulative_extract_bytes: int = 0,
+        budget: _RecursiveScanBudget | None = None,
     ) -> ScanResult:
         """Recursively scan a 7-Zip archive and its contents."""
+        if budget is None:
+            budget = _RecursiveScanBudget()
+
         result = ScanResult(scanner_name=self.name, scanner=self)
+
+        if budget.should_stop():
+            result.finish(success=False)
+            return result
 
         if depth >= self.max_depth:
             result.add_check(
@@ -229,6 +257,7 @@ class SevenZipScanner(BaseScanner):
 
             # Check per-archive entry limit
             if len(file_names) > self.max_entries:
+                budget.abort_due_to_limit()
                 result.add_check(
                     name="Archive Entry Limit",
                     passed=False,
@@ -249,19 +278,20 @@ class SevenZipScanner(BaseScanner):
                 return result
 
             # Check cumulative entry count across nesting depths
-            new_cumulative_entries = cumulative_entries + len(file_names)
-            if new_cumulative_entries > self.max_cumulative_entries:
+            cumulative_entries = budget.record_entries(len(file_names))
+            if cumulative_entries > self.max_cumulative_entries:
+                budget.abort_due_to_limit()
                 result.add_check(
                     name="Cumulative Entry Limit",
                     passed=False,
                     message=(
-                        f"Cumulative entry count ({new_cumulative_entries}) across nested "
+                        f"Cumulative entry count ({cumulative_entries}) across nested "
                         f"archives exceeds limit of {self.max_cumulative_entries}"
                     ),
                     severity=IssueSeverity.CRITICAL,
                     location=path,
                     details={
-                        "cumulative_entries": new_cumulative_entries,
+                        "cumulative_entries": cumulative_entries,
                         "limit": self.max_cumulative_entries,
                         "potential_threat": "nested_zip_bomb",
                     },
@@ -295,8 +325,7 @@ class SevenZipScanner(BaseScanner):
                     path,
                     result,
                     depth,
-                    cumulative_entries=new_cumulative_entries,
-                    cumulative_extract_bytes=cumulative_extract_bytes,
+                    budget=budget,
                 )
 
             result.metadata["total_files"] = len(file_names)
@@ -304,7 +333,7 @@ class SevenZipScanner(BaseScanner):
             result.metadata["unsafe_entries"] = len(file_names) - len(safe_file_names)
             result.metadata["file_size"] = os.path.getsize(path)
 
-        result.finish(success=True)
+        result.finish(success=not budget.should_stop())
         return result
 
     def _identify_scannable_files(self, file_names: list[str]) -> list[str]:
@@ -435,8 +464,7 @@ class SevenZipScanner(BaseScanner):
         archive_path: str,
         result: ScanResult,
         depth: int,
-        cumulative_entries: int = 0,
-        cumulative_extract_bytes: int = 0,
+        budget: _RecursiveScanBudget,
     ) -> None:
         """Extract scannable files and run appropriate scanners on them"""
         extractable_files = []
@@ -462,7 +490,7 @@ class SevenZipScanner(BaseScanner):
 
             extractable_files.append(file_name)
 
-        if not extractable_files:
+        if not extractable_files or budget.should_stop():
             return
 
         with tempfile.TemporaryDirectory(prefix="modelaudit_7z_") as tmp_dir:
@@ -470,9 +498,9 @@ class SevenZipScanner(BaseScanner):
                 # Extract all scannable files at once to avoid py7zr state issues
                 archive.extract(path=tmp_dir, targets=extractable_files)
 
-                # Scan each extracted file
-                running_extract_bytes = cumulative_extract_bytes
                 for file_name in extractable_files:
+                    if budget.should_stop():
+                        return
                     try:
                         extracted_path = os.path.join(tmp_dir, file_name)
 
@@ -506,19 +534,20 @@ class SevenZipScanner(BaseScanner):
                                 continue
 
                             # Check cumulative extraction size
-                            running_extract_bytes += extracted_size
-                            if running_extract_bytes > self.max_total_extract_size:
+                            cumulative_extract_bytes = budget.record_extract_bytes(extracted_size)
+                            if cumulative_extract_bytes > self.max_total_extract_size:
+                                budget.abort_due_to_limit()
                                 result.add_check(
                                     name="Cumulative Extraction Size",
                                     passed=False,
                                     message=(
-                                        f"Cumulative extracted bytes ({running_extract_bytes}) "
+                                        f"Cumulative extracted bytes ({cumulative_extract_bytes}) "
                                         f"exceed limit of {self.max_total_extract_size}"
                                     ),
                                     severity=IssueSeverity.CRITICAL,
                                     location=archive_path,
                                     details={
-                                        "cumulative_bytes": running_extract_bytes,
+                                        "cumulative_bytes": cumulative_extract_bytes,
                                         "limit": self.max_total_extract_size,
                                         "potential_threat": "zip_bomb",
                                     },
@@ -532,9 +561,10 @@ class SevenZipScanner(BaseScanner):
                                 archive_path,
                                 result,
                                 depth,
-                                cumulative_entries=cumulative_entries,
-                                cumulative_extract_bytes=running_extract_bytes,
+                                budget=budget,
                             )
+                            if budget.should_stop():
+                                return
                         else:
                             # File was not extracted - log as warning
                             result.add_check(
@@ -613,8 +643,7 @@ class SevenZipScanner(BaseScanner):
         archive_path: str,
         result: ScanResult,
         depth: int,
-        cumulative_entries: int = 0,
-        cumulative_extract_bytes: int = 0,
+        budget: _RecursiveScanBudget,
     ) -> None:
         """Scan an individual extracted file using the appropriate scanner"""
         try:
@@ -622,8 +651,7 @@ class SevenZipScanner(BaseScanner):
                 file_result = self._scan_7z_file(
                     extracted_path,
                     depth + 1,
-                    cumulative_entries=cumulative_entries,
-                    cumulative_extract_bytes=cumulative_extract_bytes,
+                    budget=budget,
                 )
             else:
                 _, original_ext = os.path.splitext(original_name.lower())
