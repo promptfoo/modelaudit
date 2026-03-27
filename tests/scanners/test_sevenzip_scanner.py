@@ -229,7 +229,7 @@ class TestSevenZipScanner:
                 os.unlink(temp_pickle_path)
 
     @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
-    def test_scan_nested_7z_archive(self, scanner, temp_7z_file) -> None:
+    def test_scan_nested_7z_archive(self, scanner: SevenZipScanner, temp_7z_file: str) -> None:
         """Nested 7z archives should be scanned recursively."""
         import py7zr  # type: ignore[import-untyped]
 
@@ -265,7 +265,9 @@ class TestSevenZipScanner:
             mock_scanner.scan.assert_called_once()
             nested_issues = [issue for issue in result.issues if issue.message == "Nested pickle scanned"]
             assert len(nested_issues) == 1
-            assert f"{temp_7z_file}:nested.7z:nested_model.pkl" in nested_issues[0].location
+            nested_location = nested_issues[0].location
+            assert nested_location is not None
+            assert f"{temp_7z_file}:nested.7z:nested_model.pkl" in nested_location
 
         finally:
             if os.path.exists(temp_pickle_path):
@@ -274,7 +276,11 @@ class TestSevenZipScanner:
                 inner_7z_path.unlink()
 
     @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
-    def test_scan_extensionless_nested_7z_archive(self, scanner, temp_7z_file) -> None:
+    def test_scan_extensionless_nested_7z_archive(
+        self,
+        scanner: SevenZipScanner,
+        temp_7z_file: str,
+    ) -> None:
         """Extensionless nested 7z archives should recurse based on file content."""
         import py7zr  # type: ignore[import-untyped]
 
@@ -316,7 +322,7 @@ class TestSevenZipScanner:
                 inner_7z_path.unlink()
 
     @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
-    def test_max_depth_limit(self, temp_7z_file) -> None:
+    def test_max_depth_limit(self, temp_7z_file: str) -> None:
         """Nested 7z archives should enforce the configured maximum depth."""
         import py7zr  # type: ignore[import-untyped]
 
@@ -346,7 +352,11 @@ class TestSevenZipScanner:
                     archive_path.unlink()
 
     @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
-    def test_extensionless_non_7z_member_is_not_reported_as_unsupported(self, scanner, temp_7z_file) -> None:
+    def test_extensionless_non_7z_member_is_not_reported_as_unsupported(
+        self,
+        scanner: SevenZipScanner,
+        temp_7z_file: str,
+    ) -> None:
         """Extensionless non-7z members should not emit noisy unsupported-file checks."""
         import py7zr  # type: ignore[import-untyped]
 
@@ -439,7 +449,11 @@ class TestSevenZipScanner:
             mock_archive.extract.assert_called_once()
             assert mock_archive.extract.call_args.kwargs["targets"] == ["safe.pkl"]
 
-    def test_oversized_entries_are_skipped_before_extraction(self, scanner, temp_7z_file) -> None:
+    def test_oversized_entries_are_skipped_before_extraction(
+        self,
+        scanner: SevenZipScanner,
+        temp_7z_file: str,
+    ) -> None:
         """Archive member sizes should be checked before extraction materializes files."""
         scanner.max_extract_size = 100
 
@@ -466,7 +480,11 @@ class TestSevenZipScanner:
             assert mock_archive.extract.call_args.kwargs["targets"] == ["safe.pkl"]
             mock_scan_extracted_file.assert_called_once()
 
-    def test_extensionless_non_7z_members_are_filtered_before_full_extraction(self, scanner, temp_7z_file) -> None:
+    def test_extensionless_non_7z_members_are_filtered_before_full_extraction(
+        self,
+        scanner: SevenZipScanner,
+        temp_7z_file: str,
+    ) -> None:
         """Only header-confirmed extensionless members should reach the full extraction pass."""
         extensionless_members = [f"asset_{index:03d}" for index in range(32)]
 
@@ -777,7 +795,7 @@ class TestSevenZipScannerConfiguration:
         assert scanner.max_entries == 5000
         assert scanner.max_extract_size == 512 * 1024 * 1024
 
-    def test_nested_scans_receive_scanner_config(self, temp_7z_file) -> None:
+    def test_nested_scans_receive_scanner_config(self, temp_7z_file: str) -> None:
         """Nested file scans should preserve the parent scanner config."""
         config = {
             "max_7z_depth": 4,
