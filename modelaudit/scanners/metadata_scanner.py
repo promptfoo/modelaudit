@@ -44,12 +44,23 @@ class MetadataScanner(BaseScanner):
         if path_check_result:
             return path_check_result
 
+        size_check = self._check_size_limit(path)
+        if size_check:
+            return size_check
+
+        self._start_scan_timer()
         result = self._create_result()
         p = Path(path)
+        file_size = self.get_file_size(path)
+        result.metadata["file_size"] = file_size
 
         try:
+            self.current_file_path = path
+            self._check_timeout()
+
             # MetadataScanner only handles text/documentation files
             issues = self._scan_text_metadata(path)
+            self._check_timeout()
             for issue in issues:
                 result.add_check(
                     name=issue.type or "Metadata Security Check",
@@ -61,6 +72,16 @@ class MetadataScanner(BaseScanner):
                     why=issue.why,
                 )
 
+        except TimeoutError as e:
+            result.add_check(
+                name="Metadata Scan Timeout",
+                passed=False,
+                message=f"Scan timed out: {e!s}",
+                severity=IssueSeverity.WARNING,
+                location=path,
+                details={"timeout_seconds": self.timeout},
+                why="Metadata scanning exceeded the configured timeout before all checks completed",
+            )
         except Exception as e:
             logger.warning(f"Error scanning metadata file {path}: {e}")
             result.add_check(
@@ -73,7 +94,7 @@ class MetadataScanner(BaseScanner):
                 why="Failed to process metadata file during scanning",
             )
 
-        result.bytes_scanned = p.stat().st_size if p.exists() else 0
+        result.bytes_scanned = file_size if p.exists() else 0
         result.finish(success=True)
         return result
 
@@ -85,8 +106,11 @@ class MetadataScanner(BaseScanner):
             with open(file_path, encoding="utf-8") as f:
                 content = f.read()
 
+            self._check_timeout()
+
             # Check for suspicious URLs
             issues.extend(self._check_suspicious_urls_in_text(content, file_path))
+            self._check_timeout()
 
             # Check for exposed credentials in text
             issues.extend(self._check_exposed_secrets_in_text(content, file_path))
@@ -129,6 +153,7 @@ class MetadataScanner(BaseScanner):
 
         seen = set()
         for url in urls:
+            self._check_timeout()
             if url in seen:
                 continue
             parsed = urlparse(url)
@@ -201,8 +226,10 @@ class MetadataScanner(BaseScanner):
         ]
 
         for pattern, description in secret_patterns:
+            self._check_timeout()
             matches = re.finditer(pattern, content, re.IGNORECASE)
             for match in matches:
+                self._check_timeout()
                 # Skip obvious examples or placeholders
                 matched_text = match.group(0)
 

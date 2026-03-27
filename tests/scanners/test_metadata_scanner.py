@@ -3,7 +3,9 @@
 import tempfile
 from pathlib import Path
 
-from modelaudit.scanners.base import IssueSeverity
+import pytest
+
+from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.metadata_scanner import MetadataScanner
 
 
@@ -166,3 +168,37 @@ class TestMetadataScanner:
 
         assert result.bytes_scanned > 0
         assert result.bytes_scanned == expected_size
+
+    def test_scan_enforces_size_limit(self, tmp_path: Path) -> None:
+        """Metadata scans should stop when max_file_read_size is exceeded."""
+        scanner = MetadataScanner(config={"max_file_read_size": 8})
+        readme_path = tmp_path / "README.md"
+        readme_path.write_text("# Test README\n")
+
+        result = scanner.scan(str(readme_path))
+
+        assert result.success is False
+        size_checks = [check for check in result.checks if check.name == "File Size Limit"]
+        assert len(size_checks) == 1
+        assert size_checks[0].status == CheckStatus.FAILED
+        assert result.metadata["file_size"] == readme_path.stat().st_size
+
+    def test_scan_enforces_timeout(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Metadata scans should stop when the scanner timeout is exceeded."""
+        scanner = MetadataScanner(config={"timeout": 1})
+        readme_path = tmp_path / "README.md"
+        readme_path.write_text("# Test README\n")
+
+        def expire_timeout(_content: str, _file_path: str) -> list:
+            scanner.scan_start_time = 0
+            return []
+
+        monkeypatch.setattr(scanner, "_check_suspicious_urls_in_text", expire_timeout)
+
+        result = scanner.scan(str(readme_path))
+
+        assert result.success is True
+        timeout_checks = [check for check in result.checks if check.name == "Metadata Scan Timeout"]
+        assert len(timeout_checks) == 1
+        assert timeout_checks[0].status == CheckStatus.FAILED
+        assert timeout_checks[0].severity == IssueSeverity.WARNING

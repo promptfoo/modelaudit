@@ -362,8 +362,35 @@ TRUSTED_URL_DOMAINS = [
     "0.0.0.0",
 ]
 
+# Broad user-content hosting domains should only trust the exact host, not
+# arbitrary attacker-controlled subdomains.
+TRUSTED_URL_EXACT_DOMAINS = {
+    "cloudfront.net",
+    "github.io",
+    "gitlab.io",
+    "googleusercontent.com",
+}
+
 # Regex to find URLs in text
 URL_PATTERN = re.compile(r'https?://[^\s<>"\']+[^\s<>"\',.]')
+
+
+def _is_trusted_url_domain(url: str) -> bool:
+    """Check if a URL host is in the trusted domain allowlist."""
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if not host:
+        return False
+
+    for domain in TRUSTED_URL_DOMAINS:
+        trusted = domain.lower().rstrip(".")
+        if host == trusted:
+            return True
+        if trusted in TRUSTED_URL_EXACT_DOMAINS:
+            continue
+        if host.endswith(f".{trusted}"):
+            return True
+    return False
 
 
 class ManifestScanner(BaseScanner):
@@ -464,6 +491,7 @@ class ManifestScanner(BaseScanner):
         if size_check:
             return size_check
 
+        self._start_scan_timer()
         result = self._create_result()
         file_size = self.get_file_size(path)
         result.metadata["file_size"] = file_size
@@ -472,15 +500,20 @@ class ManifestScanner(BaseScanner):
             # Store the file path for use in issue locations
             self.current_file_path = path
 
+            self._check_timeout()
+
             # Check the raw file content for blacklisted terms
             self._check_file_for_blacklist(path, result)
+            self._check_timeout()
 
             # Check for cloud storage URLs (external resource references)
             self._check_cloud_storage_urls(path, result)
+            self._check_timeout()
 
             # Parse the file based on its extension
             ext = os.path.splitext(path)[1].lower()
             content = self._parse_file(path, ext, result)
+            self._check_timeout()
 
             if content:
                 result.bytes_scanned = file_size
@@ -500,9 +533,11 @@ class ManifestScanner(BaseScanner):
 
                     # Check for blacklisted model names in config values
                     self._check_model_name_policies(content, result)
+                    self._check_timeout()
 
                     # Check for suspicious URLs in config values
                     self._check_suspicious_urls(content, result)
+                    self._check_timeout()
 
                     # Check for weak hash algorithms used for integrity verification
                     self._check_weak_hashes(content, result)
@@ -517,6 +552,17 @@ class ManifestScanner(BaseScanner):
                     rule_code="S902",
                 )
 
+        except TimeoutError as e:
+            result.add_check(
+                name="Manifest Scan Timeout",
+                passed=False,
+                message=f"Scan timed out: {e!s}",
+                severity=IssueSeverity.WARNING,
+                location=path,
+                details={"timeout_seconds": self.timeout},
+            )
+            result.finish(success=True)
+            return result
         except Exception as e:
             result.add_check(
                 name="Manifest File Scan",
@@ -543,6 +589,7 @@ class ManifestScanner(BaseScanner):
 
             found_blacklisted = False
             for pattern in self.blacklist_patterns:
+                self._check_timeout()
                 pattern_lower = pattern.lower()
                 if pattern_lower in content:
                     result.add_check(
@@ -792,22 +839,15 @@ class ManifestScanner(BaseScanner):
 
         def is_trusted_domain(url: str) -> bool:
             """Check if URL host is in the trusted domain allowlist."""
-            parsed = urlparse(url)
-            host = (parsed.hostname or "").lower().rstrip(".")
-            if not host:
-                return False
-
-            for domain in TRUSTED_URL_DOMAINS:
-                trusted = domain.lower().rstrip(".")
-                if host == trusted or host.endswith(f".{trusted}"):
-                    return True
-            return False
+            return _is_trusted_url_domain(url)
 
         def extract_urls_from_value(value: Any, key_path: str) -> None:
             """Recursively extract and check URLs from any value type."""
+            self._check_timeout()
             if isinstance(value, str):
                 urls = URL_PATTERN.findall(value)
                 for url in urls:
+                    self._check_timeout()
                     if url in seen_urls:
                         continue
                     seen_urls.add(url)

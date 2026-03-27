@@ -1,6 +1,8 @@
 import json
 import logging
 
+import pytest
+
 from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.manifest_scanner import ManifestScanner
 
@@ -268,9 +270,11 @@ def test_manifest_scanner_trusted_urls_not_flagged(tmp_path):
         "model_type": "bert",
         "_name_or_path": "https://huggingface.co/bert-base-uncased",
         "repository": "https://github.com/huggingface/transformers",
+        "raw_config": "https://raw.githubusercontent.com/huggingface/transformers/main/config.json",
         "homepage": "https://pytorch.org/models",
         "weights": "https://s3.amazonaws.com/models/bert.bin",
         "storage": "https://storage.googleapis.com/models/bert",
+        "dataset_docs": "https://openimages.github.io/dataset/",
     }
 
     test_file.write_text(json.dumps(config_with_trusted_urls))
@@ -286,6 +290,32 @@ def test_manifest_scanner_trusted_urls_not_flagged(tmp_path):
         c for c in result.checks if c.name == "Untrusted URL Check" and c.status == CheckStatus.FAILED
     ]
     assert len(untrusted_url_checks) == 0, f"Unexpected untrusted URL checks: {untrusted_url_checks}"
+
+
+def test_manifest_scanner_broad_hosting_subdomains_flagged(tmp_path):
+    """Attacker-controlled subdomains on broad hosting domains should not be trusted."""
+    test_file = tmp_path / "config.json"
+    config_with_hosting_urls = {
+        "model_type": "bert",
+        "github_pages": "https://attacker.github.io/model.bin",
+        "cloudfront": "https://d111111abcdef8.cloudfront.net/model.bin",
+        "googleusercontent": "https://evil.googleusercontent.com/model.bin",
+    }
+
+    test_file.write_text(json.dumps(config_with_hosting_urls))
+
+    scanner = ManifestScanner()
+    result = scanner.scan(str(test_file))
+
+    assert result.success is True
+
+    failed_url_checks = [c for c in result.checks if c.name == "Untrusted URL Check" and c.status == CheckStatus.FAILED]
+    assert len(failed_url_checks) == 3
+
+    detected_urls = {c.details.get("url", "") for c in failed_url_checks}
+    assert "https://attacker.github.io/model.bin" in detected_urls
+    assert "https://d111111abcdef8.cloudfront.net/model.bin" in detected_urls
+    assert "https://evil.googleusercontent.com/model.bin" in detected_urls
 
 
 def test_manifest_scanner_untrusted_domain_flagged(tmp_path):
@@ -393,3 +423,39 @@ def test_manifest_scanner_duplicate_urls_not_repeated(tmp_path):
     url_checks = [check for check in result.checks if "Untrusted URL" in check.name]
     failed_url_checks = [c for c in url_checks if c.status == CheckStatus.FAILED]
     assert len(failed_url_checks) == 1
+
+
+def test_manifest_scanner_enforces_size_limit(tmp_path):
+    """Manifest scans should stop when max_file_read_size is exceeded."""
+    test_file = tmp_path / "config.json"
+    test_file.write_text(json.dumps({"model_type": "bert", "description": "x" * 64}))
+
+    scanner = ManifestScanner(config={"max_file_read_size": 16})
+    result = scanner.scan(str(test_file))
+
+    assert result.success is False
+    size_checks = [check for check in result.checks if check.name == "File Size Limit"]
+    assert len(size_checks) == 1
+    assert size_checks[0].status == CheckStatus.FAILED
+    assert result.metadata["file_size"] == test_file.stat().st_size
+
+
+def test_manifest_scanner_enforces_timeout(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    """Manifest scans should stop when the scanner timeout is exceeded."""
+    test_file = tmp_path / "config.json"
+    test_file.write_text(json.dumps({"model_type": "bert"}))
+
+    scanner = ManifestScanner(config={"timeout": 1})
+
+    def expire_timeout(_path: str, _result: ScanResult) -> None:
+        scanner.scan_start_time = 0
+
+    monkeypatch.setattr(scanner, "_check_file_for_blacklist", expire_timeout)
+
+    result = scanner.scan(str(test_file))
+
+    assert result.success is True
+    timeout_checks = [check for check in result.checks if check.name == "Manifest Scan Timeout"]
+    assert len(timeout_checks) == 1
+    assert timeout_checks[0].status == CheckStatus.FAILED
+    assert timeout_checks[0].severity == IssueSeverity.WARNING

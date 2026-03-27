@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- harden manifest URL trust checks and enforce metadata/manifest scan limits
 - preserve validated PE detections in pickle binary ML-context filtering
 
 ## [0.2.28](https://github.com/promptfoo/modelaudit/compare/v0.2.27...v0.2.28) (2026-03-20)
