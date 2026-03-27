@@ -1,9 +1,13 @@
 """Tests for directory scanning with file filtering."""
 
+import bz2
+import gzip
+import lzma
+import tarfile
 import tempfile
 from pathlib import Path
 
-from modelaudit.core import scan_model_directory_or_file
+from modelaudit.core import _is_huggingface_cache_file, scan_model_directory_or_file
 
 
 class TestDirectoryFileFiltering:
@@ -117,6 +121,54 @@ class TestDirectoryFileFiltering:
             assert file_meta[license_plain_resolved]["license_info"]
             assert license_txt_resolved in file_meta
             assert file_meta[license_txt_resolved]["license_info"]
+
+    def test_registered_archives_hidden_models_and_metadata_are_scanned(self, tmp_path: Path) -> None:
+        """Directory prefilter should not skip scannable archives, hidden models, or .metadata files."""
+        (tmp_path / ".weights.onnx").write_bytes(b"\x08\x01\x12\x00onnx")
+        (tmp_path / "model.metadata").write_text('{"name": "test/model"}')
+
+        tar_path = tmp_path / "archive.tar"
+        tar_member = tmp_path / "member.txt"
+        tar_member.write_text("tar payload")
+        with tarfile.open(tar_path, "w") as tar:
+            tar.add(tar_member, arcname="member.txt")
+        tar_member.unlink()
+
+        (tmp_path / "archive.gz").write_bytes(gzip.compress(b"gz payload"))
+        (tmp_path / "archive.bz2").write_bytes(bz2.compress(b"bz2 payload"))
+        (tmp_path / "archive.xz").write_bytes(lzma.compress(b"xz payload"))
+        (tmp_path / "archive.7z").write_bytes(b"7z\xbc\xaf\x27\x1c" + b"payload")
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 7
+        asset_names = {Path(asset.path).name for asset in results.assets}
+        assert ".weights.onnx" in asset_names
+        assert "model.metadata" in asset_names
+        assert "archive.tar" in asset_names
+        assert "archive.gz" in asset_names
+        assert "archive.bz2" in asset_names
+        assert "archive.xz" in asset_names
+        assert "archive.7z" in asset_names
+
+    def test_only_huggingface_bookkeeping_metadata_is_skipped(self, tmp_path: Path) -> None:
+        """Local .metadata files should be scanned unless they are in HuggingFace cache layouts."""
+        local_metadata = tmp_path / "model.metadata"
+        hf_cache_metadata = (
+            tmp_path
+            / ".cache"
+            / "huggingface"
+            / "hub"
+            / "models--org--repo"
+            / "snapshots"
+            / "abc123"
+            / "model.metadata"
+        )
+        hf_download_metadata = tmp_path / ".cache" / "huggingface" / "download" / "model.metadata"
+
+        assert _is_huggingface_cache_file(str(local_metadata)) is False
+        assert _is_huggingface_cache_file(str(hf_cache_metadata)) is True
+        assert _is_huggingface_cache_file(str(hf_download_metadata)) is True
 
     def test_performance_with_many_files(self):
         """Test that file filtering improves performance with many non-model files."""

@@ -1147,16 +1147,20 @@ def _is_huggingface_cache_file(path: str) -> bool:
     import os
 
     filename = os.path.basename(path)
+    path_obj = Path(path)
 
-    # HuggingFace cache file patterns - be more specific
-    hf_cache_patterns = [
-        ".lock",  # Download lock files
-        ".metadata",  # HuggingFace metadata files
-    ]
+    # Download lock files are HuggingFace bookkeeping files regardless of cache layout.
+    if filename.endswith(".lock"):
+        return True
 
-    # Check if file ends with cache patterns
-    for pattern in hf_cache_patterns:
-        if filename.endswith(pattern):
+    # Only skip HuggingFace .metadata files in known cache/download layouts.
+    if filename.endswith(".metadata"):
+        hf_cache_root = _find_hf_cache_root(path_obj)
+        if hf_cache_root is not None and _path_has_part(path_obj, "huggingface") and _path_has_part(path_obj, "hub"):
+            return True
+
+        normalized_parts = [part.lower() for part in path_obj.parent.parts]
+        if len(normalized_parts) >= 3 and normalized_parts[-3:] == [".cache", "huggingface", "download"]:
             return True
 
     # Check for specific HuggingFace cache metadata files
