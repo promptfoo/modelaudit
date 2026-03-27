@@ -1,8 +1,10 @@
 """Tests for HuggingFace URL handling."""
 
 import concurrent.futures
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -219,7 +221,12 @@ class TestModelDownload:
                 return None
 
         class TimeoutExecutor:
-            def submit(self, _fn, *_args, **_kwargs) -> TimeoutFuture:
+            def submit(
+                self,
+                _fn: Callable[..., object],
+                *_args: Any,
+                **_kwargs: Any,
+            ) -> TimeoutFuture:
                 return TimeoutFuture()
 
             def shutdown(self, wait: bool = True, cancel_futures: bool = False) -> None:
