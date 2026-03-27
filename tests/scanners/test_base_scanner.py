@@ -503,6 +503,60 @@ def test_whitelist_no_model_id():
     assert result.issues[0].details.get("whitelist_downgrade") is None
 
 
+def test_whitelist_no_downgrade_local_spoofed_config(tmp_path: Path) -> None:
+    """Local config metadata should not make files eligible for whitelist downgrades."""
+    whitelisted_model = "Qwen/Qwen2.5-0.5B"
+    model_dir = tmp_path / "spoofed-model"
+    model_dir.mkdir()
+    model_path = model_dir / "model.test"
+    model_path.write_bytes(b"test")
+    (model_dir / "config.json").write_text(f'{{"_name_or_path": "{whitelisted_model}"}}')
+
+    scanner = MockScanner()
+    scanner._initialize_context(str(model_path))
+
+    assert scanner.context is not None
+    assert scanner.context.model_id == whitelisted_model
+    assert scanner.context.model_source == "local"
+
+    result = scanner._create_result()
+    result._add_issue("Test warning", severity=IssueSeverity.WARNING)
+
+    assert len(result.issues) == 1
+    assert result.issues[0].severity == IssueSeverity.WARNING
+    assert result.issues[0].details.get("whitelist_downgrade") is None
+
+
+def test_whitelist_no_downgrade_hf_cache_path(tmp_path: Path) -> None:
+    """Local HuggingFace cache paths should not be eligible for whitelist downgrades."""
+    model_path = (
+        tmp_path
+        / ".cache"
+        / "huggingface"
+        / "hub"
+        / "models--Qwen--Qwen2.5-0.5B"
+        / "snapshots"
+        / "abc123"
+        / "model.test"
+    )
+    model_path.parent.mkdir(parents=True)
+    model_path.write_bytes(b"test")
+
+    scanner = MockScanner()
+    scanner._initialize_context(str(model_path))
+
+    assert scanner.context is not None
+    assert scanner.context.model_id == "Qwen/Qwen2.5-0.5B"
+    assert scanner.context.model_source == "huggingface_cache"
+
+    result = scanner._create_result()
+    result._add_issue("Test warning", severity=IssueSeverity.WARNING)
+
+    assert len(result.issues) == 1
+    assert result.issues[0].severity == IssueSeverity.WARNING
+    assert result.issues[0].details.get("whitelist_downgrade") is None
+
+
 def test_whitelist_downgrade_check_critical():
     """Test that whitelisted models have critical checks downgraded to INFO."""
     from modelaudit.whitelists import POPULAR_MODELS

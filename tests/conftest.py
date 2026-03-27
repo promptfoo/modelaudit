@@ -108,6 +108,7 @@ def pytest_runtest_setup(item):
             "test_debug_command.py",  # debug output telemetry flags
             "test_auth_config.py",  # auth config path and secret-storage hardening tests
             "test_utils.py",  # archive path sanitization regression coverage
+            "test_huggingface.py",  # HuggingFace provenance and cache path tests
             "test_oci_layer_scanner.py",  # OCI layer path safety regression tests
             "test_jfrog.py",  # JFrog utility tests
             "test_jfrog_integration.py",  # JFrog integration tests

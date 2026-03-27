@@ -450,8 +450,8 @@ class BaseScanner(ABC):
         if not use_whitelist:
             return False
 
-        # Check if we have a model ID and it's whitelisted
-        if self.context and self.context.model_id:
+        # Only trusted HuggingFace provenance/cache paths are eligible for downgrades.
+        if self.context and self.context.model_id and self.context.model_source == "huggingface":
             from modelaudit.whitelists import is_whitelisted_model
 
             return is_whitelisted_model(self.context.model_id)

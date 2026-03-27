@@ -734,6 +734,34 @@ class TestCVE202624747PickleScanner:
             f"Expected SETITEM/CVE-2026-24747 signal. Issues: {[i.message for i in result.issues]}"
         )
 
+    def test_pickle_scanner_detects_setitem_after_rebuild_tensor_with_padding(self, tmp_path: Path) -> None:
+        """Stack-neutral padding beyond the old lookback window should not hide SETITEM abuse."""
+        pickle_bytes = (
+            b"\x80\x02"  # PROTO 2
+            b"ctorch._utils\n_rebuild_tensor_v2\n"  # GLOBAL
+            b")\x81"  # EMPTY_TUPLE + NEWOBJ
+            + (b"N0" * 40)  # NONE + POP padding
+            + b"X\x03\x00\x00\x00key"  # BINUNICODE "key"
+            + b"X\x05\x00\x00\x00value"  # BINUNICODE "value"
+            + b"s"  # SETITEM
+            + b"."  # STOP
+        )
+
+        test_file = tmp_path / "setitem_abuse_padded.pkl"
+        test_file.write_bytes(pickle_bytes)
+
+        result = PickleScanner().scan(str(test_file))
+
+        cve_2026_issues = [
+            issue
+            for issue in result.issues
+            if "CVE-2026-24747" in issue.message or "CVE-2026-24747" in str(issue.details)
+        ]
+        assert cve_2026_issues, (
+            f"Expected CVE-2026-24747 detection after stack-neutral padding. "
+            f"Issues: {[i.message for i in result.issues]}"
+        )
+
     def test_pickle_scanner_no_setitem_false_positive(self, tmp_path: Path) -> None:
         """Test that normal dict SETITEM is not flagged by CVE-2026-24747 detection."""
         # Standard pickle with dict + SETITEM (the normal case)
@@ -753,6 +781,33 @@ class TestCVE202624747PickleScanner:
 
         assert len(cve_2026_issues) == 0, (
             f"Normal dict pickle should not trigger CVE-2026-24747. Issues: {[i.message for i in cve_2026_issues]}"
+        )
+
+    def test_pickle_scanner_no_setitem_false_positive_with_padding(self, tmp_path: Path) -> None:
+        """Stack-neutral padding before dict SETITEM should remain benign."""
+        pickle_bytes = (
+            b"\x80\x02"  # PROTO 2
+            b"}"  # EMPTY_DICT
+            + (b"N0" * 40)  # NONE + POP padding
+            + b"X\x03\x00\x00\x00key"  # BINUNICODE "key"
+            + b"X\x05\x00\x00\x00value"  # BINUNICODE "value"
+            + b"s"  # SETITEM
+            + b"."  # STOP
+        )
+
+        test_file = tmp_path / "normal_dict_setitem_padded.pkl"
+        test_file.write_bytes(pickle_bytes)
+
+        result = PickleScanner().scan(str(test_file))
+
+        cve_2026_issues = [
+            issue
+            for issue in result.issues
+            if "CVE-2026-24747" in issue.message or "CVE-2026-24747" in str(issue.details)
+        ]
+        assert len(cve_2026_issues) == 0, (
+            f"Normal dict pickle with padding should not trigger CVE-2026-24747. "
+            f"Issues: {[i.message for i in cve_2026_issues]}"
         )
 
 
