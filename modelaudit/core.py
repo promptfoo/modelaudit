@@ -247,7 +247,11 @@ def _path_has_part(path: Path, part: str) -> bool:
 def _find_hf_cache_root(path: Path) -> Path | None:
     """Return the HuggingFace cache root containing models--* if present."""
     for index, segment in enumerate(path.parts):
-        if segment.lower().startswith("models--"):
+        if (
+            segment.lower().startswith("models--")
+            and index >= 3
+            and [part.lower() for part in path.parts[index - 3 : index]] == [".cache", "huggingface", "hub"]
+        ):
             return Path(*path.parts[: index + 1])
     return None
 

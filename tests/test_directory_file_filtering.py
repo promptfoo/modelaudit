@@ -173,6 +173,9 @@ class TestDirectoryFileFiltering:
         local_cache_shaped_metadata = (
             tmp_path / "project" / "huggingface" / "hub" / "models--org--repo" / "model.metadata"
         )
+        local_snapshots_metadata = (
+            tmp_path / "project" / "hub" / "models--org--repo" / "snapshots" / "abc123" / "model.metadata"
+        )
         hf_cache_metadata = (
             tmp_path
             / ".cache"
@@ -187,6 +190,7 @@ class TestDirectoryFileFiltering:
 
         assert _is_huggingface_cache_file(str(local_metadata)) is False
         assert _is_huggingface_cache_file(str(local_cache_shaped_metadata)) is False
+        assert _is_huggingface_cache_file(str(local_snapshots_metadata)) is False
         assert _is_huggingface_cache_file(str(hf_cache_metadata)) is True
         assert _is_huggingface_cache_file(str(hf_download_metadata)) is True
 
