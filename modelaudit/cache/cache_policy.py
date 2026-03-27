@@ -3,27 +3,30 @@
 from typing import Any
 
 _OPERATIONAL_ERROR_INDICATORS = (
-    "Error during scan",
-    "Error checking file size",
-    "Error scanning file",
-    "Scanner crashed",
-    "Scan timeout",
-    "Path does not exist",
-    "Path is not readable",
-    "Permission denied",
-    "File not found",
+    "error during scan",
+    "error checking file size",
+    "error scanning file",
+    "scanning error",
+    "memory-mapped scan error",
+    "error scanning shard",
+    "scanner crashed",
+    "scan timeout",
+    "path does not exist",
+    "path is not readable",
+    "permission denied",
+    "file not found",
     "not installed, cannot scan",
-    "Missing dependency",
-    "Import error",
-    "Module not found",
+    "missing dependency",
+    "import error",
+    "module not found",
     "not a valid",
-    "Invalid file format",
-    "Corrupted file",
-    "Bad file signature",
-    "Unable to parse",
-    "Out of memory",
-    "Disk space",
-    "Too many open files",
+    "invalid file format",
+    "corrupted file",
+    "bad file signature",
+    "unable to parse",
+    "out of memory",
+    "disk space",
+    "too many open files",
 )
 
 
@@ -39,7 +42,9 @@ def should_cache_scan_result(scan_result: dict[str, Any]) -> bool:
                 continue
 
             message = entry.get("message")
-            if isinstance(message, str) and any(indicator in message for indicator in _OPERATIONAL_ERROR_INDICATORS):
+            if isinstance(message, str) and any(
+                indicator in message.lower() for indicator in _OPERATIONAL_ERROR_INDICATORS
+            ):
                 return False
 
     return True

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -24,11 +26,13 @@ def reset_cache_state() -> Iterator[None]:
     extractor = get_config_extractor()
     extractor._config_cache.clear()
     extractor._result_cache.clear()
+    extractor._last_cleanup = time.monotonic()
     yield
     reset_cache_manager()
     reset_config()
     extractor._config_cache.clear()
     extractor._result_cache.clear()
+    extractor._last_cleanup = time.monotonic()
 
 
 def _make_cacheable_file(tmp_path: Path, name: str = "model.bin") -> Path:
@@ -158,6 +162,54 @@ def test_cached_scan_skips_persisting_operational_failures_from_checks(tmp_path:
     assert cache_manager.get_stats()["total_entries"] == 0
 
 
+def test_cached_scan_skips_persisting_scanning_error_messages(tmp_path: Path) -> None:
+    file_path = _make_cacheable_file(tmp_path)
+    cache_dir = tmp_path / "cache"
+    config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
+    calls = {"count": 0}
+
+    @cached_scan()
+    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
+        calls["count"] += 1
+        return {
+            "checks": [],
+            "issues": [{"message": "Scanning error: failed to read shard 0", "severity": "warning"}],
+            "scan_count": calls["count"],
+        }
+
+    first = scan(str(file_path), config)
+    second = scan(str(file_path), config)
+
+    assert first["scan_count"] == 1
+    assert second["scan_count"] == 2
+    assert calls["count"] == 2
+    assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+
+
+def test_cached_scan_skips_persisting_memory_mapped_scan_errors(tmp_path: Path) -> None:
+    file_path = _make_cacheable_file(tmp_path)
+    cache_dir = tmp_path / "cache"
+    config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
+    calls = {"count": 0}
+
+    @cached_scan()
+    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
+        calls["count"] += 1
+        return {
+            "checks": [{"message": "Memory-mapped scan error: invalid mapping", "status": "failed"}],
+            "issues": [],
+            "scan_count": calls["count"],
+        }
+
+    first = scan(str(file_path), config)
+    second = scan(str(file_path), config)
+
+    assert first["scan_count"] == 1
+    assert second["scan_count"] == 2
+    assert calls["count"] == 2
+    assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+
+
 def test_configuration_extractor_rebuilds_cached_config_after_mutation() -> None:
     extractor = ConfigurationExtractor()
     config = {"cache_enabled": True, "timeout": 30}
@@ -199,3 +251,29 @@ def test_batch_lookup_returns_cached_entries(tmp_path: Path) -> None:
     cached_results = batch_ops.batch_lookup([str(file_path)], version_context=version_context)
 
     assert cached_results[str(file_path)] == expected
+
+
+def test_cache_entry_omits_raw_version_context(tmp_path: Path) -> None:
+    file_path = _make_cacheable_file(tmp_path)
+    cache_dir = tmp_path / "cache"
+    cache_manager = get_cache_manager(str(cache_dir), enabled=True)
+    version_context = build_cache_version_context({"timeout": 30, "api_token": "super-secret-token"})
+    expected = {"checks": [], "issues": [], "metadata": {}, "scanner": "test", "success": True}
+
+    cache_manager.store_result(
+        str(file_path),
+        expected,
+        10,
+        version_context=version_context,
+    )
+
+    assert cache_manager.cache is not None
+    cache_key = cache_manager.cache.generate_cache_key(str(file_path), version_context=version_context)
+    assert cache_key is not None
+    cache_file_path = cache_manager.cache._get_cache_file_path(cache_key)
+
+    raw_cache_text = cache_file_path.read_text(encoding="utf-8")
+    cache_entry = json.loads(raw_cache_text)
+
+    assert "super-secret-token" not in raw_cache_text
+    assert "version_context" not in cache_entry["version_info"]

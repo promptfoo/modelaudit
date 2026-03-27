@@ -330,7 +330,6 @@ class ScanResultsCache:
                 "modelaudit_version": modelaudit_version,
                 "scanner_versions": self._get_scanner_versions(),
                 "config_hash": self._get_config_hash(version_context),
-                "version_context": version_context or build_cache_version_context(),
             }
         except Exception as e:
             logger.debug(f"Failed to get version info: {e}")
@@ -338,7 +337,6 @@ class ScanResultsCache:
                 "modelaudit_version": "unknown",
                 "scanner_versions": {},
                 "config_hash": "unknown",
-                "version_context": version_context or build_cache_version_context(),
             }
 
     def _get_scanner_versions(self) -> dict[str, str]:
