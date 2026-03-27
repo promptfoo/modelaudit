@@ -1592,6 +1592,8 @@ def scan_command(
                             blacklist_patterns=list(blacklist) if blacklist else None,
                             max_file_size=final_max_file_size,
                             max_total_size=final_max_total_size,
+                            cache_enabled=final_cache,
+                            cache_dir=final_cache_dir,
                         )
 
                         if download_spinner:
@@ -1645,6 +1647,8 @@ def scan_command(
                             max_total_size=final_max_total_size,
                             strict_license=final_strict_license,
                             skip_file_types=final_skip_files,
+                            cache_enabled=final_cache,
+                            cache_dir=final_cache_dir,
                         )
 
                         if download_spinner:

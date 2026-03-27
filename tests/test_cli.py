@@ -17,6 +17,8 @@ from modelaudit.core import scan_model_directory_or_file
 from modelaudit.models import ModelAuditResultModel, create_initial_audit_result
 from tests.cli_output import parse_click_json_output
 
+DEFAULT_REMOTE_CACHE_DIR = str(Path.home() / ".modelaudit" / "cache")
+
 
 def strip_ansi(text: str) -> str:
     """Strip ANSI color codes from text for testing."""
@@ -1349,6 +1351,8 @@ def test_scan_jfrog_url_success(mock_scan_jfrog, mock_is_jfrog):
         max_total_size=0,
         strict_license=False,
         skip_file_types=True,
+        cache_enabled=True,
+        cache_dir=DEFAULT_REMOTE_CACHE_DIR,
     )
 
 
@@ -1399,6 +1403,78 @@ def test_scan_jfrog_url_with_auth(mock_scan_jfrog, mock_is_jfrog):
         max_total_size=0,
         strict_license=False,
         skip_file_types=True,
+        cache_enabled=True,
+        cache_dir=DEFAULT_REMOTE_CACHE_DIR,
+    )
+
+
+@patch("modelaudit.cli.is_jfrog_url")
+@patch("modelaudit.cli.scan_jfrog_artifact")
+def test_scan_jfrog_url_with_cache_dir(mock_scan_jfrog, mock_is_jfrog, tmp_path: Path) -> None:
+    """Test scanning a JFrog URL with an explicit cache directory."""
+    mock_is_jfrog.return_value = True
+    mock_scan_jfrog.return_value = create_mock_scan_result(
+        bytes_scanned=512, issues=[], files_scanned=1, assets=[], has_errors=False, scanners=["test_scanner"]
+    )
+
+    cache_dir = tmp_path / "jfrog-cache"
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["scan", "--cache-dir", str(cache_dir), "https://company.jfrog.io/artifactory/repo/model.bin"],
+    )
+
+    assert result.exit_code == 0
+    mock_scan_jfrog.assert_called_once_with(
+        "https://company.jfrog.io/artifactory/repo/model.bin",
+        api_token=None,
+        access_token=None,
+        timeout=3600,
+        blacklist_patterns=None,
+        max_file_size=0,
+        max_total_size=0,
+        strict_license=False,
+        skip_file_types=True,
+        cache_enabled=True,
+        cache_dir=str(cache_dir),
+    )
+
+
+@patch("modelaudit.cli.is_jfrog_url")
+@patch("modelaudit.cli.scan_jfrog_artifact")
+def test_scan_jfrog_url_no_cache_overrides_cache_dir(mock_scan_jfrog, mock_is_jfrog, tmp_path: Path) -> None:
+    """Test that --no-cache disables JFrog caching even when --cache-dir is set."""
+    mock_is_jfrog.return_value = True
+    mock_scan_jfrog.return_value = create_mock_scan_result(
+        bytes_scanned=512, issues=[], files_scanned=1, assets=[], has_errors=False, scanners=["test_scanner"]
+    )
+
+    cache_dir = tmp_path / "jfrog-cache"
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "scan",
+            "--cache-dir",
+            str(cache_dir),
+            "--no-cache",
+            "https://company.jfrog.io/artifactory/repo/model.bin",
+        ],
+    )
+
+    assert result.exit_code == 0
+    mock_scan_jfrog.assert_called_once_with(
+        "https://company.jfrog.io/artifactory/repo/model.bin",
+        api_token=None,
+        access_token=None,
+        timeout=3600,
+        blacklist_patterns=None,
+        max_file_size=0,
+        max_total_size=0,
+        strict_license=False,
+        skip_file_types=True,
+        cache_enabled=False,
+        cache_dir=None,
     )
 
 
@@ -1433,6 +1509,8 @@ def test_scan_mlflow_uri_success(mock_scan_mlflow):
         blacklist_patterns=None,
         max_file_size=0,
         max_total_size=0,
+        cache_enabled=True,
+        cache_dir=DEFAULT_REMOTE_CACHE_DIR,
     )
 
 
@@ -1475,6 +1553,56 @@ def test_scan_mlflow_uri_with_options(mock_scan_mlflow):
         blacklist_patterns=None,
         max_file_size=5000000,
         max_total_size=5000000,
+        cache_enabled=True,
+        cache_dir=DEFAULT_REMOTE_CACHE_DIR,
+    )
+
+
+@patch("modelaudit.integrations.mlflow.scan_mlflow_model")
+def test_scan_mlflow_uri_with_cache_dir(mock_scan_mlflow, tmp_path: Path) -> None:
+    """Test scanning an MLflow URI with an explicit cache directory."""
+    mock_scan_mlflow.return_value = create_mock_scan_result(
+        bytes_scanned=1024, issues=[], files_scanned=1, assets=[], has_errors=False, scanners=["test_scanner"]
+    )
+
+    cache_dir = tmp_path / "mlflow-cache"
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "--cache-dir", str(cache_dir), "models:/TestModel/1"])
+
+    assert result.exit_code == 0
+    mock_scan_mlflow.assert_called_once_with(
+        "models:/TestModel/1",
+        registry_uri=None,
+        timeout=3600,
+        blacklist_patterns=None,
+        max_file_size=0,
+        max_total_size=0,
+        cache_enabled=True,
+        cache_dir=str(cache_dir),
+    )
+
+
+@patch("modelaudit.integrations.mlflow.scan_mlflow_model")
+def test_scan_mlflow_uri_no_cache_overrides_cache_dir(mock_scan_mlflow, tmp_path: Path) -> None:
+    """Test that --no-cache disables MLflow caching even when --cache-dir is set."""
+    mock_scan_mlflow.return_value = create_mock_scan_result(
+        bytes_scanned=1024, issues=[], files_scanned=1, assets=[], has_errors=False, scanners=["test_scanner"]
+    )
+
+    cache_dir = tmp_path / "mlflow-cache"
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "--cache-dir", str(cache_dir), "--no-cache", "models:/TestModel/1"])
+
+    assert result.exit_code == 0
+    mock_scan_mlflow.assert_called_once_with(
+        "models:/TestModel/1",
+        registry_uri=None,
+        timeout=3600,
+        blacklist_patterns=None,
+        max_file_size=0,
+        max_total_size=0,
+        cache_enabled=False,
+        cache_dir=None,
     )
 
 
