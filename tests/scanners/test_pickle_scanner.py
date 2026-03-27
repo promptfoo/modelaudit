@@ -1155,6 +1155,7 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
         )
 
     def test_plausible_module_allows_mixed_case_identifiers(self) -> None:
+        assert _is_plausible_python_module("EVIL")
         assert _is_plausible_python_module("EvilPkg")
         assert _is_plausible_python_module("PIL")
         assert _is_plausible_python_module("MyOrg.InternalPkg")
@@ -1175,6 +1176,17 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
         )
         assert not any("implausible module name 'EvilPkg'" in c.message for c in reduce_checks), (
             "Mixed-case module names should not be classified as implausible"
+        )
+
+    def test_uppercase_global_reduce_is_not_suppressed(self) -> None:
+        result = self._scan_bytes(self._craft_global_reduce_pickle("EVIL", "run"))
+
+        reduce_checks = [c for c in result.checks if c.name == "REDUCE Opcode Safety Check"]
+        assert any(c.status == CheckStatus.FAILED and "EVIL.run" in c.message for c in reduce_checks), (
+            f"Expected failed REDUCE check for uppercase module, got: {[c.message for c in reduce_checks]}"
+        )
+        assert not any("implausible module name 'EVIL'" in c.message for c in reduce_checks), (
+            "All-uppercase module names should not be classified as implausible"
         )
 
     def test_pil_global_reduce_is_not_suppressed(self) -> None:
