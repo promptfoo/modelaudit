@@ -17,7 +17,10 @@ from modelaudit.core import scan_model_directory_or_file
 from modelaudit.models import ModelAuditResultModel, create_initial_audit_result
 from tests.cli_output import parse_click_json_output
 
-DEFAULT_REMOTE_CACHE_DIR = str(Path.home() / ".modelaudit" / "cache")
+
+def default_remote_cache_dir() -> str:
+    """Compute the CLI's default remote cache root at assertion time."""
+    return str(Path.home() / ".modelaudit" / "cache")
 
 
 def strip_ansi(text: str) -> str:
@@ -1352,7 +1355,7 @@ def test_scan_jfrog_url_success(mock_scan_jfrog, mock_is_jfrog):
         strict_license=False,
         skip_file_types=True,
         cache_enabled=True,
-        cache_dir=DEFAULT_REMOTE_CACHE_DIR,
+        cache_dir=default_remote_cache_dir(),
     )
 
 
@@ -1404,7 +1407,7 @@ def test_scan_jfrog_url_with_auth(mock_scan_jfrog, mock_is_jfrog):
         strict_license=False,
         skip_file_types=True,
         cache_enabled=True,
-        cache_dir=DEFAULT_REMOTE_CACHE_DIR,
+        cache_dir=default_remote_cache_dir(),
     )
 
 
@@ -1512,7 +1515,7 @@ def test_scan_mlflow_uri_success(mock_scan_mlflow):
         max_file_size=0,
         max_total_size=0,
         cache_enabled=True,
-        cache_dir=DEFAULT_REMOTE_CACHE_DIR,
+        cache_dir=default_remote_cache_dir(),
     )
 
 
@@ -1556,7 +1559,7 @@ def test_scan_mlflow_uri_with_options(mock_scan_mlflow):
         max_file_size=5000000,
         max_total_size=5000000,
         cache_enabled=True,
-        cache_dir=DEFAULT_REMOTE_CACHE_DIR,
+        cache_dir=default_remote_cache_dir(),
     )
 
 

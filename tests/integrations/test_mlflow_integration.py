@@ -86,14 +86,16 @@ def test_scan_mlflow_model_uses_cache_dir_for_downloads(
     mock_mlflow = MagicMock()
     cache_dir = tmp_path / "cache"
     cache_key = hashlib.sha256(b"models:/TestModel/1").hexdigest()[:16]
-    expected_download_dir = cache_dir / "mlflow" / cache_key
+    expected_download_root = cache_dir / "mlflow"
+    expected_download_dir = expected_download_root / f"{cache_key}-run"
+    mock_mkdtemp.return_value = str(expected_download_dir)
     mock_mlflow.artifacts.download_artifacts.return_value = str(expected_download_dir)
     mock_scan.return_value = {"bytes_scanned": 256, "issues": []}
 
     with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
         scan_mlflow_model("models:/TestModel/1", cache_enabled=True, cache_dir=str(cache_dir))
 
-    mock_mkdtemp.assert_not_called()
+    mock_mkdtemp.assert_called_once_with(prefix=f"{cache_key}-", dir=str(expected_download_root))
     mock_mlflow.artifacts.download_artifacts.assert_called_once_with(
         artifact_uri="models:/TestModel/1",
         dst_path=str(expected_download_dir),
@@ -107,7 +109,7 @@ def test_scan_mlflow_model_uses_cache_dir_for_downloads(
         cache_enabled=True,
         cache_dir=str(cache_dir),
     )
-    mock_rmtree.assert_not_called()
+    mock_rmtree.assert_called_once_with(str(expected_download_dir), ignore_errors=True)
 
 
 @patch("modelaudit.integrations.mlflow.shutil.rmtree")

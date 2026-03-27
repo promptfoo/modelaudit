@@ -96,7 +96,9 @@ def test_scan_jfrog_artifact_uses_cache_dir_for_downloads(
     url = "https://company.jfrog.io/artifactory/repo/model.pt"
     cache_dir = tmp_path / "cache"
     cache_key = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
-    expected_download_dir = cache_dir / "jfrog" / cache_key
+    expected_download_root = cache_dir / "jfrog"
+    expected_download_dir = expected_download_root / f"{cache_key}-run"
+    mock_mkdtemp.return_value = str(expected_download_dir)
 
     mock_detect.return_value = {"type": "file", "repo": "test-repo"}
     mock_download.return_value = expected_download_dir / "model.pt"
@@ -111,7 +113,7 @@ def test_scan_jfrog_artifact_uses_cache_dir_for_downloads(
 
     results = scan_jfrog_artifact(url, api_token="token", cache_enabled=True, cache_dir=str(cache_dir))
 
-    mock_mkdtemp.assert_not_called()
+    mock_mkdtemp.assert_called_once_with(prefix=f"{cache_key}-", dir=str(expected_download_root))
     mock_download.assert_called_once_with(
         url,
         cache_dir=expected_download_dir,
@@ -128,7 +130,7 @@ def test_scan_jfrog_artifact_uses_cache_dir_for_downloads(
     assert scan_call[1]["max_total_size"] == 0
     assert scan_call[1]["cache_enabled"] is True
     assert scan_call[1]["cache_dir"] == str(cache_dir)
-    mock_rmtree.assert_not_called()
+    mock_rmtree.assert_called_once_with(expected_download_dir, ignore_errors=True)
     assert results == mock_result
 
 

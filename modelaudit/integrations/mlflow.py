@@ -17,11 +17,9 @@ def _prepare_download_dir(model_uri: str, cache_dir: str | None) -> tuple[str, b
         return tempfile.mkdtemp(prefix="modelaudit_mlflow_"), True
 
     cache_key = hashlib.sha256(model_uri.encode("utf-8")).hexdigest()[:16]
-    download_dir = Path(cache_dir).expanduser() / "mlflow" / cache_key
-    if download_dir.exists():
-        shutil.rmtree(download_dir, ignore_errors=True)
-    download_dir.mkdir(parents=True, exist_ok=True)
-    return str(download_dir), False
+    download_root = Path(cache_dir).expanduser() / "mlflow"
+    download_root.mkdir(parents=True, exist_ok=True)
+    return tempfile.mkdtemp(prefix=f"{cache_key}-", dir=str(download_root)), True
 
 
 def scan_mlflow_model(
