@@ -41,6 +41,24 @@ class ZipScanner(BaseScanner):
             10000,
         )  # Limit number of entries
 
+    def _get_zip_depth(self) -> int:
+        """Return the current nested ZIP depth from config."""
+        raw_depth = self.config.get("_zip_depth", 0)
+        try:
+            depth = int(raw_depth)
+        except (TypeError, ValueError):
+            return 0
+        return max(depth, 0)
+
+    def _get_archive_depth(self) -> int:
+        """Return the current shared archive depth from config."""
+        raw_depth = self.config.get("_archive_depth", 0)
+        try:
+            depth = int(raw_depth)
+        except (TypeError, ValueError):
+            return 0
+        return max(depth, 0)
+
     @classmethod
     def can_handle(cls, path: str) -> bool:
         """Check if this scanner can handle the given path"""
@@ -49,7 +67,7 @@ class ZipScanner(BaseScanner):
 
         # Check file extension
         ext = os.path.splitext(path)[1].lower()
-        if ext not in cls.supported_extensions:
+        if ext and ext not in cls.supported_extensions:
             return False
 
         # Verify it's actually a zip file
@@ -84,13 +102,13 @@ class ZipScanner(BaseScanner):
             # Store the file path for use in issue locations
             self.current_file_path = path
 
-            # Scan the zip file recursively
-            try:
-                archive_depth = int(self.config.get("_archive_depth", 0))
-            except (TypeError, ValueError):
-                archive_depth = 0
-
-            scan_result = self._scan_zip_file(path, depth=max(archive_depth, 0))
+            # Scan the zip file recursively. Shared archive depth must survive
+            # scanner handoffs, while nested ZIP recursion still needs its own
+            # counter for extensionless ZIP members routed through core dispatch.
+            scan_result = self._scan_zip_file(
+                path,
+                depth=max(self._get_archive_depth(), self._get_zip_depth()),
+            )
             result.merge(scan_result)
 
         except zipfile.BadZipFile:
@@ -359,56 +377,40 @@ class ZipScanner(BaseScanner):
                                     )
                                 tmp.write(chunk)
 
-                    # Check if it's another zip file
-                    if name.lower().endswith(".zip"):
-                        try:
-                            nested_result = self._scan_zip_file(tmp_path, depth + 1)
-                            self._rewrite_nested_result_context(nested_result, tmp_path, path, name)
-                            result.merge(nested_result)
+                    try:
+                        if archive_ext == ".mar" and name.lower().endswith(".py"):
+                            mar_python_result = self._scan_mar_python_entry(path, name, tmp_path, total_size)
+                            if mar_python_result is not None:
+                                result.merge(mar_python_result)
 
-                            asset_entry = asset_from_scan_result(
-                                f"{path}:{name}",
-                                nested_result,
-                            )
-                            asset_entry.setdefault("size", info.file_size)
-                            contents.append(asset_entry)
-                        finally:
-                            os.unlink(tmp_path)
-                    else:
-                        # Try to scan the file with appropriate scanner
-                        # Write to temporary file with proper extension and original filename
-                        # This preserves the original filename for scanners that need it (like ManifestScanner)
+                        # Import core here to avoid circular import
+                        from .. import core
 
-                        try:
-                            if archive_ext == ".mar" and name.lower().endswith(".py"):
-                                mar_python_result = self._scan_mar_python_entry(path, name, tmp_path, total_size)
-                                if mar_python_result is not None:
-                                    result.merge(mar_python_result)
+                        nested_config = dict(self.config)
+                        nested_config["_archive_depth"] = depth + 1
+                        if zipfile.is_zipfile(tmp_path):
+                            nested_config["_zip_depth"] = depth + 1
 
-                            # Import core here to avoid circular import
-                            from .. import core
+                        # Use core.scan_file so ZIP-based formats still reach their
+                        # specialized scanners, while shared archive depth remains
+                        # consistent across mixed ZIP/TAR/MAR recursion.
+                        file_result = core.scan_file(tmp_path, nested_config)
+                        self._rewrite_nested_result_context(file_result, tmp_path, path, name)
 
-                            nested_config = dict(self.config)
-                            nested_config["_archive_depth"] = depth + 1
+                        result.merge(file_result)
 
-                            # Use core.scan_file to scan with appropriate scanner
-                            file_result = core.scan_file(tmp_path, nested_config)
-                            self._rewrite_nested_result_context(file_result, tmp_path, path, name)
+                        asset_entry = asset_from_scan_result(
+                            f"{path}:{name}",
+                            file_result,
+                        )
+                        asset_entry.setdefault("size", info.file_size)
+                        contents.append(asset_entry)
 
-                            result.merge(file_result)
-
-                            asset_entry = asset_from_scan_result(
-                                f"{path}:{name}",
-                                file_result,
-                            )
-                            asset_entry.setdefault("size", info.file_size)
-                            contents.append(asset_entry)
-
-                            # If no scanner handled the file, count the bytes ourselves
-                            if file_result.scanner_name == "unknown":
-                                result.bytes_scanned += total_size
-                        finally:
-                            os.unlink(tmp_path)
+                        # If no scanner handled the file, count the bytes ourselves
+                        if file_result.scanner_name == "unknown":
+                            result.bytes_scanned += total_size
+                    finally:
+                        os.unlink(tmp_path)
 
                 except Exception as e:
                     result.add_check(

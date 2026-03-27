@@ -485,6 +485,38 @@ def download_file_from_hf(url: str, cache_dir: Path | None = None) -> Path:
         raise Exception(f"Failed to download file from {url}: {e!s}") from e
 
 
+def _path_has_part(path: Path, part: str) -> bool:
+    """Return True if any path segment matches part (case-insensitive)."""
+    part_lower = part.lower()
+    return any(segment.lower() == part_lower for segment in path.parts)
+
+
+def _find_hf_cache_root(path: Path) -> Path | None:
+    """Return the HuggingFace cache root containing models--* if present."""
+    for index, segment in enumerate(path.parts):
+        if segment.startswith("models--"):
+            return Path(*path.parts[: index + 1])
+    return None
+
+
+def is_huggingface_cache_path(path: str | Path) -> bool:
+    """Return True if a path is inside a HuggingFace cache layout."""
+    path_obj = Path(path)
+    cache_root = _find_hf_cache_root(path_obj)
+    if cache_root is None or not _path_has_part(cache_root, "huggingface"):
+        return False
+
+    try:
+        relative_parts = path_obj.relative_to(cache_root).parts
+    except ValueError:
+        return False
+
+    if relative_parts and relative_parts[0] in {"snapshots", "blobs", "refs"}:
+        return True
+
+    return any((cache_root / cache_part).exists() for cache_part in ("snapshots", "blobs", "refs"))
+
+
 def extract_model_id_from_path(path: str) -> tuple[str | None, str | None]:
     """Extract HuggingFace model ID and source from a path or URL.
 
@@ -505,18 +537,17 @@ def extract_model_id_from_path(path: str) -> tuple[str | None, str | None]:
         except ValueError:
             pass
 
-    # Check if it's a local path with HuggingFace cache structure
+    # Check if it's a local path with HuggingFace cache structure.
     # HuggingFace cache typically has structure like: models--namespace--repo-name/...
     path_obj = Path(path)
-    if "models--" in path:
-        # Extract from HF cache path structure
-        for part in path_obj.parts:
-            if part.startswith("models--"):
-                # Format: models--namespace--repo-name
-                parts = part[len("models--") :].split("--")
-                if len(parts) >= 2:
-                    model_id = f"{parts[0]}/{parts[1]}"
-                    return model_id, "huggingface"
+    if is_huggingface_cache_path(path_obj):
+        cache_root = _find_hf_cache_root(path_obj)
+        if cache_root is not None:
+            # Format: models--namespace--repo-name
+            parts = cache_root.name[len("models--") :].split("--")
+            if len(parts) >= 2:
+                model_id = f"{parts[0]}/{parts[1]}"
+                return model_id, "huggingface_cache"
 
     # Check for config.json or model metadata in parent directories
     current_path = path_obj if path_obj.is_dir() else path_obj.parent
