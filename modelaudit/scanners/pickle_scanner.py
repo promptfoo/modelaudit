@@ -4516,7 +4516,9 @@ class PickleScanner(BaseScanner):
                 passed=False,
                 message=(
                     "Raw byte-pattern analysis covered only the first 10 MB of this pickle; "
-                    "full opcode analysis still ran, but heuristic string matches beyond that prefix were not evaluated"
+                    "opcode analysis continued beyond that prefix but may still stop early if timeout "
+                    "or opcode-budget limits are reached; heuristic string matches beyond that prefix "
+                    "were not evaluated"
                 ),
                 severity=IssueSeverity.INFO,
                 location=self.current_file_path,
@@ -4529,8 +4531,9 @@ class PickleScanner(BaseScanner):
                 },
                 why=(
                     "To bound memory usage, raw byte/string heuristic checks analyze only a leading prefix of large "
-                    "pickle files. Opcode-level analysis still processes the pickle stream, but suspicious strings "
-                    "located entirely beyond the scanned prefix are not evaluated by this heuristic layer."
+                    "pickle files. Opcode-level analysis proceeds separately and may itself stop early due to "
+                    "timeout or opcode budgets, but suspicious strings located entirely beyond the scanned prefix "
+                    "are not evaluated by this heuristic layer."
                 ),
                 rule_code="S902",
             )

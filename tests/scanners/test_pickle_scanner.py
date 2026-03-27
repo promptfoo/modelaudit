@@ -186,6 +186,30 @@ def test_large_pickle_tail_pattern_surfaces_raw_pattern_limit(tmp_path: Path) ->
     )
 
 
+def test_large_pickle_raw_pattern_limit_with_opcode_budget_truncation(tmp_path: Path) -> None:
+    """Large files should surface both the raw-pattern prefix limit and opcode truncation."""
+    pickle_path = tmp_path / "large-multistream.pkl"
+    large_prefix_stream = pickle.dumps(b"A" * (_RAW_PATTERN_SCAN_LIMIT_BYTES + 128), protocol=4)
+    follow_on_streams = b"".join(
+        pickle.dumps({"stream": index, "weights": [1, 2, 3]}, protocol=4) for index in range(32)
+    )
+    pickle_path.write_bytes(large_prefix_stream + follow_on_streams)
+
+    result = PickleScanner({"max_opcodes": 10}).scan(str(pickle_path))
+
+    raw_pattern_checks = [check for check in result.checks if check.name == "Raw Pattern Coverage Check"]
+    assert len(raw_pattern_checks) == 1
+    assert "may still stop early" in raw_pattern_checks[0].message.lower()
+    assert result.metadata["raw_pattern_scan_complete"] is False
+
+    opcode_checks = [
+        check for check in result.checks if check.name == "Opcode Count Check" and check.status == CheckStatus.FAILED
+    ]
+    assert len(opcode_checks) == 1
+    assert opcode_checks[0].details["analysis_incomplete"] is True
+    assert result.metadata["analysis_incomplete"] is True
+
+
 class TestPickleScanner(unittest.TestCase):
     def setUp(self):
         # Path to assets/samples/pickles/evil.pickle sample
