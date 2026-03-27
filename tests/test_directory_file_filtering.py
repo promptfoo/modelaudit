@@ -154,6 +154,9 @@ class TestDirectoryFileFiltering:
     def test_only_huggingface_bookkeeping_metadata_is_skipped(self, tmp_path: Path) -> None:
         """Local .metadata files should be scanned unless they are in HuggingFace cache layouts."""
         local_metadata = tmp_path / "model.metadata"
+        local_cache_shaped_metadata = (
+            tmp_path / "project" / "huggingface" / "hub" / "models--org--repo" / "model.metadata"
+        )
         hf_cache_metadata = (
             tmp_path
             / ".cache"
@@ -167,6 +170,7 @@ class TestDirectoryFileFiltering:
         hf_download_metadata = tmp_path / ".cache" / "huggingface" / "download" / "model.metadata"
 
         assert _is_huggingface_cache_file(str(local_metadata)) is False
+        assert _is_huggingface_cache_file(str(local_cache_shaped_metadata)) is False
         assert _is_huggingface_cache_file(str(hf_cache_metadata)) is True
         assert _is_huggingface_cache_file(str(hf_download_metadata)) is True
 

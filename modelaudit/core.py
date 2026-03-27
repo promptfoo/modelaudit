@@ -1156,8 +1156,17 @@ def _is_huggingface_cache_file(path: str) -> bool:
     # Only skip HuggingFace .metadata files in known cache/download layouts.
     if filename.endswith(".metadata"):
         hf_cache_root = _find_hf_cache_root(path_obj)
-        if hf_cache_root is not None and _path_has_part(path_obj, "huggingface") and _path_has_part(path_obj, "hub"):
-            return True
+        if hf_cache_root is not None and hf_cache_root.parent.name.lower() == "hub":
+            try:
+                relative_parts = path_obj.relative_to(hf_cache_root).parts
+            except ValueError:
+                relative_parts = ()
+
+            if relative_parts and relative_parts[0] in {"snapshots", "blobs", "refs"}:
+                return True
+
+            if any((hf_cache_root / cache_part).exists() for cache_part in ("snapshots", "blobs", "refs")):
+                return True
 
         normalized_parts = [part.lower() for part in path_obj.parent.parts]
         if len(normalized_parts) >= 3 and normalized_parts[-3:] == [".cache", "huggingface", "download"]:
