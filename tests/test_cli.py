@@ -1410,9 +1410,7 @@ def test_scan_jfrog_url_with_auth(mock_scan_jfrog, mock_is_jfrog):
 
 @patch("modelaudit.cli.is_jfrog_url")
 @patch("modelaudit.cli.scan_jfrog_artifact")
-def test_scan_jfrog_url_with_cache_dir(
-    mock_scan_jfrog: MagicMock, mock_is_jfrog: MagicMock, tmp_path: Path
-) -> None:
+def test_scan_jfrog_url_with_cache_dir(mock_scan_jfrog: MagicMock, mock_is_jfrog: MagicMock, tmp_path: Path) -> None:
     """Test scanning a JFrog URL with an explicit cache directory."""
     mock_is_jfrog.return_value = True
     mock_scan_jfrog.return_value = create_mock_scan_result(
