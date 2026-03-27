@@ -175,7 +175,7 @@ jobs:
               'Public Domain',
           ]
 
-          # Classifiers that must NOT pass the OSI Approved catch-all.
+          # Classifiers that require explicit package-level approval.
           BLOCKED_CLASSIFIERS = [
               'GNU General Public License',
               'GNU Affero General Public License',
@@ -233,8 +233,6 @@ jobs:
 
               for cls in lic_classifiers:
                   if any(frag in cls for frag in APPROVED_CLASSIFIERS):
-                      return True
-                  if 'OSI Approved' in cls:
                       return True
 
               return False
