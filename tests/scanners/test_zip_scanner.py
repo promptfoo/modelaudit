@@ -1,11 +1,13 @@
+import io
 import os
 import tempfile
 import zipfile
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
-from modelaudit.scanners.base import IssueSeverity
+from modelaudit.scanners.base import IssueSeverity, ScanResult
 from modelaudit.scanners.zip_scanner import ZipScanner
 
 
@@ -153,6 +155,100 @@ class TestZipScanner:
         finally:
             os.unlink(inner_path)
             os.unlink(outer_path)
+
+    def test_scan_extensionless_nested_zip_recurses(self, tmp_path: Path) -> None:
+        """Extensionless ZIP members should be recursively scanned by content."""
+        inner_zip = io.BytesIO()
+        with zipfile.ZipFile(inner_zip, "w") as inner_archive:
+            inner_archive.writestr("payload.pkl", b'cos\nsystem\n(S"echo pwned"\ntR.')
+
+        archive_path = tmp_path / "outer.zip"
+        with zipfile.ZipFile(archive_path, "w") as outer_archive:
+            outer_archive.writestr("nested", inner_zip.getvalue())
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert result.success is True
+        assert result.has_errors is True
+        assert any(
+            check.details.get("zip_entry") == "nested:payload.pkl"
+            and check.location == f"{archive_path}:nested:payload.pkl"
+            for check in result.checks
+        ), f"Expected nested extensionless ZIP checks, got: {[(c.location, c.details) for c in result.checks]}"
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL
+            and issue.details.get("zip_entry") == "nested:payload.pkl"
+            and issue.location == f"{archive_path}:nested:payload.pkl"
+            and ("os.system" in issue.message.lower() or "posix.system" in issue.message.lower())
+            for issue in result.issues
+        ), (
+            "Expected critical nested pickle finding, got: "
+            f"{[(i.location, i.message, i.details) for i in result.issues]}"
+        )
+
+    def test_nested_keras_member_routes_through_core_dispatch(self, tmp_path: Path) -> None:
+        """Nested ZIP-based model members should keep ZIP depth and use core dispatch."""
+        nested_keras = io.BytesIO()
+        with zipfile.ZipFile(nested_keras, "w"):
+            pass
+
+        archive_path = tmp_path / "outer.zip"
+        with zipfile.ZipFile(archive_path, "w") as outer_archive:
+            outer_archive.writestr("nested_model.keras", nested_keras.getvalue())
+
+        dispatched_result = ScanResult(scanner_name="keras_zip")
+        dispatched_result.metadata["file_size"] = len(nested_keras.getvalue())
+        dispatched_result.finish(success=True)
+
+        with patch("modelaudit.core.scan_file", return_value=dispatched_result) as mock_scan_file:
+            result = self.scanner.scan(str(archive_path))
+
+        assert result.success is True
+        assert mock_scan_file.call_count == 1
+
+        scan_path, scan_config = mock_scan_file.call_args.args
+        assert scan_path.endswith(".keras")
+        assert scan_config["_zip_depth"] == 1
+
+        assert result.metadata["contents"] == [
+            {
+                "path": f"{archive_path}:nested_model.keras",
+                "type": "keras_zip",
+                "size": len(nested_keras.getvalue()),
+            }
+        ]
+
+    def test_max_depth_limit_on_extensionless_nested_zip_chain(self, tmp_path: Path) -> None:
+        """Extensionless nested ZIP chains should still honor max_zip_depth."""
+        nested_zip_bytes = io.BytesIO()
+        with zipfile.ZipFile(nested_zip_bytes, "w") as nested_archive:
+            nested_archive.writestr("payload.pkl", b'cos\nsystem\n(S"echo pwned"\ntR.')
+
+        for entry_name in ("level2", "level1", "level0"):
+            parent_zip_bytes = io.BytesIO()
+            with zipfile.ZipFile(parent_zip_bytes, "w") as parent_archive:
+                parent_archive.writestr(entry_name, nested_zip_bytes.getvalue())
+            nested_zip_bytes = parent_zip_bytes
+
+        archive_path = tmp_path / "outer.zip"
+        archive_path.write_bytes(nested_zip_bytes.getvalue())
+
+        result = ZipScanner(config={"max_zip_depth": 2}).scan(str(archive_path))
+
+        assert result.success is True
+        assert any(
+            issue.message == "Maximum ZIP nesting depth (2) exceeded"
+            and issue.location == f"{archive_path}:level0:level1"
+            and issue.details.get("zip_entry") == "level0:level1"
+            and issue.details.get("depth") == 2
+            and issue.details.get("max_depth") == 2
+            for issue in result.issues
+        ), f"Expected extensionless depth issue, got: {[(i.location, i.message, i.details) for i in result.issues]}"
+        assert not any(
+            issue.severity == IssueSeverity.CRITICAL
+            and ("os.system" in issue.message.lower() or "posix.system" in issue.message.lower())
+            for issue in result.issues
+        ), f"Depth limit should stop payload scan, got: {[(i.location, i.message) for i in result.issues]}"
 
     def test_directory_traversal_detection(self):
         """Test detection of directory traversal attempts in ZIP files"""

@@ -1371,6 +1371,38 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
         ]
         assert os_issues, f"Expected CRITICAL os issue after separator byte, got: {[i.message for i in result.issues]}"
 
+    def test_multi_stream_large_padding_resync(self) -> None:
+        """Scanner must detect malicious streams after padding larger than 64KiB."""
+        import io
+
+        buf = io.BytesIO()
+        pickle.dump({"safe": True}, buf, protocol=2)
+        buf.write(b"\x00" * (70 * 1024))
+        buf.write(self._craft_global_reduce_pickle("os", "system"))
+
+        result = self._scan_bytes(buf.getvalue())
+
+        assert result.success
+        assert any(
+            i.severity == IssueSeverity.CRITICAL and ("os" in i.message.lower() or "posix" in i.message.lower())
+            for i in result.issues
+        ), f"Expected CRITICAL os issue after large padding, got: {[i.message for i in result.issues]}"
+
+    def test_multi_stream_large_padding_without_follow_on_stream_is_benign(self) -> None:
+        """Large non-pickle padding after a benign stream should not create security findings."""
+        import io
+
+        buf = io.BytesIO()
+        pickle.dump({"safe": True}, buf, protocol=2)
+        buf.write(b"\x00" * (70 * 1024))
+
+        result = self._scan_bytes(buf.getvalue())
+
+        assert result.success
+        assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues), (
+            f"Unexpected critical issue for benign large padding: {[i.message for i in result.issues]}"
+        )
+
     def test_multi_stream_malformed_first_stream_still_detects_second(self) -> None:
         """Scanner must detect malicious stream 2 even when stream 1 is malformed.
 
