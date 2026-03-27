@@ -322,6 +322,7 @@ class TestSevenZipScanner:
         self,
         scanner: SevenZipScanner,
         temp_7z_file: str,
+        tmp_path: Path,
     ) -> None:
         """Nested 7z archives should recurse even when the member has a misleading extension."""
         import py7zr  # type: ignore[import-untyped]
@@ -332,14 +333,14 @@ class TestSevenZipScanner:
 
                 return (os_module.system, ("echo disguised_7z_nested",))
 
-        inner_7z_path = Path(temp_7z_file).with_name("misnamed_inner.7z")
-        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as temp_pickle:
+        inner_7z_path = tmp_path / "misnamed_inner.7z"
+        temp_pickle_path = tmp_path / "payload.pkl"
+        with temp_pickle_path.open("wb") as temp_pickle:
             pickle.dump(MaliciousClass(), temp_pickle)
-            temp_pickle_path = temp_pickle.name
 
         try:
             with py7zr.SevenZipFile(inner_7z_path, "w") as archive:
-                archive.write(temp_pickle_path, "payload.pkl")
+                archive.write(str(temp_pickle_path), "payload.pkl")
 
             with py7zr.SevenZipFile(temp_7z_file, "w") as archive:
                 archive.write(str(inner_7z_path), "nested.jpg")
@@ -362,8 +363,8 @@ class TestSevenZipScanner:
             assert any(issue.severity == IssueSeverity.CRITICAL for issue in nested_issues)
 
         finally:
-            if os.path.exists(temp_pickle_path):
-                os.unlink(temp_pickle_path)
+            if temp_pickle_path.exists():
+                temp_pickle_path.unlink()
             if inner_7z_path.exists():
                 inner_7z_path.unlink()
 
