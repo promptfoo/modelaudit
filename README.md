@@ -1,6 +1,6 @@
 # ModelAudit
 
-**Secure your AI models before deployment.** Static scanner that detects malicious code, backdoors, and security vulnerabilities in ML model files — without ever loading or executing them.
+**Secure your AI models before deployment.** Static scanner that detects malicious code, backdoors, and security vulnerabilities in ML model files without executing them. Most scanners avoid loading model objects; ONNX metadata uses protobuf parsing via `onnx.load()`, and optional PyTorch weight analysis uses `torch.load()` for tensor statistics.
 
 [![PyPI version](https://badge.fury.io/py/modelaudit.svg)](https://pypi.org/project/modelaudit/)
 [![Python versions](https://img.shields.io/pypi/pyversions/modelaudit.svg)](https://pypi.org/project/modelaudit/)
@@ -198,10 +198,10 @@ modelaudit metadata model.onnx --security-only
 
 ModelAudit includes telemetry for product reliability and usage analytics.
 
-- Collected metadata can include command usage, scan timing, scanner/file-type usage, issue severity/type aggregates, raw and hashed path/URL identifiers, and coarse metadata like file extension/domain.
-- Raw URL telemetry fields may include query parameters (for example presigned/SAS credentials). Avoid passing credential-bearing URLs when telemetry is enabled.
+- Collected metadata can include command usage, scan timing, scanner/file-type usage, stable issue severity/type/rule aggregates, and coarse metadata like file extension/domain/model name.
+- Telemetry does not send raw issue messages, raw file paths, raw URLs, or model binary contents. URL metadata strips credentials, query strings, and fragments before events are sent.
 - Model files are scanned locally and ModelAudit does not upload model binary contents as telemetry events.
-- Telemetry is disabled automatically in CI/test environments and in editable development installs by default.
+- Telemetry is enabled by default for release installs and disabled automatically in CI/test environments and editable development installs.
 
 Opt out explicitly with either environment variable:
 

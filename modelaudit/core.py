@@ -88,6 +88,28 @@ def _to_telemetry_severity(severity: Any) -> str:
     return severity_str
 
 
+def _to_telemetry_issue_type(issue_dict: dict[str, Any], scanner_name: str | None = None) -> str:
+    """Return a stable issue type for telemetry without using raw messages."""
+    issue_type = issue_dict.get("type")
+    if isinstance(issue_type, str) and issue_type:
+        return issue_type
+
+    rule_code = issue_dict.get("rule_code")
+    if isinstance(rule_code, str) and rule_code:
+        return rule_code
+
+    if scanner_name and scanner_name != "unknown":
+        return f"{scanner_name}_issue"
+
+    return "unknown_issue"
+
+
+def _to_telemetry_rule_code(issue_dict: dict[str, Any]) -> str | None:
+    """Return a stable rule code for telemetry when available."""
+    rule_code = issue_dict.get("rule_code")
+    return rule_code if isinstance(rule_code, str) and rule_code else None
+
+
 def _add_asset_to_results(
     results: ModelAuditResultModel,
     file_path: str,
@@ -136,10 +158,11 @@ def _add_scan_result_to_model(
         issue_dict = issue.to_dict() if hasattr(issue, "to_dict") else issue
         if isinstance(issue_dict, dict):
             record_issue_found(
-                issue_type=str(issue_dict.get("message", "unknown_issue")),
+                issue_type=_to_telemetry_issue_type(issue_dict, file_result.scanner_name),
                 severity=_to_telemetry_severity(issue_dict.get("severity", "unknown")),
                 scanner=file_result.scanner_name,
                 file_path=file_path,
+                rule_code=_to_telemetry_rule_code(issue_dict),
             )
             results.issues.append(Issue(**issue_dict))
 
@@ -853,10 +876,11 @@ def scan_model_directory_or_file(
                             issue_dict = issue.to_dict() if hasattr(issue, "to_dict") else issue
                             if isinstance(issue_dict, dict):
                                 record_issue_found(
-                                    issue_type=str(issue_dict.get("message", "unknown_issue")),
+                                    issue_type=_to_telemetry_issue_type(issue_dict, file_result.scanner_name),
                                     severity=_to_telemetry_severity(issue_dict.get("severity", "unknown")),
                                     scanner=file_result.scanner_name,
                                     file_path=representative_file,
+                                    rule_code=_to_telemetry_rule_code(issue_dict),
                                 )
                                 if not issue_dict.get("location"):
                                     issue_dict["location"] = representative_file
@@ -1504,11 +1528,13 @@ def merge_scan_result(
     if isinstance(scan_result, ScanResult):
         file_path = scan_result.file_path if hasattr(scan_result, "file_path") else None
         for issue in scan_result.issues:
+            issue_dict = issue.to_dict() if hasattr(issue, "to_dict") else {}
             record_issue_found(
-                issue.message,
-                issue.severity.name if hasattr(issue.severity, "name") else str(issue.severity),
-                scan_result.scanner_name,
+                issue_type=_to_telemetry_issue_type(issue_dict, scan_result.scanner_name),
+                severity=_to_telemetry_severity(issue_dict.get("severity", "unknown")),
+                scanner=scan_result.scanner_name,
                 file_path=file_path,
+                rule_code=_to_telemetry_rule_code(issue_dict),
             )
         # Use the new direct aggregation method for better performance and type safety
         results.aggregate_scan_result_direct(scan_result)
@@ -1516,12 +1542,15 @@ def merge_scan_result(
         # Fallback to dict-based aggregation for backward compatibility with telemetry
         file_path = scan_result.get("file_path")
         for issue in scan_result.get("issues", []):
-            record_issue_found(
-                issue.get("message", "unknown_issue"),
-                issue.get("severity", "unknown"),
-                scan_result.get("scanner_name", "unknown"),
-                file_path=file_path,
-            )
+            if isinstance(issue, dict):
+                scanner_name = scan_result.get("scanner_name", "unknown")
+                record_issue_found(
+                    issue_type=_to_telemetry_issue_type(issue, scanner_name),
+                    severity=_to_telemetry_severity(issue.get("severity", "unknown")),
+                    scanner=scanner_name,
+                    file_path=file_path,
+                    rule_code=_to_telemetry_rule_code(issue),
+                )
         results.aggregate_scan_result(scan_result)
 
 

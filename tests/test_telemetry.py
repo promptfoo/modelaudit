@@ -301,16 +301,27 @@ class TestTelemetryClient:
                     {"path": str(second_model), "type": "zip"},
                 ],
                 "issues": [
-                    {"message": "Issue A", "severity": "critical", "location": str(first_model)},
-                    {"message": "Issue B", "severity": "warning", "location": str(second_model)},
                     {
                         "type": "pickle_dangerous_global",
+                        "rule_code": "MA-PKL-001",
+                        "message": "Issue A with user-controlled /tmp/secret-a",
+                        "severity": "critical",
+                        "location": str(first_model),
+                    },
+                    {
+                        "rule_code": "MA-ZIP-001",
+                        "message": "Issue B with user-controlled /tmp/secret-b",
+                        "severity": "warning",
+                        "location": str(second_model),
+                    },
+                    {
+                        "type": "pickle_dangerous_import",
                         "message": "Legacy message should not be used when type exists",
                         "severity": "info",
                         "location": str(first_model),
                     },
                     {
-                        "message": "Issue with no location",
+                        "message": "Issue with no location and /tmp/secret-c",
                         "severity": "warning",
                         "location": None,
                     },
@@ -322,10 +333,15 @@ class TestTelemetryClient:
 
             assert properties["total_files"] == 2
             assert properties["total_issues"] == 4
-            assert properties["issue_types"]["Issue A"] == 1
-            assert properties["issue_types"]["Issue B"] == 1
             assert properties["issue_types"]["pickle_dangerous_global"] == 1
-            assert properties["issue_types"]["Issue with no location"] == 1
+            assert properties["issue_types"]["MA-ZIP-001"] == 1
+            assert properties["issue_types"]["pickle_dangerous_import"] == 1
+            assert properties["issue_types"]["unknown"] == 1
+            assert properties["issue_rules"]["MA-PKL-001"] == 1
+            assert properties["issue_rules"]["MA-ZIP-001"] == 1
+            assert "Issue A with user-controlled /tmp/secret-a" not in properties["issue_types"]
+            assert "Issue B with user-controlled /tmp/secret-b" not in properties["issue_types"]
+            assert "Issue with no location and /tmp/secret-c" not in properties["issue_types"]
             assert "Legacy message should not be used when type exists" not in properties["issue_types"]
             assert properties["issue_severities"]["critical"] == 1
             assert properties["issue_severities"]["warning"] == 2
@@ -339,16 +355,23 @@ class TestTelemetryClient:
             canonical_issue = next(
                 detail for detail in properties["issue_details"] if detail["type"] == "pickle_dangerous_global"
             )
+            assert canonical_issue["rule_code"] == "MA-PKL-001"
             assert canonical_issue["model_name"] == "a.pkl"
             assert canonical_issue["model_reference"] == "a.pkl"
+            fallback_issue = next(detail for detail in properties["issue_details"] if detail["type"] == "MA-ZIP-001")
+            assert fallback_issue["rule_code"] == "MA-ZIP-001"
             missing_location_issue = next(
-                detail for detail in properties["issue_details"] if detail["type"] == "Issue with no location"
+                detail for detail in properties["issue_details"] if detail["type"] == "unknown"
             )
+            assert missing_location_issue["rule_code"] is None
             assert missing_location_issue["location_type"] == "unknown"
             assert missing_location_issue["model_name"] is None
             assert missing_location_issue["model_reference"] is None
             assert "location_identifier" not in canonical_issue
             assert str(first_model) not in json.dumps(properties)
+            assert "/tmp/secret-a" not in json.dumps(properties)
+            assert "/tmp/secret-b" not in json.dumps(properties)
+            assert "/tmp/secret-c" not in json.dumps(properties)
             assert '"None"' not in json.dumps(properties)
 
     def test_scan_started_includes_per_path_fields(self, tmp_path: Path) -> None:
@@ -419,9 +442,18 @@ class TestTelemetryClient:
             assert "path_identifier" not in file_props
             assert str(sensitive_path) not in json.dumps(file_props)
 
-            client.record_issue_found("dangerous pattern", "critical", "pickle", str(sensitive_path))
+            client.record_issue_found(
+                "pickle_dangerous_global",
+                "critical",
+                "pickle",
+                str(sensitive_path),
+                rule_code="MA-PKL-001",
+            )
             issue_props = mock_posthog.capture.call_args.kwargs["properties"]
             assert "file_path" not in issue_props
+            assert issue_props["issue_type"] == "pickle_dangerous_global"
+            assert issue_props["rule_code"] == "MA-PKL-001"
+            assert "issue_message" not in issue_props
             assert issue_props["model_name"] == "model.pkl"
             assert issue_props["model_reference"] == "model.pkl"
             assert "path_identifier" not in issue_props
@@ -672,6 +704,34 @@ class TestTelemetryIntegration:
 
         assert len(result.issues) > 0
         assert mock_record_issue_found.call_count > 0
+
+    @patch("modelaudit.core.record_issue_found")
+    def test_merge_scan_result_emits_structured_issue_telemetry(self, mock_record_issue_found) -> None:
+        """Merge telemetry should use stable issue fields instead of raw messages."""
+        from modelaudit.core import merge_scan_result
+        from modelaudit.models import create_initial_audit_result
+        from modelaudit.scanners.base import Issue, IssueSeverity, ScanResult
+
+        scan_result = ScanResult(scanner_name="pickle")
+        scan_result.issues.append(
+            Issue(
+                message="User-controlled issue message with /tmp/secret-model.pkl",
+                severity=IssueSeverity.CRITICAL,
+                type="pickle_dangerous_global",
+                rule_code="MA-PKL-001",
+            )
+        )
+
+        results = create_initial_audit_result()
+        merge_scan_result(results, scan_result)
+
+        mock_record_issue_found.assert_called_once_with(
+            issue_type="pickle_dangerous_global",
+            severity="critical",
+            scanner="pickle",
+            file_path=None,
+            rule_code="MA-PKL-001",
+        )
 
 
 if __name__ == "__main__":

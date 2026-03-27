@@ -30,7 +30,7 @@ ModelAudit performs static analysis on model files before they are loaded into a
 | ModelAudit process itself            | Trusted               | Runs with the invoking user's privileges                                              |
 | ModelAudit dependencies              | Conditionally trusted | Monitored via PR CI audit, GitHub dependency alerts, Renovate security PRs, and Trivy |
 
-The scanning engine makes no outbound network requests. The CLI may download model files from remote sources (e.g., HuggingFace Hub) before invoking the scanner.
+The scanning engine makes no outbound network requests. The CLI may download model files from remote sources (e.g., HuggingFace Hub) before invoking the scanner, and release installs send opt-out telemetry for product reliability and usage analytics unless disabled.
 
 ---
 

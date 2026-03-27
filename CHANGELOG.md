@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- minimize issue telemetry payloads and document opt-out network behavior
+- include py7zr in all/all-ci extras for 7z archive support
 - preserve validated PE detections in pickle binary ML-context filtering
 
 ## [0.2.28](https://github.com/promptfoo/modelaudit/compare/v0.2.27...v0.2.28) (2026-03-20)

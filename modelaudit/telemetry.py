@@ -409,6 +409,23 @@ class TelemetryClient:
             counts[value] = counts.get(value, 0) + 1
         return counts
 
+    def _normalize_issue_type(self, issue: dict[str, Any]) -> str:
+        """Return a stable issue type for telemetry without using raw messages."""
+        issue_type = issue.get("type")
+        if isinstance(issue_type, str) and issue_type:
+            return issue_type
+
+        rule_code = issue.get("rule_code")
+        if isinstance(rule_code, str) and rule_code:
+            return rule_code
+
+        return "unknown"
+
+    def _normalize_issue_rule_code(self, issue: dict[str, Any]) -> str | None:
+        """Return a stable rule code for telemetry when available."""
+        rule_code = issue.get("rule_code")
+        return rule_code if isinstance(rule_code, str) and rule_code else None
+
     def _send_event_internal(self, event: TelemetryEvent, properties: dict[str, Any]) -> None:
         """Internal method to send events without checking disabled state."""
         event_properties = {
@@ -546,15 +563,18 @@ class TelemetryClient:
         issues = self._iter_result_issues(results)
         assets = self._iter_result_assets(results)
 
-        # Collect all unique issue types with counts
+        # Collect all unique issue types/rules with counts
         issue_types: dict[str, int] = {}
+        issue_rules: dict[str, int] = {}
         issue_details: list[dict[str, Any]] = []
 
         for issue in issues:
-            # Prefer structured issue type when available, fall back to message for legacy payloads.
-            issue_type = str(issue.get("type") or issue.get("message") or "unknown")
+            issue_type = self._normalize_issue_type(issue)
+            rule_code = self._normalize_issue_rule_code(issue)
             severity = str(issue.get("severity", "unknown"))
             issue_types[issue_type] = issue_types.get(issue_type, 0) + 1
+            if rule_code:
+                issue_rules[rule_code] = issue_rules.get(rule_code, 0) + 1
             # Capture first 50 issues in detail without including raw paths or identifiers.
             if len(issue_details) < 50:
                 raw_issue_location = issue.get("location")
@@ -562,6 +582,7 @@ class TelemetryClient:
                 issue_details.append(
                     {
                         "type": issue_type,
+                        "rule_code": rule_code,
                         "severity": severity,
                         "location_type": self._classify_path(issue_location) if issue_location else "unknown",
                         "model_name": self._extract_model_name(issue_location) if issue_location else None,
@@ -585,6 +606,7 @@ class TelemetryClient:
                 "file_types": file_types,
                 "scanners_used": sorted(set(scanner_names)),
                 "issue_types": issue_types,
+                "issue_rules": issue_rules,
                 "issue_details": issue_details,
                 "model_references": [
                     self._extract_model_reference(str(asset.get("path", "")))
@@ -633,13 +655,14 @@ class TelemetryClient:
         severity: str,
         scanner: str,
         file_path: str | None = None,
+        rule_code: str | None = None,
     ) -> None:
         """Record that a security issue was found."""
         properties: dict[str, Any] = {
             "severity": severity,
             "scanner": scanner,
             "issue_type": issue_type,
-            "issue_message": issue_type,  # Full message for analytics
+            "rule_code": rule_code,
         }
 
         if file_path:
@@ -863,11 +886,17 @@ def record_file_type_detected(file_path: str, detected_type: str, confidence: fl
 
 
 @safe_telemetry
-def record_issue_found(issue_type: str, severity: str, scanner: str, file_path: str | None = None) -> None:
+def record_issue_found(
+    issue_type: str,
+    severity: str,
+    scanner: str,
+    file_path: str | None = None,
+    rule_code: str | None = None,
+) -> None:
     """Record that a security issue was found."""
     client = get_telemetry_client()
     if client is not None:
-        client.record_issue_found(issue_type, severity, scanner, file_path)
+        client.record_issue_found(issue_type, severity, scanner, file_path, rule_code)
 
 
 @safe_telemetry
