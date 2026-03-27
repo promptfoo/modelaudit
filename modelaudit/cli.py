@@ -2372,6 +2372,9 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
     # Check if scan had operational errors first (highest priority in exit code)
     has_operational_errors = bool(results.get("has_errors"))
     files_scanned = results.get("files_scanned", 0)
+    has_critical_findings = any(_get_issue_attr(issue, "severity") == "critical" for issue in visible_issues)
+    has_warning_findings = any(_get_issue_attr(issue, "severity") == "warning" for issue in visible_issues)
+    has_security_findings = has_critical_findings or has_warning_findings
     if has_operational_errors:
         status_icon = "❌"
         status_msg = "SCAN COMPLETED WITH OPERATIONAL ERRORS"
@@ -2380,6 +2383,18 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
         output_lines.append(
             f"  {style_text('Review warnings above and use --verbose for troubleshooting details.', fg='yellow')}"
         )
+    # Determine overall status
+    elif has_security_findings:
+        if has_critical_findings:
+            status_icon = "❌"
+            status_msg = "CRITICAL SECURITY ISSUES FOUND"
+            status_color = "red"
+        elif has_warning_findings:
+            status_icon = "⚠️"
+            status_msg = "WARNINGS DETECTED"
+            status_color = "yellow"
+        status_line = style_text(f"{status_icon} {status_msg}", fg=status_color, bold=True)
+        output_lines.append(f"  {status_line}")
     # Check if no files were scanned
     elif files_scanned == 0:
         status_icon = "❌"
@@ -2389,13 +2404,12 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
         output_lines.append(
             f"  {style_text('Warning: No model files were found at the specified location.', fg='yellow')}"
         )
-    # Determine overall status
     elif visible_issues:
-        if any(_get_issue_attr(issue, "severity") == "critical" for issue in visible_issues):
+        if has_critical_findings:
             status_icon = "❌"
             status_msg = "CRITICAL SECURITY ISSUES FOUND"
             status_color = "red"
-        elif any(_get_issue_attr(issue, "severity") == "warning" for issue in visible_issues):
+        elif has_warning_findings:
             status_icon = "⚠️"
             status_msg = "WARNINGS DETECTED"
             status_color = "yellow"

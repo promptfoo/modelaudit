@@ -133,6 +133,40 @@ def test_scan_model_streaming_symlink_outside_directory_matches_normal_scan(
     assert streaming_result.files_scanned == 1
 
 
+def test_scan_model_streaming_symlink_outside_directory_without_safe_files_returns_security_exit_code(
+    tmp_path: Path,
+    requires_symlinks: None,
+) -> None:
+    """Traversal findings should keep the security exit code even when no files were scanned."""
+    base_dir = tmp_path / "base"
+    base_dir.mkdir()
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+
+    with (outside_dir / "secret.pkl").open("wb") as f:
+        pickle.dump({"data": "secret"}, f)
+
+    symlink_path = base_dir / "link.pkl"
+    symlink_path.symlink_to(outside_dir / "secret.pkl")
+
+    result = scan_model_streaming(
+        file_generator=iterate_files_streaming(base_dir),
+        timeout=30,
+        delete_after_scan=False,
+        scan_root=str(base_dir),
+        cache_enabled=False,
+    )
+
+    traversal_issues = [issue for issue in result.issues if "path traversal" in issue.message.lower()]
+
+    assert result.files_scanned == 0
+    assert result.has_errors is False
+    assert len(traversal_issues) == 1
+    assert traversal_issues[0].location == str(symlink_path)
+    assert traversal_issues[0].severity == IssueSeverity.CRITICAL
+    assert determine_exit_code(result) == 1
+
+
 def test_scan_model_streaming_hf_cache_symlink_allowed(
     tmp_path: Path,
     requires_symlinks: None,

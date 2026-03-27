@@ -1123,7 +1123,8 @@ def determine_exit_code(results: ModelAuditResultModel) -> int:
     Exit codes:
     - 0: Success, no security issues found
     - 1: Security issues found (scan completed successfully)
-    - 2: Operational errors occurred during scanning or no files scanned
+    - 2: Operational errors occurred during scanning, or no files were scanned
+         and no security issues were found
 
     Args:
         results: ModelAuditResultModel with scan results
@@ -1135,13 +1136,10 @@ def determine_exit_code(results: ModelAuditResultModel) -> int:
     if getattr(results, "has_errors", False):
         return 2
 
-    # Check if no files were scanned
-    files_scanned = results.files_scanned
-    if files_scanned == 0:
-        return 2
-
-    # Check for any security findings (warnings, errors, or critical issues)
-    issues = results.issues
+    # Check for any security findings before treating zero scanned files as
+    # an operational-style outcome. Path traversal and similar safeguards can
+    # report a finding before any file is scanned.
+    issues = results.issues or []
     if issues:
         # Filter out DEBUG and INFO level issues for exit code determination
         # Only WARNING, ERROR (legacy), and CRITICAL issues should trigger exit code 1
@@ -1154,6 +1152,11 @@ def determine_exit_code(results: ModelAuditResultModel) -> int:
         ]
         if security_issues:
             return 1
+
+    # Check if no files were scanned
+    files_scanned = results.files_scanned
+    if files_scanned == 0:
+        return 2
 
     # No issues found
     return 0

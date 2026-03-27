@@ -1623,6 +1623,33 @@ def test_exit_code_security_issues_streaming_local_directory(tmp_path: Path) -> 
     assert evil_pickle_path.exists()
 
 
+def test_exit_code_streaming_symlink_traversal_without_safe_files(tmp_path: Path, requires_symlinks: None) -> None:
+    """Streaming traversal findings should exit 1 even when no files are ultimately scanned."""
+    import pickle
+
+    base_dir = tmp_path / "base"
+    base_dir.mkdir()
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+
+    with (outside_dir / "secret.pkl").open("wb") as f:
+        pickle.dump({"data": "secret"}, f)
+
+    symlink_path = base_dir / "link.pkl"
+    symlink_path.symlink_to(outside_dir / "secret.pkl")
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "--stream", "--format", "text", str(base_dir)])
+
+    output = strip_ansi(result.output)
+
+    assert result.exit_code == 1, f"Expected exit code 1, got {result.exit_code}. Output: {result.output}"
+    assert str(symlink_path) in output
+    assert "Path traversal outside scanned directory" in output
+    assert "CRITICAL SECURITY ISSUES FOUND" in output
+    assert "NO FILES SCANNED" not in output
+
+
 def test_exit_code_scan_errors(tmp_path):
     """Test exit code 2 when errors occur during scanning."""
     runner = CliRunner()
