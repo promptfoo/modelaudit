@@ -530,3 +530,26 @@ def test_manifest_scanner_cloud_url_timeout_reports_only_timeout(tmp_path, monke
     assert result.success is True
     assert [check.name for check in result.checks if check.status == CheckStatus.FAILED] == ["Manifest Scan Timeout"]
     assert not any(check.name == "Manifest File Scan" for check in result.checks)
+
+
+def test_manifest_scanner_weak_hash_timeout_reports_only_timeout(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Timeout overruns after weak-hash analysis should still report a manifest timeout."""
+    test_file = tmp_path / "config.json"
+    test_file.write_text(json.dumps({"model_type": "bert", "checksum": "e3b0c44298fc1c149afbf4c8996fb924"}))
+
+    scanner = ManifestScanner(config={"timeout": 1})
+    monkeypatch.setattr(scanner, "_check_file_for_blacklist", lambda _path, _result: None)
+    monkeypatch.setattr(scanner, "_check_cloud_storage_urls", lambda _path, _result: None)
+    monkeypatch.setattr(scanner, "_check_model_name_policies", lambda _content, _result: None)
+    monkeypatch.setattr(scanner, "_check_suspicious_urls", lambda _content, _result: None)
+
+    def expire_timeout(_content: object, _result: ScanResult) -> None:
+        scanner.scan_start_time = 0
+
+    monkeypatch.setattr(scanner, "_check_weak_hashes", expire_timeout)
+
+    result = scanner.scan(str(test_file))
+
+    assert result.success is True
+    assert [check.name for check in result.checks if check.status == CheckStatus.FAILED] == ["Manifest Scan Timeout"]
+    assert not any(check.name == "Manifest File Scan" for check in result.checks)

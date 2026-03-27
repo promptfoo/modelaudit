@@ -541,6 +541,7 @@ class ManifestScanner(BaseScanner):
 
                     # Check for weak hash algorithms used for integrity verification
                     self._check_weak_hashes(content, result)
+                    self._check_timeout()
 
             else:
                 result.add_check(
