@@ -504,7 +504,7 @@ def download_jfrog_folder(
     except (ValueError, IndexError):
         base_repo_path = ""
 
-    download_failures = []
+    completed_downloads = 0
 
     for file_info in files:
         try:
@@ -547,24 +547,16 @@ def download_jfrog_folder(
                 if local_file.exists():
                     local_file.unlink()
                 downloaded_file.rename(local_file)
+            completed_downloads += 1
 
         except Exception as e:
             error_msg = f"Failed to download {file_info['name']}: {e}"
             logger.warning(error_msg)
-            download_failures.append({"file": file_info["name"], "error": str(e)})
-            continue
-
-    # Report download failures if any occurred
-    if download_failures:
-        failure_summary = f"{len(download_failures)} file(s) failed to download"
-        if show_progress:
-            click.echo(f"⚠️  {failure_summary}")
-
-        # If all files failed, raise an exception
-        if len(download_failures) == len(files):
-            failure_details = "; ".join([f"{f['file']}: {f['error']}" for f in download_failures[:3]])
-            if len(download_failures) > 3:
-                failure_details += f" (and {len(download_failures) - 3} more)"
-            raise Exception(f"All downloads failed. {failure_details}")
+            if show_progress:
+                click.echo("❌ Aborting JFrog folder download to avoid scanning a partial dataset")
+            raise Exception(
+                "JFrog folder download failed after "
+                f"{completed_downloads} of {len(files)} file(s) completed. {file_info['name']}: {e}"
+            ) from e
 
     return download_dir
