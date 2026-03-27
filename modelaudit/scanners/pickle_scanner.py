@@ -351,18 +351,29 @@ def _genops_with_fallback(
                 return  # EOF
             resync_skipped += 1
             if resync_skipped >= _MAX_RESYNC_BYTES:
-                # Bounded fast-forward search for the next likely protocol header
-                # so simple padding cannot terminate multi-stream scanning.
-                probe_start = file_obj.tell()
-                probe = file_obj.read(64 * 1024)
-                candidate = next(
-                    (idx for idx in range(len(probe) - 1) if probe[idx] == 0x80 and probe[idx + 1] in (2, 3, 4, 5)),
-                    -1,
-                )
-                if candidate < 0:
-                    return
-                file_obj.seek(probe_start + candidate, 0)
-                resync_skipped = 0
+                # Fast-forward search for the next likely protocol header so
+                # large padding blocks cannot terminate multi-stream scanning.
+                previous_tail = b""
+                while True:
+                    _check_budget()
+                    probe_start = file_obj.tell()
+                    probe = file_obj.read(64 * 1024)
+                    if not probe:
+                        return
+                    search_window = previous_tail + probe
+                    candidate = next(
+                        (
+                            idx
+                            for idx in range(len(search_window) - 1)
+                            if search_window[idx] == 0x80 and search_window[idx + 1] in (2, 3, 4, 5)
+                        ),
+                        -1,
+                    )
+                    if candidate >= 0:
+                        file_obj.seek(probe_start - len(previous_tail) + candidate, 0)
+                        resync_skipped = 0
+                        break
+                    previous_tail = probe[-1:]
             continue
 
         # Found a valid stream — reset resync counter
