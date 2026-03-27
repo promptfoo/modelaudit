@@ -127,7 +127,10 @@ class TorchServeMarScanner(BaseScanner):
         result.metadata["file_size"] = self.get_file_size(path)
         self.add_file_integrity_check(path, result)
 
-        current_depth = self._get_int_config("_mar_depth", 0, minimum=0)
+        current_depth = max(
+            self._get_int_config("_mar_depth", 0, minimum=0),
+            self._get_int_config("_archive_depth", 0, minimum=0),
+        )
         if current_depth >= self.max_depth:
             result.add_check(
                 name="TorchServe MAR Depth Limit",
@@ -843,6 +846,7 @@ class TorchServeMarScanner(BaseScanner):
 
                 nested_config = dict(self.config)
                 nested_config["_mar_depth"] = current_depth + 1
+                nested_config["_archive_depth"] = current_depth + 1
                 file_result = core.scan_file(temp_path, nested_config)
                 self._rewrite_scan_locations(
                     file_result=file_result,

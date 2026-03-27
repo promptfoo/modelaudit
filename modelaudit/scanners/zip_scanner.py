@@ -22,6 +22,10 @@ CRITICAL_SYSTEM_PATHS = [
     "/sbin",
     "C:\\Windows",
 ]
+DEFAULT_MAX_ZIP_DEPTH = 5
+DEFAULT_MAX_ZIP_ENTRIES = 10000
+MAX_ZIP_SYMLINK_TARGET_BYTES = 4096
+MAX_ZIP_COMPRESSION_RATIO = 100.0
 
 
 class ZipScanner(BaseScanner):
@@ -35,11 +39,8 @@ class ZipScanner(BaseScanner):
 
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
-        self.max_depth = self.config.get("max_zip_depth", 5)  # Prevent zip bomb attacks
-        self.max_entries = self.config.get(
-            "max_zip_entries",
-            10000,
-        )  # Limit number of entries
+        self.max_depth = self.config.get("max_zip_depth", DEFAULT_MAX_ZIP_DEPTH)  # Prevent zip bomb attacks
+        self.max_entries = self.config.get("max_zip_entries", DEFAULT_MAX_ZIP_ENTRIES)  # Limit number of entries
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -49,7 +50,7 @@ class ZipScanner(BaseScanner):
 
         # Check file extension
         ext = os.path.splitext(path)[1].lower()
-        if ext not in cls.supported_extensions:
+        if ext and ext not in cls.supported_extensions:
             return False
 
         # Verify it's actually a zip file
@@ -85,7 +86,12 @@ class ZipScanner(BaseScanner):
             self.current_file_path = path
 
             # Scan the zip file recursively
-            scan_result = self._scan_zip_file(path, depth=0)
+            try:
+                archive_depth = int(self.config.get("_archive_depth", 0))
+            except (TypeError, ValueError):
+                archive_depth = 0
+
+            scan_result = self._scan_zip_file(path, depth=max(archive_depth, 0))
             result.merge(scan_result)
 
         except zipfile.BadZipFile:
@@ -155,6 +161,29 @@ class ZipScanner(BaseScanner):
                 if isinstance(existing_check_entry, str) and existing_check_entry
                 else entry_name
             )
+
+    def _read_member_bounded(
+        self,
+        archive: zipfile.ZipFile,
+        member_info: zipfile.ZipInfo,
+        max_bytes: int,
+    ) -> bytes:
+        """Read a ZIP member with a hard byte cap."""
+        if member_info.file_size > max_bytes:
+            raise ValueError(
+                f"Archive member {member_info.filename} exceeds size limit ({member_info.file_size} > {max_bytes})",
+            )
+
+        data = bytearray()
+        with archive.open(member_info, "r") as handle:
+            while True:
+                chunk = handle.read(4096)
+                if not chunk:
+                    break
+                data.extend(chunk)
+                if len(data) > max_bytes:
+                    raise ValueError(f"Archive member {member_info.filename} exceeded bounded read limit ({max_bytes})")
+        return bytes(data)
 
     def _scan_zip_file(self, path: str, depth: int = 0) -> ScanResult:
         """Recursively scan a ZIP file and its contents"""
@@ -234,7 +263,10 @@ class ZipScanner(BaseScanner):
                 is_symlink = (info.external_attr >> 16) & 0o170000 == stat.S_IFLNK
                 if is_symlink:
                     try:
-                        target = z.read(name).decode("utf-8", "replace")
+                        target = self._read_member_bounded(z, info, MAX_ZIP_SYMLINK_TARGET_BYTES).decode(
+                            "utf-8",
+                            "replace",
+                        )
                     except Exception:
                         target = ""
                     target_base = os.path.dirname(resolved_name)
@@ -286,7 +318,7 @@ class ZipScanner(BaseScanner):
                 # Check compression ratio for zip bomb detection
                 if info.compress_size > 0:
                     compression_ratio = info.file_size / info.compress_size
-                    if compression_ratio > 100:
+                    if compression_ratio > MAX_ZIP_COMPRESSION_RATIO:
                         result.add_check(
                             name="Compression Ratio Check",
                             passed=False,
@@ -299,9 +331,10 @@ class ZipScanner(BaseScanner):
                                 "compressed_size": info.compress_size,
                                 "uncompressed_size": info.file_size,
                                 "ratio": compression_ratio,
-                                "threshold": 100,
+                                "threshold": MAX_ZIP_COMPRESSION_RATIO,
                             },
                         )
+                        continue
                     else:
                         # Record safe compression ratio
                         result.add_check(
@@ -314,7 +347,7 @@ class ZipScanner(BaseScanner):
                                 "compressed_size": info.compress_size,
                                 "uncompressed_size": info.file_size,
                                 "ratio": compression_ratio,
-                                "threshold": 100,
+                                "threshold": MAX_ZIP_COMPRESSION_RATIO,
                             },
                             rule_code=None,  # Passing check
                         )
@@ -383,8 +416,11 @@ class ZipScanner(BaseScanner):
                             # Import core here to avoid circular import
                             from .. import core
 
+                            nested_config = dict(self.config)
+                            nested_config["_archive_depth"] = depth + 1
+
                             # Use core.scan_file to scan with appropriate scanner
-                            file_result = core.scan_file(tmp_path, self.config)
+                            file_result = core.scan_file(tmp_path, nested_config)
                             self._rewrite_nested_result_context(file_result, tmp_path, path, name)
 
                             result.merge(file_result)

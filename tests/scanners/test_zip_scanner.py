@@ -1,11 +1,16 @@
+import io
 import os
+import stat
+import tarfile
 import tempfile
 import zipfile
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from modelaudit.scanners.base import IssueSeverity
+import pytest
+
+from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.zip_scanner import ZipScanner
 
 
@@ -154,6 +159,53 @@ class TestZipScanner:
             os.unlink(inner_path)
             os.unlink(outer_path)
 
+    def test_scan_extensionless_nested_zip_recurses(self, tmp_path: Path) -> None:
+        """Extensionless ZIP members should be recursively scanned by content."""
+        import pickle
+
+        inner_zip = io.BytesIO()
+        with zipfile.ZipFile(inner_zip, "w") as inner_archive:
+            inner_archive.writestr("payload.pkl", pickle.dumps({"safe": "data"}))
+
+        archive_path = tmp_path / "outer.zip"
+        with zipfile.ZipFile(archive_path, "w") as outer_archive:
+            outer_archive.writestr("nested", inner_zip.getvalue())
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert result.success is True
+        assert any(
+            check.details.get("zip_entry") == "nested:payload.pkl"
+            and check.location == f"{archive_path}:nested:payload.pkl"
+            for check in result.checks
+        ), f"Expected nested extensionless ZIP checks, got: {[(c.location, c.details) for c in result.checks]}"
+
+    def test_scan_alternating_zip_tar_enforces_shared_depth_limit(self, tmp_path: Path) -> None:
+        """Archive depth should not reset when recursion alternates between ZIP and TAR."""
+        inner_zip = tmp_path / "inner.zip"
+        with zipfile.ZipFile(inner_zip, "w") as archive:
+            archive.writestr("payload.txt", "deep content")
+
+        middle_tar = tmp_path / "middle.tar"
+        with tarfile.open(middle_tar, "w") as archive:
+            archive.add(inner_zip, arcname="inner.zip")
+
+        outer_zip = tmp_path / "outer.zip"
+        with zipfile.ZipFile(outer_zip, "w") as archive:
+            archive.write(middle_tar, arcname="middle.tar")
+
+        scanner = ZipScanner(config={"max_zip_depth": 2, "max_tar_depth": 2})
+        result = scanner.scan(str(outer_zip))
+
+        depth_checks = [
+            check
+            for check in result.checks
+            if check.name == "ZIP Depth Bomb Protection" and check.status == CheckStatus.FAILED
+        ]
+        assert len(depth_checks) == 1
+        assert "maximum zip nesting depth (2) exceeded" in depth_checks[0].message.lower()
+        assert depth_checks[0].location == f"{outer_zip}:middle.tar:inner.zip"
+
     def test_directory_traversal_detection(self):
         """Test detection of directory traversal attempts in ZIP files"""
         with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
@@ -218,6 +270,78 @@ class TestZipScanner:
             assert len(compression_issues) >= 1
         finally:
             os.unlink(tmp_path)
+
+    def test_scan_zip_reads_symlink_targets_with_bounded_stream(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Symlink target reads should use bounded streaming instead of ZipFile.read()."""
+        archive_path = tmp_path / "symlink.zip"
+        info = zipfile.ZipInfo("link.txt")
+        info.create_system = 3
+        info.external_attr = (stat.S_IFLNK | 0o777) << 16
+
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr(info, "../evil.txt")
+
+        read_sizes: list[int | None] = []
+        original_read = zipfile.ZipExtFile.read
+
+        def fail_zipfile_read(self: zipfile.ZipFile, name: Any, pwd: bytes | None = None) -> bytes:
+            raise AssertionError("ZipScanner should not call ZipFile.read() for symlink targets")
+
+        def tracked_read(self: zipfile.ZipExtFile, size: int | None = None) -> bytes:
+            read_sizes.append(size)
+            return original_read(self, size)
+
+        monkeypatch.setattr(zipfile.ZipFile, "read", fail_zipfile_read)
+        monkeypatch.setattr(zipfile.ZipExtFile, "read", tracked_read)
+
+        result = self.scanner.scan(str(archive_path))
+
+        symlink_issues = [issue for issue in result.issues if "symlink" in issue.message.lower()]
+        assert any("outside" in issue.message.lower() for issue in symlink_issues)
+        assert read_sizes
+        assert set(read_sizes) == {4096}
+
+    def test_scan_zip_skips_high_compression_ratio_entries(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Entries with suspicious compression ratios should not be extracted after detection."""
+        archive_path = tmp_path / "ratio_skip.zip"
+        with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("suspicious.txt", "A" * 300000)
+
+        original_open = zipfile.ZipFile.open
+
+        def fail_suspicious_open(
+            self: zipfile.ZipFile,
+            name: Any,
+            mode: str = "r",
+            pwd: bytes | None = None,
+            *,
+            force_zip64: bool = False,
+        ) -> Any:
+            target_name = name.filename if isinstance(name, zipfile.ZipInfo) else name
+            if target_name == "suspicious.txt":
+                raise AssertionError("ZipScanner should skip extraction for high-ratio entries")
+            return original_open(self, name, mode=mode, pwd=pwd, force_zip64=force_zip64)
+
+        monkeypatch.setattr(zipfile.ZipFile, "open", fail_suspicious_open)
+
+        result = self.scanner.scan(str(archive_path))
+
+        compression_checks = [
+            check
+            for check in result.checks
+            if check.name == "Compression Ratio Check" and check.status == CheckStatus.FAILED
+        ]
+        assert len(compression_checks) == 1
+        assert result.bytes_scanned == 0
+        assert all(check.name != "ZIP Entry Scan" for check in result.checks)
 
     def test_max_depth_limit(self):
         """Test that maximum nesting depth is enforced"""
