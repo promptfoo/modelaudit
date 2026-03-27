@@ -3,6 +3,7 @@ import logging
 
 import pytest
 
+import modelaudit.scanners.manifest_scanner as manifest_scanner_module
 from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.manifest_scanner import ManifestScanner
 
@@ -459,3 +460,73 @@ def test_manifest_scanner_enforces_timeout(tmp_path, monkeypatch: pytest.MonkeyP
     assert len(timeout_checks) == 1
     assert timeout_checks[0].status == CheckStatus.FAILED
     assert timeout_checks[0].severity == IssueSeverity.WARNING
+
+
+def test_manifest_scanner_blacklist_timeout_reports_only_timeout(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    """Timeouts in blacklist checks should not be converted to blacklist errors."""
+    test_file = tmp_path / "config.json"
+    test_file.write_text(json.dumps({"model_type": "bert"}))
+
+    scanner = ManifestScanner(config={"timeout": 1, "blacklist_patterns": ["bert"]})
+    timeout_calls = 0
+
+    def raise_on_helper_timeout(*_args: object, **_kwargs: object) -> bool:
+        nonlocal timeout_calls
+        timeout_calls += 1
+        if timeout_calls == 2:
+            raise TimeoutError("blacklist helper timed out")
+        return False
+
+    monkeypatch.setattr(scanner, "_check_timeout", raise_on_helper_timeout)
+
+    result = scanner.scan(str(test_file))
+
+    assert result.success is True
+    assert [check.name for check in result.checks if check.status == CheckStatus.FAILED] == ["Manifest Scan Timeout"]
+
+
+def test_manifest_scanner_parse_timeout_reports_only_timeout(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    """Timeouts in manifest parsing should not be converted to parse errors."""
+    test_file = tmp_path / "config.json"
+    test_file.write_text(json.dumps({"model_type": "bert"}))
+
+    scanner = ManifestScanner(config={"timeout": 1})
+    monkeypatch.setattr(scanner, "_check_file_for_blacklist", lambda _path, _result: None)
+    monkeypatch.setattr(scanner, "_check_cloud_storage_urls", lambda _path, _result: None)
+    monkeypatch.setattr(
+        manifest_scanner_module.json,
+        "loads",
+        lambda _content: (_ for _ in ()).throw(TimeoutError("parse helper timed out")),
+    )
+
+    result = scanner.scan(str(test_file))
+
+    assert result.success is True
+    assert [check.name for check in result.checks if check.status == CheckStatus.FAILED] == ["Manifest Scan Timeout"]
+    assert not any(check.name == "File Parse Error" for check in result.checks)
+    assert not any(check.name == "Manifest Parse Attempt" for check in result.checks)
+
+
+def test_manifest_scanner_cloud_url_timeout_reports_only_timeout(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    """Timeouts in cloud URL checks should not be swallowed."""
+    test_file = tmp_path / "config.json"
+    test_file.write_text(json.dumps({"model_type": "bert"}))
+
+    scanner = ManifestScanner(config={"timeout": 1})
+    timeout_calls = 0
+
+    def raise_on_helper_timeout(*_args: object, **_kwargs: object) -> bool:
+        nonlocal timeout_calls
+        timeout_calls += 1
+        if timeout_calls == 3:
+            raise TimeoutError("cloud URL helper timed out")
+        return False
+
+    monkeypatch.setattr(scanner, "_check_file_for_blacklist", lambda _path, _result: None)
+    monkeypatch.setattr(scanner, "_check_timeout", raise_on_helper_timeout)
+
+    result = scanner.scan(str(test_file))
+
+    assert result.success is True
+    assert [check.name for check in result.checks if check.status == CheckStatus.FAILED] == ["Manifest Scan Timeout"]
+    assert not any(check.name == "Manifest File Scan" for check in result.checks)

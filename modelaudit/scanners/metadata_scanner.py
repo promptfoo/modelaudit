@@ -115,6 +115,8 @@ class MetadataScanner(BaseScanner):
             # Check for exposed credentials in text
             issues.extend(self._check_exposed_secrets_in_text(content, file_path))
 
+        except TimeoutError:
+            raise
         except Exception as e:
             issues.append(
                 Issue(

@@ -616,6 +616,8 @@ class ManifestScanner(BaseScanner):
                     location=self.current_file_path,
                     details={"patterns_checked": len(self.blacklist_patterns)},
                 )
+        except TimeoutError:
+            raise
         except Exception as e:
             result.add_check(
                 name="Blacklist Pattern Check",
@@ -658,9 +660,13 @@ class ManifestScanner(BaseScanner):
                 if HAS_YAML:
                     try:
                         return yaml.safe_load(content)
+                    except TimeoutError:
+                        raise
                     except Exception:
                         pass
 
+        except TimeoutError:
+            raise
         except Exception as e:
             logger.warning(f"Error parsing file {path}: {e!s}")
             if result is not None:
@@ -784,10 +790,13 @@ class ManifestScanner(BaseScanner):
             with open(path, encoding="utf-8") as f:
                 content = f.read()
 
+            self._check_timeout()
             seen_urls: set[str] = set()
 
             for pattern, description, provider in CLOUD_STORAGE_PATTERNS:
+                self._check_timeout()
                 for match in pattern.finditer(content):
+                    self._check_timeout()
                     url = match.group()
 
                     # Skip duplicates
@@ -823,6 +832,8 @@ class ManifestScanner(BaseScanner):
                         ),
                     )
 
+        except TimeoutError:
+            raise
         except Exception as e:
             logger.debug(f"Error checking cloud storage URLs in {path}: {e}")
 

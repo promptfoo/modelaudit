@@ -184,14 +184,13 @@ class TestMetadataScanner:
         assert result.metadata["file_size"] == readme_path.stat().st_size
 
     def test_scan_enforces_timeout(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Metadata scans should stop when the scanner timeout is exceeded."""
+        """Helper timeouts should report timeout only, not generic file errors."""
         scanner = MetadataScanner(config={"timeout": 1})
         readme_path = tmp_path / "README.md"
         readme_path.write_text("# Test README\n")
 
         def expire_timeout(_content: str, _file_path: str) -> list:
-            scanner.scan_start_time = 0
-            return []
+            raise TimeoutError("metadata helper timed out")
 
         monkeypatch.setattr(scanner, "_check_suspicious_urls_in_text", expire_timeout)
 
@@ -202,3 +201,5 @@ class TestMetadataScanner:
         assert len(timeout_checks) == 1
         assert timeout_checks[0].status == CheckStatus.FAILED
         assert timeout_checks[0].severity == IssueSeverity.WARNING
+        assert not any(check.name == "Metadata Scan Error" for check in result.checks)
+        assert not any(issue.type == "file_error" for issue in result.issues)
