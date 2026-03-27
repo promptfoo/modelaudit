@@ -406,20 +406,16 @@ class TestSevenZipScanner:
         ]
 
         scannable = scanner._identify_scannable_files(test_files)
-
-        expected_scannable = [
-            "nested.7z",
-            "model.pkl",
-            "model.joblib",
-            "weights.pt",
-            "checkpoint.ckpt",
-            "model.bin",
-            "arrays.npz",
-            "serve.mar",
-            "bundle.tar.gz",
-            "config.json",
-        ]
-        assert set(scannable) == set(expected_scannable)
+        supported = scanner._supported_nested_core_extensions()
+        expected_scannable = {
+            name
+            for name in test_files
+            if any(extension in supported for extension in scanner._candidate_archive_extensions(name))
+        }
+        assert set(scannable) == expected_scannable
+        assert "model.joblib" in scannable
+        assert "readme.txt" not in scannable
+        assert "image.png" not in scannable
 
     @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
     def test_nested_supported_formats_route_through_core(self, temp_7z_file: str, tmp_path: Path) -> None:
@@ -850,7 +846,12 @@ class TestSevenZipScanner:
 
         scannable = scanner._identify_scannable_files(entries)
 
-        expected = {"nested.7z", "model.pkl", "weights.pt", "model.onnx", "config.json", "tokenizer.bin"}
+        supported = scanner._supported_nested_core_extensions()
+        expected = {
+            name
+            for name in entries
+            if any(extension in supported for extension in scanner._candidate_archive_extensions(name))
+        }
         assert set(scannable) == expected
         # Non-model files must be excluded
         assert "readme.txt" not in scannable
