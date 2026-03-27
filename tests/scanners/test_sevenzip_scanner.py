@@ -228,9 +228,55 @@ class TestSevenZipScanner:
             if os.path.exists(temp_pickle_path):
                 os.unlink(temp_pickle_path)
 
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_scan_nested_7z_archive(self, scanner, temp_7z_file) -> None:
+        """Nested 7z archives should be scanned recursively."""
+        import py7zr  # type: ignore[import-untyped]
+
+        inner_7z_path = Path(temp_7z_file).with_name("nested_inner.7z")
+        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as temp_pickle:
+            pickle.dump({"safe": True}, temp_pickle)
+            temp_pickle_path = temp_pickle.name
+
+        try:
+            with py7zr.SevenZipFile(inner_7z_path, "w") as archive:
+                archive.write(temp_pickle_path, "nested_model.pkl")
+
+            with py7zr.SevenZipFile(temp_7z_file, "w") as archive:
+                archive.write(str(inner_7z_path), "nested.7z")
+
+            with patch("modelaudit.scanners.get_scanner_for_file") as mock_get_scanner:
+                mock_scanner = MagicMock()
+                mock_issue = MagicMock()
+                mock_issue.message = "Nested pickle scanned"
+                mock_issue.location = "pickle_scan"
+                mock_issue.details = {}
+
+                mock_result = MagicMock()
+                mock_result.issues = [mock_issue]
+                mock_result.checks = []
+                mock_result.metadata = {}
+                mock_scanner.scan.return_value = mock_result
+                mock_get_scanner.return_value = mock_scanner
+
+                result = scanner.scan(temp_7z_file)
+
+            assert result.success
+            mock_scanner.scan.assert_called_once()
+            nested_issues = [issue for issue in result.issues if issue.message == "Nested pickle scanned"]
+            assert len(nested_issues) == 1
+            assert f"{temp_7z_file}:nested.7z:nested_model.pkl" in nested_issues[0].location
+
+        finally:
+            if os.path.exists(temp_pickle_path):
+                os.unlink(temp_pickle_path)
+            if inner_7z_path.exists():
+                inner_7z_path.unlink()
+
     def test_identify_scannable_files(self, scanner):
         """Test identification of scannable files"""
         test_files = [
+            "nested.7z",  # Scannable
             "model.pkl",  # Scannable
             "weights.pt",  # Scannable
             "model.bin",  # Scannable
@@ -242,7 +288,7 @@ class TestSevenZipScanner:
 
         scannable = scanner._identify_scannable_files(test_files)
 
-        expected_scannable = ["model.pkl", "weights.pt", "model.bin", "config.json"]
+        expected_scannable = ["nested.7z", "model.pkl", "weights.pt", "model.bin", "config.json"]
         assert set(scannable) == set(expected_scannable)
 
     @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
@@ -296,6 +342,33 @@ class TestSevenZipScanner:
             assert result.metadata["scannable_files"] == 1
             mock_archive.extract.assert_called_once()
             assert mock_archive.extract.call_args.kwargs["targets"] == ["safe.pkl"]
+
+    def test_oversized_entries_are_skipped_before_extraction(self, scanner, temp_7z_file) -> None:
+        """Archive member sizes should be checked before extraction materializes files."""
+        scanner.max_extract_size = 100
+
+        with (
+            patch("modelaudit.scanners.sevenzip_scanner.HAS_PY7ZR", True),
+            patch("modelaudit.scanners.sevenzip_scanner.py7zr") as mock_py7zr,
+            patch.object(scanner, "_scan_extracted_file") as mock_scan_extracted_file,
+            patch("os.path.isfile", return_value=True),
+            patch("os.path.getsize", return_value=32),
+        ):
+            mock_archive = MagicMock()
+            mock_archive.getnames.return_value = ["large_file.pkl", "safe.pkl"]
+            mock_archive.getinfo.side_effect = lambda name: MagicMock(
+                uncompressed=1000 if name == "large_file.pkl" else 10
+            )
+            mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
+
+            result = scanner.scan(temp_7z_file)
+
+            large_file_issues = [i for i in result.issues if "too large" in i.message]
+            assert len(large_file_issues) == 1
+            assert large_file_issues[0].details["extracted_size"] == 1000
+            mock_archive.extract.assert_called_once()
+            assert mock_archive.extract.call_args.kwargs["targets"] == ["safe.pkl"]
+            mock_scan_extracted_file.assert_called_once()
 
     def test_max_entries_protection(self, scanner, temp_7z_file):
         """Test protection against archives with too many entries"""
@@ -525,6 +598,7 @@ class TestSevenZipScanner:
     def test_multiple_model_formats_identified(self, scanner):
         """Archives containing diverse model-format files scan all scannable entries."""
         entries = [
+            "nested.7z",
             "model.pkl",
             "weights.pt",
             "model.onnx",
@@ -536,7 +610,7 @@ class TestSevenZipScanner:
 
         scannable = scanner._identify_scannable_files(entries)
 
-        expected = {"model.pkl", "weights.pt", "model.onnx", "config.json", "tokenizer.bin"}
+        expected = {"nested.7z", "model.pkl", "weights.pt", "model.onnx", "config.json", "tokenizer.bin"}
         assert set(scannable) == expected
         # Non-model files must be excluded
         assert "readme.txt" not in scannable
@@ -564,19 +638,59 @@ class TestSevenZipScannerConfiguration:
         """Test default scanner configuration"""
         scanner = SevenZipScanner()
 
+        assert scanner.max_depth == 5
         assert scanner.max_entries == 10000
         assert scanner.max_extract_size == 1024 * 1024 * 1024  # 1GB
 
     def test_custom_configuration(self):
         """Test custom scanner configuration"""
         config = {
+            "max_7z_depth": 3,
             "max_7z_entries": 5000,
             "max_7z_extract_size": 512 * 1024 * 1024,  # 512MB
         }
         scanner = SevenZipScanner(config)
 
+        assert scanner.max_depth == 3
         assert scanner.max_entries == 5000
         assert scanner.max_extract_size == 512 * 1024 * 1024
+
+    def test_nested_scans_receive_scanner_config(self, temp_7z_file) -> None:
+        """Nested file scans should preserve the parent scanner config."""
+        config = {
+            "max_7z_depth": 4,
+            "max_7z_entries": 5000,
+            "max_7z_extract_size": 2048,
+            "max_file_size": 1024,
+        }
+        scanner = SevenZipScanner(config)
+
+        with (
+            patch("modelaudit.scanners.sevenzip_scanner.HAS_PY7ZR", True),
+            patch("modelaudit.scanners.sevenzip_scanner.py7zr") as mock_py7zr,
+            patch("modelaudit.scanners.get_scanner_for_file") as mock_get_scanner,
+            patch("os.path.isfile", return_value=True),
+            patch("os.path.getsize", return_value=32),
+        ):
+            mock_archive = MagicMock()
+            mock_archive.getnames.return_value = ["safe.pkl"]
+            mock_archive.getinfo.return_value = MagicMock(uncompressed=16)
+            mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
+
+            mock_scanner = MagicMock()
+            mock_result = MagicMock()
+            mock_result.issues = []
+            mock_result.checks = []
+            mock_result.metadata = {}
+            mock_scanner.scan.return_value = mock_result
+            mock_get_scanner.return_value = mock_scanner
+
+            result = scanner.scan(temp_7z_file)
+
+            assert result.success
+            mock_get_scanner.assert_called_once()
+            assert mock_get_scanner.call_args.kwargs["config"] == scanner.config
+            mock_scanner.scan.assert_called_once_with(mock_get_scanner.call_args.args[0])
 
     def test_large_extracted_file_handling(self, scanner, temp_7z_file):
         """Test handling of files that are too large after extraction"""

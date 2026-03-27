@@ -35,6 +35,7 @@ class SevenZipScanner(BaseScanner):
 
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
+        self.max_depth = self.config.get("max_7z_depth", 5)
         self.max_entries = self.config.get("max_7z_entries", 10000)
         self.max_extract_size = self.config.get("max_7z_extract_size", 1024 * 1024 * 1024)  # 1GB
 
@@ -100,48 +101,8 @@ class SevenZipScanner(BaseScanner):
         self.add_file_integrity_check(path, result)
 
         try:
-            with py7zr.SevenZipFile(path, mode="r") as archive:
-                # Get file listing
-                file_names = archive.getnames()
-                result.metadata["total_files"] = len(file_names)
-
-                # Check for zip bomb protection
-                if len(file_names) > self.max_entries:
-                    result.add_check(
-                        name="Archive Entry Limit",
-                        passed=False,
-                        message=f"7z archive contains {len(file_names)} files, exceeding limit of {self.max_entries}",
-                        severity=IssueSeverity.CRITICAL,
-                        location=path,
-                        details={
-                            "file_count": len(file_names),
-                            "limit": self.max_entries,
-                            "potential_threat": "zip_bomb",
-                        },
-                    )
-                    result.finish(success=False)
-                    return result
-
-                # Check for path traversal vulnerabilities and only keep safe entries
-                safe_file_names = self._check_path_traversal(file_names, path, result)
-
-                # Filter for scannable model files from safe entries only
-                scannable_files = self._identify_scannable_files(safe_file_names)
-                result.metadata["scannable_files"] = len(scannable_files)
-                result.metadata["unsafe_entries"] = len(file_names) - len(safe_file_names)
-
-                if not scannable_files:
-                    result.add_check(
-                        name="Archive Content Check",
-                        passed=True,
-                        message=f"No scannable model files found in 7z archive (found {len(file_names)} total files)",
-                        location=path,
-                    )
-                    result.finish(success=True)
-                    return result
-
-                # Extract and scan scannable files
-                self._extract_and_scan_files(archive, scannable_files, path, result)
+            scan_result = self._scan_7z_file(path, depth=0)
+            result.merge(scan_result)
 
         except py7zr.Bad7zFile as e:
             result.add_check(
@@ -167,12 +128,88 @@ class SevenZipScanner(BaseScanner):
             result.finish(success=False)
             return result
 
-        result.finish(success=True)
+        result.metadata["file_size"] = file_size
+        result.metadata["archive_type"] = "7z"
+        result.finish(success=scan_result.success)
+        return result
+
+    def _scan_7z_file(self, path: str, depth: int = 0) -> ScanResult:
+        """Recursively scan a 7-Zip archive and its contents."""
+        result = ScanResult(scanner_name=self.name, scanner=self)
+
+        if depth >= self.max_depth:
+            result.add_check(
+                name="7z Depth Bomb Protection",
+                passed=False,
+                message=f"Maximum 7z nesting depth ({self.max_depth}) exceeded",
+                severity=IssueSeverity.WARNING,
+                location=path,
+                details={"depth": depth, "max_depth": self.max_depth},
+            )
+            return result
+
+        result.add_check(
+            name="7z Depth Bomb Protection",
+            passed=True,
+            message="7z nesting depth is within safe limits",
+            location=path,
+            details={"depth": depth, "max_depth": self.max_depth},
+        )
+
+        with py7zr.SevenZipFile(path, mode="r") as archive:
+            # Get file listing
+            file_names = archive.getnames()
+
+            # Check for zip bomb protection
+            if len(file_names) > self.max_entries:
+                result.add_check(
+                    name="Archive Entry Limit",
+                    passed=False,
+                    message=f"7z archive contains {len(file_names)} files, exceeding limit of {self.max_entries}",
+                    severity=IssueSeverity.CRITICAL,
+                    location=path,
+                    details={
+                        "file_count": len(file_names),
+                        "limit": self.max_entries,
+                        "potential_threat": "zip_bomb",
+                    },
+                )
+                result.metadata["total_files"] = len(file_names)
+                result.metadata["scannable_files"] = 0
+                result.metadata["unsafe_entries"] = 0
+                result.metadata["file_size"] = os.path.getsize(path)
+                result.finish(success=False)
+                return result
+
+            # Check for path traversal vulnerabilities and only keep safe entries
+            safe_file_names = self._check_path_traversal(file_names, path, result)
+
+            # Filter for scannable model files from safe entries only
+            scannable_files = self._identify_scannable_files(safe_file_names)
+
+            if not scannable_files:
+                result.add_check(
+                    name="Archive Content Check",
+                    passed=True,
+                    message=f"No scannable model files found in 7z archive (found {len(file_names)} total files)",
+                    location=path,
+                )
+            else:
+                # Extract and scan scannable files
+                self._extract_and_scan_files(archive, scannable_files, path, result, depth)
+
+            result.metadata["total_files"] = len(file_names)
+            result.metadata["scannable_files"] = len(scannable_files)
+            result.metadata["unsafe_entries"] = len(file_names) - len(safe_file_names)
+            result.metadata["file_size"] = os.path.getsize(path)
+
+        result.finish(success=not result.has_errors)
         return result
 
     def _identify_scannable_files(self, file_names: list[str]) -> list[str]:
         """Identify files that can be scanned for security issues"""
         scannable_extensions = {
+            ".7z",  # Nested 7z archives
             ".pkl",
             ".pickle",  # Pickle files
             ".pt",
@@ -222,16 +259,40 @@ class SevenZipScanner(BaseScanner):
         return safe_entries
 
     def _extract_and_scan_files(
-        self, archive: Any, scannable_files: list[str], archive_path: str, result: ScanResult
+        self,
+        archive: Any,
+        scannable_files: list[str],
+        archive_path: str,
+        result: ScanResult,
+        depth: int,
     ) -> None:
         """Extract scannable files and run appropriate scanners on them"""
+        extractable_files = []
+        for file_name in scannable_files:
+            member_size = self._get_archive_member_size(archive, file_name)
+            if member_size is not None and member_size > self.max_extract_size:
+                result.add_check(
+                    name="Extracted File Size",
+                    passed=False,
+                    message=f"Extracted file {file_name} is too large ({member_size} bytes)",
+                    severity=IssueSeverity.WARNING,
+                    location=f"{archive_path}:{file_name}",
+                    details={"extracted_size": member_size, "size_limit": self.max_extract_size},
+                )
+                continue
+
+            extractable_files.append(file_name)
+
+        if not extractable_files:
+            return
+
         with tempfile.TemporaryDirectory(prefix="modelaudit_7z_") as tmp_dir:
             try:
                 # Extract all scannable files at once to avoid py7zr state issues
-                archive.extract(path=tmp_dir, targets=scannable_files)
+                archive.extract(path=tmp_dir, targets=extractable_files)
 
                 # Scan each extracted file
-                for file_name in scannable_files:
+                for file_name in extractable_files:
                     try:
                         extracted_path = os.path.join(tmp_dir, file_name)
                         if os.path.isfile(extracted_path):
@@ -249,7 +310,7 @@ class SevenZipScanner(BaseScanner):
                                 continue
 
                             # Get appropriate scanner for the extracted file
-                            self._scan_extracted_file(extracted_path, file_name, archive_path, result)
+                            self._scan_extracted_file(extracted_path, file_name, archive_path, result, depth)
                         else:
                             # File was not extracted - log as warning
                             result.add_check(
@@ -281,47 +342,79 @@ class SevenZipScanner(BaseScanner):
                     details={"error": str(e)},
                 )
 
+    @staticmethod
+    def _get_archive_member_size(archive: Any, file_name: str) -> int | None:
+        """Return the uncompressed size for an archive member when available."""
+        try:
+            member_info = archive.getinfo(file_name)
+        except Exception:
+            return None
+
+        member_size = getattr(member_info, "uncompressed", None)
+        if isinstance(member_size, int):
+            return member_size
+        return None
+
+    def _rewrite_nested_result_context(
+        self, file_result: ScanResult, extracted_path: str, archive_path: str, original_name: str
+    ) -> None:
+        """Rewrite nested scan locations to preserve archive member context."""
+        archive_location = f"{archive_path}:{original_name}"
+
+        for issue in file_result.issues:
+            if issue.location:
+                if issue.location.startswith(extracted_path):
+                    issue.location = issue.location.replace(extracted_path, archive_location, 1)
+                else:
+                    issue.location = f"{archive_location} {issue.location}"
+            else:
+                issue.location = archive_location
+
+            issue.details["archive_path"] = archive_path
+            issue.details["extracted_from"] = original_name
+
+        for check in file_result.checks:
+            if check.location:
+                if check.location.startswith(extracted_path):
+                    check.location = check.location.replace(extracted_path, archive_location, 1)
+                else:
+                    check.location = f"{archive_location} {check.location}"
+            else:
+                check.location = archive_location
+
     def _scan_extracted_file(
-        self, extracted_path: str, original_name: str, archive_path: str, result: ScanResult
+        self,
+        extracted_path: str,
+        original_name: str,
+        archive_path: str,
+        result: ScanResult,
+        depth: int,
     ) -> None:
         """Scan an individual extracted file using the appropriate scanner"""
         try:
-            # Import scanner registry to find appropriate scanner
-            from . import get_scanner_for_file
+            if original_name.lower().endswith(".7z"):
+                file_result = self._scan_7z_file(extracted_path, depth + 1)
+            else:
+                # Import scanner registry to find appropriate scanner
+                from . import get_scanner_for_file
 
-            file_scanner = get_scanner_for_file(extracted_path)
+                file_scanner = get_scanner_for_file(extracted_path, config=self.config)
+                if not file_scanner:
+                    # No scanner available for this file type
+                    result.add_check(
+                        name=f"File Type Support: {original_name}",
+                        passed=True,
+                        message=f"No scanner available for file type: {original_name}",
+                        location=f"{archive_path}:{original_name}",
+                        details={"file_type": "unsupported"},
+                    )
+                    return
 
-            if file_scanner:
                 # Scan the extracted file
                 file_result = file_scanner.scan(extracted_path)
 
-                # Adjust issue locations to show archive context
-                for issue in file_result.issues:
-                    issue.location = f"{archive_path}:{original_name}"
-                    # Add archive context to details
-                    if not issue.details:
-                        issue.details = {}
-                    issue.details["archive_path"] = archive_path
-                    issue.details["extracted_from"] = original_name
-
-                # Adjust check locations
-                for check in file_result.checks:
-                    check.location = f"{archive_path}:{original_name}"
-
-                # Merge results
-                result.issues.extend(file_result.issues)
-                result.checks.extend(file_result.checks)
-                result.metadata.update(file_result.metadata)
-
-            else:
-                # No scanner available for this file type
-                result.add_check(
-                    name=f"File Type Support: {original_name}",
-                    passed=True,
-                    message=f"No scanner available for file type: {original_name}",
-                    location=f"{archive_path}:{original_name}",
-                    details={"file_type": "unsupported"},
-                )
+            self._rewrite_nested_result_context(file_result, extracted_path, archive_path, original_name)
+            result.merge(file_result)
 
         except Exception as e:
             result.add_check(
