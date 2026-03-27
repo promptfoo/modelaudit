@@ -1,3 +1,4 @@
+import io
 import os
 import tempfile
 import zipfile
@@ -153,6 +154,36 @@ class TestZipScanner:
         finally:
             os.unlink(inner_path)
             os.unlink(outer_path)
+
+    def test_scan_extensionless_nested_zip_recurses(self, tmp_path: Path) -> None:
+        """Extensionless ZIP members should be recursively scanned by content."""
+        inner_zip = io.BytesIO()
+        with zipfile.ZipFile(inner_zip, "w") as inner_archive:
+            inner_archive.writestr("payload.pkl", b'cos\nsystem\n(S"echo pwned"\ntR.')
+
+        archive_path = tmp_path / "outer.zip"
+        with zipfile.ZipFile(archive_path, "w") as outer_archive:
+            outer_archive.writestr("nested", inner_zip.getvalue())
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert result.success is True
+        assert result.has_errors is True
+        assert any(
+            check.details.get("zip_entry") == "nested:payload.pkl"
+            and check.location == f"{archive_path}:nested:payload.pkl"
+            for check in result.checks
+        ), f"Expected nested extensionless ZIP checks, got: {[(c.location, c.details) for c in result.checks]}"
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL
+            and issue.details.get("zip_entry") == "nested:payload.pkl"
+            and issue.location == f"{archive_path}:nested:payload.pkl"
+            and ("os.system" in issue.message.lower() or "posix.system" in issue.message.lower())
+            for issue in result.issues
+        ), (
+            "Expected critical nested pickle finding, got: "
+            f"{[(i.location, i.message, i.details) for i in result.issues]}"
+        )
 
     def test_directory_traversal_detection(self):
         """Test detection of directory traversal attempts in ZIP files"""

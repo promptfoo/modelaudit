@@ -49,7 +49,7 @@ class ZipScanner(BaseScanner):
 
         # Check file extension
         ext = os.path.splitext(path)[1].lower()
-        if ext not in cls.supported_extensions:
+        if ext and ext not in cls.supported_extensions:
             return False
 
         # Verify it's actually a zip file
