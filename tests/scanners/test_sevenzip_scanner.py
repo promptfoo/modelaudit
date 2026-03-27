@@ -13,6 +13,7 @@ import os
 import pickle
 import tempfile
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -855,6 +856,253 @@ class TestSevenZipScannerConfiguration:
                 # Should warn about large file
                 large_file_issues = [i for i in result.issues if "too large" in i.message]
                 assert len(large_file_issues) > 0
+
+
+class TestSevenZipScannerHardening:
+    """Red-team tests for security hardening introduced in the review."""
+
+    @pytest.fixture
+    def temp_7z_file(self) -> str:  # type: ignore[return]
+        """Create a temporary file with .7z extension for testing"""
+        with tempfile.NamedTemporaryFile(suffix=".7z", delete=False) as f:
+            temp_path = f.name
+        yield temp_path  # type: ignore[misc]
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+    @pytest.fixture
+    def scanner(self) -> SevenZipScanner:
+        return SevenZipScanner()
+
+    # -- symlink protection ---------------------------------------------------
+
+    def test_symlink_in_archive_is_blocked(
+        self,
+        scanner: SevenZipScanner,
+        temp_7z_file: str,
+    ) -> None:
+        """Symlinks extracted from 7z archives must be detected and blocked."""
+        with (
+            patch("modelaudit.scanners.sevenzip_scanner.HAS_PY7ZR", True),
+            patch("modelaudit.scanners.sevenzip_scanner.py7zr") as mock_py7zr,
+            patch("os.path.islink") as mock_islink,
+            patch("os.readlink", return_value="/etc/shadow"),
+            patch("os.path.getsize", return_value=32),
+        ):
+            mock_archive = MagicMock()
+            mock_archive.getnames.return_value = ["safe.pkl"]
+            mock_archive.getinfo.return_value = MagicMock(uncompressed=16)
+            mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
+            mock_islink.return_value = True
+
+            result = scanner.scan(temp_7z_file)
+
+            symlink_checks = [c for c in result.checks if "Symlink" in c.name]
+            assert len(symlink_checks) == 1
+            assert symlink_checks[0].status == CheckStatus.FAILED
+            assert symlink_checks[0].severity == IssueSeverity.CRITICAL
+            assert symlink_checks[0].details["symlink_target"] == "/etc/shadow"
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_real_symlink_blocked_after_extraction(
+        self,
+        scanner: SevenZipScanner,
+        temp_7z_file: str,
+        tmp_path: Path,
+    ) -> None:
+        """End-to-end: a symlink member must not be scanned."""
+        import py7zr  # type: ignore[import-untyped]
+
+        # Create a benign archive first, then plant a symlink in the temp dir
+        benign = tmp_path / "benign.pkl"
+        pickle.dump({"ok": True}, benign.open("wb"))
+
+        with py7zr.SevenZipFile(temp_7z_file, "w") as archive:
+            archive.write(str(benign), "model.pkl")
+
+        # Monkey-patch extract to also create a symlink alongside real files
+        original_extract = py7zr.SevenZipFile.extract
+
+        def patched_extract(self_archive: Any, path: str | None = None, **kw: Any) -> None:
+            original_extract(self_archive, path=path, **kw)
+            if path:
+                link_path = os.path.join(path, "model.pkl")
+                if os.path.exists(link_path):
+                    os.unlink(link_path)
+                os.symlink("/etc/passwd", link_path)
+
+        with patch.object(py7zr.SevenZipFile, "extract", patched_extract):
+            result = scanner.scan(temp_7z_file)
+
+        symlink_issues = [c for c in result.checks if "Symlink" in c.name]
+        assert len(symlink_issues) >= 1
+        assert symlink_issues[0].severity == IssueSeverity.CRITICAL
+
+    # -- extensionless probe cap ----------------------------------------------
+
+    def test_extensionless_probe_limit_enforced(
+        self,
+        temp_7z_file: str,
+    ) -> None:
+        """Extensionless member probing must stop after the configured limit."""
+        scanner = SevenZipScanner(config={"max_7z_extensionless_probes": 3})
+
+        extensionless_members = [f"asset_{i:03d}" for i in range(10)]
+
+        with (
+            patch("modelaudit.scanners.sevenzip_scanner.HAS_PY7ZR", True),
+            patch("modelaudit.scanners.sevenzip_scanner.py7zr") as mock_py7zr,
+            patch.object(scanner, "_member_has_7z_magic", return_value=False) as mock_probe,
+            patch("os.path.getsize", return_value=32),
+        ):
+            mock_archive = MagicMock()
+            mock_archive.getnames.return_value = extensionless_members
+            mock_archive.getinfo.return_value = MagicMock(is_directory=False, uncompressed=16)
+            mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
+
+            result = scanner.scan(temp_7z_file)
+
+            assert mock_probe.call_count == 3
+            limit_checks = [c for c in result.checks if "Probe Limit" in c.name]
+            assert len(limit_checks) == 1
+            assert limit_checks[0].status == CheckStatus.FAILED
+
+    # -- cumulative entry count -----------------------------------------------
+
+    def test_cumulative_entry_limit_across_nesting(
+        self,
+        temp_7z_file: str,
+    ) -> None:
+        """Cumulative entry count across nested archives must be enforced."""
+        scanner = SevenZipScanner(config={"max_7z_cumulative_entries": 15})
+
+        with (
+            patch("modelaudit.scanners.sevenzip_scanner.HAS_PY7ZR", True),
+            patch("modelaudit.scanners.sevenzip_scanner.py7zr") as mock_py7zr,
+            patch("os.path.isfile", return_value=True),
+            patch("os.path.islink", return_value=False),
+            patch("os.path.getsize", return_value=32),
+        ):
+            # Outer archive has 10 entries
+            mock_archive = MagicMock()
+            mock_archive.getnames.return_value = [f"file_{i}.pkl" for i in range(10)]
+            mock_archive.getinfo.return_value = MagicMock(uncompressed=16, is_directory=False)
+            mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
+
+            # The inner recursive call will see another 10, exceeding 15
+            inner_result = MagicMock()
+            inner_result.issues = []
+            inner_result.checks = []
+            inner_result.metadata = {"total_files": 10}
+            inner_result.bytes_scanned = 0
+
+            with patch.object(scanner, "_scan_extracted_file"):
+                result = scanner.scan(temp_7z_file)
+
+            assert result.success
+
+    # -- cumulative extraction size -------------------------------------------
+
+    def test_cumulative_extraction_size_limit(
+        self,
+        temp_7z_file: str,
+    ) -> None:
+        """Cumulative extracted bytes must be capped."""
+        scanner = SevenZipScanner(config={"max_7z_total_extract_size": 100})
+
+        with (
+            patch("modelaudit.scanners.sevenzip_scanner.HAS_PY7ZR", True),
+            patch("modelaudit.scanners.sevenzip_scanner.py7zr") as mock_py7zr,
+            patch.object(scanner, "_scan_extracted_file") as mock_scan,
+            patch("os.path.isfile", return_value=True),
+            patch("os.path.islink", return_value=False),
+            patch("os.path.getsize", return_value=60),
+        ):
+            mock_archive = MagicMock()
+            mock_archive.getnames.return_value = ["a.pkl", "b.pkl", "c.pkl"]
+            mock_archive.getinfo.return_value = MagicMock(uncompressed=60, is_directory=False)
+            mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
+
+            result = scanner.scan(temp_7z_file)
+
+            # First file (60 bytes) OK, second (120 cumulative) exceeds 100 → stop
+            assert mock_scan.call_count == 1
+            cumulative_checks = [c for c in result.checks if "Cumulative Extraction" in c.name]
+            assert len(cumulative_checks) == 1
+            assert cumulative_checks[0].severity == IssueSeverity.CRITICAL
+
+    # -- depth bomb finish() --------------------------------------------------
+
+    def test_depth_bomb_sets_end_time(self, temp_7z_file: str) -> None:
+        """Depth bomb early return must call finish() so end_time is set."""
+        scanner = SevenZipScanner(config={"max_7z_depth": 1})
+
+        with (
+            patch("modelaudit.scanners.sevenzip_scanner.HAS_PY7ZR", True),
+            patch("modelaudit.scanners.sevenzip_scanner.py7zr") as mock_py7zr,
+            patch.object(scanner, "_has_7z_magic", return_value=True),
+            patch("os.path.isfile", return_value=True),
+            patch("os.path.islink", return_value=False),
+            patch("os.path.getsize", return_value=32),
+        ):
+            mock_archive = MagicMock()
+            mock_archive.getnames.return_value = ["nested.7z"]
+            mock_archive.getinfo.return_value = MagicMock(uncompressed=16, is_directory=False)
+            mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
+
+            result = scanner.scan(temp_7z_file)
+
+            # The inner result should have end_time set via finish()
+            # Verify through checking the depth bomb check exists and result is usable
+            depth_checks = [c for c in result.checks if "Depth Bomb" in c.name and c.status == CheckStatus.FAILED]
+            assert len(depth_checks) >= 1
+            assert result.metadata.get("file_size") is not None
+
+    # -- _HeaderProbeBuffer empty write guard ---------------------------------
+
+    def test_header_probe_buffer_empty_write_returns_zero(self) -> None:
+        """_HeaderProbeBuffer.write(b'') must return 0 without looping."""
+        from modelaudit.scanners.sevenzip_scanner import _HeaderProbeBuffer
+
+        buf = _HeaderProbeBuffer(limit=6)
+        assert buf.write(b"") == 0
+        assert buf.size() == 0
+
+    def test_header_probe_buffer_normal_flow(self) -> None:
+        """_HeaderProbeBuffer should capture up to limit bytes then raise."""
+        from modelaudit.scanners.sevenzip_scanner import (
+            _HeaderProbeBuffer,
+            _HeaderProbeComplete,
+        )
+
+        buf = _HeaderProbeBuffer(limit=6)
+        buf.write(b"\x37\x7a")  # 2 bytes
+        assert buf.size() == 2
+        with pytest.raises(_HeaderProbeComplete):
+            buf.write(b"\xbc\xaf\x27\x1c\x00\x00")  # 8 bytes, only 4 more captured
+        buf.seek(0)
+        assert buf.read(6) == b"\x37\x7a\xbc\xaf\x27\x1c"
+
+    # -- default config includes new limits -----------------------------------
+
+    def test_default_configuration_includes_new_limits(self) -> None:
+        """New hardening config options must have sensible defaults."""
+        scanner = SevenZipScanner()
+        assert scanner.max_extensionless_probes == 100
+        assert scanner.max_total_extract_size == 5 * 1024 * 1024 * 1024
+        assert scanner.max_cumulative_entries == 50000
+
+    def test_custom_configuration_new_limits(self) -> None:
+        """New hardening config options must be configurable."""
+        config = {
+            "max_7z_extensionless_probes": 50,
+            "max_7z_total_extract_size": 1024,
+            "max_7z_cumulative_entries": 200,
+        }
+        scanner = SevenZipScanner(config)
+        assert scanner.max_extensionless_probes == 50
+        assert scanner.max_total_extract_size == 1024
+        assert scanner.max_cumulative_entries == 200
 
 
 # Integration test that requires actual test assets

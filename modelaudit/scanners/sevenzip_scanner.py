@@ -34,6 +34,8 @@ class _HeaderProbeBuffer:
         self._buffer = io.BytesIO()
 
     def write(self, data: bytes | bytearray) -> int:
+        if not data:
+            return 0
         remaining = self._limit - self.size()
         if remaining > 0:
             self._buffer.write(data[:remaining])
@@ -80,11 +82,18 @@ class SevenZipScanner(BaseScanner):
     supported_extensions: ClassVar[list[str]] = [".7z"]
     _SEVENZIP_MAGIC: ClassVar[bytes] = b"7z\xbc\xaf\x27\x1c"
 
+    _MAX_EXTENSIONLESS_PROBES: ClassVar[int] = 100
+    _MAX_TOTAL_EXTRACT_SIZE: ClassVar[int] = 5 * 1024 * 1024 * 1024  # 5 GB
+    _MAX_CUMULATIVE_ENTRIES: ClassVar[int] = 50000
+
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
         self.max_depth = self.config.get("max_7z_depth", 5)
         self.max_entries = self.config.get("max_7z_entries", 10000)
         self.max_extract_size = self.config.get("max_7z_extract_size", 1024 * 1024 * 1024)  # 1GB
+        self.max_extensionless_probes = self.config.get("max_7z_extensionless_probes", self._MAX_EXTENSIONLESS_PROBES)
+        self.max_total_extract_size = self.config.get("max_7z_total_extract_size", self._MAX_TOTAL_EXTRACT_SIZE)
+        self.max_cumulative_entries = self.config.get("max_7z_cumulative_entries", self._MAX_CUMULATIVE_ENTRIES)
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -184,7 +193,13 @@ class SevenZipScanner(BaseScanner):
         result.finish(success=scan_result.success)
         return result
 
-    def _scan_7z_file(self, path: str, depth: int = 0) -> ScanResult:
+    def _scan_7z_file(
+        self,
+        path: str,
+        depth: int = 0,
+        cumulative_entries: int = 0,
+        cumulative_extract_bytes: int = 0,
+    ) -> ScanResult:
         """Recursively scan a 7-Zip archive and its contents."""
         result = ScanResult(scanner_name=self.name, scanner=self)
 
@@ -197,6 +212,7 @@ class SevenZipScanner(BaseScanner):
                 location=path,
                 details={"depth": depth, "max_depth": self.max_depth},
             )
+            result.finish(success=True)
             return result
 
         result.add_check(
@@ -211,7 +227,7 @@ class SevenZipScanner(BaseScanner):
             # Get file listing
             file_names = archive.getnames()
 
-            # Check for zip bomb protection
+            # Check per-archive entry limit
             if len(file_names) > self.max_entries:
                 result.add_check(
                     name="Archive Entry Limit",
@@ -223,6 +239,31 @@ class SevenZipScanner(BaseScanner):
                         "file_count": len(file_names),
                         "limit": self.max_entries,
                         "potential_threat": "zip_bomb",
+                    },
+                )
+                result.metadata["total_files"] = len(file_names)
+                result.metadata["scannable_files"] = 0
+                result.metadata["unsafe_entries"] = 0
+                result.metadata["file_size"] = os.path.getsize(path)
+                result.finish(success=False)
+                return result
+
+            # Check cumulative entry count across nesting depths
+            new_cumulative_entries = cumulative_entries + len(file_names)
+            if new_cumulative_entries > self.max_cumulative_entries:
+                result.add_check(
+                    name="Cumulative Entry Limit",
+                    passed=False,
+                    message=(
+                        f"Cumulative entry count ({new_cumulative_entries}) across nested "
+                        f"archives exceeds limit of {self.max_cumulative_entries}"
+                    ),
+                    severity=IssueSeverity.CRITICAL,
+                    location=path,
+                    details={
+                        "cumulative_entries": new_cumulative_entries,
+                        "limit": self.max_cumulative_entries,
+                        "potential_threat": "nested_zip_bomb",
                     },
                 )
                 result.metadata["total_files"] = len(file_names)
@@ -248,7 +289,15 @@ class SevenZipScanner(BaseScanner):
                 )
             else:
                 # Extract and scan scannable files
-                self._extract_and_scan_files(archive, scannable_files, path, result, depth)
+                self._extract_and_scan_files(
+                    archive,
+                    scannable_files,
+                    path,
+                    result,
+                    depth,
+                    cumulative_entries=new_cumulative_entries,
+                    cumulative_extract_bytes=cumulative_extract_bytes,
+                )
 
             result.metadata["total_files"] = len(file_names)
             result.metadata["scannable_files"] = len(scannable_files)
@@ -289,10 +338,25 @@ class SevenZipScanner(BaseScanner):
     ) -> list[str]:
         """Inspect extensionless members and keep only confirmed nested 7z archives."""
         nested_archives: list[str] = []
+        probes_remaining = self.max_extensionless_probes
         for file_name in file_names:
             _, ext = os.path.splitext(file_name.lower())
             if ext:
                 continue
+
+            if probes_remaining <= 0:
+                result.add_check(
+                    name="Extensionless Probe Limit",
+                    passed=False,
+                    message=(
+                        f"Extensionless member probe limit ({self.max_extensionless_probes}) "
+                        f"reached; remaining extensionless members were not inspected"
+                    ),
+                    severity=IssueSeverity.WARNING,
+                    location=archive_path,
+                    details={"limit": self.max_extensionless_probes},
+                )
+                break
 
             member_info = None
             with suppress(Exception):
@@ -301,6 +365,7 @@ class SevenZipScanner(BaseScanner):
             if getattr(member_info, "is_directory", False) is True:
                 continue
 
+            probes_remaining -= 1
             try:
                 if self._member_has_7z_magic(archive, file_name):
                     nested_archives.append(file_name)
@@ -370,6 +435,8 @@ class SevenZipScanner(BaseScanner):
         archive_path: str,
         result: ScanResult,
         depth: int,
+        cumulative_entries: int = 0,
+        cumulative_extract_bytes: int = 0,
     ) -> None:
         """Extract scannable files and run appropriate scanners on them"""
         extractable_files = []
@@ -404,9 +471,26 @@ class SevenZipScanner(BaseScanner):
                 archive.extract(path=tmp_dir, targets=extractable_files)
 
                 # Scan each extracted file
+                running_extract_bytes = cumulative_extract_bytes
                 for file_name in extractable_files:
                     try:
                         extracted_path = os.path.join(tmp_dir, file_name)
+
+                        # Block symlinks — matches zip_scanner / pytorch_zip_scanner
+                        if os.path.islink(extracted_path):
+                            result.add_check(
+                                name="7z Symlink Protection",
+                                passed=False,
+                                message=f"Symlink detected in 7z archive: {file_name}",
+                                severity=IssueSeverity.CRITICAL,
+                                location=f"{archive_path}:{file_name}",
+                                details={
+                                    "threat_type": "symlink_traversal",
+                                    "symlink_target": os.readlink(extracted_path),
+                                },
+                            )
+                            continue
+
                         if os.path.isfile(extracted_path):
                             # Check extracted file size
                             extracted_size = os.path.getsize(extracted_path)
@@ -421,8 +505,36 @@ class SevenZipScanner(BaseScanner):
                                 )
                                 continue
 
+                            # Check cumulative extraction size
+                            running_extract_bytes += extracted_size
+                            if running_extract_bytes > self.max_total_extract_size:
+                                result.add_check(
+                                    name="Cumulative Extraction Size",
+                                    passed=False,
+                                    message=(
+                                        f"Cumulative extracted bytes ({running_extract_bytes}) "
+                                        f"exceed limit of {self.max_total_extract_size}"
+                                    ),
+                                    severity=IssueSeverity.CRITICAL,
+                                    location=archive_path,
+                                    details={
+                                        "cumulative_bytes": running_extract_bytes,
+                                        "limit": self.max_total_extract_size,
+                                        "potential_threat": "zip_bomb",
+                                    },
+                                )
+                                return
+
                             # Get appropriate scanner for the extracted file
-                            self._scan_extracted_file(extracted_path, file_name, archive_path, result, depth)
+                            self._scan_extracted_file(
+                                extracted_path,
+                                file_name,
+                                archive_path,
+                                result,
+                                depth,
+                                cumulative_entries=cumulative_entries,
+                                cumulative_extract_bytes=running_extract_bytes,
+                            )
                         else:
                             # File was not extracted - log as warning
                             result.add_check(
@@ -501,11 +613,18 @@ class SevenZipScanner(BaseScanner):
         archive_path: str,
         result: ScanResult,
         depth: int,
+        cumulative_entries: int = 0,
+        cumulative_extract_bytes: int = 0,
     ) -> None:
         """Scan an individual extracted file using the appropriate scanner"""
         try:
             if original_name.lower().endswith(".7z") or self._has_7z_magic(extracted_path):
-                file_result = self._scan_7z_file(extracted_path, depth + 1)
+                file_result = self._scan_7z_file(
+                    extracted_path,
+                    depth + 1,
+                    cumulative_entries=cumulative_entries,
+                    cumulative_extract_bytes=cumulative_extract_bytes,
+                )
             else:
                 _, original_ext = os.path.splitext(original_name.lower())
                 # Import scanner registry to find appropriate scanner
