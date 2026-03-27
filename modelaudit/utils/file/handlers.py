@@ -178,6 +178,11 @@ class MemoryMappedHandler:
                 details={"error": str(e), "bytes_scanned": bytes_scanned},
             )
 
+        result.finish(
+            success=not any(
+                check.name == "Memory-Mapped Scan" and check.status.value == "failed" for check in result.checks
+            )
+        )
         return result
 
     def _analyze_window(self, data: bytes, offset: int) -> "ScanResult":
@@ -418,11 +423,19 @@ class AdvancedFileHandler:
     def _scan_large_file_distributed(self) -> "ScanResult":
         from ...scanners.base import IssueSeverity, ScanResult
 
-        """Scan large files using memory-mapped approach with FULL security checks."""
-        logger.debug(f"Scanning file ({self.total_size:,} bytes) with full security checks")
+        """Scan very large files using only bounded, scanner-aware analysis."""
+        logger.debug(f"Scanning file ({self.total_size:,} bytes) with bounded large-file analysis")
 
         # Add informational note about file size
         result = ScanResult(scanner_name=self.scanner.name)
+        supports_bounded_analysis = any(
+            hasattr(self.scanner, attr) for attr in ("_scan_with_mmap", "_analyze_chunk", "_analyze_bytes")
+        )
+        strategy = (
+            "scanner-defined memory-mapped analysis"
+            if hasattr(self.scanner, "_scan_with_mmap")
+            else "memory-mapped chunk analysis"
+        )
         result.add_check(
             name="Large File Detection",
             passed=True,
@@ -430,63 +443,38 @@ class AdvancedFileHandler:
             severity=IssueSeverity.INFO,
             details={
                 "file_size": self.total_size,
-                "strategy": "memory-mapped with full checks",
-                "note": "All security checks will be performed",
+                "strategy": strategy,
+                "note": "Bounded analysis enabled for this scanner",
             },
         )
 
-        # Use memory-mapped scanner to run ALL checks
-        # This ensures we don't skip any security validations
-        mmap_scanner = MemoryMappedHandler(self.file_path, self.scanner)
+        if not supports_bounded_analysis:
+            result.add_check(
+                name="Large File Coverage Check",
+                passed=False,
+                message=(
+                    f"Scanner {self.scanner.name} does not support bounded large-file analysis "
+                    "for this file size; aborting to avoid partial coverage."
+                ),
+                severity=IssueSeverity.INFO,
+                details={
+                    "file_size": self.total_size,
+                    "strategy": "unsupported",
+                    "scanner": self.scanner.name,
+                    "threshold_bytes": LARGE_MODEL_THRESHOLD_200GB,
+                },
+            )
+            result.finish(success=False)
+            return result
 
-        # If the scanner has its own scanning method, try to use it with memory mapping
+        mmap_scanner = MemoryMappedHandler(self.file_path, self.scanner)
         if hasattr(self.scanner, "_scan_with_mmap"):
-            # Scanner supports memory-mapped scanning directly
             scan_result = self.scanner._scan_with_mmap(self.file_path, self.progress_callback)
         else:
-            # Use our generic memory-mapped approach but with the scanner's checks
             scan_result = mmap_scanner.scan_with_mmap(self.progress_callback)
 
-            # Also run the scanner's normal checks on sampled sections
-            # to ensure we don't miss scanner-specific validations
-            try:
-                # Let the scanner analyze the header (first 10GB)
-                with open(self.file_path, "rb") as f:
-                    header_data = f.read(min(10 * 1024 * 1024 * 1024, self.total_size))
-
-                    # If scanner has special header analysis, use it
-                    if hasattr(self.scanner, "_analyze_header"):
-                        header_result = self.scanner._analyze_header(header_data)
-                        scan_result.merge(header_result)
-                    elif hasattr(self.scanner, "_analyze_chunk"):
-                        header_result = self.scanner._analyze_chunk(header_data, 0)
-                        scan_result.merge(header_result)
-
-                    # For scanners that need the full scan method, create a temp file with sample
-                    # This ensures pickle scanners, etc. can run their full validation
-                    if hasattr(self.scanner, "scan") and not hasattr(self.scanner, "_analyze_chunk"):
-                        import tempfile
-
-                        with tempfile.NamedTemporaryFile(suffix=".tmp", delete=False) as tmp:
-                            tmp.write(header_data)
-                            tmp_path = tmp.name
-
-                        try:
-                            # Run scanner's full validation on the sample
-                            sample_result = self.scanner.scan(tmp_path)
-                            # Merge findings but note they're from a sample
-                            for issue in sample_result.issues:
-                                issue.message = f"[Sample] {issue.message}"
-                            scan_result.merge(sample_result)
-                        finally:
-                            import os as os_module
-
-                            os_module.unlink(tmp_path)
-
-            except Exception as e:
-                logger.warning(f"Error running additional scanner checks: {e}")
-
         result.merge(scan_result)
+        result.finish(success=bool(scan_result.success))
         return result
 
 
