@@ -5,7 +5,7 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from click.testing import CliRunner
@@ -1410,7 +1410,9 @@ def test_scan_jfrog_url_with_auth(mock_scan_jfrog, mock_is_jfrog):
 
 @patch("modelaudit.cli.is_jfrog_url")
 @patch("modelaudit.cli.scan_jfrog_artifact")
-def test_scan_jfrog_url_with_cache_dir(mock_scan_jfrog, mock_is_jfrog, tmp_path: Path) -> None:
+def test_scan_jfrog_url_with_cache_dir(
+    mock_scan_jfrog: MagicMock, mock_is_jfrog: MagicMock, tmp_path: Path
+) -> None:
     """Test scanning a JFrog URL with an explicit cache directory."""
     mock_is_jfrog.return_value = True
     mock_scan_jfrog.return_value = create_mock_scan_result(
@@ -1442,7 +1444,9 @@ def test_scan_jfrog_url_with_cache_dir(mock_scan_jfrog, mock_is_jfrog, tmp_path:
 
 @patch("modelaudit.cli.is_jfrog_url")
 @patch("modelaudit.cli.scan_jfrog_artifact")
-def test_scan_jfrog_url_no_cache_overrides_cache_dir(mock_scan_jfrog, mock_is_jfrog, tmp_path: Path) -> None:
+def test_scan_jfrog_url_no_cache_overrides_cache_dir(
+    mock_scan_jfrog: MagicMock, mock_is_jfrog: MagicMock, tmp_path: Path
+) -> None:
     """Test that --no-cache disables JFrog caching even when --cache-dir is set."""
     mock_is_jfrog.return_value = True
     mock_scan_jfrog.return_value = create_mock_scan_result(
@@ -1559,7 +1563,7 @@ def test_scan_mlflow_uri_with_options(mock_scan_mlflow):
 
 
 @patch("modelaudit.integrations.mlflow.scan_mlflow_model")
-def test_scan_mlflow_uri_with_cache_dir(mock_scan_mlflow, tmp_path: Path) -> None:
+def test_scan_mlflow_uri_with_cache_dir(mock_scan_mlflow: MagicMock, tmp_path: Path) -> None:
     """Test scanning an MLflow URI with an explicit cache directory."""
     mock_scan_mlflow.return_value = create_mock_scan_result(
         bytes_scanned=1024, issues=[], files_scanned=1, assets=[], has_errors=False, scanners=["test_scanner"]
@@ -1583,7 +1587,7 @@ def test_scan_mlflow_uri_with_cache_dir(mock_scan_mlflow, tmp_path: Path) -> Non
 
 
 @patch("modelaudit.integrations.mlflow.scan_mlflow_model")
-def test_scan_mlflow_uri_no_cache_overrides_cache_dir(mock_scan_mlflow, tmp_path: Path) -> None:
+def test_scan_mlflow_uri_no_cache_overrides_cache_dir(mock_scan_mlflow: MagicMock, tmp_path: Path) -> None:
     """Test that --no-cache disables MLflow caching even when --cache-dir is set."""
     mock_scan_mlflow.return_value = create_mock_scan_result(
         bytes_scanned=1024, issues=[], files_scanned=1, assets=[], has_errors=False, scanners=["test_scanner"]

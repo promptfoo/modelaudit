@@ -76,7 +76,12 @@ def test_scan_mlflow_model_success(mock_scan, mock_mkdtemp, mock_rmtree):
 @patch("modelaudit.integrations.mlflow.shutil.rmtree")
 @patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
 @patch("modelaudit.core.scan_model_directory_or_file")
-def test_scan_mlflow_model_uses_cache_dir_for_downloads(mock_scan, mock_mkdtemp, mock_rmtree, tmp_path: Path) -> None:
+def test_scan_mlflow_model_uses_cache_dir_for_downloads(
+    mock_scan: MagicMock,
+    mock_mkdtemp: MagicMock,
+    mock_rmtree: MagicMock,
+    tmp_path: Path,
+) -> None:
     """Test MLflow model downloads use a dedicated subdirectory under cache_dir."""
     mock_mlflow = MagicMock()
     cache_dir = tmp_path / "cache"

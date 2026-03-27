@@ -1,6 +1,6 @@
 import hashlib
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -85,7 +85,12 @@ def test_scan_jfrog_artifact_success(mock_scan, mock_download, mock_detect, mock
 @patch("modelaudit.integrations.jfrog.download_artifact")
 @patch("modelaudit.core.scan_model_directory_or_file")
 def test_scan_jfrog_artifact_uses_cache_dir_for_downloads(
-    mock_scan, mock_download, mock_detect, mock_mkdtemp, mock_rmtree, tmp_path: Path
+    mock_scan: MagicMock,
+    mock_download: MagicMock,
+    mock_detect: MagicMock,
+    mock_mkdtemp: MagicMock,
+    mock_rmtree: MagicMock,
+    tmp_path: Path,
 ) -> None:
     """Test JFrog downloads use a dedicated subdirectory under cache_dir."""
     url = "https://company.jfrog.io/artifactory/repo/model.pt"
