@@ -108,8 +108,7 @@ class SafeTensorsScanner(BaseScanner):
                         details={"header_len": header_len},
                     )
 
-                skip_deep_metadata_analysis = header_len > max_header_bytes
-                if skip_deep_metadata_analysis:
+                if header_len > max_header_bytes:
                     result.add_check(
                         name="Header Size Limit",
                         passed=False,
@@ -124,14 +123,18 @@ class SafeTensorsScanner(BaseScanner):
                             "denial-of-service risk."
                         ),
                     )
-                else:
-                    result.add_check(
-                        name="Header Size Limit",
-                        passed=True,
-                        message="SafeTensors header is within configured size limit",
-                        location=path,
-                        details={"header_len": header_len, "max_allowed": max_header_bytes},
-                    )
+                    result.metadata["analysis_incomplete"] = True
+                    result.bytes_scanned = len(header_len_bytes)
+                    result.finish(success=False)
+                    return result
+
+                result.add_check(
+                    name="Header Size Limit",
+                    passed=True,
+                    message="SafeTensors header is within configured size limit",
+                    location=path,
+                    details={"header_len": header_len, "max_allowed": max_header_bytes},
+                )
 
                 header_bytes = f.read(header_len)
                 if len(header_bytes) != header_len:
@@ -188,7 +191,7 @@ class SafeTensorsScanner(BaseScanner):
                     header=header,
                     result=result,
                     path=path,
-                    analyze_metadata_content=not skip_deep_metadata_analysis,
+                    analyze_metadata_content=True,
                 )
 
                 # Validate tensor offsets and sizes

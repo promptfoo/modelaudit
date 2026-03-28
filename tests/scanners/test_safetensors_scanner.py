@@ -1,6 +1,10 @@
+import builtins
 import json
+import os
 import struct
 from pathlib import Path
+from types import TracebackType
+from typing import Any, BinaryIO
 
 import numpy as np
 import pytest
@@ -69,6 +73,8 @@ def test_oversized_header_triggers_limit_check(tmp_path: Path) -> None:
     assert header_limit_check is not None
     assert header_limit_check.status.value == "failed"
     assert "exceeds maximum allowed size" in header_limit_check.message
+    assert result.success is False
+    assert result.metadata["analysis_incomplete"] is True
 
 
 def test_oversized_header_skips_metadata_content_analysis(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -86,6 +92,61 @@ def test_oversized_header_skips_metadata_content_analysis(tmp_path: Path, monkey
     scanner.scan(str(file_path))
 
     assert analyze_called["value"] is False
+
+
+def test_oversized_header_does_not_read_beyond_configured_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    file_path = tmp_path / "oversized_guarded_read.safetensors"
+    oversized_header_len = 100 * 1024 * 1024
+    max_header_bytes = 16 * 1024 * 1024
+    _write_oversized_header_safetensors(file_path, header_len=oversized_header_len)
+
+    original_open: Any = builtins.open
+
+    class GuardedReader:
+        def __init__(self, handle: BinaryIO) -> None:
+            self._handle = handle
+
+        def read(self, size: int = -1) -> bytes:
+            if size > max_header_bytes:
+                raise AssertionError(f"scanner attempted oversized read: {size}")
+            return self._handle.read(size)
+
+        def __enter__(self) -> "GuardedReader":
+            self._handle.__enter__()
+            return self
+
+        def __exit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc: BaseException | None,
+            tb: TracebackType | None,
+        ) -> Any:
+            return self._handle.__exit__(exc_type, exc, tb)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._handle, name)
+
+    def guarded_open(
+        file: str | os.PathLike[str] | int,
+        mode: str = "r",
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        handle = original_open(file, mode, *args, **kwargs)
+        if isinstance(file, (str, os.PathLike)) and Path(file) == file_path and "rb" in mode:
+            return GuardedReader(handle)
+        return handle
+
+    monkeypatch.setattr(builtins, "open", guarded_open)
+
+    scanner = SafeTensorsScanner({"max_safetensors_header_bytes": max_header_bytes})
+    result = scanner.scan(str(file_path))
+
+    header_limit_check = next((check for check in result.checks if check.name == "Header Size Limit"), None)
+    assert header_limit_check is not None
+    assert header_limit_check.status.value == "failed"
 
 
 def test_corrupted_header(tmp_path: Path) -> None:
