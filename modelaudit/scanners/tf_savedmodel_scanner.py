@@ -349,7 +349,46 @@ class TensorFlowSavedModelScanner(BaseScanner):
         """Scan SavedModel asset directories for suspicious executable content."""
         for assets_dir_name in ("assets", "assets.extra"):
             assets_dir = model_root / assets_dir_name
-            if not assets_dir.is_dir():
+            if not assets_dir.exists():
+                continue
+
+            try:
+                assets_dir_stat = assets_dir.lstat()
+            except OSError as exc:
+                result.add_check(
+                    name="SavedModel Assets Security Check",
+                    passed=False,
+                    message=f"Cannot inspect asset directory for security analysis: {assets_dir_name}: {exc}",
+                    severity=IssueSeverity.WARNING,
+                    location=str(assets_dir),
+                    details={
+                        "file_name": assets_dir_name,
+                        "detected_content_type": "unscannable_asset_dir",
+                        "asset_kind": "stat_error",
+                        "exception": str(exc),
+                        "exception_type": type(exc).__name__,
+                    },
+                    rule_code="S902",
+                )
+                continue
+
+            if stat.S_ISLNK(assets_dir_stat.st_mode):
+                result.add_check(
+                    name="SavedModel Assets Security Check",
+                    passed=False,
+                    message=f"Symlinked asset directory is not traversed during security analysis: {assets_dir_name}",
+                    severity=IssueSeverity.WARNING,
+                    location=str(assets_dir),
+                    details={
+                        "file_name": assets_dir_name,
+                        "detected_content_type": "unscannable_asset_dir",
+                        "asset_kind": "symlink_directory",
+                    },
+                    rule_code="S902",
+                )
+                continue
+
+            if not stat.S_ISDIR(assets_dir_stat.st_mode):
                 continue
 
             for root, _dirs, files in os.walk(assets_dir):
