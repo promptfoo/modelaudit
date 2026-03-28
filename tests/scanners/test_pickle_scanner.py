@@ -211,6 +211,21 @@ def test_large_pickle_raw_pattern_limit_with_opcode_budget_truncation(tmp_path: 
     assert result.success is False
 
 
+def test_scan_pickle_timeout_finishes_fail_closed(tmp_path: Path) -> None:
+    """Top-level pickle scans should finish unsuccessful when the timeout path trips."""
+    pickle_path = tmp_path / "timeout.pkl"
+    pickle_path.write_bytes(pickle.dumps({"weights": [1, 2, 3], "name": "safe"}))
+
+    result = PickleScanner({"timeout": 0}).scan(str(pickle_path))
+
+    timeout_checks = [
+        check for check in result.checks if check.name == "Scan Timeout Check" and check.status == CheckStatus.FAILED
+    ]
+    assert len(timeout_checks) == 1
+    assert "timed out" in timeout_checks[0].message.lower()
+    assert result.success is False
+
+
 class TestPickleScanner(unittest.TestCase):
     def setUp(self):
         # Path to assets/samples/pickles/evil.pickle sample
