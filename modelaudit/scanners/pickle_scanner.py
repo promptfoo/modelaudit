@@ -59,6 +59,7 @@ _STACK_GLOBAL_OPERAND_PREVIEWER.maxfrozenset = 4
 _STACK_GLOBAL_OPERAND_PREVIEWER.maxdict = 4
 _RAW_PATTERN_SCAN_LIMIT_BYTES = 10 * 1024 * 1024
 _POST_BUDGET_GLOBAL_SCAN_LIMIT_BYTES = 100 * 1024 * 1024
+_POST_BUDGET_GLOBAL_CONTEXT_BYTES = 4096
 
 
 StackGlobalOperandKind = Literal["string", "missing_memo", "unknown", "non_string"]
@@ -4507,10 +4508,18 @@ class PickleScanner(BaseScanner):
         if scan_limit <= 0:
             return findings
 
+        minimum_offset = max(0, minimum_offset)
+        context_bytes = min(minimum_offset, _POST_BUDGET_GLOBAL_CONTEXT_BYTES)
+        tail_scan_bytes = min(max(file_size - minimum_offset, 0), self.post_budget_global_scan_limit_bytes)
+        if tail_scan_bytes <= 0:
+            return findings
+        scan_start = max(0, minimum_offset - context_bytes)
+        read_size = context_bytes + tail_scan_bytes
+
         original_pos = file_obj.tell()
         try:
-            file_obj.seek(0)
-            data = file_obj.read(scan_limit)
+            file_obj.seek(scan_start)
+            data = file_obj.read(read_size)
         finally:
             file_obj.seek(original_pos)
 
@@ -4550,6 +4559,63 @@ class PickleScanner(BaseScanner):
                 }
             )
 
+        def _decode_string_push(start: int, end: int) -> tuple[str, int] | None:
+            if start < 0 or end > data_len or start >= end:
+                return None
+
+            opcode = data[start]
+            if opcode == 0x8C:  # SHORT_BINUNICODE
+                if start + 2 > end:
+                    return None
+                string_len = data[start + 1]
+                value_start = start + 2
+            elif opcode == 0x58:  # BINUNICODE
+                if start + 5 > end:
+                    return None
+                string_len = int.from_bytes(data[start + 1 : start + 5], "little")
+                value_start = start + 5
+            elif opcode == 0x8D:  # BINUNICODE8
+                if start + 9 > end:
+                    return None
+                string_len = int.from_bytes(data[start + 1 : start + 9], "little")
+                value_start = start + 9
+            else:
+                return None
+
+            value_end = value_start + string_len
+            if value_end != end or string_len < 0:
+                return None
+
+            value = data[value_start:value_end].decode("utf-8", errors="ignore").strip()
+            return value, value_end
+
+        def _extract_stack_global_values(stack_global_index: int) -> list[str]:
+            values: list[str] = []
+            cursor = stack_global_index
+            lookback_start = max(0, stack_global_index - _POST_BUDGET_GLOBAL_CONTEXT_BYTES)
+
+            while len(values) < 2 and cursor > lookback_start:
+                while cursor > lookback_start and data[cursor - 1] == 0x94:  # MEMOIZE
+                    cursor -= 1
+
+                found_value: str | None = None
+                found_start: int | None = None
+                for candidate in range(cursor - 1, lookback_start - 1, -1):
+                    parsed = _decode_string_push(candidate, cursor)
+                    if parsed is None:
+                        continue
+                    found_value = parsed[0]
+                    found_start = candidate
+                    break
+
+                if found_value is None or found_start is None:
+                    break
+
+                values.append(found_value)
+                cursor = found_start
+
+            return list(reversed(values))
+
         cursor = 0
         data_len = len(data)
         while cursor < data_len:
@@ -4562,32 +4628,19 @@ class PickleScanner(BaseScanner):
                         module = data[cursor + 1 : module_end].decode("utf-8", errors="ignore").strip()
                         function = data[module_end + 1 : function_end].decode("utf-8", errors="ignore").strip()
                         opcode_name = "GLOBAL" if opcode_value == ord("c") else "INST"
-                        _record_reference(module, function, cursor, opcode_name)
+                        _record_reference(module, function, scan_start + cursor, opcode_name)
                         cursor = function_end + 1
                         continue
             cursor += 1
 
-        for idx in range(max(0, data_len - 5)):
-            if data[idx] != 0x8C:  # SHORT_BINUNICODE
+        for idx in range(data_len):
+            if data[idx] != 0x93:  # STACK_GLOBAL
                 continue
-            module_len = data[idx + 1]
-            module_start = idx + 2
-            module_end = module_start + module_len
-            if module_end + 3 > data_len:
+            values = _extract_stack_global_values(idx)
+            if len(values) != 2:
                 continue
-            if data[module_end] != 0x8C:
-                continue
-            function_len = data[module_end + 1]
-            function_start = module_end + 2
-            function_end = function_start + function_len
-            if function_end >= data_len:
-                continue
-            if data[function_end] != 0x93:  # STACK_GLOBAL
-                continue
-
-            module = data[module_start:module_end].decode("utf-8", errors="ignore").strip()
-            function = data[function_start:function_end].decode("utf-8", errors="ignore").strip()
-            _record_reference(module, function, function_end, "STACK_GLOBAL")
+            module, function = values
+            _record_reference(module, function, scan_start + idx, "STACK_GLOBAL")
 
         return findings
 
@@ -4989,7 +5042,10 @@ class PickleScanner(BaseScanner):
                     )
                     additional = len(post_budget_global_findings) - 1
                     additional_note = f" (+{additional} more)" if additional > 0 else ""
-                    post_budget_scan_bytes = min(file_size, self.post_budget_global_scan_limit_bytes)
+                    post_budget_scan_bytes = min(
+                        max(file_size - (max_analyzed_offset + 1), 0),
+                        self.post_budget_global_scan_limit_bytes,
+                    )
                     suspicious_count += len(post_budget_global_findings)
                     result.add_check(
                         name="Post-Budget Global Reference Scan",

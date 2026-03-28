@@ -4,7 +4,7 @@ import struct
 import sys
 import tempfile
 import unittest
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from io import BytesIO
 from pathlib import Path
 from typing import ClassVar
@@ -310,37 +310,61 @@ def test_post_budget_global_scan_warning_only_for_unknown_import(tmp_path: Path)
 
 def test_post_budget_global_scan_honors_configured_byte_limit(tmp_path: Path) -> None:
     """Configured byte limits should bound how far the fallback scan can see."""
-    pickle_path = tmp_path / "post-budget-configured-limit.pkl"
-    benign_padding = _make_opcode_padding_stream(opcode_pairs=256)
+    gap = b"A" * 256
     malicious_stream = b"\x80\x02cos\nsystem\n)R."
-    pickle_path.write_bytes(benign_padding + malicious_stream)
+    payload = b"B" * 32 + gap + malicious_stream
+    minimum_offset = 32
 
-    hidden_result = PickleScanner(
-        {
-            "max_opcodes": 64,
-            "post_budget_global_scan_limit_bytes": len(benign_padding),
-        }
-    ).scan(str(pickle_path))
-    visible_result = PickleScanner(
-        {
-            "max_opcodes": 64,
-            "post_budget_global_scan_limit_bytes": len(benign_padding) + len(malicious_stream),
-        }
-    ).scan(str(pickle_path))
-
-    assert not any(
-        check.name == "Post-Budget Global Reference Scan" and check.status == CheckStatus.FAILED
-        for check in hidden_result.checks
+    hidden_findings = PickleScanner(
+        {"post_budget_global_scan_limit_bytes": len(gap) - 1}
+    )._scan_global_references_unbounded(
+        BytesIO(payload),
+        file_size=len(payload),
+        minimum_offset=minimum_offset,
+        ml_context={},
     )
-    visible_checks = [check for check in visible_result.checks if check.name == "Post-Budget Global Reference Scan"]
-    assert len(visible_checks) == 1
-    assert visible_checks[0].severity == IssueSeverity.CRITICAL
-    assert "os.system" in visible_checks[0].message
+    visible_findings = PickleScanner(
+        {"post_budget_global_scan_limit_bytes": len(gap) + len(malicious_stream)}
+    )._scan_global_references_unbounded(
+        BytesIO(payload),
+        file_size=len(payload),
+        minimum_offset=minimum_offset,
+        ml_context={},
+    )
+
+    assert hidden_findings == []
+    assert any(finding["import_reference"] == "os.system" for finding in visible_findings)
 
 
 def test_post_budget_global_scan_uses_stack_global_opcode_offset() -> None:
     """STACK_GLOBAL references that cross the budget boundary should still be reported."""
     raw_stack_global = _short_binunicode(b"os") + _short_binunicode(b"system") + b"\x93"
+    scanner = PickleScanner()
+
+    findings = scanner._scan_global_references_unbounded(
+        BytesIO(raw_stack_global),
+        file_size=len(raw_stack_global),
+        minimum_offset=len(raw_stack_global) - 1,
+        ml_context={},
+    )
+
+    assert len(findings) == 1
+    assert findings[0]["import_reference"] == "os.system"
+    assert findings[0]["opcode"] == "STACK_GLOBAL"
+    assert findings[0]["offset"] == len(raw_stack_global) - 1
+
+
+@pytest.mark.parametrize(
+    "builder",
+    [
+        lambda value: b"\x8c" + bytes([len(value)]) + value,
+        lambda value: b"X" + struct.pack("<I", len(value)) + value,
+        lambda value: b"\x8d" + struct.pack("<Q", len(value)) + value,
+    ],
+)
+def test_post_budget_global_scan_recovers_stack_global_with_memoize(builder: Callable[[bytes], bytes]) -> None:
+    """Protocol-4/5 STACK_GLOBAL tails with MEMOIZE and varied string encodings should be detected."""
+    raw_stack_global = builder(b"os") + b"\x94" + builder(b"system") + b"\x94" + b"\x93"
     scanner = PickleScanner()
 
     findings = scanner._scan_global_references_unbounded(
