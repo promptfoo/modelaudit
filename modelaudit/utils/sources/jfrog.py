@@ -485,9 +485,11 @@ def download_jfrog_folder(
         raise ValueError("No scannable model files found in JFrog folder")
 
     # Create download directory
-    if cache_dir is None:
+    owns_download_dir = cache_dir is None
+    if owns_download_dir:
         download_dir = Path(tempfile.mkdtemp(prefix="modelaudit_jfrog_folder_"))
     else:
+        assert cache_dir is not None
         download_dir = cache_dir
         download_dir.mkdir(parents=True, exist_ok=True)
 
@@ -556,6 +558,8 @@ def download_jfrog_folder(
             logger.warning(error_msg)
             if show_progress:
                 click.echo("❌ Aborting JFrog folder download to avoid scanning a partial dataset")
+            if owns_download_dir and download_dir.exists():
+                shutil.rmtree(download_dir, ignore_errors=True)
             raise Exception(
                 "JFrog folder download failed after "
                 f"{completed_downloads} of {len(files)} file(s) completed. {file_info['name']}: {e}"

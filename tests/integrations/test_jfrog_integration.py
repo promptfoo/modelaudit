@@ -1,5 +1,5 @@
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -183,8 +183,12 @@ def test_scan_jfrog_folder_success(mock_scan, mock_download_folder, mock_detect,
 @patch("modelaudit.integrations.jfrog.download_jfrog_folder")
 @patch("modelaudit.core.scan_model_directory_or_file")
 def test_scan_jfrog_folder_download_error_aborts_scan(
-    mock_scan, mock_download_folder, mock_detect, mock_mkdtemp, mock_rmtree
-):
+    mock_scan: MagicMock,
+    mock_download_folder: MagicMock,
+    mock_detect: MagicMock,
+    mock_mkdtemp: MagicMock,
+    mock_rmtree: MagicMock,
+) -> None:
     """Test that folder download failures stop before scanning."""
     temp_dir = "/tmp/modelaudit_jfrog_test"
     mock_mkdtemp.return_value = temp_dir

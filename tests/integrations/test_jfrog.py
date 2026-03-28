@@ -3,7 +3,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import requests
@@ -396,7 +396,7 @@ class TestJFrogFolderListing:
             list_jfrog_folder_contents("https://company.jfrog.io/artifactory/repo/model.pkl")
 
     @patch("modelaudit.utils.sources.jfrog.detect_jfrog_target_type")
-    def test_list_jfrog_folder_contents_propagates_subfolder_error(self, mock_detect) -> None:
+    def test_list_jfrog_folder_contents_propagates_subfolder_error(self, mock_detect: MagicMock) -> None:
         """Listing must fail closed when a subfolder API call errors."""
 
         def mock_detect_side_effect(url: str, *args: object, **kwargs: object) -> dict:
@@ -423,7 +423,7 @@ class TestJFrogFolderListing:
             )
 
     @patch("modelaudit.utils.sources.jfrog.detect_jfrog_target_type")
-    def test_list_jfrog_folder_contents_raises_on_max_depth(self, mock_detect) -> None:
+    def test_list_jfrog_folder_contents_raises_on_max_depth(self, mock_detect: MagicMock) -> None:
         """Listing must fail closed when recursion depth is exceeded."""
 
         def mock_detect_side_effect(url: str, *args: object, **kwargs: object) -> dict:
@@ -563,3 +563,37 @@ class TestJFrogFolderDownload:
 
         assert attempted_downloads == ["model1.pkl", "model2.pt"]
         assert not (tmp_path / "model3.safetensors").exists()
+
+    @patch("modelaudit.utils.sources.jfrog.tempfile.mkdtemp")
+    @patch("modelaudit.utils.sources.jfrog.download_artifact")
+    @patch("modelaudit.utils.sources.jfrog.list_jfrog_folder_contents")
+    def test_download_jfrog_folder_cleans_owned_temp_dir_on_failure(
+        self,
+        mock_list: MagicMock,
+        mock_download: MagicMock,
+        mock_mkdtemp: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Owned temp directories must be removed when a download aborts."""
+        owned_download_dir = tmp_path / "owned-jfrog-downloads"
+        owned_download_dir.mkdir()
+        mock_mkdtemp.return_value = str(owned_download_dir)
+        mock_list.return_value = [
+            {
+                "name": "model1.pkl",
+                "path": "https://company.jfrog.io/artifactory/repo/models/model1.pkl",
+                "size": 1024,
+                "human_size": "1.0 KB",
+            }
+        ]
+        mock_download.side_effect = Exception("boom")
+
+        with pytest.raises(Exception, match=r"failed after 0 of 1 file\(s\) completed"):
+            download_jfrog_folder(
+                "https://company.jfrog.io/artifactory/repo/models/",
+                cache_dir=None,
+                api_token="test-token",
+                show_progress=False,
+            )
+
+        assert not owned_download_dir.exists()
