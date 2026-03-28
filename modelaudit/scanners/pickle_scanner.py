@@ -4504,10 +4504,6 @@ class PickleScanner(BaseScanner):
         findings: list[dict[str, Any]] = []
         seen: set[tuple[int, str]] = set()
 
-        scan_limit = min(file_size, self.post_budget_global_scan_limit_bytes)
-        if scan_limit <= 0:
-            return findings
-
         minimum_offset = max(0, minimum_offset)
         context_bytes = min(minimum_offset, _POST_BUDGET_GLOBAL_CONTEXT_BYTES)
         tail_scan_bytes = min(max(file_size - minimum_offset, 0), self.post_budget_global_scan_limit_bytes)
@@ -4589,14 +4585,37 @@ class PickleScanner(BaseScanner):
             value = data[value_start:value_end].decode("utf-8", errors="ignore").strip()
             return value, value_end
 
+        def _skip_trailing_memo_ops(cursor: int, lookback_start: int) -> int:
+            while cursor > lookback_start:
+                if data[cursor - 1] == 0x94:  # MEMOIZE
+                    cursor -= 1
+                    continue
+                if cursor >= lookback_start + 2 and data[cursor - 2] == 0x71:  # BINPUT
+                    cursor -= 2
+                    continue
+                if cursor >= lookback_start + 5 and data[cursor - 5] == 0x72:  # LONG_BINPUT
+                    cursor -= 5
+                    continue
+                if data[cursor - 1] != 0x0A:  # PUT is newline-terminated
+                    break
+
+                digit_start = cursor - 1
+                while digit_start > lookback_start and data[digit_start - 1] in b"0123456789":
+                    digit_start -= 1
+                if digit_start < cursor - 1 and digit_start > lookback_start and data[digit_start - 1] == 0x70:
+                    cursor = digit_start - 1
+                    continue
+                break
+
+            return cursor
+
         def _extract_stack_global_values(stack_global_index: int) -> list[str]:
             values: list[str] = []
             cursor = stack_global_index
             lookback_start = max(0, stack_global_index - _POST_BUDGET_GLOBAL_CONTEXT_BYTES)
 
             while len(values) < 2 and cursor > lookback_start:
-                while cursor > lookback_start and data[cursor - 1] == 0x94:  # MEMOIZE
-                    cursor -= 1
+                cursor = _skip_trailing_memo_ops(cursor, lookback_start)
 
                 found_value: str | None = None
                 found_start: int | None = None

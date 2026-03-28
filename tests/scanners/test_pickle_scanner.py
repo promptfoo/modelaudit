@@ -355,16 +355,21 @@ def test_post_budget_global_scan_uses_stack_global_opcode_offset() -> None:
 
 
 @pytest.mark.parametrize(
-    "builder",
+    ("builder", "memo_ops"),
     [
-        lambda value: b"\x8c" + bytes([len(value)]) + value,
-        lambda value: b"X" + struct.pack("<I", len(value)) + value,
-        lambda value: b"\x8d" + struct.pack("<Q", len(value)) + value,
+        (lambda value: b"\x8c" + bytes([len(value)]) + value, (b"\x94", b"\x94")),
+        (lambda value: b"X" + struct.pack("<I", len(value)) + value, (b"\x94", b"\x94")),
+        (lambda value: b"\x8d" + struct.pack("<Q", len(value)) + value, (b"\x94", b"\x94")),
+        (lambda value: b"\x8c" + bytes([len(value)]) + value, (b"q\x00", b"q\x01")),
+        (lambda value: b"\x8c" + bytes([len(value)]) + value, (b"r\x00\x00\x00\x00", b"r\x01\x00\x00\x00")),
+        (lambda value: b"\x8c" + bytes([len(value)]) + value, (b"p0\n", b"p1\n")),
     ],
 )
-def test_post_budget_global_scan_recovers_stack_global_with_memoize(builder: Callable[[bytes], bytes]) -> None:
-    """Protocol-4/5 STACK_GLOBAL tails with MEMOIZE and varied string encodings should be detected."""
-    raw_stack_global = builder(b"os") + b"\x94" + builder(b"system") + b"\x94" + b"\x93"
+def test_post_budget_global_scan_recovers_stack_global_with_memoized_strings(
+    builder: Callable[[bytes], bytes], memo_ops: tuple[bytes, bytes]
+) -> None:
+    """STACK_GLOBAL tails with interleaved memo opcodes should still be recovered."""
+    raw_stack_global = builder(b"os") + memo_ops[0] + builder(b"system") + memo_ops[1] + b"\x93"
     scanner = PickleScanner()
 
     findings = scanner._scan_global_references_unbounded(
@@ -378,6 +383,24 @@ def test_post_budget_global_scan_recovers_stack_global_with_memoize(builder: Cal
     assert findings[0]["import_reference"] == "os.system"
     assert findings[0]["opcode"] == "STACK_GLOBAL"
     assert findings[0]["offset"] == len(raw_stack_global) - 1
+
+
+def test_scan_pickle_detects_post_budget_stack_global_with_binput(tmp_path: Path) -> None:
+    """End-to-end scans should catch STACK_GLOBAL tails that use BINPUT memo opcodes."""
+    pickle_path = tmp_path / "post-budget-stack-global-binput.pkl"
+    benign_padding = _make_opcode_padding_stream(opcode_pairs=512)
+    malicious_stream = b"\x80\x04" + _short_binunicode(b"os") + b"q\x00" + _short_binunicode(b"system") + b"q\x01"
+    malicious_stream += b"\x93)R."
+    pickle_path.write_bytes(benign_padding + malicious_stream)
+
+    result = PickleScanner({"max_opcodes": 64}).scan(str(pickle_path))
+
+    checks = [check for check in result.checks if check.name == "Post-Budget Global Reference Scan"]
+    assert len(checks) == 1
+    assert checks[0].status == CheckStatus.FAILED
+    assert checks[0].severity == IssueSeverity.CRITICAL
+    assert "os.system" in checks[0].message
+    assert result.success is False
 
 
 class TestPickleScanner(unittest.TestCase):
