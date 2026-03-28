@@ -524,11 +524,12 @@ def test_scan_pickle_detects_post_budget_stack_global_with_binget(tmp_path: Path
 def test_post_budget_global_scan_runs_after_deadline_truncation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Deadline-triggered truncation should still run the post-budget import scan."""
+    """Deadline-triggered truncation should not continue scanning past the timeout boundary."""
     import modelaudit.scanners.pickle_scanner as pickle_scanner_module
 
     pickle_path = tmp_path / "post-budget-deadline.pkl"
     pickle_path.write_bytes(b"\x80\x04cmysterypkg\nloader\n.")
+    call_counter = {"calls": 0}
 
     def _deadline_after_first_opcode(
         file_obj: BinaryIO,
@@ -542,18 +543,37 @@ def test_post_budget_global_scan_runs_after_deadline_truncation(
         yield next(op_iter)
         raise _GenopsBudgetExceeded("deadline")
 
+    def _counting_tail_scan(
+        self: PickleScanner,
+        _file_obj: object,
+        *,
+        file_size: int,
+        minimum_offset: int,
+        ml_context: dict[str, object],
+    ) -> list[dict[str, object]]:
+        del self, _file_obj, file_size, minimum_offset, ml_context
+        call_counter["calls"] += 1
+        return []
+
     monkeypatch.setattr(pickle_scanner_module, "_genops_with_fallback", _deadline_after_first_opcode)
+    monkeypatch.setattr(PickleScanner, "_scan_global_references_unbounded", _counting_tail_scan)
 
     result = PickleScanner({"timeout": 1}).scan(str(pickle_path))
 
     timeout_checks = [check for check in result.checks if check.name == "Scan Timeout Check"]
     assert timeout_checks and timeout_checks[0].status == CheckStatus.FAILED
+    assert call_counter["calls"] == 0
     checks = [check for check in result.checks if check.name == "Post-Budget Global Reference Scan"]
-    assert len(checks) == 1
-    assert checks[0].status == CheckStatus.FAILED
-    assert checks[0].severity == IssueSeverity.WARNING
-    assert "mysterypkg.loader" in checks[0].message
+    assert checks == []
+    assert result.metadata["post_budget_global_scan_skipped_due_to_timeout"] is True
     assert result.success is True
+
+
+def test_invalid_post_budget_global_scan_limit_uses_default() -> None:
+    """Invalid config values should not crash scanner construction."""
+    scanner = PickleScanner({"post_budget_global_scan_limit_bytes": "not-an-int"})
+
+    assert scanner.post_budget_global_scan_limit_bytes > 0
 
 
 class TestPickleScanner(unittest.TestCase):

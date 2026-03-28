@@ -3625,7 +3625,11 @@ class PickleScanner(BaseScanner):
             "post_budget_global_scan_limit_bytes",
             _POST_BUDGET_GLOBAL_SCAN_LIMIT_BYTES,
         )
-        self.post_budget_global_scan_limit_bytes = max(0, int(configured_post_budget_limit))
+        try:
+            parsed_post_budget_limit = int(configured_post_budget_limit)
+        except (TypeError, ValueError):
+            parsed_post_budget_limit = _POST_BUDGET_GLOBAL_SCAN_LIMIT_BYTES
+        self.post_budget_global_scan_limit_bytes = max(0, parsed_post_budget_limit)
         # Initialize analyzers
         self.entropy_analyzer = EntropyAnalyzer()
         self.semantic_analyzer = SemanticAnalyzer()
@@ -5151,7 +5155,11 @@ class PickleScanner(BaseScanner):
             )
             post_budget_minimum_offset = max(max_analyzed_end_offset, max_analyzed_offset + 1, 0)
 
-            if opcode_budget_exceeded or timeout_exceeded:
+            should_run_post_budget_scan = opcode_budget_exceeded and not timeout_exceeded
+            if timeout_exceeded:
+                result.metadata["post_budget_global_scan_skipped_due_to_timeout"] = True
+
+            if should_run_post_budget_scan:
                 post_budget_global_findings = self._scan_global_references_unbounded(
                     file_obj,
                     file_size=file_size,
