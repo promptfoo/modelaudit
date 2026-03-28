@@ -227,6 +227,36 @@ def test_non_handler_python_analysis_parses_each_helper_module_once(
     assert utils_parse_count == 1
 
 
+def test_non_handler_python_metadata_assignments_do_not_trigger_import_time_execution(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"import utils\n\ndef handle(data, context):\n    return utils.transform(data)\n",
+            "utils.py": (
+                b'"""Metadata-only helper."""\n'
+                b'__all__ = ["transform"]\n'
+                b'__version__ = "1.0.0"\n'
+                b"import typing\n"
+                b"if typing.TYPE_CHECKING:\n"
+                b"    from typing import Any\n"
+                b'if __name__ == "__main__":\n'
+                b'    raise RuntimeError("cli only")\n'
+                b"\n"
+                b"def transform(data):\n"
+                b"    return data\n"
+            ),
+            "weights.bin": b"weights",
+        },
+        filename="metadata_only_utils.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    non_handler_failures = _failed_checks(result, "MAR Non-Handler Python Analysis")
+    assert non_handler_failures == []
+
+
 def test_non_handler_python_analysis_detects_malicious_init_module(tmp_path: Path) -> None:
     manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
     mar_path = _create_mar_archive(

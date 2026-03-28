@@ -701,6 +701,59 @@ class TorchServeMarScanner(BaseScanner):
                     modules.add(f"{base_module}.{alias.name}")
         return modules
 
+    def _is_literal_metadata_assignment(self, node: ast.Assign | ast.AnnAssign) -> bool:
+        value: ast.expr | None
+        if isinstance(node, ast.Assign):
+            targets: list[ast.expr] = list(node.targets)
+            value = node.value
+        else:
+            targets = [node.target]
+            value = node.value
+
+        def _is_simple_name_target(target: ast.expr) -> bool:
+            if isinstance(target, ast.Name):
+                return True
+            if isinstance(target, (ast.Tuple, ast.List)):
+                return all(_is_simple_name_target(elt) for elt in target.elts)
+            return False
+
+        if not targets or not all(_is_simple_name_target(target) for target in targets):
+            return False
+        if value is None:
+            return True
+        try:
+            ast.literal_eval(value)
+            return True
+        except Exception:
+            return False
+
+    def _is_non_executing_import_guard(self, node: ast.If) -> bool:
+        test = node.test
+        if isinstance(test, ast.Name) and test.id == "TYPE_CHECKING":
+            return True
+        if (
+            isinstance(test, ast.Attribute)
+            and isinstance(test.value, ast.Name)
+            and test.value.id == "typing"
+            and test.attr == "TYPE_CHECKING"
+        ):
+            return True
+        if (
+            isinstance(test, ast.Compare)
+            and len(test.ops) == 1
+            and isinstance(test.ops[0], ast.Eq)
+            and len(test.comparators) == 1
+        ):
+            pairs = ((test.left, test.comparators[0]), (test.comparators[0], test.left))
+            return any(
+                isinstance(left, ast.Name)
+                and left.id == "__name__"
+                and isinstance(right, ast.Constant)
+                and right.value == "__main__"
+                for left, right in pairs
+            )
+        return False
+
     def _has_import_time_execution(self, tree: ast.Module) -> bool:
         for node in tree.body:
             if (
@@ -710,7 +763,16 @@ class TorchServeMarScanner(BaseScanner):
             ):
                 # Module docstring.
                 continue
+            if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant):
+                # Bare module metadata constants do not execute code.
+                continue
+            if isinstance(node, ast.Pass):
+                continue
             if isinstance(node, (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            if isinstance(node, (ast.Assign, ast.AnnAssign)) and self._is_literal_metadata_assignment(node):
+                continue
+            if isinstance(node, ast.If) and self._is_non_executing_import_guard(node):
                 continue
             return True
         return False
