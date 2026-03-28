@@ -850,15 +850,18 @@ class KerasZipScanner(BaseScanner):
             return
 
         lowered = raw_config_text.lower()
-        has_module_context = re.search(r'"module"\s*:\s*"keras(?:\.src)?\.config"', lowered) is not None
-        has_function_context = (
-            re.search(r'"(?:fn|function|callable)"\s*:\s*"enable_unsafe_deserialization"', lowered) is not None
-        )
         full_symbol_match = re.search(
             r'"(?:loader|fn|function|callable)"\s*:\s*"(keras(?:\.src)?\.config\.enable_unsafe_deserialization)"',
             lowered,
         )
-        if not ((has_module_context and has_function_context) or full_symbol_match):
+        executable_pair_patterns = (
+            r'\{[^{}]{0,1024}"module"\s*:\s*"keras(?:\.src)?\.config"[^{}]{0,1024}'
+            r'"(?:fn|function|callable)"\s*:\s*"enable_unsafe_deserialization"',
+            r'\{[^{}]{0,1024}"(?:fn|function|callable)"\s*:\s*"enable_unsafe_deserialization"'
+            r'[^{}]{0,1024}"module"\s*:\s*"keras(?:\.src)?\.config"',
+        )
+        has_scoped_executable_pair = any(re.search(pattern, lowered) for pattern in executable_pair_patterns)
+        if not (has_scoped_executable_pair or full_symbol_match):
             return
         matched_symbol = full_symbol_match.group(1) if full_symbol_match else "enable_unsafe_deserialization"
 

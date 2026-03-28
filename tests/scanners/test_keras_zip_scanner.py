@@ -1926,8 +1926,7 @@ class TestCVE20259906UnsafeDeserialization:
         """Malformed JSON should still trigger raw fallback when executable keys are present."""
         scanner = KerasZipScanner()
         config_str = (
-            '{"class_name":"Sequential","config":{"module":"keras.config",'
-            '"fn":"enable_unsafe_deserialization",}'
+            '{"class_name":"Sequential","config":{"module":"keras.config","fn":"enable_unsafe_deserialization",}'
         )
 
         result = scanner.scan(self._make_keras_zip(config_str, tmp_path))
@@ -1946,6 +1945,15 @@ class TestCVE20259906UnsafeDeserialization:
             '{"description":"This documentation mentions '
             'keras.config.enable_unsafe_deserialization for awareness only",'
         )
+
+        result = scanner.scan(self._make_keras_zip(config_str, tmp_path))
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-9906"]
+        assert len(cve_issues) == 0
+
+    def test_malformed_json_split_object_context_not_flagged(self, tmp_path: Path) -> None:
+        """Module and function keys in different objects must not combine into a raw finding."""
+        scanner = KerasZipScanner()
+        config_str = '{"layers":[{"module":"keras.config"},{"fn":"enable_unsafe_deserialization"}],'
 
         result = scanner.scan(self._make_keras_zip(config_str, tmp_path))
         cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-9906"]
