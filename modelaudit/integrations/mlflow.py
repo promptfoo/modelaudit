@@ -12,13 +12,15 @@ logger = logging.getLogger(__name__)
 
 
 def _prepare_download_dir(model_uri: str, cache_dir: str | None) -> tuple[str, bool]:
-    """Return a download directory scoped to the configured cache root."""
+    """Return an ephemeral per-run staging directory under the configured cache root."""
     if not cache_dir:
         return tempfile.mkdtemp(prefix="modelaudit_mlflow_"), True
 
     cache_key = hashlib.sha256(model_uri.encode("utf-8")).hexdigest()[:16]
     download_root = Path(cache_dir).expanduser() / "mlflow"
     download_root.mkdir(parents=True, exist_ok=True)
+    # Use a unique staging directory for this run. ``cache_dir`` controls where
+    # temporary downloads live, while scan-result caching is still handled by core.
     return tempfile.mkdtemp(prefix=f"{cache_key}-", dir=str(download_root)), True
 
 

@@ -17,13 +17,15 @@ logger = logging.getLogger(__name__)
 
 
 def _prepare_download_dir(url: str, cache_dir: str | None) -> tuple[Path, bool]:
-    """Return a download directory scoped to the configured cache root."""
+    """Return an ephemeral per-run staging directory under the configured cache root."""
     if not cache_dir:
         return Path(tempfile.mkdtemp(prefix="modelaudit_jfrog_")), True
 
     cache_key = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
     download_root = Path(cache_dir).expanduser() / "jfrog"
     download_root.mkdir(parents=True, exist_ok=True)
+    # Use a unique staging directory for this run. ``cache_dir`` controls where
+    # temporary downloads live, while scan-result caching is still handled by core.
     return Path(tempfile.mkdtemp(prefix=f"{cache_key}-", dir=str(download_root))), True
 
 
