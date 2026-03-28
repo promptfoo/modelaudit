@@ -340,6 +340,99 @@ def test_keras_h5_scanner_with_blacklist(tmp_path):
     assert len(relevant_issues) > 0
 
 
+def test_lambda_safe_normalization_pattern_still_passes(tmp_path: Path) -> None:
+    """Safe normalization lambdas should continue matching the safe-pattern allowlist."""
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "safe_lambda_model",
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {"function": "lambda x: x / 255"},
+                    }
+                ],
+            },
+        },
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert any(
+        check.name == "Lambda Layer Code Analysis"
+        and check.status == CheckStatus.PASSED
+        and check.details.get("pattern_type") == "safe_normalization"
+        for check in result.checks
+    )
+    assert not any("dangerous Python code" in issue.message for issue in result.issues)
+
+
+def test_lambda_safe_prefix_with_injected_code_is_flagged(tmp_path: Path) -> None:
+    """Semicolon-appended payloads must not bypass Lambda code safety checks."""
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "unsafe_lambda_model",
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {"function": 'lambda x: x / 255; __import__("os").system("evil")'},
+                    }
+                ],
+            },
+        },
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    # The injected payload must be flagged as dangerous, not allowlisted
+    assert any(
+        check.name == "Lambda Layer Code Analysis" and check.status == CheckStatus.FAILED for check in result.checks
+    ), f"Expected failed Lambda check but got: {[(c.name, c.status) for c in result.checks]}"
+    assert not any(
+        check.name == "Lambda Layer Code Analysis"
+        and check.status == CheckStatus.PASSED
+        and check.details.get("pattern_type") == "safe_normalization"
+        for check in result.checks
+    )
+
+
+def test_lambda_tf_safe_prefix_with_exec_is_not_allowlisted(tmp_path: Path) -> None:
+    """Safe tf.nn prefix should not match when arbitrary executable code is appended."""
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "unsafe_tf_lambda_model",
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {"function": 'lambda x: tf.nn.softmax(x); exec("bad")'},
+                    }
+                ],
+            },
+        },
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    # The injected payload must be flagged as dangerous, not allowlisted
+    assert any(
+        check.name == "Lambda Layer Code Analysis" and check.status == CheckStatus.FAILED for check in result.checks
+    ), f"Expected failed Lambda check but got: {[(c.name, c.status) for c in result.checks]}"
+    assert not any(
+        check.name == "Lambda Layer Code Analysis"
+        and check.status == CheckStatus.PASSED
+        and check.details.get("pattern_type") == "safe_normalization"
+        for check in result.checks
+    )
+
+
 def test_keras_h5_scanner_empty_file(tmp_path):
     """Test scanning an empty file."""
     empty_path = tmp_path / "empty.h5"
