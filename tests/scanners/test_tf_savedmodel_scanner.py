@@ -131,6 +131,24 @@ def create_tf_savedmodel(tmp_path: Path, *, malicious: bool = False) -> Path:
     return model_dir
 
 
+def _build_protocol1_pickle_payload() -> bytes:
+    import os as os_module
+
+    class DangerousPayload:
+        def __reduce__(self) -> tuple[object, tuple[str]]:
+            return (os_module.system, ("echo savedmodel-asset-test",))
+
+    return pickle.dumps(DangerousPayload(), protocol=1)
+
+
+def _build_minimal_pe_bytes() -> bytes:
+    payload = bytearray(0x80)
+    payload[0:2] = b"MZ"
+    payload[0x3C:0x40] = (0x40).to_bytes(4, "little")
+    payload[0x40:0x44] = b"PE\x00\x00"
+    return bytes(payload)
+
+
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 def test_tf_savedmodel_scanner_safe_model(tmp_path: Path) -> None:
     """Test scanning a safe TensorFlow SavedModel."""
@@ -525,12 +543,40 @@ def test_savedmodel_assets_extra_pe_executable_is_flagged(tmp_path: Path) -> Non
     extra_dir = model_dir / "assets.extra"
     extra_dir.mkdir(exist_ok=True)
     pe_path = extra_dir / "helper.dll"
-    pe_path.write_bytes(b"MZ" + b"\x00" * 100)
+    pe_path.write_bytes(_build_minimal_pe_bytes())
 
     result = TensorFlowSavedModelScanner().scan(str(model_dir))
     asset_issues = [issue for issue in result.issues if issue.location == str(pe_path)]
     assert asset_issues
     assert any("pe_executable" in issue.details.get("detected_content_type", "") for issue in asset_issues)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_assets_protocol1_pickle_is_flagged(tmp_path: Path) -> None:
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    asset_path = model_dir / "assets" / "payload.dat"
+    asset_path.write_bytes(_build_protocol1_pickle_payload())
+
+    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    asset_issues = [issue for issue in result.issues if issue.location == str(asset_path)]
+
+    assert asset_issues
+    assert any("pickle_payload" in issue.details.get("detected_content_type", "") for issue in asset_issues)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_assets_extra_comment_prefixed_protocol1_pickle_is_flagged(tmp_path: Path) -> None:
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    extra_dir = model_dir / "assets.extra"
+    extra_dir.mkdir(exist_ok=True)
+    asset_path = extra_dir / "bypass.dat"
+    asset_path.write_bytes(b"#" + _build_protocol1_pickle_payload())
+
+    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    asset_issues = [issue for issue in result.issues if issue.location == str(asset_path)]
+
+    assert asset_issues
+    assert any("pickle_payload" in issue.details.get("detected_content_type", "") for issue in asset_issues)
 
 
 def test_tf_savedmodel_scanner_not_a_directory(tmp_path):

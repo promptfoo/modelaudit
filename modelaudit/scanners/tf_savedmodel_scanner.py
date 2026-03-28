@@ -11,6 +11,7 @@ from typing import Any, ClassVar
 
 from modelaudit.config.explanations import get_tf_op_explanation
 from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_OPS, TENSORFLOW_DANGEROUS_OPS
+from modelaudit.utils.file.detection import _looks_like_proto0_or_1_pickle
 from modelaudit.utils.helpers.code_validation import (
     is_code_potentially_dangerous,
     validate_python_syntax,
@@ -44,10 +45,20 @@ _ASSET_MACHO_HEADERS = (
 )
 _ASSET_PE_HEADER = b"MZ"  # Windows PE executables
 _ASSET_PICKLE_PREFIXES = tuple(bytes([0x80, protocol]) for protocol in range(2, 6))
-_ASSET_PICKLE_PROTO0_PATTERN = re.compile(rb"^c[a-zA-Z_][\w.]*\n[a-zA-Z_]\w*\n")
 _ASSET_PYTHON_PATTERN = re.compile(
     r"(?m)(^\s*(?:from\s+\w[\w.]*\s+import\s+|import\s+\w[\w.]*|def\s+\w+\s*\(|class\s+\w+\s*[:(]))"
 )
+
+
+def _looks_like_pe_executable(content_head: bytes) -> bool:
+    """Return True for a minimally valid PE/COFF executable prefix."""
+    if not content_head.startswith(_ASSET_PE_HEADER) or len(content_head) < 0x40:
+        return False
+
+    pe_offset = int.from_bytes(content_head[0x3C:0x40], "little", signed=False)
+    if pe_offset < 0x40 or pe_offset + 4 > len(content_head):
+        return False
+    return content_head[pe_offset : pe_offset + 4] == b"PE\x00\x00"
 
 
 def _check_protos() -> bool:
@@ -368,13 +379,13 @@ class TensorFlowSavedModelScanner(BaseScanner):
             detected_types.append("script_shebang")
         if content_head.startswith(_ASSET_ELF_HEADER):
             detected_types.append("elf_binary")
-        if content_head.startswith(_ASSET_PE_HEADER):
+        if _looks_like_pe_executable(content_head):
             detected_types.append("pe_executable")
         if any(content_head.startswith(header) for header in _ASSET_MACHO_HEADERS):
             detected_types.append("macho_binary")
         if any(content_head.startswith(prefix) for prefix in _ASSET_PICKLE_PREFIXES):
             detected_types.append("pickle_payload")
-        if _ASSET_PICKLE_PROTO0_PATTERN.match(content_head):
+        if _looks_like_proto0_or_1_pickle(content_head):
             detected_types.append("pickle_payload")
 
         decoded_head = content_head.decode("utf-8", errors="ignore")
