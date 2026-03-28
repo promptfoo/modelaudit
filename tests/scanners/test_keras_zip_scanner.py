@@ -1931,6 +1931,24 @@ class TestCVE20259906UnsafeDeserialization:
         assert len(cve_issues) == 1
         assert cve_issues[0].details["detection_method"] == "raw_config_scan"
 
+    def test_doc_padding_near_threshold_still_hits_raw_detection(self, tmp_path: Path) -> None:
+        """A 50/50 doc-like split must still allow raw-config detection to win."""
+        scanner = KerasZipScanner()
+        near_threshold_text = "\n".join(
+            [
+                "This is a descriptive model note used only for context",
+                "Another explanatory line with many words but no period",
+                "keras.config.enable_unsafe_deserialization",
+                "A short line with punctuation.",
+            ]
+        )
+        config_str = json.dumps({"description": near_threshold_text})
+
+        result = scanner.scan(self._make_keras_zip(config_str, tmp_path))
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-9906"]
+        assert len(cve_issues) == 1
+        assert cve_issues[0].details["detection_method"] == "raw_config_scan"
+
     def test_benign_documentation_text_stays_clean(self, tmp_path: Path) -> None:
         """Benign long-form documentation text should not trigger CVE checks."""
         scanner = KerasZipScanner()
