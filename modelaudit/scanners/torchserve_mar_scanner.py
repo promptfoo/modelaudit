@@ -763,7 +763,7 @@ class TorchServeMarScanner(BaseScanner):
             if not member_name or member_name.endswith("/"):
                 continue
 
-            if normalized_member.endswith("requirements.txt"):
+            if PurePosixPath(normalized_member).name == "requirements.txt":
                 self._analyze_requirements_txt(
                     archive_path=archive_path,
                     archive=archive,
@@ -1015,7 +1015,12 @@ class TorchServeMarScanner(BaseScanner):
                     )
                 continue
 
-            if lowered.startswith(("-e ", "--editable ")):
+            editable_target = self._extract_pip_option_value(
+                line,
+                long_options=("--editable",),
+                short_options=("-e",),
+            )
+            if editable_target is not None:
                 findings.append(
                     {
                         "line": line_number,
@@ -1106,7 +1111,7 @@ class TorchServeMarScanner(BaseScanner):
         for option in (*long_options, *short_options):
             option_prefix = f"{option}="
             if lowered_first == option:
-                return tokens[1].strip() if len(tokens) > 1 else ""
+                return tokens[1].strip() if len(tokens) > 1 else None
             if lowered_first.startswith(option_prefix):
                 return first_token[len(option_prefix) :].strip()
         return None
@@ -1131,7 +1136,7 @@ class TorchServeMarScanner(BaseScanner):
         return parsed.scheme.lower() != "file"
 
     def _extract_requirement_name(self, line: str) -> str:
-        return re.split(r"[;@<>=!~\s\[]", line, maxsplit=1)[0].strip().lower()
+        return re.split(r"[;@<>=!~\s\[#]", line, maxsplit=1)[0].strip().lower()
 
     def _check_symlink_target(
         self,

