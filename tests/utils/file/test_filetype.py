@@ -493,6 +493,10 @@ def test_detect_format_from_extension(tmp_path):
     (dir_path / "saved_model.pb").write_bytes(b"d")
     assert detect_format_from_extension(str(dir_path)) == "tensorflow_directory"
 
+    skops_path = tmp_path / "pipeline.skops"
+    skops_path.write_bytes(b"PK\x03\x04")
+    assert detect_format_from_extension(str(skops_path)) == "skops"
+
 
 def test_detect_gguf_ggml_formats(tmp_path):
     """Test detection of GGUF and GGML formats by magic bytes."""

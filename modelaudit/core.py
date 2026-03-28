@@ -69,6 +69,47 @@ OPERATIONAL_ERROR_INDICATORS = (
     "Too many open files",
 )
 
+HEADER_FORMAT_TO_SCANNER_ID = {
+    "pickle": "pickle",
+    "pytorch_binary": "pytorch_binary",
+    "hdf5": "keras_h5",
+    "keras": "keras_h5",
+    "safetensors": "safetensors",
+    "tensorflow_directory": "tf_savedmodel",
+    "protobuf": "tf_savedmodel",
+    "tf_metagraph": "tf_metagraph",
+    "tar": "tar",
+    "zip": "zip",
+    "onnx": "onnx",
+    "gguf": "gguf",
+    "ggml": "gguf",
+    "numpy": "numpy",
+    "openvino": "openvino",
+    "pmml": "pmml",
+    "cntk": "cntk",
+    "lightgbm": "lightgbm",
+    "torch7": "torch7",
+    "catboost": "catboost",
+    "rknn": "rknn",
+    "mxnet": "mxnet",
+    "nemo": "nemo",
+    "llamafile": "llamafile",
+    "tflite": "tflite",
+    "coreml": "coreml",
+    "paddle": "paddle",
+    "tensorrt": "tensorrt",
+    "flax_msgpack": "flax_msgpack",
+    "r_serialized": "r_serialized",
+    "executorch": "executorch",
+    "compressed": "compressed",
+    "sevenzip": "sevenzip",
+    "skops": "skops",
+    "torchserve_mar": "torchserve_mar",
+    "joblib": "joblib",
+    "xgboost": "xgboost",
+    "jax_checkpoint": "jax_checkpoint",
+}
+
 
 def _has_operational_error_message(message: Any) -> bool:
     """Return True when an issue message reflects an operational scan failure."""
@@ -1421,21 +1462,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         # TorchServe .mar model archives are ZIP-based - use dedicated MAR scanner
         preferred_scanner = _registry.load_scanner_by_id("torchserve_mar")
     else:
-        format_to_scanner = {
-            "pickle": "pickle",
-            "pytorch_binary": "pytorch_binary",
-            "hdf5": "keras_h5",
-            "safetensors": "safetensors",
-            "tensorflow_directory": "tf_savedmodel",
-            "protobuf": "tf_savedmodel",
-            "tar": "tar",
-            "zip": "zip",
-            "onnx": "onnx",
-            "gguf": "gguf",
-            "ggml": "gguf",
-            "numpy": "numpy",
-        }
-        scanner_id = format_to_scanner.get(header_format)
+        scanner_id = HEADER_FORMAT_TO_SCANNER_ID.get(header_format)
         if scanner_id:
             preferred_scanner = _registry.load_scanner_by_id(scanner_id)
 

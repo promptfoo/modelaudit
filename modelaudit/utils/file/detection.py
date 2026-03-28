@@ -831,6 +831,7 @@ EXTENSION_FORMAT_MAP = {
     ".npy": "numpy",
     ".npz": "zip",
     ".joblib": "pickle",  # joblib can be either zip or pickle format
+    ".skops": "skops",
     ".pdmodel": "paddle",
     ".pdiparams": "paddle",
     ".params": "mxnet",
@@ -912,6 +913,8 @@ def detect_format_from_extension_pattern_matching(extension: FileExtension) -> F
             return "pmml"
         case ".npy" | ".npz":
             return "numpy"
+        case ".skops":
+            return "skops"
         case ".msgpack":
             return "flax_msgpack"
         case ".nemo":

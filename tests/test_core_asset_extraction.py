@@ -1,3 +1,5 @@
+import ast
+import inspect
 import ntpath
 import pickle
 import sys
@@ -10,7 +12,13 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 
-from modelaudit.core import _extract_primary_asset_from_location, scan_model_directory_or_file
+from modelaudit.core import (
+    HEADER_FORMAT_TO_SCANNER_ID,
+    _extract_primary_asset_from_location,
+    scan_model_directory_or_file,
+)
+from modelaudit.scanners import _registry
+from modelaudit.utils.file import detection
 
 
 def test_extract_primary_asset_windows_path_with_archive() -> None:
@@ -147,3 +155,26 @@ def test_check_consolidation_keeps_nested_npz_member_findings_distinct(tmp_path:
         "inner.npz:payload_a.npy",
         "inner.npz:payload_b.npy",
     }
+
+
+def test_detect_file_format_outputs_have_primary_routing_or_registered_scanner() -> None:
+    source = inspect.getsource(detection.detect_file_format)
+    function_ast = ast.parse(source)
+
+    returned_formats: set[str] = set()
+    for node in ast.walk(function_ast):
+        if isinstance(node, ast.Return) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+            returned_formats.add(node.value.value)
+
+    ignored_formats = {"unknown", "directory"}
+    registered_scanner_ids = set(_registry._scanners.keys())
+
+    unmapped_formats = sorted(
+        format_name
+        for format_name in returned_formats
+        if format_name not in ignored_formats
+        and format_name not in HEADER_FORMAT_TO_SCANNER_ID
+        and format_name not in registered_scanner_ids
+    )
+
+    assert not unmapped_formats, f"Formats must have primary routing or registered scanners: {unmapped_formats}"
