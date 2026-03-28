@@ -211,12 +211,27 @@ def test_large_pickle_raw_pattern_limit_with_opcode_budget_truncation(tmp_path: 
     assert result.success is False
 
 
-def test_scan_pickle_timeout_finishes_fail_closed(tmp_path: Path) -> None:
+def test_scan_pickle_timeout_finishes_fail_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Top-level pickle scans should finish unsuccessful when the timeout path trips."""
     pickle_path = tmp_path / "timeout.pkl"
     pickle_path.write_bytes(pickle.dumps({"weights": [1, 2, 3], "name": "safe"}))
 
-    result = PickleScanner({"timeout": 0}).scan(str(pickle_path))
+    def _fake_scan_pickle_bytes(self: PickleScanner, _file_obj: object, _file_size: int) -> ScanResult:
+        scan_result = self._create_result()
+        scan_result.add_check(
+            name="Scan Timeout Check",
+            passed=False,
+            message="Scanning timed out after 0.1 seconds",
+            severity=IssueSeverity.INFO,
+            location=str(pickle_path),
+            details={"timeout": 0.1},
+            rule_code="S902",
+        )
+        scan_result.finish(success=False)
+        return scan_result
+
+    monkeypatch.setattr(PickleScanner, "_scan_pickle_bytes", _fake_scan_pickle_bytes)
+    result = PickleScanner({"timeout": 0.1}).scan(str(pickle_path))
 
     timeout_checks = [
         check for check in result.checks if check.name == "Scan Timeout Check" and check.status == CheckStatus.FAILED
@@ -224,6 +239,63 @@ def test_scan_pickle_timeout_finishes_fail_closed(tmp_path: Path) -> None:
     assert len(timeout_checks) == 1
     assert "timed out" in timeout_checks[0].message.lower()
     assert result.success is False
+
+
+def test_scan_pickle_bytes_uses_scan_wide_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Opcode analysis should honor the scanner-wide deadline, not a fresh local timer."""
+    scanner = PickleScanner({"timeout": 0.1})
+    scanner.current_file_path = "timeout.pkl"
+    scanner.scan_start_time = 0.0
+    payload = pickle.dumps({"weights": [1, 2, 3], "name": "safe"})
+
+    monkeypatch.setattr("modelaudit.scanners.pickle_scanner.time.time", lambda: 1.0)
+
+    result = scanner._scan_pickle_bytes(BytesIO(payload), len(payload))
+
+    timeout_checks = [
+        check for check in result.checks if check.name == "Scan Timeout Check" and check.status == CheckStatus.FAILED
+    ]
+    assert len(timeout_checks) == 1
+    assert result.success is False
+
+
+def test_bin_tail_scan_runs_after_budget_exhaustion_with_malicious_tail(tmp_path: Path) -> None:
+    """Budget exhaustion after the first STOP should not suppress .bin tail scanning."""
+    first_stream = pickle.dumps({"weights": [1, 2, 3], "name": "safe"})
+    follow_on_streams = b"".join(
+        pickle.dumps({"stream": index, "weights": [1, 2, 3]}, protocol=4) for index in range(32)
+    )
+    padding = b"\x00" * max(0, 9000 - len(first_stream) - len(follow_on_streams))
+    bin_path = tmp_path / "budget-tail.bin"
+    bin_path.write_bytes(first_stream + follow_on_streams + padding + BINARY_CODE_PATTERNS[0])
+
+    result = PickleScanner({"max_opcodes": 25}).scan(str(bin_path))
+
+    assert result.success is False
+    assert result.metadata["analysis_incomplete"] is True
+    assert isinstance(result.metadata.get("first_pickle_end_pos"), int)
+    assert any(
+        check.name == "Binary Content Check" and check.status == CheckStatus.FAILED for check in result.checks
+    ), f"Expected binary tail finding, got: {[(c.name, c.status, c.message) for c in result.checks]}"
+
+
+def test_bin_tail_scan_after_budget_exhaustion_stays_clean_for_benign_tail(tmp_path: Path) -> None:
+    """Running the post-pickle .bin tail scan after truncation should not create false positives."""
+    first_stream = pickle.dumps({"weights": [1, 2, 3], "name": "safe"})
+    follow_on_streams = b"".join(
+        pickle.dumps({"stream": index, "weights": [1, 2, 3]}, protocol=4) for index in range(32)
+    )
+    padding = b"\x00" * max(0, 9000 - len(first_stream) - len(follow_on_streams))
+    bin_path = tmp_path / "budget-tail-benign.bin"
+    bin_path.write_bytes(first_stream + follow_on_streams + padding + b"benign-tensor-data")
+
+    result = PickleScanner({"max_opcodes": 25}).scan(str(bin_path))
+
+    assert result.success is False
+    assert result.metadata["analysis_incomplete"] is True
+    assert not any(
+        check.name == "Binary Content Check" and check.status == CheckStatus.FAILED for check in result.checks
+    ), f"Unexpected binary tail finding, got: {[(c.name, c.status, c.message) for c in result.checks]}"
 
 
 class TestPickleScanner(unittest.TestCase):
@@ -2600,7 +2672,7 @@ def test_scan_legitimate_pytorch_pickle_memory_error_is_non_failing(
     monkeypatch.setattr(
         PickleScanner,
         "_extract_globals_advanced",
-        lambda self, file_obj, multiple_pickles=True: {("torch", "OrderedDict", "GLOBAL")},
+        lambda self, file_obj, multiple_pickles=True, scan_start_time=None: {("torch", "OrderedDict", "GLOBAL")},
     )
 
     result = PickleScanner().scan(str(model_path))
@@ -2644,7 +2716,7 @@ def test_scan_legitimate_pytorch_bin_memory_error_is_informational(
     monkeypatch.setattr(
         PickleScanner,
         "_extract_globals_advanced",
-        lambda self, file_obj, multiple_pickles=True: {
+        lambda self, file_obj, multiple_pickles=True, scan_start_time=None: {
             ("torch._utils", "_rebuild_tensor_v2", "GLOBAL"),
             ("collections", "OrderedDict", "GLOBAL"),
         },

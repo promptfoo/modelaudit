@@ -3775,11 +3775,11 @@ class PickleScanner(BaseScanner):
                 result.merge(scan_result)
 
                 # For .bin files, also scan the remaining binary content
-                # PyTorch files have pickle header followed by tensor data
-                if is_bin_file and scan_result.success:
-                    # Use the first pickle stream end position (before multi-stream
-                    # scanning consumed additional bytes) for binary content scanning.
-                    pickle_end_pos = scan_result.metadata.get("first_pickle_end_pos", f.tell())
+                # PyTorch files have pickle header followed by tensor data. Keep
+                # scanning the tail when the first pickle stream completed even if
+                # opcode-budget or timeout limits marked the opcode scan unsuccessful.
+                pickle_end_pos = scan_result.metadata.get("first_pickle_end_pos")
+                if is_bin_file and isinstance(pickle_end_pos, int):
                     remaining_bytes = file_size - pickle_end_pos
 
                     if remaining_bytes > 0:
@@ -4499,7 +4499,7 @@ class PickleScanner(BaseScanner):
 
         file_obj.seek(current_pos)  # Reset position
         # Extract global references across all pickle streams
-        advanced_globals = self._extract_globals_advanced(file_obj)
+        advanced_globals = self._extract_globals_advanced(file_obj, scan_start_time=self.scan_start_time)
         file_obj.seek(current_pos)  # Reset again after extraction
 
         raw_pattern_scan_complete = file_size <= _RAW_PATTERN_SCAN_LIMIT_BYTES
@@ -4693,12 +4693,15 @@ class PickleScanner(BaseScanner):
             opcode_budget_exceeded = False
             timed_out = False
 
+            scan_start_time = self.scan_start_time if self.scan_start_time is not None else result.start_time
+            deadline = scan_start_time + self.timeout
+
             try:
                 for opcode, arg, pos in _genops_with_fallback(
                     file_obj,
                     multi_stream=True,
                     max_items=self.max_opcodes + 1,
-                    deadline=result.start_time + self.timeout,
+                    deadline=deadline,
                 ):
                     # Check for interrupts periodically during opcode processing
                     if opcode_count % 1000 == 0:  # Check every 1000 opcodes
@@ -4776,7 +4779,7 @@ class PickleScanner(BaseScanner):
                         break
 
                     # Check for timeout
-                    if time.time() - result.start_time > self.timeout:
+                    if time.time() > deadline:
                         timed_out = True
                         result.add_check(
                             name="Scan Timeout Check",
@@ -4813,7 +4816,7 @@ class PickleScanner(BaseScanner):
                     rule_code="S902",
                 )
 
-            if time.time() - result.start_time > self.timeout and not any(
+            if time.time() > deadline and not any(
                 check.name == "Scan Timeout Check" and check.status == CheckStatus.FAILED for check in result.checks
             ):
                 timed_out = True
