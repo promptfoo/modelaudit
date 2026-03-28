@@ -2078,6 +2078,15 @@ def _is_warning_severity_ref(normalized_mod: str, normalized_func: str) -> bool:
     return normalized_func in warning_funcs
 
 
+def _dangerous_ref_base_severity(normalized_mod: str, normalized_func: str) -> IssueSeverity:
+    """Return the base severity for a resolved dangerous import reference."""
+    return (
+        IssueSeverity.WARNING
+        if _is_warning_severity_ref(normalized_mod, normalized_func)
+        else IssueSeverity.CRITICAL
+    )
+
+
 def _is_resolved_import_target(mod: str, func: str) -> bool:
     """Return True when module/function look like concrete Python import targets."""
     if not mod or not func:
@@ -2108,19 +2117,11 @@ def _classify_import_reference(
 
     normalized_mod, normalized_func = _normalize_import_reference(mod, func)
     if is_import_only and (normalized_mod, normalized_func) in IMPORT_ONLY_ALWAYS_DANGEROUS_GLOBALS:
-        base_sev = (
-            IssueSeverity.WARNING
-            if _is_warning_severity_ref(normalized_mod, normalized_func)
-            else IssueSeverity.CRITICAL
-        )
+        base_sev = _dangerous_ref_base_severity(normalized_mod, normalized_func)
         return True, base_sev, "dangerous"
 
     if _is_actually_dangerous_global(mod, func, ml_context):
-        base_sev = (
-            IssueSeverity.WARNING
-            if _is_warning_severity_ref(normalized_mod, normalized_func)
-            else IssueSeverity.CRITICAL
-        )
+        base_sev = _dangerous_ref_base_severity(normalized_mod, normalized_func)
         return True, base_sev, "dangerous"
 
     if _is_safe_ml_global(mod, func):
@@ -5010,11 +5011,7 @@ class PickleScanner(BaseScanner):
                 if _is_actually_dangerous_global(mod, func, ml_context):
                     suspicious_count += 1
                     normalized_mod, normalized_func = _normalize_import_reference(mod, func)
-                    base_sev = (
-                        IssueSeverity.WARNING
-                        if _is_warning_severity_ref(normalized_mod, normalized_func)
-                        else IssueSeverity.CRITICAL
-                    )
+                    base_sev = _dangerous_ref_base_severity(normalized_mod, normalized_func)
                     severity = _get_context_aware_severity(
                         base_sev,
                         ml_context,
@@ -5169,13 +5166,22 @@ class PickleScanner(BaseScanner):
                             # NOT in safe globals - check if it's actually dangerous
                             # Use _is_actually_dangerous_global to determine severity (CRITICAL vs WARNING)
                             if reduce_mod and reduce_func:
+                                normalized_reduce_mod, normalized_reduce_func = _normalize_import_reference(
+                                    reduce_mod,
+                                    reduce_func,
+                                )
+                                dangerous_base_severity = _dangerous_ref_base_severity(
+                                    normalized_reduce_mod,
+                                    normalized_reduce_func,
+                                )
                                 is_actually_dangerous = reduce_origin_is_ext or _is_actually_dangerous_global(
                                     reduce_mod, reduce_func, ml_context
                                 )
                                 if is_actually_dangerous:
-                                    # Dangerous global (e.g., os.system) - CRITICAL
+                                    # Dangerous global (e.g., os.system) - CRITICAL unless
+                                    # the dangerous ref is explicitly configured as WARNING.
                                     severity = _get_context_aware_severity(
-                                        IssueSeverity.CRITICAL,
+                                        dangerous_base_severity,
                                         ml_context,
                                         issue_type="dangerous_global",
                                     )
@@ -5329,13 +5335,22 @@ class PickleScanner(BaseScanner):
                         else:
                             # NOT in safe classes - check if actually dangerous
                             if class_mod and class_name:
+                                normalized_class_mod, normalized_class_name = _normalize_import_reference(
+                                    class_mod,
+                                    class_name,
+                                )
+                                dangerous_base_severity = _dangerous_ref_base_severity(
+                                    normalized_class_mod,
+                                    normalized_class_name,
+                                )
                                 is_actually_dangerous = class_origin_is_ext or _is_actually_dangerous_global(
                                     class_mod, class_name, ml_context
                                 )
                                 if is_actually_dangerous:
-                                    # Dangerous class (e.g., os.system wrapper) - CRITICAL
+                                    # Dangerous class (e.g., os.system wrapper) - CRITICAL unless
+                                    # the dangerous ref is explicitly configured as WARNING.
                                     severity = _get_context_aware_severity(
-                                        IssueSeverity.CRITICAL,
+                                        dangerous_base_severity,
                                         ml_context,
                                         issue_type="dangerous_global",
                                     )
@@ -5763,8 +5778,17 @@ class PickleScanner(BaseScanner):
             )
             if dangerous_pattern:
                 suspicious_count += 1
+                normalized_pattern_mod, normalized_pattern_func = _normalize_import_reference(
+                    dangerous_pattern.get("module", ""),
+                    dangerous_pattern.get("function", ""),
+                )
+                dangerous_pattern_base_severity = (
+                    _dangerous_ref_base_severity(normalized_pattern_mod, normalized_pattern_func)
+                    if normalized_pattern_mod and normalized_pattern_func
+                    else IssueSeverity.CRITICAL
+                )
                 severity = _get_context_aware_severity(
-                    IssueSeverity.CRITICAL,
+                    dangerous_pattern_base_severity,
                     ml_context,
                     issue_type="dangerous_import",
                 )

@@ -2089,11 +2089,34 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
         result = self._scan_bytes(self._craft_global_reduce_pickle("functools", "partial"))
 
         assert result.success
-        assert result.has_errors
+        assert not result.has_errors
         partial_issues = [i for i in result.issues if "functools.partial" in i.message.lower()]
         assert partial_issues, f"Expected functools.partial finding, got: {[i.message for i in result.issues]}"
         assert any(issue.severity == IssueSeverity.WARNING for issue in partial_issues), (
             f"Expected WARNING functools.partial finding, got: {[(i.severity, i.message) for i in partial_issues]}"
+        )
+        assert not any(issue.severity == IssueSeverity.CRITICAL for issue in partial_issues), (
+            "Did not expect CRITICAL functools.partial finding, "
+            f"got: {[(i.severity, i.message) for i in partial_issues]}"
+        )
+
+    def test_functools_partialmethod_remains_warning(self) -> None:
+        """functools.partialmethod should inherit the same WARNING downgrade as partial."""
+        result = self._scan_bytes(self._craft_global_reduce_pickle("functools", "partialmethod"))
+
+        assert result.success
+        assert not result.has_errors
+        partialmethod_issues = [i for i in result.issues if "functools.partialmethod" in i.message.lower()]
+        assert partialmethod_issues, (
+            f"Expected functools.partialmethod finding, got: {[i.message for i in result.issues]}"
+        )
+        assert any(issue.severity == IssueSeverity.WARNING for issue in partialmethod_issues), (
+            "Expected WARNING functools.partialmethod finding, "
+            f"got: {[(i.severity, i.message) for i in partialmethod_issues]}"
+        )
+        assert not any(issue.severity == IssueSeverity.CRITICAL for issue in partialmethod_issues), (
+            "Did not expect CRITICAL functools.partialmethod finding, "
+            f"got: {[(i.severity, i.message) for i in partialmethod_issues]}"
         )
 
     # ------------------------------------------------------------------
