@@ -369,6 +369,59 @@ class TestSevenZipScanner:
                 inner_7z_path.unlink()
 
     @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_scan_misnamed_nested_7z_archive_ignores_low_value_fillers(
+        self,
+        temp_7z_file: str,
+        tmp_path: Path,
+    ) -> None:
+        """Low-value unsupported members should not consume the nested-archive probe budget."""
+        import py7zr  # type: ignore[import-untyped]
+
+        class MaliciousClass:
+            def __reduce__(self):
+                import os as os_module
+
+                return (os_module.system, ("echo disguised_7z_nested",))
+
+        scanner = SevenZipScanner(config={"max_7z_extensionless_probes": 1})
+        inner_7z_path = tmp_path / "misnamed_inner.7z"
+        temp_pickle_path = tmp_path / "payload.pkl"
+        with temp_pickle_path.open("wb") as temp_pickle:
+            pickle.dump(MaliciousClass(), temp_pickle)
+
+        try:
+            with py7zr.SevenZipFile(inner_7z_path, "w") as archive:
+                archive.write(str(temp_pickle_path), "payload.pkl")
+
+            with py7zr.SevenZipFile(temp_7z_file, "w") as archive:
+                for index in range(10):
+                    archive.writestr(b"filler", f"docs/{index}.txt")
+                archive.write(str(inner_7z_path), "nested.jpg")
+
+            result = scanner.scan(temp_7z_file)
+
+            system_symbols = {
+                "os.system",
+                f"{os.system.__module__}.system",
+            }
+            nested_issues = [
+                issue
+                for issue in result.issues
+                if issue.location
+                and f"{temp_7z_file}:nested.jpg:payload.pkl" in issue.location
+                and any(symbol in issue.message.lower() for symbol in system_symbols)
+            ]
+            assert result.success
+            assert len(nested_issues) > 0
+            assert not any(check.name == "Nested Member Probe Limit" for check in result.checks)
+
+        finally:
+            if temp_pickle_path.exists():
+                temp_pickle_path.unlink()
+            if inner_7z_path.exists():
+                inner_7z_path.unlink()
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
     def test_max_depth_limit(self, temp_7z_file: str) -> None:
         """Nested 7z archives should enforce the configured maximum depth."""
         import py7zr  # type: ignore[import-untyped]
@@ -594,10 +647,8 @@ class TestSevenZipScanner:
             assert result.metadata["total_files"] == 3
             assert result.metadata["unsafe_entries"] == 1
             assert result.metadata["scannable_files"] == 1
-            assert mock_archive.extract.call_count == 2
-            assert mock_archive.extract.call_args_list[0].kwargs["targets"] == ["readme.txt"]
-            assert "factory" in mock_archive.extract.call_args_list[0].kwargs
-            assert mock_archive.extract.call_args_list[1].kwargs["targets"] == ["safe.pkl"]
+            mock_archive.extract.assert_called_once()
+            assert mock_archive.extract.call_args.kwargs["targets"] == ["safe.pkl"]
 
     def test_oversized_entries_are_skipped_before_extraction(
         self,
