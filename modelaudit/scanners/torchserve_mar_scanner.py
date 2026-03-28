@@ -719,7 +719,7 @@ class TorchServeMarScanner(BaseScanner):
                 )
                 continue
 
-            risky_calls, parse_error = self._find_high_risk_calls(source_bytes)
+            tree, parse_error = self._parse_python_source(source_bytes)
             if parse_error is not None:
                 non_handler_findings += 1
                 result.add_check(
@@ -732,7 +732,8 @@ class TorchServeMarScanner(BaseScanner):
                 )
                 continue
 
-            tree = ast.parse(source_bytes.decode("utf-8", errors="replace"))
+            assert tree is not None
+            risky_calls = self._find_high_risk_calls_from_tree(tree)
             has_import_time_execution = self._has_import_time_execution(tree)
             is_init_module = member_name.endswith("/__init__.py") or member_name == "__init__.py"
 
@@ -832,7 +833,7 @@ class TorchServeMarScanner(BaseScanner):
             return resolved_head
         return ".".join([resolved_head, *tail])
 
-    def _find_high_risk_calls(self, source_bytes: bytes) -> tuple[set[str], str | None]:
+    def _parse_python_source(self, source_bytes: bytes) -> tuple[ast.Module | None, str | None]:
         try:
             source = source_bytes.decode("utf-8")
         except UnicodeDecodeError:
@@ -841,8 +842,11 @@ class TorchServeMarScanner(BaseScanner):
         try:
             tree = ast.parse(source)
         except SyntaxError as exc:
-            return set(), str(exc)
+            return None, str(exc)
 
+        return tree, None
+
+    def _find_high_risk_calls_from_tree(self, tree: ast.AST) -> set[str]:
         aliases = self._collect_import_aliases(tree)
         risky_calls: set[str] = set()
         for node in ast.walk(tree):
@@ -860,7 +864,14 @@ class TorchServeMarScanner(BaseScanner):
             if resolved_name.startswith("subprocess."):
                 risky_calls.add(resolved_name)
 
-        return risky_calls, None
+        return risky_calls
+
+    def _find_high_risk_calls(self, source_bytes: bytes) -> tuple[set[str], str | None]:
+        tree, parse_error = self._parse_python_source(source_bytes)
+        if tree is None:
+            return set(), parse_error
+
+        return self._find_high_risk_calls_from_tree(tree), None
 
     def _scan_archive_members(
         self,

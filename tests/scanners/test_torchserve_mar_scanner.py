@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import pickle
 import zipfile
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
+
+import pytest
 
 from modelaudit import core
 from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
@@ -155,6 +158,38 @@ def test_non_handler_python_analysis_detects_malicious_utils_module(tmp_path: Pa
         check.severity == IssueSeverity.WARNING and "high-risk calls: os.system" in check.message
         for check in non_handler_failures
     )
+
+
+def test_non_handler_python_analysis_parses_each_helper_module_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"import utils\n\ndef handle(data, context):\n    return utils.transform(data)\n",
+            "utils.py": b"def transform(data):\n    return {'ok': True, 'data': data}\n",
+            "weights.bin": b"weights",
+        },
+        filename="single_parse_utils.mar",
+    )
+
+    real_parse = ast.parse
+    parsed_sources: list[str] = []
+
+    def counting_parse(source: str, *args: Any, **kwargs: Any) -> ast.AST:
+        parsed_sources.append(source)
+        return cast(ast.AST, real_parse(source, *args, **kwargs))
+
+    monkeypatch.setattr("modelaudit.scanners.torchserve_mar_scanner.ast.parse", counting_parse)
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+
+    assert result.success
+    utils_parse_count = sum("def transform(data)" in source for source in parsed_sources)
+    assert utils_parse_count == 1
 
 
 def test_non_handler_python_analysis_detects_malicious_init_module(tmp_path: Path) -> None:
