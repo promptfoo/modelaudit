@@ -42,7 +42,9 @@ _ASSET_MACHO_HEADERS = (
     b"\xca\xfe\xba\xbe",  # FAT_MAGIC
     b"\xbe\xba\xfe\xca",  # FAT_CIGAM
 )
+_ASSET_PE_HEADER = b"MZ"  # Windows PE executables
 _ASSET_PICKLE_PREFIXES = tuple(bytes([0x80, protocol]) for protocol in range(2, 6))
+_ASSET_PICKLE_PROTO0_PATTERN = re.compile(rb"^c[a-zA-Z_][\w.]*\n[a-zA-Z_]\w*\n")
 _ASSET_PYTHON_PATTERN = re.compile(
     r"(?m)(^\s*(?:from\s+\w[\w.]*\s+import\s+|import\s+\w[\w.]*|def\s+\w+\s*\(|class\s+\w+\s*[:(]))"
 )
@@ -320,7 +322,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
             for root, _dirs, files in os.walk(assets_dir):
                 for file_name in files:
                     file_path = Path(root) / file_name
-                    detected_types = self._detect_suspicious_asset_content(file_path)
+                    detected_types = self._detect_suspicious_asset_content(file_path, result)
                     if not detected_types:
                         continue
 
@@ -342,12 +344,23 @@ class TensorFlowSavedModelScanner(BaseScanner):
                         rule_code="S902",
                     )
 
-    def _detect_suspicious_asset_content(self, file_path: Path) -> list[str]:
+    def _detect_suspicious_asset_content(self, file_path: Path, result: ScanResult) -> list[str]:
         """Return suspicious content types found in a SavedModel asset file."""
+        if not file_path.is_file():
+            return []
+
         try:
             with file_path.open("rb") as file_obj:
                 content_head = file_obj.read(8192)
-        except OSError:
+        except OSError as exc:
+            result.add_check(
+                name="SavedModel Assets Security Check",
+                passed=False,
+                message=f"Cannot read asset file for security analysis: {file_path.name}: {exc}",
+                severity=IssueSeverity.WARNING,
+                location=str(file_path),
+                rule_code="S902",
+            )
             return []
 
         detected_types: list[str] = []
@@ -355,9 +368,13 @@ class TensorFlowSavedModelScanner(BaseScanner):
             detected_types.append("script_shebang")
         if content_head.startswith(_ASSET_ELF_HEADER):
             detected_types.append("elf_binary")
+        if content_head.startswith(_ASSET_PE_HEADER):
+            detected_types.append("pe_executable")
         if any(content_head.startswith(header) for header in _ASSET_MACHO_HEADERS):
             detected_types.append("macho_binary")
         if any(content_head.startswith(prefix) for prefix in _ASSET_PICKLE_PREFIXES):
+            detected_types.append("pickle_payload")
+        if _ASSET_PICKLE_PROTO0_PATTERN.match(content_head):
             detected_types.append("pickle_payload")
 
         decoded_head = content_head.decode("utf-8", errors="ignore")

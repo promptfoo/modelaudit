@@ -519,6 +519,20 @@ def test_savedmodel_assets_python_pattern_in_non_py_file_is_flagged(tmp_path: Pa
     assert all(isinstance(check.details.get("size"), int) and check.details["size"] > 0 for check in matching_checks)
 
 
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_assets_extra_pe_executable_is_flagged(tmp_path: Path) -> None:
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    extra_dir = model_dir / "assets.extra"
+    extra_dir.mkdir(exist_ok=True)
+    pe_path = extra_dir / "helper.dll"
+    pe_path.write_bytes(b"MZ" + b"\x00" * 100)
+
+    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    asset_issues = [issue for issue in result.issues if issue.location == str(pe_path)]
+    assert asset_issues
+    assert any("pe_executable" in issue.details.get("detected_content_type", "") for issue in asset_issues)
+
+
 def test_tf_savedmodel_scanner_not_a_directory(tmp_path):
     """Test scanning a file instead of a directory."""
     # Create a file
