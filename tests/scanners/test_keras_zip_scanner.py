@@ -1959,6 +1959,23 @@ class TestCVE20259906UnsafeDeserialization:
         cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-9906"]
         assert len(cve_issues) == 0
 
+    def test_invalid_utf8_config_bytes_still_trigger_raw_fallback(self, tmp_path: Path) -> None:
+        """Invalid UTF-8 should still use the raw fallback instead of bypassing detection."""
+        scanner = KerasZipScanner()
+        keras_path = tmp_path / "invalid_utf8.keras"
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            zf.writestr("config.json", b'{"loader":"keras.config.enable_unsafe_deserialization",\xff')
+            zf.writestr("metadata.json", json.dumps({"keras_version": "3.13.2"}))
+
+        result = scanner.scan(str(keras_path))
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-9906"]
+        assert len(cve_issues) == 1
+        assert cve_issues[0].details["detection_method"] == "raw_config_scan"
+        parse_checks = [c for c in result.checks if c.name == "Config JSON Parsing"]
+        assert len(parse_checks) == 1
+        assert parse_checks[0].status != CheckStatus.PASSED
+        assert result.success is False
+
     def test_benign_documentation_text_stays_clean(self, tmp_path: Path) -> None:
         """Benign long-form documentation text should not trigger CVE checks."""
         scanner = KerasZipScanner()

@@ -259,7 +259,7 @@ class KerasZipScanner(BaseScanner):
                     raw_config_text = config_data.decode("utf-8", errors="ignore")
                     try:
                         model_config = json.loads(config_data)
-                    except json.JSONDecodeError as e:
+                    except (json.JSONDecodeError, UnicodeDecodeError) as e:
                         # Fall back to a structure-aware raw scan only when the archive
                         # config is malformed and cannot be parsed as JSON.
                         self._check_unsafe_deserialization_bypass_raw(raw_config_text, result)
