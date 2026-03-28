@@ -4,6 +4,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import ClassVar
 
+import pytest
+
 import modelaudit.scanners.base as base_module
 import modelaudit.whitelists as whitelist_module
 from modelaudit.analysis.unified_context import UnifiedMLContext
@@ -562,6 +564,31 @@ def test_whitelist_staleness_warning_only_logs_once(monkeypatch, caplog):
 
     warning_messages = [rec.message for rec in caplog.records if "HuggingFace whitelist is" in rec.message]
     assert len(warning_messages) == 1
+
+
+def test_whitelist_staleness_unknown_model_no_warning(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Unknown models should not emit a stale whitelist warning."""
+    stale_date = (datetime.now(timezone.utc).date() - timedelta(days=180)).isoformat()
+    monkeypatch.setattr(base_module, "_has_logged_stale_whitelist_warning", False)
+    monkeypatch.setattr(whitelist_module, "WHITELIST_GENERATED_AT", stale_date)
+
+    scanner = MockScanner()
+    scanner.context = UnifiedMLContext(
+        file_path=Path("/tmp/test.pkl"),
+        file_size=100,
+        file_type=".pkl",
+        model_id="unknown-author/unknown-model-12345",
+        model_source="huggingface",
+    )
+
+    with caplog.at_level(logging.WARNING, logger="modelaudit.scanners"):
+        result = scanner._create_result()
+        result._add_issue("Test warning", severity=IssueSeverity.WARNING)
+
+    assert not any("HuggingFace whitelist is" in rec.message for rec in caplog.records)
 
 
 def test_whitelist_unknown_model():
