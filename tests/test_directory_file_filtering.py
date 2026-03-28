@@ -194,6 +194,18 @@ class TestDirectoryFileFiltering:
 
         assert results["files_scanned"] == 0
 
+    def test_disguised_executorch_zip_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
+        """Directory scans should preserve disguised ZIPs that contain supported ExecuTorch payloads."""
+        disguised_zip = tmp_path / "executorch.jpg"
+        with zipfile.ZipFile(disguised_zip, "w") as archive:
+            archive.writestr("model.pte", b"executorch payload")
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        asset_names = {Path(asset.path).name for asset in results.assets}
+        assert "executorch.jpg" in asset_names
+
     def test_docx_like_zip_remains_skipped(self, tmp_path: Path) -> None:
         """Common document containers should not be treated as model archives."""
         docx_path = tmp_path / "report.docx"

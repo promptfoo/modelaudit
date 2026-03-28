@@ -1,5 +1,6 @@
 """File filtering utilities for ModelAudit."""
 
+import logging
 import os
 import zipfile
 from pathlib import Path
@@ -107,40 +108,35 @@ DEFAULT_SCANNABLE_SKIP_OVERRIDES = {
     ".7z",
 }
 
-_ZIP_MEMBER_SNIFF_LIMIT = 256
-_OFFICE_ARCHIVE_PREFIXES = ("word/", "xl/", "ppt/")
-_MODEL_ARCHIVE_SIGNAL_EXTENSIONS = frozenset(
+_ARCHIVE_SIGNAL_EXTENSION_EXCLUSIONS: frozenset[str] = frozenset(
     {
-        ".pkl",
-        ".pickle",
-        ".joblib",
-        ".pt",
-        ".pth",
-        ".ckpt",
-        ".onnx",
-        ".h5",
-        ".keras",
-        ".safetensors",
-        ".pb",
-        ".tflite",
-        ".npz",
-        ".npy",
-        ".mar",
-        ".tar",
-        ".tar.gz",
-        ".tgz",
-        ".tar.bz2",
-        ".tbz2",
-        ".tar.xz",
-        ".txz",
-        ".gz",
-        ".bz2",
-        ".xz",
-        ".zip",
-        ".7z",
+        ".bin",
+        ".json",
+        ".xml",
+        ".txt",
+        ".md",
+        ".markdown",
+        ".rst",
+        ".yaml",
+        ".yml",
+        ".cfg",
+        ".conf",
+        ".ini",
+        ".toml",
+        ".py",
+        ".js",
+        ".ts",
+        ".css",
+        ".scss",
+        ".sass",
+        ".less",
+        ".html",
     }
 )
-_MODEL_ARCHIVE_SIGNAL_BASENAMES = frozenset(
+
+_ZIP_MEMBER_SNIFF_LIMIT: int = 256
+_OFFICE_ARCHIVE_PREFIXES: tuple[str, ...] = ("word/", "xl/", "ppt/")
+_MODEL_ARCHIVE_SIGNAL_BASENAMES: frozenset[str] = frozenset(
     {
         "pytorch_model.bin",
         "adapter_model.bin",
@@ -155,6 +151,15 @@ def _get_scannable_extensions() -> set[str]:
     from ..model_extensions import get_model_extensions
 
     return get_model_extensions()
+
+
+def _get_model_archive_signal_extensions() -> frozenset[str]:
+    """Return model-bearing archive member suffixes that should promote skipped ZIP containers."""
+    return frozenset(
+        extension
+        for extension in _get_scannable_extensions()
+        if extension not in _ARCHIVE_SIGNAL_EXTENSION_EXCLUSIONS
+    )
 
 
 def _get_candidate_extensions(filename: str) -> list[str]:
@@ -184,15 +189,26 @@ def _has_scannable_content(path: str) -> bool:
             return True
 
         with zipfile.ZipFile(path, "r") as archive:
+            model_archive_signal_extensions = _get_model_archive_signal_extensions()
             has_keras_config = False
             has_keras_marker = False
             has_pytorch_data = False
             has_pytorch_marker = False
-            saw_office_prefix = False
             saw_content_types = False
+            saw_office_prefix = False
             processed_members = 0
+            file_infos = archive.filelist
+            for member in file_infos:
+                if not member.filename or member.is_dir():
+                    continue
+                normalized_member_name = member.filename.replace("\\", "/").strip("/")
+                if normalized_member_name == "[Content_Types].xml":
+                    saw_content_types = True
+                    continue
+                if normalized_member_name.startswith(_OFFICE_ARCHIVE_PREFIXES):
+                    saw_office_prefix = True
 
-            for member in archive.infolist():
+            for member in file_infos:
                 if processed_members >= _ZIP_MEMBER_SNIFF_LIMIT:
                     # If we cannot finish classifying the archive within the
                     # prefilter budget, preserve it for full scanning unless it
@@ -241,7 +257,7 @@ def _has_scannable_content(path: str) -> bool:
                     has_pytorch_marker = True
 
                 candidate_extensions = _get_candidate_extensions(member_name)
-                if any(candidate in _MODEL_ARCHIVE_SIGNAL_EXTENSIONS for candidate in candidate_extensions):
+                if any(candidate in model_archive_signal_extensions for candidate in candidate_extensions):
                     return True
 
                 if member_basename in _MODEL_ARCHIVE_SIGNAL_BASENAMES:
@@ -254,8 +270,9 @@ def _has_scannable_content(path: str) -> bool:
                 return True
 
         return False
-    except Exception:
-        return False
+    except Exception as exc:
+        logger.debug("Content sniffing failed for %s; preserving file for full scan: %s", path, exc)
+        return True
 
 
 def should_skip_file(
@@ -330,3 +347,4 @@ def should_skip_file(
 
     # Skip specific filenames
     return filename in skip_filenames
+logger = logging.getLogger(__name__)
