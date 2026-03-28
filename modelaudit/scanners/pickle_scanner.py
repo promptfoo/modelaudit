@@ -2584,6 +2584,11 @@ def _simulate_symbolic_reference_maps(
         if name == "READONLY_BUFFER":
             continue
 
+        # Preserve alignment for stack-neutral protocol markers like PROTO/FRAME.
+        if getattr(opcode, "stack_before", None) == [] and getattr(opcode, "stack_after", None) == []:
+            logger.debug(f"Simulator: ignoring stack-neutral opcode {opcode.name} at pos {_pos}")
+            continue
+
         # Unknown opcode - push a sentinel to keep stack in sync.
         # This handles future protocol versions gracefully.
         logger.debug(f"Simulator: unhandled opcode {opcode.name} at pos {_pos}")
