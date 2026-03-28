@@ -81,6 +81,31 @@ def test_scan_file_routes_misnamed_keras_zip_by_content(tmp_path: Path) -> None:
     assert any("lambda" in issue.message.lower() for issue in result.issues)
 
 
+def test_scan_file_routes_misnamed_config_only_keras_zip_by_content(tmp_path: Path) -> None:
+    disguised_keras = tmp_path / "model.jpg"
+    malicious_code = "exec(\"print('Malicious!')\")"
+    encoded_code = base64.b64encode(malicious_code.encode()).decode()
+    config = {
+        "class_name": "Functional",
+        "config": {
+            "layers": [
+                {"class_name": "InputLayer", "name": "input_1", "config": {}},
+                {
+                    "class_name": "Lambda",
+                    "name": "lambda_1",
+                    "config": {"function": [encoded_code, None, None], "function_type": "lambda"},
+                },
+            ]
+        },
+    }
+    _create_misnamed_zip(disguised_keras, {"config.json": json.dumps(config).encode("utf-8")})
+
+    result = scan_file(str(disguised_keras))
+
+    assert result.scanner_name == "keras_zip"
+    assert any("lambda" in issue.message.lower() for issue in result.issues)
+
+
 def test_scan_file_routes_config_only_keras_by_suffix(tmp_path: Path) -> None:
     keras_model = tmp_path / "model.keras"
     _create_misnamed_zip(
@@ -121,6 +146,15 @@ def test_scan_file_does_not_route_non_pytorch_zip_with_generic_pickle(tmp_path: 
             "version": b"1.0",
         },
     )
+
+    result = scan_file(str(disguised_zip))
+
+    assert result.scanner_name == "zip"
+
+
+def test_scan_file_does_not_route_generic_data_pickle_without_pytorch_metadata(tmp_path: Path) -> None:
+    disguised_zip = tmp_path / "data.jpg"
+    _create_misnamed_zip(disguised_zip, {"data.pkl": pickle.dumps({"weights": [1, 2, 3]})})
 
     result = scan_file(str(disguised_zip))
 

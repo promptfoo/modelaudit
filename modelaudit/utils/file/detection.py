@@ -60,6 +60,10 @@ _TORCHSERVE_MANIFEST_PATH = "MAR-INF/MANIFEST.json"
 _TORCHSERVE_MANIFEST_MAX_BYTES = 1 * 1024 * 1024
 _KERAS_ZIP_REQUIRED_ENTRY = "config.json"
 _KERAS_ZIP_MARKERS = frozenset({"metadata.json", "model.weights.h5", "variables.h5"})
+_KERAS_ZIP_CONFIG_MAX_BYTES = 4 * 1024 * 1024
+_KERAS_MODEL_CONFIG_KEYS = frozenset({"layers", "input_layers", "output_layers"})
+_KERAS_MODEL_TOP_LEVEL_HINTS = frozenset({"build_config", "compile_config", "module", "registered_name"})
+_PYTORCH_ZIP_METADATA_MAX_BYTES = 64
 _COMPRESSED_EXTENSION_CODECS = {
     ".gz": "gzip",
     ".bz2": "bzip2",
@@ -187,6 +191,55 @@ def _looks_like_torchserve_manifest(manifest_data: object) -> bool:
     return bool(handler_candidates) and bool(serialized_candidates)
 
 
+def _looks_like_keras_config(config_data: object) -> bool:
+    """Require enough config structure to justify Keras-specific routing."""
+    if not isinstance(config_data, dict):
+        return False
+
+    class_name = config_data.get("class_name")
+    config = config_data.get("config")
+    if not isinstance(class_name, str) or not class_name.strip() or not isinstance(config, dict):
+        return False
+
+    if any(key in config for key in _KERAS_MODEL_CONFIG_KEYS):
+        return True
+
+    return any(key in config_data for key in _KERAS_MODEL_TOP_LEVEL_HINTS)
+
+
+def _read_zip_member_text(
+    archive: zipfile.ZipFile,
+    member_info: zipfile.ZipInfo,
+    max_bytes: int,
+) -> str | None:
+    """Read a bounded ZIP member as UTF-8 text."""
+    try:
+        data = _read_zip_member_bounded(archive, member_info, max_bytes)
+        return data.decode("utf-8", errors="strict").strip()
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+
+
+def _looks_like_pytorch_zip_metadata(archive: zipfile.ZipFile, prefix: str) -> bool:
+    """Require conservative, PyTorch-specific ZIP metadata near data.pkl."""
+    version_name = f"{prefix}/version" if prefix else "version"
+    byteorder_name = f"{prefix}/byteorder" if prefix else "byteorder"
+
+    version_info = archive.NameToInfo.get(version_name)
+    if version_info is not None:
+        version_text = _read_zip_member_text(archive, version_info, _PYTORCH_ZIP_METADATA_MAX_BYTES)
+        if version_text is not None and re.fullmatch(r"\d+(?:\.\d+)?", version_text):
+            return True
+
+    byteorder_info = archive.NameToInfo.get(byteorder_name)
+    if byteorder_info is not None:
+        byteorder_text = _read_zip_member_text(archive, byteorder_info, _PYTORCH_ZIP_METADATA_MAX_BYTES)
+        if byteorder_text in {"little", "big"}:
+            return True
+
+    return False
+
+
 def is_torchserve_mar_archive(path: str) -> bool:
     """Return whether a ZIP-backed `.mar` looks like a real TorchServe archive."""
     file_path = Path(path)
@@ -227,21 +280,38 @@ def is_keras_zip_archive(path: str, *, allow_config_only: bool = False) -> bool:
 
     try:
         with zipfile.ZipFile(file_path, "r") as archive:
-            member_names = {
-                _normalize_archive_member_name(info.filename)
-                for info in archive.infolist()
-                if info.filename and not info.is_dir()
-            }
+            member_names: set[str] = set()
+            config_info: zipfile.ZipInfo | None = None
+            for info in archive.infolist():
+                if not info.filename or info.is_dir():
+                    continue
+
+                normalized_name = _normalize_archive_member_name(info.filename)
+                member_names.add(normalized_name)
+                if normalized_name == _KERAS_ZIP_REQUIRED_ENTRY:
+                    config_info = info
+
+            if _KERAS_ZIP_REQUIRED_ENTRY not in member_names:
+                return False
+
+            if allow_config_only:
+                return True
+
+            if any(marker in member_names for marker in _KERAS_ZIP_MARKERS):
+                return True
+
+            if config_info is None:
+                return False
+
+            try:
+                config_data = json.loads(_read_zip_member_bounded(archive, config_info, _KERAS_ZIP_CONFIG_MAX_BYTES))
+            except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+                return False
+
+            return _looks_like_keras_config(config_data)
     except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile):
         return False
-
-    if _KERAS_ZIP_REQUIRED_ENTRY not in member_names:
-        return False
-
-    if allow_config_only:
-        return True
-
-    return any(marker in member_names for marker in _KERAS_ZIP_MARKERS)
+    return False
 
 
 def is_pytorch_zip_archive(path: str) -> bool:
@@ -257,10 +327,21 @@ def is_pytorch_zip_archive(path: str) -> bool:
                 for info in archive.infolist()
                 if info.filename and not info.is_dir()
             }
+
+            for name in member_names:
+                if name == "data.pkl":
+                    prefix = ""
+                elif name.endswith("/data.pkl"):
+                    prefix = name[: -len("/data.pkl")]
+                else:
+                    continue
+
+                if _looks_like_pytorch_zip_metadata(archive, prefix):
+                    return True
     except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile):
         return False
 
-    return any(name == "data.pkl" or name.endswith("/data.pkl") for name in member_names)
+    return False
 
 
 def _is_tar_archive(path: str) -> bool:

@@ -193,40 +193,27 @@ class TestKerasZipScanner:
         assert all(check.name != "Embedded Weights Size Limit" for check in result.checks)
         assert not any(check.name == "Keras ZIP File Scan" for check in result.checks)
 
-    def test_can_handle_keras_zip(self):
+    def test_can_handle_keras_zip(self, tmp_path: Path) -> None:
         """Test that scanner can identify ZIP-based .keras files."""
         scanner = KerasZipScanner()
+        keras_path = tmp_path / "model.keras"
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            config = {"class_name": "Sequential", "config": {"layers": []}}
+            zf.writestr("config.json", json.dumps(config))
+            metadata = {"keras_version": "3.0.0"}
+            zf.writestr("metadata.json", json.dumps(metadata))
 
-        # Create a minimal Keras ZIP file
-        with tempfile.NamedTemporaryFile(suffix=".keras", delete=False) as f:
-            with zipfile.ZipFile(f, "w") as zf:
-                # Add minimal config.json
-                config = {"class_name": "Sequential", "config": {"layers": []}}
-                zf.writestr("config.json", json.dumps(config))
-                # Add metadata.json
-                metadata = {"keras_version": "3.0.0"}
-                zf.writestr("metadata.json", json.dumps(metadata))
-            temp_path = f.name
+        assert scanner.can_handle(str(keras_path))
 
-        try:
-            assert scanner.can_handle(temp_path)
-        finally:
-            os.unlink(temp_path)
-
-    def test_can_handle_keras_zip_with_only_config_json(self):
+    def test_can_handle_keras_zip_with_only_config_json(self, tmp_path: Path) -> None:
         """A real .keras suffix should still route to the Keras scanner with only config.json."""
         scanner = KerasZipScanner()
+        keras_path = tmp_path / "config_only.keras"
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            config = {"class_name": "Sequential", "config": {"layers": []}}
+            zf.writestr("config.json", json.dumps(config))
 
-        with tempfile.NamedTemporaryFile(suffix=".keras", delete=False) as f:
-            with zipfile.ZipFile(f, "w") as zf:
-                config = {"class_name": "Sequential", "config": {"layers": []}}
-                zf.writestr("config.json", json.dumps(config))
-            temp_path = f.name
-
-        try:
-            assert scanner.can_handle(temp_path)
-        finally:
-            os.unlink(temp_path)
+        assert scanner.can_handle(str(keras_path))
 
     def test_lambda_layer_with_exec(self):
         """Test detection of Lambda layer with exec() call."""
