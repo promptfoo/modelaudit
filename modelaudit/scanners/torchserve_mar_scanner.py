@@ -343,7 +343,7 @@ class TorchServeMarScanner(BaseScanner):
             member_set=member_set,
             result=result,
         )
-        self._analyze_handlers(
+        manifest_context["handler_trees"] = self._analyze_handlers(
             archive_path=archive_path,
             archive=archive,
             member_set=member_set,
@@ -571,8 +571,9 @@ class TorchServeMarScanner(BaseScanner):
         member_set: set[str],
         handler_paths: list[str],
         result: ScanResult,
-    ) -> None:
+    ) -> dict[str, ast.Module]:
         analyzed_handler = False
+        handler_trees: dict[str, ast.Module] = {}
         member_lookup = {
             self._normalize_member_name(member_info.filename): member_info
             for member_info in archive.infolist()
@@ -606,7 +607,7 @@ class TorchServeMarScanner(BaseScanner):
                     )
                     continue
 
-                risky_calls, parse_error = self._find_high_risk_calls(handler_bytes)
+                tree, parse_error = self._parse_python_source(handler_bytes)
                 if parse_error is not None:
                     result.add_check(
                         name="TorchServe Handler Static Analysis",
@@ -617,7 +618,10 @@ class TorchServeMarScanner(BaseScanner):
                         details={"handler": normalized_handler},
                     )
                     continue
+                assert tree is not None
+                handler_trees[normalized_handler] = tree
 
+                risky_calls = self._find_high_risk_calls_from_tree(tree)
                 if risky_calls:
                     result.add_check(
                         name="TorchServe Handler Static Analysis",
@@ -644,6 +648,8 @@ class TorchServeMarScanner(BaseScanner):
                 location=archive_path,
             )
 
+        return handler_trees
+
     def _resolve_handler_members(self, member_set: set[str], handler_paths: list[str]) -> set[str]:
         resolved_handlers: set[str] = set()
         for handler_path in handler_paths:
@@ -654,15 +660,45 @@ class TorchServeMarScanner(BaseScanner):
                     resolved_handlers.add(normalized_candidate)
         return resolved_handlers
 
-    def _collect_imported_modules(self, tree: ast.AST) -> set[str]:
+    def _resolve_import_from_module(
+        self,
+        importing_member: str | None,
+        level: int,
+        module: str | None,
+    ) -> str | None:
+        if level == 0:
+            return module
+        if importing_member is None:
+            # Relative imports need the importing module's package path for resolution.
+            return None
+
+        package_parts = [part for part in PurePosixPath(importing_member).parent.parts if part not in {"", "."}]
+        trim = level - 1
+        if trim > len(package_parts):
+            return None
+        base_parts = package_parts[: len(package_parts) - trim]
+        if module:
+            base_parts.extend(part for part in module.split(".") if part)
+        if not base_parts:
+            return None
+        return ".".join(base_parts)
+
+    def _collect_imported_modules(self, tree: ast.AST, importing_member: str | None = None) -> set[str]:
         modules: set[str] = set()
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
                     if alias.name:
                         modules.add(alias.name)
-            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-                modules.add(node.module)
+            elif isinstance(node, ast.ImportFrom):
+                base_module = self._resolve_import_from_module(importing_member, node.level, node.module)
+                if not base_module:
+                    continue
+                modules.add(base_module)
+                for alias in node.names:
+                    if alias.name == "*":
+                        continue
+                    modules.add(f"{base_module}.{alias.name}")
         return modules
 
     def _has_import_time_execution(self, tree: ast.Module) -> bool:
@@ -685,6 +721,7 @@ class TorchServeMarScanner(BaseScanner):
         archive: zipfile.ZipFile,
         member_lookup: dict[str, zipfile.ZipInfo],
         handler_members: set[str],
+        handler_trees: dict[str, ast.Module],
         result: ScanResult,
     ) -> None:
         python_members = sorted(name for name in member_lookup if name.endswith(".py"))
@@ -785,12 +822,16 @@ class TorchServeMarScanner(BaseScanner):
             if handler_info is None:
                 continue
             try:
-                handler_source = self._read_member_bounded(archive, handler_info, self.max_member_bytes)
-                handler_tree = ast.parse(handler_source.decode("utf-8", errors="replace"))
+                handler_tree = handler_trees.get(handler_member)
+                if handler_tree is None:
+                    handler_source = self._read_member_bounded(archive, handler_info, self.max_member_bytes)
+                    handler_tree, parse_error = self._parse_python_source(handler_source)
+                    if parse_error is not None or handler_tree is None:
+                        continue
             except (SyntaxError, ValueError, OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile):
                 continue
 
-            for module_name in sorted(self._collect_imported_modules(handler_tree)):
+            for module_name in sorted(self._collect_imported_modules(handler_tree, handler_member)):
                 module_path = module_name.replace(".", "/")
                 for candidate in (f"{module_path}.py", f"{module_path}/__init__.py"):
                     normalized_candidate = self._normalize_member_name(candidate)
@@ -1069,6 +1110,7 @@ class TorchServeMarScanner(BaseScanner):
             archive=archive,
             member_lookup=analyzable_member_lookup,
             handler_members=handler_members,
+            handler_trees=manifest_context.get("handler_trees", {}),
             result=result,
         )
 
