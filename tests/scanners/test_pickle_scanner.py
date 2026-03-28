@@ -3158,7 +3158,7 @@ def test_genops_with_fallback_does_not_emit_buffered_partial_second_stream_on_bu
 
 
 def test_scan_pickle_reports_opcode_budget_truncation_for_buffered_follow_on_stream(tmp_path: Path) -> None:
-    """Budget exhaustion in a later buffered stream should surface analysis truncation."""
+    """Budget exhaustion in a later buffered stream should surface the tail detection."""
     clean_path = tmp_path / "clean.pkl"
     clean_path.write_bytes(pickle.dumps({"weights": [1, 2, 3], "name": "safe"}))
 
@@ -3183,7 +3183,18 @@ def test_scan_pickle_reports_opcode_budget_truncation_for_buffered_follow_on_str
     assert "opcode budget" in opcode_checks[0].message.lower()
     assert opcode_checks[0].details["analysis_incomplete"] is True
     assert result.metadata["analysis_incomplete"] is True
-    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    post_budget_checks = [
+        check
+        for check in result.checks
+        if check.name == "Post-Budget Global Reference Scan" and check.status == CheckStatus.FAILED
+    ]
+    assert len(post_budget_checks) == 1
+    assert post_budget_checks[0].severity == IssueSeverity.CRITICAL
+    assert any(
+        finding["import_reference"].endswith(".system")
+        for finding in post_budget_checks[0].details.get("dangerous_references", [])
+    )
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
 def test_extract_globals_advanced_preserves_partial_globals_when_genops_raises(
