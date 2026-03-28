@@ -112,6 +112,7 @@ uv run pytest -n auto -m "not slow and not integration" --maxfail=1
 - Use typed pytest tests: add `-> None`, annotate fixtures like `tmp_path: Path` / `monkeypatch: pytest.MonkeyPatch`, and prefer `pathlib` over `os.path`.
 - Keep fixtures deterministic and self-contained under `tmp_path`; never rely on host paths or global temp filenames.
 - If a new regression test must run on reduced CI lanes, add the file to `allowed_test_files` in `tests/conftest.py`.
+- Match local validation to the CI lane that will exercise the change when possible; if optional dependencies or Python-version gates prevent that, call it out explicitly in the PR.
 - For file routing, prefiltering, or archive-triage changes, add at least one malicious positive regression and one benign near-match negative regression.
 - Prefer trusted file structure or bounded content sniffing over suffix-only routing. Extension checks are a fallback, not a source of truth.
 - When a scan intentionally fails closed for coverage or safety reasons, make the behavior operationally explicit and test the message plus the relevant `success`, exit-code, and cache semantics.
