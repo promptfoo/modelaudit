@@ -191,6 +191,13 @@ def test_detect_file_format_from_magic_malformed_safetensors_header_len_rejected
     assert detect_file_format_from_magic(str(malformed_path)) == "unknown"
 
 
+def test_detect_file_format_from_magic_invalid_safetensors_json_rejected(tmp_path: Path) -> None:
+    malformed_path = tmp_path / "invalid-header.unknown"
+    malformed_path.write_bytes(struct.pack("<Q", 1) + b"{" + b"\x00")
+
+    assert detect_file_format_from_magic(str(malformed_path)) == "unknown"
+
+
 def test_detect_file_format_coreml_validation_passthrough(tmp_path: Path) -> None:
     """CoreML extension routing should remain scanner-level validated."""
     model_path = tmp_path / "model.mlmodel"

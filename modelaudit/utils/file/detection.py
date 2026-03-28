@@ -118,7 +118,7 @@ def _read_pickle_probe_sample(path: Path, size: int, header16: bytes) -> bytes:
         return f.read(min(size, PROTO0_1_MAX_PROBE_BYTES))
 
 
-def _looks_like_safetensors_structure(magic8: bytes, magic16: bytes, file_size: int) -> bool:
+def _looks_like_safetensors_structure(path: Path | None, magic8: bytes, file_size: int) -> bool:
     """Validate safetensors framing: <u64 header_len><JSON header><tensor data>."""
     if file_size <= 8 or len(magic8) < 8:
         return False
@@ -135,7 +135,25 @@ def _looks_like_safetensors_structure(magic8: bytes, magic16: bytes, file_size: 
     if header_len >= file_size - 8:
         return False
 
-    return len(magic16) >= 9 and magic16[8:9] == b"{"
+    if path is None:
+        return False
+
+    try:
+        with path.open("rb") as handle:
+            handle.seek(8)
+            header = handle.read(header_len)
+    except OSError:
+        return False
+
+    if len(header) != header_len or not header.startswith(b"{"):
+        return False
+
+    try:
+        parsed_header = json.loads(header.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+
+    return isinstance(parsed_header, dict)
 
 
 def _normalize_archive_member_name(member_name: str) -> str:
@@ -407,7 +425,7 @@ def _detect_compression_format(prefix: bytes) -> str | None:
 
 
 def detect_format_from_magic_bytes(
-    magic4: MagicBytes, magic8: MagicBytes, magic16: MagicBytes, file_size: int
+    magic4: MagicBytes, magic8: MagicBytes, magic16: MagicBytes, file_size: int, file_path: Path | None = None
 ) -> FileFormat:
     """Detect file format using Python 3.10+ pattern matching on magic bytes."""
     compression_format = _detect_compression_format(magic16)
@@ -457,13 +475,13 @@ def detect_format_from_magic_bytes(
             return "pickle"
         case _:
             pass
-    if _looks_like_safetensors_structure(magic8, magic16, file_size):
+    if _looks_like_safetensors_structure(file_path, magic8, file_size):
         return "safetensors"
 
     # Check for patterns in first 16 bytes
     if b"onnx" in magic16:
         return "onnx"
-    if b'"__metadata__"' in magic16 and _looks_like_safetensors_structure(magic8, magic16, file_size):
+    if b'"__metadata__"' in magic16 and _looks_like_safetensors_structure(file_path, magic8, file_size):
         return "safetensors"
 
     return "unknown"
@@ -507,7 +525,7 @@ def detect_file_format_from_magic(path: str) -> str:
                 return "executorch"
 
             # Try the new pattern matching approach first
-            format_result = detect_format_from_magic_bytes(magic4, magic8, magic16, size)
+            format_result = detect_format_from_magic_bytes(magic4, magic8, magic16, size, file_path)
             if format_result == "zip" and file_path.suffix.lower() == ".mar" and is_torchserve_mar_archive(path):
                 return "torchserve_mar"
             if format_result != "unknown":
@@ -545,9 +563,6 @@ def detect_file_format_from_magic(path: str) -> str:
                 if b"<PMML" in xml_header:
                     return "pmml"
 
-            if _looks_like_safetensors_structure(magic8, magic16, size):
-                return "safetensors"
-
     except OSError:
         return "unknown"
 
@@ -556,7 +571,7 @@ def detect_file_format_from_magic(path: str) -> str:
     magic8 = header[:8]
     magic16 = header[:16]
 
-    if _looks_like_safetensors_structure(magic8, magic16, size):
+    if _looks_like_safetensors_structure(file_path, magic8, size):
         return "safetensors"
 
     if magic4 == b"\x08\x01\x12\x00" or b"onnx" in magic16:
@@ -669,7 +684,7 @@ def detect_file_format(path: str) -> str:
         if MARKED_PROTOCOL0_GLOBAL_RE.match(magic64):
             return "pickle"
         # Check for safetensors format (<u64 header_len> + JSON header).
-        if _looks_like_safetensors_structure(magic8, magic16, size):
+        if _looks_like_safetensors_structure(file_path, magic8, size):
             return "safetensors"
 
         # Check for ONNX format (protobuf)
