@@ -917,7 +917,7 @@ def test_scan_huggingface_url_with_issues(mock_rmtree, mock_scan, mock_download,
 
 
 @patch("modelaudit.cli.scan_model_directory_or_file")
-def test_scan_no_whitelist_passes_config_and_preserves_critical_exit_code(mock_scan, tmp_path: Path) -> None:
+def test_scan_no_whitelist_passes_config_and_preserves_critical_exit_code(mock_scan: MagicMock, tmp_path: Path) -> None:
     """--no-whitelist should disable downgrade config and keep CRITICAL findings as exit-code 1."""
     test_file = tmp_path / "model.pkl"
     test_file.write_bytes(b"dummy")
@@ -947,7 +947,7 @@ def test_scan_no_whitelist_passes_config_and_preserves_critical_exit_code(mock_s
 
 
 @patch("modelaudit.cli.scan_model_directory_or_file")
-def test_scan_defaults_keep_whitelist_enabled(mock_scan, tmp_path: Path) -> None:
+def test_scan_defaults_keep_whitelist_enabled(mock_scan: MagicMock, tmp_path: Path) -> None:
     """Without flags, whitelist downgrading remains enabled for backward compatibility."""
     test_file = tmp_path / "model.pkl"
     test_file.write_bytes(b"dummy")
@@ -962,7 +962,7 @@ def test_scan_defaults_keep_whitelist_enabled(mock_scan, tmp_path: Path) -> None
 
 
 @patch("modelaudit.cli.scan_model_directory_or_file")
-def test_scan_strict_implies_no_whitelist_and_no_cache(mock_scan, tmp_path: Path) -> None:
+def test_scan_strict_implies_no_whitelist_and_no_cache(mock_scan: MagicMock, tmp_path: Path) -> None:
     """--strict should imply both --no-whitelist and --no-cache."""
     test_file = tmp_path / "model.pkl"
     test_file.write_bytes(b"dummy")
