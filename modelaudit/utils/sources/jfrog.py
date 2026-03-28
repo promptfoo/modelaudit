@@ -390,49 +390,51 @@ def list_jfrog_folder_contents(
     base_url = url.rstrip("/")
 
     def _collect_files(folder_url: str, depth: int = 0) -> None:
-        """Recursively collect files from folder."""
-        if depth > MAX_RECURSION_DEPTH:  # Prevent infinite recursion
-            logger.warning(f"Maximum recursion depth reached for {folder_url}")
+        """Recursively collect files from folder.
+
+        Raises on any API or network error so that callers never operate
+        on a partial file listing.
+        """
+        if depth > MAX_RECURSION_DEPTH:
+            raise Exception(
+                f"Maximum recursion depth ({MAX_RECURSION_DEPTH}) exceeded listing {folder_url}. "
+                "Aborting to avoid incomplete file listing."
+            )
+
+        folder_info = detect_jfrog_target_type(folder_url, api_token, access_token, timeout)
+
+        if folder_info["type"] != "folder":
             return
 
-        try:
-            folder_info = detect_jfrog_target_type(folder_url, api_token, access_token, timeout)
+        for child in folder_info["children"]:
+            child_name = child["uri"].lstrip("/")
+            child_url = f"{folder_url.rstrip('/')}/{child_name}"
 
-            if folder_info["type"] != "folder":
-                return
+            if child["folder"]:
+                # It's a subfolder
+                if recursive:
+                    _collect_files(child_url, depth + 1)
+            else:
+                # It's a file
+                size = child.get("size", 0)
 
-            for child in folder_info["children"]:
-                child_name = child["uri"].lstrip("/")
-                child_url = f"{folder_url.rstrip('/')}/{child_name}"
+                # Optionally fetch accurate size if requested
+                if fetch_sizes and size == 0:
+                    try:
+                        file_info = detect_jfrog_target_type(child_url, api_token, access_token, timeout)
+                        if file_info["type"] == "file":
+                            size = file_info.get("size", 0)
+                    except Exception as e:
+                        logger.warning(f"Failed to fetch size for {child_url}: {e}")
 
-                if child["folder"]:
-                    # It's a subfolder
-                    if recursive:
-                        _collect_files(child_url, depth + 1)
-                else:
-                    # It's a file
-                    size = child.get("size", 0)
-
-                    # Optionally fetch accurate size if requested
-                    if fetch_sizes and size == 0:
-                        try:
-                            file_info = detect_jfrog_target_type(child_url, api_token, access_token, timeout)
-                            if file_info["type"] == "file":
-                                size = file_info.get("size", 0)
-                        except Exception as e:
-                            logger.warning(f"Failed to fetch size for {child_url}: {e}")
-
-                    files.append(
-                        {
-                            "name": child_name,
-                            "path": child_url,
-                            "size": size,
-                            "human_size": format_size(size) if size > 0 else "Unknown",
-                        }
-                    )
-
-        except Exception as e:
-            logger.warning(f"Failed to list contents of {folder_url}: {e}")
+                files.append(
+                    {
+                        "name": child_name,
+                        "path": child_url,
+                        "size": size,
+                        "human_size": format_size(size) if size > 0 else "Unknown",
+                    }
+                )
 
     _collect_files(base_url)
 

@@ -395,6 +395,54 @@ class TestJFrogFolderListing:
         with pytest.raises(ValueError, match="not a JFrog folder"):
             list_jfrog_folder_contents("https://company.jfrog.io/artifactory/repo/model.pkl")
 
+    @patch("modelaudit.utils.sources.jfrog.detect_jfrog_target_type")
+    def test_list_jfrog_folder_contents_propagates_subfolder_error(self, mock_detect) -> None:
+        """Listing must fail closed when a subfolder API call errors."""
+
+        def mock_detect_side_effect(url: str, *args: object, **kwargs: object) -> dict:
+            if url.endswith("models/") or url.endswith("models"):
+                return {
+                    "type": "folder",
+                    "children": [
+                        {"uri": "/model1.pkl", "folder": False, "size": 1024},
+                        {"uri": "/subdir", "folder": True},
+                    ],
+                }
+            if "subdir" in url:
+                raise Exception("network timeout")
+            return {"type": "file", "size": 0, "path": "", "repo": ""}
+
+        mock_detect.side_effect = mock_detect_side_effect
+
+        with pytest.raises(Exception, match="network timeout"):
+            list_jfrog_folder_contents(
+                "https://company.jfrog.io/artifactory/repo/models/",
+                api_token="test-token",
+                recursive=True,
+                selective=False,
+            )
+
+    @patch("modelaudit.utils.sources.jfrog.detect_jfrog_target_type")
+    def test_list_jfrog_folder_contents_raises_on_max_depth(self, mock_detect) -> None:
+        """Listing must fail closed when recursion depth is exceeded."""
+
+        def mock_detect_side_effect(url: str, *args: object, **kwargs: object) -> dict:
+            # Every URL returns a folder with one subfolder to force deep recursion
+            return {
+                "type": "folder",
+                "children": [{"uri": "/deeper", "folder": True}],
+            }
+
+        mock_detect.side_effect = mock_detect_side_effect
+
+        with pytest.raises(Exception, match="Maximum recursion depth"):
+            list_jfrog_folder_contents(
+                "https://company.jfrog.io/artifactory/repo/models/",
+                api_token="test-token",
+                recursive=True,
+                selective=False,
+            )
+
 
 class TestJFrogFolderDownload:
     """Test JFrog folder download functionality."""
