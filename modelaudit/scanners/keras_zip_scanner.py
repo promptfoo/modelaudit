@@ -257,11 +257,12 @@ class KerasZipScanner(BaseScanner):
                 with zf.open("config.json") as config_file:
                     config_data = config_file.read()
                     raw_config_text = config_data.decode("utf-8", errors="ignore")
-                    # Run raw-text CVE detection before JSON parsing so malformed JSON cannot bypass it.
-                    self._check_unsafe_deserialization_bypass_raw(raw_config_text, result)
                     try:
                         model_config = json.loads(config_data)
                     except json.JSONDecodeError as e:
+                        # Fall back to a structure-aware raw scan only when the archive
+                        # config is malformed and cannot be parsed as JSON.
+                        self._check_unsafe_deserialization_bypass_raw(raw_config_text, result)
                         result.add_check(
                             name="Config JSON Parsing",
                             passed=False,
@@ -844,24 +845,28 @@ class KerasZipScanner(BaseScanner):
             )
 
     def _check_unsafe_deserialization_bypass_raw(self, raw_config_text: str, result: ScanResult) -> None:
-        """Raw-text CVE check to catch references before JSON parsing."""
+        """Raw-text CVE fallback for malformed JSON configs."""
         if self._has_cve_2025_9906_issue(result):
             return
 
         lowered = raw_config_text.lower()
-        raw_symbols = (
-            "keras.config.enable_unsafe_deserialization",
-            "keras.src.config.enable_unsafe_deserialization",
+        has_module_context = re.search(r'"module"\s*:\s*"keras(?:\.src)?\.config"', lowered) is not None
+        has_function_context = (
+            re.search(r'"(?:fn|function|callable)"\s*:\s*"enable_unsafe_deserialization"', lowered) is not None
         )
-        matched_symbol = next((symbol for symbol in raw_symbols if symbol in lowered), None)
-        if not matched_symbol:
+        full_symbol_match = re.search(
+            r'"(?:loader|fn|function|callable)"\s*:\s*"(keras(?:\.src)?\.config\.enable_unsafe_deserialization)"',
+            lowered,
+        )
+        if not ((has_module_context and has_function_context) or full_symbol_match):
             return
+        matched_symbol = full_symbol_match.group(1) if full_symbol_match else "enable_unsafe_deserialization"
 
         result.add_check(
             name="CVE-2025-9906: Unsafe Deserialization Bypass",
             passed=False,
             message=(
-                "CVE-2025-9906: config.json contains raw reference to "
+                "CVE-2025-9906: config.json contains raw executable reference to "
                 "enable_unsafe_deserialization (safe_mode bypass attempt)"
             ),
             severity=IssueSeverity.CRITICAL,

@@ -1911,43 +1911,45 @@ class TestCVE20259906UnsafeDeserialization:
 
         assert KerasZipScanner._is_primarily_documentation_text(text) is True
 
-    def test_doc_padding_lines_do_not_suppress_raw_detection(self, tmp_path: Path) -> None:
-        """Documentation-like padding must not suppress CVE-2025-9906 detection."""
-        scanner = KerasZipScanner()
-        padded_lines = "\n".join(
+    def test_dangerous_line_does_not_count_toward_documentation_ratio(self) -> None:
+        """Dangerous literals must not inflate the documentation ratio."""
+        text = "\n".join(
             [
-                "This is a descriptive model note used only for context",
-                "Another explanatory line with many words but no period",
-                "Additional harmless narrative text for documentation padding only",
-                "Further description text that stays verbose and punctuation free",
-                "Yet another line intended to mimic long natural prose content",
-                "One more benign looking sentence for non executable metadata",
+                "This line is harmless documentation padding only",
+                "This warning mentions keras.config.enable_unsafe_deserialization as prose only",
             ]
         )
-        config_str = json.dumps({"description": f"{padded_lines}\nkeras.config.enable_unsafe_deserialization"})
+
+        assert KerasZipScanner._is_primarily_documentation_text(text) is False
+
+    def test_malformed_json_with_executable_raw_reference_is_detected(self, tmp_path: Path) -> None:
+        """Malformed JSON should still trigger raw fallback when executable keys are present."""
+        scanner = KerasZipScanner()
+        config_str = (
+            '{"class_name":"Sequential","config":{"module":"keras.config",'
+            '"fn":"enable_unsafe_deserialization",}'
+        )
 
         result = scanner.scan(self._make_keras_zip(config_str, tmp_path))
         cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-9906"]
         assert len(cve_issues) == 1
         assert cve_issues[0].details["detection_method"] == "raw_config_scan"
+        parse_checks = [c for c in result.checks if c.name == "Config JSON Parsing"]
+        assert len(parse_checks) == 1
+        assert parse_checks[0].status != CheckStatus.PASSED
+        assert result.success is False
 
-    def test_doc_padding_near_threshold_still_hits_raw_detection(self, tmp_path: Path) -> None:
-        """A 50/50 doc-like split must still allow raw-config detection to win."""
+    def test_malformed_json_doc_symbol_without_executable_context_not_flagged(self, tmp_path: Path) -> None:
+        """Malformed JSON documentation mentions alone must not trigger the raw fallback."""
         scanner = KerasZipScanner()
-        near_threshold_text = "\n".join(
-            [
-                "This is a descriptive model note used only for context",
-                "Another explanatory line with many words but no period",
-                "keras.config.enable_unsafe_deserialization",
-                "A short line with punctuation.",
-            ]
+        config_str = (
+            '{"description":"This documentation mentions '
+            'keras.config.enable_unsafe_deserialization for awareness only",'
         )
-        config_str = json.dumps({"description": near_threshold_text})
 
         result = scanner.scan(self._make_keras_zip(config_str, tmp_path))
         cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-9906"]
-        assert len(cve_issues) == 1
-        assert cve_issues[0].details["detection_method"] == "raw_config_scan"
+        assert len(cve_issues) == 0
 
     def test_benign_documentation_text_stays_clean(self, tmp_path: Path) -> None:
         """Benign long-form documentation text should not trigger CVE checks."""
@@ -1957,7 +1959,8 @@ class TestCVE20259906UnsafeDeserialization:
                 "class_name": "Model",
                 "config": {
                     "notes": (
-                        "This documentation example explains safe usage only\n"
+                        "This documentation example mentions keras.config.enable_unsafe_deserialization "
+                        "for awareness only\n"
                         "Another long descriptive line for awareness and guidance\n"
                         "Helpful prose about model metadata and no executable content"
                     ),
