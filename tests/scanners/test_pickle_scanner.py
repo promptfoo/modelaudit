@@ -2090,8 +2090,7 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
         failed_checks = [check for check in result.checks if check.status == CheckStatus.FAILED]
         matching_checks = [check for check in failed_checks if "copyreg.remove_extension" in check.message.lower()]
         assert matching_checks, (
-            "Expected suspicious copyreg.remove_extension finding, "
-            f"got: {[check.message for check in failed_checks]}"
+            f"Expected suspicious copyreg.remove_extension finding, got: {[check.message for check in failed_checks]}"
         )
         assert any(check.severity == IssueSeverity.CRITICAL for check in matching_checks), (
             f"Expected CRITICAL copyreg.remove_extension finding, got: "
@@ -2122,8 +2121,7 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
         ]
         assert reduce_checks, [check.message for check in result.checks]
         assert all(check.severity == expected_severity for check in reduce_checks), (
-            f"Unexpected REDUCE severities for {target}: "
-            f"{[(check.severity, check.message) for check in reduce_checks]}"
+            f"Unexpected REDUCE severities for {target}: {[(check.severity, check.message) for check in reduce_checks]}"
         )
 
         reduce_pattern_checks = [
