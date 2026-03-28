@@ -1,3 +1,4 @@
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -195,6 +196,7 @@ def test_tflite_scanner_excessive_subgraph_count_stops_scan(tmp_path: Path) -> N
     with (
         patch("modelaudit.scanners.tflite_scanner.HAS_TFLITE", True),
         patch("modelaudit.scanners.tflite_scanner.tflite", create=True) as mock_tflite,
+        patch.dict(sys.modules, {"tflite": mock_tflite}),
     ):
         mock_model = MagicMock()
         mock_model.SubgraphsLength.return_value = _MAX_COUNT + 1
@@ -206,4 +208,32 @@ def test_tflite_scanner_excessive_subgraph_count_stops_scan(tmp_path: Path) -> N
 
         assert not result.success
         assert any(check.name == "Subgraph Count Validation" for check in result.checks)
+        mock_model.Subgraphs.assert_not_called()
+
+
+def test_tflite_metadata_extraction_excessive_subgraph_count_stops_early(tmp_path: Path) -> None:
+    """Regression: metadata extraction refuses excessive subgraph counts without dereferencing them."""
+    path = tmp_path / "model.tflite"
+    valid_header = b"\x00\x00\x00\x00TFL3" + b"\x00" * 100
+    path.write_bytes(valid_header)
+
+    with (
+        patch("modelaudit.scanners.tflite_scanner.HAS_TFLITE", True),
+        patch("modelaudit.scanners.tflite_scanner.tflite", create=True) as mock_tflite,
+        patch.dict(sys.modules, {"tflite": mock_tflite}),
+    ):
+        mock_model = MagicMock()
+        mock_model.Version.return_value = 3
+        mock_model.Description.return_value = None
+        mock_model.OperatorCodesLength.return_value = 0
+        mock_model.SubgraphsLength.return_value = _MAX_COUNT + 1
+        mock_model.Subgraphs.side_effect = RuntimeError("should not iterate subgraphs")
+        mock_tflite.Model.GetRootAsModel.return_value = mock_model
+
+        scanner = TFLiteScanner()
+        metadata = scanner.extract_metadata(str(path))
+
+        assert metadata["subgraph_count"] == _MAX_COUNT + 1
+        assert "extraction_error" in metadata
+        assert "safe limit" in metadata["extraction_error"]
         mock_model.Subgraphs.assert_not_called()

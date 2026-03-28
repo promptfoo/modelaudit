@@ -184,6 +184,12 @@ class TFLiteScanner(BaseScanner):
                 }
             )
 
+            if metadata["subgraph_count"] > _MAX_COUNT:
+                metadata["extraction_error"] = (
+                    f"Model declares {metadata['subgraph_count']} subgraphs which exceeds the safe limit"
+                )
+                return metadata
+
             # Analyze subgraphs
             if model.SubgraphsLength() > 0:
                 subgraph = model.Subgraphs(0)  # Main subgraph
