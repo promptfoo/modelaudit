@@ -872,23 +872,6 @@ class TorchServeMarScanner(BaseScanner):
         current_depth: int,
     ) -> None:
         contents: list[dict[str, Any]] = []
-        member_lookup = {
-            self._normalize_member_name(member_info.filename): member_info
-            for member_info in member_infos
-            if member_info.filename and not member_info.filename.endswith("/")
-        }
-        handler_members = self._resolve_handler_members(
-            member_set=set(member_lookup),
-            handler_paths=manifest_context.get("handler_paths", []),
-        )
-        self._analyze_non_handler_python_files(
-            archive_path=archive_path,
-            archive=archive,
-            member_lookup=member_lookup,
-            handler_members=handler_members,
-            result=result,
-        )
-
         serialized_refs = {
             self._normalize_member_name(path)
             for path in manifest_context.get("serialized_paths", [])
@@ -920,6 +903,7 @@ class TorchServeMarScanner(BaseScanner):
             entries_to_process = member_infos
 
         processed_uncompressed = 0
+        analyzable_member_lookup: dict[str, zipfile.ZipInfo] = {}
         for member_info in entries_to_process:
             self.check_interrupted()
 
@@ -991,6 +975,8 @@ class TorchServeMarScanner(BaseScanner):
                 )
                 continue
 
+            analyzable_member_lookup[normalized_member] = member_info
+
             try:
                 temp_path, total_size = self._extract_member_to_tempfile(
                     archive=archive,
@@ -1051,6 +1037,18 @@ class TorchServeMarScanner(BaseScanner):
             finally:
                 with contextlib.suppress(OSError):
                     os.unlink(temp_path)
+
+        handler_members = self._resolve_handler_members(
+            member_set=set(analyzable_member_lookup),
+            handler_paths=manifest_context.get("handler_paths", []),
+        )
+        self._analyze_non_handler_python_files(
+            archive_path=archive_path,
+            archive=archive,
+            member_lookup=analyzable_member_lookup,
+            handler_members=handler_members,
+            result=result,
+        )
 
         if serialized_refs:
             if serialized_findings:

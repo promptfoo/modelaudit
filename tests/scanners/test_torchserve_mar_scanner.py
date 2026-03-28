@@ -196,6 +196,52 @@ def test_non_handler_python_analysis_without_extra_python_files_is_back_compatib
     assert len(non_handler_failures) == 0
 
 
+def test_non_handler_python_analysis_respects_entry_limit(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
+            "utils.py": b"import os\n\ndef transform(data):\n    return os.system('echo owned')\n",
+            "weights.bin": b"weights",
+        },
+        filename="entry_limit_non_handler.mar",
+    )
+
+    result = TorchServeMarScanner(config={"max_mar_entries": 2}).scan(str(mar_path))
+
+    non_handler_failures = _failed_checks(result, "MAR Non-Handler Python Analysis")
+    assert len(non_handler_failures) == 0
+    entry_limit_failures = _failed_checks(result, "TorchServe MAR Entry Limit")
+    assert len(entry_limit_failures) == 1
+
+
+def test_non_handler_python_analysis_respects_uncompressed_budget(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
+            "utils.py": b"import os\n\ndef transform(data):\n    return os.system('echo owned')\n",
+            "weights.bin": b"weights",
+        },
+        filename="budget_limited_non_handler.mar",
+    )
+
+    with zipfile.ZipFile(mar_path, "r") as archive:
+        member_sizes = {info.filename: info.file_size for info in archive.infolist()}
+
+    budget = member_sizes["MAR-INF/MANIFEST.json"] + member_sizes["handler.py"]
+    result = TorchServeMarScanner(config={"max_mar_uncompressed_bytes": budget}).scan(str(mar_path))
+
+    non_handler_failures = _failed_checks(result, "MAR Non-Handler Python Analysis")
+    assert len(non_handler_failures) == 0
+    budget_failures = _failed_checks(result, "TorchServe MAR Uncompressed Size Budget")
+    assert len(budget_failures) == 1
+
+
 def test_scan_resolves_bare_module_handler_names(tmp_path: Path) -> None:
     manifest = {"model": {"handler": "custom_handler", "serializedFile": "weights.bin"}}
     mar_path = _create_mar_archive(
