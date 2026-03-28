@@ -193,6 +193,12 @@ class ScanResultsCache:
             # Get file stats ONCE and reuse
             file_stat = os.stat(file_path)
 
+            # Resolve version info once — used for both the cache key and the
+            # stored entry to avoid a redundant (and potentially flaky) second call.
+            version_info = self._get_version_info(version_context)
+            if version_info is None:
+                return
+
             # Pass file_stat to avoid redundant calls
             cache_key = self._generate_cache_key(file_path, file_stat=file_stat, version_context=version_context)
             if not cache_key:
@@ -209,7 +215,7 @@ class ScanResultsCache:
                     "original_name": os.path.basename(file_path),
                     "mtime": file_stat.st_mtime,
                 },
-                version_info=self._get_version_info(version_context),
+                version_info=version_info,
                 scan_result=scan_result,
                 cache_metadata={
                     "scanned_at": time.time(),
@@ -263,8 +269,12 @@ class ScanResultsCache:
             else:
                 file_key = self.key_generator.generate_key(file_path)
 
-            # Get version information
+            # Get version information — returns None when version components
+            # cannot be resolved, in which case we must not cache at all to
+            # avoid collisions between different configs/scanner versions.
             version_info = self._get_version_info(version_context)
+            if version_info is None:
+                return None
 
             # Create version fingerprint
             version_str = json.dumps(version_info, sort_keys=True)
@@ -295,8 +305,12 @@ class ScanResultsCache:
         # This prevents too many files in a single directory
         return self.cache_dir / cache_key[:2] / cache_key[2:4] / f"{cache_key}.json"
 
-    def _get_version_info(self, version_context: dict[str, Any] | None = None) -> dict[str, Any]:
-        """Get current version information for cache invalidation."""
+    def _get_version_info(self, version_context: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        """Get current version information for cache invalidation.
+
+        Returns None when a material component cannot be resolved, signalling
+        that caching must be skipped to avoid key collisions.
+        """
         try:
             from modelaudit import __version__ as modelaudit_version
         except ImportError:
@@ -308,14 +322,14 @@ class ScanResultsCache:
         try:
             config_hash = self._get_config_hash(version_context)
         except Exception as e:
-            logger.debug(f"Failed to compute cache config hash: {e}")
-            config_hash = "unknown"
+            logger.debug(f"Failed to compute cache config hash, disabling cache for this key: {e}")
+            return None
 
         try:
             scanner_versions = self._get_scanner_versions()
         except Exception as e:
-            logger.debug(f"Failed to resolve scanner versions: {e}")
-            scanner_versions = {}
+            logger.debug(f"Failed to resolve scanner versions, disabling cache for this key: {e}")
+            return None
 
         return {
             "modelaudit_version": modelaudit_version,

@@ -383,25 +383,22 @@ def test_cache_entry_omits_raw_version_context(tmp_path: Path) -> None:
     assert "version_context" not in cache_entry["version_info"]
 
 
-def test_cache_key_changes_with_version_context_when_scanner_versions_unavailable(
+def test_cache_key_is_none_when_scanner_versions_unavailable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """When scanner versions cannot be resolved, caching must be disabled
+    entirely to avoid key collisions between different scanner versions."""
     file_path = _make_cacheable_file(tmp_path)
     cache = ScanResultsCache(str(tmp_path / "scan-cache"))
-    version_context_a = build_cache_version_context({"timeout": 30})
-    version_context_b = build_cache_version_context({"timeout": 5})
+    version_context = build_cache_version_context({"timeout": 30})
 
     def raise_scanner_versions() -> dict[str, str]:
         raise RuntimeError("scanner registry unavailable")
 
     monkeypatch.setattr(cache, "_get_scanner_versions", raise_scanner_versions)
 
-    key_a = cache.generate_cache_key(str(file_path), version_context=version_context_a)
-    key_b = cache.generate_cache_key(str(file_path), version_context=version_context_b)
-
-    assert key_a is not None
-    assert key_b is not None
-    assert key_a != key_b
+    key = cache.generate_cache_key(str(file_path), version_context=version_context)
+    assert key is None
 
 
 def test_cache_key_generation_avoids_full_hash_for_medium_files(
