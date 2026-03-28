@@ -7,7 +7,11 @@ import zipfile
 from typing import Any, ClassVar
 
 from ..utils import sanitize_archive_path
-from ..utils.file.detection import _is_executorch_binary_signature, _is_valid_executorch_binary
+from ..utils.file.detection import (
+    _is_executorch_binary_signature,
+    _is_valid_executorch_binary,
+    is_executorch_archive,
+)
 from .base import BaseScanner, IssueSeverity, ScanResult
 from .pickle_scanner import PickleScanner
 
@@ -28,7 +32,9 @@ class ExecuTorchScanner(BaseScanner):
         if not os.path.isfile(path):
             return False
         ext = os.path.splitext(path)[1].lower()
-        return ext in cls.supported_extensions
+        if ext in cls.supported_extensions:
+            return True
+        return is_executorch_archive(path)
 
     @staticmethod
     def _read_header(path: str, length: int = 4) -> bytes:

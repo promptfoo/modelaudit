@@ -23,6 +23,7 @@ from modelaudit.utils.file.detection import (
     detect_file_format,
     detect_file_format_from_magic,
     detect_format_from_extension,
+    is_executorch_archive,
     is_keras_zip_archive,
     is_pytorch_zip_archive,
     is_torchserve_mar_archive,
@@ -172,6 +173,8 @@ def _select_preferred_scanner_id(path: str, header_format: str, ext: str) -> str
             return "keras_zip"
         if is_pytorch_zip_archive(path):
             return "pytorch_zip"
+        if is_executorch_archive(path):
+            return "executorch"
 
         if ext == ".bin":
             # ZIP-backed torch.save() .bin files are routed through the pickle scanner,

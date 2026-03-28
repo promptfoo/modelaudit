@@ -137,6 +137,24 @@ def test_scan_file_routes_misnamed_pytorch_zip_by_content(tmp_path: Path) -> Non
     assert any("data.pkl" in (issue.location or "") for issue in result.issues)
 
 
+def test_scan_file_routes_misnamed_executorch_archive_by_content(tmp_path: Path) -> None:
+    disguised_exec = tmp_path / "model.jpg"
+    _create_misnamed_zip(
+        disguised_exec,
+        {
+            "bytecode.pkl": pickle.dumps({"weights": [1, 2, 3]}),
+            "version": b"1",
+            "evil.py": b"print('evil')\n",
+        },
+    )
+
+    result = scan_file(str(disguised_exec))
+
+    assert result.scanner_name == "executorch"
+    assert any(issue.rule_code == "S507" and "evil.py" in (issue.location or "") for issue in result.issues)
+    assert any(issue.rule_code == "S104" and "evil.py" in (issue.location or "") for issue in result.issues)
+
+
 def test_scan_file_does_not_route_non_pytorch_zip_with_generic_pickle(tmp_path: Path) -> None:
     disguised_zip = tmp_path / "weights.jpg"
     _create_misnamed_zip(
@@ -144,6 +162,21 @@ def test_scan_file_does_not_route_non_pytorch_zip_with_generic_pickle(tmp_path: 
         {
             "weights.pkl": pickle.dumps({"weights": [1, 2, 3]}),
             "version": b"1.0",
+        },
+    )
+
+    result = scan_file(str(disguised_zip))
+
+    assert result.scanner_name == "zip"
+
+
+def test_scan_file_does_not_route_near_match_executorch_zip_without_numeric_version(tmp_path: Path) -> None:
+    disguised_zip = tmp_path / "bytecode.jpg"
+    _create_misnamed_zip(
+        disguised_zip,
+        {
+            "bytecode.pkl": pickle.dumps({"weights": [1, 2, 3]}),
+            "version": b"dev",
         },
     )
 

@@ -343,6 +343,42 @@ def is_pytorch_zip_archive(path: str) -> bool:
     return False
 
 
+def is_executorch_archive(path: str) -> bool:
+    """Return whether a ZIP-backed file matches the mobile/ExecuTorch archive layout."""
+    file_path = Path(path)
+    if not file_path.is_file():
+        return False
+
+    try:
+        with zipfile.ZipFile(file_path, "r") as archive:
+            member_names = {
+                _normalize_archive_member_name(info.filename)
+                for info in archive.infolist()
+                if info.filename and not info.is_dir()
+            }
+
+            for name in member_names:
+                if name == "bytecode.pkl":
+                    prefix = ""
+                elif name.endswith("/bytecode.pkl"):
+                    prefix = name[: -len("/bytecode.pkl")]
+                else:
+                    continue
+
+                version_name = f"{prefix}/version" if prefix else "version"
+                version_info = archive.NameToInfo.get(version_name)
+                if version_info is None:
+                    continue
+
+                version_text = _read_zip_member_text(archive, version_info, _PYTORCH_ZIP_METADATA_MAX_BYTES)
+                if version_text is not None and re.fullmatch(r"\d+(?:\.\d+)?", version_text):
+                    return True
+    except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile):
+        return False
+
+    return False
+
+
 def _is_tar_archive(path: str) -> bool:
     """Return whether a path is a TAR archive, including compressed wrappers."""
     try:
