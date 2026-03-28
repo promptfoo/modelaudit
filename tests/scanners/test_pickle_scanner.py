@@ -34,6 +34,7 @@ from modelaudit.scanners.pickle_scanner import (
     _simulate_symbolic_reference_maps,
     check_opcode_sequence,
 )
+from modelaudit.scanners.rule_mapper import get_pickle_opcode_rule_code
 from tests.assets.generators.generate_advanced_pickle_tests import (
     generate_memo_based_attack,
     generate_multiple_pickle_attack,
@@ -3728,27 +3729,34 @@ def test_build_on_non_safe_global_emits_setstate_warning(tmp_path: Path) -> None
 
     result = scanner.scan(str(payload_path))
 
-    reduce_pattern_checks = [
+    build_pattern_checks = [
         check
         for check in result.checks
-        if check.name == "Reduce Pattern Analysis"
+        if check.name == "BUILD Opcode Analysis"
         and check.status == CheckStatus.FAILED
         and check.details.get("pattern") == "BUILD_SETSTATE_NON_SAFE_GLOBAL"
     ]
-    assert reduce_pattern_checks, [check.details for check in result.checks if check.name == "Reduce Pattern Analysis"]
-    assert reduce_pattern_checks[0].severity == IssueSeverity.WARNING
-    assert reduce_pattern_checks[0].details.get("associated_global") == "evilpkg.StateCarrier"
-    assert "__setstate__" in str(reduce_pattern_checks[0].details.get("description", ""))
+    assert build_pattern_checks, [check.details for check in result.checks if check.name == "BUILD Opcode Analysis"]
+    assert build_pattern_checks[0].severity == IssueSeverity.WARNING
+    assert build_pattern_checks[0].message == (
+        "Detected potential __setstate__ exploitation via BUILD with evilpkg.StateCarrier"
+    )
+    assert build_pattern_checks[0].rule_code == get_pickle_opcode_rule_code("BUILD")
+    assert build_pattern_checks[0].details.get("associated_global") == "evilpkg.StateCarrier"
+    assert build_pattern_checks[0].details.get("module") == "evilpkg"
+    assert build_pattern_checks[0].details.get("function") == "StateCarrier"
+    assert build_pattern_checks[0].details.get("position") == 27
+    assert "__setstate__" in str(build_pattern_checks[0].details.get("description", ""))
 
 
 def test_tree_marker_threshold_escalation_blocked_by_dangerous_global() -> None:
-    """Tree-marker threshold escalation should not apply when dangerous globals are present."""
+    """Tree-marker threshold escalation should not apply when risky ML globals are present."""
     opcodes: list[tuple[object, object, int]] = [
         (type("Op", (), {"name": "GLOBAL"})(), "sklearn.ensemble._forest RandomForestClassifier", 0),
     ]
     opcodes.extend((type("Op", (), {"name": "REDUCE"})(), None, index) for index in range(1, 62))
 
-    callable_refs = dict.fromkeys(range(1, 62), ("os", "system"))
+    callable_refs = dict.fromkeys(range(1, 62), ("numpy", "load"))
     suspicious = check_opcode_sequence(
         opcodes,
         {"is_ml_content": True, "frameworks": {"sklearn": {}}, "overall_confidence": 0.9},
@@ -3758,6 +3766,28 @@ def test_tree_marker_threshold_escalation_blocked_by_dangerous_global() -> None:
     )
 
     assert any(seq.get("pattern") == "MANY_DANGEROUS_OPCODES" for seq in suspicious), suspicious
+
+
+def test_safe_builtin_global_does_not_block_tree_threshold_escalation() -> None:
+    """Allowlisted globals from dangerous modules must not suppress tree-model threshold escalation."""
+    opcodes: list[tuple[object, object, int]] = [
+        (type("Op", (), {"name": "GLOBAL"})(), "sklearn.ensemble._forest RandomForestClassifier", 0),
+        (type("Op", (), {"name": "GLOBAL"})(), "builtins set", 1),
+    ]
+    for index in range(2, 122, 2):
+        opcodes.append((type("Op", (), {"name": "REDUCE"})(), None, index))
+        opcodes.append((type("Op", (), {"name": "BUILD"})(), None, index + 1))
+
+    callable_refs = dict.fromkeys(range(2, 122, 2), ("sklearn.tree._tree", "Tree"))
+    suspicious = check_opcode_sequence(
+        opcodes,
+        {"is_ml_content": True, "frameworks": {"sklearn": {}}, "overall_confidence": 0.9},
+        stack_global_refs={},
+        callable_refs=callable_refs,
+        callable_origin_is_ext={},
+    )
+
+    assert not any(seq.get("pattern") == "MANY_DANGEROUS_OPCODES" for seq in suspicious), suspicious
 
 
 def test_clean_sklearn_build_sequence_stays_below_opcode_alert_threshold() -> None:

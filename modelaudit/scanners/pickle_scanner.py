@@ -3463,13 +3463,37 @@ def check_opcode_sequence(
     known_tree_frameworks = _tree_ensemble_frameworks & _ml_frameworks
 
     def _stream_has_dangerous_globals(stream_id: int) -> bool:
-        for raw_ref in stream_refs.get(stream_id, []):
-            parsed = _parse_module_function(raw_ref)
+        for idx, (mod, func) in resolved_stack_globals.items():
+            if (
+                0 <= idx < len(stream_id_by_index)
+                and stream_id_by_index[idx] == stream_id
+                and _is_actually_dangerous_global(mod, func, ml_context)
+            ):
+                return True
+
+        for idx, (mod, func) in resolved_callables.items():
+            if (
+                0 <= idx < len(stream_id_by_index)
+                and stream_id_by_index[idx] == stream_id
+                and (
+                    resolved_callable_origin_is_ext.get(idx, False)
+                    or _is_actually_dangerous_global(mod, func, ml_context)
+                )
+            ):
+                return True
+
+        for idx, (op, arg, _p) in enumerate(opcodes):
+            if stream_id_by_index[idx] != stream_id:
+                continue
+            if op.name != "GLOBAL" or not isinstance(arg, str):
+                continue
+            parsed = _parse_module_function(arg)
             if not parsed:
                 continue
             mod, func = parsed
-            if _is_dangerous_module(mod) or is_suspicious_global(mod, func):
+            if _is_actually_dangerous_global(mod, func, ml_context):
                 return True
+
         return False
 
     for stream_id, stream_length in stream_lengths.items():
@@ -5793,11 +5817,8 @@ class PickleScanner(BaseScanner):
             )
             if dangerous_pattern:
                 suspicious_count += 1
-                baseline_severity = (
-                    IssueSeverity.WARNING
-                    if dangerous_pattern.get("pattern") == "BUILD_SETSTATE_NON_SAFE_GLOBAL"
-                    else IssueSeverity.CRITICAL
-                )
+                is_build_setstate = dangerous_pattern.get("pattern") == "BUILD_SETSTATE_NON_SAFE_GLOBAL"
+                baseline_severity = IssueSeverity.WARNING if is_build_setstate else IssueSeverity.CRITICAL
                 severity = _get_context_aware_severity(
                     baseline_severity,
                     ml_context,
@@ -5809,12 +5830,15 @@ class PickleScanner(BaseScanner):
                 func_name = dangerous_pattern.get("function", "")
                 rule_code = get_import_rule_code(module_name, func_name)
                 if not rule_code:
-                    rule_code = "S201"  # REDUCE opcode
+                    rule_code = get_pickle_opcode_rule_code("BUILD") if is_build_setstate else "S201"
                 result.add_check(
-                    name="Reduce Pattern Analysis",
+                    name="BUILD Opcode Analysis" if is_build_setstate else "Reduce Pattern Analysis",
                     passed=False,
-                    message=f"Detected dangerous __reduce__ pattern with "
-                    f"{dangerous_pattern.get('module', '')}.{dangerous_pattern.get('function', '')}",
+                    message=(
+                        f"Detected potential __setstate__ exploitation via BUILD with {module_name}.{func_name}"
+                        if is_build_setstate
+                        else f"Detected dangerous __reduce__ pattern with {module_name}.{func_name}"
+                    ),
                     severity=severity,
                     rule_code=rule_code,
                     location=f"{self.current_file_path} (pos {dangerous_pattern.get('position', 0)})",
