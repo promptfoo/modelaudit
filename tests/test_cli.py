@@ -1358,7 +1358,13 @@ def test_scan_stream_help():
 @patch("modelaudit.cli.download_from_cloud")
 @patch("modelaudit.cli.scan_model_directory_or_file")
 @patch("shutil.rmtree")
-def test_scan_cloud_url_success(mock_rmtree, mock_scan, mock_download, mock_is_cloud, tmp_path):
+def test_scan_cloud_url_success(
+    mock_rmtree: MagicMock,
+    mock_scan: MagicMock,
+    mock_download: MagicMock,
+    mock_is_cloud: MagicMock,
+    tmp_path: Path,
+) -> None:
     """Test scanning a cloud storage URL successfully."""
     mock_is_cloud.return_value = True
     test_dir = tmp_path / "cloud"
@@ -1379,7 +1385,7 @@ def test_scan_cloud_url_success(mock_rmtree, mock_scan, mock_download, mock_is_c
 
 @patch("modelaudit.cli.is_cloud_url")
 @patch("modelaudit.cli.download_from_cloud")
-def test_scan_cloud_url_download_failure(mock_download, mock_is_cloud):
+def test_scan_cloud_url_download_failure(mock_download: MagicMock, mock_is_cloud: MagicMock) -> None:
     """Test download failure for cloud storage URL."""
     mock_is_cloud.return_value = True
     mock_download.side_effect = Exception("boom")
@@ -1394,7 +1400,13 @@ def test_scan_cloud_url_download_failure(mock_download, mock_is_cloud):
 @patch("modelaudit.cli.download_from_cloud")
 @patch("modelaudit.cli.scan_model_directory_or_file")
 @patch("shutil.rmtree")
-def test_scan_cloud_url_with_issues(mock_rmtree, mock_scan, mock_download, mock_is_cloud, tmp_path):
+def test_scan_cloud_url_with_issues(
+    mock_rmtree: MagicMock,
+    mock_scan: MagicMock,
+    mock_download: MagicMock,
+    mock_is_cloud: MagicMock,
+    tmp_path: Path,
+) -> None:
     """Test scanning a cloud storage URL that has issues."""
     mock_is_cloud.return_value = True
     test_dir = tmp_path / "cloud"
@@ -1415,6 +1427,64 @@ def test_scan_cloud_url_with_issues(mock_rmtree, mock_scan, mock_download, mock_
 
     assert result.exit_code == 1
     mock_rmtree.assert_called()
+
+
+@patch("modelaudit.cli.is_cloud_url")
+@patch("modelaudit.cli.download_from_cloud")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+@patch("shutil.rmtree")
+def test_scan_cloud_url_no_cache_with_cache_dir_cleans_downloads(
+    mock_rmtree: MagicMock,
+    mock_scan: MagicMock,
+    mock_download: MagicMock,
+    mock_is_cloud: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """--no-cache must not preserve remote downloads just because --cache-dir was provided."""
+    mock_is_cloud.return_value = True
+    test_dir = tmp_path / "cloud-nocache"
+    test_dir.mkdir()
+    (test_dir / "model.bin").write_text("dummy")
+    mock_download.return_value = test_dir
+    mock_scan.return_value = create_mock_scan_result(
+        bytes_scanned=123, issues=[], files_scanned=1, assets=[], has_errors=False, scanners=["test"]
+    )
+
+    cache_dir = tmp_path / "cache"
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "--no-cache", "--cache-dir", str(cache_dir), "s3://bucket/model.bin"])
+
+    assert result.exit_code == 0
+    mock_download.assert_called_once()
+    assert mock_download.call_args.kwargs["cache_dir"] is None
+    mock_rmtree.assert_called()
+
+
+@patch("modelaudit.cli.is_cloud_url")
+@patch("modelaudit.cli.download_from_cloud")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+def test_scan_cloud_url_strict_disables_selective_prefiltering(
+    mock_scan: MagicMock,
+    mock_download: MagicMock,
+    mock_is_cloud: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Strict mode should disable cloud-side selective filtering."""
+    mock_is_cloud.return_value = True
+    test_dir = tmp_path / "cloud-strict"
+    test_dir.mkdir()
+    (test_dir / "helper.py").write_text("print('strict cloud file')\n")
+    mock_download.return_value = test_dir
+    mock_scan.return_value = create_mock_scan_result(files_scanned=1, issues=[])
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "--strict", "s3://bucket/model-prefix/"])
+
+    assert result.exit_code == 0
+    mock_download.assert_called_once()
+    assert mock_download.call_args.kwargs["selective"] is False
+    mock_scan.assert_called_once()
+    assert mock_scan.call_args.kwargs["skip_file_types"] is False
 
 
 @patch("modelaudit.cli.is_jfrog_url")

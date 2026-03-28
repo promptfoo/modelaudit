@@ -898,6 +898,7 @@ def scan_command(
         user_overrides["scan_and_delete"] = True
     if strict:
         user_overrides["skip_non_model_files"] = False
+        user_overrides["selective_download"] = False
         user_overrides["strict_license"] = True
         user_overrides["use_cache"] = False
         user_overrides["use_hf_whitelist"] = False
@@ -918,7 +919,7 @@ def scan_command(
     final_timeout = config.get("timeout", 3600)
     final_progress = config.get("show_progress", False)
     final_cache = config.get("use_cache", True)
-    final_cache_dir = config.get("cache_dir")
+    final_cache_dir = config.get("cache_dir") if final_cache else None
     final_format = config.get("format", "text")
     # Determine if we should show styled console output (spinners, colors, headers)
     # Show styled output when: text format OR output goes to file (stdout is free)
@@ -1977,7 +1978,7 @@ def scan_command(
 
             finally:
                 # Defer cleanup until after SBOM generation to avoid FileNotFoundError
-                if temp_dir and os.path.exists(temp_dir) and not final_cache_dir:
+                if temp_dir and os.path.exists(temp_dir) and not final_cache:
                     temp_dirs_to_cleanup.append(temp_dir)
                     if verbose:
                         logger.debug(f"Deferring cleanup of temporary directory: {temp_dir}")
