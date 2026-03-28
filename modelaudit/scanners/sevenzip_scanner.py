@@ -529,9 +529,11 @@ class SevenZipScanner(BaseScanner):
         if not candidate_extensions:
             return 5
 
-        leaf_extension = candidate_extensions[0]
+        leaf_extension = Path(file_name).suffix.lower()
+        if not leaf_extension:
+            leaf_extension = candidate_extensions[-1]
         if leaf_extension in cls._LOW_VALUE_NESTED_PROBE_EXTENSIONS:
-            return 0
+            return 1
 
         priority = 2
         if leaf_extension in cls._COMMON_NESTED_DISGUISE_EXTENSIONS:
