@@ -975,6 +975,35 @@ def test_scan_strict_implies_no_whitelist_and_no_cache(mock_scan: MagicMock, tmp
     mock_scan.assert_called_once()
     assert mock_scan.call_args.kwargs["use_hf_whitelist"] is False
     assert mock_scan.call_args.kwargs["cache_enabled"] is False
+    assert mock_scan.call_args.kwargs["skip_file_types"] is False
+
+
+@patch("modelaudit.cli.scan_model_directory_or_file")
+def test_scan_default_skips_non_model_python_files(mock_scan: MagicMock, tmp_path: Path) -> None:
+    test_file = tmp_path / "helper.py"
+    test_file.write_text("print('not a model')\n")
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", str(test_file), "--format", "json"])
+    parsed = parse_click_json_output(result.output)
+
+    assert result.exit_code == 2
+    mock_scan.assert_not_called()
+    assert parsed["files_scanned"] == 0
+
+
+@patch("modelaudit.cli.scan_model_directory_or_file")
+def test_scan_strict_scans_non_model_python_files(mock_scan: MagicMock, tmp_path: Path) -> None:
+    test_file = tmp_path / "helper.py"
+    test_file.write_text("print('not a model')\n")
+    mock_scan.return_value = create_mock_scan_result(files_scanned=1, issues=[])
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", str(test_file), "--format", "json", "--strict"])
+
+    assert result.exit_code == 0
+    mock_scan.assert_called_once()
+    assert mock_scan.call_args.kwargs["skip_file_types"] is False
 
 
 @patch("modelaudit.cli.scan_model_directory_or_file")

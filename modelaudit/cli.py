@@ -1701,7 +1701,7 @@ def scan_command(
                 #       no registered scanner can handle the file.
                 # Use actual_path (which may be a downloaded file) instead of original path
                 scan_path = actual_path if url_handled else path
-                if os.path.isfile(scan_path):
+                if final_skip_files and os.path.isfile(scan_path):
                     _, ext = os.path.splitext(scan_path)
                     ext = ext.lower()
                     if ext in (
