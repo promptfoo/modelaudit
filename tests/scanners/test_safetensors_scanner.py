@@ -10,6 +10,7 @@ pytest.importorskip("safetensors")
 
 from safetensors.numpy import save_file
 
+from modelaudit.scanners.base import CheckStatus
 from modelaudit.scanners.safetensors_scanner import SafeTensorsScanner
 
 
@@ -19,6 +20,23 @@ def create_safetensors_file(path: Path) -> None:
         "t2": np.ones((2, 2), dtype=np.int64),
     }
     save_file(data, str(path))
+
+
+def create_safetensors_with_dtype_size_mismatch(path: Path, dtype: str) -> None:
+    create_safetensors_file(path)
+
+    with open(path, "rb") as f:
+        header_len = struct.unpack("<Q", f.read(8))[0]
+        header_bytes = f.read(header_len)
+        data_bytes = f.read()
+
+    header = json.loads(header_bytes.decode("utf-8"))
+    header["t2"]["dtype"] = dtype
+    header["t2"]["shape"] = [4]
+    header["t2"]["data_offsets"] = [0, 3]
+
+    new_header_bytes = json.dumps(header).encode("utf-8")
+    path.write_bytes(struct.pack("<Q", len(new_header_bytes)) + new_header_bytes + data_bytes)
 
 
 def test_valid_safetensors_file(tmp_path: Path) -> None:
@@ -80,6 +98,29 @@ def test_bad_offsets(tmp_path: Path) -> None:
 
     assert result.has_errors
     assert any("offset" in issue.message.lower() for issue in result.issues)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "expected_size"),
+    [("BOOL", 4), ("BF16", 8), ("F8_E4M3", 4), ("F16", 8), ("F32", 16), ("F64", 32)],
+)
+def test_tensor_size_check_runs_for_supported_dtypes(tmp_path: Path, dtype: str, expected_size: int) -> None:
+    file_path = tmp_path / f"mismatch_{dtype}.safetensors"
+    create_safetensors_with_dtype_size_mismatch(file_path, dtype)
+
+    scanner = SafeTensorsScanner()
+    result = scanner.scan(str(file_path))
+
+    size_checks = [
+        check
+        for check in result.checks
+        if check.name == "Tensor Size Consistency Check" and check.details.get("tensor") == "t2"
+    ]
+    assert size_checks, f"Expected Tensor Size Consistency Check for dtype {dtype}"
+    assert any(
+        check.status == CheckStatus.FAILED and check.details.get("expected_size") == expected_size
+        for check in size_checks
+    ), f"Expected failing size consistency check for dtype {dtype}"
 
 
 def test_deeply_nested_header(tmp_path: Path) -> None:

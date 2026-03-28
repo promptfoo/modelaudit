@@ -14,9 +14,13 @@ from .base import BaseScanner, IssueSeverity, ScanResult
 
 # Map SafeTensors dtypes to byte sizes for integrity checking
 _DTYPE_SIZES = {
+    "BOOL": 1,
+    "BF16": 2,
     "F16": 2,
     "F32": 4,
     "F64": 8,
+    "F8_E4M3": 1,
+    "F8_E5M2": 1,
     "I8": 1,
     "I16": 2,
     "I32": 4,
