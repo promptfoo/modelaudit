@@ -26,6 +26,7 @@ _DTYPE_SIZES = {
     "U32": 4,
     "U64": 8,
 }
+MAX_HEADER_BYTES = 16 * 1024 * 1024
 
 
 class SafeTensorsScanner(BaseScanner):
@@ -86,6 +87,7 @@ class SafeTensorsScanner(BaseScanner):
                     return result
 
                 header_len = struct.unpack("<Q", header_len_bytes)[0]
+                max_header_bytes = int(self.config.get("max_safetensors_header_bytes", MAX_HEADER_BYTES))
                 if header_len <= 0 or header_len > file_size - 8:
                     result.add_check(
                         name="Header Length Validation",
@@ -104,6 +106,31 @@ class SafeTensorsScanner(BaseScanner):
                         message="SafeTensors header length is valid",
                         location=path,
                         details={"header_len": header_len},
+                    )
+
+                skip_deep_metadata_analysis = header_len > max_header_bytes
+                if skip_deep_metadata_analysis:
+                    result.add_check(
+                        name="Header Size Limit",
+                        passed=False,
+                        message=(
+                            f"SafeTensors header exceeds maximum allowed size ({header_len} > {max_header_bytes})"
+                        ),
+                        severity=IssueSeverity.WARNING,
+                        location=path,
+                        details={"header_len": header_len, "max_allowed": max_header_bytes},
+                        why=(
+                            "Large metadata headers can trigger expensive regular-expression processing and increase "
+                            "denial-of-service risk."
+                        ),
+                    )
+                else:
+                    result.add_check(
+                        name="Header Size Limit",
+                        passed=True,
+                        message="SafeTensors header is within configured size limit",
+                        location=path,
+                        details={"header_len": header_len, "max_allowed": max_header_bytes},
                     )
 
                 header_bytes = f.read(header_len)
@@ -157,7 +184,12 @@ class SafeTensorsScanner(BaseScanner):
                 result.metadata["tensors"] = tensor_names
 
                 # Enhanced SafeTensors metadata injection detection
-                self._detect_metadata_injection_attacks(header, result, path)
+                self._detect_metadata_injection_attacks(
+                    header=header,
+                    result=result,
+                    path=path,
+                    analyze_metadata_content=not skip_deep_metadata_analysis,
+                )
 
                 # Validate tensor offsets and sizes
                 tensor_entries: list[tuple[str, Any]] = [(k, v) for k, v in header.items() if k != "__metadata__"]
@@ -365,13 +397,19 @@ class SafeTensorsScanner(BaseScanner):
             total *= dim
         return total * size
 
-    def _detect_metadata_injection_attacks(self, header: dict[str, Any], result: ScanResult, path: str) -> None:
+    def _detect_metadata_injection_attacks(
+        self,
+        header: dict[str, Any],
+        result: ScanResult,
+        path: str,
+        analyze_metadata_content: bool = True,
+    ) -> None:
         """Detect metadata injection attacks in SafeTensors files"""
 
         # Check if __metadata__ exists and analyze it
         metadata = header.get("__metadata__", {})
 
-        if metadata:
+        if metadata and analyze_metadata_content:
             # Analyze the metadata for injection patterns
             self._analyze_metadata_content(metadata, result, path)
 
