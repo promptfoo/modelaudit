@@ -742,9 +742,7 @@ class TestSevenZipScanner:
             assert result.metadata["unsafe_entries"] == 1
             assert result.metadata["scannable_files"] == 1
             extract_targets = [
-                call.kwargs["targets"]
-                for call in mock_archive.extract.call_args_list
-                if "targets" in call.kwargs
+                call.kwargs["targets"] for call in mock_archive.extract.call_args_list if "targets" in call.kwargs
             ]
             assert ["safe.pkl"] in extract_targets
             assert all("../../../escape.pkl" not in targets for targets in extract_targets)
