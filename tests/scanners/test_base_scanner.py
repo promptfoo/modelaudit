@@ -482,7 +482,10 @@ def test_whitelist_disabled():
     assert result.issues[0].details.get("whitelist_downgrade") is None
 
 
-def test_whitelist_staleness_recent_no_warning(monkeypatch, caplog):
+def test_whitelist_staleness_recent_no_warning(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """Recent whitelist snapshots should not emit a staleness warning."""
     from modelaudit.whitelists import POPULAR_MODELS
 
@@ -505,7 +508,10 @@ def test_whitelist_staleness_recent_no_warning(monkeypatch, caplog):
     assert not any("HuggingFace whitelist is" in rec.message for rec in caplog.records)
 
 
-def test_whitelist_staleness_warning_logged_for_stale_snapshot(monkeypatch, caplog):
+def test_whitelist_staleness_warning_logged_for_stale_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """Stale whitelist snapshots should emit a warning when used."""
     from modelaudit.whitelists import POPULAR_MODELS
 
@@ -529,7 +535,10 @@ def test_whitelist_staleness_warning_logged_for_stale_snapshot(monkeypatch, capl
     assert any("HuggingFace whitelist is 180 days old" in rec.message for rec in caplog.records)
 
 
-def test_whitelist_staleness_warning_only_logs_once(monkeypatch, caplog):
+def test_whitelist_staleness_warning_only_logs_once(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """Stale whitelist warning should only be logged once per scan session."""
     from modelaudit.whitelists import POPULAR_MODELS
 
