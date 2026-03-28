@@ -242,6 +242,7 @@ def test_post_budget_global_scan_has_no_false_positives_for_clean_large_payload(
 
     result = PickleScanner({"max_opcodes": 64}).scan(str(pickle_path))
 
+    assert result.success is True
     assert any(check.name == "Opcode Count Check" and check.status == CheckStatus.FAILED for check in result.checks), (
         "Expected opcode budget exhaustion check"
     )
@@ -282,6 +283,77 @@ def test_post_budget_global_scan_runs_only_when_opcode_budget_is_exceeded(
     large_path.write_bytes(_make_opcode_padding_stream(opcode_pairs=256) + pickle.dumps({"safe": True}, protocol=4))
     scanner.scan(str(large_path))
     assert call_counter["calls"] == 1
+
+
+def test_post_budget_global_scan_warning_only_for_unknown_import(tmp_path: Path) -> None:
+    """Unknown third-party imports beyond the budget should stay at warning severity."""
+    pickle_path = tmp_path / "post-budget-unknown-import.pkl"
+    benign_padding = _make_opcode_padding_stream(opcode_pairs=512)
+    suspicious_stream = b"\x80\x02cmysterypkg\nloader\n."
+    pickle_path.write_bytes(benign_padding + suspicious_stream)
+
+    result = PickleScanner({"max_opcodes": 64}).scan(str(pickle_path))
+
+    checks = [check for check in result.checks if check.name == "Post-Budget Global Reference Scan"]
+    assert len(checks) == 1
+    assert checks[0].status == CheckStatus.FAILED
+    assert checks[0].severity == IssueSeverity.WARNING
+    assert "mysterypkg.loader" in checks[0].message
+    assert checks[0].details["dangerous_references"] == []
+    references = checks[0].details["references"]
+    assert any(
+        finding["import_reference"] == "mysterypkg.loader" and finding["severity"] == IssueSeverity.WARNING.value
+        for finding in references
+    )
+    assert result.success is True
+
+
+def test_post_budget_global_scan_honors_configured_byte_limit(tmp_path: Path) -> None:
+    """Configured byte limits should bound how far the fallback scan can see."""
+    pickle_path = tmp_path / "post-budget-configured-limit.pkl"
+    benign_padding = _make_opcode_padding_stream(opcode_pairs=256)
+    malicious_stream = b"\x80\x02cos\nsystem\n)R."
+    pickle_path.write_bytes(benign_padding + malicious_stream)
+
+    hidden_result = PickleScanner(
+        {
+            "max_opcodes": 64,
+            "post_budget_global_scan_limit_bytes": len(benign_padding),
+        }
+    ).scan(str(pickle_path))
+    visible_result = PickleScanner(
+        {
+            "max_opcodes": 64,
+            "post_budget_global_scan_limit_bytes": len(benign_padding) + len(malicious_stream),
+        }
+    ).scan(str(pickle_path))
+
+    assert not any(
+        check.name == "Post-Budget Global Reference Scan" and check.status == CheckStatus.FAILED
+        for check in hidden_result.checks
+    )
+    visible_checks = [check for check in visible_result.checks if check.name == "Post-Budget Global Reference Scan"]
+    assert len(visible_checks) == 1
+    assert visible_checks[0].severity == IssueSeverity.CRITICAL
+    assert "os.system" in visible_checks[0].message
+
+
+def test_post_budget_global_scan_uses_stack_global_opcode_offset() -> None:
+    """STACK_GLOBAL references that cross the budget boundary should still be reported."""
+    raw_stack_global = _short_binunicode(b"os") + _short_binunicode(b"system") + b"\x93"
+    scanner = PickleScanner()
+
+    findings = scanner._scan_global_references_unbounded(
+        BytesIO(raw_stack_global),
+        file_size=len(raw_stack_global),
+        minimum_offset=len(raw_stack_global) - 1,
+        ml_context={},
+    )
+
+    assert len(findings) == 1
+    assert findings[0]["import_reference"] == "os.system"
+    assert findings[0]["opcode"] == "STACK_GLOBAL"
+    assert findings[0]["offset"] == len(raw_stack_global) - 1
 
 
 class TestPickleScanner(unittest.TestCase):

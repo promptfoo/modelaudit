@@ -4081,11 +4081,13 @@ class PickleScanner(BaseScanner):
             result.finish(success=False)
             return result
 
-        has_post_budget_failure = any(
-            check.name == "Post-Budget Global Reference Scan" and check.status == CheckStatus.FAILED
+        has_critical_post_budget_failure = any(
+            check.name == "Post-Budget Global Reference Scan"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
             for check in result.checks
         )
-        result.finish(success=not has_post_budget_failure)
+        result.finish(success=result.success and not has_critical_post_budget_failure)
         return result
 
     def _scan_for_dangerous_patterns(self, data: bytes, result: ScanResult, context_path: str) -> None:
@@ -4518,13 +4520,15 @@ class PickleScanner(BaseScanner):
             if not module or not function or not _is_plausible_python_module(module):
                 return
 
-            is_failure, _severity, classification = _classify_import_reference(
+            is_failure, severity, classification = _classify_import_reference(
                 module,
                 function,
                 ml_context,
                 is_import_only=True,
             )
             if not is_failure:
+                return
+            if severity is None:
                 return
 
             import_reference = f"{module}.{function}"
@@ -4541,6 +4545,7 @@ class PickleScanner(BaseScanner):
                     "offset": offset,
                     "opcode": opcode_name,
                     "classification": classification,
+                    "severity": severity.value,
                     "rule_code": get_import_rule_code(module, function) or "S206",
                 }
             )
@@ -4550,9 +4555,9 @@ class PickleScanner(BaseScanner):
         while cursor < data_len:
             opcode_value = data[cursor]
             if opcode_value in (ord("c"), ord("i")):
-                module_end = data.find(b"\n", cursor + 1)
+                module_end = data.find(b"\n", cursor + 1, min(data_len, cursor + 257))
                 if module_end != -1 and module_end - cursor <= 256:
-                    function_end = data.find(b"\n", module_end + 1)
+                    function_end = data.find(b"\n", module_end + 1, min(data_len, module_end + 257))
                     if function_end != -1 and function_end - module_end <= 256:
                         module = data[cursor + 1 : module_end].decode("utf-8", errors="ignore").strip()
                         function = data[module_end + 1 : function_end].decode("utf-8", errors="ignore").strip()
@@ -4582,7 +4587,7 @@ class PickleScanner(BaseScanner):
 
             module = data[module_start:module_end].decode("utf-8", errors="ignore").strip()
             function = data[function_start:function_end].decode("utf-8", errors="ignore").strip()
-            _record_reference(module, function, idx, "STACK_GLOBAL")
+            _record_reference(module, function, function_end, "STACK_GLOBAL")
 
         return findings
 
@@ -4973,7 +4978,15 @@ class PickleScanner(BaseScanner):
                     ml_context=ml_context,
                 )
                 if post_budget_global_findings:
-                    first_finding = post_budget_global_findings[0]
+                    critical_findings = [
+                        finding
+                        for finding in post_budget_global_findings
+                        if finding["severity"] == IssueSeverity.CRITICAL.value
+                    ]
+                    highest_severity = IssueSeverity.CRITICAL if critical_findings else IssueSeverity.WARNING
+                    representative_finding = (
+                        critical_findings[0] if critical_findings else post_budget_global_findings[0]
+                    )
                     additional = len(post_budget_global_findings) - 1
                     additional_note = f" (+{additional} more)" if additional > 0 else ""
                     post_budget_scan_bytes = min(file_size, self.post_budget_global_scan_limit_bytes)
@@ -4982,26 +4995,35 @@ class PickleScanner(BaseScanner):
                         name="Post-Budget Global Reference Scan",
                         passed=False,
                         message=(
-                            "Dangerous reference found beyond opcode budget: "
-                            f"{first_finding['import_reference']} at byte offset {first_finding['offset']}"
+                            (
+                                "Dangerous reference found beyond opcode budget: "
+                                if highest_severity == IssueSeverity.CRITICAL
+                                else "Suspicious import reference found beyond opcode budget: "
+                            )
+                            + f"{representative_finding['import_reference']} at byte offset "
+                            + f"{representative_finding['offset']}"
                             f"{additional_note}"
                         ),
-                        severity=IssueSeverity.CRITICAL,
+                        severity=highest_severity,
                         location=self.current_file_path,
-                        rule_code=first_finding["rule_code"],
+                        rule_code=representative_finding["rule_code"],
                         details={
                             "scan_limit_bytes": self.post_budget_global_scan_limit_bytes,
                             "scan_bytes": post_budget_scan_bytes,
                             "scan_total_bytes": file_size,
                             "minimum_offset": max_analyzed_offset + 1,
-                            "dangerous_references": post_budget_global_findings,
+                            "references": post_budget_global_findings,
+                            "dangerous_references": critical_findings,
                         },
                         why=(
                             "The opcode pass stopped at the configured budget, so a separate byte-level import scan "
-                            "checked the remaining payload and found dangerous GLOBAL/INST/STACK_GLOBAL references."
+                            "checked the remaining payload and found "
+                            + ("dangerous" if highest_severity == IssueSeverity.CRITICAL else "suspicious")
+                            + " GLOBAL/INST/STACK_GLOBAL references."
                         ),
                     )
-                    result.success = False
+                    if highest_severity == IssueSeverity.CRITICAL:
+                        result.success = False
 
             # CVE-2025-32434 specific opcode sequence analysis - REMOVED
             # Now only show CVE info in REDUCE opcode detection messages
