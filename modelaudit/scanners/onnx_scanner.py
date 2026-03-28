@@ -45,12 +45,14 @@ def _get_onnx_mapping() -> Any:
 # Defer ONNX availability check to avoid module-level imports
 HAS_ONNX: bool | None = None
 mapping = None
-STANDARD_ONNX_DOMAINS = {
-    "",
-    "ai.onnx",
-    "ai.onnx.ml",
-    "ai.onnx.preview.training",
-}
+STANDARD_ONNX_DOMAINS: frozenset[str] = frozenset(
+    {
+        "",
+        "ai.onnx",
+        "ai.onnx.ml",
+        "ai.onnx.preview.training",
+    }
+)
 
 
 def _check_onnx() -> bool:
