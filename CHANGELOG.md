@@ -63,6 +63,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **security:** inspect TensorFlow SavedModel function definitions when scanning for dangerous ops and protobuf string abuse, with function-aware finding locations
 - **cli:** include streamed artifacts as SBOM components when `scan --stream --sbom` is used
 - **cli:** exclude HuggingFace download cache bookkeeping files from remote SBOMs and asset lists
+- **cli:** add `--no-whitelist` and `--strict` whitelist/caching hardening so CI scans can disable HF severity downgrades and force uncached analysis
 - **security:** require official or explicitly allowlisted JFrog hosts before treating `/artifactory/` URLs as authenticated JFrog endpoints
 - **security:** detect CVE-2024-5480 PyTorch torch.distributed.rpc arbitrary function execution via PythonUDF (CVSS 10.0)
 - **security:** detect CVE-2024-48063 PyTorch torch.distributed.rpc.RemoteModule deserialization RCE via pickle (CVSS 9.8)

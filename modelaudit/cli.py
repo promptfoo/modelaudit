@@ -676,7 +676,12 @@ def delegate_info() -> None:
 @click.option(
     "--strict",
     is_flag=True,
-    help="Strict mode: fail on warnings, scan all file types, strict license validation",
+    help="Strict mode: imply --no-whitelist and --no-cache, scan all file types, strict license validation",
+)
+@click.option(
+    "--no-whitelist",
+    is_flag=True,
+    help="Disable HuggingFace whitelist severity downgrading",
 )
 @click.option(
     "--suppress",
@@ -742,6 +747,7 @@ def scan_command(
     quiet: bool,
     blacklist: tuple[str, ...],
     strict: bool,
+    no_whitelist: bool,
     suppress: tuple[str, ...],
     severity: tuple[str, ...],
     progress: bool,
@@ -807,6 +813,7 @@ def scan_command(
         "verbose": verbose,
         "cache_enabled": not no_cache,
         "strict": strict,
+        "no_whitelist": no_whitelist,
         "dry_run": dry_run,
         "num_paths": len(paths),
     }
@@ -885,11 +892,15 @@ def scan_command(
         user_overrides["show_progress"] = True
     if no_cache:
         user_overrides["use_cache"] = False
+    if no_whitelist:
+        user_overrides["use_hf_whitelist"] = False
     if stream:
         user_overrides["scan_and_delete"] = True
     if strict:
         user_overrides["skip_non_model_files"] = False
         user_overrides["strict_license"] = True
+        user_overrides["use_cache"] = False
+        user_overrides["use_hf_whitelist"] = False
     if verbose:
         user_overrides["verbose"] = True
     if quiet:
@@ -919,6 +930,7 @@ def scan_command(
     final_max_total_size = config.get("max_total_size", 0)
     final_skip_files = config.get("skip_non_model_files", True)
     final_strict_license = config.get("strict_license", False)
+    final_use_hf_whitelist = config.get("use_hf_whitelist", True)
 
     # Apply rule configuration from CLI and any trusted local config for this scan mode.
     severity_overrides = parse_severity_overrides(severity)
@@ -1216,6 +1228,7 @@ def scan_command(
                                 max_total_size=final_max_total_size,
                                 strict_license=final_strict_license,
                                 skip_file_types=final_skip_files,
+                                use_hf_whitelist=final_use_hf_whitelist,
                                 cache_enabled=final_cache,
                                 cache_dir=final_cache_dir,
                                 **streaming_kwargs,
@@ -1324,6 +1337,7 @@ def scan_command(
                                 max_total_size=final_max_total_size,
                                 strict_license=final_strict_license,
                                 skip_file_types=final_skip_files,
+                                use_hf_whitelist=final_use_hf_whitelist,
                                 cache_enabled=final_cache,
                                 cache_dir=final_cache_dir,
                             )
@@ -1480,6 +1494,7 @@ def scan_command(
                                 max_total_size=final_max_total_size,
                                 strict_license=final_strict_license,
                                 skip_file_types=final_skip_files,
+                                use_hf_whitelist=final_use_hf_whitelist,
                                 cache_enabled=final_cache,
                                 cache_dir=final_cache_dir,
                             )
@@ -1592,6 +1607,7 @@ def scan_command(
                             blacklist_patterns=list(blacklist) if blacklist else None,
                             max_file_size=final_max_file_size,
                             max_total_size=final_max_total_size,
+                            use_hf_whitelist=final_use_hf_whitelist,
                         )
 
                         if download_spinner:
@@ -1645,6 +1661,7 @@ def scan_command(
                             max_total_size=final_max_total_size,
                             strict_license=final_strict_license,
                             skip_file_types=final_skip_files,
+                            use_hf_whitelist=final_use_hf_whitelist,
                         )
 
                         if download_spinner:
@@ -1808,6 +1825,7 @@ def scan_command(
                             max_total_size=final_max_total_size,
                             strict_license=final_strict_license,
                             skip_file_types=final_skip_files,
+                            use_hf_whitelist=final_use_hf_whitelist,
                             cache_enabled=final_cache,
                             cache_dir=final_cache_dir,
                         )
@@ -1857,6 +1875,7 @@ def scan_command(
                         strict_license=final_strict_license,
                         progress_callback=progress_callback,
                         skip_file_types=final_skip_files,
+                        use_hf_whitelist=final_use_hf_whitelist,
                         **config_overrides,
                     )
 

@@ -117,6 +117,7 @@ def test_scan_command_help():
     assert "--verbose" in result.output
     assert "--max-size" in result.output  # Updated from --max-file-size
     assert "--strict" in result.output  # New consolidated flag
+    assert "--no-whitelist" in result.output
     assert "--dry-run" in result.output  # New flag
     assert "Defaults:" in result.output or "Automatic defaults:" in result.output
 
@@ -916,6 +917,67 @@ def test_scan_huggingface_url_with_issues(mock_rmtree, mock_scan, mock_download,
 
 
 @patch("modelaudit.cli.scan_model_directory_or_file")
+def test_scan_no_whitelist_passes_config_and_preserves_critical_exit_code(mock_scan, tmp_path: Path) -> None:
+    """--no-whitelist should disable downgrade config and keep CRITICAL findings as exit-code 1."""
+    test_file = tmp_path / "model.pkl"
+    test_file.write_bytes(b"dummy")
+
+    mock_scan.return_value = create_mock_scan_result(
+        bytes_scanned=2048,
+        issues=[
+            {
+                "message": "Dangerous import detected",
+                "severity": "critical",
+                "location": "model.pkl",
+                "details": {},
+            }
+        ],
+        files_scanned=1,
+        assets=[],
+        has_errors=False,
+        scanners=["pickle_scanner"],
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", str(test_file), "--format", "json", "--no-whitelist"])
+
+    assert result.exit_code == 1
+    mock_scan.assert_called_once()
+    assert mock_scan.call_args.kwargs["use_hf_whitelist"] is False
+
+
+@patch("modelaudit.cli.scan_model_directory_or_file")
+def test_scan_defaults_keep_whitelist_enabled(mock_scan, tmp_path: Path) -> None:
+    """Without flags, whitelist downgrading remains enabled for backward compatibility."""
+    test_file = tmp_path / "model.pkl"
+    test_file.write_bytes(b"dummy")
+    mock_scan.return_value = create_mock_scan_result(files_scanned=1, issues=[])
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", str(test_file), "--format", "json"])
+
+    assert result.exit_code == 0
+    mock_scan.assert_called_once()
+    assert mock_scan.call_args.kwargs["use_hf_whitelist"] is True
+
+
+@patch("modelaudit.cli.scan_model_directory_or_file")
+def test_scan_strict_implies_no_whitelist_and_no_cache(mock_scan, tmp_path: Path) -> None:
+    """--strict should imply both --no-whitelist and --no-cache."""
+    test_file = tmp_path / "model.pkl"
+    test_file.write_bytes(b"dummy")
+    mock_scan.return_value = create_mock_scan_result(files_scanned=1, issues=[])
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", str(test_file), "--format", "json", "--strict"])
+
+    assert result.exit_code == 0
+    mock_scan.assert_called_once()
+    assert mock_scan.call_args.kwargs["use_hf_whitelist"] is False
+    assert mock_scan.call_args.kwargs["cache_enabled"] is False
+
+
+@patch("modelaudit.cli.scan_model_directory_or_file")
 def test_scan_mixed_paths_and_urls(mock_scan):
     """Test scanning both local paths and HuggingFace URLs in one command."""
     runner = CliRunner()
@@ -1349,6 +1411,7 @@ def test_scan_jfrog_url_success(mock_scan_jfrog, mock_is_jfrog):
         max_total_size=0,
         strict_license=False,
         skip_file_types=True,
+        use_hf_whitelist=True,
     )
 
 
@@ -1399,6 +1462,7 @@ def test_scan_jfrog_url_with_auth(mock_scan_jfrog, mock_is_jfrog):
         max_total_size=0,
         strict_license=False,
         skip_file_types=True,
+        use_hf_whitelist=True,
     )
 
 
@@ -1433,6 +1497,7 @@ def test_scan_mlflow_uri_success(mock_scan_mlflow):
         blacklist_patterns=None,
         max_file_size=0,
         max_total_size=0,
+        use_hf_whitelist=True,
     )
 
 
@@ -1475,6 +1540,7 @@ def test_scan_mlflow_uri_with_options(mock_scan_mlflow):
         blacklist_patterns=None,
         max_file_size=5000000,
         max_total_size=5000000,
+        use_hf_whitelist=True,
     )
 
 
