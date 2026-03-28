@@ -916,6 +916,35 @@ def test_scan_huggingface_url_with_issues(mock_rmtree, mock_scan, mock_download,
     mock_rmtree.assert_called()
 
 
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.cli.download_model")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+@patch("shutil.rmtree")
+def test_scan_huggingface_no_cache_uses_ephemeral_cache_dir(
+    mock_rmtree: MagicMock,
+    mock_scan: MagicMock,
+    mock_download: MagicMock,
+    mock_is_hf_url: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """No-cache HuggingFace model scans should use a private temp cache, not HF's shared cache."""
+    mock_is_hf_url.return_value = True
+    downloaded_dir = tmp_path / "downloaded"
+    downloaded_dir.mkdir()
+    (downloaded_dir / "model.safetensors").write_bytes(b"weights")
+    mock_download.return_value = downloaded_dir
+    mock_scan.return_value = create_mock_scan_result(files_scanned=1, issues=[])
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "--quiet", "--no-cache", "hf://test/model"])
+
+    assert result.exit_code == 0
+    cache_dir = mock_download.call_args.kwargs["cache_dir"]
+    assert isinstance(cache_dir, Path)
+    assert cache_dir.name.startswith("modelaudit_hf_")
+    mock_rmtree.assert_called()
+
+
 @patch("modelaudit.cli.scan_model_directory_or_file")
 def test_scan_no_whitelist_passes_config_and_preserves_critical_exit_code(mock_scan: MagicMock, tmp_path: Path) -> None:
     """--no-whitelist should disable downgrade config and keep CRITICAL findings as exit-code 1."""
@@ -1108,6 +1137,39 @@ def test_scan_huggingface_streaming_success(mock_scan_streaming, mock_download_s
         assert output_json["files_scanned"] == 3
     except json.JSONDecodeError:
         pytest.fail("Output is not valid JSON")
+
+
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+@patch("modelaudit.core.scan_model_streaming")
+@patch("shutil.rmtree")
+def test_scan_huggingface_strict_streaming_uses_ephemeral_cache_dir(
+    mock_rmtree: MagicMock,
+    mock_scan_streaming: MagicMock,
+    mock_download_streaming: MagicMock,
+    mock_is_hf_url: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Strict streaming scans should use a private temp cache instead of the shared HF cache."""
+    mock_is_hf_url.return_value = True
+
+    streamed_file = tmp_path / "weights.bin"
+    streamed_file.write_bytes(b"weights")
+
+    def file_generator():
+        yield (streamed_file, True)
+
+    mock_download_streaming.return_value = file_generator()
+    mock_scan_streaming.return_value = create_mock_scan_result(files_scanned=1, issues=[])
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "--stream", "--strict", "--quiet", "hf://test/model"])
+
+    assert result.exit_code == 0
+    cache_dir = mock_download_streaming.call_args.kwargs["cache_dir"]
+    assert isinstance(cache_dir, Path)
+    assert cache_dir.name.startswith("modelaudit_hf_")
+    mock_rmtree.assert_called()
 
 
 @patch("modelaudit.cli.is_huggingface_url")

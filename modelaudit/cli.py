@@ -1182,11 +1182,17 @@ def scan_command(
                         source_model_id, source_model_source = extract_model_id_from_path(path)
                         # Convert cache_dir string to Path if provided
                         hf_cache_dir = None
+                        tmp_hf_dir = None
                         if final_cache and final_cache_dir:
                             hf_cache_dir = Path(final_cache_dir)
                         elif final_cache:
                             # Use default cache directory
                             hf_cache_dir = Path.home() / ".modelaudit" / "cache"
+                        else:
+                            import tempfile
+
+                            tmp_hf_dir = Path(tempfile.mkdtemp(prefix="modelaudit_hf_"))
+                            hf_cache_dir = tmp_hf_dir
 
                         # Record download start and feature usage
                         record_download_started("huggingface", path)
@@ -1248,6 +1254,7 @@ def scan_command(
                             if show_styled_output:
                                 click.echo(style_text("✅ Streaming scan complete", fg="green", bold=True))
 
+                            temp_dir = str(tmp_hf_dir) if tmp_hf_dir is not None else None
                             # No actual_path to scan in normal flow - already done
                             url_handled = True
                             continue
@@ -1263,8 +1270,8 @@ def scan_command(
                             show_progress = show_styled_output and should_show_spinner()
                             download_path = download_model(path, cache_dir=hf_cache_dir, show_progress=show_progress)
                             actual_path = str(download_path)
-                            # Only track for cleanup if not using cache
-                            temp_dir = str(download_path) if not final_cache else None
+                            # Only clean up temporary directories created for this no-cache run.
+                            temp_dir = str(tmp_hf_dir) if tmp_hf_dir is not None else None
 
                             # Record download completion
                             download_duration = time.time() - download_start
