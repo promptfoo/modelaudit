@@ -8,6 +8,7 @@ from typing import Any
 
 from .adaptive_cache_keys import AdaptiveCacheKeyGenerator
 from .cache_manager import CacheManager
+from .cache_policy import should_cache_scan_result
 
 logger = logging.getLogger(__name__)
 
@@ -194,6 +195,10 @@ class BatchCacheOperations:
     ) -> bool:
         """Store a single result and return success status."""
         try:
+            if not should_cache_scan_result(scan_result):
+                logger.debug(f"Skipping batch cache store for operational result from {os.path.basename(file_path)}")
+                return False
+
             self.cache_manager.store_result(
                 file_path,
                 scan_result,

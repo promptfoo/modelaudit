@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from ..utils.helpers.secure_hasher import SecureFileHasher
+from .adaptive_cache_keys import AdaptiveCacheKeyGenerator
 from .optimized_config import build_cache_version_context
 
 logger = logging.getLogger(__name__)
@@ -49,6 +50,7 @@ class ScanResultsCache:
 
         self.metadata_file = self.cache_dir / "cache_metadata.json"
         self.hasher = SecureFileHasher()
+        self.key_generator = AdaptiveCacheKeyGenerator()
 
         self._ensure_metadata_exists()
 
@@ -67,48 +69,13 @@ class ScanResultsCache:
             Cached scan result dictionary if found and valid, None otherwise
         """
         try:
-            # Get file stats ONCE and reuse for both cache key generation and validation
             file_stat = os.stat(file_path)
-
-            # Generate cache key with stat reuse
-            cache_key = self._generate_cache_key(file_path, file_stat=file_stat, version_context=version_context)
-            if not cache_key:
-                return None
-
-            # Find cache file
-            cache_file_path = self._get_cache_file_path(cache_key)
-
-            if not cache_file_path.exists():
-                self._record_cache_miss("not_found")
-                return None
-
-            # Load cache entry
-            with open(cache_file_path, encoding="utf-8") as f:
-                cache_entry = json.load(f)
-
-            # Validate entry is still valid (pass stat to avoid another os.stat call)
-            if not self._is_cache_entry_valid_with_stat(cache_entry, file_path, file_stat):
-                # Remove invalid entry
-                cache_file_path.unlink()
-                self._record_cache_miss("invalid")
-                return None
-
-            # Update access statistics
-            cache_entry["cache_metadata"]["access_count"] += 1
-            cache_entry["cache_metadata"]["last_access"] = time.time()
-
-            # Write back updated entry
-            with open(cache_file_path, "w", encoding="utf-8") as f:
-                json.dump(cache_entry, f, indent=2)
-
-            self._record_cache_hit()
-            logger.debug(f"Cache hit for {os.path.basename(file_path)}")
-            return cache_entry["scan_result"]  # type: ignore[no-any-return]
-
-        except Exception as e:
+        except OSError as e:
             logger.debug(f"Cache lookup failed for {file_path}: {e}")
             self._record_cache_miss("error")
             return None
+
+        return self._get_cached_result_with_known_stat(file_path, file_stat, version_context)
 
     def get_cached_result_with_stat(
         self,
@@ -127,6 +94,15 @@ class ScanResultsCache:
         Returns:
             Cached scan result dictionary if found and valid, None otherwise
         """
+        return self._get_cached_result_with_known_stat(file_path, file_stat, version_context)
+
+    def _get_cached_result_with_known_stat(
+        self,
+        file_path: str,
+        file_stat: os.stat_result,
+        version_context: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Load and validate a cache entry using a caller-provided stat result."""
         try:
             cache_key = self._generate_cache_key(file_path, file_stat=file_stat, version_context=version_context)
             if not cache_key:
@@ -282,8 +258,10 @@ class ScanResultsCache:
             Cache key string or None if generation failed
         """
         try:
-            # Get file hash (with optional stat reuse)
-            file_hash = self.hasher.hash_file_with_stat(file_path, file_stat)
+            if file_stat is not None:
+                file_key = self.key_generator.generate_key_with_stat_reuse(file_path, file_stat)
+            else:
+                file_key = self.key_generator.generate_key(file_path)
 
             # Get version information
             version_info = self._get_version_info(version_context)
@@ -294,8 +272,8 @@ class ScanResultsCache:
 
             # Combine file hash with version hash
             # Remove any prefix from file hash for key generation
-            clean_file_hash = file_hash.split(":")[-1]
-            cache_key = f"{clean_file_hash}_{version_hash}"
+            clean_file_key = file_key.split(":")[-1]
+            cache_key = f"{clean_file_key}_{version_hash}"
 
             return cache_key
 

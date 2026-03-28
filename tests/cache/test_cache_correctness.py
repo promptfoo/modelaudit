@@ -163,6 +163,83 @@ def test_cached_scan_skips_persisting_operational_failures_from_checks(tmp_path:
     assert cache_manager.get_stats()["total_entries"] == 0
 
 
+def test_cached_scan_skips_persisting_scan_timed_out_messages(tmp_path: Path) -> None:
+    file_path = _make_cacheable_file(tmp_path)
+    cache_dir = tmp_path / "cache"
+    config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
+    calls = {"count": 0}
+
+    @cached_scan()
+    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
+        calls["count"] += 1
+        return {
+            "checks": [],
+            "issues": [{"message": "Scan timed out: metadata helper exceeded limit", "severity": "warning"}],
+            "timeout_count": calls["count"],
+        }
+
+    first = scan(str(file_path), config)
+    second = scan(str(file_path), config)
+
+    assert first["timeout_count"] == 1
+    assert second["timeout_count"] == 2
+    assert calls["count"] == 2
+    assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+
+
+def test_cached_scan_skips_persisting_package_not_installed_messages(tmp_path: Path) -> None:
+    file_path = _make_cacheable_file(tmp_path)
+    cache_dir = tmp_path / "cache"
+    config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
+    calls = {"count": 0}
+
+    @cached_scan()
+    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
+        calls["count"] += 1
+        return {
+            "checks": [
+                {
+                    "message": "paddlepaddle package not installed. Install with 'pip install paddlepaddle'",
+                    "status": "failed",
+                }
+            ],
+            "issues": [],
+            "scan_count": calls["count"],
+        }
+
+    first = scan(str(file_path), config)
+    second = scan(str(file_path), config)
+
+    assert first["scan_count"] == 1
+    assert second["scan_count"] == 2
+    assert calls["count"] == 2
+    assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+
+
+def test_cached_scan_skips_persisting_os_level_errors(tmp_path: Path) -> None:
+    file_path = _make_cacheable_file(tmp_path)
+    cache_dir = tmp_path / "cache"
+    config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
+    calls = {"count": 0}
+
+    @cached_scan()
+    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
+        calls["count"] += 1
+        return {
+            "checks": [],
+            "issues": [{"message": "No such file or directory while opening sidecar", "severity": "warning"}],
+            "scan_count": calls["count"],
+        }
+
+    first = scan(str(file_path), config)
+    second = scan(str(file_path), config)
+
+    assert first["scan_count"] == 1
+    assert second["scan_count"] == 2
+    assert calls["count"] == 2
+    assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+
+
 def test_cached_scan_skips_persisting_scanning_error_messages(tmp_path: Path) -> None:
     file_path = _make_cacheable_file(tmp_path)
     cache_dir = tmp_path / "cache"
@@ -254,6 +331,32 @@ def test_batch_lookup_returns_cached_entries(tmp_path: Path) -> None:
     assert cached_results[str(file_path)] == expected
 
 
+def test_batch_store_skips_operational_failures(tmp_path: Path) -> None:
+    file_path = _make_cacheable_file(tmp_path)
+    cache_dir = tmp_path / "cache"
+    cache_manager = get_cache_manager(str(cache_dir), enabled=True)
+    batch_ops = BatchCacheOperations(cache_manager)
+
+    stored_count = batch_ops.batch_store(
+        [
+            (
+                str(file_path),
+                {
+                    "scanner": "test",
+                    "success": False,
+                    "issues": [{"message": "Scan timed out: metadata helper exceeded limit", "severity": "warning"}],
+                    "checks": [],
+                    "metadata": {},
+                },
+                10,
+            )
+        ]
+    )
+
+    assert stored_count == 0
+    assert cache_manager.get_stats()["total_entries"] == 0
+
+
 def test_cache_entry_omits_raw_version_context(tmp_path: Path) -> None:
     file_path = _make_cacheable_file(tmp_path)
     cache_dir = tmp_path / "cache"
@@ -299,3 +402,20 @@ def test_cache_key_changes_with_version_context_when_scanner_versions_unavailabl
     assert key_a is not None
     assert key_b is not None
     assert key_a != key_b
+
+
+def test_cache_key_generation_avoids_full_hash_for_medium_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    file_path = _make_cacheable_file(tmp_path, name="medium.bin")
+    file_path.write_bytes(b"x" * (2 * 1024 * 1024))
+    cache = ScanResultsCache(str(tmp_path / "scan-cache"))
+
+    def fail_hash(_: str) -> str:
+        raise AssertionError("content hash should not be used for medium-file cache lookups")
+
+    monkeypatch.setattr(cache.key_generator.hasher, "hash_file", fail_hash)
+
+    cache_key = cache.generate_cache_key(str(file_path), version_context=build_cache_version_context({"timeout": 30}))
+
+    assert cache_key is not None
