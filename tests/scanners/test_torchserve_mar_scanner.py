@@ -737,5 +737,5 @@ def test_scan_detects_typo_package_with_inline_hash_comment(tmp_path: Path) -> N
 
     assert len(requirements_failures) == 1
     assert any(
-        finding["reason"] == "typosquat_ml_package" for finding in requirements_failures[0].details.get("findings", [])
+        finding["reason"] == "typosquatting_pattern" for finding in requirements_failures[0].details.get("findings", [])
     )
