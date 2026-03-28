@@ -4518,6 +4518,7 @@ class PickleScanner(BaseScanner):
             data = file_obj.read(read_size)
         finally:
             file_obj.seek(original_pos)
+        data_len = len(data)
 
         def _record_reference(module: str, function: str, offset: int, opcode_name: str) -> None:
             if offset < minimum_offset:
@@ -4555,23 +4556,23 @@ class PickleScanner(BaseScanner):
                 }
             )
 
-        def _decode_string_push(start: int, end: int) -> tuple[str, int] | None:
-            if start < 0 or end > data_len or start >= end:
+        def _decode_string_push_at(start: int) -> tuple[str, int] | None:
+            if start < 0 or start >= data_len:
                 return None
 
             opcode = data[start]
             if opcode == 0x8C:  # SHORT_BINUNICODE
-                if start + 2 > end:
+                if start + 2 > data_len:
                     return None
                 string_len = data[start + 1]
                 value_start = start + 2
             elif opcode == 0x58:  # BINUNICODE
-                if start + 5 > end:
+                if start + 5 > data_len:
                     return None
                 string_len = int.from_bytes(data[start + 1 : start + 5], "little")
                 value_start = start + 5
             elif opcode == 0x8D:  # BINUNICODE8
-                if start + 9 > end:
+                if start + 9 > data_len:
                     return None
                 string_len = int.from_bytes(data[start + 1 : start + 9], "little")
                 value_start = start + 9
@@ -4579,35 +4580,135 @@ class PickleScanner(BaseScanner):
                 return None
 
             value_end = value_start + string_len
-            if value_end != end or string_len < 0:
+            if value_end > data_len or string_len < 0:
                 return None
 
             value = data[value_start:value_end].decode("utf-8", errors="ignore").strip()
             return value, value_end
 
-        def _skip_trailing_memo_ops(cursor: int, lookback_start: int) -> int:
-            while cursor > lookback_start:
-                if data[cursor - 1] == 0x94:  # MEMOIZE
-                    cursor -= 1
-                    continue
-                if cursor >= lookback_start + 2 and data[cursor - 2] == 0x71:  # BINPUT
-                    cursor -= 2
-                    continue
-                if cursor >= lookback_start + 5 and data[cursor - 5] == 0x72:  # LONG_BINPUT
-                    cursor -= 5
-                    continue
-                if data[cursor - 1] != 0x0A:  # PUT is newline-terminated
-                    break
+        def _parse_text_memo_index(start: int) -> tuple[int, int] | None:
+            if start + 2 > data_len:
+                return None
+            end = data.find(b"\n", start + 1, min(data_len, start + 22))
+            if end == -1:
+                return None
+            digits = data[start + 1 : end]
+            if not digits or any(ch not in b"0123456789" for ch in digits):
+                return None
+            return int(digits.decode("ascii")), end + 1
 
-                digit_start = cursor - 1
-                while digit_start > lookback_start and data[digit_start - 1] in b"0123456789":
-                    digit_start -= 1
-                if digit_start < cursor - 1 and digit_start > lookback_start and data[digit_start - 1] == 0x70:
-                    cursor = digit_start - 1
-                    continue
-                break
+        value_end_to_info: dict[int, tuple[str, int]] = {}
+        memo_values: dict[int, tuple[str, int]] = {}
+        stack_global_positions: list[int] = []
+        next_memo_index = 0
+        parse_cursor = 0
+        last_value_info: tuple[str, int] | None = None
+        last_value_end = -1
 
-            return cursor
+        while parse_cursor < data_len:
+            opcode_value = data[parse_cursor]
+            parsed_string = _decode_string_push_at(parse_cursor)
+            if parsed_string is not None:
+                value, value_end = parsed_string
+                last_value_info = (value, parse_cursor)
+                last_value_end = value_end
+                value_end_to_info[value_end] = last_value_info
+                parse_cursor = value_end
+                continue
+
+            if opcode_value == 0x94:  # MEMOIZE
+                if last_value_info is not None and last_value_end == parse_cursor:
+                    memo_values[next_memo_index] = last_value_info
+                    value_end_to_info[parse_cursor + 1] = last_value_info
+                    last_value_end = parse_cursor + 1
+                    next_memo_index += 1
+                else:
+                    last_value_info = None
+                    last_value_end = -1
+                parse_cursor += 1
+                continue
+
+            if opcode_value == 0x71 and parse_cursor + 2 <= data_len:  # BINPUT
+                if last_value_info is not None and last_value_end == parse_cursor:
+                    memo_values[data[parse_cursor + 1]] = last_value_info
+                    value_end_to_info[parse_cursor + 2] = last_value_info
+                    last_value_end = parse_cursor + 2
+                else:
+                    last_value_info = None
+                    last_value_end = -1
+                parse_cursor += 2
+                continue
+
+            if opcode_value == 0x72 and parse_cursor + 5 <= data_len:  # LONG_BINPUT
+                if last_value_info is not None and last_value_end == parse_cursor:
+                    memo_values[int.from_bytes(data[parse_cursor + 1 : parse_cursor + 5], "little")] = last_value_info
+                    value_end_to_info[parse_cursor + 5] = last_value_info
+                    last_value_end = parse_cursor + 5
+                else:
+                    last_value_info = None
+                    last_value_end = -1
+                parse_cursor += 5
+                continue
+
+            if opcode_value == 0x70:  # PUT
+                parsed_index = _parse_text_memo_index(parse_cursor)
+                if parsed_index is not None:
+                    memo_index, memo_end = parsed_index
+                    if last_value_info is not None and last_value_end == parse_cursor:
+                        memo_values[memo_index] = last_value_info
+                        value_end_to_info[memo_end] = last_value_info
+                        last_value_end = memo_end
+                    else:
+                        last_value_info = None
+                        last_value_end = -1
+                    parse_cursor = memo_end
+                    continue
+
+            if opcode_value == 0x68 and parse_cursor + 2 <= data_len:  # BINGET
+                resolved_value = memo_values.get(data[parse_cursor + 1])
+                if resolved_value is not None:
+                    value_end_to_info[parse_cursor + 2] = resolved_value
+                    last_value_info = resolved_value
+                    last_value_end = parse_cursor + 2
+                else:
+                    last_value_info = None
+                    last_value_end = -1
+                parse_cursor += 2
+                continue
+
+            if opcode_value == 0x6A and parse_cursor + 5 <= data_len:  # LONG_BINGET
+                resolved_value = memo_values.get(int.from_bytes(data[parse_cursor + 1 : parse_cursor + 5], "little"))
+                if resolved_value is not None:
+                    value_end_to_info[parse_cursor + 5] = resolved_value
+                    last_value_info = resolved_value
+                    last_value_end = parse_cursor + 5
+                else:
+                    last_value_info = None
+                    last_value_end = -1
+                parse_cursor += 5
+                continue
+
+            if opcode_value == 0x67:  # GET
+                parsed_index = _parse_text_memo_index(parse_cursor)
+                if parsed_index is not None:
+                    memo_index, memo_end = parsed_index
+                    resolved_value = memo_values.get(memo_index)
+                    if resolved_value is not None:
+                        value_end_to_info[memo_end] = resolved_value
+                        last_value_info = resolved_value
+                        last_value_end = memo_end
+                    else:
+                        last_value_info = None
+                        last_value_end = -1
+                    parse_cursor = memo_end
+                    continue
+
+            if opcode_value == 0x93:  # STACK_GLOBAL
+                stack_global_positions.append(parse_cursor)
+
+            last_value_info = None
+            last_value_end = -1
+            parse_cursor += 1
 
         def _extract_stack_global_values(stack_global_index: int) -> list[str]:
             values: list[str] = []
@@ -4615,28 +4716,19 @@ class PickleScanner(BaseScanner):
             lookback_start = max(0, stack_global_index - _POST_BUDGET_GLOBAL_CONTEXT_BYTES)
 
             while len(values) < 2 and cursor > lookback_start:
-                cursor = _skip_trailing_memo_ops(cursor, lookback_start)
-
-                found_value: str | None = None
-                found_start: int | None = None
-                for candidate in range(cursor - 1, lookback_start - 1, -1):
-                    parsed = _decode_string_push(candidate, cursor)
-                    if parsed is None:
-                        continue
-                    found_value = parsed[0]
-                    found_start = candidate
+                resolved_value = value_end_to_info.get(cursor)
+                if resolved_value is None:
                     break
 
-                if found_value is None or found_start is None:
+                found_value, found_start = resolved_value
+                if found_start < lookback_start or found_start >= cursor:
                     break
-
                 values.append(found_value)
                 cursor = found_start
 
             return list(reversed(values))
 
         cursor = 0
-        data_len = len(data)
         while cursor < data_len:
             opcode_value = data[cursor]
             if opcode_value in (ord("c"), ord("i")):
@@ -4652,9 +4744,7 @@ class PickleScanner(BaseScanner):
                         continue
             cursor += 1
 
-        for idx in range(data_len):
-            if data[idx] != 0x93:  # STACK_GLOBAL
-                continue
+        for idx in stack_global_positions:
             values = _extract_stack_global_values(idx)
             if len(values) != 2:
                 continue
@@ -4670,6 +4760,8 @@ class PickleScanner(BaseScanner):
         suspicious_count = 0
 
         current_pos = file_obj.tell()
+        max_analyzed_end_offset = current_pos
+        timeout_exceeded = False
 
         # Read file data - either all at once for small files or first chunk for large files.
         # For large files, read only the first 10MB for in-memory string/pattern analysis to cap
@@ -4888,6 +4980,7 @@ class PickleScanner(BaseScanner):
                         self.check_interrupted()
 
                     opcodes.append((opcode, arg, pos))
+                    max_analyzed_end_offset = max(max_analyzed_end_offset, file_obj.tell())
                     opcode_count += 1
 
                     # Enhanced opcode sequence analysis
@@ -4960,6 +5053,7 @@ class PickleScanner(BaseScanner):
 
                     # Check for timeout
                     if time.time() - result.start_time > self.timeout:
+                        timeout_exceeded = True
                         result.add_check(
                             name="Scan Timeout Check",
                             passed=False,
@@ -4977,9 +5071,13 @@ class PickleScanner(BaseScanner):
             except _GenopsBudgetExceeded as e:
                 if e.reason == "max_items":
                     opcode_budget_exceeded = True
+                elif e.reason == "deadline":
+                    timeout_exceeded = True
+
+            if opcode_budget_exceeded or timeout_exceeded:
+                result.metadata["analysis_incomplete"] = True
 
             if opcode_budget_exceeded:
-                result.metadata["analysis_incomplete"] = True
                 result.add_check(
                     name="Opcode Count Check",
                     passed=False,
@@ -4995,7 +5093,7 @@ class PickleScanner(BaseScanner):
                     rule_code="S902",
                 )
 
-            if time.time() - result.start_time > self.timeout and not any(
+            if (timeout_exceeded or time.time() - result.start_time > self.timeout) and not any(
                 check.name == "Scan Timeout Check" and check.status == CheckStatus.FAILED for check in result.checks
             ):
                 result.add_check(
@@ -5041,12 +5139,13 @@ class PickleScanner(BaseScanner):
                 (int(pos) for _opcode, _arg, pos in opcodes if pos is not None),
                 default=-1,
             )
+            post_budget_minimum_offset = max(max_analyzed_end_offset, max_analyzed_offset + 1, 0)
 
-            if opcode_budget_exceeded:
+            if opcode_budget_exceeded or timeout_exceeded:
                 post_budget_global_findings = self._scan_global_references_unbounded(
                     file_obj,
                     file_size=file_size,
-                    minimum_offset=max_analyzed_offset + 1,
+                    minimum_offset=post_budget_minimum_offset,
                     ml_context=ml_context,
                 )
                 if post_budget_global_findings:
@@ -5062,7 +5161,7 @@ class PickleScanner(BaseScanner):
                     additional = len(post_budget_global_findings) - 1
                     additional_note = f" (+{additional} more)" if additional > 0 else ""
                     post_budget_scan_bytes = min(
-                        max(file_size - (max_analyzed_offset + 1), 0),
+                        max(file_size - post_budget_minimum_offset, 0),
                         self.post_budget_global_scan_limit_bytes,
                     )
                     suspicious_count += len(post_budget_global_findings)
@@ -5086,7 +5185,7 @@ class PickleScanner(BaseScanner):
                             "scan_limit_bytes": self.post_budget_global_scan_limit_bytes,
                             "scan_bytes": post_budget_scan_bytes,
                             "scan_total_bytes": file_size,
-                            "minimum_offset": max_analyzed_offset + 1,
+                            "minimum_offset": post_budget_minimum_offset,
                             "references": post_budget_global_findings,
                             "dangerous_references": critical_findings,
                         },

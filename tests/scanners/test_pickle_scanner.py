@@ -1,5 +1,6 @@
 import os
 import pickle
+import pickletools
 import struct
 import sys
 import tempfile
@@ -7,7 +8,7 @@ import unittest
 from collections.abc import Callable, Iterator
 from io import BytesIO
 from pathlib import Path
-from typing import ClassVar
+from typing import Any, BinaryIO, ClassVar
 
 import pytest
 
@@ -401,6 +402,113 @@ def test_scan_pickle_detects_post_budget_stack_global_with_binput(tmp_path: Path
     assert checks[0].severity == IssueSeverity.CRITICAL
     assert "os.system" in checks[0].message
     assert result.success is False
+
+
+def test_post_budget_global_scan_uses_consumed_opcode_boundary(tmp_path: Path) -> None:
+    """Large operands should not consume the entire post-budget tail window."""
+    pickle_path = tmp_path / "post-budget-consumed-boundary.pkl"
+    payload = b"\x80\x04" + b"\x8d" + struct.pack("<Q", 120) + (b"A" * 120) + b"cmysterypkg\nloader\n."
+    pickle_path.write_bytes(payload)
+
+    result = PickleScanner({"max_opcodes": 1, "post_budget_global_scan_limit_bytes": 64}).scan(str(pickle_path))
+
+    checks = [check for check in result.checks if check.name == "Post-Budget Global Reference Scan"]
+    assert len(checks) == 1
+    assert checks[0].status == CheckStatus.FAILED
+    assert checks[0].severity == IssueSeverity.WARNING
+    assert "mysterypkg.loader" in checks[0].message
+    assert checks[0].details["minimum_offset"] == 131
+    assert result.success is True
+
+
+@pytest.mark.parametrize(
+    ("memo_write_ops", "memo_read_ops"),
+    [
+        ((b"\x94", b"\x94"), (b"h\x00", b"h\x01")),
+        ((b"p0\n", b"p1\n"), (b"g0\n", b"g1\n")),
+        ((b"r\x00\x00\x00\x00", b"r\x01\x00\x00\x00"), (b"j\x00\x00\x00\x00", b"j\x01\x00\x00\x00")),
+    ],
+)
+def test_post_budget_global_scan_recovers_stack_global_with_memo_reads(
+    memo_write_ops: tuple[bytes, bytes], memo_read_ops: tuple[bytes, bytes]
+) -> None:
+    """Memoized string reads should remain resolvable in the post-budget STACK_GLOBAL fallback."""
+    raw_stack_global = (
+        _short_binunicode(b"os")
+        + memo_write_ops[0]
+        + _short_binunicode(b"system")
+        + memo_write_ops[1]
+        + memo_read_ops[0]
+        + memo_read_ops[1]
+        + b"\x93"
+    )
+    scanner = PickleScanner()
+
+    findings = scanner._scan_global_references_unbounded(
+        BytesIO(raw_stack_global),
+        file_size=len(raw_stack_global),
+        minimum_offset=len(raw_stack_global) - 1,
+        ml_context={},
+    )
+
+    assert len(findings) == 1
+    assert findings[0]["import_reference"] == "os.system"
+    assert findings[0]["opcode"] == "STACK_GLOBAL"
+    assert findings[0]["offset"] == len(raw_stack_global) - 1
+
+
+def test_scan_pickle_detects_post_budget_stack_global_with_binget(tmp_path: Path) -> None:
+    """End-to-end scans should catch STACK_GLOBAL tails that use BINGET memo reads."""
+    pickle_path = tmp_path / "post-budget-stack-global-binget.pkl"
+    benign_padding = _make_opcode_padding_stream(opcode_pairs=512)
+    malicious_stream = (
+        b"\x80\x04" + _short_binunicode(b"os") + b"\x94" + _short_binunicode(b"system") + b"\x94" + b"h\x00h\x01\x93)R."
+    )
+    pickle_path.write_bytes(benign_padding + malicious_stream)
+
+    result = PickleScanner({"max_opcodes": 64}).scan(str(pickle_path))
+
+    checks = [check for check in result.checks if check.name == "Post-Budget Global Reference Scan"]
+    assert len(checks) == 1
+    assert checks[0].status == CheckStatus.FAILED
+    assert checks[0].severity == IssueSeverity.CRITICAL
+    assert "os.system" in checks[0].message
+    assert result.success is False
+
+
+def test_post_budget_global_scan_runs_after_deadline_truncation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Deadline-triggered truncation should still run the post-budget import scan."""
+    import modelaudit.scanners.pickle_scanner as pickle_scanner_module
+
+    pickle_path = tmp_path / "post-budget-deadline.pkl"
+    pickle_path.write_bytes(b"\x80\x04cmysterypkg\nloader\n.")
+
+    def _deadline_after_first_opcode(
+        file_obj: BinaryIO,
+        *,
+        multi_stream: bool = False,
+        max_items: int | None = None,
+        deadline: float | None = None,
+    ) -> Iterator[tuple[Any, Any, int | None]]:
+        del multi_stream, max_items, deadline
+        op_iter = pickletools.genops(file_obj)
+        yield next(op_iter)
+        raise _GenopsBudgetExceeded("deadline")
+
+    monkeypatch.setattr(pickle_scanner_module, "_genops_with_fallback", _deadline_after_first_opcode)
+
+    result = PickleScanner({"timeout": 1}).scan(str(pickle_path))
+
+    timeout_checks = [check for check in result.checks if check.name == "Scan Timeout Check"]
+    assert timeout_checks and timeout_checks[0].status == CheckStatus.FAILED
+    checks = [check for check in result.checks if check.name == "Post-Budget Global Reference Scan"]
+    assert len(checks) == 1
+    assert checks[0].status == CheckStatus.FAILED
+    assert checks[0].severity == IssueSeverity.WARNING
+    assert "mysterypkg.loader" in checks[0].message
+    assert result.success is True
 
 
 class TestPickleScanner(unittest.TestCase):
