@@ -32,6 +32,20 @@ PYTHON_OPS = ("PyFunc", "PyCall", "PyFuncStateless", "EagerPyFunc")
 
 # Defer protobuf availability check to avoid module-level imports
 HAS_PROTOS: bool | None = None
+_ASSET_SCRIPT_SHEBANG = b"#!"
+_ASSET_ELF_HEADER = b"\x7fELF"
+_ASSET_MACHO_HEADERS = (
+    b"\xfe\xed\xfa\xce",  # MH_MAGIC
+    b"\xfe\xed\xfa\xcf",  # MH_MAGIC_64
+    b"\xce\xfa\xed\xfe",  # MH_CIGAM
+    b"\xcf\xfa\xed\xfe",  # MH_CIGAM_64
+    b"\xca\xfe\xba\xbe",  # FAT_MAGIC
+    b"\xbe\xba\xfe\xca",  # FAT_CIGAM
+)
+_ASSET_PICKLE_PREFIXES = tuple(bytes([0x80, protocol]) for protocol in range(2, 6))
+_ASSET_PYTHON_PATTERN = re.compile(
+    r"(?m)(^\s*(?:from\s+\w[\w.]*\s+import\s+|import\s+\w[\w.]*|def\s+\w+\s*\(|class\s+\w+\s*[:(]))"
+)
 
 
 def _check_protos() -> bool:
@@ -227,6 +241,8 @@ class TensorFlowSavedModelScanner(BaseScanner):
         if keras_metadata_path.exists():
             self._scan_keras_metadata(str(keras_metadata_path), result)
 
+        self._scan_saved_model_assets(Path(dir_path), result)
+
         # Check for other suspicious files in the directory
         for root, _dirs, files in os.walk(dir_path):
             for file in files:
@@ -293,6 +309,62 @@ class TensorFlowSavedModelScanner(BaseScanner):
 
         result.finish(success=True)
         return result
+
+    def _scan_saved_model_assets(self, model_root: Path, result: ScanResult) -> None:
+        """Scan SavedModel asset directories for suspicious executable content."""
+        for assets_dir_name in ("assets", "assets.extra"):
+            assets_dir = model_root / assets_dir_name
+            if not assets_dir.is_dir():
+                continue
+
+            for root, _dirs, files in os.walk(assets_dir):
+                for file_name in files:
+                    file_path = Path(root) / file_name
+                    detected_types = self._detect_suspicious_asset_content(file_path)
+                    if not detected_types:
+                        continue
+
+                    file_size = self.get_file_size(str(file_path))
+                    result.add_check(
+                        name="SavedModel Assets Security Check",
+                        passed=False,
+                        message=(
+                            "Suspicious executable-like content detected in SavedModel assets: "
+                            f"{file_path.relative_to(model_root)}"
+                        ),
+                        severity=IssueSeverity.WARNING,
+                        location=str(file_path),
+                        details={
+                            "file_name": file_name,
+                            "detected_content_type": ", ".join(detected_types),
+                            "size": file_size,
+                        },
+                        rule_code="S902",
+                    )
+
+    def _detect_suspicious_asset_content(self, file_path: Path) -> list[str]:
+        """Return suspicious content types found in a SavedModel asset file."""
+        try:
+            with file_path.open("rb") as file_obj:
+                content_head = file_obj.read(8192)
+        except OSError:
+            return []
+
+        detected_types: list[str] = []
+        if content_head.startswith(_ASSET_SCRIPT_SHEBANG):
+            detected_types.append("script_shebang")
+        if content_head.startswith(_ASSET_ELF_HEADER):
+            detected_types.append("elf_binary")
+        if any(content_head.startswith(header) for header in _ASSET_MACHO_HEADERS):
+            detected_types.append("macho_binary")
+        if any(content_head.startswith(prefix) for prefix in _ASSET_PICKLE_PREFIXES):
+            detected_types.append("pickle_payload")
+
+        decoded_head = content_head.decode("utf-8", errors="ignore")
+        if decoded_head and _ASSET_PYTHON_PATTERN.search(decoded_head):
+            detected_types.append("python_source_pattern")
+
+        return detected_types
 
     def _get_meta_graph_tag(self, meta_graph: Any) -> str:
         """Return a stable label for a MetaGraphDef."""

