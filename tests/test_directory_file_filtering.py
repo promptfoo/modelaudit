@@ -205,6 +205,18 @@ class TestDirectoryFileFiltering:
 
         assert results["files_scanned"] == 0
 
+    def test_docx_with_embedded_ole_bin_remains_skipped(self, tmp_path: Path) -> None:
+        """Office containers with embedded OLE payloads should still be skipped."""
+        docx_path = tmp_path / "report.docx"
+        with zipfile.ZipFile(docx_path, "w") as archive:
+            archive.writestr("[Content_Types].xml", "<Types></Types>")
+            archive.writestr("word/document.xml", "<w:document></w:document>")
+            archive.writestr("word/embeddings/oleObject1.bin", b"embedded-ole")
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 0
+
     def test_only_huggingface_bookkeeping_metadata_is_skipped(self, tmp_path: Path) -> None:
         """Local .metadata files should be scanned unless they are in HuggingFace cache layouts."""
         local_metadata = tmp_path / "model.metadata"

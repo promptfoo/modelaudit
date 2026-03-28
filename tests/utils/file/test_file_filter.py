@@ -5,6 +5,7 @@ import zipfile
 from pathlib import Path
 
 from modelaudit.utils.file.filtering import (
+    _ZIP_MEMBER_SNIFF_LIMIT,
     should_skip_file,
 )
 
@@ -161,3 +162,23 @@ class TestFileFilter:
             archive.writestr("word/document.xml", "<w:document></w:document>")
 
         assert should_skip_file(str(docx_path))
+
+    def test_docx_with_embedded_ole_bin_remains_skipped(self, tmp_path: Path) -> None:
+        """Office ZIPs with embedded OLE binaries should not be treated as model archives."""
+        docx_path = tmp_path / "embedded.docx"
+        with zipfile.ZipFile(docx_path, "w") as archive:
+            archive.writestr("[Content_Types].xml", "<Types></Types>")
+            archive.writestr("word/document.xml", "<w:document></w:document>")
+            archive.writestr("word/embeddings/oleObject1.bin", b"embedded-ole")
+
+        assert should_skip_file(str(docx_path))
+
+    def test_large_ambiguous_zip_is_preserved_for_scanning(self, tmp_path: Path) -> None:
+        """Ambiguous ZIPs should survive the prefilter when the sniff budget is exhausted."""
+        disguised_zip = tmp_path / "archive.jpg"
+        with zipfile.ZipFile(disguised_zip, "w") as archive:
+            for index in range(_ZIP_MEMBER_SNIFF_LIMIT):
+                archive.writestr(f"docs/{index}.txt", "filler")
+            archive.writestr("payload.pkl", pickle.dumps({"safe": True}))
+
+        assert not should_skip_file(str(disguised_zip))

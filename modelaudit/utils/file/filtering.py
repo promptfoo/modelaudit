@@ -132,6 +132,48 @@ _ARCHIVE_SIGNAL_EXTENSION_EXCLUSIONS = frozenset(
     }
 )
 
+_ZIP_MEMBER_SNIFF_LIMIT = 256
+_OFFICE_ARCHIVE_PREFIXES = ("word/", "xl/", "ppt/")
+_MODEL_ARCHIVE_SIGNAL_EXTENSIONS = frozenset(
+    {
+        ".pkl",
+        ".pickle",
+        ".joblib",
+        ".pt",
+        ".pth",
+        ".ckpt",
+        ".onnx",
+        ".h5",
+        ".keras",
+        ".safetensors",
+        ".pb",
+        ".tflite",
+        ".npz",
+        ".npy",
+        ".mar",
+        ".tar",
+        ".tar.gz",
+        ".tgz",
+        ".tar.bz2",
+        ".tbz2",
+        ".tar.xz",
+        ".txz",
+        ".gz",
+        ".bz2",
+        ".xz",
+        ".zip",
+        ".7z",
+    }
+)
+_MODEL_ARCHIVE_SIGNAL_BASENAMES = frozenset(
+    {
+        "pytorch_model.bin",
+        "adapter_model.bin",
+        "diffusion_pytorch_model.bin",
+        "flax_model.msgpack",
+    }
+)
+
 
 def _get_scannable_extensions() -> set[str]:
     """Lazy-load scannable extensions to avoid circular imports."""
@@ -167,28 +209,74 @@ def _has_scannable_content(path: str) -> bool:
             return True
 
         with zipfile.ZipFile(path, "r") as archive:
-            member_names = {
-                member.filename.replace("\\", "/").strip("/")
-                for member in archive.infolist()
-                if member.filename and not member.is_dir()
-            }
+            has_keras_config = False
+            has_keras_marker = False
+            has_pytorch_data = False
+            has_pytorch_marker = False
+            saw_office_prefix = False
+            saw_content_types = False
+            processed_members = 0
 
-            # Preserve Keras, TorchServe, and PyTorch ZIP containers even when
-            # the outer filename uses a skipped suffix.
-            if "MAR-INF/MANIFEST.json" in member_names:
-                return True
-            if "config.json" in member_names and any(
-                marker in member_names for marker in {"metadata.json", "model.weights.h5", "variables.h5"}
-            ):
-                return True
-            if any(name == "data.pkl" or name.endswith("/data.pkl") for name in member_names):
-                return True
+            for member in archive.infolist():
+                if processed_members >= _ZIP_MEMBER_SNIFF_LIMIT:
+                    # If we cannot finish classifying the archive within the
+                    # prefilter budget, preserve it for full scanning unless it
+                    # already looks like a standard Office document container.
+                    return not (saw_content_types and saw_office_prefix)
 
-            scannable_extensions = _get_scannable_extensions() - _ARCHIVE_SIGNAL_EXTENSION_EXCLUSIONS
-            for member_name in member_names:
-                candidate_extensions = _get_candidate_extensions(member_name)
-                if any(candidate in scannable_extensions for candidate in candidate_extensions):
+                if not member.filename or member.is_dir():
+                    continue
+
+                processed_members += 1
+                member_name = member.filename.replace("\\", "/").strip("/")
+                member_basename = Path(member_name).name.lower()
+
+                if member_name == "[Content_Types].xml":
+                    saw_content_types = True
+                    continue
+
+                if member_name.startswith(_OFFICE_ARCHIVE_PREFIXES):
+                    saw_office_prefix = True
+
+                # Preserve Keras, TorchServe, and PyTorch ZIP containers even
+                # when the outer filename uses a skipped suffix.
+                if member_name == "MAR-INF/MANIFEST.json":
                     return True
+
+                if member_name == "config.json":
+                    has_keras_config = True
+                    continue
+
+                if member_name in {"metadata.json", "model.weights.h5", "variables.h5"}:
+                    has_keras_marker = True
+                    continue
+
+                if member_name == "data.pkl" or member_name.endswith("/data.pkl"):
+                    has_pytorch_data = True
+                    continue
+
+                if (
+                    member_name == "version"
+                    or member_name.endswith("/version")
+                    or member_name == "byteorder"
+                    or member_name.endswith("/byteorder")
+                    or member_name.startswith("data/")
+                    or "/data/" in member_name
+                ):
+                    has_pytorch_marker = True
+
+                candidate_extensions = _get_candidate_extensions(member_name)
+                if any(candidate in _MODEL_ARCHIVE_SIGNAL_EXTENSIONS for candidate in candidate_extensions):
+                    return True
+
+                if member_basename in _MODEL_ARCHIVE_SIGNAL_BASENAMES:
+                    return True
+
+            if has_keras_config and has_keras_marker:
+                return True
+
+            if has_pytorch_data and has_pytorch_marker:
+                return True
 
         return False
     except OSError:
