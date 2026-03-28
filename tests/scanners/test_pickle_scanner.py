@@ -32,6 +32,7 @@ from modelaudit.scanners.pickle_scanner import (
     _is_plausible_python_module,
     _is_safe_import_only_global,
     _simulate_symbolic_reference_maps,
+    check_opcode_sequence,
 )
 from tests.assets.generators.generate_advanced_pickle_tests import (
     generate_memo_based_attack,
@@ -3717,6 +3718,67 @@ def test_risky_ml_import_only_globals_are_detected(
     )
     assert matching_issues, f"Expected issue for risky ML import {full_ref}, got: {result.issues}"
     assert any(issue.why for issue in matching_issues), f"Expected explanation for risky ML import {full_ref}"
+
+
+def test_build_on_non_safe_global_emits_setstate_warning(tmp_path: Path) -> None:
+    """BUILD should be flagged when it mutates an object from a non-safe global."""
+    scanner = PickleScanner()
+    payload_path = tmp_path / "build_setstate_non_safe.pkl"
+    payload_path.write_bytes(b"\x80\x02cevilpkg\nStateCarrier\n)R}b.")
+
+    result = scanner.scan(str(payload_path))
+
+    reduce_pattern_checks = [
+        check
+        for check in result.checks
+        if check.name == "Reduce Pattern Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("pattern") == "BUILD_SETSTATE_NON_SAFE_GLOBAL"
+    ]
+    assert reduce_pattern_checks, [check.details for check in result.checks if check.name == "Reduce Pattern Analysis"]
+    assert reduce_pattern_checks[0].severity == IssueSeverity.WARNING
+    assert reduce_pattern_checks[0].details.get("associated_global") == "evilpkg.StateCarrier"
+    assert "__setstate__" in str(reduce_pattern_checks[0].details.get("description", ""))
+
+
+def test_tree_marker_threshold_escalation_blocked_by_dangerous_global() -> None:
+    """Tree-marker threshold escalation should not apply when dangerous globals are present."""
+    opcodes: list[tuple[object, object, int]] = [
+        (type("Op", (), {"name": "GLOBAL"})(), "sklearn.ensemble._forest RandomForestClassifier", 0),
+    ]
+    opcodes.extend((type("Op", (), {"name": "REDUCE"})(), None, index) for index in range(1, 62))
+
+    callable_refs = dict.fromkeys(range(1, 62), ("os", "system"))
+    suspicious = check_opcode_sequence(
+        opcodes,
+        {"is_ml_content": True, "frameworks": {"sklearn": {}}, "overall_confidence": 0.9},
+        stack_global_refs={},
+        callable_refs=callable_refs,
+        callable_origin_is_ext={},
+    )
+
+    assert any(seq.get("pattern") == "MANY_DANGEROUS_OPCODES" for seq in suspicious), suspicious
+
+
+def test_clean_sklearn_build_sequence_stays_below_opcode_alert_threshold() -> None:
+    """Legitimate sklearn REDUCE+BUILD patterns should remain suppressed."""
+    opcodes: list[tuple[object, object, int]] = [
+        (type("Op", (), {"name": "GLOBAL"})(), "sklearn.ensemble._forest RandomForestClassifier", 0),
+    ]
+    for index in range(1, 121, 2):
+        opcodes.append((type("Op", (), {"name": "REDUCE"})(), None, index))
+        opcodes.append((type("Op", (), {"name": "BUILD"})(), None, index + 1))
+
+    callable_refs = dict.fromkeys(range(1, 121, 2), ("sklearn.tree._tree", "Tree"))
+    suspicious = check_opcode_sequence(
+        opcodes,
+        {"is_ml_content": True, "frameworks": {"sklearn": {}}, "overall_confidence": 0.9},
+        stack_global_refs={},
+        callable_refs=callable_refs,
+        callable_origin_is_ext={},
+    )
+
+    assert not suspicious
 
 
 @pytest.mark.parametrize(

@@ -2486,6 +2486,10 @@ def _simulate_symbolic_reference_maps(
             continue
 
         if name == "BUILD":
+            if len(stack) >= 2:
+                target = stack[-2]
+                if isinstance(target, _MutationTargetRef):
+                    mutation_target_refs[i] = target
             _pop()
             continue
 
@@ -3132,6 +3136,7 @@ def is_dangerous_reduce_pattern(
     stack_global_refs: dict[int, tuple[str, str]] | None = None,
     callable_refs: dict[int, tuple[str, str]] | None = None,
     callable_origin_is_ext: dict[int, bool] | None = None,
+    mutation_target_refs: dict[int, _MutationTargetRef] | None = None,
 ) -> dict[str, Any] | None:
     """
     Check for patterns that indicate a dangerous __reduce__ method.
@@ -3164,26 +3169,35 @@ def is_dangerous_reduce_pattern(
         # Check SUSPICIOUS_GLOBALS (the fallback)
         return is_suspicious_global(mod, func)
 
-    if stack_global_refs is None or callable_refs is None or callable_origin_is_ext is None:
+    if (
+        stack_global_refs is None
+        or callable_refs is None
+        or callable_origin_is_ext is None
+        or mutation_target_refs is None
+    ):
         (
             computed_stack_refs,
             computed_callable_refs,
             _computed_callable_origin_refs,
             computed_callable_origin_is_ext,
             _computed_malformed_stack_globals,
-            _computed_mutation_target_refs,
+            computed_mutation_target_refs,
         ) = _simulate_symbolic_reference_maps(opcodes)
     else:
-        computed_stack_refs, computed_callable_refs, computed_callable_origin_is_ext = (
+        computed_stack_refs, computed_callable_refs, computed_callable_origin_is_ext, computed_mutation_target_refs = (
             stack_global_refs,
             callable_refs,
             callable_origin_is_ext,
+            mutation_target_refs,
         )
 
     resolved_stack_globals = stack_global_refs if stack_global_refs is not None else computed_stack_refs
     resolved_callables = callable_refs if callable_refs is not None else computed_callable_refs
     resolved_callable_origin_is_ext = (
         callable_origin_is_ext if callable_origin_is_ext is not None else computed_callable_origin_is_ext
+    )
+    resolved_mutation_targets = (
+        mutation_target_refs if mutation_target_refs is not None else computed_mutation_target_refs
     )
 
     # Look for common patterns in __reduce__ exploits
@@ -3200,6 +3214,25 @@ def is_dangerous_reduce_pattern(
                         "function": func,
                         "position": pos,
                         "opcode": opcode.name,
+                    }
+
+        # BUILD mutates a previously-constructed object and may invoke
+        # __setstate__ with attacker-controlled state.
+        if opcode.name == "BUILD":
+            target_ref = resolved_mutation_targets.get(i)
+            if target_ref and target_ref.kind == "object" and target_ref.callable_ref:
+                mod, func = target_ref.callable_ref
+                if not _is_safe_ml_global(mod, func):
+                    return {
+                        "pattern": "BUILD_SETSTATE_NON_SAFE_GLOBAL",
+                        "module": mod,
+                        "function": func,
+                        "associated_global": f"{mod}.{func}",
+                        "position": pos,
+                        "opcode": opcode.name,
+                        "description": (
+                            "BUILD applied state to object from non-safe global; potential __setstate__ exploitation"
+                        ),
                     }
 
         # Check for GLOBAL followed by REDUCE - common in exploits
@@ -3429,6 +3462,16 @@ def check_opcode_sequence(
     ml_confidence_val = float(ml_context.get("overall_confidence", 0) or 0)
     known_tree_frameworks = _tree_ensemble_frameworks & _ml_frameworks
 
+    def _stream_has_dangerous_globals(stream_id: int) -> bool:
+        for raw_ref in stream_refs.get(stream_id, []):
+            parsed = _parse_module_function(raw_ref)
+            if not parsed:
+                continue
+            mod, func = parsed
+            if _is_dangerous_module(mod) or is_suspicious_global(mod, func):
+                return True
+        return False
+
     for stream_id, stream_length in stream_lengths.items():
         threshold = default_threshold
         refs_str = " ".join(stream_refs.get(stream_id, []))
@@ -3440,8 +3483,14 @@ def check_opcode_sequence(
             for framework in known_tree_frameworks
         )
         has_tree_markers = any(marker in refs_str for marker in _tree_ensemble_markers)
+        has_dangerous_globals = _stream_has_dangerous_globals(stream_id)
 
-        if ml_context.get("is_ml_content", False) and has_tree_framework and has_tree_markers:
+        if (
+            ml_context.get("is_ml_content", False)
+            and has_tree_framework
+            and has_tree_markers
+            and not has_dangerous_globals
+        ):
             # Tree-ensemble markers in-stream (e.g. RandomForest, DecisionTree)
             # are strong evidence of legitimate model reconstruction behavior.
             # Scale by stream size to handle large tree ensembles, with a
@@ -5740,11 +5789,17 @@ class PickleScanner(BaseScanner):
                 stack_global_refs=stack_global_refs,
                 callable_refs=callable_refs,
                 callable_origin_is_ext=callable_origin_is_ext,
+                mutation_target_refs=_mutation_target_refs,
             )
             if dangerous_pattern:
                 suspicious_count += 1
+                baseline_severity = (
+                    IssueSeverity.WARNING
+                    if dangerous_pattern.get("pattern") == "BUILD_SETSTATE_NON_SAFE_GLOBAL"
+                    else IssueSeverity.CRITICAL
+                )
                 severity = _get_context_aware_severity(
-                    IssueSeverity.CRITICAL,
+                    baseline_severity,
                     ml_context,
                     issue_type="dangerous_import",
                 )
