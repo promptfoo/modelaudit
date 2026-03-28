@@ -2081,52 +2081,76 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
             f"got: {[(check.severity, check.message) for check in matching_checks]}"
         )
 
-    def test_functools_reduce_remains_critical(self) -> None:
-        """functools.reduce must remain CRITICAL even while partial stays WARNING."""
-        result = self._scan_bytes(self._craft_global_reduce_pickle("functools", "reduce"))
+    def test_copyreg_remove_extension_import_only_is_flagged(self) -> None:
+        """copyreg.remove_extension import references must be treated as suspicious."""
+        result = self._scan_bytes(self._craft_global_import_only_pickle("copyreg", "remove_extension"))
 
         assert result.success
         assert result.has_errors
-        reduce_issues = [i for i in result.issues if "functools.reduce" in i.message.lower()]
-        assert reduce_issues, f"Expected functools.reduce finding, got: {[i.message for i in result.issues]}"
-        assert any(issue.severity == IssueSeverity.CRITICAL for issue in reduce_issues), (
-            f"Expected CRITICAL functools.reduce finding, got: {[(i.severity, i.message) for i in reduce_issues]}"
+        failed_checks = [check for check in result.checks if check.status == CheckStatus.FAILED]
+        matching_checks = [check for check in failed_checks if "copyreg.remove_extension" in check.message.lower()]
+        assert matching_checks, (
+            "Expected suspicious copyreg.remove_extension finding, "
+            f"got: {[check.message for check in failed_checks]}"
         )
+        assert any(check.severity == IssueSeverity.CRITICAL for check in matching_checks), (
+            f"Expected CRITICAL copyreg.remove_extension finding, got: "
+            f"{[(check.severity, check.message) for check in matching_checks]}"
+        )
+        assert not any(check.severity == IssueSeverity.WARNING for check in matching_checks), (
+            "Did not expect WARNING copyreg.remove_extension finding, "
+            f"got: {[(check.severity, check.message) for check in matching_checks]}"
+        )
+
+    def _assert_reduce_target_severity(self, function_name: str, expected_severity: IssueSeverity) -> None:
+        """Assert the executed-call findings for a functools REDUCE target use the expected severity."""
+        result = self._scan_bytes(self._craft_global_reduce_pickle("functools", function_name))
+
+        assert result.success
+        if expected_severity == IssueSeverity.CRITICAL:
+            assert result.has_errors
+        else:
+            assert not result.has_errors
+
+        target = f"functools.{function_name}"
+        reduce_checks = [
+            check
+            for check in result.checks
+            if check.name == "REDUCE Opcode Safety Check"
+            and check.status == CheckStatus.FAILED
+            and check.details.get("associated_global") == target
+        ]
+        assert reduce_checks, [check.message for check in result.checks]
+        assert all(check.severity == expected_severity for check in reduce_checks), (
+            f"Unexpected REDUCE severities for {target}: "
+            f"{[(check.severity, check.message) for check in reduce_checks]}"
+        )
+
+        reduce_pattern_checks = [
+            check
+            for check in result.checks
+            if check.name == "Reduce Pattern Analysis"
+            and check.status == CheckStatus.FAILED
+            and check.details.get("module") == "functools"
+            and check.details.get("function") == function_name
+        ]
+        assert reduce_pattern_checks, [check.message for check in result.checks]
+        assert all(check.severity == expected_severity for check in reduce_pattern_checks), (
+            f"Unexpected reduce-pattern severities for {target}: "
+            f"{[(check.severity, check.message) for check in reduce_pattern_checks]}"
+        )
+
+    def test_functools_reduce_remains_critical(self) -> None:
+        """functools.reduce must remain CRITICAL even while partial stays WARNING."""
+        self._assert_reduce_target_severity("reduce", IssueSeverity.CRITICAL)
 
     def test_functools_partial_remains_warning(self) -> None:
         """functools.partial should still be downgraded to WARNING."""
-        result = self._scan_bytes(self._craft_global_reduce_pickle("functools", "partial"))
-
-        assert result.success
-        assert not result.has_errors
-        partial_issues = [i for i in result.issues if "functools.partial" in i.message.lower()]
-        assert partial_issues, f"Expected functools.partial finding, got: {[i.message for i in result.issues]}"
-        assert any(issue.severity == IssueSeverity.WARNING for issue in partial_issues), (
-            f"Expected WARNING functools.partial finding, got: {[(i.severity, i.message) for i in partial_issues]}"
-        )
-        assert not any(issue.severity == IssueSeverity.CRITICAL for issue in partial_issues), (
-            "Did not expect CRITICAL functools.partial finding, "
-            f"got: {[(i.severity, i.message) for i in partial_issues]}"
-        )
+        self._assert_reduce_target_severity("partial", IssueSeverity.WARNING)
 
     def test_functools_partialmethod_remains_warning(self) -> None:
         """functools.partialmethod should inherit the same WARNING downgrade as partial."""
-        result = self._scan_bytes(self._craft_global_reduce_pickle("functools", "partialmethod"))
-
-        assert result.success
-        assert not result.has_errors
-        partialmethod_issues = [i for i in result.issues if "functools.partialmethod" in i.message.lower()]
-        assert partialmethod_issues, (
-            f"Expected functools.partialmethod finding, got: {[i.message for i in result.issues]}"
-        )
-        assert any(issue.severity == IssueSeverity.WARNING for issue in partialmethod_issues), (
-            "Expected WARNING functools.partialmethod finding, "
-            f"got: {[(i.severity, i.message) for i in partialmethod_issues]}"
-        )
-        assert not any(issue.severity == IssueSeverity.CRITICAL for issue in partialmethod_issues), (
-            "Did not expect CRITICAL functools.partialmethod finding, "
-            f"got: {[(i.severity, i.message) for i in partialmethod_issues]}"
-        )
+        self._assert_reduce_target_severity("partialmethod", IssueSeverity.WARNING)
 
     def _assert_ext_resolved_functools_ref_is_critical(self, target_name: str) -> None:
         """EXT-origin functools refs must remain CRITICAL despite warning downgrades for direct refs."""
