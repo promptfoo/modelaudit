@@ -208,8 +208,11 @@ class TestModelDownload:
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
     @patch("huggingface_hub.snapshot_download")
     def test_download_model_listing_timeout_uses_extension_allow_patterns(
-        self, mock_snapshot_download, _mock_get_extensions, tmp_path
-    ):
+        self,
+        mock_snapshot_download: MagicMock,
+        _mock_get_extensions: MagicMock,
+        tmp_path: Path,
+    ) -> None:
         """Listing timeouts should keep the selective allowlist instead of falling back to a full snapshot."""
 
         download_path = tmp_path / "download"
@@ -227,7 +230,7 @@ class TestModelDownload:
         assert allow_patterns == ["**/*.bin", "*.bin"]
 
     @patch("huggingface_hub.list_repo_files", return_value=["config.json"])
-    def test_list_repo_files_timeout_uses_daemon_thread(self, _mock_list_repo_files) -> None:
+    def test_list_repo_files_timeout_uses_daemon_thread(self, _mock_list_repo_files: MagicMock) -> None:
         """Timeout helper should use a daemon thread so timed-out listings cannot block process exit."""
 
         class StalledThread:
@@ -257,8 +260,11 @@ class TestModelDownload:
     @patch("huggingface_hub.list_repo_files", return_value=["notes.unknown"])
     @patch("huggingface_hub.snapshot_download")
     def test_download_model_listing_success_without_scannable_files_keeps_full_snapshot_fallback(
-        self, mock_snapshot_download, _mock_list_repo_files, tmp_path
-    ):
+        self,
+        mock_snapshot_download: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        tmp_path: Path,
+    ) -> None:
         """A successful listing with no scannable files should preserve the existing full-snapshot fallback."""
         download_path = tmp_path / "download"
         download_path.mkdir()
