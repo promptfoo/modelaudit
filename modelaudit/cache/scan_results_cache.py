@@ -320,24 +320,30 @@ class ScanResultsCache:
     def _get_version_info(self, version_context: dict[str, Any] | None = None) -> dict[str, Any]:
         """Get current version information for cache invalidation."""
         try:
-            # Try to import ModelAudit version
-            try:
-                from modelaudit import __version__ as modelaudit_version
-            except ImportError:
-                modelaudit_version = "dev"
-
-            return {
-                "modelaudit_version": modelaudit_version,
-                "scanner_versions": self._get_scanner_versions(),
-                "config_hash": self._get_config_hash(version_context),
-            }
+            from modelaudit import __version__ as modelaudit_version
+        except ImportError:
+            modelaudit_version = "dev"
         except Exception as e:
-            logger.debug(f"Failed to get version info: {e}")
-            return {
-                "modelaudit_version": "unknown",
-                "scanner_versions": {},
-                "config_hash": "unknown",
-            }
+            logger.debug(f"Failed to resolve modelaudit version: {e}")
+            modelaudit_version = "unknown"
+
+        try:
+            config_hash = self._get_config_hash(version_context)
+        except Exception as e:
+            logger.debug(f"Failed to compute cache config hash: {e}")
+            config_hash = "unknown"
+
+        try:
+            scanner_versions = self._get_scanner_versions()
+        except Exception as e:
+            logger.debug(f"Failed to resolve scanner versions: {e}")
+            scanner_versions = {}
+
+        return {
+            "modelaudit_version": modelaudit_version,
+            "scanner_versions": scanner_versions,
+            "config_hash": config_hash,
+        }
 
     def _get_scanner_versions(self) -> dict[str, str]:
         """Get version fingerprint for all scanners."""
@@ -351,8 +357,8 @@ class ScanResultsCache:
                 versions[name] = getattr(info, "version", "1.0")
 
             return versions
-        except ImportError:
-            logger.debug("Could not import scanner registry for version info")
+        except Exception as e:
+            logger.debug(f"Could not import scanner registry for version info: {e}")
             return {}
 
     def _get_config_hash(self, version_context: dict[str, Any] | None = None) -> str:
