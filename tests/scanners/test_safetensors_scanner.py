@@ -102,7 +102,7 @@ def test_bad_offsets(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
     ("dtype", "expected_size"),
-    [("BOOL", 4), ("BF16", 8), ("F8_E4M3", 4), ("F16", 8), ("F32", 16), ("F64", 32)],
+    [("BOOL", 4), ("BF16", 8), ("F8_E4M3", 4), ("F8_E5M2", 4), ("F16", 8), ("F32", 16), ("F64", 32)],
 )
 def test_tensor_size_check_runs_for_supported_dtypes(tmp_path: Path, dtype: str, expected_size: int) -> None:
     file_path = tmp_path / f"mismatch_{dtype}.safetensors"
