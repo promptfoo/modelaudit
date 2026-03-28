@@ -49,7 +49,6 @@ STANDARD_ONNX_DOMAINS = {
     "",
     "ai.onnx",
     "ai.onnx.ml",
-    "ai.onnx.training",
     "ai.onnx.preview.training",
 }
 
