@@ -55,8 +55,8 @@ def scan_mlflow_model(
 
     Returns
     -------
-    dict
-        Scan results dictionary as returned by
+    ModelAuditResultModel
+        Scan results as returned by
         :func:`scan_model_directory_or_file`.
 
     Raises

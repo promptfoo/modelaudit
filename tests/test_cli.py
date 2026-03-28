@@ -1333,8 +1333,14 @@ def test_scan_cloud_url_with_issues(mock_rmtree, mock_scan, mock_download, mock_
 
 @patch("modelaudit.cli.is_jfrog_url")
 @patch("modelaudit.cli.scan_jfrog_artifact")
-def test_scan_jfrog_url_success(mock_scan_jfrog, mock_is_jfrog):
+def test_scan_jfrog_url_success(
+    mock_scan_jfrog: MagicMock,
+    mock_is_jfrog: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     """Test scanning a JFrog URL."""
+    monkeypatch.setenv("HOME", str(tmp_path))
     mock_is_jfrog.return_value = True
     mock_scan_jfrog.return_value = create_mock_scan_result(
         bytes_scanned=512, issues=[], files_scanned=1, assets=[], has_errors=False, scanners=["test_scanner"]
@@ -1375,8 +1381,14 @@ def test_scan_jfrog_url_download_failure(mock_scan_jfrog, mock_is_jfrog):
 
 @patch("modelaudit.cli.is_jfrog_url")
 @patch("modelaudit.cli.scan_jfrog_artifact")
-def test_scan_jfrog_url_with_auth(mock_scan_jfrog, mock_is_jfrog):
+def test_scan_jfrog_url_with_auth(
+    mock_scan_jfrog: MagicMock,
+    mock_is_jfrog: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     """Test scanning a JFrog URL with authentication."""
+    monkeypatch.setenv("HOME", str(tmp_path))
     mock_is_jfrog.return_value = True
     mock_scan_jfrog.return_value = create_mock_scan_result(
         bytes_scanned=512, issues=[], files_scanned=1, assets=[], has_errors=False, scanners=["test_scanner"]
@@ -1484,8 +1496,13 @@ def test_scan_jfrog_url_no_cache_overrides_cache_dir(
 
 
 @patch("modelaudit.integrations.mlflow.scan_mlflow_model")
-def test_scan_mlflow_uri_success(mock_scan_mlflow):
+def test_scan_mlflow_uri_success(
+    mock_scan_mlflow: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     """Test successful scanning of an MLflow URI."""
+    monkeypatch.setenv("HOME", str(tmp_path))
     # Setup mock
     mock_scan_mlflow.return_value = create_mock_scan_result(
         bytes_scanned=1024, issues=[], files_scanned=1, assets=[], has_errors=False, scanners=["test_scanner"]
@@ -1520,8 +1537,13 @@ def test_scan_mlflow_uri_success(mock_scan_mlflow):
 
 
 @patch("modelaudit.integrations.mlflow.scan_mlflow_model")
-def test_scan_mlflow_uri_with_options(mock_scan_mlflow):
+def test_scan_mlflow_uri_with_options(
+    mock_scan_mlflow: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     """Test MLflow URI scanning with additional options."""
+    monkeypatch.setenv("HOME", str(tmp_path))
     # Setup mock
     mock_scan_mlflow.return_value = create_mock_scan_result(
         bytes_scanned=2048,
