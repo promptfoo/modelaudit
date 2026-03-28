@@ -945,6 +945,31 @@ def test_scan_huggingface_no_cache_uses_ephemeral_cache_dir(
     mock_rmtree.assert_called()
 
 
+@patch("tempfile.mkdtemp")
+@patch("shutil.rmtree")
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.cli.download_model")
+def test_scan_huggingface_no_cache_download_failure_cleans_ephemeral_cache_dir(
+    mock_download: MagicMock,
+    mock_is_hf_url: MagicMock,
+    mock_rmtree: MagicMock,
+    mock_mkdtemp: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """No-cache HuggingFace failures should still clean up the private temp cache directory."""
+    mock_is_hf_url.return_value = True
+    temp_cache_dir = tmp_path / "modelaudit_hf_failed"
+    temp_cache_dir.mkdir()
+    mock_mkdtemp.return_value = str(temp_cache_dir)
+    mock_download.side_effect = Exception("Download failed")
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "--no-cache", "hf://test/model"])
+
+    assert result.exit_code == 2
+    mock_rmtree.assert_called_once_with(str(temp_cache_dir))
+
+
 @patch("modelaudit.cli.scan_model_directory_or_file")
 def test_scan_no_whitelist_passes_config_and_preserves_critical_exit_code(mock_scan: MagicMock, tmp_path: Path) -> None:
     """--no-whitelist should disable downgrade config and keep CRITICAL findings as exit-code 1."""
@@ -1445,6 +1470,36 @@ def test_scan_cloud_url_success(
     mock_rmtree.assert_called()
 
 
+@patch("os.remove")
+@patch("shutil.rmtree")
+@patch("modelaudit.cli.is_cloud_url")
+@patch("modelaudit.cli.download_from_cloud")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+def test_scan_cloud_file_no_cache_cleans_up_downloaded_file(
+    mock_scan: MagicMock,
+    mock_download: MagicMock,
+    mock_is_cloud: MagicMock,
+    mock_rmtree: MagicMock,
+    mock_remove: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """No-cache cloud scans should delete downloaded files, not treat them as directories."""
+    mock_is_cloud.return_value = True
+    downloaded_file = tmp_path / "downloaded-model.bin"
+    downloaded_file.write_bytes(b"weights")
+    mock_download.return_value = downloaded_file
+    mock_scan.return_value = create_mock_scan_result(
+        bytes_scanned=123, issues=[], files_scanned=1, assets=[], has_errors=False, scanners=["test"]
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "--no-cache", "s3://bucket/model.bin"])
+
+    assert result.exit_code == 0
+    mock_remove.assert_called_once_with(str(downloaded_file))
+    mock_rmtree.assert_not_called()
+
+
 @patch("modelaudit.cli.is_cloud_url")
 @patch("modelaudit.cli.download_from_cloud")
 def test_scan_cloud_url_download_failure(mock_download: MagicMock, mock_is_cloud: MagicMock) -> None:
@@ -1572,6 +1627,7 @@ def test_scan_jfrog_url_success(mock_scan_jfrog, mock_is_jfrog):
         max_total_size=0,
         strict_license=False,
         skip_file_types=True,
+        selective_download=True,
         use_hf_whitelist=True,
     )
 
@@ -1623,8 +1679,29 @@ def test_scan_jfrog_url_with_auth(mock_scan_jfrog, mock_is_jfrog):
         max_total_size=0,
         strict_license=False,
         skip_file_types=True,
+        selective_download=True,
         use_hf_whitelist=True,
     )
+
+
+@patch("modelaudit.cli.is_jfrog_url")
+@patch("modelaudit.cli.scan_jfrog_artifact")
+def test_scan_jfrog_url_strict_disables_selective_prefiltering(
+    mock_scan_jfrog: MagicMock, mock_is_jfrog: MagicMock
+) -> None:
+    """Strict JFrog scans should disable folder prefiltering before scanning."""
+    mock_is_jfrog.return_value = True
+    mock_scan_jfrog.return_value = create_mock_scan_result(
+        bytes_scanned=512, issues=[], files_scanned=1, assets=[], has_errors=False, scanners=["test_scanner"]
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "--strict", "https://company.jfrog.io/artifactory/repo/models/"])
+
+    assert result.exit_code == 0
+    assert mock_scan_jfrog.call_args.kwargs["selective_download"] is False
+    assert mock_scan_jfrog.call_args.kwargs["skip_file_types"] is False
+    assert mock_scan_jfrog.call_args.kwargs["use_hf_whitelist"] is False
 
 
 @patch("modelaudit.integrations.mlflow.scan_mlflow_model")

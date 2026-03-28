@@ -1,14 +1,16 @@
 """Tests for CLI cache_dir option."""
 
-from unittest.mock import patch
+from pathlib import Path
+from typing import Any
+from unittest.mock import MagicMock, patch
 
 from click.testing import CliRunner
 
 from modelaudit.cli import cli
-from modelaudit.models import create_initial_audit_result
+from modelaudit.models import ModelAuditResultModel, create_initial_audit_result
 
 
-def create_mock_scan_result(**kwargs):
+def create_mock_scan_result(**kwargs: Any) -> ModelAuditResultModel:
     """Create a mock ModelAuditResultModel for testing."""
     result = create_initial_audit_result()
     result.success = kwargs.get("success", True)
@@ -43,7 +45,7 @@ def create_mock_scan_result(**kwargs):
 class TestCacheDirOption:
     """Test the --cache-dir option functionality."""
 
-    def test_cache_dir_option_exists(self):
+    def test_cache_dir_option_exists(self) -> None:
         """Test that cache directory option is available."""
         runner = CliRunner()
         result = runner.invoke(cli, ["scan", "--help"])
@@ -56,8 +58,13 @@ class TestCacheDirOption:
     @patch("modelaudit.cli.is_huggingface_url")
     @patch("modelaudit.cli.scan_model_directory_or_file")
     def test_huggingface_download_with_cache_dir(
-        self, mock_scan, mock_is_hf_url, mock_download_model, mock_spinner, tmp_path
-    ):
+        self,
+        mock_scan: MagicMock,
+        mock_is_hf_url: MagicMock,
+        mock_download_model: MagicMock,
+        mock_spinner: MagicMock,
+        tmp_path: Path,
+    ) -> None:
         """Test HuggingFace download uses automatic defaults for cache directory."""
         # Setup mocks
         mock_is_hf_url.return_value = True
@@ -82,8 +89,13 @@ class TestCacheDirOption:
     @patch("modelaudit.cli.is_cloud_url")
     @patch("modelaudit.cli.scan_model_directory_or_file")
     def test_cloud_download_with_cache_dir(
-        self, mock_scan, mock_is_cloud_url, mock_download_cloud, mock_spinner, tmp_path
-    ):
+        self,
+        mock_scan: MagicMock,
+        mock_is_cloud_url: MagicMock,
+        mock_download_cloud: MagicMock,
+        mock_spinner: MagicMock,
+        tmp_path: Path,
+    ) -> None:
         """Test cloud storage download uses automatic defaults for cache directory."""
         # Setup mocks
         mock_is_cloud_url.return_value = True
@@ -107,7 +119,14 @@ class TestCacheDirOption:
     @patch("modelaudit.cli.is_huggingface_url")
     @patch("modelaudit.cli.scan_model_directory_or_file")
     @patch("shutil.rmtree")
-    def test_no_cleanup_with_cache_dir(self, mock_rmtree, mock_scan, mock_is_hf_url, mock_download_model, tmp_path):
+    def test_no_cleanup_with_cache_dir(
+        self,
+        mock_rmtree: MagicMock,
+        mock_scan: MagicMock,
+        mock_is_hf_url: MagicMock,
+        mock_download_model: MagicMock,
+        tmp_path: Path,
+    ) -> None:
         """Test that temporary directories are not cleaned up when using automatic-defaults caching."""
         # Setup mocks
         mock_is_hf_url.return_value = True
@@ -130,7 +149,14 @@ class TestCacheDirOption:
     @patch("modelaudit.cli.is_huggingface_url")
     @patch("modelaudit.cli.scan_model_directory_or_file")
     @patch("shutil.rmtree")
-    def test_cleanup_without_cache_dir(self, mock_rmtree, mock_scan, mock_is_hf_url, mock_download_model, tmp_path):
+    def test_cleanup_without_cache_dir(
+        self,
+        mock_rmtree: MagicMock,
+        mock_scan: MagicMock,
+        mock_is_hf_url: MagicMock,
+        mock_download_model: MagicMock,
+        tmp_path: Path,
+    ) -> None:
         """Test that no-cache HuggingFace scans clean up the private temp cache directory they create."""
         # Setup mocks
         mock_is_hf_url.return_value = True
@@ -155,7 +181,9 @@ class TestCacheDirOption:
 
     @patch("modelaudit.cli.download_model")
     @patch("modelaudit.cli.is_huggingface_url")
-    def test_disk_space_error_message_mentions_cache_dir(self, mock_is_hf_url, mock_download_model):
+    def test_disk_space_error_message_mentions_cache_dir(
+        self, mock_is_hf_url: MagicMock, mock_download_model: MagicMock
+    ) -> None:
         """Test that disk space error messages mention --cache-dir option."""
         # Setup mocks
         mock_is_hf_url.return_value = True
@@ -176,7 +204,14 @@ class TestCacheDirOption:
     @patch("modelaudit.cli.download_model")
     @patch("modelaudit.cli.is_huggingface_url")
     @patch("modelaudit.cli.scan_model_directory_or_file")
-    def test_explicit_cache_dir_flag(self, mock_scan, mock_is_hf_url, mock_download_model, mock_spinner, tmp_path):
+    def test_explicit_cache_dir_flag(
+        self,
+        mock_scan: MagicMock,
+        mock_is_hf_url: MagicMock,
+        mock_download_model: MagicMock,
+        mock_spinner: MagicMock,
+        tmp_path: Path,
+    ) -> None:
         """Test that --cache-dir flag sets cache_dir and enables caching."""
         mock_is_hf_url.return_value = True
         mock_download_path = tmp_path / "downloaded_model"
@@ -201,8 +236,14 @@ class TestCacheDirOption:
     @patch("modelaudit.cli.scan_model_directory_or_file")
     @patch("shutil.rmtree")
     def test_no_cache_overrides_cache_dir(
-        self, mock_rmtree, mock_scan, mock_is_hf_url, mock_download_model, mock_spinner, tmp_path
-    ):
+        self,
+        mock_rmtree: MagicMock,
+        mock_scan: MagicMock,
+        mock_is_hf_url: MagicMock,
+        mock_download_model: MagicMock,
+        mock_spinner: MagicMock,
+        tmp_path: Path,
+    ) -> None:
         """Test that --no-cache takes precedence over --cache-dir and avoids persisting downloads there."""
         mock_is_hf_url.return_value = True
         mock_download_path = tmp_path / "downloaded_model"

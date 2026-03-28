@@ -1072,8 +1072,9 @@ def scan_command(
         if not added_path:
             scanned_paths.append(fallback_path)
 
-    # Track temporary directories to clean up after SBOM generation
-    temp_dirs_to_cleanup: list[str] = []
+    # Track temporary artifacts to clean up after SBOM generation.
+    # Store whether each path is a directory so file downloads don't leak.
+    temp_cleanup_entries: list[tuple[str, bool]] = []
 
     # Scan each path with interrupt handling
     with interruptible_scan() as interrupt_handler:
@@ -1114,13 +1115,16 @@ def scan_command(
 
                             tmp_dl_dir = Path(tempfile.mkdtemp(prefix="modelaudit_hf_"))
                             hf_cache_dir = tmp_dl_dir
+                            temp_dir = str(tmp_dl_dir)
 
                         # Download single file
                         download_path = download_file_from_hf(path, cache_dir=hf_cache_dir)
                         actual_path = str(download_path)
                         source_model_id, source_model_source = extract_model_id_from_path(path)
-                        # Only track for cleanup if we created an ephemeral cache above
-                        temp_dir = str(hf_cache_dir) if not final_cache else None
+                        # Only track for cleanup if we created an ephemeral cache above.
+                        # temp_dir is already set when we own the cache directory.
+                        if not final_cache and temp_dir is None:
+                            temp_dir = str(hf_cache_dir)
 
                         if download_spinner:
                             download_spinner.ok(style_text("✅ Downloaded", fg="green", bold=True))
@@ -1193,6 +1197,7 @@ def scan_command(
 
                             tmp_hf_dir = Path(tempfile.mkdtemp(prefix="modelaudit_hf_"))
                             hf_cache_dir = tmp_hf_dir
+                            temp_dir = str(tmp_hf_dir)
 
                         # Record download start and feature usage
                         record_download_started("huggingface", path)
@@ -1254,7 +1259,8 @@ def scan_command(
                             if show_styled_output:
                                 click.echo(style_text("✅ Streaming scan complete", fg="green", bold=True))
 
-                            temp_dir = str(tmp_hf_dir) if tmp_hf_dir is not None else None
+                            if tmp_hf_dir is not None:
+                                temp_dir = str(tmp_hf_dir)
                             # No actual_path to scan in normal flow - already done
                             url_handled = True
                             continue
@@ -1271,7 +1277,8 @@ def scan_command(
                             download_path = download_model(path, cache_dir=hf_cache_dir, show_progress=show_progress)
                             actual_path = str(download_path)
                             # Only clean up temporary directories created for this no-cache run.
-                            temp_dir = str(tmp_hf_dir) if tmp_hf_dir is not None else None
+                            if tmp_hf_dir is not None:
+                                temp_dir = str(tmp_hf_dir)
 
                             # Record download completion
                             download_duration = time.time() - download_start
@@ -1669,6 +1676,7 @@ def scan_command(
                             max_total_size=final_max_total_size,
                             strict_license=final_strict_license,
                             skip_file_types=final_skip_files,
+                            selective_download=final_selective,
                             use_hf_whitelist=final_use_hf_whitelist,
                         )
 
@@ -1986,9 +1994,9 @@ def scan_command(
             finally:
                 # Defer cleanup until after SBOM generation to avoid FileNotFoundError
                 if temp_dir and os.path.exists(temp_dir) and not final_cache:
-                    temp_dirs_to_cleanup.append(temp_dir)
+                    temp_cleanup_entries.append((temp_dir, os.path.isdir(temp_dir)))
                     if verbose:
-                        logger.debug(f"Deferring cleanup of temporary directory: {temp_dir}")
+                        logger.debug(f"Deferring cleanup of temporary artifact: {temp_dir}")
 
                 # Check if we were interrupted and should stop processing more paths
                 if interrupt_handler.is_interrupted():
@@ -2064,15 +2072,18 @@ def scan_command(
         with open(sbom, "w", encoding="utf-8") as f:
             f.write(sbom_text)
 
-    # Clean up temporary directories after SBOM generation
-    for temp_dir in temp_dirs_to_cleanup:
-        if os.path.exists(temp_dir):
+    # Clean up temporary artifacts after SBOM generation
+    for temp_path, is_dir in temp_cleanup_entries:
+        if os.path.exists(temp_path):
             try:
-                shutil.rmtree(temp_dir)
+                if is_dir:
+                    shutil.rmtree(temp_path)
+                else:
+                    os.remove(temp_path)
                 if verbose:
-                    logger.debug(f"Cleaned up temporary directory: {temp_dir}")
+                    logger.debug(f"Cleaned up temporary artifact: {temp_path}")
             except Exception as e:
-                logger.warning(f"Failed to clean up temporary directory {temp_dir}: {e!s}")
+                logger.warning(f"Failed to clean up temporary artifact {temp_path}: {e!s}")
 
     # Format the output
     if final_format == "json":
