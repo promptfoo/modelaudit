@@ -443,6 +443,30 @@ class TestJFrogFolderListing:
                 selective=False,
             )
 
+    @patch("modelaudit.utils.sources.jfrog.detect_jfrog_target_type")
+    def test_list_jfrog_folder_contents_raises_on_non_folder_subpath(self, mock_detect: MagicMock) -> None:
+        """Listing must fail closed when a supposed subfolder resolves to a non-folder."""
+
+        def mock_detect_side_effect(url: str, *args: object, **kwargs: object) -> dict:
+            if url.endswith("models/") or url.endswith("models"):
+                return {
+                    "type": "folder",
+                    "children": [{"uri": "/subdir", "folder": True}],
+                }
+            if "subdir" in url:
+                return {"type": "file", "size": 0, "path": "subdir", "repo": "repo"}
+            return {"type": "file", "size": 0, "path": "", "repo": ""}
+
+        mock_detect.side_effect = mock_detect_side_effect
+
+        with pytest.raises(Exception, match="Expected JFrog folder while listing"):
+            list_jfrog_folder_contents(
+                "https://company.jfrog.io/artifactory/repo/models/",
+                api_token="test-token",
+                recursive=True,
+                selective=False,
+            )
+
 
 class TestJFrogFolderDownload:
     """Test JFrog folder download functionality."""

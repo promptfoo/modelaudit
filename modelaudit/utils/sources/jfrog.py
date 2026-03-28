@@ -404,7 +404,10 @@ def list_jfrog_folder_contents(
         folder_info = detect_jfrog_target_type(folder_url, api_token, access_token, timeout)
 
         if folder_info["type"] != "folder":
-            return
+            raise Exception(
+                f"Expected JFrog folder while listing {folder_url}, got {folder_info['type']}. "
+                "Aborting to avoid incomplete file listing."
+            )
 
         for child in folder_info["children"]:
             child_name = child["uri"].lstrip("/")
