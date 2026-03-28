@@ -64,9 +64,10 @@ def _write_oversized_header_safetensors(path: Path, header_len: int) -> None:
 
 def test_oversized_header_triggers_limit_check(tmp_path: Path) -> None:
     file_path = tmp_path / "oversized_header.safetensors"
-    _write_oversized_header_safetensors(file_path, header_len=100 * 1024 * 1024)
+    max_header_bytes = 1 * 1024 * 1024
+    _write_oversized_header_safetensors(file_path, header_len=max_header_bytes + 1)
 
-    scanner = SafeTensorsScanner()
+    scanner = SafeTensorsScanner({"max_safetensors_header_bytes": max_header_bytes})
     result = scanner.scan(str(file_path))
 
     header_limit_check = next((check for check in result.checks if check.name == "Header Size Limit"), None)
@@ -75,13 +76,15 @@ def test_oversized_header_triggers_limit_check(tmp_path: Path) -> None:
     assert "exceeds maximum allowed size" in header_limit_check.message
     assert result.success is False
     assert result.metadata["analysis_incomplete"] is True
+    assert result.bytes_scanned == file_path.stat().st_size
 
 
 def test_oversized_header_skips_metadata_content_analysis(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     file_path = tmp_path / "oversized_skip_analysis.safetensors"
-    _write_oversized_header_safetensors(file_path, header_len=100 * 1024 * 1024)
+    max_header_bytes = 1 * 1024 * 1024
+    _write_oversized_header_safetensors(file_path, header_len=max_header_bytes + 1)
 
-    scanner = SafeTensorsScanner()
+    scanner = SafeTensorsScanner({"max_safetensors_header_bytes": max_header_bytes})
     analyze_called = {"value": False}
 
     def track_analyze(metadata: dict[str, object], result: object, path: str) -> None:
@@ -98,8 +101,8 @@ def test_oversized_header_does_not_read_beyond_configured_limit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     file_path = tmp_path / "oversized_guarded_read.safetensors"
-    oversized_header_len = 100 * 1024 * 1024
-    max_header_bytes = 16 * 1024 * 1024
+    max_header_bytes = 8 * 1024 * 1024
+    oversized_header_len = max_header_bytes + 1
     _write_oversized_header_safetensors(file_path, header_len=oversized_header_len)
 
     original_open: Any = builtins.open
