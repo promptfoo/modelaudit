@@ -156,9 +156,7 @@ def _get_scannable_extensions() -> set[str]:
 def _get_model_archive_signal_extensions() -> frozenset[str]:
     """Return model-bearing archive member suffixes that should promote skipped ZIP containers."""
     return frozenset(
-        extension
-        for extension in _get_scannable_extensions()
-        if extension not in _ARCHIVE_SIGNAL_EXTENSION_EXCLUSIONS
+        extension for extension in _get_scannable_extensions() if extension not in _ARCHIVE_SIGNAL_EXTENSION_EXCLUSIONS
     )
 
 
@@ -347,4 +345,6 @@ def should_skip_file(
 
     # Skip specific filenames
     return filename in skip_filenames
+
+
 logger = logging.getLogger(__name__)
