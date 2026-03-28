@@ -103,6 +103,99 @@ def test_scan_benign_mar_with_safe_handler(tmp_path: Path) -> None:
     assert len(handler_failures) == 0
 
 
+def test_non_handler_python_analysis_clean_handler_and_utils_has_no_failures(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"import utils\n\ndef handle(data, context):\n    return utils.transform(data)\n",
+            "utils.py": b"def transform(data):\n    return {'ok': True, 'data': data}\n",
+            "weights.bin": b"weights",
+        },
+        filename="clean_utils.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    non_handler_failures = _failed_checks(result, "MAR Non-Handler Python Analysis")
+    assert len(non_handler_failures) == 0
+
+    relationship_checks = [
+        check
+        for check in result.checks
+        if check.name == "MAR Non-Handler Python Analysis"
+        and check.status == CheckStatus.PASSED
+        and check.details.get("import_relationships")
+    ]
+    assert len(relationship_checks) >= 1
+    relationships = relationship_checks[0].details["import_relationships"]
+    assert any(
+        relationship["handler"] == "handler.py" and relationship["resolved_member"] == "utils.py"
+        for relationship in relationships
+    )
+
+
+def test_non_handler_python_analysis_detects_malicious_utils_module(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"import utils\n\ndef handle(data, context):\n    return utils.transform(data)\n",
+            "utils.py": b"import os\n\ndef transform(data):\n    return os.system('echo owned')\n",
+            "weights.bin": b"weights",
+        },
+        filename="malicious_utils.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    non_handler_failures = _failed_checks(result, "MAR Non-Handler Python Analysis")
+    assert len(non_handler_failures) >= 1
+    assert any(
+        check.severity == IssueSeverity.WARNING and "high-risk calls: os.system" in check.message
+        for check in non_handler_failures
+    )
+
+
+def test_non_handler_python_analysis_detects_malicious_init_module(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"import pkg\n\ndef handle(data, context):\n    return {'ok': True}\n",
+            "pkg/__init__.py": b"import os\nos.system('echo owned')\n",
+            "weights.bin": b"weights",
+        },
+        filename="malicious_init.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    non_handler_failures = _failed_checks(result, "MAR Non-Handler Python Analysis")
+    assert len(non_handler_failures) >= 1
+    assert any(
+        check.severity == IssueSeverity.WARNING and "__init__.py executes during package import" in check.message
+        for check in non_handler_failures
+    )
+
+
+def test_non_handler_python_analysis_without_extra_python_files_is_back_compatible(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
+            "weights.bin": b"weights",
+        },
+        filename="no_extra_python.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    non_handler_failures = _failed_checks(result, "MAR Non-Handler Python Analysis")
+    assert len(non_handler_failures) == 0
+
+
 def test_scan_resolves_bare_module_handler_names(tmp_path: Path) -> None:
     manifest = {"model": {"handler": "custom_handler", "serializedFile": "weights.bin"}}
     mar_path = _create_mar_archive(

@@ -644,6 +644,166 @@ class TorchServeMarScanner(BaseScanner):
                 location=archive_path,
             )
 
+    def _resolve_handler_members(self, member_set: set[str], handler_paths: list[str]) -> set[str]:
+        resolved_handlers: set[str] = set()
+        for handler_path in handler_paths:
+            resolved_candidates = self._resolve_handler_member_candidates(handler_path)
+            for candidate in resolved_candidates:
+                normalized_candidate = self._normalize_member_name(candidate)
+                if normalized_candidate in member_set and normalized_candidate.endswith(".py"):
+                    resolved_handlers.add(normalized_candidate)
+        return resolved_handlers
+
+    def _collect_imported_modules(self, tree: ast.AST) -> set[str]:
+        modules: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name:
+                        modules.add(alias.name)
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                modules.add(node.module)
+        return modules
+
+    def _has_import_time_execution(self, tree: ast.Module) -> bool:
+        for node in tree.body:
+            if (
+                isinstance(node, ast.Expr)
+                and isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, str)
+            ):
+                # Module docstring.
+                continue
+            if isinstance(node, (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            return True
+        return False
+
+    def _analyze_non_handler_python_files(
+        self,
+        archive_path: str,
+        archive: zipfile.ZipFile,
+        member_lookup: dict[str, zipfile.ZipInfo],
+        handler_members: set[str],
+        result: ScanResult,
+    ) -> None:
+        python_members = sorted(name for name in member_lookup if name.endswith(".py"))
+        non_handler_members = [name for name in python_members if name not in handler_members]
+
+        if not non_handler_members:
+            result.add_check(
+                name="MAR Non-Handler Python Analysis",
+                passed=True,
+                message="No non-handler Python files found in archive",
+                location=archive_path,
+            )
+            return
+
+        relationships: list[dict[str, str]] = []
+        non_handler_set = set(non_handler_members)
+        non_handler_findings = 0
+
+        for member_name in non_handler_members:
+            member_info = member_lookup[member_name]
+            try:
+                source_bytes = self._read_member_bounded(archive, member_info, self.max_member_bytes)
+            except ValueError as exc:
+                non_handler_findings += 1
+                result.add_check(
+                    name="MAR Non-Handler Python Analysis",
+                    passed=False,
+                    message=str(exc),
+                    severity=IssueSeverity.WARNING,
+                    location=f"{archive_path}:{member_name}",
+                    details={"member": member_name, "analysis_kind": "bounded_read"},
+                )
+                continue
+
+            risky_calls, parse_error = self._find_high_risk_calls(source_bytes)
+            if parse_error is not None:
+                non_handler_findings += 1
+                result.add_check(
+                    name="MAR Non-Handler Python Analysis",
+                    passed=False,
+                    message=f"Unable to parse non-handler Python source for static analysis: {parse_error}",
+                    severity=IssueSeverity.WARNING,
+                    location=f"{archive_path}:{member_name}",
+                    details={"member": member_name, "analysis_kind": "syntax"},
+                )
+                continue
+
+            tree = ast.parse(source_bytes.decode("utf-8", errors="replace"))
+            has_import_time_execution = self._has_import_time_execution(tree)
+            is_init_module = member_name.endswith("/__init__.py") or member_name == "__init__.py"
+
+            if risky_calls or has_import_time_execution:
+                non_handler_findings += 1
+                finding_reasons: list[str] = []
+                if risky_calls:
+                    finding_reasons.append(f"high-risk calls: {', '.join(sorted(risky_calls))}")
+                if has_import_time_execution:
+                    finding_reasons.append("module-level code executes at import time")
+                if is_init_module:
+                    finding_reasons.append("__init__.py executes during package import")
+
+                result.add_check(
+                    name="MAR Non-Handler Python Analysis",
+                    passed=False,
+                    message=f"Non-handler Python file is risky ({'; '.join(finding_reasons)})",
+                    severity=IssueSeverity.WARNING,
+                    location=f"{archive_path}:{member_name}",
+                    details={
+                        "member": member_name,
+                        "risky_calls": sorted(risky_calls),
+                        "has_import_time_execution": has_import_time_execution,
+                        "is_init_module": is_init_module,
+                    },
+                )
+            else:
+                result.add_check(
+                    name="MAR Non-Handler Python Analysis",
+                    passed=True,
+                    message="Non-handler Python source has no high-risk calls or import-time execution",
+                    location=f"{archive_path}:{member_name}",
+                    details={"member": member_name},
+                )
+
+        for handler_member in sorted(handler_members):
+            handler_info = member_lookup.get(handler_member)
+            if handler_info is None:
+                continue
+            try:
+                handler_source = self._read_member_bounded(archive, handler_info, self.max_member_bytes)
+                handler_tree = ast.parse(handler_source.decode("utf-8", errors="replace"))
+            except (SyntaxError, ValueError):
+                continue
+
+            for module_name in sorted(self._collect_imported_modules(handler_tree)):
+                module_path = module_name.replace(".", "/")
+                for candidate in (f"{module_path}.py", f"{module_path}/__init__.py"):
+                    normalized_candidate = self._normalize_member_name(candidate)
+                    if normalized_candidate in non_handler_set:
+                        relationships.append(
+                            {
+                                "handler": handler_member,
+                                "imported_module": module_name,
+                                "resolved_member": normalized_candidate,
+                            },
+                        )
+
+        if relationships:
+            result.add_check(
+                name="MAR Non-Handler Python Analysis",
+                passed=(non_handler_findings == 0),
+                message="Analyzed non-handler Python files and mapped handler import relationships",
+                severity=IssueSeverity.WARNING if non_handler_findings else IssueSeverity.INFO,
+                location=archive_path,
+                details={
+                    "non_handler_python_files": non_handler_members,
+                    "import_relationships": relationships,
+                },
+            )
+
     def _collect_import_aliases(self, tree: ast.AST) -> dict[str, str]:
         aliases: dict[str, str] = {}
         for node in ast.walk(tree):
@@ -712,6 +872,23 @@ class TorchServeMarScanner(BaseScanner):
         current_depth: int,
     ) -> None:
         contents: list[dict[str, Any]] = []
+        member_lookup = {
+            self._normalize_member_name(member_info.filename): member_info
+            for member_info in member_infos
+            if member_info.filename and not member_info.filename.endswith("/")
+        }
+        handler_members = self._resolve_handler_members(
+            member_set=set(member_lookup),
+            handler_paths=manifest_context.get("handler_paths", []),
+        )
+        self._analyze_non_handler_python_files(
+            archive_path=archive_path,
+            archive=archive,
+            member_lookup=member_lookup,
+            handler_members=handler_members,
+            result=result,
+        )
+
         serialized_refs = {
             self._normalize_member_name(path)
             for path in manifest_context.get("serialized_paths", [])
