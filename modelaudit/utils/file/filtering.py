@@ -107,31 +107,6 @@ DEFAULT_SCANNABLE_SKIP_OVERRIDES = {
     ".7z",
 }
 
-_ARCHIVE_SIGNAL_EXTENSION_EXCLUSIONS = frozenset(
-    {
-        ".json",
-        ".xml",
-        ".txt",
-        ".md",
-        ".markdown",
-        ".rst",
-        ".yaml",
-        ".yml",
-        ".cfg",
-        ".conf",
-        ".ini",
-        ".toml",
-        ".py",
-        ".js",
-        ".ts",
-        ".css",
-        ".scss",
-        ".sass",
-        ".less",
-        ".html",
-    }
-)
-
 _ZIP_MEMBER_SNIFF_LIMIT = 256
 _OFFICE_ARCHIVE_PREFIXES = ("word/", "xl/", "ppt/")
 _MODEL_ARCHIVE_SIGNAL_EXTENSIONS = frozenset(
@@ -279,9 +254,7 @@ def _has_scannable_content(path: str) -> bool:
                 return True
 
         return False
-    except OSError:
-        return False
-    except zipfile.BadZipFile:
+    except Exception:
         return False
 
 
@@ -338,7 +311,7 @@ def should_skip_file(
     ):
         return False
 
-    if ext in skip_extensions and _has_scannable_content(path):
+    if use_default_skip_extensions and ext in skip_extensions and _has_scannable_content(path):
         return False
 
     # Skip based on extension
