@@ -117,11 +117,15 @@ class BatchCacheOperations:
         """Process all cache files in a single directory efficiently."""
         results: dict[str, dict[str, Any] | None] = {}
 
-        for file_path, cache_key, _stat_result in group_files:
+        for file_path, cache_key, stat_result in group_files:
             try:
                 # Use optimized cache lookup
                 if self.cache_manager.cache is not None:
-                    cached_result = self.cache_manager.cache.get_cached_result_by_key(cache_key)
+                    cached_result = self.cache_manager.cache.get_cached_result_by_key(
+                        cache_key,
+                        file_path=file_path,
+                        file_stat=stat_result,
+                    )
                 else:
                     cached_result = None
                 results[file_path] = cached_result
@@ -199,13 +203,12 @@ class BatchCacheOperations:
                 logger.debug(f"Skipping batch cache store for operational result from {os.path.basename(file_path)}")
                 return False
 
-            self.cache_manager.store_result(
+            return self.cache_manager.store_result(
                 file_path,
                 scan_result,
                 scan_duration_ms,
                 version_context=version_context,
             )
-            return True
         except Exception as e:
             logger.debug(f"Failed to store result for {file_path}: {e}")
             return False

@@ -136,7 +136,13 @@ class ScanResultsCache:
             self._record_cache_miss("error")
             return None
 
-    def get_cached_result_by_key(self, cache_key: str) -> dict[str, Any] | None:
+    def get_cached_result_by_key(
+        self,
+        cache_key: str,
+        *,
+        file_path: str | None = None,
+        file_stat: os.stat_result | None = None,
+    ) -> dict[str, Any] | None:
         """
         Get cached scan result by pre-generated cache key (for performance optimization).
 
@@ -146,6 +152,15 @@ class ScanResultsCache:
         Returns:
             Cached scan result dictionary if found, None otherwise
         """
+        return self._get_cached_result_by_key(cache_key, file_path=file_path, file_stat=file_stat)
+
+    def _get_cached_result_by_key(
+        self,
+        cache_key: str,
+        file_path: str | None = None,
+        file_stat: os.stat_result | None = None,
+    ) -> dict[str, Any] | None:
+        """Get a cached result using a precomputed key, optionally validating with caller-provided stat data."""
         try:
             cache_file_path = self._get_cache_file_path(cache_key)
 
@@ -156,6 +171,15 @@ class ScanResultsCache:
             # Load cache entry
             with open(cache_file_path, encoding="utf-8") as f:
                 cache_entry = json.load(f)
+
+            if (
+                file_path is not None
+                and file_stat is not None
+                and not self._is_cache_entry_valid_with_stat(cache_entry, file_path, file_stat)
+            ):
+                cache_file_path.unlink()
+                self._record_cache_miss("invalid")
+                return None
 
             # Update access statistics
             cache_entry["cache_metadata"]["access_count"] += 1
@@ -180,7 +204,7 @@ class ScanResultsCache:
         scan_result: dict[str, Any],
         scan_duration_ms: int | None = None,
         version_context: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> bool:
         """
         Store scan result in cache with optimized file system calls.
 
@@ -188,24 +212,29 @@ class ScanResultsCache:
             file_path: Path to file that was scanned
             scan_result: Scan result dictionary to cache
             scan_duration_ms: Optional scan duration in milliseconds
+        Returns:
+            True when a cache entry was persisted, False when storage was skipped or failed.
         """
         try:
             # Get file stats ONCE and reuse
             file_stat = os.stat(file_path)
-
-            # Resolve version info once — used for both the cache key and the
-            # stored entry to avoid a redundant (and potentially flaky) second call.
             version_info = self._get_version_info(version_context)
             if version_info is None:
-                return
+                return False
 
             # Pass file_stat to avoid redundant calls
-            cache_key = self._generate_cache_key(file_path, file_stat=file_stat, version_context=version_context)
+            cache_key = self._generate_cache_key(
+                file_path,
+                file_stat=file_stat,
+                version_context=version_context,
+                version_info=version_info,
+            )
             if not cache_key:
-                return
+                return False
 
             # Use optimized hash method with stat reuse
             file_hash = self.hasher.hash_file_with_stat(file_path, file_stat)
+            mtime_ns = getattr(file_stat, "st_mtime_ns", int(file_stat.st_mtime * 1_000_000_000))
 
             cache_entry = CacheEntry(
                 cache_key=cache_key,
@@ -214,6 +243,7 @@ class ScanResultsCache:
                     "size": file_stat.st_size,
                     "original_name": os.path.basename(file_path),
                     "mtime": file_stat.st_mtime,
+                    "mtime_ns": mtime_ns,
                 },
                 version_info=version_info,
                 scan_result=scan_result,
@@ -234,24 +264,33 @@ class ScanResultsCache:
                 json.dump(asdict(cache_entry), f, indent=2)
 
             logger.debug(f"Cached scan result for {os.path.basename(file_path)}")
+            return True
 
         except Exception as e:
             logger.debug(f"Failed to cache result for {file_path}: {e}")
+            return False
 
     def generate_cache_key(
         self,
         file_path: str,
         file_stat: os.stat_result | None = None,
         version_context: dict[str, Any] | None = None,
+        version_info: dict[str, Any] | None = None,
     ) -> str | None:
         """Public wrapper for cache key generation used by higher-level cache callers."""
-        return self._generate_cache_key(file_path, file_stat=file_stat, version_context=version_context)
+        return self._generate_cache_key(
+            file_path,
+            file_stat=file_stat,
+            version_context=version_context,
+            version_info=version_info,
+        )
 
     def _generate_cache_key(
         self,
         file_path: str,
         file_stat: os.stat_result | None = None,
         version_context: dict[str, Any] | None = None,
+        version_info: dict[str, Any] | None = None,
     ) -> str | None:
         """
         Generate cache key from file hash and version info.
@@ -269,15 +308,14 @@ class ScanResultsCache:
             else:
                 file_key = self.key_generator.generate_key(file_path)
 
-            # Get version information — returns None when version components
-            # cannot be resolved, in which case we must not cache at all to
-            # avoid collisions between different configs/scanner versions.
-            version_info = self._get_version_info(version_context)
-            if version_info is None:
+            resolved_version_info = (
+                version_info if version_info is not None else self._get_version_info(version_context)
+            )
+            if resolved_version_info is None:
                 return None
 
             # Create version fingerprint
-            version_str = json.dumps(version_info, sort_keys=True)
+            version_str = json.dumps(resolved_version_info, sort_keys=True)
             version_hash = hashlib.blake2b(version_str.encode(), digest_size=16).hexdigest()
 
             # Combine file hash with version hash
@@ -390,11 +428,14 @@ class ScanResultsCache:
         """
         try:
             # Check file hasn't changed
-            cached_mtime = cache_entry["file_info"]["mtime"]
+            cached_mtime_ns = cache_entry["file_info"].get("mtime_ns")
             cached_size = cache_entry["file_info"]["size"]
+            current_mtime_ns = getattr(file_stat, "st_mtime_ns", int(file_stat.st_mtime * 1_000_000_000))
 
-            # Check modification time (allow 1 second tolerance)
-            if abs(file_stat.st_mtime - cached_mtime) > 1.0:
+            if cached_mtime_ns is None:
+                cached_mtime_ns = int(float(cache_entry["file_info"]["mtime"]) * 1_000_000_000)
+
+            if int(cached_mtime_ns) != current_mtime_ns:
                 return False
 
             # Check file size

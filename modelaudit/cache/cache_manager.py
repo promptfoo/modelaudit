@@ -79,7 +79,7 @@ class CacheManager:
         scan_result: dict[str, Any],
         scan_duration_ms: int | None = None,
         version_context: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> bool:
         """
         Store scan result in cache.
 
@@ -89,9 +89,9 @@ class CacheManager:
             scan_duration_ms: Optional scan duration
         """
         if not self.enabled or not self.cache:
-            return
+            return False
 
-        self.cache.store_result(file_path, scan_result, scan_duration_ms, version_context=version_context)
+        return self.cache.store_result(file_path, scan_result, scan_duration_ms, version_context=version_context)
 
     def cached_scan(
         self,

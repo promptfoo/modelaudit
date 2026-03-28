@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -331,6 +332,30 @@ def test_batch_lookup_returns_cached_entries(tmp_path: Path) -> None:
     assert cached_results[str(file_path)] == expected
 
 
+def test_batch_lookup_rejects_stale_cache_entries(tmp_path: Path) -> None:
+    file_path = _make_cacheable_file(tmp_path)
+    cache_dir = tmp_path / "cache"
+    cache_manager = get_cache_manager(str(cache_dir), enabled=True)
+    batch_ops = BatchCacheOperations(cache_manager)
+    version_context = build_cache_version_context({"timeout": 30})
+    expected = {"checks": [], "issues": [], "metadata": {}, "scanner": "test", "success": True}
+
+    assert cache_manager.store_result(str(file_path), expected, 10, version_context=version_context) is True
+    assert cache_manager.cache is not None
+
+    cache_key = cache_manager.cache.generate_cache_key(str(file_path), version_context=version_context)
+    assert cache_key is not None
+    cache_file_path = cache_manager.cache._get_cache_file_path(cache_key)
+    cache_entry = json.loads(cache_file_path.read_text(encoding="utf-8"))
+    cache_entry["cache_metadata"]["scanned_at"] = time.time() - (31 * 24 * 60 * 60)
+    cache_file_path.write_text(json.dumps(cache_entry, indent=2), encoding="utf-8")
+
+    cached_results = batch_ops.batch_lookup([str(file_path)], version_context=version_context)
+
+    assert cached_results[str(file_path)] is None
+    assert not cache_file_path.exists()
+
+
 def test_batch_store_skips_operational_failures(tmp_path: Path) -> None:
     file_path = _make_cacheable_file(tmp_path)
     cache_dir = tmp_path / "cache"
@@ -345,6 +370,35 @@ def test_batch_store_skips_operational_failures(tmp_path: Path) -> None:
                     "scanner": "test",
                     "success": False,
                     "issues": [{"message": "Scan timed out: metadata helper exceeded limit", "severity": "warning"}],
+                    "checks": [],
+                    "metadata": {},
+                },
+                10,
+            )
+        ]
+    )
+
+    assert stored_count == 0
+    assert cache_manager.get_stats()["total_entries"] == 0
+
+
+def test_batch_store_counts_only_persisted_results(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    file_path = _make_cacheable_file(tmp_path)
+    cache_dir = tmp_path / "cache"
+    cache_manager = get_cache_manager(str(cache_dir), enabled=True)
+    batch_ops = BatchCacheOperations(cache_manager)
+
+    assert cache_manager.cache is not None
+    monkeypatch.setattr(cache_manager.cache, "_generate_cache_key", lambda *args, **kwargs: None)
+
+    stored_count = batch_ops.batch_store(
+        [
+            (
+                str(file_path),
+                {
+                    "scanner": "test",
+                    "success": True,
+                    "issues": [],
                     "checks": [],
                     "metadata": {},
                 },
@@ -383,9 +437,7 @@ def test_cache_entry_omits_raw_version_context(tmp_path: Path) -> None:
     assert "version_context" not in cache_entry["version_info"]
 
 
-def test_cache_key_is_none_when_scanner_versions_unavailable(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_cache_key_is_none_when_scanner_versions_unavailable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """When scanner versions cannot be resolved, caching must be disabled
     entirely to avoid key collisions between different scanner versions."""
     file_path = _make_cacheable_file(tmp_path)
@@ -416,3 +468,23 @@ def test_cache_key_generation_avoids_full_hash_for_medium_files(
     cache_key = cache.generate_cache_key(str(file_path), version_context=build_cache_version_context({"timeout": 30}))
 
     assert cache_key is not None
+
+
+def test_same_size_rewrite_with_high_resolution_mtime_invalidates_cache(tmp_path: Path) -> None:
+    file_path = _make_cacheable_file(tmp_path, name="medium.bin")
+    cache = ScanResultsCache(str(tmp_path / "scan-cache"))
+    version_context = build_cache_version_context({"timeout": 30})
+    expected = {"checks": [], "issues": [], "metadata": {}, "scanner": "test", "success": True}
+
+    assert cache.store_result(str(file_path), expected, 10, version_context=version_context) is True
+
+    original_stat = file_path.stat()
+    file_path.write_bytes(b"y" * 2048)
+    base_second_ns = (original_stat.st_mtime_ns // 1_000_000_000) * 1_000_000_000
+    original_offset_ns = original_stat.st_mtime_ns % 1_000_000_000
+    new_offset_ns = 123_456_789 if original_offset_ns != 123_456_789 else 123_456_790
+    os.utime(file_path, ns=(original_stat.st_atime_ns, base_second_ns + new_offset_ns))
+
+    cached_result = cache.get_cached_result(str(file_path), version_context=version_context)
+
+    assert cached_result is None
