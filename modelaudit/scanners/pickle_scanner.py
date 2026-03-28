@@ -3445,56 +3445,35 @@ def check_opcode_sequence(
     # Compute per-stream thresholds so appended streams are analyzed
     # independently even when the file contains mixed-size streams.
     stream_refs: dict[int, list[str]] = {stream_id: [] for stream_id in stream_lengths}
+    stream_has_dangerous_globals: dict[int, bool] = dict.fromkeys(stream_lengths, False)
 
     for idx, (mod, func) in resolved_stack_globals.items():
         if 0 <= idx < len(stream_id_by_index):
-            stream_refs.setdefault(stream_id_by_index[idx], []).append(f"{mod}.{func}")
+            stream_id = stream_id_by_index[idx]
+            stream_refs.setdefault(stream_id, []).append(f"{mod}.{func}")
+            if _is_actually_dangerous_global(mod, func, ml_context):
+                stream_has_dangerous_globals[stream_id] = True
 
     for idx, (mod, func) in resolved_callables.items():
         if 0 <= idx < len(stream_id_by_index):
-            stream_refs.setdefault(stream_id_by_index[idx], []).append(f"{mod}.{func}")
+            stream_id = stream_id_by_index[idx]
+            stream_refs.setdefault(stream_id, []).append(f"{mod}.{func}")
+            if resolved_callable_origin_is_ext.get(idx, False) or _is_actually_dangerous_global(mod, func, ml_context):
+                stream_has_dangerous_globals[stream_id] = True
 
     for idx, (op, arg, _p) in enumerate(opcodes):
         if op.name == "GLOBAL" and isinstance(arg, str):
-            stream_refs.setdefault(stream_id_by_index[idx], []).append(str(arg))
+            stream_id = stream_id_by_index[idx]
+            stream_refs.setdefault(stream_id, []).append(str(arg))
+            parsed = _parse_module_function(arg)
+            if parsed:
+                mod, func = parsed
+                if _is_actually_dangerous_global(mod, func, ml_context):
+                    stream_has_dangerous_globals[stream_id] = True
 
     stream_thresholds: dict[int, int] = {}
     ml_confidence_val = float(ml_context.get("overall_confidence", 0) or 0)
     known_tree_frameworks = _tree_ensemble_frameworks & _ml_frameworks
-
-    def _stream_has_dangerous_globals(stream_id: int) -> bool:
-        for idx, (mod, func) in resolved_stack_globals.items():
-            if (
-                0 <= idx < len(stream_id_by_index)
-                and stream_id_by_index[idx] == stream_id
-                and _is_actually_dangerous_global(mod, func, ml_context)
-            ):
-                return True
-
-        for idx, (mod, func) in resolved_callables.items():
-            if (
-                0 <= idx < len(stream_id_by_index)
-                and stream_id_by_index[idx] == stream_id
-                and (
-                    resolved_callable_origin_is_ext.get(idx, False)
-                    or _is_actually_dangerous_global(mod, func, ml_context)
-                )
-            ):
-                return True
-
-        for idx, (op, arg, _p) in enumerate(opcodes):
-            if stream_id_by_index[idx] != stream_id:
-                continue
-            if op.name != "GLOBAL" or not isinstance(arg, str):
-                continue
-            parsed = _parse_module_function(arg)
-            if not parsed:
-                continue
-            mod, func = parsed
-            if _is_actually_dangerous_global(mod, func, ml_context):
-                return True
-
-        return False
 
     for stream_id, stream_length in stream_lengths.items():
         threshold = default_threshold
@@ -3507,7 +3486,7 @@ def check_opcode_sequence(
             for framework in known_tree_frameworks
         )
         has_tree_markers = any(marker in refs_str for marker in _tree_ensemble_markers)
-        has_dangerous_globals = _stream_has_dangerous_globals(stream_id)
+        has_dangerous_globals = stream_has_dangerous_globals.get(stream_id, False)
 
         if (
             ml_context.get("is_ml_content", False)
