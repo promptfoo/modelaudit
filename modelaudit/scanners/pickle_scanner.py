@@ -4561,6 +4561,13 @@ class PickleScanner(BaseScanner):
                 return None
 
             opcode = data[start]
+            if opcode == 0x56:  # UNICODE
+                value_start = start + 1
+                value_end = data.find(b"\n", value_start, min(data_len, value_start + 4097))
+                if value_end == -1:
+                    return None
+                value = data[value_start:value_end].decode("utf-8", errors="ignore").strip()
+                return value, value_end + 1
             if opcode == 0x8C:  # SHORT_BINUNICODE
                 if start + 2 > data_len:
                     return None
@@ -4705,6 +4712,9 @@ class PickleScanner(BaseScanner):
 
             if opcode_value == 0x93:  # STACK_GLOBAL
                 stack_global_positions.append(parse_cursor)
+            elif opcode_value == 0x95 and parse_cursor + 9 <= data_len:  # FRAME
+                parse_cursor += 9
+                continue
 
             last_value_info = None
             last_value_end = -1

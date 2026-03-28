@@ -417,7 +417,8 @@ def test_post_budget_global_scan_uses_consumed_opcode_boundary(tmp_path: Path) -
     assert checks[0].status == CheckStatus.FAILED
     assert checks[0].severity == IssueSeverity.WARNING
     assert "mysterypkg.loader" in checks[0].message
-    assert checks[0].details["minimum_offset"] == 131
+    expected_minimum_offset = len(b"\x80\x04") + len(b"\x8d") + struct.calcsize("<Q") + 120
+    assert checks[0].details["minimum_offset"] == expected_minimum_offset
     assert result.success is True
 
 
@@ -455,6 +456,50 @@ def test_post_budget_global_scan_recovers_stack_global_with_memo_reads(
     assert findings[0]["import_reference"] == "os.system"
     assert findings[0]["opcode"] == "STACK_GLOBAL"
     assert findings[0]["offset"] == len(raw_stack_global) - 1
+
+
+def test_post_budget_global_scan_recovers_unicode_stack_global() -> None:
+    """UNICODE-encoded STACK_GLOBAL values should be recoverable from the post-budget tail."""
+    raw_stack_global = b"\x80\x04Vos\nVsystem\n\x93."
+    scanner = PickleScanner()
+
+    findings = scanner._scan_global_references_unbounded(
+        BytesIO(raw_stack_global),
+        file_size=len(raw_stack_global),
+        minimum_offset=0,
+        ml_context={},
+    )
+
+    assert len(findings) == 1
+    assert findings[0]["import_reference"] == "os.system"
+    assert findings[0]["opcode"] == "STACK_GLOBAL"
+    assert findings[0]["offset"] == len(raw_stack_global) - 2
+
+
+def test_post_budget_global_scan_recovers_stack_global_after_frame() -> None:
+    """FRAME boundaries should not suppress STACK_GLOBAL recovery in the tail scan."""
+    raw_stack_global = (
+        b"\x80\x04"
+        + b"\x95\x0c\x00\x00\x00\x00\x00\x00\x00"
+        + _short_binunicode(b"os")
+        + b"\x94"
+        + _short_binunicode(b"system")
+        + b"\x94"
+        + b"\x93."
+    )
+    scanner = PickleScanner()
+
+    findings = scanner._scan_global_references_unbounded(
+        BytesIO(raw_stack_global),
+        file_size=len(raw_stack_global),
+        minimum_offset=0,
+        ml_context={},
+    )
+
+    assert len(findings) == 1
+    assert findings[0]["import_reference"] == "os.system"
+    assert findings[0]["opcode"] == "STACK_GLOBAL"
+    assert findings[0]["offset"] == len(raw_stack_global) - 2
 
 
 def test_scan_pickle_detects_post_budget_stack_global_with_binget(tmp_path: Path) -> None:
