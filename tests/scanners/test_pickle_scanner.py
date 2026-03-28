@@ -58,6 +58,10 @@ def _write_pickle_with_tail(path: Path, tail: bytes, *, pad_to_bytes: int | None
     path.write_bytes(payload + tail)
 
 
+def _make_opcode_padding_stream(opcode_pairs: int) -> bytes:
+    return b"\x80\x02" + (b"K\x010" * opcode_pairs) + b"."
+
+
 @pytest.mark.parametrize(
     "fixture_name",
     [
@@ -208,6 +212,76 @@ def test_large_pickle_raw_pattern_limit_with_opcode_budget_truncation(tmp_path: 
     assert len(opcode_checks) == 1
     assert opcode_checks[0].details["analysis_incomplete"] is True
     assert result.metadata["analysis_incomplete"] is True
+
+
+def test_post_budget_global_scan_detects_dangerous_second_stream(tmp_path: Path) -> None:
+    """Dangerous imports hidden beyond opcode budget should be detected by the fallback scan."""
+    pickle_path = tmp_path / "post-budget-os-system.pkl"
+    benign_padding = _make_opcode_padding_stream(opcode_pairs=512)
+    malicious_stream = b"\x80\x02cos\nsystem\n)R."
+    pickle_path.write_bytes(benign_padding + malicious_stream)
+
+    result = PickleScanner({"max_opcodes": 64}).scan(str(pickle_path))
+
+    checks = [check for check in result.checks if check.name == "Post-Budget Global Reference Scan"]
+    assert len(checks) == 1
+    assert checks[0].status == CheckStatus.FAILED
+    assert checks[0].severity == IssueSeverity.CRITICAL
+    assert "os.system" in checks[0].message
+    findings = checks[0].details["dangerous_references"]
+    assert any(finding["import_reference"] == "os.system" for finding in findings)
+    assert result.success is False
+
+
+def test_post_budget_global_scan_has_no_false_positives_for_clean_large_payload(tmp_path: Path) -> None:
+    """Budget exhaustion alone should not produce post-budget findings for clean payloads."""
+    pickle_path = tmp_path / "post-budget-clean.pkl"
+    benign_padding = _make_opcode_padding_stream(opcode_pairs=1024)
+    clean_tail = pickle.dumps({"safe": True, "weights": [1, 2, 3]}, protocol=4)
+    pickle_path.write_bytes(benign_padding + clean_tail)
+
+    result = PickleScanner({"max_opcodes": 64}).scan(str(pickle_path))
+
+    assert any(check.name == "Opcode Count Check" and check.status == CheckStatus.FAILED for check in result.checks), (
+        "Expected opcode budget exhaustion check"
+    )
+    assert not any(
+        check.name == "Post-Budget Global Reference Scan" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    ), f"Unexpected post-budget findings: {[(c.name, c.message) for c in result.checks]}"
+
+
+def test_post_budget_global_scan_runs_only_when_opcode_budget_is_exceeded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The post-budget scan should execute only on opcode-budget truncation."""
+    scanner = PickleScanner({"max_opcodes": 4096})
+    call_counter = {"calls": 0}
+
+    def _counting_scan(
+        self: PickleScanner,
+        _file_obj: object,
+        *,
+        file_size: int,
+        minimum_offset: int,
+        ml_context: dict[str, object],
+    ) -> list[dict[str, object]]:
+        del self, _file_obj, file_size, minimum_offset, ml_context
+        call_counter["calls"] += 1
+        return []
+
+    monkeypatch.setattr(PickleScanner, "_scan_global_references_unbounded", _counting_scan)
+
+    small_path = tmp_path / "small.pkl"
+    small_path.write_bytes(pickle.dumps({"safe": True}, protocol=4))
+    scanner.scan(str(small_path))
+    assert call_counter["calls"] == 0
+
+    scanner.max_opcodes = 16
+    large_path = tmp_path / "large-budget.pkl"
+    large_path.write_bytes(_make_opcode_padding_stream(opcode_pairs=256) + pickle.dumps({"safe": True}, protocol=4))
+    scanner.scan(str(large_path))
+    assert call_counter["calls"] == 1
 
 
 class TestPickleScanner(unittest.TestCase):

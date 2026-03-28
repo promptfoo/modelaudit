@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - count successful `stream://` scans in `files_scanned` so clean streaming scans return exit code 0 instead of 2
 - harden 7z nested archive scanning and pre-extraction size checks
 - scan follow-on pickle streams after large padding blocks
+- **security:** add a budget-independent post-truncation GLOBAL/INST/STACK_GLOBAL byte scan (100 MB capped) so dangerous imports hidden past opcode limits are still detected
 - **security:** detect nested pickle payloads in BINBYTES8 and BYTEARRAY8 opcodes
 - reject local streaming symlink traversal outside the scan root
 - require explicit remote Hugging Face provenance for whitelist downgrades

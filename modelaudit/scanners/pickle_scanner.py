@@ -58,6 +58,7 @@ _STACK_GLOBAL_OPERAND_PREVIEWER.maxset = 4
 _STACK_GLOBAL_OPERAND_PREVIEWER.maxfrozenset = 4
 _STACK_GLOBAL_OPERAND_PREVIEWER.maxdict = 4
 _RAW_PATTERN_SCAN_LIMIT_BYTES = 10 * 1024 * 1024
+_POST_BUDGET_GLOBAL_SCAN_LIMIT_BYTES = 100 * 1024 * 1024
 
 
 StackGlobalOperandKind = Literal["string", "missing_memo", "unknown", "non_string"]
@@ -3619,6 +3620,11 @@ class PickleScanner(BaseScanner):
         super().__init__(config)
         # Additional pickle-specific configuration
         self.max_opcodes = self.config.get("max_opcodes", 1000000)
+        configured_post_budget_limit = self.config.get(
+            "post_budget_global_scan_limit_bytes",
+            _POST_BUDGET_GLOBAL_SCAN_LIMIT_BYTES,
+        )
+        self.post_budget_global_scan_limit_bytes = max(0, int(configured_post_budget_limit))
         # Initialize analyzers
         self.entropy_analyzer = EntropyAnalyzer()
         self.semantic_analyzer = SemanticAnalyzer()
@@ -4075,7 +4081,11 @@ class PickleScanner(BaseScanner):
             result.finish(success=False)
             return result
 
-        result.finish(success=True)
+        has_post_budget_failure = any(
+            check.name == "Post-Budget Global Reference Scan" and check.status == CheckStatus.FAILED
+            for check in result.checks
+        )
+        result.finish(success=not has_post_budget_failure)
         return result
 
     def _scan_for_dangerous_patterns(self, data: bytes, result: ScanResult, context_path: str) -> None:
@@ -4479,6 +4489,103 @@ class PickleScanner(BaseScanner):
 
         return values
 
+    def _scan_global_references_unbounded(
+        self,
+        file_obj: BinaryIO,
+        *,
+        file_size: int,
+        minimum_offset: int,
+        ml_context: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Perform a post-budget raw byte scan for GLOBAL/INST/STACK_GLOBAL references."""
+        findings: list[dict[str, Any]] = []
+        seen: set[tuple[int, str]] = set()
+
+        scan_limit = min(file_size, self.post_budget_global_scan_limit_bytes)
+        if scan_limit <= 0:
+            return findings
+
+        original_pos = file_obj.tell()
+        try:
+            file_obj.seek(0)
+            data = file_obj.read(scan_limit)
+        finally:
+            file_obj.seek(original_pos)
+
+        def _record_reference(module: str, function: str, offset: int, opcode_name: str) -> None:
+            if offset < minimum_offset:
+                return
+            if not module or not function or not _is_plausible_python_module(module):
+                return
+
+            is_failure, _severity, classification = _classify_import_reference(
+                module,
+                function,
+                ml_context,
+                is_import_only=True,
+            )
+            if not is_failure:
+                return
+
+            import_reference = f"{module}.{function}"
+            dedupe_key = (offset, import_reference)
+            if dedupe_key in seen:
+                return
+            seen.add(dedupe_key)
+
+            findings.append(
+                {
+                    "module": module,
+                    "function": function,
+                    "import_reference": import_reference,
+                    "offset": offset,
+                    "opcode": opcode_name,
+                    "classification": classification,
+                    "rule_code": get_import_rule_code(module, function) or "S206",
+                }
+            )
+
+        cursor = 0
+        data_len = len(data)
+        while cursor < data_len:
+            opcode_value = data[cursor]
+            if opcode_value in (ord("c"), ord("i")):
+                module_end = data.find(b"\n", cursor + 1)
+                if module_end != -1 and module_end - cursor <= 256:
+                    function_end = data.find(b"\n", module_end + 1)
+                    if function_end != -1 and function_end - module_end <= 256:
+                        module = data[cursor + 1 : module_end].decode("utf-8", errors="ignore").strip()
+                        function = data[module_end + 1 : function_end].decode("utf-8", errors="ignore").strip()
+                        opcode_name = "GLOBAL" if opcode_value == ord("c") else "INST"
+                        _record_reference(module, function, cursor, opcode_name)
+                        cursor = function_end + 1
+                        continue
+            cursor += 1
+
+        for idx in range(max(0, data_len - 5)):
+            if data[idx] != 0x8C:  # SHORT_BINUNICODE
+                continue
+            module_len = data[idx + 1]
+            module_start = idx + 2
+            module_end = module_start + module_len
+            if module_end + 3 > data_len:
+                continue
+            if data[module_end] != 0x8C:
+                continue
+            function_len = data[module_end + 1]
+            function_start = module_end + 2
+            function_end = function_start + function_len
+            if function_end >= data_len:
+                continue
+            if data[function_end] != 0x93:  # STACK_GLOBAL
+                continue
+
+            module = data[module_start:module_end].decode("utf-8", errors="ignore").strip()
+            function = data[function_start:function_end].decode("utf-8", errors="ignore").strip()
+            _record_reference(module, function, idx, "STACK_GLOBAL")
+
+        return findings
+
     def _scan_pickle_bytes(self, file_obj: BinaryIO, file_size: int) -> ScanResult:
         """Scan pickle file content for suspicious opcodes"""
         result = self._create_result()
@@ -4771,19 +4878,7 @@ class PickleScanner(BaseScanner):
 
                     # Check for too many opcodes
                     if opcode_count > self.max_opcodes:
-                        result.add_check(
-                            name="Opcode Count Check",
-                            passed=False,
-                            message=f"Too many opcodes in pickle (> {self.max_opcodes})",
-                            severity=IssueSeverity.INFO,
-                            location=self.current_file_path,
-                            details={
-                                "opcode_count": opcode_count,
-                                "max_opcodes": self.max_opcodes,
-                            },
-                            why=get_pattern_explanation("pickle_size_limit"),
-                            rule_code="S902",
-                        )
+                        opcode_budget_exceeded = True
                         break
 
                     # Check for timeout
@@ -4865,6 +4960,48 @@ class PickleScanner(BaseScanner):
                 _mutation_target_refs,
             ) = _simulate_symbolic_reference_maps(opcodes)
             executed_import_origins = set(callable_origin_refs.values())
+            max_analyzed_offset = max(
+                (int(pos) for _opcode, _arg, pos in opcodes if pos is not None),
+                default=-1,
+            )
+
+            if opcode_budget_exceeded:
+                post_budget_global_findings = self._scan_global_references_unbounded(
+                    file_obj,
+                    file_size=file_size,
+                    minimum_offset=max_analyzed_offset + 1,
+                    ml_context=ml_context,
+                )
+                if post_budget_global_findings:
+                    first_finding = post_budget_global_findings[0]
+                    additional = len(post_budget_global_findings) - 1
+                    additional_note = f" (+{additional} more)" if additional > 0 else ""
+                    post_budget_scan_bytes = min(file_size, self.post_budget_global_scan_limit_bytes)
+                    suspicious_count += len(post_budget_global_findings)
+                    result.add_check(
+                        name="Post-Budget Global Reference Scan",
+                        passed=False,
+                        message=(
+                            "Dangerous reference found beyond opcode budget: "
+                            f"{first_finding['import_reference']} at byte offset {first_finding['offset']}"
+                            f"{additional_note}"
+                        ),
+                        severity=IssueSeverity.CRITICAL,
+                        location=self.current_file_path,
+                        rule_code=first_finding["rule_code"],
+                        details={
+                            "scan_limit_bytes": self.post_budget_global_scan_limit_bytes,
+                            "scan_bytes": post_budget_scan_bytes,
+                            "scan_total_bytes": file_size,
+                            "minimum_offset": max_analyzed_offset + 1,
+                            "dangerous_references": post_budget_global_findings,
+                        },
+                        why=(
+                            "The opcode pass stopped at the configured budget, so a separate byte-level import scan "
+                            "checked the remaining payload and found dangerous GLOBAL/INST/STACK_GLOBAL references."
+                        ),
+                    )
+                    result.success = False
 
             # CVE-2025-32434 specific opcode sequence analysis - REMOVED
             # Now only show CVE info in REDUCE opcode detection messages
