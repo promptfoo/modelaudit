@@ -73,10 +73,11 @@ MARKED_PROTOCOL0_GLOBAL_RE = re.compile(rb"^[\(\]\}]c[^\n\r]{1,64}\n[^\n\r]{1,64
 
 # Protocol 0/1 pickles are ASCII and may not start with GLOBAL/INST.
 # Use bounded opcode parsing to reduce false positives on plain text and
-# still detect prefixed payloads (e.g., MARK/LIST/POP before GLOBAL).
+# still detect prefixed payloads (for example MARK/LIST/POP or BININT1/POP
+# before a GLOBAL/INST opcode).
 PROTO0_1_MAX_PROBE_BYTES: int = 64 * 1024
 PROTO0_1_MAX_PROBE_OPCODES: int = 4096
-PROTO0_1_START_BYTES: bytes = b"(]})cilp0IJSVNTF"
+PROTO0_1_START_BYTES: bytes = b"()]}cilp0FGIJKLMNSTUVX"
 
 
 def _looks_like_proto0_or_1_pickle(sample: bytes) -> bool:

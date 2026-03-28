@@ -598,10 +598,48 @@ def test_savedmodel_asset_directory_symlink_is_not_traversed(tmp_path: Path) -> 
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_nested_asset_directory_symlink_is_reported_without_traversal(tmp_path: Path) -> None:
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    external_dir = tmp_path / "outside-nested-assets"
+    external_dir.mkdir()
+    (external_dir / "outside.sh").write_text("#!/bin/bash\necho escape\n", encoding="utf-8")
+    nested_dir = model_dir / "assets" / "nested"
+    try:
+        nested_dir.symlink_to(external_dir, target_is_directory=True)
+    except (NotImplementedError, OSError, PermissionError) as exc:
+        pytest.skip(f"Symlinks unavailable in test environment: {exc}")
+
+    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+
+    nested_dir_issues = [issue for issue in result.issues if issue.location == str(nested_dir)]
+    traversed_issues = [issue for issue in result.issues if issue.location and issue.location.endswith("outside.sh")]
+
+    assert nested_dir_issues
+    assert all(issue.severity == IssueSeverity.WARNING for issue in nested_dir_issues)
+    assert all("symlinked nested asset directory" in issue.message.lower() for issue in nested_dir_issues)
+    assert all(issue.details.get("detected_content_type") == "unscannable_asset_dir" for issue in nested_dir_issues)
+    assert all(issue.details.get("asset_kind") == "symlink_directory" for issue in nested_dir_issues)
+    assert traversed_issues == []
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 def test_savedmodel_assets_protocol1_pickle_is_flagged(tmp_path: Path) -> None:
     model_dir = Path(create_tf_savedmodel(tmp_path))
     asset_path = model_dir / "assets" / "payload.dat"
     asset_path.write_bytes(_build_protocol1_pickle_payload())
+
+    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    asset_issues = [issue for issue in result.issues if issue.location == str(asset_path)]
+
+    assert asset_issues
+    assert any("pickle_payload" in issue.details.get("detected_content_type", "") for issue in asset_issues)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_assets_protocol1_pickle_with_binint1_pop_prefix_is_flagged(tmp_path: Path) -> None:
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    asset_path = model_dir / "assets" / "prefixed-payload.dat"
+    asset_path.write_bytes(b"K\x000" + _build_protocol1_pickle_payload())
 
     result = TensorFlowSavedModelScanner().scan(str(model_dir))
     asset_issues = [issue for issue in result.issues if issue.location == str(asset_path)]

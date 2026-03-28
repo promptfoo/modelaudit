@@ -391,7 +391,57 @@ class TensorFlowSavedModelScanner(BaseScanner):
             if not stat.S_ISDIR(assets_dir_stat.st_mode):
                 continue
 
-            for root, _dirs, files in os.walk(assets_dir):
+            for root, dir_names, files in os.walk(assets_dir):
+                retained_dirs: list[str] = []
+                for dir_name in dir_names:
+                    child_dir = Path(root) / dir_name
+                    try:
+                        child_stat = child_dir.lstat()
+                    except OSError as exc:
+                        result.add_check(
+                            name="SavedModel Assets Security Check",
+                            passed=False,
+                            message=(
+                                "Cannot inspect nested asset directory for security analysis: "
+                                f"{child_dir.relative_to(model_root)}: {exc}"
+                            ),
+                            severity=IssueSeverity.WARNING,
+                            location=str(child_dir),
+                            details={
+                                "file_name": dir_name,
+                                "detected_content_type": "unscannable_asset_dir",
+                                "asset_kind": "stat_error",
+                                "exception": str(exc),
+                                "exception_type": type(exc).__name__,
+                            },
+                            rule_code="S902",
+                        )
+                        continue
+
+                    if stat.S_ISLNK(child_stat.st_mode):
+                        result.add_check(
+                            name="SavedModel Assets Security Check",
+                            passed=False,
+                            message=(
+                                "Symlinked nested asset directory is not traversed during security analysis: "
+                                f"{child_dir.relative_to(model_root)}"
+                            ),
+                            severity=IssueSeverity.WARNING,
+                            location=str(child_dir),
+                            details={
+                                "file_name": dir_name,
+                                "detected_content_type": "unscannable_asset_dir",
+                                "asset_kind": "symlink_directory",
+                            },
+                            rule_code="S902",
+                        )
+                        continue
+
+                    if stat.S_ISDIR(child_stat.st_mode):
+                        retained_dirs.append(dir_name)
+
+                dir_names[:] = retained_dirs
+
                 for file_name in files:
                     file_path = Path(root) / file_name
                     detected_types = self._detect_suspicious_asset_content(file_path, result)

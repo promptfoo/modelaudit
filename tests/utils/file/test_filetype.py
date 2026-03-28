@@ -330,10 +330,28 @@ def test_detect_file_format_proto0_prefixed_pickle_with_extended_probe(tmp_path:
     assert detect_file_format_from_magic(str(payload)) == "pickle"
 
 
+def test_detect_file_format_proto1_binint1_pop_prefixed_pickle(tmp_path: Path) -> None:
+    """Protocol 1 BININT1/POP prefixes should not suppress pickle detection."""
+    payload = tmp_path / "proto1-prefixed-pickle.txt"
+    payload.write_bytes(b"K\x000cos\nsystem\n.")
+
+    assert detect_file_format(str(payload)) == "pickle"
+    assert detect_file_format_from_magic(str(payload)) == "pickle"
+
+
 def test_detect_file_format_plain_text_global_prefix_not_pickle(tmp_path: Path) -> None:
     """Plain text that begins with GLOBAL-like bytes should not be treated as pickle."""
     payload = tmp_path / "notes.txt"
     payload.write_bytes(b"c\nthis is plain text\nnot a pickle stream")
+
+    assert detect_file_format(str(payload)) != "pickle"
+    assert detect_file_format_from_magic(str(payload)) != "pickle"
+
+
+def test_detect_file_format_plain_text_binint1_prefix_not_pickle(tmp_path: Path) -> None:
+    """Short plain text with a BININT1-looking prefix should not be treated as pickle."""
+    payload = tmp_path / "binint1-prefixed-notes.txt"
+    payload.write_bytes(b"K\x00not a pickle stream")
 
     assert detect_file_format(str(payload)) != "pickle"
     assert detect_file_format_from_magic(str(payload)) != "pickle"
