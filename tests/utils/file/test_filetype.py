@@ -162,6 +162,35 @@ def test_detect_file_format_hdf5(tmp_path):
     assert detect_file_format(str(hdf5_path)) == "hdf5"
 
 
+def test_detect_file_format_from_magic_valid_safetensors_structure(tmp_path: Path) -> None:
+    metadata = b'{"tensor":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}'
+    safetensors_path = tmp_path / "model.unknown"
+    safetensors_path.write_bytes(struct.pack("<Q", len(metadata)) + metadata + b"\x00\x00\x00\x00")
+
+    assert detect_file_format_from_magic(str(safetensors_path)) == "safetensors"
+
+
+def test_detect_file_format_from_magic_json_not_misrouted_as_safetensors(tmp_path: Path) -> None:
+    json_path = tmp_path / "config.unknown"
+    json_path.write_text('{"name":"model","version":1}', encoding="utf-8")
+
+    assert detect_file_format_from_magic(str(json_path)) == "unknown"
+
+
+def test_detect_file_format_from_magic_proto0_pickle_not_misrouted_as_safetensors(tmp_path: Path) -> None:
+    pickle_path = tmp_path / "payload.unknown"
+    pickle_path.write_bytes(b"{cposix\nsystem\n(S'echo pwned'\ntR.")
+
+    assert detect_file_format_from_magic(str(pickle_path)) != "safetensors"
+
+
+def test_detect_file_format_from_magic_malformed_safetensors_header_len_rejected(tmp_path: Path) -> None:
+    malformed_path = tmp_path / "malformed.unknown"
+    malformed_path.write_bytes(struct.pack("<Q", 100 * 1024 * 1024) + b'{"x":1}' + b"\x00" * 16)
+
+    assert detect_file_format_from_magic(str(malformed_path)) == "unknown"
+
+
 def test_detect_file_format_coreml_validation_passthrough(tmp_path: Path) -> None:
     """CoreML extension routing should remain scanner-level validated."""
     model_path = tmp_path / "model.mlmodel"
@@ -589,9 +618,10 @@ def test_validate_file_type(tmp_path):
     unknown_ext.write_bytes(b"some data")
     assert validate_file_type(str(unknown_ext)) is True
 
-    # SafeTensors file with JSON header
+    # SafeTensors file with framed JSON header
     safetensors_path = tmp_path / "model.safetensors"
-    safetensors_path.write_bytes(b'{"metadata": "test"}' + b"\x00" * 20)
+    safetensors_header = b'{"__metadata__": {}, "tensor": {"dtype":"F32","shape":[1],"data_offsets":[0,4]}}'
+    safetensors_path.write_bytes(struct.pack("<Q", len(safetensors_header)) + safetensors_header + b"\x00\x00\x00\x00")
     assert validate_file_type(str(safetensors_path)) is True
 
     # PyTorch binary (.bin) that's actually a ZIP (valid case)
