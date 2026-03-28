@@ -131,7 +131,7 @@ class TestCacheDirOption:
     @patch("modelaudit.cli.scan_model_directory_or_file")
     @patch("shutil.rmtree")
     def test_cleanup_without_cache_dir(self, mock_rmtree, mock_scan, mock_is_hf_url, mock_download_model, tmp_path):
-        """Test that temporary directories ARE cleaned up when NOT using --cache-dir."""
+        """Test that no-cache HuggingFace scans clean up the private temp cache directory they create."""
         # Setup mocks
         mock_is_hf_url.return_value = True
         temp_download_path = tmp_path / "temp_model"
@@ -146,8 +146,11 @@ class TestCacheDirOption:
             ["scan", "--no-cache", "hf://test/model"],  # No --cache-dir option, disable caching
         )
 
-        # Verify cleanup WAS called since we didn't use a cache directory
-        mock_rmtree.assert_called_once_with(str(temp_download_path))
+        # Verify the downloader used a private temp cache dir and CLI cleaned it up.
+        cache_dir = mock_download_model.call_args.kwargs["cache_dir"]
+        assert cache_dir is not None
+        assert cache_dir.name.startswith("modelaudit_hf_")
+        mock_rmtree.assert_called_once_with(str(cache_dir))
         assert result.exit_code == 0
 
     @patch("modelaudit.cli.download_model")
@@ -196,8 +199,11 @@ class TestCacheDirOption:
     @patch("modelaudit.cli.download_model")
     @patch("modelaudit.cli.is_huggingface_url")
     @patch("modelaudit.cli.scan_model_directory_or_file")
-    def test_no_cache_overrides_cache_dir(self, mock_scan, mock_is_hf_url, mock_download_model, mock_spinner, tmp_path):
-        """Test that --no-cache takes precedence over --cache-dir."""
+    @patch("shutil.rmtree")
+    def test_no_cache_overrides_cache_dir(
+        self, mock_rmtree, mock_scan, mock_is_hf_url, mock_download_model, mock_spinner, tmp_path
+    ):
+        """Test that --no-cache takes precedence over --cache-dir and avoids persisting downloads there."""
         mock_is_hf_url.return_value = True
         mock_download_path = tmp_path / "downloaded_model"
         mock_download_path.mkdir()
@@ -211,3 +217,8 @@ class TestCacheDirOption:
         result = runner.invoke(cli, ["scan", "--cache-dir", str(cache_path), "--no-cache", "hf://test/model"])
 
         assert result.exit_code == 0
+        call_kwargs = mock_download_model.call_args.kwargs
+        cache_dir = call_kwargs["cache_dir"]
+        assert cache_dir != cache_path
+        assert cache_dir.name.startswith("modelaudit_hf_")
+        mock_rmtree.assert_called_once_with(str(cache_dir))
