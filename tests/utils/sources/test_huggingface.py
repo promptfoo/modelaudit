@@ -1,7 +1,5 @@
 """Tests for HuggingFace URL handling."""
 
-import concurrent.futures
-from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -10,6 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from modelaudit.utils.sources.huggingface import (
+    _list_repo_files_with_timeout,
     download_file_from_hf,
     download_model,
     extract_model_id_from_path,
@@ -213,35 +212,47 @@ class TestModelDownload:
     ):
         """Listing timeouts should keep the selective allowlist instead of falling back to a full snapshot."""
 
-        class TimeoutFuture:
-            def result(self, timeout: int) -> list[str]:
-                raise concurrent.futures.TimeoutError
-
-            def cancel(self) -> None:
-                return None
-
-        class TimeoutExecutor:
-            def submit(
-                self,
-                _fn: Callable[..., object],
-                *_args: Any,
-                **_kwargs: Any,
-            ) -> TimeoutFuture:
-                return TimeoutFuture()
-
-            def shutdown(self, wait: bool = True, cancel_futures: bool = False) -> None:
-                return None
-
         download_path = tmp_path / "download"
         download_path.mkdir()
         (download_path / "model.bin").write_bytes(b"weights")
         mock_snapshot_download.return_value = str(download_path)
 
-        with patch("concurrent.futures.ThreadPoolExecutor", return_value=TimeoutExecutor()):
+        with patch(
+            "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+            return_value=(None, "timed out after 30 seconds"),
+        ):
             download_model("https://huggingface.co/test/model")
 
         allow_patterns = mock_snapshot_download.call_args.kwargs["allow_patterns"]
         assert allow_patterns == ["**/*.bin", "*.bin"]
+
+    @patch("huggingface_hub.list_repo_files", return_value=["config.json"])
+    def test_list_repo_files_timeout_uses_daemon_thread(self, _mock_list_repo_files) -> None:
+        """Timeout helper should use a daemon thread so timed-out listings cannot block process exit."""
+
+        class StalledThread:
+            last_daemon: bool | None = None
+
+            def __init__(
+                self,
+                *,
+                target: Any = None,
+                name: str | None = None,
+                daemon: bool | None = None,
+            ) -> None:
+                self.target = target
+                self.name = name
+                StalledThread.last_daemon = daemon
+
+            def start(self) -> None:
+                return None
+
+        with patch("modelaudit.utils.sources.huggingface.threading.Thread", StalledThread):
+            repo_files, error = _list_repo_files_with_timeout("test/model", timeout_seconds=0)
+
+        assert repo_files is None
+        assert error == "timed out after 0 seconds"
+        assert StalledThread.last_daemon is True
 
     @patch("huggingface_hub.list_repo_files", return_value=["notes.unknown"])
     @patch("huggingface_hub.snapshot_download")

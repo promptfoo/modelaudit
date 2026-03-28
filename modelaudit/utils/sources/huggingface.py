@@ -1,9 +1,9 @@
 """Utilities for handling HuggingFace model downloads."""
 
-import concurrent.futures
 import json
 import logging
 import re
+import threading
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -44,21 +44,39 @@ def _get_hf_cache_root() -> Path:
         return Path.home() / ".cache" / "huggingface" / "hub"
 
 
-def _list_repo_files_with_timeout(repo_id: str, timeout_seconds: int = 30) -> tuple[list[str] | None, str | None]:
+def _list_repo_files_with_timeout(repo_id: str, timeout_seconds: float = 30) -> tuple[list[str] | None, str | None]:
     """Return repository files or a failure reason if listing times out/errors."""
     from huggingface_hub import list_repo_files
 
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    future = executor.submit(list_repo_files, repo_id)
-    try:
-        return future.result(timeout=timeout_seconds), None
-    except concurrent.futures.TimeoutError:
-        future.cancel()
+    outcome: dict[str, list[str] | str | None] = {"files": None, "error": None}
+    completed = threading.Event()
+
+    def run_listing() -> None:
+        try:
+            outcome["files"] = list_repo_files(repo_id)
+        except Exception as exc:
+            outcome["error"] = str(exc)
+        finally:
+            completed.set()
+
+    worker = threading.Thread(
+        target=run_listing,
+        name=f"hf-list-repo-files:{repo_id}",
+        daemon=True,
+    )
+    worker.start()
+
+    if not completed.wait(timeout_seconds):
         return None, f"timed out after {timeout_seconds} seconds"
-    except Exception as exc:
-        return None, str(exc)
-    finally:
-        executor.shutdown(wait=False, cancel_futures=True)
+
+    if outcome["error"] is not None:
+        return None, str(outcome["error"])
+
+    files = outcome["files"]
+    if isinstance(files, list):
+        return files, None
+
+    return None, "unknown repo listing error"
 
 
 def is_huggingface_url(url: str) -> bool:
@@ -410,7 +428,7 @@ def download_model_streaming(
         Exception: If download fails
     """
     try:
-        from huggingface_hub import hf_hub_download, list_repo_files
+        from huggingface_hub import hf_hub_download
     except ImportError as e:
         raise ImportError(
             "huggingface-hub package is required for HuggingFace URL support. "
@@ -422,7 +440,6 @@ def download_model_streaming(
 
     try:
         # List all files in the repository
-        import concurrent.futures
         import os
 
         from huggingface_hub.utils import disable_progress_bars, enable_progress_bars
@@ -434,13 +451,12 @@ def download_model_streaming(
             enable_progress_bars()
             os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "0"
 
-        # List files with timeout
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            future = executor.submit(list_repo_files, repo_id)
-            try:
-                repo_files = future.result(timeout=30)
-            except concurrent.futures.TimeoutError as e:
-                raise Exception(f"Timeout listing files in repository {repo_id}") from e
+        # List files with timeout without leaking a blocking worker thread.
+        repo_files, repo_listing_error = _list_repo_files_with_timeout(repo_id)
+        if repo_files is None:
+            if repo_listing_error and repo_listing_error.startswith("timed out after"):
+                raise Exception(f"Timeout listing files in repository {repo_id}")
+            raise Exception(f"Failed listing files in repository {repo_id}: {repo_listing_error}")
 
         # Filter for model files
         model_extensions = _get_model_extensions()
