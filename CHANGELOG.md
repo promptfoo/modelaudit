@@ -26,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - harden 7z nested archive scanning and pre-extraction size checks
 - scan follow-on pickle streams after large padding blocks
 - **security:** detect nested pickle payloads in BINBYTES8 and BYTEARRAY8 opcodes
+- **onnx:** treat official `ai.onnx.ml`, `ai.onnx.training`, and `ai.onnx.preview.training` domains as standard so only truly custom domains are flagged
 - reject local streaming symlink traversal outside the scan root
 - require explicit remote Hugging Face provenance for whitelist downgrades
 - preserve scannable archives, hidden model files, hidden DVC pointers, and local `.metadata` files in directory scans
