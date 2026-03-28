@@ -7,6 +7,7 @@ import contextlib
 import json
 import os
 import re
+import shlex
 import stat
 import tempfile
 import zipfile
@@ -34,7 +35,6 @@ CRITICAL_SYSTEM_PATHS = [
 
 MANIFEST_ENTRY_PATH = "MAR-INF/MANIFEST.json"
 URL_SCHEME_PATTERN = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
-REMOTE_FIND_LINKS_PATTERN = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
 POPULAR_ML_PACKAGE_TYPOS = {
     "torcch": "torch",
     "numppy": "numpy",
@@ -72,6 +72,7 @@ class TorchServeMarScanner(BaseScanner):
     supported_extensions: ClassVar[list[str]] = [".mar"]
 
     MAX_MANIFEST_BYTES: ClassVar[int] = 1 * 1024 * 1024
+    MAX_REQUIREMENTS_TXT_BYTES: ClassVar[int] = 10 * 1024 * 1024
     DEFAULT_MAX_MEMBER_BYTES: ClassVar[int] = 64 * 1024 * 1024
     DEFAULT_MAX_UNCOMPRESSED_BYTES: ClassVar[int] = 512 * 1024 * 1024
     DEFAULT_MAX_ENTRIES: ClassVar[int] = 4096
@@ -934,7 +935,7 @@ class TorchServeMarScanner(BaseScanner):
     ) -> None:
         location = f"{archive_path}:{normalized_member}"
         try:
-            requirements_bytes = self._read_member_bounded(archive, member_info, self.max_member_bytes)
+            requirements_bytes = self._read_member_bounded(archive, member_info, self.MAX_REQUIREMENTS_TXT_BYTES)
         except ValueError as exc:
             result.add_check(
                 name="TorchServe Requirements Supply Chain Analysis",
@@ -958,9 +959,12 @@ class TorchServeMarScanner(BaseScanner):
 
             lowered = line.lower()
 
-            if lowered.startswith(("--index-url", "--extra-index-url")):
-                parts = line.split(maxsplit=1)
-                index_url = parts[1].strip() if len(parts) > 1 else ""
+            index_url = self._extract_pip_option_value(
+                line,
+                long_options=("--index-url", "--extra-index-url"),
+                short_options=("-i",),
+            )
+            if index_url is not None:
                 if self._is_non_pypi_index(index_url):
                     findings.append(
                         {
@@ -983,10 +987,13 @@ class TorchServeMarScanner(BaseScanner):
                     )
                 continue
 
-            if lowered.startswith("--find-links"):
-                parts = line.split(maxsplit=1)
-                find_links_url = parts[1].strip() if len(parts) > 1 else ""
-                if REMOTE_FIND_LINKS_PATTERN.match(find_links_url):
+            find_links_url = self._extract_pip_option_value(
+                line,
+                long_options=("--find-links",),
+                short_options=("-f",),
+            )
+            if find_links_url is not None:
+                if self._is_remote_requirement_url(find_links_url):
                     findings.append(
                         {
                             "line": line_number,
@@ -1079,8 +1086,33 @@ class TorchServeMarScanner(BaseScanner):
             location=location,
         )
 
+    def _extract_pip_option_value(
+        self,
+        line: str,
+        *,
+        long_options: tuple[str, ...],
+        short_options: tuple[str, ...] = (),
+    ) -> str | None:
+        try:
+            tokens = shlex.split(line, comments=False, posix=True)
+        except ValueError:
+            tokens = line.split()
+
+        if not tokens:
+            return None
+
+        first_token = tokens[0]
+        lowered_first = first_token.lower()
+        for option in (*long_options, *short_options):
+            option_prefix = f"{option}="
+            if lowered_first == option:
+                return tokens[1].strip() if len(tokens) > 1 else ""
+            if lowered_first.startswith(option_prefix):
+                return first_token[len(option_prefix) :].strip()
+        return None
+
     def _is_non_pypi_index(self, url: str) -> bool:
-        stripped_url = url.strip()
+        stripped_url = url.strip().strip("'\"")
         if not stripped_url:
             return False
 
@@ -1089,6 +1121,14 @@ class TorchServeMarScanner(BaseScanner):
         if not hostname:
             return True
         return hostname not in TRUSTED_PYPI_HOSTS
+
+    def _is_remote_requirement_url(self, url: str) -> bool:
+        stripped_url = url.strip().strip("'\"")
+        if not stripped_url or not URL_SCHEME_PATTERN.match(stripped_url):
+            return False
+
+        parsed = urlparse(stripped_url)
+        return parsed.scheme.lower() != "file"
 
     def _extract_requirement_name(self, line: str) -> str:
         return re.split(r"[;@<>=!~\s\[]", line, maxsplit=1)[0].strip().lower()

