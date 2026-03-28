@@ -6,6 +6,7 @@ import ast
 import contextlib
 import json
 import os
+import posixpath
 import re
 import shlex
 import stat
@@ -934,139 +935,15 @@ class TorchServeMarScanner(BaseScanner):
         result: ScanResult,
     ) -> None:
         location = f"{archive_path}:{normalized_member}"
-        try:
-            requirements_bytes = self._read_member_bounded(archive, member_info, self.MAX_REQUIREMENTS_TXT_BYTES)
-        except ValueError as exc:
-            result.add_check(
-                name="TorchServe Requirements Supply Chain Analysis",
-                passed=False,
-                message=str(exc),
-                severity=IssueSeverity.WARNING,
-                location=location,
-            )
-            return
-
-        try:
-            requirements_text = requirements_bytes.decode("utf-8")
-        except UnicodeDecodeError:
-            requirements_text = requirements_bytes.decode("utf-8", errors="replace")
-
-        findings: list[dict[str, Any]] = []
-        for line_number, raw_line in enumerate(requirements_text.splitlines(), start=1):
-            line = raw_line.strip()
-            if not line or line.startswith("#"):
-                continue
-
-            lowered = line.lower()
-
-            index_url = self._extract_pip_option_value(
-                line,
-                long_options=("--index-url", "--extra-index-url"),
-                short_options=("-i",),
-            )
-            if index_url is not None:
-                if self._is_non_pypi_index(index_url):
-                    findings.append(
-                        {
-                            "line": line_number,
-                            "line_content": line,
-                            "severity": IssueSeverity.CRITICAL,
-                            "reason": "non_pypi_index_url",
-                            "message": "requirements.txt redirects package resolution to a non-PyPI index",
-                        },
-                    )
-                if "http://" in lowered:
-                    findings.append(
-                        {
-                            "line": line_number,
-                            "line_content": line,
-                            "severity": IssueSeverity.WARNING,
-                            "reason": "insecure_http_transport",
-                            "message": "requirements.txt uses insecure HTTP transport",
-                        },
-                    )
-                continue
-
-            find_links_url = self._extract_pip_option_value(
-                line,
-                long_options=("--find-links",),
-                short_options=("-f",),
-            )
-            if find_links_url is not None:
-                if self._is_remote_requirement_url(find_links_url):
-                    findings.append(
-                        {
-                            "line": line_number,
-                            "line_content": line,
-                            "severity": IssueSeverity.WARNING,
-                            "reason": "remote_find_links",
-                            "message": "requirements.txt uses remote --find-links source",
-                        },
-                    )
-                if "http://" in find_links_url.lower():
-                    findings.append(
-                        {
-                            "line": line_number,
-                            "line_content": line,
-                            "severity": IssueSeverity.WARNING,
-                            "reason": "insecure_http_transport",
-                            "message": "requirements.txt uses insecure HTTP transport",
-                        },
-                    )
-                continue
-
-            editable_target = self._extract_pip_option_value(
-                line,
-                long_options=("--editable",),
-                short_options=("-e",),
-            )
-            if editable_target is not None:
-                findings.append(
-                    {
-                        "line": line_number,
-                        "line_content": line,
-                        "severity": IssueSeverity.WARNING,
-                        "reason": "editable_install",
-                        "message": "requirements.txt uses editable install, which can execute arbitrary setup code",
-                    },
-                )
-
-            if "git+" in lowered:
-                findings.append(
-                    {
-                        "line": line_number,
-                        "line_content": line,
-                        "severity": IssueSeverity.WARNING,
-                        "reason": "git_install",
-                        "message": (
-                            "requirements.txt installs directly from git, which can execute arbitrary setup code"
-                        ),
-                    },
-                )
-
-            if "http://" in lowered:
-                findings.append(
-                    {
-                        "line": line_number,
-                        "line_content": line,
-                        "severity": IssueSeverity.WARNING,
-                        "reason": "insecure_http_transport",
-                        "message": "requirements.txt uses insecure HTTP transport",
-                    },
-                )
-
-            package_name = self._extract_requirement_name(line)
-            typo_target = POPULAR_ML_PACKAGE_TYPOS.get(package_name)
-            if typo_target:
-                findings.append(
-                    {
-                        "line": line_number,
-                        "line_content": line,
-                        "severity": IssueSeverity.WARNING,
-                        "reason": "typosquatting_pattern",
-                        "message": f"Potential typosquatting package '{package_name}' (did you mean '{typo_target}'?)",
-                    },
-                )
+        members_by_normalized = {
+            self._normalize_archive_member_name(info.filename): info for info in archive.infolist() if not info.is_dir()
+        }
+        findings = self._collect_requirements_findings(
+            archive,
+            members_by_normalized,
+            self._normalize_archive_member_name(normalized_member),
+            visited=set(),
+        )
 
         if findings:
             highest_severity = (
@@ -1091,12 +968,246 @@ class TorchServeMarScanner(BaseScanner):
             location=location,
         )
 
+    def _normalize_archive_member_name(self, member_name: str) -> str:
+        return posixpath.normpath(member_name.replace("\\", "/"))
+
+    def _resolve_local_requirements_reference(self, current_member: str, reference: str) -> str | None:
+        stripped_reference = reference.strip().strip("'\"")
+        if not stripped_reference:
+            return None
+        if URL_SCHEME_PATTERN.match(stripped_reference):
+            return None
+
+        normalized_reference = stripped_reference.replace("\\", "/")
+        if re.match(r"^[a-zA-Z]:/", normalized_reference) or normalized_reference.startswith("/"):
+            return None
+
+        current_dir = posixpath.dirname(current_member)
+        resolved = posixpath.normpath(posixpath.join(current_dir, normalized_reference))
+        if resolved in {"", "."} or resolved.startswith("../"):
+            return None
+        return resolved
+
+    def _build_requirements_finding(
+        self,
+        *,
+        requirements_file: str,
+        line_number: int,
+        line_content: str,
+        severity: IssueSeverity,
+        reason: str,
+        message: str,
+    ) -> dict[str, Any]:
+        return {
+            "line": line_number,
+            "line_content": line_content,
+            "requirements_file": requirements_file,
+            "severity": severity,
+            "reason": reason,
+            "message": message,
+        }
+
+    def _collect_requirements_findings(
+        self,
+        archive: zipfile.ZipFile,
+        members_by_normalized: dict[str, zipfile.ZipInfo],
+        normalized_member: str,
+        *,
+        visited: set[str],
+    ) -> list[dict[str, Any]]:
+        if normalized_member in visited:
+            return []
+        visited.add(normalized_member)
+
+        member_info = members_by_normalized.get(normalized_member)
+        if member_info is None:
+            return []
+
+        try:
+            requirements_bytes = self._read_member_bounded(archive, member_info, self.MAX_REQUIREMENTS_TXT_BYTES)
+        except ValueError as exc:
+            return [
+                self._build_requirements_finding(
+                    requirements_file=normalized_member,
+                    line_number=0,
+                    line_content="",
+                    severity=IssueSeverity.WARNING,
+                    reason="requirements_read_error",
+                    message=str(exc),
+                )
+            ]
+
+        try:
+            requirements_text = requirements_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            requirements_text = requirements_bytes.decode("utf-8", errors="replace")
+
+        findings: list[dict[str, Any]] = []
+        for line_number, raw_line in enumerate(requirements_text.splitlines(), start=1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+
+            lowered = line.lower()
+
+            include_target = self._extract_pip_option_value(
+                line,
+                long_options=("--requirement", "--constraint"),
+                short_options=("-r", "-c"),
+                allow_concatenated_short=True,
+            )
+            if include_target is not None:
+                if self._is_remote_requirement_url(include_target):
+                    findings.append(
+                        self._build_requirements_finding(
+                            requirements_file=normalized_member,
+                            line_number=line_number,
+                            line_content=line,
+                            severity=IssueSeverity.WARNING,
+                            reason="remote_requirements_include",
+                            message="requirements.txt includes a remote requirements file",
+                        )
+                    )
+                    continue
+
+                resolved_include = self._resolve_local_requirements_reference(normalized_member, include_target)
+                if resolved_include and resolved_include in members_by_normalized:
+                    findings.extend(
+                        self._collect_requirements_findings(
+                            archive,
+                            members_by_normalized,
+                            resolved_include,
+                            visited=visited,
+                        )
+                    )
+                continue
+
+            index_url = self._extract_pip_option_value(
+                line,
+                long_options=("--index-url", "--extra-index-url"),
+                short_options=("-i",),
+                allow_concatenated_short=True,
+            )
+            if index_url is not None:
+                if self._is_non_pypi_index(index_url):
+                    findings.append(
+                        self._build_requirements_finding(
+                            requirements_file=normalized_member,
+                            line_number=line_number,
+                            line_content=line,
+                            severity=IssueSeverity.CRITICAL,
+                            reason="non_pypi_index_url",
+                            message="requirements.txt redirects package resolution to a non-PyPI index",
+                        )
+                    )
+                if "http://" in lowered:
+                    findings.append(
+                        self._build_requirements_finding(
+                            requirements_file=normalized_member,
+                            line_number=line_number,
+                            line_content=line,
+                            severity=IssueSeverity.WARNING,
+                            reason="insecure_http_transport",
+                            message="requirements.txt uses insecure HTTP transport",
+                        )
+                    )
+                continue
+
+            find_links_url = self._extract_pip_option_value(
+                line,
+                long_options=("--find-links",),
+                short_options=("-f",),
+                allow_concatenated_short=True,
+            )
+            if find_links_url is not None:
+                if self._is_remote_requirement_url(find_links_url):
+                    findings.append(
+                        self._build_requirements_finding(
+                            requirements_file=normalized_member,
+                            line_number=line_number,
+                            line_content=line,
+                            severity=IssueSeverity.WARNING,
+                            reason="remote_find_links",
+                            message="requirements.txt uses remote --find-links source",
+                        )
+                    )
+                if "http://" in find_links_url.lower():
+                    findings.append(
+                        self._build_requirements_finding(
+                            requirements_file=normalized_member,
+                            line_number=line_number,
+                            line_content=line,
+                            severity=IssueSeverity.WARNING,
+                            reason="insecure_http_transport",
+                            message="requirements.txt uses insecure HTTP transport",
+                        )
+                    )
+                continue
+
+            editable_target = self._extract_pip_option_value(
+                line,
+                long_options=("--editable",),
+                short_options=("-e",),
+            )
+            if editable_target is not None:
+                findings.append(
+                    self._build_requirements_finding(
+                        requirements_file=normalized_member,
+                        line_number=line_number,
+                        line_content=line,
+                        severity=IssueSeverity.WARNING,
+                        reason="editable_install",
+                        message="requirements.txt uses editable install, which can execute arbitrary setup code",
+                    )
+                )
+
+            if "git+" in lowered:
+                findings.append(
+                    self._build_requirements_finding(
+                        requirements_file=normalized_member,
+                        line_number=line_number,
+                        line_content=line,
+                        severity=IssueSeverity.WARNING,
+                        reason="git_install",
+                        message="requirements.txt installs directly from git, which can execute arbitrary setup code",
+                    )
+                )
+
+            if "http://" in lowered:
+                findings.append(
+                    self._build_requirements_finding(
+                        requirements_file=normalized_member,
+                        line_number=line_number,
+                        line_content=line,
+                        severity=IssueSeverity.WARNING,
+                        reason="insecure_http_transport",
+                        message="requirements.txt uses insecure HTTP transport",
+                    )
+                )
+
+            package_name = self._extract_requirement_name(line)
+            typo_target = POPULAR_ML_PACKAGE_TYPOS.get(package_name)
+            if typo_target:
+                findings.append(
+                    self._build_requirements_finding(
+                        requirements_file=normalized_member,
+                        line_number=line_number,
+                        line_content=line,
+                        severity=IssueSeverity.WARNING,
+                        reason="typosquatting_pattern",
+                        message=f"Potential typosquatting package '{package_name}' (did you mean '{typo_target}'?)",
+                    )
+                )
+
+        return findings
+
     def _extract_pip_option_value(
         self,
         line: str,
         *,
         long_options: tuple[str, ...],
         short_options: tuple[str, ...] = (),
+        allow_concatenated_short: bool = False,
     ) -> str | None:
         try:
             tokens = shlex.split(line, comments=False, posix=True)
@@ -1114,6 +1225,10 @@ class TorchServeMarScanner(BaseScanner):
                 return tokens[1].strip() if len(tokens) > 1 else None
             if lowered_first.startswith(option_prefix):
                 return first_token[len(option_prefix) :].strip()
+            if allow_concatenated_short and option in short_options and lowered_first.startswith(option):
+                value = first_token[len(option) :].strip()
+                if value:
+                    return value
         return None
 
     def _is_non_pypi_index(self, url: str) -> bool:
