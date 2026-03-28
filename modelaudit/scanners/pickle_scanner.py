@@ -753,13 +753,14 @@ ALWAYS_DANGEROUS_MODULES: set[str] = {
 # Modules that are suspicious but should only be flagged at WARNING severity.
 # These modules appear frequently in legitimate ML pipelines and cannot directly
 # execute arbitrary code, so CRITICAL would cause too many false positives.
-WARNING_SEVERITY_MODULES: set[str] = {
-    # functools.partial is heavily used in PyTorch models; functools.reduce is
-    # the only genuinely dangerous entry and is still in SUSPICIOUS_GLOBALS.
-    "functools",
+WARNING_SEVERITY_MODULES: dict[str, set[str] | None] = {
+    # functools.partial/partialmethod are heavily used in PyTorch models and
+    # should remain WARNING-level noise reducers. functools.reduce is excluded
+    # so reduce-driven execution chains stay CRITICAL.
+    "functools": {"partial", "partialmethod"},
     # glob.glob / glob.iglob are common in dataset loading pipelines and
     # cannot directly execute code.
-    "glob",
+    "glob": None,
 }
 
 # Risky ML-specific import surfaces that must be flagged even when they appear
@@ -952,10 +953,6 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "_rebuild_device_tensor_from_numpy",
         "_rebuild_qtensor",
         "_rebuild_sparse_tensor",
-    ],
-    "_pickle": [
-        "Unpickler",
-        "Pickler",
     ],
     # Python builtins - safe built-in types and functions
     # NOTE: eval, exec, compile, __import__, open, file are NOT in this list (they remain dangerous)
@@ -2071,6 +2068,16 @@ def _normalize_import_reference(mod: str, func: str) -> tuple[str, str]:
     return mod.strip().lower(), func.strip().lower()
 
 
+def _is_warning_severity_ref(normalized_mod: str, normalized_func: str) -> bool:
+    """Return True when a dangerous ref should be downgraded to WARNING severity."""
+    if normalized_mod not in WARNING_SEVERITY_MODULES:
+        return False
+    warning_funcs = WARNING_SEVERITY_MODULES[normalized_mod]
+    if warning_funcs is None:
+        return True
+    return normalized_func in warning_funcs
+
+
 def _is_resolved_import_target(mod: str, func: str) -> bool:
     """Return True when module/function look like concrete Python import targets."""
     if not mod or not func:
@@ -2101,11 +2108,19 @@ def _classify_import_reference(
 
     normalized_mod, normalized_func = _normalize_import_reference(mod, func)
     if is_import_only and (normalized_mod, normalized_func) in IMPORT_ONLY_ALWAYS_DANGEROUS_GLOBALS:
-        base_sev = IssueSeverity.WARNING if normalized_mod in WARNING_SEVERITY_MODULES else IssueSeverity.CRITICAL
+        base_sev = (
+            IssueSeverity.WARNING
+            if _is_warning_severity_ref(normalized_mod, normalized_func)
+            else IssueSeverity.CRITICAL
+        )
         return True, base_sev, "dangerous"
 
     if _is_actually_dangerous_global(mod, func, ml_context):
-        base_sev = IssueSeverity.WARNING if normalized_mod in WARNING_SEVERITY_MODULES else IssueSeverity.CRITICAL
+        base_sev = (
+            IssueSeverity.WARNING
+            if _is_warning_severity_ref(normalized_mod, normalized_func)
+            else IssueSeverity.CRITICAL
+        )
         return True, base_sev, "dangerous"
 
     if _is_safe_ml_global(mod, func):
@@ -4994,7 +5009,12 @@ class PickleScanner(BaseScanner):
             for mod, func, opcode_name in advanced_globals:
                 if _is_actually_dangerous_global(mod, func, ml_context):
                     suspicious_count += 1
-                    base_sev = IssueSeverity.WARNING if mod in WARNING_SEVERITY_MODULES else IssueSeverity.CRITICAL
+                    normalized_mod, normalized_func = _normalize_import_reference(mod, func)
+                    base_sev = (
+                        IssueSeverity.WARNING
+                        if _is_warning_severity_ref(normalized_mod, normalized_func)
+                        else IssueSeverity.CRITICAL
+                    )
                     severity = _get_context_aware_severity(
                         base_sev,
                         ml_context,

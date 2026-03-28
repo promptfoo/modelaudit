@@ -2039,6 +2039,52 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
             f"Expected CRITICAL joblib.load issue, got: {critical_messages}"
         )
 
+    def test_pickle_unpickler_reduce_is_critical(self) -> None:
+        """_pickle.Unpickler must never be treated as a safe global."""
+        result = self._scan_bytes(self._craft_global_reduce_pickle("_pickle", "Unpickler"))
+
+        assert result.success
+        assert result.has_errors
+        critical_messages = [i.message.lower() for i in result.issues if i.severity == IssueSeverity.CRITICAL]
+        assert any("_pickle.unpickler" in msg for msg in critical_messages), (
+            f"Expected CRITICAL _pickle.Unpickler issue, got: {critical_messages}"
+        )
+
+    def test_copyreg_add_extension_import_only_is_flagged(self) -> None:
+        """copyreg.add_extension import references must be treated as suspicious."""
+        result = self._scan_bytes(self._craft_global_import_only_pickle("copyreg", "add_extension"))
+
+        assert result.success
+        assert result.has_errors
+        failed_checks = [check for check in result.checks if check.status == CheckStatus.FAILED]
+        assert any("copyreg.add_extension" in check.message.lower() for check in failed_checks), (
+            f"Expected suspicious copyreg.add_extension finding, got: {[check.message for check in failed_checks]}"
+        )
+
+    def test_functools_reduce_remains_critical(self) -> None:
+        """functools.reduce must remain CRITICAL even while partial stays WARNING."""
+        result = self._scan_bytes(self._craft_global_reduce_pickle("functools", "reduce"))
+
+        assert result.success
+        assert result.has_errors
+        reduce_issues = [i for i in result.issues if "functools.reduce" in i.message.lower()]
+        assert reduce_issues, f"Expected functools.reduce finding, got: {[i.message for i in result.issues]}"
+        assert any(issue.severity == IssueSeverity.CRITICAL for issue in reduce_issues), (
+            f"Expected CRITICAL functools.reduce finding, got: {[(i.severity, i.message) for i in reduce_issues]}"
+        )
+
+    def test_functools_partial_remains_warning(self) -> None:
+        """functools.partial should still be downgraded to WARNING."""
+        result = self._scan_bytes(self._craft_global_reduce_pickle("functools", "partial"))
+
+        assert result.success
+        assert result.has_errors
+        partial_issues = [i for i in result.issues if "functools.partial" in i.message.lower()]
+        assert partial_issues, f"Expected functools.partial finding, got: {[i.message for i in result.issues]}"
+        assert any(issue.severity == IssueSeverity.WARNING for issue in partial_issues), (
+            f"Expected WARNING functools.partial finding, got: {[(i.severity, i.message) for i in partial_issues]}"
+        )
+
     # ------------------------------------------------------------------
     # Fix 4: NEWOBJ_EX with dangerous class
     # ------------------------------------------------------------------

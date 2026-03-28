@@ -58,6 +58,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **security:** detect import-only pickle `GLOBAL`/`STACK_GLOBAL` references while preserving safe constructor imports and avoiding mislabeling executed call chains as import-only
 - **security:** fail closed on malformed `STACK_GLOBAL` operands when memo lookups are missing or operand types are non-string, while keeping simple truncation-only context informational
 - **security:** remove `builtins.hasattr` / `__builtin__.hasattr` from the pickle safe-global allowlist so attribute-access primitives stay flagged as dangerous builtins
+- **security:** harden pickle blocklist enforcement by removing `_pickle.Unpickler`/`_pickle.Pickler` from safe globals, adding `copyreg.add_extension`/`copyreg.remove_extension` to suspicious globals, and limiting functools warning downgrades to `partial`/`partialmethod` so `functools.reduce` findings stay CRITICAL
 - **security:** harden TensorFlow weight extraction limits to bound actual tensor payload materialization, including malformed `tensor_content` and string-backed tensors, and continue scanning past oversized `Const` nodes
 - **security:** stream TAR members to temp files under size limits instead of buffering whole entries in memory during scan
 - **security:** inspect TensorFlow SavedModel function definitions when scanning for dangerous ops and protobuf string abuse, with function-aware finding locations
