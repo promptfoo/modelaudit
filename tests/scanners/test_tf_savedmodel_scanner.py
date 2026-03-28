@@ -552,6 +552,27 @@ def test_savedmodel_assets_extra_pe_executable_is_flagged(tmp_path: Path) -> Non
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_asset_symlink_is_reported_without_following_target(tmp_path: Path) -> None:
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    external_script = tmp_path / "outside.sh"
+    external_script.write_text("#!/bin/bash\necho escape\n", encoding="utf-8")
+    asset_path = model_dir / "assets" / "outside-link.sh"
+    try:
+        asset_path.symlink_to(external_script)
+    except (NotImplementedError, OSError, PermissionError) as exc:
+        pytest.skip(f"Symlinks unavailable in test environment: {exc}")
+
+    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    asset_issues = [issue for issue in result.issues if issue.location == str(asset_path)]
+
+    assert asset_issues
+    assert all(issue.severity == IssueSeverity.WARNING for issue in asset_issues)
+    assert all("symlink" in issue.message.lower() for issue in asset_issues)
+    assert all(issue.details.get("detected_content_type") == "unscannable_asset" for issue in asset_issues)
+    assert all(issue.details.get("asset_kind") == "symlink" for issue in asset_issues)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 def test_savedmodel_assets_protocol1_pickle_is_flagged(tmp_path: Path) -> None:
     model_dir = Path(create_tf_savedmodel(tmp_path))
     asset_path = model_dir / "assets" / "payload.dat"

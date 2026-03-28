@@ -4,6 +4,7 @@ import contextlib
 import logging
 import os
 import re
+import stat
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -378,7 +379,56 @@ class TensorFlowSavedModelScanner(BaseScanner):
 
     def _detect_suspicious_asset_content(self, file_path: Path, result: ScanResult) -> list[str]:
         """Return suspicious content types found in a SavedModel asset file."""
-        if not file_path.is_file():
+        try:
+            file_stat = file_path.lstat()
+        except OSError as exc:
+            result.add_check(
+                name="SavedModel Assets Security Check",
+                passed=False,
+                message=f"Cannot inspect asset file for security analysis: {file_path.name}: {exc}",
+                severity=IssueSeverity.WARNING,
+                location=str(file_path),
+                details={
+                    "file_name": file_path.name,
+                    "detected_content_type": "unscannable_asset",
+                    "asset_kind": "stat_error",
+                    "exception": str(exc),
+                    "exception_type": type(exc).__name__,
+                },
+                rule_code="S902",
+            )
+            return []
+        if stat.S_ISLNK(file_stat.st_mode):
+            result.add_check(
+                name="SavedModel Assets Security Check",
+                passed=False,
+                message=f"Symlink asset is not followed during security analysis: {file_path.name}",
+                severity=IssueSeverity.WARNING,
+                location=str(file_path),
+                details={
+                    "file_name": file_path.name,
+                    "detected_content_type": "unscannable_asset",
+                    "asset_kind": "symlink",
+                    "size": file_stat.st_size,
+                },
+                rule_code="S902",
+            )
+            return []
+        if not stat.S_ISREG(file_stat.st_mode):
+            result.add_check(
+                name="SavedModel Assets Security Check",
+                passed=False,
+                message=f"Non-regular asset file is not scanned during security analysis: {file_path.name}",
+                severity=IssueSeverity.WARNING,
+                location=str(file_path),
+                details={
+                    "file_name": file_path.name,
+                    "detected_content_type": "unscannable_asset",
+                    "asset_kind": "non_regular",
+                    "size": file_stat.st_size,
+                },
+                rule_code="S902",
+            )
             return []
 
         try:
@@ -391,6 +441,14 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 message=f"Cannot read asset file for security analysis: {file_path.name}: {exc}",
                 severity=IssueSeverity.WARNING,
                 location=str(file_path),
+                details={
+                    "file_name": file_path.name,
+                    "detected_content_type": "unscannable_asset",
+                    "asset_kind": "unreadable",
+                    "size": file_stat.st_size,
+                    "exception": str(exc),
+                    "exception_type": type(exc).__name__,
+                },
                 rule_code="S902",
             )
             return []
