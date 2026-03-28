@@ -311,7 +311,6 @@ def is_keras_zip_archive(path: str, *, allow_config_only: bool = False) -> bool:
             return _looks_like_keras_config(config_data)
     except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile):
         return False
-    return False
 
 
 def is_pytorch_zip_archive(path: str) -> bool:
