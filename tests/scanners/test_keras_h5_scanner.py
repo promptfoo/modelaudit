@@ -454,8 +454,7 @@ def test_lambda_safe_prefix_with_comment_token_in_malicious_payload_is_flagged(t
     result = KerasH5Scanner().scan(str(model_path))
 
     assert any(
-        check.name == "Lambda Layer Code Analysis" and check.status == CheckStatus.FAILED
-        for check in result.checks
+        check.name == "Lambda Layer Code Analysis" and check.status == CheckStatus.FAILED for check in result.checks
     )
     assert not any(
         check.name == "Lambda Layer Code Analysis"
