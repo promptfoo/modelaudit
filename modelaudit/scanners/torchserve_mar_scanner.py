@@ -718,6 +718,17 @@ class TorchServeMarScanner(BaseScanner):
                     details={"member": member_name, "analysis_kind": "bounded_read"},
                 )
                 continue
+            except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
+                non_handler_findings += 1
+                result.add_check(
+                    name="MAR Non-Handler Python Analysis",
+                    passed=False,
+                    message=f"Unable to read non-handler Python source for static analysis: {exc}",
+                    severity=IssueSeverity.WARNING,
+                    location=f"{archive_path}:{member_name}",
+                    details={"member": member_name, "analysis_kind": "read"},
+                )
+                continue
 
             tree, parse_error = self._parse_python_source(source_bytes)
             if parse_error is not None:
@@ -776,7 +787,7 @@ class TorchServeMarScanner(BaseScanner):
             try:
                 handler_source = self._read_member_bounded(archive, handler_info, self.max_member_bytes)
                 handler_tree = ast.parse(handler_source.decode("utf-8", errors="replace"))
-            except (SyntaxError, ValueError):
+            except (SyntaxError, ValueError, OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile):
                 continue
 
             for module_name in sorted(self._collect_imported_modules(handler_tree)):
@@ -841,7 +852,7 @@ class TorchServeMarScanner(BaseScanner):
 
         try:
             tree = ast.parse(source)
-        except SyntaxError as exc:
+        except (SyntaxError, ValueError) as exc:
             return None, str(exc)
 
         return tree, None
