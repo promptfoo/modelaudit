@@ -3,7 +3,6 @@
 import json
 import logging
 import re
-import threading
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -46,37 +45,28 @@ def _get_hf_cache_root() -> Path:
 
 def _list_repo_files_with_timeout(repo_id: str, timeout_seconds: float = 30) -> tuple[list[str] | None, str | None]:
     """Return repository files or a failure reason if listing times out/errors."""
-    from huggingface_hub import list_repo_files
+    from huggingface_hub import HfApi
 
-    outcome: dict[str, list[str] | str | None] = {"files": None, "error": None}
-    completed = threading.Event()
+    try:
+        repo_info = HfApi().repo_info(repo_id, timeout=timeout_seconds, files_metadata=False)
+    except Exception as exc:
+        return None, str(exc)
 
-    def run_listing() -> None:
-        try:
-            outcome["files"] = list_repo_files(repo_id)
-        except Exception as exc:
-            outcome["error"] = str(exc)
-        finally:
-            completed.set()
+    siblings = getattr(repo_info, "siblings", None)
+    if siblings is None:
+        return None, "repository listing unavailable"
 
-    worker = threading.Thread(
-        target=run_listing,
-        name=f"hf-list-repo-files:{repo_id}",
-        daemon=True,
-    )
-    worker.start()
+    files: list[str] = []
+    for sibling in siblings:
+        if isinstance(sibling, dict):
+            file_name = sibling.get("rfilename") or sibling.get("path")
+        else:
+            file_name = getattr(sibling, "rfilename", None) or getattr(sibling, "path", None)
 
-    if not completed.wait(timeout_seconds):
-        return None, f"timed out after {timeout_seconds} seconds"
+        if isinstance(file_name, str) and file_name:
+            files.append(file_name)
 
-    if outcome["error"] is not None:
-        return None, str(outcome["error"])
-
-    files = outcome["files"]
-    if isinstance(files, list):
-        return files, None
-
-    return None, "unknown repo listing error"
+    return files, None
 
 
 def is_huggingface_url(url: str) -> bool:
