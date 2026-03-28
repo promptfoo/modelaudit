@@ -73,6 +73,7 @@ def pytest_runtest_setup(item):
             "test_file_hash.py",  # SHA256 hashing utility tests
             "test_streaming_scan.py",  # Streaming scan tests
             "test_secure_hasher.py",  # Aggregate hash computation tests
+            "test_advanced_file_handler.py",  # Large-file fail-closed handler regressions
             "test_huggingface_extensions.py",  # HuggingFace MODEL_EXTENSIONS tests
             "test_regular_scan_hash.py",  # Regular scan mode hash generation tests
             "test_core_asset_extraction.py",  # Check consolidation and location parsing regressions

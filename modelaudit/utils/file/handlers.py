@@ -453,7 +453,8 @@ class AdvancedFileHandler:
                 name="Large File Coverage Check",
                 passed=False,
                 message=(
-                    f"Scanner {self.scanner.name} does not support bounded large-file analysis "
+                    "Error scanning file: "
+                    f"scanner {self.scanner.name} does not support bounded large-file analysis "
                     "for this file size; aborting to avoid partial coverage."
                 ),
                 severity=IssueSeverity.INFO,
