@@ -2078,8 +2078,15 @@ def _is_warning_severity_ref(normalized_mod: str, normalized_func: str) -> bool:
     return normalized_func in warning_funcs
 
 
-def _dangerous_ref_base_severity(normalized_mod: str, normalized_func: str) -> IssueSeverity:
+def _dangerous_ref_base_severity(
+    normalized_mod: str,
+    normalized_func: str,
+    *,
+    origin_is_ext: bool = False,
+) -> IssueSeverity:
     """Return the base severity for a resolved dangerous import reference."""
+    if origin_is_ext or _is_copyreg_extension_ref(normalized_mod):
+        return IssueSeverity.CRITICAL
     return (
         IssueSeverity.WARNING if _is_warning_severity_ref(normalized_mod, normalized_func) else IssueSeverity.CRITICAL
     )
@@ -3207,13 +3214,15 @@ def is_dangerous_reduce_pattern(
             reduce_ref = resolved_callables.get(i)
             if reduce_ref:
                 mod, func = reduce_ref
-                if _is_dangerous_ref(mod, func, origin_is_ext=resolved_callable_origin_is_ext.get(i, False)):
+                origin_is_ext = resolved_callable_origin_is_ext.get(i, False)
+                if _is_dangerous_ref(mod, func, origin_is_ext=origin_is_ext):
                     return {
                         "pattern": "RESOLVED_REDUCE_CALL_TARGET",
                         "module": mod,
                         "function": func,
                         "position": pos,
                         "opcode": opcode.name,
+                        "origin_is_ext": origin_is_ext,
                     }
 
         # Check for GLOBAL followed by REDUCE - common in exploits
@@ -3290,12 +3299,14 @@ def is_dangerous_reduce_pattern(
             ref = resolved_callables.get(i)
             if ref:
                 mod, func = ref
-                if _is_dangerous_ref(mod, func, origin_is_ext=resolved_callable_origin_is_ext.get(i, False)):
+                origin_is_ext = resolved_callable_origin_is_ext.get(i, False)
+                if _is_dangerous_ref(mod, func, origin_is_ext=origin_is_ext):
                     return {
                         "pattern": f"{opcode.name}_EXECUTION",
                         "argument": f"{mod}.{func}",
                         "position": pos,
                         "opcode": opcode.name,
+                        "origin_is_ext": origin_is_ext,
                     }
 
         # Check for suspicious attribute access patterns (GETATTR followed by CALL)
@@ -5171,6 +5182,7 @@ class PickleScanner(BaseScanner):
                                 dangerous_base_severity = _dangerous_ref_base_severity(
                                     normalized_reduce_mod,
                                     normalized_reduce_func,
+                                    origin_is_ext=reduce_origin_is_ext,
                                 )
                                 is_actually_dangerous = reduce_origin_is_ext or _is_actually_dangerous_global(
                                     reduce_mod, reduce_func, ml_context
@@ -5340,6 +5352,7 @@ class PickleScanner(BaseScanner):
                                 dangerous_base_severity = _dangerous_ref_base_severity(
                                     normalized_class_mod,
                                     normalized_class_name,
+                                    origin_is_ext=class_origin_is_ext,
                                 )
                                 is_actually_dangerous = class_origin_is_ext or _is_actually_dangerous_global(
                                     class_mod, class_name, ml_context
@@ -5781,7 +5794,11 @@ class PickleScanner(BaseScanner):
                     dangerous_pattern.get("function", ""),
                 )
                 dangerous_pattern_base_severity = (
-                    _dangerous_ref_base_severity(normalized_pattern_mod, normalized_pattern_func)
+                    _dangerous_ref_base_severity(
+                        normalized_pattern_mod,
+                        normalized_pattern_func,
+                        origin_is_ext=bool(dangerous_pattern.get("origin_is_ext")),
+                    )
                     if normalized_pattern_mod and normalized_pattern_func
                     else IssueSeverity.CRITICAL
                 )

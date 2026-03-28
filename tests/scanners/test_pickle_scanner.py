@@ -2068,8 +2068,17 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
         assert result.success
         assert result.has_errors
         failed_checks = [check for check in result.checks if check.status == CheckStatus.FAILED]
-        assert any("copyreg.add_extension" in check.message.lower() for check in failed_checks), (
+        matching_checks = [check for check in failed_checks if "copyreg.add_extension" in check.message.lower()]
+        assert matching_checks, (
             f"Expected suspicious copyreg.add_extension finding, got: {[check.message for check in failed_checks]}"
+        )
+        assert any(check.severity == IssueSeverity.CRITICAL for check in matching_checks), (
+            f"Expected CRITICAL copyreg.add_extension finding, got: "
+            f"{[(check.severity, check.message) for check in matching_checks]}"
+        )
+        assert not any(check.severity == IssueSeverity.WARNING for check in matching_checks), (
+            "Did not expect WARNING copyreg.add_extension finding, "
+            f"got: {[(check.severity, check.message) for check in matching_checks]}"
         )
 
     def test_functools_reduce_remains_critical(self) -> None:
@@ -2118,6 +2127,55 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
             "Did not expect CRITICAL functools.partialmethod finding, "
             f"got: {[(i.severity, i.message) for i in partialmethod_issues]}"
         )
+
+    def _assert_ext_resolved_functools_ref_is_critical(self, target_name: str) -> None:
+        """EXT-origin functools refs must remain CRITICAL despite warning downgrades for direct refs."""
+        import copyreg
+        from contextlib import suppress
+
+        inverted_registry = getattr(copyreg, "_inverted_registry", {})
+        extension_registry = getattr(copyreg, "_extension_registry", {})
+        existing_code = extension_registry.get(("functools", target_name))
+        ext_code = next((candidate for candidate in range(1, 256) if candidate not in inverted_registry), None)
+        if ext_code is None:
+            pytest.skip("No free copyreg extension code available in range 1-255")
+
+        try:
+            if isinstance(existing_code, int):
+                with suppress(ValueError):
+                    copyreg.remove_extension("functools", target_name, existing_code)
+
+            copyreg.add_extension("functools", target_name, ext_code)
+            try:
+                result = self._scan_bytes(b"\x80\x02\x82" + bytes([ext_code]) + b")R.")
+
+                assert result.success
+                assert result.has_errors
+                target_issues = [
+                    issue for issue in result.issues if f"functools.{target_name}" in issue.message.lower()
+                ]
+                assert target_issues, (
+                    f"Expected functools.{target_name} findings, got: {[issue.message for issue in result.issues]}"
+                )
+                assert all(issue.severity == IssueSeverity.CRITICAL for issue in target_issues), (
+                    f"Expected CRITICAL functools.{target_name} findings, got: "
+                    f"{[(issue.severity, issue.message) for issue in target_issues]}"
+                )
+            finally:
+                with suppress(ValueError):
+                    copyreg.remove_extension("functools", target_name, ext_code)
+        finally:
+            if isinstance(existing_code, int):
+                with suppress(ValueError):
+                    copyreg.add_extension("functools", target_name, existing_code)
+
+    def test_ext_resolved_functools_partial_remains_critical(self) -> None:
+        """EXT-origin functools.partial must remain CRITICAL."""
+        self._assert_ext_resolved_functools_ref_is_critical("partial")
+
+    def test_ext_resolved_functools_partialmethod_remains_critical(self) -> None:
+        """EXT-origin functools.partialmethod must remain CRITICAL."""
+        self._assert_ext_resolved_functools_ref_is_critical("partialmethod")
 
     # ------------------------------------------------------------------
     # Fix 4: NEWOBJ_EX with dangerous class
