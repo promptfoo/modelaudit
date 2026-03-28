@@ -1899,6 +1899,70 @@ class TestCVE20259906UnsafeDeserialization:
         cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-9906"]
         assert len(cve_issues) >= 1
 
+    def test_doc_padding_lines_do_not_suppress_raw_detection(self, tmp_path: Path) -> None:
+        """Documentation-like padding must not suppress CVE-2025-9906 detection."""
+        scanner = KerasZipScanner()
+        padded_lines = "\n".join(
+            [
+                "This is a descriptive model note used only for context",
+                "Another explanatory line with many words but no period",
+                "Additional harmless narrative text for documentation padding only",
+                "Further description text that stays verbose and punctuation free",
+                "Yet another line intended to mimic long natural prose content",
+                "One more benign looking sentence for non executable metadata",
+            ]
+        )
+        config_str = json.dumps(
+            {
+                "description": padded_lines,
+                "module": "keras.config",
+                "class_name": "enable_unsafe_deserialization",
+            }
+        )
+
+        result = scanner.scan(self._make_keras_zip(config_str, tmp_path))
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-9906"]
+        assert len(cve_issues) >= 1
+
+    def test_benign_documentation_text_stays_clean(self, tmp_path: Path) -> None:
+        """Benign long-form documentation text should not trigger CVE checks."""
+        scanner = KerasZipScanner()
+        config_str = json.dumps(
+            {
+                "class_name": "Model",
+                "config": {
+                    "notes": (
+                        "This documentation example explains safe usage only\n"
+                        "Another long descriptive line for awareness and guidance\n"
+                        "Helpful prose about model metadata and no executable content"
+                    ),
+                    "description": "Documentation for awareness and onboarding only",
+                },
+            }
+        )
+
+        result = scanner.scan(self._make_keras_zip(config_str, tmp_path))
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-9906"]
+        assert len(cve_issues) == 0
+
+    def test_description_text_without_dangerous_tokens_not_flagged(self, tmp_path: Path) -> None:
+        """Config descriptions should remain clean when dangerous symbols are absent."""
+        scanner = KerasZipScanner()
+        config_str = json.dumps(
+            {
+                "class_name": "Sequential",
+                "description": (
+                    "This model config includes many words to document architecture choices\n"
+                    "Padding text for readability and transparency without any dangerous references"
+                ),
+                "config": {"layers": [{"class_name": "Dense", "config": {"units": 4}}]},
+            }
+        )
+
+        result = scanner.scan(self._make_keras_zip(config_str, tmp_path))
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-9906"]
+        assert len(cve_issues) == 0
+
 
 class TestCVE20243660LambdaAttribution:
     """Test CVE-2024-3660: Lambda layer code injection attribution."""

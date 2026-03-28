@@ -856,8 +856,6 @@ class KerasZipScanner(BaseScanner):
         matched_symbol = next((symbol for symbol in raw_symbols if symbol in lowered), None)
         if not matched_symbol:
             return
-        if self._is_primarily_documentation_text(raw_config_text):
-            return
 
         result.add_check(
             name="CVE-2025-9906: Unsafe Deserialization Bypass",
@@ -1249,9 +1247,21 @@ class KerasZipScanner(BaseScanner):
         if not lines:
             return False
 
+        dangerous_tokens = (
+            "enable_unsafe_deserialization",
+            "keras.config",
+            "__import__",
+            "exec(",
+            "eval(",
+        )
+        structured_markers = ('":', '{"', "class_name", "module", "config")
         doc_like_lines = 0
         for line in lines:
             lowered = line.lower()
+            if any(token in lowered for token in dangerous_tokens):
+                continue
+            if any(marker in line for marker in structured_markers):
+                continue
             if (
                 line.startswith(("#", "//", "/*", "*", "- ", "* "))
                 or "documentation" in lowered
