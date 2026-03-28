@@ -66,6 +66,7 @@ def pytest_runtest_setup(item):
             "test_base_scanner.py",
             "test_core.py",
             "test_cli.py",
+            "test_directory_file_filtering.py",  # Directory prefilter regression tests
             "test_bug1_confidence_exploit.py",  # Security bug test
             "test_gguf_scanner.py",  # GGUF scanner tests
             "test_shebang_context.py",  # Shebang context verification tests
@@ -76,6 +77,7 @@ def pytest_runtest_setup(item):
             "test_regular_scan_hash.py",  # Regular scan mode hash generation tests
             "test_core_asset_extraction.py",  # Check consolidation and location parsing regressions
             "test_manifest_scanner.py",  # Manifest scanner tests
+            "test_metadata_scanner.py",  # Metadata scanner tests
             "test_weak_hash_detection.py",  # Weak hash detection tests
             "test_cloud_url_detection.py",  # Cloud storage URL detection tests
             "test_skops_scanner.py",  # Skops scanner CVE detection tests
@@ -100,6 +102,7 @@ def pytest_runtest_setup(item):
             "test_llamafile_scanner.py",  # Llamafile executable scanner tests
             "test_coreml_scanner.py",  # CoreML scanner tests
             "test_mxnet_scanner.py",  # MXNet scanner tests
+            "test_filetype.py",  # File type detection and validation tests
             "test_tf_metagraph_scanner.py",  # TensorFlow MetaGraph scanner tests
             "test_tflite_scanner.py",  # TFLite scanner guardrail tests
             "test_torchserve_mar_scanner.py",  # TorchServe .mar scanner tests
@@ -109,6 +112,9 @@ def pytest_runtest_setup(item):
             "test_debug_command.py",  # debug output telemetry flags
             "test_auth_config.py",  # auth config path and secret-storage hardening tests
             "test_utils.py",  # archive path sanitization regression coverage
+            "test_exit_codes.py",  # exit-code precedence regression tests
+            "test_file_filter.py",  # Directory file prefilter tests
+            "test_huggingface.py",  # HuggingFace provenance and cache path tests
             "test_oci_layer_scanner.py",  # OCI layer path safety regression tests
             "test_jfrog.py",  # JFrog utility tests
             "test_jfrog_integration.py",  # JFrog integration tests

@@ -20,7 +20,6 @@ class TestFileFilter:
             "data.log",
             "image.jpg",
             "video.mp4",
-            "archive.tar",
             "backup.bak",
         ]
 
@@ -43,6 +42,13 @@ class TestFileFilter:
             "model.safetensors",
             "data.npz",
             "weights.onnx",
+            "archive.tar",
+            "archive.tar.gz",
+            "archive.gz",
+            "archive.bz2",
+            "archive.xz",
+            "archive.7z",
+            "model.metadata",
         ]
 
         for file in model_files:
@@ -59,6 +65,7 @@ class TestFileFilter:
         assert not should_skip_file(".model.pkl")
         assert not should_skip_file(".weights.pt")
         assert not should_skip_file(".checkpoint.h5")
+        assert not should_skip_file(".weights.onnx")
 
     def test_skip_specific_filenames(self):
         """Test that specific filenames are skipped."""

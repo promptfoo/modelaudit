@@ -193,6 +193,42 @@ def _add_issue_to_model(
     results.issues.append(issue)
 
 
+def _normalize_streamed_location(location: str | None, report_path: str, resolved_path: str) -> str | None:
+    """Rewrite streamed result locations to the original source path when needed."""
+    if not location or report_path == resolved_path:
+        return location
+
+    if location == resolved_path:
+        return report_path
+
+    if not location.startswith(resolved_path):
+        return location
+
+    suffix = location[len(resolved_path) :]
+    if suffix and suffix[0] not in {":", " ", "(", "[", "/", "\\"}:
+        return location
+
+    return f"{report_path}{suffix}"
+
+
+def _serialize_streamed_records(records: list[Any], report_path: str, resolved_path: str) -> list[dict[str, Any]]:
+    """Convert streamed issues/checks into dicts with source-path locations."""
+    serialized: list[dict[str, Any]] = []
+    for record in records:
+        record_dict = record.to_dict() if hasattr(record, "to_dict") else record
+        if not isinstance(record_dict, dict):
+            continue
+
+        normalized_record = dict(record_dict)
+        location = normalized_record.get("location")
+        if isinstance(location, str):
+            normalized_record["location"] = _normalize_streamed_location(location, report_path, resolved_path)
+
+        serialized.append(normalized_record)
+
+    return serialized
+
+
 def _calculate_file_hash(file_path: str) -> str:
     """Calculate SHA256 hash of a file for deduplication purposes.
 
@@ -247,9 +283,62 @@ def _path_has_part(path: Path, part: str) -> bool:
 def _find_hf_cache_root(path: Path) -> Path | None:
     """Return the HuggingFace cache root containing models--* if present."""
     for index, segment in enumerate(path.parts):
-        if segment.lower().startswith("models--"):
+        if (
+            segment.lower().startswith("models--")
+            and index >= 3
+            and [part.lower() for part in path.parts[index - 3 : index]] == [".cache", "huggingface", "hub"]
+        ):
             return Path(*path.parts[: index + 1])
     return None
+
+
+def _resolve_directory_scan_target(
+    file_path: Path,
+    base_dir: Path,
+    *,
+    is_hf_cache: bool,
+    hf_cache_root: Path | None,
+    results: ModelAuditResultModel,
+) -> tuple[Path | None, bool]:
+    """Resolve a directory entry and reject symlink traversal outside the scan root."""
+    resolved_file = file_path.resolve()
+
+    # Check if this is a HuggingFace cache symlink scenario
+    is_hf_cache_symlink = False
+    if file_path.is_symlink() and is_hf_cache and _path_has_part(file_path, "snapshots"):
+        try:
+            link_target = os.readlink(file_path)
+        except OSError as e:
+            _add_issue_to_model(
+                results,
+                "Broken symlink encountered",
+                severity=IssueSeverity.INFO.value,
+                location=str(file_path),
+                details={"error": str(e)},
+            )
+            return None, False
+
+        # Resolve the relative link target
+        resolved_target = (file_path.parent / link_target).resolve()
+        # Check if target is in the blobs directory of the same model cache
+        if hf_cache_root is not None:
+            blobs_root = hf_cache_root / "blobs"
+            if is_within_directory(str(blobs_root), str(resolved_target)):
+                is_hf_cache_symlink = True
+                # Update the resolved_file to the actual target for scanning
+                resolved_file = resolved_target
+
+    if not is_hf_cache_symlink and not is_within_directory(str(base_dir), str(resolved_file)):
+        _add_issue_to_model(
+            results,
+            "Path traversal outside scanned directory",
+            severity=IssueSeverity.CRITICAL.value,
+            location=str(file_path),
+            details={"resolved_path": str(resolved_file)},
+        )
+        return None, False
+
+    return resolved_file, is_hf_cache_symlink
 
 
 def _extract_primary_asset_from_location(location: str) -> str:
@@ -625,6 +714,8 @@ def scan_model_directory_or_file(
             if scanner:
                 scan_result, was_complete = stream_analyze_file(stream_url, scanner)
                 if scan_result:
+                    results.files_scanned += 1
+
                     # Use helper function to add scan result to Pydantic model
                     _add_scan_result_to_model(results, scan_metadata, scan_result, stream_url)
 
@@ -703,41 +794,14 @@ def scan_model_directory_or_file(
                         logger.debug(f"Skipping HuggingFace cache file: {file_path}")
                         continue
 
-                    resolved_file = Path(file_path).resolve()
-
-                    # Check if this is a HuggingFace cache symlink scenario
-                    is_hf_cache_symlink = False
-                    if os.path.islink(file_path) and is_hf_cache and _path_has_part(Path(file_path), "snapshots"):
-                        try:
-                            link_target = os.readlink(file_path)
-                        except OSError as e:
-                            _add_issue_to_model(
-                                results,
-                                "Broken symlink encountered",
-                                severity=IssueSeverity.INFO.value,
-                                location=file_path,
-                                details={"error": str(e)},
-                            )
-                            continue
-
-                        # Resolve the relative link target
-                        resolved_target = (Path(file_path).parent / link_target).resolve()
-                        # Check if target is in the blobs directory of the same model cache
-                        if hf_cache_root is not None:
-                            blobs_root = hf_cache_root / "blobs"
-                            if is_within_directory(str(blobs_root), str(resolved_target)):
-                                is_hf_cache_symlink = True
-                                # Update the resolved_file to the actual target for scanning
-                                resolved_file = resolved_target
-
-                    if not is_hf_cache_symlink and not is_within_directory(str(base_dir), str(resolved_file)):
-                        _add_issue_to_model(
-                            results,
-                            "Path traversal outside scanned directory",
-                            severity=IssueSeverity.CRITICAL.value,
-                            location=file_path,
-                            details={"resolved_path": str(resolved_file)},
-                        )
+                    resolved_file, is_hf_cache_symlink = _resolve_directory_scan_target(
+                        Path(file_path),
+                        base_dir,
+                        is_hf_cache=is_hf_cache,
+                        hf_cache_root=hf_cache_root,
+                        results=results,
+                    )
+                    if resolved_file is None:
                         continue
 
                     # Skip non-model files early if filtering is enabled
@@ -1095,7 +1159,8 @@ def determine_exit_code(results: ModelAuditResultModel) -> int:
     Exit codes:
     - 0: Success, no security issues found
     - 1: Security issues found (scan completed successfully)
-    - 2: Operational errors occurred during scanning or no files scanned
+    - 2: Operational errors occurred during scanning, or no files were scanned
+         and no security issues were found
 
     Args:
         results: ModelAuditResultModel with scan results
@@ -1107,13 +1172,10 @@ def determine_exit_code(results: ModelAuditResultModel) -> int:
     if getattr(results, "has_errors", False):
         return 2
 
-    # Check if no files were scanned
-    files_scanned = results.files_scanned
-    if files_scanned == 0:
-        return 2
-
-    # Check for any security findings (warnings, errors, or critical issues)
-    issues = results.issues
+    # Check for any security findings before treating zero scanned files as
+    # an operational-style outcome. Path traversal and similar safeguards can
+    # report a finding before any file is scanned.
+    issues = results.issues or []
     if issues:
         # Filter out DEBUG and INFO level issues for exit code determination
         # Only WARNING, ERROR (legacy), and CRITICAL issues should trigger exit code 1
@@ -1126,6 +1188,11 @@ def determine_exit_code(results: ModelAuditResultModel) -> int:
         ]
         if security_issues:
             return 1
+
+    # Check if no files were scanned
+    files_scanned = results.files_scanned
+    if files_scanned == 0:
+        return 2
 
     # No issues found
     return 0
@@ -1147,16 +1214,26 @@ def _is_huggingface_cache_file(path: str) -> bool:
     import os
 
     filename = os.path.basename(path)
+    path_obj = Path(path)
 
-    # HuggingFace cache file patterns - be more specific
-    hf_cache_patterns = [
-        ".lock",  # Download lock files
-        ".metadata",  # HuggingFace metadata files
-    ]
+    # Download lock files are HuggingFace bookkeeping files regardless of cache layout.
+    if filename.endswith(".lock"):
+        return True
 
-    # Check if file ends with cache patterns
-    for pattern in hf_cache_patterns:
-        if filename.endswith(pattern):
+    # Only skip HuggingFace .metadata files in known cache/download layouts.
+    if filename.endswith(".metadata"):
+        hf_cache_root = _find_hf_cache_root(path_obj)
+        if hf_cache_root is not None and hf_cache_root.parent.name.lower() == "hub":
+            try:
+                relative_parts = path_obj.relative_to(hf_cache_root).parts
+            except ValueError:
+                relative_parts = ()
+
+            if relative_parts and relative_parts[0] in {"snapshots", "blobs", "refs"}:
+                return True
+
+        normalized_parts = [part.lower() for part in path_obj.parent.parts]
+        if len(normalized_parts) >= 3 and normalized_parts[-3:] == [".cache", "huggingface", "download"]:
             return True
 
     # Check for specific HuggingFace cache metadata files
@@ -1530,6 +1607,7 @@ def scan_model_streaming(
     timeout: int = 3600,
     progress_callback: ProgressCallback | None = None,
     delete_after_scan: bool = True,
+    scan_root: FilePath | None = None,
     **kwargs: Any,
 ) -> ModelAuditResultModel:
     """
@@ -1543,6 +1621,7 @@ def scan_model_streaming(
         timeout: Scan timeout in seconds
         progress_callback: Optional callback for progress reporting
         delete_after_scan: Whether to delete files after scanning (default: True)
+        scan_root: Optional root directory for local streaming traversal validation
         **kwargs: Additional arguments passed to scanners
 
     Returns:
@@ -1558,8 +1637,21 @@ def scan_model_streaming(
     file_hashes: list[str] = []
     files_processed = 0
 
+    base_dir = Path(scan_root).resolve() if scan_root is not None else None
+    hf_cache_root = _find_hf_cache_root(base_dir) if base_dir is not None else None
+    is_hf_cache = (
+        base_dir is not None
+        and hf_cache_root is not None
+        and _path_has_part(base_dir, "huggingface")
+        and _path_has_part(base_dir, "hub")
+    )
+
     try:
         for file_path, _is_last in file_generator:
+            source_path = Path(file_path)
+            scan_path = source_path
+            report_path = str(source_path)
+
             # Check for interruption
             check_interrupted()
 
@@ -1570,16 +1662,28 @@ def scan_model_streaming(
                 break
 
             try:
+                if base_dir is not None:
+                    resolved_path, _is_hf_cache_symlink = _resolve_directory_scan_target(
+                        source_path,
+                        base_dir,
+                        is_hf_cache=is_hf_cache,
+                        hf_cache_root=hf_cache_root,
+                        results=results,
+                    )
+                    if resolved_path is None:
+                        continue
+                    scan_path = resolved_path
+
                 # Compute file hash
                 if progress_callback:
-                    progress_callback(f"Hashing {file_path.name}", (files_processed / (files_processed + 1)) * 100)
+                    progress_callback(f"Hashing {source_path.name}", (files_processed / (files_processed + 1)) * 100)
 
-                file_hash = compute_sha256_hash(file_path)
+                file_hash = compute_sha256_hash(scan_path)
                 file_hashes.append(file_hash)
 
                 # Scan the file
                 if progress_callback:
-                    progress_callback(f"Scanning {file_path.name}", (files_processed / (files_processed + 1)) * 100)
+                    progress_callback(f"Scanning {source_path.name}", (files_processed / (files_processed + 1)) * 100)
 
                 # Build config dict for scan_file
                 scan_config = {
@@ -1588,14 +1692,18 @@ def scan_model_streaming(
                 }
 
                 scan_result = scan_file(
-                    str(file_path),
+                    str(scan_path),
                     config=scan_config,
                 )
 
                 # Merge results
                 if scan_result:
+                    resolved_report_path = str(scan_path)
                     metadata_dict = dict(scan_result.metadata or {})
-                    metadata_dict.setdefault("file_size", file_path.stat().st_size)
+                    metadata_dict.setdefault("file_size", scan_path.stat().st_size)
+                    if report_path != resolved_report_path:
+                        metadata_dict.setdefault("source_path", report_path)
+                        metadata_dict.setdefault("resolved_path", resolved_report_path)
                     operational_scan_failure = any(
                         _has_operational_error_message(issue.message) for issue in (scan_result.issues or [])
                     )
@@ -1615,32 +1723,40 @@ def scan_model_streaming(
                         # and only reported informational integrity findings.
                         "has_errors": operational_scan_failure,
                         "success": scan_result.success,
-                        "issues": [issue.__dict__ for issue in (scan_result.issues or [])],
-                        "checks": [check.__dict__ for check in (scan_result.checks or [])],
+                        "issues": _serialize_streamed_records(
+                            list(scan_result.issues or []),
+                            report_path,
+                            resolved_report_path,
+                        ),
+                        "checks": _serialize_streamed_records(
+                            list(scan_result.checks or []),
+                            report_path,
+                            resolved_report_path,
+                        ),
                         "scanners": [scan_result.scanner_name] if scan_result.scanner_name else [],
-                        "file_metadata": {str(file_path): metadata_dict},
+                        "file_metadata": {report_path: metadata_dict},
                     }
                     results.aggregate_scan_result(scan_result_dict)
 
                     # Add asset
-                    asset = asset_from_scan_result(str(file_path), scan_result)
+                    asset = asset_from_scan_result(report_path, scan_result, metadata=metadata_dict)
                     if asset:
                         results.assets.extend(convert_assets_to_models([asset]))
 
                 files_processed += 1
 
             except Exception as e:
-                logger.error(f"Error processing {file_path}: {e}", exc_info=True)
+                logger.error(f"Error processing {source_path}: {e}", exc_info=True)
                 results.has_errors = True
 
             finally:
                 # Delete file after scanning if requested
-                if delete_after_scan and file_path.exists():
+                if delete_after_scan and source_path.exists():
                     try:
-                        file_path.unlink()
-                        logger.debug(f"Deleted {file_path} after scanning")
+                        source_path.unlink()
+                        logger.debug(f"Deleted {source_path} after scanning")
                     except Exception as e:
-                        logger.warning(f"Failed to delete {file_path}: {e}")
+                        logger.warning(f"Failed to delete {source_path}: {e}")
 
         # Compute aggregate hash from all file hashes
         if file_hashes:

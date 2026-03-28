@@ -1,3 +1,4 @@
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -13,7 +14,7 @@ except ImportError:
     HAS_TFLITE = False
 
 
-def test_tflite_scanner_can_handle(tmp_path):
+def test_tflite_scanner_can_handle(tmp_path: Path) -> None:
     """Test the can_handle method recognizes .tflite files regardless of tflite package."""
     path = tmp_path / "model.tflite"
     path.write_bytes(b"some content")
@@ -23,19 +24,19 @@ def test_tflite_scanner_can_handle(tmp_path):
     assert TFLiteScanner.can_handle(str(path)) is True
 
 
-def test_tflite_scanner_can_handle_missing_path():
+def test_tflite_scanner_can_handle_missing_path() -> None:
     """Regression: can_handle returns False for non-existent .tflite paths."""
     assert TFLiteScanner.can_handle("/nonexistent/path/model.tflite") is False
 
 
-def test_tflite_scanner_cannot_handle_wrong_extension(tmp_path):
+def test_tflite_scanner_cannot_handle_wrong_extension(tmp_path: Path) -> None:
     """Test the can_handle method with wrong file extension."""
     path = tmp_path / "model.pb"
     path.write_bytes(b"some content")
     assert TFLiteScanner.can_handle(str(path)) is False
 
 
-def test_tflite_scanner_file_not_found():
+def test_tflite_scanner_file_not_found() -> None:
     """Test scanning non-existent file."""
     scanner = TFLiteScanner()
     result = scanner.scan("non_existent_file.tflite")
@@ -43,7 +44,7 @@ def test_tflite_scanner_file_not_found():
     assert "Path does not exist" in result.issues[0].message
 
 
-def test_tflite_scanner_no_tflite_installed(tmp_path):
+def test_tflite_scanner_no_tflite_installed(tmp_path: Path) -> None:
     """Test scanner behavior when tflite package is not installed."""
     path = tmp_path / "model.tflite"
     path.touch()
@@ -56,7 +57,7 @@ def test_tflite_scanner_no_tflite_installed(tmp_path):
 
 
 @pytest.mark.skipif(not HAS_TFLITE, reason="tflite not installed")
-def test_tflite_scanner_parsing_error(tmp_path):
+def test_tflite_scanner_parsing_error(tmp_path: Path) -> None:
     """Test scanner behavior with invalid tflite data."""
     path = tmp_path / "model.tflite"
     # Scanner now checks for magic bytes first, so invalid data triggers that check
@@ -72,7 +73,7 @@ def test_tflite_scanner_parsing_error(tmp_path):
 
 
 @pytest.mark.skipif(not HAS_TFLITE, reason="tflite not installed")
-def test_tflite_scanner_custom_operator(tmp_path):
+def test_tflite_scanner_custom_operator(tmp_path: Path) -> None:
     """Test scanner behavior with custom operators."""
     path = tmp_path / "model.tflite"
     # Create data with valid TFLite magic bytes ("TFL3" at offset 4)
@@ -109,7 +110,7 @@ def test_tflite_scanner_custom_operator(tmp_path):
 
 
 @pytest.mark.skipif(not HAS_TFLITE, reason="tflite not installed")
-def test_tflite_scanner_safe_model(tmp_path):
+def test_tflite_scanner_safe_model(tmp_path: Path) -> None:
     """Test scanner behavior with safe model."""
     path = tmp_path / "model.tflite"
     # Create data with valid TFLite magic bytes ("TFL3" at offset 4)
@@ -143,7 +144,7 @@ def test_tflite_scanner_safe_model(tmp_path):
         assert not result.issues
 
 
-def test_tflite_scanner_metadata_collection(tmp_path):
+def test_tflite_scanner_metadata_collection(tmp_path: Path) -> None:
     """Test that scanner collects appropriate metadata."""
     path = tmp_path / "model.tflite"
     # Create data with valid TFLite magic bytes ("TFL3" at offset 4)
@@ -185,7 +186,7 @@ def test_tflite_scanner_metadata_collection(tmp_path):
         assert "file_size" in result.metadata
 
 
-def test_tflite_scanner_excessive_subgraph_count_stops_scan(tmp_path):
+def test_tflite_scanner_excessive_subgraph_count_stops_scan(tmp_path: Path) -> None:
     """Regression: scanner stops before iterating an excessive subgraph count."""
     path = tmp_path / "model.tflite"
     valid_header = b"\x00\x00\x00\x00TFL3" + b"\x00" * 100

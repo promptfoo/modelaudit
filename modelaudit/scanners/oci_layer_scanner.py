@@ -206,7 +206,14 @@ class OciLayerScanner(BaseScanner):
 
                             from .. import core
 
-                            file_result = core.scan_file(tmp_path, self.config)
+                            nested_config = dict(self.config)
+                            try:
+                                _oci_depth = int(nested_config.get("_archive_depth", 0))
+                            except (TypeError, ValueError):
+                                _oci_depth = 0
+                            nested_config["_archive_depth"] = max(_oci_depth, 0) + 1
+
+                            file_result = core.scan_file(tmp_path, nested_config)
                             detected_suffix = self._get_detected_format_suffix(tmp_path)
                             if (
                                 file_result.scanner_name == "unknown"
@@ -216,7 +223,7 @@ class OciLayerScanner(BaseScanner):
                                 retargeted_path = f"{tmp_path}{detected_suffix}"
                                 os.replace(tmp_path, retargeted_path)
                                 tmp_path = retargeted_path
-                                file_result = core.scan_file(tmp_path, self.config)
+                                file_result = core.scan_file(tmp_path, nested_config)
                             for check in file_result.checks:
                                 check.location = self._rewrite_embedded_location(
                                     check.location,

@@ -6,14 +6,19 @@ if TYPE_CHECKING:
     from modelaudit.scanners.base import ScanResult
 
 
-def asset_from_scan_result(path: str, scan_result: ScanResult) -> dict[str, Any]:
+def asset_from_scan_result(
+    path: str,
+    scan_result: ScanResult,
+    *,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Build an asset entry from a ScanResult."""
     entry: dict[str, Any] = {
         "path": path,
         "type": scan_result.scanner_name,
     }
 
-    meta = scan_result.metadata
+    meta = metadata if metadata is not None else scan_result.metadata
     if "file_size" in meta:
         entry["size"] = meta["file_size"]
     if "tensors" in meta:

@@ -23,6 +23,7 @@ from modelaudit.detectors.suspicious_symbols import (
 )
 from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.pickle_scanner import (
+    _RAW_PATTERN_SCAN_LIMIT_BYTES,
     PickleScanner,
     _genops_with_fallback,
     _GenopsBudgetExceeded,
@@ -48,6 +49,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 def _short_binunicode(value: bytes) -> bytes:
     return b"\x8c" + bytes([len(value)]) + value
+
+
+def _write_pickle_with_tail(path: Path, tail: bytes, *, pad_to_bytes: int | None = None) -> None:
+    payload = pickle.dumps({"weights": [1, 2, 3]})
+    if pad_to_bytes is not None and len(payload) < pad_to_bytes:
+        payload += b"\x00" * (pad_to_bytes - len(payload))
+    path.write_bytes(payload + tail)
 
 
 @pytest.mark.parametrize(
@@ -135,6 +143,71 @@ def test_unknown_opcode_bin_parse_failure_still_scans_full_binary_content(
     assert any(
         check.name == "Binary Content Check" and check.status == CheckStatus.FAILED for check in result.checks
     ), f"Expected binary fallback finding, got: {[(c.name, c.status) for c in result.checks]}"
+
+
+def test_small_pickle_tail_pattern_is_detected_without_raw_pattern_limit(tmp_path: Path) -> None:
+    """Small pickle files should still fully analyze raw patterns without a coverage warning."""
+    pickle_path = tmp_path / "small-tail.pkl"
+    _write_pickle_with_tail(pickle_path, b"os.system")
+
+    result = PickleScanner().scan(str(pickle_path))
+
+    assert not any(check.name == "Raw Pattern Coverage Check" for check in result.checks)
+    assert any("os.system" in issue.message for issue in result.issues)
+
+
+def test_large_pickle_tail_pattern_surfaces_raw_pattern_limit(tmp_path: Path) -> None:
+    """Large pickle files should explicitly report the bounded raw-pattern coverage."""
+    pickle_path = tmp_path / "large-tail.pkl"
+    _write_pickle_with_tail(
+        pickle_path,
+        b"os.system",
+        pad_to_bytes=_RAW_PATTERN_SCAN_LIMIT_BYTES + 128,
+    )
+
+    result = PickleScanner().scan(str(pickle_path))
+
+    raw_pattern_checks = [check for check in result.checks if check.name == "Raw Pattern Coverage Check"]
+    assert len(raw_pattern_checks) == 1
+    raw_pattern_check = raw_pattern_checks[0]
+    assert raw_pattern_check.status == CheckStatus.FAILED
+    assert raw_pattern_check.severity == IssueSeverity.INFO
+    assert raw_pattern_check.details["reason"] == "raw_pattern_prefix_limit"
+    assert raw_pattern_check.details["raw_pattern_analysis_limited"] is True
+    assert raw_pattern_check.details["raw_pattern_scan_bytes"] == _RAW_PATTERN_SCAN_LIMIT_BYTES
+    assert raw_pattern_check.details["raw_pattern_scan_limit_bytes"] == _RAW_PATTERN_SCAN_LIMIT_BYTES
+    assert raw_pattern_check.details["raw_pattern_total_bytes"] == pickle_path.stat().st_size
+    assert result.metadata["raw_pattern_scan_complete"] is False
+    assert result.metadata["raw_pattern_scan_bytes"] == _RAW_PATTERN_SCAN_LIMIT_BYTES
+    assert result.metadata["raw_pattern_total_bytes"] == pickle_path.stat().st_size
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert not any(
+        "os.system" in issue.message for issue in result.issues if issue.message != raw_pattern_check.message
+    )
+
+
+def test_large_pickle_raw_pattern_limit_with_opcode_budget_truncation(tmp_path: Path) -> None:
+    """Large files should surface both the raw-pattern prefix limit and opcode truncation."""
+    pickle_path = tmp_path / "large-multistream.pkl"
+    large_prefix_stream = pickle.dumps(b"A" * (_RAW_PATTERN_SCAN_LIMIT_BYTES + 128), protocol=4)
+    follow_on_streams = b"".join(
+        pickle.dumps({"stream": index, "weights": [1, 2, 3]}, protocol=4) for index in range(32)
+    )
+    pickle_path.write_bytes(large_prefix_stream + follow_on_streams)
+
+    result = PickleScanner({"max_opcodes": 10}).scan(str(pickle_path))
+
+    raw_pattern_checks = [check for check in result.checks if check.name == "Raw Pattern Coverage Check"]
+    assert len(raw_pattern_checks) == 1
+    assert "may still stop early" in raw_pattern_checks[0].message.lower()
+    assert result.metadata["raw_pattern_scan_complete"] is False
+
+    opcode_checks = [
+        check for check in result.checks if check.name == "Opcode Count Check" and check.status == CheckStatus.FAILED
+    ]
+    assert len(opcode_checks) == 1
+    assert opcode_checks[0].details["analysis_incomplete"] is True
+    assert result.metadata["analysis_incomplete"] is True
 
 
 class TestPickleScanner(unittest.TestCase):
@@ -931,6 +1004,84 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
         finally:
             os.unlink(path)
 
+    def test_nested_pickle_detection_binbytes8_and_bytearray8(self) -> None:
+        """BINBYTES8/BYTEARRAY8 payloads should be scanned for nested pickles."""
+        inner_bytes = pickle.dumps({"ab": 1}, protocol=4)
+
+        for opcode_name, payload in (
+            ("BINBYTES8", b"\x80\x04\x8e" + struct.pack("<Q", len(inner_bytes)) + inner_bytes + b"."),
+            ("BYTEARRAY8", b"\x80\x05\x96" + struct.pack("<Q", len(inner_bytes)) + inner_bytes + b"."),
+        ):
+            with self.subTest(opcode_name=opcode_name):
+                result = self._scan_bytes(payload)
+
+                nested_checks = [
+                    check
+                    for check in result.checks
+                    if check.name == "Nested Pickle Detection" and check.status == CheckStatus.FAILED
+                ]
+                assert any(check.details.get("opcode") == opcode_name for check in nested_checks), (
+                    f"Expected nested pickle detection for {opcode_name}, got: "
+                    f"{[(c.name, c.status, c.details) for c in result.checks]}"
+                )
+
+    def test_non_pickle_binbytes8_and_bytearray8_do_not_trigger_nested_detection(self) -> None:
+        """Non-pickle BINBYTES8/BYTEARRAY8 payloads should not trigger nested pickle findings."""
+        benign_bytes = b"not a pickle payload"
+
+        for payload in (
+            b"\x80\x04\x8e" + struct.pack("<Q", len(benign_bytes)) + benign_bytes + b".",
+            b"\x80\x05\x96" + struct.pack("<Q", len(benign_bytes)) + benign_bytes + b".",
+        ):
+            with self.subTest(payload=payload[:3]):
+                result = self._scan_bytes(payload)
+
+                assert not any(
+                    check.name == "Nested Pickle Detection" and check.status == CheckStatus.FAILED
+                    for check in result.checks
+                ), f"Unexpected nested pickle detection: {[(c.name, c.status, c.details) for c in result.checks]}"
+
+    def test_nested_pickle_detection_binstring_legacy(self) -> None:
+        """BINSTRING/SHORT_BINSTRING carry raw bytes as latin-1 strings; nested pickles must be detected."""
+        inner_bytes = pickle.dumps({"ab": 1}, protocol=2)
+
+        # SHORT_BINSTRING: opcode 'U', 1-byte length, protocol 2
+        short_binstring_payload = b"\x80\x02U" + bytes([len(inner_bytes)]) + inner_bytes + b"."
+        result = self._scan_bytes(short_binstring_payload)
+        nested_checks = [
+            c for c in result.checks if c.name == "Nested Pickle Detection" and c.status == CheckStatus.FAILED
+        ]
+        assert any(c.details.get("opcode") == "SHORT_BINSTRING" for c in nested_checks), (
+            f"Expected nested pickle detection for SHORT_BINSTRING, got: "
+            f"{[(c.name, c.status, c.details) for c in result.checks]}"
+        )
+
+        # BINSTRING: opcode 'T', 4-byte little-endian length, protocol 1
+        binstring_payload = b"\x80\x02T" + struct.pack("<i", len(inner_bytes)) + inner_bytes + b"."
+        result = self._scan_bytes(binstring_payload)
+        nested_checks = [
+            c for c in result.checks if c.name == "Nested Pickle Detection" and c.status == CheckStatus.FAILED
+        ]
+        assert any(c.details.get("opcode") == "BINSTRING" for c in nested_checks), (
+            f"Expected nested pickle detection for BINSTRING, got: "
+            f"{[(c.name, c.status, c.details) for c in result.checks]}"
+        )
+
+    def test_non_pickle_binstring_does_not_trigger_nested_detection(self) -> None:
+        """Non-pickle BINSTRING/SHORT_BINSTRING payloads should not trigger nested pickle findings."""
+        benign = b"just a plain string"
+
+        for opcode, length in (
+            (b"U", bytes([len(benign)])),
+            (b"T", struct.pack("<i", len(benign))),
+        ):
+            with self.subTest(opcode=opcode):
+                payload = b"\x80\x02" + opcode + length + benign + b"."
+                result = self._scan_bytes(payload)
+                assert not any(
+                    c.name == "Nested Pickle Detection" and c.status == CheckStatus.FAILED for c in result.checks
+                ), f"Unexpected nested pickle detection: {[(c.name, c.status, c.details) for c in result.checks]}"
+
     def test_builtins_hasattr_is_critical(self) -> None:
         """builtins.hasattr must not be allowlisted as safe."""
         result = self._scan_bytes(self._craft_global_reduce_pickle("builtins", "hasattr"))
@@ -1077,6 +1228,7 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
         )
 
     def test_plausible_module_allows_mixed_case_identifiers(self) -> None:
+        assert _is_plausible_python_module("EVIL")
         assert _is_plausible_python_module("EvilPkg")
         assert _is_plausible_python_module("PIL")
         assert _is_plausible_python_module("MyOrg.InternalPkg")
@@ -1097,6 +1249,17 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
         )
         assert not any("implausible module name 'EvilPkg'" in c.message for c in reduce_checks), (
             "Mixed-case module names should not be classified as implausible"
+        )
+
+    def test_uppercase_global_reduce_is_not_suppressed(self) -> None:
+        result = self._scan_bytes(self._craft_global_reduce_pickle("EVIL", "run"))
+
+        reduce_checks = [c for c in result.checks if c.name == "REDUCE Opcode Safety Check"]
+        assert any(c.status == CheckStatus.FAILED and "EVIL.run" in c.message for c in reduce_checks), (
+            f"Expected failed REDUCE check for uppercase module, got: {[c.message for c in reduce_checks]}"
+        )
+        assert not any("implausible module name 'EVIL'" in c.message for c in reduce_checks), (
+            "All-uppercase module names should not be classified as implausible"
         )
 
     def test_pil_global_reduce_is_not_suppressed(self) -> None:
@@ -1292,6 +1455,38 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
             if i.severity == IssueSeverity.CRITICAL and ("os" in i.message.lower() or "posix" in i.message.lower())
         ]
         assert os_issues, f"Expected CRITICAL os issue after separator byte, got: {[i.message for i in result.issues]}"
+
+    def test_multi_stream_large_padding_resync(self) -> None:
+        """Scanner must detect malicious streams after padding larger than 64KiB."""
+        import io
+
+        buf = io.BytesIO()
+        pickle.dump({"safe": True}, buf, protocol=2)
+        buf.write(b"\x00" * (70 * 1024))
+        buf.write(self._craft_global_reduce_pickle("os", "system"))
+
+        result = self._scan_bytes(buf.getvalue())
+
+        assert result.success
+        assert any(
+            i.severity == IssueSeverity.CRITICAL and ("os" in i.message.lower() or "posix" in i.message.lower())
+            for i in result.issues
+        ), f"Expected CRITICAL os issue after large padding, got: {[i.message for i in result.issues]}"
+
+    def test_multi_stream_large_padding_without_follow_on_stream_is_benign(self) -> None:
+        """Large non-pickle padding after a benign stream should not create security findings."""
+        import io
+
+        buf = io.BytesIO()
+        pickle.dump({"safe": True}, buf, protocol=2)
+        buf.write(b"\x00" * (70 * 1024))
+
+        result = self._scan_bytes(buf.getvalue())
+
+        assert result.success
+        assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues), (
+            f"Unexpected critical issue for benign large padding: {[i.message for i in result.issues]}"
+        )
 
     def test_multi_stream_malformed_first_stream_still_detects_second(self) -> None:
         """Scanner must detect malicious stream 2 even when stream 1 is malformed.
@@ -3444,11 +3639,13 @@ class TestPickleImportOnlyGlobalFindings:
             callable_origin_refs,
             callable_origin_is_ext,
             malformed_stack_globals,
+            mutation_target_refs,
         ) = _simulate_symbolic_reference_maps(opcodes)
 
         assert callable_refs[2] == ("collections", "OrderedDict")
         assert callable_origin_refs[2] == 2
         assert callable_origin_is_ext == {}
+        assert mutation_target_refs == {}
         assert 5 not in stack_global_refs
         assert malformed_stack_globals[5]["reason"] == "insufficient_context"
 
@@ -3469,6 +3666,7 @@ class TestPickleImportOnlyGlobalFindings:
             callable_origin_refs,
             callable_origin_is_ext,
             malformed_stack_globals,
+            mutation_target_refs,
         ) = _simulate_symbolic_reference_maps(opcodes)
 
         assert stack_global_refs[6] == ("evilpkg", "thing")
@@ -3476,6 +3674,7 @@ class TestPickleImportOnlyGlobalFindings:
         assert callable_origin_refs == {}
         assert callable_origin_is_ext == {}
         assert malformed_stack_globals == {}
+        assert mutation_target_refs == {}
 
 
 @pytest.mark.parametrize(

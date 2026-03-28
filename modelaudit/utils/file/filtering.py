@@ -1,6 +1,7 @@
 """File filtering utilities for ModelAudit."""
 
 import os
+from pathlib import Path
 
 # Default extensions to skip when scanning directories
 DEFAULT_SKIP_EXTENSIONS = {
@@ -91,6 +92,38 @@ DEFAULT_SKIP_FILENAMES = {
     "yarn.lock",
 }
 
+DEFAULT_SCANNABLE_SKIP_OVERRIDES = {
+    ".tar",
+    ".tar.gz",
+    ".tgz",
+    ".tar.bz2",
+    ".tbz2",
+    ".tar.xz",
+    ".txz",
+    ".gz",
+    ".bz2",
+    ".xz",
+    ".7z",
+}
+
+
+def _get_scannable_extensions() -> set[str]:
+    """Lazy-load scannable extensions to avoid circular imports."""
+    from ..model_extensions import get_model_extensions
+
+    return get_model_extensions()
+
+
+def _get_candidate_extensions(filename: str) -> list[str]:
+    """Return suffix candidates from most specific to least specific."""
+    suffixes = [suffix.lower() for suffix in Path(filename).suffixes]
+    candidates: list[str] = []
+    for i in range(len(suffixes), 0, -1):
+        candidate = "".join(suffixes[-i:])
+        if candidate not in candidates:
+            candidates.append(candidate)
+    return candidates
+
 
 def should_skip_file(
     path: str,
@@ -112,6 +145,7 @@ def should_skip_file(
     Returns:
         True if the file should be skipped
     """
+    use_default_skip_extensions = skip_extensions is None
     if skip_extensions is None:
         skip_extensions = DEFAULT_SKIP_EXTENSIONS
     if skip_filenames is None:
@@ -120,6 +154,8 @@ def should_skip_file(
     filename = os.path.basename(path)
     _, ext = os.path.splitext(filename)
     ext = ext.lower()
+    candidate_extensions = _get_candidate_extensions(filename)
+    scannable_extensions = _get_scannable_extensions()
 
     # Special handling for metadata files that scanners can handle
     metadata_extensions = {".md", ".yml", ".yaml"}
@@ -134,15 +170,25 @@ def should_skip_file(
     ):
         return False
 
+    # Preserve scanner coverage for archive/metadata formats that are otherwise
+    # part of the default skip list.
+    if use_default_skip_extensions and any(
+        candidate in DEFAULT_SCANNABLE_SKIP_OVERRIDES and candidate in scannable_extensions
+        for candidate in candidate_extensions
+    ):
+        return False
+
     # Skip based on extension
     if ext in skip_extensions:
         return True
 
-    # Skip hidden files (starting with .) except for specific model extensions
+    # Preserve hidden DVC pointers so directory scans can expand them before
+    # applying normal scanner selection to their targets.
     if (
         skip_hidden
         and filename.startswith(".")
-        and ext not in {".pkl", ".pt", ".pth", ".h5", ".ckpt", ".npz", ".dvc", ".safetensors"}
+        and ext != ".dvc"
+        and not any(candidate in scannable_extensions for candidate in candidate_extensions)
     ):
         return True
 

@@ -41,23 +41,27 @@ package's distribution or at the URLs below.
 
 These are installed only when the corresponding extra is requested.
 
-| Package      | Extra         | License      | URL                                          |
-| ------------ | ------------- | ------------ | -------------------------------------------- |
-| dill         | `dill`        | BSD-3-Clause | <https://github.com/uqfoundation/dill>       |
-| h5py         | `h5`          | BSD-3-Clause | <https://www.h5py.org/>                      |
-| joblib       | `joblib`      | BSD-3-Clause | <https://joblib.readthedocs.io/>             |
-| mlflow       | `mlflow`      | Apache-2.0   | <https://mlflow.org/>                        |
-| msgpack      | `flax`        | Apache-2.0   | <https://github.com/msgpack/msgpack-python>  |
-| onnx         | `onnx`        | Apache-2.0   | <https://onnx.ai/>                           |
-| py7zr        | `sevenzip`    | LGPL-2.1+    | <https://github.com/miurahr/py7zr>           |
-| py-ubjson    | `xgboost`     | Apache-2.0   | <https://github.com/Iber/py-ubjson>          |
-| safetensors  | `safetensors` | Apache-2.0   | <https://github.com/huggingface/safetensors> |
-| scikit-learn | `joblib`      | BSD-3-Clause | <https://scikit-learn.org/>                  |
-| tensorflow   | `tensorflow`  | Apache-2.0   | <https://www.tensorflow.org/>                |
-| tensorrt     | `tensorrt`    | NVIDIA Prop. | <https://developer.nvidia.com/tensorrt>      |
-| tflite       | `tflite`      | Apache-2.0   | <https://www.tensorflow.org/lite>            |
-| torch        | `pytorch`     | BSD-3-Clause | <https://pytorch.org/>                       |
-| xgboost      | `xgboost`     | Apache-2.0   | <https://xgboost.readthedocs.io/>            |
+| Package         | Extra         | License      | URL                                          |
+| --------------- | ------------- | ------------ | -------------------------------------------- |
+| dill            | `dill`        | BSD-3-Clause | <https://github.com/uqfoundation/dill>       |
+| h5py            | `h5`          | BSD-3-Clause | <https://www.h5py.org/>                      |
+| inflate64       | `sevenzip`    | LGPL-2.1+    | <https://github.com/miurahr/inflate64>       |
+| joblib          | `joblib`      | BSD-3-Clause | <https://joblib.readthedocs.io/>             |
+| mlflow          | `mlflow`      | Apache-2.0   | <https://mlflow.org/>                        |
+| msgpack         | `flax`        | Apache-2.0   | <https://github.com/msgpack/msgpack-python>  |
+| multivolumefile | `sevenzip`    | LGPL-2.1+    | <https://github.com/miurahr/multivolume>     |
+| onnx            | `onnx`        | Apache-2.0   | <https://onnx.ai/>                           |
+| py7zr           | `sevenzip`    | LGPL-2.1+    | <https://github.com/miurahr/py7zr>           |
+| pybcj           | `sevenzip`    | LGPL-2.1+    | <https://github.com/miurahr/pybcj>           |
+| py-ubjson       | `xgboost`     | Apache-2.0   | <https://github.com/Iber/py-ubjson>          |
+| pyppmd          | `sevenzip`    | LGPL-2.1+    | <https://github.com/miurahr/pyppmd>          |
+| safetensors     | `safetensors` | Apache-2.0   | <https://github.com/huggingface/safetensors> |
+| scikit-learn    | `joblib`      | BSD-3-Clause | <https://scikit-learn.org/>                  |
+| tensorflow      | `tensorflow`  | Apache-2.0   | <https://www.tensorflow.org/>                |
+| tensorrt        | `tensorrt`    | NVIDIA Prop. | <https://developer.nvidia.com/tensorrt>      |
+| tflite          | `tflite`      | Apache-2.0   | <https://www.tensorflow.org/lite>            |
+| torch           | `pytorch`     | BSD-3-Clause | <https://pytorch.org/>                       |
+| xgboost         | `xgboost`     | Apache-2.0   | <https://xgboost.readthedocs.io/>            |
 
 ## License Compatibility
 
@@ -65,7 +69,9 @@ All runtime dependencies use permissive licenses (MIT, BSD, Apache-2.0, PSF-2.0)
 compatible with ModelAudit's MIT license. Optional dependencies with non-permissive
 licenses are only installed on explicit user request:
 
-- **py7zr** (LGPL-2.1+): Copyleft; dynamically linked via the `sevenzip` extra.
+- **py7zr**, **inflate64**, **multivolumefile**, **pybcj**, and **pyppmd**
+  (LGPL-2.1+): 7z support only; installed via the `sevenzip` extra or aggregate
+  extras that explicitly opt into it.
 - **tensorrt** (NVIDIA Proprietary): Proprietary; installed via the `tensorrt` extra. Linux/Windows only. Used as a transitive dependency for PyTorch TensorRT support.
 
 Dev-only dependencies (ruff, mypy, pytest, etc.) are not distributed to users and
@@ -73,6 +79,6 @@ are excluded from this notice.
 
 ---
 
-_This file was last reviewed on 2026-02-22. Run
+_This file was last reviewed on 2026-03-26. Run
 `uv run python -c "import importlib.metadata as md; [print(f'{d.metadata[\"Name\"]} {d.metadata[\"Version\"]} {d.metadata.get(\"License\",\"\")}') for d in md.distributions()]"`
 to regenerate the installed package list._

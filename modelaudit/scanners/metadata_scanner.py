@@ -2,11 +2,24 @@
 
 import logging
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from .base import BaseScanner, Issue, IssueSeverity, ScanResult
 
 logger = logging.getLogger(__name__)
+
+SUSPICIOUS_URL_DOMAINS = (
+    "bit.ly",
+    "tinyurl.com",
+    "t.co",
+    "goo.gl",
+    "ow.ly",
+    "is.gd",
+    "rb.gy",
+    "tiny.one",
+    "ngrok.io",
+    "localtunnel.me",
+)
 
 
 class MetadataScanner(BaseScanner):
@@ -44,23 +57,34 @@ class MetadataScanner(BaseScanner):
         if path_check_result:
             return path_check_result
 
+        size_check = self._check_size_limit(path)
+        if size_check:
+            return size_check
+
+        self._start_scan_timer()
         result = self._create_result()
         p = Path(path)
+        file_size = self.get_file_size(path)
+        result.metadata["file_size"] = file_size
 
         try:
-            # MetadataScanner only handles text/documentation files
-            issues = self._scan_text_metadata(path)
-            for issue in issues:
-                result.add_check(
-                    name=issue.type or "Metadata Security Check",
-                    passed=False,
-                    message=issue.message,
-                    severity=issue.severity,
-                    location=issue.location,
-                    details=issue.details,
-                    why=issue.why,
-                )
+            self.current_file_path = path
+            self._check_timeout()
 
+            # MetadataScanner only handles text/documentation files
+            self._scan_text_metadata(path, result)
+            self._check_timeout()
+
+        except TimeoutError as e:
+            result.add_check(
+                name="Metadata Scan Timeout",
+                passed=False,
+                message=f"Scan timed out: {e!s}",
+                severity=IssueSeverity.WARNING,
+                location=path,
+                details={"timeout_seconds": self.timeout},
+                why="Metadata scanning exceeded the configured timeout before all checks completed",
+            )
         except Exception as e:
             logger.warning(f"Error scanning metadata file {path}: {e}")
             result.add_check(
@@ -73,26 +97,42 @@ class MetadataScanner(BaseScanner):
                 why="Failed to process metadata file during scanning",
             )
 
-        result.bytes_scanned = p.stat().st_size if p.exists() else 0
+        result.bytes_scanned = file_size if p.exists() else 0
         result.finish(success=True)
         return result
 
-    def _scan_text_metadata(self, file_path: str) -> list[Issue]:
-        """Scan text metadata files (README, model cards) for security issues."""
-        issues: list[Issue] = []
+    def _add_issue_check(self, result: ScanResult, issue: Issue) -> None:
+        """Persist an issue as a failed check on the scan result."""
+        result.add_check(
+            name=issue.type or "Metadata Security Check",
+            passed=False,
+            message=issue.message,
+            severity=issue.severity,
+            location=issue.location,
+            details=issue.details,
+            why=issue.why,
+        )
 
+    def _scan_text_metadata(self, file_path: str, result: ScanResult) -> None:
+        """Scan text metadata files (README, model cards) for security issues."""
         try:
             with open(file_path, encoding="utf-8") as f:
                 content = f.read()
 
+            self._check_timeout()
+
             # Check for suspicious URLs
-            issues.extend(self._check_suspicious_urls_in_text(content, file_path))
+            self._check_suspicious_urls_in_text(content, file_path, result)
+            self._check_timeout()
 
             # Check for exposed credentials in text
-            issues.extend(self._check_exposed_secrets_in_text(content, file_path))
+            self._check_exposed_secrets_in_text(content, file_path, result)
 
+        except TimeoutError:
+            raise
         except Exception as e:
-            issues.append(
+            self._add_issue_check(
+                result,
                 Issue(
                     message=f"Error reading text metadata file: {e}",
                     severity=IssueSeverity.WARNING,
@@ -100,55 +140,70 @@ class MetadataScanner(BaseScanner):
                     details={"error": str(e)},
                     why="File access errors may indicate permission issues or tampering",
                     type="file_error",
-                )
+                ),
             )
 
-        return issues
-
-    def _check_suspicious_urls_in_text(self, content: str, file_path: str) -> list[Issue]:
+    def _check_suspicious_urls_in_text(self, content: str, file_path: str, result: ScanResult) -> None:
         """Check for suspicious URLs in text content."""
-        issues: list[Issue] = []
         import re
 
         # Find URLs in text
         url_pattern = r'https?://[^\s<>"\']+[^\s<>"\',.]'
         urls = re.findall(url_pattern, content)
 
-        suspicious_domains = [
-            "bit.ly",
-            "tinyurl.com",
-            "t.co",
-            "goo.gl",
-            "ow.ly",
-            "is.gd",
-            "rb.gy",
-            "tiny.one",
-            "ngrok.io",
-            "localtunnel.me",
-        ]
-
         seen = set()
         for url in urls:
+            self._check_timeout()
             if url in seen:
                 continue
             parsed = urlparse(url)
-            hostname = parsed.hostname.lower() if parsed.hostname else ""
-            for domain in suspicious_domains:
-                if hostname == domain or hostname.endswith(f".{domain}"):
-                    seen.add(url)
-                    issues.append(
-                        Issue(
-                            message=f"Suspicious URL found in text metadata: {url}",
-                            severity=IssueSeverity.INFO,
-                            location=file_path,
-                            details={"url": url, "suspicious_domain": domain},
-                            why="URL shorteners and tunnel services can hide malicious endpoints",
-                            type="suspicious_url",
-                        )
-                    )
-                    break  # Avoid duplicate issues for the same URL
+            matched_domain = None
+            matched_component = None
 
-        return issues
+            for userinfo_part in (parsed.username, parsed.password):
+                matched_domain = self._match_suspicious_domain(userinfo_part or "")
+                if matched_domain is not None:
+                    matched_component = "userinfo"
+                    break
+
+            # Treat deceptive userinfo consistently with manifest semantics while
+            # avoiding noise from ordinary authenticated URLs.
+            if matched_domain is None:
+                matched_domain = self._match_suspicious_domain(parsed.hostname or "")
+                if matched_domain is not None:
+                    matched_component = "hostname"
+
+            if matched_domain is None:
+                continue
+
+            seen.add(url)
+            self._add_issue_check(
+                result,
+                Issue(
+                    message=f"Suspicious URL found in text metadata: {url}",
+                    severity=IssueSeverity.INFO,
+                    location=file_path,
+                    details={
+                        "url": url,
+                        "suspicious_domain": matched_domain,
+                        "url_component": matched_component,
+                    },
+                    why="URL shorteners and tunnel services can hide malicious endpoints",
+                    type="suspicious_url",
+                ),
+            )
+
+    @staticmethod
+    def _match_suspicious_domain(candidate: str) -> str | None:
+        """Return the matching suspicious domain for a URL component, if any."""
+        normalized = unquote(candidate).lower().rstrip(".")
+        if not normalized:
+            return None
+
+        for domain in SUSPICIOUS_URL_DOMAINS:
+            if normalized == domain or normalized.endswith(f".{domain}"):
+                return domain
+        return None
 
     def _calculate_entropy(self, text: str) -> float:
         """Calculate the Shannon entropy of a text string."""
@@ -171,9 +226,8 @@ class MetadataScanner(BaseScanner):
 
         return entropy
 
-    def _check_exposed_secrets_in_text(self, content: str, file_path: str) -> list[Issue]:
+    def _check_exposed_secrets_in_text(self, content: str, file_path: str, result: ScanResult) -> None:
         """Check for exposed secrets in text content."""
-        issues: list[Issue] = []
         import re
 
         # Specific secret patterns (removed overly broad generic pattern)
@@ -201,8 +255,10 @@ class MetadataScanner(BaseScanner):
         ]
 
         for pattern, description in secret_patterns:
+            self._check_timeout()
             matches = re.finditer(pattern, content, re.IGNORECASE)
             for match in matches:
+                self._check_timeout()
                 # Skip obvious examples or placeholders
                 matched_text = match.group(0)
 
@@ -236,7 +292,8 @@ class MetadataScanner(BaseScanner):
                 if is_known_format:
                     # Known format - report if not a placeholder
                     if not is_placeholder:
-                        issues.append(
+                        self._add_issue_check(
+                            result,
                             Issue(
                                 message=f"Potential exposed secret in text metadata: {description}",
                                 severity=IssueSeverity.INFO,
@@ -250,7 +307,7 @@ class MetadataScanner(BaseScanner):
                                 },
                                 why="Exposed secrets in documentation can lead to unauthorized access",
                                 type="exposed_secret",
-                            )
+                            ),
                         )
                 else:
                     # Generic pattern - use entropy check to reduce false positives
@@ -258,7 +315,8 @@ class MetadataScanner(BaseScanner):
                     min_entropy = 4.0
 
                     if not is_placeholder and entropy >= min_entropy and len(secret_part) >= 16:
-                        issues.append(
+                        self._add_issue_check(
+                            result,
                             Issue(
                                 message=f"Potential exposed secret in text metadata: {description}",
                                 severity=IssueSeverity.INFO,
@@ -273,7 +331,5 @@ class MetadataScanner(BaseScanner):
                                 },
                                 why="Exposed secrets in documentation can lead to unauthorized access",
                                 type="exposed_secret",
-                            )
+                            ),
                         )
-
-        return issues

@@ -1,8 +1,17 @@
 import json
 import logging
+from pathlib import Path
 
+import pytest
+
+import modelaudit.scanners.manifest_scanner as manifest_scanner_module
 from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
-from modelaudit.scanners.manifest_scanner import ManifestScanner
+from modelaudit.scanners.manifest_scanner import ManifestScanner, _is_trusted_url_domain
+
+
+def _https_url(host: str, path: str = "/model.bin") -> str:
+    """Build HTTPS URLs without embedding full host literals in test assertions."""
+    return f"https://{host}{path}"
 
 
 def test_manifest_scanner_blacklist(tmp_path):
@@ -268,9 +277,11 @@ def test_manifest_scanner_trusted_urls_not_flagged(tmp_path):
         "model_type": "bert",
         "_name_or_path": "https://huggingface.co/bert-base-uncased",
         "repository": "https://github.com/huggingface/transformers",
+        "raw_config": "https://raw.githubusercontent.com/huggingface/transformers/main/config.json",
         "homepage": "https://pytorch.org/models",
         "weights": "https://s3.amazonaws.com/models/bert.bin",
         "storage": "https://storage.googleapis.com/models/bert",
+        "dataset_docs": "https://openimages.github.io/dataset/",
     }
 
     test_file.write_text(json.dumps(config_with_trusted_urls))
@@ -286,6 +297,121 @@ def test_manifest_scanner_trusted_urls_not_flagged(tmp_path):
         c for c in result.checks if c.name == "Untrusted URL Check" and c.status == CheckStatus.FAILED
     ]
     assert len(untrusted_url_checks) == 0, f"Unexpected untrusted URL checks: {untrusted_url_checks}"
+
+
+def test_manifest_scanner_regional_s3_urls_not_flagged(tmp_path: Path) -> None:
+    """Legitimate S3 virtual-hosted regional endpoints should remain trusted."""
+    test_file = tmp_path / "config.json"
+    config_with_s3_urls = {
+        "model_type": "bert",
+        "legacy_virtual_hosted": _https_url("bucket.s3.amazonaws.com"),
+        "regional_virtual_hosted": _https_url("bucket.s3.us-east-1.amazonaws.com"),
+        "legacy_regional_virtual_hosted": _https_url("bucket.s3-us-west-2.amazonaws.com"),
+    }
+
+    test_file.write_text(json.dumps(config_with_s3_urls))
+
+    scanner = ManifestScanner()
+    result = scanner.scan(str(test_file))
+
+    assert result.success is True
+    failed_url_checks = [c for c in result.checks if c.name == "Untrusted URL Check" and c.status == CheckStatus.FAILED]
+    assert failed_url_checks == []
+    cloud_storage_checks = [c for c in result.checks if c.name == "Cloud Storage URL Detection"]
+    detected_urls = {c.details.get("url", "") for c in cloud_storage_checks}
+    assert detected_urls == {
+        config_with_s3_urls["legacy_virtual_hosted"],
+        config_with_s3_urls["regional_virtual_hosted"],
+        config_with_s3_urls["legacy_regional_virtual_hosted"],
+    }
+
+
+def test_manifest_scanner_non_s3_amazonaws_hosts_flagged(tmp_path: Path) -> None:
+    """Non-S3 amazonaws.com hosts should not become implicitly trusted."""
+    test_file = tmp_path / "config.json"
+    bucket_root_url = _https_url("bucket.amazonaws.com")
+    ec2_api_url = _https_url("ec2.us-east-1.amazonaws.com", "/")
+    s3_control_url = _https_url("s3-control.us-east-1.amazonaws.com", "/v20180820/accesspoint/example")
+    config_with_non_s3_amazonaws_urls = {
+        "model_type": "bert",
+        "bucket_root": bucket_root_url,
+        "ec2_api": ec2_api_url,
+        "s3_control": s3_control_url,
+    }
+
+    test_file.write_text(json.dumps(config_with_non_s3_amazonaws_urls))
+
+    scanner = ManifestScanner()
+    result = scanner.scan(str(test_file))
+
+    assert result.success is True
+    failed_url_checks = [c for c in result.checks if c.name == "Untrusted URL Check" and c.status == CheckStatus.FAILED]
+    assert len(failed_url_checks) == 3
+
+    detected_urls = {c.details.get("url", "") for c in failed_url_checks}
+    assert bucket_root_url in detected_urls
+    assert ec2_api_url in detected_urls
+    assert s3_control_url in detected_urls
+
+
+def test_manifest_scanner_path_style_regional_s3_hosts_flagged(tmp_path: Path) -> None:
+    """Bare S3 service hosts without a bucket prefix must stay untrusted."""
+    test_file = tmp_path / "config.json"
+    path_style_urls = {
+        "regional_path_style": _https_url("s3.us-east-1.amazonaws.com", "/bucket/model.bin"),
+        "legacy_regional_path_style": _https_url("s3-us-west-2.amazonaws.com", "/bucket/model.bin"),
+    }
+    test_file.write_text(json.dumps(path_style_urls))
+
+    scanner = ManifestScanner()
+    result = scanner.scan(str(test_file))
+
+    failed_url_checks = [c for c in result.checks if c.name == "Untrusted URL Check" and c.status == CheckStatus.FAILED]
+    assert {c.details.get("url", "") for c in failed_url_checks} == set(path_style_urls.values())
+
+
+def test_manifest_scanner_official_registry_subdomains_not_flagged(tmp_path: Path) -> None:
+    """Official registry service subdomains should remain trusted."""
+    test_file = tmp_path / "config.json"
+    config_with_registry_urls = {
+        "model_type": "bert",
+        "docker_registry": "https://registry-1.docker.io/v2/library/python/manifests/latest",
+        "gcr_registry": "https://us.gcr.io/project/image:latest",
+    }
+
+    test_file.write_text(json.dumps(config_with_registry_urls))
+
+    scanner = ManifestScanner()
+    result = scanner.scan(str(test_file))
+
+    failed_url_checks = [c for c in result.checks if c.name == "Untrusted URL Check" and c.status == CheckStatus.FAILED]
+    assert failed_url_checks == []
+
+
+def test_manifest_scanner_broad_hosting_subdomains_flagged(tmp_path):
+    """Attacker-controlled subdomains on broad hosting domains should not be trusted."""
+    test_file = tmp_path / "config.json"
+    config_with_hosting_urls = {
+        "model_type": "bert",
+        "github_pages": "https://attacker.github.io/model.bin",
+        "cloudfront": "https://d111111abcdef8.cloudfront.net/model.bin",
+        "googleusercontent": "https://evil.googleusercontent.com/model.bin",
+    }
+
+    test_file.write_text(json.dumps(config_with_hosting_urls))
+
+    scanner = ManifestScanner()
+    result = scanner.scan(str(test_file))
+
+    assert result.success is True
+
+    failed_url_checks = [c for c in result.checks if c.name == "Untrusted URL Check" and c.status == CheckStatus.FAILED]
+    assert len(failed_url_checks) == 3
+
+    detected_urls = {c.details.get("url", "") for c in failed_url_checks}
+    assert "https://attacker.github.io/model.bin" in detected_urls
+    assert "https://d111111abcdef8.cloudfront.net/model.bin" in detected_urls
+    assert "https://evil.googleusercontent.com/model.bin" in detected_urls
 
 
 def test_manifest_scanner_untrusted_domain_flagged(tmp_path):
@@ -393,3 +519,258 @@ def test_manifest_scanner_duplicate_urls_not_repeated(tmp_path):
     url_checks = [check for check in result.checks if "Untrusted URL" in check.name]
     failed_url_checks = [c for c in url_checks if c.status == CheckStatus.FAILED]
     assert len(failed_url_checks) == 1
+
+
+def test_manifest_scanner_enforces_size_limit(tmp_path):
+    """Manifest scans should stop when max_file_read_size is exceeded."""
+    test_file = tmp_path / "config.json"
+    test_file.write_text(json.dumps({"model_type": "bert", "description": "x" * 64}))
+
+    scanner = ManifestScanner(config={"max_file_read_size": 16})
+    result = scanner.scan(str(test_file))
+
+    assert result.success is False
+    size_checks = [check for check in result.checks if check.name == "File Size Limit"]
+    assert len(size_checks) == 1
+    assert size_checks[0].status == CheckStatus.FAILED
+    assert result.metadata["file_size"] == test_file.stat().st_size
+
+
+def test_manifest_scanner_enforces_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Manifest scans should stop when the scanner timeout is exceeded."""
+    test_file = tmp_path / "config.json"
+    test_file.write_text(json.dumps({"model_type": "bert"}))
+
+    scanner = ManifestScanner(config={"timeout": 1})
+
+    def expire_timeout(_path: str, _result: ScanResult) -> None:
+        scanner.scan_start_time = 0
+
+    monkeypatch.setattr(scanner, "_check_file_for_blacklist", expire_timeout)
+
+    result = scanner.scan(str(test_file))
+
+    assert result.success is True
+    timeout_checks = [check for check in result.checks if check.name == "Manifest Scan Timeout"]
+    assert len(timeout_checks) == 1
+    assert timeout_checks[0].status == CheckStatus.FAILED
+    assert timeout_checks[0].severity == IssueSeverity.WARNING
+
+
+def test_manifest_scanner_blacklist_timeout_reports_only_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Timeouts in blacklist checks should not be converted to blacklist errors."""
+    test_file = tmp_path / "config.json"
+    test_file.write_text(json.dumps({"model_type": "bert"}))
+
+    scanner = ManifestScanner(config={"timeout": 1, "blacklist_patterns": ["bert"]})
+    timeout_calls = 0
+
+    def raise_on_helper_timeout(*_args: object, **_kwargs: object) -> bool:
+        nonlocal timeout_calls
+        timeout_calls += 1
+        if timeout_calls == 2:
+            raise TimeoutError("blacklist helper timed out")
+        return False
+
+    monkeypatch.setattr(scanner, "_check_timeout", raise_on_helper_timeout)
+
+    result = scanner.scan(str(test_file))
+
+    assert result.success is True
+    assert [check.name for check in result.checks if check.status == CheckStatus.FAILED] == ["Manifest Scan Timeout"]
+
+
+def test_manifest_scanner_parse_timeout_reports_only_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Timeouts in manifest parsing should not be converted to parse errors."""
+    test_file = tmp_path / "config.json"
+    test_file.write_text(json.dumps({"model_type": "bert"}))
+
+    scanner = ManifestScanner(config={"timeout": 1})
+    monkeypatch.setattr(scanner, "_check_file_for_blacklist", lambda _path, _result: None)
+    monkeypatch.setattr(scanner, "_check_cloud_storage_urls", lambda _path, _result: None)
+
+    def raise_timeout(_content: str) -> dict:
+        raise TimeoutError("parse helper timed out")
+
+    monkeypatch.setattr(manifest_scanner_module.json, "loads", raise_timeout)
+
+    result = scanner.scan(str(test_file))
+
+    assert result.success is True
+    assert [check.name for check in result.checks if check.status == CheckStatus.FAILED] == ["Manifest Scan Timeout"]
+    assert not any(check.name == "File Parse Error" for check in result.checks)
+    assert not any(check.name == "Manifest Parse Attempt" for check in result.checks)
+
+
+def test_manifest_scanner_cloud_url_timeout_reports_only_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Timeouts in cloud URL checks should not be swallowed."""
+    test_file = tmp_path / "config.json"
+    test_file.write_text(json.dumps({"model_type": "bert"}))
+
+    scanner = ManifestScanner(config={"timeout": 1})
+    timeout_calls = 0
+
+    def raise_on_helper_timeout(*_args: object, **_kwargs: object) -> bool:
+        nonlocal timeout_calls
+        timeout_calls += 1
+        if timeout_calls == 3:
+            raise TimeoutError("cloud URL helper timed out")
+        return False
+
+    monkeypatch.setattr(scanner, "_check_file_for_blacklist", lambda _path, _result: None)
+    monkeypatch.setattr(scanner, "_check_timeout", raise_on_helper_timeout)
+
+    result = scanner.scan(str(test_file))
+
+    assert result.success is True
+    assert [check.name for check in result.checks if check.status == CheckStatus.FAILED] == ["Manifest Scan Timeout"]
+    assert not any(check.name == "Manifest File Scan" for check in result.checks)
+
+
+def test_manifest_scanner_weak_hash_timeout_reports_only_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Timeout overruns after weak-hash analysis should still report a manifest timeout."""
+    test_file = tmp_path / "config.json"
+    test_file.write_text(json.dumps({"model_type": "bert", "checksum": "e3b0c44298fc1c149afbf4c8996fb924"}))
+
+    scanner = ManifestScanner(config={"timeout": 1})
+    monkeypatch.setattr(scanner, "_check_file_for_blacklist", lambda _path, _result: None)
+    monkeypatch.setattr(scanner, "_check_cloud_storage_urls", lambda _path, _result: None)
+    monkeypatch.setattr(scanner, "_check_model_name_policies", lambda _content, _result: None)
+    monkeypatch.setattr(scanner, "_check_suspicious_urls", lambda _content, _result: None)
+
+    def expire_timeout(_content: object, _result: ScanResult) -> None:
+        scanner.scan_start_time = 0
+
+    monkeypatch.setattr(scanner, "_check_weak_hashes", expire_timeout)
+
+    result = scanner.scan(str(test_file))
+
+    assert result.success is True
+    assert [check.name for check in result.checks if check.status == CheckStatus.FAILED] == ["Manifest Scan Timeout"]
+    assert not any(check.name == "Manifest File Scan" for check in result.checks)
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for _is_trusted_url_domain
+# ---------------------------------------------------------------------------
+
+
+class TestIsTrustedUrlDomain:
+    """Direct tests for the module-level domain trust function."""
+
+    def test_exact_trusted_domain(self) -> None:
+        assert _is_trusted_url_domain("https://github.com/repo") is True
+        assert _is_trusted_url_domain("https://huggingface.co/model") is True
+
+    def test_s3_endpoint_host_patterns_trusted(self) -> None:
+        assert _is_trusted_url_domain("https://bucket.s3.amazonaws.com/model.bin") is True
+        assert _is_trusted_url_domain("https://bucket.s3.us-east-1.amazonaws.com/model.bin") is True
+        assert _is_trusted_url_domain("https://bucket.s3-us-west-2.amazonaws.com/model.bin") is True
+
+    def test_subdomain_of_trusted_domain(self) -> None:
+        assert _is_trusted_url_domain("https://raw.githubusercontent.com/f") is True
+        assert _is_trusted_url_domain("https://sub.pytorch.org/w") is True
+
+    def test_non_s3_amazonaws_hosts_untrusted(self) -> None:
+        assert _is_trusted_url_domain("https://bucket.amazonaws.com/model.bin") is False
+        assert _is_trusted_url_domain("https://ec2.us-east-1.amazonaws.com/") is False
+        assert _is_trusted_url_domain("https://s3-control.us-east-1.amazonaws.com/v20180820/accesspoint/example") is (
+            False
+        )
+
+    def test_exact_match_domains_block_subdomains(self) -> None:
+        """Subdomains of exact-match hosting domains must NOT be trusted."""
+        assert _is_trusted_url_domain("https://attacker.github.io/p") is False
+        assert _is_trusted_url_domain("https://evil.cloudfront.net/p") is False
+        assert _is_trusted_url_domain("https://evil.googleusercontent.com/p") is False
+        assert _is_trusted_url_domain("https://evil.readthedocs.io/p") is False
+        assert _is_trusted_url_domain("https://evil.gitbook.io/p") is False
+        assert _is_trusted_url_domain("https://evil.streamlit.io/p") is False
+        assert _is_trusted_url_domain("https://evil.gradio.app/p") is False
+        assert _is_trusted_url_domain("https://evil.fastly.net/p") is False
+        assert _is_trusted_url_domain("https://evil.azureedge.net/p") is False
+        assert _is_trusted_url_domain("https://evil.sourceforge.net/p") is False
+        assert _is_trusted_url_domain("https://evil.quay.io/p") is False
+
+    def test_official_registry_subdomains_trusted(self) -> None:
+        assert _is_trusted_url_domain("https://registry-1.docker.io/v2/library/python/manifests/latest") is True
+        assert _is_trusted_url_domain("https://us.gcr.io/project/image:latest") is True
+
+    def test_exact_match_domain_itself_trusted(self) -> None:
+        """The bare exact-match domain should still be trusted."""
+        assert _is_trusted_url_domain("https://github.io/page") is True
+        assert _is_trusted_url_domain("https://cloudfront.net/res") is True
+        assert _is_trusted_url_domain("https://readthedocs.io/docs") is True
+
+    def test_userinfo_bypass_blocked(self) -> None:
+        """URLs with userinfo (user@host) must NOT be trusted."""
+        assert _is_trusted_url_domain("https://evil.com@github.com/payload") is False
+        assert _is_trusted_url_domain("https://evil.com@huggingface.co/model") is False
+        assert _is_trusted_url_domain("https://user:pass@pytorch.org/w") is False
+
+    def test_untrusted_domain(self) -> None:
+        assert _is_trusted_url_domain("https://evil-site.com/payload") is False
+        assert _is_trusted_url_domain("https://not-github.com/repo") is False
+
+    def test_empty_and_malformed(self) -> None:
+        assert _is_trusted_url_domain("") is False
+        assert _is_trusted_url_domain("not-a-url") is False
+        assert _is_trusted_url_domain("https://") is False
+
+    def test_trailing_dot_normalization(self) -> None:
+        assert _is_trusted_url_domain("https://github.com./repo") is True
+
+
+def test_manifest_scanner_userinfo_url_flagged(tmp_path: Path) -> None:
+    """URLs with userinfo should be flagged as untrusted even if hostname is trusted."""
+    test_file = tmp_path / "config.json"
+    config = {
+        "model_type": "bert",
+        "download": "https://evil.com@huggingface.co/model.bin",
+    }
+    test_file.write_text(json.dumps(config))
+
+    scanner = ManifestScanner()
+    result = scanner.scan(str(test_file))
+
+    failed_url_checks = [c for c in result.checks if c.name == "Untrusted URL Check" and c.status == CheckStatus.FAILED]
+    assert len(failed_url_checks) >= 1
+    detected_urls = {c.details.get("url", "") for c in failed_url_checks}
+    assert any("evil.com@huggingface.co" in u for u in detected_urls)
+
+
+def test_manifest_scanner_expanded_exact_domains_flagged(tmp_path: Path) -> None:
+    """Newly added exact-match domains should flag attacker subdomains."""
+    test_file = tmp_path / "config.json"
+    config = {
+        "model_type": "bert",
+        "docs": "https://evil.readthedocs.io/payload",
+        "cdn": "https://evil.fastly.net/payload",
+        "app": "https://evil.streamlit.io/payload",
+    }
+    test_file.write_text(json.dumps(config))
+
+    scanner = ManifestScanner()
+    result = scanner.scan(str(test_file))
+
+    failed_url_checks = [c for c in result.checks if c.name == "Untrusted URL Check" and c.status == CheckStatus.FAILED]
+    assert len(failed_url_checks) == 3
+    detected_urls = {c.details.get("url", "") for c in failed_url_checks}
+    assert "https://evil.readthedocs.io/payload" in detected_urls
+    assert "https://evil.fastly.net/payload" in detected_urls
+    assert "https://evil.streamlit.io/payload" in detected_urls

@@ -72,6 +72,16 @@ CLOUD_STORAGE_PATTERNS: list[tuple[re.Pattern[str], str, str]] = [
         "s3",
     ),
     (
+        re.compile(r"https?://[a-zA-Z0-9.-]+\.s3\.[a-z0-9-]+\.amazonaws\.com(?:/[^\s\"'<>]*)?", re.IGNORECASE),
+        "AWS S3 Regional URL",
+        "s3",
+    ),
+    (
+        re.compile(r"https?://[a-zA-Z0-9.-]+\.s3-[a-z0-9-]+\.amazonaws\.com(?:/[^\s\"'<>]*)?", re.IGNORECASE),
+        "AWS S3 Regional URL",
+        "s3",
+    ),
+    (
         re.compile(r"https?://s3\.amazonaws\.com/[a-zA-Z0-9.\-_]+(?:/[^\s\"'<>]*)?", re.IGNORECASE),
         "AWS S3 URL",
         "s3",
@@ -212,8 +222,6 @@ TRUSTED_URL_DOMAINS = [
     # ===========================================
     # AWS
     "s3.amazonaws.com",
-    "s3-",  # Regional: s3-us-west-2.amazonaws.com
-    ".s3.",  # Bucket URLs: bucket.s3.region.amazonaws.com
     "cloudfront.net",
     # Google Cloud
     "storage.googleapis.com",
@@ -362,8 +370,72 @@ TRUSTED_URL_DOMAINS = [
     "0.0.0.0",
 ]
 
+# Broad user-content hosting domains should only trust the exact host, not
+# arbitrary attacker-controlled subdomains.
+TRUSTED_URL_EXACT_DOMAINS = {
+    # CDNs — anyone can provision an endpoint
+    "akamaized.net",
+    "azureedge.net",
+    "cloudfront.net",
+    "fastly.net",
+    # User-content hosting — arbitrary subdomains are attacker-controlled
+    "ghcr.io",
+    "gitbook.io",
+    "github.io",
+    "gitlab.io",
+    "googleusercontent.com",
+    "gradio.app",
+    "nvcr.io",
+    "quay.io",
+    "readthedocs.io",
+    "rtfd.io",
+    "sourceforge.net",
+    "streamlit.io",
+}
+
 # Regex to find URLs in text
 URL_PATTERN = re.compile(r'https?://[^\s<>"\']+[^\s<>"\',.]')
+_AWS_S3_REGION_PATTERN = r"[a-z]{2}(?:-[a-z0-9]+)+-\d"
+_S3_HOST_LABEL_PATTERN = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+_S3_BUCKET_HOST_PREFIX_PATTERN = rf"{_S3_HOST_LABEL_PATTERN}(?:\.{_S3_HOST_LABEL_PATTERN})*"
+_TRUSTED_S3_ENDPOINT_HOST_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(rf"^{_S3_BUCKET_HOST_PREFIX_PATTERN}\.s3\.amazonaws\.com$"),
+    re.compile(rf"^{_S3_BUCKET_HOST_PREFIX_PATTERN}\.s3\.{_AWS_S3_REGION_PATTERN}\.amazonaws\.com$"),
+    re.compile(rf"^{_S3_BUCKET_HOST_PREFIX_PATTERN}\.s3-{_AWS_S3_REGION_PATTERN}\.amazonaws\.com$"),
+)
+
+
+def _is_trusted_s3_endpoint_host(host: str) -> bool:
+    """Return True for supported S3 endpoint host layouts only."""
+    return any(pattern.match(host) for pattern in _TRUSTED_S3_ENDPOINT_HOST_PATTERNS)
+
+
+def _is_trusted_url_domain(url: str) -> bool:
+    """Check if a URL host is in the trusted domain allowlist."""
+    parsed = urlparse(url)
+
+    # URLs with userinfo (user@host) are inherently suspicious — an attacker
+    # can craft https://evil.com@github.com/payload where urlparse sees the
+    # hostname as github.com while the visual target appears to be evil.com.
+    if parsed.username or parsed.password:
+        return False
+
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if not host:
+        return False
+
+    if _is_trusted_s3_endpoint_host(host):
+        return True
+
+    for domain in TRUSTED_URL_DOMAINS:
+        trusted = domain.lower().rstrip(".")
+        if host == trusted:
+            return True
+        if trusted in TRUSTED_URL_EXACT_DOMAINS:
+            continue
+        if host.endswith(f".{trusted}"):
+            return True
+    return False
 
 
 class ManifestScanner(BaseScanner):
@@ -464,6 +536,7 @@ class ManifestScanner(BaseScanner):
         if size_check:
             return size_check
 
+        self._start_scan_timer()
         result = self._create_result()
         file_size = self.get_file_size(path)
         result.metadata["file_size"] = file_size
@@ -472,15 +545,20 @@ class ManifestScanner(BaseScanner):
             # Store the file path for use in issue locations
             self.current_file_path = path
 
+            self._check_timeout()
+
             # Check the raw file content for blacklisted terms
             self._check_file_for_blacklist(path, result)
+            self._check_timeout()
 
             # Check for cloud storage URLs (external resource references)
             self._check_cloud_storage_urls(path, result)
+            self._check_timeout()
 
             # Parse the file based on its extension
             ext = os.path.splitext(path)[1].lower()
             content = self._parse_file(path, ext, result)
+            self._check_timeout()
 
             if content:
                 result.bytes_scanned = file_size
@@ -500,12 +578,15 @@ class ManifestScanner(BaseScanner):
 
                     # Check for blacklisted model names in config values
                     self._check_model_name_policies(content, result)
+                    self._check_timeout()
 
                     # Check for suspicious URLs in config values
                     self._check_suspicious_urls(content, result)
+                    self._check_timeout()
 
                     # Check for weak hash algorithms used for integrity verification
                     self._check_weak_hashes(content, result)
+                    self._check_timeout()
 
             else:
                 result.add_check(
@@ -517,6 +598,17 @@ class ManifestScanner(BaseScanner):
                     rule_code="S902",
                 )
 
+        except TimeoutError as e:
+            result.add_check(
+                name="Manifest Scan Timeout",
+                passed=False,
+                message=f"Scan timed out: {e!s}",
+                severity=IssueSeverity.WARNING,
+                location=path,
+                details={"timeout_seconds": self.timeout},
+            )
+            result.finish(success=True)
+            return result
         except Exception as e:
             result.add_check(
                 name="Manifest File Scan",
@@ -543,6 +635,7 @@ class ManifestScanner(BaseScanner):
 
             found_blacklisted = False
             for pattern in self.blacklist_patterns:
+                self._check_timeout()
                 pattern_lower = pattern.lower()
                 if pattern_lower in content:
                     result.add_check(
@@ -569,6 +662,8 @@ class ManifestScanner(BaseScanner):
                     location=self.current_file_path,
                     details={"patterns_checked": len(self.blacklist_patterns)},
                 )
+        except TimeoutError:
+            raise
         except Exception as e:
             result.add_check(
                 name="Blacklist Pattern Check",
@@ -611,9 +706,13 @@ class ManifestScanner(BaseScanner):
                 if HAS_YAML:
                     try:
                         return yaml.safe_load(content)
+                    except TimeoutError:
+                        raise
                     except Exception:
                         pass
 
+        except TimeoutError:
+            raise
         except Exception as e:
             logger.warning(f"Error parsing file {path}: {e!s}")
             if result is not None:
@@ -671,6 +770,7 @@ class ManifestScanner(BaseScanner):
         """Check for blacklisted model names in config values"""
 
         def check_dict(d: Any, prefix: str = "") -> None:
+            self._check_timeout()
             if not isinstance(d, dict):
                 return
 
@@ -737,10 +837,13 @@ class ManifestScanner(BaseScanner):
             with open(path, encoding="utf-8") as f:
                 content = f.read()
 
+            self._check_timeout()
             seen_urls: set[str] = set()
 
             for pattern, description, provider in CLOUD_STORAGE_PATTERNS:
+                self._check_timeout()
                 for match in pattern.finditer(content):
+                    self._check_timeout()
                     url = match.group()
 
                     # Skip duplicates
@@ -776,6 +879,8 @@ class ManifestScanner(BaseScanner):
                         ),
                     )
 
+        except TimeoutError:
+            raise
         except Exception as e:
             logger.debug(f"Error checking cloud storage URLs in {path}: {e}")
 
@@ -792,22 +897,15 @@ class ManifestScanner(BaseScanner):
 
         def is_trusted_domain(url: str) -> bool:
             """Check if URL host is in the trusted domain allowlist."""
-            parsed = urlparse(url)
-            host = (parsed.hostname or "").lower().rstrip(".")
-            if not host:
-                return False
-
-            for domain in TRUSTED_URL_DOMAINS:
-                trusted = domain.lower().rstrip(".")
-                if host == trusted or host.endswith(f".{trusted}"):
-                    return True
-            return False
+            return _is_trusted_url_domain(url)
 
         def extract_urls_from_value(value: Any, key_path: str) -> None:
             """Recursively extract and check URLs from any value type."""
+            self._check_timeout()
             if isinstance(value, str):
                 urls = URL_PATTERN.findall(value)
                 for url in urls:
+                    self._check_timeout()
                     if url in seen_urls:
                         continue
                     seen_urls.add(url)
@@ -919,6 +1017,7 @@ class ManifestScanner(BaseScanner):
 
         def traverse_for_hashes(d: Any, prefix: str = "") -> None:
             """Recursively check dictionary for weak hashes."""
+            self._check_timeout()
             if not isinstance(d, dict):
                 return
 

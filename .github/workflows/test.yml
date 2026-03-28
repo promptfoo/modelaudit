@@ -175,10 +175,11 @@ jobs:
               'Public Domain',
           ]
 
-          # Classifiers that must NOT pass the OSI Approved catch-all.
+          # Classifiers that require explicit package-level approval.
           BLOCKED_CLASSIFIERS = [
               'GNU General Public License',
               'GNU Affero General Public License',
+              'GNU Lesser General Public License',
           ]
 
           # NVIDIA CUDA packages are proprietary but are required transitive
@@ -190,7 +191,13 @@ jobs:
           # LGPL packages that have received explicit maintainer approval.
           # Per policy, LGPL requires case-by-case approval. Each entry here
           # must have a corresponding note in THIRD_PARTY_NOTICES.md.
-          APPROVED_LGPL_PACKAGES = {'py7zr'}
+          APPROVED_LGPL_PACKAGES = {
+              'inflate64',
+              'multivolumefile',
+              'pybcj',
+              'py7zr',
+              'pyppmd',
+          }
 
           # Packages that ship no license metadata at all but are known-good.
           # Verify manually on PyPI before adding here.
@@ -226,8 +233,6 @@ jobs:
 
               for cls in lic_classifiers:
                   if any(frag in cls for frag in APPROVED_CLASSIFIERS):
-                      return True
-                  if 'OSI Approved' in cls:
                       return True
 
               return False
