@@ -3676,6 +3676,31 @@ class TestPickleImportOnlyGlobalFindings:
         assert malformed_stack_globals == {}
         assert mutation_target_refs == {}
 
+    def test_symbolic_simulation_unknown_opcode_uses_unknown_push_sentinel(self) -> None:
+        opcodes = [
+            (type("Op", (), {"name": "UNICODE"})(), "evilpkg", 0),
+            (type("Op", (), {"name": "FUTURE_PUSH_OPCODE"})(), None, 1),
+            (type("Op", (), {"name": "POP"})(), None, 2),
+            (type("Op", (), {"name": "UNICODE"})(), "thing", 3),
+            (type("Op", (), {"name": "STACK_GLOBAL"})(), None, 4),
+        ]
+
+        (
+            stack_global_refs,
+            callable_refs,
+            callable_origin_refs,
+            callable_origin_is_ext,
+            malformed_stack_globals,
+            mutation_target_refs,
+        ) = _simulate_symbolic_reference_maps(opcodes)
+
+        assert stack_global_refs[4] == ("evilpkg", "thing")
+        assert callable_refs == {}
+        assert callable_origin_refs == {}
+        assert callable_origin_is_ext == {}
+        assert malformed_stack_globals == {}
+        assert mutation_target_refs == {}
+
 
 @pytest.mark.parametrize(
     ("module_name", "func_name", "payload"),

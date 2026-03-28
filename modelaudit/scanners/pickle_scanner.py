@@ -2584,6 +2584,11 @@ def _simulate_symbolic_reference_maps(
         if name == "READONLY_BUFFER":
             continue
 
+        # Unknown opcode - push a sentinel to keep stack in sync.
+        # This handles future protocol versions gracefully.
+        logger.debug(f"Simulator: unhandled opcode {opcode.name} at pos {_pos}")
+        stack.append(unknown)
+
     return (
         stack_global_refs,
         callable_refs,
