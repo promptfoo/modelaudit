@@ -569,6 +569,10 @@ def test_validate_file_type(tmp_path):
     npz_path.write_bytes(b"PK\x03\x04" + b"\x00" * 100)
     assert validate_file_type(str(npz_path)) is True
 
+    skops_path = tmp_path / "pipeline.skops"
+    skops_path.write_bytes(b"PK\x03\x04" + b"\x00" * 100)
+    assert validate_file_type(str(skops_path)) is True
+
     # NumPy .npy file should have numpy magic
     npy_path = tmp_path / "array.npy"
     npy_path.write_bytes(b"\x93NUMPY" + b"\x00" * 20)

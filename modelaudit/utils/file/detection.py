@@ -1065,6 +1065,10 @@ def validate_file_type(path: str) -> bool:
                 return header_format in {"zip", "numpy"}
             return header_format == "numpy"
 
+        # skops files are ZIP containers by design.
+        if ext_format == "skops":
+            return header_format in {"skops", "zip"}
+
         # PaddlePaddle files: .pdmodel files are protobuf serialised program
         # descriptors and .pdiparams files are raw binary weight tensors.
         # Neither format has distinctive magic bytes, so magic-based
