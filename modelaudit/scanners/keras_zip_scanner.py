@@ -1254,13 +1254,13 @@ class KerasZipScanner(BaseScanner):
             "exec(",
             "eval(",
         )
-        structured_markers = ('":', '{"', "class_name", "module", "config")
+        structured_markers = ('":', '{"', '"class_name"', '"module"', '"config"')
         doc_like_lines = 0
         for line in lines:
             lowered = line.lower()
             if any(token in lowered for token in dangerous_tokens):
                 continue
-            if any(marker in line for marker in structured_markers):
+            if any(marker in lowered for marker in structured_markers):
                 continue
             if (
                 line.startswith(("#", "//", "/*", "*", "- ", "* "))

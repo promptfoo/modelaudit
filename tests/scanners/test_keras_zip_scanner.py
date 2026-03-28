@@ -1899,6 +1899,18 @@ class TestCVE20259906UnsafeDeserialization:
         cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-9906"]
         assert len(cve_issues) >= 1
 
+    def test_documentation_text_with_bare_config_words_stays_documentation(self) -> None:
+        """Bare prose mentions of config/module should not stop doc-like scoring."""
+        text = "\n".join(
+            [
+                "This model config includes safe defaults and explanatory guidance only",
+                "The module description here is narrative text for documentation readers",
+                "Another long descriptive line for awareness and onboarding context",
+            ]
+        )
+
+        assert KerasZipScanner._is_primarily_documentation_text(text) is True
+
     def test_doc_padding_lines_do_not_suppress_raw_detection(self, tmp_path: Path) -> None:
         """Documentation-like padding must not suppress CVE-2025-9906 detection."""
         scanner = KerasZipScanner()
@@ -1912,17 +1924,12 @@ class TestCVE20259906UnsafeDeserialization:
                 "One more benign looking sentence for non executable metadata",
             ]
         )
-        config_str = json.dumps(
-            {
-                "description": padded_lines,
-                "module": "keras.config",
-                "class_name": "enable_unsafe_deserialization",
-            }
-        )
+        config_str = json.dumps({"description": f"{padded_lines}\nkeras.config.enable_unsafe_deserialization"})
 
         result = scanner.scan(self._make_keras_zip(config_str, tmp_path))
         cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-9906"]
-        assert len(cve_issues) >= 1
+        assert len(cve_issues) == 1
+        assert cve_issues[0].details["detection_method"] == "raw_config_scan"
 
     def test_benign_documentation_text_stays_clean(self, tmp_path: Path) -> None:
         """Benign long-form documentation text should not trigger CVE checks."""
