@@ -2050,6 +2050,17 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
             f"Expected CRITICAL _pickle.Unpickler issue, got: {critical_messages}"
         )
 
+    def test_pickle_pickler_reduce_is_critical(self) -> None:
+        """_pickle.Pickler must never be treated as a safe global."""
+        result = self._scan_bytes(self._craft_global_reduce_pickle("_pickle", "Pickler"))
+
+        assert result.success
+        assert result.has_errors
+        critical_messages = [i.message.lower() for i in result.issues if i.severity == IssueSeverity.CRITICAL]
+        assert any("_pickle.pickler" in msg for msg in critical_messages), (
+            f"Expected CRITICAL _pickle.Pickler issue, got: {critical_messages}"
+        )
+
     def test_copyreg_add_extension_import_only_is_flagged(self) -> None:
         """copyreg.add_extension import references must be treated as suspicious."""
         result = self._scan_bytes(self._craft_global_import_only_pickle("copyreg", "add_extension"))
