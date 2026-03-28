@@ -125,7 +125,7 @@ class SafeTensorsScanner(BaseScanner):
                     )
                     result.metadata["analysis_incomplete"] = True
                     result.bytes_scanned = file_size
-                    result.finish(success=False)
+                    result.finish(success=True)
                     return result
 
                 result.add_check(

@@ -74,7 +74,7 @@ def test_oversized_header_triggers_limit_check(tmp_path: Path) -> None:
     assert header_limit_check is not None
     assert header_limit_check.status.value == "failed"
     assert "exceeds maximum allowed size" in header_limit_check.message
-    assert result.success is False
+    assert result.success is True
     assert result.metadata["analysis_incomplete"] is True
     assert result.bytes_scanned == file_path.stat().st_size
 
@@ -92,9 +92,14 @@ def test_oversized_header_skips_metadata_content_analysis(tmp_path: Path, monkey
 
     monkeypatch.setattr(scanner, "_analyze_metadata_content", track_analyze)
 
-    scanner.scan(str(file_path))
+    result = scanner.scan(str(file_path))
 
     assert analyze_called["value"] is False
+    header_limit_check = next((check for check in result.checks if check.name == "Header Size Limit"), None)
+    assert header_limit_check is not None
+    assert header_limit_check.status.value == "failed"
+    assert result.metadata["analysis_incomplete"] is True
+    assert result.success is True
 
 
 def test_oversized_header_does_not_read_beyond_configured_limit(
@@ -110,11 +115,16 @@ def test_oversized_header_does_not_read_beyond_configured_limit(
     class GuardedReader:
         def __init__(self, handle: BinaryIO) -> None:
             self._handle = handle
+            self._total_read = 0
 
         def read(self, size: int = -1) -> bytes:
             if size > max_header_bytes:
                 raise AssertionError(f"scanner attempted oversized read: {size}")
-            return self._handle.read(size)
+            chunk = self._handle.read(size)
+            self._total_read += len(chunk)
+            if self._total_read > 8:
+                raise AssertionError(f"scanner read past the 8-byte header length field: {self._total_read}")
+            return chunk
 
         def __enter__(self) -> "GuardedReader":
             self._handle.__enter__()
