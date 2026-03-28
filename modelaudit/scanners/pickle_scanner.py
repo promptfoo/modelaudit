@@ -2081,9 +2081,7 @@ def _is_warning_severity_ref(normalized_mod: str, normalized_func: str) -> bool:
 def _dangerous_ref_base_severity(normalized_mod: str, normalized_func: str) -> IssueSeverity:
     """Return the base severity for a resolved dangerous import reference."""
     return (
-        IssueSeverity.WARNING
-        if _is_warning_severity_ref(normalized_mod, normalized_func)
-        else IssueSeverity.CRITICAL
+        IssueSeverity.WARNING if _is_warning_severity_ref(normalized_mod, normalized_func) else IssueSeverity.CRITICAL
     )
 
 
