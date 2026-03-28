@@ -433,6 +433,38 @@ def test_lambda_tf_safe_prefix_with_exec_is_not_allowlisted(tmp_path: Path) -> N
     )
 
 
+def test_lambda_safe_prefix_with_comment_token_in_malicious_payload_is_flagged(tmp_path: Path) -> None:
+    """A single comment token in malicious payload must not suppress detection."""
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "unsafe_comment_lambda_model",
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {"function": 'lambda x: x / 255; __import__("os").system("evil") # noop'},
+                    }
+                ],
+            },
+        },
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert any(
+        check.name == "Lambda Layer Code Analysis" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+    assert not any(
+        check.name == "Lambda Layer Code Analysis"
+        and check.status == CheckStatus.PASSED
+        and check.details.get("pattern_type") == "safe_normalization"
+        for check in result.checks
+    )
+
+
 def test_keras_h5_scanner_empty_file(tmp_path):
     """Test scanning an empty file."""
     empty_path = tmp_path / "empty.h5"
