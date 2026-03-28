@@ -11,7 +11,7 @@ from typing import Any, ClassVar
 
 from modelaudit.config.explanations import get_tf_op_explanation
 from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_OPS, TENSORFLOW_DANGEROUS_OPS
-from modelaudit.utils.file.detection import _looks_like_proto0_or_1_pickle
+from modelaudit.utils.file.detection import PROTO0_1_MAX_PROBE_BYTES, _looks_like_proto0_or_1_pickle
 from modelaudit.utils.helpers.code_validation import (
     is_code_potentially_dangerous,
     validate_python_syntax,
@@ -45,6 +45,7 @@ _ASSET_MACHO_HEADERS = (
 )
 _ASSET_PE_HEADER = b"MZ"  # Windows PE executables
 _ASSET_PICKLE_PREFIXES = tuple(bytes([0x80, protocol]) for protocol in range(2, 6))
+_ASSET_PROBE_BYTES = max(8192, PROTO0_1_MAX_PROBE_BYTES)
 _ASSET_PYTHON_PATTERN = re.compile(
     r"(?m)(^\s*(?:from\s+\w[\w.]*\s+import\s+|import\s+\w[\w.]*|def\s+\w+\s*\(|class\s+\w+\s*[:(]))"
 )
@@ -69,6 +70,26 @@ def _check_protos() -> bool:
 
         HAS_PROTOS = modelaudit.protos._check_vendored_protos()
     return HAS_PROTOS
+
+
+def _strip_leading_comment_lines(content: bytes) -> bytes:
+    """Remove leading comment/blank lines before protocol 0/1 pickle probing."""
+    offset = 0
+    content_len = len(content)
+
+    while offset < content_len:
+        line_start = offset
+        while offset < content_len and content[offset] not in (0x0A, 0x0D):
+            offset += 1
+        line = content[line_start:offset].lstrip()
+        while offset < content_len and content[offset] in (0x0A, 0x0D):
+            offset += 1
+
+        if not line or line.startswith(b"#"):
+            continue
+        return content[line_start:]
+
+    return b""
 
 
 # Create a placeholder for type hints when TensorFlow is not available
@@ -362,7 +383,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
 
         try:
             with file_path.open("rb") as file_obj:
-                content_head = file_obj.read(8192)
+                content_head = file_obj.read(_ASSET_PROBE_BYTES)
         except OSError as exc:
             result.add_check(
                 name="SavedModel Assets Security Check",
@@ -375,22 +396,30 @@ class TensorFlowSavedModelScanner(BaseScanner):
             return []
 
         detected_types: list[str] = []
+
+        def _record_detected_type(content_type: str) -> None:
+            if content_type not in detected_types:
+                detected_types.append(content_type)
+
         if content_head.startswith(_ASSET_SCRIPT_SHEBANG):
-            detected_types.append("script_shebang")
+            _record_detected_type("script_shebang")
         if content_head.startswith(_ASSET_ELF_HEADER):
-            detected_types.append("elf_binary")
+            _record_detected_type("elf_binary")
         if _looks_like_pe_executable(content_head):
-            detected_types.append("pe_executable")
+            _record_detected_type("pe_executable")
         if any(content_head.startswith(header) for header in _ASSET_MACHO_HEADERS):
-            detected_types.append("macho_binary")
+            _record_detected_type("macho_binary")
         if any(content_head.startswith(prefix) for prefix in _ASSET_PICKLE_PREFIXES):
-            detected_types.append("pickle_payload")
-        if _looks_like_proto0_or_1_pickle(content_head):
-            detected_types.append("pickle_payload")
+            _record_detected_type("pickle_payload")
+        proto0_probe = _strip_leading_comment_lines(content_head)
+        if _looks_like_proto0_or_1_pickle(content_head) or (
+            proto0_probe and _looks_like_proto0_or_1_pickle(proto0_probe)
+        ):
+            _record_detected_type("pickle_payload")
 
         decoded_head = content_head.decode("utf-8", errors="ignore")
         if decoded_head and _ASSET_PYTHON_PATTERN.search(decoded_head):
-            detected_types.append("python_source_pattern")
+            _record_detected_type("python_source_pattern")
 
         return detected_types
 

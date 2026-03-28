@@ -577,6 +577,25 @@ def test_savedmodel_assets_extra_comment_prefixed_protocol1_pickle_is_flagged(tm
 
     assert asset_issues
     assert any("pickle_payload" in issue.details.get("detected_content_type", "") for issue in asset_issues)
+    assert all(
+        issue.details.get("detected_content_type", "").split(", ").count("pickle_payload") == 1
+        for issue in asset_issues
+    )
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_assets_extra_long_comment_prefixed_protocol1_pickle_is_flagged(tmp_path: Path) -> None:
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    extra_dir = model_dir / "assets.extra"
+    extra_dir.mkdir(exist_ok=True)
+    asset_path = extra_dir / "deep_bypass.dat"
+    asset_path.write_bytes((b"# asset padding for documentation only\n" * 300) + _build_protocol1_pickle_payload())
+
+    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    asset_issues = [issue for issue in result.issues if issue.location == str(asset_path)]
+
+    assert asset_issues
+    assert any("pickle_payload" in issue.details.get("detected_content_type", "") for issue in asset_issues)
 
 
 def test_tf_savedmodel_scanner_not_a_directory(tmp_path):
