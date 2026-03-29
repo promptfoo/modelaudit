@@ -22,10 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **security:** enforce SafeTensors `MAX_HEADER_BYTES` during `scan()` and skip regex-heavy metadata-content analysis when headers exceed the configured limit to reduce header-based DoS risk
+- emit a one-time warning when the HuggingFace whitelist snapshot is older than 90 days while preserving existing whitelist severity downgrades
 - harden pickle CVE-2026-24747 SETITEM detection against stack-neutral padding
+- **keras:** harden CVE-2025-9906 detection against documentation-padding bypasses in `.keras` `config.json`
 - count successful `stream://` scans in `files_scanned` so clean streaming scans return exit code 0 instead of 2
 - harden 7z nested archive scanning and pre-extraction size checks
 - scan follow-on pickle streams after large padding blocks
+- **security:** add a budget-independent post-truncation GLOBAL/INST/STACK_GLOBAL byte scan (100 MB capped) so dangerous imports hidden past opcode limits are still detected
 - **security:** detect nested pickle payloads in BINBYTES8 and BYTEARRAY8 opcodes
 - reject local streaming symlink traversal outside the scan root
 - require explicit remote Hugging Face provenance for whitelist downgrades
@@ -59,11 +62,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **security:** detect import-only pickle `GLOBAL`/`STACK_GLOBAL` references while preserving safe constructor imports and avoiding mislabeling executed call chains as import-only
 - **security:** fail closed on malformed `STACK_GLOBAL` operands when memo lookups are missing or operand types are non-string, while keeping simple truncation-only context informational
 - **security:** remove `builtins.hasattr` / `__builtin__.hasattr` from the pickle safe-global allowlist so attribute-access primitives stay flagged as dangerous builtins
+- **security:** harden pickle blocklist enforcement by removing `_pickle.Unpickler`/`_pickle.Pickler` from safe globals, adding `copyreg.add_extension`/`copyreg.remove_extension` to suspicious globals, and limiting functools warning downgrades to `partial`/`partialmethod` so `functools.reduce` findings stay CRITICAL
 - **security:** harden TensorFlow weight extraction limits to bound actual tensor payload materialization, including malformed `tensor_content` and string-backed tensors, and continue scanning past oversized `Const` nodes
 - **security:** stream TAR members to temp files under size limits instead of buffering whole entries in memory during scan
 - **security:** inspect TensorFlow SavedModel function definitions when scanning for dangerous ops and protobuf string abuse, with function-aware finding locations
 - **cli:** include streamed artifacts as SBOM components when `scan --stream --sbom` is used
 - **cli:** exclude HuggingFace download cache bookkeeping files from remote SBOMs and asset lists
+- **cli:** add `--no-whitelist` and `--strict` whitelist/caching hardening so CI scans can disable HF severity downgrades and force uncached analysis
 - **security:** require official or explicitly allowlisted JFrog hosts before treating `/artifactory/` URLs as authenticated JFrog endpoints
 - **security:** detect CVE-2024-5480 PyTorch torch.distributed.rpc arbitrary function execution via PythonUDF (CVSS 10.0)
 - **security:** detect CVE-2024-48063 PyTorch torch.distributed.rpc.RemoteModule deserialization RCE via pickle (CVSS 9.8)
@@ -113,6 +118,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **security**: detect protocol 0/1 ASCII pickle signatures in generic file-format detection to prevent ZIP entry extension bypasses (e.g., malicious `payload.txt`)
 - **security**: harden protocol 0/1 pickle format detection with bounded opcode parsing to catch prefixed payloads (e.g., `MARK/LIST` before `GLOBAL`) while reducing plain-text false positives in ZIP entry scanning
 - **security**: keep opcode-level pickle analysis active when malformed streams trigger unicode/text parse errors after partial opcode extraction
+- **security:** analyze all Python files in TorchServe `.mar` archives (including non-handler modules and `__init__.py`) for risky calls, import-time execution, and handler-to-utility import relationships
 
 ### Security
 
