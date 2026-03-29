@@ -7,8 +7,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from modelaudit.utils.sources.huggingface import (
+    _list_repo_files_with_timeout,
     download_file_from_hf,
     download_model,
+    download_model_streaming,
     extract_model_id_from_path,
     get_model_info,
     get_model_size,
@@ -186,6 +188,83 @@ class TestModelDownload:
         call_args = mock_snapshot_download.call_args
         assert call_args[1]["local_dir"] == str(cache_dir / "huggingface" / "test" / "model")
 
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin", ".json"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(None, "repo listing failed"),
+    )
+    @patch("huggingface_hub.snapshot_download")
+    def test_download_model_listing_error_uses_extension_allow_patterns(
+        self,
+        mock_snapshot_download: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Listing failures should keep a restrictive allowlist instead of downloading the full snapshot."""
+        download_path = tmp_path / "download"
+        download_path.mkdir()
+        (download_path / "config.json").write_text("{}")
+        mock_snapshot_download.return_value = str(download_path)
+
+        download_model("https://huggingface.co/test/model")
+
+        allow_patterns = mock_snapshot_download.call_args.kwargs["allow_patterns"]
+        assert allow_patterns == ["**/*.bin", "**/*.json", "*.bin", "*.json"]
+
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
+    @patch("huggingface_hub.snapshot_download")
+    def test_download_model_listing_timeout_uses_extension_allow_patterns(
+        self,
+        mock_snapshot_download: MagicMock,
+        _mock_get_extensions: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Listing timeouts should keep the selective allowlist instead of falling back to a full snapshot."""
+
+        download_path = tmp_path / "download"
+        download_path.mkdir()
+        (download_path / "model.bin").write_bytes(b"weights")
+        mock_snapshot_download.return_value = str(download_path)
+
+        with patch(
+            "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+            return_value=(None, "timed out after 30 seconds"),
+        ):
+            download_model("https://huggingface.co/test/model")
+
+        allow_patterns = mock_snapshot_download.call_args.kwargs["allow_patterns"]
+        assert allow_patterns == ["**/*.bin", "*.bin"]
+
+    @patch("huggingface_hub.HfApi.repo_info")
+    def test_list_repo_files_timeout_uses_hfapi_timeout(self, mock_repo_info: MagicMock) -> None:
+        """Timeout helper should use the request-layer timeout instead of background threads."""
+        mock_repo_info.return_value = SimpleNamespace(siblings=[SimpleNamespace(rfilename="config.json")])
+
+        repo_files, error = _list_repo_files_with_timeout("test/model", timeout_seconds=7)
+
+        assert repo_files == ["config.json"]
+        assert error is None
+        mock_repo_info.assert_called_once_with("test/model", timeout=7, files_metadata=False)
+
+    @patch("modelaudit.utils.sources.huggingface._list_repo_files_with_timeout", return_value=(["notes.unknown"], None))
+    @patch("huggingface_hub.snapshot_download")
+    def test_download_model_listing_success_without_scannable_files_keeps_full_snapshot_fallback(
+        self,
+        mock_snapshot_download: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """A successful listing with no scannable files should preserve the existing full-snapshot fallback."""
+        download_path = tmp_path / "download"
+        download_path.mkdir()
+        (download_path / "config.json").write_text("{}")
+        mock_snapshot_download.return_value = str(download_path)
+
+        download_model("https://huggingface.co/test/model")
+
+        assert "allow_patterns" not in mock_snapshot_download.call_args.kwargs
+
     @patch("huggingface_hub.snapshot_download")
     @patch("shutil.rmtree")
     def test_download_model_cleanup_on_failure(self, mock_rmtree, mock_snapshot_download):
@@ -218,6 +297,72 @@ class TestModelDownload:
             mock_import.side_effect = side_effect
             with pytest.raises(ImportError, match="huggingface-hub package is required"):
                 download_model("https://huggingface.co/test/model")
+
+
+class TestModelDownloadStreaming:
+    """Test streaming model downloads from HuggingFace."""
+
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["pytorch_model.bin", "README.md"], None),
+    )
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_downloads_scannable_files_only(
+        self,
+        mock_hf_hub_download: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Streaming downloads should only request recognized scannable files."""
+        downloaded_file = tmp_path / "huggingface" / "test" / "model" / "pytorch_model.bin"
+        mock_hf_hub_download.return_value = str(downloaded_file)
+
+        results = list(download_model_streaming("https://huggingface.co/test/model", cache_dir=tmp_path))
+
+        assert results == [(downloaded_file, True)]
+        mock_hf_hub_download.assert_called_once_with(
+            repo_id="test/model",
+            filename="pytorch_model.bin",
+            cache_dir=str(tmp_path / "huggingface"),
+            local_dir=str(tmp_path / "huggingface" / "test" / "model"),
+        )
+
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(None, "timed out after 30 seconds"),
+    )
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_listing_timeout_fails_closed(
+        self,
+        mock_hf_hub_download: MagicMock,
+        _mock_list_repo_files: MagicMock,
+    ) -> None:
+        """Streaming mode should fail closed when repo listing times out."""
+        with pytest.raises(Exception, match="Timeout listing files in repository test/model"):
+            list(download_model_streaming("https://huggingface.co/test/model"))
+
+        mock_hf_hub_download.assert_not_called()
+
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(None, "repository listing unavailable"),
+    )
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_listing_error_fails_closed(
+        self,
+        mock_hf_hub_download: MagicMock,
+        _mock_list_repo_files: MagicMock,
+    ) -> None:
+        """Streaming mode should fail closed when repo listing errors out."""
+        with pytest.raises(
+            Exception,
+            match="Failed listing files in repository test/model: repository listing unavailable",
+        ):
+            list(download_model_streaming("https://huggingface.co/test/model"))
+
+        mock_hf_hub_download.assert_not_called()
 
 
 class TestModelSizeAndDiskSpace:
@@ -302,10 +447,19 @@ class TestModelSizeAndDiskSpace:
 
     @patch("modelaudit.utils.sources.huggingface.get_model_size")
     @patch("modelaudit.utils.sources.huggingface.check_disk_space")
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["config.json", "pytorch_model.bin"], None),
+    )
     @patch("huggingface_hub.snapshot_download")
     def test_download_model_with_disk_space_check(
-        self, mock_snapshot_download, mock_check_disk_space, mock_get_model_size, tmp_path
-    ):
+        self,
+        mock_snapshot_download: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        mock_check_disk_space: MagicMock,
+        mock_get_model_size: MagicMock,
+        tmp_path: Path,
+    ) -> None:
         """Test successful download with disk space check when using custom cache."""
         # Mock model size
         mock_get_model_size.return_value = 1024 * 1024 * 1024  # 1 GB
@@ -327,6 +481,40 @@ class TestModelSizeAndDiskSpace:
         # Verify download proceeded
         mock_snapshot_download.assert_called_once()
         assert result == Path(mock_path)
+
+    @patch("modelaudit.utils.sources.huggingface.get_model_size")
+    @patch("modelaudit.utils.sources.huggingface.check_disk_space")
+    @patch("modelaudit.utils.sources.huggingface._get_hf_cache_root")
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["config.json", "pytorch_model.bin"], None),
+    )
+    @patch("huggingface_hub.snapshot_download")
+    def test_download_model_without_cache_dir_checks_default_hf_cache(
+        self,
+        mock_snapshot_download: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        mock_get_hf_cache_root: MagicMock,
+        mock_check_disk_space: MagicMock,
+        mock_get_model_size: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Disk preflight should run against the default HF cache root when no cache_dir is supplied."""
+        mock_get_model_size.return_value = 1024 * 1024
+        mock_check_disk_space.return_value = (True, "Sufficient disk space available")
+
+        hf_cache_root = tmp_path / "hf-cache" / "hub"
+        mock_get_hf_cache_root.return_value = hf_cache_root
+
+        download_path = tmp_path / "download"
+        download_path.mkdir()
+        (download_path / "config.json").write_text("{}")
+        mock_snapshot_download.return_value = str(download_path)
+
+        download_model("https://huggingface.co/test/model")
+
+        assert hf_cache_root.exists()
+        mock_check_disk_space.assert_called_once_with(hf_cache_root, 1024 * 1024)
 
 
 class TestGetModelInfo:

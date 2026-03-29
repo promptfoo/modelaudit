@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import shutil
 import tempfile
@@ -15,6 +16,19 @@ from ..utils.sources.jfrog import detect_jfrog_target_type, download_artifact, d
 logger = logging.getLogger(__name__)
 
 
+def _prepare_download_dir(url: str, cache_dir: str | None) -> tuple[Path, bool]:
+    """Return an ephemeral per-run staging directory under the configured cache root."""
+    if not cache_dir:
+        return Path(tempfile.mkdtemp(prefix="modelaudit_jfrog_")), True
+
+    cache_key = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
+    download_root = Path(cache_dir).expanduser() / "jfrog"
+    download_root.mkdir(parents=True, exist_ok=True)
+    # Use a unique staging directory for this run. ``cache_dir`` controls where
+    # temporary downloads live, while scan-result caching is still handled by core.
+    return Path(tempfile.mkdtemp(prefix=f"{cache_key}-", dir=str(download_root))), True
+
+
 def scan_jfrog_artifact(
     url: str,
     *,
@@ -24,6 +38,7 @@ def scan_jfrog_artifact(
     blacklist_patterns: list[str] | None = None,
     max_file_size: int = 0,
     max_total_size: int = 0,
+    selective_download: bool = True,
     **kwargs: Any,
 ) -> ModelAuditResultModel:
     """Download and scan an artifact or folder from JFrog Artifactory.
@@ -47,6 +62,8 @@ def scan_jfrog_artifact(
         Maximum file size to scan in bytes (0 = unlimited).
     max_total_size:
         Maximum total bytes to scan before stopping (0 = unlimited).
+    selective_download:
+        Whether folder downloads should prefilter to scannable model files.
     **kwargs:
         Additional arguments passed to :func:`scan_model_directory_or_file`.
 
@@ -70,7 +87,11 @@ def scan_jfrog_artifact(
         ... )
     """
 
-    tmp_dir = tempfile.mkdtemp(prefix="modelaudit_jfrog_")
+    scan_kwargs = kwargs.copy()
+    cache_enabled = scan_kwargs.pop("cache_enabled", True)
+    raw_cache_dir = scan_kwargs.pop("cache_dir", None)
+    scan_cache_dir = str(Path(raw_cache_dir).expanduser()) if cache_enabled and raw_cache_dir else None
+    download_dir, cleanup_download_dir = _prepare_download_dir(url, scan_cache_dir)
     start_time = time.time()
 
     try:
@@ -84,23 +105,23 @@ def scan_jfrog_artifact(
         )
 
         if target_info["type"] == "file":
-            logger.debug(f"Downloading JFrog file {url} to {tmp_dir}")
+            logger.debug(f"Downloading JFrog file {url} to {download_dir}")
             download_path = download_artifact(
                 url,
-                cache_dir=Path(tmp_dir),
+                cache_dir=download_dir,
                 api_token=api_token,
                 access_token=access_token,
                 timeout=timeout,
             )
         else:
-            logger.debug(f"Downloading JFrog folder {url} to {tmp_dir}")
+            logger.debug(f"Downloading JFrog folder {url} to {download_dir}")
             download_path = download_jfrog_folder(
                 url,
-                cache_dir=Path(tmp_dir),
+                cache_dir=download_dir,
                 api_token=api_token,
                 access_token=access_token,
                 timeout=timeout,
-                selective=True,  # Only download scannable model files
+                selective=selective_download,
                 show_progress=True,
             )
 
@@ -109,13 +130,7 @@ def scan_jfrog_artifact(
         remaining_timeout = max(timeout - elapsed_time, 30)  # Ensure at least 30 seconds for scanning
         logger.debug(f"Spent {elapsed_time:.1f}s on download, {remaining_timeout:.1f}s remaining for scan")
 
-        # Ensure cache configuration is passed through from kwargs
-        # Remove cache config from kwargs to avoid conflicts
-        scan_kwargs = kwargs.copy()
-        cache_config = {
-            "cache_enabled": scan_kwargs.pop("cache_enabled", True),
-            "cache_dir": scan_kwargs.pop("cache_dir", None),
-        }
+        cache_config = {"cache_enabled": cache_enabled, "cache_dir": scan_cache_dir}
 
         # Import here to avoid circular dependency
         from ..core import scan_model_directory_or_file
@@ -145,4 +160,5 @@ def scan_jfrog_artifact(
 
         return result
     finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        if cleanup_download_dir:
+            shutil.rmtree(download_dir, ignore_errors=True)
