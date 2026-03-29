@@ -143,7 +143,7 @@ class TestAdvancedFileHandler:
     @patch("modelaudit.utils.file.handlers.os.path.getsize")
     def test_extreme_file_detection(self, mock_getsize: Any) -> None:
         """Test detection of extreme large files."""
-        # Test file over 200GB threshold
+        # Test file over the 50GB advanced-handler threshold
         mock_getsize.return_value = 300 * 1024 * 1024 * 1024  # 300GB
 
         assert should_use_advanced_handler("large_model.bin")
@@ -156,9 +156,9 @@ class TestAdvancedFileHandler:
     @patch("modelaudit.utils.file.handlers.os.path.getsize")
     @patch("modelaudit.utils.file.handlers.ShardedModelDetector.detect_shards")
     def test_massive_file_handling(self, mock_detect: Any, mock_getsize: Any) -> None:
-        """Test handling of massive files (>200GB)."""
+        """Test handling of massive files above the distributed-scan threshold."""
         mock_detect.return_value = None  # Not sharded
-        mock_getsize.return_value = 250 * 1024 * 1024 * 1024  # 250GB
+        mock_getsize.return_value = 600 * 1024 * 1024 * 1024  # 600GB
 
         with tempfile.NamedTemporaryFile() as f:
             f.write(b"\x80\x03test")  # Pickle header
@@ -179,3 +179,30 @@ class TestAdvancedFileHandler:
                 # With full scanning, we don't warn about size anymore
                 # The scan should complete successfully
                 assert result is not None
+
+    @patch("modelaudit.utils.file.handlers.os.path.getsize")
+    @patch("modelaudit.utils.file.handlers.ShardedModelDetector.detect_shards")
+    def test_massive_file_without_bounded_support_fails_closed(
+        self,
+        mock_detect: Any,
+        mock_getsize: Any,
+        tmp_path: Path,
+    ) -> None:
+        """Unsupported scanners should stop with an operational-style error message."""
+        mock_detect.return_value = None
+        mock_getsize.return_value = 600 * 1024 * 1024 * 1024
+
+        model_path = tmp_path / "huge-model.bin"
+        model_path.write_bytes(b"test")
+
+        class ScannerWithoutBoundedSupport:
+            name = "test_scanner"
+
+        handler = AdvancedFileHandler(str(model_path), ScannerWithoutBoundedSupport())
+        result = handler.scan()
+
+        assert not result.success
+        assert any(
+            check.name == "Large File Coverage Check" and "Error scanning file:" in check.message
+            for check in result.checks
+        )

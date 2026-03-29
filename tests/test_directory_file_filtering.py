@@ -9,6 +9,8 @@ import tempfile
 import zipfile
 from pathlib import Path
 
+import pytest
+
 from modelaudit.core import _is_huggingface_cache_file, scan_model_directory_or_file
 
 
@@ -205,6 +207,27 @@ class TestDirectoryFileFiltering:
         assert results["files_scanned"] == 1
         asset_names = {Path(asset.path).name for asset in results.assets}
         assert "executorch.jpg" in asset_names
+        assert "zip" in results.scanner_names
+        assert "unknown" not in results.scanner_names
+        assert not any("Unknown or unhandled format" in issue.message for issue in results.issues)
+
+    def test_disguised_sevenzip_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
+        """Directory scans should route disguised 7z containers to the sevenzip scanner."""
+        py7zr = pytest.importorskip("py7zr")
+
+        disguised_7z = tmp_path / "payload.jpg"
+        nested_payload = tmp_path / "payload.txt"
+        nested_payload.write_text("safe nested payload")
+
+        with py7zr.SevenZipFile(disguised_7z, "w") as archive:
+            archive.write(str(nested_payload), "payload.txt")
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        assert "sevenzip" in results.scanner_names
+        assert "unknown" not in results.scanner_names
+        assert not any("Unknown or unhandled format" in issue.message for issue in results.issues)
 
     def test_docx_like_zip_remains_skipped(self, tmp_path: Path) -> None:
         """Common document containers should not be treated as model archives."""

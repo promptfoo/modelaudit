@@ -408,6 +408,42 @@ def test_scan_model_streaming_informational_failed_scan_does_not_set_operational
     assert determine_exit_code(result) == 1
 
 
+def test_scan_model_streaming_operational_info_failure_sets_exit_code_2(
+    temp_test_files: list[Path],
+) -> None:
+    """Informational coverage failures must still fail closed when flagged as operational."""
+
+    def file_generator():
+        yield (temp_test_files[0], True)
+
+    info_result = ScanResult(scanner_name="pickle")
+    info_result.add_check(
+        name="Large File Coverage Check",
+        passed=False,
+        message=(
+            "Error scanning file: scanner pickle does not support bounded large-file analysis "
+            "for this file size; aborting to avoid partial coverage."
+        ),
+        severity=IssueSeverity.INFO,
+        location=str(temp_test_files[0]),
+    )
+    info_result.metadata["operational_error"] = True
+    info_result.metadata["operational_error_reason"] = "unsupported_bounded_large_file_analysis"
+    info_result.finish(success=False)
+
+    with patch("modelaudit.core.scan_file", return_value=info_result):
+        result = scan_model_streaming(
+            file_generator=file_generator(),
+            timeout=30,
+            delete_after_scan=False,
+        )
+
+    assert result.files_scanned == 1
+    assert result.success is False
+    assert result.has_errors is True
+    assert determine_exit_code(result) == 2
+
+
 def test_scan_model_streaming_content_hash_deterministic():
     """Test that content hash is deterministic for same files."""
     # Create two files with same content

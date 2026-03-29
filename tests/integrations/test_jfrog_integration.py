@@ -1,5 +1,6 @@
+import hashlib
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -67,7 +68,7 @@ def test_scan_jfrog_artifact_success(mock_scan, mock_download, mock_detect, mock
     assert scan_call[1]["max_total_size"] == 2000
     assert scan_call[1]["cache_enabled"] is True
     assert scan_call[1]["cache_dir"] is None
-    mock_rmtree.assert_called_once_with(temp_dir, ignore_errors=True)
+    mock_rmtree.assert_called_once_with(Path(temp_dir), ignore_errors=True)
     assert results == mock_result
 
     # Verify JFrog metadata was added
@@ -76,6 +77,61 @@ def test_scan_jfrog_artifact_success(mock_scan, mock_download, mock_detect, mock
     assert "jfrog_source" in metadata
     assert metadata["jfrog_source"]["type"] == "file"
     assert metadata["jfrog_source"]["repo"] == "test-repo"
+
+
+@patch("modelaudit.integrations.jfrog.shutil.rmtree")
+@patch("modelaudit.integrations.jfrog.tempfile.mkdtemp")
+@patch("modelaudit.integrations.jfrog.detect_jfrog_target_type")
+@patch("modelaudit.integrations.jfrog.download_artifact")
+@patch("modelaudit.core.scan_model_directory_or_file")
+def test_scan_jfrog_artifact_uses_cache_dir_for_downloads(
+    mock_scan: MagicMock,
+    mock_download: MagicMock,
+    mock_detect: MagicMock,
+    mock_mkdtemp: MagicMock,
+    mock_rmtree: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Test JFrog downloads use a dedicated subdirectory under cache_dir."""
+    url = "https://company.jfrog.io/artifactory/repo/model.pt"
+    cache_dir = tmp_path / "cache"
+    cache_key = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
+    expected_download_root = cache_dir / "jfrog"
+    expected_download_dir = expected_download_root / f"{cache_key}-run"
+    mock_mkdtemp.return_value = str(expected_download_dir)
+
+    mock_detect.return_value = {"type": "file", "repo": "test-repo"}
+    mock_download.return_value = expected_download_dir / "model.pt"
+
+    from modelaudit.models import create_initial_audit_result
+
+    mock_result = create_initial_audit_result()
+    mock_result.bytes_scanned = 512
+    mock_result.files_scanned = 1
+    mock_result.scanner_names = ["test_scanner"]
+    mock_scan.return_value = mock_result
+
+    results = scan_jfrog_artifact(url, api_token="token", cache_enabled=True, cache_dir=str(cache_dir))
+
+    mock_mkdtemp.assert_called_once_with(prefix=f"{cache_key}-", dir=str(expected_download_root))
+    mock_download.assert_called_once_with(
+        url,
+        cache_dir=expected_download_dir,
+        api_token="token",
+        access_token=None,
+        timeout=3600,
+    )
+    mock_scan.assert_called_once()
+    scan_call = mock_scan.call_args
+    assert scan_call[0][0] == str(expected_download_dir / "model.pt")
+    assert scan_call[1]["blacklist_patterns"] is None
+    assert 3599 <= scan_call[1]["timeout"] <= 3600
+    assert scan_call[1]["max_file_size"] == 0
+    assert scan_call[1]["max_total_size"] == 0
+    assert scan_call[1]["cache_enabled"] is True
+    assert scan_call[1]["cache_dir"] == str(cache_dir)
+    mock_rmtree.assert_called_once_with(expected_download_dir, ignore_errors=True)
+    assert results == mock_result
 
 
 @patch("modelaudit.integrations.jfrog.shutil.rmtree")
@@ -96,7 +152,7 @@ def test_scan_jfrog_artifact_download_error(mock_download, mock_detect, mock_mkd
     with pytest.raises(Exception, match="fail"):
         scan_jfrog_artifact("https://company.jfrog.io/artifactory/repo/model.pt")
 
-    mock_rmtree.assert_called_once_with(temp_dir, ignore_errors=True)
+    mock_rmtree.assert_called_once_with(Path(temp_dir), ignore_errors=True)
 
 
 @patch("modelaudit.integrations.jfrog.shutil.rmtree")
@@ -166,7 +222,7 @@ def test_scan_jfrog_folder_success(mock_scan, mock_download_folder, mock_detect,
     assert scan_call[1]["cache_enabled"] is True
     assert scan_call[1]["cache_dir"] is None
 
-    mock_rmtree.assert_called_once_with(temp_dir, ignore_errors=True)
+    mock_rmtree.assert_called_once_with(Path(temp_dir), ignore_errors=True)
 
     # Verify JFrog metadata was added to results
     assert hasattr(results, "metadata")
@@ -175,6 +231,71 @@ def test_scan_jfrog_folder_success(mock_scan, mock_download_folder, mock_detect,
     assert metadata["jfrog_source"]["type"] == "folder"
     assert metadata["jfrog_source"]["url"] == "https://company.jfrog.io/artifactory/repo/models/"
     assert metadata["jfrog_source"]["repo"] == "test-repo"
+
+
+@patch("modelaudit.integrations.jfrog.shutil.rmtree")
+@patch("modelaudit.integrations.jfrog.tempfile.mkdtemp")
+@patch("modelaudit.integrations.jfrog.detect_jfrog_target_type")
+@patch("modelaudit.integrations.jfrog.download_jfrog_folder")
+@patch("modelaudit.core.scan_model_directory_or_file")
+def test_scan_jfrog_folder_download_error_aborts_scan(
+    mock_scan: MagicMock,
+    mock_download_folder: MagicMock,
+    mock_detect: MagicMock,
+    mock_mkdtemp: MagicMock,
+    mock_rmtree: MagicMock,
+) -> None:
+    """Test that folder download failures stop before scanning."""
+    temp_dir = "/tmp/modelaudit_jfrog_test"
+    mock_mkdtemp.return_value = temp_dir
+    mock_detect.return_value = {"type": "folder", "repo": "test-repo", "path": "/models"}
+    mock_download_folder.side_effect = Exception("JFrog folder download failed after 1 of 2 file(s) completed")
+
+    with pytest.raises(Exception, match="JFrog folder download failed"):
+        scan_jfrog_artifact("https://company.jfrog.io/artifactory/repo/models/")
+
+    mock_scan.assert_not_called()
+
+
+@patch("modelaudit.integrations.jfrog.shutil.rmtree")
+@patch("modelaudit.integrations.jfrog.tempfile.mkdtemp")
+@patch("modelaudit.integrations.jfrog.detect_jfrog_target_type")
+@patch("modelaudit.integrations.jfrog.download_jfrog_folder")
+@patch("modelaudit.core.scan_model_directory_or_file")
+def test_scan_jfrog_folder_respects_selective_download(
+    mock_scan, mock_download_folder, mock_detect, mock_mkdtemp, mock_rmtree
+):
+    """Explicit selective_download should flow through to folder downloads."""
+    temp_dir = "/tmp/modelaudit_jfrog_test"
+    mock_mkdtemp.return_value = temp_dir
+    mock_detect.return_value = {"type": "folder", "repo": "test-repo", "path": "/models"}
+    mock_download_folder.return_value = Path(f"{temp_dir}/models")
+
+    from modelaudit.models import create_initial_audit_result
+
+    mock_result = create_initial_audit_result()
+    mock_result.bytes_scanned = 2048
+    mock_result.files_scanned = 3
+    mock_result.scanner_names = ["pickle_scanner", "pytorch_scanner"]
+    mock_scan.return_value = mock_result
+
+    scan_jfrog_artifact(
+        "https://company.jfrog.io/artifactory/repo/models/",
+        api_token="token",
+        timeout=200,
+        selective_download=False,
+    )
+
+    mock_download_folder.assert_called_once_with(
+        "https://company.jfrog.io/artifactory/repo/models/",
+        cache_dir=Path(temp_dir),
+        api_token="token",
+        access_token=None,
+        timeout=200,
+        selective=False,
+        show_progress=True,
+    )
+    mock_rmtree.assert_called_once_with(Path(temp_dir), ignore_errors=True)
 
 
 @patch("modelaudit.integrations.jfrog.shutil.rmtree")
@@ -189,7 +310,7 @@ def test_scan_jfrog_artifact_detection_error(mock_detect, mock_mkdtemp, mock_rmt
     with pytest.raises(Exception, match="Authentication failed"):
         scan_jfrog_artifact("https://company.jfrog.io/artifactory/repo/model.pt")
 
-    mock_rmtree.assert_called_once_with(temp_dir, ignore_errors=True)
+    mock_rmtree.assert_called_once_with(Path(temp_dir), ignore_errors=True)
 
 
 class TestJFrogIntegrationEndToEnd:

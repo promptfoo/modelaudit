@@ -216,6 +216,7 @@ SUSPICIOUS_GLOBALS = {
     # Pickle recursion
     "cloudpickle": "*",
     "joblib": "*",
+    "copyreg": ["add_extension", "remove_extension"],
     # Filesystem / shell
     "filecmp": "*",
     "distutils": "*",
