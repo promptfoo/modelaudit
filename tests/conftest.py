@@ -15,11 +15,11 @@ import pytest
 # Framework availability detection (cached for performance)
 # ============================================================================
 def _check_framework(name: str) -> bool:
-    """Check if a framework is available."""
+    """Check if a framework can be imported successfully."""
     try:
         __import__(name)
         return True
-    except ImportError:
+    except Exception:
         return False
 
 

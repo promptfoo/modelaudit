@@ -317,7 +317,6 @@ class TestModelMetadataExtractor:
 
     def test_xgboost_metadata_no_deserialization(self, tmp_path: Path) -> None:
         """Ensure XGBoost metadata extraction is blocked without deserialization flag."""
-        pytest.importorskip("xgboost")
         extractor = ModelMetadataExtractor()
 
         # Create a minimal XGBoost JSON model
