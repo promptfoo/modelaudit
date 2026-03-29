@@ -52,9 +52,12 @@ class TestCVE202510155FormatDetection:
         assert detect_file_format(str(bin_path)) == "pickle"
 
     def test_safetensors_bin_not_misdetected(self, tmp_path: Path) -> None:
-        """Safetensors .bin files (JSON header) should not be detected as pickle."""
+        """Safetensors .bin files with a framed header should not be detected as pickle."""
+        import struct
+
         bin_path = tmp_path / "model.bin"
-        bin_path.write_bytes(b'{"__metadata__": {}, "weight": {}}')
+        header = b'{"__metadata__": {}, "weight": {"dtype":"F32","shape":[1],"data_offsets":[0,4]}}'
+        bin_path.write_bytes(struct.pack("<Q", len(header)) + header + b"\x00\x00\x00\x00")
         assert detect_file_format(str(bin_path)) == "safetensors"
 
     def test_zip_bin_not_misdetected(self, tmp_path: Path) -> None:

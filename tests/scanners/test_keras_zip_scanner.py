@@ -1899,6 +1899,123 @@ class TestCVE20259906UnsafeDeserialization:
         cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-9906"]
         assert len(cve_issues) >= 1
 
+    def test_documentation_text_with_bare_config_words_stays_documentation(self) -> None:
+        """Bare prose mentions of config/module should not stop doc-like scoring."""
+        text = "\n".join(
+            [
+                "This model config includes safe defaults and explanatory guidance only",
+                "The module description here is narrative text for documentation readers",
+                "Another long descriptive line for awareness and onboarding context",
+            ]
+        )
+
+        assert KerasZipScanner._is_primarily_documentation_text(text) is True
+
+    def test_dangerous_line_does_not_count_toward_documentation_ratio(self) -> None:
+        """Dangerous literals must not inflate the documentation ratio."""
+        text = "\n".join(
+            [
+                "This line is harmless documentation padding only",
+                "This warning mentions keras.config.enable_unsafe_deserialization as prose only",
+            ]
+        )
+
+        assert KerasZipScanner._is_primarily_documentation_text(text) is False
+
+    def test_malformed_json_with_executable_raw_reference_is_detected(self, tmp_path: Path) -> None:
+        """Malformed JSON should still trigger raw fallback when executable keys are present."""
+        scanner = KerasZipScanner()
+        config_str = (
+            '{"class_name":"Sequential","config":{"module":"keras.config","fn":"enable_unsafe_deserialization",}'
+        )
+
+        result = scanner.scan(self._make_keras_zip(config_str, tmp_path))
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-9906"]
+        assert len(cve_issues) == 1
+        assert cve_issues[0].details["detection_method"] == "raw_config_scan"
+        parse_checks = [c for c in result.checks if c.name == "Config JSON Parsing"]
+        assert len(parse_checks) == 1
+        assert parse_checks[0].status != CheckStatus.PASSED
+        assert result.success is False
+
+    def test_malformed_json_doc_symbol_without_executable_context_not_flagged(self, tmp_path: Path) -> None:
+        """Malformed JSON documentation mentions alone must not trigger the raw fallback."""
+        scanner = KerasZipScanner()
+        config_str = (
+            '{"description":"This documentation mentions '
+            'keras.config.enable_unsafe_deserialization for awareness only",'
+        )
+
+        result = scanner.scan(self._make_keras_zip(config_str, tmp_path))
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-9906"]
+        assert len(cve_issues) == 0
+
+    def test_malformed_json_split_object_context_not_flagged(self, tmp_path: Path) -> None:
+        """Module and function keys in different objects must not combine into a raw finding."""
+        scanner = KerasZipScanner()
+        config_str = '{"layers":[{"module":"keras.config"},{"fn":"enable_unsafe_deserialization"}],'
+
+        result = scanner.scan(self._make_keras_zip(config_str, tmp_path))
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-9906"]
+        assert len(cve_issues) == 0
+
+    def test_invalid_utf8_config_bytes_still_trigger_raw_fallback(self, tmp_path: Path) -> None:
+        """Invalid UTF-8 should still use the raw fallback instead of bypassing detection."""
+        scanner = KerasZipScanner()
+        keras_path = tmp_path / "invalid_utf8.keras"
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            zf.writestr("config.json", b'{"loader":"keras.config.enable_unsafe_deserialization",\xff')
+            zf.writestr("metadata.json", json.dumps({"keras_version": "3.13.2"}))
+
+        result = scanner.scan(str(keras_path))
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-9906"]
+        assert len(cve_issues) == 1
+        assert cve_issues[0].details["detection_method"] == "raw_config_scan"
+        parse_checks = [c for c in result.checks if c.name == "Config JSON Parsing"]
+        assert len(parse_checks) == 1
+        assert parse_checks[0].status != CheckStatus.PASSED
+        assert result.success is False
+
+    def test_benign_documentation_text_stays_clean(self, tmp_path: Path) -> None:
+        """Benign long-form documentation text should not trigger CVE checks."""
+        scanner = KerasZipScanner()
+        config_str = json.dumps(
+            {
+                "class_name": "Model",
+                "config": {
+                    "notes": (
+                        "This documentation example mentions keras.config.enable_unsafe_deserialization "
+                        "for awareness only\n"
+                        "Another long descriptive line for awareness and guidance\n"
+                        "Helpful prose about model metadata and no executable content"
+                    ),
+                    "description": "Documentation for awareness and onboarding only",
+                },
+            }
+        )
+
+        result = scanner.scan(self._make_keras_zip(config_str, tmp_path))
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-9906"]
+        assert len(cve_issues) == 0
+
+    def test_description_text_without_dangerous_tokens_not_flagged(self, tmp_path: Path) -> None:
+        """Config descriptions should remain clean when dangerous symbols are absent."""
+        scanner = KerasZipScanner()
+        config_str = json.dumps(
+            {
+                "class_name": "Sequential",
+                "description": (
+                    "This model config includes many words to document architecture choices\n"
+                    "Padding text for readability and transparency without any dangerous references"
+                ),
+                "config": {"layers": [{"class_name": "Dense", "config": {"units": 4}}]},
+            }
+        )
+
+        result = scanner.scan(self._make_keras_zip(config_str, tmp_path))
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-9906"]
+        assert len(cve_issues) == 0
+
 
 class TestCVE20243660LambdaAttribution:
     """Test CVE-2024-3660: Lambda layer code injection attribution."""

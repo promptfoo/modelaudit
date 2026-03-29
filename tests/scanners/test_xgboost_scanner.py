@@ -459,6 +459,7 @@ class TestXGBoostPickleIntegration:
 
 # Integration tests (require actual dependencies)
 @pytest.mark.integration
+@pytest.mark.xgboost
 class TestXGBoostScannerIntegration:
     """Integration tests requiring actual XGBoost/ubjson libraries."""
 
