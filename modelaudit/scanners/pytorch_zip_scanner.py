@@ -68,6 +68,7 @@ class PyTorchZipScanner(BaseScanner):
         self.pickle_scanner: PickleScanner = PickleScanner(config)
         self.current_file_path = ""  # Will be set when scanning files
         self._relaxed_crc_reads: dict[str, set[str]] = {}
+        self._relaxed_crc_check_indices: dict[str, tuple[int, int]] = {}
         # Configurable limits (can override class defaults via config)
         self.max_compression_ratio = self.config.get("max_compression_ratio", self.MAX_COMPRESSION_RATIO)
         self.max_archive_entries = self.config.get("max_archive_entries", self.MAX_ARCHIVE_ENTRIES)
@@ -114,6 +115,7 @@ class PyTorchZipScanner(BaseScanner):
         # Start timeout tracking
         self._start_scan_timer()
         self._relaxed_crc_reads = {}
+        self._relaxed_crc_check_indices = {}
 
         try:
             # Initial validation and setup
@@ -213,10 +215,20 @@ class PyTorchZipScanner(BaseScanner):
         is_new_member = member_name not in self._relaxed_crc_reads
         phases = self._relaxed_crc_reads.setdefault(member_name, set())
         phases.add(phase)
+        phase_list = sorted(phases)
         result.metadata["relaxed_crc_members"] = {
             name: sorted(recorded_phases) for name, recorded_phases in self._relaxed_crc_reads.items()
         }
         result.metadata["relaxed_crc_used"] = True
+
+        existing_indices = self._relaxed_crc_check_indices.get(member_name)
+        if existing_indices is not None:
+            check_index, issue_index = existing_indices
+            for details_dict in (
+                result.checks[check_index].details,
+                result.issues[issue_index].details,
+            ):
+                details_dict["scan_phases"] = phase_list
 
         if not is_new_member:
             return
@@ -233,7 +245,7 @@ class PyTorchZipScanner(BaseScanner):
             location=f"{archive_path}:{member_name}",
             details={
                 "zip_entry": member_name,
-                "scan_phases": sorted(phases),
+                "scan_phases": phase_list,
                 "relaxed_crc": True,
                 "exception": str(error) if error else None,
                 "exception_type": type(error).__name__ if error else None,
@@ -245,6 +257,7 @@ class PyTorchZipScanner(BaseScanner):
                 "integrity anomaly for review."
             ),
         )
+        self._relaxed_crc_check_indices[member_name] = (len(result.checks) - 1, len(result.issues) - 1)
 
     def _read_member_prefix(
         self,

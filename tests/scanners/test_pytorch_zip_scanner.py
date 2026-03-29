@@ -96,6 +96,8 @@ def test_pytorch_zip_scanner_relaxes_crc_for_pickle_scan(tmp_path: Path) -> None
     assert crc_checks[0].status == CheckStatus.FAILED
     assert crc_checks[0].severity == IssueSeverity.WARNING
     assert crc_checks[0].details["zip_entry"] == "data.pkl"
+    assert crc_checks[0].details["scan_phases"] == result.metadata["relaxed_crc_members"]["data.pkl"]
+    assert "pickle_scan" in crc_checks[0].details["scan_phases"]
     assert "pickle_scan" in result.metadata["relaxed_crc_members"]["data.pkl"]
 
 
