@@ -676,7 +676,12 @@ def delegate_info() -> None:
 @click.option(
     "--strict",
     is_flag=True,
-    help="Strict mode: fail on warnings, scan all file types, strict license validation",
+    help="Strict mode: imply --no-whitelist and --no-cache, scan all file types, strict license validation",
+)
+@click.option(
+    "--no-whitelist",
+    is_flag=True,
+    help="Disable HuggingFace whitelist severity downgrading",
 )
 @click.option(
     "--suppress",
@@ -742,6 +747,7 @@ def scan_command(
     quiet: bool,
     blacklist: tuple[str, ...],
     strict: bool,
+    no_whitelist: bool,
     suppress: tuple[str, ...],
     severity: tuple[str, ...],
     progress: bool,
@@ -807,6 +813,7 @@ def scan_command(
         "verbose": verbose,
         "cache_enabled": not no_cache,
         "strict": strict,
+        "no_whitelist": no_whitelist,
         "dry_run": dry_run,
         "num_paths": len(paths),
     }
@@ -885,11 +892,16 @@ def scan_command(
         user_overrides["show_progress"] = True
     if no_cache:
         user_overrides["use_cache"] = False
+    if no_whitelist:
+        user_overrides["use_hf_whitelist"] = False
     if stream:
         user_overrides["scan_and_delete"] = True
     if strict:
         user_overrides["skip_non_model_files"] = False
+        user_overrides["selective_download"] = False
         user_overrides["strict_license"] = True
+        user_overrides["use_cache"] = False
+        user_overrides["use_hf_whitelist"] = False
     if verbose:
         user_overrides["verbose"] = True
     if quiet:
@@ -907,7 +919,7 @@ def scan_command(
     final_timeout = config.get("timeout", 3600)
     final_progress = config.get("show_progress", False)
     final_cache = config.get("use_cache", True)
-    final_cache_dir = config.get("cache_dir")
+    final_cache_dir = config.get("cache_dir") if final_cache else None
     final_format = config.get("format", "text")
     # Determine if we should show styled console output (spinners, colors, headers)
     # Show styled output when: text format OR output goes to file (stdout is free)
@@ -919,6 +931,7 @@ def scan_command(
     final_max_total_size = config.get("max_total_size", 0)
     final_skip_files = config.get("skip_non_model_files", True)
     final_strict_license = config.get("strict_license", False)
+    final_use_hf_whitelist = config.get("use_hf_whitelist", True)
 
     # Apply rule configuration from CLI and any trusted local config for this scan mode.
     severity_overrides = parse_severity_overrides(severity)
@@ -1059,8 +1072,9 @@ def scan_command(
         if not added_path:
             scanned_paths.append(fallback_path)
 
-    # Track temporary directories to clean up after SBOM generation
-    temp_dirs_to_cleanup: list[str] = []
+    # Track temporary artifacts to clean up after SBOM generation.
+    # Store whether each path is a directory so file downloads don't leak.
+    temp_cleanup_entries: list[tuple[str, bool]] = []
 
     # Scan each path with interrupt handling
     with interruptible_scan() as interrupt_handler:
@@ -1101,13 +1115,16 @@ def scan_command(
 
                             tmp_dl_dir = Path(tempfile.mkdtemp(prefix="modelaudit_hf_"))
                             hf_cache_dir = tmp_dl_dir
+                            temp_dir = str(tmp_dl_dir)
 
                         # Download single file
                         download_path = download_file_from_hf(path, cache_dir=hf_cache_dir)
                         actual_path = str(download_path)
                         source_model_id, source_model_source = extract_model_id_from_path(path)
-                        # Only track for cleanup if we created an ephemeral cache above
-                        temp_dir = str(hf_cache_dir) if not final_cache else None
+                        # Only track for cleanup if we created an ephemeral cache above.
+                        # temp_dir is already set when we own the cache directory.
+                        if not final_cache and temp_dir is None:
+                            temp_dir = str(hf_cache_dir)
 
                         if download_spinner:
                             download_spinner.ok(style_text("✅ Downloaded", fg="green", bold=True))
@@ -1169,11 +1186,18 @@ def scan_command(
                         source_model_id, source_model_source = extract_model_id_from_path(path)
                         # Convert cache_dir string to Path if provided
                         hf_cache_dir = None
+                        tmp_hf_dir = None
                         if final_cache and final_cache_dir:
                             hf_cache_dir = Path(final_cache_dir)
                         elif final_cache:
                             # Use default cache directory
                             hf_cache_dir = Path.home() / ".modelaudit" / "cache"
+                        else:
+                            import tempfile
+
+                            tmp_hf_dir = Path(tempfile.mkdtemp(prefix="modelaudit_hf_"))
+                            hf_cache_dir = tmp_hf_dir
+                            temp_dir = str(tmp_hf_dir)
 
                         # Record download start and feature usage
                         record_download_started("huggingface", path)
@@ -1216,6 +1240,7 @@ def scan_command(
                                 max_total_size=final_max_total_size,
                                 strict_license=final_strict_license,
                                 skip_file_types=final_skip_files,
+                                use_hf_whitelist=final_use_hf_whitelist,
                                 cache_enabled=final_cache,
                                 cache_dir=final_cache_dir,
                                 **streaming_kwargs,
@@ -1234,6 +1259,8 @@ def scan_command(
                             if show_styled_output:
                                 click.echo(style_text("✅ Streaming scan complete", fg="green", bold=True))
 
+                            if tmp_hf_dir is not None:
+                                temp_dir = str(tmp_hf_dir)
                             # No actual_path to scan in normal flow - already done
                             url_handled = True
                             continue
@@ -1249,8 +1276,9 @@ def scan_command(
                             show_progress = show_styled_output and should_show_spinner()
                             download_path = download_model(path, cache_dir=hf_cache_dir, show_progress=show_progress)
                             actual_path = str(download_path)
-                            # Only track for cleanup if not using cache
-                            temp_dir = str(download_path) if not final_cache else None
+                            # Only clean up temporary directories created for this no-cache run.
+                            if tmp_hf_dir is not None:
+                                temp_dir = str(tmp_hf_dir)
 
                             # Record download completion
                             download_duration = time.time() - download_start
@@ -1324,6 +1352,7 @@ def scan_command(
                                 max_total_size=final_max_total_size,
                                 strict_license=final_strict_license,
                                 skip_file_types=final_skip_files,
+                                use_hf_whitelist=final_use_hf_whitelist,
                                 cache_enabled=final_cache,
                                 cache_dir=final_cache_dir,
                             )
@@ -1480,6 +1509,7 @@ def scan_command(
                                 max_total_size=final_max_total_size,
                                 strict_license=final_strict_license,
                                 skip_file_types=final_skip_files,
+                                use_hf_whitelist=final_use_hf_whitelist,
                                 cache_enabled=final_cache,
                                 cache_dir=final_cache_dir,
                             )
@@ -1592,6 +1622,7 @@ def scan_command(
                             blacklist_patterns=list(blacklist) if blacklist else None,
                             max_file_size=final_max_file_size,
                             max_total_size=final_max_total_size,
+                            use_hf_whitelist=final_use_hf_whitelist,
                         )
 
                         if download_spinner:
@@ -1645,6 +1676,8 @@ def scan_command(
                             max_total_size=final_max_total_size,
                             strict_license=final_strict_license,
                             skip_file_types=final_skip_files,
+                            selective_download=final_selective,
+                            use_hf_whitelist=final_use_hf_whitelist,
                         )
 
                         if download_spinner:
@@ -1684,7 +1717,7 @@ def scan_command(
                 #       no registered scanner can handle the file.
                 # Use actual_path (which may be a downloaded file) instead of original path
                 scan_path = actual_path if url_handled else path
-                if os.path.isfile(scan_path):
+                if final_skip_files and os.path.isfile(scan_path):
                     _, ext = os.path.splitext(scan_path)
                     ext = ext.lower()
                     if ext in (
@@ -1808,6 +1841,7 @@ def scan_command(
                             max_total_size=final_max_total_size,
                             strict_license=final_strict_license,
                             skip_file_types=final_skip_files,
+                            use_hf_whitelist=final_use_hf_whitelist,
                             cache_enabled=final_cache,
                             cache_dir=final_cache_dir,
                         )
@@ -1857,6 +1891,7 @@ def scan_command(
                         strict_license=final_strict_license,
                         progress_callback=progress_callback,
                         skip_file_types=final_skip_files,
+                        use_hf_whitelist=final_use_hf_whitelist,
                         **config_overrides,
                     )
 
@@ -1958,10 +1993,10 @@ def scan_command(
 
             finally:
                 # Defer cleanup until after SBOM generation to avoid FileNotFoundError
-                if temp_dir and os.path.exists(temp_dir) and not final_cache_dir:
-                    temp_dirs_to_cleanup.append(temp_dir)
+                if temp_dir and os.path.exists(temp_dir) and not final_cache:
+                    temp_cleanup_entries.append((temp_dir, os.path.isdir(temp_dir)))
                     if verbose:
-                        logger.debug(f"Deferring cleanup of temporary directory: {temp_dir}")
+                        logger.debug(f"Deferring cleanup of temporary artifact: {temp_dir}")
 
                 # Check if we were interrupted and should stop processing more paths
                 if interrupt_handler.is_interrupted():
@@ -2037,15 +2072,18 @@ def scan_command(
         with open(sbom, "w", encoding="utf-8") as f:
             f.write(sbom_text)
 
-    # Clean up temporary directories after SBOM generation
-    for temp_dir in temp_dirs_to_cleanup:
-        if os.path.exists(temp_dir):
+    # Clean up temporary artifacts after SBOM generation
+    for temp_path, is_dir in temp_cleanup_entries:
+        if os.path.exists(temp_path):
             try:
-                shutil.rmtree(temp_dir)
+                if is_dir:
+                    shutil.rmtree(temp_path)
+                else:
+                    os.remove(temp_path)
                 if verbose:
-                    logger.debug(f"Cleaned up temporary directory: {temp_dir}")
+                    logger.debug(f"Cleaned up temporary artifact: {temp_path}")
             except Exception as e:
-                logger.warning(f"Failed to clean up temporary directory {temp_dir}: {e!s}")
+                logger.warning(f"Failed to clean up temporary artifact {temp_path}: {e!s}")
 
     # Format the output
     if final_format == "json":
