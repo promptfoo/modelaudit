@@ -569,10 +569,10 @@ class TestJFrogFolderDownload:
         def mock_download_side_effect(url, cache_dir, **kwargs):
             filename = Path(url).name
             attempted_downloads.append(filename)
-            if filename == "model2.pt":
-                raise Exception("boom")
             downloaded_file = cache_dir / filename
             downloaded_file.write_bytes(b"mock file content")
+            if filename == "model2.pt":
+                raise Exception("boom")
             return downloaded_file
 
         mock_download.side_effect = mock_download_side_effect
@@ -586,7 +586,7 @@ class TestJFrogFolderDownload:
             )
 
         assert attempted_downloads == ["model1.pkl", "model2.pt"]
-        assert not (tmp_path / "model3.safetensors").exists()
+        assert not any(tmp_path.iterdir())
 
     @patch("modelaudit.utils.sources.jfrog.tempfile.mkdtemp")
     @patch("modelaudit.utils.sources.jfrog.download_artifact")

@@ -194,9 +194,12 @@ def test_filetype_detection_for_bin_files(tmp_path):
     pickle_bin.write_bytes(b"\x80\x03}q\x00.")  # Pickle protocol 3
     assert detect_file_format(str(pickle_bin)) == "pickle"
 
-    # Test safetensors format .bin
+    # Test safetensors format .bin (needs proper 8-byte header length prefix)
+    import struct
+
+    safetensors_header = b'{"__metadata__": {"format": "pt"}}'
     safetensors_bin = tmp_path / "safetensors.bin"
-    safetensors_bin.write_bytes(b'{"__metadata__": {"format": "pt"}}' + b"\x00" * 100)
+    safetensors_bin.write_bytes(struct.pack("<Q", len(safetensors_header)) + safetensors_header + b"\x00" * 100)
     assert detect_file_format(str(safetensors_bin)) == "safetensors"
 
     # Test ONNX format .bin

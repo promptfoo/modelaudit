@@ -17,7 +17,7 @@ from ...config.constants import SCANNABLE_MODEL_EXTENSIONS
 logger = logging.getLogger(__name__)
 
 # Constants
-MAX_RECURSION_DEPTH = 10  # Prevent infinite recursion in folder traversal
+MAX_RECURSION_DEPTH = 64  # Prevent runaway recursion in folder traversal
 
 
 def _safe_download_path(download_dir: Path, relative_path: str) -> Path:
@@ -34,6 +34,43 @@ def _safe_download_path(download_dir: Path, relative_path: str) -> Path:
         raise ValueError(f"Unsafe JFrog artifact path: {relative_path}")
 
     return local_file
+
+
+def _cleanup_failed_folder_download(
+    download_dir: Path,
+    *,
+    owns_download_dir: bool,
+    downloaded_files: list[Path],
+    current_file_candidates: list[Path],
+) -> None:
+    """Remove partial folder-download artifacts after an abort."""
+    if owns_download_dir:
+        if download_dir.exists():
+            shutil.rmtree(download_dir, ignore_errors=True)
+        return
+
+    cleanup_paths = {
+        path
+        for path in [*downloaded_files, *current_file_candidates]
+        if path.is_relative_to(download_dir) or path == download_dir
+    }
+
+    for path in sorted(cleanup_paths, key=lambda value: len(value.parts), reverse=True):
+        if path.exists() and path.is_file():
+            try:
+                path.unlink()
+            except OSError:
+                continue
+
+    parent_dirs = sorted({path.parent for path in cleanup_paths}, key=lambda value: len(value.parts), reverse=True)
+    for directory in parent_dirs:
+        current = directory
+        while current != download_dir:
+            try:
+                current.rmdir()
+            except OSError:
+                break
+            current = current.parent
 
 
 # TypedDict definitions for JFrog API responses
@@ -512,8 +549,11 @@ def download_jfrog_folder(
         base_repo_path = ""
 
     completed_downloads = 0
+    downloaded_files: list[Path] = []
 
     for file_info in files:
+        local_file: Path | None = None
+        downloaded_file: Path | None = None
         try:
             if show_progress:
                 size_display = file_info["human_size"] if file_info["human_size"] != "Unknown" else "size unknown"
@@ -554,15 +594,22 @@ def download_jfrog_folder(
                 if local_file.exists():
                     local_file.unlink()
                 downloaded_file.rename(local_file)
+                downloaded_file = local_file
             completed_downloads += 1
+            downloaded_files.append(downloaded_file)
 
         except Exception as e:
             error_msg = f"Failed to download {file_info['name']}: {e}"
             logger.warning(error_msg)
             if show_progress:
                 click.echo("❌ Aborting JFrog folder download to avoid scanning a partial dataset")
-            if owns_download_dir and download_dir.exists():
-                shutil.rmtree(download_dir, ignore_errors=True)
+            current_file_candidates = [path for path in (local_file, downloaded_file) if path is not None]
+            _cleanup_failed_folder_download(
+                download_dir,
+                owns_download_dir=owns_download_dir,
+                downloaded_files=downloaded_files,
+                current_file_candidates=current_file_candidates,
+            )
             raise Exception(
                 "JFrog folder download failed after "
                 f"{completed_downloads} of {len(files)} file(s) completed. {file_info['name']}: {e}"
