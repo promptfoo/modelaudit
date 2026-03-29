@@ -180,6 +180,47 @@ def test_scan_jfrog_folder_success(mock_scan, mock_download_folder, mock_detect,
 @patch("modelaudit.integrations.jfrog.shutil.rmtree")
 @patch("modelaudit.integrations.jfrog.tempfile.mkdtemp")
 @patch("modelaudit.integrations.jfrog.detect_jfrog_target_type")
+@patch("modelaudit.integrations.jfrog.download_jfrog_folder")
+@patch("modelaudit.core.scan_model_directory_or_file")
+def test_scan_jfrog_folder_respects_selective_download(
+    mock_scan, mock_download_folder, mock_detect, mock_mkdtemp, mock_rmtree
+):
+    """Explicit selective_download should flow through to folder downloads."""
+    temp_dir = "/tmp/modelaudit_jfrog_test"
+    mock_mkdtemp.return_value = temp_dir
+    mock_detect.return_value = {"type": "folder", "repo": "test-repo", "path": "/models"}
+    mock_download_folder.return_value = Path(f"{temp_dir}/models")
+
+    from modelaudit.models import create_initial_audit_result
+
+    mock_result = create_initial_audit_result()
+    mock_result.bytes_scanned = 2048
+    mock_result.files_scanned = 3
+    mock_result.scanner_names = ["pickle_scanner", "pytorch_scanner"]
+    mock_scan.return_value = mock_result
+
+    scan_jfrog_artifact(
+        "https://company.jfrog.io/artifactory/repo/models/",
+        api_token="token",
+        timeout=200,
+        selective_download=False,
+    )
+
+    mock_download_folder.assert_called_once_with(
+        "https://company.jfrog.io/artifactory/repo/models/",
+        cache_dir=Path(temp_dir),
+        api_token="token",
+        access_token=None,
+        timeout=200,
+        selective=False,
+        show_progress=True,
+    )
+    mock_rmtree.assert_called_once_with(temp_dir, ignore_errors=True)
+
+
+@patch("modelaudit.integrations.jfrog.shutil.rmtree")
+@patch("modelaudit.integrations.jfrog.tempfile.mkdtemp")
+@patch("modelaudit.integrations.jfrog.detect_jfrog_target_type")
 def test_scan_jfrog_artifact_detection_error(mock_detect, mock_mkdtemp, mock_rmtree):
     """Test error handling when JFrog target detection fails."""
     temp_dir = "/tmp/modelaudit_jfrog_test"

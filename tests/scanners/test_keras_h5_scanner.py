@@ -369,6 +369,37 @@ def test_lambda_safe_normalization_pattern_still_passes(tmp_path: Path) -> None:
     assert not any("dangerous Python code" in issue.message for issue in result.issues)
 
 
+@pytest.mark.parametrize(
+    "function_str",
+    [
+        "lambda x: x * 2",
+        "lambda x: K.softmax(x)",
+        "lambda x: (x - 128) / 128",
+    ],
+)
+def test_lambda_additional_safe_normalization_patterns_still_pass(tmp_path: Path, function_str: str) -> None:
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "safe_lambda_model_extra",
+                "layers": [{"class_name": "Lambda", "config": {"function": function_str}}],
+            },
+        },
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert any(
+        check.name == "Lambda Layer Code Analysis"
+        and check.status == CheckStatus.PASSED
+        and check.details.get("pattern_type") == "safe_normalization"
+        for check in result.checks
+    )
+    assert not any("dangerous Python code" in issue.message for issue in result.issues)
+
+
 def test_lambda_safe_prefix_with_injected_code_is_flagged(tmp_path: Path) -> None:
     """Semicolon-appended payloads must not bypass Lambda code safety checks."""
     model_path = create_custom_h5_file(
@@ -390,6 +421,42 @@ def test_lambda_safe_prefix_with_injected_code_is_flagged(tmp_path: Path) -> Non
     result = KerasH5Scanner().scan(str(model_path))
 
     # The injected payload must be flagged as dangerous, not allowlisted
+    assert any(
+        check.name == "Lambda Layer Code Analysis" and check.status == CheckStatus.FAILED for check in result.checks
+    ), f"Expected failed Lambda check but got: {[(c.name, c.status) for c in result.checks]}"
+    assert not any(
+        check.name == "Lambda Layer Code Analysis"
+        and check.status == CheckStatus.PASSED
+        and check.details.get("pattern_type") == "safe_normalization"
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "function_str",
+    [
+        'lambda x: x * 2; exec("bad")',
+        'lambda x: K.softmax(x); __import__("os").system("evil")',
+        'lambda x: (x - 128) / 128; exec("bad")',
+    ],
+)
+def test_lambda_additional_safe_prefixes_with_injected_code_are_flagged(
+    tmp_path: Path,
+    function_str: str,
+) -> None:
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "unsafe_lambda_model_extra",
+                "layers": [{"class_name": "Lambda", "config": {"function": function_str}}],
+            },
+        },
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
     assert any(
         check.name == "Lambda Layer Code Analysis" and check.status == CheckStatus.FAILED for check in result.checks
     ), f"Expected failed Lambda check but got: {[(c.name, c.status) for c in result.checks]}"
