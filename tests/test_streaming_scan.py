@@ -411,7 +411,7 @@ def test_scan_model_streaming_informational_failed_scan_does_not_set_operational
 def test_scan_model_streaming_operational_info_failure_sets_exit_code_2(
     temp_test_files: list[Path],
 ) -> None:
-    """Operational error phrases must still fail closed even when the check is informational."""
+    """Informational coverage failures must still fail closed when flagged as operational."""
 
     def file_generator():
         yield (temp_test_files[0], True)
@@ -427,6 +427,8 @@ def test_scan_model_streaming_operational_info_failure_sets_exit_code_2(
         severity=IssueSeverity.INFO,
         location=str(temp_test_files[0]),
     )
+    info_result.metadata["operational_error"] = True
+    info_result.metadata["operational_error_reason"] = "unsupported_bounded_large_file_analysis"
     info_result.finish(success=False)
 
     with patch("modelaudit.core.scan_file", return_value=info_result):

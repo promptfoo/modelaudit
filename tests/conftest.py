@@ -15,11 +15,11 @@ import pytest
 # Framework availability detection (cached for performance)
 # ============================================================================
 def _check_framework(name: str) -> bool:
-    """Check if a framework is available."""
+    """Check if a framework can be imported successfully."""
     try:
         __import__(name)
         return True
-    except ImportError:
+    except Exception:
         return False
 
 
@@ -86,6 +86,7 @@ def pytest_runtest_setup(item):
             "test_nemo_scanner.py",  # NeMo scanner CVE-2025-23304 tests
             "test_numpy_scanner.py",  # NumPy scanner CVE-2019-6446 tests
             "test_onnx_scanner.py",  # ONNX scanner CVE-2025-51480 tests
+            "test_safetensors_scanner.py",  # SafeTensors scanner dtype and metadata tests
             "test_rule_mapper.py",  # Rule mapper validity and network mapping tests
             "test_rule_code_registry_consistency.py",  # Scanner literal rule-code registry consistency
             "test_keras_h5_scanner.py",  # Keras H5 scanner CVE-2025-9905 tests
@@ -105,6 +106,7 @@ def pytest_runtest_setup(item):
             "test_mxnet_scanner.py",  # MXNet scanner tests
             "test_filetype.py",  # File type detection and validation tests
             "test_tf_metagraph_scanner.py",  # TensorFlow MetaGraph scanner tests
+            "test_tf_savedmodel_scanner.py",  # TensorFlow SavedModel scanner tests
             "test_torchserve_mar_scanner.py",  # TorchServe .mar scanner tests
             "test_executorch_scanner.py",  # ExecuTorch scanner tests
             "test_telemetry.py",  # telemetry payload and availability tests
@@ -118,6 +120,7 @@ def pytest_runtest_setup(item):
             "test_oci_layer_scanner.py",  # OCI layer path safety regression tests
             "test_jfrog.py",  # JFrog utility tests
             "test_jfrog_integration.py",  # JFrog integration tests
+            "test_mlflow_integration.py",  # MLflow integration tests
             "test_tar_scanner.py",  # TAR archive scanner tests
             "test_zip_scanner.py",  # ZIP archive scanner tests
             "test_sevenzip_scanner.py",  # 7-Zip archive scanner tests
@@ -125,7 +128,11 @@ def pytest_runtest_setup(item):
             "test_nested_pickle_integration.py",  # nested pickle false-positive/true-positive integration tests
             "test_ml_context_false_positives.py",  # ML-context executable filtering regression tests
             "test_cli_output.py",  # CliRunner JSON parsing helper regression tests
+            "test_cache_cli.py",  # cache CLI command regression tests
+            "test_cache_correctness.py",  # cache invalidation and persistence correctness tests
+            "test_optimized_config.py",  # optimized cache config regression tests
             "test_large_file_handler.py",  # Large file handler regression tests
+            "test_file_iterator.py",  # Streaming file iterator memory regression tests
         ]
 
         # Check if this is an allowed test file

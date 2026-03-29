@@ -105,6 +105,29 @@ def test_advanced_large_file_fails_closed_without_bounded_scanner_support(
 
     assert scanner.scan_calls == 0
     assert result.success is False
+    assert result.metadata["operational_error"] is True
+    assert result.metadata["operational_error_reason"] == "unsupported_bounded_large_file_analysis"
+    assert any("bounded large-file analysis" in issue.message.lower() for issue in result.issues)
+
+
+def test_advanced_extreme_file_fails_closed_without_bounded_scanner_support(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unsupported scanners must also fail closed in the 50GB-500GB mmap path."""
+    test_file = tmp_path / "model.bin"
+    test_file.write_bytes(b"0" * 64)
+
+    monkeypatch.setattr(advanced_handlers, "EXTREME_MODEL_THRESHOLD", 1)
+    monkeypatch.setattr(advanced_handlers, "LARGE_MODEL_THRESHOLD_200GB", 10_000)
+
+    scanner = DummyNonChunkScanner()
+    handler = advanced_handlers.AdvancedFileHandler(str(test_file), scanner)
+    result = handler.scan()
+
+    assert scanner.scan_calls == 0
+    assert result.success is False
+    assert result.metadata["operational_error"] is True
+    assert result.metadata["operational_error_reason"] == "unsupported_bounded_large_file_analysis"
     assert any("bounded large-file analysis" in issue.message.lower() for issue in result.issues)
 
 

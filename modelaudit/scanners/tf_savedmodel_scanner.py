@@ -4,6 +4,7 @@ import contextlib
 import logging
 import os
 import re
+import stat
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +12,7 @@ from typing import Any, ClassVar
 
 from modelaudit.config.explanations import get_tf_op_explanation
 from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_OPS, TENSORFLOW_DANGEROUS_OPS
+from modelaudit.utils.file.detection import PROTO0_1_MAX_PROBE_BYTES, _looks_like_proto0_or_1_pickle
 from modelaudit.utils.helpers.code_validation import (
     is_code_potentially_dangerous,
     validate_python_syntax,
@@ -32,6 +34,38 @@ PYTHON_OPS = ("PyFunc", "PyCall", "PyFuncStateless", "EagerPyFunc")
 
 # Defer protobuf availability check to avoid module-level imports
 HAS_PROTOS: bool | None = None
+_ASSET_SCRIPT_SHEBANG = b"#!"
+_ASSET_ELF_HEADER = b"\x7fELF"
+_ASSET_MACHO_HEADERS = (
+    b"\xfe\xed\xfa\xce",  # MH_MAGIC
+    b"\xfe\xed\xfa\xcf",  # MH_MAGIC_64
+    b"\xce\xfa\xed\xfe",  # MH_CIGAM
+    b"\xcf\xfa\xed\xfe",  # MH_CIGAM_64
+    b"\xca\xfe\xba\xbe",  # FAT_MAGIC
+    b"\xbe\xba\xfe\xca",  # FAT_CIGAM
+)
+_ASSET_PE_HEADER = b"MZ"  # Windows PE executables
+_ASSET_PICKLE_PREFIXES = tuple(bytes([0x80, protocol]) for protocol in range(2, 6))
+_ASSET_PROBE_BYTES = max(8192, PROTO0_1_MAX_PROBE_BYTES)
+_ASSET_PYTHON_PATTERN = re.compile(
+    r"(?m)(^\s*(?:"
+    r"from\s+[A-Za-z_][\w.]*\s+import\s+"
+    r"|import\s+[A-Za-z_][\w.]*"
+    r"|def\s+[A-Za-z_]\w*\s*\("
+    r"|class\s+[A-Za-z_]\w*\s*[:(]"
+    r"))"
+)
+
+
+def _looks_like_pe_executable(content_head: bytes) -> bool:
+    """Return True for a minimally valid PE/COFF executable prefix."""
+    if not content_head.startswith(_ASSET_PE_HEADER) or len(content_head) < 0x40:
+        return False
+
+    pe_offset = int.from_bytes(content_head[0x3C:0x40], "little", signed=False)
+    if pe_offset < 0x40 or pe_offset + 4 > len(content_head):
+        return False
+    return content_head[pe_offset : pe_offset + 4] == b"PE\x00\x00"
 
 
 def _check_protos() -> bool:
@@ -42,6 +76,26 @@ def _check_protos() -> bool:
 
         HAS_PROTOS = modelaudit.protos._check_vendored_protos()
     return HAS_PROTOS
+
+
+def _strip_leading_comment_lines(content: bytes) -> bytes:
+    """Remove leading comment/blank lines before protocol 0/1 pickle probing."""
+    offset = 0
+    content_len = len(content)
+
+    while offset < content_len:
+        line_start = offset
+        while offset < content_len and content[offset] not in (0x0A, 0x0D):
+            offset += 1
+        line = content[line_start:offset].lstrip()
+        while offset < content_len and content[offset] in (0x0A, 0x0D):
+            offset += 1
+
+        if not line or line.startswith(b"#"):
+            continue
+        return content[line_start:]
+
+    return b""
 
 
 # Create a placeholder for type hints when TensorFlow is not available
@@ -203,9 +257,10 @@ class TensorFlowSavedModelScanner(BaseScanner):
     def _scan_saved_model_directory(self, dir_path: str) -> ScanResult:
         """Scan a SavedModel directory"""
         result = self._create_result()
+        model_root = Path(dir_path)
 
         # Look for saved_model.pb in the directory
-        saved_model_path = Path(dir_path) / "saved_model.pb"
+        saved_model_path = model_root / "saved_model.pb"
         if not saved_model_path.exists():
             result.add_check(
                 name="SavedModel Structure Check",
@@ -223,14 +278,21 @@ class TensorFlowSavedModelScanner(BaseScanner):
         result.merge(file_scan_result)
 
         # Check for keras_metadata.pb which contains Lambda layer definitions
-        keras_metadata_path = Path(dir_path) / "keras_metadata.pb"
+        keras_metadata_path = model_root / "keras_metadata.pb"
         if keras_metadata_path.exists():
             self._scan_keras_metadata(str(keras_metadata_path), result)
+
+        self._scan_saved_model_assets(model_root, result)
 
         # Check for other suspicious files in the directory
         for root, _dirs, files in os.walk(dir_path):
             for file in files:
                 file_path = Path(root) / file
+                if any(
+                    file_path.is_relative_to(model_root / asset_dir_name)
+                    for asset_dir_name in ("assets", "assets.extra")
+                ) and file_path.is_symlink():
+                    continue
                 # Look for potentially suspicious Python files
                 if file.endswith(".py"):
                     result.add_check(
@@ -293,6 +355,231 @@ class TensorFlowSavedModelScanner(BaseScanner):
 
         result.finish(success=True)
         return result
+
+    def _scan_saved_model_assets(self, model_root: Path, result: ScanResult) -> None:
+        """Scan SavedModel asset directories for suspicious executable content."""
+        for assets_dir_name in ("assets", "assets.extra"):
+            assets_dir = model_root / assets_dir_name
+            if not assets_dir.exists() and not assets_dir.is_symlink():
+                continue
+
+            try:
+                assets_dir_stat = assets_dir.lstat()
+            except OSError as exc:
+                result.add_check(
+                    name="SavedModel Assets Security Check",
+                    passed=False,
+                    message=f"Cannot inspect asset directory for security analysis: {assets_dir_name}: {exc}",
+                    severity=IssueSeverity.WARNING,
+                    location=str(assets_dir),
+                    details={
+                        "file_name": assets_dir_name,
+                        "detected_content_type": "unscannable_asset_dir",
+                        "asset_kind": "stat_error",
+                        "exception": str(exc),
+                        "exception_type": type(exc).__name__,
+                    },
+                    rule_code="S902",
+                )
+                continue
+
+            if stat.S_ISLNK(assets_dir_stat.st_mode):
+                result.add_check(
+                    name="SavedModel Assets Security Check",
+                    passed=False,
+                    message=f"Symlinked asset directory is not traversed during security analysis: {assets_dir_name}",
+                    severity=IssueSeverity.WARNING,
+                    location=str(assets_dir),
+                    details={
+                        "file_name": assets_dir_name,
+                        "detected_content_type": "unscannable_asset_dir",
+                        "asset_kind": "symlink_directory",
+                    },
+                    rule_code="S902",
+                )
+                continue
+
+            if not stat.S_ISDIR(assets_dir_stat.st_mode):
+                continue
+
+            for root, dir_names, files in os.walk(assets_dir):
+                retained_dirs: list[str] = []
+                for dir_name in dir_names:
+                    child_dir = Path(root) / dir_name
+                    try:
+                        child_stat = child_dir.lstat()
+                    except OSError as exc:
+                        result.add_check(
+                            name="SavedModel Assets Security Check",
+                            passed=False,
+                            message=(
+                                "Cannot inspect nested asset directory for security analysis: "
+                                f"{child_dir.relative_to(model_root)}: {exc}"
+                            ),
+                            severity=IssueSeverity.WARNING,
+                            location=str(child_dir),
+                            details={
+                                "file_name": dir_name,
+                                "detected_content_type": "unscannable_asset_dir",
+                                "asset_kind": "stat_error",
+                                "exception": str(exc),
+                                "exception_type": type(exc).__name__,
+                            },
+                            rule_code="S902",
+                        )
+                        continue
+
+                    if stat.S_ISLNK(child_stat.st_mode):
+                        result.add_check(
+                            name="SavedModel Assets Security Check",
+                            passed=False,
+                            message=(
+                                "Symlinked nested asset directory is not traversed during security analysis: "
+                                f"{child_dir.relative_to(model_root)}"
+                            ),
+                            severity=IssueSeverity.WARNING,
+                            location=str(child_dir),
+                            details={
+                                "file_name": dir_name,
+                                "detected_content_type": "unscannable_asset_dir",
+                                "asset_kind": "symlink_directory",
+                            },
+                            rule_code="S902",
+                        )
+                        continue
+
+                    if stat.S_ISDIR(child_stat.st_mode):
+                        retained_dirs.append(dir_name)
+
+                dir_names[:] = retained_dirs
+
+                for file_name in files:
+                    file_path = Path(root) / file_name
+                    detected_types = self._detect_suspicious_asset_content(file_path, result)
+                    if not detected_types:
+                        continue
+
+                    file_size = self.get_file_size(str(file_path))
+                    result.add_check(
+                        name="SavedModel Assets Security Check",
+                        passed=False,
+                        message=(
+                            "Suspicious executable-like content detected in SavedModel assets: "
+                            f"{file_path.relative_to(model_root)}"
+                        ),
+                        severity=IssueSeverity.WARNING,
+                        location=str(file_path),
+                        details={
+                            "file_name": file_name,
+                            "detected_content_type": ", ".join(detected_types),
+                            "size": file_size,
+                        },
+                        rule_code="S902",
+                    )
+
+    def _detect_suspicious_asset_content(self, file_path: Path, result: ScanResult) -> list[str]:
+        """Return suspicious content types found in a SavedModel asset file."""
+        try:
+            file_stat = file_path.lstat()
+        except OSError as exc:
+            result.add_check(
+                name="SavedModel Assets Security Check",
+                passed=False,
+                message=f"Cannot inspect asset file for security analysis: {file_path.name}: {exc}",
+                severity=IssueSeverity.WARNING,
+                location=str(file_path),
+                details={
+                    "file_name": file_path.name,
+                    "detected_content_type": "unscannable_asset",
+                    "asset_kind": "stat_error",
+                    "exception": str(exc),
+                    "exception_type": type(exc).__name__,
+                },
+                rule_code="S902",
+            )
+            return []
+        if stat.S_ISLNK(file_stat.st_mode):
+            result.add_check(
+                name="SavedModel Assets Security Check",
+                passed=False,
+                message=f"Symlink asset is not followed during security analysis: {file_path.name}",
+                severity=IssueSeverity.WARNING,
+                location=str(file_path),
+                details={
+                    "file_name": file_path.name,
+                    "detected_content_type": "unscannable_asset",
+                    "asset_kind": "symlink",
+                    "size": file_stat.st_size,
+                },
+                rule_code="S902",
+            )
+            return []
+        if not stat.S_ISREG(file_stat.st_mode):
+            result.add_check(
+                name="SavedModel Assets Security Check",
+                passed=False,
+                message=f"Non-regular asset file is not scanned during security analysis: {file_path.name}",
+                severity=IssueSeverity.WARNING,
+                location=str(file_path),
+                details={
+                    "file_name": file_path.name,
+                    "detected_content_type": "unscannable_asset",
+                    "asset_kind": "non_regular",
+                    "size": file_stat.st_size,
+                },
+                rule_code="S902",
+            )
+            return []
+
+        try:
+            with file_path.open("rb") as file_obj:
+                content_head = file_obj.read(_ASSET_PROBE_BYTES)
+        except OSError as exc:
+            result.add_check(
+                name="SavedModel Assets Security Check",
+                passed=False,
+                message=f"Cannot read asset file for security analysis: {file_path.name}: {exc}",
+                severity=IssueSeverity.WARNING,
+                location=str(file_path),
+                details={
+                    "file_name": file_path.name,
+                    "detected_content_type": "unscannable_asset",
+                    "asset_kind": "unreadable",
+                    "size": file_stat.st_size,
+                    "exception": str(exc),
+                    "exception_type": type(exc).__name__,
+                },
+                rule_code="S902",
+            )
+            return []
+
+        detected_types: list[str] = []
+
+        def _record_detected_type(content_type: str) -> None:
+            if content_type not in detected_types:
+                detected_types.append(content_type)
+
+        if content_head.startswith(_ASSET_SCRIPT_SHEBANG):
+            _record_detected_type("script_shebang")
+        if content_head.startswith(_ASSET_ELF_HEADER):
+            _record_detected_type("elf_binary")
+        if _looks_like_pe_executable(content_head):
+            _record_detected_type("pe_executable")
+        if any(content_head.startswith(header) for header in _ASSET_MACHO_HEADERS):
+            _record_detected_type("macho_binary")
+        if any(content_head.startswith(prefix) for prefix in _ASSET_PICKLE_PREFIXES):
+            _record_detected_type("pickle_payload")
+        proto0_probe = _strip_leading_comment_lines(content_head)
+        if _looks_like_proto0_or_1_pickle(content_head) or (
+            proto0_probe and _looks_like_proto0_or_1_pickle(proto0_probe)
+        ):
+            _record_detected_type("pickle_payload")
+
+        decoded_head = content_head.decode("utf-8", errors="ignore")
+        if decoded_head and _ASSET_PYTHON_PATTERN.search(decoded_head):
+            _record_detected_type("python_source_pattern")
+
+        return detected_types
 
     def _get_meta_graph_tag(self, meta_graph: Any) -> str:
         """Return a stable label for a MetaGraphDef."""

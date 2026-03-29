@@ -7,6 +7,7 @@ import os
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, ClassVar, Final
 
@@ -36,6 +37,8 @@ logger = logging.getLogger("modelaudit.scanners")
 
 TRUSTED_HUGGINGFACE_SOURCES = frozenset({"huggingface"})
 _TRUSTED_SOURCE_PROVENANCE_TOKEN: Final[object] = object()
+_WHITELIST_STALE_WARNING_THRESHOLD_DAYS: Final[int] = 90
+_has_logged_stale_whitelist_warning = False
 
 
 @dataclass(frozen=True)
@@ -475,9 +478,30 @@ class BaseScanner(ABC):
         # Only trusted HuggingFace provenance is eligible for downgrades.
         # Local metadata-derived model IDs do not qualify; validated HF cache layouts do.
         if self.context and self.context.model_id and self.context.model_source in TRUSTED_HUGGINGFACE_SOURCES:
-            from modelaudit.whitelists import is_whitelisted_model
+            from modelaudit.whitelists import WHITELIST_GENERATED_AT, is_whitelisted_model
 
-            return is_whitelisted_model(self.context.model_id)
+            is_whitelisted = is_whitelisted_model(self.context.model_id)
+            if not is_whitelisted:
+                return False
+
+            global _has_logged_stale_whitelist_warning
+            if not _has_logged_stale_whitelist_warning:
+                try:
+                    whitelist_generated_at = datetime.fromisoformat(WHITELIST_GENERATED_AT).date()
+                    whitelist_age_days = (datetime.now(timezone.utc).date() - whitelist_generated_at).days
+                    if whitelist_age_days > _WHITELIST_STALE_WARNING_THRESHOLD_DAYS:
+                        logger.warning(
+                            "HuggingFace whitelist is %d days old. Consider updating for best supply chain coverage.",
+                            whitelist_age_days,
+                        )
+                        _has_logged_stale_whitelist_warning = True
+                except ValueError:
+                    logger.debug(
+                        "Invalid WHITELIST_GENERATED_AT value %r; skipping whitelist staleness check.",
+                        WHITELIST_GENERATED_AT,
+                    )
+
+            return True
 
         return False
 

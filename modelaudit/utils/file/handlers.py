@@ -381,6 +381,47 @@ class AdvancedFileHandler:
             handler = LargeFileHandler(self.file_path, self.scanner, self.progress_callback, self.timeout)
             return handler.scan()
 
+    def _supports_bounded_large_file_analysis(self) -> bool:
+        """Return True when the scanner exposes a bounded large-file strategy."""
+        return any(hasattr(self.scanner, attr) for attr in ("_scan_with_mmap", "_analyze_chunk", "_analyze_bytes"))
+
+    def _fail_closed_large_file_coverage(self, *, threshold_bytes: int) -> "ScanResult":
+        from ...scanners.base import IssueSeverity, ScanResult
+
+        """Abort with an operational-style result when large-file coverage would be partial."""
+        result = ScanResult(scanner_name=self.scanner.name)
+        result.add_check(
+            name="Large File Detection",
+            passed=True,
+            message=f"Scanning file ({self.total_size:,} bytes) - processing may take additional time",
+            severity=IssueSeverity.INFO,
+            details={
+                "file_size": self.total_size,
+                "strategy": "unsupported",
+                "note": "Bounded analysis unavailable for this scanner; aborting to avoid partial coverage.",
+            },
+        )
+        result.add_check(
+            name="Large File Coverage Check",
+            passed=False,
+            message=(
+                "Error scanning file: "
+                f"scanner {self.scanner.name} does not support bounded large-file analysis "
+                "for this file size; aborting to avoid partial coverage."
+            ),
+            severity=IssueSeverity.INFO,
+            details={
+                "file_size": self.total_size,
+                "strategy": "unsupported",
+                "scanner": self.scanner.name,
+                "threshold_bytes": threshold_bytes,
+            },
+        )
+        result.metadata["operational_error"] = True
+        result.metadata["operational_error_reason"] = "unsupported_bounded_large_file_analysis"
+        result.finish(success=False)
+        return result
+
     def _scan_sharded_model(self) -> "ScanResult":
         from ...scanners.base import IssueSeverity, ScanResult
 
@@ -417,6 +458,9 @@ class AdvancedFileHandler:
 
     def _scan_with_mmap(self) -> "ScanResult":
         """Scan using memory mapping."""
+        if not self._supports_bounded_large_file_analysis():
+            return self._fail_closed_large_file_coverage(threshold_bytes=EXTREME_MODEL_THRESHOLD)
+
         mmap_scanner = MemoryMappedHandler(self.file_path, self.scanner)
         return mmap_scanner.scan_with_mmap(self.progress_callback)
 
@@ -426,11 +470,10 @@ class AdvancedFileHandler:
         """Scan very large files using only bounded, scanner-aware analysis."""
         logger.debug(f"Scanning file ({self.total_size:,} bytes) with bounded large-file analysis")
 
-        # Add informational note about file size
+        if not self._supports_bounded_large_file_analysis():
+            return self._fail_closed_large_file_coverage(threshold_bytes=LARGE_MODEL_THRESHOLD_200GB)
+
         result = ScanResult(scanner_name=self.scanner.name)
-        supports_bounded_analysis = any(
-            hasattr(self.scanner, attr) for attr in ("_scan_with_mmap", "_analyze_chunk", "_analyze_bytes")
-        )
         strategy = (
             "scanner-defined memory-mapped analysis"
             if hasattr(self.scanner, "_scan_with_mmap")
@@ -447,26 +490,6 @@ class AdvancedFileHandler:
                 "note": "Bounded analysis enabled for this scanner",
             },
         )
-
-        if not supports_bounded_analysis:
-            result.add_check(
-                name="Large File Coverage Check",
-                passed=False,
-                message=(
-                    "Error scanning file: "
-                    f"scanner {self.scanner.name} does not support bounded large-file analysis "
-                    "for this file size; aborting to avoid partial coverage."
-                ),
-                severity=IssueSeverity.INFO,
-                details={
-                    "file_size": self.total_size,
-                    "strategy": "unsupported",
-                    "scanner": self.scanner.name,
-                    "threshold_bytes": LARGE_MODEL_THRESHOLD_200GB,
-                },
-            )
-            result.finish(success=False)
-            return result
 
         mmap_scanner = MemoryMappedHandler(self.file_path, self.scanner)
         if hasattr(self.scanner, "_scan_with_mmap"):
@@ -531,8 +554,10 @@ def scan_advanced_large_file(
     # Use cache manager for advanced large file scans
     try:
         from ...cache import get_cache_manager
+        from ...cache.optimized_config import build_cache_version_context
 
         cache_manager = get_cache_manager(cache_dir, enabled=True)
+        version_context = build_cache_version_context(config)
 
         # Create wrapper function for cache manager
         def cached_advanced_scan_wrapper(fpath: str) -> dict:
@@ -540,7 +565,11 @@ def scan_advanced_large_file(
             return result.to_dict()
 
         # Get cached result or perform scan
-        result_dict = cache_manager.cached_scan(file_path, cached_advanced_scan_wrapper)
+        result_dict = cache_manager.cached_scan(
+            file_path,
+            cached_advanced_scan_wrapper,
+            version_context=version_context,
+        )
 
         # Convert back to ScanResult
         from ...utils.helpers.result_conversion import scan_result_from_dict

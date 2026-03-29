@@ -45,6 +45,14 @@ def _get_onnx_mapping() -> Any:
 # Defer ONNX availability check to avoid module-level imports
 HAS_ONNX: bool | None = None
 mapping = None
+STANDARD_ONNX_DOMAINS: frozenset[str] = frozenset(
+    {
+        "",
+        "ai.onnx",
+        "ai.onnx.ml",
+        "ai.onnx.preview.training",
+    }
+)
 
 
 def _check_onnx() -> bool:
@@ -208,7 +216,7 @@ class OnnxScanner(BaseScanner):
         for node in model.graph.node:
             # Check for interrupts periodically during node processing
             self.check_interrupted()
-            if node.domain and node.domain not in ("", "ai.onnx"):
+            if node.domain and node.domain not in STANDARD_ONNX_DOMAINS:
                 custom_domains.add(node.domain)
 
                 # All custom domains are INFO - they're metadata, not executable code
@@ -680,7 +688,7 @@ class OnnxScanner(BaseScanner):
 
             # Custom domains
             custom_domains = sorted(
-                {node.domain for node in model.graph.node if node.domain and node.domain not in {"", "ai.onnx"}}
+                {node.domain for node in model.graph.node if node.domain and node.domain not in STANDARD_ONNX_DOMAINS}
             )
             if custom_domains:
                 metadata["custom_domains"] = custom_domains
