@@ -6221,6 +6221,9 @@ class PickleScanner(BaseScanner):
                                         }
 
                                 location = f"{self.current_file_path} (pos {pos})"
+                                reduce_why = (
+                                    get_import_explanation(associated_global) if associated_global is not None else None
+                                ) or get_opcode_explanation("REDUCE")
                                 if (
                                     reduce_mod
                                     and reduce_func
@@ -6231,7 +6234,7 @@ class PickleScanner(BaseScanner):
                                         severity=severity,
                                         location=location,
                                         details=_reduce_details,
-                                        why=get_opcode_explanation("REDUCE"),
+                                        why=reduce_why,
                                         rule_code=None,
                                     )
                                 ):

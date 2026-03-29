@@ -226,7 +226,7 @@ class TestRunpyDetection:
             finally:
                 os.unlink(temp_path)
 
-    def test_runpy_severity_levels(self):
+    def test_runpy_severity_levels(self) -> None:
         """Test that runpy remains CRITICAL and preserves execution context evidence."""
         scanner = PickleScanner()
 

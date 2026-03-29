@@ -78,7 +78,8 @@ def test_max_file_size(tmp_path):
     # Scan with max_file_size smaller than the file
     results = scan_model_directory_or_file(str(test_file), max_file_size=500, cache_enabled=False)
 
-    assert results.success is True
+    assert results.success is False
+    assert results.has_errors is True
     assert results.files_scanned == 1
 
     # Should have an issue about file being too large

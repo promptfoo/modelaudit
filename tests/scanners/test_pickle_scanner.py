@@ -47,9 +47,14 @@ from tests.assets.generators.generate_evil_pickle import EvilClass
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 PYTORCH_FIXTURE_DIR = Path(__file__).resolve().parent.parent / "assets" / "samples" / "pytorch"
+SYSTEM_GLOBAL_VARIANTS = {"os.system", "posix.system", "nt.system"}
 
 
 # Import only what we need for the pickle scanner test
+
+
+def _contains_system_global(text: str) -> bool:
+    return any(target in text for target in SYSTEM_GLOBAL_VARIANTS)
 
 
 def _short_binunicode(value: bytes) -> bytes:
@@ -879,11 +884,11 @@ class TestPickleScanner(unittest.TestCase):
         for issue in result.issues:
             if "REDUCE" in issue.message:
                 has_reduce_detection = True
-            if "posix.system" in issue.message or "os.system" in issue.message:
+            if _contains_system_global(issue.message):
                 has_os_system_detection = True
 
         assert has_reduce_detection, "Failed to detect REDUCE opcode"
-        assert has_os_system_detection, "Failed to detect os.system/posix.system reference"
+        assert has_os_system_detection, "Failed to detect os.system/posix.system/nt.system reference"
 
     def test_scan_dill_pickle(self):
         """Scanner should flag suspicious dill references"""
@@ -1058,7 +1063,7 @@ class TestPickleScannerAdvanced(unittest.TestCase):
             for check in result.checks
             if check.name == "REDUCE Opcode Safety Check"
             and check.status == CheckStatus.FAILED
-            and check.details.get("associated_global") == "posix.system"
+            and check.details.get("associated_global") in SYSTEM_GLOBAL_VARIANTS
         ]
         assert reduce_checks, f"Expected primary REDUCE finding, got: {[i.message for i in result.issues]}"
         assert all(check.rule_code for check in reduce_checks), (
@@ -1066,10 +1071,10 @@ class TestPickleScannerAdvanced(unittest.TestCase):
         )
         assert any(
             evidence.get("check_name") == "STACK_GLOBAL Module Check"
-            and evidence.get("details", {}).get("import_reference") == "posix.system"
+            and evidence.get("details", {}).get("import_reference") in SYSTEM_GLOBAL_VARIANTS
             for check in reduce_checks
             for evidence in check.details.get("supporting_evidence", [])
-        ), f"Expected folded STACK_GLOBAL evidence on posix.system finding: {reduce_checks}"
+        ), f"Expected folded STACK_GLOBAL evidence on os/posix/nt.system finding: {reduce_checks}"
 
     def test_memo_object_tracking(self) -> None:
         scanner = PickleScanner()
@@ -1200,9 +1205,9 @@ class TestDillLoadersRegression:
                     for c in result.checks
                     if c.name == "REDUCE Opcode Safety Check"
                     and c.status == CheckStatus.FAILED
-                    and c.details.get("associated_global") == "posix.system"
+                    and c.details.get("associated_global") in SYSTEM_GLOBAL_VARIANTS
                 ]
-                assert reduce_checks, "Expected REDUCE detection for memoized posix.system target"
+                assert reduce_checks, "Expected REDUCE detection for memoized os/posix/nt.system target"
                 assert any(
                     evidence.get("check_name") == "Reduce Pattern Analysis"
                     for check in reduce_checks
@@ -1255,16 +1260,14 @@ class TestDillLoadersRegression:
 
                 reduce_checks = [c for c in result.checks if c.name == "REDUCE Opcode Safety Check"]
                 matching_reduce_checks = [
-                    c
-                    for c in reduce_checks
-                    if c.status.value == "failed" and ("posix.system" in c.message or "os.system" in c.message)
+                    c for c in reduce_checks if c.status.value == "failed" and _contains_system_global(c.message)
                 ]
                 assert matching_reduce_checks, (
-                    f"Expected REDUCE check to resolve os/posix.system, got: {[c.message for c in reduce_checks]}"
+                    f"Expected REDUCE check to resolve os/posix/nt.system, got: {[c.message for c in reduce_checks]}"
                 )
                 assert any(
                     evidence.get("check_name") == "STACK_GLOBAL Module Check"
-                    and evidence.get("details", {}).get("import_reference") in {"os.system", "posix.system"}
+                    and evidence.get("details", {}).get("import_reference") in SYSTEM_GLOBAL_VARIANTS
                     for check in matching_reduce_checks
                     for evidence in check.details.get("supporting_evidence", [])
                 ), f"Expected folded STACK_GLOBAL evidence on REDUCE finding: {matching_reduce_checks}"
@@ -2416,7 +2419,7 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
         assert result.has_errors
 
         reduce_messages = [i.message.lower() for i in result.issues if "reduce" in i.message.lower()]
-        assert any("os.system" in msg or "posix.system" in msg for msg in reduce_messages), (
+        assert any(_contains_system_global(msg) for msg in reduce_messages), (
             f"Expected dangerous REDUCE detection alongside malformed STACK_GLOBAL, got: {reduce_messages}"
         )
 
@@ -2508,10 +2511,10 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
             issue
             for issue in result.issues
             if issue.severity == IssueSeverity.CRITICAL
-            and ("os" in issue.message.lower() or "posix" in issue.message.lower())
+            and ("os" in issue.message.lower() or "posix" in issue.message.lower() or "nt" in issue.message.lower())
         ]
         assert structural_checks, "Expected structural tamper findings"
-        assert critical_os, f"Expected CRITICAL os/posix finding, got: {[i.message for i in result.issues]}"
+        assert critical_os, f"Expected CRITICAL os/posix/nt finding, got: {[i.message for i in result.issues]}"
 
     def test_structural_tamper_with_safe_ml_payload_only_info_severity(self) -> None:
         """Structural findings should remain low severity when payload is otherwise benign."""
@@ -2574,8 +2577,9 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
                     assert result.has_errors
                     reduce_issues = [i for i in result.issues if "reduce" in i.message.lower()]
                     assert reduce_issues, f"Expected REDUCE issue, got: {[i.message for i in result.issues]}"
-                    assert any("os.system" in i.message or "posix.system" in i.message for i in reduce_issues), (
-                        f"Expected resolved os/posix.system in REDUCE issues, got: {[i.message for i in reduce_issues]}"
+                    assert any(_contains_system_global(i.message) for i in reduce_issues), (
+                        "Expected resolved os/posix/nt.system in REDUCE issues, "
+                        f"got: {[i.message for i in reduce_issues]}"
                     )
                 finally:
                     with suppress(ValueError):
@@ -2687,8 +2691,8 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
             assert result.success
             assert result.has_errors
             critical_messages = [i.message.lower() for i in result.issues if i.severity == IssueSeverity.CRITICAL]
-            assert any("os.system" in msg or "posix.system" in msg for msg in critical_messages), (
-                f"Expected critical os/posix.system issue, got: {critical_messages}"
+            assert any(_contains_system_global(msg) for msg in critical_messages), (
+                f"Expected critical os/posix/nt.system issue, got: {critical_messages}"
             )
 
     # ------------------------------------------------------------------
@@ -4654,29 +4658,29 @@ class TestPickleImportOnlyGlobalFindings:
             for c in result.checks
             if c.name == "REDUCE Opcode Safety Check"
             and c.status == CheckStatus.FAILED
-            and c.details.get("associated_global") == "os.system"
+            and c.details.get("associated_global") in SYSTEM_GLOBAL_VARIANTS
         ]
         assert len(primary_reduce_checks) == 1, [c.details for c in result.checks]
         assert any(
             evidence.get("check_name") == "Global Module Reference Check"
             and evidence.get("details", {}).get("import_only") is True
-            and evidence.get("details", {}).get("import_reference") == "os.system"
+            and evidence.get("details", {}).get("import_reference") in SYSTEM_GLOBAL_VARIANTS
             for evidence in primary_reduce_checks[0].details.get("supporting_evidence", [])
         ), f"Expected multistream import-only evidence on REDUCE finding: {primary_reduce_checks[0].details}"
         assert not any(
             c.name == "Global Module Reference Check"
             and c.status == CheckStatus.FAILED
             and c.details.get("import_only") is True
-            and c.details.get("import_reference") == "os.system"
+            and c.details.get("import_reference") in SYSTEM_GLOBAL_VARIANTS
             for c in result.checks
-        ), f"Expected os.system import-only failure to fold into the REDUCE finding: {result.checks}"
+        ), f"Expected os/posix/nt.system import-only failure to fold into the REDUCE finding: {result.checks}"
         assert not any(
             c.name == "Reduce Pattern Analysis"
             and c.status == CheckStatus.FAILED
             and c.details.get("module") == "os"
             and c.details.get("function") == "system"
             for c in result.checks
-        ), f"Expected os.system to emit a single primary finding across streams: {result.checks}"
+        ), f"Expected os/posix/nt.system to emit a single primary finding across streams: {result.checks}"
 
     @pytest.mark.parametrize(
         ("payload", "check_name"),
