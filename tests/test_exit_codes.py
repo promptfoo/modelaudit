@@ -1,5 +1,6 @@
 """Tests specifically for exit code logic."""
 
+from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
@@ -264,7 +265,7 @@ def test_exit_code_files_scanned_with_issues():
     assert determine_exit_code(results) == 1
 
 
-def test_exit_code_file_scan_failure(tmp_path):
+def test_exit_code_file_scan_failure(tmp_path: Path) -> None:
     """Return exit code 2 when an exception occurs during file scan."""
     test_file = tmp_path / "bad.pkl"
     test_file.write_text("data")
@@ -282,7 +283,7 @@ def test_exit_code_file_scan_failure(tmp_path):
     assert determine_exit_code(results) == 2
 
 
-def test_scan_result_warning_message_without_operational_flag_keeps_exit_code_1(tmp_path) -> None:
+def test_scan_result_warning_message_without_operational_flag_keeps_exit_code_1(tmp_path: Path) -> None:
     """Warning findings should not become exit code 2 just because the message looks like a parse error."""
     test_file = tmp_path / "malicious.pkl"
     test_file.write_bytes(b"payload")
@@ -313,7 +314,7 @@ def test_scan_result_warning_message_without_operational_flag_keeps_exit_code_1(
     assert determine_exit_code(results) == 1
 
 
-def test_scan_result_operational_flag_keeps_exit_code_2(tmp_path) -> None:
+def test_scan_result_operational_flag_keeps_exit_code_2(tmp_path: Path) -> None:
     """Explicit operational-error metadata should drive exit code 2 without message parsing."""
     test_file = tmp_path / "timeout.pkl"
     test_file.write_bytes(b"payload")
@@ -338,7 +339,7 @@ def test_scan_result_operational_flag_keeps_exit_code_2(tmp_path) -> None:
     assert determine_exit_code(results) == 2
 
 
-def test_scan_result_info_only_failed_scan_without_operational_flag_keeps_exit_code_0(tmp_path) -> None:
+def test_scan_result_info_only_failed_scan_without_operational_flag_keeps_exit_code_0(tmp_path: Path) -> None:
     """Informational failed scans should stay clean without explicit operational metadata."""
     test_file = tmp_path / "trailing.npy"
     test_file.write_bytes(b"payload")
