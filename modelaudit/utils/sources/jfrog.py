@@ -17,7 +17,7 @@ from ...config.constants import SCANNABLE_MODEL_EXTENSIONS
 logger = logging.getLogger(__name__)
 
 # Constants
-MAX_RECURSION_DEPTH = 10  # Prevent infinite recursion in folder traversal
+MAX_RECURSION_DEPTH = 64  # Prevent runaway recursion in folder traversal
 
 
 def _safe_download_path(download_dir: Path, relative_path: str) -> Path:
@@ -34,6 +34,43 @@ def _safe_download_path(download_dir: Path, relative_path: str) -> Path:
         raise ValueError(f"Unsafe JFrog artifact path: {relative_path}")
 
     return local_file
+
+
+def _cleanup_failed_folder_download(
+    download_dir: Path,
+    *,
+    owns_download_dir: bool,
+    downloaded_files: list[Path],
+    current_file_candidates: list[Path],
+) -> None:
+    """Remove partial folder-download artifacts after an abort."""
+    if owns_download_dir:
+        if download_dir.exists():
+            shutil.rmtree(download_dir, ignore_errors=True)
+        return
+
+    cleanup_paths = {
+        path
+        for path in [*downloaded_files, *current_file_candidates]
+        if path.is_relative_to(download_dir) or path == download_dir
+    }
+
+    for path in sorted(cleanup_paths, key=lambda value: len(value.parts), reverse=True):
+        if path.exists() and path.is_file():
+            try:
+                path.unlink()
+            except OSError:
+                continue
+
+    parent_dirs = sorted({path.parent for path in cleanup_paths}, key=lambda value: len(value.parts), reverse=True)
+    for directory in parent_dirs:
+        current = directory
+        while current != download_dir:
+            try:
+                current.rmdir()
+            except OSError:
+                break
+            current = current.parent
 
 
 # TypedDict definitions for JFrog API responses
@@ -390,49 +427,54 @@ def list_jfrog_folder_contents(
     base_url = url.rstrip("/")
 
     def _collect_files(folder_url: str, depth: int = 0) -> None:
-        """Recursively collect files from folder."""
-        if depth > MAX_RECURSION_DEPTH:  # Prevent infinite recursion
-            logger.warning(f"Maximum recursion depth reached for {folder_url}")
-            return
+        """Recursively collect files from folder.
 
-        try:
-            folder_info = detect_jfrog_target_type(folder_url, api_token, access_token, timeout)
+        Raises on any API or network error so that callers never operate
+        on a partial file listing.
+        """
+        if depth > MAX_RECURSION_DEPTH:
+            raise Exception(
+                f"Maximum recursion depth ({MAX_RECURSION_DEPTH}) exceeded listing {folder_url}. "
+                "Aborting to avoid incomplete file listing."
+            )
 
-            if folder_info["type"] != "folder":
-                return
+        folder_info = detect_jfrog_target_type(folder_url, api_token, access_token, timeout)
 
-            for child in folder_info["children"]:
-                child_name = child["uri"].lstrip("/")
-                child_url = f"{folder_url.rstrip('/')}/{child_name}"
+        if folder_info["type"] != "folder":
+            raise Exception(
+                f"Expected JFrog folder while listing {folder_url}, got {folder_info['type']}. "
+                "Aborting to avoid incomplete file listing."
+            )
 
-                if child["folder"]:
-                    # It's a subfolder
-                    if recursive:
-                        _collect_files(child_url, depth + 1)
-                else:
-                    # It's a file
-                    size = child.get("size", 0)
+        for child in folder_info["children"]:
+            child_name = child["uri"].lstrip("/")
+            child_url = f"{folder_url.rstrip('/')}/{child_name}"
 
-                    # Optionally fetch accurate size if requested
-                    if fetch_sizes and size == 0:
-                        try:
-                            file_info = detect_jfrog_target_type(child_url, api_token, access_token, timeout)
-                            if file_info["type"] == "file":
-                                size = file_info.get("size", 0)
-                        except Exception as e:
-                            logger.warning(f"Failed to fetch size for {child_url}: {e}")
+            if child["folder"]:
+                # It's a subfolder
+                if recursive:
+                    _collect_files(child_url, depth + 1)
+            else:
+                # It's a file
+                size = child.get("size", 0)
 
-                    files.append(
-                        {
-                            "name": child_name,
-                            "path": child_url,
-                            "size": size,
-                            "human_size": format_size(size) if size > 0 else "Unknown",
-                        }
-                    )
+                # Optionally fetch accurate size if requested
+                if fetch_sizes and size == 0:
+                    try:
+                        file_info = detect_jfrog_target_type(child_url, api_token, access_token, timeout)
+                        if file_info["type"] == "file":
+                            size = file_info.get("size", 0)
+                    except Exception as e:
+                        logger.warning(f"Failed to fetch size for {child_url}: {e}")
 
-        except Exception as e:
-            logger.warning(f"Failed to list contents of {folder_url}: {e}")
+                files.append(
+                    {
+                        "name": child_name,
+                        "path": child_url,
+                        "size": size,
+                        "human_size": format_size(size) if size > 0 else "Unknown",
+                    }
+                )
 
     _collect_files(base_url)
 
@@ -483,9 +525,11 @@ def download_jfrog_folder(
         raise ValueError("No scannable model files found in JFrog folder")
 
     # Create download directory
-    if cache_dir is None:
+    owns_download_dir = cache_dir is None
+    if owns_download_dir:
         download_dir = Path(tempfile.mkdtemp(prefix="modelaudit_jfrog_folder_"))
     else:
+        assert cache_dir is not None
         download_dir = cache_dir
         download_dir.mkdir(parents=True, exist_ok=True)
 
@@ -504,9 +548,12 @@ def download_jfrog_folder(
     except (ValueError, IndexError):
         base_repo_path = ""
 
-    download_failures = []
+    completed_downloads = 0
+    downloaded_files: list[Path] = []
 
     for file_info in files:
+        local_file: Path | None = None
+        downloaded_file: Path | None = None
         try:
             if show_progress:
                 size_display = file_info["human_size"] if file_info["human_size"] != "Unknown" else "size unknown"
@@ -547,24 +594,25 @@ def download_jfrog_folder(
                 if local_file.exists():
                     local_file.unlink()
                 downloaded_file.rename(local_file)
+                downloaded_file = local_file
+            completed_downloads += 1
+            downloaded_files.append(downloaded_file)
 
         except Exception as e:
             error_msg = f"Failed to download {file_info['name']}: {e}"
             logger.warning(error_msg)
-            download_failures.append({"file": file_info["name"], "error": str(e)})
-            continue
-
-    # Report download failures if any occurred
-    if download_failures:
-        failure_summary = f"{len(download_failures)} file(s) failed to download"
-        if show_progress:
-            click.echo(f"⚠️  {failure_summary}")
-
-        # If all files failed, raise an exception
-        if len(download_failures) == len(files):
-            failure_details = "; ".join([f"{f['file']}: {f['error']}" for f in download_failures[:3]])
-            if len(download_failures) > 3:
-                failure_details += f" (and {len(download_failures) - 3} more)"
-            raise Exception(f"All downloads failed. {failure_details}")
+            if show_progress:
+                click.echo("❌ Aborting JFrog folder download to avoid scanning a partial dataset")
+            current_file_candidates = [path for path in (local_file, downloaded_file) if path is not None]
+            _cleanup_failed_folder_download(
+                download_dir,
+                owns_download_dir=owns_download_dir,
+                downloaded_files=downloaded_files,
+                current_file_candidates=current_file_candidates,
+            )
+            raise Exception(
+                "JFrog folder download failed after "
+                f"{completed_downloads} of {len(files)} file(s) completed. {file_info['name']}: {e}"
+            ) from e
 
     return download_dir

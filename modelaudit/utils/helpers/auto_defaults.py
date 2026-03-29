@@ -179,8 +179,9 @@ def _get_default_cache_dir() -> str:
 
 def _should_use_selective_download(input_types: list[str]) -> bool:
     """Determine if selective download should be used."""
-    # Use selective download for cloud directories and HuggingFace models
-    return any(t in ["cloud_s3", "cloud_gcs", "cloud_azure", "huggingface"] for t in input_types)
+    # Remote registries benefit from server-side filtering to avoid downloading
+    # entire model trees by default. Strict mode can still override this later.
+    return any(t in ["cloud_s3", "cloud_gcs", "cloud_azure", "huggingface", "jfrog"] for t in input_types)
 
 
 def _has_strict_mode_inputs(input_types: list[str]) -> bool:

@@ -24,6 +24,7 @@ def scan_jfrog_artifact(
     blacklist_patterns: list[str] | None = None,
     max_file_size: int = 0,
     max_total_size: int = 0,
+    selective_download: bool = True,
     **kwargs: Any,
 ) -> ModelAuditResultModel:
     """Download and scan an artifact or folder from JFrog Artifactory.
@@ -47,6 +48,8 @@ def scan_jfrog_artifact(
         Maximum file size to scan in bytes (0 = unlimited).
     max_total_size:
         Maximum total bytes to scan before stopping (0 = unlimited).
+    selective_download:
+        Whether folder downloads should prefilter to scannable model files.
     **kwargs:
         Additional arguments passed to :func:`scan_model_directory_or_file`.
 
@@ -100,7 +103,7 @@ def scan_jfrog_artifact(
                 api_token=api_token,
                 access_token=access_token,
                 timeout=timeout,
-                selective=True,  # Only download scannable model files
+                selective=selective_download,
                 show_progress=True,
             )
 
