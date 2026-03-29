@@ -5,7 +5,7 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from click.testing import CliRunner
@@ -117,6 +117,7 @@ def test_scan_command_help():
     assert "--verbose" in result.output
     assert "--max-size" in result.output  # Updated from --max-file-size
     assert "--strict" in result.output  # New consolidated flag
+    assert "--no-whitelist" in result.output
     assert "--dry-run" in result.output  # New flag
     assert "Defaults:" in result.output or "Automatic defaults:" in result.output
 
@@ -915,6 +916,150 @@ def test_scan_huggingface_url_with_issues(mock_rmtree, mock_scan, mock_download,
     mock_rmtree.assert_called()
 
 
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.cli.download_model")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+@patch("shutil.rmtree")
+def test_scan_huggingface_no_cache_uses_ephemeral_cache_dir(
+    mock_rmtree: MagicMock,
+    mock_scan: MagicMock,
+    mock_download: MagicMock,
+    mock_is_hf_url: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """No-cache HuggingFace model scans should use a private temp cache, not HF's shared cache."""
+    mock_is_hf_url.return_value = True
+    downloaded_dir = tmp_path / "downloaded"
+    downloaded_dir.mkdir()
+    (downloaded_dir / "model.safetensors").write_bytes(b"weights")
+    mock_download.return_value = downloaded_dir
+    mock_scan.return_value = create_mock_scan_result(files_scanned=1, issues=[])
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "--quiet", "--no-cache", "hf://test/model"])
+
+    assert result.exit_code == 0
+    cache_dir = mock_download.call_args.kwargs["cache_dir"]
+    assert isinstance(cache_dir, Path)
+    assert cache_dir.name.startswith("modelaudit_hf_")
+    mock_rmtree.assert_called()
+
+
+@patch("tempfile.mkdtemp")
+@patch("shutil.rmtree")
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.cli.download_model")
+def test_scan_huggingface_no_cache_download_failure_cleans_ephemeral_cache_dir(
+    mock_download: MagicMock,
+    mock_is_hf_url: MagicMock,
+    mock_rmtree: MagicMock,
+    mock_mkdtemp: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """No-cache HuggingFace failures should still clean up the private temp cache directory."""
+    mock_is_hf_url.return_value = True
+    temp_cache_dir = tmp_path / "modelaudit_hf_failed"
+    temp_cache_dir.mkdir()
+    mock_mkdtemp.return_value = str(temp_cache_dir)
+    mock_download.side_effect = Exception("Download failed")
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "--no-cache", "hf://test/model"])
+
+    assert result.exit_code == 2
+    mock_rmtree.assert_called_once_with(str(temp_cache_dir))
+
+
+@patch("modelaudit.cli.scan_model_directory_or_file")
+def test_scan_no_whitelist_passes_config_and_preserves_critical_exit_code(mock_scan: MagicMock, tmp_path: Path) -> None:
+    """--no-whitelist should disable downgrade config and keep CRITICAL findings as exit-code 1."""
+    test_file = tmp_path / "model.pkl"
+    test_file.write_bytes(b"dummy")
+
+    mock_scan.return_value = create_mock_scan_result(
+        bytes_scanned=2048,
+        issues=[
+            {
+                "message": "Dangerous import detected",
+                "severity": "critical",
+                "location": "model.pkl",
+                "details": {},
+            }
+        ],
+        files_scanned=1,
+        assets=[],
+        has_errors=False,
+        scanners=["pickle_scanner"],
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", str(test_file), "--format", "json", "--no-whitelist"])
+
+    assert result.exit_code == 1
+    mock_scan.assert_called_once()
+    assert mock_scan.call_args.kwargs["use_hf_whitelist"] is False
+
+
+@patch("modelaudit.cli.scan_model_directory_or_file")
+def test_scan_defaults_keep_whitelist_enabled(mock_scan: MagicMock, tmp_path: Path) -> None:
+    """Without flags, whitelist downgrading remains enabled for backward compatibility."""
+    test_file = tmp_path / "model.pkl"
+    test_file.write_bytes(b"dummy")
+    mock_scan.return_value = create_mock_scan_result(files_scanned=1, issues=[])
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", str(test_file), "--format", "json"])
+
+    assert result.exit_code == 0
+    mock_scan.assert_called_once()
+    assert mock_scan.call_args.kwargs["use_hf_whitelist"] is True
+
+
+@patch("modelaudit.cli.scan_model_directory_or_file")
+def test_scan_strict_implies_no_whitelist_and_no_cache(mock_scan: MagicMock, tmp_path: Path) -> None:
+    """--strict should imply both --no-whitelist and --no-cache."""
+    test_file = tmp_path / "model.pkl"
+    test_file.write_bytes(b"dummy")
+    mock_scan.return_value = create_mock_scan_result(files_scanned=1, issues=[])
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", str(test_file), "--format", "json", "--strict"])
+
+    assert result.exit_code == 0
+    mock_scan.assert_called_once()
+    assert mock_scan.call_args.kwargs["use_hf_whitelist"] is False
+    assert mock_scan.call_args.kwargs["cache_enabled"] is False
+    assert mock_scan.call_args.kwargs["skip_file_types"] is False
+
+
+@patch("modelaudit.cli.scan_model_directory_or_file")
+def test_scan_default_skips_non_model_python_files(mock_scan: MagicMock, tmp_path: Path) -> None:
+    test_file = tmp_path / "helper.py"
+    test_file.write_text("print('not a model')\n")
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", str(test_file), "--format", "json"])
+    parsed = parse_click_json_output(result.output)
+
+    assert result.exit_code == 2
+    mock_scan.assert_not_called()
+    assert parsed["files_scanned"] == 0
+
+
+@patch("modelaudit.cli.scan_model_directory_or_file")
+def test_scan_strict_scans_non_model_python_files(mock_scan: MagicMock, tmp_path: Path) -> None:
+    test_file = tmp_path / "helper.py"
+    test_file.write_text("print('not a model')\n")
+    mock_scan.return_value = create_mock_scan_result(files_scanned=1, issues=[])
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", str(test_file), "--format", "json", "--strict"])
+
+    assert result.exit_code == 0
+    mock_scan.assert_called_once()
+    assert mock_scan.call_args.kwargs["skip_file_types"] is False
+
+
 @patch("modelaudit.cli.scan_model_directory_or_file")
 def test_scan_mixed_paths_and_urls(mock_scan):
     """Test scanning both local paths and HuggingFace URLs in one command."""
@@ -1017,6 +1162,39 @@ def test_scan_huggingface_streaming_success(mock_scan_streaming, mock_download_s
         assert output_json["files_scanned"] == 3
     except json.JSONDecodeError:
         pytest.fail("Output is not valid JSON")
+
+
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+@patch("modelaudit.core.scan_model_streaming")
+@patch("shutil.rmtree")
+def test_scan_huggingface_strict_streaming_uses_ephemeral_cache_dir(
+    mock_rmtree: MagicMock,
+    mock_scan_streaming: MagicMock,
+    mock_download_streaming: MagicMock,
+    mock_is_hf_url: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Strict streaming scans should use a private temp cache instead of the shared HF cache."""
+    mock_is_hf_url.return_value = True
+
+    streamed_file = tmp_path / "weights.bin"
+    streamed_file.write_bytes(b"weights")
+
+    def file_generator():
+        yield (streamed_file, True)
+
+    mock_download_streaming.return_value = file_generator()
+    mock_scan_streaming.return_value = create_mock_scan_result(files_scanned=1, issues=[])
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "--stream", "--strict", "--quiet", "hf://test/model"])
+
+    assert result.exit_code == 0
+    cache_dir = mock_download_streaming.call_args.kwargs["cache_dir"]
+    assert isinstance(cache_dir, Path)
+    assert cache_dir.name.startswith("modelaudit_hf_")
+    mock_rmtree.assert_called()
 
 
 @patch("modelaudit.cli.is_huggingface_url")
@@ -1267,7 +1445,13 @@ def test_scan_stream_help():
 @patch("modelaudit.cli.download_from_cloud")
 @patch("modelaudit.cli.scan_model_directory_or_file")
 @patch("shutil.rmtree")
-def test_scan_cloud_url_success(mock_rmtree, mock_scan, mock_download, mock_is_cloud, tmp_path):
+def test_scan_cloud_url_success(
+    mock_rmtree: MagicMock,
+    mock_scan: MagicMock,
+    mock_download: MagicMock,
+    mock_is_cloud: MagicMock,
+    tmp_path: Path,
+) -> None:
     """Test scanning a cloud storage URL successfully."""
     mock_is_cloud.return_value = True
     test_dir = tmp_path / "cloud"
@@ -1286,9 +1470,39 @@ def test_scan_cloud_url_success(mock_rmtree, mock_scan, mock_download, mock_is_c
     mock_rmtree.assert_called()
 
 
+@patch("os.remove")
+@patch("shutil.rmtree")
 @patch("modelaudit.cli.is_cloud_url")
 @patch("modelaudit.cli.download_from_cloud")
-def test_scan_cloud_url_download_failure(mock_download, mock_is_cloud):
+@patch("modelaudit.cli.scan_model_directory_or_file")
+def test_scan_cloud_file_no_cache_cleans_up_downloaded_file(
+    mock_scan: MagicMock,
+    mock_download: MagicMock,
+    mock_is_cloud: MagicMock,
+    mock_rmtree: MagicMock,
+    mock_remove: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """No-cache cloud scans should delete downloaded files, not treat them as directories."""
+    mock_is_cloud.return_value = True
+    downloaded_file = tmp_path / "downloaded-model.bin"
+    downloaded_file.write_bytes(b"weights")
+    mock_download.return_value = downloaded_file
+    mock_scan.return_value = create_mock_scan_result(
+        bytes_scanned=123, issues=[], files_scanned=1, assets=[], has_errors=False, scanners=["test"]
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "--no-cache", "s3://bucket/model.bin"])
+
+    assert result.exit_code == 0
+    mock_remove.assert_called_once_with(str(downloaded_file))
+    mock_rmtree.assert_not_called()
+
+
+@patch("modelaudit.cli.is_cloud_url")
+@patch("modelaudit.cli.download_from_cloud")
+def test_scan_cloud_url_download_failure(mock_download: MagicMock, mock_is_cloud: MagicMock) -> None:
     """Test download failure for cloud storage URL."""
     mock_is_cloud.return_value = True
     mock_download.side_effect = Exception("boom")
@@ -1303,7 +1517,13 @@ def test_scan_cloud_url_download_failure(mock_download, mock_is_cloud):
 @patch("modelaudit.cli.download_from_cloud")
 @patch("modelaudit.cli.scan_model_directory_or_file")
 @patch("shutil.rmtree")
-def test_scan_cloud_url_with_issues(mock_rmtree, mock_scan, mock_download, mock_is_cloud, tmp_path):
+def test_scan_cloud_url_with_issues(
+    mock_rmtree: MagicMock,
+    mock_scan: MagicMock,
+    mock_download: MagicMock,
+    mock_is_cloud: MagicMock,
+    tmp_path: Path,
+) -> None:
     """Test scanning a cloud storage URL that has issues."""
     mock_is_cloud.return_value = True
     test_dir = tmp_path / "cloud"
@@ -1324,6 +1544,64 @@ def test_scan_cloud_url_with_issues(mock_rmtree, mock_scan, mock_download, mock_
 
     assert result.exit_code == 1
     mock_rmtree.assert_called()
+
+
+@patch("modelaudit.cli.is_cloud_url")
+@patch("modelaudit.cli.download_from_cloud")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+@patch("shutil.rmtree")
+def test_scan_cloud_url_no_cache_with_cache_dir_cleans_downloads(
+    mock_rmtree: MagicMock,
+    mock_scan: MagicMock,
+    mock_download: MagicMock,
+    mock_is_cloud: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """--no-cache must not preserve remote downloads just because --cache-dir was provided."""
+    mock_is_cloud.return_value = True
+    test_dir = tmp_path / "cloud-nocache"
+    test_dir.mkdir()
+    (test_dir / "model.bin").write_text("dummy")
+    mock_download.return_value = test_dir
+    mock_scan.return_value = create_mock_scan_result(
+        bytes_scanned=123, issues=[], files_scanned=1, assets=[], has_errors=False, scanners=["test"]
+    )
+
+    cache_dir = tmp_path / "cache"
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "--no-cache", "--cache-dir", str(cache_dir), "s3://bucket/model.bin"])
+
+    assert result.exit_code == 0
+    mock_download.assert_called_once()
+    assert mock_download.call_args.kwargs["cache_dir"] is None
+    mock_rmtree.assert_called()
+
+
+@patch("modelaudit.cli.is_cloud_url")
+@patch("modelaudit.cli.download_from_cloud")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+def test_scan_cloud_url_strict_disables_selective_prefiltering(
+    mock_scan: MagicMock,
+    mock_download: MagicMock,
+    mock_is_cloud: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Strict mode should disable cloud-side selective filtering."""
+    mock_is_cloud.return_value = True
+    test_dir = tmp_path / "cloud-strict"
+    test_dir.mkdir()
+    (test_dir / "helper.py").write_text("print('strict cloud file')\n")
+    mock_download.return_value = test_dir
+    mock_scan.return_value = create_mock_scan_result(files_scanned=1, issues=[])
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "--strict", "s3://bucket/model-prefix/"])
+
+    assert result.exit_code == 0
+    mock_download.assert_called_once()
+    assert mock_download.call_args.kwargs["selective"] is False
+    mock_scan.assert_called_once()
+    assert mock_scan.call_args.kwargs["skip_file_types"] is False
 
 
 @patch("modelaudit.cli.is_jfrog_url")
@@ -1349,6 +1627,8 @@ def test_scan_jfrog_url_success(mock_scan_jfrog, mock_is_jfrog):
         max_total_size=0,
         strict_license=False,
         skip_file_types=True,
+        selective_download=True,
+        use_hf_whitelist=True,
     )
 
 
@@ -1399,7 +1679,29 @@ def test_scan_jfrog_url_with_auth(mock_scan_jfrog, mock_is_jfrog):
         max_total_size=0,
         strict_license=False,
         skip_file_types=True,
+        selective_download=True,
+        use_hf_whitelist=True,
     )
+
+
+@patch("modelaudit.cli.is_jfrog_url")
+@patch("modelaudit.cli.scan_jfrog_artifact")
+def test_scan_jfrog_url_strict_disables_selective_prefiltering(
+    mock_scan_jfrog: MagicMock, mock_is_jfrog: MagicMock
+) -> None:
+    """Strict JFrog scans should disable folder prefiltering before scanning."""
+    mock_is_jfrog.return_value = True
+    mock_scan_jfrog.return_value = create_mock_scan_result(
+        bytes_scanned=512, issues=[], files_scanned=1, assets=[], has_errors=False, scanners=["test_scanner"]
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "--strict", "https://company.jfrog.io/artifactory/repo/models/"])
+
+    assert result.exit_code == 0
+    assert mock_scan_jfrog.call_args.kwargs["selective_download"] is False
+    assert mock_scan_jfrog.call_args.kwargs["skip_file_types"] is False
+    assert mock_scan_jfrog.call_args.kwargs["use_hf_whitelist"] is False
 
 
 @patch("modelaudit.integrations.mlflow.scan_mlflow_model")
@@ -1433,6 +1735,7 @@ def test_scan_mlflow_uri_success(mock_scan_mlflow):
         blacklist_patterns=None,
         max_file_size=0,
         max_total_size=0,
+        use_hf_whitelist=True,
     )
 
 
@@ -1475,6 +1778,7 @@ def test_scan_mlflow_uri_with_options(mock_scan_mlflow):
         blacklist_patterns=None,
         max_file_size=5000000,
         max_total_size=5000000,
+        use_hf_whitelist=True,
     )
 
 

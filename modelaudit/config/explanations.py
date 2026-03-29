@@ -309,6 +309,10 @@ PATTERN_EXPLANATIONS = {
     "pickle_size_limit": (
         "Extremely large pickle files may indicate embedded malicious data or attempts to cause resource exhaustion."
     ),
+    "pickle_expansion_attack": (
+        "Repeated memo expansion, dense DUP usage, and extreme memo read/write imbalance can indicate a pickle "
+        "bomb designed to consume excessive CPU or memory during unpickling."
+    ),
     "nested_pickle": (
         "Pickle operations within pickled data (nested pickling) is often used to create multi-stage exploits or "
         "hide malicious payloads."
