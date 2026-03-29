@@ -53,6 +53,10 @@ HIGH_RISK_CALLS = {
     "subprocess.run",
 }
 
+SAFE_IMPORT_TIME_CALLS = {
+    "logging.getLogger",
+}
+
 
 class TorchServeMarScanner(BaseScanner):
     """Scan TorchServe .mar archives and embedded payloads."""
@@ -701,7 +705,33 @@ class TorchServeMarScanner(BaseScanner):
                     modules.add(f"{base_module}.{alias.name}")
         return modules
 
-    def _is_literal_metadata_assignment(self, node: ast.Assign | ast.AnnAssign) -> bool:
+    def _is_safe_import_time_value(self, value: ast.expr | None, aliases: dict[str, str]) -> bool:
+        if value is None:
+            return True
+        try:
+            ast.literal_eval(value)
+            return True
+        except Exception:
+            pass
+
+        if not isinstance(value, ast.Call):
+            return False
+
+        call_name = self._resolve_call_name(value.func)
+        if call_name is None:
+            return False
+
+        resolved_name = self._apply_alias(call_name, aliases)
+        if resolved_name not in SAFE_IMPORT_TIME_CALLS:
+            return False
+
+        return sum(1 for node in ast.walk(value) if isinstance(node, ast.Call)) == 1
+
+    def _is_safe_import_time_assignment(
+        self,
+        node: ast.Assign | ast.AnnAssign,
+        aliases: dict[str, str],
+    ) -> bool:
         value: ast.expr | None
         if isinstance(node, ast.Assign):
             targets: list[ast.expr] = list(node.targets)
@@ -719,13 +749,7 @@ class TorchServeMarScanner(BaseScanner):
 
         if not targets or not all(_is_simple_name_target(target) for target in targets):
             return False
-        if value is None:
-            return True
-        try:
-            ast.literal_eval(value)
-            return True
-        except Exception:
-            return False
+        return self._is_safe_import_time_value(value, aliases)
 
     def _is_non_executing_import_guard(self, node: ast.If) -> bool:
         test = node.test
@@ -755,6 +779,7 @@ class TorchServeMarScanner(BaseScanner):
         return False
 
     def _has_import_time_execution(self, tree: ast.Module) -> bool:
+        aliases = self._collect_import_aliases(tree)
         for node in tree.body:
             if (
                 isinstance(node, ast.Expr)
@@ -770,7 +795,7 @@ class TorchServeMarScanner(BaseScanner):
                 continue
             if isinstance(node, (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 continue
-            if isinstance(node, (ast.Assign, ast.AnnAssign)) and self._is_literal_metadata_assignment(node):
+            if isinstance(node, (ast.Assign, ast.AnnAssign)) and self._is_safe_import_time_assignment(node, aliases):
                 continue
             if isinstance(node, ast.If) and self._is_non_executing_import_guard(node):
                 continue

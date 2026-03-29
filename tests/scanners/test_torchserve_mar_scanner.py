@@ -257,6 +257,30 @@ def test_non_handler_python_metadata_assignments_do_not_trigger_import_time_exec
     assert non_handler_failures == []
 
 
+def test_non_handler_python_logger_initialization_does_not_trigger_import_time_execution(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"import utils\n\ndef handle(data, context):\n    return utils.transform(data)\n",
+            "utils.py": (
+                b"import logging as log\n"
+                b"logger = log.getLogger(__name__)\n"
+                b"\n"
+                b"def transform(data):\n"
+                b"    return data\n"
+            ),
+            "weights.bin": b"weights",
+        },
+        filename="logger_init_utils.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    non_handler_failures = _failed_checks(result, "MAR Non-Handler Python Analysis")
+    assert non_handler_failures == []
+
+
 def test_non_handler_python_analysis_detects_malicious_init_module(tmp_path: Path) -> None:
     manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
     mar_path = _create_mar_archive(
