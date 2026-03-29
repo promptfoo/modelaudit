@@ -3712,6 +3712,34 @@ class PickleScanner(BaseScanner):
         end = min(len(data), position + window_size // 2)
         return data[start:end]
 
+    @staticmethod
+    def _is_zip_backed_pytorch_container(path: str) -> bool:
+        """Return whether the path is a ZIP-backed PyTorch-style container."""
+        file_ext = os.path.splitext(path)[1].lower()
+        if file_ext not in {".bin", ".pt", ".pth", ".ckpt"}:
+            return False
+
+        try:
+            from modelaudit.utils.file.detection import detect_file_format
+
+            return detect_file_format(path) == "zip"
+        except Exception:
+            return False
+
+    def _scan_zip_backed_pytorch_container(self, path: str) -> ScanResult | None:
+        """Delegate ZIP-backed PyTorch-style containers to the ZIP scanner."""
+        if not self._is_zip_backed_pytorch_container(path):
+            return None
+
+        try:
+            from .pytorch_zip_scanner import PyTorchZipScanner
+        except Exception as e:
+            logger.warning(f"Unable to load PyTorch ZIP scanner for {path}: {e}")
+            return None
+
+        logger.debug(f"Delegating ZIP-backed PyTorch container to PyTorchZipScanner: {path}")
+        return PyTorchZipScanner(config=self.config).scan(path, timeout=self.timeout)
+
     def scan(self, path: str) -> ScanResult:
         """Scan a pickle file for suspicious content"""
         # Start scan timer for timeout tracking
@@ -3732,6 +3760,10 @@ class PickleScanner(BaseScanner):
         size_check = self._check_size_limit(path)
         if size_check:
             return size_check
+
+        zip_container_result = self._scan_zip_backed_pytorch_container(path)
+        if zip_container_result is not None:
+            return zip_container_result
 
         result = self._create_result()
         file_size = self.get_file_size(path)

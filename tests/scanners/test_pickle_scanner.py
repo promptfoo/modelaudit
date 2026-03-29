@@ -44,6 +44,8 @@ from tests.assets.generators.generate_evil_pickle import EvilClass
 # Add the parent directory to sys.path to allow importing modelaudit
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+PYTORCH_FIXTURE_DIR = Path(__file__).resolve().parent.parent / "assets" / "samples" / "pytorch"
+
 
 # Import only what we need for the pickle scanner test
 
@@ -61,6 +63,45 @@ def _write_pickle_with_tail(path: Path, tail: bytes, *, pad_to_bytes: int | None
 
 def _make_opcode_padding_stream(opcode_pairs: int) -> bytes:
     return b"\x80\x02" + (b"K\x010" * opcode_pairs) + b"."
+
+
+def test_direct_pickle_scanner_routes_zip_backed_malicious_pt_fixture() -> None:
+    """Direct PickleScanner scans should route ZIP-backed .pt fixtures through the ZIP path."""
+    fixture_path = PYTORCH_FIXTURE_DIR / "malicious_eval.pt"
+
+    result = PickleScanner().scan(str(fixture_path))
+
+    assert result.scanner_name == "pytorch_zip"
+    assert result.success is True
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and "eval" in issue.message.lower() for issue in result.issues
+    ), f"Expected critical eval finding, got: {[(issue.severity.value, issue.message) for issue in result.issues]}"
+    assert not any("not a valid pickle file" in issue.message.lower() for issue in result.issues)
+    assert any(
+        check.name == "ZIP Format Validation" and check.status == CheckStatus.PASSED for check in result.checks
+    ), f"Expected ZIP validation check, got: {[(check.name, check.status.value) for check in result.checks]}"
+
+
+@pytest.mark.parametrize("container_ext", [".pt", ".pth", ".bin", ".ckpt"])
+def test_direct_pickle_scanner_routes_zip_backed_safe_pytorch_containers(container_ext: str, tmp_path: Path) -> None:
+    """ZIP-backed PyTorch containers should scan as PyTorch ZIP regardless of extension."""
+    fixture_path = PYTORCH_FIXTURE_DIR / "safe_model.pt"
+    container_path = tmp_path / f"safe_model{container_ext}"
+    container_path.write_bytes(fixture_path.read_bytes())
+
+    result = PickleScanner().scan(str(container_path))
+
+    assert result.scanner_name == "pytorch_zip"
+    assert result.success is True
+    assert result.metadata.get("pickle_files"), f"Expected embedded pickle discovery, got: {result.metadata}"
+    findings = [(issue.severity.value, issue.message) for issue in result.issues]
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues), (
+        f"Expected no warning/critical findings, got: {findings}"
+    )
+    assert not any("not a valid pickle file" in issue.message.lower() for issue in result.issues)
+    assert any(
+        check.name == "ZIP Format Validation" and check.status == CheckStatus.PASSED for check in result.checks
+    ), f"Expected ZIP validation check, got: {[(check.name, check.status.value) for check in result.checks]}"
 
 
 @pytest.mark.parametrize(
