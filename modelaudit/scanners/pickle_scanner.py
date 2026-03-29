@@ -6,7 +6,7 @@ import pickletools
 import reprlib
 import struct
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any, BinaryIO, ClassVar, Literal, TypedDict, TypeGuard
 
 from modelaudit.analysis.enhanced_pattern_detector import EnhancedPatternDetector, PatternMatch
@@ -60,6 +60,24 @@ _STACK_GLOBAL_OPERAND_PREVIEWER.maxdict = 4
 _RAW_PATTERN_SCAN_LIMIT_BYTES = 10 * 1024 * 1024
 _POST_BUDGET_GLOBAL_SCAN_LIMIT_BYTES = 100 * 1024 * 1024
 _POST_BUDGET_GLOBAL_CONTEXT_BYTES = 4096
+_MEMO_WRITE_OPCODES = frozenset({"PUT", "BINPUT", "LONG_BINPUT", "MEMOIZE"})
+_MEMO_READ_OPCODES = frozenset({"GET", "BINGET", "LONG_BINGET"})
+_EXPANSION_EVENT_WINDOW = 6
+_EXPANSION_GROWTH_BUILDERS = frozenset({"TUPLE", "TUPLE1", "TUPLE2", "TUPLE3", "LIST", "APPENDS", "APPEND"})
+_EXPANSION_DUP_COUNT_THRESHOLD = 128
+_EXPANSION_DUP_DENSITY_THRESHOLD = 0.10
+_EXPANSION_GET_PUT_RATIO_THRESHOLD = 32.0
+_EXPANSION_GET_PUT_MIN_READS = 128
+_EXPANSION_MEMO_GROWTH_MIN_WRITES = 64
+_EXPANSION_MEMO_GROWTH_STEPS_THRESHOLD = 32
+_EXPANSION_MEMO_GROWTH_RATIO_THRESHOLD = 0.50
+_EXPANSION_RATIO_SUPPORTING_DUP_THRESHOLD = 64
+_EXPANSION_RATIO_SUPPORTING_GROWTH_THRESHOLD = 16
+_EXPANSION_TRIGGER_LABELS = {
+    "suspicious_get_put_ratio": "high memo GET/PUT ratio",
+    "excessive_dup_usage": "dense DUP usage",
+    "memo_growth_chain": "iterative memo growth chain",
+}
 
 
 StackGlobalOperandKind = Literal["string", "missing_memo", "unknown", "non_string"]
@@ -2192,6 +2210,36 @@ class _MutationTargetRef:
     callable_ref: tuple[str, str] | None = None
 
 
+@dataclass
+class _ExpansionHeuristicStreamState:
+    stream_id: int
+    opcode_count: int = 0
+    memo_reads: int = 0
+    memo_writes: int = 0
+    dup_count: int = 0
+    memo_growth_steps: int = 0
+    max_memo_index: int = -1
+    next_memo_index: int = 0
+    last_written_index: int | None = None
+    last_position: int = 0
+    event_window: list[tuple[str, int | str]] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class _ExpansionHeuristicFinding:
+    stream_id: int
+    position: int
+    opcode_count: int
+    memo_reads: int
+    memo_writes: int
+    get_put_ratio: float
+    dup_count: int
+    dup_density: float
+    memo_growth_steps: int
+    memo_slots_used: int
+    triggers: tuple[str, ...]
+
+
 def _resolve_copyreg_extension(code: Any, origin_index: int) -> _ResolvedImportRef:
     """
     Resolve EXT opcode codes through copyreg when available.
@@ -2641,6 +2689,119 @@ def _simulate_symbolic_reference_maps(
         malformed_stack_globals,
         mutation_target_refs,
     )
+
+
+def _build_expansion_heuristic_finding(
+    state: _ExpansionHeuristicStreamState,
+) -> _ExpansionHeuristicFinding | None:
+    """Summarize stream-local memo/DUP behavior into a bounded expansion heuristic finding."""
+    if state.opcode_count == 0:
+        return None
+
+    get_put_ratio = (state.memo_reads / state.memo_writes) if state.memo_writes else 0.0
+    dup_density = state.dup_count / state.opcode_count
+    memo_growth_ratio = (state.memo_growth_steps / state.memo_writes) if state.memo_writes else 0.0
+
+    triggers: list[str] = []
+    if (
+        state.memo_writes >= _EXPANSION_MEMO_GROWTH_MIN_WRITES
+        and state.memo_growth_steps >= _EXPANSION_MEMO_GROWTH_STEPS_THRESHOLD
+        and memo_growth_ratio >= _EXPANSION_MEMO_GROWTH_RATIO_THRESHOLD
+    ):
+        triggers.append("memo_growth_chain")
+
+    if state.dup_count >= _EXPANSION_DUP_COUNT_THRESHOLD and dup_density >= _EXPANSION_DUP_DENSITY_THRESHOLD:
+        triggers.append("excessive_dup_usage")
+
+    if (
+        state.memo_reads >= _EXPANSION_GET_PUT_MIN_READS
+        and get_put_ratio >= _EXPANSION_GET_PUT_RATIO_THRESHOLD
+        and (
+            state.dup_count >= _EXPANSION_RATIO_SUPPORTING_DUP_THRESHOLD
+            or state.memo_growth_steps >= _EXPANSION_RATIO_SUPPORTING_GROWTH_THRESHOLD
+        )
+    ):
+        triggers.append("suspicious_get_put_ratio")
+
+    if not triggers:
+        return None
+
+    memo_slots_used = state.max_memo_index + 1 if state.max_memo_index >= 0 else 0
+    return _ExpansionHeuristicFinding(
+        stream_id=state.stream_id,
+        position=state.last_position,
+        opcode_count=state.opcode_count,
+        memo_reads=state.memo_reads,
+        memo_writes=state.memo_writes,
+        get_put_ratio=round(get_put_ratio, 2),
+        dup_count=state.dup_count,
+        dup_density=round(dup_density, 4),
+        memo_growth_steps=state.memo_growth_steps,
+        memo_slots_used=memo_slots_used,
+        triggers=tuple(triggers),
+    )
+
+
+def _detect_pickle_expansion_heuristics(opcodes: list[tuple[Any, Any, int | None]]) -> list[_ExpansionHeuristicFinding]:
+    """Detect memo expansion and DUP-heavy pickle-bomb patterns on a per-stream basis."""
+    findings: list[_ExpansionHeuristicFinding] = []
+    state = _ExpansionHeuristicStreamState(stream_id=0)
+
+    for opcode, arg, pos in opcodes:
+        name = opcode.name
+        state.opcode_count += 1
+        if pos is not None:
+            state.last_position = int(pos)
+
+        if name == "DUP":
+            state.dup_count += 1
+
+        if name in _MEMO_READ_OPCODES:
+            state.memo_reads += 1
+        elif name in _MEMO_WRITE_OPCODES:
+            state.memo_writes += 1
+            memo_index: int | None
+            if name == "MEMOIZE":
+                memo_index = state.next_memo_index
+                state.next_memo_index += 1
+            else:
+                memo_index = int(arg) if isinstance(arg, int) else None
+                if memo_index is not None:
+                    state.next_memo_index = max(state.next_memo_index, memo_index + 1)
+
+            lookback = state.event_window[-_EXPANSION_EVENT_WINDOW:]
+            previous_memo_index = state.last_written_index
+            read_indices = [value for kind, value in lookback if kind == "READ" and isinstance(value, int)]
+            repeated_previous_read = previous_memo_index is not None and read_indices.count(previous_memo_index) >= 2
+            has_growth_builder = any(kind == "OP" and value in _EXPANSION_GROWTH_BUILDERS for kind, value in lookback)
+            is_sequential_growth = (
+                previous_memo_index is not None and memo_index is not None and memo_index == previous_memo_index + 1
+            )
+            if is_sequential_growth and repeated_previous_read and has_growth_builder:
+                state.memo_growth_steps += 1
+
+            if memo_index is not None:
+                state.max_memo_index = max(state.max_memo_index, memo_index)
+                state.last_written_index = memo_index
+
+        if name in _MEMO_READ_OPCODES:
+            state.event_window.append(("READ", int(arg) if isinstance(arg, int) else -1))
+        else:
+            state.event_window.append(("OP", name))
+        if len(state.event_window) > _EXPANSION_EVENT_WINDOW:
+            del state.event_window[:-_EXPANSION_EVENT_WINDOW]
+
+        if name == "STOP":
+            finding = _build_expansion_heuristic_finding(state)
+            if finding is not None:
+                findings.append(finding)
+            state = _ExpansionHeuristicStreamState(stream_id=state.stream_id + 1)
+
+    final_finding = _build_expansion_heuristic_finding(state)
+    if final_finding is not None:
+        findings.append(final_finding)
+
+    return findings
 
 
 def _build_symbolic_reference_maps(
@@ -5382,6 +5543,45 @@ class PickleScanner(BaseScanner):
 
             # Also add to metadata for analysis
             result.metadata["max_stack_depth"] = max_stack_depth
+
+            expansion_findings = _detect_pickle_expansion_heuristics(opcodes)
+            if expansion_findings:
+                suspicious_count += len(expansion_findings)
+                primary_finding = expansion_findings[0]
+                trigger_labels = ", ".join(
+                    _EXPANSION_TRIGGER_LABELS.get(trigger, trigger.replace("_", " "))
+                    for trigger in primary_finding.triggers
+                )
+                additional_streams = len(expansion_findings) - 1
+                additional_streams_note = (
+                    f" (+{additional_streams} more stream{'s' if additional_streams != 1 else ''})"
+                    if additional_streams > 0
+                    else ""
+                )
+                result.add_check(
+                    name="Pickle Expansion Heuristic Check",
+                    passed=False,
+                    message=(
+                        "Suspicious pickle expansion/resource-exhaustion pattern detected: "
+                        f"{trigger_labels}{additional_streams_note}"
+                    ),
+                    severity=IssueSeverity.WARNING,
+                    location=f"{self.current_file_path} (pos {primary_finding.position})",
+                    details={
+                        "findings": [asdict(finding) for finding in expansion_findings],
+                        "suspicious_streams": len(expansion_findings),
+                    },
+                    why=get_pattern_explanation("pickle_expansion_attack"),
+                    rule_code="S902",
+                )
+            else:
+                result.add_check(
+                    name="Pickle Expansion Heuristic Check",
+                    passed=True,
+                    message="No suspicious expansion/resource-exhaustion pickle patterns detected",
+                    location=self.current_file_path,
+                    details={"opcode_count": opcode_count},
+                )
 
             # Add ML context to metadata for debugging
             result.metadata.update(
