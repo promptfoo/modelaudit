@@ -15,6 +15,7 @@ import pytest
 from modelaudit.core import (
     HEADER_FORMAT_TO_SCANNER_ID,
     _extract_primary_asset_from_location,
+    scan_file,
     scan_model_directory_or_file,
 )
 from modelaudit.scanners import _registry
@@ -178,3 +179,15 @@ def test_detect_file_format_outputs_have_primary_routing_or_registered_scanner()
     )
 
     assert not unmapped_formats, f"Formats must have primary routing or registered scanners: {unmapped_formats}"
+
+
+def test_scan_skops_file_does_not_emit_format_validation_mismatch(tmp_path: Path) -> None:
+    skops_file = tmp_path / "model.skops"
+    with zipfile.ZipFile(skops_file, "w") as zf:
+        zf.writestr("schema.json", '{"version": "1.0"}')
+
+    result = scan_file(str(skops_file))
+
+    assert result.scanner_name == "skops"
+    mismatch_messages = [check.message for check in result.checks if check.name == "Format Validation"]
+    assert not mismatch_messages, f"Unexpected format mismatch checks: {mismatch_messages}"
