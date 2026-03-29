@@ -3945,7 +3945,7 @@ class PickleScanner(BaseScanner):
             is_recursion_on_legitimate_model = is_recursion_error and is_large_ml_model and is_legitimate_file
 
             # If we already found security issues, those take precedence over recursion handling
-            if has_security_findings:
+            if has_security_findings and is_recursion_error:
                 logger.warning(
                     f"Recursion error occurred during scan of {path}, but security issues were already "
                     f"detected in early analysis. Preserving security findings."
@@ -4179,6 +4179,8 @@ class PickleScanner(BaseScanner):
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )
+            result.metadata["operational_error"] = True
+            result.metadata["operational_error_reason"] = "pickle_file_open_failed"
             result.finish(success=False)
             return result
 
