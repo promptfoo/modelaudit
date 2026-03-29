@@ -98,3 +98,12 @@ def test_auto_defaults_huggingface():
     assert defaults["use_cache"] is True  # Remote operations should cache
     assert defaults["selective_download"] is True  # HuggingFace models
     assert "timeout" in defaults
+
+
+def test_auto_defaults_jfrog() -> None:
+    """JFrog URLs should keep selective download enabled by default."""
+    paths = ["https://company.jfrog.io/artifactory/repo/model.pt"]
+    defaults = generate_auto_defaults(paths)
+
+    assert defaults["use_cache"] is True
+    assert defaults["selective_download"] is True

@@ -1,5 +1,6 @@
 """Scanner for PyTorch zip-archived model files (.pt, .pth)."""
 
+import contextlib
 import io
 import logging
 import os
@@ -66,6 +67,8 @@ class PyTorchZipScanner(BaseScanner):
         # Initialize a pickle scanner for embedded pickles
         self.pickle_scanner: PickleScanner = PickleScanner(config)
         self.current_file_path = ""  # Will be set when scanning files
+        self._relaxed_crc_reads: dict[str, set[str]] = {}
+        self._relaxed_crc_check_indices: dict[str, tuple[int, int]] = {}
         # Configurable limits (can override class defaults via config)
         self.max_compression_ratio = self.config.get("max_compression_ratio", self.MAX_COMPRESSION_RATIO)
         self.max_archive_entries = self.config.get("max_archive_entries", self.MAX_ARCHIVE_ENTRIES)
@@ -111,6 +114,8 @@ class PyTorchZipScanner(BaseScanner):
 
         # Start timeout tracking
         self._start_scan_timer()
+        self._relaxed_crc_reads = {}
+        self._relaxed_crc_check_indices = {}
 
         try:
             # Initial validation and setup
@@ -172,6 +177,200 @@ class PyTorchZipScanner(BaseScanner):
 
         result.finish(success=True)
         return result
+
+    @staticmethod
+    def _get_zip_member_name(name: str | zipfile.ZipInfo) -> str:
+        """Return the archive member name for a string or ZipInfo."""
+        return name.filename if isinstance(name, zipfile.ZipInfo) else name
+
+    @staticmethod
+    def _is_crc_mismatch_error(error: Exception) -> bool:
+        """Return True when the error indicates a ZIP member CRC mismatch."""
+        return isinstance(error, zipfile.BadZipFile) and "Bad CRC-32" in str(error)
+
+    @staticmethod
+    def _open_zip_member(
+        zip_file: zipfile.ZipFile,
+        name: str | zipfile.ZipInfo,
+        *,
+        relaxed_crc: bool = False,
+    ) -> Any:
+        """Open a ZIP member, optionally disabling CRC enforcement on the stream."""
+        handle: Any = zip_file.open(name, "r")
+        if relaxed_crc and hasattr(handle, "_expected_crc"):
+            # PyTorch-generated archives can have incorrect member CRCs. Disable
+            # per-member CRC enforcement only after a strict read failed so the
+            # scanner can still inspect the payload.
+            handle._expected_crc = None
+        return handle
+
+    def _record_relaxed_crc_usage(
+        self,
+        member_name: str,
+        phase: str,
+        result: ScanResult,
+        error: Exception | None = None,
+    ) -> None:
+        """Record that a member needed relaxed CRC handling during scanning."""
+        is_new_member = member_name not in self._relaxed_crc_reads
+        phases = self._relaxed_crc_reads.setdefault(member_name, set())
+        phases.add(phase)
+        phase_list = sorted(phases)
+        result.metadata["relaxed_crc_members"] = {
+            name: sorted(recorded_phases) for name, recorded_phases in self._relaxed_crc_reads.items()
+        }
+        result.metadata["relaxed_crc_used"] = True
+
+        existing_indices = self._relaxed_crc_check_indices.get(member_name)
+        if existing_indices is not None:
+            check_index, issue_index = existing_indices
+            for details_dict in (
+                result.checks[check_index].details,
+                result.issues[issue_index].details,
+            ):
+                details_dict["scan_phases"] = phase_list
+
+        if not is_new_member:
+            return
+
+        archive_path = self.current_file_path or member_name
+        result.add_check(
+            name="PyTorch ZIP CRC Handling",
+            passed=False,
+            message=(
+                f"CRC validation failed for archive member {member_name}; "
+                "continuing scan with relaxed CRC handling for content analysis"
+            ),
+            severity=IssueSeverity.WARNING,
+            location=f"{archive_path}:{member_name}",
+            details={
+                "zip_entry": member_name,
+                "scan_phases": phase_list,
+                "relaxed_crc": True,
+                "exception": str(error) if error else None,
+                "exception_type": type(error).__name__ if error else None,
+            },
+            why=(
+                "Some PyTorch ZIP archives contain member-level CRC mismatches. "
+                "The scanner retries those member reads with CRC enforcement "
+                "relaxed so payload analysis can continue, but surfaces the "
+                "integrity anomaly for review."
+            ),
+        )
+        self._relaxed_crc_check_indices[member_name] = (len(result.checks) - 1, len(result.issues) - 1)
+
+    def _read_member_prefix(
+        self,
+        zip_file: zipfile.ZipFile,
+        name: str | zipfile.ZipInfo,
+        limit: int,
+        *,
+        phase: str,
+        result: ScanResult,
+    ) -> bytes:
+        """Read up to ``limit`` bytes from a ZIP member with guarded CRC fallback."""
+        member_name = self._get_zip_member_name(name)
+        relaxed_crc = member_name in self._relaxed_crc_reads
+        if relaxed_crc:
+            self._record_relaxed_crc_usage(member_name, phase, result)
+
+        try:
+            with self._open_zip_member(zip_file, name, relaxed_crc=relaxed_crc) as handle:
+                return handle.read(limit)
+        except zipfile.BadZipFile as exc:
+            if relaxed_crc or not self._is_crc_mismatch_error(exc):
+                raise
+            self._record_relaxed_crc_usage(member_name, phase, result, exc)
+        with self._open_zip_member(zip_file, name, relaxed_crc=True) as handle:
+            return handle.read(limit)
+
+    def _read_member_bytes(
+        self,
+        zip_file: zipfile.ZipFile,
+        name: str | zipfile.ZipInfo,
+        *,
+        phase: str,
+        result: ScanResult,
+        max_bytes: int | None = None,
+    ) -> bytes:
+        """Read an entire ZIP member with optional bounded size and guarded CRC fallback."""
+        member_name = self._get_zip_member_name(name)
+        member_info = name if isinstance(name, zipfile.ZipInfo) else zip_file.getinfo(name)
+        if max_bytes is not None and member_info.file_size > max_bytes:
+            raise ValueError(
+                f"Archive member {member_name} exceeds bounded read limit ({member_info.file_size} > {max_bytes})",
+            )
+
+        def read_all(*, relaxed_crc: bool) -> bytes:
+            with self._open_zip_member(zip_file, member_info, relaxed_crc=relaxed_crc) as handle:
+                data = bytearray()
+                while True:
+                    chunk = handle.read(64 * 1024)
+                    if not chunk:
+                        break
+                    data.extend(chunk)
+                    if max_bytes is not None and len(data) > max_bytes:
+                        raise ValueError(f"Archive member {member_name} exceeded bounded read limit ({max_bytes})")
+                return bytes(data)
+
+        relaxed_crc = member_name in self._relaxed_crc_reads
+        if relaxed_crc:
+            self._record_relaxed_crc_usage(member_name, phase, result)
+        try:
+            return read_all(relaxed_crc=relaxed_crc)
+        except zipfile.BadZipFile as exc:
+            if relaxed_crc or not self._is_crc_mismatch_error(exc):
+                raise
+            self._record_relaxed_crc_usage(member_name, phase, result, exc)
+        return read_all(relaxed_crc=True)
+
+    def _read_member_to_spooled_file(
+        self,
+        zip_file: zipfile.ZipFile,
+        name: str | zipfile.ZipInfo,
+        *,
+        phase: str,
+        result: ScanResult,
+        max_size: int,
+        max_bytes: int | None = None,
+    ) -> tuple[Any, int]:
+        """Copy a ZIP member into a spooled temp file with guarded CRC fallback."""
+        member_name = self._get_zip_member_name(name)
+        member_info = name if isinstance(name, zipfile.ZipInfo) else zip_file.getinfo(name)
+        if max_bytes is not None and member_info.file_size > max_bytes:
+            raise ValueError(
+                f"Archive member {member_name} exceeds bounded read limit ({member_info.file_size} > {max_bytes})",
+            )
+
+        def copy_to_spool(*, relaxed_crc: bool) -> tuple[Any, int]:
+            with contextlib.ExitStack() as stack:
+                spool = stack.enter_context(tempfile.SpooledTemporaryFile(max_size=max_size))
+                total_bytes = 0
+                with self._open_zip_member(zip_file, member_info, relaxed_crc=relaxed_crc) as handle:
+                    while True:
+                        chunk = handle.read(64 * 1024)
+                        if not chunk:
+                            break
+                        total_bytes += len(chunk)
+                        if max_bytes is not None and total_bytes > max_bytes:
+                            raise ValueError(
+                                f"Archive member {member_name} exceeded bounded read limit ({max_bytes})",
+                            )
+                        spool.write(chunk)
+                spool.seek(0)
+                stack.pop_all()
+                return spool, total_bytes
+
+        relaxed_crc = member_name in self._relaxed_crc_reads
+        if relaxed_crc:
+            self._record_relaxed_crc_usage(member_name, phase, result)
+        try:
+            return copy_to_spool(relaxed_crc=relaxed_crc)
+        except zipfile.BadZipFile as exc:
+            if relaxed_crc or not self._is_crc_mismatch_error(exc):
+                raise
+            self._record_relaxed_crc_usage(member_name, phase, result, exc)
+        return copy_to_spool(relaxed_crc=True)
 
     def _initialize_scan(self, path: str) -> ScanResult:
         """Initialize scan with basic validation and setup"""
@@ -286,8 +485,13 @@ class PyTorchZipScanner(BaseScanner):
                     # Read only a bounded prefix (4KB) to avoid DoS from a
                     # symlink entry that hides a large compressed payload.
                     # Real symlink targets are short filesystem paths.
-                    with zip_file.open(name) as entry:
-                        target = entry.read(4096).decode("utf-8", "replace")
+                    target = self._read_member_prefix(
+                        zip_file,
+                        name,
+                        4096,
+                        phase="symlink_target_validation",
+                        result=result,
+                    ).decode("utf-8", "replace")
                 except Exception:
                     target = "<unreadable>"
                 result.add_check(
@@ -382,8 +586,13 @@ class PyTorchZipScanner(BaseScanner):
         if not pickle_files:
             for name in safe_entries:
                 try:
-                    with zip_file.open(name, "r") as zef:
-                        data_start = zef.read(8)  # header only
+                    data_start = self._read_member_prefix(
+                        zip_file,
+                        name,
+                        8,
+                        phase="pickle_discovery",
+                        result=result,
+                    )
                     # Include protocol 1 and check for protocol 0 ASCII pickles
                     pickle_magics = [b"\x80\x01", b"\x80\x02", b"\x80\x03", b"\x80\x04", b"\x80\x05"]
                     # Common Protocol 0 ASCII opcodes: MARK '(', PUT 'p', GLOBAL 'c',
@@ -403,7 +612,7 @@ class PyTorchZipScanner(BaseScanner):
         self, zip_file: zipfile.ZipFile, safe_entries: list[str], result: ScanResult, path: str
     ) -> None:
         """Extract PyTorch version info and check for CVE vulnerabilities"""
-        pytorch_version_info = self._extract_pytorch_version_info(zip_file, safe_entries)
+        pytorch_version_info = self._extract_pytorch_version_info(zip_file, safe_entries, result)
         result.metadata.update(pytorch_version_info)
         self._check_cve_2025_32434_vulnerability(pytorch_version_info, result, path)
         self._check_cve_2026_24747_vulnerability(pytorch_version_info, result, path)
@@ -437,7 +646,12 @@ class PyTorchZipScanner(BaseScanner):
             cfg = self.config or {}
             max_in_mem = int(cfg.get("pickle_max_memory_read", 32 * 1024 * 1024))  # 32MB default
             if pickle_data_size <= max_in_mem:
-                data = zip_file.read(name)
+                data = self._read_member_bytes(
+                    zip_file,
+                    name,
+                    phase="pickle_scan",
+                    result=result,
+                )
                 bytes_scanned += len(data)
                 with io.BytesIO(data) as file_like:
                     # IMPORTANT: Pass original ZIP file size, not pickle data size
@@ -445,10 +659,15 @@ class PyTorchZipScanner(BaseScanner):
                     sub_result = self.pickle_scanner._scan_pickle_bytes(file_like, original_file_size)
             else:
                 # Stream to a spooled temp file to avoid OOM and provide seek()
-                with zip_file.open(name, "r") as zf, tempfile.SpooledTemporaryFile(max_size=max_in_mem) as spool:
-                    for chunk in iter(lambda: zf.read(1024 * 1024), b""):
-                        spool.write(chunk)
-                        bytes_scanned += len(chunk)
+                with self._read_member_to_spooled_file(
+                    zip_file,
+                    name,
+                    phase="pickle_scan",
+                    result=result,
+                    max_size=max_in_mem,
+                )[0] as spool:
+                    spool.seek(0, io.SEEK_END)
+                    bytes_scanned += spool.tell()
                     spool.seek(0)
                     # IMPORTANT: Pass original ZIP file size, not pickle data size
                     # This enables proper density-based CVE detection
@@ -491,28 +710,28 @@ class PyTorchZipScanner(BaseScanner):
                 if re.match(r"^(?:.+/)?data/\d+$", name):
                     continue
 
-                with zip_file.open(name, "r") as zf:
-                    # Collect all data from this file for analysis
-                    chunks: list[bytes] = []
-                    for chunk in iter(lambda: zf.read(1024 * 1024), b""):
-                        bytes_scanned += len(chunk)
-                        chunks.append(chunk)
-                    file_data = b"".join(chunks)
+                file_data = self._read_member_bytes(
+                    zip_file,
+                    name,
+                    phase="jit_script_scan",
+                    result=result,
+                )
+                bytes_scanned += len(file_data)
 
-                    # Collect findings for this file without creating individual checks
-                    if file_data:  # Only process if we have data
-                        jit_findings = self.collect_jit_script_findings(
-                            file_data,
-                            model_type="pytorch",
-                            context=f"{path}:{name}",
-                        )
-                        network_findings = self.collect_network_communication_findings(
-                            file_data,
-                            context=f"{path}:{name}",
-                        )
+                # Collect findings for this file without creating individual checks
+                if file_data:  # Only process if we have data
+                    jit_findings = self.collect_jit_script_findings(
+                        file_data,
+                        model_type="pytorch",
+                        context=f"{path}:{name}",
+                    )
+                    network_findings = self.collect_network_communication_findings(
+                        file_data,
+                        context=f"{path}:{name}",
+                    )
 
-                        all_jit_findings.extend(jit_findings)
-                        all_network_findings.extend(network_findings)
+                    all_jit_findings.extend(jit_findings)
+                    all_network_findings.extend(network_findings)
 
             except Exception as e:
                 # Skip files that can't be read
@@ -673,7 +892,13 @@ class PyTorchZipScanner(BaseScanner):
     ) -> None:
         """Stream large files and check patterns in chunks"""
         found_patterns = []
-        with zip_file.open(name, "r") as zf:
+        with self._read_member_to_spooled_file(
+            zip_file,
+            name,
+            phase="blacklist_check",
+            result=result,
+            max_size=8 * 1024 * 1024,
+        )[0] as zf:
             chunk_size = 1024 * 1024  # 1MB chunks
             overlap_buffer = b""
             max_pattern_len = max(len(p.encode("utf-8")) for p in blacklist_patterns) if blacklist_patterns else 0
@@ -730,7 +955,12 @@ class PyTorchZipScanner(BaseScanner):
         self, zip_file: zipfile.ZipFile, name: str, blacklist_patterns: list[str], result: ScanResult
     ) -> None:
         """Scan small files for blacklisted patterns"""
-        file_data = zip_file.read(name)
+        file_data = self._read_member_bytes(
+            zip_file,
+            name,
+            phase="blacklist_check",
+            result=result,
+        )
 
         # For pickled files, check for patterns in the binary data
         if name.endswith(".pkl"):
@@ -842,7 +1072,12 @@ class PyTorchZipScanner(BaseScanner):
         result.finish(success=False)
         return result
 
-    def _extract_pytorch_version_info(self, zipfile_obj: zipfile.ZipFile, safe_entries: list[str]) -> dict[str, Any]:
+    def _extract_pytorch_version_info(
+        self,
+        zipfile_obj: zipfile.ZipFile,
+        safe_entries: list[str],
+        result: ScanResult,
+    ) -> dict[str, Any]:
         """Extract PyTorch version information from model archive for CVE-2025-32434 detection"""
         version_info: dict[str, Any] = {
             "pytorch_archive_version": None,
@@ -853,11 +1088,29 @@ class PyTorchZipScanner(BaseScanner):
         try:
             # Check for PyTorch archive version file
             if "version" in safe_entries:
-                version_data = zipfile_obj.read("version").decode("utf-8", errors="ignore").strip()
+                version_data = (
+                    self._read_member_bytes(
+                        zipfile_obj,
+                        "version",
+                        phase="version_probe",
+                        result=result,
+                    )
+                    .decode("utf-8", errors="ignore")
+                    .strip()
+                )
                 version_info["pytorch_archive_version"] = version_data
                 version_info["pytorch_version_source"] = "version"
             elif "archive/version" in safe_entries:
-                version_data = zipfile_obj.read("archive/version").decode("utf-8", errors="ignore").strip()
+                version_data = (
+                    self._read_member_bytes(
+                        zipfile_obj,
+                        "archive/version",
+                        phase="version_probe",
+                        result=result,
+                    )
+                    .decode("utf-8", errors="ignore")
+                    .strip()
+                )
                 version_info["pytorch_archive_version"] = version_data
                 version_info["pytorch_version_source"] = "archive/version"
 
@@ -867,10 +1120,15 @@ class PyTorchZipScanner(BaseScanner):
                 if name.endswith(".pkl"):
                     try:
                         # Cap read for version probing to 1MB; adjust via config if needed
-                        with zipfile_obj.open(name, "r") as zf:
-                            cfg = self.config or {}
-                            probe_bytes = cfg.get("version_probe_bytes", 1024 * 1024)  # 1MB default
-                            pickle_data = zf.read(probe_bytes)
+                        cfg = self.config or {}
+                        probe_bytes = cfg.get("version_probe_bytes", 1024 * 1024)  # 1MB default
+                        pickle_data = self._read_member_prefix(
+                            zipfile_obj,
+                            name,
+                            probe_bytes,
+                            phase="version_probe",
+                            result=result,
+                        )
                         # Look for torch version patterns in pickle data
                         framework_version = self._extract_framework_version_from_pickle(pickle_data)
                         if framework_version:
@@ -887,7 +1145,14 @@ class PyTorchZipScanner(BaseScanner):
                     try:
                         import json
 
-                        meta_data = json.loads(zipfile_obj.read(meta_file).decode("utf-8"))
+                        meta_data = json.loads(
+                            self._read_member_bytes(
+                                zipfile_obj,
+                                meta_file,
+                                phase="version_probe",
+                                result=result,
+                            ).decode("utf-8")
+                        )
                         # Look for framework-specific version fields in metadata.
                         # Avoid generic "version" keys, which often describe model/config
                         # schema versions and can cause false CVE attributions.
@@ -1373,10 +1638,20 @@ class PyTorchZipScanner(BaseScanner):
             try:
                 pkl_info = zip_file.getinfo(pkl_name)
                 if pkl_info.file_size > max_pkl_read:
-                    with zip_file.open(pkl_name) as f:
-                        pkl_data = f.read(max_pkl_read)
+                    pkl_data = self._read_member_prefix(
+                        zip_file,
+                        pkl_name,
+                        max_pkl_read,
+                        phase="tensor_metadata_validation",
+                        result=result,
+                    )
                 else:
-                    pkl_data = zip_file.read(pkl_name)
+                    pkl_data = self._read_member_bytes(
+                        zip_file,
+                        pkl_name,
+                        phase="tensor_metadata_validation",
+                        result=result,
+                    )
                 mismatches = self._check_tensor_storage_mismatches(pkl_data, data_blob_sizes)
                 if mismatches:
                     result.add_check(
