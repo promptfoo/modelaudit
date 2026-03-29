@@ -3407,6 +3407,88 @@ def test_scan_memory_error_with_dangerous_globals_not_downgraded(
     assert format_validation_checks[0].details["exception_type"] == "MemoryError"
 
 
+def test_recursion_with_security_findings_uses_limitation_note(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only true RecursionError should preserve findings via the limitation note."""
+    model_path = tmp_path / "malicious.pkl"
+    model_path.write_bytes(pickle.dumps({"weights": [1, 2, 3]}))
+
+    def _flag_security(
+        self: PickleScanner,
+        _data: bytes,
+        result: ScanResult,
+        context_path: str,
+    ) -> None:
+        result.add_check(
+            name="Dangerous Pattern Detection",
+            passed=False,
+            message="Suspicious raw pickle pattern detected",
+            severity=IssueSeverity.WARNING,
+            location=context_path,
+        )
+
+    def _raise_recursion(self: PickleScanner, _file_obj: BinaryIO, _file_size: int) -> ScanResult:
+        raise RecursionError("simulated recursion depth")
+
+    monkeypatch.setattr(PickleScanner, "_scan_for_dangerous_patterns", _flag_security)
+    monkeypatch.setattr(PickleScanner, "_scan_pickle_bytes", _raise_recursion)
+
+    result = PickleScanner().scan(str(model_path))
+
+    limitation_checks = [
+        check
+        for check in result.checks
+        if check.name == "Recursion Depth Check" and check.details.get("reason") == "recursion_with_security_findings"
+    ]
+    assert len(limitation_checks) == 1
+    assert limitation_checks[0].severity == IssueSeverity.INFO
+    assert result.metadata["recursion_limited"] is True
+    assert result.success is True
+    assert any(
+        issue.severity == IssueSeverity.WARNING and issue.message == "Suspicious raw pickle pattern detected"
+        for issue in result.issues
+    )
+
+
+def test_non_recursion_exception_with_security_findings_avoids_limitation_note(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Non-recursion failures must not take the recursion-limitation downgrade path."""
+    model_path = tmp_path / "malicious.pkl"
+    model_path.write_bytes(pickle.dumps({"weights": [1, 2, 3]}))
+
+    def _flag_security(
+        self: PickleScanner,
+        _data: bytes,
+        result: ScanResult,
+        context_path: str,
+    ) -> None:
+        result.add_check(
+            name="Dangerous Pattern Detection",
+            passed=False,
+            message="Suspicious raw pickle pattern detected",
+            severity=IssueSeverity.WARNING,
+            location=context_path,
+        )
+
+    def _raise_runtime(self: PickleScanner, _file_obj: BinaryIO, _file_size: int) -> ScanResult:
+        raise RuntimeError("simulated scanner bug")
+
+    monkeypatch.setattr(PickleScanner, "_scan_for_dangerous_patterns", _flag_security)
+    monkeypatch.setattr(PickleScanner, "_scan_pickle_bytes", _raise_runtime)
+
+    result = PickleScanner().scan(str(model_path))
+
+    assert not any(check.details.get("reason") == "recursion_with_security_findings" for check in result.checks)
+    assert result.metadata.get("recursion_limited") is not True
+    assert result.metadata["operational_error"] is True
+    assert result.metadata["operational_error_reason"] == "pickle_file_open_failed"
+    file_open_checks = [check for check in result.checks if check.name == "Pickle File Open"]
+    assert len(file_open_checks) == 1
+    assert file_open_checks[0].status == CheckStatus.FAILED
+    assert file_open_checks[0].severity == IssueSeverity.CRITICAL
+    assert result.success is False
+
+
 def test_extract_globals_advanced_respects_max_opcodes(monkeypatch: pytest.MonkeyPatch) -> None:
     """Advanced extraction should stop after max_opcodes instead of parsing everything."""
     scanner = PickleScanner({"max_opcodes": 3})
