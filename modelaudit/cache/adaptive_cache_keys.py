@@ -18,7 +18,7 @@ class FileFingerprint:
 
     path_hash: str
     size: int
-    mtime: float
+    mtime_ns: int
     inode: int
     content_hash: str | None = None  # Lazy-loaded for large files
 
@@ -27,8 +27,9 @@ class FileFingerprint:
         """Create fingerprint from existing stat result to avoid redundant syscalls."""
         # Use blake2b for fast path hashing (much faster than sha256)
         path_hash = hashlib.blake2b(file_path.encode(), digest_size=8).hexdigest()
+        mtime_ns = getattr(stat_result, "st_mtime_ns", int(stat_result.st_mtime * 1_000_000_000))
 
-        return cls(path_hash=path_hash, size=stat_result.st_size, mtime=stat_result.st_mtime, inode=stat_result.st_ino)
+        return cls(path_hash=path_hash, size=stat_result.st_size, mtime_ns=mtime_ns, inode=stat_result.st_ino)
 
     @classmethod
     def from_path(cls, file_path: str) -> "FileFingerprint":
@@ -38,7 +39,7 @@ class FileFingerprint:
 
     def quick_key(self) -> str:
         """Generate fast cache key without content hash (for small files)."""
-        return f"{self.path_hash}_{self.size}_{int(self.mtime)}_{self.inode}"
+        return f"{self.path_hash}_{self.size}_{self.mtime_ns}_{self.inode}"
 
     def secure_key(self, file_path: str, hasher: SecureFileHasher | None = None) -> str:
         """Generate secure cache key with content hash (lazy-loaded)."""

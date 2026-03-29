@@ -441,8 +441,9 @@ class TestCacheOptimizationCorrectness:
     def test_optimized_config_extraction_correctness(self):
         """Test that optimized config extraction maintains correctness."""
         extractor = ConfigurationExtractor()
+        expected_cache_dir = str(Path("/tmp/test"))
 
-        test_config = {"cache_enabled": True, "cache_dir": "/tmp/test", "max_cache_file_size": 1000000}
+        test_config = {"cache_enabled": True, "cache_dir": expected_cache_dir, "max_cache_file_size": 1000000}
 
         # Test various argument patterns
         test_cases = [
@@ -456,6 +457,6 @@ class TestCacheOptimizationCorrectness:
 
             assert cache_config is not None, "cache_config should not be None"
             assert cache_config.enabled == test_config["cache_enabled"]
-            assert cache_config.cache_dir == test_config["cache_dir"]
+            assert cache_config.cache_dir == expected_cache_dir
             assert cache_config.max_file_size == test_config["max_cache_file_size"]
             assert file_path == "file.bin"

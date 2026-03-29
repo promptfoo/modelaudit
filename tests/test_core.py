@@ -1,0 +1,255 @@
+"""Core dispatch regressions for content-routed model formats."""
+
+from __future__ import annotations
+
+import base64
+import json
+import pickle
+import zipfile
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from modelaudit.core import scan_file
+
+
+def _build_malicious_pickle() -> bytes:
+    import os as os_module
+
+    class DangerousPayload:
+        def __reduce__(self) -> tuple[Any, tuple[str]]:
+            return (os_module.system, ("echo core-dispatch-test",))
+
+    return pickle.dumps(DangerousPayload())
+
+
+def _create_misnamed_zip(path: Path, entries: dict[str, bytes]) -> None:
+    with zipfile.ZipFile(path, "w") as archive:
+        for name, data in entries.items():
+            archive.writestr(name, data)
+
+
+def test_scan_file_detects_malicious_zip_with_misleading_extension(tmp_path: Path) -> None:
+    disguised_zip = tmp_path / "payload.jpg"
+    _create_misnamed_zip(disguised_zip, {"payload.pkl": _build_malicious_pickle()})
+
+    result = scan_file(str(disguised_zip))
+
+    assert result.scanner_name == "zip"
+    assert any("payload.pkl" in (issue.location or "") for issue in result.issues)
+
+
+def test_scan_file_does_not_route_generic_zip_config_to_keras(tmp_path: Path) -> None:
+    disguised_zip = tmp_path / "repo.jpg"
+    _create_misnamed_zip(disguised_zip, {"config.json": json.dumps({"model_type": "bert"}).encode("utf-8")})
+
+    result = scan_file(str(disguised_zip))
+
+    assert result.scanner_name == "zip"
+    assert not any(check.name.startswith("Keras ZIP") for check in result.checks)
+
+
+def test_scan_file_routes_misnamed_keras_zip_by_content(tmp_path: Path) -> None:
+    disguised_keras = tmp_path / "model.jpg"
+    malicious_code = "exec(\"print('Malicious!')\")"
+    encoded_code = base64.b64encode(malicious_code.encode()).decode()
+    config = {
+        "class_name": "Functional",
+        "config": {
+            "layers": [
+                {"class_name": "InputLayer", "name": "input_1", "config": {}},
+                {
+                    "class_name": "Lambda",
+                    "name": "lambda_1",
+                    "config": {"function": [encoded_code, None, None], "function_type": "lambda"},
+                },
+            ]
+        },
+    }
+    _create_misnamed_zip(
+        disguised_keras,
+        {
+            "config.json": json.dumps(config).encode("utf-8"),
+            "metadata.json": json.dumps({"keras_version": "3.0.0"}).encode("utf-8"),
+        },
+    )
+
+    result = scan_file(str(disguised_keras))
+
+    assert result.scanner_name == "keras_zip"
+    assert any("lambda" in issue.message.lower() for issue in result.issues)
+
+
+def test_scan_file_routes_misnamed_config_only_keras_zip_by_content(tmp_path: Path) -> None:
+    disguised_keras = tmp_path / "model.jpg"
+    malicious_code = "exec(\"print('Malicious!')\")"
+    encoded_code = base64.b64encode(malicious_code.encode()).decode()
+    config = {
+        "class_name": "Functional",
+        "config": {
+            "layers": [
+                {"class_name": "InputLayer", "name": "input_1", "config": {}},
+                {
+                    "class_name": "Lambda",
+                    "name": "lambda_1",
+                    "config": {"function": [encoded_code, None, None], "function_type": "lambda"},
+                },
+            ]
+        },
+    }
+    _create_misnamed_zip(disguised_keras, {"config.json": json.dumps(config).encode("utf-8")})
+
+    result = scan_file(str(disguised_keras))
+
+    assert result.scanner_name == "keras_zip"
+    assert any("lambda" in issue.message.lower() for issue in result.issues)
+
+
+def test_scan_file_routes_config_only_keras_by_suffix(tmp_path: Path) -> None:
+    keras_model = tmp_path / "model.keras"
+    _create_misnamed_zip(
+        keras_model,
+        {
+            "config.json": json.dumps({"class_name": "Sequential", "config": {"layers": []}}).encode("utf-8"),
+        },
+    )
+
+    result = scan_file(str(keras_model))
+
+    assert result.scanner_name == "keras_zip"
+    assert result.success
+
+
+def test_scan_file_routes_misnamed_pytorch_zip_by_content(tmp_path: Path) -> None:
+    disguised_torch = tmp_path / "model.jpg"
+    _create_misnamed_zip(
+        disguised_torch,
+        {
+            "data.pkl": _build_malicious_pickle(),
+            "version": b"1.6",
+        },
+    )
+
+    result = scan_file(str(disguised_torch))
+
+    assert result.scanner_name == "pytorch_zip"
+    assert any("data.pkl" in (issue.location or "") for issue in result.issues)
+
+
+def test_scan_file_routes_misnamed_executorch_archive_by_content(tmp_path: Path) -> None:
+    disguised_exec = tmp_path / "model.jpg"
+    _create_misnamed_zip(
+        disguised_exec,
+        {
+            "bytecode.pkl": pickle.dumps({"weights": [1, 2, 3]}),
+            "version": b"1",
+            "evil.py": b"print('evil')\n",
+        },
+    )
+
+    result = scan_file(str(disguised_exec))
+
+    assert result.scanner_name == "executorch"
+    assert any(issue.rule_code == "S507" and "evil.py" in (issue.location or "") for issue in result.issues)
+    assert any(issue.rule_code == "S104" and "evil.py" in (issue.location or "") for issue in result.issues)
+
+
+def test_scan_file_does_not_route_non_pytorch_zip_with_generic_pickle(tmp_path: Path) -> None:
+    disguised_zip = tmp_path / "weights.jpg"
+    _create_misnamed_zip(
+        disguised_zip,
+        {
+            "weights.pkl": pickle.dumps({"weights": [1, 2, 3]}),
+            "version": b"1.0",
+        },
+    )
+
+    result = scan_file(str(disguised_zip))
+
+    assert result.scanner_name == "zip"
+
+
+def test_scan_file_does_not_route_near_match_executorch_zip_without_numeric_version(tmp_path: Path) -> None:
+    disguised_zip = tmp_path / "bytecode.jpg"
+    _create_misnamed_zip(
+        disguised_zip,
+        {
+            "bytecode.pkl": pickle.dumps({"weights": [1, 2, 3]}),
+            "version": b"dev",
+        },
+    )
+
+    result = scan_file(str(disguised_zip))
+
+    assert result.scanner_name == "zip"
+
+
+def test_scan_file_does_not_route_generic_data_pickle_without_pytorch_metadata(tmp_path: Path) -> None:
+    disguised_zip = tmp_path / "data.jpg"
+    _create_misnamed_zip(disguised_zip, {"data.pkl": pickle.dumps({"weights": [1, 2, 3]})})
+
+    result = scan_file(str(disguised_zip))
+
+    assert result.scanner_name == "zip"
+
+
+def test_scan_file_routes_misnamed_torchserve_mar_by_content(tmp_path: Path) -> None:
+    disguised_mar = tmp_path / "model.jpg"
+    manifest = {
+        "model": {
+            "handler": "handler.py",
+            "serializedFile": "model.pkl",
+        }
+    }
+    _create_misnamed_zip(
+        disguised_mar,
+        {
+            "MAR-INF/MANIFEST.json": json.dumps(manifest).encode("utf-8"),
+            "handler.py": b"def handle(data, context):\n    return data\n",
+            "model.pkl": _build_malicious_pickle(),
+        },
+    )
+
+    result = scan_file(str(disguised_mar))
+
+    assert result.scanner_name == "torchserve_mar"
+    assert any("model.pkl" in (issue.location or "") for issue in result.issues)
+
+
+def test_scan_file_routes_misnamed_keras_hdf5_by_header(tmp_path: Path) -> None:
+    h5py = pytest.importorskip("h5py")
+
+    disguised_h5 = tmp_path / "model.jpg"
+    with h5py.File(disguised_h5, "w") as handle:
+        handle.attrs["model_config"] = json.dumps(
+            {
+                "class_name": "Sequential",
+                "config": {
+                    "name": "test",
+                    "layers": [{"class_name": "Lambda", "config": {"function": "lambda x: x * 2"}}],
+                },
+            }
+        )
+        handle.attrs["keras_version"] = "3.11.2"
+
+    result = scan_file(str(disguised_h5))
+
+    assert result.scanner_name == "keras_h5"
+    assert any("CVE-2025-9905" in issue.message for issue in result.issues)
+
+
+def test_scan_file_routes_misnamed_sevenzip_by_header(tmp_path: Path) -> None:
+    py7zr = pytest.importorskip("py7zr")
+
+    disguised_7z = tmp_path / "archive.jpg"
+    payload = tmp_path / "payload.pkl"
+    payload.write_bytes(_build_malicious_pickle())
+
+    with py7zr.SevenZipFile(disguised_7z, "w") as archive:
+        archive.write(payload, arcname="payload.pkl")
+
+    result = scan_file(str(disguised_7z))
+
+    assert result.scanner_name == "sevenzip"
+    assert any("payload.pkl" in (issue.location or "") for issue in result.issues)

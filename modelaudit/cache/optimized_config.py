@@ -1,9 +1,166 @@
 """Optimized configuration handling for cache operations."""
 
 import functools
+import json
 import threading
 import time
+from dataclasses import fields, is_dataclass
+from enum import Enum
+from pathlib import Path
 from typing import Any
+
+CACHE_SCHEMA_VERSION = "2.0"
+
+_CACHE_ONLY_CONFIG_KEYS = frozenset(
+    {
+        "cache_dir",
+        "cache_enabled",
+        "content_hash_threshold",
+        "max_cache_file_size",
+        "min_cache_file_size",
+        "use_cache",
+    }
+)
+_RUNTIME_ONLY_CONFIG_KEYS = frozenset(
+    {
+        "enable_progress",
+        "format",
+        "output",
+        "progress_callback",
+        "quiet",
+        "show_progress",
+        "verbose",
+    }
+)
+
+
+def _serialize_fingerprint_value(value: Any) -> str:
+    """Serialize a normalized value into a stable string fingerprint."""
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _normalize_fingerprint_value(value: Any) -> Any:
+    """Normalize arbitrary values into stable, JSON-serializable structures."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+
+    if isinstance(value, Enum):
+        return value.value
+
+    if isinstance(value, Path):
+        return str(value)
+
+    if isinstance(value, dict):
+        return {
+            str(key): _normalize_fingerprint_value(item)
+            for key, item in sorted(value.items(), key=lambda item: str(item[0]))
+        }
+
+    if isinstance(value, (list, tuple)):
+        return [_normalize_fingerprint_value(item) for item in value]
+
+    if isinstance(value, (set, frozenset)):
+        normalized_items = [_normalize_fingerprint_value(item) for item in value]
+        return sorted(normalized_items, key=_serialize_fingerprint_value)
+
+    if is_dataclass(value):
+        normalized = {
+            "__type__": f"{value.__class__.__module__}.{value.__class__.__qualname__}",
+        }
+        for field in fields(value):
+            if field.name == "token":
+                continue
+            normalized[field.name] = _normalize_fingerprint_value(getattr(value, field.name))
+        return normalized
+
+    if hasattr(value, "model_dump"):
+        try:
+            return _normalize_fingerprint_value(value.model_dump())
+        except Exception:
+            pass
+
+    if hasattr(value, "to_dict"):
+        try:
+            return _normalize_fingerprint_value(value.to_dict())
+        except Exception:
+            pass
+
+    return repr(value)
+
+
+def _normalize_cache_settings(config: dict[str, Any] | None) -> dict[str, Any]:
+    """Normalize cache-only settings used by the fast extractor and manager selection."""
+    raw_config = config if isinstance(config, dict) else {}
+    raw_cache_dir = raw_config.get("cache_dir")
+
+    return {
+        "cache_enabled": raw_config.get("cache_enabled", raw_config.get("use_cache", True)),
+        "cache_dir": str(Path(raw_cache_dir).expanduser()) if raw_cache_dir else None,
+        "content_hash_threshold": raw_config.get("content_hash_threshold", 10 * 1024 * 1024),
+        "max_cache_file_size": raw_config.get("max_cache_file_size", 100 * 1024 * 1024),
+        "min_cache_file_size": raw_config.get("min_cache_file_size", 1024),
+    }
+
+
+def normalize_material_scan_config(config: dict[str, Any] | None) -> dict[str, Any]:
+    """Return the subset of scan config that can materially change findings."""
+    raw_config = config if isinstance(config, dict) else {}
+    normalized: dict[str, Any] = {}
+
+    for key, value in sorted(raw_config.items(), key=lambda item: str(item[0])):
+        key_str = str(key)
+        if key_str in _CACHE_ONLY_CONFIG_KEYS or key_str in _RUNTIME_ONLY_CONFIG_KEYS:
+            continue
+        normalized[key_str] = _normalize_fingerprint_value(value)
+
+    return normalized
+
+
+def _get_rule_config_snapshot() -> dict[str, Any]:
+    """Capture the active rule configuration that affects emitted findings."""
+    try:
+        from ..config.rule_config import get_config
+
+        rule_config = get_config()
+        return {
+            "ignore": {
+                pattern: sorted(codes)
+                for pattern, codes in sorted(rule_config.ignore.items(), key=lambda item: item[0])
+            },
+            "options": _normalize_fingerprint_value(rule_config.options),
+            "severity": {
+                code: getattr(level, "value", str(level))
+                for code, level in sorted(rule_config.severity.items(), key=lambda item: item[0])
+            },
+            "suppress": sorted(rule_config.suppress),
+        }
+    except Exception:
+        return {"ignore": {}, "options": {}, "severity": {}, "suppress": []}
+
+
+def build_cache_version_context(
+    config: dict[str, Any] | None = None,
+    *,
+    normalized_scan_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build a stable cache-version context for a scan."""
+    scan_config = (
+        normalized_scan_config if normalized_scan_config is not None else normalize_material_scan_config(config)
+    )
+    return {
+        "cache_schema_version": CACHE_SCHEMA_VERSION,
+        "rule_config": _get_rule_config_snapshot(),
+        "scan_config": scan_config,
+    }
+
+
+def _build_config_signature(config: dict[str, Any] | None) -> str:
+    """Build a stable signature for cached CacheConfiguration objects."""
+    payload = {
+        "cache_settings": _normalize_cache_settings(config),
+        "scan_config": normalize_material_scan_config(config),
+    }
+    return _serialize_fingerprint_value(payload)
 
 
 class CacheConfiguration:
@@ -13,15 +170,21 @@ class CacheConfiguration:
         if config is None:
             config = {}
 
-        self.enabled = config.get("cache_enabled", True)
-        self.cache_dir = config.get("cache_dir")
-        self.max_file_size = config.get("max_cache_file_size", 100 * 1024 * 1024)  # 100MB default
-        self.min_file_size = config.get("min_cache_file_size", 1024)  # 1KB minimum
-        self.use_content_hash_threshold = config.get("content_hash_threshold", 10 * 1024 * 1024)  # 10MB
+        cache_settings = _normalize_cache_settings(config)
+        self.enabled = cache_settings["cache_enabled"]
+        self.cache_dir = cache_settings["cache_dir"]
+        self.max_file_size = cache_settings["max_cache_file_size"]
+        self.min_file_size = cache_settings["min_cache_file_size"]
+        self.use_content_hash_threshold = cache_settings["content_hash_threshold"]
+        self._normalized_scan_config = normalize_material_scan_config(config)
 
         # Pre-compute common decisions
         self._small_file_extensions = {".txt", ".md", ".json", ".yaml", ".yml"}
         self._large_file_extensions = {".bin", ".pkl", ".h5", ".onnx", ".pb", ".pth", ".pt"}
+
+    def get_version_context(self) -> dict[str, Any]:
+        """Return the stable cache-version context for the current scan config."""
+        return build_cache_version_context(normalized_scan_config=self._normalized_scan_config)
 
     @functools.lru_cache(maxsize=128)  # noqa: B019
     def should_cache_file(self, file_size: int, file_ext: str = "") -> bool:
@@ -77,8 +240,8 @@ class ConfigurationExtractor:
     """Optimized configuration extraction with minimal overhead."""
 
     def __init__(self):
-        self._config_cache: dict[Any, tuple[CacheConfiguration, float]] = {}
-        self._result_cache: dict[tuple[Any, str | None], tuple[CacheConfiguration, str | None, float]] = {}
+        self._config_cache: dict[str, tuple[CacheConfiguration, float]] = {}
+        self._result_cache: dict[tuple[str, str | None], tuple[CacheConfiguration, str | None, float]] = {}
         self._cache_expiry = 30.0  # 30 seconds
         self._last_cleanup = time.monotonic()
         self._lock = threading.RLock()
@@ -112,12 +275,9 @@ class ConfigurationExtractor:
         if not file_path:
             return CacheConfiguration({}), None
 
-        # Cache entries are keyed by id(config_dict), so callers must treat config dicts as
-        # immutable after CacheConfiguration construction. This is safe for current flows that
-        # use apply_smart_overrides() to build fresh dicts, but mutating a config object later
-        # can cause stale _config_cache/_result_cache entries until _cache_expiry elapses.
-        # Check cache for parsed configuration.
-        config_key = id(config_dict) if config_dict else "default"
+        # Cache entries are keyed by a stable configuration signature so in-place
+        # mutations of config dicts cannot reuse stale cache settings.
+        config_key = _build_config_signature(config_dict if isinstance(config_dict, dict) else None)
         now = time.monotonic()
 
         with self._lock:

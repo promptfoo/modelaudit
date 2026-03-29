@@ -63,12 +63,12 @@ class KerasH5Scanner(BaseScanner):
         if not os.path.isfile(path):
             return False
 
-        ext = os.path.splitext(path)[1].lower()
-        if ext not in cls.supported_extensions:
-            return False
-
         if not HAS_H5PY:
-            return True  # Let scan() handle the missing dep with a proper message
+            try:
+                with open(path, "rb") as handle:
+                    return handle.read(8) == b"\x89HDF\r\n\x1a\n"
+            except OSError:
+                return False
 
         # Try to open as HDF5 file
         try:
@@ -599,11 +599,11 @@ class KerasH5Scanner(BaseScanner):
 
         # Common safe Lambda patterns for normalization
         SAFE_LAMBDA_PATTERNS = [
-            r"lambda\s+x\s*:\s*x\s*/\s*\d+",  # lambda x: x / 255
-            r"lambda\s+x\s*:\s*x\s*\*\s*\d+",  # lambda x: x * 2
-            r"lambda\s+x\s*:\s*tf\.nn\.\w+\(x\)",  # lambda x: tf.nn.softmax(x)
-            r"lambda\s+x\s*:\s*K\.\w+\(x",  # lambda x: K.softmax(x)
-            r"lambda\s+x\s*:\s*\(x\s*-\s*\d+\)\s*/\s*\d+",  # lambda x: (x - 128) / 128
+            r"lambda\s+x\s*:\s*x\s*/\s*\d+$",  # lambda x: x / 255
+            r"lambda\s+x\s*:\s*x\s*\*\s*\d+$",  # lambda x: x * 2
+            r"lambda\s+x\s*:\s*tf\.nn\.\w+\(x\)$",  # lambda x: tf.nn.softmax(x)
+            r"lambda\s+x\s*:\s*K\.\w+\(x\)$",  # lambda x: K.softmax(x)
+            r"lambda\s+x\s*:\s*\(x\s*-\s*\d+\)\s*/\s*\d+$",  # lambda x: (x - 128) / 128
         ]
 
         # Check if there's actual Python code to validate

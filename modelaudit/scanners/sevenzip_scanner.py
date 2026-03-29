@@ -113,6 +113,66 @@ class SevenZipScanner(BaseScanner):
     _NESTED_CORE_EXTENSION_EXCLUSIONS: ClassVar[frozenset[str]] = frozenset(
         {".txt", ".md", ".markdown", ".rst", ".j2", ".jinja", ".template"},
     )
+    _LOW_VALUE_NESTED_PROBE_EXTENSIONS: ClassVar[frozenset[str]] = frozenset(
+        {
+            ".txt",
+            ".md",
+            ".markdown",
+            ".rst",
+            ".json",
+            ".yaml",
+            ".yml",
+            ".xml",
+            ".ini",
+            ".cfg",
+            ".conf",
+            ".toml",
+            ".csv",
+            ".tsv",
+            ".log",
+            ".html",
+            ".css",
+            ".scss",
+            ".sass",
+            ".less",
+            ".js",
+            ".ts",
+            ".py",
+            ".java",
+            ".c",
+            ".cpp",
+            ".h",
+            ".go",
+            ".rs",
+            ".sh",
+            ".bat",
+            ".ps1",
+        }
+    )
+    _COMMON_NESTED_DISGUISE_EXTENSIONS: ClassVar[frozenset[str]] = frozenset(
+        {
+            ".jpg",
+            ".jpeg",
+            ".png",
+            ".gif",
+            ".bmp",
+            ".svg",
+            ".ico",
+            ".webp",
+            ".pdf",
+            ".doc",
+            ".docx",
+            ".ppt",
+            ".pptx",
+            ".xls",
+            ".xlsx",
+            ".bin",
+            ".dat",
+        }
+    )
+    _SUSPICIOUS_NESTED_PROBE_TOKENS: ClassVar[frozenset[str]] = frozenset(
+        {"model", "weight", "tensor", "checkpoint", "archive", "payload", "nested", "data"},
+    )
 
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
@@ -130,10 +190,6 @@ class SevenZipScanner(BaseScanner):
             return False
 
         if not os.path.isfile(path):
-            return False
-
-        # Check extension
-        if not path.lower().endswith(".7z"):
             return False
 
         return cls._has_7z_magic(path)
@@ -395,28 +451,14 @@ class SevenZipScanner(BaseScanner):
     def _identify_extensionless_nested_7z_files(
         self, archive: Any, file_names: list[str], archive_path: str, result: ScanResult
     ) -> list[str]:
-        """Inspect extensionless members and keep only confirmed nested 7z archives."""
+        """Inspect likely disguised nested members and keep only confirmed 7z archives."""
         nested_archives: list[str] = []
-        probe_targets: list[str] = []
-        probes_remaining = self.max_extensionless_probes
-        for file_name in file_names:
-            _, ext = os.path.splitext(file_name.lower())
-            if ext:
+        probe_candidates: list[tuple[int, int, str]] = []
+        supported_extensions = self._supported_nested_core_extensions()
+        for index, file_name in enumerate(file_names):
+            candidate_extensions = self._candidate_archive_extensions(file_name)
+            if any(extension in supported_extensions for extension in candidate_extensions):
                 continue
-
-            if probes_remaining <= 0:
-                result.add_check(
-                    name="Extensionless Probe Limit",
-                    passed=False,
-                    message=(
-                        f"Extensionless member probe limit ({self.max_extensionless_probes}) "
-                        f"reached; remaining extensionless members were not inspected"
-                    ),
-                    severity=IssueSeverity.WARNING,
-                    location=archive_path,
-                    details={"limit": self.max_extensionless_probes},
-                )
-                break
 
             member_info = None
             with suppress(Exception):
@@ -425,9 +467,27 @@ class SevenZipScanner(BaseScanner):
             if getattr(member_info, "is_directory", False) is True:
                 continue
 
-            probes_remaining -= 1
-            probe_targets.append(file_name)
+            priority = self._nested_probe_priority(file_name)
+            if priority <= 0:
+                continue
 
+            probe_candidates.append((priority, index, file_name))
+
+        if len(probe_candidates) > self.max_extensionless_probes:
+            result.add_check(
+                name="Nested Member Probe Limit",
+                passed=False,
+                message=(
+                    f"Nested member probe limit ({self.max_extensionless_probes}) "
+                    f"reached; remaining unsupported members were not inspected"
+                ),
+                severity=IssueSeverity.WARNING,
+                location=archive_path,
+                details={"limit": self.max_extensionless_probes},
+            )
+
+        probe_candidates.sort(key=lambda item: (-item[0], item[1]))
+        probe_targets = [file_name for _, _, file_name in probe_candidates[: self.max_extensionless_probes]]
         if not probe_targets:
             return nested_archives
 
@@ -448,15 +508,38 @@ class SevenZipScanner(BaseScanner):
                     nested_archives.append(file_name)
             except Exception as e:
                 result.add_check(
-                    name=f"Extensionless 7z Probe: {file_name}",
+                    name=f"Nested 7z Probe: {file_name}",
                     passed=False,
-                    message=f"Failed to inspect extensionless archive member {file_name}: {e}",
+                    message=f"Failed to inspect nested archive candidate {file_name}: {e}",
                     severity=IssueSeverity.WARNING,
                     location=f"{archive_path}:{file_name}",
                     details={"error": str(e)},
                 )
 
         return nested_archives
+
+    @classmethod
+    def _nested_probe_priority(cls, file_name: str) -> int:
+        """Score unsupported members so likely nested-archive disguises consume probe budget first."""
+        candidate_extensions = cls._candidate_archive_extensions(file_name)
+        if not candidate_extensions:
+            return 5
+
+        leaf_extension = Path(file_name).suffix.lower()
+        if not leaf_extension:
+            leaf_extension = candidate_extensions[-1]
+        if leaf_extension in cls._LOW_VALUE_NESTED_PROBE_EXTENSIONS:
+            return 1
+
+        priority = 2
+        if leaf_extension in cls._COMMON_NESTED_DISGUISE_EXTENSIONS:
+            priority = 4
+
+        basename = Path(file_name).name.lower()
+        if any(token in basename for token in cls._SUSPICIOUS_NESTED_PROBE_TOKENS):
+            priority += 1
+
+        return priority
 
     def _probe_extensionless_members(self, archive: Any, file_names: list[str]) -> dict[str, bool]:
         """Batch probe extensionless members in one pass to avoid repeated archive resets."""

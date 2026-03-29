@@ -8,6 +8,12 @@
 - `scanners/`: Format-specific scanner implementations
 - `utils/file/detection.py`: File type and content detection utilities
 
+## Routing & Coverage Invariants
+
+- Prefer trusted file structure and bounded content sniffing over extension-only routing, especially for ZIP-like containers and nested archives.
+- For routing, prefiltering, or archive-recursion changes, add one malicious positive regression and one benign near-match negative regression.
+- If a scanner aborts to avoid partial coverage, make the result operationally explicit (`success=False` with a clear error message) and preserve consistent exit-code and cache behavior.
+
 ## Scanner System
 
 All scanners inherit from `BaseScanner` in `modelaudit/scanners/base.py`:

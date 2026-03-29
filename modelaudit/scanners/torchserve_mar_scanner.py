@@ -6,12 +6,15 @@ import ast
 import contextlib
 import json
 import os
+import posixpath
 import re
+import shlex
 import stat
 import tempfile
 import zipfile
 from pathlib import PurePosixPath
 from typing import Any, ClassVar
+from urllib.parse import urlparse
 
 from ..utils import is_absolute_archive_path, is_critical_system_path, sanitize_archive_path
 from ..utils.helpers.assets import asset_from_scan_result
@@ -33,6 +36,14 @@ CRITICAL_SYSTEM_PATHS = [
 
 MANIFEST_ENTRY_PATH = "MAR-INF/MANIFEST.json"
 URL_SCHEME_PATTERN = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
+POPULAR_ML_PACKAGE_TYPOS = {
+    "torcch": "torch",
+    "numppy": "numpy",
+    "scikit_learn": "scikit-learn",
+    "tensorflo": "tensorflow",
+    "trransformers": "transformers",
+}
+TRUSTED_PYPI_HOSTS = {"pypi.org", "files.pythonhosted.org", "test.pypi.org"}
 
 HIGH_RISK_CALLS = {
     "__import__",
@@ -53,6 +64,10 @@ HIGH_RISK_CALLS = {
     "subprocess.run",
 }
 
+SAFE_IMPORT_TIME_CALLS = {
+    "logging.getLogger",
+}
+
 
 class TorchServeMarScanner(BaseScanner):
     """Scan TorchServe .mar archives and embedded payloads."""
@@ -62,6 +77,7 @@ class TorchServeMarScanner(BaseScanner):
     supported_extensions: ClassVar[list[str]] = [".mar"]
 
     MAX_MANIFEST_BYTES: ClassVar[int] = 1 * 1024 * 1024
+    MAX_REQUIREMENTS_TXT_BYTES: ClassVar[int] = 10 * 1024 * 1024
     DEFAULT_MAX_MEMBER_BYTES: ClassVar[int] = 64 * 1024 * 1024
     DEFAULT_MAX_UNCOMPRESSED_BYTES: ClassVar[int] = 512 * 1024 * 1024
     DEFAULT_MAX_ENTRIES: ClassVar[int] = 4096
@@ -103,8 +119,6 @@ class TorchServeMarScanner(BaseScanner):
     @classmethod
     def can_handle(cls, path: str) -> bool:
         if not os.path.isfile(path):
-            return False
-        if os.path.splitext(path)[1].lower() not in cls.supported_extensions:
             return False
 
         try:
@@ -343,7 +357,7 @@ class TorchServeMarScanner(BaseScanner):
             member_set=member_set,
             result=result,
         )
-        self._analyze_handlers(
+        manifest_context["handler_trees"] = self._analyze_handlers(
             archive_path=archive_path,
             archive=archive,
             member_set=member_set,
@@ -571,8 +585,9 @@ class TorchServeMarScanner(BaseScanner):
         member_set: set[str],
         handler_paths: list[str],
         result: ScanResult,
-    ) -> None:
+    ) -> dict[str, ast.Module]:
         analyzed_handler = False
+        handler_trees: dict[str, ast.Module] = {}
         member_lookup = {
             self._normalize_member_name(member_info.filename): member_info
             for member_info in archive.infolist()
@@ -606,7 +621,7 @@ class TorchServeMarScanner(BaseScanner):
                     )
                     continue
 
-                risky_calls, parse_error = self._find_high_risk_calls(handler_bytes)
+                tree, parse_error = self._parse_python_source(handler_bytes)
                 if parse_error is not None:
                     result.add_check(
                         name="TorchServe Handler Static Analysis",
@@ -617,7 +632,10 @@ class TorchServeMarScanner(BaseScanner):
                         details={"handler": normalized_handler},
                     )
                     continue
+                assert tree is not None
+                handler_trees[normalized_handler] = tree
 
+                risky_calls = self._find_high_risk_calls_from_tree(tree)
                 if risky_calls:
                     result.add_check(
                         name="TorchServe Handler Static Analysis",
@@ -642,6 +660,298 @@ class TorchServeMarScanner(BaseScanner):
                 passed=True,
                 message="No Python handler files found for static analysis",
                 location=archive_path,
+            )
+
+        return handler_trees
+
+    def _resolve_handler_members(self, member_set: set[str], handler_paths: list[str]) -> set[str]:
+        resolved_handlers: set[str] = set()
+        for handler_path in handler_paths:
+            resolved_candidates = self._resolve_handler_member_candidates(handler_path)
+            for candidate in resolved_candidates:
+                normalized_candidate = self._normalize_member_name(candidate)
+                if normalized_candidate in member_set and normalized_candidate.endswith(".py"):
+                    resolved_handlers.add(normalized_candidate)
+        return resolved_handlers
+
+    def _resolve_import_from_module(
+        self,
+        importing_member: str | None,
+        level: int,
+        module: str | None,
+    ) -> str | None:
+        if level == 0:
+            return module
+        if importing_member is None:
+            # Relative imports need the importing module's package path for resolution.
+            return None
+
+        package_parts = [part for part in PurePosixPath(importing_member).parent.parts if part not in {"", "."}]
+        trim = level - 1
+        if trim > len(package_parts):
+            return None
+        base_parts = package_parts[: len(package_parts) - trim]
+        if module:
+            base_parts.extend(part for part in module.split(".") if part)
+        if not base_parts:
+            return None
+        return ".".join(base_parts)
+
+    def _collect_imported_modules(self, tree: ast.AST, importing_member: str | None = None) -> set[str]:
+        modules: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name:
+                        modules.add(alias.name)
+            elif isinstance(node, ast.ImportFrom):
+                base_module = self._resolve_import_from_module(importing_member, node.level, node.module)
+                if not base_module:
+                    continue
+                modules.add(base_module)
+                for alias in node.names:
+                    if alias.name == "*":
+                        continue
+                    modules.add(f"{base_module}.{alias.name}")
+        return modules
+
+    def _is_safe_import_time_value(self, value: ast.expr | None, aliases: dict[str, str]) -> bool:
+        if value is None:
+            return True
+        try:
+            ast.literal_eval(value)
+            return True
+        except Exception:
+            pass
+
+        if not isinstance(value, ast.Call):
+            return False
+
+        call_name = self._resolve_call_name(value.func)
+        if call_name is None:
+            return False
+
+        resolved_name = self._apply_alias(call_name, aliases)
+        if resolved_name not in SAFE_IMPORT_TIME_CALLS:
+            return False
+
+        return sum(1 for node in ast.walk(value) if isinstance(node, ast.Call)) == 1
+
+    def _is_safe_import_time_assignment(
+        self,
+        node: ast.Assign | ast.AnnAssign,
+        aliases: dict[str, str],
+    ) -> bool:
+        value: ast.expr | None
+        if isinstance(node, ast.Assign):
+            targets: list[ast.expr] = list(node.targets)
+            value = node.value
+        else:
+            targets = [node.target]
+            value = node.value
+
+        def _is_simple_name_target(target: ast.expr) -> bool:
+            if isinstance(target, ast.Name):
+                return True
+            if isinstance(target, (ast.Tuple, ast.List)):
+                return all(_is_simple_name_target(elt) for elt in target.elts)
+            return False
+
+        if not targets or not all(_is_simple_name_target(target) for target in targets):
+            return False
+        return self._is_safe_import_time_value(value, aliases)
+
+    def _is_non_executing_import_guard(self, node: ast.If) -> bool:
+        test = node.test
+        if isinstance(test, ast.Name) and test.id == "TYPE_CHECKING":
+            return True
+        if (
+            isinstance(test, ast.Attribute)
+            and isinstance(test.value, ast.Name)
+            and test.value.id == "typing"
+            and test.attr == "TYPE_CHECKING"
+        ):
+            return True
+        if (
+            isinstance(test, ast.Compare)
+            and len(test.ops) == 1
+            and isinstance(test.ops[0], ast.Eq)
+            and len(test.comparators) == 1
+        ):
+            pairs = ((test.left, test.comparators[0]), (test.comparators[0], test.left))
+            return any(
+                isinstance(left, ast.Name)
+                and left.id == "__name__"
+                and isinstance(right, ast.Constant)
+                and right.value == "__main__"
+                for left, right in pairs
+            )
+        return False
+
+    def _has_import_time_execution(self, tree: ast.Module) -> bool:
+        aliases = self._collect_import_aliases(tree)
+        for node in tree.body:
+            if (
+                isinstance(node, ast.Expr)
+                and isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, str)
+            ):
+                # Module docstring.
+                continue
+            if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant):
+                # Bare module metadata constants do not execute code.
+                continue
+            if isinstance(node, ast.Pass):
+                continue
+            if isinstance(node, (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            if isinstance(node, (ast.Assign, ast.AnnAssign)) and self._is_safe_import_time_assignment(node, aliases):
+                continue
+            if isinstance(node, ast.If) and self._is_non_executing_import_guard(node):
+                continue
+            return True
+        return False
+
+    def _analyze_non_handler_python_files(
+        self,
+        archive_path: str,
+        archive: zipfile.ZipFile,
+        member_lookup: dict[str, zipfile.ZipInfo],
+        handler_members: set[str],
+        handler_trees: dict[str, ast.Module],
+        result: ScanResult,
+    ) -> None:
+        python_members = sorted(name for name in member_lookup if name.endswith(".py"))
+        non_handler_members = [name for name in python_members if name not in handler_members]
+
+        if not non_handler_members:
+            result.add_check(
+                name="MAR Non-Handler Python Analysis",
+                passed=True,
+                message="No non-handler Python files found in archive",
+                location=archive_path,
+            )
+            return
+
+        relationships: list[dict[str, str]] = []
+        non_handler_set = set(non_handler_members)
+        non_handler_findings = 0
+
+        for member_name in non_handler_members:
+            member_info = member_lookup[member_name]
+            try:
+                source_bytes = self._read_member_bounded(archive, member_info, self.max_member_bytes)
+            except ValueError as exc:
+                non_handler_findings += 1
+                result.add_check(
+                    name="MAR Non-Handler Python Analysis",
+                    passed=False,
+                    message=str(exc),
+                    severity=IssueSeverity.WARNING,
+                    location=f"{archive_path}:{member_name}",
+                    details={"member": member_name, "analysis_kind": "bounded_read"},
+                )
+                continue
+            except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
+                non_handler_findings += 1
+                result.add_check(
+                    name="MAR Non-Handler Python Analysis",
+                    passed=False,
+                    message=f"Unable to read non-handler Python source for static analysis: {exc}",
+                    severity=IssueSeverity.WARNING,
+                    location=f"{archive_path}:{member_name}",
+                    details={"member": member_name, "analysis_kind": "read"},
+                )
+                continue
+
+            tree, parse_error = self._parse_python_source(source_bytes)
+            if parse_error is not None:
+                non_handler_findings += 1
+                result.add_check(
+                    name="MAR Non-Handler Python Analysis",
+                    passed=False,
+                    message=f"Unable to parse non-handler Python source for static analysis: {parse_error}",
+                    severity=IssueSeverity.WARNING,
+                    location=f"{archive_path}:{member_name}",
+                    details={"member": member_name, "analysis_kind": "syntax"},
+                )
+                continue
+
+            assert tree is not None
+            risky_calls = self._find_high_risk_calls_from_tree(tree)
+            has_import_time_execution = self._has_import_time_execution(tree)
+            is_init_module = member_name.endswith("/__init__.py") or member_name == "__init__.py"
+
+            if risky_calls or has_import_time_execution:
+                non_handler_findings += 1
+                finding_reasons: list[str] = []
+                if risky_calls:
+                    finding_reasons.append(f"high-risk calls: {', '.join(sorted(risky_calls))}")
+                if has_import_time_execution:
+                    finding_reasons.append("module-level code executes at import time")
+                if is_init_module:
+                    finding_reasons.append("__init__.py executes during package import")
+
+                result.add_check(
+                    name="MAR Non-Handler Python Analysis",
+                    passed=False,
+                    message=f"Non-handler Python file is risky ({'; '.join(finding_reasons)})",
+                    severity=IssueSeverity.WARNING,
+                    location=f"{archive_path}:{member_name}",
+                    details={
+                        "member": member_name,
+                        "risky_calls": sorted(risky_calls),
+                        "has_import_time_execution": has_import_time_execution,
+                        "is_init_module": is_init_module,
+                    },
+                )
+            else:
+                result.add_check(
+                    name="MAR Non-Handler Python Analysis",
+                    passed=True,
+                    message="Non-handler Python source has no high-risk calls or import-time execution",
+                    location=f"{archive_path}:{member_name}",
+                    details={"member": member_name},
+                )
+
+        for handler_member in sorted(handler_members):
+            handler_info = member_lookup.get(handler_member)
+            if handler_info is None:
+                continue
+            try:
+                handler_tree = handler_trees.get(handler_member)
+                if handler_tree is None:
+                    handler_source = self._read_member_bounded(archive, handler_info, self.max_member_bytes)
+                    handler_tree, parse_error = self._parse_python_source(handler_source)
+                    if parse_error is not None or handler_tree is None:
+                        continue
+            except (SyntaxError, ValueError, OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile):
+                continue
+
+            for module_name in sorted(self._collect_imported_modules(handler_tree, handler_member)):
+                module_path = module_name.replace(".", "/")
+                for candidate in (f"{module_path}.py", f"{module_path}/__init__.py"):
+                    normalized_candidate = self._normalize_member_name(candidate)
+                    if normalized_candidate in non_handler_set:
+                        relationships.append(
+                            {
+                                "handler": handler_member,
+                                "imported_module": module_name,
+                                "resolved_member": normalized_candidate,
+                            },
+                        )
+
+        if relationships:
+            result.add_check(
+                name="MAR Non-Handler Python Analysis",
+                passed=(non_handler_findings == 0),
+                message="Analyzed non-handler Python files and mapped handler import relationships",
+                severity=IssueSeverity.WARNING if non_handler_findings else IssueSeverity.INFO,
+                location=archive_path,
+                details={
+                    "non_handler_python_files": non_handler_members,
+                    "import_relationships": relationships,
+                },
             )
 
     def _collect_import_aliases(self, tree: ast.AST) -> dict[str, str]:
@@ -672,7 +982,7 @@ class TorchServeMarScanner(BaseScanner):
             return resolved_head
         return ".".join([resolved_head, *tail])
 
-    def _find_high_risk_calls(self, source_bytes: bytes) -> tuple[set[str], str | None]:
+    def _parse_python_source(self, source_bytes: bytes) -> tuple[ast.Module | None, str | None]:
         try:
             source = source_bytes.decode("utf-8")
         except UnicodeDecodeError:
@@ -680,9 +990,12 @@ class TorchServeMarScanner(BaseScanner):
 
         try:
             tree = ast.parse(source)
-        except SyntaxError as exc:
-            return set(), str(exc)
+        except (SyntaxError, ValueError) as exc:
+            return None, str(exc)
 
+        return tree, None
+
+    def _find_high_risk_calls_from_tree(self, tree: ast.AST) -> set[str]:
         aliases = self._collect_import_aliases(tree)
         risky_calls: set[str] = set()
         for node in ast.walk(tree):
@@ -700,7 +1013,14 @@ class TorchServeMarScanner(BaseScanner):
             if resolved_name.startswith("subprocess."):
                 risky_calls.add(resolved_name)
 
-        return risky_calls, None
+        return risky_calls
+
+    def _find_high_risk_calls(self, source_bytes: bytes) -> tuple[set[str], str | None]:
+        tree, parse_error = self._parse_python_source(source_bytes)
+        if tree is None:
+            return set(), parse_error
+
+        return self._find_high_risk_calls_from_tree(tree), None
 
     def _scan_archive_members(
         self,
@@ -743,6 +1063,7 @@ class TorchServeMarScanner(BaseScanner):
             entries_to_process = member_infos
 
         processed_uncompressed = 0
+        analyzable_member_lookup: dict[str, zipfile.ZipInfo] = {}
         for member_info in entries_to_process:
             self.check_interrupted()
 
@@ -751,6 +1072,15 @@ class TorchServeMarScanner(BaseScanner):
 
             if not member_name or member_name.endswith("/"):
                 continue
+
+            if PurePosixPath(normalized_member).name == "requirements.txt":
+                self._analyze_requirements_txt(
+                    archive_path=archive_path,
+                    archive=archive,
+                    member_info=member_info,
+                    normalized_member=normalized_member,
+                    result=result,
+                )
 
             processed_uncompressed += max(member_info.file_size, 0)
             if processed_uncompressed > self.max_uncompressed_bytes:
@@ -814,6 +1144,8 @@ class TorchServeMarScanner(BaseScanner):
                 )
                 continue
 
+            analyzable_member_lookup[normalized_member] = member_info
+
             try:
                 temp_path, total_size = self._extract_member_to_tempfile(
                     archive=archive,
@@ -875,6 +1207,19 @@ class TorchServeMarScanner(BaseScanner):
                 with contextlib.suppress(OSError):
                     os.unlink(temp_path)
 
+        handler_members = self._resolve_handler_members(
+            member_set=set(analyzable_member_lookup),
+            handler_paths=manifest_context.get("handler_paths", []),
+        )
+        self._analyze_non_handler_python_files(
+            archive_path=archive_path,
+            archive=archive,
+            member_lookup=analyzable_member_lookup,
+            handler_members=handler_members,
+            handler_trees=manifest_context.get("handler_trees", {}),
+            result=result,
+        )
+
         if serialized_refs:
             if serialized_findings:
                 highest_severity = IssueSeverity.WARNING
@@ -904,6 +1249,421 @@ class TorchServeMarScanner(BaseScanner):
 
         result.metadata["contents"] = contents
         result.metadata["file_size"] = os.path.getsize(archive_path)
+
+    def _analyze_requirements_txt(
+        self,
+        archive_path: str,
+        archive: zipfile.ZipFile,
+        member_info: zipfile.ZipInfo,
+        normalized_member: str,
+        result: ScanResult,
+    ) -> None:
+        location = f"{archive_path}:{normalized_member}"
+        members_by_normalized = {
+            self._normalize_archive_member_name(info.filename): info for info in archive.infolist() if not info.is_dir()
+        }
+        findings = self._collect_requirements_findings(
+            archive,
+            members_by_normalized,
+            self._normalize_archive_member_name(normalized_member),
+            visited=set(),
+        )
+
+        if findings:
+            highest_severity = (
+                IssueSeverity.CRITICAL
+                if any(finding["severity"] == IssueSeverity.CRITICAL for finding in findings)
+                else IssueSeverity.WARNING
+            )
+            result.add_check(
+                name="TorchServe Requirements Supply Chain Analysis",
+                passed=False,
+                message="requirements.txt contains potential supply-chain attack patterns",
+                severity=highest_severity,
+                location=location,
+                details={"findings": findings},
+            )
+            return
+
+        result.add_check(
+            name="TorchServe Requirements Supply Chain Analysis",
+            passed=True,
+            message="requirements.txt does not contain known supply-chain attack patterns",
+            location=location,
+        )
+
+    def _normalize_archive_member_name(self, member_name: str) -> str:
+        return posixpath.normpath(member_name.replace("\\", "/"))
+
+    def _resolve_local_requirements_reference(self, current_member: str, reference: str) -> str | None:
+        stripped_reference = reference.strip().strip("'\"")
+        if not stripped_reference:
+            return None
+        if URL_SCHEME_PATTERN.match(stripped_reference):
+            return None
+
+        normalized_reference = stripped_reference.replace("\\", "/")
+        if re.match(r"^[a-zA-Z]:/", normalized_reference) or normalized_reference.startswith("/"):
+            return None
+
+        current_dir = posixpath.dirname(current_member)
+        resolved = posixpath.normpath(posixpath.join(current_dir, normalized_reference))
+        if resolved in {"", "."} or resolved.startswith("../"):
+            return None
+        return resolved
+
+    def _is_external_requirements_reference(self, reference: str) -> bool:
+        stripped_reference = reference.strip().strip("'\"")
+        if not stripped_reference:
+            return False
+
+        if URL_SCHEME_PATTERN.match(stripped_reference):
+            parsed = urlparse(stripped_reference)
+            return parsed.scheme.lower() == "file"
+
+        normalized_reference = stripped_reference.replace("\\", "/")
+        if re.match(r"^[a-zA-Z]:/", normalized_reference) or normalized_reference.startswith("/"):
+            return True
+
+        return posixpath.normpath(normalized_reference).startswith("../")
+
+    def _strip_inline_requirement_comment(self, line: str) -> str:
+        in_single_quote = False
+        in_double_quote = False
+        escaped = False
+
+        for index, char in enumerate(line):
+            if escaped:
+                escaped = False
+                continue
+            if char == "\\":
+                escaped = True
+                continue
+            if char == "'" and not in_double_quote:
+                in_single_quote = not in_single_quote
+                continue
+            if char == '"' and not in_single_quote:
+                in_double_quote = not in_double_quote
+                continue
+            if (
+                char == "#"
+                and not in_single_quote
+                and not in_double_quote
+                and (index == 0 or line[index - 1].isspace())
+            ):
+                return line[:index].strip()
+
+        return line.strip()
+
+    def _extract_direct_requirement_url(self, line: str) -> str | None:
+        direct_url = line.strip()
+        if not direct_url:
+            return None
+
+        direct_reference_match = re.match(r"^[A-Za-z0-9_.\-\[\],]+\s*@\s*(.+)$", direct_url)
+        if direct_reference_match is not None:
+            direct_url = direct_reference_match.group(1).strip()
+
+        direct_url = direct_url.split(";", 1)[0].strip()
+        if not direct_url:
+            return None
+
+        if not self._is_remote_requirement_url(direct_url):
+            return None
+
+        return direct_url
+
+    def _build_requirements_finding(
+        self,
+        *,
+        requirements_file: str,
+        line_number: int,
+        line_content: str,
+        severity: IssueSeverity,
+        reason: str,
+        message: str,
+    ) -> dict[str, Any]:
+        return {
+            "line": line_number,
+            "line_content": line_content,
+            "requirements_file": requirements_file,
+            "severity": severity,
+            "reason": reason,
+            "message": message,
+        }
+
+    def _collect_requirements_findings(
+        self,
+        archive: zipfile.ZipFile,
+        members_by_normalized: dict[str, zipfile.ZipInfo],
+        normalized_member: str,
+        *,
+        visited: set[str],
+    ) -> list[dict[str, Any]]:
+        if normalized_member in visited:
+            return []
+        visited.add(normalized_member)
+
+        member_info = members_by_normalized.get(normalized_member)
+        if member_info is None:
+            return []
+
+        try:
+            requirements_bytes = self._read_member_bounded(archive, member_info, self.MAX_REQUIREMENTS_TXT_BYTES)
+        except ValueError as exc:
+            return [
+                self._build_requirements_finding(
+                    requirements_file=normalized_member,
+                    line_number=0,
+                    line_content="",
+                    severity=IssueSeverity.WARNING,
+                    reason="requirements_read_error",
+                    message=str(exc),
+                )
+            ]
+
+        try:
+            requirements_text = requirements_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            requirements_text = requirements_bytes.decode("utf-8", errors="replace")
+
+        findings: list[dict[str, Any]] = []
+        for line_number, raw_line in enumerate(requirements_text.splitlines(), start=1):
+            line = self._strip_inline_requirement_comment(raw_line)
+            if not line:
+                continue
+
+            lowered = line.lower()
+
+            include_target = self._extract_pip_option_value(
+                line,
+                long_options=("--requirement", "--constraint"),
+                short_options=("-r", "-c"),
+                allow_concatenated_short=True,
+            )
+            if include_target is not None:
+                if self._is_remote_requirement_url(include_target):
+                    findings.append(
+                        self._build_requirements_finding(
+                            requirements_file=normalized_member,
+                            line_number=line_number,
+                            line_content=line,
+                            severity=IssueSeverity.WARNING,
+                            reason="remote_requirements_include",
+                            message="requirements.txt includes a remote requirements file",
+                        )
+                    )
+                    continue
+
+                if self._is_external_requirements_reference(include_target):
+                    findings.append(
+                        self._build_requirements_finding(
+                            requirements_file=normalized_member,
+                            line_number=line_number,
+                            line_content=line,
+                            severity=IssueSeverity.WARNING,
+                            reason="external_requirements_include",
+                            message="requirements.txt includes a local requirements file outside the archive",
+                        )
+                    )
+                    continue
+
+                resolved_include = self._resolve_local_requirements_reference(normalized_member, include_target)
+                if resolved_include and resolved_include in members_by_normalized:
+                    findings.extend(
+                        self._collect_requirements_findings(
+                            archive,
+                            members_by_normalized,
+                            resolved_include,
+                            visited=visited,
+                        )
+                    )
+                continue
+
+            index_url = self._extract_pip_option_value(
+                line,
+                long_options=("--index-url", "--extra-index-url"),
+                short_options=("-i",),
+                allow_concatenated_short=True,
+            )
+            if index_url is not None:
+                if self._is_non_pypi_index(index_url):
+                    findings.append(
+                        self._build_requirements_finding(
+                            requirements_file=normalized_member,
+                            line_number=line_number,
+                            line_content=line,
+                            severity=IssueSeverity.CRITICAL,
+                            reason="non_pypi_index_url",
+                            message="requirements.txt redirects package resolution to a non-PyPI index",
+                        )
+                    )
+                if "http://" in lowered:
+                    findings.append(
+                        self._build_requirements_finding(
+                            requirements_file=normalized_member,
+                            line_number=line_number,
+                            line_content=line,
+                            severity=IssueSeverity.WARNING,
+                            reason="insecure_http_transport",
+                            message="requirements.txt uses insecure HTTP transport",
+                        )
+                    )
+                continue
+
+            find_links_url = self._extract_pip_option_value(
+                line,
+                long_options=("--find-links",),
+                short_options=("-f",),
+                allow_concatenated_short=True,
+            )
+            if find_links_url is not None:
+                if self._is_remote_requirement_url(find_links_url):
+                    findings.append(
+                        self._build_requirements_finding(
+                            requirements_file=normalized_member,
+                            line_number=line_number,
+                            line_content=line,
+                            severity=IssueSeverity.WARNING,
+                            reason="remote_find_links",
+                            message="requirements.txt uses remote --find-links source",
+                        )
+                    )
+                if "http://" in find_links_url.lower():
+                    findings.append(
+                        self._build_requirements_finding(
+                            requirements_file=normalized_member,
+                            line_number=line_number,
+                            line_content=line,
+                            severity=IssueSeverity.WARNING,
+                            reason="insecure_http_transport",
+                            message="requirements.txt uses insecure HTTP transport",
+                        )
+                    )
+                continue
+
+            editable_target = self._extract_pip_option_value(
+                line,
+                long_options=("--editable",),
+                short_options=("-e",),
+                allow_concatenated_short=True,
+            )
+            if editable_target is not None:
+                findings.append(
+                    self._build_requirements_finding(
+                        requirements_file=normalized_member,
+                        line_number=line_number,
+                        line_content=line,
+                        severity=IssueSeverity.WARNING,
+                        reason="editable_install",
+                        message="requirements.txt uses editable install, which can execute arbitrary setup code",
+                    )
+                )
+
+            if "git+" in lowered:
+                findings.append(
+                    self._build_requirements_finding(
+                        requirements_file=normalized_member,
+                        line_number=line_number,
+                        line_content=line,
+                        severity=IssueSeverity.WARNING,
+                        reason="git_install",
+                        message="requirements.txt installs directly from git, which can execute arbitrary setup code",
+                    )
+                )
+
+            direct_url = self._extract_direct_requirement_url(line)
+            if direct_url is not None:
+                findings.append(
+                    self._build_requirements_finding(
+                        requirements_file=normalized_member,
+                        line_number=line_number,
+                        line_content=line,
+                        severity=IssueSeverity.WARNING,
+                        reason="direct_url_install",
+                        message="requirements.txt installs package directly from a remote URL",
+                    )
+                )
+
+            if "http://" in lowered:
+                findings.append(
+                    self._build_requirements_finding(
+                        requirements_file=normalized_member,
+                        line_number=line_number,
+                        line_content=line,
+                        severity=IssueSeverity.WARNING,
+                        reason="insecure_http_transport",
+                        message="requirements.txt uses insecure HTTP transport",
+                    )
+                )
+
+            package_name = self._extract_requirement_name(line)
+            typo_target = POPULAR_ML_PACKAGE_TYPOS.get(package_name)
+            if typo_target:
+                findings.append(
+                    self._build_requirements_finding(
+                        requirements_file=normalized_member,
+                        line_number=line_number,
+                        line_content=line,
+                        severity=IssueSeverity.WARNING,
+                        reason="typosquatting_pattern",
+                        message=f"Potential typosquatting package '{package_name}' (did you mean '{typo_target}'?)",
+                    )
+                )
+
+        return findings
+
+    def _extract_pip_option_value(
+        self,
+        line: str,
+        *,
+        long_options: tuple[str, ...],
+        short_options: tuple[str, ...] = (),
+        allow_concatenated_short: bool = False,
+    ) -> str | None:
+        try:
+            tokens = shlex.split(line, comments=False, posix=True)
+        except ValueError:
+            tokens = line.split()
+
+        if not tokens:
+            return None
+
+        first_token = tokens[0]
+        lowered_first = first_token.lower()
+        for option in (*long_options, *short_options):
+            option_prefix = f"{option}="
+            if lowered_first == option:
+                return tokens[1].strip() if len(tokens) > 1 else None
+            if lowered_first.startswith(option_prefix):
+                return first_token[len(option_prefix) :].strip()
+            if allow_concatenated_short and option in short_options and lowered_first.startswith(option):
+                value = first_token[len(option) :].strip()
+                if value:
+                    return value
+        return None
+
+    def _is_non_pypi_index(self, url: str) -> bool:
+        stripped_url = url.strip().strip("'\"")
+        if not stripped_url:
+            return False
+
+        parsed = urlparse(stripped_url)
+        hostname = (parsed.hostname or "").lower()
+        if not hostname:
+            return True
+        return hostname not in TRUSTED_PYPI_HOSTS
+
+    def _is_remote_requirement_url(self, url: str) -> bool:
+        stripped_url = url.strip().strip("'\"")
+        if not stripped_url or not URL_SCHEME_PATTERN.match(stripped_url):
+            return False
+
+        parsed = urlparse(stripped_url)
+        return parsed.scheme.lower() != "file"
+
+    def _extract_requirement_name(self, line: str) -> str:
+        return re.split(r"[;@<>=!~\s\[#]", line, maxsplit=1)[0].strip().lower()
 
     def _check_symlink_target(
         self,

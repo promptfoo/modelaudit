@@ -247,8 +247,10 @@ def scan_large_file(
     # Use cache manager for large file scans
     try:
         from ...cache import get_cache_manager
+        from ...cache.optimized_config import build_cache_version_context
 
         cache_manager = get_cache_manager(cache_dir, enabled=True)
+        version_context = build_cache_version_context(config)
 
         # Create wrapper function for cache manager
         def cached_large_scan_wrapper(fpath: str) -> dict:
@@ -256,7 +258,11 @@ def scan_large_file(
             return result.to_dict()
 
         # Get cached result or perform scan
-        result_dict = cache_manager.cached_scan(file_path, cached_large_scan_wrapper)
+        result_dict = cache_manager.cached_scan(
+            file_path,
+            cached_large_scan_wrapper,
+            version_context=version_context,
+        )
 
         # Convert back to ScanResult
         from ...utils.helpers.result_conversion import scan_result_from_dict
