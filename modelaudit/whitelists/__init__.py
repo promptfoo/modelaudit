@@ -19,6 +19,9 @@ from modelaudit.whitelists.huggingface_popular import (
     is_popular_model,
 )
 
+# Timestamp for the current HuggingFace whitelist snapshot (ISO 8601 date).
+WHITELIST_GENERATED_AT = "2025-10-23"
+
 # Combine both whitelists into a single set
 ALL_WHITELISTED_MODELS = POPULAR_MODELS | ORGANIZATION_MODELS
 
@@ -41,6 +44,7 @@ __all__ = [
     "ALL_WHITELISTED_MODELS",
     "ORGANIZATION_MODELS",
     "POPULAR_MODELS",
+    "WHITELIST_GENERATED_AT",
     "is_from_trusted_organization",
     "is_popular_model",
     "is_whitelisted_model",
