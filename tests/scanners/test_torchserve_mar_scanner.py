@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import pickle
 import zipfile
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
+
+import pytest
 
 from modelaudit import core
 from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
@@ -101,6 +104,343 @@ def test_scan_benign_mar_with_safe_handler(tmp_path: Path) -> None:
     result = TorchServeMarScanner().scan(str(mar_path))
     handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
     assert len(handler_failures) == 0
+
+
+def test_non_handler_python_analysis_clean_handler_and_utils_has_no_failures(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"import utils\n\ndef handle(data, context):\n    return utils.transform(data)\n",
+            "utils.py": b"def transform(data):\n    return {'ok': True, 'data': data}\n",
+            "weights.bin": b"weights",
+        },
+        filename="clean_utils.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    non_handler_failures = _failed_checks(result, "MAR Non-Handler Python Analysis")
+    assert len(non_handler_failures) == 0
+
+    relationship_checks = [
+        check
+        for check in result.checks
+        if check.name == "MAR Non-Handler Python Analysis"
+        and check.status == CheckStatus.PASSED
+        and check.details.get("import_relationships")
+    ]
+    assert len(relationship_checks) >= 1
+    relationships = relationship_checks[0].details["import_relationships"]
+    assert any(
+        relationship["handler"] == "handler.py" and relationship["resolved_member"] == "utils.py"
+        for relationship in relationships
+    )
+
+
+def test_non_handler_python_analysis_tracks_relative_import_relationships(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "pkg/handlers/model.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "pkg/handlers/model.py": (
+                b"from . import utils\n\ndef handle(data, context):\n    return utils.transform(data)\n"
+            ),
+            "pkg/handlers/utils.py": b"def transform(data):\n    return {'ok': True, 'data': data}\n",
+            "weights.bin": b"weights",
+        },
+        filename="relative_utils.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    relationship_checks = [
+        check
+        for check in result.checks
+        if check.name == "MAR Non-Handler Python Analysis"
+        and check.status == CheckStatus.PASSED
+        and check.details.get("import_relationships")
+    ]
+    assert len(relationship_checks) >= 1
+    relationships = relationship_checks[0].details["import_relationships"]
+    assert any(
+        relationship["handler"] == "pkg/handlers/model.py"
+        and relationship["imported_module"] == "pkg.handlers.utils"
+        and relationship["resolved_member"] == "pkg/handlers/utils.py"
+        for relationship in relationships
+    )
+
+
+def test_non_handler_python_analysis_detects_malicious_utils_module(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"import utils\n\ndef handle(data, context):\n    return utils.transform(data)\n",
+            "utils.py": b"import os\n\ndef transform(data):\n    return os.system('echo owned')\n",
+            "weights.bin": b"weights",
+        },
+        filename="malicious_utils.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    non_handler_failures = _failed_checks(result, "MAR Non-Handler Python Analysis")
+    assert len(non_handler_failures) >= 1
+    assert any(
+        check.severity == IssueSeverity.WARNING and "high-risk calls: os.system" in check.message
+        for check in non_handler_failures
+    )
+
+
+def test_non_handler_python_analysis_parses_each_helper_module_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"import utils\n\ndef handle(data, context):\n    return utils.transform(data)\n",
+            "utils.py": b"def transform(data):\n    return {'ok': True, 'data': data}\n",
+            "weights.bin": b"weights",
+        },
+        filename="single_parse_utils.mar",
+    )
+
+    real_parse = ast.parse
+    parsed_sources: list[str] = []
+
+    def counting_parse(source: str, *args: Any, **kwargs: Any) -> ast.AST:
+        parsed_sources.append(source)
+        return cast(ast.AST, real_parse(source, *args, **kwargs))
+
+    monkeypatch.setattr("modelaudit.scanners.torchserve_mar_scanner.ast.parse", counting_parse)
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+
+    assert result.success
+    handler_parse_count = sum("def handle(data, context)" in source for source in parsed_sources)
+    utils_parse_count = sum("def transform(data)" in source for source in parsed_sources)
+    assert handler_parse_count == 1
+    assert utils_parse_count == 1
+
+
+def test_non_handler_python_metadata_assignments_do_not_trigger_import_time_execution(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"import utils\n\ndef handle(data, context):\n    return utils.transform(data)\n",
+            "utils.py": (
+                b'"""Metadata-only helper."""\n'
+                b'__all__ = ["transform"]\n'
+                b'__version__ = "1.0.0"\n'
+                b"import typing\n"
+                b"if typing.TYPE_CHECKING:\n"
+                b"    from typing import Any\n"
+                b'if __name__ == "__main__":\n'
+                b'    raise RuntimeError("cli only")\n'
+                b"\n"
+                b"def transform(data):\n"
+                b"    return data\n"
+            ),
+            "weights.bin": b"weights",
+        },
+        filename="metadata_only_utils.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    non_handler_failures = _failed_checks(result, "MAR Non-Handler Python Analysis")
+    assert non_handler_failures == []
+
+
+def test_non_handler_python_logger_initialization_does_not_trigger_import_time_execution(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"import utils\n\ndef handle(data, context):\n    return utils.transform(data)\n",
+            "utils.py": (
+                b"import logging as log\n"
+                b"logger = log.getLogger(__name__)\n"
+                b"\n"
+                b"def transform(data):\n"
+                b"    return data\n"
+            ),
+            "weights.bin": b"weights",
+        },
+        filename="logger_init_utils.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    non_handler_failures = _failed_checks(result, "MAR Non-Handler Python Analysis")
+    assert non_handler_failures == []
+
+
+def test_non_handler_python_analysis_detects_malicious_init_module(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"import pkg\n\ndef handle(data, context):\n    return {'ok': True}\n",
+            "pkg/__init__.py": b"import os\nos.system('echo owned')\n",
+            "weights.bin": b"weights",
+        },
+        filename="malicious_init.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    non_handler_failures = _failed_checks(result, "MAR Non-Handler Python Analysis")
+    assert len(non_handler_failures) >= 1
+    assert any(
+        check.severity == IssueSeverity.WARNING and "__init__.py executes during package import" in check.message
+        for check in non_handler_failures
+    )
+
+
+def test_non_handler_python_analysis_without_extra_python_files_is_back_compatible(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
+            "weights.bin": b"weights",
+        },
+        filename="no_extra_python.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    non_handler_failures = _failed_checks(result, "MAR Non-Handler Python Analysis")
+    assert len(non_handler_failures) == 0
+
+
+def test_non_handler_python_analysis_respects_entry_limit(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
+            "utils.py": b"import os\n\ndef transform(data):\n    return os.system('echo owned')\n",
+            "weights.bin": b"weights",
+        },
+        filename="entry_limit_non_handler.mar",
+    )
+
+    result = TorchServeMarScanner(config={"max_mar_entries": 2}).scan(str(mar_path))
+
+    non_handler_failures = _failed_checks(result, "MAR Non-Handler Python Analysis")
+    assert len(non_handler_failures) == 0
+    entry_limit_failures = _failed_checks(result, "TorchServe MAR Entry Limit")
+    assert len(entry_limit_failures) == 1
+
+
+def test_non_handler_python_analysis_respects_uncompressed_budget(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
+            "utils.py": b"import os\n\ndef transform(data):\n    return os.system('echo owned')\n",
+            "weights.bin": b"weights",
+        },
+        filename="budget_limited_non_handler.mar",
+    )
+
+    with zipfile.ZipFile(mar_path, "r") as archive:
+        member_sizes = {info.filename: info.file_size for info in archive.infolist()}
+
+    budget = member_sizes["MAR-INF/MANIFEST.json"] + member_sizes["handler.py"]
+    result = TorchServeMarScanner(config={"max_mar_uncompressed_bytes": budget}).scan(str(mar_path))
+
+    non_handler_failures = _failed_checks(result, "MAR Non-Handler Python Analysis")
+    assert len(non_handler_failures) == 0
+    budget_failures = _failed_checks(result, "TorchServe MAR Uncompressed Size Budget")
+    assert len(budget_failures) == 1
+
+
+def test_non_handler_python_analysis_handles_valueerror_from_ast_parse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"import utils\n\ndef handle(data, context):\n    return utils.transform(data)\n",
+            "utils.py": b"def transform(data):\n    return {'ok': True, 'data': data}\n",
+            "weights.bin": b"weights",
+        },
+        filename="valueerror_utils.mar",
+    )
+
+    real_parse = ast.parse
+
+    def parse_with_valueerror(source: str, *args: Any, **kwargs: Any) -> ast.AST:
+        if "def transform(data)" in source:
+            raise ValueError("source code string cannot contain null bytes")
+        return cast(ast.AST, real_parse(source, *args, **kwargs))
+
+    monkeypatch.setattr("modelaudit.scanners.torchserve_mar_scanner.ast.parse", parse_with_valueerror)
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+
+    non_handler_failures = _failed_checks(result, "MAR Non-Handler Python Analysis")
+    assert any(
+        check.location == f"{mar_path}:utils.py"
+        and "Unable to parse non-handler Python source for static analysis" in check.message
+        and check.details.get("analysis_kind") == "syntax"
+        for check in non_handler_failures
+    )
+    assert not _failed_checks(result, "TorchServe MAR Scan")
+    assert result.success
+
+
+def test_non_handler_python_analysis_read_failure_is_reported_without_aborting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"import utils\n\ndef handle(data, context):\n    return utils.transform(data)\n",
+            "utils.py": b"def transform(data):\n    return {'ok': True, 'data': data}\n",
+            "weights.bin": b"weights",
+        },
+        filename="read_failure_utils.mar",
+    )
+
+    scanner = TorchServeMarScanner()
+    original_read_member_bounded = scanner._read_member_bounded
+
+    def read_with_failure(archive: zipfile.ZipFile, member_info: zipfile.ZipInfo, max_bytes: int) -> bytes:
+        if member_info.filename == "utils.py":
+            raise RuntimeError("CRC mismatch")
+        return original_read_member_bounded(archive, member_info, max_bytes)
+
+    monkeypatch.setattr(scanner, "_read_member_bounded", read_with_failure)
+
+    result = scanner.scan(str(mar_path))
+
+    non_handler_failures = _failed_checks(result, "MAR Non-Handler Python Analysis")
+    assert any(
+        check.location == f"{mar_path}:utils.py"
+        and "Unable to read non-handler Python source for static analysis: CRC mismatch" in check.message
+        and check.details.get("analysis_kind") == "read"
+        for check in non_handler_failures
+    )
+    assert not _failed_checks(result, "TorchServe MAR Scan")
+    assert result.success
 
 
 def test_scan_resolves_bare_module_handler_names(tmp_path: Path) -> None:
