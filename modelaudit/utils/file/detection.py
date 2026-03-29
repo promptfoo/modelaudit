@@ -79,10 +79,42 @@ MARKED_PROTOCOL0_GLOBAL_RE = re.compile(rb"^[\(\]\}]c[^\n\r]{1,64}\n[^\n\r]{1,64
 
 # Protocol 0/1 pickles are ASCII and may not start with GLOBAL/INST.
 # Use bounded opcode parsing to reduce false positives on plain text and
-# still detect prefixed payloads (e.g., MARK/LIST/POP before GLOBAL).
+# still detect prefixed payloads (for example MARK/LIST/POP or BININT1/POP
+# before a GLOBAL/INST opcode).
 PROTO0_1_MAX_PROBE_BYTES: int = 64 * 1024
 PROTO0_1_MAX_PROBE_OPCODES: int = 4096
-PROTO0_1_START_BYTES: bytes = b"(]})cilp0IJSVNTF"
+PROTO0_1_START_BYTES: bytes = b"()]}cilp0FGIJKLMNSTUVX"
+PROTO0_1_IGNORABLE_TRAILING_BYTES: bytes = b" \t\r\n\x00"
+PROTO0_1_TRIVIAL_LEADING_OPCODES: frozenset[str] = frozenset(
+    {
+        "MARK",
+        "POP",
+        "PUT",
+        "EMPTY_TUPLE",
+        "EMPTY_LIST",
+        "EMPTY_DICT",
+        "LIST",
+        "INT",
+        "BININT",
+        "BININT1",
+        "BININT2",
+        "LONG",
+        "LONG1",
+        "LONG4",
+        "FLOAT",
+        "BINFLOAT",
+        "NONE",
+        "NEWTRUE",
+        "NEWFALSE",
+        "STRING",
+        "BINSTRING",
+        "SHORT_BINSTRING",
+        "UNICODE",
+        "BINUNICODE",
+        "SHORT_BINUNICODE",
+    },
+)
+SAFETENSORS_MAX_HEADER_BYTES: int = 100 * 1024 * 1024
 
 
 def _looks_like_proto0_or_1_pickle(sample: bytes) -> bool:
@@ -96,11 +128,21 @@ def _looks_like_proto0_or_1_pickle(sample: bytes) -> bool:
             return False
 
         opcode_count = 0
+        first_opcode_name: str | None = None
         try:
             for opcode, _arg, _pos in pickletools.genops(candidate):
                 opcode_count += 1
+                if first_opcode_name is None:
+                    first_opcode_name = opcode.name
                 if opcode.name == "STOP":
-                    return opcode_count >= 2
+                    stop_pos = 0 if _pos is None else _pos
+                    trailing = candidate[stop_pos + 1 :]
+                    if not trailing or not trailing.strip(PROTO0_1_IGNORABLE_TRAILING_BYTES):
+                        return opcode_count >= 2
+                    if first_opcode_name not in PROTO0_1_TRIVIAL_LEADING_OPCODES:
+                        return opcode_count >= 2
+                    stripped_trailing = trailing.lstrip(PROTO0_1_IGNORABLE_TRAILING_BYTES)
+                    return bool(stripped_trailing) and _looks_like_proto0_or_1_pickle(stripped_trailing)
                 if opcode_count >= PROTO0_1_MAX_PROBE_OPCODES:
                     return False
         except Exception:
@@ -121,6 +163,44 @@ def _read_pickle_probe_sample(path: Path, size: int, header16: bytes) -> bytes:
         return header16
     with path.open("rb") as f:
         return f.read(min(size, PROTO0_1_MAX_PROBE_BYTES))
+
+
+def _looks_like_safetensors_structure(path: Path | None, magic8: bytes, file_size: int) -> bool:
+    """Validate safetensors framing: <u64 header_len><JSON header><tensor data>."""
+    if file_size <= 8 or len(magic8) < 8:
+        return False
+
+    try:
+        header_len = struct.unpack("<Q", magic8)[0]
+    except struct.error:
+        return False
+
+    if header_len <= 0:
+        return False
+    if header_len >= SAFETENSORS_MAX_HEADER_BYTES:
+        return False
+    if header_len > file_size - 8:
+        return False
+
+    if path is None:
+        return False
+
+    try:
+        with path.open("rb") as handle:
+            handle.seek(8)
+            header = handle.read(header_len)
+    except OSError:
+        return False
+
+    if len(header) != header_len or not header.startswith(b"{"):
+        return False
+
+    try:
+        parsed_header = json.loads(header.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+
+    return isinstance(parsed_header, dict)
 
 
 def _normalize_archive_member_name(member_name: str) -> str:
@@ -547,7 +627,9 @@ def _detect_compression_format(prefix: bytes) -> str | None:
     return None
 
 
-def detect_format_from_magic_bytes(magic4: MagicBytes, magic8: MagicBytes, magic16: MagicBytes) -> FileFormat:
+def detect_format_from_magic_bytes(
+    magic4: MagicBytes, magic8: MagicBytes, magic16: MagicBytes, file_size: int, file_path: Path | None = None
+) -> FileFormat:
     """Detect file format using Python 3.10+ pattern matching on magic bytes."""
     compression_format = _detect_compression_format(magic16)
     if compression_format:
@@ -596,17 +678,13 @@ def detect_format_from_magic_bytes(magic4: MagicBytes, magic8: MagicBytes, magic
             return "pickle"
         case _:
             pass
-    # Check for JSON-like formats (SafeTensors, etc.)
-    match magic4[0:1]:
-        case b"{":
-            return "safetensors"
-        case _:
-            pass
+    if _looks_like_safetensors_structure(file_path, magic8, file_size):
+        return "safetensors"
 
     # Check for patterns in first 16 bytes
     if b"onnx" in magic16:
         return "onnx"
-    if b'"__metadata__"' in magic16:
+    if b'"__metadata__"' in magic16 and _looks_like_safetensors_structure(file_path, magic8, file_size):
         return "safetensors"
 
     return "unknown"
@@ -650,7 +728,7 @@ def detect_file_format_from_magic(path: str) -> str:
                 return "executorch"
 
             # Try the new pattern matching approach first
-            format_result = detect_format_from_magic_bytes(magic4, magic8, magic16)
+            format_result = detect_format_from_magic_bytes(magic4, magic8, magic16, size, file_path)
             if format_result == "zip" and file_path.suffix.lower() == ".mar" and is_torchserve_mar_archive(path):
                 return "torchserve_mar"
             if format_result != "unknown":
@@ -688,28 +766,15 @@ def detect_file_format_from_magic(path: str) -> str:
                 if b"<PMML" in xml_header:
                     return "pmml"
 
-            # SafeTensors format check: 8-byte length header + JSON metadata
-            if size >= 12:  # Minimum: 8 bytes length + some JSON
-                try:
-                    json_length = struct.unpack("<Q", magic8)[0]
-                    # Sanity check: JSON length should be reasonable
-                    if 0 < json_length < size and json_length < 1024 * 1024:  # Max 1MB JSON
-                        f.seek(8)
-                        json_start = f.read(min(32, json_length))
-                        if json_start.startswith(b"{") and b'"' in json_start:
-                            return "safetensors"
-                except (struct.error, OSError):
-                    pass
-
     except OSError:
         return "unknown"
 
-    # Fallback: check if it starts with JSON (for old safetensors or other JSON formats)
+    # Fallback: use strict safetensors framing; plain JSON must not be routed as safetensors.
     magic4 = header[:4]
     magic8 = header[:8]
     magic16 = header[:16]
 
-    if magic4[0:1] == b"{" or (size > 8 and b'"__metadata__"' in magic16):
+    if _looks_like_safetensors_structure(file_path, magic8, size):
         return "safetensors"
 
     if magic4 == b"\x08\x01\x12\x00" or b"onnx" in magic16:
@@ -821,8 +886,8 @@ def detect_file_format(path: str) -> str:
         # followed by a properly formed GLOBAL opcode sequence.
         if MARKED_PROTOCOL0_GLOBAL_RE.match(magic64):
             return "pickle"
-        # Check for safetensors format (starts with JSON header)
-        if magic4[0:1] == b"{" or (size > 8 and b'"__metadata__"' in magic16):
+        # Check for safetensors format (<u64 header_len> + JSON header).
+        if _looks_like_safetensors_structure(file_path, magic8, size):
             return "safetensors"
 
         # Check for ONNX format (protobuf)
@@ -928,6 +993,8 @@ def detect_file_format(path: str) -> str:
         ".txz",
     ):
         return "tar"
+    if _looks_like_safetensors_structure(file_path, magic8, size):
+        return "safetensors"
     return "unknown"
 
 
@@ -993,6 +1060,7 @@ EXTENSION_FORMAT_MAP = {
     ".npy": "numpy",
     ".npz": "zip",
     ".joblib": "pickle",  # joblib can be either zip or pickle format
+    ".skops": "skops",
     ".pdmodel": "paddle",
     ".pdiparams": "paddle",
     ".params": "mxnet",
@@ -1074,6 +1142,8 @@ def detect_format_from_extension_pattern_matching(extension: FileExtension) -> F
             return "pmml"
         case ".npy" | ".npz":
             return "numpy"
+        case ".skops":
+            return "skops"
         case ".msgpack":
             return "flax_msgpack"
         case ".nemo":
@@ -1223,6 +1293,10 @@ def validate_file_type(path: str) -> bool:
             if file_path.suffix.lower() == ".npz":
                 return header_format in {"zip", "numpy"}
             return header_format == "numpy"
+
+        # skops files are ZIP containers by design.
+        if ext_format == "skops":
+            return header_format in {"skops", "zip"}
 
         # PaddlePaddle files: .pdmodel files are protobuf serialised program
         # descriptors and .pdiparams files are raw binary weight tensors.

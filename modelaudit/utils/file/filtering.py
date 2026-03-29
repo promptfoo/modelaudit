@@ -1,6 +1,8 @@
 """File filtering utilities for ModelAudit."""
 
+import logging
 import os
+import zipfile
 from pathlib import Path
 
 # Default extensions to skip when scanning directories
@@ -106,12 +108,63 @@ DEFAULT_SCANNABLE_SKIP_OVERRIDES = {
     ".7z",
 }
 
+_ARCHIVE_SIGNAL_EXTENSION_EXCLUSIONS: frozenset[str] = frozenset(
+    {
+        ".bin",
+        ".json",
+        ".xml",
+        ".txt",
+        ".md",
+        ".markdown",
+        ".rst",
+        ".yaml",
+        ".yml",
+        ".cfg",
+        ".conf",
+        ".ini",
+        ".toml",
+        ".py",
+        ".js",
+        ".ts",
+        ".css",
+        ".scss",
+        ".sass",
+        ".less",
+        ".html",
+    }
+)
+
+_ZIP_MEMBER_SNIFF_LIMIT: int = 256
+_OFFICE_ARCHIVE_PREFIXES: tuple[str, ...] = ("word/", "xl/", "ppt/")
+_OFFICE_ARCHIVE_MARKER_FILES: frozenset[str] = frozenset(
+    {
+        "word/document.xml",
+        "xl/workbook.xml",
+        "ppt/presentation.xml",
+    }
+)
+_MODEL_ARCHIVE_SIGNAL_BASENAMES: frozenset[str] = frozenset(
+    {
+        "pytorch_model.bin",
+        "adapter_model.bin",
+        "diffusion_pytorch_model.bin",
+        "flax_model.msgpack",
+    }
+)
+
 
 def _get_scannable_extensions() -> set[str]:
     """Lazy-load scannable extensions to avoid circular imports."""
     from ..model_extensions import get_model_extensions
 
     return get_model_extensions()
+
+
+def _get_model_archive_signal_extensions() -> frozenset[str]:
+    """Return model-bearing archive member suffixes that should promote skipped ZIP containers."""
+    return frozenset(
+        extension for extension in _get_scannable_extensions() if extension not in _ARCHIVE_SIGNAL_EXTENSION_EXCLUSIONS
+    )
 
 
 def _get_candidate_extensions(filename: str) -> list[str]:
@@ -123,6 +176,98 @@ def _get_candidate_extensions(filename: str) -> list[str]:
         if candidate not in candidates:
             candidates.append(candidate)
     return candidates
+
+
+def _has_scannable_content(path: str) -> bool:
+    """Return whether on-disk file contents map to a supported format."""
+    if not os.path.isfile(path):
+        return False
+
+    try:
+        from .detection import detect_file_format
+
+        detected_format = detect_file_format(path)
+        if detected_format == "unknown":
+            return False
+
+        if detected_format != "zip":
+            return True
+
+        with zipfile.ZipFile(path, "r") as archive:
+            model_archive_signal_extensions = _get_model_archive_signal_extensions()
+            has_keras_config = False
+            has_keras_marker = False
+            has_pytorch_data = False
+            has_pytorch_marker = False
+            processed_members = 0
+            archive_names = archive.NameToInfo
+            saw_content_types = "[Content_Types].xml" in archive_names
+            saw_office_prefix = any(marker in archive_names for marker in _OFFICE_ARCHIVE_MARKER_FILES)
+            for member in archive.filelist:
+                if processed_members >= _ZIP_MEMBER_SNIFF_LIMIT:
+                    # If we cannot finish classifying the archive within the
+                    # prefilter budget, preserve it for full scanning unless it
+                    # already looks like a standard Office document container.
+                    return not (saw_content_types and saw_office_prefix)
+
+                if not member.filename or member.is_dir():
+                    continue
+
+                processed_members += 1
+                member_name = member.filename.replace("\\", "/").strip("/")
+                member_basename = Path(member_name).name.lower()
+
+                if member_name == "[Content_Types].xml":
+                    saw_content_types = True
+                    continue
+
+                if member_name.startswith(_OFFICE_ARCHIVE_PREFIXES):
+                    saw_office_prefix = True
+
+                # Preserve Keras, TorchServe, and PyTorch ZIP containers even
+                # when the outer filename uses a skipped suffix.
+                if member_name == "MAR-INF/MANIFEST.json":
+                    return True
+
+                if member_name == "config.json":
+                    has_keras_config = True
+                    continue
+
+                if member_name in {"metadata.json", "model.weights.h5", "variables.h5"}:
+                    has_keras_marker = True
+                    continue
+
+                if member_name == "data.pkl" or member_name.endswith("/data.pkl"):
+                    has_pytorch_data = True
+                    continue
+
+                if (
+                    member_name == "version"
+                    or member_name.endswith("/version")
+                    or member_name == "byteorder"
+                    or member_name.endswith("/byteorder")
+                    or member_name.startswith("data/")
+                    or "/data/" in member_name
+                ):
+                    has_pytorch_marker = True
+
+                candidate_extensions = _get_candidate_extensions(member_name)
+                if any(candidate in model_archive_signal_extensions for candidate in candidate_extensions):
+                    return True
+
+                if member_basename in _MODEL_ARCHIVE_SIGNAL_BASENAMES:
+                    return True
+
+            if has_keras_config and has_keras_marker:
+                return True
+
+            if has_pytorch_data and has_pytorch_marker:
+                return True
+
+        return False
+    except Exception as exc:
+        logger.debug("Content sniffing failed for %s; preserving file for full scan: %s", path, exc)
+        return True
 
 
 def should_skip_file(
@@ -178,6 +323,9 @@ def should_skip_file(
     ):
         return False
 
+    if use_default_skip_extensions and ext in skip_extensions and _has_scannable_content(path):
+        return False
+
     # Skip based on extension
     if ext in skip_extensions:
         return True
@@ -194,3 +342,6 @@ def should_skip_file(
 
     # Skip specific filenames
     return filename in skip_filenames
+
+
+logger = logging.getLogger(__name__)

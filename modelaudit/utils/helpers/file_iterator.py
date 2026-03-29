@@ -34,15 +34,18 @@ def iterate_files_streaming(path: Path | str, pattern: str = "**/*") -> Iterator
         logger.warning(f"Path {path} is neither a file nor directory")
         return
 
-    # Collect all files first to determine is_last
-    files = [f for f in path.glob(pattern) if f.is_file()]
+    files = (matched_path for matched_path in path.glob(pattern) if matched_path.is_file())
 
-    if not files:
+    try:
+        current_file = next(files)
+    except StopIteration:
         logger.warning(f"No files found in {path} matching pattern {pattern}")
         return
 
-    logger.debug(f"Found {len(files)} files in {path}")
+    # Hold a single item of lookahead so we can preserve the is_last flag
+    # without materializing the entire directory listing.
+    for next_file in files:
+        yield (current_file, False)
+        current_file = next_file
 
-    for i, file_path in enumerate(files):
-        is_last = i == len(files) - 1
-        yield (file_path, is_last)
+    yield (current_file, True)

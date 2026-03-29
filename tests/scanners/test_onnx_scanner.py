@@ -1,5 +1,6 @@
 import struct
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -18,6 +19,8 @@ def create_onnx_model(
     tmp_path: Path,
     *,
     custom: bool = False,
+    custom_domain: str = "com.test",
+    custom_op_type: str = "CustomOp",
     external: bool = False,
     external_path: str = "weights.bin",
     missing_external: bool = False,
@@ -26,10 +29,10 @@ def create_onnx_model(
     Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1])
     node = (
         helper.make_node(
-            "CustomOp",
+            custom_op_type,
             ["input"],
             ["output"],
-            domain="com.test",
+            domain=custom_domain,
             name="custom",
         )
         if custom
@@ -70,6 +73,18 @@ def create_python_onnx_model(tmp_path: Path) -> Path:
     return path
 
 
+def _failed_custom_domain_checks(result: Any) -> list[Any]:
+    return [c for c in result.checks if c.name == "Custom Operator Domain Check" and c.status == CheckStatus.FAILED]
+
+
+def _scan_and_extract_custom_domains(model_path: Path) -> tuple[Any, list[Any], list[str]]:
+    scanner = OnnxScanner()
+    result = scanner.scan(str(model_path))
+    metadata = scanner.extract_metadata(str(model_path))
+    custom_domains = metadata.get("custom_domains", [])
+    return result, _failed_custom_domain_checks(result), custom_domains
+
+
 def test_onnx_scanner_can_handle(tmp_path):
     model_path = create_onnx_model(tmp_path)
     assert OnnxScanner.can_handle(str(model_path))
@@ -88,6 +103,73 @@ def test_onnx_scanner_custom_op(tmp_path):
     model_path = create_onnx_model(tmp_path, custom=True)
     result = OnnxScanner().scan(str(model_path))
     assert any("custom operator" in i.message.lower() for i in result.issues)
+
+
+def test_onnx_scanner_standard_ai_onnx_ml_domain_not_flagged(tmp_path: Path) -> None:
+    model_path = create_onnx_model(
+        tmp_path,
+        custom=True,
+        custom_domain="ai.onnx.ml",
+        custom_op_type="LinearRegressor",
+    )
+    result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
+    assert len(custom_domain_checks) == 0, (
+        f"Expected no custom-domain finding for ai.onnx.ml. Checks: {[c.message for c in result.checks]}"
+    )
+    assert "ai.onnx.ml" not in metadata_custom_domains
+
+
+def test_onnx_scanner_standard_preview_training_domain_not_flagged(tmp_path: Path) -> None:
+    model_path = create_onnx_model(
+        tmp_path,
+        custom=True,
+        custom_domain="ai.onnx.preview.training",
+        custom_op_type="Adam",
+    )
+    result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
+    assert len(custom_domain_checks) == 0, (
+        f"Expected no custom-domain finding for ai.onnx.preview.training. Checks: {[c.message for c in result.checks]}"
+    )
+    assert "ai.onnx.preview.training" not in metadata_custom_domains
+
+
+def test_onnx_scanner_custom_domain_still_flagged(tmp_path: Path) -> None:
+    model_path = create_onnx_model(
+        tmp_path,
+        custom=True,
+        custom_domain="com.evil.ops",
+        custom_op_type="BackdoorOp",
+    )
+    _result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
+    assert len(custom_domain_checks) > 0, "Expected custom domain finding for com.evil.ops"
+    assert any(c.details.get("domain") == "com.evil.ops" for c in custom_domain_checks)
+    assert "com.evil.ops" in metadata_custom_domains
+
+
+def test_onnx_scanner_ai_onnx_ml_subdomain_still_flagged(tmp_path: Path) -> None:
+    model_path = create_onnx_model(
+        tmp_path,
+        custom=True,
+        custom_domain="ai.onnx.ml.malicious",
+        custom_op_type="BackdoorOp",
+    )
+    _result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
+    assert len(custom_domain_checks) > 0, "Expected non-standard ai.onnx.ml subdomain to be flagged"
+    assert any(c.details.get("domain") == "ai.onnx.ml.malicious" for c in custom_domain_checks)
+    assert "ai.onnx.ml.malicious" in metadata_custom_domains
+
+
+def test_onnx_scanner_ai_onnx_training_domain_still_flagged(tmp_path: Path) -> None:
+    model_path = create_onnx_model(
+        tmp_path,
+        custom=True,
+        custom_domain="ai.onnx.training",
+        custom_op_type="BackdoorOp",
+    )
+    _result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
+    assert len(custom_domain_checks) > 0, "Expected non-standard ai.onnx.training domain to be flagged"
+    assert any(c.details.get("domain") == "ai.onnx.training" for c in custom_domain_checks)
+    assert "ai.onnx.training" in metadata_custom_domains
 
 
 def test_onnx_scanner_external_data_missing(tmp_path):

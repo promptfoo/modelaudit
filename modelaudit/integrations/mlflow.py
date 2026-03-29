@@ -1,12 +1,27 @@
+import hashlib
 import logging
 import os
 import shutil
 import tempfile
+from pathlib import Path
 from typing import Any
 
 from ..models import ModelAuditResultModel
 
 logger = logging.getLogger(__name__)
+
+
+def _prepare_download_dir(model_uri: str, cache_dir: str | None) -> tuple[str, bool]:
+    """Return an ephemeral per-run staging directory under the configured cache root."""
+    if not cache_dir:
+        return tempfile.mkdtemp(prefix="modelaudit_mlflow_"), True
+
+    cache_key = hashlib.sha256(model_uri.encode("utf-8")).hexdigest()[:16]
+    download_root = Path(cache_dir).expanduser() / "mlflow"
+    download_root.mkdir(parents=True, exist_ok=True)
+    # Use a unique staging directory for this run. ``cache_dir`` controls where
+    # temporary downloads live, while scan-result caching is still handled by core.
+    return tempfile.mkdtemp(prefix=f"{cache_key}-", dir=str(download_root)), True
 
 
 def scan_mlflow_model(
@@ -42,8 +57,8 @@ def scan_mlflow_model(
 
     Returns
     -------
-    dict
-        Scan results dictionary as returned by
+    ModelAuditResultModel
+        Scan results as returned by
         :func:`scan_model_directory_or_file`.
 
     Raises
@@ -59,19 +74,18 @@ def scan_mlflow_model(
     if registry_uri:
         mlflow.set_registry_uri(registry_uri)  # type: ignore[possibly-unbound-attribute]
 
-    tmp_dir = tempfile.mkdtemp(prefix="modelaudit_mlflow_")
+    scan_kwargs = kwargs.copy()
+    cache_enabled = scan_kwargs.pop("cache_enabled", True)
+    raw_cache_dir = scan_kwargs.pop("cache_dir", None)
+    scan_cache_dir = str(Path(raw_cache_dir).expanduser()) if cache_enabled and raw_cache_dir else None
+    download_dir, cleanup_download_dir = _prepare_download_dir(model_uri, scan_cache_dir)
+
     try:
-        logger.debug(f"Downloading MLflow model {model_uri} to {tmp_dir}")
-        local_path = mlflow.artifacts.download_artifacts(artifact_uri=model_uri, dst_path=tmp_dir)  # type: ignore[possibly-unbound-attribute]
-        # mlflow may return a file within tmp_dir; ensure directory path
+        logger.debug(f"Downloading MLflow model {model_uri} to {download_dir}")
+        local_path = mlflow.artifacts.download_artifacts(artifact_uri=model_uri, dst_path=download_dir)  # type: ignore[possibly-unbound-attribute]
+        # mlflow may return a file within the download directory; ensure directory path
         download_path = os.path.dirname(local_path) if os.path.isfile(local_path) else local_path
-        # Ensure cache configuration is passed through from kwargs
-        # Remove cache config from kwargs to avoid conflicts
-        scan_kwargs = kwargs.copy()
-        cache_config = {
-            "cache_enabled": scan_kwargs.pop("cache_enabled", True),
-            "cache_dir": scan_kwargs.pop("cache_dir", None),
-        }
+        cache_config = {"cache_enabled": cache_enabled, "cache_dir": scan_cache_dir}
 
         # Import here to avoid circular dependency
         from ..core import scan_model_directory_or_file
@@ -86,4 +100,5 @@ def scan_mlflow_model(
             **scan_kwargs,
         )
     finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        if cleanup_download_dir:
+            shutil.rmtree(download_dir, ignore_errors=True)

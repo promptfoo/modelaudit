@@ -65,7 +65,8 @@ class ZipScanner(BaseScanner):
         if not os.path.isfile(path):
             return False
 
-        # Verify it's actually a zip file
+        # Verify it's actually a zip file. Header-routed scans may reach this
+        # scanner even when the outer filename uses a misleading suffix.
         try:
             with zipfile.ZipFile(path, "r") as _:
                 pass

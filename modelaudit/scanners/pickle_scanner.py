@@ -6,7 +6,7 @@ import pickletools
 import reprlib
 import struct
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any, BinaryIO, ClassVar, Literal, TypedDict, TypeGuard
 
 from modelaudit.analysis.enhanced_pattern_detector import EnhancedPatternDetector, PatternMatch
@@ -58,6 +58,26 @@ _STACK_GLOBAL_OPERAND_PREVIEWER.maxset = 4
 _STACK_GLOBAL_OPERAND_PREVIEWER.maxfrozenset = 4
 _STACK_GLOBAL_OPERAND_PREVIEWER.maxdict = 4
 _RAW_PATTERN_SCAN_LIMIT_BYTES = 10 * 1024 * 1024
+_POST_BUDGET_GLOBAL_SCAN_LIMIT_BYTES = 100 * 1024 * 1024
+_POST_BUDGET_GLOBAL_CONTEXT_BYTES = 4096
+_POST_BUDGET_EXPANSION_SCAN_LIMIT_BYTES = 8 * 1024 * 1024
+_MEMO_WRITE_OPCODES = frozenset({"PUT", "BINPUT", "LONG_BINPUT", "MEMOIZE"})
+_MEMO_READ_OPCODES = frozenset({"GET", "BINGET", "LONG_BINGET"})
+_EXPANSION_EVENT_WINDOW = 6
+_EXPANSION_GROWTH_BUILDERS = frozenset({"TUPLE", "TUPLE1", "TUPLE2", "TUPLE3", "LIST", "APPENDS", "APPEND"})
+_EXPANSION_DUP_COUNT_THRESHOLD = 128
+_EXPANSION_DUP_DENSITY_THRESHOLD = 0.10
+_EXPANSION_GET_PUT_RATIO_THRESHOLD = 32.0
+_EXPANSION_GET_PUT_MIN_READS = 128
+_EXPANSION_MEMO_GROWTH_MIN_WRITES = 64
+_EXPANSION_MEMO_GROWTH_STEPS_THRESHOLD = 32
+_EXPANSION_RATIO_SUPPORTING_DUP_THRESHOLD = 64
+_EXPANSION_RATIO_SUPPORTING_GROWTH_THRESHOLD = 16
+_EXPANSION_TRIGGER_LABELS = {
+    "suspicious_get_put_ratio": "high memo GET/PUT ratio",
+    "excessive_dup_usage": "dense DUP usage",
+    "memo_growth_chain": "iterative memo growth chain",
+}
 
 
 StackGlobalOperandKind = Literal["string", "missing_memo", "unknown", "non_string"]
@@ -753,13 +773,14 @@ ALWAYS_DANGEROUS_MODULES: set[str] = {
 # Modules that are suspicious but should only be flagged at WARNING severity.
 # These modules appear frequently in legitimate ML pipelines and cannot directly
 # execute arbitrary code, so CRITICAL would cause too many false positives.
-WARNING_SEVERITY_MODULES: set[str] = {
-    # functools.partial is heavily used in PyTorch models; functools.reduce is
-    # the only genuinely dangerous entry and is still in SUSPICIOUS_GLOBALS.
-    "functools",
+WARNING_SEVERITY_MODULES: dict[str, set[str] | None] = {
+    # functools.partial/partialmethod are heavily used in PyTorch models and
+    # should remain WARNING-level noise reducers. functools.reduce is excluded
+    # so reduce-driven execution chains stay CRITICAL.
+    "functools": {"partial", "partialmethod"},
     # glob.glob / glob.iglob are common in dataset loading pipelines and
     # cannot directly execute code.
-    "glob",
+    "glob": None,
 }
 
 # Risky ML-specific import surfaces that must be flagged even when they appear
@@ -908,6 +929,7 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "ModuleDict",
         "ParameterList",
         "ParameterDict",
+        "functional",
         "Embedding",
         "EmbeddingBag",
         "RNN",
@@ -943,6 +965,9 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "Subset",
         "random_split",
     ],
+    "torch.nn.functional": [
+        "relu",
+    ],
     # torch._utils - internal PyTorch utilities used in serialization
     "torch._utils": [
         "_rebuild_tensor",
@@ -952,10 +977,6 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "_rebuild_device_tensor_from_numpy",
         "_rebuild_qtensor",
         "_rebuild_sparse_tensor",
-    ],
-    "_pickle": [
-        "Unpickler",
-        "Pickler",
     ],
     # Python builtins - safe built-in types and functions
     # NOTE: eval, exec, compile, __import__, open, file are NOT in this list (they remain dangerous)
@@ -2052,7 +2073,17 @@ def _is_safe_ml_global(mod: str, func: str) -> bool:
         if func in safe_funcs:
             return True
 
-    return False
+    if "." not in func:
+        return False
+
+    current_mod = mod
+    for part in func.split("."):
+        nested_safe_funcs = ML_SAFE_GLOBALS.get(current_mod)
+        if nested_safe_funcs is None or part not in nested_safe_funcs:
+            return False
+        current_mod = f"{current_mod}.{part}"
+
+    return True
 
 
 def _is_safe_import_only_global(mod: str, func: str, ml_context: dict[str, Any] | None = None) -> bool:
@@ -2071,6 +2102,30 @@ def _normalize_import_reference(mod: str, func: str) -> tuple[str, str]:
     return mod.strip().lower(), func.strip().lower()
 
 
+def _is_warning_severity_ref(normalized_mod: str, normalized_func: str) -> bool:
+    """Return True when a dangerous ref should be downgraded to WARNING severity."""
+    if normalized_mod not in WARNING_SEVERITY_MODULES:
+        return False
+    warning_funcs = WARNING_SEVERITY_MODULES[normalized_mod]
+    if warning_funcs is None:
+        return True
+    return normalized_func in warning_funcs
+
+
+def _dangerous_ref_base_severity(
+    normalized_mod: str,
+    normalized_func: str,
+    *,
+    origin_is_ext: bool = False,
+) -> IssueSeverity:
+    """Return the base severity for a resolved dangerous import reference."""
+    if origin_is_ext or _is_copyreg_extension_ref(normalized_mod):
+        return IssueSeverity.CRITICAL
+    return (
+        IssueSeverity.WARNING if _is_warning_severity_ref(normalized_mod, normalized_func) else IssueSeverity.CRITICAL
+    )
+
+
 def _is_resolved_import_target(mod: str, func: str) -> bool:
     """Return True when module/function look like concrete Python import targets."""
     if not mod or not func:
@@ -2080,7 +2135,7 @@ def _is_resolved_import_target(mod: str, func: str) -> bool:
     if not all(part.isidentifier() for part in module_parts):
         return False
 
-    return func.isidentifier()
+    return all(part.isidentifier() for part in func.split("."))
 
 
 def _is_plausible_import_only_module(mod: str) -> bool:
@@ -2101,11 +2156,11 @@ def _classify_import_reference(
 
     normalized_mod, normalized_func = _normalize_import_reference(mod, func)
     if is_import_only and (normalized_mod, normalized_func) in IMPORT_ONLY_ALWAYS_DANGEROUS_GLOBALS:
-        base_sev = IssueSeverity.WARNING if normalized_mod in WARNING_SEVERITY_MODULES else IssueSeverity.CRITICAL
+        base_sev = _dangerous_ref_base_severity(normalized_mod, normalized_func)
         return True, base_sev, "dangerous"
 
     if _is_actually_dangerous_global(mod, func, ml_context):
-        base_sev = IssueSeverity.WARNING if normalized_mod in WARNING_SEVERITY_MODULES else IssueSeverity.CRITICAL
+        base_sev = _dangerous_ref_base_severity(normalized_mod, normalized_func)
         return True, base_sev, "dangerous"
 
     if _is_safe_ml_global(mod, func):
@@ -2167,6 +2222,82 @@ class _ResolvedImportRef:
 class _MutationTargetRef:
     kind: Literal["dict", "object"]
     callable_ref: tuple[str, str] | None = None
+
+
+@dataclass
+class _ExpansionHeuristicStreamState:
+    stream_id: int
+    opcode_count: int = 0
+    memo_reads: int = 0
+    memo_writes: int = 0
+    dup_count: int = 0
+    memo_growth_steps: int = 0
+    max_memo_index: int = -1
+    next_memo_index: int = 0
+    last_written_index: int | None = None
+    last_position: int = 0
+    event_window: list[tuple[str, int | str]] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class _ExpansionHeuristicFinding:
+    stream_id: int
+    position: int
+    opcode_count: int
+    memo_reads: int
+    memo_writes: int
+    get_put_ratio: float
+    dup_count: int
+    dup_density: float
+    memo_growth_steps: int
+    memo_slots_used: int
+    triggers: tuple[str, ...]
+
+
+@dataclass
+class _PrimaryRefFinding:
+    check_index: int
+    issue_index: int
+
+
+@dataclass
+class _PickleOpcodeAnalysis:
+    opcodes: list[tuple[Any, Any, int | None]] = field(default_factory=list)
+    globals_found: set[tuple[str, str, str]] = field(default_factory=set)
+    sequence_results: list[Any] = field(default_factory=list)
+    stack_global_refs: dict[int, tuple[str, str]] = field(default_factory=dict)
+    callable_refs: dict[int, tuple[str, str]] = field(default_factory=dict)
+    callable_origin_refs: dict[int, int] = field(default_factory=dict)
+    callable_origin_is_ext: dict[int, bool] = field(default_factory=dict)
+    malformed_stack_globals: dict[int, MalformedStackGlobalDetails] = field(default_factory=dict)
+    mutation_target_refs: dict[int, _MutationTargetRef] = field(default_factory=dict)
+    executed_import_origins: set[int] = field(default_factory=set)
+    executed_ref_keys: set[tuple[str, str]] = field(default_factory=set)
+    max_analyzed_end_offset: int = 0
+    max_analyzed_offset: int = -1
+    first_pickle_end_pos: int | None = None
+    opcode_count: int = 0
+    max_stack_depth: int = 0
+    stack_depth_warnings: list[dict[str, int | str]] = field(default_factory=list)
+    extreme_stack_depth_event: dict[str, int | str] | None = None
+    opcode_budget_exceeded: bool = False
+    timeout_exceeded: bool = False
+    error: Exception | None = None
+
+
+_SEVERITY_PRIORITY = {
+    IssueSeverity.DEBUG: 0,
+    IssueSeverity.INFO: 1,
+    IssueSeverity.WARNING: 2,
+    IssueSeverity.CRITICAL: 3,
+}
+
+
+def _severity_priority(severity: IssueSeverity | None) -> int:
+    """Return an ordering key for failed-check severity comparisons."""
+    if severity is None:
+        return -1
+    return _SEVERITY_PRIORITY.get(severity, -1)
 
 
 def _resolve_copyreg_extension(code: Any, origin_index: int) -> _ResolvedImportRef:
@@ -2486,6 +2617,10 @@ def _simulate_symbolic_reference_maps(
             continue
 
         if name == "BUILD":
+            if len(stack) >= 2:
+                target = stack[-2]
+                if isinstance(target, _MutationTargetRef):
+                    mutation_target_refs[i] = target
             _pop()
             continue
 
@@ -2584,6 +2719,32 @@ def _simulate_symbolic_reference_maps(
         if name == "READONLY_BUFFER":
             continue
 
+        stack_before = getattr(opcode, "stack_before", None)
+        stack_after = getattr(opcode, "stack_after", None)
+        if isinstance(stack_before, list) and isinstance(stack_after, list):
+            if stack_before == [] and stack_after == []:
+                logger.debug(f"Simulator: ignoring stack-neutral opcode {opcode.name} at pos {_pos}")
+                continue
+
+            logger.debug(f"Simulator: applying generic stack effect for opcode {opcode.name} at pos {_pos}")
+            for stack_effect in reversed(stack_before):
+                effect_name = repr(stack_effect)
+                if effect_name == "stackslice":
+                    continue
+                if effect_name == "mark":
+                    _pop_to_mark()
+                    continue
+                _pop()
+
+            for _ in stack_after:
+                stack.append(unknown)
+            continue
+
+        # Unknown opcode - push a sentinel to keep stack in sync.
+        # This handles future protocol versions gracefully.
+        logger.debug(f"Simulator: unhandled opcode {opcode.name} at pos {_pos}")
+        stack.append(unknown)
+
     return (
         stack_global_refs,
         callable_refs,
@@ -2592,6 +2753,117 @@ def _simulate_symbolic_reference_maps(
         malformed_stack_globals,
         mutation_target_refs,
     )
+
+
+def _build_expansion_heuristic_finding(
+    state: _ExpansionHeuristicStreamState,
+) -> _ExpansionHeuristicFinding | None:
+    """Summarize stream-local memo/DUP behavior into a bounded expansion heuristic finding."""
+    if state.opcode_count == 0:
+        return None
+
+    get_put_ratio = (state.memo_reads / state.memo_writes) if state.memo_writes else 0.0
+    dup_density = state.dup_count / state.opcode_count
+
+    triggers: list[str] = []
+    if (
+        state.memo_writes >= _EXPANSION_MEMO_GROWTH_MIN_WRITES
+        and state.memo_growth_steps >= _EXPANSION_MEMO_GROWTH_STEPS_THRESHOLD
+    ):
+        triggers.append("memo_growth_chain")
+
+    if state.dup_count >= _EXPANSION_DUP_COUNT_THRESHOLD and dup_density >= _EXPANSION_DUP_DENSITY_THRESHOLD:
+        triggers.append("excessive_dup_usage")
+
+    if (
+        state.memo_reads >= _EXPANSION_GET_PUT_MIN_READS
+        and get_put_ratio >= _EXPANSION_GET_PUT_RATIO_THRESHOLD
+        and (
+            state.dup_count >= _EXPANSION_RATIO_SUPPORTING_DUP_THRESHOLD
+            or state.memo_growth_steps >= _EXPANSION_RATIO_SUPPORTING_GROWTH_THRESHOLD
+        )
+    ):
+        triggers.append("suspicious_get_put_ratio")
+
+    if not triggers:
+        return None
+
+    memo_slots_used = state.max_memo_index + 1 if state.max_memo_index >= 0 else 0
+    return _ExpansionHeuristicFinding(
+        stream_id=state.stream_id,
+        position=state.last_position,
+        opcode_count=state.opcode_count,
+        memo_reads=state.memo_reads,
+        memo_writes=state.memo_writes,
+        get_put_ratio=round(get_put_ratio, 2),
+        dup_count=state.dup_count,
+        dup_density=round(dup_density, 4),
+        memo_growth_steps=state.memo_growth_steps,
+        memo_slots_used=memo_slots_used,
+        triggers=tuple(triggers),
+    )
+
+
+def _detect_pickle_expansion_heuristics(opcodes: list[tuple[Any, Any, int | None]]) -> list[_ExpansionHeuristicFinding]:
+    """Detect memo expansion and DUP-heavy pickle-bomb patterns on a per-stream basis."""
+    findings: list[_ExpansionHeuristicFinding] = []
+    state = _ExpansionHeuristicStreamState(stream_id=0)
+
+    for opcode, arg, pos in opcodes:
+        name = opcode.name
+        state.opcode_count += 1
+        if pos is not None:
+            state.last_position = int(pos)
+
+        if name == "DUP":
+            state.dup_count += 1
+
+        if name in _MEMO_READ_OPCODES:
+            state.memo_reads += 1
+        elif name in _MEMO_WRITE_OPCODES:
+            state.memo_writes += 1
+            memo_index: int | None
+            if name == "MEMOIZE":
+                memo_index = state.next_memo_index
+                state.next_memo_index += 1
+            else:
+                memo_index = int(arg) if isinstance(arg, int) else None
+                if memo_index is not None:
+                    state.next_memo_index = max(state.next_memo_index, memo_index + 1)
+
+            lookback = state.event_window[-_EXPANSION_EVENT_WINDOW:]
+            previous_memo_index = state.last_written_index
+            read_indices = [value for kind, value in lookback if kind == "READ" and isinstance(value, int)]
+            repeated_previous_read = previous_memo_index is not None and read_indices.count(previous_memo_index) >= 2
+            has_growth_builder = any(kind == "OP" and value in _EXPANSION_GROWTH_BUILDERS for kind, value in lookback)
+            is_sequential_growth = (
+                previous_memo_index is not None and memo_index is not None and memo_index == previous_memo_index + 1
+            )
+            if is_sequential_growth and repeated_previous_read and has_growth_builder:
+                state.memo_growth_steps += 1
+
+            if memo_index is not None:
+                state.max_memo_index = max(state.max_memo_index, memo_index)
+                state.last_written_index = memo_index
+
+        if name in _MEMO_READ_OPCODES:
+            state.event_window.append(("READ", int(arg) if isinstance(arg, int) else -1))
+        else:
+            state.event_window.append(("OP", name))
+        if len(state.event_window) > _EXPANSION_EVENT_WINDOW:
+            del state.event_window[:-_EXPANSION_EVENT_WINDOW]
+
+        if name == "STOP":
+            finding = _build_expansion_heuristic_finding(state)
+            if finding is not None:
+                findings.append(finding)
+            state = _ExpansionHeuristicStreamState(stream_id=state.stream_id + 1)
+
+    final_finding = _build_expansion_heuristic_finding(state)
+    if final_finding is not None:
+        findings.append(final_finding)
+
+    return findings
 
 
 def _build_symbolic_reference_maps(
@@ -3132,6 +3404,7 @@ def is_dangerous_reduce_pattern(
     stack_global_refs: dict[int, tuple[str, str]] | None = None,
     callable_refs: dict[int, tuple[str, str]] | None = None,
     callable_origin_is_ext: dict[int, bool] | None = None,
+    mutation_target_refs: dict[int, _MutationTargetRef] | None = None,
 ) -> dict[str, Any] | None:
     """
     Check for patterns that indicate a dangerous __reduce__ method.
@@ -3164,26 +3437,35 @@ def is_dangerous_reduce_pattern(
         # Check SUSPICIOUS_GLOBALS (the fallback)
         return is_suspicious_global(mod, func)
 
-    if stack_global_refs is None or callable_refs is None or callable_origin_is_ext is None:
+    if (
+        stack_global_refs is None
+        or callable_refs is None
+        or callable_origin_is_ext is None
+        or mutation_target_refs is None
+    ):
         (
             computed_stack_refs,
             computed_callable_refs,
             _computed_callable_origin_refs,
             computed_callable_origin_is_ext,
             _computed_malformed_stack_globals,
-            _computed_mutation_target_refs,
+            computed_mutation_target_refs,
         ) = _simulate_symbolic_reference_maps(opcodes)
     else:
-        computed_stack_refs, computed_callable_refs, computed_callable_origin_is_ext = (
+        computed_stack_refs, computed_callable_refs, computed_callable_origin_is_ext, computed_mutation_target_refs = (
             stack_global_refs,
             callable_refs,
             callable_origin_is_ext,
+            mutation_target_refs,
         )
 
     resolved_stack_globals = stack_global_refs if stack_global_refs is not None else computed_stack_refs
     resolved_callables = callable_refs if callable_refs is not None else computed_callable_refs
     resolved_callable_origin_is_ext = (
         callable_origin_is_ext if callable_origin_is_ext is not None else computed_callable_origin_is_ext
+    )
+    resolved_mutation_targets = (
+        mutation_target_refs if mutation_target_refs is not None else computed_mutation_target_refs
     )
 
     # Look for common patterns in __reduce__ exploits
@@ -3193,13 +3475,34 @@ def is_dangerous_reduce_pattern(
             reduce_ref = resolved_callables.get(i)
             if reduce_ref:
                 mod, func = reduce_ref
-                if _is_dangerous_ref(mod, func, origin_is_ext=resolved_callable_origin_is_ext.get(i, False)):
+                origin_is_ext = resolved_callable_origin_is_ext.get(i, False)
+                if _is_dangerous_ref(mod, func, origin_is_ext=origin_is_ext):
                     return {
                         "pattern": "RESOLVED_REDUCE_CALL_TARGET",
                         "module": mod,
                         "function": func,
                         "position": pos,
                         "opcode": opcode.name,
+                        "origin_is_ext": origin_is_ext,
+                    }
+
+        # BUILD mutates a previously-constructed object and may invoke
+        # __setstate__ with attacker-controlled state.
+        if opcode.name == "BUILD":
+            target_ref = resolved_mutation_targets.get(i)
+            if target_ref and target_ref.kind == "object" and target_ref.callable_ref:
+                mod, func = target_ref.callable_ref
+                if not _is_safe_ml_global(mod, func):
+                    return {
+                        "pattern": "BUILD_SETSTATE_NON_SAFE_GLOBAL",
+                        "module": mod,
+                        "function": func,
+                        "associated_global": f"{mod}.{func}",
+                        "position": pos,
+                        "opcode": opcode.name,
+                        "description": (
+                            "BUILD applied state to object from non-safe global; potential __setstate__ exploitation"
+                        ),
                     }
 
         # Check for GLOBAL followed by REDUCE - common in exploits
@@ -3276,12 +3579,14 @@ def is_dangerous_reduce_pattern(
             ref = resolved_callables.get(i)
             if ref:
                 mod, func = ref
-                if _is_dangerous_ref(mod, func, origin_is_ext=resolved_callable_origin_is_ext.get(i, False)):
+                origin_is_ext = resolved_callable_origin_is_ext.get(i, False)
+                if _is_dangerous_ref(mod, func, origin_is_ext=origin_is_ext):
                     return {
                         "pattern": f"{opcode.name}_EXECUTION",
                         "argument": f"{mod}.{func}",
                         "position": pos,
                         "opcode": opcode.name,
+                        "origin_is_ext": origin_is_ext,
                     }
 
         # Check for suspicious attribute access patterns (GETATTR followed by CALL)
@@ -3412,18 +3717,31 @@ def check_opcode_sequence(
     # Compute per-stream thresholds so appended streams are analyzed
     # independently even when the file contains mixed-size streams.
     stream_refs: dict[int, list[str]] = {stream_id: [] for stream_id in stream_lengths}
+    stream_has_dangerous_globals: dict[int, bool] = dict.fromkeys(stream_lengths, False)
 
     for idx, (mod, func) in resolved_stack_globals.items():
         if 0 <= idx < len(stream_id_by_index):
-            stream_refs.setdefault(stream_id_by_index[idx], []).append(f"{mod}.{func}")
+            stream_id = stream_id_by_index[idx]
+            stream_refs.setdefault(stream_id, []).append(f"{mod}.{func}")
+            if _is_actually_dangerous_global(mod, func, ml_context):
+                stream_has_dangerous_globals[stream_id] = True
 
     for idx, (mod, func) in resolved_callables.items():
         if 0 <= idx < len(stream_id_by_index):
-            stream_refs.setdefault(stream_id_by_index[idx], []).append(f"{mod}.{func}")
+            stream_id = stream_id_by_index[idx]
+            stream_refs.setdefault(stream_id, []).append(f"{mod}.{func}")
+            if resolved_callable_origin_is_ext.get(idx, False) or _is_actually_dangerous_global(mod, func, ml_context):
+                stream_has_dangerous_globals[stream_id] = True
 
     for idx, (op, arg, _p) in enumerate(opcodes):
         if op.name == "GLOBAL" and isinstance(arg, str):
-            stream_refs.setdefault(stream_id_by_index[idx], []).append(str(arg))
+            stream_id = stream_id_by_index[idx]
+            stream_refs.setdefault(stream_id, []).append(str(arg))
+            parsed = _parse_module_function(arg)
+            if parsed:
+                mod, func = parsed
+                if _is_actually_dangerous_global(mod, func, ml_context):
+                    stream_has_dangerous_globals[stream_id] = True
 
     stream_thresholds: dict[int, int] = {}
     ml_confidence_val = float(ml_context.get("overall_confidence", 0) or 0)
@@ -3440,8 +3758,14 @@ def check_opcode_sequence(
             for framework in known_tree_frameworks
         )
         has_tree_markers = any(marker in refs_str for marker in _tree_ensemble_markers)
+        has_dangerous_globals = stream_has_dangerous_globals.get(stream_id, False)
 
-        if ml_context.get("is_ml_content", False) and has_tree_framework and has_tree_markers:
+        if (
+            ml_context.get("is_ml_content", False)
+            and has_tree_framework
+            and has_tree_markers
+            and not has_dangerous_globals
+        ):
             # Tree-ensemble markers in-stream (e.g. RandomForest, DecisionTree)
             # are strong evidence of legitimate model reconstruction behavior.
             # Scale by stream size to handle large tree ensembles, with a
@@ -3619,6 +3943,27 @@ class PickleScanner(BaseScanner):
         super().__init__(config)
         # Additional pickle-specific configuration
         self.max_opcodes = self.config.get("max_opcodes", 1000000)
+        configured_post_budget_limit = self.config.get(
+            "post_budget_global_scan_limit_bytes",
+            _POST_BUDGET_GLOBAL_SCAN_LIMIT_BYTES,
+        )
+        try:
+            parsed_post_budget_limit = int(configured_post_budget_limit)
+        except (TypeError, ValueError):
+            parsed_post_budget_limit = _POST_BUDGET_GLOBAL_SCAN_LIMIT_BYTES
+        self.post_budget_global_scan_limit_bytes = max(0, parsed_post_budget_limit)
+        configured_post_budget_expansion_limit = self.config.get(
+            "post_budget_expansion_scan_limit_bytes",
+            min(self.post_budget_global_scan_limit_bytes, _POST_BUDGET_EXPANSION_SCAN_LIMIT_BYTES),
+        )
+        try:
+            parsed_post_budget_expansion_limit = int(configured_post_budget_expansion_limit)
+        except (TypeError, ValueError):
+            parsed_post_budget_expansion_limit = min(
+                self.post_budget_global_scan_limit_bytes,
+                _POST_BUDGET_EXPANSION_SCAN_LIMIT_BYTES,
+            )
+        self.post_budget_expansion_scan_limit_bytes = max(0, parsed_post_budget_expansion_limit)
         # Initialize analyzers
         self.entropy_analyzer = EntropyAnalyzer()
         self.semantic_analyzer = SemanticAnalyzer()
@@ -3676,6 +4021,34 @@ class PickleScanner(BaseScanner):
         end = min(len(data), position + window_size // 2)
         return data[start:end]
 
+    @staticmethod
+    def _is_zip_backed_pytorch_container(path: str) -> bool:
+        """Return whether the path is a ZIP-backed PyTorch-style container."""
+        file_ext = os.path.splitext(path)[1].lower()
+        if file_ext not in {".bin", ".pt", ".pth", ".ckpt", ".pkl"}:
+            return False
+
+        try:
+            from modelaudit.utils.file.detection import detect_file_format
+
+            return detect_file_format(path) == "zip"
+        except Exception:
+            return False
+
+    def _scan_zip_backed_pytorch_container(self, path: str) -> ScanResult | None:
+        """Delegate ZIP-backed PyTorch-style containers to the ZIP scanner."""
+        if not self._is_zip_backed_pytorch_container(path):
+            return None
+
+        try:
+            from .pytorch_zip_scanner import PyTorchZipScanner
+        except Exception as e:
+            logger.warning(f"Unable to load PyTorch ZIP scanner for {path}: {e}")
+            return None
+
+        logger.debug(f"Delegating ZIP-backed PyTorch container to PyTorchZipScanner: {path}")
+        return PyTorchZipScanner(config=self.config).scan(path, timeout=self.timeout)
+
     def scan(self, path: str) -> ScanResult:
         """Scan a pickle file for suspicious content"""
         # Start scan timer for timeout tracking
@@ -3696,6 +4069,10 @@ class PickleScanner(BaseScanner):
         size_check = self._check_size_limit(path)
         if size_check:
             return size_check
+
+        zip_container_result = self._scan_zip_backed_pytorch_container(path)
+        if zip_container_result is not None:
+            return zip_container_result
 
         result = self._create_result()
         file_size = self.get_file_size(path)
@@ -3775,11 +4152,11 @@ class PickleScanner(BaseScanner):
                 result.merge(scan_result)
 
                 # For .bin files, also scan the remaining binary content
-                # PyTorch files have pickle header followed by tensor data
-                if is_bin_file and scan_result.success:
-                    # Use the first pickle stream end position (before multi-stream
-                    # scanning consumed additional bytes) for binary content scanning.
-                    pickle_end_pos = scan_result.metadata.get("first_pickle_end_pos", f.tell())
+                # PyTorch files have pickle header followed by tensor data. Keep
+                # scanning the tail when the first pickle stream completed even if
+                # opcode-budget or timeout limits marked the opcode scan unsuccessful.
+                pickle_end_pos = scan_result.metadata.get("first_pickle_end_pos")
+                if is_bin_file and isinstance(pickle_end_pos, int):
                     remaining_bytes = file_size - pickle_end_pos
 
                     if remaining_bytes > 0:
@@ -3838,7 +4215,7 @@ class PickleScanner(BaseScanner):
             is_recursion_on_legitimate_model = is_recursion_error and is_large_ml_model and is_legitimate_file
 
             # If we already found security issues, those take precedence over recursion handling
-            if has_security_findings:
+            if has_security_findings and is_recursion_error:
                 logger.warning(
                     f"Recursion error occurred during scan of {path}, but security issues were already "
                     f"detected in early analysis. Preserving security findings."
@@ -4072,10 +4449,18 @@ class PickleScanner(BaseScanner):
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )
+            result.metadata["operational_error"] = True
+            result.metadata["operational_error_reason"] = "pickle_file_open_failed"
             result.finish(success=False)
             return result
 
-        result.finish(success=True)
+        has_critical_post_budget_failure = any(
+            check.name == "Post-Budget Global Reference Scan"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+            for check in result.checks
+        )
+        result.finish(success=scan_result.success and not has_critical_post_budget_failure)
         return result
 
     def _scan_for_dangerous_patterns(self, data: bytes, result: ScanResult, context_path: str) -> None:
@@ -4389,6 +4774,122 @@ class PickleScanner(BaseScanner):
             ),
         )
 
+    def _build_pickle_opcode_analysis(
+        self,
+        data: BinaryIO,
+        *,
+        multiple_pickles: bool,
+        scan_start_time: float | None = None,
+        include_sequence_analysis: bool,
+        include_stack_metrics: bool,
+        probe_for_budget_exceeded: bool,
+        skip_symbolic_postprocessing_on_timeout: bool = False,
+    ) -> _PickleOpcodeAnalysis:
+        """Walk pickle opcodes once and retain the shared analysis state."""
+
+        effective_scan_start_time = scan_start_time if scan_start_time is not None else self.scan_start_time
+        deadline = effective_scan_start_time + self.timeout if effective_scan_start_time is not None else None
+        opcode_limit = self.max_opcodes
+        analysis = _PickleOpcodeAnalysis(max_analyzed_end_offset=data.tell())
+        max_items = opcode_limit + 1 if probe_for_budget_exceeded else opcode_limit
+
+        current_stack_depth = 0
+        base_stack_depth_limit = 3000
+
+        try:
+            for opcode, arg, pos in _genops_with_fallback(
+                data,
+                multi_stream=multiple_pickles,
+                max_items=max_items,
+                deadline=deadline,
+            ):
+                if include_sequence_analysis and analysis.opcode_count % 1000 == 0:
+                    self.check_interrupted()
+
+                analysis.opcodes.append((opcode, arg, pos))
+                analysis.max_analyzed_end_offset = max(analysis.max_analyzed_end_offset, data.tell())
+                analysis.opcode_count += 1
+
+                op_name = opcode.name
+                if op_name in {"GLOBAL", "INST"} and isinstance(arg, str):
+                    parsed = _parse_module_function(arg)
+                    if parsed is not None:
+                        analysis.globals_found.add((*parsed, op_name))
+
+                if include_sequence_analysis:
+                    sequence_results = self.opcode_sequence_analyzer.analyze_opcode(op_name, arg, pos)
+                    if sequence_results:
+                        analysis.sequence_results.extend(sequence_results)
+
+                if include_stack_metrics:
+                    if op_name in {"MARK", "TUPLE", "LIST", "DICT", "FROZENSET", "INST", "OBJ", "BUILD"}:
+                        current_stack_depth += 1
+                        analysis.max_stack_depth = max(analysis.max_stack_depth, current_stack_depth)
+                    elif op_name in {"POP", "POP_MARK", "SETITEM", "SETITEMS", "APPEND", "APPENDS"}:
+                        current_stack_depth = max(0, current_stack_depth - 1)
+                    elif op_name == "STOP":
+                        current_stack_depth = 0
+
+                    if current_stack_depth > base_stack_depth_limit:
+                        analysis.stack_depth_warnings.append(
+                            {
+                                "current_depth": int(current_stack_depth),
+                                "position": int(pos) if pos is not None else 0,
+                                "opcode": str(op_name),
+                            }
+                        )
+                        if current_stack_depth > base_stack_depth_limit * 10:
+                            analysis.extreme_stack_depth_event = {
+                                "current_depth": int(current_stack_depth),
+                                "position": int(pos) if pos is not None else 0,
+                                "opcode": str(op_name),
+                                "max_allowed": base_stack_depth_limit * 10,
+                            }
+                            break
+
+                if op_name == "STOP" and analysis.first_pickle_end_pos is None and pos is not None:
+                    analysis.first_pickle_end_pos = int(pos) + 1
+
+                if probe_for_budget_exceeded and analysis.opcode_count > opcode_limit:
+                    analysis.opcode_budget_exceeded = True
+                    break
+
+                if deadline is not None and time.time() > deadline:
+                    analysis.timeout_exceeded = True
+                    break
+
+        except _GenopsBudgetExceeded as e:
+            if e.reason == "max_items":
+                analysis.opcode_budget_exceeded = True
+            else:
+                analysis.timeout_exceeded = True
+        except Exception as e:
+            analysis.error = e
+
+        if analysis.opcodes and not (skip_symbolic_postprocessing_on_timeout and analysis.timeout_exceeded):
+            (
+                analysis.stack_global_refs,
+                analysis.callable_refs,
+                analysis.callable_origin_refs,
+                analysis.callable_origin_is_ext,
+                analysis.malformed_stack_globals,
+                analysis.mutation_target_refs,
+            ) = _simulate_symbolic_reference_maps(analysis.opcodes)
+
+            for index, resolved in analysis.stack_global_refs.items():
+                analysis.globals_found.add((*resolved, analysis.opcodes[index][0].name))
+
+            analysis.executed_import_origins = set(analysis.callable_origin_refs.values())
+            analysis.executed_ref_keys = {
+                _normalize_import_reference(mod, func) for mod, func in analysis.callable_refs.values()
+            }
+
+        analysis.max_analyzed_offset = max(
+            (int(pos) for _opcode, _arg, pos in analysis.opcodes if pos is not None),
+            default=-1,
+        )
+        return analysis
+
     def _extract_globals_advanced(
         self,
         data: BinaryIO,
@@ -4396,62 +4897,29 @@ class PickleScanner(BaseScanner):
         scan_start_time: float | None = None,
     ) -> set[tuple[str, str, str]]:
         """Advanced pickle global extraction with STACK_GLOBAL and memo support."""
-        globals_found: set[tuple[str, str, str]] = set()
-        effective_scan_start_time = scan_start_time if scan_start_time is not None else self.scan_start_time
-        deadline = effective_scan_start_time + self.timeout if effective_scan_start_time is not None else None
-        timeout_warning_emitted = False
-        ops: list[tuple[Any, Any, int | None]] = []
+        analysis = self._build_pickle_opcode_analysis(
+            data,
+            multiple_pickles=multiple_pickles,
+            scan_start_time=scan_start_time,
+            include_sequence_analysis=False,
+            include_stack_metrics=False,
+            probe_for_budget_exceeded=False,
+            skip_symbolic_postprocessing_on_timeout=True,
+        )
 
-        try:
-            for opcode, arg, pos in _genops_with_fallback(
-                data,
-                multi_stream=multiple_pickles,
-                max_items=self.max_opcodes,
-                deadline=deadline,
-            ):
-                ops.append((opcode, arg, pos))
-                op_name = opcode.name
-                if op_name in {"GLOBAL", "INST"} and isinstance(arg, str):
-                    parsed = _parse_module_function(arg)
-                    if parsed is not None:
-                        globals_found.add((*parsed, op_name))
-        except _GenopsBudgetExceeded as e:
-            if e.reason == "max_items":
-                logger.warning(f"Advanced global extraction stopped after reaching max_opcodes ({self.max_opcodes})")
-            else:
-                logger.warning(f"Advanced global extraction stopped after exceeding timeout ({self.timeout}s)")
-            return globals_found
-        except Exception as e:
-            if globals_found:
-                logger.warning(f"Pickle parsing failed, but found {len(globals_found)} globals: {e}")
-                return globals_found
-            logger.debug(f"Pickle parsing failed during advanced global extraction: {e}")
-            return set()
-
-        if len(ops) >= self.max_opcodes:
+        if analysis.opcode_budget_exceeded:
             logger.warning(f"Advanced global extraction stopped after reaching max_opcodes ({self.max_opcodes})")
-        elif deadline is not None and time.time() > deadline:
+        elif analysis.timeout_exceeded:
             logger.warning(f"Advanced global extraction stopped after exceeding timeout ({self.timeout}s)")
-            timeout_warning_emitted = True
-            return globals_found
+        elif analysis.error is not None:
+            if analysis.globals_found:
+                logger.warning(
+                    f"Pickle parsing failed, but found {len(analysis.globals_found)} globals: {analysis.error}"
+                )
+            else:
+                logger.debug(f"Pickle parsing failed during advanced global extraction: {analysis.error}")
 
-        stack_global_refs, _callable_refs, _malformed_stack_globals = _build_symbolic_reference_maps(ops)
-
-        for n, (opcode, _arg, _pos) in enumerate(ops):
-            op_name = opcode.name
-            if deadline is not None and time.time() > deadline:
-                if not timeout_warning_emitted:
-                    logger.warning(f"Advanced global extraction stopped after exceeding timeout ({self.timeout}s)")
-                break
-
-            if op_name == "STACK_GLOBAL":
-                resolved = stack_global_refs.get(n)
-                if resolved:
-                    globals_found.add((*resolved, op_name))
-                else:
-                    logger.debug(f"STACK_GLOBAL parsing failed at position {n}")
-                    globals_found.add(("unknown", "unknown", op_name))
-        return globals_found
+        return analysis.globals_found
 
     def _extract_stack_global_values(
         self, ops: list[tuple[Any, Any, int | None]], position: int, memo: dict[int | str, str]
@@ -4479,13 +4947,331 @@ class PickleScanner(BaseScanner):
 
         return values
 
+    def _scan_global_references_unbounded(
+        self,
+        file_obj: BinaryIO,
+        *,
+        file_size: int,
+        minimum_offset: int,
+        ml_context: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Perform a post-budget raw byte scan for GLOBAL/INST/STACK_GLOBAL references."""
+        findings: list[dict[str, Any]] = []
+        seen: set[tuple[int, str]] = set()
+
+        minimum_offset = max(0, minimum_offset)
+        context_bytes = min(minimum_offset, _POST_BUDGET_GLOBAL_CONTEXT_BYTES)
+        tail_scan_bytes = min(max(file_size - minimum_offset, 0), self.post_budget_global_scan_limit_bytes)
+        if tail_scan_bytes <= 0:
+            return findings
+        scan_start = max(0, minimum_offset - context_bytes)
+        read_size = context_bytes + tail_scan_bytes
+
+        original_pos = file_obj.tell()
+        try:
+            file_obj.seek(scan_start)
+            data = file_obj.read(read_size)
+        finally:
+            file_obj.seek(original_pos)
+        data_len = len(data)
+
+        def _record_reference(module: str, function: str, offset: int, opcode_name: str) -> None:
+            if offset < minimum_offset:
+                return
+            if not module or not function or not _is_plausible_python_module(module):
+                return
+
+            is_failure, severity, classification = _classify_import_reference(
+                module,
+                function,
+                ml_context,
+                is_import_only=True,
+            )
+            if not is_failure:
+                return
+            if severity is None:
+                return
+
+            import_reference = f"{module}.{function}"
+            dedupe_key = (offset, import_reference)
+            if dedupe_key in seen:
+                return
+            seen.add(dedupe_key)
+
+            findings.append(
+                {
+                    "module": module,
+                    "function": function,
+                    "import_reference": import_reference,
+                    "offset": offset,
+                    "opcode": opcode_name,
+                    "classification": classification,
+                    "severity": severity.value,
+                    "rule_code": get_import_rule_code(module, function) or "S206",
+                }
+            )
+
+        def _decode_string_push_at(start: int) -> tuple[str, int] | None:
+            if start < 0 or start >= data_len:
+                return None
+
+            opcode = data[start]
+            if opcode == 0x56:  # UNICODE
+                value_start = start + 1
+                value_end = data.find(b"\n", value_start, min(data_len, value_start + 4097))
+                if value_end == -1:
+                    return None
+                value = data[value_start:value_end].decode("utf-8", errors="ignore").strip()
+                return value, value_end + 1
+            if opcode == 0x8C:  # SHORT_BINUNICODE
+                if start + 2 > data_len:
+                    return None
+                string_len = data[start + 1]
+                value_start = start + 2
+            elif opcode == 0x58:  # BINUNICODE
+                if start + 5 > data_len:
+                    return None
+                string_len = int.from_bytes(data[start + 1 : start + 5], "little")
+                value_start = start + 5
+            elif opcode == 0x8D:  # BINUNICODE8
+                if start + 9 > data_len:
+                    return None
+                string_len = int.from_bytes(data[start + 1 : start + 9], "little")
+                value_start = start + 9
+            else:
+                return None
+
+            value_end = value_start + string_len
+            if value_end > data_len or string_len < 0:
+                return None
+
+            value = data[value_start:value_end].decode("utf-8", errors="ignore").strip()
+            return value, value_end
+
+        def _parse_text_memo_index(start: int) -> tuple[int, int] | None:
+            if start + 2 > data_len:
+                return None
+            end = data.find(b"\n", start + 1, min(data_len, start + 22))
+            if end == -1:
+                return None
+            digits = data[start + 1 : end]
+            if not digits or any(ch not in b"0123456789" for ch in digits):
+                return None
+            return int(digits.decode("ascii")), end + 1
+
+        value_end_to_info: dict[int, tuple[str, int]] = {}
+        memo_values: dict[int, tuple[str, int]] = {}
+        stack_global_positions: list[int] = []
+        next_memo_index = 0
+        parse_cursor = 0
+        last_value_info: tuple[str, int] | None = None
+        last_value_end = -1
+
+        while parse_cursor < data_len:
+            opcode_value = data[parse_cursor]
+            parsed_string = _decode_string_push_at(parse_cursor)
+            if parsed_string is not None:
+                value, value_end = parsed_string
+                last_value_info = (value, parse_cursor)
+                last_value_end = value_end
+                value_end_to_info[value_end] = last_value_info
+                parse_cursor = value_end
+                continue
+
+            if opcode_value == 0x94:  # MEMOIZE
+                if last_value_info is not None and last_value_end == parse_cursor:
+                    memo_values[next_memo_index] = last_value_info
+                    value_end_to_info[parse_cursor + 1] = last_value_info
+                    last_value_end = parse_cursor + 1
+                    next_memo_index += 1
+                else:
+                    last_value_info = None
+                    last_value_end = -1
+                parse_cursor += 1
+                continue
+
+            if opcode_value == 0x71 and parse_cursor + 2 <= data_len:  # BINPUT
+                if last_value_info is not None and last_value_end == parse_cursor:
+                    memo_values[data[parse_cursor + 1]] = last_value_info
+                    value_end_to_info[parse_cursor + 2] = last_value_info
+                    last_value_end = parse_cursor + 2
+                else:
+                    last_value_info = None
+                    last_value_end = -1
+                parse_cursor += 2
+                continue
+
+            if opcode_value == 0x72 and parse_cursor + 5 <= data_len:  # LONG_BINPUT
+                if last_value_info is not None and last_value_end == parse_cursor:
+                    memo_values[int.from_bytes(data[parse_cursor + 1 : parse_cursor + 5], "little")] = last_value_info
+                    value_end_to_info[parse_cursor + 5] = last_value_info
+                    last_value_end = parse_cursor + 5
+                else:
+                    last_value_info = None
+                    last_value_end = -1
+                parse_cursor += 5
+                continue
+
+            if opcode_value == 0x70:  # PUT
+                parsed_index = _parse_text_memo_index(parse_cursor)
+                if parsed_index is not None:
+                    memo_index, memo_end = parsed_index
+                    if last_value_info is not None and last_value_end == parse_cursor:
+                        memo_values[memo_index] = last_value_info
+                        value_end_to_info[memo_end] = last_value_info
+                        last_value_end = memo_end
+                    else:
+                        last_value_info = None
+                        last_value_end = -1
+                    parse_cursor = memo_end
+                    continue
+
+            if opcode_value == 0x68 and parse_cursor + 2 <= data_len:  # BINGET
+                resolved_value = memo_values.get(data[parse_cursor + 1])
+                if resolved_value is not None:
+                    value_end_to_info[parse_cursor + 2] = resolved_value
+                    last_value_info = resolved_value
+                    last_value_end = parse_cursor + 2
+                else:
+                    last_value_info = None
+                    last_value_end = -1
+                parse_cursor += 2
+                continue
+
+            if opcode_value == 0x6A and parse_cursor + 5 <= data_len:  # LONG_BINGET
+                resolved_value = memo_values.get(int.from_bytes(data[parse_cursor + 1 : parse_cursor + 5], "little"))
+                if resolved_value is not None:
+                    value_end_to_info[parse_cursor + 5] = resolved_value
+                    last_value_info = resolved_value
+                    last_value_end = parse_cursor + 5
+                else:
+                    last_value_info = None
+                    last_value_end = -1
+                parse_cursor += 5
+                continue
+
+            if opcode_value == 0x67:  # GET
+                parsed_index = _parse_text_memo_index(parse_cursor)
+                if parsed_index is not None:
+                    memo_index, memo_end = parsed_index
+                    resolved_value = memo_values.get(memo_index)
+                    if resolved_value is not None:
+                        value_end_to_info[memo_end] = resolved_value
+                        last_value_info = resolved_value
+                        last_value_end = memo_end
+                    else:
+                        last_value_info = None
+                        last_value_end = -1
+                    parse_cursor = memo_end
+                    continue
+
+            if opcode_value == 0x93:  # STACK_GLOBAL
+                stack_global_positions.append(parse_cursor)
+            elif opcode_value == 0x95 and parse_cursor + 9 <= data_len:  # FRAME
+                parse_cursor += 9
+                continue
+
+            last_value_info = None
+            last_value_end = -1
+            parse_cursor += 1
+
+        def _extract_stack_global_values(stack_global_index: int) -> list[str]:
+            values: list[str] = []
+            cursor = stack_global_index
+            lookback_start = max(0, stack_global_index - _POST_BUDGET_GLOBAL_CONTEXT_BYTES)
+
+            while len(values) < 2 and cursor > lookback_start:
+                resolved_value = value_end_to_info.get(cursor)
+                if resolved_value is None:
+                    break
+
+                found_value, found_start = resolved_value
+                if found_start < lookback_start or found_start >= cursor:
+                    break
+                values.append(found_value)
+                cursor = found_start
+
+            return list(reversed(values))
+
+        cursor = 0
+        while cursor < data_len:
+            opcode_value = data[cursor]
+            if opcode_value in (ord("c"), ord("i")):
+                module_end = data.find(b"\n", cursor + 1, min(data_len, cursor + 257))
+                if module_end != -1 and module_end - cursor <= 256:
+                    function_end = data.find(b"\n", module_end + 1, min(data_len, module_end + 257))
+                    if function_end != -1 and function_end - module_end <= 256:
+                        module = data[cursor + 1 : module_end].decode("utf-8", errors="ignore").strip()
+                        function = data[module_end + 1 : function_end].decode("utf-8", errors="ignore").strip()
+                        opcode_name = "GLOBAL" if opcode_value == ord("c") else "INST"
+                        _record_reference(module, function, scan_start + cursor, opcode_name)
+                        cursor = function_end + 1
+                        continue
+            cursor += 1
+
+        for idx in stack_global_positions:
+            values = _extract_stack_global_values(idx)
+            if len(values) != 2:
+                continue
+            module, function = values
+            _record_reference(module, function, scan_start + idx, "STACK_GLOBAL")
+
+        return findings
+
+    def _scan_expansion_heuristics_unbounded(
+        self,
+        file_obj: BinaryIO,
+        *,
+        file_size: int,
+        minimum_offset: int,
+        deadline: float | None,
+    ) -> list[_ExpansionHeuristicFinding]:
+        """Perform a bounded post-budget opcode scan for expansion-style pickle bombs."""
+        minimum_offset = max(0, minimum_offset)
+        tail_scan_bytes = min(max(file_size - minimum_offset, 0), self.post_budget_expansion_scan_limit_bytes)
+        if tail_scan_bytes <= 0:
+            return []
+
+        original_pos = file_obj.tell()
+        try:
+            file_obj.seek(minimum_offset)
+            tail_data = file_obj.read(tail_scan_bytes)
+        finally:
+            file_obj.seek(original_pos)
+        if not tail_data:
+            return []
+
+        opcodes: list[tuple[Any, Any, int | None]] = []
+        tail_stream = io.BytesIO(tail_data)
+        try:
+            for opcode, arg, pos in _genops_with_fallback(
+                tail_stream,
+                multi_stream=True,
+                deadline=deadline,
+            ):
+                shifted_pos = minimum_offset + int(pos) if pos is not None else None
+                opcodes.append((opcode, arg, shifted_pos))
+        except _GenopsBudgetExceeded as exc:
+            if exc.reason == "deadline":
+                logger.debug(
+                    "Post-budget expansion scan stopped after exceeding timeout (%ss)",
+                    self.timeout,
+                )
+        except Exception as exc:
+            logger.debug("Post-budget expansion scan failed: %s", exc)
+
+        return _detect_pickle_expansion_heuristics(opcodes)
+
     def _scan_pickle_bytes(self, file_obj: BinaryIO, file_size: int) -> ScanResult:
         """Scan pickle file content for suspicious opcodes"""
         result = self._create_result()
         opcode_count = 0
         suspicious_count = 0
+        advanced_globals: set[tuple[str, str, str]] = set()
 
         current_pos = file_obj.tell()
+        timeout_exceeded = False
+        timed_out = False
 
         # Read file data - either all at once for small files or first chunk for large files.
         # For large files, read only the first 10MB for in-memory string/pattern analysis to cap
@@ -4498,9 +5284,6 @@ class PickleScanner(BaseScanner):
         )
 
         file_obj.seek(current_pos)  # Reset position
-        # Extract global references across all pickle streams
-        advanced_globals = self._extract_globals_advanced(file_obj)
-        file_obj.seek(current_pos)  # Reset again after extraction
 
         raw_pattern_scan_complete = file_size <= _RAW_PATTERN_SCAN_LIMIT_BYTES
         result.metadata.update(
@@ -4673,141 +5456,64 @@ class PickleScanner(BaseScanner):
             sys.setrecursionlimit(new_limit)
             # Process the pickle
             start_pos = file_obj.tell()
-
-            # Store opcodes for pattern analysis
-            opcodes = []
-            # Track strings on the stack for STACK_GLOBAL opcode analysis
-            string_stack = []
-            # Track end position of the first pickle stream for binary scanning
-            first_pickle_end_pos: int | None = None
-
-            # Track stack depth for complexity analysis
-            current_stack_depth = 0
-            max_stack_depth = 0
-            # Tiered stack depth limits for better false positive handling
-            # Legitimate large ML models often have stack depths of 1000-3000
             base_stack_depth_limit = 3000
             warning_stack_depth_limit = 5000
-            # Store warnings for ML-context-aware processing
-            stack_depth_warnings: list[dict[str, int | str]] = []
-            opcode_budget_exceeded = False
+            scan_start_time = self.scan_start_time if self.scan_start_time is not None else result.start_time
+            deadline = scan_start_time + self.timeout
+            analysis = self._build_pickle_opcode_analysis(
+                file_obj,
+                multiple_pickles=True,
+                scan_start_time=scan_start_time,
+                include_sequence_analysis=True,
+                include_stack_metrics=True,
+                probe_for_budget_exceeded=True,
+            )
+            advanced_globals = analysis.globals_found
+            opcodes = analysis.opcodes
+            opcode_count = analysis.opcode_count
+            timeout_exceeded = analysis.timeout_exceeded
+            opcode_budget_exceeded = analysis.opcode_budget_exceeded
+            max_analyzed_end_offset = analysis.max_analyzed_end_offset
+            first_pickle_end_pos = analysis.first_pickle_end_pos
+            max_stack_depth = analysis.max_stack_depth
+            stack_depth_warnings = analysis.stack_depth_warnings
 
-            try:
-                for opcode, arg, pos in _genops_with_fallback(
-                    file_obj,
-                    multi_stream=True,
-                    max_items=self.max_opcodes + 1,
-                    deadline=result.start_time + self.timeout,
-                ):
-                    # Check for interrupts periodically during opcode processing
-                    if opcode_count % 1000 == 0:  # Check every 1000 opcodes
-                        self.check_interrupted()
+            for sequence_result in analysis.sequence_results:
+                self._create_opcode_sequence_check(sequence_result, result)
 
-                    opcodes.append((opcode, arg, pos))
-                    opcode_count += 1
+            if analysis.extreme_stack_depth_event is not None:
+                result.add_check(
+                    name="Stack Depth Safety Check",
+                    passed=False,
+                    message=(
+                        "Extreme stack depth "
+                        f"({analysis.extreme_stack_depth_event['current_depth']}) - stopping scan for safety"
+                    ),
+                    severity=IssueSeverity.CRITICAL,
+                    location=f"{self.current_file_path} (pos {analysis.extreme_stack_depth_event['position']})",
+                    details=analysis.extreme_stack_depth_event,
+                    why=(
+                        "Stack depth is extremely high and could indicate a maliciously crafted pickle designed to "
+                        "cause resource exhaustion."
+                    ),
+                )
 
-                    # Enhanced opcode sequence analysis
-                    sequence_results = self.opcode_sequence_analyzer.analyze_opcode(opcode.name, arg, pos)
+            if analysis.error is not None:
+                if not advanced_globals:
+                    file_obj.seek(start_pos)
+                    advanced_globals = self._extract_globals_advanced(
+                        file_obj,
+                        scan_start_time=scan_start_time,
+                    )
+                    file_obj.seek(start_pos)
+                raise analysis.error
 
-                    # Process any detected dangerous sequences
-                    if sequence_results:
-                        for seq_result in sequence_results:
-                            self._create_opcode_sequence_check(seq_result, result)
+            timed_out = timeout_exceeded or time.time() > deadline
 
-                    # Track stack depth based on opcode type
-                    # Stack-building opcodes
-                    if opcode.name in ["MARK", "TUPLE", "LIST", "DICT", "FROZENSET", "INST", "OBJ", "BUILD"]:
-                        current_stack_depth += 1
-                        max_stack_depth = max(max_stack_depth, current_stack_depth)
-                    # Stack-consuming opcodes
-                    elif opcode.name in ["POP", "POP_MARK", "SETITEM", "SETITEMS", "APPEND", "APPENDS"]:
-                        current_stack_depth = max(0, current_stack_depth - 1)
-                    # STOP resets the stack
-                    elif opcode.name == "STOP":
-                        current_stack_depth = 0
-                        if first_pickle_end_pos is None:
-                            # pickletools reports absolute positions even when parsing
-                            # starts from a non-zero file offset.
-                            first_pickle_end_pos = pos + 1
-
-                    # Store stack depth warnings for ML-context-aware processing later
-                    if current_stack_depth > base_stack_depth_limit:
-                        # Don't break immediately - store the warning for context-aware processing
-                        stack_depth_warnings.append(
-                            {
-                                "current_depth": int(current_stack_depth),
-                                "position": int(pos) if pos is not None else 0,
-                                "opcode": str(opcode.name),
-                            }
-                        )
-                        # Only break if stack depth becomes extremely high (10x base limit)
-                        # to prevent actual resource exhaustion attacks
-                        if current_stack_depth > base_stack_depth_limit * 10:
-                            result.add_check(
-                                name="Stack Depth Safety Check",
-                                passed=False,
-                                message=f"Extreme stack depth ({current_stack_depth}) - stopping scan for safety",
-                                severity=IssueSeverity.CRITICAL,
-                                location=f"{self.current_file_path} (pos {pos})",
-                                details={
-                                    "current_depth": current_stack_depth,
-                                    "max_allowed": base_stack_depth_limit * 10,
-                                    "position": pos,
-                                    "opcode": opcode.name,
-                                },
-                                why=(
-                                    "Stack depth is extremely high and could indicate a maliciously crafted pickle "
-                                    "designed to cause resource exhaustion."
-                                ),
-                            )
-                            break
-
-                    # Track strings for STACK_GLOBAL analysis
-                    if opcode.name in STRING_OPCODES and isinstance(arg, str):
-                        string_stack.append(arg)
-                        # Keep only the last 10 strings to avoid memory issues
-                        if len(string_stack) > 10:
-                            string_stack.pop(0)
-
-                    # Check for too many opcodes
-                    if opcode_count > self.max_opcodes:
-                        result.add_check(
-                            name="Opcode Count Check",
-                            passed=False,
-                            message=f"Too many opcodes in pickle (> {self.max_opcodes})",
-                            severity=IssueSeverity.INFO,
-                            location=self.current_file_path,
-                            details={
-                                "opcode_count": opcode_count,
-                                "max_opcodes": self.max_opcodes,
-                            },
-                            why=get_pattern_explanation("pickle_size_limit"),
-                            rule_code="S902",
-                        )
-                        break
-
-                    # Check for timeout
-                    if time.time() - result.start_time > self.timeout:
-                        result.add_check(
-                            name="Scan Timeout Check",
-                            passed=False,
-                            message=f"Scanning timed out after {self.timeout} seconds",
-                            severity=IssueSeverity.INFO,
-                            location=self.current_file_path,
-                            details={"opcode_count": opcode_count, "timeout": self.timeout},
-                            why=(
-                                "The scan exceeded the configured time limit. Large or complex pickle files may take "
-                                "longer to analyze due to the number of opcodes that need to be processed."
-                            ),
-                            rule_code="S902",
-                        )
-                        break
-            except _GenopsBudgetExceeded as e:
-                if e.reason == "max_items":
-                    opcode_budget_exceeded = True
+            if opcode_budget_exceeded or timed_out:
+                result.metadata["analysis_incomplete"] = True
 
             if opcode_budget_exceeded:
-                result.metadata["analysis_incomplete"] = True
                 result.add_check(
                     name="Opcode Count Check",
                     passed=False,
@@ -4823,7 +5529,7 @@ class PickleScanner(BaseScanner):
                     rule_code="S902",
                 )
 
-            if time.time() - result.start_time > self.timeout and not any(
+            if timed_out and not any(
                 check.name == "Scan Timeout Check" and check.status == CheckStatus.FAILED for check in result.checks
             ):
                 result.add_check(
@@ -4856,21 +5562,135 @@ class PickleScanner(BaseScanner):
 
             # ML CONTEXT FILTERING: Analyze ML context once for the entire pickle
             ml_context = _detect_ml_context(opcodes)
-            (
-                stack_global_refs,
-                callable_refs,
-                callable_origin_refs,
-                callable_origin_is_ext,
-                malformed_stack_globals,
-                _mutation_target_refs,
-            ) = _simulate_symbolic_reference_maps(opcodes)
-            executed_import_origins = set(callable_origin_refs.values())
+            stack_global_refs = analysis.stack_global_refs
+            callable_refs = analysis.callable_refs
+            callable_origin_is_ext = analysis.callable_origin_is_ext
+            malformed_stack_globals = analysis.malformed_stack_globals
+            executed_import_origins = analysis.executed_import_origins
+            executed_ref_keys = analysis.executed_ref_keys
+            max_analyzed_offset = analysis.max_analyzed_offset
+            post_budget_minimum_offset = max(max_analyzed_end_offset, max_analyzed_offset + 1, 0)
+
+            should_run_post_budget_scan = opcode_budget_exceeded and not timed_out
+            if timed_out:
+                result.metadata["post_budget_global_scan_skipped_due_to_timeout"] = True
+
+            if should_run_post_budget_scan:
+                post_budget_global_findings = self._scan_global_references_unbounded(
+                    file_obj,
+                    file_size=file_size,
+                    minimum_offset=post_budget_minimum_offset,
+                    ml_context=ml_context,
+                )
+                if post_budget_global_findings:
+                    critical_findings = [
+                        finding
+                        for finding in post_budget_global_findings
+                        if finding["severity"] == IssueSeverity.CRITICAL.value
+                    ]
+                    highest_severity = IssueSeverity.CRITICAL if critical_findings else IssueSeverity.WARNING
+                    representative_finding = (
+                        critical_findings[0] if critical_findings else post_budget_global_findings[0]
+                    )
+                    additional = len(post_budget_global_findings) - 1
+                    additional_note = f" (+{additional} more)" if additional > 0 else ""
+                    post_budget_scan_bytes = min(
+                        max(file_size - post_budget_minimum_offset, 0),
+                        self.post_budget_global_scan_limit_bytes,
+                    )
+                    suspicious_count += len(post_budget_global_findings)
+                    result.add_check(
+                        name="Post-Budget Global Reference Scan",
+                        passed=False,
+                        message=(
+                            (
+                                "Dangerous reference found beyond opcode budget: "
+                                if highest_severity == IssueSeverity.CRITICAL
+                                else "Suspicious import reference found beyond opcode budget: "
+                            )
+                            + f"{representative_finding['import_reference']} at byte offset "
+                            + f"{representative_finding['offset']}"
+                            f"{additional_note}"
+                        ),
+                        severity=highest_severity,
+                        location=self.current_file_path,
+                        rule_code=representative_finding["rule_code"],
+                        details={
+                            "scan_limit_bytes": self.post_budget_global_scan_limit_bytes,
+                            "scan_bytes": post_budget_scan_bytes,
+                            "scan_total_bytes": file_size,
+                            "minimum_offset": post_budget_minimum_offset,
+                            "references": post_budget_global_findings,
+                            "dangerous_references": critical_findings,
+                        },
+                        why=(
+                            "The opcode pass stopped at the configured budget, so a separate byte-level import scan "
+                            "checked the remaining payload and found "
+                            + ("dangerous" if highest_severity == IssueSeverity.CRITICAL else "suspicious")
+                            + " GLOBAL/INST/STACK_GLOBAL references."
+                        ),
+                    )
+                    if highest_severity == IssueSeverity.CRITICAL:
+                        result.success = False
+
+                post_budget_expansion_findings = self._scan_expansion_heuristics_unbounded(
+                    file_obj,
+                    file_size=file_size,
+                    minimum_offset=post_budget_minimum_offset,
+                    deadline=deadline,
+                )
+                if post_budget_expansion_findings:
+                    suspicious_count += len(post_budget_expansion_findings)
+                    primary_finding = post_budget_expansion_findings[0]
+                    trigger_labels = ", ".join(
+                        _EXPANSION_TRIGGER_LABELS.get(trigger, trigger.replace("_", " "))
+                        for trigger in primary_finding.triggers
+                    )
+                    additional_streams = len(post_budget_expansion_findings) - 1
+                    additional_note = (
+                        f" (+{additional_streams} more stream{'s' if additional_streams != 1 else ''})"
+                        if additional_streams > 0
+                        else ""
+                    )
+                    post_budget_expansion_scan_bytes = min(
+                        max(file_size - post_budget_minimum_offset, 0),
+                        self.post_budget_expansion_scan_limit_bytes,
+                    )
+                    result.add_check(
+                        name="Post-Budget Pickle Expansion Heuristic Check",
+                        passed=False,
+                        message=(
+                            "Suspicious pickle expansion/resource-exhaustion pattern found beyond opcode budget: "
+                            f"{trigger_labels}{additional_note}"
+                        ),
+                        severity=IssueSeverity.WARNING,
+                        location=f"{self.current_file_path} (pos {primary_finding.position})",
+                        rule_code="S902",
+                        details={
+                            "scan_limit_bytes": self.post_budget_expansion_scan_limit_bytes,
+                            "scan_bytes": post_budget_expansion_scan_bytes,
+                            "scan_total_bytes": file_size,
+                            "minimum_offset": post_budget_minimum_offset,
+                            "findings": [asdict(finding) for finding in post_budget_expansion_findings],
+                            "suspicious_streams": len(post_budget_expansion_findings),
+                        },
+                        why=(
+                            "The opcode pass stopped at the configured budget, so a targeted tail scan continued "
+                            "looking for memo/DUP expansion patterns in the remaining payload. "
+                            + (get_pattern_explanation("pickle_expansion_attack") or "")
+                        ),
+                    )
 
             # CVE-2025-32434 specific opcode sequence analysis - REMOVED
             # Now only show CVE info in REDUCE opcode detection messages
 
             # CVE-2026-24747: Context-aware SETITEM/SETITEMS abuse detection
-            cve_2026_patterns = self._detect_cve_2026_24747_sequences(opcodes, file_size)
+            cve_2026_patterns = self._detect_cve_2026_24747_sequences(
+                opcodes,
+                file_size,
+                stack_global_refs=stack_global_refs,
+                mutation_target_refs=analysis.mutation_target_refs,
+            )
             if cve_2026_patterns:
                 for pattern in cve_2026_patterns:
                     result.add_check(
@@ -4979,6 +5799,45 @@ class PickleScanner(BaseScanner):
             # Also add to metadata for analysis
             result.metadata["max_stack_depth"] = max_stack_depth
 
+            expansion_findings = _detect_pickle_expansion_heuristics(opcodes)
+            if expansion_findings:
+                suspicious_count += len(expansion_findings)
+                primary_finding = expansion_findings[0]
+                trigger_labels = ", ".join(
+                    _EXPANSION_TRIGGER_LABELS.get(trigger, trigger.replace("_", " "))
+                    for trigger in primary_finding.triggers
+                )
+                additional_streams = len(expansion_findings) - 1
+                additional_streams_note = (
+                    f" (+{additional_streams} more stream{'s' if additional_streams != 1 else ''})"
+                    if additional_streams > 0
+                    else ""
+                )
+                result.add_check(
+                    name="Pickle Expansion Heuristic Check",
+                    passed=False,
+                    message=(
+                        "Suspicious pickle expansion/resource-exhaustion pattern detected: "
+                        f"{trigger_labels}{additional_streams_note}"
+                    ),
+                    severity=IssueSeverity.WARNING,
+                    location=f"{self.current_file_path} (pos {primary_finding.position})",
+                    details={
+                        "findings": [asdict(finding) for finding in expansion_findings],
+                        "suspicious_streams": len(expansion_findings),
+                    },
+                    why=get_pattern_explanation("pickle_expansion_attack"),
+                    rule_code="S902",
+                )
+            else:
+                result.add_check(
+                    name="Pickle Expansion Heuristic Check",
+                    passed=True,
+                    message="No suspicious expansion/resource-exhaustion pickle patterns detected",
+                    location=self.current_file_path,
+                    details={"opcode_count": opcode_count},
+                )
+
             # Add ML context to metadata for debugging
             result.metadata.update(
                 {
@@ -4990,37 +5849,116 @@ class PickleScanner(BaseScanner):
             if first_pickle_end_pos is not None:
                 result.metadata["first_pickle_end_pos"] = first_pickle_end_pos
 
-            # Analyze globals extracted from all pickle streams
-            for mod, func, opcode_name in advanced_globals:
-                if _is_actually_dangerous_global(mod, func, ml_context):
-                    suspicious_count += 1
-                    base_sev = IssueSeverity.WARNING if mod in WARNING_SEVERITY_MODULES else IssueSeverity.CRITICAL
-                    severity = _get_context_aware_severity(
-                        base_sev,
-                        ml_context,
-                        issue_type="dangerous_global",
-                    )
-                    rule_code = get_import_rule_code(mod, func)
-                    if not rule_code:
-                        rule_code = get_pickle_opcode_rule_code(opcode_name) or "S206"
-                    result.add_check(
-                        name="Advanced Global Reference Check",
-                        passed=False,
-                        message=f"Suspicious reference {mod}.{func}",
-                        severity=severity,
-                        location=self.current_file_path,
-                        rule_code=rule_code,
-                        details={
-                            "module": mod,
-                            "function": func,
-                            "opcode": opcode_name,
-                            "ml_context_confidence": ml_context.get(
-                                "overall_confidence",
-                                0,
-                            ),
-                        },
-                        why=get_import_explanation(f"{mod}.{func}"),
-                    )
+            primary_ref_findings: dict[tuple[str, str], _PrimaryRefFinding] = {}
+            pending_supporting_imports: dict[tuple[str, str], list[dict[str, Any]]] = {}
+
+            def _build_supporting_evidence(
+                *,
+                name: str,
+                message: str,
+                location: str,
+                details: dict[str, Any],
+                severity: IssueSeverity | None = None,
+                rule_code: str | None = None,
+            ) -> dict[str, Any]:
+                evidence = {
+                    "check_name": name,
+                    "message": message,
+                    "location": location,
+                    "details": dict(details),
+                }
+                if severity is not None:
+                    evidence["severity"] = severity.value
+                if rule_code is not None:
+                    evidence["rule_code"] = rule_code
+                return evidence
+
+            def _append_supporting_evidence(record: _PrimaryRefFinding, evidence: dict[str, Any]) -> None:
+                for details_dict in (
+                    result.checks[record.check_index].details,
+                    result.issues[record.issue_index].details,
+                ):
+                    supporting = details_dict.setdefault("supporting_evidence", [])
+                    supporting.append(evidence)
+                    details_dict["supporting_evidence_count"] = len(supporting)
+
+            def _record_reference_primary(
+                ref_key: tuple[str, str],
+                *,
+                name: str,
+                message: str,
+                severity: IssueSeverity,
+                location: str,
+                details: dict[str, Any],
+                why: str | None,
+                rule_code: str | None,
+            ) -> bool:
+                evidence = _build_supporting_evidence(
+                    name=name,
+                    message=message,
+                    location=location,
+                    details=details,
+                    severity=severity,
+                    rule_code=rule_code,
+                )
+                existing = primary_ref_findings.get(ref_key)
+                if existing is not None:
+                    existing_check = result.checks[existing.check_index]
+                    existing_issue = result.issues[existing.issue_index]
+                    if _severity_priority(severity) > _severity_priority(existing_check.severity):
+                        existing_details = dict(existing_check.details)
+                        previous_supporting = list(existing_details.pop("supporting_evidence", []))
+                        existing_details.pop("supporting_evidence_count", None)
+                        previous_primary = _build_supporting_evidence(
+                            name=existing_check.name,
+                            message=existing_check.message,
+                            location=existing_check.location or location,
+                            details=existing_details,
+                            severity=existing_check.severity,
+                            rule_code=existing_check.rule_code,
+                        )
+                        promoted_details = dict(details)
+                        if previous_supporting:
+                            promoted_details["supporting_evidence"] = previous_supporting
+                            promoted_details["supporting_evidence_count"] = len(previous_supporting)
+                        existing_check.name = name
+                        existing_check.message = message
+                        existing_check.severity = severity
+                        existing_check.location = location
+                        existing_check.details = promoted_details
+                        existing_check.why = why
+                        existing_check.rule_code = rule_code
+                        existing_issue.message = message
+                        existing_issue.severity = severity
+                        existing_issue.location = location
+                        existing_issue.details = dict(promoted_details)
+                        existing_issue.why = why
+                        existing_issue.rule_code = rule_code
+                        _append_supporting_evidence(existing, previous_primary)
+                        return False
+                    _append_supporting_evidence(existing, evidence)
+                    return False
+
+                checks_before = len(result.checks)
+                issues_before = len(result.issues)
+                result.add_check(
+                    name=name,
+                    passed=False,
+                    message=message,
+                    severity=severity,
+                    location=location,
+                    rule_code=rule_code,
+                    details=details,
+                    why=why,
+                )
+                if len(result.checks) == checks_before or len(result.issues) == issues_before:
+                    return False
+
+                record = _PrimaryRefFinding(len(result.checks) - 1, len(result.issues) - 1)
+                primary_ref_findings[ref_key] = record
+                for pending in pending_supporting_imports.pop(ref_key, []):
+                    _append_supporting_evidence(record, pending)
+                return True
 
             # Record successful ML context validation if content appears safe
             if ml_context.get("is_ml_content") and ml_context.get("overall_confidence", 0) > 0.5:
@@ -5051,7 +5989,7 @@ class PickleScanner(BaseScanner):
                             is_import_only=is_import_only,
                         )
                         if is_failure and base_sev_global is not None:
-                            suspicious_count += 1
+                            ref_key = _normalize_import_reference(mod, func)
                             severity_level_global: IssueSeverity = base_sev_global
                             severity = _get_context_aware_severity(
                                 severity_level_global,
@@ -5064,25 +6002,42 @@ class PickleScanner(BaseScanner):
                                 if classification == "unknown_third_party" and is_import_only
                                 else f"Suspicious reference {mod}.{func}"
                             )
-                            result.add_check(
+                            location = f"{self.current_file_path} (pos {pos})"
+                            details = {
+                                "module": mod,
+                                "function": func,
+                                "position": pos,
+                                "opcode": opcode.name,
+                                "import_reference": f"{mod}.{func}",
+                                "import_only": is_import_only,
+                                "classification": classification,
+                                "ml_context_confidence": ml_context.get("overall_confidence", 0),
+                            }
+                            if ref_key in executed_ref_keys:
+                                supporting_import_evidence = {
+                                    "check_name": "Global Module Reference Check",
+                                    "message": message,
+                                    "location": location,
+                                    "details": dict(details),
+                                }
+                                existing = primary_ref_findings.get(ref_key)
+                                if existing is not None:
+                                    _append_supporting_evidence(existing, supporting_import_evidence)
+                                else:
+                                    pending_supporting_imports.setdefault(ref_key, []).append(
+                                        supporting_import_evidence,
+                                    )
+                            elif _record_reference_primary(
+                                ref_key,
                                 name="Global Module Reference Check",
-                                passed=False,
                                 message=message,
                                 severity=severity,
-                                location=f"{self.current_file_path} (pos {pos})",
-                                rule_code=rule_code,
-                                details={
-                                    "module": mod,
-                                    "function": func,
-                                    "position": pos,
-                                    "opcode": opcode.name,
-                                    "import_reference": f"{mod}.{func}",
-                                    "import_only": is_import_only,
-                                    "classification": classification,
-                                    "ml_context_confidence": ml_context.get("overall_confidence", 0),
-                                },
+                                location=location,
+                                details=details,
                                 why=get_import_explanation(f"{mod}.{func}"),
-                            )
+                                rule_code=rule_code,
+                            ):
+                                suspicious_count += 1
                         elif classification == "safe_allowlisted":
                             result.add_check(
                                 name="Global Module Reference Check",
@@ -5149,13 +6104,23 @@ class PickleScanner(BaseScanner):
                             # NOT in safe globals - check if it's actually dangerous
                             # Use _is_actually_dangerous_global to determine severity (CRITICAL vs WARNING)
                             if reduce_mod and reduce_func:
+                                normalized_reduce_mod, normalized_reduce_func = _normalize_import_reference(
+                                    reduce_mod,
+                                    reduce_func,
+                                )
+                                dangerous_base_severity = _dangerous_ref_base_severity(
+                                    normalized_reduce_mod,
+                                    normalized_reduce_func,
+                                    origin_is_ext=reduce_origin_is_ext,
+                                )
                                 is_actually_dangerous = reduce_origin_is_ext or _is_actually_dangerous_global(
                                     reduce_mod, reduce_func, ml_context
                                 )
                                 if is_actually_dangerous:
-                                    # Dangerous global (e.g., os.system) - CRITICAL
+                                    # Dangerous global (e.g., os.system) - CRITICAL unless
+                                    # the dangerous ref is explicitly configured as WARNING.
                                     severity = _get_context_aware_severity(
-                                        IssueSeverity.CRITICAL,
+                                        dangerous_base_severity,
                                         ml_context,
                                         issue_type="dangerous_global",
                                     )
@@ -5255,15 +6220,22 @@ class PickleScanner(BaseScanner):
                                             ),
                                         }
 
-                                result.add_check(
-                                    name="REDUCE Opcode Safety Check",
-                                    passed=False,
-                                    message=_reduce_msg,
-                                    severity=severity,
-                                    location=f"{self.current_file_path} (pos {pos})",
-                                    details=_reduce_details,
-                                    why=get_opcode_explanation("REDUCE"),
-                                )
+                                location = f"{self.current_file_path} (pos {pos})"
+                                if (
+                                    reduce_mod
+                                    and reduce_func
+                                    and _record_reference_primary(
+                                        _normalize_import_reference(reduce_mod, reduce_func),
+                                        name="REDUCE Opcode Safety Check",
+                                        message=_reduce_msg,
+                                        severity=severity,
+                                        location=location,
+                                        details=_reduce_details,
+                                        why=get_opcode_explanation("REDUCE"),
+                                        rule_code=None,
+                                    )
+                                ):
+                                    suspicious_count += 1
 
                 # Check NEWOBJ/NEWOBJ_EX/OBJ/INST opcodes for potential security issues
                 # Apply same logic as REDUCE: check if class is in ML_SAFE_GLOBALS
@@ -5309,13 +6281,23 @@ class PickleScanner(BaseScanner):
                         else:
                             # NOT in safe classes - check if actually dangerous
                             if class_mod and class_name:
+                                normalized_class_mod, normalized_class_name = _normalize_import_reference(
+                                    class_mod,
+                                    class_name,
+                                )
+                                dangerous_base_severity = _dangerous_ref_base_severity(
+                                    normalized_class_mod,
+                                    normalized_class_name,
+                                    origin_is_ext=class_origin_is_ext,
+                                )
                                 is_actually_dangerous = class_origin_is_ext or _is_actually_dangerous_global(
                                     class_mod, class_name, ml_context
                                 )
                                 if is_actually_dangerous:
-                                    # Dangerous class (e.g., os.system wrapper) - CRITICAL
+                                    # Dangerous class (e.g., os.system wrapper) - CRITICAL unless
+                                    # the dangerous ref is explicitly configured as WARNING.
                                     severity = _get_context_aware_severity(
-                                        IssueSeverity.CRITICAL,
+                                        dangerous_base_severity,
                                         ml_context,
                                         issue_type="dangerous_global",
                                     )
@@ -5351,26 +6333,30 @@ class PickleScanner(BaseScanner):
                                         ml_context,
                                     )
 
-                                result.add_check(
+                                location = f"{self.current_file_path} (pos {pos})"
+                                details = {
+                                    "position": pos,
+                                    "opcode": opcode.name,
+                                    "associated_class": associated_class,
+                                    "origin_is_ext": class_origin_is_ext,
+                                    "ml_context_confidence": ml_context.get(
+                                        "overall_confidence",
+                                        0,
+                                    ),
+                                }
+                                if _record_reference_primary(
+                                    _normalize_import_reference(class_mod, class_name),
                                     name="INST/OBJ/NEWOBJ/NEWOBJ_EX Opcode Safety Check",
-                                    passed=False,
                                     message=(
                                         f"Found {opcode.name} opcode with non-allowlisted class: {associated_class}"
                                     ),
                                     severity=severity,
-                                    location=f"{self.current_file_path} (pos {pos})",
-                                    details={
-                                        "position": pos,
-                                        "opcode": opcode.name,
-                                        "associated_class": associated_class,
-                                        "origin_is_ext": class_origin_is_ext,
-                                        "ml_context_confidence": ml_context.get(
-                                            "overall_confidence",
-                                            0,
-                                        ),
-                                    },
+                                    location=location,
+                                    details=details,
                                     why=get_opcode_explanation(opcode.name),
-                                )
+                                    rule_code=None,
+                                ):
+                                    suspicious_count += 1
                     else:
                         # No associated class found via backward search
                         # Try fallback: INST in protocol 0 encodes class info directly in arg
@@ -5447,19 +6433,19 @@ class PickleScanner(BaseScanner):
                             )
                         )
                         # Determine rule code based on pattern
-                        rule_code = None
+                        string_rule_code: str | None = None
                         if "eval" in suspicious_pattern or "exec" in suspicious_pattern:
-                            rule_code = "S104"
+                            string_rule_code = "S104"
                         elif "os.system" in suspicious_pattern:
-                            rule_code = "S101"
+                            string_rule_code = "S101"
                         elif "subprocess" in suspicious_pattern:
-                            rule_code = "S103"
+                            string_rule_code = "S103"
                         elif "__import__" in suspicious_pattern:
-                            rule_code = "S106"
+                            string_rule_code = "S106"
                         elif "compile" in suspicious_pattern:
-                            rule_code = "S105"
+                            string_rule_code = "S105"
                         else:
-                            rule_code = get_generic_rule_code(suspicious_pattern)
+                            string_rule_code = get_generic_rule_code(suspicious_pattern)
 
                         result.add_check(
                             name="String Pattern Security Check",
@@ -5467,7 +6453,7 @@ class PickleScanner(BaseScanner):
                             message=f"Suspicious string pattern: {suspicious_pattern}",
                             severity=severity,
                             location=f"{self.current_file_path} (pos {pos})",
-                            rule_code=rule_code,
+                            rule_code=string_rule_code,
                             details={
                                 "position": pos,
                                 "opcode": opcode.name,
@@ -5612,7 +6598,7 @@ class PickleScanner(BaseScanner):
                             is_import_only=is_import_only,
                         )
                         if is_failure and base_sev_stack is not None:
-                            suspicious_count += 1
+                            ref_key = _normalize_import_reference(mod, func)
                             severity_level_stack: IssueSeverity = base_sev_stack
                             severity = _get_context_aware_severity(
                                 severity_level_stack,
@@ -5625,25 +6611,42 @@ class PickleScanner(BaseScanner):
                                 if classification == "unknown_third_party" and is_import_only
                                 else f"Suspicious module reference found: {mod}.{func}"
                             )
-                            result.add_check(
+                            location = f"{self.current_file_path} (pos {pos})"
+                            details = {
+                                "module": mod,
+                                "function": func,
+                                "position": pos,
+                                "opcode": opcode.name,
+                                "import_reference": f"{mod}.{func}",
+                                "import_only": is_import_only,
+                                "classification": classification,
+                                "ml_context_confidence": ml_context.get("overall_confidence", 0),
+                            }
+                            if ref_key in executed_ref_keys:
+                                supporting_import_evidence = {
+                                    "check_name": "STACK_GLOBAL Module Check",
+                                    "message": message,
+                                    "location": location,
+                                    "details": dict(details),
+                                }
+                                existing = primary_ref_findings.get(ref_key)
+                                if existing is not None:
+                                    _append_supporting_evidence(existing, supporting_import_evidence)
+                                else:
+                                    pending_supporting_imports.setdefault(ref_key, []).append(
+                                        supporting_import_evidence,
+                                    )
+                            elif _record_reference_primary(
+                                ref_key,
                                 name="STACK_GLOBAL Module Check",
-                                passed=False,
                                 message=message,
                                 severity=severity,
-                                location=f"{self.current_file_path} (pos {pos})",
-                                rule_code=rule_code,
-                                details={
-                                    "module": mod,
-                                    "function": func,
-                                    "position": pos,
-                                    "opcode": opcode.name,
-                                    "import_reference": f"{mod}.{func}",
-                                    "import_only": is_import_only,
-                                    "classification": classification,
-                                    "ml_context_confidence": ml_context.get("overall_confidence", 0),
-                                },
+                                location=location,
+                                details=details,
                                 why=get_import_explanation(f"{mod}.{func}"),
-                            )
+                                rule_code=rule_code,
+                            ):
+                                suspicious_count += 1
                         elif classification == "safe_allowlisted":
                             result.add_check(
                                 name="STACK_GLOBAL Module Check",
@@ -5740,40 +6743,104 @@ class PickleScanner(BaseScanner):
                 stack_global_refs=stack_global_refs,
                 callable_refs=callable_refs,
                 callable_origin_is_ext=callable_origin_is_ext,
+                mutation_target_refs=analysis.mutation_target_refs,
             )
             if dangerous_pattern:
-                suspicious_count += 1
+                normalized_pattern_mod, normalized_pattern_func = _normalize_import_reference(
+                    dangerous_pattern.get("module", ""),
+                    dangerous_pattern.get("function", ""),
+                )
+                is_build_setstate = dangerous_pattern.get("pattern") == "BUILD_SETSTATE_NON_SAFE_GLOBAL"
+                dangerous_pattern_base_severity = (
+                    _dangerous_ref_base_severity(
+                        normalized_pattern_mod,
+                        normalized_pattern_func,
+                        origin_is_ext=bool(dangerous_pattern.get("origin_is_ext")),
+                    )
+                    if normalized_pattern_mod and normalized_pattern_func and not is_build_setstate
+                    else (IssueSeverity.WARNING if is_build_setstate else IssueSeverity.CRITICAL)
+                )
                 severity = _get_context_aware_severity(
-                    IssueSeverity.CRITICAL,
+                    dangerous_pattern_base_severity,
                     ml_context,
                     issue_type="dangerous_import",
                 )
                 module_name = dangerous_pattern.get("module", "")
-                # Get rule code for the dangerous module
-                module_name = dangerous_pattern.get("module", "")
                 func_name = dangerous_pattern.get("function", "")
-                rule_code = get_import_rule_code(module_name, func_name)
-                if not rule_code:
-                    rule_code = "S201"  # REDUCE opcode
-                result.add_check(
-                    name="Reduce Pattern Analysis",
-                    passed=False,
-                    message=f"Detected dangerous __reduce__ pattern with "
-                    f"{dangerous_pattern.get('module', '')}.{dangerous_pattern.get('function', '')}",
-                    severity=severity,
-                    rule_code=rule_code,
-                    location=f"{self.current_file_path} (pos {dangerous_pattern.get('position', 0)})",
-                    details={
-                        **dangerous_pattern,
-                        "ml_context_confidence": ml_context.get(
-                            "overall_confidence",
-                            0,
-                        ),
-                    },
-                    why=get_import_explanation(f"{module_name}.{func_name}")
-                    if module_name
-                    else "A dangerous pattern was detected that could execute arbitrary code during unpickling.",
+                dangerous_pattern_rule_code = (
+                    get_pickle_opcode_rule_code("BUILD")
+                    if is_build_setstate
+                    else get_import_rule_code(module_name, func_name)
                 )
+                if not dangerous_pattern_rule_code:
+                    dangerous_pattern_rule_code = "S201"  # REDUCE opcode
+                finding_name = "BUILD Opcode Analysis" if is_build_setstate else "Reduce Pattern Analysis"
+                finding_message = (
+                    f"Detected potential __setstate__ exploitation via BUILD with {module_name}.{func_name}"
+                    if is_build_setstate
+                    else (
+                        "Detected dangerous __reduce__ pattern with "
+                        f"{dangerous_pattern.get('module', '')}.{dangerous_pattern.get('function', '')}"
+                    )
+                )
+                location = f"{self.current_file_path} (pos {dangerous_pattern.get('position', 0)})"
+                details = {
+                    **dangerous_pattern,
+                    "ml_context_confidence": ml_context.get(
+                        "overall_confidence",
+                        0,
+                    ),
+                }
+                dangerous_pattern_why: str | None = (
+                    "BUILD can invoke __setstate__ on the constructed object. "
+                    "When that object comes from a non-safe global, attacker-controlled state may execute code."
+                    if is_build_setstate
+                    else get_import_explanation(f"{module_name}.{func_name}")
+                )
+                if is_build_setstate:
+                    suspicious_count += 1
+                    result.add_check(
+                        name=finding_name,
+                        passed=False,
+                        message=finding_message,
+                        severity=severity,
+                        rule_code=dangerous_pattern_rule_code,
+                        location=location,
+                        details=details,
+                        why=dangerous_pattern_why,
+                    )
+                elif module_name and func_name:
+                    if _record_reference_primary(
+                        (normalized_pattern_mod, normalized_pattern_func),
+                        name=finding_name,
+                        message=finding_message,
+                        severity=severity,
+                        location=location,
+                        details=details,
+                        why=dangerous_pattern_why,
+                        rule_code=dangerous_pattern_rule_code,
+                    ):
+                        suspicious_count += 1
+                else:
+                    suspicious_count += 1
+                    result.add_check(
+                        name=finding_name,
+                        passed=False,
+                        message=(
+                            "Detected potential __setstate__ exploitation via BUILD"
+                            if is_build_setstate
+                            else "Detected dangerous __reduce__ pattern"
+                        ),
+                        severity=severity,
+                        rule_code=dangerous_pattern_rule_code,
+                        location=location,
+                        details=details,
+                        why=(
+                            "BUILD can invoke __setstate__ on attacker-controlled state."
+                            if is_build_setstate
+                            else "A dangerous pattern was detected that could execute arbitrary code during unpickling."
+                        ),
+                    )
             else:
                 # Record successful validation - no dangerous reduce patterns found
                 result.add_check(
@@ -6159,6 +7226,7 @@ class PickleScanner(BaseScanner):
             with contextlib.suppress(NameError):
                 sys.setrecursionlimit(original_recursion_limit)  # type: ignore[possibly-unresolved-reference]
 
+        result.finish(success=not timed_out)
         return result
 
     def _is_legitimate_pytorch_model(self, path: str) -> bool:
@@ -6779,7 +7847,14 @@ class PickleScanner(BaseScanner):
 
         return patterns
 
-    def _detect_cve_2026_24747_sequences(self, opcodes: list[tuple], file_size: int) -> list[dict]:
+    def _detect_cve_2026_24747_sequences(
+        self,
+        opcodes: list[tuple],
+        file_size: int,
+        *,
+        stack_global_refs: dict[int, tuple[str, str]] | None = None,
+        mutation_target_refs: dict[int, _MutationTargetRef] | None = None,
+    ) -> list[dict]:
         """Detect opcode sequences indicating CVE-2026-24747 exploitation.
 
         CVE-2026-24747 bypasses PyTorch's weights_only=True restricted unpickler
@@ -6794,14 +7869,19 @@ class PickleScanner(BaseScanner):
         # Pre-compute symbolic references and mutation targets.
         # This handles BINUNICODE8, memoized strings (BINGET/LONG_BINGET),
         # and indirect stack flows that a narrow lookback would miss.
-        (
-            stack_global_refs,
-            _callable_refs,
-            _callable_origin_refs,
-            _callable_origin_is_ext,
-            _malformed_stack_globals,
-            mutation_target_refs,
-        ) = _simulate_symbolic_reference_maps(opcodes)
+        if stack_global_refs is None or mutation_target_refs is None:
+            (
+                computed_stack_global_refs,
+                _callable_refs,
+                _callable_origin_refs,
+                _callable_origin_is_ext,
+                _malformed_stack_globals,
+                computed_mutation_target_refs,
+            ) = _simulate_symbolic_reference_maps(opcodes)
+            if stack_global_refs is None:
+                stack_global_refs = computed_stack_global_refs
+            if mutation_target_refs is None:
+                mutation_target_refs = computed_mutation_target_refs
 
         for i, (opcode, _arg, pos) in enumerate(opcodes):
             if opcode.name not in ("SETITEM", "SETITEMS"):

@@ -3,10 +3,13 @@
 import bz2
 import gzip
 import lzma
+import pickle
 import tarfile
 import tempfile
 import zipfile
 from pathlib import Path
+
+import pytest
 
 from modelaudit.core import _is_huggingface_cache_file, scan_model_directory_or_file
 
@@ -166,6 +169,88 @@ class TestDirectoryFileFiltering:
         assert results["files_scanned"] == 1
         asset_names = {Path(asset.path).name for asset in results.assets}
         assert asset_names == {".artifact"}
+
+    def test_disguised_pickle_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
+        """Directory scans should not skip payloads whose content is a supported format."""
+        disguised_payload = tmp_path / "payload.jpg"
+
+        class DangerousPayload:
+            def __reduce__(self) -> tuple[object, tuple[str]]:
+                import os as os_module
+
+                return (os_module.system, ("echo directory-prefilter-test",))
+
+        disguised_payload.write_bytes(pickle.dumps(DangerousPayload()))
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        assert any("payload.jpg" in (issue.location or "") for issue in results.issues)
+
+    def test_real_images_remain_skipped(self, tmp_path: Path) -> None:
+        """Content sniffing should not promote ordinary media files into the scan set."""
+        image_path = tmp_path / "cover.jpg"
+        image_path.write_bytes(b"\xff\xd8\xff\xe0" + b"jpeg")
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 0
+
+    def test_disguised_executorch_zip_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
+        """Directory scans should preserve disguised ZIPs that contain supported ExecuTorch payloads."""
+        disguised_zip = tmp_path / "executorch.jpg"
+        with zipfile.ZipFile(disguised_zip, "w") as archive:
+            archive.writestr("model.pte", b"executorch payload")
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        asset_names = {Path(asset.path).name for asset in results.assets}
+        assert "executorch.jpg" in asset_names
+        assert "zip" in results.scanner_names
+        assert "unknown" not in results.scanner_names
+        assert not any("Unknown or unhandled format" in issue.message for issue in results.issues)
+
+    def test_disguised_sevenzip_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
+        """Directory scans should route disguised 7z containers to the sevenzip scanner."""
+        py7zr = pytest.importorskip("py7zr")
+
+        disguised_7z = tmp_path / "payload.jpg"
+        nested_payload = tmp_path / "payload.txt"
+        nested_payload.write_text("safe nested payload")
+
+        with py7zr.SevenZipFile(disguised_7z, "w") as archive:
+            archive.write(str(nested_payload), "payload.txt")
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        assert "sevenzip" in results.scanner_names
+        assert "unknown" not in results.scanner_names
+        assert not any("Unknown or unhandled format" in issue.message for issue in results.issues)
+
+    def test_docx_like_zip_remains_skipped(self, tmp_path: Path) -> None:
+        """Common document containers should not be treated as model archives."""
+        docx_path = tmp_path / "report.docx"
+        with zipfile.ZipFile(docx_path, "w") as archive:
+            archive.writestr("[Content_Types].xml", "<Types></Types>")
+            archive.writestr("word/document.xml", "<w:document></w:document>")
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 0
+
+    def test_docx_with_embedded_ole_bin_remains_skipped(self, tmp_path: Path) -> None:
+        """Office containers with embedded OLE payloads should still be skipped."""
+        docx_path = tmp_path / "report.docx"
+        with zipfile.ZipFile(docx_path, "w") as archive:
+            archive.writestr("[Content_Types].xml", "<Types></Types>")
+            archive.writestr("word/document.xml", "<w:document></w:document>")
+            archive.writestr("word/embeddings/oleObject1.bin", b"embedded-ole")
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 0
 
     def test_only_huggingface_bookkeeping_metadata_is_skipped(self, tmp_path: Path) -> None:
         """Local .metadata files should be scanned unless they are in HuggingFace cache layouts."""

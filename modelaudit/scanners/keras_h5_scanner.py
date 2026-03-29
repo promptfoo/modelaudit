@@ -599,11 +599,11 @@ class KerasH5Scanner(BaseScanner):
 
         # Common safe Lambda patterns for normalization
         SAFE_LAMBDA_PATTERNS = [
-            r"lambda\s+x\s*:\s*x\s*/\s*\d+",  # lambda x: x / 255
-            r"lambda\s+x\s*:\s*x\s*\*\s*\d+",  # lambda x: x * 2
-            r"lambda\s+x\s*:\s*tf\.nn\.\w+\(x\)",  # lambda x: tf.nn.softmax(x)
-            r"lambda\s+x\s*:\s*K\.\w+\(x",  # lambda x: K.softmax(x)
-            r"lambda\s+x\s*:\s*\(x\s*-\s*\d+\)\s*/\s*\d+",  # lambda x: (x - 128) / 128
+            r"lambda\s+x\s*:\s*x\s*/\s*\d+$",  # lambda x: x / 255
+            r"lambda\s+x\s*:\s*x\s*\*\s*\d+$",  # lambda x: x * 2
+            r"lambda\s+x\s*:\s*tf\.nn\.\w+\(x\)$",  # lambda x: tf.nn.softmax(x)
+            r"lambda\s+x\s*:\s*K\.\w+\(x\)$",  # lambda x: K.softmax(x)
+            r"lambda\s+x\s*:\s*\(x\s*-\s*\d+\)\s*/\s*\d+$",  # lambda x: (x - 128) / 128
         ]
 
         # Check if there's actual Python code to validate
