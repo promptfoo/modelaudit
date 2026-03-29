@@ -10,6 +10,7 @@ from modelaudit.utils.sources.huggingface import (
     _list_repo_files_with_timeout,
     download_file_from_hf,
     download_model,
+    download_model_streaming,
     extract_model_id_from_path,
     get_model_info,
     get_model_size,
@@ -296,6 +297,72 @@ class TestModelDownload:
             mock_import.side_effect = side_effect
             with pytest.raises(ImportError, match="huggingface-hub package is required"):
                 download_model("https://huggingface.co/test/model")
+
+
+class TestModelDownloadStreaming:
+    """Test streaming model downloads from HuggingFace."""
+
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["pytorch_model.bin", "README.md"], None),
+    )
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_downloads_scannable_files_only(
+        self,
+        mock_hf_hub_download: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Streaming downloads should only request recognized scannable files."""
+        downloaded_file = tmp_path / "huggingface" / "test" / "model" / "pytorch_model.bin"
+        mock_hf_hub_download.return_value = str(downloaded_file)
+
+        results = list(download_model_streaming("https://huggingface.co/test/model", cache_dir=tmp_path))
+
+        assert results == [(downloaded_file, True)]
+        mock_hf_hub_download.assert_called_once_with(
+            repo_id="test/model",
+            filename="pytorch_model.bin",
+            cache_dir=str(tmp_path / "huggingface"),
+            local_dir=str(tmp_path / "huggingface" / "test" / "model"),
+        )
+
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(None, "timed out after 30 seconds"),
+    )
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_listing_timeout_fails_closed(
+        self,
+        mock_hf_hub_download: MagicMock,
+        _mock_list_repo_files: MagicMock,
+    ) -> None:
+        """Streaming mode should fail closed when repo listing times out."""
+        with pytest.raises(Exception, match="Timeout listing files in repository test/model"):
+            list(download_model_streaming("https://huggingface.co/test/model"))
+
+        mock_hf_hub_download.assert_not_called()
+
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(None, "repository listing unavailable"),
+    )
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_listing_error_fails_closed(
+        self,
+        mock_hf_hub_download: MagicMock,
+        _mock_list_repo_files: MagicMock,
+    ) -> None:
+        """Streaming mode should fail closed when repo listing errors out."""
+        with pytest.raises(
+            Exception,
+            match="Failed listing files in repository test/model: repository listing unavailable",
+        ):
+            list(download_model_streaming("https://huggingface.co/test/model"))
+
+        mock_hf_hub_download.assert_not_called()
 
 
 class TestModelSizeAndDiskSpace:

@@ -15,11 +15,11 @@ import pytest
 # Framework availability detection (cached for performance)
 # ============================================================================
 def _check_framework(name: str) -> bool:
-    """Check if a framework is available."""
+    """Check if a framework can be imported successfully."""
     try:
         __import__(name)
         return True
-    except ImportError:
+    except Exception:
         return False
 
 
@@ -85,6 +85,7 @@ def pytest_runtest_setup(item):
             "test_nemo_scanner.py",  # NeMo scanner CVE-2025-23304 tests
             "test_numpy_scanner.py",  # NumPy scanner CVE-2019-6446 tests
             "test_onnx_scanner.py",  # ONNX scanner CVE-2025-51480 tests
+            "test_safetensors_scanner.py",  # SafeTensors scanner dtype and metadata tests
             "test_rule_mapper.py",  # Rule mapper validity and network mapping tests
             "test_rule_code_registry_consistency.py",  # Scanner literal rule-code registry consistency
             "test_keras_h5_scanner.py",  # Keras H5 scanner CVE-2025-9905 tests
@@ -104,6 +105,7 @@ def pytest_runtest_setup(item):
             "test_mxnet_scanner.py",  # MXNet scanner tests
             "test_filetype.py",  # File type detection and validation tests
             "test_tf_metagraph_scanner.py",  # TensorFlow MetaGraph scanner tests
+            "test_tf_savedmodel_scanner.py",  # TensorFlow SavedModel scanner tests
             "test_torchserve_mar_scanner.py",  # TorchServe .mar scanner tests
             "test_executorch_scanner.py",  # ExecuTorch scanner tests
             "test_telemetry.py",  # telemetry payload and availability tests
@@ -125,6 +127,7 @@ def pytest_runtest_setup(item):
             "test_ml_context_false_positives.py",  # ML-context executable filtering regression tests
             "test_cli_output.py",  # CliRunner JSON parsing helper regression tests
             "test_large_file_handler.py",  # Large file handler regression tests
+            "test_file_iterator.py",  # Streaming file iterator memory regression tests
         ]
 
         # Check if this is an allowed test file
