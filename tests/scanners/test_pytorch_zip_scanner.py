@@ -1,5 +1,6 @@
 import json
 import pickle
+import struct
 import time
 import zipfile
 from pathlib import Path
@@ -10,6 +11,32 @@ import pytest
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.pytorch_zip_scanner import PyTorchZipScanner
 from tests.helpers import create_mock_pytorch_zip
+
+
+def _corrupt_zip_member_crc(zip_path: Path, member_name: str) -> None:
+    """Patch ZIP headers so one member reports an incorrect CRC without changing data."""
+    with zipfile.ZipFile(zip_path, "r") as zip_file:
+        info = zip_file.getinfo(member_name)
+        central_directory_offset = zip_file.start_dir
+
+    archive_bytes = bytearray(zip_path.read_bytes())
+    local_crc_offset = info.header_offset + 14
+    original_crc = struct.unpack_from("<I", archive_bytes, local_crc_offset)[0]
+    corrupt_crc = (original_crc ^ 0xFFFFFFFF) & 0xFFFFFFFF
+    struct.pack_into("<I", archive_bytes, local_crc_offset, corrupt_crc)
+
+    cursor = central_directory_offset
+    while cursor < len(archive_bytes) and archive_bytes[cursor : cursor + 4] == b"PK\x01\x02":
+        filename_len, extra_len, comment_len = struct.unpack_from("<HHH", archive_bytes, cursor + 28)
+        filename_start = cursor + 46
+        filename_end = filename_start + filename_len
+        if archive_bytes[filename_start:filename_end] == member_name.encode("utf-8"):
+            struct.pack_into("<I", archive_bytes, cursor + 16, corrupt_crc)
+            zip_path.write_bytes(archive_bytes)
+            return
+        cursor = filename_end + extra_len + comment_len
+
+    raise AssertionError(f"Unable to locate central directory entry for {member_name}")
 
 
 def test_pytorch_zip_scanner_can_handle(tmp_path):
@@ -52,6 +79,37 @@ def test_pytorch_zip_scanner_malicious_model(tmp_path):
     # The scanner should detect the eval function in the pickle
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
     assert any("eval" in issue.message.lower() for issue in result.issues)
+
+
+def test_pytorch_zip_scanner_relaxes_crc_for_pickle_scan(tmp_path: Path) -> None:
+    """CRC-mismatched pickle entries should still be scanned with an explicit warning."""
+    model_path = create_mock_pytorch_zip(tmp_path / "crc_mismatch.pt", malicious=True)
+    _corrupt_zip_member_crc(model_path, "data.pkl")
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    crc_checks = [check for check in result.checks if check.name == "PyTorch ZIP CRC Handling"]
+
+    assert result.success is True
+    assert any(issue.severity == IssueSeverity.CRITICAL and "eval" in issue.message.lower() for issue in result.issues)
+    assert len(crc_checks) == 1
+    assert crc_checks[0].status == CheckStatus.FAILED
+    assert crc_checks[0].severity == IssueSeverity.WARNING
+    assert crc_checks[0].details["zip_entry"] == "data.pkl"
+    assert crc_checks[0].details["scan_phases"] == result.metadata["relaxed_crc_members"]["data.pkl"]
+    assert "pickle_scan" in crc_checks[0].details["scan_phases"]
+    assert "pickle_scan" in result.metadata["relaxed_crc_members"]["data.pkl"]
+
+
+def test_pytorch_zip_scanner_normal_archive_skips_relaxed_crc_signal(tmp_path: Path) -> None:
+    """Valid archives should stay on the strict member-read path."""
+    model_path = create_mock_pytorch_zip(tmp_path / "model.pt")
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert "relaxed_crc_members" not in result.metadata
+    assert not [check for check in result.checks if check.name == "PyTorch ZIP CRC Handling"]
 
 
 def test_pytorch_zip_scanner_invalid_zip(tmp_path):
