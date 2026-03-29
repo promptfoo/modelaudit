@@ -1,5 +1,11 @@
 """Tests for file iterator utility."""
 
+import logging
+from collections.abc import Iterator
+from pathlib import Path
+
+import pytest
+
 from modelaudit.utils.helpers.file_iterator import iterate_files_streaming
 
 
@@ -130,3 +136,90 @@ class TestIterateFilesStreaming:
         # Should be an iterator/generator
         assert hasattr(result, "__iter__")
         assert hasattr(result, "__next__")
+
+    def test_directory_iteration_is_lazy(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test that directory traversal does not exhaust the full file list up front."""
+        files = [tmp_path / f"file{i}.txt" for i in range(5)]
+        for file_path in files:
+            file_path.write_text("content")
+
+        iterated = 0
+        original_glob = Path.glob
+
+        def fake_glob(self: Path, pattern: str) -> Iterator[Path]:
+            nonlocal iterated
+            if self == tmp_path and pattern == "**/*":
+
+                def glob_iter() -> Iterator[Path]:
+                    nonlocal iterated
+                    for file_path in files:
+                        iterated += 1
+                        yield file_path
+
+                return glob_iter()
+
+            return original_glob(self, pattern)
+
+        monkeypatch.setattr(Path, "glob", fake_glob)
+
+        result = iterate_files_streaming(tmp_path)
+
+        first_item = next(result)
+
+        assert first_item == (files[0], False)
+        assert iterated == 2
+
+        remaining = list(result)
+
+        assert iterated == len(files)
+        assert remaining[-1] == (files[-1], True)
+
+    def test_single_matching_file_in_directory_is_marked_last(self, tmp_path: Path) -> None:
+        """Test that a single file match in a directory is marked as the last item."""
+        (tmp_path / "match.pkl").write_text("model")
+        (tmp_path / "ignore.txt").write_text("notes")
+
+        results = list(iterate_files_streaming(tmp_path, pattern="*.pkl"))
+
+        assert results == [(tmp_path / "match.pkl", True)]
+
+    def test_directory_entries_do_not_break_last_flag(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Test that interleaved directory entries are skipped without affecting is_last."""
+        first_file = tmp_path / "first.txt"
+        first_file.write_text("first")
+        subdir = tmp_path / "subdir"
+        subdir.mkdir()
+        second_file = tmp_path / "second.txt"
+        second_file.write_text("second")
+
+        def fake_glob(self: Path, pattern: str) -> Iterator[Path]:
+            if self == tmp_path and pattern == "**/*":
+                return iter([first_file, subdir, second_file])
+
+            return iter(())
+
+        monkeypatch.setattr(Path, "glob", fake_glob)
+
+        results = list(iterate_files_streaming(tmp_path))
+
+        assert results == [(first_file, False), (second_file, True)]
+
+    def test_empty_directory_logs_warning(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        """Test that empty directories emit a warning."""
+        with caplog.at_level(logging.WARNING, logger="modelaudit.utils.helpers.file_iterator"):
+            results = list(iterate_files_streaming(tmp_path))
+
+        assert results == []
+        assert f"No files found in {tmp_path} matching pattern **/*" in caplog.text
+
+    def test_nonexistent_path_logs_warning(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        """Test that nonexistent paths emit a warning."""
+        nonexistent = tmp_path / "nonexistent"
+
+        with caplog.at_level(logging.WARNING, logger="modelaudit.utils.helpers.file_iterator"):
+            results = list(iterate_files_streaming(nonexistent))
+
+        assert results == []
+        assert f"Path {nonexistent} is neither a file nor directory" in caplog.text

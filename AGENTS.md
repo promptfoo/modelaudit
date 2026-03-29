@@ -27,7 +27,7 @@ uv sync --extra all-ci
 # Pre-commit workflow (MUST run before every commit)
 uv run ruff format modelaudit/ tests/
 uv run ruff check --fix modelaudit/ tests/
-uv run mypy modelaudit/
+uv run mypy modelaudit/ tests/
 uv run pytest -n auto -m "not slow and not integration" --maxfail=1
 ```
 
@@ -36,7 +36,7 @@ uv run pytest -n auto -m "not slow and not integration" --maxfail=1
 1. **Understand:** Read nearby code, tests, and docs (`docs/agents/*.md`) before editing.
 2. **Plan:** For anything non-trivial, present a short multi-step plan; refine iteratively.
 3. **Implement:** Preserve security focus, follow `BaseScanner` patterns (see `docs/agents/architecture.md`), handle missing deps gracefully, and update `SCANNER_REGISTRY` when adding scanners.
-4. **Verify:** Run the validation commands above. Format/linters must be clean. Use targeted `pytest` when appropriate.
+4. **Verify:** Run the validation commands above. Format/linters must be clean. Use targeted `pytest` when appropriate, and type-check modified tests as part of the normal `mypy modelaudit/ tests/` pass.
 5. **Report:** Summarize changes with file references and note residual risks or follow-ups.
 
 ## Branch & Git Hygiene
@@ -65,6 +65,7 @@ gh pr create --title "feat: descriptive title" --body "Brief description"
 ```
 
 - Use non-interactive flags (`--no-edit`, `-m`). One command per invocation; avoid long `&&` chains.
+- When updating an existing PR, confirm the actual head branch with `gh pr view <number> --json headRefName` and sync that branch before editing or pushing.
 - If `.git/index.lock` exists and no git process is running, remove the lock file.
 - Add only intended paths; avoid committing artifacts. Prefer `gh run rerun <run-id>` over force-pushing to rerun CI.
 - Keep CHANGELOG entries in `[Unreleased]` when adding user-visible changes (Keep a Changelog format).
@@ -74,7 +75,7 @@ gh pr create --title "feat: descriptive title" --body "Brief description"
 ```bash
 uv run ruff check modelaudit/ tests/          # Lint (no errors)
 uv run ruff format --check modelaudit/ tests/ # Format (no changes)
-uv run mypy modelaudit/                       # Types (no errors)
+uv run mypy modelaudit/ tests/                # Types (no errors)
 uv run pytest -n auto -m "not slow and not integration" --maxfail=1
 ```
 
@@ -104,6 +105,17 @@ uv run pytest -n auto -m "not slow and not integration" --maxfail=1
 - Follow existing scanner patterns and update registries, CLI wiring, and docs as needed.
 - Add comprehensive tests, including edge cases and regression coverage.
 - Ensure compatibility across Python 3.10–3.13 and handle missing optional deps gracefully.
+
+## Testing & Routing Guardrails
+
+- Apply the test-style rules below to all new or modified tests, not just CVE coverage.
+- Use typed pytest tests: add `-> None`, annotate fixtures like `tmp_path: Path` / `monkeypatch: pytest.MonkeyPatch`, and prefer `pathlib` over `os.path`.
+- Keep fixtures deterministic and self-contained under `tmp_path`; never rely on host paths or global temp filenames.
+- If a new regression test must run on reduced CI lanes, add the file to `allowed_test_files` in `tests/conftest.py`.
+- Match local validation to the CI lane that will exercise the change when possible; if optional dependencies or Python-version gates prevent that, call it out explicitly in the PR.
+- For file routing, prefiltering, or archive-triage changes, add at least one malicious positive regression and one benign near-match negative regression.
+- Prefer trusted file structure or bounded content sniffing over suffix-only routing. Extension checks are a fallback, not a source of truth.
+- When a scan intentionally fails closed for coverage or safety reasons, make the behavior operationally explicit and test the message plus the relevant `success`, exit-code, and cache semantics.
 
 ## CVE Detection Checklist
 
