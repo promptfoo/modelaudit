@@ -143,14 +143,18 @@ class ZipScanner(BaseScanner):
         """Rewrite nested result locations so archive members, not temp files, are reported."""
         archive_location = f"{archive_path}:{entry_name}"
 
+        def _rewrite_archive_location(location: str | None) -> str:
+            if not location:
+                return archive_location
+            if location.startswith(tmp_path):
+                suffix = location[len(tmp_path) :]
+                if suffix.startswith(":"):
+                    return f"{archive_location}{suffix}"
+                return archive_location
+            return f"{archive_location} {location}"
+
         for issue in scan_result.issues:
-            if issue.location:
-                if issue.location.startswith(tmp_path):
-                    issue.location = issue.location.replace(tmp_path, archive_location, 1)
-                else:
-                    issue.location = f"{archive_location} {issue.location}"
-            else:
-                issue.location = archive_location
+            issue.location = _rewrite_archive_location(issue.location)
 
             existing_issue_entry = issue.details.get("zip_entry")
             issue.details["zip_entry"] = (
@@ -160,13 +164,7 @@ class ZipScanner(BaseScanner):
             )
 
         for check in scan_result.checks:
-            if check.location:
-                if check.location.startswith(tmp_path):
-                    check.location = check.location.replace(tmp_path, archive_location, 1)
-                else:
-                    check.location = f"{archive_location} {check.location}"
-            else:
-                check.location = archive_location
+            check.location = _rewrite_archive_location(check.location)
 
             existing_check_entry = check.details.get("zip_entry")
             check.details["zip_entry"] = (

@@ -288,10 +288,13 @@ class TensorFlowSavedModelScanner(BaseScanner):
         for root, _dirs, files in os.walk(dir_path):
             for file in files:
                 file_path = Path(root) / file
-                if any(
-                    file_path.is_relative_to(model_root / asset_dir_name)
-                    for asset_dir_name in ("assets", "assets.extra")
-                ) and file_path.is_symlink():
+                if (
+                    any(
+                        file_path.is_relative_to(model_root / asset_dir_name)
+                        for asset_dir_name in ("assets", "assets.extra")
+                    )
+                    and file_path.is_symlink()
+                ):
                     continue
                 # Look for potentially suspicious Python files
                 if file.endswith(".py"):

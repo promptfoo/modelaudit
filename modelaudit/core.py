@@ -210,6 +210,8 @@ def _add_scan_result_to_model(
 def _select_preferred_scanner_id(path: str, header_format: str, ext: str) -> str | None:
     """Select a scanner by trusted file structure, not just suffix."""
     if header_format == "zip":
+        if ext == ".skops":
+            return "skops"
         if is_torchserve_mar_archive(path):
             return "torchserve_mar"
         if is_keras_zip_archive(path, allow_config_only=ext == ".keras"):

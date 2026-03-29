@@ -156,13 +156,7 @@ class TarScanner(BaseScanner):
         archive_location = f"{archive_path}:{entry_name}"
 
         for issue in scan_result.issues:
-            if issue.location:
-                if issue.location.startswith(tmp_path):
-                    issue.location = issue.location.replace(tmp_path, archive_location, 1)
-                else:
-                    issue.location = f"{archive_location} {issue.location}"
-            else:
-                issue.location = archive_location
+            issue.location = self._rewrite_archive_location(issue.location, tmp_path, archive_location)
 
             existing_issue_entry = issue.details.get("tar_entry")
             issue.details["tar_entry"] = (
@@ -172,13 +166,7 @@ class TarScanner(BaseScanner):
             )
 
         for check in scan_result.checks:
-            if check.location:
-                if check.location.startswith(tmp_path):
-                    check.location = check.location.replace(tmp_path, archive_location, 1)
-                else:
-                    check.location = f"{archive_location} {check.location}"
-            else:
-                check.location = archive_location
+            check.location = self._rewrite_archive_location(check.location, tmp_path, archive_location)
 
             existing_check_entry = check.details.get("tar_entry")
             check.details["tar_entry"] = (
@@ -186,6 +174,19 @@ class TarScanner(BaseScanner):
                 if isinstance(existing_check_entry, str) and existing_check_entry
                 else entry_name
             )
+
+    @staticmethod
+    def _rewrite_archive_location(location: str | None, tmp_path: str, archive_location: str) -> str:
+        if not location:
+            return archive_location
+
+        if location.startswith(tmp_path):
+            suffix = location[len(tmp_path) :]
+            if suffix.startswith(":"):
+                return f"{archive_location}{suffix}"
+            return archive_location
+
+        return f"{archive_location} {location}"
 
     def _extract_member_to_tempfile(
         self,

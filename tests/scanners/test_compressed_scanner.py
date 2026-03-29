@@ -152,8 +152,11 @@ def test_compressed_scanner_surfaces_malicious_inner_findings(tmp_path: Path) ->
     scanner = CompressedScanner()
     result = scanner.scan(str(path))
 
-    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
-    assert any("eval" in issue.message.lower() for issue in result.issues)
+    critical_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL]
+
+    assert critical_issues
+    assert any("eval" in issue.message.lower() for issue in critical_issues)
+    assert any(issue.location == f"{path} -> malicious.pkl" for issue in critical_issues)
 
 
 def test_compressed_scanner_corrupt_stream_is_warning_not_critical(tmp_path: Path) -> None:

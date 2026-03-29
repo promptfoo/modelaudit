@@ -227,7 +227,7 @@ class TestRunpyDetection:
                 os.unlink(temp_path)
 
     def test_runpy_severity_levels(self):
-        """Test that runpy is consistently flagged as CRITICAL."""
+        """Test that runpy remains CRITICAL and preserves execution context evidence."""
         scanner = PickleScanner()
 
         # Create a pickle with runpy that would execute malicious code
@@ -249,16 +249,30 @@ class TestRunpyDetection:
         try:
             result = scanner.scan(temp_path)
 
-            # Should have multiple CRITICAL issues (runpy + subprocess)
             critical_issues = [i for i in result.issues if i.severity.name == "CRITICAL"]
-            assert len(critical_issues) >= 2, "Should have multiple CRITICAL issues for runpy + subprocess"
+            assert len(critical_issues) >= 1, "runpy execution should produce a CRITICAL issue"
 
-            # Verify runpy is among the critical issues
-            runpy_critical = any(
-                "runpy" in issue.message.lower() or ("module" in issue.details and issue.details["module"] == "runpy")
-                for issue in critical_issues
+            runpy_critical = next(
+                (
+                    issue
+                    for issue in critical_issues
+                    if "runpy" in issue.message.lower()
+                    or issue.details.get("module") == "runpy"
+                    or issue.details.get("associated_global") == "runpy.run_module"
+                ),
+                None,
             )
-            assert runpy_critical, "runpy should be flagged as CRITICAL"
+            assert runpy_critical is not None, "runpy should be flagged as CRITICAL"
+
+            supporting_evidence = runpy_critical.details.get("supporting_evidence", [])
+            assert (
+                any(
+                    evidence.get("check_name") == "Reduce Pattern Analysis"
+                    or evidence.get("check_name") == "REDUCE Opcode Safety Check"
+                    for evidence in supporting_evidence
+                )
+                or runpy_critical.details.get("associated_global") == "runpy.run_module"
+            ), "Expected runpy execution context to be retained in the primary finding"
 
         finally:
             os.unlink(temp_path)

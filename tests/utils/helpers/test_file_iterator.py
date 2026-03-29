@@ -183,9 +183,7 @@ class TestIterateFilesStreaming:
 
         assert results == [(tmp_path / "match.pkl", True)]
 
-    def test_directory_entries_do_not_break_last_flag(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_directory_entries_do_not_break_last_flag(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Test that interleaved directory entries are skipped without affecting is_last."""
         first_file = tmp_path / "first.txt"
         first_file.write_text("first")

@@ -269,11 +269,7 @@ def test_non_handler_python_logger_initialization_does_not_trigger_import_time_e
         entries={
             "handler.py": b"import utils\n\ndef handle(data, context):\n    return utils.transform(data)\n",
             "utils.py": (
-                b"import logging as log\n"
-                b"logger = log.getLogger(__name__)\n"
-                b"\n"
-                b"def transform(data):\n"
-                b"    return data\n"
+                b"import logging as log\nlogger = log.getLogger(__name__)\n\ndef transform(data):\n    return data\n"
             ),
             "weights.bin": b"weights",
         },
@@ -1173,8 +1169,7 @@ def test_scan_flags_direct_url_requirement_as_warning(tmp_path: Path) -> None:
     assert len(requirements_failures) == 1
     assert requirements_failures[0].severity == IssueSeverity.WARNING
     assert any(
-        finding["reason"] == "direct_url_install"
-        for finding in requirements_failures[0].details.get("findings", [])
+        finding["reason"] == "direct_url_install" for finding in requirements_failures[0].details.get("findings", [])
     )
 
 
@@ -1208,8 +1203,7 @@ def test_scan_flags_concatenated_editable_short_requirements_as_warning(
     assert len(requirements_failures) == 1
     assert requirements_failures[0].severity == IssueSeverity.WARNING
     assert any(
-        finding["reason"] == "editable_install"
-        for finding in requirements_failures[0].details.get("findings", [])
+        finding["reason"] == "editable_install" for finding in requirements_failures[0].details.get("findings", [])
     )
 
 
@@ -1232,8 +1226,7 @@ def test_scan_flags_bare_direct_url_with_userinfo_as_warning(tmp_path: Path) -> 
     assert len(requirements_failures) == 1
     assert requirements_failures[0].severity == IssueSeverity.WARNING
     assert any(
-        finding["reason"] == "direct_url_install"
-        for finding in requirements_failures[0].details.get("findings", [])
+        finding["reason"] == "direct_url_install" for finding in requirements_failures[0].details.get("findings", [])
     )
 
 

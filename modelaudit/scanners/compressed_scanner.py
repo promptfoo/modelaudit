@@ -304,15 +304,22 @@ class CompressedScanner(BaseScanner):
         return temp_path, total_out
 
     @staticmethod
+    def _rewrite_wrapper_location(location: str | None, temp_path: str, provenance: str) -> str:
+        if not location:
+            return provenance
+
+        if location.startswith(temp_path):
+            suffix = location[len(temp_path) :]
+            if suffix.startswith(":"):
+                return f"{provenance}{suffix}"
+            return provenance
+
+        return f"{provenance} {location}"
+
+    @staticmethod
     def _rewrite_inner_locations(inner_result: ScanResult, temp_path: str, provenance: str) -> None:
         for issue in inner_result.issues:
-            if issue.location:
-                if issue.location.startswith(temp_path):
-                    issue.location = issue.location.replace(temp_path, provenance, 1)
-                else:
-                    issue.location = f"{provenance} {issue.location}"
-            else:
-                issue.location = provenance
+            issue.location = CompressedScanner._rewrite_wrapper_location(issue.location, temp_path, provenance)
 
             if issue.details:
                 issue.details["compressed_wrapper"] = provenance
@@ -320,13 +327,7 @@ class CompressedScanner(BaseScanner):
                 issue.details = {"compressed_wrapper": provenance}
 
         for check in inner_result.checks:
-            if check.location:
-                if check.location.startswith(temp_path):
-                    check.location = check.location.replace(temp_path, provenance, 1)
-                else:
-                    check.location = f"{provenance} {check.location}"
-            else:
-                check.location = provenance
+            check.location = CompressedScanner._rewrite_wrapper_location(check.location, temp_path, provenance)
 
             if check.details:
                 check.details["compressed_wrapper"] = provenance
