@@ -48,7 +48,12 @@ _ASSET_PE_HEADER = b"MZ"  # Windows PE executables
 _ASSET_PICKLE_PREFIXES = tuple(bytes([0x80, protocol]) for protocol in range(2, 6))
 _ASSET_PROBE_BYTES = max(8192, PROTO0_1_MAX_PROBE_BYTES)
 _ASSET_PYTHON_PATTERN = re.compile(
-    r"(?m)(^\s*(?:from\s+\w[\w.]*\s+import\s+|import\s+\w[\w.]*|def\s+\w+\s*\(|class\s+\w+\s*[:(]))"
+    r"(?m)(^\s*(?:"
+    r"from\s+[A-Za-z_][\w.]*\s+import\s+"
+    r"|import\s+[A-Za-z_][\w.]*"
+    r"|def\s+[A-Za-z_]\w*\s*\("
+    r"|class\s+[A-Za-z_]\w*\s*[:(]"
+    r"))"
 )
 
 
@@ -252,9 +257,10 @@ class TensorFlowSavedModelScanner(BaseScanner):
     def _scan_saved_model_directory(self, dir_path: str) -> ScanResult:
         """Scan a SavedModel directory"""
         result = self._create_result()
+        model_root = Path(dir_path)
 
         # Look for saved_model.pb in the directory
-        saved_model_path = Path(dir_path) / "saved_model.pb"
+        saved_model_path = model_root / "saved_model.pb"
         if not saved_model_path.exists():
             result.add_check(
                 name="SavedModel Structure Check",
@@ -272,16 +278,21 @@ class TensorFlowSavedModelScanner(BaseScanner):
         result.merge(file_scan_result)
 
         # Check for keras_metadata.pb which contains Lambda layer definitions
-        keras_metadata_path = Path(dir_path) / "keras_metadata.pb"
+        keras_metadata_path = model_root / "keras_metadata.pb"
         if keras_metadata_path.exists():
             self._scan_keras_metadata(str(keras_metadata_path), result)
 
-        self._scan_saved_model_assets(Path(dir_path), result)
+        self._scan_saved_model_assets(model_root, result)
 
         # Check for other suspicious files in the directory
         for root, _dirs, files in os.walk(dir_path):
             for file in files:
                 file_path = Path(root) / file
+                if any(
+                    file_path.is_relative_to(model_root / asset_dir_name)
+                    for asset_dir_name in ("assets", "assets.extra")
+                ) and file_path.is_symlink():
+                    continue
                 # Look for potentially suspicious Python files
                 if file.endswith(".py"):
                     result.add_check(
@@ -349,7 +360,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
         """Scan SavedModel asset directories for suspicious executable content."""
         for assets_dir_name in ("assets", "assets.extra"):
             assets_dir = model_root / assets_dir_name
-            if not assets_dir.exists():
+            if not assets_dir.exists() and not assets_dir.is_symlink():
                 continue
 
             try:

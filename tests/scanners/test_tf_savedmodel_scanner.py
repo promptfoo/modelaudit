@@ -538,6 +538,22 @@ def test_savedmodel_assets_python_pattern_in_non_py_file_is_flagged(tmp_path: Pa
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_assets_numeric_class_labels_do_not_trigger_python_source_detection(tmp_path: Path) -> None:
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    asset_path = model_dir / "assets" / "labels.txt"
+    asset_path.write_text("class 1: dog\nclass 2: cat\n", encoding="utf-8")
+
+    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    matching_checks = [
+        check
+        for check in result.checks
+        if check.name == "SavedModel Assets Security Check" and check.location == str(asset_path)
+    ]
+
+    assert matching_checks == []
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 def test_savedmodel_assets_extra_pe_executable_is_flagged(tmp_path: Path) -> None:
     model_dir = Path(create_tf_savedmodel(tmp_path))
     extra_dir = model_dir / "assets.extra"
@@ -573,6 +589,25 @@ def test_savedmodel_asset_symlink_is_reported_without_following_target(tmp_path:
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_asset_symlink_is_not_followed_by_blacklist_scan(
+    tmp_path: Path,
+    requires_symlinks: None,
+) -> None:
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    external_text = tmp_path / "outside.txt"
+    external_text.write_text("contains suspicious_function\n", encoding="utf-8")
+    asset_path = model_dir / "assets" / "outside-link.txt"
+    asset_path.symlink_to(external_text)
+
+    result = TensorFlowSavedModelScanner(config={"blacklist_patterns": ["suspicious_function"]}).scan(str(model_dir))
+    asset_issues = [issue for issue in result.issues if issue.location == str(asset_path)]
+
+    assert asset_issues
+    assert any(issue.details.get("asset_kind") == "symlink" for issue in asset_issues)
+    assert all("blacklisted pattern" not in issue.message.lower() for issue in asset_issues)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 def test_savedmodel_asset_directory_symlink_is_not_traversed(tmp_path: Path) -> None:
     model_dir = Path(create_tf_savedmodel(tmp_path))
     external_dir = tmp_path / "outside-assets"
@@ -595,6 +630,25 @@ def test_savedmodel_asset_directory_symlink_is_not_traversed(tmp_path: Path) -> 
     assert all(issue.details.get("detected_content_type") == "unscannable_asset_dir" for issue in symlink_dir_issues)
     assert all(issue.details.get("asset_kind") == "symlink_directory" for issue in symlink_dir_issues)
     assert traversed_issues == []
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_dangling_asset_directory_symlink_is_reported(
+    tmp_path: Path,
+    requires_symlinks: None,
+) -> None:
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    extra_dir = model_dir / "assets.extra"
+    extra_dir.symlink_to(tmp_path / "missing-assets", target_is_directory=True)
+
+    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    symlink_dir_issues = [issue for issue in result.issues if issue.location == str(extra_dir)]
+
+    assert symlink_dir_issues
+    assert all(issue.severity == IssueSeverity.WARNING for issue in symlink_dir_issues)
+    assert all("symlinked asset directory" in issue.message.lower() for issue in symlink_dir_issues)
+    assert all(issue.details.get("detected_content_type") == "unscannable_asset_dir" for issue in symlink_dir_issues)
+    assert all(issue.details.get("asset_kind") == "symlink_directory" for issue in symlink_dir_issues)
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")

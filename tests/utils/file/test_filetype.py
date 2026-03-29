@@ -357,6 +357,24 @@ def test_detect_file_format_plain_text_binint1_prefix_not_pickle(tmp_path: Path)
     assert detect_file_format_from_magic(str(payload)) != "pickle"
 
 
+def test_detect_file_format_proto1_scalar_with_trailing_text_not_pickle(tmp_path: Path) -> None:
+    """A trivial scalar pickle prefix with trailing text should not force pickle detection."""
+    payload = tmp_path / "proto1-scalar-prefixed-notes.txt"
+    payload.write_bytes(b"K\x00.not a pickle stream")
+
+    assert detect_file_format(str(payload)) != "pickle"
+    assert detect_file_format_from_magic(str(payload)) != "pickle"
+
+
+def test_detect_file_format_empty_tuple_with_trailing_text_not_pickle(tmp_path: Path) -> None:
+    """A trivial tuple pickle prefix with trailing text should not force pickle detection."""
+    payload = tmp_path / "empty-tuple-prefixed-notes.txt"
+    payload.write_bytes(b").trailing text")
+
+    assert detect_file_format(str(payload)) != "pickle"
+    assert detect_file_format_from_magic(str(payload)) != "pickle"
+
+
 def test_detect_file_format_small_file(tmp_path):
     """Test detecting format of a very small file."""
     small_file = tmp_path / "small.dat"

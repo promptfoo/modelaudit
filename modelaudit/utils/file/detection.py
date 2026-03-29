@@ -78,6 +78,36 @@ MARKED_PROTOCOL0_GLOBAL_RE = re.compile(rb"^[\(\]\}]c[^\n\r]{1,64}\n[^\n\r]{1,64
 PROTO0_1_MAX_PROBE_BYTES: int = 64 * 1024
 PROTO0_1_MAX_PROBE_OPCODES: int = 4096
 PROTO0_1_START_BYTES: bytes = b"()]}cilp0FGIJKLMNSTUVX"
+PROTO0_1_IGNORABLE_TRAILING_BYTES: bytes = b" \t\r\n\x00"
+PROTO0_1_TRIVIAL_LEADING_OPCODES: frozenset[str] = frozenset(
+    {
+        "MARK",
+        "POP",
+        "PUT",
+        "EMPTY_TUPLE",
+        "EMPTY_LIST",
+        "EMPTY_DICT",
+        "LIST",
+        "INT",
+        "BININT",
+        "BININT1",
+        "BININT2",
+        "LONG",
+        "LONG1",
+        "LONG4",
+        "FLOAT",
+        "BINFLOAT",
+        "NONE",
+        "NEWTRUE",
+        "NEWFALSE",
+        "STRING",
+        "BINSTRING",
+        "SHORT_BINSTRING",
+        "UNICODE",
+        "BINUNICODE",
+        "SHORT_BINUNICODE",
+    },
+)
 
 
 def _looks_like_proto0_or_1_pickle(sample: bytes) -> bool:
@@ -91,11 +121,21 @@ def _looks_like_proto0_or_1_pickle(sample: bytes) -> bool:
             return False
 
         opcode_count = 0
+        first_opcode_name: str | None = None
         try:
             for opcode, _arg, _pos in pickletools.genops(candidate):
                 opcode_count += 1
+                if first_opcode_name is None:
+                    first_opcode_name = opcode.name
                 if opcode.name == "STOP":
-                    return opcode_count >= 2
+                    stop_pos = 0 if _pos is None else _pos
+                    trailing = candidate[stop_pos + 1 :]
+                    if not trailing or not trailing.strip(PROTO0_1_IGNORABLE_TRAILING_BYTES):
+                        return opcode_count >= 2
+                    if first_opcode_name not in PROTO0_1_TRIVIAL_LEADING_OPCODES:
+                        return opcode_count >= 2
+                    stripped_trailing = trailing.lstrip(PROTO0_1_IGNORABLE_TRAILING_BYTES)
+                    return bool(stripped_trailing) and _looks_like_proto0_or_1_pickle(stripped_trailing)
                 if opcode_count >= PROTO0_1_MAX_PROBE_OPCODES:
                     return False
         except Exception:
