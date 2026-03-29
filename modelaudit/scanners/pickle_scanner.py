@@ -2060,8 +2060,8 @@ def _is_safe_ml_global(mod: str, func: str) -> bool:
 
     current_mod = mod
     for part in func.split("."):
-        safe_funcs = ML_SAFE_GLOBALS.get(current_mod)
-        if safe_funcs is None or part not in safe_funcs:
+        nested_safe_funcs = ML_SAFE_GLOBALS.get(current_mod)
+        if nested_safe_funcs is None or part not in nested_safe_funcs:
             return False
         current_mod = f"{current_mod}.{part}"
 
@@ -2235,6 +2235,21 @@ class _PickleOpcodeAnalysis:
     opcode_budget_exceeded: bool = False
     timeout_exceeded: bool = False
     error: Exception | None = None
+
+
+_SEVERITY_PRIORITY = {
+    IssueSeverity.DEBUG: 0,
+    IssueSeverity.INFO: 1,
+    IssueSeverity.WARNING: 2,
+    IssueSeverity.CRITICAL: 3,
+}
+
+
+def _severity_priority(severity: IssueSeverity | None) -> int:
+    """Return an ordering key for failed-check severity comparisons."""
+    if severity is None:
+        return -1
+    return _SEVERITY_PRIORITY.get(severity, -1)
 
 
 def _resolve_copyreg_extension(code: Any, origin_index: int) -> _ResolvedImportRef:
@@ -5448,6 +5463,27 @@ class PickleScanner(BaseScanner):
             primary_ref_findings: dict[tuple[str, str], _PrimaryRefFinding] = {}
             pending_supporting_imports: dict[tuple[str, str], list[dict[str, Any]]] = {}
 
+            def _build_supporting_evidence(
+                *,
+                name: str,
+                message: str,
+                location: str,
+                details: dict[str, Any],
+                severity: IssueSeverity | None = None,
+                rule_code: str | None = None,
+            ) -> dict[str, Any]:
+                evidence = {
+                    "check_name": name,
+                    "message": message,
+                    "location": location,
+                    "details": dict(details),
+                }
+                if severity is not None:
+                    evidence["severity"] = severity.value
+                if rule_code is not None:
+                    evidence["rule_code"] = rule_code
+                return evidence
+
             def _append_supporting_evidence(record: _PrimaryRefFinding, evidence: dict[str, Any]) -> None:
                 for details_dict in (
                     result.checks[record.check_index].details,
@@ -5468,14 +5504,49 @@ class PickleScanner(BaseScanner):
                 why: str | None,
                 rule_code: str | None,
             ) -> bool:
-                evidence = {
-                    "check_name": name,
-                    "message": message,
-                    "location": location,
-                    "details": dict(details),
-                }
+                evidence = _build_supporting_evidence(
+                    name=name,
+                    message=message,
+                    location=location,
+                    details=details,
+                    severity=severity,
+                    rule_code=rule_code,
+                )
                 existing = primary_ref_findings.get(ref_key)
                 if existing is not None:
+                    existing_check = result.checks[existing.check_index]
+                    existing_issue = result.issues[existing.issue_index]
+                    if _severity_priority(severity) > _severity_priority(existing_check.severity):
+                        existing_details = dict(existing_check.details)
+                        previous_supporting = list(existing_details.pop("supporting_evidence", []))
+                        existing_details.pop("supporting_evidence_count", None)
+                        previous_primary = _build_supporting_evidence(
+                            name=existing_check.name,
+                            message=existing_check.message,
+                            location=existing_check.location or location,
+                            details=existing_details,
+                            severity=existing_check.severity,
+                            rule_code=existing_check.rule_code,
+                        )
+                        promoted_details = dict(details)
+                        if previous_supporting:
+                            promoted_details["supporting_evidence"] = previous_supporting
+                            promoted_details["supporting_evidence_count"] = len(previous_supporting)
+                        existing_check.name = name
+                        existing_check.message = message
+                        existing_check.severity = severity
+                        existing_check.location = location
+                        existing_check.details = promoted_details
+                        existing_check.why = why
+                        existing_check.rule_code = rule_code
+                        existing_issue.message = message
+                        existing_issue.severity = severity
+                        existing_issue.location = location
+                        existing_issue.details = dict(promoted_details)
+                        existing_issue.why = why
+                        existing_issue.rule_code = rule_code
+                        _append_supporting_evidence(existing, previous_primary)
+                        return False
                     _append_supporting_evidence(existing, evidence)
                     return False
 
@@ -5973,19 +6044,19 @@ class PickleScanner(BaseScanner):
                             )
                         )
                         # Determine rule code based on pattern
-                        rule_code = None
+                        string_rule_code: str | None = None
                         if "eval" in suspicious_pattern or "exec" in suspicious_pattern:
-                            rule_code = "S104"
+                            string_rule_code = "S104"
                         elif "os.system" in suspicious_pattern:
-                            rule_code = "S101"
+                            string_rule_code = "S101"
                         elif "subprocess" in suspicious_pattern:
-                            rule_code = "S103"
+                            string_rule_code = "S103"
                         elif "__import__" in suspicious_pattern:
-                            rule_code = "S106"
+                            string_rule_code = "S106"
                         elif "compile" in suspicious_pattern:
-                            rule_code = "S105"
+                            string_rule_code = "S105"
                         else:
-                            rule_code = get_generic_rule_code(suspicious_pattern)
+                            string_rule_code = get_generic_rule_code(suspicious_pattern)
 
                         result.add_check(
                             name="String Pattern Security Check",
@@ -5993,7 +6064,7 @@ class PickleScanner(BaseScanner):
                             message=f"Suspicious string pattern: {suspicious_pattern}",
                             severity=severity,
                             location=f"{self.current_file_path} (pos {pos})",
-                            rule_code=rule_code,
+                            rule_code=string_rule_code,
                             details={
                                 "position": pos,
                                 "opcode": opcode.name,
@@ -6307,9 +6378,9 @@ class PickleScanner(BaseScanner):
                 # Get rule code for the dangerous module
                 module_name = dangerous_pattern.get("module", "")
                 func_name = dangerous_pattern.get("function", "")
-                rule_code = get_import_rule_code(module_name, func_name)
-                if not rule_code:
-                    rule_code = "S201"  # REDUCE opcode
+                dangerous_pattern_rule_code = get_import_rule_code(module_name, func_name)
+                if not dangerous_pattern_rule_code:
+                    dangerous_pattern_rule_code = "S201"  # REDUCE opcode
                 location = f"{self.current_file_path} (pos {dangerous_pattern.get('position', 0)})"
                 details = {
                     **dangerous_pattern,
@@ -6330,7 +6401,7 @@ class PickleScanner(BaseScanner):
                         location=location,
                         details=details,
                         why=get_import_explanation(f"{module_name}.{func_name}"),
-                        rule_code=rule_code,
+                    rule_code=dangerous_pattern_rule_code,
                     ):
                         suspicious_count += 1
                 else:

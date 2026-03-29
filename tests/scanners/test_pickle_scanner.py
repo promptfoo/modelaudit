@@ -781,15 +781,27 @@ class TestPickleScannerAdvanced(unittest.TestCase):
         assert len(os_issues) > 0, f"Expected OS-related issues, but found: {[i.message for i in result.issues]}"
 
     def test_advanced_global_reference_issue_has_rule_code(self) -> None:
-        """Dangerous advanced global references should carry a rule code."""
+        """Dangerous advanced global references should keep a rule code on the primary finding."""
         scanner = PickleScanner()
         result = scanner.scan(str(Path(__file__).parent.parent / "assets" / "pickles" / "stack_global_attack.pkl"))
 
-        advanced_issues = [i for i in result.issues if i.message.startswith("Suspicious reference ")]
-        assert advanced_issues, f"Expected advanced global issues, got: {[i.message for i in result.issues]}"
-        assert all(i.rule_code for i in advanced_issues), (
-            f"Expected rule codes on advanced global issues, got: {[i.rule_code for i in advanced_issues]}"
+        reduce_checks = [
+            check
+            for check in result.checks
+            if check.name == "REDUCE Opcode Safety Check"
+            and check.status == CheckStatus.FAILED
+            and check.details.get("associated_global") == "posix.system"
+        ]
+        assert reduce_checks, f"Expected primary REDUCE finding, got: {[i.message for i in result.issues]}"
+        assert all(check.rule_code for check in reduce_checks), (
+            f"Expected rule codes on primary REDUCE findings, got: {[check.rule_code for check in reduce_checks]}"
         )
+        assert any(
+            evidence.get("check_name") == "STACK_GLOBAL Module Check"
+            and evidence.get("details", {}).get("import_reference") == "posix.system"
+            for check in reduce_checks
+            for evidence in check.details.get("supporting_evidence", [])
+        ), f"Expected folded STACK_GLOBAL evidence on posix.system finding: {reduce_checks}"
 
     def test_memo_object_tracking(self) -> None:
         scanner = PickleScanner()
@@ -973,18 +985,21 @@ class TestDillLoadersRegression:
 
                 result = scanner.scan(f.name)
 
-                stack_checks = [c for c in result.checks if c.name == "STACK_GLOBAL Module Check"]
-                assert stack_checks, "Expected STACK_GLOBAL Module Check"
-                assert any(
-                    c.status.value == "failed" and ("posix.system" in c.message or "os.system" in c.message)
-                    for c in stack_checks
-                ), f"Expected failed STACK_GLOBAL check for os/posix.system, got: {[c.message for c in stack_checks]}"
-
                 reduce_checks = [c for c in result.checks if c.name == "REDUCE Opcode Safety Check"]
-                assert any(
-                    c.status.value == "failed" and ("posix.system" in c.message or "os.system" in c.message)
+                matching_reduce_checks = [
+                    c
                     for c in reduce_checks
-                ), f"Expected REDUCE check to resolve os/posix.system, got: {[c.message for c in reduce_checks]}"
+                    if c.status.value == "failed" and ("posix.system" in c.message or "os.system" in c.message)
+                ]
+                assert matching_reduce_checks, (
+                    f"Expected REDUCE check to resolve os/posix.system, got: {[c.message for c in reduce_checks]}"
+                )
+                assert any(
+                    evidence.get("check_name") == "STACK_GLOBAL Module Check"
+                    and evidence.get("details", {}).get("import_reference") in {"os.system", "posix.system"}
+                    for check in matching_reduce_checks
+                    for evidence in check.details.get("supporting_evidence", [])
+                ), f"Expected folded STACK_GLOBAL evidence on REDUCE finding: {matching_reduce_checks}"
 
             finally:
                 os.unlink(f.name)
@@ -1461,17 +1476,23 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
 
         assert result.success
         assert result.has_errors
-        failed_global_checks = [
+        failed_reduce_checks = [
             check
             for check in result.checks
-            if check.name == "Global Module Reference Check"
+            if check.name == "REDUCE Opcode Safety Check"
             and check.status == CheckStatus.FAILED
             and check.severity == IssueSeverity.CRITICAL
+            and check.details.get("associated_global") == "builtins.hasattr"
         ]
-        assert any("builtins.hasattr" in check.message for check in failed_global_checks), (
-            f"Expected CRITICAL Global Module Reference Check for builtins.hasattr, "
-            f"got: {[check.message for check in failed_global_checks]}"
+        assert failed_reduce_checks, (
+            f"Expected CRITICAL REDUCE primary for builtins.hasattr, got: {[check.message for check in result.checks]}"
         )
+        assert any(
+            evidence.get("check_name") == "Global Module Reference Check"
+            and evidence.get("details", {}).get("import_reference") == "builtins.hasattr"
+            for check in failed_reduce_checks
+            for evidence in check.details.get("supporting_evidence", [])
+        ), f"Expected folded GLOBAL evidence on builtins.hasattr finding: {failed_reduce_checks}"
 
     def test_dunder_builtin_hasattr_is_critical(self) -> None:
         """__builtin__.hasattr must not be allowlisted as safe."""
@@ -1479,17 +1500,24 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
 
         assert result.success
         assert result.has_errors
-        failed_global_checks = [
+        failed_reduce_checks = [
             check
             for check in result.checks
-            if check.name == "Global Module Reference Check"
+            if check.name == "REDUCE Opcode Safety Check"
             and check.status == CheckStatus.FAILED
             and check.severity == IssueSeverity.CRITICAL
+            and check.details.get("associated_global") == "__builtin__.hasattr"
         ]
-        assert any("__builtin__.hasattr" in check.message for check in failed_global_checks), (
-            f"Expected CRITICAL Global Module Reference Check for __builtin__.hasattr, "
-            f"got: {[check.message for check in failed_global_checks]}"
+        assert failed_reduce_checks, (
+            f"Expected CRITICAL REDUCE primary for __builtin__.hasattr, got: "
+            f"{[check.message for check in result.checks]}"
         )
+        assert any(
+            evidence.get("check_name") == "Global Module Reference Check"
+            and evidence.get("details", {}).get("import_reference") == "__builtin__.hasattr"
+            for check in failed_reduce_checks
+            for evidence in check.details.get("supporting_evidence", [])
+        ), f"Expected folded GLOBAL evidence on __builtin__.hasattr finding: {failed_reduce_checks}"
 
     def test_safe_builtins_remain_allowlisted(self) -> None:
         """Safe reconstruction builtins must remain non-failing."""
@@ -1544,17 +1572,24 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
 
         assert result.success
         assert result.has_errors
-        failed_stack_global_checks = [
+        failed_reduce_checks = [
             check
             for check in result.checks
-            if check.name == "STACK_GLOBAL Module Check"
+            if check.name == "REDUCE Opcode Safety Check"
             and check.status == CheckStatus.FAILED
             and check.severity == IssueSeverity.CRITICAL
+            and check.details.get("associated_global") == "builtins.hasattr"
         ]
-        assert any("builtins.hasattr" in check.message for check in failed_stack_global_checks), (
-            f"Expected CRITICAL STACK_GLOBAL Module Check for builtins.hasattr, "
-            f"got: {[check.message for check in failed_stack_global_checks]}"
+        assert failed_reduce_checks, (
+            f"Expected CRITICAL REDUCE primary for builtins.hasattr STACK_GLOBAL payload, "
+            f"got: {[check.message for check in result.checks]}"
         )
+        assert any(
+            evidence.get("check_name") == "STACK_GLOBAL Module Check"
+            and evidence.get("details", {}).get("import_reference") == "builtins.hasattr"
+            for check in failed_reduce_checks
+            for evidence in check.details.get("supporting_evidence", [])
+        ), f"Expected folded STACK_GLOBAL evidence on builtins.hasattr finding: {failed_reduce_checks}"
 
     def test_framed_protocol_four_stack_global_import_only_is_critical(self) -> None:
         """A framed protocol-4 pickle should still surface dangerous STACK_GLOBAL refs."""
@@ -2593,6 +2628,69 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
         """EXT-origin functools.partialmethod must remain CRITICAL."""
         self._assert_ext_resolved_functools_ref_is_critical("partialmethod")
 
+    def test_multistream_functools_partial_promotes_warning_to_critical(self) -> None:
+        """A later EXT-resolved functools.partial must upgrade an earlier warning primary."""
+        import copyreg
+        from contextlib import suppress
+
+        inverted_registry = getattr(copyreg, "_inverted_registry", {})
+        extension_registry = getattr(copyreg, "_extension_registry", {})
+        existing_code = extension_registry.get(("functools", "partial"))
+        ext_code = next((candidate for candidate in range(1, 256) if candidate not in inverted_registry), None)
+        if ext_code is None:
+            pytest.skip("No free copyreg extension code available in range 1-255")
+
+        try:
+            if isinstance(existing_code, int):
+                with suppress(ValueError):
+                    copyreg.remove_extension("functools", "partial", existing_code)
+
+            copyreg.add_extension("functools", "partial", ext_code)
+            try:
+                payload = self._craft_global_reduce_pickle("functools", "partial")
+                payload += b"\x80\x02\x82" + bytes([ext_code]) + b")R."
+
+                result = self._scan_bytes(payload)
+
+                assert result.success
+                assert result.has_errors
+
+                reduce_checks = [
+                    check
+                    for check in result.checks
+                    if check.name == "REDUCE Opcode Safety Check"
+                    and check.status == CheckStatus.FAILED
+                    and check.details.get("associated_global") == "functools.partial"
+                ]
+                assert len(reduce_checks) == 1, [check.details for check in result.checks]
+                reduce_check = reduce_checks[0]
+                assert reduce_check.severity == IssueSeverity.CRITICAL, reduce_check.details
+                assert reduce_check.details.get("origin_is_ext") is True, reduce_check.details
+                assert any(
+                    evidence.get("check_name") == "REDUCE Opcode Safety Check"
+                    and evidence.get("severity") == IssueSeverity.WARNING.value
+                    and evidence.get("details", {}).get("associated_global") == "functools.partial"
+                    and evidence.get("details", {}).get("origin_is_ext") is not True
+                    for evidence in reduce_check.details.get("supporting_evidence", [])
+                ), (
+                    "Expected warning REDUCE evidence to be folded into promoted "
+                    f"functools.partial finding: {reduce_check.details}"
+                )
+
+                partial_issues = [issue for issue in result.issues if "functools.partial" in issue.message.lower()]
+                assert partial_issues, [issue.message for issue in result.issues]
+                assert all(issue.severity == IssueSeverity.CRITICAL for issue in partial_issues), (
+                    f"Expected surviving functools.partial issue to remain CRITICAL, got: "
+                    f"{[(issue.severity, issue.message) for issue in partial_issues]}"
+                )
+            finally:
+                with suppress(ValueError):
+                    copyreg.remove_extension("functools", "partial", ext_code)
+        finally:
+            if isinstance(existing_code, int):
+                with suppress(ValueError):
+                    copyreg.add_extension("functools", "partial", existing_code)
+
     # ------------------------------------------------------------------
     # Fix 4: NEWOBJ_EX with dangerous class
     # ------------------------------------------------------------------
@@ -3138,7 +3236,7 @@ def test_scan_legitimate_pytorch_pickle_memory_error_is_non_failing(
     monkeypatch.setattr(
         PickleScanner,
         "_extract_globals_advanced",
-        lambda self, file_obj, multiple_pickles=True: {("torch", "OrderedDict", "GLOBAL")},
+        lambda self, file_obj, multiple_pickles=True, **kwargs: {("torch", "OrderedDict", "GLOBAL")},
     )
 
     result = PickleScanner().scan(str(model_path))
@@ -3182,7 +3280,7 @@ def test_scan_legitimate_pytorch_bin_memory_error_is_informational(
     monkeypatch.setattr(
         PickleScanner,
         "_extract_globals_advanced",
-        lambda self, file_obj, multiple_pickles=True: {
+        lambda self, file_obj, multiple_pickles=True, **kwargs: {
             ("torch._utils", "_rebuild_tensor_v2", "GLOBAL"),
             ("collections", "OrderedDict", "GLOBAL"),
         },
@@ -3216,7 +3314,7 @@ def test_scan_dill_memory_error_without_dill_globals_not_downgraded(
     monkeypatch.setattr(
         PickleScanner,
         "_extract_globals_advanced",
-        lambda self, file_obj, multiple_pickles=True, scan_start_time=None: set(),
+        lambda self, file_obj, multiple_pickles=True, **kwargs: set(),
     )
 
     result = PickleScanner().scan(str(model_path))
@@ -3241,7 +3339,7 @@ def test_scan_joblib_memory_error_requires_joblib_globals(tmp_path: Path, monkey
     monkeypatch.setattr(
         PickleScanner,
         "_extract_globals_advanced",
-        lambda self, file_obj, multiple_pickles=True, scan_start_time=None: {
+        lambda self, file_obj, multiple_pickles=True, **kwargs: {
             ("joblib.numpy_pickle", "NumpyArrayWrapper", "GLOBAL")
         },
     )
@@ -3276,7 +3374,7 @@ def test_scan_joblib_memory_error_without_joblib_globals_not_downgraded(
     monkeypatch.setattr(
         PickleScanner,
         "_extract_globals_advanced",
-        lambda self, file_obj, multiple_pickles=True, scan_start_time=None: set(),
+        lambda self, file_obj, multiple_pickles=True, **kwargs: set(),
     )
 
     result = PickleScanner().scan(str(model_path))
@@ -3303,7 +3401,7 @@ def test_scan_dill_memory_error_with_dill_globals_is_informational(
     monkeypatch.setattr(
         PickleScanner,
         "_extract_globals_advanced",
-        lambda self, file_obj, multiple_pickles=True, scan_start_time=None: {("dill", "dump", "GLOBAL")},
+        lambda self, file_obj, multiple_pickles=True, **kwargs: {("dill", "dump", "GLOBAL")},
     )
 
     result = PickleScanner().scan(str(model_path))
@@ -3332,7 +3430,7 @@ def test_scan_plain_dill_memory_error_without_globals_is_informational(
     monkeypatch.setattr(
         PickleScanner,
         "_extract_globals_advanced",
-        lambda self, file_obj, multiple_pickles=True, scan_start_time=None: set(),
+        lambda self, file_obj, multiple_pickles=True, **kwargs: set(),
     )
 
     result = PickleScanner().scan(str(model_path))
@@ -3361,7 +3459,7 @@ def test_scan_dill_memory_error_with_internal_dill_globals_is_informational(
     monkeypatch.setattr(
         PickleScanner,
         "_extract_globals_advanced",
-        lambda self, file_obj, multiple_pickles=True, scan_start_time=None: {("_dill", "dump", "GLOBAL")},
+        lambda self, file_obj, multiple_pickles=True, **kwargs: {("_dill", "dump", "GLOBAL")},
     )
 
     result = PickleScanner().scan(str(model_path))
@@ -3390,7 +3488,7 @@ def test_scan_joblib_memory_error_with_dangerous_prefix_not_downgraded(
     monkeypatch.setattr(
         PickleScanner,
         "_extract_globals_advanced",
-        lambda self, file_obj, multiple_pickles=True, scan_start_time=None: set(),
+        lambda self, file_obj, multiple_pickles=True, **kwargs: set(),
     )
 
     result = PickleScanner().scan(str(model_path))
@@ -3422,7 +3520,7 @@ def test_scan_memory_error_with_dangerous_globals_not_downgraded(
     monkeypatch.setattr(
         PickleScanner,
         "_extract_globals_advanced",
-        lambda self, file_obj, multiple_pickles=True, scan_start_time=None: {("builtins", "eval", "GLOBAL")},
+        lambda self, file_obj, multiple_pickles=True, **kwargs: {("builtins", "eval", "GLOBAL")},
     )
 
     result = PickleScanner().scan(str(model_path))
