@@ -45,34 +45,34 @@ from modelaudit.utils.lfs import check_lfs_pointer, get_lfs_issue_details, get_l
 
 logger = logging.getLogger("modelaudit.core")
 
-OPERATIONAL_ERROR_INDICATORS = (
-    "Error during scan",
-    "Error checking file size",
-    "Error scanning file",
-    "Scanner crashed",
-    "Scan timeout",
-    "Path does not exist",
-    "Path is not readable",
-    "Permission denied",
-    "File not found",
-    "not installed, cannot scan",
-    "Missing dependency",
-    "Import error",
-    "Module not found",
-    "not a valid",
-    "Invalid file format",
-    "Corrupted file",
-    "Bad file signature",
-    "Unable to parse",
-    "Out of memory",
-    "Disk space",
-    "Too many open files",
-)
+_OPERATIONAL_ERROR_METADATA_KEY = "operational_error"
+_OPERATIONAL_ERROR_REASON_METADATA_KEY = "operational_error_reason"
 
 
-def _has_operational_error_message(message: Any) -> bool:
-    """Return True when an issue message reflects an operational scan failure."""
-    return isinstance(message, str) and any(indicator in message for indicator in OPERATIONAL_ERROR_INDICATORS)
+def _mark_operational_scan_error(scan_result: ScanResult, reason: str) -> None:
+    """Mark a scan result as an operational failure for exit-code aggregation."""
+    scan_result.metadata[_OPERATIONAL_ERROR_METADATA_KEY] = True
+    scan_result.metadata[_OPERATIONAL_ERROR_REASON_METADATA_KEY] = reason
+
+
+def _scan_result_has_operational_error(scan_result: ScanResult) -> bool:
+    """Return True when a scan result represents an operational failure."""
+    metadata = scan_result.metadata or {}
+    explicit_flag = metadata.get(_OPERATIONAL_ERROR_METADATA_KEY)
+    if explicit_flag is not None:
+        return bool(explicit_flag)
+
+    return False
+
+
+def _results_have_operational_error(results: ModelAuditResultModel) -> bool:
+    """Return True when aggregated results include an operational failure."""
+    if getattr(results, "has_errors", False):
+        return True
+
+    return any(
+        bool(metadata.get(_OPERATIONAL_ERROR_METADATA_KEY)) for metadata in (results.file_metadata or {}).values()
+    )
 
 
 def _to_telemetry_severity(severity: Any) -> str:
@@ -130,6 +130,8 @@ def _add_scan_result_to_model(
         and file_result.scanner_name != "unknown"
     ):
         results.scanner_names.append(file_result.scanner_name)
+    if _scan_result_has_operational_error(file_result):
+        scan_metadata["has_operational_errors"] = True
 
     # Convert and add issues
     for issue in file_result.issues:
@@ -678,6 +680,7 @@ def scan_model_directory_or_file(
     scan_metadata = {
         "path": path,
         "success": True,
+        "has_operational_errors": False,
         "scanners": [],  # Track the scanners used (different from scanner_names)
     }
     # Track file hashes for aggregate hash computation
@@ -740,6 +743,8 @@ def scan_model_directory_or_file(
                 _consolidate_checks(results)
             except Exception as e:
                 logger.warning(f"Error consolidating checks ({type(e).__name__}): {e!s}", exc_info=e)
+            results.has_errors = bool(scan_metadata.get("has_operational_errors", False))
+            results.success = bool(scan_metadata.get("success", True)) and not results.has_errors
             results.finalize_statistics()
             return results
 
@@ -893,6 +898,8 @@ def scan_model_directory_or_file(
                         check_interrupted()
 
                         file_result = scan_file(representative_file, config)
+                        if _scan_result_has_operational_error(file_result):
+                            scan_metadata["has_operational_errors"] = True
                         results.bytes_scanned += file_result.bytes_scanned
                         results.files_scanned += len(file_paths)  # Count all copies
                         processed_files += len(file_paths)  # Count all copies for progress
@@ -1123,21 +1130,11 @@ def scan_model_directory_or_file(
     except Exception as e:
         logger.warning(f"Error checking license warnings: {e!s}")
 
-    # Determine if there were operational scan errors vs security findings
-    # has_errors should only be True for operational errors (scanner crashes,
-    # file not found, etc.) not for security findings detected in models
-    # Check for operational errors in issues
-    results.has_errors = (
-        any(
-            _has_operational_error_message(issue.message)
-            for issue in results.issues
-            if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-        )
-        or not scan_metadata["success"]
-    )
+    # Determine if there were operational scan errors vs security findings.
+    results.has_errors = bool(scan_metadata.get("has_operational_errors", False) or not scan_metadata["success"])
 
     # Set success flag for backward compatibility
-    results.success = bool(scan_metadata.get("success", True))
+    results.success = bool(scan_metadata.get("success", True)) and not results.has_errors
 
     # Compute aggregate content hash if we collected file hashes
     if file_hashes:
@@ -1169,7 +1166,7 @@ def determine_exit_code(results: ModelAuditResultModel) -> int:
         Exit code (0, 1, or 2)
     """
     # Check for operational errors first (highest priority)
-    if getattr(results, "has_errors", False):
+    if _results_have_operational_error(results):
         return 2
 
     # Check for any security findings before treating zero scanned files as
@@ -1341,6 +1338,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             severity=IssueSeverity.INFO,
             details={"error": str(e), "path": path},
         )
+        _mark_operational_scan_error(sr, "file_size_check_failed")
         sr.finish(success=False)
         return sr
 
@@ -1364,6 +1362,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                 "hint": "Consider using extreme large model support for files over 50GB",
             },
         )
+        _mark_operational_scan_error(sr, "max_file_size_exceeded")
         sr.finish(success=False)
         return sr
 
@@ -1482,6 +1481,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                 location=path,
                 details={"timeout": config.get("timeout", 3600), "error": str(e)},
             )
+            _mark_operational_scan_error(result, "scan_timeout")
             result.finish(success=False)
     else:
         # Use registry's lazy loading method to avoid loading all scanners
@@ -1519,6 +1519,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                     location=path,
                     details={"timeout": config.get("timeout", 3600), "error": str(e)},
                 )
+                _mark_operational_scan_error(result, "scan_timeout")
                 result.finish(success=False)
         else:
             format_ = header_format
@@ -1704,9 +1705,7 @@ def scan_model_streaming(
                     if report_path != resolved_report_path:
                         metadata_dict.setdefault("source_path", report_path)
                         metadata_dict.setdefault("resolved_path", resolved_report_path)
-                    operational_scan_failure = any(
-                        _has_operational_error_message(issue.message) for issue in (scan_result.issues or [])
-                    )
+                    operational_scan_failure = _scan_result_has_operational_error(scan_result)
 
                     existing_hashes = metadata_dict.get("file_hashes")
                     if isinstance(existing_hashes, dict):
@@ -1765,6 +1764,7 @@ def scan_model_streaming(
 
         # Finalize statistics
         results.finalize_statistics()
+        results.success = not _results_have_operational_error(results)
 
     except Exception as e:
         logger.error(f"Streaming scan failed: {e}")

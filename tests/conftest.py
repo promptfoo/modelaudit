@@ -15,11 +15,11 @@ import pytest
 # Framework availability detection (cached for performance)
 # ============================================================================
 def _check_framework(name: str) -> bool:
-    """Check if a framework is available."""
+    """Check if a framework can be imported successfully."""
     try:
         __import__(name)
         return True
-    except ImportError:
+    except Exception:
         return False
 
 
@@ -105,6 +105,7 @@ def pytest_runtest_setup(item):
             "test_mxnet_scanner.py",  # MXNet scanner tests
             "test_filetype.py",  # File type detection and validation tests
             "test_tf_metagraph_scanner.py",  # TensorFlow MetaGraph scanner tests
+            "test_tf_savedmodel_scanner.py",  # TensorFlow SavedModel scanner tests
             "test_torchserve_mar_scanner.py",  # TorchServe .mar scanner tests
             "test_executorch_scanner.py",  # ExecuTorch scanner tests
             "test_telemetry.py",  # telemetry payload and availability tests
