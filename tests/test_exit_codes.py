@@ -336,3 +336,24 @@ def test_scan_result_operational_flag_keeps_exit_code_2(tmp_path) -> None:
     assert results.has_errors is True
     assert results.success is False
     assert determine_exit_code(results) == 2
+
+
+def test_scan_result_info_only_failed_scan_without_operational_flag_keeps_exit_code_0(tmp_path) -> None:
+    """Informational failed scans should stay clean without explicit operational metadata."""
+    test_file = tmp_path / "trailing.npy"
+    test_file.write_bytes(b"payload")
+
+    scan_result = ScanResult(scanner_name="numpy")
+    scan_result.add_issue(
+        "Object-dtype payload contains trailing bytes after the embedded pickle stream",
+        severity=IssueSeverity.INFO,
+        location=str(test_file),
+    )
+    scan_result.finish(success=False)
+
+    with patch("modelaudit.core.scan_file", return_value=scan_result):
+        results = scan_model_directory_or_file(str(test_file))
+
+    assert results.has_errors is False
+    assert results.success is True
+    assert determine_exit_code(results) == 0

@@ -62,10 +62,7 @@ def _scan_result_has_operational_error(scan_result: ScanResult) -> bool:
     if explicit_flag is not None:
         return bool(explicit_flag)
 
-    if scan_result.success or metadata.get("scanner_limitation"):
-        return False
-
-    return not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in scan_result.issues)
+    return False
 
 
 def _results_have_operational_error(results: ModelAuditResultModel) -> bool:
