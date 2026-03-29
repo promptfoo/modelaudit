@@ -915,15 +915,22 @@ class TestDillLoadersRegression:
 
                 result = scanner.scan(f.name)
 
-                reduce_pattern_checks = [c for c in result.checks if c.name == "Reduce Pattern Analysis"]
-                assert reduce_pattern_checks, "Expected Reduce Pattern Analysis check"
-                assert any(c.status.value == "failed" for c in reduce_pattern_checks), (
-                    "Reduce Pattern Analysis should fail for memoized posix.system REDUCE target"
-                )
-                assert any("posix.system" in c.message for c in reduce_pattern_checks), (
-                    "Expected posix.system in Reduce Pattern Analysis message: "
-                    f"{[c.message for c in reduce_pattern_checks]}"
-                )
+                reduce_checks = [
+                    c
+                    for c in result.checks
+                    if c.name == "REDUCE Opcode Safety Check"
+                    and c.status == CheckStatus.FAILED
+                    and c.details.get("associated_global") == "posix.system"
+                ]
+                assert reduce_checks, "Expected REDUCE detection for memoized posix.system target"
+                assert any(
+                    evidence.get("check_name") == "Reduce Pattern Analysis"
+                    for check in reduce_checks
+                    for evidence in check.details.get("supporting_evidence", [])
+                ), f"Expected Reduce Pattern Analysis evidence to fold into REDUCE finding: {result.checks}"
+                assert not any(
+                    c.name == "Reduce Pattern Analysis" and c.status == CheckStatus.FAILED for c in result.checks
+                ), f"Expected memoized reduce root cause to be deduplicated: {result.checks}"
 
             finally:
                 os.unlink(f.name)
@@ -2510,19 +2517,20 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
             f"Unexpected REDUCE severities for {target}: {[(check.severity, check.message) for check in reduce_checks]}"
         )
 
-        reduce_pattern_checks = [
-            check
-            for check in result.checks
-            if check.name == "Reduce Pattern Analysis"
+        assert any(
+            evidence.get("check_name") == "Reduce Pattern Analysis"
+            and evidence.get("details", {}).get("module") == "functools"
+            and evidence.get("details", {}).get("function") == function_name
+            for check in reduce_checks
+            for evidence in check.details.get("supporting_evidence", [])
+        ), f"Expected reduce-pattern evidence to fold into {target}: {result.checks}"
+        assert not any(
+            check.name == "Reduce Pattern Analysis"
             and check.status == CheckStatus.FAILED
             and check.details.get("module") == "functools"
             and check.details.get("function") == function_name
-        ]
-        assert reduce_pattern_checks, [check.message for check in result.checks]
-        assert all(check.severity == expected_severity for check in reduce_pattern_checks), (
-            f"Unexpected reduce-pattern severities for {target}: "
-            f"{[(check.severity, check.message) for check in reduce_pattern_checks]}"
-        )
+            for check in result.checks
+        ), f"Expected {target} reduce-pattern failure to be deduplicated: {result.checks}"
 
     def test_functools_reduce_remains_critical(self) -> None:
         """functools.reduce must remain CRITICAL even while partial stays WARNING."""
@@ -3616,16 +3624,23 @@ def test_extract_globals_advanced_skips_symbolic_post_processing_after_timeout(
         yield (type("Op", (), {"name": "GLOBAL"})(), "early func", 0)
         yield (type("Op", (), {"name": "STACK_GLOBAL"})(), None, 1)
 
-    def _fake_build_symbolic_reference_maps(
+    def _fake_simulate_symbolic_reference_maps(
         opcodes: list[tuple[object, object, int | None]],
-    ) -> tuple[dict[int, tuple[str, str]], dict[int, tuple[str, str]]]:
+    ) -> tuple[
+        dict[int, tuple[str, str]],
+        dict[int, tuple[str, str]],
+        dict[int, int],
+        dict[int, bool],
+        dict[int, dict[str, str]],
+        dict[int, object],
+    ]:
         build_calls.append(opcodes)
-        return {}, {}
+        return {}, {}, {}, {}, {}, {}
 
     monkeypatch.setattr("modelaudit.scanners.pickle_scanner._genops_with_fallback", _fake_genops_with_fallback)
     monkeypatch.setattr(
-        "modelaudit.scanners.pickle_scanner._build_symbolic_reference_maps",
-        _fake_build_symbolic_reference_maps,
+        "modelaudit.scanners.pickle_scanner._simulate_symbolic_reference_maps",
+        _fake_simulate_symbolic_reference_maps,
     )
     monkeypatch.setattr("modelaudit.scanners.pickle_scanner.time.time", lambda: 102.0)
 
@@ -4093,7 +4108,7 @@ class TestPickleImportOnlyGlobalFindings:
         assert not import_only_failures, [c.message for c in import_only_failures]
         assert any(c.name == "REDUCE Opcode Safety Check" and c.status == CheckStatus.FAILED for c in result.checks)
 
-    def test_same_reference_import_only_origin_is_not_suppressed_by_later_reduce(self, tmp_path: Path) -> None:
+    def test_same_reference_import_only_origin_is_folded_into_later_reduce(self, tmp_path: Path) -> None:
         scanner = PickleScanner()
         payload_path = tmp_path / "import_only_then_reduce.pkl"
         payload_path.write_bytes(b"cevilpkg\nthing\ncevilpkg\nthing\n(tR.")
@@ -4108,17 +4123,31 @@ class TestPickleImportOnlyGlobalFindings:
             and c.details.get("import_only") is True
             and c.details.get("import_reference") == "evilpkg.thing"
         ]
-        assert len(import_only_failures) == 1
-        assert any(
-            c.name == "REDUCE Opcode Safety Check"
+        assert not import_only_failures, [c.details for c in result.checks]
+
+        reduce_checks = [
+            c
+            for c in result.checks
+            if c.name == "REDUCE Opcode Safety Check"
             and c.status == CheckStatus.FAILED
             and c.details.get("associated_global") == "evilpkg.thing"
+        ]
+        assert len(reduce_checks) == 1, [c.details for c in result.checks]
+        assert any(
+            evidence.get("check_name") == "Global Module Reference Check"
+            and evidence.get("details", {}).get("import_only") is True
+            and evidence.get("details", {}).get("import_reference") == "evilpkg.thing"
+            for evidence in reduce_checks[0].details.get("supporting_evidence", [])
+        ), f"Expected folded import-only evidence on REDUCE finding: {reduce_checks[0].details}"
+        assert not any(
+            c.name == "Reduce Pattern Analysis"
+            and c.status == CheckStatus.FAILED
+            and c.details.get("module") == "evilpkg"
+            and c.details.get("function") == "thing"
             for c in result.checks
-        )
+        ), f"Expected single primary finding for evilpkg.thing: {result.checks}"
 
-    def test_same_stack_global_reference_import_only_origin_is_not_suppressed_by_later_reduce(
-        self, tmp_path: Path
-    ) -> None:
+    def test_same_stack_global_reference_import_only_origin_is_folded_into_later_reduce(self, tmp_path: Path) -> None:
         scanner = PickleScanner()
         payload_path = tmp_path / "stack_global_import_only_then_reduce.pkl"
         payload_path.write_bytes(
@@ -4141,13 +4170,65 @@ class TestPickleImportOnlyGlobalFindings:
             and c.details.get("import_only") is True
             and c.details.get("import_reference") == "evilpkg.thing"
         ]
-        assert len(import_only_failures) == 1
-        assert any(
-            c.name == "REDUCE Opcode Safety Check"
+        assert not import_only_failures, [c.details for c in result.checks]
+
+        reduce_checks = [
+            c
+            for c in result.checks
+            if c.name == "REDUCE Opcode Safety Check"
             and c.status == CheckStatus.FAILED
             and c.details.get("associated_global") == "evilpkg.thing"
+        ]
+        assert len(reduce_checks) == 1, [c.details for c in result.checks]
+        assert any(
+            evidence.get("check_name") == "STACK_GLOBAL Module Check"
+            and evidence.get("details", {}).get("import_only") is True
+            and evidence.get("details", {}).get("import_reference") == "evilpkg.thing"
+            for evidence in reduce_checks[0].details.get("supporting_evidence", [])
+        ), f"Expected folded STACK_GLOBAL evidence on REDUCE finding: {reduce_checks[0].details}"
+        assert not any(
+            c.name == "Reduce Pattern Analysis"
+            and c.status == CheckStatus.FAILED
+            and c.details.get("module") == "evilpkg"
+            and c.details.get("function") == "thing"
             for c in result.checks
-        )
+        ), f"Expected single primary finding for evilpkg.thing: {result.checks}"
+
+    def test_same_reference_across_streams_is_folded_into_single_primary_finding(self, tmp_path: Path) -> None:
+        scanner = PickleScanner()
+        payload_path = tmp_path / "multistream_import_then_reduce.pkl"
+        payload_path.write_bytes(b"cos\nsystem\n." + b"cos\nsystem\n(Vecho hi\ntR.")
+
+        result = scanner.scan(str(payload_path))
+
+        primary_reduce_checks = [
+            c
+            for c in result.checks
+            if c.name == "REDUCE Opcode Safety Check"
+            and c.status == CheckStatus.FAILED
+            and c.details.get("associated_global") == "os.system"
+        ]
+        assert len(primary_reduce_checks) == 1, [c.details for c in result.checks]
+        assert any(
+            evidence.get("check_name") == "Global Module Reference Check"
+            and evidence.get("details", {}).get("import_only") is True
+            and evidence.get("details", {}).get("import_reference") == "os.system"
+            for evidence in primary_reduce_checks[0].details.get("supporting_evidence", [])
+        ), f"Expected multistream import-only evidence on REDUCE finding: {primary_reduce_checks[0].details}"
+        assert not any(
+            c.name == "Global Module Reference Check"
+            and c.status == CheckStatus.FAILED
+            and c.details.get("import_only") is True
+            and c.details.get("import_reference") == "os.system"
+            for c in result.checks
+        ), f"Expected os.system import-only failure to fold into the REDUCE finding: {result.checks}"
+        assert not any(
+            c.name == "Reduce Pattern Analysis"
+            and c.status == CheckStatus.FAILED
+            and c.details.get("module") == "os"
+            and c.details.get("function") == "system"
+            for c in result.checks
+        ), f"Expected os.system to emit a single primary finding across streams: {result.checks}"
 
     @pytest.mark.parametrize(
         ("payload", "check_name"),
@@ -4445,13 +4526,19 @@ def test_risky_ml_reduce_target_is_detected(tmp_path: Path) -> None:
         f"{[(check.severity, check.message) for check in reduce_checks]}"
     )
     assert any(
+        evidence.get("check_name") == "Reduce Pattern Analysis"
+        and evidence.get("details", {}).get("module") == "torch.jit"
+        and evidence.get("details", {}).get("function") == "load"
+        for check in reduce_checks
+        for evidence in check.details.get("supporting_evidence", [])
+    ), f"Expected Reduce Pattern Analysis evidence for torch.jit.load, got: {result.checks}"
+    assert not any(
         check.name == "Reduce Pattern Analysis"
         and check.status == CheckStatus.FAILED
-        and check.severity == IssueSeverity.CRITICAL
         and check.details.get("module") == "torch.jit"
         and check.details.get("function") == "load"
         for check in result.checks
-    ), f"Expected failed Reduce Pattern Analysis for torch.jit.load, got: {result.checks}"
+    ), f"Expected torch.jit.load to emit a single primary finding, got: {result.checks}"
 
 
 def test_comment_token_does_not_bypass_risky_ml_reduce_detection(tmp_path: Path) -> None:
@@ -4473,13 +4560,22 @@ def test_comment_token_does_not_bypass_risky_ml_reduce_detection(tmp_path: Path)
         for check in result.checks
     ), f"Expected torch.jit.load REDUCE detection despite comment token, checks: {result.checks}"
     assert any(
+        evidence.get("check_name") == "Reduce Pattern Analysis"
+        and evidence.get("details", {}).get("module") == "torch.jit"
+        and evidence.get("details", {}).get("function") == "load"
+        for check in result.checks
+        if check.name == "REDUCE Opcode Safety Check"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("associated_global") == "torch.jit.load"
+        for evidence in check.details.get("supporting_evidence", [])
+    ), f"Expected Reduce Pattern Analysis evidence despite comment token, checks: {result.checks}"
+    assert not any(
         check.name == "Reduce Pattern Analysis"
         and check.status == CheckStatus.FAILED
-        and check.severity == IssueSeverity.CRITICAL
         and check.details.get("module") == "torch.jit"
         and check.details.get("function") == "load"
         for check in result.checks
-    ), f"Expected Reduce Pattern Analysis failure despite comment token, checks: {result.checks}"
+    ), f"Expected torch.jit.load to emit a single primary finding despite comment token, got: {result.checks}"
 
 
 def test_risky_ml_stack_global_detection(tmp_path: Path) -> None:
