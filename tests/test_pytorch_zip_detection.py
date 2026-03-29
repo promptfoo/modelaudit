@@ -38,6 +38,21 @@ class TestPyTorchZipDetection:
         assert result.scanner_name == "pytorch_zip"
         assert result.bytes_scanned > 0
 
+    def test_detect_zip_ckpt_file(self, tmp_path):
+        """ZIP-backed .ckpt files should route through the PyTorch ZIP scanner."""
+        model_data = {"weights": torch.tensor([1.0, 2.0, 3.0])}
+
+        ckpt_file = tmp_path / "pytorch_model.ckpt"
+        torch.save(model_data, ckpt_file)
+
+        format_type = detect_file_format(str(ckpt_file))
+        assert format_type == "zip", f"Expected 'zip' but got '{format_type}'"
+
+        result = scan_file(str(ckpt_file))
+        assert result is not None
+        assert result.scanner_name == "pytorch_zip"
+        assert result.bytes_scanned > 0
+
     def test_scan_malicious_bin_file(self, tmp_path):
         """Test detection of malicious code in .bin PyTorch files."""
 

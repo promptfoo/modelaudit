@@ -377,19 +377,14 @@ class ScanResultsCache:
 
     def _get_scanner_versions(self) -> dict[str, str]:
         """Get version fingerprint for all scanners."""
-        try:
-            # Try to import scanner registry
-            from modelaudit.scanners import SCANNER_REGISTRY
+        from modelaudit.scanners import _registry
 
-            versions = {}
-            for name, info in SCANNER_REGISTRY.items():  # type: ignore[attr-defined]
-                # Get scanner class version if available
-                versions[name] = getattr(info, "version", "1.0")
+        versions = {}
+        for scanner_id in sorted(_registry.get_available_scanners()):
+            info = _registry.get_scanner_info(scanner_id) or {}
+            versions[scanner_id] = str(info.get("version", "1.0"))
 
-            return versions
-        except Exception as e:
-            logger.debug(f"Could not import scanner registry for version info: {e}")
-            return {}
+        return versions
 
     def _get_config_hash(self, version_context: dict[str, Any] | None = None) -> str:
         """Hash of current scanning configuration that affects results."""
@@ -441,6 +436,15 @@ class ScanResultsCache:
             # Check file size
             if file_stat.st_size != cached_size:
                 return False
+
+            # Metadata-only cache keys must still validate file contents, or an
+            # in-place rewrite that restores size/mtime can hit stale entries.
+            if not self.key_generator._should_use_content_hash(file_stat.st_size):
+                cached_hash = cache_entry["file_info"].get("hash")
+                if cached_hash is not None:
+                    current_hash = self.hasher.hash_file_with_stat(file_path, file_stat)
+                    if current_hash != cached_hash:
+                        return False
 
             # Check entry isn't too old (30 days default)
             scanned_at = cache_entry["cache_metadata"]["scanned_at"]

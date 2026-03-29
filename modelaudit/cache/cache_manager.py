@@ -184,9 +184,12 @@ class CacheManager:
     def enable(self, cache_dir: str | None = None) -> None:
         """Enable caching."""
         self.enabled = True
-        self.cache_dir = str(Path(cache_dir).expanduser()) if cache_dir else None
-        if not self.cache:
-            self.cache = ScanResultsCache(self.cache_dir)
+        normalized_cache_dir = str(Path(cache_dir).expanduser()) if cache_dir else None
+        if self.cache is None or self.cache_dir != normalized_cache_dir:
+            self.cache = ScanResultsCache(normalized_cache_dir)
+        if self.key_generator is None:
+            self.key_generator = AdaptiveCacheKeyGenerator()
+        self.cache_dir = normalized_cache_dir
         logger.debug("Cache enabled")
 
 

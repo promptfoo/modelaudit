@@ -289,6 +289,36 @@ def test_cached_scan_skips_persisting_memory_mapped_scan_errors(tmp_path: Path) 
     assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Associated .bin weights file not found",
+        "Not a valid zip file: /tmp/example.zip",
+    ],
+)
+def test_cached_scan_persists_deterministic_validation_findings(tmp_path: Path, message: str) -> None:
+    file_path = _make_cacheable_file(tmp_path)
+    cache_dir = tmp_path / "cache"
+    config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
+    calls = {"count": 0}
+
+    @cached_scan()
+    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
+        calls["count"] += 1
+        return {
+            "checks": [],
+            "issues": [{"message": message, "severity": "warning"}],
+            "scan_count": calls["count"],
+        }
+
+    first = scan(str(file_path), config)
+    second = scan(str(file_path), config)
+
+    assert first == second
+    assert calls["count"] == 1
+    assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 1
+
+
 def test_configuration_extractor_rebuilds_cached_config_after_mutation() -> None:
     extractor = ConfigurationExtractor()
     config = {"cache_enabled": True, "timeout": 30}
@@ -310,6 +340,20 @@ def test_get_cache_manager_reinitializes_for_new_cache_dir(tmp_path: Path) -> No
     assert first is not second
     assert second.cache is not None
     assert second.cache.cache_dir == tmp_path / "cache-b"
+
+
+def test_get_cache_manager_reenables_cache_subsystems(tmp_path: Path) -> None:
+    cache_dir = tmp_path / "cache"
+    disabled_manager = get_cache_manager(str(cache_dir), enabled=False)
+    assert disabled_manager.enabled is False
+
+    enabled_manager = get_cache_manager(str(cache_dir), enabled=True)
+    batch_ops = BatchCacheOperations(enabled_manager)
+
+    assert enabled_manager.enabled is True
+    assert enabled_manager.cache is not None
+    assert enabled_manager.key_generator is not None
+    assert batch_ops.get_batch_stats()["enabled"] is True
 
 
 def test_batch_lookup_returns_cached_entries(tmp_path: Path) -> None:
@@ -484,6 +528,23 @@ def test_same_size_rewrite_with_high_resolution_mtime_invalidates_cache(tmp_path
     original_offset_ns = original_stat.st_mtime_ns % 1_000_000_000
     new_offset_ns = 123_456_789 if original_offset_ns != 123_456_789 else 123_456_790
     os.utime(file_path, ns=(original_stat.st_atime_ns, base_second_ns + new_offset_ns))
+
+    cached_result = cache.get_cached_result(str(file_path), version_context=version_context)
+
+    assert cached_result is None
+
+
+def test_same_size_rewrite_with_restored_mtime_invalidates_cache(tmp_path: Path) -> None:
+    file_path = _make_cacheable_file(tmp_path, name="small.bin")
+    cache = ScanResultsCache(str(tmp_path / "scan-cache"))
+    version_context = build_cache_version_context({"timeout": 30})
+    expected = {"checks": [], "issues": [], "metadata": {}, "scanner": "test", "success": True}
+
+    assert cache.store_result(str(file_path), expected, 10, version_context=version_context) is True
+
+    original_stat = file_path.stat()
+    file_path.write_bytes(b"y" * 2048)
+    os.utime(file_path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
 
     cached_result = cache.get_cached_result(str(file_path), version_context=version_context)
 
