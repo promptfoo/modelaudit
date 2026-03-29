@@ -1,6 +1,10 @@
+import builtins
 import json
+import os
 import struct
 from pathlib import Path
+from types import TracebackType
+from typing import Any, BinaryIO
 
 import numpy as np
 import pytest
@@ -10,6 +14,7 @@ pytest.importorskip("safetensors")
 
 from safetensors.numpy import save_file
 
+from modelaudit.scanners.base import CheckStatus
 from modelaudit.scanners.safetensors_scanner import SafeTensorsScanner
 
 
@@ -19,6 +24,23 @@ def create_safetensors_file(path: Path) -> None:
         "t2": np.ones((2, 2), dtype=np.int64),
     }
     save_file(data, str(path))
+
+
+def create_safetensors_with_dtype_size_mismatch(path: Path, dtype: str) -> None:
+    create_safetensors_file(path)
+
+    with open(path, "rb") as f:
+        header_len = struct.unpack("<Q", f.read(8))[0]
+        header_bytes = f.read(header_len)
+        data_bytes = f.read()
+
+    header = json.loads(header_bytes.decode("utf-8"))
+    header["t2"]["dtype"] = dtype
+    header["t2"]["shape"] = [4]
+    header["t2"]["data_offsets"] = [0, 3]
+
+    new_header_bytes = json.dumps(header).encode("utf-8")
+    path.write_bytes(struct.pack("<Q", len(new_header_bytes)) + new_header_bytes + data_bytes)
 
 
 def test_valid_safetensors_file(tmp_path: Path) -> None:
@@ -31,6 +53,131 @@ def test_valid_safetensors_file(tmp_path: Path) -> None:
     assert result.success is True
     assert not result.has_errors
     assert result.metadata.get("tensor_count") == 2
+    header_limit_check = next((check for check in result.checks if check.name == "Header Size Limit"), None)
+    assert header_limit_check is not None
+    assert header_limit_check.status.value == "passed"
+
+
+def _write_oversized_header_safetensors(path: Path, header_len: int) -> None:
+    header_obj = {
+        "__metadata__": {"safe": "value"},
+        "t": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+    }
+    header_prefix = json.dumps(header_obj, separators=(",", ":")).encode("utf-8")
+    assert len(header_prefix) < header_len
+
+    with open(path, "wb") as handle:
+        handle.write(struct.pack("<Q", header_len))
+        handle.write(header_prefix)
+
+        remaining = header_len - len(header_prefix)
+        chunk_size = 1024 * 1024
+        for _ in range(remaining // chunk_size):
+            handle.write(b" " * chunk_size)
+        if remaining % chunk_size:
+            handle.write(b" " * (remaining % chunk_size))
+
+        handle.write(b"\x00\x00\x00\x00")
+
+
+def test_oversized_header_triggers_limit_check(tmp_path: Path) -> None:
+    file_path = tmp_path / "oversized_header.safetensors"
+    max_header_bytes = 1 * 1024 * 1024
+    _write_oversized_header_safetensors(file_path, header_len=max_header_bytes + 1)
+
+    scanner = SafeTensorsScanner({"max_safetensors_header_bytes": max_header_bytes})
+    result = scanner.scan(str(file_path))
+
+    header_limit_check = next((check for check in result.checks if check.name == "Header Size Limit"), None)
+    assert header_limit_check is not None
+    assert header_limit_check.status.value == "failed"
+    assert "exceeds maximum allowed size" in header_limit_check.message
+    assert result.success is True
+    assert result.metadata["analysis_incomplete"] is True
+    assert result.bytes_scanned == file_path.stat().st_size
+
+
+def test_oversized_header_skips_metadata_content_analysis(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    file_path = tmp_path / "oversized_skip_analysis.safetensors"
+    max_header_bytes = 1 * 1024 * 1024
+    _write_oversized_header_safetensors(file_path, header_len=max_header_bytes + 1)
+
+    scanner = SafeTensorsScanner({"max_safetensors_header_bytes": max_header_bytes})
+    analyze_called = {"value": False}
+
+    def track_analyze(metadata: dict[str, object], result: object, path: str) -> None:
+        analyze_called["value"] = True
+
+    monkeypatch.setattr(scanner, "_analyze_metadata_content", track_analyze)
+
+    result = scanner.scan(str(file_path))
+
+    assert analyze_called["value"] is False
+    header_limit_check = next((check for check in result.checks if check.name == "Header Size Limit"), None)
+    assert header_limit_check is not None
+    assert header_limit_check.status.value == "failed"
+    assert result.metadata["analysis_incomplete"] is True
+    assert result.success is True
+
+
+def test_oversized_header_does_not_read_beyond_configured_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    file_path = tmp_path / "oversized_guarded_read.safetensors"
+    max_header_bytes = 8 * 1024 * 1024
+    oversized_header_len = max_header_bytes + 1
+    _write_oversized_header_safetensors(file_path, header_len=oversized_header_len)
+
+    original_open: Any = builtins.open
+
+    class GuardedReader:
+        def __init__(self, handle: BinaryIO) -> None:
+            self._handle = handle
+            self._total_read = 0
+
+        def read(self, size: int = -1) -> bytes:
+            if size > max_header_bytes:
+                raise AssertionError(f"scanner attempted oversized read: {size}")
+            chunk = self._handle.read(size)
+            self._total_read += len(chunk)
+            if self._total_read > 8:
+                raise AssertionError(f"scanner read past the 8-byte header length field: {self._total_read}")
+            return chunk
+
+        def __enter__(self) -> "GuardedReader":
+            self._handle.__enter__()
+            return self
+
+        def __exit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc: BaseException | None,
+            tb: TracebackType | None,
+        ) -> Any:
+            return self._handle.__exit__(exc_type, exc, tb)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._handle, name)
+
+    def guarded_open(
+        file: str | os.PathLike[str] | int,
+        mode: str = "r",
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        handle = original_open(file, mode, *args, **kwargs)
+        if isinstance(file, (str, os.PathLike)) and Path(file) == file_path and "rb" in mode:
+            return GuardedReader(handle)
+        return handle
+
+    monkeypatch.setattr(builtins, "open", guarded_open)
+
+    scanner = SafeTensorsScanner({"max_safetensors_header_bytes": max_header_bytes})
+    result = scanner.scan(str(file_path))
+
+    header_limit_check = next((check for check in result.checks if check.name == "Header Size Limit"), None)
+    assert header_limit_check is not None
+    assert header_limit_check.status.value == "failed"
 
 
 def test_corrupted_header(tmp_path: Path) -> None:
@@ -80,6 +227,29 @@ def test_bad_offsets(tmp_path: Path) -> None:
 
     assert result.has_errors
     assert any("offset" in issue.message.lower() for issue in result.issues)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "expected_size"),
+    [("BOOL", 4), ("BF16", 8), ("F8_E4M3", 4), ("F8_E5M2", 4), ("F16", 8), ("F32", 16), ("F64", 32)],
+)
+def test_tensor_size_check_runs_for_supported_dtypes(tmp_path: Path, dtype: str, expected_size: int) -> None:
+    file_path = tmp_path / f"mismatch_{dtype}.safetensors"
+    create_safetensors_with_dtype_size_mismatch(file_path, dtype)
+
+    scanner = SafeTensorsScanner()
+    result = scanner.scan(str(file_path))
+
+    size_checks = [
+        check
+        for check in result.checks
+        if check.name == "Tensor Size Consistency Check" and check.details.get("tensor") == "t2"
+    ]
+    assert size_checks, f"Expected Tensor Size Consistency Check for dtype {dtype}"
+    assert any(
+        check.status == CheckStatus.FAILED and check.details.get("expected_size") == expected_size
+        for check in size_checks
+    ), f"Expected failing size consistency check for dtype {dtype}"
 
 
 def test_deeply_nested_header(tmp_path: Path) -> None:

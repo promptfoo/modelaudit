@@ -7,7 +7,7 @@ from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 
 # Ensure models are rebuilt for forward references
 from modelaudit.models import ModelAuditResultModel, rebuild_models
-from modelaudit.scanners.base import Issue, IssueSeverity
+from modelaudit.scanners.base import Issue, IssueSeverity, ScanResult
 
 rebuild_models()
 
@@ -280,3 +280,80 @@ def test_exit_code_file_scan_failure(tmp_path):
     assert any("error" in issue.message.lower() for issue in results.issues)
     # Exit code 2 indicates operational errors
     assert determine_exit_code(results) == 2
+
+
+def test_scan_result_warning_message_without_operational_flag_keeps_exit_code_1(tmp_path) -> None:
+    """Warning findings should not become exit code 2 just because the message looks like a parse error."""
+    test_file = tmp_path / "malicious.pkl"
+    test_file.write_bytes(b"payload")
+
+    scan_result = ScanResult(scanner_name="pickle")
+    scan_result.add_check(
+        name="Dangerous Pattern Detection",
+        passed=False,
+        message="Suspicious global reference detected",
+        severity=IssueSeverity.WARNING,
+        location=str(test_file),
+    )
+    scan_result.add_check(
+        name="Pickle Format Validation",
+        passed=False,
+        message="Unable to parse pickle file: ValueError",
+        severity=IssueSeverity.WARNING,
+        location=str(test_file),
+        details={"exception_type": "ValueError"},
+    )
+    scan_result.finish(success=False)
+
+    with patch("modelaudit.core.scan_file", return_value=scan_result):
+        results = scan_model_directory_or_file(str(test_file))
+
+    assert results.has_errors is False
+    assert results.success is True
+    assert determine_exit_code(results) == 1
+
+
+def test_scan_result_operational_flag_keeps_exit_code_2(tmp_path) -> None:
+    """Explicit operational-error metadata should drive exit code 2 without message parsing."""
+    test_file = tmp_path / "timeout.pkl"
+    test_file.write_bytes(b"payload")
+
+    scan_result = ScanResult(scanner_name="pickle")
+    scan_result.add_check(
+        name="Scan Timeout Check",
+        passed=False,
+        message="Scan timeout: simulated timeout",
+        severity=IssueSeverity.INFO,
+        location=str(test_file),
+    )
+    scan_result.metadata["operational_error"] = True
+    scan_result.metadata["operational_error_reason"] = "scan_timeout"
+    scan_result.finish(success=False)
+
+    with patch("modelaudit.core.scan_file", return_value=scan_result):
+        results = scan_model_directory_or_file(str(test_file))
+
+    assert results.has_errors is True
+    assert results.success is False
+    assert determine_exit_code(results) == 2
+
+
+def test_scan_result_info_only_failed_scan_without_operational_flag_keeps_exit_code_0(tmp_path) -> None:
+    """Informational failed scans should stay clean without explicit operational metadata."""
+    test_file = tmp_path / "trailing.npy"
+    test_file.write_bytes(b"payload")
+
+    scan_result = ScanResult(scanner_name="numpy")
+    scan_result.add_issue(
+        "Object-dtype payload contains trailing bytes after the embedded pickle stream",
+        severity=IssueSeverity.INFO,
+        location=str(test_file),
+    )
+    scan_result.finish(success=False)
+
+    with patch("modelaudit.core.scan_file", return_value=scan_result):
+        results = scan_model_directory_or_file(str(test_file))
+
+    assert results.has_errors is False
+    assert results.success is True
+    assert determine_exit_code(results) == 0

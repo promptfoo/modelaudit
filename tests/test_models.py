@@ -538,6 +538,41 @@ class TestModelAuditResultModel:
         assert result.issues[0].rule_code == "S101"
         assert result.checks[0].rule_code == "S101"
 
+    def test_aggregate_scan_result_direct_info_only_failure_keeps_success(self) -> None:
+        """Direct aggregation should not treat info-only failed scans as operational errors."""
+        result = create_initial_audit_result()
+        scan_result = ScanResult(scanner_name="numpy")
+        scan_result.add_issue(
+            "Object-dtype payload contains trailing bytes after the embedded pickle stream",
+            severity=IssueSeverity.INFO,
+            location="trailing.npy",
+        )
+        scan_result.finish(success=False)
+
+        result.aggregate_scan_result_direct(scan_result)
+
+        assert result.has_errors is False
+        assert result.success is True
+
+    def test_aggregate_scan_result_direct_operational_flag_sets_error_state(self) -> None:
+        """Direct aggregation should honor explicit operational-error metadata."""
+        result = create_initial_audit_result()
+        scan_result = ScanResult(scanner_name="pickle")
+        scan_result.add_check(
+            name="Scan Timeout Check",
+            passed=False,
+            message="Scan timeout: simulated timeout",
+            severity=IssueSeverity.INFO,
+        )
+        scan_result.metadata["operational_error"] = True
+        scan_result.metadata["operational_error_reason"] = "scan_timeout"
+        scan_result.finish(success=False)
+
+        result.aggregate_scan_result_direct(scan_result)
+
+        assert result.has_errors is True
+        assert result.success is False
+
 
 class TestScanConfigModel:
     """Tests for ScanConfigModel."""
