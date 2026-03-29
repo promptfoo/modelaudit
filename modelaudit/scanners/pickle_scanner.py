@@ -2607,9 +2607,25 @@ def _simulate_symbolic_reference_maps(
         if name == "READONLY_BUFFER":
             continue
 
-        # Preserve alignment for stack-neutral protocol markers like PROTO/FRAME.
-        if getattr(opcode, "stack_before", None) == [] and getattr(opcode, "stack_after", None) == []:
-            logger.debug(f"Simulator: ignoring stack-neutral opcode {opcode.name} at pos {_pos}")
+        stack_before = getattr(opcode, "stack_before", None)
+        stack_after = getattr(opcode, "stack_after", None)
+        if isinstance(stack_before, list) and isinstance(stack_after, list):
+            if stack_before == [] and stack_after == []:
+                logger.debug(f"Simulator: ignoring stack-neutral opcode {opcode.name} at pos {_pos}")
+                continue
+
+            logger.debug(f"Simulator: applying generic stack effect for opcode {opcode.name} at pos {_pos}")
+            for stack_effect in reversed(stack_before):
+                effect_name = repr(stack_effect)
+                if effect_name == "stackslice":
+                    continue
+                if effect_name == "mark":
+                    _pop_to_mark()
+                    continue
+                _pop()
+
+            for _ in stack_after:
+                stack.append(unknown)
             continue
 
         # Unknown opcode - push a sentinel to keep stack in sync.

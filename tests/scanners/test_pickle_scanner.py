@@ -1549,6 +1549,26 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
             f"got: {[check.message for check in failed_stack_global_checks]}"
         )
 
+    def test_framed_protocol_four_stack_global_import_only_is_critical(self) -> None:
+        """A framed protocol-4 pickle should still surface dangerous STACK_GLOBAL refs."""
+        payload = pickle.dumps(eval, protocol=4)
+
+        result = self._scan_bytes(payload)
+
+        assert result.success
+        assert result.has_errors
+        failed_stack_global_checks = [
+            check
+            for check in result.checks
+            if check.name == "STACK_GLOBAL Module Check"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+        ]
+        assert any("builtins.eval" in check.message for check in failed_stack_global_checks), (
+            f"Expected CRITICAL STACK_GLOBAL Module Check for builtins.eval, "
+            f"got: {[check.message for check in failed_stack_global_checks]}"
+        )
+
     def test_builtins_hasattr_binput_binget_recall_is_critical(self) -> None:
         """Memoized callable recall via BINPUT/BINGET must keep builtins.hasattr dangerous."""
         payload = b"\x80\x02cbuiltins\nhasattr\nq\x010h\x01(tR."
@@ -4213,12 +4233,12 @@ class TestPickleImportOnlyGlobalFindings:
         assert malformed_stack_globals == {}
         assert mutation_target_refs == {}
 
-    def test_symbolic_simulation_unknown_opcode_uses_unknown_push_sentinel(self) -> None:
+    def test_symbolic_simulation_unknown_opcode_uses_generic_stack_effect_metadata(self) -> None:
         opcodes = [
-            (type("Op", (), {"name": "UNICODE"})(), "evilpkg", 0),
-            (type("Op", (), {"name": "FUTURE_PUSH_OPCODE"})(), None, 1),
-            (type("Op", (), {"name": "POP"})(), None, 2),
-            (type("Op", (), {"name": "UNICODE"})(), "thing", 3),
+            (type("Op", (), {"name": "UNICODE"})(), "os", 0),
+            (type("Op", (), {"name": "UNICODE"})(), "garbage", 1),
+            (type("Op", (), {"name": "FUTURE_POP_OPCODE", "stack_before": [object()], "stack_after": []})(), None, 2),
+            (type("Op", (), {"name": "UNICODE"})(), "system", 3),
             (type("Op", (), {"name": "STACK_GLOBAL"})(), None, 4),
         ]
 
@@ -4231,12 +4251,39 @@ class TestPickleImportOnlyGlobalFindings:
             mutation_target_refs,
         ) = _simulate_symbolic_reference_maps(opcodes)
 
-        assert stack_global_refs[4] == ("evilpkg", "thing")
+        assert stack_global_refs[4] == ("os", "system")
         assert callable_refs == {}
         assert callable_origin_refs == {}
         assert callable_origin_is_ext == {}
         assert malformed_stack_globals == {}
         assert mutation_target_refs == {}
+
+    def test_symbolic_simulation_generic_stack_effect_preserves_setitems_target(self) -> None:
+        opcodes = [
+            (type("Op", (), {"name": "EMPTY_DICT"})(), None, 0),
+            (type("Op", (), {"name": "MARK"})(), None, 1),
+            (type("Op", (), {"name": "UNICODE"})(), "key", 2),
+            (type("Op", (), {"name": "UNICODE"})(), "garbage", 3),
+            (type("Op", (), {"name": "FUTURE_POP_OPCODE", "stack_before": [object()], "stack_after": []})(), None, 4),
+            (type("Op", (), {"name": "UNICODE"})(), "value", 5),
+            (type("Op", (), {"name": "SETITEMS"})(), None, 6),
+        ]
+
+        (
+            stack_global_refs,
+            callable_refs,
+            callable_origin_refs,
+            callable_origin_is_ext,
+            malformed_stack_globals,
+            mutation_target_refs,
+        ) = _simulate_symbolic_reference_maps(opcodes)
+
+        assert stack_global_refs == {}
+        assert callable_refs == {}
+        assert callable_origin_refs == {}
+        assert callable_origin_is_ext == {}
+        assert malformed_stack_globals == {}
+        assert mutation_target_refs[6].kind == "dict"
 
     def test_symbolic_simulation_stack_neutral_opcode_does_not_shift_stack_global(self) -> None:
         opcodes = [
