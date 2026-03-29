@@ -1,5 +1,7 @@
 """Tests for optimized cache configuration."""
 
+from pathlib import Path
+
 from modelaudit.cache.optimized_config import (
     CacheConfiguration,
     ConfigurationExtractor,
@@ -20,16 +22,17 @@ class TestCacheConfiguration:
 
     def test_custom_values(self):
         """Test custom configuration values."""
+        cache_dir = str(Path("/tmp/cache"))
         config = CacheConfiguration(
             {
                 "cache_enabled": False,
-                "cache_dir": "/tmp/cache",
+                "cache_dir": cache_dir,
                 "max_cache_file_size": 50 * 1024 * 1024,
                 "min_cache_file_size": 2048,
             }
         )
         assert config.enabled is False
-        assert config.cache_dir == "/tmp/cache"
+        assert config.cache_dir == cache_dir
         assert config.max_file_size == 50 * 1024 * 1024
         assert config.min_file_size == 2048
 
@@ -152,7 +155,8 @@ class TestConfigurationExtractor:
             extractor.extract_fast((f"/file{i}.pkl", config_dict), {})
 
         # Trigger cleanup
-        extractor._cleanup_config_cache()
+        newest_timestamp = max(timestamp for _, timestamp in extractor._config_cache.values())
+        extractor._cleanup_config_cache(current_time=newest_timestamp + 1.0)
 
         # Cache should be cleaned
         assert len(extractor._config_cache) <= 20
