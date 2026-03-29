@@ -1314,6 +1314,64 @@ class TorchServeMarScanner(BaseScanner):
             return None
         return resolved
 
+    def _is_external_requirements_reference(self, reference: str) -> bool:
+        stripped_reference = reference.strip().strip("'\"")
+        if not stripped_reference:
+            return False
+
+        if URL_SCHEME_PATTERN.match(stripped_reference):
+            parsed = urlparse(stripped_reference)
+            return parsed.scheme.lower() == "file"
+
+        normalized_reference = stripped_reference.replace("\\", "/")
+        if re.match(r"^[a-zA-Z]:/", normalized_reference) or normalized_reference.startswith("/"):
+            return True
+
+        return posixpath.normpath(normalized_reference).startswith("../")
+
+    def _strip_inline_requirement_comment(self, line: str) -> str:
+        in_single_quote = False
+        in_double_quote = False
+        escaped = False
+
+        for index, char in enumerate(line):
+            if escaped:
+                escaped = False
+                continue
+            if char == "\\":
+                escaped = True
+                continue
+            if char == "'" and not in_double_quote:
+                in_single_quote = not in_single_quote
+                continue
+            if char == '"' and not in_single_quote:
+                in_double_quote = not in_double_quote
+                continue
+            if char == "#" and not in_single_quote and not in_double_quote and (
+                index == 0 or line[index - 1].isspace()
+            ):
+                return line[:index].strip()
+
+        return line.strip()
+
+    def _extract_direct_requirement_url(self, line: str) -> str | None:
+        direct_url = line.strip()
+        if not direct_url:
+            return None
+
+        direct_reference_match = re.match(r"^[A-Za-z0-9_.\-\[\],]+\s*@\s*(.+)$", direct_url)
+        if direct_reference_match is not None:
+            direct_url = direct_reference_match.group(1).strip()
+
+        direct_url = direct_url.split(";", 1)[0].strip()
+        if not direct_url:
+            return None
+
+        if not self._is_remote_requirement_url(direct_url):
+            return None
+
+        return direct_url
+
     def _build_requirements_finding(
         self,
         *,
@@ -1370,8 +1428,8 @@ class TorchServeMarScanner(BaseScanner):
 
         findings: list[dict[str, Any]] = []
         for line_number, raw_line in enumerate(requirements_text.splitlines(), start=1):
-            line = raw_line.strip()
-            if not line or line.startswith("#"):
+            line = self._strip_inline_requirement_comment(raw_line)
+            if not line:
                 continue
 
             lowered = line.lower()
@@ -1392,6 +1450,19 @@ class TorchServeMarScanner(BaseScanner):
                             severity=IssueSeverity.WARNING,
                             reason="remote_requirements_include",
                             message="requirements.txt includes a remote requirements file",
+                        )
+                    )
+                    continue
+
+                if self._is_external_requirements_reference(include_target):
+                    findings.append(
+                        self._build_requirements_finding(
+                            requirements_file=normalized_member,
+                            line_number=line_number,
+                            line_content=line,
+                            severity=IssueSeverity.WARNING,
+                            reason="external_requirements_include",
+                            message="requirements.txt includes a local requirements file outside the archive",
                         )
                     )
                     continue
@@ -1474,6 +1545,7 @@ class TorchServeMarScanner(BaseScanner):
                 line,
                 long_options=("--editable",),
                 short_options=("-e",),
+                allow_concatenated_short=True,
             )
             if editable_target is not None:
                 findings.append(
@@ -1496,6 +1568,19 @@ class TorchServeMarScanner(BaseScanner):
                         severity=IssueSeverity.WARNING,
                         reason="git_install",
                         message="requirements.txt installs directly from git, which can execute arbitrary setup code",
+                    )
+                )
+
+            direct_url = self._extract_direct_requirement_url(line)
+            if direct_url is not None:
+                findings.append(
+                    self._build_requirements_finding(
+                        requirements_file=normalized_member,
+                        line_number=line_number,
+                        line_content=line,
+                        severity=IssueSeverity.WARNING,
+                        reason="direct_url_install",
+                        message="requirements.txt installs package directly from a remote URL",
                     )
                 )
 
