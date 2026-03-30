@@ -27,6 +27,7 @@ from modelaudit.scanners.pickle_scanner import (
     _NESTED_PICKLE_HEADER_SEARCH_LIMIT_BYTES,
     _RAW_PATTERN_SCAN_LIMIT_BYTES,
     PickleScanner,
+    _find_nested_pickle_match,
     _genops_with_fallback,
     _GenopsBudgetExceeded,
     _is_actually_dangerous_global,
@@ -1807,6 +1808,15 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
                 assert not any(
                     c.name == "Nested Pickle Detection" and c.status == CheckStatus.FAILED for c in result.checks
                 ), f"Unexpected nested pickle detection: {[(c.name, c.status, c.details) for c in result.checks]}"
+
+    def test_incomplete_trailing_header_prefix_is_ignored(self) -> None:
+        """Trailing 0x80/proto fragments must not raise during nested-header search."""
+        for data in (
+            b"A\x80\x04",
+            b"A" * (_NESTED_PICKLE_HEADER_SEARCH_LIMIT_BYTES - 2) + b"\x80\x04",
+        ):
+            with self.subTest(length=len(data)):
+                assert _find_nested_pickle_match(data) is None
 
     def test_large_benign_raw_blob_does_not_trigger_nested_detection(self) -> None:
         """Large raw blobs with invalid header-like bytes should stay below the nested-pickle threshold."""

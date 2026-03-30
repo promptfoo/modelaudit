@@ -3147,7 +3147,8 @@ def _find_nested_pickle_match(data: bytes | bytearray) -> _NestedPickleMatch | N
 
     candidate_count = 0
     cursor = 0
-    max_header_start = search_limit - 2
+    # Binary pickle headers need three readable bytes: PROTO, protocol, opcode.
+    max_header_start = search_limit - 3
 
     while cursor <= max_header_start and candidate_count < _NESTED_PICKLE_MAX_HEADER_CANDIDATES:
         header_offset = data_bytes.find(b"\x80", cursor, max_header_start + 1)
