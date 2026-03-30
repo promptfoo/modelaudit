@@ -558,6 +558,44 @@ def test_scan_binary_payload_does_not_mark_full_binary_coverage_for_partial_scan
     assert result.metadata["binary_scan_total_bytes"] == 1024
 
 
+def test_scan_binary_payload_caps_tail_scan_bytes_and_tracks_pickle_offset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tail scan metadata should clamp overreported bytes to remaining binary length."""
+    scanner = PickleScanner()
+    scanner.current_file_path = "checkpoint.bin"
+    result = scanner._create_result()
+    result.bytes_scanned = 64
+
+    overreported_binary_result = scanner._create_result()
+    overreported_binary_result.bytes_scanned = 9999
+
+    def _overreported_binary_scan(
+        self: PickleScanner,
+        _file_obj: BinaryIO,
+        start_pos: int,
+        file_size: int,
+    ) -> ScanResult:
+        del self, start_pos, file_size
+        return overreported_binary_result
+
+    monkeypatch.setattr(PickleScanner, "_scan_binary_content", _overreported_binary_scan)
+
+    scanner._scan_binary_payload(
+        BytesIO(b"A" * 2048),
+        result,
+        start_pos=512,
+        file_size=1536,
+    )
+
+    assert result.bytes_scanned == 1536
+    assert result.metadata["pickle_bytes"] == 512
+    assert result.metadata["binary_bytes"] == 1024
+    assert result.metadata["binary_scan_completed"] is True
+    assert result.metadata["binary_scan_bytes_scanned"] == 1024
+    assert result.metadata["binary_scan_total_bytes"] == 1024
+
+
 def test_small_pickle_tail_pattern_is_detected_without_raw_pattern_limit(tmp_path: Path) -> None:
     """Small pickle files should still fully analyze raw patterns without a coverage warning."""
     pickle_path = tmp_path / "small-tail.pkl"
