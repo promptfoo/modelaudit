@@ -800,6 +800,40 @@ class TestCVE202624747PickleScanner:
         )
         assert all((check.details or {}).get("cve_id") == "CVE-2026-24747" for check in matching_checks)
 
+    def test_pickle_scanner_does_not_flag_setitem_near_safe_global(self, tmp_path: Path) -> None:
+        """Safe globals in the same shape should not trigger the dangerous-global SETITEM branch."""
+        pickle_bytes = (
+            b"\x80\x04"  # PROTO 4
+            b"\x8c\x0bcollections"  # SHORT_BINUNICODE "collections"
+            b"\x8c\x0bOrderedDict"  # SHORT_BINUNICODE "OrderedDict"
+            b"\x93"  # STACK_GLOBAL
+            b")R"  # EMPTY_TUPLE + REDUCE
+            + (b"N0" * 40)  # Stack-neutral padding beyond the lookback window
+            + b"\x8c\x03key"  # SHORT_BINUNICODE "key"
+            + b"\x8c\x05value"  # SHORT_BINUNICODE "value"
+            + b"s"  # SETITEM
+            + b"."  # STOP
+        )
+
+        test_file = tmp_path / "setitem_safe_global.pkl"
+        test_file.write_bytes(pickle_bytes)
+
+        result = PickleScanner().scan(str(test_file))
+
+        matching_checks = []
+        for check in result.checks:
+            details = check.details or {}
+            if (
+                check.name == "CVE-2026-24747 SETITEM Abuse Detection"
+                and details.get("pattern_type") == "setitem_near_dangerous_global"
+            ):
+                matching_checks.append(check)
+
+        assert not matching_checks, (
+            "Safe globals should not trigger setitem_near_dangerous_global. "
+            f"Checks: {[(c.name, c.message, c.details) for c in result.checks]}"
+        )
+
     def test_pickle_scanner_no_setitem_false_positive(self, tmp_path: Path) -> None:
         """Test that normal dict SETITEM is not flagged by CVE-2026-24747 detection."""
         # Standard pickle with dict + SETITEM (the normal case)
