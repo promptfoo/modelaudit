@@ -4534,7 +4534,15 @@ class PickleScanner(BaseScanner):
                     and not result.metadata.get("operational_error")
                     and not _scan_result_has_security_findings(result)
                 ):
-                    _mark_inconclusive_scan_result(result, "incomplete_analysis")
+                    fallback_reason = (
+                        "scan_timeout"
+                        if any(
+                            check.name == "Scan Timeout Check" and check.status == CheckStatus.FAILED
+                            for check in result.checks
+                        )
+                        else "incomplete_analysis"
+                    )
+                    _mark_inconclusive_scan_result(result, fallback_reason)
 
                 # For .bin files, also scan the remaining binary content
                 # PyTorch files have pickle header followed by tensor data. Keep

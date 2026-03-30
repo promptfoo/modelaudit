@@ -594,7 +594,7 @@ def test_scan_pickle_timeout_finishes_fail_closed(tmp_path: Path, monkeypatch: p
     assert len(timeout_checks) == 1
     assert "timed out" in timeout_checks[0].message.lower()
     assert result.metadata["scan_outcome"] == "inconclusive"
-    assert "incomplete_analysis" in result.metadata["scan_outcome_reasons"]
+    assert "scan_timeout" in result.metadata["scan_outcome_reasons"]
     assert result.success is False
 
 
@@ -1215,7 +1215,9 @@ def test_post_budget_opcode_scan_ignores_decoy_nested_headers_without_pickle(tmp
     assert not any(
         check.name == "Post-Budget Opcode Detection" and check.status == CheckStatus.FAILED for check in result.checks
     ), f"Unexpected post-budget opcode finding for decoy headers: {result.checks}"
-    assert result.success is True
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "opcode_budget_exceeded" in result.metadata["scan_outcome_reasons"]
+    assert result.success is False
 
 
 def test_post_budget_opcode_scan_ignores_benign_encoded_string_payload(tmp_path: Path) -> None:
@@ -1233,7 +1235,9 @@ def test_post_budget_opcode_scan_ignores_benign_encoded_string_payload(tmp_path:
     assert not any(
         check.name == "Post-Budget Opcode Detection" and check.status == CheckStatus.FAILED for check in result.checks
     ), f"Unexpected post-budget opcode finding for benign encoded string: {result.checks}"
-    assert result.success is True
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "opcode_budget_exceeded" in result.metadata["scan_outcome_reasons"]
+    assert result.success is False
 
 
 def test_post_budget_opcode_scan_detects_malformed_stack_global(tmp_path: Path) -> None:
