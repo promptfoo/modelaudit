@@ -4764,7 +4764,7 @@ class PickleScanner(BaseScanner):
 
     def _is_pickle_parse_failure(self, error: Exception) -> bool:
         """Return whether an exception looks like a pickle/format parse failure."""
-        if not isinstance(error, (ValueError, struct.error)):
+        if not isinstance(error, (EOFError, ValueError, struct.error)):
             return False
 
         error_message = str(error).lower()

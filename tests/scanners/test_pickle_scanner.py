@@ -203,15 +203,25 @@ def test_unknown_opcode_pickle_parse_failure_fails_closed(tmp_path: Path, monkey
     ), f"Expected fail-closed format check, got: {[(c.name, c.status, c.severity) for c in result.checks]}"
 
 
-def test_unknown_opcode_bin_parse_failure_still_scans_full_binary_content(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("exception_type", "message"),
+    [
+        pytest.param(ValueError, "at position 2, opcode b'\\xff' unknown", id="unknown-opcode"),
+        pytest.param(EOFError, "pickle exhausted before seeing stop", id="eof"),
+    ],
+)
+def test_bin_parse_failure_still_scans_full_binary_content(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    exception_type: type[Exception],
+    message: str,
 ) -> None:
-    """Unknown opcode parse failures in .bin files should still fall back to full binary scanning."""
+    """Parse failures in .bin files should still fall back to full binary scanning."""
     bin_path = tmp_path / "unknown_opcode.bin"
     bin_path.write_bytes(b"\x80\x04K\x01." + (b"A" * 9000) + BINARY_CODE_PATTERNS[0])
 
     def _raise_unknown_opcode(self: PickleScanner, _file_obj: object, _file_size: int) -> ScanResult:
-        raise ValueError("at position 2, opcode b'\\xff' unknown")
+        raise exception_type(message)
 
     monkeypatch.setattr(PickleScanner, "_scan_pickle_bytes", _raise_unknown_opcode)
 
@@ -224,13 +234,26 @@ def test_unknown_opcode_bin_parse_failure_still_scans_full_binary_content(
     assert any(check.name == "Pickle Format Check" and check.status == CheckStatus.PASSED for check in result.checks), (
         f"Expected passing .bin format check, got: {[(c.name, c.status) for c in result.checks]}"
     )
+    assert not any(check.name == "Pickle File Open" for check in result.checks), (
+        f"Unexpected generic open failure, got: {[(c.name, c.status) for c in result.checks]}"
+    )
     assert any(
         check.name == "Binary Content Check" and check.status == CheckStatus.FAILED for check in result.checks
     ), f"Expected binary fallback finding, got: {[(c.name, c.status) for c in result.checks]}"
 
 
-def test_unknown_opcode_bin_parse_failure_runs_binary_fallback_after_raw_scan_exception(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("exception_type", "message"),
+    [
+        pytest.param(ValueError, "at position 2, opcode b'\\xff' unknown", id="unknown-opcode"),
+        pytest.param(EOFError, "pickle exhausted before seeing stop", id="eof"),
+    ],
+)
+def test_bin_parse_failure_runs_binary_fallback_after_raw_scan_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    exception_type: type[Exception],
+    message: str,
 ) -> None:
     """A raw-scan exception must not suppress the .bin parse-failure binary fallback."""
     bin_path = tmp_path / "unknown_opcode_raw_scan_exception.bin"
@@ -247,7 +270,7 @@ def test_unknown_opcode_bin_parse_failure_runs_binary_fallback_after_raw_scan_ex
         raise RuntimeError("simulated raw-scan failure")
 
     def _raise_unknown_opcode(self: PickleScanner, _file_obj: object, _file_size: int) -> ScanResult:
-        raise ValueError("at position 2, opcode b'\\xff' unknown")
+        raise exception_type(message)
 
     monkeypatch.setattr(PickleScanner, "_scan_for_dangerous_patterns", _raise_raw_scan)
     monkeypatch.setattr(PickleScanner, "_scan_pickle_bytes", _raise_unknown_opcode)
@@ -271,15 +294,25 @@ def test_unknown_opcode_bin_parse_failure_runs_binary_fallback_after_raw_scan_ex
     ), f"Expected CRITICAL executable-signature issue, got: {[(i.severity, i.message) for i in result.issues]}"
 
 
-def test_unknown_opcode_bin_parse_failure_with_benign_binary_content_stays_clean(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("exception_type", "message"),
+    [
+        pytest.param(ValueError, "at position 2, opcode b'\\xff' unknown", id="unknown-opcode"),
+        pytest.param(EOFError, "pickle exhausted before seeing stop", id="eof"),
+    ],
+)
+def test_bin_parse_failure_with_benign_binary_content_stays_clean(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    exception_type: type[Exception],
+    message: str,
 ) -> None:
     """Parse-failed .bin files should still complete binary fallback scanning when content is benign."""
     bin_path = tmp_path / "unknown_opcode_benign.bin"
     bin_path.write_bytes(b"\x80\x04K\x01." + (b"\x00" * 9000) + b"tensor-weights")
 
     def _raise_unknown_opcode(self: PickleScanner, _file_obj: object, _file_size: int) -> ScanResult:
-        raise ValueError("at position 2, opcode b'\\xff' unknown")
+        raise exception_type(message)
 
     monkeypatch.setattr(PickleScanner, "_scan_pickle_bytes", _raise_unknown_opcode)
 
@@ -292,6 +325,9 @@ def test_unknown_opcode_bin_parse_failure_with_benign_binary_content_stays_clean
     assert result.metadata["binary_bytes"] == bin_path.stat().st_size
     assert any(check.name == "Pickle Format Check" and check.status == CheckStatus.PASSED for check in result.checks), (
         f"Expected passing .bin format check, got: {[(c.name, c.status) for c in result.checks]}"
+    )
+    assert not any(check.name == "Pickle File Open" for check in result.checks), (
+        f"Unexpected generic open failure, got: {[(c.name, c.status) for c in result.checks]}"
     )
     assert not any(
         check.name == "Binary Content Check" and check.status == CheckStatus.FAILED for check in result.checks
