@@ -1,0 +1,163 @@
+name: Performance Benchmarks
+
+on:
+  pull_request:
+    paths:
+      - "modelaudit/**"
+      - "tests/**"
+      - "scripts/benchmark_report.py"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/perf.yml"
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  benchmarks:
+    name: Benchmarks (Python 3.11)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Pin Python version
+        run: |
+          uv python pin 3.11
+
+      - name: Benchmark base commit
+        if: github.event_name == 'pull_request'
+        run: |
+          git worktree add /tmp/modelaudit-base "${{ github.event.pull_request.base.sha }}"
+          cd /tmp/modelaudit-base
+          if [ ! -f tests/benchmarks/test_scan_benchmarks.py ]; then
+            echo "Base branch does not include the benchmark suite yet; skipping baseline run."
+            exit 0
+          fi
+          uv python pin 3.11
+          uv run --locked --with pytest-benchmark pytest \
+            tests/benchmarks/test_scan_benchmarks.py \
+            --benchmark-json=/tmp/benchmark-base.json \
+            -q
+
+      - name: Benchmark current commit
+        run: |
+          # Keep this lane single-process; pytest-benchmark disables itself under xdist.
+          uv run --locked --with pytest-benchmark pytest \
+            tests/benchmarks/test_scan_benchmarks.py \
+            --benchmark-json=/tmp/benchmark-head.json \
+            -q
+
+      - name: Compare against base
+        id: compare
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        run: |
+          if [ -f /tmp/benchmark-base.json ]; then
+            set +e
+            uv run --locked python scripts/benchmark_report.py \
+              --current /tmp/benchmark-head.json \
+              --baseline /tmp/benchmark-base.json \
+              --threshold 0.15 \
+              --summary-file /tmp/benchmark-comment.md
+            compare_exit=$?
+            set -e
+          else
+            {
+              echo "Base branch does not include the benchmark suite yet; showing current results only."
+              echo
+            } > /tmp/benchmark-comment.md
+            uv run --locked python scripts/benchmark_report.py \
+              --current /tmp/benchmark-head.json \
+              --summary-file /tmp/benchmark-current.md
+            cat /tmp/benchmark-current.md >> /tmp/benchmark-comment.md
+            compare_exit=0
+          fi
+          cat /tmp/benchmark-comment.md >> "$GITHUB_STEP_SUMMARY"
+          exit "$compare_exit"
+
+      - name: Summarize current results
+        if: github.event_name != 'pull_request'
+        run: |
+          uv run --locked python scripts/benchmark_report.py \
+            --current /tmp/benchmark-head.json \
+            --summary-file "$GITHUB_STEP_SUMMARY"
+
+      - name: Comment benchmark summary on PR
+        if: >
+          always() &&
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/github-script@v8
+        env:
+          COMMENT_BODY_PATH: /tmp/benchmark-comment.md
+        with:
+          script: |
+            const fs = require("fs")
+            if (!fs.existsSync(process.env.COMMENT_BODY_PATH)) {
+              core.warning(`No benchmark comment body found at ${process.env.COMMENT_BODY_PATH}`)
+              return
+            }
+            const marker = "<!-- modelaudit-perf-benchmarks -->"
+            const body = `${marker}\n${fs.readFileSync(process.env.COMMENT_BODY_PATH, "utf8")}`
+            const { owner, repo } = context.repo
+            const issue_number = context.issue.number
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner,
+              repo,
+              issue_number,
+              per_page: 100,
+            })
+
+            const existing = comments.find(
+              (comment) => comment.user?.type === "Bot" && comment.body?.includes(marker),
+            )
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner,
+                repo,
+                comment_id: existing.id,
+                body,
+              })
+            } else {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number,
+                body,
+              })
+            }
+
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-python-3.11
+          path: |
+            /tmp/benchmark-head.json
+            /tmp/benchmark-base.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Fail on benchmark regression
+        if: github.event_name == 'pull_request' && steps.compare.outcome == 'failure'
+        run: exit 1

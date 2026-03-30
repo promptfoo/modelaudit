@@ -134,6 +134,7 @@ def pytest_runtest_setup(item):
             "test_optimized_config.py",  # optimized cache config regression tests
             "test_large_file_handler.py",  # Large file handler regression tests
             "test_file_iterator.py",  # Streaming file iterator memory regression tests
+            "test_benchmark_report.py",  # benchmark CI summary and regression gate tests
         ]
 
         # Check if this is an allowed test file
