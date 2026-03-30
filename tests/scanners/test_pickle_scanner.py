@@ -5,6 +5,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from collections import Counter
 from collections.abc import Callable, Iterator
 from io import BytesIO
 from pathlib import Path
@@ -44,6 +45,7 @@ from tests.assets.generators.generate_advanced_pickle_tests import (
     generate_stack_global_attack,
 )
 from tests.assets.generators.generate_evil_pickle import EvilClass
+from tests.helpers import create_mock_pytorch_zip
 
 # Add the parent directory to sys.path to allow importing modelaudit
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -101,6 +103,145 @@ def _make_dup_heavy_pickle(iterations: int) -> bytes:
         payload += b"h\x002a0"
     payload += b"."
     return bytes(payload)
+
+
+@pytest.mark.parametrize("suffix", [".pkl", ".pickle", ".dill", ".joblib"])
+def test_pickle_scanner_can_handle_known_extensions_without_reading_file(suffix: str) -> None:
+    """Known pickle extensions should take the extension fast path."""
+    assert PickleScanner.can_handle(f"/definitely/missing/model{suffix}") is True
+
+
+def test_pickle_scanner_can_handle_detects_protocol_zero_pickle_content(tmp_path: Path) -> None:
+    """Unknown extensions should still be accepted when content looks like a pickle."""
+    model_path = tmp_path / "model.weights"
+    model_path.write_bytes(pickle.dumps({"safe": True}, protocol=0))
+
+    assert PickleScanner.can_handle(str(model_path)) is True
+
+
+def test_pickle_scanner_can_handle_rejects_non_pickle_content(tmp_path: Path) -> None:
+    """Unknown extensions should be rejected when neither extension nor content match."""
+    model_path = tmp_path / "model.weights"
+    model_path.write_bytes(b"not a pickle payload")
+
+    assert PickleScanner.can_handle(str(model_path)) is False
+
+
+@pytest.mark.parametrize("suffix", [".bin", ".pt", ".pth"])
+def test_pickle_scanner_can_handle_rejects_zip_backed_pytorch_extensions(suffix: str, tmp_path: Path) -> None:
+    """ZIP-backed PyTorch containers should not route through PickleScanner.can_handle()."""
+    model_path = create_mock_pytorch_zip(tmp_path / f"model{suffix}")
+
+    assert PickleScanner.can_handle(str(model_path)) is False
+
+
+@pytest.mark.parametrize(
+    ("suffix", "expected"),
+    [
+        (".bin", True),
+        (".txt", False),
+    ],
+)
+def test_pickle_scanner_can_handle_falls_back_to_extension_on_detection_error(
+    suffix: str, expected: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Detection errors should fall back to the supported-extension list."""
+    model_path = tmp_path / f"model{suffix}"
+    model_path.write_bytes(b"not a pickle payload")
+
+    def _raise_detection(_path: str) -> str:
+        raise RuntimeError("detection exploded")
+
+    monkeypatch.setattr("modelaudit.utils.file.detection.detect_file_format", _raise_detection)
+
+    assert PickleScanner.can_handle(str(model_path)) is expected
+
+
+def test_pickle_scanner_can_handle_still_accepts_detected_pickle_when_validation_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Validation helper failures should not discard a positive pickle content detection."""
+    model_path = tmp_path / "model.weights"
+    model_path.write_bytes(pickle.dumps({"safe": True}, protocol=0))
+
+    monkeypatch.setattr("modelaudit.utils.file.detection.detect_file_format", lambda _path: "pickle")
+
+    def _raise_validation(_path: str) -> bool:
+        raise RuntimeError("validation exploded")
+
+    monkeypatch.setattr("modelaudit.utils.file.detection.validate_file_type", _raise_validation)
+
+    assert PickleScanner.can_handle(str(model_path)) is True
+
+
+def test_pickle_scanner_extract_metadata_counts_protocol_and_opcodes(tmp_path: Path) -> None:
+    """Metadata extraction should report protocol and exact opcode counts."""
+    model_path = tmp_path / "metadata.pkl"
+    payload = pickle.dumps({"weights": [1, 2, 3], "name": "safe"}, protocol=4)
+    model_path.write_bytes(payload)
+
+    expected_opcode_counts = Counter(op.name for op, _arg, _pos in pickletools.genops(BytesIO(payload)))
+
+    metadata = PickleScanner().extract_metadata(str(model_path))
+
+    assert metadata["format"] == "pickle"
+    assert metadata["file_size"] == model_path.stat().st_size
+    assert metadata["pickle_size"] == len(payload)
+    assert metadata["pickle_protocol"] == 4
+    assert metadata["opcode_counts"] == dict(expected_opcode_counts)
+    assert metadata["total_opcodes"] == sum(expected_opcode_counts.values())
+    assert metadata["dangerous_opcodes"] == []
+    assert metadata["has_dangerous_opcodes"] is False
+    assert metadata["safe_loading"] is False
+    assert metadata["deserialization_skipped"] is True
+    assert metadata["reason"] == "Deserialization disabled for metadata extraction"
+
+
+def test_pickle_scanner_extract_metadata_reports_dangerous_opcodes(tmp_path: Path) -> None:
+    """Metadata extraction should surface dangerous pickle opcodes without deserializing."""
+    model_path = tmp_path / "dangerous.pkl"
+    payload = b"cos\nsystem\n(S'echo pwned'\ntR."
+    model_path.write_bytes(payload)
+
+    metadata = PickleScanner().extract_metadata(str(model_path))
+
+    assert metadata["pickle_protocol"] == 0
+    assert metadata["opcode_counts"]["GLOBAL"] == 1
+    assert metadata["opcode_counts"]["REDUCE"] == 1
+    assert metadata["has_dangerous_opcodes"] is True
+    assert {"GLOBAL", "REDUCE"} <= set(metadata["dangerous_opcodes"])
+    assert metadata["safe_loading"] is False
+    assert "object_type" not in metadata
+
+
+def test_pickle_scanner_extract_metadata_enforces_read_limit(tmp_path: Path) -> None:
+    """Metadata extraction should fail closed when the configured read limit is exceeded."""
+    model_path = tmp_path / "large-metadata.pkl"
+    model_path.write_bytes(pickle.dumps({"weights": list(range(32))}, protocol=4))
+
+    metadata = PickleScanner({"max_metadata_pickle_read_size": 32}).extract_metadata(str(model_path))
+
+    assert metadata["format"] == "pickle"
+    assert metadata["file_size"] == model_path.stat().st_size
+    assert "Pickle metadata read limit exceeded" in metadata["extraction_error"]
+    assert "pickle_size" not in metadata
+
+
+def test_pickle_scanner_extract_metadata_adds_opt_in_deserialization_details(tmp_path: Path) -> None:
+    """Object metadata should only be populated when deserialization is explicitly enabled."""
+    model_path = tmp_path / "safe-metadata.pkl"
+    payload = {"weights": [1, 2, 3], "name": "safe"}
+    model_path.write_bytes(pickle.dumps(payload, protocol=4))
+
+    metadata = PickleScanner({"allow_metadata_deserialization": True}).extract_metadata(str(model_path))
+
+    assert metadata["pickle_protocol"] == 4
+    assert metadata["object_type"] == "dict"
+    assert metadata["object_module"] == "builtins"
+    assert metadata["dict_size"] == len(payload)
+    assert metadata["dict_keys"] == list(payload.keys())
+    assert "deserialization_skipped" not in metadata
+    assert "extraction_error" not in metadata
 
 
 def test_direct_pickle_scanner_routes_zip_backed_malicious_pt_fixture() -> None:
