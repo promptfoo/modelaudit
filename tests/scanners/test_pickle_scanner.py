@@ -796,6 +796,142 @@ def test_scan_pickle_detects_post_budget_stack_global_with_binget(tmp_path: Path
     assert result.success is False
 
 
+def test_post_budget_opcode_scan_detects_nested_pickle_payload(tmp_path: Path) -> None:
+    """Nested inner pickle payloads beyond the opcode budget should still be surfaced."""
+    inner_pickle = pickle.dumps({"ab": 1}, protocol=4)
+    pickle_path = tmp_path / "post-budget-nested-pickle.pkl"
+    benign_padding = _make_opcode_padding_stream(opcode_pairs=512)
+    malicious_stream = b"\x80\x04B" + struct.pack("<I", len(inner_pickle)) + inner_pickle + b"."
+    pickle_path.write_bytes(benign_padding + malicious_stream)
+
+    result = PickleScanner({"max_opcodes": 64}).scan(str(pickle_path))
+
+    checks = [check for check in result.checks if check.name == "Post-Budget Opcode Detection"]
+    assert len(checks) == 1, f"Expected one post-budget opcode finding, got: {result.checks}"
+    assert checks[0].status == CheckStatus.FAILED
+    assert checks[0].severity == IssueSeverity.CRITICAL
+    assert "Nested pickle payload detected" in checks[0].message
+    assert any(
+        finding["check_name"] == "Nested Pickle Detection" and finding["details"].get("opcode") == "BINBYTES"
+        for finding in checks[0].details["findings"]
+    ), checks[0].details
+    assert not any(
+        check.name == "Post-Budget Global Reference Scan" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    ), f"Expected opcode-based detection, got: {result.checks}"
+    assert result.success is False
+
+
+def test_post_budget_opcode_scan_detects_encoded_pickle_payload(tmp_path: Path) -> None:
+    """Encoded inner pickle payloads beyond the opcode budget should still be surfaced."""
+    import base64
+
+    inner_pickle = pickle.dumps({"ab": 1}, protocol=4)
+    encoded_pickle = base64.b64encode(inner_pickle)
+    pickle_path = tmp_path / "post-budget-encoded-pickle.pkl"
+    benign_padding = _make_opcode_padding_stream(opcode_pairs=512)
+    malicious_stream = b"\x80\x04" + _short_binunicode(encoded_pickle) + b"."
+    pickle_path.write_bytes(benign_padding + malicious_stream)
+
+    result = PickleScanner({"max_opcodes": 64}).scan(str(pickle_path))
+
+    checks = [check for check in result.checks if check.name == "Post-Budget Opcode Detection"]
+    assert len(checks) == 1, f"Expected one post-budget opcode finding, got: {result.checks}"
+    assert checks[0].status == CheckStatus.FAILED
+    assert checks[0].severity == IssueSeverity.CRITICAL
+    assert "Encoded pickle payload detected" in checks[0].message
+    assert any(
+        finding["check_name"] == "Encoded Pickle Detection"
+        and finding["details"].get("encoding") == "base64"
+        and finding["details"].get("opcode") == "SHORT_BINUNICODE"
+        for finding in checks[0].details["findings"]
+    ), checks[0].details
+    assert not any(
+        check.name == "Post-Budget Global Reference Scan" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    ), f"Expected opcode-based detection, got: {result.checks}"
+    assert result.success is False
+
+
+def test_post_budget_opcode_scan_detects_malformed_stack_global(tmp_path: Path) -> None:
+    """Malformed STACK_GLOBAL payloads beyond the opcode budget should still fail closed."""
+    pickle_path = tmp_path / "post-budget-malformed-stack-global.pkl"
+    benign_padding = _make_opcode_padding_stream(opcode_pairs=512)
+    malicious_stream = b"\x80\x04\x8c\x02osK\x01\x93."
+    pickle_path.write_bytes(benign_padding + malicious_stream)
+
+    result = PickleScanner({"max_opcodes": 64}).scan(str(pickle_path))
+
+    checks = [check for check in result.checks if check.name == "Post-Budget Opcode Detection"]
+    assert len(checks) == 1, f"Expected one post-budget opcode finding, got: {result.checks}"
+    assert checks[0].status == CheckStatus.FAILED
+    assert checks[0].severity == IssueSeverity.CRITICAL
+    assert any(
+        finding["check_name"] == "STACK_GLOBAL Context Check"
+        and finding["details"].get("module") == "os"
+        and finding["details"].get("reason") == "mixed_or_non_string"
+        for finding in checks[0].details["findings"]
+    ), checks[0].details
+    assert not any(
+        check.name == "Post-Budget Global Reference Scan" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    ), f"Expected opcode-based detection, got: {result.checks}"
+    assert result.success is False
+
+
+def test_post_budget_opcode_scan_detects_ext_reduce_target(tmp_path: Path) -> None:
+    """Dangerous EXT/copyreg call targets beyond the opcode budget should still be surfaced."""
+    import copyreg
+    from contextlib import suppress
+
+    inverted_registry = getattr(copyreg, "_inverted_registry", {})
+    extension_registry = getattr(copyreg, "_extension_registry", {})
+    existing_code = extension_registry.get(("builtins", "set"))
+
+    ext_code = next((candidate for candidate in range(1, 256) if candidate not in inverted_registry), None)
+    if ext_code is None:
+        pytest.skip("No free copyreg extension code available in range 1-255")
+
+    pickle_path = tmp_path / "post-budget-ext-reduce.pkl"
+    benign_padding = _make_opcode_padding_stream(opcode_pairs=512)
+    result: ScanResult | None = None
+
+    try:
+        if isinstance(existing_code, int):
+            with suppress(ValueError):
+                copyreg.remove_extension("builtins", "set", existing_code)
+
+        copyreg.add_extension("builtins", "set", ext_code)
+        malicious_stream = b"\x80\x02\x82" + bytes([ext_code]) + b")R."
+        pickle_path.write_bytes(benign_padding + malicious_stream)
+
+        result = PickleScanner({"max_opcodes": 64}).scan(str(pickle_path))
+    finally:
+        with suppress(ValueError):
+            copyreg.remove_extension("builtins", "set", ext_code)
+        if isinstance(existing_code, int):
+            with suppress(ValueError):
+                copyreg.add_extension("builtins", "set", existing_code)
+
+    assert result is not None
+    checks = [check for check in result.checks if check.name == "Post-Budget Opcode Detection"]
+    assert len(checks) == 1, f"Expected one post-budget opcode finding, got: {result.checks}"
+    assert checks[0].status == CheckStatus.FAILED
+    assert checks[0].severity == IssueSeverity.CRITICAL
+    assert any(
+        finding["check_name"] == "Reduce Pattern Analysis"
+        and finding["details"].get("module") == "builtins"
+        and finding["details"].get("function") == "set"
+        and finding["details"].get("origin_is_ext") is True
+        for finding in checks[0].details["findings"]
+    ), checks[0].details
+    assert not any(
+        check.name == "Post-Budget Global Reference Scan" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    ), f"Expected opcode-based detection, got: {result.checks}"
+    assert result.success is False
+
+
 def test_post_budget_global_scan_runs_after_deadline_truncation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

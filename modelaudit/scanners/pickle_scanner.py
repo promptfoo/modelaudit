@@ -3470,6 +3470,7 @@ def is_dangerous_reduce_pattern(
     callable_refs: dict[int, tuple[str, str]] | None = None,
     callable_origin_is_ext: dict[int, bool] | None = None,
     mutation_target_refs: dict[int, _MutationTargetRef] | None = None,
+    minimum_position: int | None = None,
 ) -> dict[str, Any] | None:
     """
     Check for patterns that indicate a dangerous __reduce__ method.
@@ -3501,6 +3502,11 @@ def is_dangerous_reduce_pattern(
             return False
         # Check SUSPICIOUS_GLOBALS (the fallback)
         return is_suspicious_global(mod, func)
+
+    def _position_in_scope(position: int | None) -> bool:
+        if minimum_position is None:
+            return True
+        return position is not None and int(position) >= minimum_position
 
     if (
         stack_global_refs is None
@@ -3541,7 +3547,7 @@ def is_dangerous_reduce_pattern(
             if reduce_ref:
                 mod, func = reduce_ref
                 origin_is_ext = resolved_callable_origin_is_ext.get(i, False)
-                if _is_dangerous_ref(mod, func, origin_is_ext=origin_is_ext):
+                if _is_dangerous_ref(mod, func, origin_is_ext=origin_is_ext) and _position_in_scope(pos):
                     return {
                         "pattern": "RESOLVED_REDUCE_CALL_TARGET",
                         "module": mod,
@@ -3557,7 +3563,7 @@ def is_dangerous_reduce_pattern(
             target_ref = resolved_mutation_targets.get(i)
             if target_ref and target_ref.kind == "object" and target_ref.callable_ref:
                 mod, func = target_ref.callable_ref
-                if not _is_safe_ml_global(mod, func):
+                if not _is_safe_ml_global(mod, func) and _position_in_scope(pos):
                     return {
                         "pattern": "BUILD_SETSTATE_NON_SAFE_GLOBAL",
                         "module": mod,
@@ -3566,7 +3572,8 @@ def is_dangerous_reduce_pattern(
                         "position": pos,
                         "opcode": opcode.name,
                         "description": (
-                            "BUILD applied state to object from non-safe global; potential __setstate__ exploitation"
+                            "BUILD applied state to object from non-safe global; "
+                            "potential __setstate__ exploitation"
                         ),
                     }
 
@@ -3577,7 +3584,7 @@ def is_dangerous_reduce_pattern(
             parts = arg.split(" ", 1) if " " in arg else arg.rsplit(".", 1) if "." in arg else [arg, ""]
             if len(parts) == 2:
                 mod, func = parts
-                if _is_dangerous_ref(mod, func):
+                if _is_dangerous_ref(mod, func) and _position_in_scope(pos):
                     return {
                         "pattern": "GLOBAL+REDUCE",
                         "module": mod,
@@ -3595,7 +3602,7 @@ def is_dangerous_reduce_pattern(
                     resolved = resolved_stack_globals.get(i)
                     if resolved:
                         mod, func = resolved
-                        if _is_dangerous_ref(mod, func):
+                        if _is_dangerous_ref(mod, func) and _position_in_scope(pos):
                             return {
                                 "pattern": "STACK_GLOBAL+REDUCE",
                                 "module": mod,
@@ -3630,7 +3637,7 @@ def is_dangerous_reduce_pattern(
                 ref = resolved_callables.get(i)
                 if ref:
                     is_safe = _is_safe_ml_global(ref[0], ref[1])
-            if not is_safe:
+            if not is_safe and _position_in_scope(pos):
                 return {
                     "pattern": f"{opcode.name}_EXECUTION",
                     "argument": arg,
@@ -3645,7 +3652,7 @@ def is_dangerous_reduce_pattern(
             if ref:
                 mod, func = ref
                 origin_is_ext = resolved_callable_origin_is_ext.get(i, False)
-                if _is_dangerous_ref(mod, func, origin_is_ext=origin_is_ext):
+                if _is_dangerous_ref(mod, func, origin_is_ext=origin_is_ext) and _position_in_scope(pos):
                     return {
                         "pattern": f"{opcode.name}_EXECUTION",
                         "argument": f"{mod}.{func}",
@@ -3655,7 +3662,12 @@ def is_dangerous_reduce_pattern(
                     }
 
         # Check for suspicious attribute access patterns (GETATTR followed by CALL)
-        if opcode.name == "GETATTR" and i + 1 < len(opcodes) and opcodes[i + 1][0].name == "CALL":
+        if (
+            opcode.name == "GETATTR"
+            and i + 1 < len(opcodes)
+            and opcodes[i + 1][0].name == "CALL"
+            and _position_in_scope(pos)
+        ):
             return {
                 "pattern": "GETATTR+CALL",
                 "attribute": arg,
@@ -3664,6 +3676,296 @@ def is_dangerous_reduce_pattern(
             }
 
     return None
+
+
+def _build_opcode_check_finding(
+    *,
+    check_name: str,
+    message: str,
+    severity: IssueSeverity,
+    position: int | None,
+    rule_code: str | None,
+    details: dict[str, Any],
+    why: str | None,
+) -> dict[str, Any]:
+    """Create a reusable opcode-derived finding payload."""
+    return {
+        "check_name": check_name,
+        "message": message,
+        "severity": severity,
+        "position": position,
+        "rule_code": rule_code,
+        "details": details,
+        "why": why,
+    }
+
+
+def _serialize_opcode_check_finding(finding: dict[str, Any]) -> dict[str, Any]:
+    """Convert opcode finding payloads into check-detail-friendly data."""
+    severity = finding.get("severity")
+    serialized = {
+        "check_name": finding["check_name"],
+        "message": finding["message"],
+        "severity": severity.value if isinstance(severity, IssueSeverity) else severity,
+        "position": finding.get("position"),
+        "details": dict(finding.get("details", {})),
+    }
+    if finding.get("rule_code") is not None:
+        serialized["rule_code"] = finding["rule_code"]
+    if finding.get("why") is not None:
+        serialized["why"] = finding["why"]
+    return serialized
+
+
+def _collect_nested_pickle_opcode_findings(
+    opcode_name: str,
+    arg: Any,
+    pos: int | None,
+    ml_context: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Return nested/encoded pickle findings for a single opcode payload."""
+    findings: list[dict[str, Any]] = []
+
+    if opcode_name in {"BINBYTES", "SHORT_BINBYTES", "BINBYTES8", "BYTEARRAY8"} and isinstance(
+        arg, bytes | bytearray
+    ):
+        nested_match = _find_nested_pickle_match(arg)
+        if nested_match is not None:
+            severity = _get_context_aware_severity(IssueSeverity.CRITICAL, ml_context)
+            findings.append(
+                _build_opcode_check_finding(
+                    check_name="Nested Pickle Detection",
+                    message="Nested pickle payload detected",
+                    severity=severity,
+                    position=pos,
+                    rule_code="S213",
+                    details={
+                        "position": pos,
+                        "opcode": opcode_name,
+                        "nested_offset": nested_match.offset,
+                        "sample_size": nested_match.sample_size,
+                        "searched_bytes": nested_match.searched_bytes,
+                    },
+                    why=get_pattern_explanation("nested_pickle"),
+                )
+            )
+
+    if opcode_name in {"BINSTRING", "SHORT_BINSTRING"} and isinstance(arg, str):
+        try:
+            nested_match = _find_nested_pickle_match(arg.encode("latin-1"))
+            if nested_match is not None:
+                severity = _get_context_aware_severity(IssueSeverity.CRITICAL, ml_context)
+                findings.append(
+                    _build_opcode_check_finding(
+                        check_name="Nested Pickle Detection",
+                        message="Nested pickle payload detected in legacy string opcode",
+                        severity=severity,
+                        position=pos,
+                        rule_code="S213",
+                        details={
+                            "position": pos,
+                            "opcode": opcode_name,
+                            "nested_offset": nested_match.offset,
+                            "sample_size": nested_match.sample_size,
+                            "searched_bytes": nested_match.searched_bytes,
+                        },
+                        why=get_pattern_explanation("nested_pickle"),
+                    )
+                )
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            pass
+
+    if opcode_name in STRING_OPCODES and isinstance(arg, str):
+        for enc, decoded in _decode_string_to_bytes(arg):
+            nested_match = _find_nested_pickle_match(decoded)
+            if nested_match is not None:
+                severity = _get_context_aware_severity(IssueSeverity.CRITICAL, ml_context)
+                findings.append(
+                    _build_opcode_check_finding(
+                        check_name="Encoded Pickle Detection",
+                        message="Encoded pickle payload detected",
+                        severity=severity,
+                        position=pos,
+                        rule_code=get_encoding_rule_code(enc),
+                        details={
+                            "position": pos,
+                            "opcode": opcode_name,
+                            "encoding": enc,
+                            "decoded_size": len(decoded),
+                            "nested_offset": nested_match.offset,
+                            "sample_size": nested_match.sample_size,
+                            "searched_bytes": nested_match.searched_bytes,
+                        },
+                        why=get_pattern_explanation("nested_pickle"),
+                    )
+                )
+
+    return findings
+
+
+def _collect_encoded_python_opcode_findings(
+    opcode_name: str,
+    arg: Any,
+    pos: int | None,
+    ml_context: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Return encoded-Python findings preserved from the main opcode loop."""
+    if opcode_name not in STRING_OPCODES or not isinstance(arg, str):
+        return []
+
+    findings: list[dict[str, Any]] = []
+    for enc, decoded in _decode_string_to_bytes(arg):
+        if _find_nested_pickle_match(decoded) is not None:
+            continue
+        try:
+            decoded_str = decoded.decode("utf-8", errors="ignore")
+            if len(decoded_str) <= 10 or not any(
+                pattern in decoded_str for pattern in ["import ", "def ", "class ", "eval(", "exec(", "__import__"]
+            ):
+                continue
+            is_valid, _ = validate_python_syntax(decoded_str)
+            if not is_valid:
+                continue
+            is_dangerous, risk_desc = is_code_potentially_dangerous(decoded_str, "low")
+            if not is_dangerous:
+                continue
+            severity = _get_context_aware_severity(IssueSeverity.WARNING, ml_context)
+            enc_rule = get_encoding_rule_code(enc) or "S507"
+            findings.append(
+                _build_opcode_check_finding(
+                    check_name="Encoded Python Code Detection",
+                    message=f"Encoded Python code detected ({enc})",
+                    severity=severity,
+                    position=pos,
+                    rule_code=enc_rule,
+                    details={
+                        "position": pos,
+                        "opcode": opcode_name,
+                        "encoding": enc,
+                        "risk_analysis": risk_desc,
+                        "code_preview": decoded_str[:100] + "..." if len(decoded_str) > 100 else decoded_str,
+                    },
+                    why="Encoded Python code was found that could be executed during unpickling.",
+                )
+            )
+        except Exception:
+            continue
+
+    return findings
+
+
+def _build_malformed_stack_global_finding(
+    *,
+    pos: int | None,
+    malformed: MalformedStackGlobalDetails,
+    ml_context: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the fail-closed STACK_GLOBAL finding shared by main and tail scans."""
+    module_hint = malformed["module"]
+    function_hint = malformed["function"]
+    module_kind = malformed["module_kind"]
+    function_kind = malformed["function_kind"]
+    reason = malformed["reason"]
+    module_looks_high_risk = (
+        module_kind == "string"
+        and module_hint not in {"", "unknown"}
+        and (_is_dangerous_module(module_hint) or _is_risky_ml_module_prefix(module_hint))
+    )
+    severity = IssueSeverity.CRITICAL if module_looks_high_risk else IssueSeverity.WARNING
+    if reason == "missing_memo":
+        message = (
+            "STACK_GLOBAL references missing or invalid memoized operand(s): "
+            f"module={module_hint} ({module_kind}), function={function_hint} ({function_kind})"
+        )
+    else:
+        message = (
+            "Malformed STACK_GLOBAL operand types can hide dangerous imports: "
+            f"module={module_hint} ({module_kind}), function={function_hint} ({function_kind})"
+        )
+
+    return _build_opcode_check_finding(
+        check_name="STACK_GLOBAL Context Check",
+        message=message,
+        severity=severity,
+        position=pos,
+        rule_code="S205",
+        details={
+            "position": pos,
+            "opcode": "STACK_GLOBAL",
+            "module": module_hint,
+            "function": function_hint,
+            "module_kind": module_kind,
+            "function_kind": function_kind,
+            "reason": reason,
+            "ml_context_confidence": ml_context.get("overall_confidence", 0),
+        },
+        why=(
+            "STACK_GLOBAL should be formed from two string operands. Non-string operands "
+            "or missing memoized values indicate a malformed-by-design payload and are "
+            "treated as a security finding under fail-closed handling."
+        ),
+    )
+
+
+def _build_dangerous_reduce_pattern_finding(
+    dangerous_pattern: dict[str, Any],
+    ml_context: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the shared check payload for dangerous reduce/call-target patterns."""
+    normalized_pattern_mod, normalized_pattern_func = _normalize_import_reference(
+        dangerous_pattern.get("module", ""),
+        dangerous_pattern.get("function", ""),
+    )
+    is_build_setstate = dangerous_pattern.get("pattern") == "BUILD_SETSTATE_NON_SAFE_GLOBAL"
+    dangerous_pattern_base_severity = (
+        _dangerous_ref_base_severity(
+            normalized_pattern_mod,
+            normalized_pattern_func,
+            origin_is_ext=bool(dangerous_pattern.get("origin_is_ext")),
+        )
+        if normalized_pattern_mod and normalized_pattern_func and not is_build_setstate
+        else (IssueSeverity.WARNING if is_build_setstate else IssueSeverity.CRITICAL)
+    )
+    severity = _get_context_aware_severity(
+        dangerous_pattern_base_severity,
+        ml_context,
+        issue_type="dangerous_import",
+    )
+    module_name = dangerous_pattern.get("module", "")
+    func_name = dangerous_pattern.get("function", "")
+    dangerous_pattern_rule_code = (
+        get_pickle_opcode_rule_code("BUILD")
+        if is_build_setstate
+        else get_import_rule_code(module_name, func_name)
+    )
+    if not dangerous_pattern_rule_code:
+        dangerous_pattern_rule_code = "S201"
+    finding_name = "BUILD Opcode Analysis" if is_build_setstate else "Reduce Pattern Analysis"
+    if is_build_setstate:
+        finding_message = f"Detected potential __setstate__ exploitation via BUILD with {module_name}.{func_name}"
+        dangerous_pattern_why: str | None = (
+            "BUILD can invoke __setstate__ on the constructed object. "
+            "When that object comes from a non-safe global, attacker-controlled state may execute code."
+        )
+    elif module_name and func_name:
+        finding_message = f"Detected dangerous __reduce__ pattern with {module_name}.{func_name}"
+        dangerous_pattern_why = get_import_explanation(f"{module_name}.{func_name}")
+    else:
+        finding_message = "Detected dangerous __reduce__ pattern"
+        dangerous_pattern_why = "A dangerous pattern was detected that could execute arbitrary code during unpickling."
+    details = {
+        **dangerous_pattern,
+        "ml_context_confidence": ml_context.get("overall_confidence", 0),
+    }
+    return _build_opcode_check_finding(
+        check_name=finding_name,
+        message=finding_message,
+        severity=severity,
+        position=dangerous_pattern.get("position"),
+        rule_code=dangerous_pattern_rule_code,
+        details=details,
+        why=dangerous_pattern_why,
+    )
 
 
 def check_opcode_sequence(
@@ -4520,7 +4822,7 @@ class PickleScanner(BaseScanner):
             return result
 
         has_critical_post_budget_failure = any(
-            check.name == "Post-Budget Global Reference Scan"
+            check.name in {"Post-Budget Global Reference Scan", "Post-Budget Opcode Detection"}
             and check.status == CheckStatus.FAILED
             and check.severity == IssueSeverity.CRITICAL
             for check in result.checks
@@ -5012,6 +5314,33 @@ class PickleScanner(BaseScanner):
 
         return values
 
+    def _read_post_budget_window(
+        self,
+        file_obj: BinaryIO,
+        *,
+        file_size: int,
+        minimum_offset: int,
+        scan_limit_bytes: int,
+    ) -> tuple[bytes, int, int]:
+        """Read a bounded post-budget window while preserving a small lookback context."""
+        minimum_offset = max(0, minimum_offset)
+        context_bytes = min(minimum_offset, _POST_BUDGET_GLOBAL_CONTEXT_BYTES)
+        tail_scan_bytes = min(max(file_size - minimum_offset, 0), scan_limit_bytes)
+        if tail_scan_bytes <= 0:
+            return b"", 0, 0
+
+        scan_start = max(0, minimum_offset - context_bytes)
+        read_size = context_bytes + tail_scan_bytes
+
+        original_pos = file_obj.tell()
+        try:
+            file_obj.seek(scan_start)
+            data = file_obj.read(read_size)
+        finally:
+            file_obj.seek(original_pos)
+
+        return data, scan_start, tail_scan_bytes
+
     def _scan_global_references_unbounded(
         self,
         file_obj: BinaryIO,
@@ -5025,19 +5354,14 @@ class PickleScanner(BaseScanner):
         seen: set[tuple[int, str]] = set()
 
         minimum_offset = max(0, minimum_offset)
-        context_bytes = min(minimum_offset, _POST_BUDGET_GLOBAL_CONTEXT_BYTES)
-        tail_scan_bytes = min(max(file_size - minimum_offset, 0), self.post_budget_global_scan_limit_bytes)
-        if tail_scan_bytes <= 0:
+        data, scan_start, _tail_scan_bytes = self._read_post_budget_window(
+            file_obj,
+            file_size=file_size,
+            minimum_offset=minimum_offset,
+            scan_limit_bytes=self.post_budget_global_scan_limit_bytes,
+        )
+        if not data:
             return findings
-        scan_start = max(0, minimum_offset - context_bytes)
-        read_size = context_bytes + tail_scan_bytes
-
-        original_pos = file_obj.tell()
-        try:
-            file_obj.seek(scan_start)
-            data = file_obj.read(read_size)
-        finally:
-            file_obj.seek(original_pos)
         data_len = len(data)
 
         def _record_reference(module: str, function: str, offset: int, opcode_name: str) -> None:
@@ -5280,6 +5604,89 @@ class PickleScanner(BaseScanner):
                 continue
             module, function = values
             _record_reference(module, function, scan_start + idx, "STACK_GLOBAL")
+
+        return findings
+
+    def _scan_post_budget_opcode_findings_unbounded(
+        self,
+        file_obj: BinaryIO,
+        *,
+        file_size: int,
+        minimum_offset: int,
+        ml_context: dict[str, Any],
+        deadline: float | None,
+    ) -> list[dict[str, Any]]:
+        """Run a bounded tail opcode pass for findings that only exist in the main opcode loop."""
+        minimum_offset = max(0, minimum_offset)
+        data, scan_start, _tail_scan_bytes = self._read_post_budget_window(
+            file_obj,
+            file_size=file_size,
+            minimum_offset=minimum_offset,
+            scan_limit_bytes=self.post_budget_global_scan_limit_bytes,
+        )
+        if not data:
+            return []
+
+        opcodes: list[tuple[Any, Any, int | None]] = []
+        tail_stream = io.BytesIO(data)
+        try:
+            for opcode, arg, pos in _genops_with_fallback(
+                tail_stream,
+                multi_stream=True,
+                deadline=deadline,
+            ):
+                shifted_pos = scan_start + int(pos) if pos is not None else None
+                opcodes.append((opcode, arg, shifted_pos))
+        except _GenopsBudgetExceeded as exc:
+            if exc.reason == "deadline":
+                logger.debug(
+                    "Post-budget opcode scan stopped after exceeding timeout (%ss)",
+                    self.timeout,
+                )
+        except Exception as exc:
+            logger.debug("Post-budget opcode scan failed: %s", exc)
+
+        if not opcodes:
+            return []
+
+        (
+            stack_global_refs,
+            callable_refs,
+            _callable_origin_refs,
+            callable_origin_is_ext,
+            malformed_stack_globals,
+            mutation_target_refs,
+        ) = _simulate_symbolic_reference_maps(opcodes)
+
+        findings: list[dict[str, Any]] = []
+        for index, (opcode, arg, pos) in enumerate(opcodes):
+            absolute_pos = int(pos) if pos is not None else None
+            if absolute_pos is None or absolute_pos < minimum_offset:
+                continue
+
+            findings.extend(_collect_nested_pickle_opcode_findings(opcode.name, arg, absolute_pos, ml_context))
+
+            if opcode.name == "STACK_GLOBAL":
+                malformed = malformed_stack_globals.get(index)
+                if malformed and malformed["reason"] != "insufficient_context":
+                    findings.append(
+                        _build_malformed_stack_global_finding(
+                            pos=absolute_pos,
+                            malformed=malformed,
+                            ml_context=ml_context,
+                        )
+                    )
+
+        dangerous_pattern = is_dangerous_reduce_pattern(
+            opcodes,
+            stack_global_refs=stack_global_refs,
+            callable_refs=callable_refs,
+            callable_origin_is_ext=callable_origin_is_ext,
+            mutation_target_refs=mutation_target_refs,
+            minimum_position=minimum_offset,
+        )
+        if dangerous_pattern is not None:
+            findings.append(_build_dangerous_reduce_pattern_finding(dangerous_pattern, ml_context))
 
         return findings
 
@@ -5641,6 +6048,10 @@ class PickleScanner(BaseScanner):
                 result.metadata["post_budget_global_scan_skipped_due_to_timeout"] = True
 
             if should_run_post_budget_scan:
+                post_budget_scan_bytes = min(
+                    max(file_size - post_budget_minimum_offset, 0),
+                    self.post_budget_global_scan_limit_bytes,
+                )
                 post_budget_global_findings = self._scan_global_references_unbounded(
                     file_obj,
                     file_size=file_size,
@@ -5659,10 +6070,6 @@ class PickleScanner(BaseScanner):
                     )
                     additional = len(post_budget_global_findings) - 1
                     additional_note = f" (+{additional} more)" if additional > 0 else ""
-                    post_budget_scan_bytes = min(
-                        max(file_size - post_budget_minimum_offset, 0),
-                        self.post_budget_global_scan_limit_bytes,
-                    )
                     suspicious_count += len(post_budget_global_findings)
                     result.add_check(
                         name="Post-Budget Global Reference Scan",
@@ -5697,6 +6104,66 @@ class PickleScanner(BaseScanner):
                     )
                     if highest_severity == IssueSeverity.CRITICAL:
                         result.success = False
+
+                post_budget_opcode_findings = self._scan_post_budget_opcode_findings_unbounded(
+                    file_obj,
+                    file_size=file_size,
+                    minimum_offset=post_budget_minimum_offset,
+                    ml_context=ml_context,
+                    deadline=deadline,
+                )
+                if post_budget_opcode_findings:
+                    suspicious_count += len(post_budget_opcode_findings)
+                    representative_finding = max(
+                        post_budget_opcode_findings,
+                        key=lambda finding: _severity_priority(finding["severity"]),
+                    )
+                    highest_severity = representative_finding["severity"]
+                    additional = len(post_budget_opcode_findings) - 1
+                    additional_note = f" (+{additional} more)" if additional > 0 else ""
+                    representative_position = representative_finding.get("position")
+                    representative_location = (
+                        f"{self.current_file_path} (pos {representative_position})"
+                        if representative_position is not None
+                        else self.current_file_path
+                    )
+                    serialized_findings = [
+                        _serialize_opcode_check_finding(finding) for finding in post_budget_opcode_findings
+                    ]
+                    result.add_check(
+                        name="Post-Budget Opcode Detection",
+                        passed=False,
+                        message=(
+                            representative_finding["message"]
+                            + (
+                                f" at byte offset {representative_position}"
+                                if representative_position is not None
+                                else ""
+                            )
+                            + " (beyond opcode budget)"
+                            + additional_note
+                        ),
+                        severity=highest_severity,
+                        location=representative_location,
+                        rule_code=representative_finding["rule_code"],
+                        details={
+                            "scan_limit_bytes": self.post_budget_global_scan_limit_bytes,
+                            "scan_bytes": post_budget_scan_bytes,
+                            "scan_total_bytes": file_size,
+                            "minimum_offset": post_budget_minimum_offset,
+                            "findings": serialized_findings,
+                            "critical_findings": [
+                                finding
+                                for finding in serialized_findings
+                                if finding["severity"] == IssueSeverity.CRITICAL.value
+                            ],
+                        },
+                        why=(
+                            "The opcode pass stopped at the configured budget, so a bounded tail opcode scan "
+                            "reused the main opcode detectors on the remaining payload window and found "
+                            "security-relevant opcode findings beyond the analyzed prefix."
+                        ),
+                    )
 
                 post_budget_expansion_findings = self._scan_expansion_heuristics_unbounded(
                     file_obj,
@@ -6540,124 +7007,34 @@ class PickleScanner(BaseScanner):
                             ),
                         )
 
-                # Detect nested pickle bytes
-                if opcode.name in ["BINBYTES", "SHORT_BINBYTES", "BINBYTES8", "BYTEARRAY8"] and isinstance(
-                    arg, bytes | bytearray
+                for nested_finding in _collect_nested_pickle_opcode_findings(opcode.name, arg, pos, ml_context):
+                    result.add_check(
+                        name=nested_finding["check_name"],
+                        passed=False,
+                        message=nested_finding["message"],
+                        severity=nested_finding["severity"],
+                        location=f"{self.current_file_path} (pos {pos})",
+                        rule_code=nested_finding["rule_code"],
+                        details=nested_finding["details"],
+                        why=nested_finding["why"],
+                    )
+
+                for encoded_python_finding in _collect_encoded_python_opcode_findings(
+                    opcode.name,
+                    arg,
+                    pos,
+                    ml_context,
                 ):
-                    nested_match = _find_nested_pickle_match(arg)
-                    if nested_match is not None:
-                        severity = _get_context_aware_severity(IssueSeverity.CRITICAL, ml_context)
-                        result.add_check(
-                            name="Nested Pickle Detection",
-                            passed=False,
-                            message="Nested pickle payload detected",
-                            severity=severity,
-                            location=f"{self.current_file_path} (pos {pos})",
-                            rule_code="S213",
-                            details={
-                                "position": pos,
-                                "opcode": opcode.name,
-                                "nested_offset": nested_match.offset,
-                                "sample_size": nested_match.sample_size,
-                                "searched_bytes": nested_match.searched_bytes,
-                            },
-                            why=get_pattern_explanation("nested_pickle"),
-                        )
-
-                # Legacy BINSTRING/SHORT_BINSTRING (protocols 0-2) carry raw
-                # bytes decoded as latin-1 strings by pickletools.  Re-encode
-                # to recover the original bytes and check for nested pickles.
-                if opcode.name in ["BINSTRING", "SHORT_BINSTRING"] and isinstance(arg, str):
-                    try:
-                        nested_match = _find_nested_pickle_match(arg.encode("latin-1"))
-                        if nested_match is not None:
-                            severity = _get_context_aware_severity(IssueSeverity.CRITICAL, ml_context)
-                            result.add_check(
-                                name="Nested Pickle Detection",
-                                passed=False,
-                                message="Nested pickle payload detected in legacy string opcode",
-                                severity=severity,
-                                location=f"{self.current_file_path} (pos {pos})",
-                                rule_code="S213",
-                                details={
-                                    "position": pos,
-                                    "opcode": opcode.name,
-                                    "nested_offset": nested_match.offset,
-                                    "sample_size": nested_match.sample_size,
-                                    "searched_bytes": nested_match.searched_bytes,
-                                },
-                                why=get_pattern_explanation("nested_pickle"),
-                            )
-                    except (UnicodeEncodeError, UnicodeDecodeError):
-                        pass
-
-                # Detect encoded nested pickle strings
-                if opcode.name in STRING_OPCODES and isinstance(arg, str):
-                    for enc, decoded in _decode_string_to_bytes(arg):
-                        nested_match = _find_nested_pickle_match(decoded)
-                        if nested_match is not None:
-                            severity = _get_context_aware_severity(IssueSeverity.CRITICAL, ml_context)
-                            # Get rule code for the detected encoding type
-                            enc_rule = get_encoding_rule_code(enc)
-                            result.add_check(
-                                name="Encoded Pickle Detection",
-                                passed=False,
-                                message="Encoded pickle payload detected",
-                                severity=severity,
-                                location=f"{self.current_file_path} (pos {pos})",
-                                rule_code=enc_rule,
-                                details={
-                                    "position": pos,
-                                    "opcode": opcode.name,
-                                    "encoding": enc,
-                                    "decoded_size": len(decoded),
-                                    "nested_offset": nested_match.offset,
-                                    "sample_size": nested_match.sample_size,
-                                    "searched_bytes": nested_match.searched_bytes,
-                                },
-                                why=get_pattern_explanation("nested_pickle"),
-                            )
-                        else:
-                            # Check if decoded content might be Python code
-                            try:
-                                decoded_str = decoded.decode("utf-8", errors="ignore")
-                                if len(decoded_str) > 10 and any(
-                                    pattern in decoded_str
-                                    for pattern in ["import ", "def ", "class ", "eval(", "exec(", "__import__"]
-                                ):
-                                    is_valid, _ = validate_python_syntax(decoded_str)
-                                    if is_valid:
-                                        is_dangerous, risk_desc = is_code_potentially_dangerous(decoded_str, "low")
-                                        if is_dangerous:
-                                            severity = _get_context_aware_severity(IssueSeverity.WARNING, ml_context)
-                                            # Get rule code for encoding type
-                                            enc_rule = get_encoding_rule_code(enc)
-                                            if not enc_rule:
-                                                enc_rule = "S507"  # Python embedded code
-                                            result.add_check(
-                                                name="Encoded Python Code Detection",
-                                                passed=False,
-                                                message=f"Encoded Python code detected ({enc})",
-                                                severity=severity,
-                                                location=f"{self.current_file_path} (pos {pos})",
-                                                rule_code=enc_rule,
-                                                details={
-                                                    "position": pos,
-                                                    "opcode": opcode.name,
-                                                    "encoding": enc,
-                                                    "risk_analysis": risk_desc,
-                                                    "code_preview": decoded_str[:100] + "..."
-                                                    if len(decoded_str) > 100
-                                                    else decoded_str,
-                                                },
-                                                why=(
-                                                    "Encoded Python code was found that could be "
-                                                    "executed during unpickling."
-                                                ),
-                                            )
-                            except Exception:
-                                # Not valid UTF-8, skip Python code check
-                                pass
+                    result.add_check(
+                        name=encoded_python_finding["check_name"],
+                        passed=False,
+                        message=encoded_python_finding["message"],
+                        severity=encoded_python_finding["severity"],
+                        location=f"{self.current_file_path} (pos {pos})",
+                        rule_code=encoded_python_finding["rule_code"],
+                        details=encoded_python_finding["details"],
+                        why=encoded_python_finding["why"],
+                    )
 
             # Check for STACK_GLOBAL patterns
             # (rebuild from opcodes to get proper context)
@@ -6745,50 +7122,20 @@ class PickleScanner(BaseScanner):
                         malformed = malformed_stack_globals.get(i)
                         if malformed and malformed["reason"] != "insufficient_context":
                             suspicious_count += 1
-                            module_hint = malformed["module"]
-                            function_hint = malformed["function"]
-                            module_kind = malformed["module_kind"]
-                            function_kind = malformed["function_kind"]
-                            reason = malformed["reason"]
-                            module_looks_high_risk = (
-                                module_kind == "string"
-                                and module_hint not in {"", "unknown"}
-                                and (_is_dangerous_module(module_hint) or _is_risky_ml_module_prefix(module_hint))
+                            malformed_finding = _build_malformed_stack_global_finding(
+                                pos=pos,
+                                malformed=malformed,
+                                ml_context=ml_context,
                             )
-                            severity = IssueSeverity.CRITICAL if module_looks_high_risk else IssueSeverity.WARNING
-                            if reason == "missing_memo":
-                                message = (
-                                    "STACK_GLOBAL references missing or invalid memoized operand(s): "
-                                    f"module={module_hint} ({module_kind}), function={function_hint} ({function_kind})"
-                                )
-                            else:
-                                message = (
-                                    "Malformed STACK_GLOBAL operand types can hide dangerous imports: "
-                                    f"module={module_hint} ({module_kind}), function={function_hint} ({function_kind})"
-                                )
-
                             result.add_check(
-                                name="STACK_GLOBAL Context Check",
+                                name=malformed_finding["check_name"],
                                 passed=False,
-                                message=message,
-                                severity=severity,
+                                message=malformed_finding["message"],
+                                severity=malformed_finding["severity"],
                                 location=f"{self.current_file_path} (pos {pos})",
-                                rule_code="S205",
-                                details={
-                                    "position": pos,
-                                    "opcode": opcode.name,
-                                    "module": module_hint,
-                                    "function": function_hint,
-                                    "module_kind": module_kind,
-                                    "function_kind": function_kind,
-                                    "reason": reason,
-                                    "ml_context_confidence": ml_context.get("overall_confidence", 0),
-                                },
-                                why=(
-                                    "STACK_GLOBAL should be formed from two string operands. Non-string operands "
-                                    "or missing memoized values indicate a malformed-by-design payload and are "
-                                    "treated as a security finding under fail-closed handling."
-                                ),
+                                rule_code=malformed_finding["rule_code"],
+                                details=malformed_finding["details"],
+                                why=malformed_finding["why"],
                             )
                         elif not ml_context.get("is_ml_content", False):
                             result.add_check(
@@ -6822,100 +7169,51 @@ class PickleScanner(BaseScanner):
                 mutation_target_refs=analysis.mutation_target_refs,
             )
             if dangerous_pattern:
+                dangerous_pattern_finding = _build_dangerous_reduce_pattern_finding(
+                    dangerous_pattern,
+                    ml_context,
+                )
                 normalized_pattern_mod, normalized_pattern_func = _normalize_import_reference(
                     dangerous_pattern.get("module", ""),
                     dangerous_pattern.get("function", ""),
                 )
                 is_build_setstate = dangerous_pattern.get("pattern") == "BUILD_SETSTATE_NON_SAFE_GLOBAL"
-                dangerous_pattern_base_severity = (
-                    _dangerous_ref_base_severity(
-                        normalized_pattern_mod,
-                        normalized_pattern_func,
-                        origin_is_ext=bool(dangerous_pattern.get("origin_is_ext")),
-                    )
-                    if normalized_pattern_mod and normalized_pattern_func and not is_build_setstate
-                    else (IssueSeverity.WARNING if is_build_setstate else IssueSeverity.CRITICAL)
-                )
-                severity = _get_context_aware_severity(
-                    dangerous_pattern_base_severity,
-                    ml_context,
-                    issue_type="dangerous_import",
-                )
-                module_name = dangerous_pattern.get("module", "")
-                func_name = dangerous_pattern.get("function", "")
-                dangerous_pattern_rule_code = (
-                    get_pickle_opcode_rule_code("BUILD")
-                    if is_build_setstate
-                    else get_import_rule_code(module_name, func_name)
-                )
-                if not dangerous_pattern_rule_code:
-                    dangerous_pattern_rule_code = "S201"  # REDUCE opcode
-                finding_name = "BUILD Opcode Analysis" if is_build_setstate else "Reduce Pattern Analysis"
-                finding_message = (
-                    f"Detected potential __setstate__ exploitation via BUILD with {module_name}.{func_name}"
-                    if is_build_setstate
-                    else (
-                        "Detected dangerous __reduce__ pattern with "
-                        f"{dangerous_pattern.get('module', '')}.{dangerous_pattern.get('function', '')}"
-                    )
-                )
                 location = f"{self.current_file_path} (pos {dangerous_pattern.get('position', 0)})"
-                details = {
-                    **dangerous_pattern,
-                    "ml_context_confidence": ml_context.get(
-                        "overall_confidence",
-                        0,
-                    ),
-                }
-                dangerous_pattern_why: str | None = (
-                    "BUILD can invoke __setstate__ on the constructed object. "
-                    "When that object comes from a non-safe global, attacker-controlled state may execute code."
-                    if is_build_setstate
-                    else get_import_explanation(f"{module_name}.{func_name}")
-                )
                 if is_build_setstate:
                     suspicious_count += 1
                     result.add_check(
-                        name=finding_name,
+                        name=dangerous_pattern_finding["check_name"],
                         passed=False,
-                        message=finding_message,
-                        severity=severity,
-                        rule_code=dangerous_pattern_rule_code,
+                        message=dangerous_pattern_finding["message"],
+                        severity=dangerous_pattern_finding["severity"],
+                        rule_code=dangerous_pattern_finding["rule_code"],
                         location=location,
-                        details=details,
-                        why=dangerous_pattern_why,
+                        details=dangerous_pattern_finding["details"],
+                        why=dangerous_pattern_finding["why"],
                     )
-                elif module_name and func_name:
+                elif dangerous_pattern.get("module") and dangerous_pattern.get("function"):
                     if _record_reference_primary(
                         (normalized_pattern_mod, normalized_pattern_func),
-                        name=finding_name,
-                        message=finding_message,
-                        severity=severity,
+                        name=dangerous_pattern_finding["check_name"],
+                        message=dangerous_pattern_finding["message"],
+                        severity=dangerous_pattern_finding["severity"],
                         location=location,
-                        details=details,
-                        why=dangerous_pattern_why,
-                        rule_code=dangerous_pattern_rule_code,
+                        details=dangerous_pattern_finding["details"],
+                        why=dangerous_pattern_finding["why"],
+                        rule_code=dangerous_pattern_finding["rule_code"],
                     ):
                         suspicious_count += 1
                 else:
                     suspicious_count += 1
                     result.add_check(
-                        name=finding_name,
+                        name=dangerous_pattern_finding["check_name"],
                         passed=False,
-                        message=(
-                            "Detected potential __setstate__ exploitation via BUILD"
-                            if is_build_setstate
-                            else "Detected dangerous __reduce__ pattern"
-                        ),
-                        severity=severity,
-                        rule_code=dangerous_pattern_rule_code,
+                        message=dangerous_pattern_finding["message"],
+                        severity=dangerous_pattern_finding["severity"],
+                        rule_code=dangerous_pattern_finding["rule_code"],
                         location=location,
-                        details=details,
-                        why=(
-                            "BUILD can invoke __setstate__ on attacker-controlled state."
-                            if is_build_setstate
-                            else "A dangerous pattern was detected that could execute arbitrary code during unpickling."
-                        ),
+                        details=dangerous_pattern_finding["details"],
+                        why=dangerous_pattern_finding["why"],
                     )
             else:
                 # Record successful validation - no dangerous reduce patterns found
