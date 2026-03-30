@@ -114,6 +114,10 @@ uv run pytest -n auto -m "not slow and not integration" --maxfail=1
 - If a new regression test must run on reduced CI lanes, add the file to `allowed_test_files` in `tests/conftest.py`.
 - Match local validation to the CI lane that will exercise the change when possible; if optional dependencies or Python-version gates prevent that, call it out explicitly in the PR.
 - For file routing, prefiltering, or archive-triage changes, add at least one malicious positive regression and one benign near-match negative regression.
+- Reuse shared fixture helpers for container formats. For PyTorch ZIP tests, prefer
+  `tests.helpers.create_mock_pytorch_zip`; if you hand-roll a ZIP-backed `.pt`/`.pkl`,
+  include minimal PyTorch markers like `version` or `byteorder` so routing matches
+  production.
 - Prefer trusted file structure or bounded content sniffing over suffix-only routing. Extension checks are a fallback, not a source of truth.
 - When a scan intentionally fails closed for coverage or safety reasons, make the behavior operationally explicit and test the message plus the relevant `success`, exit-code, and cache semantics.
 

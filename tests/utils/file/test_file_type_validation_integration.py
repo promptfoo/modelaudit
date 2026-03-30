@@ -23,6 +23,7 @@ from modelaudit.utils.file.detection import (
     detect_format_from_extension,
     validate_file_type,
 )
+from tests.helpers import create_mock_pytorch_zip
 
 try:
     from safetensors.numpy import save_file
@@ -210,12 +211,11 @@ class TestFileTypeValidationIntegration:
         # All spoofing attacks should be detected
         assert len(spoofing_attacks) == 0, f"Failed to detect spoofing attacks: {spoofing_attacks}"
 
-    def test_legitimate_cross_format_files(self, temp_test_dir):
+    def test_legitimate_cross_format_files(self, temp_test_dir: Path) -> None:
         """Test legitimate files that have different formats than their extensions suggest."""
         # Test 1: PyTorch file saved as ZIP (legitimate case)
         pytorch_zip = temp_test_dir / "model.pt"
-        with zipfile.ZipFile(pytorch_zip, "w") as zipf:
-            zipf.writestr("data.pkl", "tensor data")
+        create_mock_pytorch_zip(pytorch_zip)
 
         # Should pass validation (ZIP format with .pt extension is legitimate)
         assert validate_file_type(str(pytorch_zip)), "PyTorch ZIP file should be valid"
@@ -315,7 +315,7 @@ class TestFileTypeValidationIntegration:
         print(f"Security threat detections: {total_detections}")
         print(f"Undetected threats: {security_threats}")
 
-    def test_format_compatibility_matrix(self, tmp_path):
+    def test_format_compatibility_matrix(self, tmp_path: Path) -> None:
         """Test the file format compatibility matrix systematically."""
         test_cases = []
 
@@ -343,8 +343,7 @@ class TestFileTypeValidationIntegration:
 
         # PyTorch ZIP (legitimate cross-format)
         pt_zip = tmp_path / "model.pt"
-        with zipfile.ZipFile(pt_zip, "w") as zipf:
-            zipf.writestr("data.pkl", "tensor")
+        create_mock_pytorch_zip(pt_zip)
         test_files.append((pt_zip, True, "PyTorch ZIP"))
 
         # Invalid cases (should fail)

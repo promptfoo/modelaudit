@@ -5,13 +5,13 @@ This test provides a concise example of how the file type validation feature wor
 with real model files, showcasing both security benefits and legitimate use cases.
 """
 
-import zipfile
 from pathlib import Path
 
 import pytest
 
 from modelaudit.core import scan_file, scan_model_directory_or_file
 from modelaudit.utils.file.detection import validate_file_type
+from tests.helpers import create_mock_pytorch_zip
 
 
 class TestFileTypeValidationDemo:
@@ -79,15 +79,14 @@ class TestFileTypeValidationDemo:
             else:
                 print("   ⚠️  Threat not detected (may be due to permissive validation)")
 
-    def test_cross_format_compatibility_demo(self, tmp_path):
+    def test_cross_format_compatibility_demo(self, tmp_path: Path) -> None:
         """Demonstrate legitimate cross-format file compatibility."""
         print("\n=== File Type Validation Demo: Cross-Format Compatibility ===")
 
         # Create legitimate cross-format files
         # 1. PyTorch model saved as ZIP (common with torch.save())
         pytorch_zip = tmp_path / "model.pt"
-        with zipfile.ZipFile(pytorch_zip, "w") as zipf:
-            zipf.writestr("data.pkl", "tensor data")
+        create_mock_pytorch_zip(pytorch_zip)
 
         # 2. PyTorch binary that contains pickle data
         pytorch_pickle = tmp_path / "weights.bin"
