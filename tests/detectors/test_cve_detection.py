@@ -762,6 +762,44 @@ class TestCVE202624747PickleScanner:
             f"Issues: {[i.message for i in result.issues]}"
         )
 
+    def test_pickle_scanner_detects_setitem_near_dangerous_global(self, tmp_path: Path) -> None:
+        """Dangerous globals feeding SETITEM should trigger the live dangerous-global branch."""
+        pickle_bytes = (
+            b"\x80\x04"  # PROTO 4
+            b"\x8c\x02os"  # SHORT_BINUNICODE "os"
+            b"\x8c\x06system"  # SHORT_BINUNICODE "system"
+            b"\x93"  # STACK_GLOBAL
+            b")R"  # EMPTY_TUPLE + REDUCE
+            + (b"N0" * 40)  # Stack-neutral padding beyond the lookback window
+            + b"\x8c\x03key"  # SHORT_BINUNICODE "key"
+            + b"\x8c\x05value"  # SHORT_BINUNICODE "value"
+            + b"s"  # SETITEM
+            + b"."  # STOP
+        )
+
+        test_file = tmp_path / "setitem_dangerous_global.pkl"
+        test_file.write_bytes(pickle_bytes)
+
+        result = PickleScanner().scan(str(test_file))
+
+        matching_checks = []
+        for check in result.checks:
+            details = check.details or {}
+            if (
+                check.name == "CVE-2026-24747 SETITEM Abuse Detection"
+                and details.get("pattern_type") == "setitem_near_dangerous_global"
+            ):
+                matching_checks.append(check)
+
+        assert matching_checks, (
+            "Expected live setitem_near_dangerous_global detection. "
+            f"Checks: {[(c.name, c.message, c.details) for c in result.checks]}"
+        )
+        assert any("os.system" in check.message for check in matching_checks), (
+            f"Expected os.system context in SETITEM detection. Checks: {[c.message for c in matching_checks]}"
+        )
+        assert all((check.details or {}).get("cve_id") == "CVE-2026-24747" for check in matching_checks)
+
     def test_pickle_scanner_no_setitem_false_positive(self, tmp_path: Path) -> None:
         """Test that normal dict SETITEM is not flagged by CVE-2026-24747 detection."""
         # Standard pickle with dict + SETITEM (the normal case)
