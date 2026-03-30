@@ -5325,16 +5325,20 @@ class PickleScanner(BaseScanner):
         file_size: int,
         minimum_offset: int,
         scan_limit_bytes: int,
+        context_bytes: int | None = None,
     ) -> tuple[bytes, int, int]:
-        """Read a bounded post-budget window while preserving a small lookback context."""
+        """Read a bounded post-budget window, optionally rewinding for lookback context."""
         minimum_offset = max(0, minimum_offset)
-        context_bytes = min(minimum_offset, _POST_BUDGET_GLOBAL_CONTEXT_BYTES)
+        resolved_context_bytes = min(
+            minimum_offset,
+            _POST_BUDGET_GLOBAL_CONTEXT_BYTES if context_bytes is None else max(0, int(context_bytes)),
+        )
         tail_scan_bytes = min(max(file_size - minimum_offset, 0), scan_limit_bytes)
         if tail_scan_bytes <= 0:
             return b"", 0, 0
 
-        scan_start = max(0, minimum_offset - context_bytes)
-        read_size = context_bytes + tail_scan_bytes
+        scan_start = max(0, minimum_offset - resolved_context_bytes)
+        read_size = resolved_context_bytes + tail_scan_bytes
 
         original_pos = file_obj.tell()
         try:
@@ -5344,6 +5348,30 @@ class PickleScanner(BaseScanner):
             file_obj.seek(original_pos)
 
         return data, scan_start, tail_scan_bytes
+
+    def _select_post_budget_opcode_context(
+        self,
+        analyzed_opcodes: list[tuple[Any, Any, int | None]],
+        *,
+        minimum_offset: int,
+    ) -> list[tuple[Any, Any, int | None]]:
+        """Return the already-parsed opcode suffix that overlaps the lookback window."""
+        if not analyzed_opcodes:
+            return []
+
+        lookback_start = max(0, minimum_offset - _POST_BUDGET_GLOBAL_CONTEXT_BYTES)
+        context_start = len(analyzed_opcodes)
+        next_offset = minimum_offset
+
+        for index in range(len(analyzed_opcodes) - 1, -1, -1):
+            _opcode, _arg, pos = analyzed_opcodes[index]
+            if next_offset <= lookback_start:
+                break
+            context_start = index
+            if pos is not None:
+                next_offset = int(pos)
+
+        return analyzed_opcodes[context_start:]
 
     def _collect_post_budget_opcodes(
         self,
@@ -5664,6 +5692,7 @@ class PickleScanner(BaseScanner):
         minimum_offset: int,
         ml_context: dict[str, Any],
         deadline: float | None,
+        prefix_context_opcodes: list[tuple[Any, Any, int | None]] | None = None,
     ) -> list[dict[str, Any]]:
         """Run a bounded tail opcode pass for findings that only exist in the main opcode loop."""
         minimum_offset = max(0, minimum_offset)
@@ -5672,18 +5701,21 @@ class PickleScanner(BaseScanner):
             file_size=file_size,
             minimum_offset=minimum_offset,
             scan_limit_bytes=self.post_budget_global_scan_limit_bytes,
+            context_bytes=0,
         )
         if not data:
             return []
 
-        opcodes = self._collect_post_budget_opcodes(
+        tail_opcodes = self._collect_post_budget_opcodes(
             data,
             scan_start=scan_start,
             deadline=deadline,
             scan_label="opcode",
         )
-        if not opcodes:
+        if not tail_opcodes:
             return []
+
+        opcodes = [*(prefix_context_opcodes or []), *tail_opcodes]
 
         (
             stack_global_refs,
@@ -6135,6 +6167,10 @@ class PickleScanner(BaseScanner):
                     minimum_offset=post_budget_minimum_offset,
                     ml_context=ml_context,
                     deadline=deadline,
+                    prefix_context_opcodes=self._select_post_budget_opcode_context(
+                        analysis.opcodes,
+                        minimum_offset=post_budget_minimum_offset,
+                    ),
                 )
                 if post_budget_opcode_findings:
                     suspicious_count += len(post_budget_opcode_findings)

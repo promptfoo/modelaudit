@@ -606,6 +606,37 @@ def test_post_budget_global_scan_uses_consumed_opcode_boundary(tmp_path: Path) -
     assert result.success is True
 
 
+def test_post_budget_opcode_scan_uses_consumed_opcode_boundary(tmp_path: Path) -> None:
+    """Opcode tail scans should start at the consumed boundary, not inside the prior payload."""
+    pickle_path = tmp_path / "post-budget-opcode-consumed-boundary.pkl"
+    inner_pickle = pickle.dumps({"ab": 1}, protocol=4)
+    poison_payload = b"\x8c\xff" + (b"A" * 4998)
+    payload = (
+        b"\x80\x04"
+        + b"B"
+        + struct.pack("<I", len(poison_payload))
+        + poison_payload
+        + b"B"
+        + struct.pack("<I", len(inner_pickle))
+        + inner_pickle
+        + b"."
+    )
+    pickle_path.write_bytes(payload)
+
+    result = PickleScanner({"max_opcodes": 1}).scan(str(pickle_path))
+
+    checks = [check for check in result.checks if check.name == "Post-Budget Opcode Detection"]
+    assert len(checks) == 1, f"Expected one post-budget opcode finding, got: {result.checks}"
+    assert checks[0].status == CheckStatus.FAILED
+    assert checks[0].severity == IssueSeverity.CRITICAL
+    assert "Nested pickle payload detected" in checks[0].message
+    assert any(
+        finding["check_name"] == "Nested Pickle Detection" and finding["details"].get("opcode") == "BINBYTES"
+        for finding in checks[0].details["findings"]
+    ), checks[0].details
+    assert result.success is False
+
+
 def test_pickle_expansion_heuristics_detect_iterative_memo_growth(tmp_path: Path) -> None:
     """Repeated memo growth chains should surface a dedicated expansion warning."""
     pickle_path = tmp_path / "memo-expansion.pkl"
@@ -972,6 +1003,27 @@ def test_post_budget_opcode_scan_detects_ext_reduce_target(tmp_path: Path) -> No
         check.name == "Post-Budget Global Reference Scan" and check.status == CheckStatus.FAILED
         for check in result.checks
     ), f"Expected opcode-based detection, got: {result.checks}"
+    assert result.success is False
+
+
+def test_post_budget_opcode_scan_preserves_cross_boundary_reduce_context(tmp_path: Path) -> None:
+    """Dangerous REDUCE targets split by the opcode budget should still resolve from prefix context."""
+    pickle_path = tmp_path / "post-budget-cross-boundary-reduce.pkl"
+    pickle_path.write_bytes(b"\x80\x04cos\nsystem\n)R.")
+
+    result = PickleScanner({"max_opcodes": 2}).scan(str(pickle_path))
+
+    checks = [check for check in result.checks if check.name == "Post-Budget Opcode Detection"]
+    assert len(checks) == 1, f"Expected one post-budget opcode finding, got: {result.checks}"
+    assert checks[0].status == CheckStatus.FAILED
+    assert checks[0].severity == IssueSeverity.CRITICAL
+    assert _contains_system_global(checks[0].message)
+    assert any(
+        finding["check_name"] == "Reduce Pattern Analysis"
+        and finding["details"].get("module") in {"os", "posix", "nt"}
+        and finding["details"].get("function") == "system"
+        for finding in checks[0].details["findings"]
+    ), checks[0].details
     assert result.success is False
 
 
