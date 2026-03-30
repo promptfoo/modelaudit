@@ -927,6 +927,40 @@ def test_post_budget_opcode_scan_detects_encoded_python_payload(tmp_path: Path) 
     assert result.success is True
 
 
+def test_post_budget_opcode_scan_ignores_decoy_nested_headers_without_pickle(tmp_path: Path) -> None:
+    """Valid-looking nested-pickle decoys beyond the opcode budget must stay quiet."""
+    pickle_path = tmp_path / "post-budget-decoy-headers.pkl"
+    benign_padding = _make_opcode_padding_stream(opcode_pairs=512)
+    decoy_headers = b"\x80\x04J" * 400
+    benign_stream = b"\x80\x04B" + struct.pack("<I", len(decoy_headers)) + decoy_headers + b"."
+    pickle_path.write_bytes(benign_padding + benign_stream)
+
+    result = PickleScanner({"max_opcodes": 64}).scan(str(pickle_path))
+
+    assert not any(
+        check.name == "Post-Budget Opcode Detection" and check.status == CheckStatus.FAILED for check in result.checks
+    ), f"Unexpected post-budget opcode finding for decoy headers: {result.checks}"
+    assert result.success is True
+
+
+def test_post_budget_opcode_scan_ignores_benign_encoded_string_payload(tmp_path: Path) -> None:
+    """Harmless encoded tails beyond the opcode budget must not trip post-budget findings."""
+    import base64
+
+    encoded_benign = base64.b64encode(b"just a harmless ascii string with no code execution here")
+    pickle_path = tmp_path / "post-budget-benign-encoded-string.pkl"
+    benign_padding = _make_opcode_padding_stream(opcode_pairs=512)
+    benign_stream = b"\x80\x04" + _short_binunicode(encoded_benign) + b"."
+    pickle_path.write_bytes(benign_padding + benign_stream)
+
+    result = PickleScanner({"max_opcodes": 64}).scan(str(pickle_path))
+
+    assert not any(
+        check.name == "Post-Budget Opcode Detection" and check.status == CheckStatus.FAILED for check in result.checks
+    ), f"Unexpected post-budget opcode finding for benign encoded string: {result.checks}"
+    assert result.success is True
+
+
 def test_post_budget_opcode_scan_detects_malformed_stack_global(tmp_path: Path) -> None:
     """Malformed STACK_GLOBAL payloads beyond the opcode budget should still fail closed."""
     pickle_path = tmp_path / "post-budget-malformed-stack-global.pkl"

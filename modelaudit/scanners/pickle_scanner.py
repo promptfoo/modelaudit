@@ -3726,17 +3726,9 @@ def _collect_nested_pickle_opcode_findings(
     """Return nested/encoded pickle findings for a single opcode payload."""
     findings: list[dict[str, Any]] = []
 
-<<<<<<< HEAD
-    if opcode_name in {"BINBYTES", "SHORT_BINBYTES", "BINBYTES8", "BYTEARRAY8"} and isinstance(
-        arg, bytes | bytearray
-    ):
+    if opcode_name in {"BINBYTES", "SHORT_BINBYTES", "BINBYTES8", "BYTEARRAY8"} and isinstance(arg, bytes | bytearray):
         nested_match = _find_nested_pickle_match(arg)
         if nested_match is not None:
-=======
-    if opcode_name in {"BINBYTES", "SHORT_BINBYTES", "BINBYTES8", "BYTEARRAY8"} and isinstance(arg, bytes | bytearray):
-        sample = bytes(arg[:1024])
-        if _looks_like_pickle(sample):
->>>>>>> 98b9870 (fix: cap post-budget opcode accumulation)
             severity = _get_context_aware_severity(IssueSeverity.CRITICAL, ml_context)
             findings.append(
                 _build_opcode_check_finding(
