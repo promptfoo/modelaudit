@@ -1885,7 +1885,10 @@ ACTUAL_DANGEROUS_STRING_PATTERNS = [
 ]
 
 
-def _detect_ml_context(opcodes: list[tuple]) -> dict[str, Any]:
+def _detect_ml_context(
+    opcodes: list[tuple],
+    stack_global_refs: dict[int, tuple[str, str]] | None = None,
+) -> dict[str, Any]:
     """
     Detect ML framework context from opcodes with confidence scoring.
     Uses improved scoring that focuses on presence and diversity of ML patterns
@@ -1902,14 +1905,16 @@ def _detect_ml_context(opcodes: list[tuple]) -> dict[str, Any]:
     if total_opcodes == 0:
         return context
 
-    # Analyze GLOBAL and STACK_GLOBAL opcodes for ML patterns
+    # Analyze GLOBAL and STACK_GLOBAL opcodes for ML patterns. STACK_GLOBAL
+    # refs come from symbolic stack resolution so POP/STOP/memo behavior is
+    # respected and decoy strings cannot skew confidence gating.
     global_refs: dict[str, int] = {}
-    total_global_opcodes = 0
-    stack_strings = []  # Track strings for STACK_GLOBAL reconstruction
+    resolved_stack_globals = stack_global_refs if stack_global_refs is not None else {}
+    if stack_global_refs is None and any(opcode.name == "STACK_GLOBAL" for opcode, _arg, _pos in opcodes):
+        resolved_stack_globals = _build_symbolic_reference_maps(opcodes)[0]
 
-    for opcode, arg, _pos in opcodes:
+    for idx, (opcode, arg, _pos) in enumerate(opcodes):
         if opcode.name == "GLOBAL" and isinstance(arg, str):
-            total_global_opcodes += 1
             # Extract module name from global reference
             if "." in arg:
                 module = arg.split(".")[0]
@@ -1920,19 +1925,10 @@ def _detect_ml_context(opcodes: list[tuple]) -> dict[str, Any]:
 
             global_refs[module] = global_refs.get(module, 0) + 1
 
-        elif opcode.name in STRING_OPCODES and isinstance(arg, str):
-            # Collect strings that might be used for STACK_GLOBAL
-            stack_strings.append(arg)
-
         elif opcode.name == "STACK_GLOBAL":
-            total_global_opcodes += 1
-            # STACK_GLOBAL uses the top two stack items as module and name
-            # We approximate this by using the last two strings we've seen
-            if len(stack_strings) >= 2:
-                module = stack_strings[-2]  # Second-to-last string (module)
-                name = stack_strings[-1]  # Last string (name)
-
-                # Create a reference similar to GLOBAL format
+            resolved = resolved_stack_globals.get(idx)
+            if resolved is not None:
+                module, name = resolved
                 full_ref = f"{module}.{name}"
                 global_refs[module] = global_refs.get(module, 0) + 1
 
@@ -6081,7 +6077,7 @@ class PickleScanner(BaseScanner):
                 )
 
             # ML CONTEXT FILTERING: Analyze ML context once for the entire pickle
-            ml_context = _detect_ml_context(opcodes)
+            ml_context = _detect_ml_context(opcodes, stack_global_refs=analysis.stack_global_refs)
             stack_global_refs = analysis.stack_global_refs
             callable_refs = analysis.callable_refs
             callable_origin_is_ext = analysis.callable_origin_is_ext

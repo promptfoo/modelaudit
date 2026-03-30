@@ -267,6 +267,45 @@ class TestPickleContextFiltering(unittest.TestCase):
             "Should have some confidence in ML detection",
         )
 
+    def test_ml_context_detection_uses_symbolic_stack_global_resolution(self):
+        """Popped decoy strings should not hide ML STACK_GLOBAL references."""
+        opcodes = [
+            (type("MockOp", (), {"name": "GLOBAL"})(), "collections.OrderedDict", 0),
+            (type("MockOp", (), {"name": "UNICODE"})(), "torch", 1),
+            (type("MockOp", (), {"name": "UNICODE"})(), "decoy", 2),
+            (type("MockOp", (), {"name": "POP"})(), None, 3),
+            (type("MockOp", (), {"name": "UNICODE"})(), "nn", 4),
+            (type("MockOp", (), {"name": "STACK_GLOBAL"})(), None, 5),
+        ]
+
+        context = _detect_ml_context(opcodes)
+
+        self.assertTrue(context["is_ml_content"])
+        self.assertIn("pytorch", context["frameworks"])
+        self.assertTrue(
+            any(match.startswith("module:torch(") for match in context["detected_patterns"]),
+            f"Expected symbolic STACK_GLOBAL torch match, got: {context['detected_patterns']}",
+        )
+
+    def test_ml_context_detection_does_not_reuse_stack_global_strings_across_streams(self):
+        """STOP boundaries should prevent cross-stream STACK_GLOBAL reconstruction noise."""
+        opcodes = [
+            (type("MockOp", (), {"name": "GLOBAL"})(), "collections.OrderedDict", 0),
+            (type("MockOp", (), {"name": "UNICODE"})(), "torch", 1),
+            (type("MockOp", (), {"name": "STOP"})(), None, 2),
+            (type("MockOp", (), {"name": "UNICODE"})(), "nn", 3),
+            (type("MockOp", (), {"name": "STACK_GLOBAL"})(), None, 4),
+        ]
+
+        context = _detect_ml_context(opcodes)
+
+        self.assertFalse(context["is_ml_content"])
+        self.assertIn("pytorch", context["frameworks"])
+        self.assertFalse(
+            any(match.startswith("module:torch(") for match in context["detected_patterns"]),
+            f"Unexpected cross-stream STACK_GLOBAL torch match: {context['detected_patterns']}",
+        )
+
     def test_mixed_content_handling(self):
         """Test handling of mixed legitimate/suspicious content"""
 
