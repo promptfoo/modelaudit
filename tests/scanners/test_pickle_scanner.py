@@ -35,6 +35,7 @@ from modelaudit.scanners.pickle_scanner import (
     _is_actually_dangerous_string,
     _is_plausible_python_module,
     _is_safe_import_only_global,
+    _PickleOpcodeAnalysis,
     _simulate_symbolic_reference_maps,
     check_opcode_sequence,
 )
@@ -340,9 +341,14 @@ def test_padding_stripped_base64_candidate_still_flags_potential_base64() -> Non
     assert _is_actually_dangerous_string(padding_stripped, {}) == "potential_base64"
 
 
-def test_unknown_opcode_pickle_parse_failure_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Unknown opcode parse failures in pickle-like files must fail closed."""
-    pickle_path = tmp_path / "unknown_opcode.pkl"
+@pytest.mark.parametrize("file_ext", [".pkl", ".pt", ".pth", ".ckpt"])
+def test_unknown_opcode_pickle_parse_failure_fails_closed(
+    file_ext: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unknown opcode parse failures in raw pickle-backed checkpoint files must fail closed."""
+    pickle_path = tmp_path / f"unknown_opcode{file_ext}"
     pickle_path.write_bytes(b"\x80\x04K\x01." + (b"A" * 9000) + b"os.system")
 
     def _raise_unknown_opcode(self: PickleScanner, _file_obj: object, _file_size: int) -> ScanResult:
@@ -421,23 +427,32 @@ def test_bin_parse_failure_runs_binary_fallback_after_raw_scan_exception(
     executable_signature = b"\x7fELF"
     bin_path.write_bytes(b"\x80\x04K\x01." + (b"A" * 9000) + executable_signature)
 
-    def _raise_raw_scan(
+    original_scan_for_dangerous_patterns = PickleScanner._scan_for_dangerous_patterns
+    call_count = {"count": 0}
+    failure_injected = {"value": False}
+
+    def _fail_once_then_defer(
         self: PickleScanner,
-        _data: bytes,
-        _result: ScanResult,
-        _context_path: str,
+        data: bytes,
+        result: ScanResult,
+        context_path: str,
     ) -> None:
-        del self, _data, _result, _context_path
-        raise RuntimeError("simulated raw-scan failure")
+        call_count["count"] += 1
+        if call_count["count"] == 1:
+            failure_injected["value"] = True
+            raise RuntimeError("simulated early detection failure")
+        original_scan_for_dangerous_patterns(self, data, result, context_path)
 
     def _raise_unknown_opcode(self: PickleScanner, _file_obj: object, _file_size: int) -> ScanResult:
         raise exception_type(message)
 
-    monkeypatch.setattr(PickleScanner, "_scan_for_dangerous_patterns", _raise_raw_scan)
+    monkeypatch.setattr(PickleScanner, "_scan_for_dangerous_patterns", _fail_once_then_defer)
     monkeypatch.setattr(PickleScanner, "_scan_pickle_bytes", _raise_unknown_opcode)
 
     result = PickleScanner().scan(str(bin_path))
 
+    assert failure_injected["value"] is True
+    assert call_count["count"] == 1
     assert result.success is True
     assert result.metadata["file_type"] == "binary"
     assert result.metadata["pickle_parsing_failed"] is True
@@ -496,6 +511,51 @@ def test_bin_parse_failure_with_benign_binary_content_stays_clean(
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues), (
         f"Unexpected warning/critical issue, got: {[(i.severity, i.message) for i in result.issues]}"
     )
+
+
+def test_scan_binary_payload_does_not_mark_full_binary_coverage_for_partial_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Binary payload bookkeeping should reflect partial coverage from the binary scanner."""
+    scanner = PickleScanner()
+    scanner.current_file_path = "partial.bin"
+    result = scanner._create_result()
+    partial_binary_result = scanner._create_result()
+    partial_binary_result.bytes_scanned = 256
+    partial_binary_result.add_check(
+        name="Binary Scan Timeout Check",
+        passed=False,
+        message="Binary scanning timed out after 0.1 seconds",
+        severity=IssueSeverity.INFO,
+        location="partial.bin",
+        details={"bytes_scanned": 256, "timeout": 0.1, "scan_complete": False},
+        rule_code="S902",
+    )
+
+    def _partial_binary_scan(
+        self: PickleScanner,
+        _file_obj: BinaryIO,
+        start_pos: int,
+        file_size: int,
+    ) -> ScanResult:
+        del self, start_pos, file_size
+        return partial_binary_result
+
+    monkeypatch.setattr(PickleScanner, "_scan_binary_content", _partial_binary_scan)
+
+    scanner._scan_binary_payload(
+        BytesIO(b"A" * 1024),
+        result,
+        start_pos=0,
+        file_size=1024,
+        full_file=True,
+    )
+
+    assert result.bytes_scanned == 256
+    assert result.metadata["binary_bytes"] == 1024
+    assert result.metadata["binary_scan_completed"] is False
+    assert result.metadata["binary_scan_bytes_scanned"] == 256
+    assert result.metadata["binary_scan_total_bytes"] == 1024
 
 
 def test_small_pickle_tail_pattern_is_detected_without_raw_pattern_limit(tmp_path: Path) -> None:
@@ -4551,6 +4611,58 @@ def test_recursion_with_security_findings_uses_limitation_note(tmp_path: Path, m
     )
 
 
+def test_recursion_with_security_findings_still_scans_bin_tail_when_pickle_end_is_known(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The recursion-limited path should still inspect a .bin tail when the first stream boundary is known."""
+    first_stream = pickle.dumps({"weights": [1, 2, 3]})
+    elf_signature = next(
+        sig for sig, description in EXECUTABLE_SIGNATURES.items() if description == "Linux executable (ELF)"
+    )
+    bin_path = tmp_path / "recursion-tail.bin"
+    bin_path.write_bytes(first_stream + (b"\x00" * 4096) + elf_signature + (b"B" * 64))
+
+    def _return_recursion_analysis(
+        self: PickleScanner,
+        *args: object,
+        **kwargs: object,
+    ) -> _PickleOpcodeAnalysis:
+        del self, args, kwargs
+        return _PickleOpcodeAnalysis(
+            opcode_count=1,
+            first_pickle_end_pos=len(first_stream),
+            max_analyzed_end_offset=len(first_stream),
+            error=RecursionError("simulated recursion depth"),
+        )
+
+    def _return_no_globals(
+        self: PickleScanner,
+        _file_obj: BinaryIO,
+        multiple_pickles: bool = True,
+        **kwargs: object,
+    ) -> set[tuple[str, str, str]]:
+        del self, multiple_pickles, kwargs
+        return set()
+
+    monkeypatch.setattr(PickleScanner, "_build_pickle_opcode_analysis", _return_recursion_analysis)
+    monkeypatch.setattr(PickleScanner, "_extract_globals_advanced", _return_no_globals)
+
+    result = PickleScanner().scan(str(bin_path))
+
+    assert result.success is True
+    assert result.metadata["recursion_limited"] is True
+    assert result.metadata["first_pickle_end_pos"] == len(first_stream)
+    assert result.metadata["pickle_bytes"] == len(first_stream)
+    assert result.metadata["binary_bytes"] == bin_path.stat().st_size - len(first_stream)
+    assert result.metadata["binary_scan_completed"] is True
+    assert any(
+        check.name == "Binary Content Check"
+        and check.status == CheckStatus.FAILED
+        and "Linux executable (ELF)" in check.message
+        for check in result.checks
+    ), f"Expected ELF tail finding, got: {[(c.name, c.status, c.message) for c in result.checks]}"
+
+
 def test_recursion_limited_pickle_marks_inconclusive(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Recursion-limited pickle scans should expose the explicit inconclusive outcome."""
     model_path = tmp_path / "complex.pkl"
@@ -4628,6 +4740,29 @@ def test_non_recursion_exception_with_security_findings_avoids_limitation_note(
 
     assert not any(check.details.get("reason") == "recursion_with_security_findings" for check in result.checks)
     assert result.metadata.get("recursion_limited") is not True
+    assert result.metadata["operational_error"] is True
+    assert result.metadata["operational_error_reason"] == "pickle_scan_runtime_failed"
+    runtime_checks = [check for check in result.checks if check.name == "Pickle Scanner Runtime Error"]
+    assert len(runtime_checks) == 1
+    assert not any(check.name == "Pickle File Open" for check in result.checks)
+    assert runtime_checks[0].status == CheckStatus.FAILED
+    assert runtime_checks[0].severity == IssueSeverity.CRITICAL
+    assert result.success is False
+
+
+def test_open_failure_is_classified_as_file_open(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Actual file-open failures should still retain the file-open classification."""
+    model_path = tmp_path / "open-failure.pkl"
+    model_path.write_bytes(pickle.dumps({"weights": [1, 2, 3]}))
+
+    def _raise_open(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise OSError("simulated open failure")
+
+    monkeypatch.setattr("builtins.open", _raise_open)
+
+    result = PickleScanner().scan(str(model_path))
+
     assert result.metadata["operational_error"] is True
     assert result.metadata["operational_error_reason"] == "pickle_file_open_failed"
     file_open_checks = [check for check in result.checks if check.name == "Pickle File Open"]

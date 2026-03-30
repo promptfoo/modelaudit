@@ -4451,6 +4451,50 @@ class PickleScanner(BaseScanner):
         logger.debug(f"Delegating ZIP-backed PyTorch container to PyTorchZipScanner: {path}")
         return PyTorchZipScanner(config=self.config).scan(path, timeout=self.timeout)
 
+    def _record_pickle_operational_error(
+        self,
+        result: ScanResult,
+        error: Exception,
+        *,
+        location: str,
+        check_name: str,
+        message: str,
+        reason: str,
+    ) -> None:
+        """Record a pickle operational failure with an explicit classification."""
+        result.add_check(
+            name=check_name,
+            passed=False,
+            message=message,
+            severity=IssueSeverity.CRITICAL,
+            location=location,
+            details={"exception": str(error), "exception_type": type(error).__name__},
+        )
+        result.metadata["operational_error"] = True
+        result.metadata["operational_error_reason"] = reason
+
+    def _record_pickle_open_error(self, result: ScanResult, error: Exception, *, location: str) -> None:
+        """Record a file access failure while preparing the pickle scan."""
+        self._record_pickle_operational_error(
+            result,
+            error,
+            location=location,
+            check_name="Pickle File Open",
+            message=f"Error opening pickle file: {error!s}",
+            reason="pickle_file_open_failed",
+        )
+
+    def _record_pickle_runtime_error(self, result: ScanResult, error: Exception, *, location: str) -> None:
+        """Record an unexpected runtime failure during pickle analysis."""
+        self._record_pickle_operational_error(
+            result,
+            error,
+            location=location,
+            check_name="Pickle Scanner Runtime Error",
+            message=f"Scanner runtime failure while analyzing pickle file: {error!s}",
+            reason="pickle_scan_runtime_failed",
+        )
+
     def scan(self, path: str) -> ScanResult:
         """Scan a pickle file for suspicious content"""
         # Start scan timer for timeout tracking
@@ -4489,6 +4533,7 @@ class PickleScanner(BaseScanner):
         # Run a bounded raw scan before pickle parsing. Track completion only,
         # not a synthetic "clean" sentinel check.
         early_pattern_scan_completed = False
+        pickle_file_opened = False
 
         try:
             # Use the most basic file operations possible to avoid recursion issues
@@ -4524,6 +4569,7 @@ class PickleScanner(BaseScanner):
 
         try:
             with open(path, "rb") as f:
+                pickle_file_opened = True
                 # Store the file path for use in issue locations
                 self.current_file_path = path
                 scan_result = self._scan_pickle_bytes(f, file_size)
@@ -4544,32 +4590,14 @@ class PickleScanner(BaseScanner):
                     )
                     _mark_inconclusive_scan_result(result, fallback_reason)
 
-                # For .bin files, also scan the remaining binary content
-                # PyTorch files have pickle header followed by tensor data. Keep
-                # scanning the tail when the first pickle stream completed even if
-                # opcode-budget or timeout limits marked the opcode scan unsuccessful.
-                pickle_end_pos = scan_result.metadata.get("first_pickle_end_pos")
-                if is_bin_file and isinstance(pickle_end_pos, int):
-                    remaining_bytes = file_size - pickle_end_pos
-
-                    if remaining_bytes > 0:
-                        # Seek to the pickle end position (multi-stream scanning may
-                        # have advanced the file pointer beyond this point).
-                        f.seek(pickle_end_pos)
-                        # Always scan binary content after pickle
-                        # Removed ML confidence-based skipping to prevent security bypasses
-                        binary_result = self._scan_binary_content(
-                            f,
-                            pickle_end_pos,
-                            file_size,
-                        )
-
-                        self._merge_binary_content_findings(result, binary_result)
-
-                        # Update total bytes scanned
-                        result.bytes_scanned = file_size
-                        result.metadata["pickle_bytes"] = pickle_end_pos
-                        result.metadata["binary_bytes"] = remaining_bytes
+                # For .bin files, also scan the remaining binary content after
+                # the first pickle stream when we have a trusted boundary.
+                self._scan_remaining_bin_tail_if_needed(
+                    f,
+                    result,
+                    file_size=file_size,
+                    scan_bin_tail=is_bin_file,
+                )
 
         except Exception as e:
             # Check if we already found security issues in the early pattern detection
@@ -4770,7 +4798,7 @@ class PickleScanner(BaseScanner):
                     result.finish(success=True)
                     return result
 
-                elif file_ext in [".pkl", ".pickle", ".joblib", ".dill"]:
+                elif file_ext in [".pkl", ".pickle", ".joblib", ".dill", ".pt", ".pth", ".ckpt"]:
                     # Pickle-like files must fail closed when parsing aborts on unknown opcodes.
                     logger.warning(f"Pickle parse failed for {path}: {e}")
                     result.add_check(
@@ -4804,17 +4832,10 @@ class PickleScanner(BaseScanner):
                     result.finish(success=False)
                     return result
 
-            # Handle as critical error for truly suspicious cases
-            result.add_check(
-                name="Pickle File Open",
-                passed=False,
-                message=f"Error opening pickle file: {e!s}",
-                severity=IssueSeverity.CRITICAL,
-                location=path,
-                details={"exception": str(e), "exception_type": type(e).__name__},
-            )
-            result.metadata["operational_error"] = True
-            result.metadata["operational_error_reason"] = "pickle_file_open_failed"
+            if pickle_file_opened:
+                self._record_pickle_runtime_error(result, e, location=path)
+            else:
+                self._record_pickle_open_error(result, e, location=path)
             result.finish(success=False)
             return result
 
@@ -4865,24 +4886,74 @@ class PickleScanner(BaseScanner):
                 rule_code=issue.rule_code,
             )
 
+    def _scan_binary_payload(
+        self,
+        file_obj: BinaryIO,
+        result: ScanResult,
+        *,
+        start_pos: int,
+        file_size: int,
+        full_file: bool = False,
+    ) -> None:
+        """Scan binary bytes either after the first pickle stream or across the full file."""
+        file_obj.seek(start_pos)
+        binary_result = self._scan_binary_content(file_obj, start_pos, file_size)
+        self._merge_binary_content_findings(result, binary_result)
+        expected_binary_bytes = file_size if full_file else max(file_size - start_pos, 0)
+        actual_binary_bytes = max(0, min(binary_result.bytes_scanned, expected_binary_bytes))
+        total_scanned = actual_binary_bytes if full_file else start_pos + actual_binary_bytes
+        result.bytes_scanned = max(result.bytes_scanned, total_scanned)
+        result.metadata["binary_scan_completed"] = actual_binary_bytes >= expected_binary_bytes
+        result.metadata["binary_scan_bytes_scanned"] = actual_binary_bytes
+        result.metadata["binary_scan_total_bytes"] = expected_binary_bytes
+        if full_file:
+            result.metadata["binary_bytes"] = file_size
+        else:
+            result.metadata["pickle_bytes"] = start_pos
+            result.metadata["binary_bytes"] = expected_binary_bytes
+
+    def _scan_remaining_bin_tail_if_needed(
+        self,
+        file_obj: BinaryIO,
+        result: ScanResult,
+        *,
+        file_size: int,
+        scan_bin_tail: bool,
+    ) -> None:
+        """Scan trailing bytes in .bin containers after the first pickle stream completes."""
+        if not scan_bin_tail:
+            return
+
+        pickle_end_pos = result.metadata.get("first_pickle_end_pos")
+        if not isinstance(pickle_end_pos, int):
+            return
+
+        remaining_bytes = file_size - pickle_end_pos
+        if remaining_bytes <= 0:
+            return
+
+        self._scan_binary_payload(
+            file_obj,
+            result,
+            start_pos=pickle_end_pos,
+            file_size=file_size,
+        )
+
     def _scan_binary_content_from_path(self, path: str, result: ScanResult, file_size: int, start_pos: int = 0) -> None:
         """Scan file bytes directly when pickle parsing did not yield a trusted boundary."""
         try:
             with open(path, "rb") as f:
-                if start_pos:
-                    f.seek(start_pos)
-                binary_result = self._scan_binary_content(f, start_pos, file_size)
+                self._scan_binary_payload(
+                    f,
+                    result,
+                    start_pos=start_pos,
+                    file_size=file_size,
+                    full_file=start_pos == 0,
+                )
         except Exception as binary_scan_error:
             logger.warning(f"Binary scan failed for {path}: {binary_scan_error}")
             result.metadata["binary_scan_failed"] = str(binary_scan_error)
             return
-
-        self._merge_binary_content_findings(result, binary_result)
-        result.metadata["binary_scan_completed"] = True
-        result.metadata["binary_bytes"] = max(file_size - start_pos, 0)
-        if start_pos:
-            result.metadata["pickle_bytes"] = start_pos
-        result.bytes_scanned = file_size
 
     def _scan_for_dangerous_patterns(self, data: bytes, result: ScanResult, context_path: str) -> None:
         """Enhanced scan for dangerous patterns with ML context awareness and obfuscation detection."""
@@ -7597,6 +7668,10 @@ class PickleScanner(BaseScanner):
                         "scanner_limitation": True,
                     }
                 )
+                if first_pickle_end_pos is not None:
+                    result.metadata["first_pickle_end_pos"] = first_pickle_end_pos
+                    result.metadata["pickle_bytes"] = first_pickle_end_pos
+                    result.metadata["binary_bytes"] = max(file_size - first_pickle_end_pos, 0)
                 _mark_inconclusive_scan_result(result, "recursion_limit_exceeded")
                 # Add as debug, not critical - scanner limitation rather than security issue
                 result.add_check(
@@ -7661,6 +7736,78 @@ class PickleScanner(BaseScanner):
             else:
                 # Improve error messages for common cases
                 error_str = str(e).lower()
+                is_parse_failure = self._is_pickle_parse_failure(e)
+                is_bin_file = file_ext == ".bin"
+
+                if is_parse_failure and is_bin_file:
+                    logger.debug(f"Binary file {self.current_file_path} does not contain valid pickle data: {e}")
+                    result.add_check(
+                        name="Pickle Format Check",
+                        passed=True,
+                        message="File appears to be binary data rather than pickle format",
+                        severity=IssueSeverity.INFO,
+                        location=self.current_file_path,
+                        details={
+                            "file_type": "binary",
+                            "pickle_parse_error": str(e),
+                        },
+                        why=(
+                            "This binary file does not contain valid pickle data structure. "
+                            "Binary content was analyzed for security patterns instead."
+                        ),
+                    )
+                    result.metadata.update(
+                        {
+                            "file_type": "binary",
+                            "pickle_parsing_failed": True,
+                        }
+                    )
+                    self._scan_binary_payload(
+                        file_obj,
+                        result,
+                        start_pos=0,
+                        file_size=file_size,
+                        full_file=True,
+                    )
+                    result.finish(success=True)
+                    return result
+
+                if is_parse_failure and file_ext in [
+                    ".pkl",
+                    ".pickle",
+                    ".joblib",
+                    ".dill",
+                    ".pt",
+                    ".pth",
+                    ".ckpt",
+                ]:
+                    logger.warning(f"Pickle parse failed for {self.current_file_path}: {e}")
+                    result.add_check(
+                        name="Pickle Format Check",
+                        passed=False,
+                        message="Pickle parsing failed before full scan completion",
+                        severity=IssueSeverity.CRITICAL,
+                        location=self.current_file_path,
+                        details={
+                            "file_type": "pickle",
+                            "parse_error": str(e),
+                            "parsing_failed": True,
+                            "failure_reason": "unknown_opcode_or_format_error",
+                        },
+                        why=(
+                            "The scanner could not fully parse this pickle file due to an opcode/format error. "
+                            "Because full opcode analysis did not complete, the file is treated as unsafe."
+                        ),
+                    )
+                    result.metadata.update(
+                        {
+                            "file_type": "pickle",
+                            "parsing_failed": True,
+                            "failure_reason": "unknown_opcode_or_format_error",
+                        }
+                    )
+                    result.finish(success=False)
+                    return result
 
                 # Determine user-friendly error message and severity
                 if "pickle exhausted before seeing stop" in error_str:
