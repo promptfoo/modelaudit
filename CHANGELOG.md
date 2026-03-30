@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.30](https://github.com/promptfoo/modelaudit/compare/v0.2.29...v0.2.30) (2026-03-30)
+
+
+### Bug Fixes
+
+* always run binary fallback for parse-failed .bin files ([#814](https://github.com/promptfoo/modelaudit/issues/814)) ([f5f3c90](https://github.com/promptfoo/modelaudit/commit/f5f3c904855bbd0c305690196826453d54502983))
+* harden nested pickle detection against padded payloads ([#812](https://github.com/promptfoo/modelaudit/issues/812)) ([c15f53e](https://github.com/promptfoo/modelaudit/commit/c15f53eb8960e2328440b5c300c435d5a53d42d1))
+* mark incomplete pickle scans as inconclusive ([#810](https://github.com/promptfoo/modelaudit/issues/810)) ([ade9296](https://github.com/promptfoo/modelaudit/commit/ade9296b6f1c41e8bae1ac6bdbd2fd83d6234c9a))
+* normalize archive locations and route .skops ZIPs ([#805](https://github.com/promptfoo/modelaudit/issues/805)) ([f7c8277](https://github.com/promptfoo/modelaudit/commit/f7c8277adaf505655b5414aa1cda4d79a906c955))
+* preserve fail-closed pickle fallback semantics ([#817](https://github.com/promptfoo/modelaudit/issues/817)) ([e8a6db7](https://github.com/promptfoo/modelaudit/commit/e8a6db7275aba944666bd668f6ae8e782618bb0f))
+* restore post-budget pickle opcode parity ([#811](https://github.com/promptfoo/modelaudit/issues/811)) ([d321309](https://github.com/promptfoo/modelaudit/commit/d32130943ba931eef7b8f85804bde4762410bf39))
+* use symbolic STACK_GLOBAL refs for pickle ML context ([#813](https://github.com/promptfoo/modelaudit/issues/813)) ([eb48c52](https://github.com/promptfoo/modelaudit/commit/eb48c52ee7522bccaf1da0d1f274ce3f33f1cb23))
+* **utils:** recurse into cloud directories with size metadata ([#819](https://github.com/promptfoo/modelaudit/issues/819)) ([2d9852d](https://github.com/promptfoo/modelaudit/commit/2d9852deaaab4f6002404c197fd22231a9c9e69d))
+
 ## [0.2.29](https://github.com/promptfoo/modelaudit/compare/v0.2.28...v0.2.29) (2026-03-29)
 
 ### Features
