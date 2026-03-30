@@ -561,6 +561,8 @@ def test_large_pickle_raw_pattern_limit_with_opcode_budget_truncation(tmp_path: 
     assert len(opcode_checks) == 1
     assert opcode_checks[0].details["analysis_incomplete"] is True
     assert result.metadata["analysis_incomplete"] is True
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "opcode_budget_exceeded" in result.metadata["scan_outcome_reasons"]
     assert result.success is True
 
 
@@ -591,6 +593,8 @@ def test_scan_pickle_timeout_finishes_fail_closed(tmp_path: Path, monkeypatch: p
     ]
     assert len(timeout_checks) == 1
     assert "timed out" in timeout_checks[0].message.lower()
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "incomplete_analysis" in result.metadata["scan_outcome_reasons"]
     assert result.success is False
 
 
@@ -609,6 +613,8 @@ def test_scan_pickle_bytes_uses_scan_wide_deadline(monkeypatch: pytest.MonkeyPat
         check for check in result.checks if check.name == "Scan Timeout Check" and check.status == CheckStatus.FAILED
     ]
     assert len(timeout_checks) == 1
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "scan_timeout" in result.metadata["scan_outcome_reasons"]
     assert result.success is False
 
 
@@ -4214,6 +4220,8 @@ def test_scan_legitimate_pytorch_pickle_memory_error_is_non_failing(
     assert result.metadata["memory_limited"] is True
     assert result.metadata["scanner_limitation"] is True
     assert result.metadata["analysis_incomplete"] is True
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "memory_limit" in result.metadata["scan_outcome_reasons"]
 
     info_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.INFO]
     assert len(info_issues) == 1
@@ -4257,6 +4265,8 @@ def test_scan_legitimate_pytorch_bin_memory_error_is_informational(
     assert resource_limit_check.details["exception_type"] == "MemoryError"
     assert resource_limit_check.details["analysis_incomplete"] is True
     assert resource_limit_check.details["scanner_limitation"] is True
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "memory_limit" in result.metadata["scan_outcome_reasons"]
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
@@ -4533,6 +4543,29 @@ def test_recursion_with_security_findings_uses_limitation_note(tmp_path: Path, m
         issue.severity == IssueSeverity.WARNING and issue.message == "Suspicious raw pickle pattern detected"
         for issue in result.issues
     )
+
+
+def test_recursion_limited_pickle_marks_inconclusive(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Recursion-limited pickle scans should expose the explicit inconclusive outcome."""
+    model_path = tmp_path / "complex.pkl"
+    model_path.write_bytes(pickle.dumps({"weights": [1, 2, 3]}))
+
+    def _raise_recursion(self: PickleScanner, _file_obj: BinaryIO, _file_size: int) -> ScanResult:
+        raise RecursionError("simulated recursion depth")
+
+    monkeypatch.setattr(PickleScanner, "_scan_pickle_bytes", _raise_recursion)
+
+    result = PickleScanner().scan(str(model_path))
+
+    limitation_checks = [check for check in result.checks if check.name == "Recursion Limit Check"]
+    assert len(limitation_checks) == 1
+    assert limitation_checks[0].details["analysis_incomplete"] is True
+    assert limitation_checks[0].details["scanner_limitation"] is True
+    assert result.metadata["recursion_limited"] is True
+    assert result.metadata["analysis_incomplete"] is True
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "recursion_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
 def test_non_recursion_exception_with_security_findings_avoids_limitation_note(

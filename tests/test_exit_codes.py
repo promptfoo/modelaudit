@@ -193,6 +193,34 @@ def test_exit_code_info_level_issues():
     assert determine_exit_code(results) == 0  # INFO level should not trigger exit code 1
 
 
+def test_exit_code_inconclusive_pickle_without_security_findings() -> None:
+    """Explicit inconclusive outcomes should return exit code 2 when no real findings exist."""
+    results = _create_result_model(
+        success=False,
+        file_metadata={"model.pkl": {"scan_outcome": "inconclusive"}},
+    )
+    assert determine_exit_code(results) == 2
+
+
+def test_exit_code_inconclusive_pickle_with_security_findings() -> None:
+    """Security findings should still return exit code 1 even if analysis was inconclusive."""
+    results = _create_result_model(
+        success=False,
+        file_metadata={"model.pkl": {"scan_outcome": "inconclusive"}},
+        issues=[
+            Issue(
+                message="Suspicious import found beyond opcode budget",
+                severity=IssueSeverity.WARNING,
+                location="model.pkl",
+                timestamp=0.0,
+                why=None,
+                type=None,
+            ),
+        ],
+    )
+    assert determine_exit_code(results) == 1
+
+
 def test_exit_code_empty_results():
     """Test exit code with minimal results structure."""
     results = _create_result_model(files_scanned=0)
@@ -358,3 +386,43 @@ def test_scan_result_info_only_failed_scan_without_operational_flag_keeps_exit_c
     assert results.has_errors is False
     assert results.success is True
     assert determine_exit_code(results) == 0
+
+
+def test_scan_result_inconclusive_with_security_finding_keeps_exit_code_1(tmp_path: Path) -> None:
+    """Security findings should outrank inconclusive metadata in aggregate scan results."""
+    test_file = tmp_path / "budget-danger.pkl"
+    test_file.write_bytes(b"payload")
+
+    scan_result = ScanResult(scanner_name="pickle")
+    scan_result.add_check(
+        name="Post-Budget Global Reference Scan",
+        passed=False,
+        message="Dangerous reference found beyond opcode budget: os.system",
+        severity=IssueSeverity.CRITICAL,
+        location=str(test_file),
+    )
+    scan_result.metadata["scan_outcome"] = "inconclusive"
+    scan_result.metadata["scan_outcome_reasons"] = ["opcode_budget_exceeded"]
+    scan_result.finish(success=True)
+
+    with patch("modelaudit.core.scan_file", return_value=scan_result):
+        results = scan_model_directory_or_file(str(test_file))
+
+    assert results.has_errors is False
+    assert results.success is True
+    assert determine_exit_code(results) == 1
+
+
+def test_scan_model_directory_or_file_inconclusive_pickle_budget_returns_exit_code_2(tmp_path: Path) -> None:
+    """Opcode-budget truncation without findings should surface as an inconclusive exit-code 2."""
+    test_file = tmp_path / "budget.pkl"
+    test_file.write_bytes(b"\x80\x02" + (b"K\x010" * 512) + b".")
+
+    results = scan_model_directory_or_file(str(test_file), max_opcodes=32)
+
+    metadata = results.file_metadata[str(test_file)]
+    assert metadata["scan_outcome"] == "inconclusive"
+    assert "opcode_budget_exceeded" in metadata["scan_outcome_reasons"]
+    assert results.has_errors is False
+    assert results.success is False
+    assert determine_exit_code(results) == 2

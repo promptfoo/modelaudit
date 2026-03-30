@@ -95,6 +95,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **security:** stop iterating malformed TFLite models after excessive subgraph counts are detected
+- **pickle:** mark timeout-, budget-, recursion-, and resource-limited pickle scans as inconclusive so clean-looking partial analysis returns exit code 2 unless real security findings were reported
 - route misnamed ZIP, HDF5, and 7z files through content-aware scanner selection
 - preserve disguised model files during directory prefiltering without promoting document ZIPs
 - recurse into nested 7z members even when their filenames use misleading extensions
