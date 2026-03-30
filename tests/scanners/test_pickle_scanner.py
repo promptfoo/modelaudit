@@ -504,6 +504,23 @@ def test_post_budget_global_scan_honors_configured_byte_limit(tmp_path: Path) ->
     assert any(finding["import_reference"] == "os.system" for finding in visible_findings)
 
 
+def test_collect_post_budget_opcodes_respects_opcode_cap() -> None:
+    """Tail opcode collection should stop once it reaches the configured cap."""
+    scanner = PickleScanner()
+
+    opcodes = scanner._collect_post_budget_opcodes(
+        _make_opcode_padding_stream(opcode_pairs=32),
+        scan_start=0,
+        deadline=None,
+        scan_label="test",
+        opcode_limit=8,
+    )
+
+    assert len(opcodes) == 8
+    assert all(position is not None for _opcode, _arg, position in opcodes)
+    assert opcodes[-1][0].name != "STOP"
+
+
 def test_post_budget_global_scan_uses_stack_global_opcode_offset() -> None:
     """STACK_GLOBAL references that cross the budget boundary should still be reported."""
     raw_stack_global = _short_binunicode(b"os") + _short_binunicode(b"system") + b"\x93"
@@ -851,6 +868,32 @@ def test_post_budget_opcode_scan_detects_encoded_pickle_payload(tmp_path: Path) 
         for check in result.checks
     ), f"Expected opcode-based detection, got: {result.checks}"
     assert result.success is False
+
+
+def test_post_budget_opcode_scan_detects_encoded_python_payload(tmp_path: Path) -> None:
+    """Encoded Python payloads beyond the opcode budget should stay aligned with the main loop."""
+    import base64
+
+    encoded_python = base64.b64encode(b"import os\nos.system('id')\n")
+    pickle_path = tmp_path / "post-budget-encoded-python.pkl"
+    benign_padding = _make_opcode_padding_stream(opcode_pairs=512)
+    malicious_stream = b"\x80\x04" + _short_binunicode(encoded_python) + b"."
+    pickle_path.write_bytes(benign_padding + malicious_stream)
+
+    result = PickleScanner({"max_opcodes": 64}).scan(str(pickle_path))
+
+    checks = [check for check in result.checks if check.name == "Post-Budget Opcode Detection"]
+    assert len(checks) == 1, f"Expected one post-budget opcode finding, got: {result.checks}"
+    assert checks[0].status == CheckStatus.FAILED
+    assert checks[0].severity == IssueSeverity.WARNING
+    assert "Encoded Python code detected (base64)" in checks[0].message
+    assert any(
+        finding["check_name"] == "Encoded Python Code Detection"
+        and finding["details"].get("encoding") == "base64"
+        and finding["details"].get("opcode") == "SHORT_BINUNICODE"
+        for finding in checks[0].details["findings"]
+    ), checks[0].details
+    assert result.success is True
 
 
 def test_post_budget_opcode_scan_detects_malformed_stack_global(tmp_path: Path) -> None:

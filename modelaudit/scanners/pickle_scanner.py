@@ -63,6 +63,7 @@ _NESTED_PICKLE_VALIDATION_WINDOW_BYTES = 8 * 1024
 _POST_BUDGET_GLOBAL_SCAN_LIMIT_BYTES = 100 * 1024 * 1024
 _POST_BUDGET_GLOBAL_CONTEXT_BYTES = 4096
 _POST_BUDGET_EXPANSION_SCAN_LIMIT_BYTES = 8 * 1024 * 1024
+_POST_BUDGET_OPCODE_SCAN_LIMIT_OPCODES = 500_000
 _MEMO_WRITE_OPCODES = frozenset({"PUT", "BINPUT", "LONG_BINPUT", "MEMOIZE"})
 _MEMO_READ_OPCODES = frozenset({"GET", "BINGET", "LONG_BINGET"})
 _EXPANSION_EVENT_WINDOW = 6
@@ -3572,8 +3573,7 @@ def is_dangerous_reduce_pattern(
                         "position": pos,
                         "opcode": opcode.name,
                         "description": (
-                            "BUILD applied state to object from non-safe global; "
-                            "potential __setstate__ exploitation"
+                            "BUILD applied state to object from non-safe global; potential __setstate__ exploitation"
                         ),
                     }
 
@@ -3726,11 +3726,17 @@ def _collect_nested_pickle_opcode_findings(
     """Return nested/encoded pickle findings for a single opcode payload."""
     findings: list[dict[str, Any]] = []
 
+<<<<<<< HEAD
     if opcode_name in {"BINBYTES", "SHORT_BINBYTES", "BINBYTES8", "BYTEARRAY8"} and isinstance(
         arg, bytes | bytearray
     ):
         nested_match = _find_nested_pickle_match(arg)
         if nested_match is not None:
+=======
+    if opcode_name in {"BINBYTES", "SHORT_BINBYTES", "BINBYTES8", "BYTEARRAY8"} and isinstance(arg, bytes | bytearray):
+        sample = bytes(arg[:1024])
+        if _looks_like_pickle(sample):
+>>>>>>> 98b9870 (fix: cap post-budget opcode accumulation)
             severity = _get_context_aware_severity(IssueSeverity.CRITICAL, ml_context)
             findings.append(
                 _build_opcode_check_finding(
@@ -3934,9 +3940,7 @@ def _build_dangerous_reduce_pattern_finding(
     module_name = dangerous_pattern.get("module", "")
     func_name = dangerous_pattern.get("function", "")
     dangerous_pattern_rule_code = (
-        get_pickle_opcode_rule_code("BUILD")
-        if is_build_setstate
-        else get_import_rule_code(module_name, func_name)
+        get_pickle_opcode_rule_code("BUILD") if is_build_setstate else get_import_rule_code(module_name, func_name)
     )
     if not dangerous_pattern_rule_code:
         dangerous_pattern_rule_code = "S201"
@@ -5341,6 +5345,51 @@ class PickleScanner(BaseScanner):
 
         return data, scan_start, tail_scan_bytes
 
+    def _collect_post_budget_opcodes(
+        self,
+        data: bytes,
+        *,
+        scan_start: int,
+        deadline: float | None,
+        scan_label: str,
+        opcode_limit: int | None = None,
+    ) -> list[tuple[Any, Any, int | None]]:
+        """Decode a tail window without retaining an unbounded opcode list."""
+        resolved_opcode_limit = (
+            _POST_BUDGET_OPCODE_SCAN_LIMIT_OPCODES if opcode_limit is None else max(0, int(opcode_limit))
+        )
+        if not data or resolved_opcode_limit <= 0:
+            return []
+
+        opcodes: list[tuple[Any, Any, int | None]] = []
+        tail_stream = io.BytesIO(data)
+        try:
+            for opcode, arg, pos in _genops_with_fallback(
+                tail_stream,
+                multi_stream=True,
+                max_items=min(len(data), resolved_opcode_limit),
+                deadline=deadline,
+            ):
+                shifted_pos = scan_start + int(pos) if pos is not None else None
+                opcodes.append((opcode, arg, shifted_pos))
+        except _GenopsBudgetExceeded as exc:
+            if exc.reason == "deadline":
+                logger.debug(
+                    "Post-budget %s scan stopped after exceeding timeout (%ss)",
+                    scan_label,
+                    self.timeout,
+                )
+            elif exc.reason == "max_items":
+                logger.debug(
+                    "Post-budget %s scan stopped after reaching opcode cap (%s)",
+                    scan_label,
+                    min(len(data), resolved_opcode_limit),
+                )
+        except Exception as exc:
+            logger.debug("Post-budget %s scan failed: %s", scan_label, exc)
+
+        return opcodes
+
     def _scan_global_references_unbounded(
         self,
         file_obj: BinaryIO,
@@ -5627,25 +5676,12 @@ class PickleScanner(BaseScanner):
         if not data:
             return []
 
-        opcodes: list[tuple[Any, Any, int | None]] = []
-        tail_stream = io.BytesIO(data)
-        try:
-            for opcode, arg, pos in _genops_with_fallback(
-                tail_stream,
-                multi_stream=True,
-                deadline=deadline,
-            ):
-                shifted_pos = scan_start + int(pos) if pos is not None else None
-                opcodes.append((opcode, arg, shifted_pos))
-        except _GenopsBudgetExceeded as exc:
-            if exc.reason == "deadline":
-                logger.debug(
-                    "Post-budget opcode scan stopped after exceeding timeout (%ss)",
-                    self.timeout,
-                )
-        except Exception as exc:
-            logger.debug("Post-budget opcode scan failed: %s", exc)
-
+        opcodes = self._collect_post_budget_opcodes(
+            data,
+            scan_start=scan_start,
+            deadline=deadline,
+            scan_label="opcode",
+        )
         if not opcodes:
             return []
 
@@ -5665,6 +5701,7 @@ class PickleScanner(BaseScanner):
                 continue
 
             findings.extend(_collect_nested_pickle_opcode_findings(opcode.name, arg, absolute_pos, ml_context))
+            findings.extend(_collect_encoded_python_opcode_findings(opcode.name, arg, absolute_pos, ml_context))
 
             if opcode.name == "STACK_GLOBAL":
                 malformed = malformed_stack_globals.get(index)
@@ -5713,25 +5750,12 @@ class PickleScanner(BaseScanner):
         if not tail_data:
             return []
 
-        opcodes: list[tuple[Any, Any, int | None]] = []
-        tail_stream = io.BytesIO(tail_data)
-        try:
-            for opcode, arg, pos in _genops_with_fallback(
-                tail_stream,
-                multi_stream=True,
-                deadline=deadline,
-            ):
-                shifted_pos = minimum_offset + int(pos) if pos is not None else None
-                opcodes.append((opcode, arg, shifted_pos))
-        except _GenopsBudgetExceeded as exc:
-            if exc.reason == "deadline":
-                logger.debug(
-                    "Post-budget expansion scan stopped after exceeding timeout (%ss)",
-                    self.timeout,
-                )
-        except Exception as exc:
-            logger.debug("Post-budget expansion scan failed: %s", exc)
-
+        opcodes = self._collect_post_budget_opcodes(
+            tail_data,
+            scan_start=minimum_offset,
+            deadline=deadline,
+            scan_label="expansion",
+        )
         return _detect_pickle_expansion_heuristics(opcodes)
 
     def _scan_pickle_bytes(self, file_obj: BinaryIO, file_size: int) -> ScanResult:
