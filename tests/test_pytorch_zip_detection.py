@@ -3,6 +3,7 @@
 import io
 import pickle
 import zipfile
+from pathlib import Path
 
 import pytest
 
@@ -254,11 +255,14 @@ class TestPyTorchZipPklExtension:
         critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
         assert len(critical_issues) == 0, f"Unexpected critical issues: {[i.message for i in critical_issues]}"
 
-    def test_scan_malicious_zip_pkl(self, tmp_path):
-        """Test detection of malicious code in ZIP-format .pkl files."""
-        # Create a ZIP file with malicious pickle content, saved as .pkl
+    def test_scan_malicious_zip_pkl(self, tmp_path: Path) -> None:
+        """Test detection of malicious code in PyTorch ZIP-format .pkl files."""
+        # Create a PyTorch-style ZIP file with malicious pickle content, saved as .pkl.
         pkl_file = tmp_path / "malicious_model.pkl"
         with zipfile.ZipFile(pkl_file, "w") as zf:
+            zf.writestr("version", "3")
+            zf.writestr("byteorder", "little")
+
             # Create a malicious pickle payload
             class MaliciousClass:
                 def __reduce__(self):
