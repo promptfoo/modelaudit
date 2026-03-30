@@ -1751,6 +1751,36 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
                     for check in nested_checks
                 ), f"Expected offset nested pickle detection for {opcode_name}, got: {result.checks}"
 
+    def test_find_nested_pickle_match_scans_past_decoy_headers(self) -> None:
+        """Valid-looking decoy headers must not exhaust the bounded nested-header search."""
+        inner_bytes = pickle.dumps({"ab": 1}, protocol=4)
+        decoy_headers = b"\x80\x04J" * 256
+
+        nested_match = _find_nested_pickle_match(decoy_headers + inner_bytes)
+
+        assert nested_match is not None
+        assert nested_match.offset == len(decoy_headers)
+
+    def test_nested_pickle_detection_survives_decoy_header_flood(self) -> None:
+        """Nested pickle detection must survive dense decoy header triplets."""
+        inner_bytes = pickle.dumps({"ab": 1}, protocol=4)
+        decoy_headers = b"\x80\x04J" * 256
+        embedded = decoy_headers + inner_bytes
+        payload = b"\x80\x04B" + struct.pack("<I", len(embedded)) + embedded + b"."
+
+        result = self._scan_bytes(payload)
+
+        assert result.success
+        nested_checks = [
+            check
+            for check in result.checks
+            if check.name == "Nested Pickle Detection" and check.status == CheckStatus.FAILED
+        ]
+        assert any(
+            check.details.get("opcode") == "BINBYTES" and check.details.get("nested_offset") == len(decoy_headers)
+            for check in nested_checks
+        ), f"Expected nested pickle detection after decoy headers, got: {result.checks}"
+
     def test_offset_nested_pickle_detection_binstring(self) -> None:
         """Offset inner pickles in BINSTRING must not evade legacy-string scanning."""
         inner_bytes = pickle.dumps({"ab": 1}, protocol=2)

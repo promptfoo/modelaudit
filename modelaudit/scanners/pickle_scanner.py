@@ -60,7 +60,6 @@ _STACK_GLOBAL_OPERAND_PREVIEWER.maxdict = 4
 _RAW_PATTERN_SCAN_LIMIT_BYTES = 10 * 1024 * 1024
 _NESTED_PICKLE_HEADER_SEARCH_LIMIT_BYTES = 64 * 1024
 _NESTED_PICKLE_VALIDATION_WINDOW_BYTES = 8 * 1024
-_NESTED_PICKLE_MAX_HEADER_CANDIDATES = 256
 _POST_BUDGET_GLOBAL_SCAN_LIMIT_BYTES = 100 * 1024 * 1024
 _POST_BUDGET_GLOBAL_CONTEXT_BYTES = 4096
 _POST_BUDGET_EXPANSION_SCAN_LIMIT_BYTES = 8 * 1024 * 1024
@@ -3145,12 +3144,13 @@ def _find_nested_pickle_match(data: bytes | bytearray) -> _NestedPickleMatch | N
     if search_limit < 3:
         return None
 
-    candidate_count = 0
     cursor = 0
     # Binary pickle headers need three readable bytes: PROTO, protocol, opcode.
     max_header_start = search_limit - 3
 
-    while cursor <= max_header_start and candidate_count < _NESTED_PICKLE_MAX_HEADER_CANDIDATES:
+    # Scan the full bounded window. A fixed candidate cap is bypassable because
+    # valid-looking header triplets can be packed densely ahead of the real stream.
+    while cursor <= max_header_start:
         header_offset = data_bytes.find(b"\x80", cursor, max_header_start + 1)
         if header_offset == -1:
             break
@@ -3161,7 +3161,6 @@ def _find_nested_pickle_match(data: bytes | bytearray) -> _NestedPickleMatch | N
         if protocol not in _BINARY_PICKLE_PROTOCOLS or next_opcode not in _PICKLE_OPCODE_BYTES:
             continue
 
-        candidate_count += 1
         sample_end = min(len(data_bytes), header_offset + _NESTED_PICKLE_VALIDATION_WINDOW_BYTES)
         if _looks_like_pickle(data_bytes[header_offset:sample_end]):
             return _NestedPickleMatch(
