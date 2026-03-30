@@ -4443,8 +4443,9 @@ class PickleScanner(BaseScanner):
         # Check if this is a .bin file that might be a PyTorch file
         is_bin_file = os.path.splitext(path)[1].lower() == ".bin"
 
-        # Early detection of dangerous patterns BEFORE attempting to parse pickle
-        early_detection_successful = False
+        # Run a bounded raw scan before pickle parsing. Track completion only,
+        # not a synthetic "clean" sentinel check.
+        early_pattern_scan_completed = False
 
         try:
             # Use the most basic file operations possible to avoid recursion issues
@@ -4468,34 +4469,9 @@ class PickleScanner(BaseScanner):
                     raw_content += chunk
                     bytes_read += len(chunk)
 
-            # Use the refactored method to scan for dangerous patterns
+            # Use the refactored method to scan for dangerous patterns.
             self._scan_for_dangerous_patterns(raw_content, result, path)
-
-            # If we scanned for dangerous patterns but found none, record a successful check
-            dangerous_found = any(
-                check.name == "Dangerous Pattern Detection" and check.status == CheckStatus.FAILED
-                for check in result.checks
-            )
-            if not dangerous_found:
-                result.add_check(
-                    name="Dangerous Pattern Detection",
-                    passed=True,
-                    message="No dangerous patterns found in raw file content",
-                    location=path,
-                    details={
-                        "detection_method": "raw_content_scan",
-                        "patterns_checked": [
-                            "posix",
-                            "subprocess",
-                            "eval",
-                            "exec",
-                            "__import__",
-                            "builtins",
-                        ],
-                    },
-                )
-
-                early_detection_successful = True
+            early_pattern_scan_completed = True
 
         except RecursionError:
             logger.warning(f"Recursion error during early pattern detection for {path}")
@@ -4530,18 +4506,7 @@ class PickleScanner(BaseScanner):
                             file_size,
                         )
 
-                        # Add binary scanning results (preserve original rule codes)
-                        for issue in binary_result.issues:
-                            result.add_check(
-                                name="Binary Content Check",
-                                passed=False,
-                                message=issue.message,
-                                severity=issue.severity,
-                                location=issue.location,
-                                details=issue.details,
-                                why=issue.why,
-                                rule_code=issue.rule_code,
-                            )
+                        self._merge_binary_content_findings(result, binary_result)
 
                         # Update total bytes scanned
                         result.bytes_scanned = file_size
@@ -4647,7 +4612,7 @@ class PickleScanner(BaseScanner):
                 is_malicious_name = any(pattern in filename for pattern in ["malicious", "evil", "hack", "exploit"])
                 is_very_small = file_size < 80
 
-                if is_malicious_name and is_very_small and not early_detection_successful:
+                if is_malicious_name and is_very_small and not early_pattern_scan_completed:
                     logger.warning(
                         f"Very small file {path} ({file_size} bytes) with suspicious filename caused recursion errors"
                     )
@@ -4661,7 +4626,7 @@ class PickleScanner(BaseScanner):
                             "reason": "malicious_indicators",
                             "file_size": file_size,
                             "exception_type": "RecursionError",
-                            "early_detection_successful": early_detection_successful,
+                            "early_detection_successful": early_pattern_scan_completed,
                             "suspicious_filename": is_malicious_name,
                         },
                         why=(
@@ -4686,7 +4651,7 @@ class PickleScanner(BaseScanner):
                             "reason": "recursion_limit_exceeded",
                             "file_size": file_size,
                             "exception_type": "RecursionError",
-                            "early_detection_successful": early_detection_successful,
+                            "early_detection_successful": early_pattern_scan_completed,
                         },
                         why=(
                             "The pickle file structure is too complex for the scanner to fully analyze due to "
@@ -4707,9 +4672,7 @@ class PickleScanner(BaseScanner):
                 return result
 
             # Handle different types of parsing errors more gracefully
-            error_message = str(e).lower()
-            if "opcode" in error_message or "unknown" in error_message:
-                # This could be a complex pickle file, corrupted data, or binary file
+            if self._is_pickle_parse_failure(e):
                 file_ext = os.path.splitext(path)[1].lower()
 
                 if is_bin_file:
@@ -4724,7 +4687,7 @@ class PickleScanner(BaseScanner):
                         details={
                             "file_type": "binary",
                             "pickle_parse_error": str(e),
-                            "early_detection_successful": early_detection_successful,
+                            "early_detection_successful": early_pattern_scan_completed,
                         },
                         why=(
                             "This binary file does not contain valid pickle data structure. "
@@ -4732,38 +4695,15 @@ class PickleScanner(BaseScanner):
                         ),
                     )
 
-                    # If early detection was successful, also perform comprehensive binary scan
-                    if early_detection_successful:
-                        result.metadata.update(
-                            {
-                                "file_type": "binary",
-                                "pickle_parsing_failed": True,
-                            }
-                        )
-
-                        # Perform comprehensive binary scan of the entire file
-                        try:
-                            with open(path, "rb") as f:
-                                binary_result = self._scan_binary_content(f, 0, file_size)
-                                # Add binary scanning results
-                                for issue in binary_result.issues:
-                                    result.add_check(
-                                        name="Binary Content Check",
-                                        passed=False,
-                                        message=issue.message,
-                                        severity=issue.severity,
-                                        location=issue.location,
-                                        details=issue.details,
-                                        why=issue.why,
-                                    )
-                                result.metadata["binary_scan_completed"] = True
-                                result.metadata["binary_bytes"] = file_size
-                        except Exception as binary_scan_error:
-                            logger.warning(f"Binary scan failed for {path}: {binary_scan_error}")
-                            result.metadata["binary_scan_failed"] = str(binary_scan_error)
-
-                        result.finish(success=True)
-                        return result
+                    result.metadata.update(
+                        {
+                            "file_type": "binary",
+                            "pickle_parsing_failed": True,
+                        }
+                    )
+                    self._scan_binary_content_from_path(path, result, file_size)
+                    result.finish(success=True)
+                    return result
 
                 elif file_ext in [".pkl", ".pickle", ".joblib", ".dill"]:
                     # Pickle-like files must fail closed when parsing aborts on unknown opcodes.
@@ -4777,7 +4717,7 @@ class PickleScanner(BaseScanner):
                         details={
                             "file_type": "pickle",
                             "parse_error": str(e),
-                            "early_detection_successful": early_detection_successful,
+                            "early_detection_successful": early_pattern_scan_completed,
                             "parsing_failed": True,
                             "failure_reason": "unknown_opcode_or_format_error",
                         },
@@ -4821,6 +4761,56 @@ class PickleScanner(BaseScanner):
         )
         result.finish(success=scan_result.success and not has_critical_post_budget_failure)
         return result
+
+    def _is_pickle_parse_failure(self, error: Exception) -> bool:
+        """Return whether an exception looks like a pickle/format parse failure."""
+        if not isinstance(error, (ValueError, struct.error)):
+            return False
+
+        error_message = str(error).lower()
+        return (
+            "opcode" in error_message
+            or "unknown" in error_message
+            or "pickle exhausted before seeing stop" in error_message
+            or ("expected" in error_message and "bytes" in error_message and "but only" in error_message)
+            or "truncated" in error_message
+            or "unpack requires" in error_message
+            or "bad marshal data" in error_message
+            or "no newline found" in error_message
+        )
+
+    def _merge_binary_content_findings(self, result: ScanResult, binary_result: ScanResult) -> None:
+        """Copy binary scan findings into the primary scan result."""
+        for issue in binary_result.issues:
+            result.add_check(
+                name="Binary Content Check",
+                passed=False,
+                message=issue.message,
+                severity=issue.severity,
+                location=issue.location,
+                details=issue.details,
+                why=issue.why,
+                rule_code=issue.rule_code,
+            )
+
+    def _scan_binary_content_from_path(self, path: str, result: ScanResult, file_size: int, start_pos: int = 0) -> None:
+        """Scan file bytes directly when pickle parsing did not yield a trusted boundary."""
+        try:
+            with open(path, "rb") as f:
+                if start_pos:
+                    f.seek(start_pos)
+                binary_result = self._scan_binary_content(f, start_pos, file_size)
+        except Exception as binary_scan_error:
+            logger.warning(f"Binary scan failed for {path}: {binary_scan_error}")
+            result.metadata["binary_scan_failed"] = str(binary_scan_error)
+            return
+
+        self._merge_binary_content_findings(result, binary_result)
+        result.metadata["binary_scan_completed"] = True
+        result.metadata["binary_bytes"] = max(file_size - start_pos, 0)
+        if start_pos:
+            result.metadata["pickle_bytes"] = start_pos
+        result.bytes_scanned = file_size
 
     def _scan_for_dangerous_patterns(self, data: bytes, result: ScanResult, context_path: str) -> None:
         """Enhanced scan for dangerous patterns with ML context awareness and obfuscation detection."""

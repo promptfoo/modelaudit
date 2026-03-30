@@ -229,6 +229,78 @@ def test_unknown_opcode_bin_parse_failure_still_scans_full_binary_content(
     ), f"Expected binary fallback finding, got: {[(c.name, c.status) for c in result.checks]}"
 
 
+def test_unknown_opcode_bin_parse_failure_runs_binary_fallback_after_raw_scan_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A raw-scan exception must not suppress the .bin parse-failure binary fallback."""
+    bin_path = tmp_path / "unknown_opcode_raw_scan_exception.bin"
+    executable_signature = b"\x7fELF"
+    bin_path.write_bytes(b"\x80\x04K\x01." + (b"A" * 9000) + executable_signature)
+
+    def _raise_raw_scan(
+        self: PickleScanner,
+        _data: bytes,
+        _result: ScanResult,
+        _context_path: str,
+    ) -> None:
+        del self, _data, _result, _context_path
+        raise RuntimeError("simulated raw-scan failure")
+
+    def _raise_unknown_opcode(self: PickleScanner, _file_obj: object, _file_size: int) -> ScanResult:
+        raise ValueError("at position 2, opcode b'\\xff' unknown")
+
+    monkeypatch.setattr(PickleScanner, "_scan_for_dangerous_patterns", _raise_raw_scan)
+    monkeypatch.setattr(PickleScanner, "_scan_pickle_bytes", _raise_unknown_opcode)
+
+    result = PickleScanner().scan(str(bin_path))
+
+    assert result.success is True
+    assert result.metadata["file_type"] == "binary"
+    assert result.metadata["pickle_parsing_failed"] is True
+    assert result.metadata["binary_scan_completed"] is True
+    assert result.metadata["binary_bytes"] == bin_path.stat().st_size
+    assert any(
+        check.name == "Binary Content Check"
+        and check.status == CheckStatus.FAILED
+        and "Executable signature found in binary data" in check.message
+        for check in result.checks
+    ), f"Expected executable-signature fallback finding, got: {[(c.name, c.status, c.message) for c in result.checks]}"
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and "Executable signature found in binary data" in issue.message
+        for issue in result.issues
+    ), f"Expected CRITICAL executable-signature issue, got: {[(i.severity, i.message) for i in result.issues]}"
+
+
+def test_unknown_opcode_bin_parse_failure_with_benign_binary_content_stays_clean(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Parse-failed .bin files should still complete binary fallback scanning when content is benign."""
+    bin_path = tmp_path / "unknown_opcode_benign.bin"
+    bin_path.write_bytes(b"\x80\x04K\x01." + (b"\x00" * 9000) + b"tensor-weights")
+
+    def _raise_unknown_opcode(self: PickleScanner, _file_obj: object, _file_size: int) -> ScanResult:
+        raise ValueError("at position 2, opcode b'\\xff' unknown")
+
+    monkeypatch.setattr(PickleScanner, "_scan_pickle_bytes", _raise_unknown_opcode)
+
+    result = PickleScanner().scan(str(bin_path))
+
+    assert result.success is True
+    assert result.metadata["file_type"] == "binary"
+    assert result.metadata["pickle_parsing_failed"] is True
+    assert result.metadata["binary_scan_completed"] is True
+    assert result.metadata["binary_bytes"] == bin_path.stat().st_size
+    assert any(check.name == "Pickle Format Check" and check.status == CheckStatus.PASSED for check in result.checks), (
+        f"Expected passing .bin format check, got: {[(c.name, c.status) for c in result.checks]}"
+    )
+    assert not any(
+        check.name == "Binary Content Check" and check.status == CheckStatus.FAILED for check in result.checks
+    ), f"Unexpected binary fallback finding, got: {[(c.name, c.status, c.message) for c in result.checks]}"
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues), (
+        f"Unexpected warning/critical issue, got: {[(i.severity, i.message) for i in result.issues]}"
+    )
+
+
 def test_small_pickle_tail_pattern_is_detected_without_raw_pattern_limit(tmp_path: Path) -> None:
     """Small pickle files should still fully analyze raw patterns without a coverage warning."""
     pickle_path = tmp_path / "small-tail.pkl"
