@@ -3,6 +3,7 @@
 import io
 import pickle
 import zipfile
+from pathlib import Path
 
 import pytest
 
@@ -195,7 +196,7 @@ class TestPyTorchBinaryDetection:
 
 
 class TestPyTorchZipPklExtension:
-    """Test that .pkl files with ZIP format are handled by PyTorchZipScanner.
+    """Test that PyTorch-style .pkl ZIP files are handled by PyTorchZipScanner.
 
     PyTorch's torch.save() uses ZIP format by default since v1.6 (_use_new_zipfile_serialization=True).
     This means .pkl files saved with torch.save() are actually ZIP files containing pickle data.
@@ -254,11 +255,16 @@ class TestPyTorchZipPklExtension:
         critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
         assert len(critical_issues) == 0, f"Unexpected critical issues: {[i.message for i in critical_issues]}"
 
-    def test_scan_malicious_zip_pkl(self, tmp_path):
-        """Test detection of malicious code in ZIP-format .pkl files."""
+    def test_scan_malicious_zip_pkl(self, tmp_path: Path) -> None:
+        """Test detection of malicious code in PyTorch-style ZIP-format .pkl files."""
         # Create a ZIP file with malicious pickle content, saved as .pkl
         pkl_file = tmp_path / "malicious_model.pkl"
         with zipfile.ZipFile(pkl_file, "w") as zf:
+            # Include the minimal PyTorch metadata required for conservative
+            # content-based routing to the PyTorch ZIP scanner.
+            zf.writestr("version", "3")
+            zf.writestr("byteorder", "little")
+
             # Create a malicious pickle payload
             class MaliciousClass:
                 def __reduce__(self):
@@ -275,6 +281,29 @@ class TestPyTorchZipPklExtension:
 
         # Should detect the malicious pattern
         assert result.scanner_name == "pytorch_zip"
+        assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues), (
+            f"Expected CRITICAL issue but got: {[i.message for i in result.issues]}"
+        )
+
+    def test_scan_generic_zip_pkl_without_pytorch_metadata_uses_zip_scanner(self, tmp_path: Path) -> None:
+        """Generic .pkl ZIPs should remain on the ZIP scanner without PyTorch markers."""
+        pkl_file = tmp_path / "generic_model.pkl"
+        with zipfile.ZipFile(pkl_file, "w") as zf:
+
+            class MaliciousClass:
+                def __reduce__(self):
+                    import os
+
+                    return (os.system, ("echo pwned",))
+
+            pickle_data = io.BytesIO()
+            pickle.dump({"model": MaliciousClass()}, pickle_data)
+            zf.writestr("data.pkl", pickle_data.getvalue())
+
+        result = scan_file(str(pkl_file))
+
+        assert result.scanner_name == "zip"
+        assert result.success is True
         assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues), (
             f"Expected CRITICAL issue but got: {[i.message for i in result.issues]}"
         )
