@@ -233,6 +233,32 @@ class TestCloudObjectSize:
         size = get_cloud_object_size(fs, "s3://bucket/dir/")
         assert size == (1024 + 2048 + 512) * 1024  # 3.5 MB
 
+    def test_get_cloud_object_size_directory_with_size_uses_walk(self) -> None:
+        """Test directory objects with a size still recurse into children."""
+        fs = MagicMock()
+
+        def info_side_effect(path: str) -> dict[str, object]:
+            if path == "s3://bucket/dir/":
+                return {"type": "directory", "size": 0}
+            if path == "s3://bucket/dir/file1.bin":
+                return {"type": "file", "size": 1024}
+            if path == "s3://bucket/dir/subdir/file2.bin":
+                return {"type": "file", "size": 2048}
+            return {}
+
+        fs.info.side_effect = info_side_effect
+        fs.walk.return_value = [
+            ("s3://bucket/dir/", ["s3://bucket/dir/subdir"], ["s3://bucket/dir/file1.bin"]),
+            ("s3://bucket/dir/subdir", [], ["s3://bucket/dir/subdir/file2.bin"]),
+        ]
+        fs.ls.side_effect = AssertionError("ls should not be called when walk succeeds")
+
+        size = get_cloud_object_size(fs, "s3://bucket/dir/")
+
+        assert size == 3072
+        fs.walk.assert_called_once_with("s3://bucket/dir/")
+        fs.ls.assert_not_called()
+
     def test_get_cloud_object_size_error(self) -> None:
         """Test size retrieval returns None on error."""
         fs = MagicMock()

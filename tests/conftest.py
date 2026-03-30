@@ -78,6 +78,7 @@ def pytest_runtest_setup(item):
             "test_manifest_scanner.py",  # Manifest scanner tests
             "test_weak_hash_detection.py",  # Weak hash detection tests
             "test_cloud_url_detection.py",  # Cloud storage URL detection tests
+            "tests/utils/sources/test_cloud_storage.py",  # Cloud storage source tests
             "test_skops_scanner.py",  # Skops scanner CVE detection tests
             "test_keras_zip_scanner.py",  # Keras ZIP scanner tests
             "test_nemo_scanner.py",  # NeMo scanner CVE-2025-23304 tests

@@ -150,7 +150,7 @@ def get_cloud_object_size(fs: Any, url: str, strict: bool = False) -> int | None
         return None
 
     top_level_size_error: Exception | None = None
-    if "size" in info:
+    if info.get("type") != "directory" and "size" in info:
         try:
             return _parse_size_value(info["size"])
         except (TypeError, ValueError) as exc:
