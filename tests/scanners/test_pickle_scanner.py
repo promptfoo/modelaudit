@@ -136,18 +136,24 @@ def test_pickle_scanner_can_handle_rejects_zip_backed_pytorch_extensions(suffix:
 
 
 @pytest.mark.parametrize(
-    ("suffix", "expected"),
+    ("filename", "payload", "expected"),
     [
-        (".bin", True),
-        (".txt", False),
+        ("model.bin", b"not a pickle payload", False),
+        ("model.bin", pickle.dumps({"safe": True}, protocol=4), True),
+        ("model.weights", pickle.dumps({"safe": True}, protocol=0), True),
+        ("model.txt", b"not a pickle payload", False),
     ],
 )
-def test_pickle_scanner_can_handle_falls_back_to_extension_on_detection_error(
-    suffix: str, expected: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_pickle_scanner_can_handle_detection_error_falls_back_to_pickle_probe(
+    filename: str,
+    payload: bytes,
+    expected: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Detection errors should fall back to the supported-extension list."""
-    model_path = tmp_path / f"model{suffix}"
-    model_path.write_bytes(b"not a pickle payload")
+    """Detection errors should fall back to a bounded pickle probe."""
+    model_path = tmp_path / filename
+    model_path.write_bytes(payload)
 
     def _raise_detection(_path: str) -> str:
         raise RuntimeError("detection exploded")
@@ -155,6 +161,20 @@ def test_pickle_scanner_can_handle_falls_back_to_extension_on_detection_error(
     monkeypatch.setattr("modelaudit.utils.file.detection.detect_file_format", _raise_detection)
 
     assert PickleScanner.can_handle(str(model_path)) is expected
+
+
+def test_pickle_scanner_can_handle_detection_error_rejects_zip_backed_pytorch_bin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Detection errors should not route ZIP-backed `.bin` containers through PickleScanner."""
+    model_path = create_mock_pytorch_zip(tmp_path / "model.bin")
+
+    def _raise_detection(_path: str) -> str:
+        raise RuntimeError("detection exploded")
+
+    monkeypatch.setattr("modelaudit.utils.file.detection.detect_file_format", _raise_detection)
+
+    assert PickleScanner.can_handle(str(model_path)) is False
 
 
 def test_pickle_scanner_can_handle_still_accepts_detected_pickle_when_validation_raises(

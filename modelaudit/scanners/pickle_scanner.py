@@ -4351,8 +4351,13 @@ class PickleScanner(BaseScanner):
 
             file_format = detect_file_format(path)
         except Exception:
-            # If detection fails, fall back to extension check
-            return file_ext in cls.supported_extensions
+            # If type detection fails, fall back to a bounded pickle probe
+            # instead of routing ambiguous extensions on suffix alone.
+            try:
+                with open(path, "rb") as handle:
+                    return _looks_like_pickle(handle.read(_NESTED_PICKLE_HEADER_SEARCH_LIMIT_BYTES))
+            except OSError:
+                return False
 
         # For security-sensitive pickle files, also validate file type.
         # Validation errors must not override a positive pickle detection.
