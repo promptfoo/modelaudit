@@ -119,6 +119,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - scan follow-on pickle streams after large padding blocks
 - **security:** add a budget-independent post-truncation GLOBAL/INST/STACK_GLOBAL byte scan (100 MB capped) so dangerous imports hidden past opcode limits are still detected
 - **security:** detect nested pickle payloads in BINBYTES8 and BYTEARRAY8 opcodes
+- **security:** scan bounded sliding windows for padded nested pickles hidden beyond the first 1 KB in raw, legacy `BINSTRING`, and base64/hex-encoded payloads
 - **onnx:** treat official `ai.onnx.ml` and `ai.onnx.preview.training` domains as standard so only truly custom domains are flagged
 - reject local streaming symlink traversal outside the scan root
 - require explicit remote Hugging Face provenance for whitelist downgrades

@@ -58,6 +58,9 @@ _STACK_GLOBAL_OPERAND_PREVIEWER.maxset = 4
 _STACK_GLOBAL_OPERAND_PREVIEWER.maxfrozenset = 4
 _STACK_GLOBAL_OPERAND_PREVIEWER.maxdict = 4
 _RAW_PATTERN_SCAN_LIMIT_BYTES = 10 * 1024 * 1024
+_NESTED_PICKLE_HEADER_SEARCH_LIMIT_BYTES = 64 * 1024
+_NESTED_PICKLE_VALIDATION_WINDOW_BYTES = 8 * 1024
+_NESTED_PICKLE_MAX_HEADER_CANDIDATES = 256
 _POST_BUDGET_GLOBAL_SCAN_LIMIT_BYTES = 100 * 1024 * 1024
 _POST_BUDGET_GLOBAL_CONTEXT_BYTES = 4096
 _POST_BUDGET_EXPANSION_SCAN_LIMIT_BYTES = 8 * 1024 * 1024
@@ -78,6 +81,8 @@ _EXPANSION_TRIGGER_LABELS = {
     "excessive_dup_usage": "dense DUP usage",
     "memo_growth_chain": "iterative memo growth chain",
 }
+_BINARY_PICKLE_PROTOCOLS = frozenset({2, 3, 4, 5})
+_PICKLE_OPCODE_BYTES = frozenset(ord(op.code) for op in pickletools.opcodes)
 
 
 StackGlobalOperandKind = Literal["string", "missing_memo", "unknown", "non_string"]
@@ -98,6 +103,13 @@ class _GenopsBudgetExceeded(Exception):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
+
+
+@dataclass(frozen=True)
+class _NestedPickleMatch:
+    offset: int
+    sample_size: int
+    searched_bytes: int
 
 
 def _format_stack_global_string_preview(value: str) -> str:
@@ -3105,6 +3117,59 @@ def _looks_like_pickle(data: bytes) -> bool:
         return False
 
     return False
+
+
+def _find_nested_pickle_match(data: bytes | bytearray) -> _NestedPickleMatch | None:
+    """Find a nested pickle within a bounded search window.
+
+    The scanner previously only checked the first 1024 bytes of embedded blobs,
+    which let attackers hide inner pickle streams behind padding. This helper
+    keeps the work bounded while scanning for plausible binary pickle headers
+    within the first search window.
+    """
+    data_bytes = bytes(data)
+    if len(data_bytes) < 2:
+        return None
+
+    search_limit = min(len(data_bytes), _NESTED_PICKLE_HEADER_SEARCH_LIMIT_BYTES)
+    validation_limit = min(len(data_bytes), _NESTED_PICKLE_VALIDATION_WINDOW_BYTES)
+
+    # Fast path: payload starts with a pickle stream (also covers protocol 0/1).
+    if _looks_like_pickle(data_bytes[:validation_limit]):
+        return _NestedPickleMatch(
+            offset=0,
+            sample_size=validation_limit,
+            searched_bytes=search_limit,
+        )
+
+    if search_limit < 3:
+        return None
+
+    candidate_count = 0
+    cursor = 0
+    max_header_start = search_limit - 2
+
+    while cursor <= max_header_start and candidate_count < _NESTED_PICKLE_MAX_HEADER_CANDIDATES:
+        header_offset = data_bytes.find(b"\x80", cursor, max_header_start + 1)
+        if header_offset == -1:
+            break
+        cursor = header_offset + 1
+
+        protocol = data_bytes[header_offset + 1]
+        next_opcode = data_bytes[header_offset + 2]
+        if protocol not in _BINARY_PICKLE_PROTOCOLS or next_opcode not in _PICKLE_OPCODE_BYTES:
+            continue
+
+        candidate_count += 1
+        sample_end = min(len(data_bytes), header_offset + _NESTED_PICKLE_VALIDATION_WINDOW_BYTES)
+        if _looks_like_pickle(data_bytes[header_offset:sample_end]):
+            return _NestedPickleMatch(
+                offset=header_offset,
+                sample_size=sample_end - header_offset,
+                searched_bytes=search_limit,
+            )
+
+    return None
 
 
 def _decode_string_to_bytes(s: str) -> list[tuple[str, bytes]]:
@@ -6479,8 +6544,8 @@ class PickleScanner(BaseScanner):
                 if opcode.name in ["BINBYTES", "SHORT_BINBYTES", "BINBYTES8", "BYTEARRAY8"] and isinstance(
                     arg, bytes | bytearray
                 ):
-                    sample = bytes(arg[:1024])  # limit to first 1024 bytes
-                    if _looks_like_pickle(sample):
+                    nested_match = _find_nested_pickle_match(arg)
+                    if nested_match is not None:
                         severity = _get_context_aware_severity(IssueSeverity.CRITICAL, ml_context)
                         result.add_check(
                             name="Nested Pickle Detection",
@@ -6492,7 +6557,9 @@ class PickleScanner(BaseScanner):
                             details={
                                 "position": pos,
                                 "opcode": opcode.name,
-                                "sample_size": len(sample),
+                                "nested_offset": nested_match.offset,
+                                "sample_size": nested_match.sample_size,
+                                "searched_bytes": nested_match.searched_bytes,
                             },
                             why=get_pattern_explanation("nested_pickle"),
                         )
@@ -6502,8 +6569,8 @@ class PickleScanner(BaseScanner):
                 # to recover the original bytes and check for nested pickles.
                 if opcode.name in ["BINSTRING", "SHORT_BINSTRING"] and isinstance(arg, str):
                     try:
-                        sample = arg[:1024].encode("latin-1")
-                        if _looks_like_pickle(sample):
+                        nested_match = _find_nested_pickle_match(arg.encode("latin-1"))
+                        if nested_match is not None:
                             severity = _get_context_aware_severity(IssueSeverity.CRITICAL, ml_context)
                             result.add_check(
                                 name="Nested Pickle Detection",
@@ -6515,7 +6582,9 @@ class PickleScanner(BaseScanner):
                                 details={
                                     "position": pos,
                                     "opcode": opcode.name,
-                                    "sample_size": len(sample),
+                                    "nested_offset": nested_match.offset,
+                                    "sample_size": nested_match.sample_size,
+                                    "searched_bytes": nested_match.searched_bytes,
                                 },
                                 why=get_pattern_explanation("nested_pickle"),
                             )
@@ -6525,7 +6594,8 @@ class PickleScanner(BaseScanner):
                 # Detect encoded nested pickle strings
                 if opcode.name in STRING_OPCODES and isinstance(arg, str):
                     for enc, decoded in _decode_string_to_bytes(arg):
-                        if _looks_like_pickle(decoded[:1024]):
+                        nested_match = _find_nested_pickle_match(decoded)
+                        if nested_match is not None:
                             severity = _get_context_aware_severity(IssueSeverity.CRITICAL, ml_context)
                             # Get rule code for the detected encoding type
                             enc_rule = get_encoding_rule_code(enc)
@@ -6541,6 +6611,9 @@ class PickleScanner(BaseScanner):
                                     "opcode": opcode.name,
                                     "encoding": enc,
                                     "decoded_size": len(decoded),
+                                    "nested_offset": nested_match.offset,
+                                    "sample_size": nested_match.sample_size,
+                                    "searched_bytes": nested_match.searched_bytes,
                                 },
                                 why=get_pattern_explanation("nested_pickle"),
                             )

@@ -24,6 +24,7 @@ from modelaudit.detectors.suspicious_symbols import (
 )
 from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.pickle_scanner import (
+    _NESTED_PICKLE_HEADER_SEARCH_LIMIT_BYTES,
     _RAW_PATTERN_SCAN_LIMIT_BYTES,
     PickleScanner,
     _genops_with_fallback,
@@ -1726,6 +1727,72 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
             f"{[(c.name, c.status, c.details) for c in result.checks]}"
         )
 
+    def test_offset_nested_pickle_detection_binbytes_variants(self) -> None:
+        """Nested pickles hidden behind padding in BINBYTES variants must still be found."""
+        inner_bytes = pickle.dumps({"ab": 1}, protocol=4)
+        padding = b"A" * 2048
+        padded_inner = padding + inner_bytes
+
+        for opcode_name, payload in (
+            ("BINBYTES8", b"\x80\x04\x8e" + struct.pack("<Q", len(padded_inner)) + padded_inner + b"."),
+            ("BYTEARRAY8", b"\x80\x05\x96" + struct.pack("<Q", len(padded_inner)) + padded_inner + b"."),
+        ):
+            with self.subTest(opcode_name=opcode_name):
+                result = self._scan_bytes(payload)
+                nested_checks = [
+                    check
+                    for check in result.checks
+                    if check.name == "Nested Pickle Detection" and check.status == CheckStatus.FAILED
+                ]
+
+                assert any(
+                    check.details.get("opcode") == opcode_name and check.details.get("nested_offset") == len(padding)
+                    for check in nested_checks
+                ), f"Expected offset nested pickle detection for {opcode_name}, got: {result.checks}"
+
+    def test_offset_nested_pickle_detection_binstring(self) -> None:
+        """Offset inner pickles in BINSTRING must not evade legacy-string scanning."""
+        inner_bytes = pickle.dumps({"ab": 1}, protocol=2)
+        padding = b"A" * 1536
+        padded_inner = padding + inner_bytes
+        payload = b"\x80\x02T" + struct.pack("<i", len(padded_inner)) + padded_inner + b"."
+
+        result = self._scan_bytes(payload)
+
+        nested_checks = [
+            c for c in result.checks if c.name == "Nested Pickle Detection" and c.status == CheckStatus.FAILED
+        ]
+        assert any(
+            c.details.get("opcode") == "BINSTRING" and c.details.get("nested_offset") == len(padding)
+            for c in nested_checks
+        ), f"Expected offset nested pickle detection for BINSTRING, got: {result.checks}"
+
+    def test_offset_encoded_nested_pickle_detection(self) -> None:
+        """Base64 and hex strings should surface nested pickles even when the decoded bytes are padded."""
+        import base64
+
+        inner_bytes = pickle.dumps({"ab": 1}, protocol=4)
+        padding = b"A" * 1536
+        padded_inner = padding + inner_bytes
+
+        for encoding, encoded_payload in (
+            ("base64", base64.b64encode(padded_inner).decode("ascii")),
+            ("hex", padded_inner.hex()),
+        ):
+            with self.subTest(encoding=encoding):
+                outer = pickle.dumps({"payload": encoded_payload}, protocol=4)
+                result = self._scan_bytes(outer)
+                encoded_checks = [
+                    check
+                    for check in result.checks
+                    if check.name == "Encoded Pickle Detection" and check.status == CheckStatus.FAILED
+                ]
+
+                assert any(
+                    check.details.get("encoding") == encoding and check.details.get("nested_offset") == len(padding)
+                    for check in encoded_checks
+                ), f"Expected offset encoded pickle detection for {encoding}, got: {result.checks}"
+
     def test_non_pickle_binstring_does_not_trigger_nested_detection(self) -> None:
         """Non-pickle BINSTRING/SHORT_BINSTRING payloads should not trigger nested pickle findings."""
         benign = b"just a plain string"
@@ -1740,6 +1807,36 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
                 assert not any(
                     c.name == "Nested Pickle Detection" and c.status == CheckStatus.FAILED for c in result.checks
                 ), f"Unexpected nested pickle detection: {[(c.name, c.status, c.details) for c in result.checks]}"
+
+    def test_large_benign_raw_blob_does_not_trigger_nested_detection(self) -> None:
+        """Large raw blobs with invalid header-like bytes should stay below the nested-pickle threshold."""
+        benign_bytes = b"A" * 2048 + b"\x80\x04ZZ" + b"B" * (_NESTED_PICKLE_HEADER_SEARCH_LIMIT_BYTES + 1024)
+        payload = b"\x80\x04\x8e" + struct.pack("<Q", len(benign_bytes)) + benign_bytes + b"."
+
+        result = self._scan_bytes(payload)
+
+        assert not any(
+            check.name == "Nested Pickle Detection" and check.status == CheckStatus.FAILED for check in result.checks
+        ), f"Unexpected nested pickle detection for benign blob: {result.checks}"
+
+    def test_large_benign_encoded_blobs_do_not_trigger_nested_detection(self) -> None:
+        """Large decoded blobs with fake headers should not produce encoded nested-pickle findings."""
+        import base64
+
+        benign_decoded = b"A" * 1536 + b"\x80\x04ZZ" + b"B" * 800
+
+        for encoding, encoded_payload in (
+            ("base64", base64.b64encode(benign_decoded).decode("ascii")),
+            ("hex", benign_decoded.hex()),
+        ):
+            with self.subTest(encoding=encoding):
+                outer = pickle.dumps({"payload": encoded_payload}, protocol=4)
+                result = self._scan_bytes(outer)
+
+                assert not any(
+                    check.name == "Encoded Pickle Detection" and check.status == CheckStatus.FAILED
+                    for check in result.checks
+                ), f"Unexpected encoded nested pickle detection for {encoding}: {result.checks}"
 
     def test_builtins_hasattr_is_critical(self) -> None:
         """builtins.hasattr must not be allowlisted as safe."""
