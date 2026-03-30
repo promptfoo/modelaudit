@@ -79,7 +79,7 @@ class TestFileTypeValidationDemo:
             else:
                 print("   ⚠️  Threat not detected (may be due to permissive validation)")
 
-    def test_cross_format_compatibility_demo(self, tmp_path):
+    def test_cross_format_compatibility_demo(self, tmp_path: Path) -> None:
         """Demonstrate legitimate cross-format file compatibility."""
         print("\n=== File Type Validation Demo: Cross-Format Compatibility ===")
 

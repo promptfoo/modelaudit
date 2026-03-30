@@ -229,7 +229,7 @@ def test_valid_file_type_no_warnings(tmp_path):
     assert len(validation_issues) == 0
 
 
-def test_pytorch_zip_file_valid(tmp_path):
+def test_pytorch_zip_file_valid(tmp_path: Path) -> None:
     """Test that PyTorch files saved as ZIP are properly validated."""
     from modelaudit.core import scan_file
 
