@@ -23,6 +23,7 @@ from modelaudit.utils.file.detection import (
     detect_format_from_extension,
     validate_file_type,
 )
+from tests.helpers import create_mock_pytorch_zip
 
 try:
     from safetensors.numpy import save_file
@@ -214,8 +215,7 @@ class TestFileTypeValidationIntegration:
         """Test legitimate files that have different formats than their extensions suggest."""
         # Test 1: PyTorch file saved as ZIP (legitimate case)
         pytorch_zip = temp_test_dir / "model.pt"
-        with zipfile.ZipFile(pytorch_zip, "w") as zipf:
-            zipf.writestr("data.pkl", "tensor data")
+        create_mock_pytorch_zip(pytorch_zip)
 
         # Should pass validation (ZIP format with .pt extension is legitimate)
         assert validate_file_type(str(pytorch_zip)), "PyTorch ZIP file should be valid"

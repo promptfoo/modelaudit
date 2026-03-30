@@ -5,13 +5,13 @@ This test provides a concise example of how the file type validation feature wor
 with real model files, showcasing both security benefits and legitimate use cases.
 """
 
-import zipfile
 from pathlib import Path
 
 import pytest
 
 from modelaudit.core import scan_file, scan_model_directory_or_file
 from modelaudit.utils.file.detection import validate_file_type
+from tests.helpers import create_mock_pytorch_zip
 
 
 class TestFileTypeValidationDemo:
@@ -86,8 +86,7 @@ class TestFileTypeValidationDemo:
         # Create legitimate cross-format files
         # 1. PyTorch model saved as ZIP (common with torch.save())
         pytorch_zip = tmp_path / "model.pt"
-        with zipfile.ZipFile(pytorch_zip, "w") as zipf:
-            zipf.writestr("data.pkl", "tensor data")
+        create_mock_pytorch_zip(pytorch_zip)
 
         # 2. PyTorch binary that contains pickle data
         pytorch_pickle = tmp_path / "weights.bin"

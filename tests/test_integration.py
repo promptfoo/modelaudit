@@ -5,6 +5,7 @@ from click.testing import CliRunner
 
 from modelaudit.cli import cli
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from tests.helpers import create_mock_pytorch_zip
 
 
 def test_scan_directory_with_multiple_models(temp_model_dir, mock_progress_callback):
@@ -230,14 +231,11 @@ def test_valid_file_type_no_warnings(tmp_path):
 
 def test_pytorch_zip_file_valid(tmp_path):
     """Test that PyTorch files saved as ZIP are properly validated."""
-    import zipfile
-
     from modelaudit.core import scan_file
 
     # Create a PyTorch file that's actually a ZIP (common with torch.save())
     pt_file = tmp_path / "model.pt"
-    with zipfile.ZipFile(pt_file, "w") as zipf:
-        zipf.writestr("data.pkl", "tensor data")
+    create_mock_pytorch_zip(pt_file)
 
     result = scan_file(str(pt_file))
 
