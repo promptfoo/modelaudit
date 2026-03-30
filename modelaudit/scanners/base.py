@@ -39,6 +39,7 @@ TRUSTED_HUGGINGFACE_SOURCES = frozenset({"huggingface"})
 _TRUSTED_SOURCE_PROVENANCE_TOKEN: Final[object] = object()
 _WHITELIST_STALE_WARNING_THRESHOLD_DAYS: Final[int] = 90
 _has_logged_stale_whitelist_warning = False
+INCONCLUSIVE_SCAN_OUTCOME: Final[str] = "inconclusive"
 
 
 @dataclass(frozen=True)

@@ -16,7 +16,7 @@ from modelaudit.integrations.license_checker import (
 )
 from modelaudit.models import ModelAuditResultModel, ScanConfigModel, create_initial_audit_result
 from modelaudit.scanners import _registry
-from modelaudit.scanners.base import BaseScanner, IssueSeverity, ScanResult
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 from modelaudit.telemetry import record_file_type_detected, record_issue_found, record_scanner_used
 from modelaudit.utils import is_within_directory, resolve_dvc_file, should_skip_file
 from modelaudit.utils.file.detection import (
@@ -52,7 +52,6 @@ logger = logging.getLogger("modelaudit.core")
 _OPERATIONAL_ERROR_METADATA_KEY = "operational_error"
 _OPERATIONAL_ERROR_REASON_METADATA_KEY = "operational_error_reason"
 _SCAN_OUTCOME_METADATA_KEY = "scan_outcome"
-_INCONCLUSIVE_SCAN_OUTCOME = "inconclusive"
 
 HEADER_FORMAT_TO_SCANNER_ID = {
     "pickle": "pickle",
@@ -143,15 +142,13 @@ def _metadata_has_scan_outcome(metadata: Any, outcome: str) -> bool:
 def _results_have_inconclusive_outcome(results: ModelAuditResultModel) -> bool:
     """Return True when any scanned file completed with an explicit inconclusive outcome."""
     return any(
-        _metadata_has_scan_outcome(metadata, _INCONCLUSIVE_SCAN_OUTCOME)
+        _metadata_has_scan_outcome(metadata, INCONCLUSIVE_SCAN_OUTCOME)
         for metadata in (results.file_metadata or {}).values()
     )
 
 
 def _results_have_security_findings(results: ModelAuditResultModel) -> bool:
     """Return True when WARNING/CRITICAL issues were reported."""
-    from modelaudit.scanners.base import IssueSeverity
-
     return any(
         hasattr(issue, "severity") and issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL)
         for issue in (results.issues or [])
@@ -290,7 +287,7 @@ def _add_issue_to_model(
     """Helper function to add an issue directly to the Pydantic model."""
     import time
 
-    from .scanners.base import Issue, IssueSeverity
+    from .scanners.base import Issue
 
     # Convert string severity to enum
     severity_enum = {
@@ -627,7 +624,6 @@ def _update_result_counts(
         consolidated_checks: List of consolidated checks
         original_count: Original number of checks before consolidation
     """
-    from .scanners.base import IssueSeverity
 
     # Filter for success rate: include all passed checks + failed WARNING/CRITICAL checks
     # Exclude failed INFO/DEBUG checks from success rate (they're informational)

@@ -35,7 +35,7 @@ from ..config.explanations import (
 )
 from ..detectors.cve_patterns import analyze_cve_patterns, enhance_scan_result_with_cve
 from ..detectors.suspicious_symbols import DANGEROUS_OPCODES
-from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult, logger
+from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult, logger
 from .rule_mapper import (
     get_embedded_code_rule_code,
     get_encoding_rule_code,
@@ -64,7 +64,6 @@ _POST_BUDGET_GLOBAL_SCAN_LIMIT_BYTES = 100 * 1024 * 1024
 _POST_BUDGET_GLOBAL_CONTEXT_BYTES = 4096
 _POST_BUDGET_EXPANSION_SCAN_LIMIT_BYTES = 8 * 1024 * 1024
 _POST_BUDGET_OPCODE_SCAN_LIMIT_OPCODES = 500_000
-_INCONCLUSIVE_SCAN_OUTCOME = "inconclusive"
 _MEMO_WRITE_OPCODES = frozenset({"PUT", "BINPUT", "LONG_BINPUT", "MEMOIZE"})
 _MEMO_READ_OPCODES = frozenset({"GET", "BINGET", "LONG_BINGET"})
 _EXPANSION_EVENT_WINDOW = 6
@@ -121,9 +120,29 @@ def _mark_inconclusive_scan_result(result: ScanResult, reason: str) -> None:
     if reason not in reasons:
         reasons.append(reason)
 
-    result.metadata["scan_outcome"] = _INCONCLUSIVE_SCAN_OUTCOME
+    result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
     result.metadata["scan_outcome_reasons"] = reasons
     result.metadata["analysis_incomplete"] = True
+
+
+def _scan_result_has_security_findings(result: ScanResult) -> bool:
+    """Return True when the result includes WARNING/CRITICAL findings."""
+    return any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+def _finish_with_inconclusive_contract(
+    result: ScanResult,
+    *,
+    default_success: bool,
+    allow_security_findings_override: bool = False,
+) -> None:
+    """Finalize success so inconclusive/no-finding scans fail closed."""
+    has_security_findings = _scan_result_has_security_findings(result)
+    if result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME and not has_security_findings:
+        result.finish(success=False)
+        return
+
+    result.finish(success=default_success or (allow_security_findings_override and has_security_findings))
 
 
 def _format_stack_global_string_preview(value: str) -> str:
@@ -4511,11 +4530,9 @@ class PickleScanner(BaseScanner):
                 result.merge(scan_result)
                 if (
                     not scan_result.success
-                    and result.metadata.get("scan_outcome") != _INCONCLUSIVE_SCAN_OUTCOME
+                    and result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
                     and not result.metadata.get("operational_error")
-                    and not any(
-                        issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues
-                    )
+                    and not _scan_result_has_security_findings(result)
                 ):
                     _mark_inconclusive_scan_result(result, "incomplete_analysis")
 
@@ -4549,9 +4566,7 @@ class PickleScanner(BaseScanner):
         except Exception as e:
             # Check if we already found security issues in the early pattern detection
             # If so, we should preserve those findings even if we hit recursion errors
-            has_security_findings = any(
-                issue.severity in [IssueSeverity.CRITICAL, IssueSeverity.WARNING] for issue in result.issues
-            )
+            has_security_findings = _scan_result_has_security_findings(result)
 
             # Check for recursion errors on legitimate ML model files
             file_ext = os.path.splitext(path)[1].lower()
@@ -4607,7 +4622,7 @@ class PickleScanner(BaseScanner):
                         "The identified security issues are valid findings that should be addressed."
                     ),
                 )
-                result.finish(success=True)
+                _finish_with_inconclusive_contract(result, default_success=True)
                 return result
             if is_recursion_on_legitimate_model:
                 # Recursion error on legitimate ML model - treat as scanner limitation, not security issue
@@ -4642,7 +4657,7 @@ class PickleScanner(BaseScanner):
                     ),
                     rule_code=None,  # Passing check
                 )
-                result.finish(success=True)  # Mark as successful scan despite limitation
+                _finish_with_inconclusive_contract(result, default_success=True)
                 return result
             if is_recursion_error:
                 # Flag extremely small files with malicious patterns
@@ -4710,7 +4725,7 @@ class PickleScanner(BaseScanner):
                     }
                 )
                 _mark_inconclusive_scan_result(result, "recursion_limit_exceeded")
-                result.finish(success=True)  # Mark as successful scan despite limitation
+                _finish_with_inconclusive_contract(result, default_success=True)
                 return result
 
             # Handle different types of parsing errors more gracefully
@@ -4801,7 +4816,14 @@ class PickleScanner(BaseScanner):
             and check.severity == IssueSeverity.CRITICAL
             for check in result.checks
         )
-        result.finish(success=scan_result.success and not has_critical_post_budget_failure)
+        if has_critical_post_budget_failure:
+            _finish_with_inconclusive_contract(result, default_success=False)
+        else:
+            _finish_with_inconclusive_contract(
+                result,
+                default_success=scan_result.success,
+                allow_security_findings_override=True,
+            )
         return result
 
     def _is_pickle_parse_failure(self, error: Exception) -> bool:
@@ -7696,7 +7718,7 @@ class PickleScanner(BaseScanner):
             with contextlib.suppress(NameError):
                 sys.setrecursionlimit(original_recursion_limit)  # type: ignore[possibly-unresolved-reference]
 
-        result.finish(success=not timed_out)
+        _finish_with_inconclusive_contract(result, default_success=not timed_out)
         return result
 
     def _is_legitimate_pytorch_model(self, path: str) -> bool:
