@@ -102,8 +102,13 @@ def test_benchmark_report_summary_only(tmp_path: Path) -> None:
     assert "| Benchmark | Target | Size | Files | Median | Mean | Rounds |" in summary_text
     assert "safe_model.pkl" in summary_text
     assert "2.0 KiB" in summary_text
-    assert "test_scan_safe_pickle" in summary_text
-    assert summary_text.index("test_scan_pytorch_zip") < summary_text.index("test_scan_safe_pickle")
+    table_rows = [
+        line for line in summary_text.splitlines() if line.startswith("| `tests/benchmarks/test_scan_benchmarks.py::")
+    ]
+    assert table_rows == [
+        "| `tests/benchmarks/test_scan_benchmarks.py::test_scan_pytorch_zip` | `state_dict.pt` | 2.0 KiB | 1 | 45.00ms | 46.00ms | 5 |",
+        "| `tests/benchmarks/test_scan_benchmarks.py::test_scan_safe_pickle` | `safe_model.pkl` | 1.0 KiB | 1 | 20.00ms | 21.00ms | 5 |",
+    ]
 
 
 def test_benchmark_report_reports_regression_without_failing(tmp_path: Path) -> None:

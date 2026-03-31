@@ -40,10 +40,6 @@ jobs:
     name: Benchmarks (Python 3.11)
     runs-on: ubuntu-latest
     timeout-minutes: 25
-    env:
-      BENCHMARK_ARTIFACT_DIR: ${{ runner.temp }}/modelaudit-benchmarks
-      BENCHMARK_BASE_WORKTREE: ${{ runner.temp }}/modelaudit-base
-      BENCHMARK_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
       - name: Checkout repo
         uses: actions/checkout@v6
@@ -60,9 +56,16 @@ jobs:
           uv python pin 3.11
 
       - name: Prepare benchmark temp directories
+        id: paths
         run: |
-          rm -rf "$BENCHMARK_ARTIFACT_DIR" "$BENCHMARK_BASE_WORKTREE"
-          mkdir -p "$BENCHMARK_ARTIFACT_DIR"
+          artifact_dir="$RUNNER_TEMP/modelaudit-benchmarks"
+          base_worktree="$RUNNER_TEMP/modelaudit-base"
+          echo "BENCHMARK_ARTIFACT_DIR=$artifact_dir" >> "$GITHUB_ENV"
+          echo "BENCHMARK_BASE_WORKTREE=$base_worktree" >> "$GITHUB_ENV"
+          echo "artifact_dir=$artifact_dir" >> "$GITHUB_OUTPUT"
+          echo "base_worktree=$base_worktree" >> "$GITHUB_OUTPUT"
+          rm -rf "$artifact_dir" "$base_worktree"
+          mkdir -p "$artifact_dir"
 
       - name: Benchmark base commit
         if: github.event_name == 'pull_request'
@@ -93,7 +96,7 @@ jobs:
         if: github.event_name == 'pull_request'
         run: |
           {
-            echo "[Workflow run and artifacts]($BENCHMARK_RUN_URL)"
+            echo "[Workflow run and artifacts](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})"
             echo
           } > "$BENCHMARK_ARTIFACT_DIR/benchmark-comment.md"
           if [ -f "$BENCHMARK_ARTIFACT_DIR/benchmark-base.json" ]; then
@@ -122,7 +125,7 @@ jobs:
         if: github.event_name != 'pull_request'
         run: |
           {
-            echo "[Workflow run and artifacts]($BENCHMARK_RUN_URL)"
+            echo "[Workflow run and artifacts](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})"
             echo
           } > "$BENCHMARK_ARTIFACT_DIR/benchmark-summary.md"
           uv run --locked python scripts/benchmark_report.py \
@@ -138,7 +141,7 @@ jobs:
           github.event.pull_request.head.repo.full_name == github.repository
         uses: actions/github-script@v8
         env:
-          COMMENT_BODY_PATH: ${{ env.BENCHMARK_ARTIFACT_DIR }}/benchmark-comment.md
+          COMMENT_BODY_PATH: ${{ steps.paths.outputs.artifact_dir }}/benchmark-comment.md
         with:
           script: |
             const fs = require("fs")
@@ -183,7 +186,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: benchmark-results-python-3.11
-          path: ${{ env.BENCHMARK_ARTIFACT_DIR }}
+          path: ${{ steps.paths.outputs.artifact_dir }}
           if-no-files-found: error
           retention-days: 14
 
