@@ -4,7 +4,10 @@ on:
   pull_request:
     paths:
       - "modelaudit/**"
-      - "tests/**"
+      - "tests/benchmarks/**"
+      - "tests/helpers/**"
+      - "tests/conftest.py"
+      - "tests/test_benchmark_report.py"
       - "scripts/benchmark_report.py"
       - "pyproject.toml"
       - "uv.lock"
@@ -12,6 +15,16 @@ on:
   push:
     branches:
       - main
+    paths:
+      - "modelaudit/**"
+      - "tests/benchmarks/**"
+      - "tests/helpers/**"
+      - "tests/conftest.py"
+      - "tests/test_benchmark_report.py"
+      - "scripts/benchmark_report.py"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/perf.yml"
   workflow_dispatch:
 
 permissions:
@@ -27,6 +40,9 @@ jobs:
     name: Benchmarks (Python 3.11)
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    env:
+      BENCHMARK_ARTIFACT_DIR: ${{ runner.temp }}/modelaudit-benchmarks
+      BENCHMARK_BASE_WORKTREE: ${{ runner.temp }}/modelaudit-base
     steps:
       - name: Checkout repo
         uses: actions/checkout@v6
@@ -42,19 +58,25 @@ jobs:
         run: |
           uv python pin 3.11
 
+      - name: Prepare benchmark temp directories
+        run: |
+          rm -rf "$BENCHMARK_ARTIFACT_DIR" "$BENCHMARK_BASE_WORKTREE"
+          mkdir -p "$BENCHMARK_ARTIFACT_DIR"
+
       - name: Benchmark base commit
         if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
-          git worktree add /tmp/modelaudit-base "${{ github.event.pull_request.base.sha }}"
-          cd /tmp/modelaudit-base
-          if [ ! -f tests/benchmarks/test_scan_benchmarks.py ]; then
+          set -euo pipefail
+          git worktree add --detach "$BENCHMARK_BASE_WORKTREE" "$BASE_SHA"
+          if [ ! -f "$BENCHMARK_BASE_WORKTREE/tests/benchmarks/test_scan_benchmarks.py" ]; then
             echo "Base branch does not include the benchmark suite yet; skipping baseline run."
             exit 0
           fi
-          uv python pin 3.11
-          uv run --locked --with pytest-benchmark pytest \
+          uv run --directory "$BENCHMARK_BASE_WORKTREE" --python 3.11 --locked --with pytest-benchmark pytest \
             tests/benchmarks/test_scan_benchmarks.py \
-            --benchmark-json=/tmp/benchmark-base.json \
+            --benchmark-json="$BENCHMARK_ARTIFACT_DIR/benchmark-base.json" \
             -q
 
       - name: Benchmark current commit
@@ -62,7 +84,7 @@ jobs:
           # Keep this lane single-process; pytest-benchmark disables itself under xdist.
           uv run --locked --with pytest-benchmark pytest \
             tests/benchmarks/test_scan_benchmarks.py \
-            --benchmark-json=/tmp/benchmark-head.json \
+            --benchmark-json="$BENCHMARK_ARTIFACT_DIR/benchmark-head.json" \
             -q
 
       - name: Compare against base
@@ -70,35 +92,37 @@ jobs:
         if: github.event_name == 'pull_request'
         continue-on-error: true
         run: |
-          if [ -f /tmp/benchmark-base.json ]; then
+          if [ -f "$BENCHMARK_ARTIFACT_DIR/benchmark-base.json" ]; then
             set +e
             uv run --locked python scripts/benchmark_report.py \
-              --current /tmp/benchmark-head.json \
-              --baseline /tmp/benchmark-base.json \
+              --current "$BENCHMARK_ARTIFACT_DIR/benchmark-head.json" \
+              --baseline "$BENCHMARK_ARTIFACT_DIR/benchmark-base.json" \
               --threshold 0.15 \
-              --summary-file /tmp/benchmark-comment.md
+              --fail-on-missing \
+              --summary-file "$BENCHMARK_ARTIFACT_DIR/benchmark-comment.md"
             compare_exit=$?
             set -e
           else
             {
               echo "Base branch does not include the benchmark suite yet; showing current results only."
               echo
-            } > /tmp/benchmark-comment.md
+            } > "$BENCHMARK_ARTIFACT_DIR/benchmark-comment.md"
             uv run --locked python scripts/benchmark_report.py \
-              --current /tmp/benchmark-head.json \
-              --summary-file /tmp/benchmark-current.md
-            cat /tmp/benchmark-current.md >> /tmp/benchmark-comment.md
+              --current "$BENCHMARK_ARTIFACT_DIR/benchmark-head.json" \
+              --summary-file "$BENCHMARK_ARTIFACT_DIR/benchmark-current.md"
+            cat "$BENCHMARK_ARTIFACT_DIR/benchmark-current.md" >> "$BENCHMARK_ARTIFACT_DIR/benchmark-comment.md"
             compare_exit=0
           fi
-          cat /tmp/benchmark-comment.md >> "$GITHUB_STEP_SUMMARY"
+          cat "$BENCHMARK_ARTIFACT_DIR/benchmark-comment.md" >> "$GITHUB_STEP_SUMMARY"
           exit "$compare_exit"
 
       - name: Summarize current results
         if: github.event_name != 'pull_request'
         run: |
           uv run --locked python scripts/benchmark_report.py \
-            --current /tmp/benchmark-head.json \
-            --summary-file "$GITHUB_STEP_SUMMARY"
+            --current "$BENCHMARK_ARTIFACT_DIR/benchmark-head.json" \
+            --summary-file "$BENCHMARK_ARTIFACT_DIR/benchmark-summary.md"
+          cat "$BENCHMARK_ARTIFACT_DIR/benchmark-summary.md" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Comment benchmark summary on PR
         if: >
@@ -107,7 +131,7 @@ jobs:
           github.event.pull_request.head.repo.full_name == github.repository
         uses: actions/github-script@v8
         env:
-          COMMENT_BODY_PATH: /tmp/benchmark-comment.md
+          COMMENT_BODY_PATH: ${{ env.BENCHMARK_ARTIFACT_DIR }}/benchmark-comment.md
         with:
           script: |
             const fs = require("fs")
@@ -152,11 +176,14 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: benchmark-results-python-3.11
-          path: |
-            /tmp/benchmark-head.json
-            /tmp/benchmark-base.json
+          path: ${{ env.BENCHMARK_ARTIFACT_DIR }}
           if-no-files-found: error
           retention-days: 14
+
+      - name: Cleanup benchmark base worktree
+        if: always() && github.event_name == 'pull_request'
+        run: |
+          git worktree remove --force "$BENCHMARK_BASE_WORKTREE" || true
 
       - name: Fail on benchmark regression
         if: github.event_name == 'pull_request' && steps.compare.outcome == 'failure'

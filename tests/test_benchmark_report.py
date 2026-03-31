@@ -78,7 +78,9 @@ def test_benchmark_report_summary_only(tmp_path: Path) -> None:
     assert completed.returncode == 0
     assert "Performance Benchmarks" in completed.stdout
     assert "Slowest median" in completed.stdout
-    assert "test_scan_safe_pickle" in summary_file.read_text(encoding="utf-8")
+    summary_text = summary_file.read_text(encoding="utf-8")
+    assert "test_scan_safe_pickle" in summary_text
+    assert summary_text.index("test_scan_pytorch_zip") < summary_text.index("test_scan_safe_pickle")
 
 
 def test_benchmark_report_fails_on_regression(tmp_path: Path) -> None:
@@ -111,3 +113,40 @@ def test_benchmark_report_fails_on_regression(tmp_path: Path) -> None:
     assert "Key changes:" in completed.stdout
     assert "regression" in completed.stdout
     assert "+35.0%" in completed.stdout
+
+
+def test_benchmark_report_fails_on_missing_benchmark(tmp_path: Path) -> None:
+    baseline_json = tmp_path / "baseline.json"
+    current_json = tmp_path / "current.json"
+
+    kept_benchmark = "tests/benchmarks/test_scan_benchmarks.py::test_scan_duplicate_directory"
+    missing_benchmark = "tests/benchmarks/test_scan_benchmarks.py::test_scan_mixed_directory"
+    _write_benchmark_json(
+        baseline_json,
+        [
+            _benchmark_entry(kept_benchmark, 0.100, 0.101),
+            _benchmark_entry(missing_benchmark, 0.200, 0.201),
+        ],
+    )
+    _write_benchmark_json(current_json, [_benchmark_entry(kept_benchmark, 0.095, 0.096)])
+
+    script = Path(__file__).resolve().parents[1] / "scripts" / "benchmark_report.py"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--current",
+            str(current_json),
+            "--baseline",
+            str(baseline_json),
+            "--fail-on-missing",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert "Missing benchmarks:" in completed.stdout
+    assert missing_benchmark in completed.stdout
+    assert "Benchmark coverage check failed" in completed.stdout

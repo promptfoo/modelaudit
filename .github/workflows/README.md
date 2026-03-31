@@ -12,4 +12,4 @@
 
 PRs run a reduced test matrix (Python 3.10 + 3.13). Main branch runs the full matrix (3.10–3.13). Documentation-only changes skip the full test suite.
 
-The performance workflow posts a sticky benchmark summary comment on same-repo PRs and uploads raw benchmark JSON as workflow artifacts.
+The performance workflow posts a sticky benchmark summary comment on same-repo PRs, uploads benchmark JSON plus Markdown summaries as workflow artifacts, and fails if compared benchmarks regress or disappear.

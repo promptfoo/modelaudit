@@ -53,6 +53,7 @@ def _build_summary(
     baseline: dict[str, BenchmarkRecord] | None,
     *,
     threshold: float,
+    fail_on_missing: bool = False,
 ) -> tuple[str, bool]:
     lines = ["## Performance Benchmarks", ""]
 
@@ -69,9 +70,10 @@ def _build_summary(
         lines.append("| Benchmark | Median | Mean | Rounds |")
         lines.append("| --- | ---: | ---: | ---: |")
 
-        for name, record in sorted(current.items()):
+        for record in sorted(current.values(), key=lambda item: item.median, reverse=True):
             lines.append(
-                f"| `{name}` | {_format_duration(record.median)} | {_format_duration(record.mean)} | {record.rounds} |"
+                f"| `{record.name}` | {_format_duration(record.median)} | "
+                f"{_format_duration(record.mean)} | {record.rounds} |"
             )
 
         return "\n".join(lines), False
@@ -118,7 +120,15 @@ def _build_summary(
         sortable_rows.append(row)
 
     lines.append(f"Compared `{len(common_names)}` shared benchmarks with a regression threshold of `{threshold:.0%}`.")
-    lines.append(f"Status: `{regression_count}` regressions, `{improved_count}` improved, `{stable_count}` stable.")
+    lines.append(
+        f"Status: `{regression_count}` regressions, `{improved_count}` improved, `{stable_count}` stable, "
+        f"`{len(new_in_current)}` new, `{len(missing_from_current)}` missing."
+    )
+    missing_failed = fail_on_missing and bool(missing_from_current)
+    if missing_failed:
+        lines.append(
+            "Benchmark coverage check failed because one or more baseline benchmarks did not appear in the current run."
+        )
     key_rows = [row for row in sorted(sortable_rows, reverse=True) if row[4] != "stable"][:3]
     if key_rows:
         lines.append("")
@@ -151,7 +161,7 @@ def _build_summary(
         for name in missing_from_current:
             lines.append(f"- `{name}`")
 
-    return "\n".join(lines), regression_count > 0
+    return "\n".join(lines), regression_count > 0 or missing_failed
 
 
 def _write_summary(summary: str, summary_file: Path | None) -> None:
@@ -176,6 +186,11 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         help="Optional path to write Markdown output, such as $GITHUB_STEP_SUMMARY.",
     )
+    parser.add_argument(
+        "--fail-on-missing",
+        action="store_true",
+        help="Fail when a baseline benchmark is missing from the current results.",
+    )
     args = parser.parse_args(argv)
 
     current = _load_records(args.current)
@@ -183,7 +198,12 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(f"No benchmark records found in {args.current}")
 
     baseline = _load_records(args.baseline) if args.baseline is not None else None
-    summary, has_regressions = _build_summary(current, baseline, threshold=args.threshold)
+    summary, has_regressions = _build_summary(
+        current,
+        baseline,
+        threshold=args.threshold,
+        fail_on_missing=args.fail_on_missing,
+    )
     _write_summary(summary, args.summary_file)
 
     if has_regressions:
