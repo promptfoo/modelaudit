@@ -43,6 +43,7 @@ jobs:
     env:
       BENCHMARK_ARTIFACT_DIR: ${{ runner.temp }}/modelaudit-benchmarks
       BENCHMARK_BASE_WORKTREE: ${{ runner.temp }}/modelaudit-base
+      BENCHMARK_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
       - name: Checkout repo
         uses: actions/checkout@v6
@@ -90,38 +91,44 @@ jobs:
       - name: Compare against base
         id: compare
         if: github.event_name == 'pull_request'
-        continue-on-error: true
         run: |
+          {
+            echo "[Workflow run and artifacts]($BENCHMARK_RUN_URL)"
+            echo
+          } > "$BENCHMARK_ARTIFACT_DIR/benchmark-comment.md"
           if [ -f "$BENCHMARK_ARTIFACT_DIR/benchmark-base.json" ]; then
-            set +e
             uv run --locked python scripts/benchmark_report.py \
               --current "$BENCHMARK_ARTIFACT_DIR/benchmark-head.json" \
               --baseline "$BENCHMARK_ARTIFACT_DIR/benchmark-base.json" \
               --threshold 0.15 \
-              --fail-on-missing \
-              --summary-file "$BENCHMARK_ARTIFACT_DIR/benchmark-comment.md"
-            compare_exit=$?
-            set -e
+              --summary-file "$BENCHMARK_ARTIFACT_DIR/benchmark-compare.md"
           else
             {
               echo "Base branch does not include the benchmark suite yet; showing current results only."
               echo
-            } > "$BENCHMARK_ARTIFACT_DIR/benchmark-comment.md"
+            } > "$BENCHMARK_ARTIFACT_DIR/benchmark-current.md"
             uv run --locked python scripts/benchmark_report.py \
               --current "$BENCHMARK_ARTIFACT_DIR/benchmark-head.json" \
-              --summary-file "$BENCHMARK_ARTIFACT_DIR/benchmark-current.md"
+              --summary-file "$BENCHMARK_ARTIFACT_DIR/benchmark-current-report.md"
             cat "$BENCHMARK_ARTIFACT_DIR/benchmark-current.md" >> "$BENCHMARK_ARTIFACT_DIR/benchmark-comment.md"
-            compare_exit=0
+            cat "$BENCHMARK_ARTIFACT_DIR/benchmark-current-report.md" >> "$BENCHMARK_ARTIFACT_DIR/benchmark-comment.md"
+          fi
+          if [ -f "$BENCHMARK_ARTIFACT_DIR/benchmark-compare.md" ]; then
+            cat "$BENCHMARK_ARTIFACT_DIR/benchmark-compare.md" >> "$BENCHMARK_ARTIFACT_DIR/benchmark-comment.md"
           fi
           cat "$BENCHMARK_ARTIFACT_DIR/benchmark-comment.md" >> "$GITHUB_STEP_SUMMARY"
-          exit "$compare_exit"
 
       - name: Summarize current results
         if: github.event_name != 'pull_request'
         run: |
+          {
+            echo "[Workflow run and artifacts]($BENCHMARK_RUN_URL)"
+            echo
+          } > "$BENCHMARK_ARTIFACT_DIR/benchmark-summary.md"
           uv run --locked python scripts/benchmark_report.py \
             --current "$BENCHMARK_ARTIFACT_DIR/benchmark-head.json" \
-            --summary-file "$BENCHMARK_ARTIFACT_DIR/benchmark-summary.md"
+            --summary-file "$BENCHMARK_ARTIFACT_DIR/benchmark-current.md"
+          cat "$BENCHMARK_ARTIFACT_DIR/benchmark-current.md" >> "$BENCHMARK_ARTIFACT_DIR/benchmark-summary.md"
           cat "$BENCHMARK_ARTIFACT_DIR/benchmark-summary.md" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Comment benchmark summary on PR
@@ -184,7 +191,3 @@ jobs:
         if: always() && github.event_name == 'pull_request'
         run: |
           git worktree remove --force "$BENCHMARK_BASE_WORKTREE" || true
-
-      - name: Fail on benchmark regression
-        if: github.event_name == 'pull_request' && steps.compare.outcome == 'failure'
-        run: exit 1

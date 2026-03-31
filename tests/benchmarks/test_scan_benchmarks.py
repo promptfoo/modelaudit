@@ -107,6 +107,20 @@ def _create_duplicate_corpus(root: Path) -> Path:
     return root
 
 
+def _path_total_bytes(path: Path) -> int:
+    if path.is_file():
+        return path.stat().st_size
+    return sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
+
+
+def _benchmark_context(path: Path) -> dict[str, int | str]:
+    return {
+        "path": path.name,
+        "bytes": _path_total_bytes(path),
+        "files": sum(1 for item in path.rglob("*") if item.is_file()) if path.is_dir() else 1,
+    }
+
+
 @pytest.fixture(scope="session")
 def benchmark_inputs(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Path]:
     root = tmp_path_factory.mktemp("scan-benchmarks")
@@ -125,13 +139,7 @@ def benchmark_inputs(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Path
 
 
 def _benchmark_scan(benchmark: Any, path: Path, *, rounds: int = SCAN_ROUNDS) -> Any:
-    benchmark.extra_info.update(
-        {
-            "path": path.name,
-            "bytes": path.stat().st_size if path.is_file() else 0,
-            "files": sum(1 for item in path.rglob("*") if item.is_file()) if path.is_dir() else 1,
-        },
-    )
+    benchmark.extra_info.update(_benchmark_context(path))
     return benchmark.pedantic(
         lambda: scan_model_directory_or_file(str(path)),
         iterations=1,
@@ -142,7 +150,7 @@ def _benchmark_scan(benchmark: Any, path: Path, *, rounds: int = SCAN_ROUNDS) ->
 
 def test_detect_file_format_safe_pickle(benchmark: Any, benchmark_inputs: dict[str, Path]) -> None:
     path = benchmark_inputs["safe_pickle"]
-    benchmark.extra_info.update({"path": path.name, "bytes": path.stat().st_size})
+    benchmark.extra_info.update(_benchmark_context(path))
 
     detected_format = benchmark.pedantic(
         lambda: detect_file_format(str(path)),
@@ -156,7 +164,7 @@ def test_detect_file_format_safe_pickle(benchmark: Any, benchmark_inputs: dict[s
 
 def test_validate_file_type_pytorch_zip(benchmark: Any, benchmark_inputs: dict[str, Path]) -> None:
     path = benchmark_inputs["pytorch_zip"]
-    benchmark.extra_info.update({"path": path.name, "bytes": path.stat().st_size})
+    benchmark.extra_info.update(_benchmark_context(path))
 
     is_valid = benchmark.pedantic(
         lambda: validate_file_type(str(path)),
