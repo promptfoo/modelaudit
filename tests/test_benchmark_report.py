@@ -106,8 +106,14 @@ def test_benchmark_report_summary_only(tmp_path: Path) -> None:
         line for line in summary_text.splitlines() if line.startswith("| `tests/benchmarks/test_scan_benchmarks.py::")
     ]
     assert table_rows == [
-        "| `tests/benchmarks/test_scan_benchmarks.py::test_scan_pytorch_zip` | `state_dict.pt` | 2.0 KiB | 1 | 45.00ms | 46.00ms | 5 |",
-        "| `tests/benchmarks/test_scan_benchmarks.py::test_scan_safe_pickle` | `safe_model.pkl` | 1.0 KiB | 1 | 20.00ms | 21.00ms | 5 |",
+        (
+            "| `tests/benchmarks/test_scan_benchmarks.py::test_scan_pytorch_zip` | "
+            "`state_dict.pt` | 2.0 KiB | 1 | 45.00ms | 46.00ms | 5 |"
+        ),
+        (
+            "| `tests/benchmarks/test_scan_benchmarks.py::test_scan_safe_pickle` | "
+            "`safe_model.pkl` | 1.0 KiB | 1 | 20.00ms | 21.00ms | 5 |"
+        ),
     ]
 
 

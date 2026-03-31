@@ -243,7 +243,10 @@ class TestCacheOptimizationPerformance:
             # once xdist workers contend for CPU. Guard against meaningful
             # regressions without failing on sub-millisecond scheduler jitter.
             absolute_overhead = opt_time - traditional_time
-            allowed_overhead = 0.05 if sys.platform == "win32" else 0.01
+            is_xdist = (
+                os.getenv("PYTEST_XDIST_WORKER") is not None or os.getenv("PYTEST_XDIST_WORKER_COUNT") is not None
+            )
+            allowed_overhead = 0.05 if sys.platform == "win32" else 0.02 if is_xdist else 0.01
             assert opt_time <= traditional_time * 1.5 or absolute_overhead <= allowed_overhead
 
     def test_file_fingerprint_performance(self):
