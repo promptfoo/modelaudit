@@ -249,3 +249,48 @@ def test_benchmark_report_can_fail_on_missing_benchmark(tmp_path: Path) -> None:
     assert completed.returncode == 1
     assert "Missing benchmarks:" in completed.stdout
     assert missing_benchmark in completed.stdout
+
+
+def test_benchmark_report_uses_baseline_size_when_current_metadata_partial(tmp_path: Path) -> None:
+    baseline_json = tmp_path / "baseline.json"
+    current_json = tmp_path / "current.json"
+
+    benchmark_name = "tests/benchmarks/test_scan_benchmarks.py::test_scan_duplicate_directory"
+    _write_benchmark_json(
+        baseline_json,
+        [
+            _benchmark_entry(
+                benchmark_name,
+                0.100,
+                0.101,
+                extra_info={"path": "baseline_dir", "bytes": 2048, "files": 4},
+            )
+        ],
+    )
+    _write_benchmark_json(
+        current_json,
+        [_benchmark_entry(benchmark_name, 0.110, 0.111, extra_info={"path": "current_dir"})],
+    )
+
+    script = Path(__file__).resolve().parents[1] / "scripts" / "benchmark_report.py"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--current",
+            str(current_json),
+            "--baseline",
+            str(baseline_json),
+            "--threshold",
+            "0.05",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0
+    expected_row_prefix = (
+        "| `tests/benchmarks/test_scan_benchmarks.py::test_scan_duplicate_directory` | `current_dir` | 2.0 KiB | 4 |"
+    )
+    assert expected_row_prefix in completed.stdout
