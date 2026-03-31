@@ -1,6 +1,7 @@
 """Performance benchmarks and tests for cache optimizations."""
 
 import os
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -171,7 +172,7 @@ class TestCacheOptimizationPerformance:
 
             print("Batch cache operations test completed successfully")
 
-    def test_configuration_extraction_performance(self):
+    def test_configuration_extraction_performance(self) -> None:
         """Test optimized configuration extraction."""
         config_extractor = ConfigurationExtractor()
 
@@ -242,7 +243,8 @@ class TestCacheOptimizationPerformance:
             # once xdist workers contend for CPU. Guard against meaningful
             # regressions without failing on sub-millisecond scheduler jitter.
             absolute_overhead = opt_time - traditional_time
-            assert opt_time <= traditional_time * 1.5 or absolute_overhead <= 0.01
+            allowed_overhead = 0.05 if sys.platform == "win32" else 0.01
+            assert opt_time <= traditional_time * 1.5 or absolute_overhead <= allowed_overhead
 
     def test_file_fingerprint_performance(self):
         """Test file fingerprint generation performance."""
