@@ -6,8 +6,10 @@ import functools
 import io
 import os
 import pickle
+import re
 from pathlib import Path
 
+import pytest
 from modelaudit_picklescan import (
     PickleScanner,
     SafetyVerdict,
@@ -17,6 +19,7 @@ from modelaudit_picklescan import (
     scan_bytes,
     scan_file,
 )
+from modelaudit_picklescan.engine import scanner as engine_scanner
 
 SYSTEM_GLOBALS = frozenset({"nt.system", "os.system", "posix.system"})
 
@@ -72,6 +75,23 @@ def test_scan_bytes_detects_reduce_invoking_os_system() -> None:
     assert any(
         ref["import_reference"] in SYSTEM_GLOBALS and ref["is_dangerous"] is True
         for ref in report.metadata["import_references"]
+    )
+
+
+def test_scan_bytes_attributes_reduce_calls_to_the_callable_operand_not_nested_args() -> None:
+    payload = b"cbuiltins\nlen\n(cos\nsystem\ntR."
+
+    report = scan_bytes(payload, source="reduce-args.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "DANGEROUS_GLOBAL" and finding.details.get("import_reference") in SYSTEM_GLOBALS
+        for finding in report.findings
+    )
+    assert not any(
+        finding.rule_code == "DANGEROUS_CALL" and finding.details.get("import_reference") in SYSTEM_GLOBALS
+        for finding in report.findings
     )
 
 
@@ -184,6 +204,12 @@ def test_scan_stream_incrementally_reads_bounded_streams_without_preloading_enti
     assert stream.max_seen_read_size <= 32
 
 
+def test_bounded_pickle_stream_normalizes_negative_reads_without_a_byte_limit() -> None:
+    stream = engine_scanner._BoundedPickleStream(io.BytesIO(b"abc"), None)
+
+    assert stream._bounded_size(-1) is None
+
+
 def test_scan_bytes_flags_malformed_stack_global_operands() -> None:
     payload = b"\x80\x04K\x01K\x02\x93."
 
@@ -250,7 +276,7 @@ def test_scan_bytes_warns_on_functools_partial_without_marking_benign_partial_ma
     assert report.status == ScanStatus.COMPLETE
     assert report.verdict == SafetyVerdict.SUSPICIOUS
     assert any(
-        finding.rule_code == "DANGEROUS_GLOBAL"
+        finding.rule_code in {"DANGEROUS_CALL", "DANGEROUS_GLOBAL"}
         and finding.severity.value == "warning"
         and finding.details.get("import_reference") == "functools.partial"
         for finding in report.findings
@@ -391,6 +417,46 @@ def test_scan_bytes_flags_escaped_hex_encoded_nested_pickle_payloads() -> None:
     assert any(finding.rule_code == "S602" for finding in report.findings)
 
 
+def test_decode_possible_encoded_pickle_bounds_base64_decode_input(monkeypatch: pytest.MonkeyPatch) -> None:
+    decoded_payload = pickle.dumps({"inner": "data"}, protocol=4)
+    oversized_literal = base64.b64encode(decoded_payload).decode("ascii") + (
+        "A" * (engine_scanner._MAX_BASE64_NESTED_PICKLE_CHARS * 4)
+    )
+    seen_lengths: list[int] = []
+
+    def fake_b64decode(value: str, *, validate: bool = False) -> bytes:
+        assert validate is True
+        seen_lengths.append(len(value))
+        return decoded_payload
+
+    monkeypatch.setattr(engine_scanner.base64, "b64decode", fake_b64decode)
+
+    decoded = engine_scanner._decode_possible_encoded_pickle(oversized_literal)
+
+    assert decoded == [("base64", decoded_payload)]
+    assert seen_lengths
+    assert max(seen_lengths) <= engine_scanner._MAX_BASE64_NESTED_PICKLE_CHARS
+
+
+def test_decode_possible_encoded_pickle_bounds_hex_decode_input(monkeypatch: pytest.MonkeyPatch) -> None:
+    decoded_payload = pickle.dumps({"inner": "data"}, protocol=4)
+    escaped_hex_payload = "".join(f"\\x{byte:02x}" for byte in decoded_payload)
+    oversized_literal = escaped_hex_payload + ("\\x41" * engine_scanner._MAX_HEX_NESTED_PICKLE_CHARS)
+    seen_lengths: list[int] = []
+
+    def fake_unhexlify(value: str) -> bytes:
+        seen_lengths.append(len(value))
+        return decoded_payload
+
+    monkeypatch.setattr(engine_scanner.binascii, "unhexlify", fake_unhexlify)
+
+    decoded = engine_scanner._decode_possible_encoded_pickle(oversized_literal)
+
+    assert decoded == [("hex", decoded_payload)]
+    assert seen_lengths
+    assert max(seen_lengths) <= engine_scanner._MAX_HEX_NESTED_PICKLE_CHARS
+
+
 def test_scan_stream_preserves_absolute_offsets_from_current_stream_position() -> None:
     prefix = b"HEADER"
     payload = pickle.dumps(MaliciousPayload())
@@ -400,9 +466,12 @@ def test_scan_stream_preserves_absolute_offsets_from_current_stream_position() -
     report = PickleScanner().scan_stream(stream, source="embedded.npy", size=len(payload))
 
     assert report.metadata["first_pickle_end_pos"] == len(prefix) + len(payload)
-    assert any(
-        finding.location is not None
-        and f"pos {len(prefix)}" not in finding.location
-        and "embedded.npy" in finding.location
+    finding_positions = [
+        int(match.group(1))
         for finding in report.findings
-    )
+        if finding.location is not None and "embedded.npy" in finding.location
+        for match in [re.search(r"\(pos (\d+)\)$", finding.location)]
+        if match is not None
+    ]
+    assert finding_positions
+    assert all(position >= len(prefix) for position in finding_positions)

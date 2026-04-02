@@ -316,6 +316,8 @@ def _apply_member_context_to_record(
         return
     if "(pos " in record.location:
         record.location = f"{member_location} {record.location}"
+        return
+    record.location = f"{member_location} {record.location}"
 
 
 def _legacy_rule_code_for_notice(notice_code: str | None) -> str | None:

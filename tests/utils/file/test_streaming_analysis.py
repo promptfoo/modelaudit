@@ -1,4 +1,7 @@
+from pathlib import Path
+
 import fsspec
+import pytest
 from fsspec.implementations.local import LocalFileSystem
 
 from modelaudit.scanners.base import IssueSeverity, ScanResult
@@ -6,7 +9,7 @@ from modelaudit.scanners.pickle_scanner import PickleScanner
 from modelaudit.utils.file import streaming
 
 
-def test_stream_analyze_file_uses_scanner(tmp_path, monkeypatch):
+def test_stream_analyze_file_uses_scanner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     file_path = tmp_path / "sample.pkl"
     file_path.write_bytes(b"\x80\x04K*\x85q\x00.")
     url = f"file://{file_path}"
@@ -16,11 +19,20 @@ def test_stream_analyze_file_uses_scanner(tmp_path, monkeypatch):
 
     called: dict[str, bool] = {"called": False}
 
-    def fake_scan_stream(self, file_obj, size):
+    def fake_scan_stream(
+        self: PickleScanner,
+        file_obj: object,
+        size: int,
+        source: str = "<stream>",
+    ) -> ScanResult:
         called["called"] = True
         result = ScanResult(scanner_name=self.name)
         result.add_check(
-            name="Test Check", passed=False, message="scanner issue", severity=IssueSeverity.WARNING, location="memory"
+            name="Test Check",
+            passed=False,
+            message="scanner issue",
+            severity=IssueSeverity.WARNING,
+            location=source,
         )
         result.metadata["scanner_used"] = True
         result.bytes_scanned = size
@@ -36,10 +48,11 @@ def test_stream_analyze_file_uses_scanner(tmp_path, monkeypatch):
     assert result is not None
     assert called["called"] is True
     assert any(issue.message == "scanner issue" for issue in result.issues)
+    assert all(issue.location == url for issue in result.issues)
     assert result.metadata.get("scanner_used") is True
 
 
-def test_stream_analyze_file_falls_back_to_bytes_to_read(tmp_path, monkeypatch):
+def test_stream_analyze_file_falls_back_to_bytes_to_read(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     file_path = tmp_path / "sample.pkl"
     file_path.write_bytes(b"\x80\x04K*\x85q\x00." * 2)
     url = f"file://{file_path}"
@@ -49,7 +62,7 @@ def test_stream_analyze_file_falls_back_to_bytes_to_read(tmp_path, monkeypatch):
 
     called: dict[str, bool] = {"called": False}
 
-    def fake_scan_stream(self, file_obj, size):
+    def fake_scan_stream(self: PickleScanner, file_obj: object, size: int) -> ScanResult:
         called["called"] = True
         result = ScanResult(scanner_name=self.name)
         result.add_check(

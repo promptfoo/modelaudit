@@ -761,7 +761,10 @@ jobs:
 
           uv pip install --python /tmp/modelaudit-wheel-smoke/bin/python dist/modelaudit-*.whl
 
-          /tmp/modelaudit-wheel-smoke/bin/python - <<'PY'
+          smoke_dir="$(mktemp -d)"
+          (
+            cd "$smoke_dir"
+            PYTHONPATH= /tmp/modelaudit-wheel-smoke/bin/python -I - <<'PY'
           import modelaudit
           import modelaudit_picklescan
 
@@ -769,6 +772,7 @@ jobs:
           assert report.status.value == "complete", report
           print(f"modelaudit {modelaudit.__version__} and modelaudit_picklescan loaded")
           PY
+          )
 
       - name: Smoke test standalone pickle package wheel
         run: |
@@ -786,7 +790,10 @@ jobs:
 
           uv pip install --python /tmp/modelaudit-picklescan-wheel-smoke/bin/python "${picklescan_wheels[0]}"
 
-          /tmp/modelaudit-picklescan-wheel-smoke/bin/python - <<'PY'
+          smoke_dir="$(mktemp -d)"
+          (
+            cd "$smoke_dir"
+            PYTHONPATH= /tmp/modelaudit-picklescan-wheel-smoke/bin/python -I - <<'PY'
           import modelaudit_picklescan
 
           report = modelaudit_picklescan.scan_bytes(b"\x80\x04}q\x00.")
@@ -794,6 +801,7 @@ jobs:
           assert report.verdict.value == "clean", report
           print("standalone modelaudit_picklescan wheel loaded")
           PY
+          )
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v7

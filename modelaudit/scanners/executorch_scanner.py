@@ -1,10 +1,9 @@
 """Scanner for ExecuTorch model files (.pte)."""
 
-import io
 import os
 import tempfile
 import zipfile
-from typing import Any, ClassVar
+from typing import Any, BinaryIO, ClassVar, cast
 
 from ..utils import sanitize_archive_path
 from ..utils.file.detection import (
@@ -121,12 +120,12 @@ class ExecuTorchScanner(BaseScanner):
                 bytes_scanned = 0
 
                 for name in pickle_files:
-                    data = z.read(name)
-                    bytes_scanned += len(data)
-                    with io.BytesIO(data) as file_like:
+                    member_info = z.getinfo(name)
+                    bytes_scanned += member_info.file_size
+                    with z.open(name, "r") as file_like:
                         sub_result = self.pickle_scanner.scan_stream(
-                            file_like,
-                            len(data),
+                            cast(BinaryIO, file_like),
+                            member_info.file_size,
                             source=f"{path}:{name}",
                         )
                     apply_pickle_member_context(sub_result, archive_path=path, member_name=name)

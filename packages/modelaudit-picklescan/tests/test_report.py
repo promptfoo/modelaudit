@@ -39,6 +39,36 @@ def test_inconclusive_report_is_not_clean_even_without_findings() -> None:
     assert report.has_security_findings is False
 
 
+def test_complete_unknown_report_without_findings_is_not_clean() -> None:
+    report = PickleReport(
+        source="unknown.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.UNKNOWN,
+    )
+
+    assert report.is_clean is False
+    assert report.has_security_findings is False
+
+
+def test_complete_clean_report_with_findings_is_not_clean() -> None:
+    report = PickleReport(
+        source="contradictory.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.CLEAN,
+        findings=(
+            Finding(
+                message="Suspicious reference",
+                severity=Severity.WARNING,
+                location="contradictory.pkl (pos 3)",
+                rule_code="S203",
+            ),
+        ),
+    )
+
+    assert report.is_clean is False
+    assert report.has_security_findings is True
+
+
 def test_malicious_report_separates_findings_notices_and_errors() -> None:
     report = PickleReport(
         source="payload.pkl",

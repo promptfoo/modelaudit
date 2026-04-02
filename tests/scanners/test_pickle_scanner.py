@@ -17,13 +17,14 @@ import pytest
 pytest.importorskip("dill")
 
 import dill
+from modelaudit_picklescan import PickleReport, SafetyVerdict, ScanStatus
 
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.detectors.suspicious_symbols import (
     BINARY_CODE_PATTERNS,
     EXECUTABLE_SIGNATURES,
 )
-from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.pickle_scanner import (
     _NESTED_PICKLE_HEADER_SEARCH_LIMIT_BYTES,
     _RAW_PATTERN_SCAN_LIMIT_BYTES,
@@ -129,11 +130,13 @@ def test_pickle_scanner_can_handle_detects_protocol_zero_pickle_content(tmp_path
     assert PickleScanner.can_handle(str(model_path)) is True
 
 
-def test_scan_stream_preserves_legacy_findings_for_non_seekable_stream() -> None:
+def test_scan_stream_preserves_legacy_findings_for_non_seekable_stream(tmp_path: Path) -> None:
     """Non-seekable streams should still run the legacy parity pass."""
-    payload = (
-        Path(__file__).resolve().parents[1] / "assets" / "exploits" / "exploit4_supply_chain_attack.pkl"
-    ).read_bytes()
+    payload_path = tmp_path / "exploit4_supply_chain_attack.pkl"
+    payload_path.write_bytes(
+        (Path(__file__).resolve().parents[1] / "assets" / "exploits" / "exploit4_supply_chain_attack.pkl").read_bytes()
+    )
+    payload = payload_path.read_bytes()
 
     scanner = PickleScanner()
     seekable_result = scanner.scan_stream(BytesIO(payload), len(payload), source="seekable.pkl")
@@ -149,6 +152,78 @@ def test_scan_stream_preserves_legacy_findings_for_non_seekable_stream() -> None
     assert ("S310", "C&C pattern detected: backdoor") in seekable_findings
     assert seekable_findings <= non_seekable_findings
     assert non_seekable_result.success is seekable_result.success
+
+
+def test_scan_stream_enforces_declared_file_size_limit() -> None:
+    payload = pickle.dumps({"safe": True}, protocol=4)
+    scanner = PickleScanner(config={"max_file_read_size": len(payload) - 1})
+
+    result = scanner.scan_stream(BytesIO(payload), len(payload), source="oversized-stream.pkl")
+
+    assert result.success is False
+    assert result.metadata["file_size"] == len(payload)
+    assert any(
+        check.name == "File Size Limit"
+        and check.status == CheckStatus.FAILED
+        and check.location == "oversized-stream.pkl"
+        for check in result.checks
+    )
+
+
+def test_scan_stream_bounds_legacy_fallback_to_declared_payload_size() -> None:
+    safe_payload = pickle.dumps({"safe": True}, protocol=4)
+    trailing_payload = pickle.dumps(EvilClass(), protocol=4)
+
+    result = PickleScanner().scan_stream(
+        BytesIO(safe_payload + trailing_payload),
+        len(safe_payload),
+        source="bounded-stream.pkl",
+    )
+
+    assert result.success is True
+    assert all(issue.rule_code not in {"S101", "S201"} for issue in result.issues)
+    assert result.metadata["first_pickle_end_pos"] == len(safe_payload)
+
+
+def test_scan_stream_preserves_absolute_first_pickle_end_offset_from_seekable_substreams() -> None:
+    prefix = b"HEADER"
+    payload = pickle.dumps({"safe": True}, protocol=4)
+    stream = BytesIO(prefix + payload)
+    stream.seek(len(prefix))
+
+    result = PickleScanner().scan_stream(stream, len(payload), source="embedded.npy")
+
+    assert result.success is True
+    assert result.metadata["first_pickle_end_pos"] == len(prefix) + len(payload)
+
+
+def test_scan_stream_restarts_timeout_budget_before_legacy_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = pickle.dumps({"safe": True}, protocol=4)
+    scanner = PickleScanner(config={"timeout": 5.0})
+
+    def fake_package_scan_stream(
+        file_obj: BinaryIO,
+        *,
+        source: str,
+        size: int | None = None,
+    ) -> PickleReport:
+        scanner.scan_start_time = 0.0
+        return PickleReport(
+            source=source,
+            status=ScanStatus.COMPLETE,
+            verdict=SafetyVerdict.CLEAN,
+            metadata={"first_pickle_end_pos": size, "import_references": []},
+        )
+
+    monkeypatch.setattr(scanner._standalone_pickle_scanner, "scan_stream", fake_package_scan_stream)
+
+    result = scanner.scan_stream(BytesIO(payload), len(payload), source="timeout-reset.pkl")
+
+    assert result.success is True
+    assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+    assert not any(check.name == "Scan Timeout Check" and check.status == CheckStatus.FAILED for check in result.checks)
 
 
 def test_pickle_scanner_can_handle_rejects_non_pickle_content(tmp_path: Path) -> None:

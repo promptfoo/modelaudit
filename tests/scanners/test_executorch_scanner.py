@@ -2,6 +2,8 @@ import pickle
 import zipfile
 from pathlib import Path
 
+import pytest
+
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.executorch_scanner import ExecuTorchScanner
 
@@ -120,3 +122,22 @@ def test_executorch_scanner_preserves_legacy_pickle_rule_codes_for_embedded_memb
     result = ExecuTorchScanner().scan(str(model_path))
 
     assert any(issue.rule_code == "S104" for issue in result.issues)
+
+
+def test_executorch_scanner_streams_pickle_members_without_zip_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = create_executorch_archive(tmp_path, malicious=True)
+    original_read = zipfile.ZipFile.read
+
+    def reject_zip_read(self: zipfile.ZipFile, name: str, pwd: bytes | None = None) -> bytes:
+        if name.endswith(".pkl"):
+            raise AssertionError("ExecuTorch pickle members should be scanned from z.open(), not z.read()")
+        return original_read(self, name, pwd)
+
+    monkeypatch.setattr(zipfile.ZipFile, "read", reject_zip_read)
+
+    result = ExecuTorchScanner().scan(str(model_path))
+
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)

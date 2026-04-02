@@ -85,6 +85,8 @@ _SUSPICIOUS_STRING_PATTERNS = frozenset(
     }
 )
 _NESTED_PICKLE_SCAN_LIMIT_BYTES = 2 * 1024 * 1024
+_MAX_BASE64_NESTED_PICKLE_CHARS = ((_NESTED_PICKLE_SCAN_LIMIT_BYTES + 2) // 3) * 4
+_MAX_HEX_NESTED_PICKLE_CHARS = _NESTED_PICKLE_SCAN_LIMIT_BYTES * 2
 _BASE64_CANDIDATE_RE = re.compile(r"[A-Za-z0-9+/]+={0,2}")
 _HEX_CANDIDATE_RE = re.compile(r"(?:\\x)?[0-9a-fA-F]+")
 
@@ -192,6 +194,8 @@ class _BoundedPickleStream:
         return chunk
 
     def _bounded_size(self, requested_size: int | None) -> int | None:
+        if requested_size is not None and requested_size < 0:
+            requested_size = None
         if self._byte_limit is None:
             return requested_size
 
@@ -600,7 +604,7 @@ class _ScanState:
             self.stack.append(self.memo.get(arg, _GlobalRef("__unknown__", f"memo_{arg}", position, malformed=True)))
             return
 
-        if op_name in {"GLOBAL", "INST"}:
+        if op_name == "GLOBAL":
             module, _, name = str(arg).partition(" ")
             ref = _GlobalRef(module=module, name=name, position=position)
             self.stack.append(ref)
@@ -634,7 +638,7 @@ class _ScanState:
             return
 
         if op_name in _REDUCE_OPCODES:
-            callable_ref = self._nearest_global_ref()
+            callable_ref = self._consume_callable_opcode(op_name, arg, position)
             if callable_ref is None:
                 return
 
@@ -676,6 +680,37 @@ class _ScanState:
         values.reverse()
         self.stack.append(tuple(values))
 
+    def _consume_callable_opcode(self, op_name: str, arg: Any, position: int) -> _GlobalRef | None:
+        callable_value: Any = None
+        if op_name in {"REDUCE", "NEWOBJ"}:
+            callable_value = self._consume_top_operands(2)
+        elif op_name == "NEWOBJ_EX":
+            callable_value = self._consume_top_operands(3)
+        elif op_name in {"OBJ", "INST"}:
+            values = self._pop_to_mark()
+            callable_value = values[0] if values else None
+            if op_name == "INST":
+                module, _, name = str(arg).partition(" ")
+                callable_value = _GlobalRef(module=module, name=name, position=position)
+                self._record_global_ref(callable_value, op_name=op_name)
+            self.stack.append(())
+        elif op_name == "BUILD":
+            callable_value = self._consume_top_operands(2)
+
+        if isinstance(callable_value, _GlobalRef) and not callable_value.malformed:
+            return callable_value
+        return None
+
+    def _consume_top_operands(self, operand_count: int) -> Any:
+        if len(self.stack) < operand_count:
+            self.stack.clear()
+            self.stack.append(())
+            return None
+        values = [self.stack.pop() for _ in range(operand_count)]
+        values.reverse()
+        self.stack.append(())
+        return values[0]
+
     def _resolve_stack_global(self, module_value: Any, name_value: Any, position: int) -> _GlobalRef:
         module = self._resolve_global_operand(module_value)
         name = self._resolve_global_operand(name_value)
@@ -713,16 +748,6 @@ class _ScanState:
             return value
         if isinstance(value, _GlobalRef) and not value.malformed:
             return value.symbol
-        return None
-
-    def _nearest_global_ref(self) -> _GlobalRef | None:
-        for item in reversed(self.stack):
-            if isinstance(item, _GlobalRef):
-                return item
-            if isinstance(item, tuple):
-                nested = _find_nested_global_ref(item)
-                if nested is not None:
-                    return nested
         return None
 
     def _scan_string_literal(self, value: str, *, op_name: str, position: int) -> None:
@@ -935,25 +960,8 @@ class _ScanState:
         self.verdict = SafetyVerdict.UNKNOWN
 
 
-def _find_nested_global_ref(values: tuple[Any, ...]) -> _GlobalRef | None:
-    for value in reversed(values):
-        if isinstance(value, _GlobalRef):
-            return value
-        if isinstance(value, tuple):
-            nested = _find_nested_global_ref(value)
-            if nested is not None:
-                return nested
-    return None
-
-
-def _is_dangerous_global(module: str, name: str) -> bool:
-    return _global_severity(module, name) == Severity.CRITICAL
-
-
 def _global_severity(module: str, name: str) -> Severity | None:
     warning_names = _WARNING_GLOBALS.get(module)
-    if warning_names is None and module in _WARNING_GLOBALS:
-        return Severity.WARNING
     if warning_names is not None and name in warning_names:
         return Severity.WARNING
 
@@ -992,7 +1000,8 @@ def _decode_possible_encoded_pickle(value: str) -> list[tuple[str, bytes]]:
     decoded_values: list[tuple[str, bytes]] = []
 
     if _BASE64_CANDIDATE_RE.fullmatch(stripped):
-        padded = stripped + ("=" * (-len(stripped) % 4))
+        bounded = stripped[:_MAX_BASE64_NESTED_PICKLE_CHARS]
+        padded = bounded + ("=" * (-len(bounded) % 4))
         try:
             decoded = base64.b64decode(padded, validate=True)
         except (binascii.Error, ValueError):
@@ -1000,15 +1009,16 @@ def _decode_possible_encoded_pickle(value: str) -> list[tuple[str, bytes]]:
         if _looks_like_pickle_payload(decoded):
             decoded_values.append(("base64", decoded))
 
-    hex_candidate = stripped.replace("\\x", "")
+    hex_candidate = stripped[: _MAX_HEX_NESTED_PICKLE_CHARS * 2].replace("\\x", "")
     if (
         len(hex_candidate) >= 16
         and len(hex_candidate) % 2 == 0
         and _HEX_CANDIDATE_RE.fullmatch(hex_candidate)
         and not re.fullmatch(r"(.)\1*", hex_candidate)
     ):
+        bounded_hex_candidate = hex_candidate[:_MAX_HEX_NESTED_PICKLE_CHARS]
         try:
-            decoded = binascii.unhexlify(hex_candidate)
+            decoded = binascii.unhexlify(bounded_hex_candidate)
         except (binascii.Error, ValueError):
             decoded = b""
         if _looks_like_pickle_payload(decoded):

@@ -1,5 +1,6 @@
 """Scanner for Python pickle serialized files (.pkl, .pickle)."""
 
+import contextlib
 import io
 import os
 import pickletools
@@ -4542,6 +4543,7 @@ class PickleScanner(BaseScanner):
 
     def _prepare_scan_context(self, source: str) -> None:
         """Reset per-scan timeout/context/analyzer state for a new pickle scan."""
+        self._path_validation_result = None
         self._start_scan_timer()
         self._initialize_context(source)
         if hasattr(self, "opcode_sequence_analyzer"):
@@ -4712,9 +4714,35 @@ class PickleScanner(BaseScanner):
         except (AttributeError, OSError, ValueError):
             return package_result
 
-        legacy_result = self._scan_pickle_bytes(file_obj, file_size)
+        max_in_mem = int((self.config or {}).get("pickle_max_memory_read", 32 * 1024 * 1024))
+        self._start_scan_timer()
+        with tempfile.SpooledTemporaryFile(max_size=max(max_in_mem, 0), mode="w+b") as spool:
+            self._copy_pickle_stream_to_spool(file_obj, file_size, cast(BinaryIO, spool))
+            spool.seek(0)
+            legacy_result = self._scan_pickle_bytes(cast(BinaryIO, spool), file_size)
+        with contextlib.suppress(AttributeError, OSError, ValueError):
+            file_obj.seek(stream_start)
         _merge_missing_pickle_checks(legacy_result, package_result)
+        first_pickle_end_pos = package_result.metadata.get("first_pickle_end_pos")
+        if isinstance(first_pickle_end_pos, int):
+            legacy_result.metadata["first_pickle_end_pos"] = first_pickle_end_pos
         return legacy_result
+
+    def _copy_pickle_stream_to_spool(self, file_obj: BinaryIO, file_size: int, spool: BinaryIO) -> None:
+        """Copy at most file_size bytes into a seekable spool while honoring interruption and timeout."""
+        remaining_bytes = max(file_size, 0)
+        while remaining_bytes > 0:
+            self.check_interrupted()
+            self._check_timeout()
+            chunk = file_obj.read(min(_NON_SEEKABLE_PICKLE_COPY_CHUNK_BYTES, remaining_bytes))
+            if not chunk:
+                break
+            if len(chunk) > remaining_bytes:
+                chunk = chunk[:remaining_bytes]
+            spool.write(chunk)
+            remaining_bytes -= len(chunk)
+            self.check_interrupted()
+            self._check_timeout()
 
     def _scan_spooled_non_seekable_pickle_stream(
         self,
@@ -4729,16 +4757,7 @@ class PickleScanner(BaseScanner):
 
         try:
             with tempfile.SpooledTemporaryFile(max_size=max(max_in_mem, 0), mode="w+b") as spool:
-                remaining_bytes = max(file_size, 0)
-                while remaining_bytes > 0:
-                    chunk = file_obj.read(min(_NON_SEEKABLE_PICKLE_COPY_CHUNK_BYTES, remaining_bytes))
-                    if not chunk:
-                        break
-                    if len(chunk) > remaining_bytes:
-                        chunk = chunk[:remaining_bytes]
-                    spool.write(chunk)
-                    remaining_bytes -= len(chunk)
-
+                self._copy_pickle_stream_to_spool(file_obj, file_size, cast(BinaryIO, spool))
                 spool.seek(0)
                 return self._scan_pickle_stream_with_package_engine(
                     cast(BinaryIO, spool),
@@ -5123,6 +5142,46 @@ class PickleScanner(BaseScanner):
             or "no newline found" in error_message
         )
 
+    def _check_scan_stream_size_limit(self, file_size: int, source: str) -> ScanResult | None:
+        """Apply the configured file-size limit to an already-open stream with a declared byte length."""
+        file_size = max(file_size, 0)
+        if self.max_file_read_size and self.max_file_read_size > 0 and file_size > self.max_file_read_size:
+            result = self._create_result()
+            result.metadata["file_size"] = file_size
+            result.add_check(
+                name="File Size Limit",
+                passed=False,
+                message=f"File too large: {file_size} bytes (max: {self.max_file_read_size})",
+                severity=IssueSeverity.INFO,
+                location=source,
+                details={
+                    "file_size": file_size,
+                    "max_file_read_size": self.max_file_read_size,
+                },
+                why=(
+                    "Large files may consume excessive memory or processing time. "
+                    "Consider whether this file size is expected for your use case."
+                ),
+            )
+            result.finish(success=False)
+            return result
+
+        if self._path_validation_result is None:
+            self._path_validation_result = ScanResult(scanner_name=self.name, scanner=self)
+        self._path_validation_result.metadata["file_size"] = file_size
+        if self.max_file_read_size and self.max_file_read_size > 0:
+            self._path_validation_result.add_check(
+                name="File Size Limit",
+                passed=True,
+                message="File size within limit",
+                location=source,
+                details={
+                    "file_size": file_size,
+                    "max_file_read_size": self.max_file_read_size,
+                },
+            )
+        return None
+
     def scan_stream(
         self,
         file_obj: BinaryIO,
@@ -5131,6 +5190,9 @@ class PickleScanner(BaseScanner):
     ) -> ScanResult:
         """Scan pickle bytes from an already-open stream."""
         self._prepare_scan_context(source)
+        size_check = self._check_scan_stream_size_limit(file_size, source)
+        if size_check:
+            return size_check
         return self._scan_pickle_stream_with_package_engine(
             file_obj,
             file_size,

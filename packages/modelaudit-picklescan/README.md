@@ -6,6 +6,16 @@ This package is intentionally small: it exposes pickle byte/stream analysis,
 safety verdicts, and typed findings without importing the broader ModelAudit
 scanner framework.
 
+## Installation
+
+The package is currently bundled in the root `modelaudit` wheel while standalone
+publishing is staged. For local package work from a checkout, install the
+package directory directly:
+
+```bash
+python -m pip install packages/modelaudit-picklescan
+```
+
 ## Usage
 
 ```python

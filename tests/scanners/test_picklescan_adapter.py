@@ -16,7 +16,11 @@ from modelaudit_picklescan import (
 
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity
 from modelaudit.scanners.executorch_scanner import ExecuTorchScanner
-from modelaudit.scanners.picklescan_adapter import pickle_report_to_scan_result, scan_options_from_config
+from modelaudit.scanners.picklescan_adapter import (
+    apply_pickle_member_context,
+    pickle_report_to_scan_result,
+    scan_options_from_config,
+)
 from modelaudit.scanners.pytorch_zip_scanner import PyTorchZipScanner
 from tests.helpers import create_mock_pytorch_zip
 
@@ -488,3 +492,25 @@ def test_executorch_scanner_does_not_duplicate_member_path_in_pickle_locations(t
         for issue in result.issues
         if issue.details.get("pickle_source") == f"{model_path}:data.pkl"
     )
+
+
+def test_apply_pickle_member_context_prepends_member_location_without_position_markers() -> None:
+    report = PickleReport(
+        source="data.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.SUSPICIOUS,
+        findings=(
+            Finding(
+                message="Found non-allowlisted __main__ global reference: __main__.CustomType",
+                severity=Severity.WARNING,
+                location="custom-location",
+                rule_code="S203",
+            ),
+        ),
+    )
+    result = pickle_report_to_scan_result(report)
+
+    apply_pickle_member_context(result, archive_path="archive.pt", member_name="data.pkl")
+
+    assert result.issues[0].location == "archive.pt:data.pkl custom-location"
+    assert result.issues[0].details["pickle_filename"] == "data.pkl"

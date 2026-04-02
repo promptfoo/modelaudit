@@ -206,12 +206,13 @@ def _classify_delta(label: str, legacy: NormalizedResult, package: NormalizedRes
 
 
 def _build_report() -> dict[str, Any]:
+    fixtures: list[Path] = []
+    comparisons: list[dict[str, Any]] = []
     previous_logging_disable_level = logging.root.manager.disable
     logging.disable(logging.CRITICAL)
     try:
         fixtures = _discover_pickle_fixtures()
         legacy_scanner = LegacyBaselinePickleScanner()
-        comparisons: list[dict[str, Any]] = []
 
         for path in fixtures:
             label = _fixture_label(path)

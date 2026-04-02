@@ -10,6 +10,7 @@ behavior.
 packages/
   modelaudit-picklescan/
     src/modelaudit_picklescan/
+      __init__.py
       api.py
       options.py
       report.py
