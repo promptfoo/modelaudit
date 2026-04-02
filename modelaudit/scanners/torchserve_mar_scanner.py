@@ -1064,6 +1064,7 @@ class TorchServeMarScanner(BaseScanner):
 
         processed_uncompressed = 0
         analyzable_member_lookup: dict[str, zipfile.ZipInfo] = {}
+        requirements_member_lookup = self._build_requirements_member_lookup(entries_to_process)
         for member_info in entries_to_process:
             self.check_interrupted()
 
@@ -1078,6 +1079,7 @@ class TorchServeMarScanner(BaseScanner):
                     archive_path=archive_path,
                     archive=archive,
                     member_info=member_info,
+                    members_by_normalized=requirements_member_lookup,
                     normalized_member=normalized_member,
                     result=result,
                 )
@@ -1255,17 +1257,11 @@ class TorchServeMarScanner(BaseScanner):
         archive_path: str,
         archive: zipfile.ZipFile,
         member_info: zipfile.ZipInfo,
+        members_by_normalized: dict[str, list[zipfile.ZipInfo]],
         normalized_member: str,
         result: ScanResult,
     ) -> None:
         location = f"{archive_path}:{normalized_member}"
-        members_by_normalized: dict[str, list[zipfile.ZipInfo]] = {}
-        for info in archive.infolist():
-            if info.is_dir():
-                continue
-            include_key = self._normalize_archive_member_name(info.filename)
-            members_by_normalized.setdefault(include_key, []).append(info)
-
         findings = self._collect_requirements_findings(
             archive,
             members_by_normalized,
@@ -1297,8 +1293,22 @@ class TorchServeMarScanner(BaseScanner):
             location=location,
         )
 
-    def _normalize_archive_member_name(self, member_name: str) -> str:
-        return posixpath.normpath(self._normalize_member_name(member_name))
+    @classmethod
+    def _build_requirements_member_lookup(
+        cls,
+        member_infos: list[zipfile.ZipInfo],
+    ) -> dict[str, list[zipfile.ZipInfo]]:
+        members_by_normalized: dict[str, list[zipfile.ZipInfo]] = {}
+        for member_info in member_infos:
+            if member_info.is_dir() or not member_info.filename:
+                continue
+            include_key = cls._normalize_archive_member_name(member_info.filename)
+            members_by_normalized.setdefault(include_key, []).append(member_info)
+        return members_by_normalized
+
+    @classmethod
+    def _normalize_archive_member_name(cls, member_name: str) -> str:
+        return posixpath.normpath(cls._normalize_member_name(member_name))
 
     def _resolve_local_requirements_reference(self, current_member: str, reference: str) -> str | None:
         stripped_reference = reference.strip().strip("'\"")

