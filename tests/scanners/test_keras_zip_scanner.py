@@ -215,6 +215,39 @@ class TestKerasZipScanner:
 
         assert scanner.can_handle(str(keras_path))
 
+    def test_scan_normalized_config_member_and_recurses_embedded_pickle(self, tmp_path: Path) -> None:
+        """Normalized ./config.json members should still receive Keras and recursive ZIP scans."""
+        scanner = KerasZipScanner()
+        keras_path = tmp_path / "normalized_config.keras"
+        malicious_code = "exec(\"print('Malicious!')\")"
+        encoded_code = base64.b64encode(malicious_code.encode()).decode()
+        config = {
+            "class_name": "Functional",
+            "config": {
+                "layers": [
+                    {"class_name": "InputLayer", "name": "input_1", "config": {}},
+                    {
+                        "class_name": "Lambda",
+                        "name": "lambda_1",
+                        "config": {"function": [encoded_code, None, None], "function_type": "lambda"},
+                    },
+                ]
+            },
+        }
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            zf.writestr("./config.json", json.dumps(config))
+            zf.writestr("./metadata.json", json.dumps({"keras_version": "3.0.0"}))
+            zf.writestr("./payload.pkl", b"cos\nsystem\n(S'echo pwned'\ntR.")
+
+        result = scanner.scan(str(keras_path))
+
+        assert any("lambda" in issue.message.lower() for issue in result.issues)
+        assert any(
+            "payload.pkl" in (issue.location or "")
+            and ("os.system" in issue.message.lower() or "posix.system" in issue.message.lower())
+            for issue in result.issues
+        )
+
     def test_lambda_layer_with_exec(self):
         """Test detection of Lambda layer with exec() call."""
         scanner = KerasZipScanner()

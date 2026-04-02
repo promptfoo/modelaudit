@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 
 from modelaudit.core import scan_file
+from modelaudit.scanners.base import IssueSeverity
 
 
 def _build_malicious_pickle() -> bytes:
@@ -104,6 +105,43 @@ def test_scan_file_routes_misnamed_config_only_keras_zip_by_content(tmp_path: Pa
 
     assert result.scanner_name == "keras_zip"
     assert any("lambda" in issue.message.lower() for issue in result.issues)
+
+
+def test_scan_file_recursively_scans_embedded_pickle_in_content_routed_keras_zip(tmp_path: Path) -> None:
+    disguised_keras = tmp_path / "model.jpg"
+    _create_misnamed_zip(
+        disguised_keras,
+        {
+            "config.json": json.dumps({"class_name": "Sequential", "config": {"layers": []}}).encode("utf-8"),
+            "payload.pkl": _build_malicious_pickle(),
+        },
+    )
+
+    result = scan_file(str(disguised_keras))
+
+    assert result.scanner_name == "keras_zip"
+    assert any(
+        "payload.pkl" in (issue.location or "")
+        and ("os.system" in issue.message.lower() or "posix.system" in issue.message.lower())
+        for issue in result.issues
+    )
+
+
+def test_scan_file_content_routed_keras_zip_with_benign_extra_member_stays_clean(tmp_path: Path) -> None:
+    disguised_keras = tmp_path / "model.jpg"
+    _create_misnamed_zip(
+        disguised_keras,
+        {
+            "config.json": json.dumps({"class_name": "Sequential", "config": {"layers": []}}).encode("utf-8"),
+            "notes.txt": b"safe archive member",
+        },
+    )
+
+    result = scan_file(str(disguised_keras))
+
+    assert result.scanner_name == "keras_zip"
+    assert result.success is True
+    assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
 def test_scan_file_routes_config_only_keras_by_suffix(tmp_path: Path) -> None:

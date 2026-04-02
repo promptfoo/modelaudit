@@ -28,6 +28,7 @@ from ..config.explanations import (
     get_cve_2026_1669_explanation,
     get_pattern_explanation,
 )
+from ..utils.file.detection import _normalize_archive_member_name
 from .base import BaseScanner, IssueSeverity, ScanResult
 from .keras_utils import (
     check_lambda_dict_function,
@@ -85,6 +86,9 @@ _GET_FILE_PATTERN = re.compile(r"get_file", re.IGNORECASE)
 _URL_PATTERN = re.compile(r"https?://", re.IGNORECASE)
 _URL_SCHEME_PATTERN = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
 _WINDOWS_ABSOLUTE_PATH_PATTERN = re.compile(r"^(?:[a-zA-Z]:[\\/]|\\\\)")
+_KERAS_CONFIG_ENTRY = "config.json"
+_KERAS_METADATA_ENTRY = "metadata.json"
+_KERAS_WEIGHTS_ENTRY = "model.weights.h5"
 
 try:
     import h5py
@@ -207,6 +211,35 @@ class KerasZipScanner(BaseScanner):
         except Exception:
             return False
 
+    @staticmethod
+    def _get_archive_member_info(
+        archive: zipfile.ZipFile,
+        member_name: str,
+    ) -> zipfile.ZipInfo | None:
+        """Return a ZIP member by normalized archive-relative name."""
+        for info in archive.infolist():
+            if not info.filename or info.is_dir():
+                continue
+            if _normalize_archive_member_name(info.filename) == member_name:
+                return info
+        return None
+
+    def _merge_recursive_archive_scan(self, path: str, result: ScanResult) -> None:
+        """Recursively scan every ZIP member through the generic archive scanner."""
+        from .zip_scanner import ZipScanner
+
+        zip_scanner = ZipScanner(self.config)
+        nested_result = zip_scanner._scan_zip_file(
+            path,
+            depth=max(zip_scanner._get_archive_depth(), zip_scanner._get_zip_depth()),
+        )
+        preserved_metadata = dict(result.metadata)
+        nested_contents = nested_result.metadata.get("contents")
+        result.merge(nested_result)
+        result.metadata.update(preserved_metadata)
+        if nested_contents is not None:
+            result.metadata["contents"] = nested_contents
+
     def scan(self, path: str) -> ScanResult:
         """Scan a ZIP-based Keras model file for suspicious configurations"""
         # Initialize context for this file
@@ -235,8 +268,9 @@ class KerasZipScanner(BaseScanner):
             with zipfile.ZipFile(path, "r") as zf:
                 result.bytes_scanned = file_size
 
+                config_info = self._get_archive_member_info(zf, _KERAS_CONFIG_ENTRY)
                 # Check for config.json
-                if "config.json" not in zf.namelist():
+                if config_info is None:
                     result.add_check(
                         name="Keras ZIP Format Check",
                         passed=False,
@@ -245,11 +279,12 @@ class KerasZipScanner(BaseScanner):
                         location=path,
                         details={"files": zf.namelist()},
                     )
+                    self._merge_recursive_archive_scan(path, result)
                     result.finish(success=True)
                     return result
 
                 # Read and parse config.json
-                with zf.open("config.json") as config_file:
+                with zf.open(config_info, "r") as config_file:
                     config_data = config_file.read()
                     raw_config_text = config_data.decode("utf-8", errors="ignore")
                     try:
@@ -263,9 +298,10 @@ class KerasZipScanner(BaseScanner):
                             passed=False,
                             message=f"Failed to parse config.json: {e}",
                             severity=IssueSeverity.CRITICAL,
-                            location=f"{path}/config.json",
+                            location=f"{path}/{config_info.filename}",
                             details={"error": str(e)},
                         )
+                        self._merge_recursive_archive_scan(path, result)
                         result.finish(success=False)
                         return result
 
@@ -275,8 +311,9 @@ class KerasZipScanner(BaseScanner):
                 self._check_unsafe_deserialization_bypass(model_config, result)
 
                 # Check for metadata.json
-                if "metadata.json" in zf.namelist():
-                    with zf.open("metadata.json") as metadata_file:
+                metadata_info = self._get_archive_member_info(zf, _KERAS_METADATA_ENTRY)
+                if metadata_info is not None:
+                    with zf.open(metadata_info, "r") as metadata_file:
                         metadata_data = metadata_file.read()
                         try:
                             metadata = json.loads(metadata_data)
@@ -313,6 +350,8 @@ class KerasZipScanner(BaseScanner):
                             location=f"{path}/{filename}",
                             details={"filename": filename},
                         )
+
+                self._merge_recursive_archive_scan(path, result)
 
         except Exception as e:
             result.add_check(
@@ -1042,11 +1081,15 @@ class KerasZipScanner(BaseScanner):
 
     def _check_embedded_hdf5_weights_external_references(self, archive: zipfile.ZipFile, result: ScanResult) -> None:
         """Detect CVE-2026-1669 external HDF5 references inside embedded .keras weights."""
-        if not HAS_H5PY or "model.weights.h5" not in archive.namelist():
+        if not HAS_H5PY:
             return
 
-        weights_info = archive.getinfo("model.weights.h5")
+        weights_info = self._get_archive_member_info(archive, _KERAS_WEIGHTS_ENTRY)
+        if weights_info is None:
+            return
+
         if weights_info.file_size > self.max_embedded_weights_bytes:
+            weights_entry = weights_info.filename
             result.add_check(
                 name="Embedded Weights Size Limit",
                 passed=False,
@@ -1055,9 +1098,9 @@ class KerasZipScanner(BaseScanner):
                     f"exceeds the configured size limit ({weights_info.file_size} > {self.max_embedded_weights_bytes})"
                 ),
                 severity=IssueSeverity.INFO,
-                location=f"{self.current_file_path}:model.weights.h5",
+                location=f"{self.current_file_path}:{weights_entry}",
                 details={
-                    "entry": "model.weights.h5",
+                    "entry": weights_entry,
                     "uncompressed_size": weights_info.file_size,
                     "compressed_size": weights_info.compress_size,
                     "max_embedded_weights_bytes": self.max_embedded_weights_bytes,
@@ -1092,14 +1135,15 @@ class KerasZipScanner(BaseScanner):
             with h5py.File(temp_path, "r") as h5_file:
                 findings = self._collect_hdf5_external_references(h5_file)
         except _EmbeddedWeightsLimitExceeded as exc:
+            weights_entry = weights_info.filename
             result.add_check(
                 name="Embedded Weights Size Limit",
                 passed=False,
                 message=str(exc),
                 severity=IssueSeverity.INFO,
-                location=f"{self.current_file_path}:model.weights.h5",
+                location=f"{self.current_file_path}:{weights_entry}",
                 details={
-                    "entry": "model.weights.h5",
+                    "entry": weights_entry,
                     "extracted_bytes": exc.extracted_bytes,
                     "uncompressed_size": weights_info.file_size,
                     "compressed_size": weights_info.compress_size,
@@ -1119,7 +1163,7 @@ class KerasZipScanner(BaseScanner):
             return
 
         keras_version = result.metadata.get("keras_version")
-        location = f"{self.current_file_path}:model.weights.h5"
+        location = f"{self.current_file_path}:{weights_info.filename}"
         details = {
             "cve_id": "CVE-2026-1669",
             "cvss": 8.1,
