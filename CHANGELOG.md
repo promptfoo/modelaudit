@@ -95,6 +95,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **pickle:** bundle the standalone `modelaudit_picklescan` API in the root `modelaudit` wheel and add source-tree coverage for the package boundary
 - **tests:** enable existing PaddlePaddle scanner tests in CI by adding `test_paddle_scanner.py` to the allowed test files list (Python 3.10/3.12/3.13)
 - **security:** detect CVE-2026-1669 Keras HDF5 external weight references in standalone `.h5` and embedded `.keras` weights
 - **security:** detect CVE-2026-24747 PyTorch weights_only=True bypass via SETITEM/SETITEMS abuse and tensor metadata mismatch detection

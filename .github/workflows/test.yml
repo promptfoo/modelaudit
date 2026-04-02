@@ -88,15 +88,15 @@ jobs:
 
       - name: Lint with Ruff
         run: |
-          uv run ruff check modelaudit/ tests/
+          uv run ruff check modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests tests/
 
       - name: Check import organization with Ruff
         run: |
-          uv run ruff check --select I modelaudit/ tests/
+          uv run ruff check --select I modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests tests/
 
       - name: Check formatting with Ruff
         run: |
-          uv run ruff format --check modelaudit/ tests/
+          uv run ruff format --check modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests tests/
 
   dependency-audit:
     name: Dependency Audit
@@ -324,7 +324,7 @@ jobs:
 
       - name: Type checking
         run: |
-          uv run mypy modelaudit/ tests/
+          uv run mypy modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests tests/
 
       - name: Check for circular imports
         run: |
@@ -753,6 +753,47 @@ jobs:
       - name: Validate package metadata
         run: |
           uvx twine check dist/*
+
+      - name: Smoke test wheel install
+        run: |
+          set -euo pipefail
+          uv venv /tmp/modelaudit-wheel-smoke
+
+          uv pip install --python /tmp/modelaudit-wheel-smoke/bin/python dist/modelaudit-*.whl
+
+          /tmp/modelaudit-wheel-smoke/bin/python - <<'PY'
+          import modelaudit
+          import modelaudit_picklescan
+
+          report = modelaudit_picklescan.scan_bytes(b"\x80\x04}q\x00.")
+          assert report.status.value == "complete", report
+          print(f"modelaudit {modelaudit.__version__} and modelaudit_picklescan loaded")
+          PY
+
+      - name: Smoke test standalone pickle package wheel
+        run: |
+          set -euo pipefail
+          uv build --project packages/modelaudit-picklescan --out-dir /tmp/modelaudit-picklescan-dist
+          uv venv /tmp/modelaudit-picklescan-wheel-smoke
+
+          shopt -s nullglob
+          picklescan_wheels=(/tmp/modelaudit-picklescan-dist/modelaudit_picklescan-*.whl)
+          if [[ ${#picklescan_wheels[@]} -ne 1 ]]; then
+            echo "ERROR: Expected exactly 1 modelaudit_picklescan wheel artifact, found ${#picklescan_wheels[@]}"
+            ls -la /tmp/modelaudit-picklescan-dist/
+            exit 1
+          fi
+
+          uv pip install --python /tmp/modelaudit-picklescan-wheel-smoke/bin/python "${picklescan_wheels[0]}"
+
+          /tmp/modelaudit-picklescan-wheel-smoke/bin/python - <<'PY'
+          import modelaudit_picklescan
+
+          report = modelaudit_picklescan.scan_bytes(b"\x80\x04}q\x00.")
+          assert report.status.value == "complete", report
+          assert report.verdict.value == "clean", report
+          print("standalone modelaudit_picklescan wheel loaded")
+          PY
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v7

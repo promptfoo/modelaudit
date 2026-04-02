@@ -25,9 +25,9 @@ This is the single source of truth for all AI coding agents (Claude, Gemini, oth
 uv sync --extra all-ci
 
 # Pre-commit workflow (MUST run before every commit)
-uv run ruff format modelaudit/ tests/
-uv run ruff check --fix modelaudit/ tests/
-uv run mypy modelaudit/ tests/
+uv run ruff format modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests tests/
+uv run ruff check --fix modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests tests/
+uv run mypy modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests tests/
 uv run pytest -n auto -m "not slow and not integration" --maxfail=1
 ```
 
@@ -36,7 +36,7 @@ uv run pytest -n auto -m "not slow and not integration" --maxfail=1
 1. **Understand:** Read nearby code, tests, and docs (`docs/agents/*.md`) before editing.
 2. **Plan:** For anything non-trivial, present a short multi-step plan; refine iteratively.
 3. **Implement:** Preserve security focus, follow `BaseScanner` patterns (see `docs/agents/architecture.md`), handle missing deps gracefully, and update `SCANNER_REGISTRY` when adding scanners.
-4. **Verify:** Run the validation commands above. Format/linters must be clean. Use targeted `pytest` when appropriate, and type-check modified tests as part of the normal `mypy modelaudit/ tests/` pass.
+4. **Verify:** Run the validation commands above. Format/linters must be clean. Use targeted `pytest` when appropriate, and type-check modified tests as part of the normal `mypy modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests tests/` pass.
 5. **Report:** Summarize changes with file references and note residual risks or follow-ups.
 
 ## Branch & Git Hygiene
@@ -73,16 +73,16 @@ gh pr create --title "feat: descriptive title" --body "Brief description"
 ## CI Compliance Requirements
 
 ```bash
-uv run ruff check modelaudit/ tests/          # Lint (no errors)
-uv run ruff format --check modelaudit/ tests/ # Format (no changes)
-uv run mypy modelaudit/ tests/                # Types (no errors)
+uv run ruff check modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests tests/          # Lint (no errors)
+uv run ruff format --check modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests tests/ # Format (no changes)
+uv run mypy modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests tests/                # Types (no errors)
 uv run pytest -n auto -m "not slow and not integration" --maxfail=1
 ```
 
 | Issue               | Fix                                                     |
 | ------------------- | ------------------------------------------------------- |
-| Import organization | `uv run ruff check --fix --select I modelaudit/ tests/` |
-| Format issues       | `uv run ruff format modelaudit/ tests/`                 |
+| Import organization | `uv run ruff check --fix --select I modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests tests/` |
+| Format issues       | `uv run ruff format modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests tests/`                 |
 | Type errors         | Fix manually, re-run `mypy`                             |
 | Test failures       | Check output, fix issues, re-run tests                  |
 
@@ -161,6 +161,7 @@ For the full multi-file workflow, see `docs/agents/new-scanner-quickstart.md` §
 
 ```bash
 modelaudit/
+├── packages/modelaudit-picklescan/ # Standalone pickle scanner package
 ├── modelaudit/           # Main package
 │   ├── analysis/         # Semantic and integrated analysis
 │   ├── auth/             # API authentication and config

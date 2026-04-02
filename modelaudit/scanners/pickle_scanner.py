@@ -6,8 +6,11 @@ import pickletools
 import reprlib
 import struct
 import time
+from collections.abc import Hashable, Mapping
 from dataclasses import asdict, dataclass, field
 from typing import Any, BinaryIO, ClassVar, Literal, TypedDict, TypeGuard
+
+from modelaudit_picklescan import PickleScanner as StandalonePickleScanner
 
 from modelaudit.analysis.enhanced_pattern_detector import EnhancedPatternDetector, PatternMatch
 from modelaudit.analysis.entropy_analyzer import EntropyAnalyzer
@@ -36,6 +39,7 @@ from ..config.explanations import (
 from ..detectors.cve_patterns import analyze_cve_patterns, enhance_scan_result_with_cve
 from ..detectors.suspicious_symbols import DANGEROUS_OPCODES
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult, logger
+from .picklescan_adapter import pickle_report_to_scan_result, scan_options_from_config
 from .rule_mapper import (
     get_embedded_code_rule_code,
     get_encoding_rule_code,
@@ -83,6 +87,22 @@ _EXPANSION_TRIGGER_LABELS = {
 }
 _BINARY_PICKLE_PROTOCOLS = frozenset({2, 3, 4, 5})
 _PICKLE_OPCODE_BYTES = frozenset(ord(op.code) for op in pickletools.opcodes)
+_STANDALONE_PICKLE_SHADOW_METADATA_KEYS = frozenset(
+    {
+        "analysis_incomplete",
+        "operational_error",
+        "operational_error_reason",
+        "scan_outcome",
+        "scan_outcome_reasons",
+    }
+)
+_STANDALONE_PICKLE_NON_FINDING_CHECKS = frozenset(
+    {
+        "Standalone Pickle Error",
+        "Standalone Pickle Notice",
+        "Standalone Pickle Scan",
+    }
+)
 
 
 StackGlobalOperandKind = Literal["string", "missing_memo", "unknown", "non_string"]
@@ -128,6 +148,128 @@ def _mark_inconclusive_scan_result(result: ScanResult, reason: str) -> None:
 def _scan_result_has_security_findings(result: ScanResult) -> bool:
     """Return True when the result includes WARNING/CRITICAL findings."""
     return any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+def _freeze_pickle_scan_value(value: Any) -> Hashable:
+    """Convert nested check details into a hashable representation for dedupe."""
+    if isinstance(value, Mapping):
+        return tuple(sorted((str(key), _freeze_pickle_scan_value(item)) for key, item in value.items()))
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_pickle_scan_value(item) for item in value)
+    if isinstance(value, set):
+        return frozenset(_freeze_pickle_scan_value(item) for item in value)
+    if isinstance(value, Hashable):
+        return value
+    return repr(value)
+
+
+def _pickle_record_identity(record: Any) -> tuple[Hashable, ...]:
+    """Return a stable semantic key for equivalent pickle scan checks/issues."""
+    if isinstance(record, Mapping):
+        rule_code = record.get("rule_code")
+        location = record.get("location")
+        message = record.get("message")
+    else:
+        rule_code = getattr(record, "rule_code", None)
+        location = getattr(record, "location", None)
+        message = getattr(record, "message", None)
+
+    if rule_code:
+        return (location, rule_code)
+
+    return (
+        location,
+        rule_code,
+        message,
+    )
+
+
+def _pickle_check_signature(check: Any) -> tuple[Hashable, ...]:
+    """Return a stable dedupe key for exact pickle scan checks/issues."""
+    severity = check.severity.value if check.severity is not None else None
+    status = check.status.value if hasattr(check, "status") else None
+    return (
+        getattr(check, "name", None),
+        status,
+        severity,
+        check.location,
+        check.rule_code,
+        check.message,
+        _freeze_pickle_scan_value(check.details),
+    )
+
+
+def _merge_missing_pickle_checks(target: ScanResult, fallback: ScanResult) -> None:
+    """Merge only compatibility fallback checks that are absent from the primary result."""
+    existing_check_signatures = {_pickle_check_signature(check) for check in target.checks}
+    existing_issue_signatures = {_pickle_check_signature(issue) for issue in target.issues}
+    existing_check_identities = {_pickle_record_identity(check): check for check in target.checks}
+    existing_issue_identities = {_pickle_record_identity(issue): issue for issue in target.issues}
+    for check in target.checks:
+        supporting_evidence = check.details.get("supporting_evidence")
+        if not isinstance(supporting_evidence, list):
+            continue
+        for evidence in supporting_evidence:
+            if isinstance(evidence, Mapping):
+                existing_check_identities.setdefault(_pickle_record_identity(evidence), check)
+    for issue in target.issues:
+        supporting_evidence = issue.details.get("supporting_evidence")
+        if not isinstance(supporting_evidence, list):
+            continue
+        for evidence in supporting_evidence:
+            if isinstance(evidence, Mapping):
+                existing_issue_identities.setdefault(_pickle_record_identity(evidence), issue)
+
+    for check in fallback.checks:
+        if check.name in _STANDALONE_PICKLE_NON_FINDING_CHECKS:
+            continue
+
+        identity = _pickle_record_identity(check)
+        if identity in existing_check_identities:
+            continue
+
+        signature = _pickle_check_signature(check)
+        if signature in existing_check_signatures:
+            continue
+        existing_check_signatures.add(signature)
+        existing_check_identities[identity] = check
+        target.checks.append(check)
+
+    for issue in fallback.issues:
+        if issue.rule_code is None:
+            continue
+
+        identity = _pickle_record_identity(issue)
+        if identity in existing_issue_identities:
+            continue
+
+        signature = _pickle_check_signature(issue)
+        if signature in existing_issue_signatures:
+            continue
+        existing_issue_signatures.add(signature)
+        existing_issue_identities[identity] = issue
+        target.issues.append(issue)
+
+    target.bytes_scanned = max(target.bytes_scanned, fallback.bytes_scanned)
+    for key, value in fallback.metadata.items():
+        if key in _STANDALONE_PICKLE_SHADOW_METADATA_KEYS:
+            continue
+        if key in target.metadata and isinstance(target.metadata[key], dict) and isinstance(value, dict):
+            target.metadata[key].update(value)
+        elif key not in target.metadata:
+            target.metadata[key] = value
+
+
+def _issue_severity_rank(severity: IssueSeverity | None) -> int:
+    if severity == IssueSeverity.CRITICAL:
+        return 3
+    if severity == IssueSeverity.WARNING:
+        return 2
+    if severity == IssueSeverity.INFO:
+        return 1
+    if severity == IssueSeverity.DEBUG:
+        return 0
+    return -1
 
 
 def _finish_with_inconclusive_contract(
@@ -4365,6 +4507,16 @@ class PickleScanner(BaseScanner):
         self.opcode_sequence_analyzer = OpcodeSequenceAnalyzer()
         self.ml_context_analyzer = MLContextAnalyzer()
         self.enhanced_pattern_detector = EnhancedPatternDetector()
+        self._standalone_pickle_scanner = StandalonePickleScanner(
+            options=scan_options_from_config(self.config),
+        )
+
+    def _prepare_scan_context(self, source: str) -> None:
+        """Reset per-scan timeout/context/analyzer state for a new pickle scan."""
+        self._start_scan_timer()
+        self._initialize_context(source)
+        if hasattr(self, "opcode_sequence_analyzer"):
+            self.opcode_sequence_analyzer.reset()
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -4495,17 +4647,47 @@ class PickleScanner(BaseScanner):
             reason="pickle_scan_runtime_failed",
         )
 
+    def _scan_pickle_stream_with_package_engine(
+        self,
+        file_obj: BinaryIO,
+        file_size: int,
+        *,
+        source: str,
+    ) -> ScanResult:
+        """Scan a pickle stream through the standalone package and preserve legacy result semantics."""
+        self.current_file_path = source
+
+        try:
+            stream_start = file_obj.tell()
+        except (AttributeError, OSError, ValueError):
+            stream_start = None
+
+        pickle_report = self._standalone_pickle_scanner.scan_stream(
+            file_obj,
+            source=source,
+            size=file_size,
+        )
+        package_result = pickle_report_to_scan_result(
+            pickle_report,
+            scanner_name=self.name,
+            scanner=self,
+        )
+
+        if stream_start is None:
+            return package_result
+
+        try:
+            file_obj.seek(stream_start)
+        except (AttributeError, OSError, ValueError):
+            return package_result
+
+        legacy_result = self._scan_pickle_bytes(file_obj, file_size)
+        _merge_missing_pickle_checks(legacy_result, package_result)
+        return legacy_result
+
     def scan(self, path: str) -> ScanResult:
         """Scan a pickle file for suspicious content"""
-        # Start scan timer for timeout tracking
-        self._start_scan_timer()
-
-        # Initialize context for this file
-        self._initialize_context(path)
-
-        # Reset analyzers for clean state
-        if hasattr(self, "opcode_sequence_analyzer"):
-            self.opcode_sequence_analyzer.reset()
+        self._prepare_scan_context(path)
 
         # Check if path is valid
         path_check_result = self._check_path(path)
@@ -4572,7 +4754,11 @@ class PickleScanner(BaseScanner):
                 pickle_file_opened = True
                 # Store the file path for use in issue locations
                 self.current_file_path = path
-                scan_result = self._scan_pickle_bytes(f, file_size)
+                scan_result = self._scan_pickle_stream_with_package_engine(
+                    f,
+                    file_size,
+                    source=path,
+                )
                 result.merge(scan_result)
                 if (
                     not scan_result.success
@@ -4870,6 +5056,20 @@ class PickleScanner(BaseScanner):
             or "unpack requires" in error_message
             or "bad marshal data" in error_message
             or "no newline found" in error_message
+        )
+
+    def scan_stream(
+        self,
+        file_obj: BinaryIO,
+        file_size: int,
+        source: str = "<stream>",
+    ) -> ScanResult:
+        """Scan pickle bytes from an already-open stream."""
+        self._prepare_scan_context(source)
+        return self._scan_pickle_stream_with_package_engine(
+            file_obj,
+            file_size,
+            source=source,
         )
 
     def _merge_binary_content_findings(self, result: ScanResult, binary_result: ScanResult) -> None:

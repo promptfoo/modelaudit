@@ -6,6 +6,8 @@ import tempfile
 import zipfile
 from typing import Any, ClassVar
 
+from modelaudit_picklescan import PickleScanner as StandalonePickleScanner
+
 from ..utils import sanitize_archive_path
 from ..utils.file.detection import (
     _is_executorch_binary_signature,
@@ -13,7 +15,11 @@ from ..utils.file.detection import (
     is_executorch_archive,
 )
 from .base import BaseScanner, IssueSeverity, ScanResult
-from .pickle_scanner import PickleScanner
+from .picklescan_adapter import (
+    apply_pickle_member_context,
+    pickle_report_to_scan_result,
+    scan_options_from_config,
+)
 
 
 class ExecuTorchScanner(BaseScanner):
@@ -25,7 +31,7 @@ class ExecuTorchScanner(BaseScanner):
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         super().__init__(config)
-        self.pickle_scanner = PickleScanner(config)
+        self.pickle_scanner = StandalonePickleScanner(options=scan_options_from_config(self.config))
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -121,16 +127,17 @@ class ExecuTorchScanner(BaseScanner):
                     data = z.read(name)
                     bytes_scanned += len(data)
                     with io.BytesIO(data) as file_like:
-                        sub_result = self.pickle_scanner._scan_pickle_bytes(file_like, len(data))
-                    for issue in sub_result.issues:
-                        if issue.details:
-                            issue.details["pickle_filename"] = name
-                        else:
-                            issue.details = {"pickle_filename": name}
-                        if not issue.location:
-                            issue.location = f"{path}:{name}"
-                        elif "pos" in issue.location:
-                            issue.location = f"{path}:{name} {issue.location}"
+                        pickle_report = self.pickle_scanner.scan_stream(
+                            file_like,
+                            source=f"{path}:{name}",
+                            size=len(data),
+                        )
+                    sub_result = pickle_report_to_scan_result(
+                        pickle_report,
+                        scanner_name="pickle",
+                        scanner=self,
+                    )
+                    apply_pickle_member_context(sub_result, archive_path=path, member_name=name)
                     result.merge(sub_result)
 
                 for name in safe_entries:

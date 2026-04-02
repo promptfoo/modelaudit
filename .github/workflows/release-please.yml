@@ -116,13 +116,13 @@ jobs:
         run: uv sync --extra all-ci
 
       - name: Lint with Ruff
-        run: uv run ruff check modelaudit/ tests/
+        run: uv run ruff check modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests tests/
 
       - name: Check formatting with Ruff
-        run: uv run ruff format --check modelaudit/ tests/
+        run: uv run ruff format --check modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests tests/
 
       - name: Type check with mypy
-        run: uv run mypy modelaudit/
+        run: uv run mypy modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests
 
       - name: Run tests
         run: |
@@ -231,20 +231,20 @@ jobs:
           fi
           WHEEL_ARTIFACT="${wheel_artifacts[0]}"
 
-          python -m venv /tmp/modelaudit-wheel-smoke
-          source /tmp/modelaudit-wheel-smoke/bin/activate
+          uv venv /tmp/modelaudit-wheel-smoke
 
-          python -m pip install --upgrade pip
-          python -m pip install "${WHEEL_ARTIFACT}"
+          uv pip install --python /tmp/modelaudit-wheel-smoke/bin/python "${WHEEL_ARTIFACT}"
 
-          INSTALLED_VERSION="$(python -c "import importlib.metadata as m; print(m.version('modelaudit'))")"
+          INSTALLED_VERSION="$(
+            /tmp/modelaudit-wheel-smoke/bin/python -c "import importlib.metadata as m; print(m.version('modelaudit'))"
+          )"
           if [[ "$INSTALLED_VERSION" != "$EXPECTED_VERSION" ]]; then
             echo "ERROR: Wheel install version mismatch: expected $EXPECTED_VERSION, got $INSTALLED_VERSION"
             exit 1
           fi
 
           # Validate required project URLs in installed metadata.
-          python - <<'PY'
+          /tmp/modelaudit-wheel-smoke/bin/python - <<'PY'
           import importlib.metadata as md
 
           # Keep these expected URLs in sync with [project.urls] in pyproject.toml.
@@ -269,10 +269,18 @@ jobs:
           print("Project URL metadata validated.")
           PY
 
-          modelaudit --version
+          /tmp/modelaudit-wheel-smoke/bin/modelaudit --version
+
+          /tmp/modelaudit-wheel-smoke/bin/python - <<'PY'
+          import modelaudit_picklescan
+
+          report = modelaudit_picklescan.scan_bytes(b"\x80\x04}q\x00.")
+          assert report.status.value == "complete", report
+          print("modelaudit_picklescan import and scan smoke test passed.")
+          PY
 
           # Basic CLI smoke run from the installed wheel.
-          python - <<'PY'
+          /tmp/modelaudit-wheel-smoke/bin/python - <<'PY'
           import pathlib
           import pickle
           import subprocess
@@ -285,7 +293,7 @@ jobs:
                   pickle.dump({"smoke": True}, f)
 
               completed = subprocess.run(
-                  ["modelaudit", str(test_file), "--format", "json"],
+                  ["/tmp/modelaudit-wheel-smoke/bin/modelaudit", str(test_file), "--format", "json"],
                   capture_output=True,
                   text=True,
                   check=False,
@@ -309,22 +317,30 @@ jobs:
           fi
           SDIST_ARTIFACT="${sdist_artifacts[0]}"
 
-          python -m venv /tmp/modelaudit-sdist-smoke
-          source /tmp/modelaudit-sdist-smoke/bin/activate
+          uv venv /tmp/modelaudit-sdist-smoke
 
-          python -m pip install --upgrade pip
-          python -m pip install "${SDIST_ARTIFACT}"
+          uv pip install --python /tmp/modelaudit-sdist-smoke/bin/python "${SDIST_ARTIFACT}"
 
-          INSTALLED_VERSION="$(python -c "import importlib.metadata as m; print(m.version('modelaudit'))")"
+          INSTALLED_VERSION="$(
+            /tmp/modelaudit-sdist-smoke/bin/python -c "import importlib.metadata as m; print(m.version('modelaudit'))"
+          )"
           if [[ "$INSTALLED_VERSION" != "$EXPECTED_VERSION" ]]; then
             echo "ERROR: sdist install version mismatch: expected $EXPECTED_VERSION, got $INSTALLED_VERSION"
             exit 1
           fi
 
-          modelaudit --version
+          /tmp/modelaudit-sdist-smoke/bin/modelaudit --version
+
+          /tmp/modelaudit-sdist-smoke/bin/python - <<'PY'
+          import modelaudit_picklescan
+
+          report = modelaudit_picklescan.scan_bytes(b"\x80\x04}q\x00.")
+          assert report.status.value == "complete", report
+          print("modelaudit_picklescan import and scan smoke test passed.")
+          PY
 
           # Basic CLI smoke run from the installed sdist.
-          python - <<'PY'
+          /tmp/modelaudit-sdist-smoke/bin/python - <<'PY'
           import pathlib
           import pickle
           import subprocess
@@ -337,7 +353,7 @@ jobs:
                   pickle.dump({"smoke": True}, f)
 
               completed = subprocess.run(
-                  ["modelaudit", str(test_file), "--format", "json"],
+                  ["/tmp/modelaudit-sdist-smoke/bin/modelaudit", str(test_file), "--format", "json"],
                   capture_output=True,
                   text=True,
                   check=False,

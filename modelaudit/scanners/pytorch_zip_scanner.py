@@ -11,9 +11,15 @@ import zipfile
 from collections.abc import Callable
 from typing import Any, ClassVar
 
+from modelaudit_picklescan import PickleScanner as StandalonePickleScanner
+
 from ..utils import sanitize_archive_path
 from .base import BaseScanner, IssueSeverity, ScanResult
-from .pickle_scanner import PickleScanner
+from .picklescan_adapter import (
+    apply_pickle_member_context,
+    pickle_report_to_scan_result,
+    scan_options_from_config,
+)
 
 logger = logging.getLogger(__name__)
 _INSTALLED_PYTORCH_VERSION_UNSET = object()
@@ -65,7 +71,7 @@ class PyTorchZipScanner(BaseScanner):
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
         # Initialize a pickle scanner for embedded pickles
-        self.pickle_scanner: PickleScanner = PickleScanner(config)
+        self.pickle_scanner = StandalonePickleScanner(options=scan_options_from_config(self.config))
         self.current_file_path = ""  # Will be set when scanning files
         self._relaxed_crc_reads: dict[str, set[str]] = {}
         self._relaxed_crc_check_indices: dict[str, tuple[int, int]] = {}
@@ -643,12 +649,10 @@ class PyTorchZipScanner(BaseScanner):
             info = zip_file.getinfo(name)
             pickle_data_size = info.file_size
 
-            # Set the current file path on the pickle scanner for proper error reporting
-            self.pickle_scanner.current_file_path = f"{path}:{name}"
-
             # Choose scanning approach based on file size with spooling for seekability
             cfg = self.config or {}
             max_in_mem = int(cfg.get("pickle_max_memory_read", 32 * 1024 * 1024))  # 32MB default
+            pickle_source = f"{path}:{name}"
             if pickle_data_size <= max_in_mem:
                 data = self._read_member_bytes(
                     zip_file,
@@ -658,9 +662,11 @@ class PyTorchZipScanner(BaseScanner):
                 )
                 bytes_scanned += len(data)
                 with io.BytesIO(data) as file_like:
-                    # IMPORTANT: Pass original ZIP file size, not pickle data size
-                    # This enables proper density-based CVE detection
-                    sub_result = self.pickle_scanner._scan_pickle_bytes(file_like, original_file_size)
+                    pickle_report = self.pickle_scanner.scan_stream(
+                        file_like,
+                        source=pickle_source,
+                        size=len(data),
+                    )
             else:
                 # Stream to a spooled temp file to avoid OOM and provide seek()
                 with self._read_member_to_spooled_file(
@@ -671,27 +677,21 @@ class PyTorchZipScanner(BaseScanner):
                     max_size=max_in_mem,
                 )[0] as spool:
                     spool.seek(0, io.SEEK_END)
-                    bytes_scanned += spool.tell()
+                    member_size = spool.tell()
+                    bytes_scanned += member_size
                     spool.seek(0)
-                    # IMPORTANT: Pass original ZIP file size, not pickle data size
-                    # This enables proper density-based CVE detection
-                    sub_result = self.pickle_scanner._scan_pickle_bytes(
+                    pickle_report = self.pickle_scanner.scan_stream(
                         spool,  # type: ignore[arg-type]
-                        original_file_size,
+                        source=pickle_source,
+                        size=member_size,
                     )
-
-            # Update issue metadata and locations
-            for issue in sub_result.issues:
-                if issue.details:
-                    issue.details["pickle_filename"] = name
-                else:
-                    issue.details = {"pickle_filename": name}
-
-                # Update location to include the main file path
-                if not issue.location:
-                    issue.location = f"{path}:{name}"
-                elif "pos" in issue.location:
-                    issue.location = f"{path}:{name} {issue.location}"
+            sub_result = pickle_report_to_scan_result(
+                pickle_report,
+                scanner_name="pickle",
+                scanner=self,
+            )
+            sub_result.metadata.setdefault("archive_file_size", original_file_size)
+            apply_pickle_member_context(sub_result, archive_path=path, member_name=name)
 
             # Add CVE-2025-32434 specific warnings
             self._add_weights_only_safety_warnings(sub_result, result, path, name)

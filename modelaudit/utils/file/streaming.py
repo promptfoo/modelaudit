@@ -86,6 +86,7 @@ def stream_analyze_file(
 
         if scan_result is None:
             partial_methods = [
+                ("scan_stream", True),
                 ("scan_bytes", False),
                 ("scan_fileobj", False),
                 ("_scan_pickle_bytes", True),

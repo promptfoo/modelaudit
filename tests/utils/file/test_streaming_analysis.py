@@ -16,7 +16,7 @@ def test_stream_analyze_file_uses_scanner(tmp_path, monkeypatch):
 
     called: dict[str, bool] = {"called": False}
 
-    def fake_scan_pickle_bytes(self, file_obj, size):
+    def fake_scan_stream(self, file_obj, size):
         called["called"] = True
         result = ScanResult(scanner_name=self.name)
         result.add_check(
@@ -27,7 +27,7 @@ def test_stream_analyze_file_uses_scanner(tmp_path, monkeypatch):
         result.finish(success=True)
         return result
 
-    monkeypatch.setattr(PickleScanner, "_scan_pickle_bytes", fake_scan_pickle_bytes)
+    monkeypatch.setattr(PickleScanner, "scan_stream", fake_scan_stream)
 
     scanner = PickleScanner()
     result, was_complete = streaming.stream_analyze_file(url, scanner)
@@ -49,7 +49,7 @@ def test_stream_analyze_file_falls_back_to_bytes_to_read(tmp_path, monkeypatch):
 
     called: dict[str, bool] = {"called": False}
 
-    def fake_scan_pickle_bytes(self, file_obj, size):
+    def fake_scan_stream(self, file_obj, size):
         called["called"] = True
         result = ScanResult(scanner_name=self.name)
         result.add_check(
@@ -58,7 +58,7 @@ def test_stream_analyze_file_falls_back_to_bytes_to_read(tmp_path, monkeypatch):
         result.finish(success=True)
         return result
 
-    monkeypatch.setattr(PickleScanner, "_scan_pickle_bytes", fake_scan_pickle_bytes)
+    monkeypatch.setattr(PickleScanner, "scan_stream", fake_scan_stream)
 
     scanner = PickleScanner()
     result, was_complete = streaming.stream_analyze_file(url, scanner, max_bytes=4)

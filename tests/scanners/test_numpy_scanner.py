@@ -323,9 +323,14 @@ def test_truncated_npy_fails_safely(tmp_path: Path) -> None:
     result = scanner.scan(str(path))
 
     assert result.success is True
-    assert result.has_errors is False
+    assert result.has_errors is True
+    assert any("exec" in i.message.lower() and i.severity == IssueSeverity.CRITICAL for i in result.issues)
     assert any(
-        i.severity in {IssueSeverity.INFO, IssueSeverity.WARNING} and "corrupted pickle" in i.message.lower()
+        i.severity in {IssueSeverity.INFO, IssueSeverity.WARNING}
+        and (
+            "corrupted pickle" in i.message.lower()
+            or "pickle parsing stopped before the stream was fully consumed" in i.message.lower()
+        )
         for i in result.issues
     ), f"Expected a non-critical corruption finding, got: {[i.message for i in result.issues]}"
 
