@@ -319,7 +319,7 @@ def _read_zip_member_text(
     try:
         data = _read_zip_member_bounded(archive, member_info, max_bytes)
         return data.decode("utf-8", errors="strict").strip()
-    except (OSError, UnicodeDecodeError, ValueError):
+    except (OSError, RuntimeError, UnicodeDecodeError, ValueError):
         return None
 
 
@@ -366,6 +366,7 @@ def is_torchserve_mar_archive(path: str) -> bool:
             return _looks_like_torchserve_manifest(manifest_data)
     except (
         OSError,
+        RuntimeError,
         ValueError,
         UnicodeDecodeError,
         json.JSONDecodeError,
@@ -408,11 +409,11 @@ def is_keras_zip_archive(path: str, *, allow_config_only: bool = False) -> bool:
 
             try:
                 config_data = json.loads(_read_zip_member_bounded(archive, config_info, _KERAS_ZIP_CONFIG_MAX_BYTES))
-            except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+            except (RuntimeError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
                 return False
 
             return _looks_like_keras_config(config_data)
-    except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile):
+    except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile):
         return False
 
 
@@ -440,7 +441,7 @@ def is_pytorch_zip_archive(path: str) -> bool:
 
                 if _looks_like_pytorch_zip_metadata(archive, prefix):
                     return True
-    except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile):
+    except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile):
         return False
 
     return False
@@ -476,7 +477,7 @@ def is_executorch_archive(path: str) -> bool:
                 version_text = _read_zip_member_text(archive, version_info, _PYTORCH_ZIP_METADATA_MAX_BYTES)
                 if version_text is not None and re.fullmatch(r"\d+(?:\.\d+)?", version_text):
                     return True
-    except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile):
+    except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile):
         return False
 
     return False
@@ -500,12 +501,12 @@ def is_skops_archive(path: str) -> bool:
 
                 try:
                     schema_data = json.loads(_read_zip_member_bounded(archive, info, _SKOPS_SCHEMA_MAX_BYTES))
-                except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+                except (RuntimeError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
                     continue
 
                 if _looks_like_skops_schema(schema_data):
                     return True
-    except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile):
+    except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile):
         return False
 
     return False

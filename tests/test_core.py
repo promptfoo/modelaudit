@@ -30,6 +30,21 @@ def _create_misnamed_zip(path: Path, entries: dict[str, bytes]) -> None:
             archive.writestr(name, data)
 
 
+def _mark_zip_entries_encrypted(path: Path) -> None:
+    """Set the ZIP encryption flag on all entries without changing payload bytes."""
+    archive_bytes = bytearray(path.read_bytes())
+    for signature, flag_offset in ((b"PK\x03\x04", 6), (b"PK\x01\x02", 8)):
+        offset = 0
+        while True:
+            offset = archive_bytes.find(signature, offset)
+            if offset < 0:
+                break
+            flags = int.from_bytes(archive_bytes[offset + flag_offset : offset + flag_offset + 2], "little")
+            archive_bytes[offset + flag_offset : offset + flag_offset + 2] = (flags | 0x1).to_bytes(2, "little")
+            offset += len(signature)
+    path.write_bytes(archive_bytes)
+
+
 def test_scan_file_detects_malicious_zip_with_misleading_extension(tmp_path: Path) -> None:
     disguised_zip = tmp_path / "payload.jpg"
     _create_misnamed_zip(disguised_zip, {"payload.pkl": _build_malicious_pickle()})
@@ -94,6 +109,30 @@ def test_scan_file_does_not_route_near_match_schema_zip_to_skops(tmp_path: Path)
 
     assert result.scanner_name == "zip"
     assert not any("CVE-2025-" in check.name for check in result.checks)
+
+
+def test_scan_file_handles_encrypted_skops_schema_without_routing_crash(tmp_path: Path) -> None:
+    disguised_zip = tmp_path / "encrypted-schema.jpg"
+    _create_misnamed_zip(
+        disguised_zip,
+        {
+            "schema.json": json.dumps(
+                {
+                    "__class__": "Pipeline",
+                    "__module__": "sklearn.pipeline",
+                    "__loader__": "ObjectNode",
+                    "_skops_version": "0.12.0",
+                    "content": {},
+                }
+            ).encode("utf-8"),
+        },
+    )
+    _mark_zip_entries_encrypted(disguised_zip)
+
+    result = scan_file(str(disguised_zip))
+
+    assert result.scanner_name == "zip"
+    assert any("encrypted" in check.message.lower() for check in result.checks)
 
 
 def test_scan_file_scans_clean_skops_without_nested_false_positives(tmp_path: Path) -> None:
