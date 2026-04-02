@@ -140,6 +140,49 @@ def test_scan_file_routes_misnamed_config_only_keras_zip_by_content(tmp_path: Pa
     assert any("lambda" in issue.message.lower() for issue in result.issues)
 
 
+def test_scan_file_routes_misnamed_oversized_config_only_keras_zip_by_content(tmp_path: Path) -> None:
+    disguised_keras = tmp_path / "model.jpg"
+    malicious_code = "exec(\"print('Malicious!')\")"
+    encoded_code = base64.b64encode(malicious_code.encode()).decode()
+    config = {
+        "class_name": "Functional",
+        "config": {
+            "layers": [
+                {"class_name": "InputLayer", "name": "input_1", "config": {}},
+                {
+                    "class_name": "Lambda",
+                    "name": "lambda_1",
+                    "config": {"function": [encoded_code, None, None], "function_type": "lambda"},
+                },
+            ]
+        },
+        "padding": "A" * (5 * 1024 * 1024),
+    }
+    with zipfile.ZipFile(disguised_keras, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("config.json", json.dumps(config))
+
+    result = scan_file(str(disguised_keras))
+
+    assert result.scanner_name == "keras_zip"
+    assert any("lambda" in issue.message.lower() for issue in result.issues)
+
+
+def test_scan_file_does_not_route_misnamed_oversized_generic_config_to_keras(tmp_path: Path) -> None:
+    disguised_zip = tmp_path / "repo.jpg"
+    generic_config = {
+        "model_type": "bert",
+        "architectures": ["BertModel"],
+        "padding": "A" * (5 * 1024 * 1024),
+    }
+    with zipfile.ZipFile(disguised_zip, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("config.json", json.dumps(generic_config))
+
+    result = scan_file(str(disguised_zip))
+
+    assert result.scanner_name == "zip"
+    assert not any(check.name.startswith("Keras ZIP") for check in result.checks)
+
+
 def test_scan_file_recursively_scans_embedded_pickle_in_content_routed_keras_zip(tmp_path: Path) -> None:
     disguised_keras = tmp_path / "model.jpg"
     _create_misnamed_zip(

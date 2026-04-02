@@ -61,8 +61,14 @@ _TORCHSERVE_MANIFEST_MAX_BYTES = 1 * 1024 * 1024
 _KERAS_ZIP_REQUIRED_ENTRY = "config.json"
 _KERAS_ZIP_MARKERS = frozenset({"metadata.json", "model.weights.h5", "variables.h5"})
 _KERAS_ZIP_CONFIG_MAX_BYTES = 4 * 1024 * 1024
+_KERAS_ZIP_CONFIG_PREFIX_MAX_BYTES = 256 * 1024
 _KERAS_MODEL_CONFIG_KEYS = frozenset({"layers", "input_layers", "output_layers"})
 _KERAS_MODEL_TOP_LEVEL_HINTS = frozenset({"build_config", "compile_config", "module", "registered_name"})
+_KERAS_CONFIG_PREFIX_CLASS_NAME_RE = re.compile(r'"class_name"\s*:\s*"[^"\\]+"')
+_KERAS_CONFIG_PREFIX_CONFIG_OBJECT_RE = re.compile(r'"config"\s*:\s*\{')
+_KERAS_CONFIG_PREFIX_HINT_RE = re.compile(
+    r'"(?:layers|input_layers|output_layers|build_config|compile_config|module|registered_name)"\s*:'
+)
 _PYTORCH_ZIP_METADATA_MAX_BYTES = 64
 _COMPRESSED_EXTENSION_CODECS = {
     ".gz": "gzip",
@@ -234,6 +240,16 @@ def _read_zip_member_bounded(
     return bytes(data)
 
 
+def _read_zip_member_prefix(
+    archive: zipfile.ZipFile,
+    member_info: zipfile.ZipInfo,
+    max_bytes: int,
+) -> bytes:
+    """Read only a bounded prefix from a ZIP member."""
+    with archive.open(member_info, "r") as handle:
+        return handle.read(max_bytes)
+
+
 def _coerce_manifest_string_list(value: object) -> list[str]:
     """Collect non-empty string values from manifest fields."""
     if isinstance(value, str):
@@ -285,6 +301,20 @@ def _looks_like_keras_config(config_data: object) -> bool:
         return True
 
     return any(key in config_data for key in _KERAS_MODEL_TOP_LEVEL_HINTS)
+
+
+def _looks_like_keras_config_prefix(config_prefix: bytes) -> bool:
+    """Best-effort Keras config sniffing for oversized JSON members."""
+    try:
+        config_text = config_prefix.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return False
+
+    return (
+        bool(_KERAS_CONFIG_PREFIX_CLASS_NAME_RE.search(config_text))
+        and bool(_KERAS_CONFIG_PREFIX_CONFIG_OBJECT_RE.search(config_text))
+        and bool(_KERAS_CONFIG_PREFIX_HINT_RE.search(config_text))
+    )
 
 
 def _read_zip_member_text(
@@ -386,6 +416,13 @@ def is_keras_zip_archive(path: str, *, allow_config_only: bool = False) -> bool:
             try:
                 config_data = json.loads(_read_zip_member_bounded(archive, config_info, _KERAS_ZIP_CONFIG_MAX_BYTES))
             except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+                if config_info.file_size > _KERAS_ZIP_CONFIG_MAX_BYTES:
+                    config_prefix = _read_zip_member_prefix(
+                        archive,
+                        config_info,
+                        _KERAS_ZIP_CONFIG_PREFIX_MAX_BYTES,
+                    )
+                    return _looks_like_keras_config_prefix(config_prefix)
                 return False
 
             return _looks_like_keras_config(config_data)
