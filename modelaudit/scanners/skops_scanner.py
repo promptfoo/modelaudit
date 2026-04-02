@@ -358,6 +358,18 @@ class SkopsScanner(BaseScanner):
                 ),
             )
 
+    def _scan_archive_members(self, path: str, result: ScanResult) -> None:
+        """Recursively scan embedded archive members through the generic ZIP pipeline."""
+        from .zip_scanner import ZipScanner
+
+        zip_scanner = ZipScanner(config=self.config)
+        result.merge(
+            zip_scanner._scan_zip_file(
+                path,
+                depth=max(zip_scanner._get_archive_depth(), zip_scanner._get_zip_depth()),
+            )
+        )
+
     def scan(self, path: str) -> ScanResult:
         """Scan a skops file for security vulnerabilities."""
         # Perform standard path checks
@@ -452,6 +464,9 @@ class SkopsScanner(BaseScanner):
 
                 # Check for unsafe joblib fallback
                 self._check_unsafe_joblib_fallback(zip_file, result, path)
+
+                # Recursively scan embedded members with the broader scanner suite.
+                self._scan_archive_members(path, result)
 
                 # Add file integrity check
                 self.add_file_integrity_check(path, result)
