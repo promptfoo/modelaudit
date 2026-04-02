@@ -72,6 +72,42 @@ class TestZipScanner:
         finally:
             os.unlink(tmp_path)
 
+    def test_duplicate_symlink_names_validate_current_entry_target(self, tmp_path: Path) -> None:
+        """Duplicate symlink entries should validate each ZipInfo target, not the last name alias."""
+        import stat
+
+        archive_path = tmp_path / "duplicate_symlink.zip"
+        with zipfile.ZipFile(archive_path, "w") as zf:
+            first_info = zipfile.ZipInfo("link.txt")
+            first_info.create_system = 3
+            first_info.external_attr = (stat.S_IFLNK | 0o777) << 16
+            zf.writestr(first_info, "/etc/passwd")
+
+            second_info = zipfile.ZipInfo("link.txt")
+            second_info.create_system = 3
+            second_info.external_attr = (stat.S_IFLNK | 0o777) << 16
+            zf.writestr(second_info, "safe-target.txt")
+
+        result = self.scanner.scan(str(archive_path))
+
+        failed_symlink_checks = [
+            check
+            for check in result.checks
+            if check.name == "Symlink Safety Validation" and check.status == CheckStatus.FAILED
+        ]
+        assert len(failed_symlink_checks) == 1
+        assert failed_symlink_checks[0].details == {
+            "entry": "link.txt",
+            "target": "/etc/passwd",
+        }
+        assert any(
+            issue.rule_code == "S406"
+            and issue.details.get("entry") == "link.txt"
+            and issue.details.get("target") == "/etc/passwd"
+            and "critical system path" in issue.message.lower()
+            for issue in result.issues
+        )
+
     def test_zip_bytes_scanned_single_count(self):
         """Ensure bytes scanned equals the sum of embedded files once."""
         with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:

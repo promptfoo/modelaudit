@@ -3,6 +3,7 @@ import gzip
 import importlib
 import io
 import lzma
+import pickle
 import struct
 import tarfile
 import zipfile
@@ -13,6 +14,7 @@ from typing import cast
 import pytest
 
 from modelaudit.utils.file.detection import (
+    PROTO0_1_MAX_PROBE_BYTES,
     detect_file_format,
     detect_file_format_from_magic,
     detect_format_from_extension,
@@ -386,6 +388,65 @@ def test_detect_file_format_proto1_binint1_pop_prefixed_pickle(tmp_path: Path) -
     assert detect_file_format_from_magic(str(payload)) == "pickle"
 
 
+def test_detect_file_format_prefixed_proto0_pickle_with_trailing_junk(tmp_path: Path) -> None:
+    """Valid pickle streams with trivial prefixes stay detectable when junk follows STOP."""
+    pickle_stream = b'(l0cos\nsystem\n(S"echo pwned"\ntR.JUNK'
+    payload = tmp_path / "prefixed-proto0-trailing-junk.dat"
+    payload.write_bytes(pickle_stream)
+
+    assert detect_file_format(str(payload)) == "pickle"
+    assert detect_file_format_from_magic(str(payload)) == "pickle"
+
+
+def test_detect_file_format_opcode_budget_padded_proto0_pickle(tmp_path: Path) -> None:
+    """Large balanced trivial prefixes should not hide a later dangerous opcode."""
+    pickle_stream = b"I0\n0" * 5000 + b'cos\nsystem\n(S"echo pwned"\ntR.'
+    payload = tmp_path / "opcode-budget-padded-proto0-pickle.dat"
+    payload.write_bytes(pickle_stream)
+
+    assert detect_file_format(str(payload)) == "pickle"
+    assert detect_file_format_from_magic(str(payload)) == "pickle"
+
+
+def test_detect_file_format_probe_boundary_prefixed_proto0_pickle(tmp_path: Path) -> None:
+    """A valid pickle stream should stay detectable when STOP lands beyond the probe window."""
+    pickle_stream = b"(t0" + b"I0\n0" * (PROTO0_1_MAX_PROBE_BYTES // 4 + 1) + b'cos\nsystem\n(S"echo pwned"\ntR.'
+    payload = tmp_path / "probe-boundary-prefixed-proto0-pickle.dat"
+    payload.write_bytes(pickle_stream)
+
+    assert detect_file_format(str(payload)) == "pickle"
+    assert detect_file_format_from_magic(str(payload)) == "pickle"
+
+
+def test_detect_file_format_trivial_probe_boundary_prefix_not_pickle(tmp_path: Path) -> None:
+    """Large no-STOP scalar opcode prefixes should not be treated as pickle by themselves."""
+    payload = tmp_path / "probe-boundary-trivial-prefix-notes.txt"
+    payload.write_bytes(b"I0\n0" * (PROTO0_1_MAX_PROBE_BYTES // 4 + 1))
+
+    assert detect_file_format(str(payload)) != "pickle"
+    assert detect_file_format_from_magic(str(payload)) != "pickle"
+
+
+def test_detect_file_format_exact_probe_boundary_prefix_without_stop_not_pickle(tmp_path: Path) -> None:
+    """Exact-size malformed prefixes without STOP should not become pickle positives."""
+    payload = tmp_path / "probe-boundary-prefix-without-stop.dat"
+    payload.write_bytes(b"I0\n0" * (PROTO0_1_MAX_PROBE_BYTES // 4))
+
+    assert detect_file_format(str(payload)) != "pickle"
+    assert detect_file_format_from_magic(str(payload)) != "pickle"
+
+
+def test_detect_file_format_safe_proto1_pickle_with_trailing_junk_still_loads(tmp_path: Path) -> None:
+    """Python ignores junk after STOP, so the probe should still classify these streams as pickle."""
+    pickle_stream = pickle.dumps({"safe": 1}, protocol=1) + b"JUNK"
+    payload = tmp_path / "safe-proto1-trailing-junk.dat"
+    payload.write_bytes(pickle_stream)
+
+    assert pickle.loads(pickle_stream) == {"safe": 1}
+    assert detect_file_format(str(payload)) == "pickle"
+    assert detect_file_format_from_magic(str(payload)) == "pickle"
+
+
 def test_detect_file_format_plain_text_global_prefix_not_pickle(tmp_path: Path) -> None:
     """Plain text that begins with GLOBAL-like bytes should not be treated as pickle."""
     payload = tmp_path / "notes.txt"
@@ -417,6 +478,15 @@ def test_detect_file_format_empty_tuple_with_trailing_text_not_pickle(tmp_path: 
     """A trivial tuple pickle prefix with trailing text should not force pickle detection."""
     payload = tmp_path / "empty-tuple-prefixed-notes.txt"
     payload.write_bytes(b").trailing text")
+
+    assert detect_file_format(str(payload)) != "pickle"
+    assert detect_file_format_from_magic(str(payload)) != "pickle"
+
+
+def test_detect_file_format_list_prefix_with_trailing_text_not_pickle(tmp_path: Path) -> None:
+    """A trivial list preamble followed by plain text should remain a non-pickle near-match."""
+    payload = tmp_path / "list-prefixed-notes.txt"
+    payload.write_bytes(b"(l0.not a pickle stream")
 
     assert detect_file_format(str(payload)) != "pickle"
     assert detect_file_format_from_magic(str(payload)) != "pickle"

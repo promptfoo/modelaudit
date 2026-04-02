@@ -208,7 +208,7 @@ class ZipScanner(BaseScanner):
 
         with zipfile.ZipFile(path, "r") as z:
             # Check number of entries
-            entry_count = len(z.namelist())
+            entry_count = len(z.infolist())
             if entry_count > self.max_entries:
                 result.add_check(
                     name="Entry Count Limit Check",
@@ -236,8 +236,10 @@ class ZipScanner(BaseScanner):
                     rule_code=None,  # Passing check
                 )
             # Scan each file in the archive
-            for name in z.namelist():
-                info = z.getinfo(name)
+            for info in z.infolist():
+                name = info.filename
+                if not name:
+                    continue
 
                 temp_base = os.path.join(tempfile.gettempdir(), "extract")
                 resolved_name, is_safe = sanitize_archive_path(name, temp_base)
@@ -256,7 +258,7 @@ class ZipScanner(BaseScanner):
                 is_symlink = (info.external_attr >> 16) & 0o170000 == stat.S_IFLNK
                 if is_symlink:
                     try:
-                        target = z.read(name).decode("utf-8", "replace")
+                        target = z.read(info).decode("utf-8", "replace")
                     except Exception:
                         target = ""
                     target_base = os.path.dirname(resolved_name)
@@ -302,7 +304,7 @@ class ZipScanner(BaseScanner):
                     continue
 
                 # Skip directories
-                if name.endswith("/"):
+                if info.is_dir():
                     continue
 
                 # Check compression ratio for zip bomb detection
@@ -364,7 +366,7 @@ class ZipScanner(BaseScanner):
                     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
                         tmp_path = tmp.name
                         total_size = 0
-                        with z.open(name) as entry:
+                        with z.open(info) as entry:
                             while True:
                                 chunk = entry.read(4096)
                                 if not chunk:

@@ -28,6 +28,7 @@ from ..config.explanations import (
     get_cve_2026_1669_explanation,
     get_pattern_explanation,
 )
+from ..utils.file.detection import _normalize_archive_member_name, _read_zip_member_bounded
 from .base import BaseScanner, IssueSeverity, ScanResult
 from .keras_utils import (
     check_lambda_dict_function,
@@ -85,6 +86,11 @@ _GET_FILE_PATTERN = re.compile(r"get_file", re.IGNORECASE)
 _URL_PATTERN = re.compile(r"https?://", re.IGNORECASE)
 _URL_SCHEME_PATTERN = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
 _WINDOWS_ABSOLUTE_PATH_PATTERN = re.compile(r"^(?:[a-zA-Z]:[\\/]|\\\\)")
+_KERAS_CONFIG_ENTRY = "config.json"
+_KERAS_CONFIG_MAX_BYTES = 10 * 1024 * 1024
+_KERAS_METADATA_ENTRY = "metadata.json"
+_KERAS_METADATA_MAX_BYTES = 10 * 1024 * 1024
+_KERAS_WEIGHTS_ENTRY = "model.weights.h5"
 
 try:
     import h5py
@@ -100,6 +106,18 @@ class _EmbeddedWeightsLimitExceeded(Exception):
     def __init__(self, message: str, extracted_bytes: int) -> None:
         super().__init__(message)
         self.extracted_bytes = extracted_bytes
+
+
+class _AmbiguousKerasArchiveMemberError(Exception):
+    """Raised when multiple non-canonical members normalize to the same Keras root path."""
+
+    def __init__(self, member_name: str, candidate_filenames: list[str]) -> None:
+        super().__init__(
+            f"Ambiguous Keras ZIP member '{member_name}' matches multiple archive entries: "
+            f"{', '.join(candidate_filenames)}"
+        )
+        self.member_name = member_name
+        self.candidate_filenames = candidate_filenames
 
 
 class KerasZipScanner(BaseScanner):
@@ -207,6 +225,65 @@ class KerasZipScanner(BaseScanner):
         except Exception:
             return False
 
+    @staticmethod
+    def _get_archive_member_info(
+        archive: zipfile.ZipFile,
+        member_name: str,
+    ) -> zipfile.ZipInfo | None:
+        """Return a canonical ZIP member deterministically by normalized archive-relative name."""
+        exact_info = archive.NameToInfo.get(member_name)
+        if exact_info is not None and exact_info.filename and not exact_info.is_dir():
+            return exact_info
+
+        normalized_matches: list[zipfile.ZipInfo] = []
+        for info in archive.infolist():
+            if not info.filename or info.is_dir():
+                continue
+            if _normalize_archive_member_name(info.filename) == member_name:
+                normalized_matches.append(info)
+
+        if len(normalized_matches) > 1:
+            raise _AmbiguousKerasArchiveMemberError(
+                member_name,
+                [info.filename for info in normalized_matches],
+            )
+
+        return normalized_matches[0] if normalized_matches else None
+
+    def _get_recursive_archive_scan_config(self) -> dict[str, Any]:
+        """Return a ZIP scanner config with an explicit bounded per-member extraction limit."""
+        recursive_config = dict(self.config)
+        member_size_limits = [self.max_embedded_weights_bytes]
+        for config_key in ("max_file_size", "max_entry_size"):
+            configured_limit = self._normalize_positive_int_config(
+                recursive_config.get(config_key),
+                0,
+            )
+            if configured_limit > 0:
+                member_size_limits.append(configured_limit)
+
+        recursive_member_size_limit = min(member_size_limits)
+        recursive_config["max_file_size"] = recursive_member_size_limit
+        recursive_config["max_entry_size"] = recursive_member_size_limit
+        return recursive_config
+
+    def _merge_recursive_archive_scan(self, path: str, result: ScanResult) -> None:
+        """Recursively scan every ZIP member through the generic archive scanner."""
+        from .zip_scanner import ZipScanner
+
+        zip_scanner = ZipScanner(self._get_recursive_archive_scan_config())
+        nested_result = zip_scanner._scan_zip_file(
+            path,
+            depth=max(zip_scanner._get_archive_depth(), zip_scanner._get_zip_depth()),
+        )
+        preserved_metadata = dict(result.metadata)
+        nested_contents = nested_result.metadata.get("contents")
+        result.merge(nested_result)
+        result.metadata.update(preserved_metadata)
+        if nested_contents is not None:
+            result.metadata["contents"] = nested_contents
+        result.success = result.success and nested_result.success
+
     def scan(self, path: str) -> ScanResult:
         """Scan a ZIP-based Keras model file for suspicious configurations"""
         # Initialize context for this file
@@ -235,8 +312,9 @@ class KerasZipScanner(BaseScanner):
             with zipfile.ZipFile(path, "r") as zf:
                 result.bytes_scanned = file_size
 
+                config_info = self._get_archive_member_info(zf, _KERAS_CONFIG_ENTRY)
                 # Check for config.json
-                if "config.json" not in zf.namelist():
+                if config_info is None:
                     result.add_check(
                         name="Keras ZIP Format Check",
                         passed=False,
@@ -245,29 +323,39 @@ class KerasZipScanner(BaseScanner):
                         location=path,
                         details={"files": zf.namelist()},
                     )
-                    result.finish(success=True)
+                    self._merge_recursive_archive_scan(path, result)
+                    result.finish(success=result.success)
                     return result
 
                 # Read and parse config.json
-                with zf.open("config.json") as config_file:
-                    config_data = config_file.read()
+                raw_config_text = ""
+                try:
+                    config_data = _read_zip_member_bounded(
+                        zf,
+                        config_info,
+                        _KERAS_CONFIG_MAX_BYTES,
+                    )
                     raw_config_text = config_data.decode("utf-8", errors="ignore")
-                    try:
-                        model_config = json.loads(config_data)
-                    except (json.JSONDecodeError, UnicodeDecodeError) as e:
-                        # Fall back to a structure-aware raw scan only when the archive
-                        # config is malformed and cannot be parsed as JSON.
+                    model_config = json.loads(config_data)
+                except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as e:
+                    # Fall back to a structure-aware raw scan only when the archive
+                    # config is malformed and cannot be parsed as JSON.
+                    if raw_config_text:
                         self._check_unsafe_deserialization_bypass_raw(raw_config_text, result)
-                        result.add_check(
-                            name="Config JSON Parsing",
-                            passed=False,
-                            message=f"Failed to parse config.json: {e}",
-                            severity=IssueSeverity.CRITICAL,
-                            location=f"{path}/config.json",
-                            details={"error": str(e)},
-                        )
-                        result.finish(success=False)
-                        return result
+                    result.add_check(
+                        name="Config JSON Parsing",
+                        passed=False,
+                        message=f"Failed to parse config.json: {e}",
+                        severity=IssueSeverity.CRITICAL,
+                        location=f"{path}/{config_info.filename}",
+                        details={
+                            "error": str(e),
+                            "max_config_bytes": _KERAS_CONFIG_MAX_BYTES,
+                        },
+                    )
+                    self._merge_recursive_archive_scan(path, result)
+                    result.finish(success=False)
+                    return result
 
                 # CVE-2025-8747: Check for structured get_file gadget usage
                 self._check_get_file_gadget(model_config, result)
@@ -275,17 +363,21 @@ class KerasZipScanner(BaseScanner):
                 self._check_unsafe_deserialization_bypass(model_config, result)
 
                 # Check for metadata.json
-                if "metadata.json" in zf.namelist():
-                    with zf.open("metadata.json") as metadata_file:
-                        metadata_data = metadata_file.read()
-                        try:
-                            metadata = json.loads(metadata_data)
-                            result.metadata["keras_metadata"] = metadata
-                            keras_version = metadata.get("keras_version")
-                            if isinstance(keras_version, str) and keras_version.strip():
-                                result.metadata["keras_version"] = keras_version.strip()
-                        except json.JSONDecodeError:
-                            pass  # Metadata parsing is optional
+                metadata_info = self._get_archive_member_info(zf, _KERAS_METADATA_ENTRY)
+                if metadata_info is not None:
+                    try:
+                        metadata_data = _read_zip_member_bounded(
+                            zf,
+                            metadata_info,
+                            _KERAS_METADATA_MAX_BYTES,
+                        )
+                        metadata = json.loads(metadata_data)
+                        result.metadata["keras_metadata"] = metadata
+                        keras_version = metadata.get("keras_version")
+                        if isinstance(keras_version, str) and keras_version.strip():
+                            result.metadata["keras_version"] = keras_version.strip()
+                    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+                        pass  # Metadata parsing is optional
 
                 self._check_embedded_hdf5_weights_external_references(zf, result)
 
@@ -314,6 +406,23 @@ class KerasZipScanner(BaseScanner):
                             details={"filename": filename},
                         )
 
+                self._merge_recursive_archive_scan(path, result)
+
+        except _AmbiguousKerasArchiveMemberError as e:
+            result.add_check(
+                name="Keras ZIP Member Path Validation",
+                passed=False,
+                message=str(e),
+                severity=IssueSeverity.CRITICAL,
+                location=path,
+                details={
+                    "member_name": e.member_name,
+                    "candidate_filenames": e.candidate_filenames,
+                },
+            )
+            self._merge_recursive_archive_scan(path, result)
+            result.finish(success=False)
+            return result
         except Exception as e:
             result.add_check(
                 name="Keras ZIP File Scan",
@@ -326,7 +435,7 @@ class KerasZipScanner(BaseScanner):
             result.finish(success=False)
             return result
 
-        result.finish(success=True)
+        result.finish(success=result.success)
         return result
 
     def _scan_model_config(self, model_config: dict[str, Any], result: ScanResult) -> None:
@@ -1042,11 +1151,15 @@ class KerasZipScanner(BaseScanner):
 
     def _check_embedded_hdf5_weights_external_references(self, archive: zipfile.ZipFile, result: ScanResult) -> None:
         """Detect CVE-2026-1669 external HDF5 references inside embedded .keras weights."""
-        if not HAS_H5PY or "model.weights.h5" not in archive.namelist():
+        if not HAS_H5PY:
             return
 
-        weights_info = archive.getinfo("model.weights.h5")
+        weights_info = self._get_archive_member_info(archive, _KERAS_WEIGHTS_ENTRY)
+        if weights_info is None:
+            return
+
         if weights_info.file_size > self.max_embedded_weights_bytes:
+            weights_entry = weights_info.filename
             result.add_check(
                 name="Embedded Weights Size Limit",
                 passed=False,
@@ -1055,9 +1168,9 @@ class KerasZipScanner(BaseScanner):
                     f"exceeds the configured size limit ({weights_info.file_size} > {self.max_embedded_weights_bytes})"
                 ),
                 severity=IssueSeverity.INFO,
-                location=f"{self.current_file_path}:model.weights.h5",
+                location=f"{self.current_file_path}:{weights_entry}",
                 details={
-                    "entry": "model.weights.h5",
+                    "entry": weights_entry,
                     "uncompressed_size": weights_info.file_size,
                     "compressed_size": weights_info.compress_size,
                     "max_embedded_weights_bytes": self.max_embedded_weights_bytes,
@@ -1092,14 +1205,15 @@ class KerasZipScanner(BaseScanner):
             with h5py.File(temp_path, "r") as h5_file:
                 findings = self._collect_hdf5_external_references(h5_file)
         except _EmbeddedWeightsLimitExceeded as exc:
+            weights_entry = weights_info.filename
             result.add_check(
                 name="Embedded Weights Size Limit",
                 passed=False,
                 message=str(exc),
                 severity=IssueSeverity.INFO,
-                location=f"{self.current_file_path}:model.weights.h5",
+                location=f"{self.current_file_path}:{weights_entry}",
                 details={
-                    "entry": "model.weights.h5",
+                    "entry": weights_entry,
                     "extracted_bytes": exc.extracted_bytes,
                     "uncompressed_size": weights_info.file_size,
                     "compressed_size": weights_info.compress_size,
@@ -1119,7 +1233,7 @@ class KerasZipScanner(BaseScanner):
             return
 
         keras_version = result.metadata.get("keras_version")
-        location = f"{self.current_file_path}:model.weights.h5"
+        location = f"{self.current_file_path}:{weights_info.filename}"
         details = {
             "cve_id": "CVE-2026-1669",
             "cvss": 8.1,

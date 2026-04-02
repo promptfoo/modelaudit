@@ -55,9 +55,7 @@ git checkout -b feat/your-feature-name  # or fix/, chore/, test/
 # Commit (conventional)
 git commit -m "feat: add scanner for XYZ format
 
-Description here.
-
-Co-Authored-By: Claude <noreply@anthropic.com>"
+Description here."
 
 # PR (after validation) - ALL changes go through PRs
 git push -u origin feat/your-feature-name
