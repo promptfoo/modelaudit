@@ -769,8 +769,9 @@ def test_post_budget_global_scan_runs_only_when_opcode_budget_is_exceeded(
         file_size: int,
         minimum_offset: int,
         ml_context: dict[str, object],
+        deadline: float | None = None,
     ) -> list[dict[str, object]]:
-        del self, _file_obj, file_size, minimum_offset, ml_context
+        del self, _file_obj, file_size, minimum_offset, ml_context, deadline
         call_counter["calls"] += 1
         return []
 
@@ -1429,8 +1430,9 @@ def test_post_budget_global_scan_runs_after_deadline_truncation(
         file_size: int,
         minimum_offset: int,
         ml_context: dict[str, object],
+        deadline: float | None = None,
     ) -> list[dict[str, object]]:
-        del self, _file_obj, file_size, minimum_offset, ml_context
+        del self, _file_obj, file_size, minimum_offset, ml_context, deadline
         call_counter["calls"] += 1
         return []
 
@@ -1453,6 +1455,76 @@ def test_invalid_post_budget_global_scan_limit_uses_default() -> None:
     scanner = PickleScanner({"post_budget_global_scan_limit_bytes": "not-an-int"})
 
     assert scanner.post_budget_global_scan_limit_bytes > 0
+
+
+def test_post_budget_global_scan_keeps_short_string_tail_state_bounded() -> None:
+    """Many tiny string opcodes must not grow tail-scan state beyond the lookback window."""
+    import tracemalloc
+
+    short_string_tail = b"\x8c\x00" * 200_000
+    raw_stack_global = short_string_tail + _short_binunicode(b"os") + _short_binunicode(b"system") + b"\x93"
+    scanner = PickleScanner({"post_budget_global_scan_limit_bytes": len(raw_stack_global)})
+
+    tracemalloc.start()
+    try:
+        findings = scanner._scan_global_references_unbounded(
+            BytesIO(raw_stack_global),
+            file_size=len(raw_stack_global),
+            minimum_offset=0,
+            ml_context={},
+        )
+        _current_bytes, peak_bytes = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert any(finding["import_reference"] == "os.system" for finding in findings)
+    assert peak_bytes < 16 * 1024 * 1024
+
+
+def test_post_budget_global_scan_reports_memo_tracking_cap(tmp_path: Path) -> None:
+    """Memo-heavy tails should fail closed once the bounded memo table starts evicting old entries."""
+    pickle_path = tmp_path / "post-budget-memo-cap.pkl"
+    benign_padding = _make_opcode_padding_stream(opcode_pairs=128)
+    memo_spray = b"\x8c\x00\x94" * 64
+    malicious_stream = _short_binunicode(b"os") + _short_binunicode(b"system") + b"\x93"
+    pickle_path.write_bytes(benign_padding + memo_spray + malicious_stream)
+
+    result = PickleScanner(
+        {
+            "max_opcodes": 64,
+            "post_budget_global_memo_limit_entries": 8,
+            "post_budget_global_scan_limit_bytes": len(benign_padding) + len(memo_spray) + len(malicious_stream),
+        }
+    ).scan(str(pickle_path))
+
+    memo_checks = [check for check in result.checks if check.name == "Post-Budget Global Memo Tracking Check"]
+    assert len(memo_checks) == 1
+    assert memo_checks[0].status == CheckStatus.FAILED
+    assert "post_budget_global_memo_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Post-Budget Global Reference Scan"
+        and check.status == CheckStatus.FAILED
+        and "os.system" in check.message
+        for check in result.checks
+    )
+    assert result.success is False
+
+
+def test_post_budget_global_scan_honors_tail_scan_deadline() -> None:
+    """The raw tail parser should stop when its own deadline expires."""
+    payload = b"\x8c\x00" * 8192 + _short_binunicode(b"os") + _short_binunicode(b"system") + b"\x93"
+    scanner = PickleScanner({"post_budget_global_scan_limit_bytes": len(payload)})
+
+    findings = scanner._scan_global_references_unbounded(
+        BytesIO(payload),
+        file_size=len(payload),
+        minimum_offset=0,
+        ml_context={},
+        deadline=0.0,
+    )
+
+    assert findings == []
+    assert scanner._post_budget_global_scan_deadline_exceeded is True
 
 
 class TestPickleScanner(unittest.TestCase):
