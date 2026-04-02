@@ -79,12 +79,12 @@ uv run mypy modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-p
 uv run pytest -n auto -m "not slow and not integration" --maxfail=1
 ```
 
-| Issue               | Fix                                                     |
-| ------------------- | ------------------------------------------------------- |
+| Issue               | Fix                                                                                                                             |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
 | Import organization | `uv run ruff check --fix --select I modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests tests/` |
 | Format issues       | `uv run ruff format modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests tests/`                 |
-| Type errors         | Fix manually, re-run `mypy`                             |
-| Test failures       | Check output, fix issues, re-run tests                  |
+| Type errors         | Fix manually, re-run `mypy`                                                                                                     |
+| Test failures       | Check output, fix issues, re-run tests                                                                                          |
 
 ## Dependency Management
 

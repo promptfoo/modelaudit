@@ -220,7 +220,7 @@ def _build_report() -> dict[str, Any]:
             adapter_delta = _classify_delta(label, legacy_result, adapter_result)
             comparisons.append(
                 {
-                    "path": str(path.relative_to(REPO_ROOT)),
+                    "path": path.relative_to(REPO_ROOT).as_posix(),
                     "label": label,
                     "package_delta": package_delta,
                     "adapter_delta": adapter_delta,

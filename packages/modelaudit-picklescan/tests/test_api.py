@@ -18,6 +18,8 @@ from modelaudit_picklescan import (
     scan_file,
 )
 
+SYSTEM_GLOBALS = frozenset({"nt.system", "os.system", "posix.system"})
+
 
 class MaliciousPayload:
     def __reduce__(self) -> tuple[object, tuple[str]]:
@@ -65,10 +67,13 @@ def test_scan_bytes_detects_reduce_invoking_os_system() -> None:
     assert report.has_security_findings is True
     assert any(finding.rule_code == "DANGEROUS_CALL" for finding in report.findings)
     assert not any(finding.rule_code == "DANGEROUS_GLOBAL" for finding in report.findings)
-    assert any("os.system" in finding.message or "posix.system" in finding.message for finding in report.findings)
-    assert any(finding.details.get("import_reference") in {"os.system", "posix.system"} for finding in report.findings)
     assert any(
-        ref["import_reference"] in {"os.system", "posix.system"} and ref["is_dangerous"] is True
+        any(symbol in finding.message for symbol in SYSTEM_GLOBALS)
+        for finding in report.findings
+    )
+    assert any(finding.details.get("import_reference") in SYSTEM_GLOBALS for finding in report.findings)
+    assert any(
+        ref["import_reference"] in SYSTEM_GLOBALS and ref["is_dangerous"] is True
         for ref in report.metadata["import_references"]
     )
 
