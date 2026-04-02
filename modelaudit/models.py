@@ -438,6 +438,7 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
 
         # Track scanner names (avoid duplicates)
         def _normalize_scanner_names(value: Any) -> list[str]:
+            """Coerce scanner metadata into a list of scanner names."""
             if value is None:
                 return []
             if isinstance(value, str):

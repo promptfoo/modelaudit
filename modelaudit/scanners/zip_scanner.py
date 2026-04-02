@@ -148,6 +148,7 @@ class ZipScanner(BaseScanner):
         archive_location = f"{archive_path}:{entry_name}"
 
         def _rewrite_archive_location(location: str | None) -> str:
+            """Map temp-file paths back to the archive member location."""
             if not location:
                 return archive_location
             if location.startswith(tmp_path):

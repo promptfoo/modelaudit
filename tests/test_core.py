@@ -15,16 +15,21 @@ from modelaudit.core import scan_file
 
 
 def _build_malicious_pickle() -> bytes:
+    """Build a tiny pickle payload that exercises nested dangerous-opcode scanning."""
     import os as os_module
 
     class DangerousPayload:
+        """Serializable payload that reduces to a shell command invocation."""
+
         def __reduce__(self) -> tuple[Any, tuple[str]]:
+            """Return a dangerous reducer target for scanner regression coverage."""
             return (os_module.system, ("echo core-dispatch-test",))
 
     return pickle.dumps(DangerousPayload())
 
 
 def _create_misnamed_zip(path: Path, entries: dict[str, bytes]) -> None:
+    """Write a ZIP archive at an intentionally misleading file path."""
     with zipfile.ZipFile(path, "w") as archive:
         for name, data in entries.items():
             archive.writestr(name, data)
