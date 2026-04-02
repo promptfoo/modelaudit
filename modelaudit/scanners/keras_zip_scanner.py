@@ -28,7 +28,7 @@ from ..config.explanations import (
     get_cve_2026_1669_explanation,
     get_pattern_explanation,
 )
-from ..utils.file.detection import _normalize_archive_member_name
+from ..utils.file.detection import _normalize_archive_member_name, _read_zip_member_bounded
 from .base import BaseScanner, IssueSeverity, ScanResult
 from .keras_utils import (
     check_lambda_dict_function,
@@ -87,7 +87,9 @@ _URL_PATTERN = re.compile(r"https?://", re.IGNORECASE)
 _URL_SCHEME_PATTERN = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
 _WINDOWS_ABSOLUTE_PATH_PATTERN = re.compile(r"^(?:[a-zA-Z]:[\\/]|\\\\)")
 _KERAS_CONFIG_ENTRY = "config.json"
+_KERAS_CONFIG_MAX_BYTES = 10 * 1024 * 1024
 _KERAS_METADATA_ENTRY = "metadata.json"
+_KERAS_METADATA_MAX_BYTES = 1 * 1024 * 1024
 _KERAS_WEIGHTS_ENTRY = "model.weights.h5"
 
 try:
@@ -326,26 +328,34 @@ class KerasZipScanner(BaseScanner):
                     return result
 
                 # Read and parse config.json
-                with zf.open(config_info, "r") as config_file:
-                    config_data = config_file.read()
+                raw_config_text = ""
+                try:
+                    config_data = _read_zip_member_bounded(
+                        zf,
+                        config_info,
+                        _KERAS_CONFIG_MAX_BYTES,
+                    )
                     raw_config_text = config_data.decode("utf-8", errors="ignore")
-                    try:
-                        model_config = json.loads(config_data)
-                    except (json.JSONDecodeError, UnicodeDecodeError) as e:
-                        # Fall back to a structure-aware raw scan only when the archive
-                        # config is malformed and cannot be parsed as JSON.
+                    model_config = json.loads(config_data)
+                except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as e:
+                    # Fall back to a structure-aware raw scan only when the archive
+                    # config is malformed and cannot be parsed as JSON.
+                    if raw_config_text:
                         self._check_unsafe_deserialization_bypass_raw(raw_config_text, result)
-                        result.add_check(
-                            name="Config JSON Parsing",
-                            passed=False,
-                            message=f"Failed to parse config.json: {e}",
-                            severity=IssueSeverity.CRITICAL,
-                            location=f"{path}/{config_info.filename}",
-                            details={"error": str(e)},
-                        )
-                        self._merge_recursive_archive_scan(path, result)
-                        result.finish(success=False)
-                        return result
+                    result.add_check(
+                        name="Config JSON Parsing",
+                        passed=False,
+                        message=f"Failed to parse config.json: {e}",
+                        severity=IssueSeverity.CRITICAL,
+                        location=f"{path}/{config_info.filename}",
+                        details={
+                            "error": str(e),
+                            "max_config_bytes": _KERAS_CONFIG_MAX_BYTES,
+                        },
+                    )
+                    self._merge_recursive_archive_scan(path, result)
+                    result.finish(success=False)
+                    return result
 
                 # CVE-2025-8747: Check for structured get_file gadget usage
                 self._check_get_file_gadget(model_config, result)
@@ -355,16 +365,19 @@ class KerasZipScanner(BaseScanner):
                 # Check for metadata.json
                 metadata_info = self._get_archive_member_info(zf, _KERAS_METADATA_ENTRY)
                 if metadata_info is not None:
-                    with zf.open(metadata_info, "r") as metadata_file:
-                        metadata_data = metadata_file.read()
-                        try:
-                            metadata = json.loads(metadata_data)
-                            result.metadata["keras_metadata"] = metadata
-                            keras_version = metadata.get("keras_version")
-                            if isinstance(keras_version, str) and keras_version.strip():
-                                result.metadata["keras_version"] = keras_version.strip()
-                        except json.JSONDecodeError:
-                            pass  # Metadata parsing is optional
+                    try:
+                        metadata_data = _read_zip_member_bounded(
+                            zf,
+                            metadata_info,
+                            _KERAS_METADATA_MAX_BYTES,
+                        )
+                        metadata = json.loads(metadata_data)
+                        result.metadata["keras_metadata"] = metadata
+                        keras_version = metadata.get("keras_version")
+                        if isinstance(keras_version, str) and keras_version.strip():
+                            result.metadata["keras_version"] = keras_version.strip()
+                    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+                        pass  # Metadata parsing is optional
 
                 self._check_embedded_hdf5_weights_external_references(zf, result)
 

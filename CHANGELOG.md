@@ -111,6 +111,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **pickle:** mark timeout-, budget-, recursion-, and resource-limited pickle scans as inconclusive so clean-looking partial analysis returns exit code 2 unless real security findings were reported
 - route misnamed ZIP, HDF5, and 7z files through content-aware scanner selection
 - **security:** recursively scan all members of content-routed `.keras` ZIP archives with bounded per-member extraction, prefer canonical root members over normalized aliases, and fail closed on ambiguous duplicate aliases so embedded payloads and `./config.json` entries are not skipped
+- **security:** scan duplicate ZIP entries by physical archive member instead of resolving repeated names to the final entry, preventing shadowed payloads from being skipped during recursive archive analysis
+- bound Keras `config.json` and `metadata.json` member reads before JSON parsing
 - preserve disguised model files during directory prefiltering without promoting document ZIPs
 - recurse into nested 7z members even when their filenames use misleading extensions
 - fail closed on extreme-size files when a scanner lacks bounded large-file analysis

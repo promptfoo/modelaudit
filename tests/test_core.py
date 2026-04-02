@@ -33,6 +33,12 @@ def _create_misnamed_zip(path: Path, entries: dict[str, bytes]) -> None:
             archive.writestr(name, data)
 
 
+def _create_zip_with_ordered_entries(path: Path, entries: list[tuple[str, bytes]]) -> None:
+    with zipfile.ZipFile(path, "w") as archive:
+        for name, data in entries:
+            archive.writestr(name, data)
+
+
 def _assert_system_pickle_detected(result: ScanResult, entry_name: str) -> None:
     assert any(
         issue.rule_code == "S201"
@@ -45,6 +51,22 @@ def _assert_system_pickle_detected(result: ScanResult, entry_name: str) -> None:
 def test_scan_file_detects_malicious_zip_with_misleading_extension(tmp_path: Path) -> None:
     disguised_zip = tmp_path / "payload.jpg"
     _create_misnamed_zip(disguised_zip, {"payload.pkl": _build_malicious_pickle()})
+
+    result = scan_file(str(disguised_zip))
+
+    assert result.scanner_name == "zip"
+    _assert_system_pickle_detected(result, "payload.pkl")
+
+
+def test_scan_file_detects_shadowed_duplicate_pickle_in_misleading_zip(tmp_path: Path) -> None:
+    disguised_zip = tmp_path / "payload.jpg"
+    _create_zip_with_ordered_entries(
+        disguised_zip,
+        [
+            ("payload.pkl", _build_malicious_pickle()),
+            ("payload.pkl", pickle.dumps({"safe": True})),
+        ],
+    )
 
     result = scan_file(str(disguised_zip))
 
@@ -136,6 +158,24 @@ def test_scan_file_recursively_scans_embedded_pickle_in_content_routed_keras_zip
     assert result.metadata.get("model_class") == "Sequential"
 
 
+def test_scan_file_scans_shadowed_duplicate_pickle_members_in_content_routed_keras_zip(tmp_path: Path) -> None:
+    disguised_keras = tmp_path / "model.jpg"
+    _create_zip_with_ordered_entries(
+        disguised_keras,
+        [
+            ("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}).encode("utf-8")),
+            ("payload.pkl", _build_malicious_pickle()),
+            ("payload.pkl", pickle.dumps({"safe": True})),
+        ],
+    )
+
+    result = scan_file(str(disguised_keras))
+
+    assert result.scanner_name == "keras_zip"
+    assert result.success is False
+    _assert_system_pickle_detected(result, "payload.pkl")
+
+
 def test_scan_file_content_routed_keras_zip_with_benign_extra_member_stays_clean(tmp_path: Path) -> None:
     disguised_keras = tmp_path / "model.jpg"
     _create_misnamed_zip(
@@ -161,6 +201,25 @@ def test_scan_file_content_routed_keras_zip_with_benign_pickle_member_stays_clea
             "config.json": json.dumps({"class_name": "Sequential", "config": {"layers": []}}).encode("utf-8"),
             "weights.pkl": pickle.dumps({"weights": [1, 2, 3], "bias": [0.1, 0.2]}),
         },
+    )
+
+    result = scan_file(str(disguised_keras))
+
+    assert result.scanner_name == "keras_zip"
+    assert result.success is True
+    assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+
+
+def test_scan_file_content_routed_keras_zip_with_duplicate_benign_pickle_members_stays_clean(tmp_path: Path) -> None:
+    disguised_keras = tmp_path / "model.jpg"
+    safe_payload = pickle.dumps({"weights": [1, 2, 3], "bias": [0.1, 0.2]})
+    _create_zip_with_ordered_entries(
+        disguised_keras,
+        [
+            ("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}).encode("utf-8")),
+            ("weights.pkl", safe_payload),
+            ("weights.pkl", safe_payload),
+        ],
     )
 
     result = scan_file(str(disguised_keras))

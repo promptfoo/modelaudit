@@ -346,6 +346,49 @@ class TestKerasZipScanner:
         assert result.success is True
         assert result.has_warnings is True
 
+    def test_scan_fails_closed_on_oversized_config_json_and_recurses_payloads(self, tmp_path: Path) -> None:
+        """Oversized config.json members should be bounded before parsing and still recurse other entries."""
+        scanner = KerasZipScanner()
+        keras_path = tmp_path / "oversized_config.keras"
+        with zipfile.ZipFile(keras_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            config = {
+                "class_name": "Sequential",
+                "config": {"layers": []},
+                "padding": "A" * (11 * 1024 * 1024),
+            }
+            zf.writestr("config.json", json.dumps(config))
+            zf.writestr("payload.pkl", b"cos\nsystem\n(S'echo pwned'\ntR.")
+
+        result = scanner.scan(str(keras_path))
+
+        config_checks = [check for check in result.checks if check.name == "Config JSON Parsing"]
+        assert len(config_checks) == 1
+        assert config_checks[0].status == CheckStatus.FAILED
+        assert "ZIP member exceeds bounded read size" in config_checks[0].message
+        assert config_checks[0].details["max_config_bytes"] == 10 * 1024 * 1024
+        assert any(
+            issue.rule_code == "S201"
+            and issue.details.get("zip_entry") == "payload.pkl"
+            and any(global_name in issue.message.lower() for global_name in ("os.system", "posix.system", "nt.system"))
+            for issue in result.issues
+        )
+        assert result.success is False
+
+    def test_scan_skips_oversized_metadata_json_without_warning_noise(self, tmp_path: Path) -> None:
+        """Oversized optional metadata.json should be bounded and ignored without adding noisy findings."""
+        scanner = KerasZipScanner()
+        keras_path = tmp_path / "oversized_metadata.keras"
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            zf.writestr("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
+            zf.writestr("metadata.json", json.dumps({"keras_version": "3.0.0", "padding": "A" * (2 * 1024 * 1024)}))
+
+        result = scanner.scan(str(keras_path))
+
+        assert result.success is True
+        assert result.metadata.get("model_class") == "Sequential"
+        assert "keras_version" not in result.metadata
+        assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+
     def test_lambda_layer_with_exec(self):
         """Test detection of Lambda layer with exec() call."""
         scanner = KerasZipScanner()
