@@ -201,6 +201,8 @@ def _pickle_check_signature(check: Any) -> tuple[Hashable, ...]:
 
 def _merge_missing_pickle_checks(target: ScanResult, fallback: ScanResult) -> None:
     """Merge only compatibility fallback checks that are absent from the primary result."""
+    fallback_source = str(fallback.metadata.get("pickle_source", ""))
+    suppress_fallback_parse_failure = os.path.splitext(fallback_source)[1].lower() == ".bin"
     existing_check_signatures = {_pickle_check_signature(check) for check in target.checks}
     existing_issue_signatures = {_pickle_check_signature(issue) for issue in target.issues}
     existing_check_identities = {_pickle_record_identity(check): check for check in target.checks}
@@ -222,6 +224,8 @@ def _merge_missing_pickle_checks(target: ScanResult, fallback: ScanResult) -> No
 
     for check in fallback.checks:
         if check.name in _STANDALONE_PICKLE_NON_FINDING_CHECKS:
+            continue
+        if suppress_fallback_parse_failure and check.name == "Standalone Pickle Parse Failure":
             continue
 
         identity = _pickle_record_identity(check)
@@ -258,6 +262,18 @@ def _merge_missing_pickle_checks(target: ScanResult, fallback: ScanResult) -> No
             target.metadata[key].update(value)
         elif key not in target.metadata:
             target.metadata[key] = value
+
+    if (
+        fallback.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+        and target.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+        and not suppress_fallback_parse_failure
+        and any(check.name == "Standalone Pickle Parse Failure" for check in target.checks)
+    ):
+        target.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+        scan_outcome_reasons = fallback.metadata.get("scan_outcome_reasons")
+        if isinstance(scan_outcome_reasons, list) and scan_outcome_reasons:
+            target.metadata["scan_outcome_reasons"] = list(scan_outcome_reasons)
+        target.metadata["analysis_incomplete"] = True
 
 
 def _issue_severity_rank(severity: IssueSeverity | None) -> int:

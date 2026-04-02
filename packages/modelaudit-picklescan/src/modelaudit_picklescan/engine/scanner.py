@@ -635,11 +635,11 @@ class _ScanState:
 
         if op_name in _REDUCE_OPCODES:
             callable_ref = self._nearest_global_ref()
-            if callable_ref is not None:
-                global_severity = _global_severity(callable_ref.module, callable_ref.name)
-            else:
-                global_severity = None
-            if callable_ref is not None and global_severity is not None:
+            if callable_ref is None:
+                return
+
+            global_severity = _global_severity(callable_ref.module, callable_ref.name)
+            if global_severity is not None:
                 self._add_finding(
                     Finding(
                         message=f"Found {op_name} opcode invoking dangerous global: {callable_ref.symbol}",

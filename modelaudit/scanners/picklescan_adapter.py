@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+import os
 import re
 from collections.abc import Mapping
 from typing import Any
@@ -38,7 +40,7 @@ def _parse_positive_float(value: Any, default: float) -> float:
         parsed = float(value)
     except (TypeError, ValueError):
         return default
-    return parsed if parsed > 0 and parsed == parsed and parsed not in {float("inf"), float("-inf")} else default
+    return parsed if parsed > 0 and math.isfinite(parsed) else default
 
 
 def _parse_min_int(value: Any, default: int, *, minimum: int) -> int:
@@ -88,6 +90,7 @@ def pickle_report_to_scan_result(
     result.metadata["pickle_verdict"] = report.verdict.value
     result.metadata["pickle_source"] = report.source
     result.metadata["pickle_coverage"] = report.coverage.to_dict()
+    suppress_parse_failure_escalation = _should_suppress_parse_failure_escalation(report)
 
     if report.status == ScanStatus.INCONCLUSIVE:
         result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
@@ -134,7 +137,7 @@ def pickle_report_to_scan_result(
             details=details,
             rule_code=_legacy_rule_code_for_notice(notice.code),
         )
-        if notice.code == "parse_incomplete":
+        if notice.code == "parse_incomplete" and not suppress_parse_failure_escalation:
             result.add_check(
                 name="Standalone Pickle Parse Failure",
                 passed=False,
@@ -235,6 +238,31 @@ def apply_pickle_member_context(result: ScanResult, *, archive_path: str, member
 
 def _to_issue_severity(severity: Severity) -> IssueSeverity:
     return IssueSeverity(severity.value)
+
+
+def _should_suppress_parse_failure_escalation(report: PickleReport) -> bool:
+    """Keep known benign malformed tails as INFO notices while preserving fail-closed truncation."""
+    if os.path.splitext(report.source)[1].lower() == ".bin":
+        return True
+
+    if report.has_security_findings:
+        return False
+
+    for notice in report.notices:
+        if notice.code != "parse_incomplete":
+            continue
+
+        if notice.details.get("exception_type") == "UnicodeDecodeError":
+            return True
+
+        if (
+            report.metadata.get("first_pickle_end_pos") is not None
+            and notice.details.get("exception_type") == "ValueError"
+            and str(notice.details.get("exception", "")).endswith("opcode b'\\x00' unknown")
+        ):
+            return True
+
+    return False
 
 
 def _apply_member_context_to_record(

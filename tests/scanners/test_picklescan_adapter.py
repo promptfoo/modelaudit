@@ -38,7 +38,7 @@ def test_scan_options_from_config_parses_string_values_and_falls_back_for_bad_va
 
     fallback = scan_options_from_config(
         {
-            "timeout": "nan",
+            "timeout": float("inf"),
             "max_opcodes": 0,
             "post_budget_global_scan_limit_bytes": -1,
         }
@@ -47,6 +47,9 @@ def test_scan_options_from_config_parses_string_values_and_falls_back_for_bad_va
     assert fallback.timeout_s == defaults.timeout_s
     assert fallback.max_opcodes == defaults.max_opcodes
     assert fallback.post_budget_scan_bytes == defaults.post_budget_scan_bytes
+
+    nan_fallback = scan_options_from_config({"timeout": "nan"})
+    assert nan_fallback.timeout_s == defaults.timeout_s
 
 
 def test_pickle_report_to_scan_result_maps_clean_report_to_successful_result() -> None:
@@ -254,6 +257,102 @@ def test_pickle_report_to_scan_result_escalates_parse_incomplete_notices_to_pars
         and issue.location == "truncated.pkl (pos 4)"
         and issue.details["parse_error"] == "pickle exhausted before seeing STOP"
         and issue.details["failure_reason"] == "unknown_opcode_or_format_error"
+        for issue in result.issues
+    )
+
+
+def test_pickle_report_to_scan_result_skips_parse_failure_escalation_for_bin_sources() -> None:
+    report = PickleReport(
+        source="weights.bin",
+        status=ScanStatus.INCONCLUSIVE,
+        verdict=SafetyVerdict.UNKNOWN,
+        notices=(
+            Notice(
+                message="Pickle parsing stopped before the stream was fully consumed: ValueError",
+                severity=Severity.INFO,
+                location="weights.bin (pos 57)",
+                code="parse_incomplete",
+                details={"analysis_incomplete": True},
+            ),
+        ),
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert not any(issue.message == "Pickle parsing failed before full scan completion" for issue in result.issues)
+    assert any(
+        issue.severity == IssueSeverity.INFO
+        and issue.rule_code == "S902"
+        and issue.message == "Pickle parsing stopped before the stream was fully consumed: ValueError"
+        for issue in result.issues
+    )
+
+
+def test_pickle_report_to_scan_result_keeps_unicode_decode_tails_as_inconclusive_notices() -> None:
+    report = PickleReport(
+        source="benign-tail.pkl",
+        status=ScanStatus.INCONCLUSIVE,
+        verdict=SafetyVerdict.UNKNOWN,
+        notices=(
+            Notice(
+                message="Pickle parsing stopped before the stream was fully consumed: UnicodeDecodeError",
+                severity=Severity.INFO,
+                location="benign-tail.pkl (pos 21)",
+                code="parse_incomplete",
+                details={
+                    "exception": "'utf-8' codec can't decode byte 0xff in position 0: invalid start byte",
+                    "exception_type": "UnicodeDecodeError",
+                    "analysis_incomplete": True,
+                },
+            ),
+        ),
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert not any(issue.message == "Pickle parsing failed before full scan completion" for issue in result.issues)
+    assert any(
+        issue.severity == IssueSeverity.INFO
+        and issue.rule_code == "S902"
+        and issue.message == "Pickle parsing stopped before the stream was fully consumed: UnicodeDecodeError"
+        for issue in result.issues
+    )
+
+
+def test_pickle_report_to_scan_result_keeps_zero_padding_tails_as_inconclusive_notices() -> None:
+    report = PickleReport(
+        source="padding.pkl",
+        status=ScanStatus.INCONCLUSIVE,
+        verdict=SafetyVerdict.UNKNOWN,
+        notices=(
+            Notice(
+                message="Pickle parsing stopped before the stream was fully consumed: ValueError",
+                severity=Severity.INFO,
+                location="padding.pkl (pos 20)",
+                code="parse_incomplete",
+                details={
+                    "exception": "at position 4096, opcode b'\\x00' unknown",
+                    "exception_type": "ValueError",
+                    "analysis_incomplete": True,
+                },
+            ),
+        ),
+        metadata={"first_pickle_end_pos": 19},
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert not any(issue.message == "Pickle parsing failed before full scan completion" for issue in result.issues)
+    assert any(
+        issue.severity == IssueSeverity.INFO
+        and issue.rule_code == "S902"
+        and issue.message == "Pickle parsing stopped before the stream was fully consumed: ValueError"
         for issue in result.issues
     )
 

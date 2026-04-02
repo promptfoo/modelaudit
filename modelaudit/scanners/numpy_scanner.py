@@ -6,10 +6,8 @@ import sys
 import warnings
 from typing import TYPE_CHECKING, Any, BinaryIO, ClassVar
 
-from modelaudit_picklescan import PickleScanner as StandalonePickleScanner
-
 from .base import BaseScanner, IssueSeverity, ScanResult
-from .picklescan_adapter import pickle_report_to_scan_result, scan_options_from_config
+from .pickle_scanner import PickleScanner
 
 # Import NumPy with compatibility handling
 try:
@@ -98,13 +96,12 @@ class NumPyScanner(BaseScanner):
         context_path: str,
     ) -> ScanResult:
         """Reuse PickleScanner analysis for object-dtype NumPy payloads."""
-        pickle_scanner = StandalonePickleScanner(options=scan_options_from_config(self.config))
-        pickle_report = pickle_scanner.scan_stream(
+        pickle_scanner = PickleScanner(config=self.config)
+        return pickle_scanner.scan_stream(
             file_obj,
+            payload_size,
             source=context_path,
-            size=payload_size,
         )
-        return pickle_report_to_scan_result(pickle_report, scanner_name="pickle", scanner=self)
 
     def _validate_dtype(self, dtype: Any) -> None:
         """Validate numpy dtype for security"""

@@ -8,12 +8,10 @@ import os
 import zlib
 from typing import Any, ClassVar
 
-from modelaudit_picklescan import PickleScanner as StandalonePickleScanner
-
 from ..detectors.cve_patterns import analyze_cve_patterns, enhance_scan_result_with_cve
 from ..utils.file.detection import read_magic_bytes
 from .base import BaseScanner, IssueSeverity, ScanResult
-from .picklescan_adapter import pickle_report_to_scan_result, scan_options_from_config
+from .pickle_scanner import PickleScanner
 
 
 class JoblibScanner(BaseScanner):
@@ -25,7 +23,7 @@ class JoblibScanner(BaseScanner):
 
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
-        self.pickle_scanner = StandalonePickleScanner(options=scan_options_from_config(self.config))
+        self.pickle_scanner = PickleScanner(config=self.config)
         # Security limits
         self.max_decompression_ratio = self.config.get("max_decompression_ratio", 100.0)
         self.max_decompressed_size = self.config.get(
@@ -210,16 +208,11 @@ class JoblibScanner(BaseScanner):
                 self._scan_for_joblib_specific_threats(data, result, path)
 
                 with io.BytesIO(data) as file_like:
-                    pickle_report = self.pickle_scanner.scan_stream(
+                    sub_result = self.pickle_scanner.scan_stream(
                         file_like,
+                        len(data),
                         source=path,
-                        size=len(data),
                     )
-                sub_result = pickle_report_to_scan_result(
-                    pickle_report,
-                    scanner_name="pickle",
-                    scanner=self,
-                )
                 result.merge(sub_result)
                 result.bytes_scanned = len(data)
             else:
@@ -278,16 +271,11 @@ class JoblibScanner(BaseScanner):
                 self._scan_for_joblib_specific_threats(decompressed, result, f"{path} (decompressed)")
 
                 with io.BytesIO(decompressed) as file_like:
-                    pickle_report = self.pickle_scanner.scan_stream(
+                    sub_result = self.pickle_scanner.scan_stream(
                         file_like,
+                        len(decompressed),
                         source=f"{path} (decompressed)",
-                        size=len(decompressed),
                     )
-                sub_result = pickle_report_to_scan_result(
-                    pickle_report,
-                    scanner_name="pickle",
-                    scanner=self,
-                )
                 result.merge(sub_result)
                 result.bytes_scanned = len(decompressed)
         except Exception as e:  # pragma: no cover

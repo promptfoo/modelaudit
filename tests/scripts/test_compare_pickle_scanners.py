@@ -84,6 +84,22 @@ def test_build_report_summarizes_drift_by_fixture_label_and_preserves_safe_fp_au
     assert "S310" in exploit4["legacy"]["rule_codes"]
 
 
+def test_fixture_label_marks_clear_malicious_paths_without_overlabeling_license_fixtures() -> None:
+    assert (
+        compare_pickle_scanners._fixture_label(
+            Path("tests/assets/scenarios/security_scenarios/mixed_malicious_model/model.pkl")
+        )
+        == "malicious"
+    )
+    assert compare_pickle_scanners._fixture_label(Path("tests/assets/samples/pickles/evil.pickle")) == "malicious"
+    assert (
+        compare_pickle_scanners._fixture_label(
+            Path("tests/assets/scenarios/license_scenarios/agpl_component/agpl_model.pkl")
+        )
+        == "unknown"
+    )
+
+
 def test_build_report_suppresses_scanner_logs_and_restores_logging_disable_level(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

@@ -12,6 +12,8 @@ from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.pytorch_zip_scanner import PyTorchZipScanner
 from tests.helpers import create_mock_pytorch_zip
 
+_ASSETS_DIR = Path(__file__).resolve().parents[1] / "assets"
+
 
 def _corrupt_zip_member_crc(zip_path: Path, member_name: str) -> None:
     """Patch ZIP headers so one member reports an incorrect CRC without changing data."""
@@ -485,6 +487,18 @@ def test_pytorch_zip_scanner_detects_malicious_zip_pkl(tmp_path):
     # Should detect the eval function
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
     assert any("eval" in issue.message.lower() for issue in result.issues)
+
+
+def test_pytorch_zip_scanner_preserves_legacy_pickle_rule_codes_for_embedded_members(tmp_path: Path) -> None:
+    fixture_path = _ASSETS_DIR / "samples" / "pickles" / "decode_exec_chain.pkl"
+    model_path = tmp_path / "decode_exec_chain.pt"
+    with zipfile.ZipFile(model_path, "w") as zipf:
+        zipf.writestr("version", "3")
+        zipf.writestr("data.pkl", fixture_path.read_bytes())
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert any(issue.rule_code == "S104" for issue in result.issues)
 
 
 def test_pytorch_zip_scanner_entry_limit(tmp_path):

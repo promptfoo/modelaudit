@@ -5,6 +5,8 @@ from pathlib import Path
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.executorch_scanner import ExecuTorchScanner
 
+_ASSETS_DIR = Path(__file__).resolve().parents[1] / "assets"
+
 
 def create_executorch_binary(tmp_path: Path, *, identifier: bytes = b"ET12") -> Path:
     binary_path = tmp_path / "program.pte"
@@ -105,4 +107,16 @@ def test_executorch_scanner_scans_polyglot_binary_zip_payload(tmp_path: Path) ->
 
     assert any(check.name == "ExecuTorch Binary Format Validation" for check in result.checks)
     assert any(issue.rule_code == "S507" for issue in result.issues)
+    assert any(issue.rule_code == "S104" for issue in result.issues)
+
+
+def test_executorch_scanner_preserves_legacy_pickle_rule_codes_for_embedded_members(tmp_path: Path) -> None:
+    fixture_path = _ASSETS_DIR / "samples" / "pickles" / "decode_exec_chain.pkl"
+    model_path = tmp_path / "decode_exec_chain.ptl"
+    with zipfile.ZipFile(model_path, "w") as zipf:
+        zipf.writestr("version", "1")
+        zipf.writestr("bytecode.pkl", fixture_path.read_bytes())
+
+    result = ExecuTorchScanner().scan(str(model_path))
+
     assert any(issue.rule_code == "S104" for issue in result.issues)

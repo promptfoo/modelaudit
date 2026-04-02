@@ -11,14 +11,11 @@ import zipfile
 from collections.abc import Callable
 from typing import Any, ClassVar
 
-from modelaudit_picklescan import PickleScanner as StandalonePickleScanner
-
 from ..utils import sanitize_archive_path
 from .base import BaseScanner, IssueSeverity, ScanResult
+from .pickle_scanner import PickleScanner
 from .picklescan_adapter import (
     apply_pickle_member_context,
-    pickle_report_to_scan_result,
-    scan_options_from_config,
 )
 
 logger = logging.getLogger(__name__)
@@ -71,7 +68,7 @@ class PyTorchZipScanner(BaseScanner):
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
         # Initialize a pickle scanner for embedded pickles
-        self.pickle_scanner = StandalonePickleScanner(options=scan_options_from_config(self.config))
+        self.pickle_scanner = PickleScanner(config=self.config)
         self.current_file_path = ""  # Will be set when scanning files
         self._relaxed_crc_reads: dict[str, set[str]] = {}
         self._relaxed_crc_check_indices: dict[str, tuple[int, int]] = {}
@@ -662,10 +659,10 @@ class PyTorchZipScanner(BaseScanner):
                 )
                 bytes_scanned += len(data)
                 with io.BytesIO(data) as file_like:
-                    pickle_report = self.pickle_scanner.scan_stream(
+                    sub_result = self.pickle_scanner.scan_stream(
                         file_like,
+                        len(data),
                         source=pickle_source,
-                        size=len(data),
                     )
             else:
                 # Stream to a spooled temp file to avoid OOM and provide seek()
@@ -680,16 +677,11 @@ class PyTorchZipScanner(BaseScanner):
                     member_size = spool.tell()
                     bytes_scanned += member_size
                     spool.seek(0)
-                    pickle_report = self.pickle_scanner.scan_stream(
+                    sub_result = self.pickle_scanner.scan_stream(
                         spool,  # type: ignore[arg-type]
+                        member_size,
                         source=pickle_source,
-                        size=member_size,
                     )
-            sub_result = pickle_report_to_scan_result(
-                pickle_report,
-                scanner_name="pickle",
-                scanner=self,
-            )
             sub_result.metadata.setdefault("archive_file_size", original_file_size)
             apply_pickle_member_context(sub_result, archive_path=path, member_name=name)
 

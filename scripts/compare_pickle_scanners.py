@@ -39,7 +39,9 @@ SAFE_FIXTURE_NAMES = {
 }
 
 MALICIOUS_FIXTURE_NAMES = {
+    "dill_func.pkl",
     "decode_exec_chain.pkl",
+    "evil.pickle",
     "exploit1_basic_torch_bypass.pkl",
     "exploit2_advanced_torch_bypass.pkl",
     "exploit3_sophisticated_hybrid.pkl",
@@ -109,7 +111,15 @@ def _discover_pickle_fixtures() -> list[Path]:
 def _fixture_label(path: Path) -> str:
     if path.name in SAFE_FIXTURE_NAMES or path.name.startswith("safe_"):
         return "safe"
-    if path.name in MALICIOUS_FIXTURE_NAMES or "exploit" in path.name or "malicious" in path.name:
+
+    path_text = path.as_posix().lower()
+    if (
+        path.name in MALICIOUS_FIXTURE_NAMES
+        or "exploit" in path_text
+        or "malicious" in path_text
+        or "evil" in path.name.lower()
+        or "security_scenarios" in path_text
+    ):
         return "malicious"
     return "unknown"
 
