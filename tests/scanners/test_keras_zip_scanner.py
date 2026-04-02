@@ -250,6 +250,74 @@ class TestKerasZipScanner:
             for issue in result.issues
         )
 
+    def test_scan_prefers_exact_config_json_over_normalized_alias(self, tmp_path: Path) -> None:
+        """A canonical config.json member should win over normalized aliases regardless of archive order."""
+        scanner = KerasZipScanner()
+        keras_path = tmp_path / "duplicate_root.keras"
+        malicious_code = "exec(\"print('Malicious!')\")"
+        encoded_code = base64.b64encode(malicious_code.encode()).decode()
+        benign_config = {"class_name": "Sequential", "config": {"layers": []}}
+        malicious_config = {
+            "class_name": "Functional",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "lambda_1",
+                        "config": {"function": [encoded_code, None, None], "function_type": "lambda"},
+                    }
+                ]
+            },
+        }
+
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            zf.writestr("./config.json", json.dumps(benign_config))
+            zf.writestr("config.json", json.dumps(malicious_config))
+
+        result = scanner.scan(str(keras_path))
+
+        assert result.success is True
+        assert any("lambda" in issue.message.lower() for issue in result.issues)
+        assert not any(check.name == "Keras ZIP Member Path Validation" for check in result.checks)
+
+    def test_scan_fails_closed_on_ambiguous_normalized_config_aliases(self, tmp_path: Path) -> None:
+        """Multiple non-canonical aliases for config.json should fail closed instead of depending on ZIP order."""
+        scanner = KerasZipScanner()
+        keras_path = tmp_path / "ambiguous_config.keras"
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            zf.writestr("./config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
+            zf.writestr("/config.json", json.dumps({"class_name": "Functional", "config": {"layers": []}}))
+
+        result = scanner.scan(str(keras_path))
+
+        ambiguity_checks = [check for check in result.checks if check.name == "Keras ZIP Member Path Validation"]
+        assert len(ambiguity_checks) == 1
+        assert ambiguity_checks[0].status == CheckStatus.FAILED
+        assert ambiguity_checks[0].details["member_name"] == "config.json"
+        assert sorted(ambiguity_checks[0].details["candidate_filenames"]) == ["./config.json", "/config.json"]
+        assert result.success is False
+
+    def test_scan_bounds_recursive_member_rescans_with_embedded_weight_limit(self, tmp_path: Path) -> None:
+        """Recursive fallback scans should not extract oversized non-Keras members with unbounded ZIP defaults."""
+        scanner = KerasZipScanner({"max_embedded_weights_bytes": 1024})
+        keras_path = tmp_path / "oversized_payload.keras"
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            zf.writestr("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
+            zf.writestr("payload.pkl", b"0" * 4096)
+
+        result = scanner.scan(str(keras_path))
+
+        recursive_size_checks = [
+            check
+            for check in result.checks
+            if check.name == "ZIP Entry Scan" and check.details.get("entry") == "payload.pkl"
+        ]
+        assert len(recursive_size_checks) == 1
+        assert recursive_size_checks[0].status == CheckStatus.FAILED
+        assert "exceeds maximum size of 1024 bytes" in recursive_size_checks[0].message
+        assert result.success is True
+        assert result.has_warnings is True
+
     def test_lambda_layer_with_exec(self):
         """Test detection of Lambda layer with exec() call."""
         scanner = KerasZipScanner()

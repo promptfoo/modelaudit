@@ -106,6 +106,18 @@ class _EmbeddedWeightsLimitExceeded(Exception):
         self.extracted_bytes = extracted_bytes
 
 
+class _AmbiguousKerasArchiveMemberError(Exception):
+    """Raised when multiple non-canonical members normalize to the same Keras root path."""
+
+    def __init__(self, member_name: str, candidate_filenames: list[str]) -> None:
+        super().__init__(
+            f"Ambiguous Keras ZIP member '{member_name}' matches multiple archive entries: "
+            f"{', '.join(candidate_filenames)}"
+        )
+        self.member_name = member_name
+        self.candidate_filenames = candidate_filenames
+
+
 class KerasZipScanner(BaseScanner):
     """Scanner for ZIP-based Keras .keras model files"""
 
@@ -216,19 +228,48 @@ class KerasZipScanner(BaseScanner):
         archive: zipfile.ZipFile,
         member_name: str,
     ) -> zipfile.ZipInfo | None:
-        """Return a ZIP member by normalized archive-relative name."""
+        """Return a canonical ZIP member deterministically by normalized archive-relative name."""
+        exact_info = archive.NameToInfo.get(member_name)
+        if exact_info is not None and exact_info.filename and not exact_info.is_dir():
+            return exact_info
+
+        normalized_matches: list[zipfile.ZipInfo] = []
         for info in archive.infolist():
             if not info.filename or info.is_dir():
                 continue
             if _normalize_archive_member_name(info.filename) == member_name:
-                return info
-        return None
+                normalized_matches.append(info)
+
+        if len(normalized_matches) > 1:
+            raise _AmbiguousKerasArchiveMemberError(
+                member_name,
+                [info.filename for info in normalized_matches],
+            )
+
+        return normalized_matches[0] if normalized_matches else None
+
+    def _get_recursive_archive_scan_config(self) -> dict[str, Any]:
+        """Return a ZIP scanner config with an explicit bounded per-member extraction limit."""
+        recursive_config = dict(self.config)
+        member_size_limits = [self.max_embedded_weights_bytes]
+        for config_key in ("max_file_size", "max_entry_size"):
+            configured_limit = self._normalize_positive_int_config(
+                recursive_config.get(config_key),
+                0,
+            )
+            if configured_limit > 0:
+                member_size_limits.append(configured_limit)
+
+        recursive_member_size_limit = min(member_size_limits)
+        recursive_config["max_file_size"] = recursive_member_size_limit
+        recursive_config["max_entry_size"] = recursive_member_size_limit
+        return recursive_config
 
     def _merge_recursive_archive_scan(self, path: str, result: ScanResult) -> None:
         """Recursively scan every ZIP member through the generic archive scanner."""
         from .zip_scanner import ZipScanner
 
-        zip_scanner = ZipScanner(self.config)
+        zip_scanner = ZipScanner(self._get_recursive_archive_scan_config())
         nested_result = zip_scanner._scan_zip_file(
             path,
             depth=max(zip_scanner._get_archive_depth(), zip_scanner._get_zip_depth()),
@@ -239,6 +280,7 @@ class KerasZipScanner(BaseScanner):
         result.metadata.update(preserved_metadata)
         if nested_contents is not None:
             result.metadata["contents"] = nested_contents
+        result.success = result.success and nested_result.success
 
     def scan(self, path: str) -> ScanResult:
         """Scan a ZIP-based Keras model file for suspicious configurations"""
@@ -280,7 +322,7 @@ class KerasZipScanner(BaseScanner):
                         details={"files": zf.namelist()},
                     )
                     self._merge_recursive_archive_scan(path, result)
-                    result.finish(success=True)
+                    result.finish(success=result.success)
                     return result
 
                 # Read and parse config.json
@@ -353,6 +395,21 @@ class KerasZipScanner(BaseScanner):
 
                 self._merge_recursive_archive_scan(path, result)
 
+        except _AmbiguousKerasArchiveMemberError as e:
+            result.add_check(
+                name="Keras ZIP Member Path Validation",
+                passed=False,
+                message=str(e),
+                severity=IssueSeverity.CRITICAL,
+                location=path,
+                details={
+                    "member_name": e.member_name,
+                    "candidate_filenames": e.candidate_filenames,
+                },
+            )
+            self._merge_recursive_archive_scan(path, result)
+            result.finish(success=False)
+            return result
         except Exception as e:
             result.add_check(
                 name="Keras ZIP File Scan",
@@ -365,7 +422,7 @@ class KerasZipScanner(BaseScanner):
             result.finish(success=False)
             return result
 
-        result.finish(success=True)
+        result.finish(success=result.success)
         return result
 
     def _scan_model_config(self, model_config: dict[str, Any], result: ScanResult) -> None:

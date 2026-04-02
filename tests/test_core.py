@@ -131,6 +131,7 @@ def test_scan_file_recursively_scans_embedded_pickle_in_content_routed_keras_zip
     result = scan_file(str(disguised_keras))
 
     assert result.scanner_name == "keras_zip"
+    assert result.success is False
     _assert_system_pickle_detected(result, "payload.pkl")
     assert result.metadata.get("model_class") == "Sequential"
 
