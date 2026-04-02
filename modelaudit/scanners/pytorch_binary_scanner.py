@@ -24,6 +24,13 @@ class PyTorchBinaryScanner(BaseScanner):
         # Get blacklist patterns from config
         self.blacklist_patterns = self.config.get("blacklist_patterns", [])
 
+    def _is_nested_archive_member(self) -> bool:
+        """Return True when this scan is running on an extracted archive member."""
+        try:
+            return int(self.config.get("_archive_depth", 0)) > 0
+        except (TypeError, ValueError):
+            return False
+
     @classmethod
     def can_handle(cls, path: str) -> bool:
         """Check if this scanner can handle the given path"""
@@ -75,7 +82,7 @@ class PyTorchBinaryScanner(BaseScanner):
             self.current_file_path = path
 
             # Check for suspiciously small files
-            if file_size < 100:
+            if file_size < 100 and not self._is_nested_archive_member():
                 result.add_check(
                     name="File Size Validation",
                     passed=False,
@@ -89,9 +96,12 @@ class PyTorchBinaryScanner(BaseScanner):
                 result.add_check(
                     name="File Size Validation",
                     passed=True,
-                    message="File size is reasonable",
+                    message=("Nested binary member size is accepted" if file_size < 100 else "File size is reasonable"),
                     location=path,
-                    details={"file_size": file_size},
+                    details={
+                        "file_size": file_size,
+                        "archive_depth": self.config.get("_archive_depth", 0),
+                    },
                     rule_code=None,  # Passing check
                 )
             # Read file in chunks to look for suspicious patterns

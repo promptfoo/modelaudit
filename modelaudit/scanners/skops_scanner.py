@@ -363,12 +363,7 @@ class SkopsScanner(BaseScanner):
         from .zip_scanner import ZipScanner
 
         zip_scanner = ZipScanner(config=self.config)
-        result.merge(
-            zip_scanner._scan_zip_file(
-                path,
-                depth=max(zip_scanner._get_archive_depth(), zip_scanner._get_zip_depth()),
-            )
-        )
+        result.merge(zip_scanner.scan_archive_members(path))
 
     def scan(self, path: str) -> ScanResult:
         """Scan a skops file for security vulnerabilities."""

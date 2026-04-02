@@ -98,13 +98,7 @@ class ZipScanner(BaseScanner):
             # Store the file path for use in issue locations
             self.current_file_path = path
 
-            # Scan the zip file recursively. Shared archive depth must survive
-            # scanner handoffs, while nested ZIP recursion still needs its own
-            # counter for extensionless ZIP members routed through core dispatch.
-            scan_result = self._scan_zip_file(
-                path,
-                depth=max(self._get_archive_depth(), self._get_zip_depth()),
-            )
+            scan_result = self.scan_archive_members(path)
             result.merge(scan_result)
 
         except zipfile.BadZipFile:
@@ -136,6 +130,16 @@ class ZipScanner(BaseScanner):
         result.metadata["contents"] = scan_result.metadata.get("contents", [])
         result.metadata["file_size"] = os.path.getsize(path)
         return result
+
+    def scan_archive_members(self, path: str) -> ScanResult:
+        """Recursively scan entries of an already validated ZIP container."""
+        # Shared archive depth must survive scanner handoffs, while nested ZIP
+        # recursion still needs its own counter for extensionless ZIP members
+        # routed through core dispatch.
+        return self._scan_zip_file(
+            path,
+            depth=max(self._get_archive_depth(), self._get_zip_depth()),
+        )
 
     def _rewrite_nested_result_context(
         self, scan_result: ScanResult, tmp_path: str, archive_path: str, entry_name: str

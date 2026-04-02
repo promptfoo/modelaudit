@@ -50,6 +50,24 @@ def test_scan_file_detects_malicious_payload_in_skops_via_zip_pipeline(tmp_path:
     assert any("payload.pkl" in (issue.location or "") for issue in result.issues)
 
 
+def test_scan_file_scans_clean_skops_without_nested_false_positives(tmp_path: Path) -> None:
+    skops_archive = tmp_path / "clean.skops"
+    _create_misnamed_zip(
+        skops_archive,
+        {
+            "schema.json": b'{"version": "1.0"}',
+            "metadata.json": b'{"name": "clean_model"}',
+            "weights.bin": b"model weights",
+        },
+    )
+
+    result = scan_file(str(skops_archive))
+
+    assert result.scanner_name == "skops"
+    assert result.success
+    assert not result.issues
+
+
 def test_scan_file_does_not_route_generic_zip_config_to_keras(tmp_path: Path) -> None:
     disguised_zip = tmp_path / "repo.jpg"
     _create_misnamed_zip(disguised_zip, {"config.json": json.dumps({"model_type": "bert"}).encode("utf-8")})
