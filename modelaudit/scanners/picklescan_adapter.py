@@ -31,6 +31,14 @@ _LEGACY_SCAN_OUTCOME_REASONS = {
 }
 _LEGACY_RULE_CODE_RE = re.compile(r"^S\d+$")
 _LOCATION_POSITION_RE = re.compile(r"\(pos\s+(?P<position>\d+)\)\s*$")
+_BENIGN_SERIALIZATION_TAIL_MODULE_PREFIXES = frozenset(
+    {
+        "collections",
+        "joblib",
+        "numpy",
+        "sklearn",
+    }
+)
 
 
 def _parse_positive_float(value: Any, default: float) -> float:
@@ -242,7 +250,8 @@ def _to_issue_severity(severity: Severity) -> IssueSeverity:
 
 def _should_suppress_parse_failure_escalation(report: PickleReport) -> bool:
     """Keep known benign malformed tails as INFO notices while preserving fail-closed truncation."""
-    if os.path.splitext(report.source)[1].lower() == ".bin":
+    source_ext = os.path.splitext(report.source)[1].lower()
+    if source_ext == ".bin":
         return True
 
     if report.has_security_findings:
@@ -255,14 +264,42 @@ def _should_suppress_parse_failure_escalation(report: PickleReport) -> bool:
         if notice.details.get("exception_type") == "UnicodeDecodeError":
             return True
 
+        if notice.details.get("exception_type") != "ValueError":
+            continue
+
+        exception_message = str(notice.details.get("exception", ""))
+        if report.metadata.get("first_pickle_end_pos") is not None and exception_message.endswith(
+            "opcode b'\\x00' unknown"
+        ):
+            return True
         if (
-            report.metadata.get("first_pickle_end_pos") is not None
-            and notice.details.get("exception_type") == "ValueError"
-            and str(notice.details.get("exception", "")).endswith("opcode b'\\x00' unknown")
+            source_ext in {".joblib", ".dill"}
+            and "opcode b'" in exception_message
+            and exception_message.endswith(" unknown")
+            and _has_only_benign_serialization_tail_imports(report)
         ):
             return True
 
     return False
+
+
+def _has_only_benign_serialization_tail_imports(report: PickleReport) -> bool:
+    import_references = report.metadata.get("import_references")
+    if not isinstance(import_references, list) or not import_references:
+        return False
+
+    for reference in import_references:
+        if not isinstance(reference, Mapping) or bool(reference.get("is_dangerous")):
+            return False
+        module = reference.get("module")
+        if not isinstance(module, str):
+            return False
+        if module not in _BENIGN_SERIALIZATION_TAIL_MODULE_PREFIXES and not any(
+            module.startswith(f"{prefix}.") for prefix in _BENIGN_SERIALIZATION_TAIL_MODULE_PREFIXES
+        ):
+            return False
+
+    return True
 
 
 def _apply_member_context_to_record(

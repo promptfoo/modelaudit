@@ -201,6 +201,16 @@ def _pickle_check_signature(check: Any) -> tuple[Hashable, ...]:
     )
 
 
+def _should_skip_fallback_pickle_issue(target: ScanResult, issue: Any) -> bool:
+    """Suppress package parse errors already represented by a legacy scanner-limitation downgrade."""
+    if not target.metadata.get("scanner_limitation") or issue.rule_code is not None:
+        return False
+    return issue.details.get("category") == "parse_error" and issue.details.get("exception_type") in {
+        "MemoryError",
+        "RecursionError",
+    }
+
+
 def _merge_missing_pickle_checks(target: ScanResult, fallback: ScanResult) -> None:
     """Merge only compatibility fallback checks that are absent from the primary result."""
     fallback_source = str(fallback.metadata.get("pickle_source", ""))
@@ -242,7 +252,7 @@ def _merge_missing_pickle_checks(target: ScanResult, fallback: ScanResult) -> No
         target.checks.append(check)
 
     for issue in fallback.issues:
-        if issue.rule_code is None:
+        if _should_skip_fallback_pickle_issue(target, issue):
             continue
 
         identity = _pickle_record_identity(issue)
@@ -276,6 +286,7 @@ def _merge_missing_pickle_checks(target: ScanResult, fallback: ScanResult) -> No
         if isinstance(scan_outcome_reasons, list) and scan_outcome_reasons:
             target.metadata["scan_outcome_reasons"] = list(scan_outcome_reasons)
         target.metadata["analysis_incomplete"] = True
+        target.finish(success=target.success and fallback.success)
 
 
 def _issue_severity_rank(severity: IssueSeverity | None) -> int:

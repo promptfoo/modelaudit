@@ -377,6 +377,20 @@ def test_scan_bytes_flags_hex_encoded_nested_pickle_payloads() -> None:
     assert any(finding.rule_code == "S602" for finding in report.findings)
 
 
+def test_scan_bytes_flags_escaped_hex_encoded_nested_pickle_payloads() -> None:
+    nested_payload = pickle.dumps({"inner": "data"}, protocol=4)
+    escaped_hex_payload = "".join(f"\\x{byte:02x}" for byte in nested_payload)
+
+    report = scan_bytes(
+        pickle.dumps({"outer": escaped_hex_payload}, protocol=4),
+        source="nested-escaped-hex.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(finding.rule_code == "S602" for finding in report.findings)
+
+
 def test_scan_stream_preserves_absolute_offsets_from_current_stream_position() -> None:
     prefix = b"HEADER"
     payload = pickle.dumps(MaliciousPayload())

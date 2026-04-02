@@ -35,6 +35,7 @@ from modelaudit.scanners.pickle_scanner import (
     _is_actually_dangerous_string,
     _is_plausible_python_module,
     _is_safe_import_only_global,
+    _merge_missing_pickle_checks,
     _PickleOpcodeAnalysis,
     _simulate_symbolic_reference_maps,
     check_opcode_sequence,
@@ -398,6 +399,52 @@ def test_unknown_opcode_pickle_parse_failure_fails_closed(
         and check.severity == IssueSeverity.CRITICAL
         for check in result.checks
     ), f"Expected fail-closed format check, got: {[(c.name, c.status, c.severity) for c in result.checks]}"
+
+
+def test_merge_missing_pickle_checks_preserves_ruleless_parse_failures_and_fails_closed() -> None:
+    """Rule-less parse-failure fallback issues must survive merge and preserve fail-closed success."""
+    scanner = PickleScanner()
+    target = ScanResult(scanner_name="pickle", scanner=scanner)
+    target.add_check(
+        name="Pickle Protocol Version Check",
+        passed=True,
+        message="Valid pickle protocol version 4",
+        location="truncated.pkl",
+    )
+    target.finish(success=True)
+
+    fallback = ScanResult(scanner_name="pickle", scanner=scanner)
+    fallback.add_check(
+        name="Standalone Pickle Parse Failure",
+        passed=False,
+        message="Pickle parsing failed before full scan completion",
+        severity=IssueSeverity.CRITICAL,
+        location="truncated.pkl (pos 4)",
+        details={
+            "parse_error": "pickle exhausted before seeing STOP",
+            "failure_reason": "unknown_opcode_or_format_error",
+            "analysis_incomplete": True,
+        },
+    )
+    fallback.checks[-1].rule_code = None
+    fallback.issues[-1].rule_code = None
+    fallback.metadata["pickle_source"] = "truncated.pkl"
+    fallback.metadata["scan_outcome"] = "inconclusive"
+    fallback.metadata["scan_outcome_reasons"] = ["pickle_analysis_incomplete"]
+    fallback.metadata["analysis_incomplete"] = True
+    fallback.finish(success=False)
+
+    _merge_missing_pickle_checks(target, fallback)
+
+    assert target.success is False
+    assert target.metadata["scan_outcome"] == "inconclusive"
+    assert target.metadata["scan_outcome_reasons"] == ["pickle_analysis_incomplete"]
+    assert any(
+        issue.rule_code is None
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.message == "Pickle parsing failed before full scan completion"
+        for issue in target.issues
+    )
 
 
 @pytest.mark.parametrize(

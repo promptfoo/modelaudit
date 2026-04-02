@@ -1004,7 +1004,7 @@ def _decode_possible_encoded_pickle(value: str) -> list[tuple[str, bytes]]:
     if (
         len(hex_candidate) >= 16
         and len(hex_candidate) % 2 == 0
-        and _HEX_CANDIDATE_RE.fullmatch(stripped)
+        and _HEX_CANDIDATE_RE.fullmatch(hex_candidate)
         and not re.fullmatch(r"(.)\1*", hex_candidate)
     ):
         try:
