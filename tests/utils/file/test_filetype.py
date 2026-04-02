@@ -3,6 +3,7 @@ import gzip
 import importlib
 import io
 import lzma
+import pickle
 import struct
 import tarfile
 import zipfile
@@ -386,6 +387,17 @@ def test_detect_file_format_proto1_binint1_pop_prefixed_pickle(tmp_path: Path) -
     assert detect_file_format_from_magic(str(payload)) == "pickle"
 
 
+def test_detect_file_format_prefixed_proto1_pickle_with_trailing_junk(tmp_path: Path) -> None:
+    """Valid pickle streams with trivial prefixes stay detectable when junk follows STOP."""
+    pickle_stream = b"(l0" + pickle.dumps({"safe": 1}, protocol=1) + b"JUNK"
+    payload = tmp_path / "prefixed-proto1-trailing-junk.dat"
+    payload.write_bytes(pickle_stream)
+
+    assert pickle.loads(pickle_stream) == {"safe": 1}
+    assert detect_file_format(str(payload)) == "pickle"
+    assert detect_file_format_from_magic(str(payload)) == "pickle"
+
+
 def test_detect_file_format_plain_text_global_prefix_not_pickle(tmp_path: Path) -> None:
     """Plain text that begins with GLOBAL-like bytes should not be treated as pickle."""
     payload = tmp_path / "notes.txt"
@@ -417,6 +429,15 @@ def test_detect_file_format_empty_tuple_with_trailing_text_not_pickle(tmp_path: 
     """A trivial tuple pickle prefix with trailing text should not force pickle detection."""
     payload = tmp_path / "empty-tuple-prefixed-notes.txt"
     payload.write_bytes(b").trailing text")
+
+    assert detect_file_format(str(payload)) != "pickle"
+    assert detect_file_format_from_magic(str(payload)) != "pickle"
+
+
+def test_detect_file_format_list_prefix_with_trailing_text_not_pickle(tmp_path: Path) -> None:
+    """A trivial list preamble followed by plain text should remain a non-pickle near-match."""
+    payload = tmp_path / "list-prefixed-notes.txt"
+    payload.write_bytes(b"(l0.not a pickle stream")
 
     assert detect_file_format(str(payload)) != "pickle"
     assert detect_file_format_from_magic(str(payload)) != "pickle"

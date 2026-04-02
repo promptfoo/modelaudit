@@ -128,21 +128,25 @@ def _looks_like_proto0_or_1_pickle(sample: bytes) -> bool:
             return False
 
         opcode_count = 0
-        first_opcode_name: str | None = None
+        has_non_trivial_opcode = False
         try:
             for opcode, _arg, _pos in pickletools.genops(candidate):
                 opcode_count += 1
-                if first_opcode_name is None:
-                    first_opcode_name = opcode.name
                 if opcode.name == "STOP":
                     stop_pos = 0 if _pos is None else _pos
                     trailing = candidate[stop_pos + 1 :]
                     if not trailing or not trailing.strip(PROTO0_1_IGNORABLE_TRAILING_BYTES):
                         return opcode_count >= 2
-                    if first_opcode_name not in PROTO0_1_TRIVIAL_LEADING_OPCODES:
+                    # Python's unpickler ignores trailing bytes after STOP. Accept
+                    # junk-suffixed streams once the parsed prefix contains any
+                    # non-trivial opcode, while still rejecting scalar/container
+                    # prefixes followed by plain text near-matches.
+                    if has_non_trivial_opcode:
                         return opcode_count >= 2
                     stripped_trailing = trailing.lstrip(PROTO0_1_IGNORABLE_TRAILING_BYTES)
                     return bool(stripped_trailing) and _looks_like_proto0_or_1_pickle(stripped_trailing)
+                if opcode.name not in PROTO0_1_TRIVIAL_LEADING_OPCODES:
+                    has_non_trivial_opcode = True
                 if opcode_count >= PROTO0_1_MAX_PROBE_OPCODES:
                     return False
         except Exception:

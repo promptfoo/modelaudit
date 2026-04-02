@@ -703,6 +703,19 @@ def test_savedmodel_assets_protocol1_pickle_with_binint1_pop_prefix_is_flagged(t
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_assets_trivial_prefix_pickle_with_trailing_junk_is_flagged(tmp_path: Path) -> None:
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    asset_path = model_dir / "assets" / "trailing-junk-payload.dat"
+    asset_path.write_bytes(b"(l0" + _build_protocol1_pickle_payload() + b"JUNK")
+
+    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    asset_issues = [issue for issue in result.issues if issue.location == str(asset_path)]
+
+    assert asset_issues
+    assert any("pickle_payload" in issue.details.get("detected_content_type", "") for issue in asset_issues)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 def test_savedmodel_assets_extra_comment_prefixed_protocol1_pickle_is_flagged(tmp_path: Path) -> None:
     model_dir = Path(create_tf_savedmodel(tmp_path))
     extra_dir = model_dir / "assets.extra"
