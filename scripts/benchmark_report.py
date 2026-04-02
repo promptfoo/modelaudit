@@ -96,6 +96,15 @@ def _record_context(record: BenchmarkRecord | None) -> tuple[str, str, str]:
     return target_label, _format_bytes(size_bytes), file_count_label
 
 
+def _merged_record_context(current_record: BenchmarkRecord, baseline_record: BenchmarkRecord) -> tuple[str, str, str]:
+    current_target, current_size, current_files = _record_context(current_record)
+    baseline_target, baseline_size, baseline_files = _record_context(baseline_record)
+    target = current_target if current_target != "-" else baseline_target
+    size = current_size if current_size != "-" else baseline_size
+    files = current_files if current_files != "-" else baseline_files
+    return target, size, files
+
+
 def _format_change(delta_ratio: float) -> str:
     return f"{delta_ratio:+.1%}"
 
@@ -163,7 +172,7 @@ def _build_summary(
             status = "stable"
             stable_count += 1
 
-        target, size, files = _record_context(current_record if current_record.extra_info else baseline_record)
+        target, size, files = _merged_record_context(current_record, baseline_record)
         comparison_rows.append(
             ComparisonRow(
                 name=name,

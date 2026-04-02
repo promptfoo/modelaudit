@@ -249,3 +249,105 @@ def test_benchmark_report_can_fail_on_missing_benchmark(tmp_path: Path) -> None:
     assert completed.returncode == 1
     assert "Missing benchmarks:" in completed.stdout
     assert missing_benchmark in completed.stdout
+
+
+def test_benchmark_report_uses_baseline_size_when_current_metadata_partial(tmp_path: Path) -> None:
+    baseline_json = tmp_path / "baseline.json"
+    current_json = tmp_path / "current.json"
+
+    benchmark_name = "tests/benchmarks/test_scan_benchmarks.py::test_scan_duplicate_directory"
+    _write_benchmark_json(
+        baseline_json,
+        [
+            _benchmark_entry(
+                benchmark_name,
+                0.100,
+                0.101,
+                extra_info={"path": "baseline_dir", "bytes": 2048, "files": 4},
+            )
+        ],
+    )
+    _write_benchmark_json(
+        current_json,
+        [_benchmark_entry(benchmark_name, 0.110, 0.111, extra_info={"path": "current_dir"})],
+    )
+
+    script = Path(__file__).resolve().parents[1] / "scripts" / "benchmark_report.py"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--current",
+            str(current_json),
+            "--baseline",
+            str(baseline_json),
+            "--threshold",
+            "0.05",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0
+    expected_row_prefix = (
+        "| `tests/benchmarks/test_scan_benchmarks.py::test_scan_duplicate_directory` | `current_dir` | 2.0 KiB | 4 |"
+    )
+    assert expected_row_prefix in completed.stdout
+
+
+def test_benchmark_report_top_improvements_and_mixed_metadata_fallback(tmp_path: Path) -> None:
+    baseline_json = tmp_path / "baseline.json"
+    current_json = tmp_path / "current.json"
+
+    improved_name = "tests/benchmarks/test_scan_benchmarks.py::test_scan_duplicate_directory"
+    missing_name = "tests/benchmarks/test_scan_benchmarks.py::test_scan_mixed_directory"
+    new_name = "tests/benchmarks/test_scan_benchmarks.py::test_scan_safe_pickle"
+    _write_benchmark_json(
+        baseline_json,
+        [
+            _benchmark_entry(
+                improved_name,
+                0.100,
+                0.101,
+                extra_info={"path": "baseline_dir", "bytes": 4096, "files": 10},
+            ),
+            _benchmark_entry(missing_name, 0.200, 0.201),
+        ],
+    )
+    _write_benchmark_json(
+        current_json,
+        [
+            _benchmark_entry(
+                improved_name,
+                0.080,
+                0.081,
+                extra_info={"path": "current_dir", "bytes": True, "files": 2},
+            ),
+            _benchmark_entry(new_name, 0.050, 0.051),
+        ],
+    )
+
+    script = Path(__file__).resolve().parents[1] / "scripts" / "benchmark_report.py"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--current",
+            str(current_json),
+            "--baseline",
+            str(baseline_json),
+            "--threshold",
+            "0.10",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0
+    assert "Status: `0` regressions, `1` improved, `0` stable, `1` new, `1` missing." in completed.stdout
+    assert "Top improvements:" in completed.stdout
+    assert f"- `{improved_name}` -20.0%" in completed.stdout
+    expected_row_prefix = f"| `{improved_name}` | `current_dir` | 4.0 KiB | 2 |"
+    assert expected_row_prefix in completed.stdout

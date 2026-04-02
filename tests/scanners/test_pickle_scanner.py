@@ -1,3 +1,4 @@
+import logging
 import os
 import pickle
 import pickletools
@@ -769,8 +770,9 @@ def test_post_budget_global_scan_runs_only_when_opcode_budget_is_exceeded(
         file_size: int,
         minimum_offset: int,
         ml_context: dict[str, object],
+        deadline: float | None = None,
     ) -> list[dict[str, object]]:
-        del self, _file_obj, file_size, minimum_offset, ml_context
+        del self, _file_obj, file_size, minimum_offset, ml_context, deadline
         call_counter["calls"] += 1
         return []
 
@@ -1429,8 +1431,9 @@ def test_post_budget_global_scan_runs_after_deadline_truncation(
         file_size: int,
         minimum_offset: int,
         ml_context: dict[str, object],
+        deadline: float | None = None,
     ) -> list[dict[str, object]]:
-        del self, _file_obj, file_size, minimum_offset, ml_context
+        del self, _file_obj, file_size, minimum_offset, ml_context, deadline
         call_counter["calls"] += 1
         return []
 
@@ -1453,6 +1456,305 @@ def test_invalid_post_budget_global_scan_limit_uses_default() -> None:
     scanner = PickleScanner({"post_budget_global_scan_limit_bytes": "not-an-int"})
 
     assert scanner.post_budget_global_scan_limit_bytes > 0
+
+
+def test_post_budget_global_scan_keeps_short_string_tail_state_bounded() -> None:
+    """Many tiny string opcodes must not grow tail-scan state beyond the lookback window."""
+    import tracemalloc
+
+    short_string_tail = b"\x8c\x00" * 200_000
+    raw_stack_global = short_string_tail + _short_binunicode(b"os") + _short_binunicode(b"system") + b"\x93"
+    scanner = PickleScanner({"post_budget_global_scan_limit_bytes": len(raw_stack_global)})
+
+    tracemalloc.start()
+    try:
+        findings = scanner._scan_global_references_unbounded(
+            BytesIO(raw_stack_global),
+            file_size=len(raw_stack_global),
+            minimum_offset=0,
+            ml_context={},
+        )
+        _current_bytes, peak_bytes = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert any(finding["import_reference"] == "os.system" for finding in findings)
+    assert peak_bytes < 16 * 1024 * 1024
+
+
+def test_post_budget_global_scan_reports_memo_tracking_cap(tmp_path: Path) -> None:
+    """Memo-heavy tails should fail closed once the bounded memo table starts evicting old entries."""
+    pickle_path = tmp_path / "post-budget-memo-cap.pkl"
+    benign_padding = _make_opcode_padding_stream(opcode_pairs=128)
+    memo_spray = b"\x8c\x00\x94" * 64
+    malicious_stream = _short_binunicode(b"os") + _short_binunicode(b"system") + b"\x93"
+    pickle_path.write_bytes(benign_padding + memo_spray + malicious_stream)
+
+    result = PickleScanner(
+        {
+            "max_opcodes": 64,
+            "post_budget_global_memo_limit_entries": 8,
+            "post_budget_global_scan_limit_bytes": len(benign_padding) + len(memo_spray) + len(malicious_stream),
+        }
+    ).scan(str(pickle_path))
+
+    memo_checks = [check for check in result.checks if check.name == "Post-Budget Global Memo Tracking Check"]
+    assert len(memo_checks) == 1
+    assert memo_checks[0].status == CheckStatus.FAILED
+    assert "post_budget_global_memo_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Post-Budget Global Reference Scan"
+        and check.status == CheckStatus.FAILED
+        and "os.system" in check.message
+        for check in result.checks
+    )
+    assert result.success is False
+
+
+def test_post_budget_global_scan_memo_cap_stays_quiet_for_benign_tail(tmp_path: Path) -> None:
+    """Memo-cap eviction should not invent suspicious import findings for benign tail payloads."""
+    pickle_path = tmp_path / "post-budget-benign-memo-cap.pkl"
+    benign_padding = _make_opcode_padding_stream(opcode_pairs=128)
+    memo_spray = b"\x8c\x00\x94" * 64
+    benign_stream = pickle.dumps({"safe": True, "weights": [1, 2, 3]}, protocol=4)
+    pickle_path.write_bytes(benign_padding + memo_spray + benign_stream)
+
+    result = PickleScanner(
+        {
+            "max_opcodes": 64,
+            "post_budget_global_memo_limit_entries": 8,
+            "post_budget_global_scan_limit_bytes": len(benign_padding) + len(memo_spray) + len(benign_stream),
+        }
+    ).scan(str(pickle_path))
+
+    memo_checks = [check for check in result.checks if check.name == "Post-Budget Global Memo Tracking Check"]
+    assert len(memo_checks) == 1
+    assert memo_checks[0].status == CheckStatus.FAILED
+    assert memo_checks[0].severity == IssueSeverity.INFO
+    assert not any(
+        check.name == "Post-Budget Global Reference Scan" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    ), result.checks
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "post_budget_global_memo_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+    assert result.success is False
+
+
+def test_post_budget_global_scan_honors_tail_scan_deadline() -> None:
+    """The raw tail parser should stop when its own deadline expires."""
+    payload = b"\x8c\x00" * 8192 + _short_binunicode(b"os") + _short_binunicode(b"system") + b"\x93"
+    scanner = PickleScanner({"post_budget_global_scan_limit_bytes": len(payload)})
+
+    findings = scanner._scan_global_references_unbounded(
+        BytesIO(payload),
+        file_size=len(payload),
+        minimum_offset=0,
+        ml_context={},
+        deadline=0.0,
+    )
+
+    assert findings == []
+    assert scanner._post_budget_global_scan_deadline_exceeded is True
+
+
+def test_post_budget_global_scan_rechecks_deadline_before_second_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The second GLOBAL/INST byte sweep should enforce the same deadline as the first parse loop."""
+    pickle_scanner_module = sys.modules["modelaudit.scanners.pickle_scanner"]
+
+    scan_times = [0.0, 2.0]
+
+    def _fake_time() -> float:
+        if scan_times:
+            return scan_times.pop(0)
+        return 2.0
+
+    monkeypatch.setattr(pickle_scanner_module.time, "time", _fake_time)
+    scanner = PickleScanner({"post_budget_global_scan_limit_bytes": 64, "timeout": 1})
+
+    findings = scanner._scan_global_references_unbounded(
+        BytesIO(b"cos\nsystem\n"),
+        file_size=len(b"cos\nsystem\n"),
+        minimum_offset=0,
+        ml_context={},
+        deadline=1.0,
+    )
+
+    assert findings == []
+    assert scanner._post_budget_global_scan_deadline_exceeded is True
+
+
+def test_post_budget_global_scan_caps_repeated_reference_findings_and_warning_logs(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Dense repeated GLOBAL references should not grow findings or warning logs without a cap."""
+    payload = b"cos\nsystem\n" * 128
+    scanner = PickleScanner(
+        {
+            "post_budget_global_max_reference_findings": 8,
+            "post_budget_global_scan_limit_bytes": len(payload),
+        }
+    )
+
+    with caplog.at_level(logging.WARNING, logger="modelaudit.scanners"):
+        findings = scanner._scan_global_references_unbounded(
+            BytesIO(payload),
+            file_size=len(payload),
+            minimum_offset=0,
+            ml_context={},
+        )
+
+    assert len(findings) == 8
+    assert all(finding["import_reference"] == "os.system" for finding in findings)
+    assert scanner._post_budget_global_reference_limit_exceeded is True
+    repeated_warnings = [
+        record for record in caplog.records if "Always-dangerous function detected: os.system" in record.getMessage()
+    ]
+    assert len(repeated_warnings) == 1
+
+
+def test_post_budget_global_scan_reference_cap_suppresses_warning_only_log_flood(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Once warning-level findings hit the cap, distinct warning-only refs should stop logging too."""
+    payload = b"".join(f"cglob\nhelper{i}\n".encode("ascii") for i in range(32))
+    scanner = PickleScanner(
+        {
+            "post_budget_global_max_reference_findings": 8,
+            "post_budget_global_scan_limit_bytes": len(payload),
+        }
+    )
+
+    with caplog.at_level(logging.WARNING, logger="modelaudit.scanners"):
+        findings = scanner._scan_global_references_unbounded(
+            BytesIO(payload),
+            file_size=len(payload),
+            minimum_offset=0,
+            ml_context={},
+        )
+
+    assert len(findings) == 8
+    assert all(finding["module"] == "glob" for finding in findings)
+    assert scanner._post_budget_global_reference_limit_exceeded is True
+    glob_warnings = [
+        record for record in caplog.records if "Always-dangerous module detected: glob.helper" in record.getMessage()
+    ]
+    assert len(glob_warnings) == 8
+
+
+def test_post_budget_global_scan_reference_cap_preserves_late_critical_tail(
+    tmp_path: Path,
+) -> None:
+    """A warning-reference spray should not hide a later dangerous import when the cap is reached."""
+    pickle_path = tmp_path / "post-budget-warning-spray.pkl"
+    benign_padding = _make_opcode_padding_stream(opcode_pairs=64)
+    warning_spray = b"".join(f"cpkg{i}\nhelper\n".encode("ascii") for i in range(32))
+    pickle_path.write_bytes(benign_padding + warning_spray + b"cos\nsystem\n")
+
+    result = PickleScanner(
+        {
+            "max_opcodes": 64,
+            "post_budget_global_max_reference_findings": 8,
+            "post_budget_global_scan_limit_bytes": len(benign_padding) + len(warning_spray) + len(b"cos\nsystem\n"),
+        }
+    ).scan(str(pickle_path))
+
+    reference_cap_checks = [
+        check for check in result.checks if check.name == "Post-Budget Global Reference Tracking Check"
+    ]
+    assert len(reference_cap_checks) == 1
+    assert reference_cap_checks[0].status == CheckStatus.FAILED
+    assert reference_cap_checks[0].severity == IssueSeverity.INFO
+    assert "post_budget_global_reference_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Post-Budget Global Reference Scan"
+        and check.status == CheckStatus.FAILED
+        and "os.system" in check.message
+        for check in result.checks
+    )
+    assert result.success is False
+
+
+def test_post_budget_global_scan_reference_cap_preserves_late_suspicious_symbol_tail(
+    tmp_path: Path,
+) -> None:
+    """Warning-only cap saturation should not hide later CRITICAL refs from SUSPICIOUS_GLOBALS."""
+    pickle_path = tmp_path / "post-budget-suspicious-global-tail.pkl"
+    benign_padding = _make_opcode_padding_stream(opcode_pairs=64)
+    warning_spray = b"".join(f"cpkg{i}\nhelper\n".encode("ascii") for i in range(32))
+    pickle_path.write_bytes(benign_padding + warning_spray + b"coperator\nattrgetter\n")
+
+    result = PickleScanner(
+        {
+            "max_opcodes": 64,
+            "post_budget_global_max_reference_findings": 8,
+            "post_budget_global_scan_limit_bytes": len(benign_padding)
+            + len(warning_spray)
+            + len(b"coperator\nattrgetter\n"),
+        }
+    ).scan(str(pickle_path))
+
+    assert any(
+        check.name == "Post-Budget Global Reference Scan"
+        and check.status == CheckStatus.FAILED
+        and "operator.attrgetter" in check.message
+        for check in result.checks
+    )
+    assert "post_budget_global_reference_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+    assert result.success is False
+
+
+def test_post_budget_global_scan_caches_benign_post_cap_classifications(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeated benign refs that pass the CRITICAL prefilter should only be classified once post-cap."""
+    pickle_scanner_module = sys.modules["modelaudit.scanners.pickle_scanner"]
+    original_classifier: Callable[..., tuple[bool, IssueSeverity | None, str]] = (
+        pickle_scanner_module._classify_import_reference
+    )
+    safe_candidate_calls = 0
+
+    def _fake_classify_import_reference(
+        mod: str,
+        func: str,
+        ml_context: dict[str, Any],
+        *,
+        is_import_only: bool,
+    ) -> tuple[bool, IssueSeverity | None, str]:
+        nonlocal safe_candidate_calls
+        if (mod, func) == ("os", "pathlike"):
+            safe_candidate_calls += 1
+            return False, None, "safe_allowlisted"
+        return original_classifier(mod, func, ml_context, is_import_only=is_import_only)
+
+    monkeypatch.setattr(
+        pickle_scanner_module,
+        "_classify_import_reference",
+        _fake_classify_import_reference,
+    )
+
+    warning_spray = b"".join(f"cglob\nhelper{i}\n".encode("ascii") for i in range(9))
+    payload = warning_spray + (b"cos\npathlike\n" * 16)
+    scanner = PickleScanner(
+        {
+            "post_budget_global_max_reference_findings": 8,
+            "post_budget_global_scan_limit_bytes": len(payload),
+        }
+    )
+
+    findings = scanner._scan_global_references_unbounded(
+        BytesIO(payload),
+        file_size=len(payload),
+        minimum_offset=0,
+        ml_context={},
+    )
+
+    assert len(findings) == 8
+    assert all(finding["module"] == "glob" for finding in findings)
+    assert safe_candidate_calls == 1
+    assert scanner._post_budget_global_reference_limit_exceeded is True
 
 
 class TestPickleScanner(unittest.TestCase):

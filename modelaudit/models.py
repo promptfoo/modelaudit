@@ -437,7 +437,23 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
                 self.file_metadata[path] = metadata
 
         # Track scanner names (avoid duplicates)
-        for scanner in results_dict.get("scanners", []):
+        def _normalize_scanner_names(value: Any) -> list[str]:
+            """Coerce scanner metadata into a list of scanner names."""
+            if value is None:
+                return []
+            if isinstance(value, str):
+                return [value]
+            if isinstance(value, list | tuple):
+                return [scanner for scanner in value if isinstance(scanner, str)]
+            if isinstance(value, set):
+                return sorted(scanner for scanner in value if isinstance(scanner, str))
+            return []
+
+        merged_scanners = [
+            *_normalize_scanner_names(results_dict.get("scanners")),
+            *_normalize_scanner_names(results_dict.get("scanner_names")),
+        ]
+        for scanner in merged_scanners:
             if scanner and scanner not in self.scanner_names and scanner != "unknown":
                 self.scanner_names.append(scanner)
 

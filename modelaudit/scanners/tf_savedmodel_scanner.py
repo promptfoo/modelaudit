@@ -555,6 +555,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 rule_code="S902",
             )
             return []
+        content_head_is_prefix = file_stat.st_size > len(content_head)
 
         detected_types: list[str] = []
 
@@ -573,8 +574,15 @@ class TensorFlowSavedModelScanner(BaseScanner):
         if any(content_head.startswith(prefix) for prefix in _ASSET_PICKLE_PREFIXES):
             _record_detected_type("pickle_payload")
         proto0_probe = _strip_leading_comment_lines(content_head)
-        if _looks_like_proto0_or_1_pickle(content_head) or (
-            proto0_probe and _looks_like_proto0_or_1_pickle(proto0_probe)
+        if _looks_like_proto0_or_1_pickle(
+            content_head,
+            sample_is_prefix=content_head_is_prefix,
+        ) or (
+            proto0_probe
+            and _looks_like_proto0_or_1_pickle(
+                proto0_probe,
+                sample_is_prefix=content_head_is_prefix,
+            )
         ):
             _record_detected_type("pickle_payload")
 

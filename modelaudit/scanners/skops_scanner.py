@@ -10,7 +10,7 @@ import os
 import zipfile
 from typing import Any, ClassVar
 
-from ..utils.file.detection import read_magic_bytes
+from ..utils.file.detection import is_skops_archive, read_magic_bytes
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 
@@ -51,16 +51,7 @@ class SkopsScanner(BaseScanner):
         if ext == ".skops":
             return True
 
-        # Also check magic bytes for ZIP signature (skops files are ZIP archives)
-        try:
-            magic = read_magic_bytes(path, 4)
-            # Check if it's a ZIP file with .skops extension or contains skops metadata
-            if magic.startswith(b"PK") and ext == ".skops":
-                return True
-        except Exception:
-            pass
-
-        return False
+        return is_skops_archive(path)
 
     def _detect_cve_2025_54412(
         self, zip_file: zipfile.ZipFile, result: ScanResult, zip_path: str, file_list: list[str]
@@ -358,6 +349,13 @@ class SkopsScanner(BaseScanner):
                 ),
             )
 
+    def _scan_archive_members(self, path: str, result: ScanResult) -> None:
+        """Recursively scan embedded archive members through the generic ZIP pipeline."""
+        from .zip_scanner import ZipScanner
+
+        zip_scanner = ZipScanner(config=self.config)
+        result.merge(zip_scanner.scan_archive_members(path))
+
     def scan(self, path: str) -> ScanResult:
         """Scan a skops file for security vulnerabilities."""
         # Perform standard path checks
@@ -453,10 +451,13 @@ class SkopsScanner(BaseScanner):
                 # Check for unsafe joblib fallback
                 self._check_unsafe_joblib_fallback(zip_file, result, path)
 
+                # Recursively scan embedded members with the broader scanner suite.
+                self._scan_archive_members(path, result)
+
                 # Add file integrity check
                 self.add_file_integrity_check(path, result)
 
-                result.bytes_scanned = file_size
+                result.bytes_scanned += file_size
 
         except zipfile.BadZipFile:
             result.add_check(

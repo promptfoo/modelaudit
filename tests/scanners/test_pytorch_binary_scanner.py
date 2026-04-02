@@ -1,4 +1,5 @@
 import struct
+from pathlib import Path
 
 import pytest
 
@@ -45,6 +46,29 @@ def test_pytorch_binary_scanner_basic_scan(tmp_path):
     # Should have no file type validation warnings (.bin files with unknown headers are valid)
     validation_issues = [i for i in result.issues if "file type validation failed" in i.message.lower()]
     assert len(validation_issues) == 0
+
+
+def test_pytorch_binary_scanner_reports_tiny_top_level_bin_files(tmp_path: Path) -> None:
+    """Top-level tiny .bin files should retain the existing size-only signal."""
+    scanner = PyTorchBinaryScanner()
+    tiny_bin = tmp_path / "tiny.bin"
+    tiny_bin.write_bytes(b"weights")
+
+    result = scanner.scan(str(tiny_bin))
+
+    assert any("Suspiciously small binary file" in issue.message for issue in result.issues)
+
+
+def test_pytorch_binary_scanner_accepts_tiny_nested_bin_members(tmp_path: Path) -> None:
+    """Nested archive members should not emit size-only false positives."""
+    scanner = PyTorchBinaryScanner(config={"_archive_depth": 1})
+    tiny_bin = tmp_path / "weights.bin"
+    tiny_bin.write_bytes(b"weights")
+
+    result = scanner.scan(str(tiny_bin))
+
+    assert result.success
+    assert not any("Suspiciously small binary file" in issue.message for issue in result.issues)
 
 
 def test_pytorch_binary_scanner_code_patterns(tmp_path):

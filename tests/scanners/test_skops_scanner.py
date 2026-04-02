@@ -370,6 +370,19 @@ class TestSkopsScannerEdgeCases:
         cve_checks = [c for c in result.checks if "CVE-2025-54886" in c.name and c.status == CheckStatus.FAILED]
         assert len(cve_checks) == 0
 
+    def test_counts_embedded_member_bytes(self, tmp_path: Path) -> None:
+        """Embedded member scans should contribute to total bytes_scanned."""
+        skops_file = tmp_path / "byte_count.skops"
+        with zipfile.ZipFile(skops_file, "w") as zf:
+            zf.writestr("schema.json", '{"version": "1.0"}')
+            zf.writestr("weights.bin", b"model weights")
+
+        scanner = SkopsScanner()
+        result = scanner.scan(str(skops_file))
+
+        assert result.success is True
+        assert result.bytes_scanned > skops_file.stat().st_size
+
 
 class TestSkopsScannerMultipleCVEs:
     """Test detection of multiple CVEs in a single file."""
