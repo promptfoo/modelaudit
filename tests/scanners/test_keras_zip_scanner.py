@@ -265,7 +265,9 @@ class TestKerasZipScanner:
         assert result.metadata.get("keras_version") == "3.12.0"
         cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
         assert len(cve_issues) == 1
-        assert cve_issues[0].location == f"{keras_path}/./model.weights.h5"
+        assert cve_issues[0].location is not None
+        assert cve_issues[0].location.startswith(f"{keras_path}:")
+        assert cve_issues[0].location.rsplit(":", 1)[-1].removeprefix("./") == "model.weights.h5"
         assert cve_issues[0].details["keras_version"] == "3.12.0"
         assert cve_issues[0].details["external_references"] == [
             {
