@@ -14,6 +14,7 @@ from typing import cast
 import pytest
 
 from modelaudit.utils.file.detection import (
+    PROTO0_1_MAX_PROBE_BYTES,
     detect_file_format,
     detect_file_format_from_magic,
     detect_format_from_extension,
@@ -395,6 +396,35 @@ def test_detect_file_format_prefixed_proto0_pickle_with_trailing_junk(tmp_path: 
 
     assert detect_file_format(str(payload)) == "pickle"
     assert detect_file_format_from_magic(str(payload)) == "pickle"
+
+
+def test_detect_file_format_opcode_budget_padded_proto0_pickle(tmp_path: Path) -> None:
+    """Large balanced trivial prefixes should not hide a later dangerous opcode."""
+    pickle_stream = b"I0\n0" * 5000 + b'cos\nsystem\n(S"echo pwned"\ntR.'
+    payload = tmp_path / "opcode-budget-padded-proto0-pickle.dat"
+    payload.write_bytes(pickle_stream)
+
+    assert detect_file_format(str(payload)) == "pickle"
+    assert detect_file_format_from_magic(str(payload)) == "pickle"
+
+
+def test_detect_file_format_probe_boundary_prefixed_proto0_pickle(tmp_path: Path) -> None:
+    """A valid pickle stream should stay detectable when STOP lands beyond the probe window."""
+    pickle_stream = b"I0\n0" * (PROTO0_1_MAX_PROBE_BYTES // 4 + 1) + b'cos\nsystem\n(S"echo pwned"\ntR.'
+    payload = tmp_path / "probe-boundary-prefixed-proto0-pickle.dat"
+    payload.write_bytes(pickle_stream)
+
+    assert detect_file_format(str(payload)) == "pickle"
+    assert detect_file_format_from_magic(str(payload)) == "pickle"
+
+
+def test_detect_file_format_exact_probe_boundary_prefix_without_stop_not_pickle(tmp_path: Path) -> None:
+    """Exact-size malformed prefixes without STOP should not become pickle positives."""
+    payload = tmp_path / "probe-boundary-prefix-without-stop.dat"
+    payload.write_bytes(b"I0\n0" * (PROTO0_1_MAX_PROBE_BYTES // 4))
+
+    assert detect_file_format(str(payload)) != "pickle"
+    assert detect_file_format_from_magic(str(payload)) != "pickle"
 
 
 def test_detect_file_format_safe_proto1_pickle_with_trailing_junk_still_loads(tmp_path: Path) -> None:

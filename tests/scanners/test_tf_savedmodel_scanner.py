@@ -7,6 +7,7 @@ import pytest
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.tf_savedmodel_scanner import TensorFlowSavedModelScanner
+from modelaudit.utils.file.detection import PROTO0_1_MAX_PROBE_BYTES
 
 
 class _NodeCollection(Protocol):
@@ -729,7 +730,45 @@ def test_scan_savedmodel_directory_detects_trailing_junk_pickle_asset(tmp_path: 
     assert any(
         issue.rule_code == "S201"
         and issue.location is not None
-        and str(asset_path) in issue.location
+        and asset_path.name in issue.location
+        and "os.system" in issue.message
+        for issue in result.issues
+    )
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_scan_savedmodel_directory_detects_opcode_budget_padded_pickle_asset(tmp_path: Path) -> None:
+    """Balanced trivial opcode padding should not suppress pickle routing in full scans."""
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    asset_path = model_dir / "assets" / "budget-padded-payload.dat"
+    asset_path.write_bytes(b"I0\n0" * 5000 + b'cos\nsystem\n(S"echo pwned"\ntR.')
+
+    result = scan_model_directory_or_file(str(model_dir))
+
+    assert determine_exit_code(result) == 1
+    assert any(
+        issue.rule_code == "S201"
+        and issue.location is not None
+        and asset_path.name in issue.location
+        and "os.system" in issue.message
+        for issue in result.issues
+    )
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_scan_savedmodel_directory_detects_probe_boundary_padded_pickle_asset(tmp_path: Path) -> None:
+    """A valid pickle prefix at the probe boundary should still route the asset into pickle analysis."""
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    asset_path = model_dir / "assets" / "probe-boundary-payload.dat"
+    asset_path.write_bytes(b"I0\n0" * (PROTO0_1_MAX_PROBE_BYTES // 4 + 1) + b'cos\nsystem\n(S"echo pwned"\ntR.')
+
+    result = scan_model_directory_or_file(str(model_dir))
+
+    assert determine_exit_code(result) == 1
+    assert any(
+        issue.rule_code == "S201"
+        and issue.location is not None
+        and asset_path.name in issue.location
         and "os.system" in issue.message
         for issue in result.issues
     )
@@ -745,7 +784,7 @@ def test_scan_savedmodel_directory_benign_list_prefix_asset_stays_clean(tmp_path
     result = scan_model_directory_or_file(str(model_dir))
 
     assert determine_exit_code(result) == 0
-    assert all(issue.location is None or str(asset_path) not in issue.location for issue in result.issues)
+    assert all(issue.location is None or asset_path.name not in issue.location for issue in result.issues)
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")

@@ -6593,6 +6593,19 @@ class PickleScanner(BaseScanner):
                     evidence["rule_code"] = rule_code
                 return evidence
 
+            def _resolve_promoted_rule_code(message: str, rule_code: str | None, fallback: str | None) -> str | None:
+                if rule_code is not None:
+                    return rule_code
+                if fallback is not None:
+                    return fallback
+
+                from ..rules import RuleRegistry
+
+                match = RuleRegistry.find_matching_rule(message)
+                if match:
+                    return match[0]
+                return None
+
             def _append_supporting_evidence(record: _PrimaryRefFinding, evidence: dict[str, Any]) -> None:
                 for details_dict in (
                     result.checks[record.check_index].details,
@@ -6626,6 +6639,11 @@ class PickleScanner(BaseScanner):
                     existing_check = result.checks[existing.check_index]
                     existing_issue = result.issues[existing.issue_index]
                     if _severity_priority(severity) > _severity_priority(existing_check.severity):
+                        promoted_rule_code = _resolve_promoted_rule_code(
+                            message,
+                            rule_code,
+                            existing_check.rule_code,
+                        )
                         existing_details = dict(existing_check.details)
                         previous_supporting = list(existing_details.pop("supporting_evidence", []))
                         existing_details.pop("supporting_evidence_count", None)
@@ -6647,13 +6665,13 @@ class PickleScanner(BaseScanner):
                         existing_check.location = location
                         existing_check.details = promoted_details
                         existing_check.why = why
-                        existing_check.rule_code = rule_code
+                        existing_check.rule_code = promoted_rule_code
                         existing_issue.message = message
                         existing_issue.severity = severity
                         existing_issue.location = location
                         existing_issue.details = dict(promoted_details)
                         existing_issue.why = why
-                        existing_issue.rule_code = rule_code
+                        existing_issue.rule_code = promoted_rule_code
                         _append_supporting_evidence(existing, previous_primary)
                         return False
                     _append_supporting_evidence(existing, evidence)

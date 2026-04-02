@@ -104,6 +104,7 @@ def scan_result_from_dict(result_dict: dict[str, Any]) -> "ScanResult":
                 details=_coerce_details(issue_dict.get("details", {})),
                 why=issue_dict.get("why"),
                 type=issue_dict.get("type", f"{scanner_name}_cached"),
+                rule_code=issue_dict.get("rule_code"),
                 timestamp=issue_dict.get("timestamp", time.time()),
             )
             result.issues.append(issue)
@@ -121,6 +122,7 @@ def scan_result_from_dict(result_dict: dict[str, Any]) -> "ScanResult":
                 location=check_dict.get("location"),
                 details=_coerce_details(check_dict.get("details", {})),
                 why=check_dict.get("why"),
+                rule_code=check_dict.get("rule_code"),
                 timestamp=check_dict.get("timestamp", time.time()),
             )
             result.checks.append(check)
@@ -166,6 +168,7 @@ def scan_result_to_dict(scan_result: "ScanResult") -> dict[str, Any]:
             "location": getattr(issue, "location", ""),
             "details": getattr(issue, "details", {}),
             "why": getattr(issue, "why", ""),
+            "rule_code": getattr(issue, "rule_code", None),
         }
         result_dict["issues"].append(issue_dict)
 
@@ -179,6 +182,7 @@ def scan_result_to_dict(scan_result: "ScanResult") -> dict[str, Any]:
             "location": getattr(check, "location", ""),
             "details": getattr(check, "details", {}),
             "why": getattr(check, "why", ""),
+            "rule_code": getattr(check, "rule_code", None),
             "timestamp": getattr(check, "timestamp", time.time()),
         }
         result_dict["checks"].append(check_dict)

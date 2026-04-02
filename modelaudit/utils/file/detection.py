@@ -82,7 +82,10 @@ MARKED_PROTOCOL0_GLOBAL_RE = re.compile(rb"^[\(\]\}]c[^\n\r]{1,64}\n[^\n\r]{1,64
 # still detect prefixed payloads (for example MARK/LIST/POP or BININT1/POP
 # before a GLOBAL/INST opcode).
 PROTO0_1_MAX_PROBE_BYTES: int = 64 * 1024
-PROTO0_1_MAX_PROBE_OPCODES: int = 4096
+# A 64 KiB probe can contain up to 64 KiB one-byte opcodes. Keep the opcode
+# budget aligned with the byte budget so trivial padding cannot hide a later
+# dangerous opcode inside the sampled prefix.
+PROTO0_1_MAX_PROBE_OPCODES: int = PROTO0_1_MAX_PROBE_BYTES
 PROTO0_1_START_BYTES: bytes = b"()]}cilp0FGIJKLMNSTUVX"
 PROTO0_1_IGNORABLE_TRAILING_BYTES: bytes = b" \t\r\n\x00"
 PROTO0_1_TRIVIAL_LEADING_OPCODES: frozenset[str] = frozenset(
@@ -117,7 +120,7 @@ PROTO0_1_TRIVIAL_LEADING_OPCODES: frozenset[str] = frozenset(
 SAFETENSORS_MAX_HEADER_BYTES: int = 100 * 1024 * 1024
 
 
-def _looks_like_proto0_or_1_pickle(sample: bytes) -> bool:
+def _looks_like_proto0_or_1_pickle(sample: bytes, *, sample_is_prefix: bool = False) -> bool:
     """Best-effort protocol 0/1 detection via bounded pickle opcode parsing."""
     if len(sample) < 2:
         return False
@@ -144,14 +147,21 @@ def _looks_like_proto0_or_1_pickle(sample: bytes) -> bool:
                     if has_non_trivial_opcode:
                         return opcode_count >= 2
                     stripped_trailing = trailing.lstrip(PROTO0_1_IGNORABLE_TRAILING_BYTES)
-                    return bool(stripped_trailing) and _looks_like_proto0_or_1_pickle(stripped_trailing)
+                    return bool(stripped_trailing) and _looks_like_proto0_or_1_pickle(
+                        stripped_trailing,
+                        sample_is_prefix=sample_is_prefix,
+                    )
                 if opcode.name not in PROTO0_1_TRIVIAL_LEADING_OPCODES:
                     has_non_trivial_opcode = True
                 if opcode_count >= PROTO0_1_MAX_PROBE_OPCODES:
                     return False
+        except ValueError as exc:
+            return sample_is_prefix and opcode_count >= 2 and str(exc) == "pickle exhausted before seeing STOP"
         except Exception:
             return False
-        return False
+        # A cleanly parsed prefix without STOP at the probe boundary is still a
+        # pickle indicator when the caller knows more bytes remain in the file.
+        return sample_is_prefix and opcode_count >= 2
 
     if _matches_proto_stream(sample):
         return True
@@ -757,7 +767,10 @@ def detect_file_format_from_magic(path: str) -> str:
             # Protocol 0/1 pickle payloads can evade short magic-byte checks.
             # Probe a bounded prefix and require a valid opcode stream.
             pickle_probe_sample = _read_pickle_probe_sample(file_path, size, magic16)
-            if _looks_like_proto0_or_1_pickle(pickle_probe_sample):
+            if _looks_like_proto0_or_1_pickle(
+                pickle_probe_sample,
+                sample_is_prefix=size > len(pickle_probe_sample),
+            ):
                 return "pickle"
 
             # Check for XML-based formats (OpenVINO and PMML)
@@ -867,7 +880,10 @@ def detect_file_format(path: str) -> str:
     if any(magic4.startswith(m) for m in pickle_magics):
         return "pickle"
     pickle_probe_sample = _read_pickle_probe_sample(file_path, size, magic16)
-    if _looks_like_proto0_or_1_pickle(pickle_probe_sample):
+    if _looks_like_proto0_or_1_pickle(
+        pickle_probe_sample,
+        sample_is_prefix=size > len(pickle_probe_sample),
+    ):
         return "pickle"
 
     # For .bin files, do more sophisticated detection
