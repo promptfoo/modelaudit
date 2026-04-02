@@ -241,10 +241,12 @@ class TestKerasZipScanner:
 
         result = scanner.scan(str(keras_path))
 
+        assert result.metadata.get("keras_version") == "3.0.0"
         assert any("lambda" in issue.message.lower() for issue in result.issues)
         assert any(
-            "payload.pkl" in (issue.location or "")
-            and ("os.system" in issue.message.lower() or "posix.system" in issue.message.lower())
+            issue.rule_code == "S201"
+            and issue.details.get("zip_entry") == "./payload.pkl"
+            and any(global_name in issue.message.lower() for global_name in ("os.system", "posix.system", "nt.system"))
             for issue in result.issues
         )
 

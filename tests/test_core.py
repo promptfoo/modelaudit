@@ -12,7 +12,9 @@ from typing import Any
 import pytest
 
 from modelaudit.core import scan_file
-from modelaudit.scanners.base import IssueSeverity
+from modelaudit.scanners.base import IssueSeverity, ScanResult
+
+_SYSTEM_GLOBAL_NAMES = ("os.system", "posix.system", "nt.system")
 
 
 def _build_malicious_pickle() -> bytes:
@@ -31,6 +33,15 @@ def _create_misnamed_zip(path: Path, entries: dict[str, bytes]) -> None:
             archive.writestr(name, data)
 
 
+def _assert_system_pickle_detected(result: ScanResult, entry_name: str) -> None:
+    assert any(
+        issue.rule_code == "S201"
+        and issue.details.get("zip_entry") == entry_name
+        and any(global_name in issue.message.lower() for global_name in _SYSTEM_GLOBAL_NAMES)
+        for issue in result.issues
+    ), f"Expected S201 finding for {entry_name}, got: {[(i.location, i.message, i.details) for i in result.issues]}"
+
+
 def test_scan_file_detects_malicious_zip_with_misleading_extension(tmp_path: Path) -> None:
     disguised_zip = tmp_path / "payload.jpg"
     _create_misnamed_zip(disguised_zip, {"payload.pkl": _build_malicious_pickle()})
@@ -38,7 +49,7 @@ def test_scan_file_detects_malicious_zip_with_misleading_extension(tmp_path: Pat
     result = scan_file(str(disguised_zip))
 
     assert result.scanner_name == "zip"
-    assert any("payload.pkl" in (issue.location or "") for issue in result.issues)
+    _assert_system_pickle_detected(result, "payload.pkl")
 
 
 def test_scan_file_does_not_route_generic_zip_config_to_keras(tmp_path: Path) -> None:
@@ -120,11 +131,8 @@ def test_scan_file_recursively_scans_embedded_pickle_in_content_routed_keras_zip
     result = scan_file(str(disguised_keras))
 
     assert result.scanner_name == "keras_zip"
-    assert any(
-        "payload.pkl" in (issue.location or "")
-        and ("os.system" in issue.message.lower() or "posix.system" in issue.message.lower())
-        for issue in result.issues
-    )
+    _assert_system_pickle_detected(result, "payload.pkl")
+    assert result.metadata.get("model_class") == "Sequential"
 
 
 def test_scan_file_content_routed_keras_zip_with_benign_extra_member_stays_clean(tmp_path: Path) -> None:
@@ -142,6 +150,23 @@ def test_scan_file_content_routed_keras_zip_with_benign_extra_member_stays_clean
     assert result.scanner_name == "keras_zip"
     assert result.success is True
     assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def test_scan_file_content_routed_keras_zip_with_benign_pickle_member_stays_clean(tmp_path: Path) -> None:
+    disguised_keras = tmp_path / "model.jpg"
+    _create_misnamed_zip(
+        disguised_keras,
+        {
+            "config.json": json.dumps({"class_name": "Sequential", "config": {"layers": []}}).encode("utf-8"),
+            "weights.pkl": pickle.dumps({"weights": [1, 2, 3], "bias": [0.1, 0.2]}),
+        },
+    )
+
+    result = scan_file(str(disguised_keras))
+
+    assert result.scanner_name == "keras_zip"
+    assert result.success is True
+    assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
 
 
 def test_scan_file_routes_config_only_keras_by_suffix(tmp_path: Path) -> None:
