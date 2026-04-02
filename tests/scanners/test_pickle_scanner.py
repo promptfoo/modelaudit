@@ -1561,7 +1561,7 @@ def test_post_budget_global_scan_rechecks_deadline_before_second_pass(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The second GLOBAL/INST byte sweep should enforce the same deadline as the first parse loop."""
-    import modelaudit.scanners.pickle_scanner as pickle_scanner_module
+    pickle_scanner_module = sys.modules["modelaudit.scanners.pickle_scanner"]
 
     scan_times = [0.0, 2.0]
 
