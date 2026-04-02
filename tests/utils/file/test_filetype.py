@@ -387,10 +387,20 @@ def test_detect_file_format_proto1_binint1_pop_prefixed_pickle(tmp_path: Path) -
     assert detect_file_format_from_magic(str(payload)) == "pickle"
 
 
-def test_detect_file_format_prefixed_proto1_pickle_with_trailing_junk(tmp_path: Path) -> None:
+def test_detect_file_format_prefixed_proto0_pickle_with_trailing_junk(tmp_path: Path) -> None:
     """Valid pickle streams with trivial prefixes stay detectable when junk follows STOP."""
-    pickle_stream = b"(l0" + pickle.dumps({"safe": 1}, protocol=1) + b"JUNK"
-    payload = tmp_path / "prefixed-proto1-trailing-junk.dat"
+    pickle_stream = b'(l0cos\nsystem\n(S"echo pwned"\ntR.JUNK'
+    payload = tmp_path / "prefixed-proto0-trailing-junk.dat"
+    payload.write_bytes(pickle_stream)
+
+    assert detect_file_format(str(payload)) == "pickle"
+    assert detect_file_format_from_magic(str(payload)) == "pickle"
+
+
+def test_detect_file_format_safe_proto1_pickle_with_trailing_junk_still_loads(tmp_path: Path) -> None:
+    """Python ignores junk after STOP, so the probe should still classify these streams as pickle."""
+    pickle_stream = pickle.dumps({"safe": 1}, protocol=1) + b"JUNK"
+    payload = tmp_path / "safe-proto1-trailing-junk.dat"
     payload.write_bytes(pickle_stream)
 
     assert pickle.loads(pickle_stream) == {"safe": 1}
