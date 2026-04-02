@@ -6,10 +6,12 @@ from pathlib import Path
 from pydantic import HttpUrl
 
 from modelaudit.integrations.license_checker import (
+    _LICENSE_HEADER_MAX_BYTES,
     CopyrightInfo,
     LicenseInfo,
     _is_ml_config_file,
     _is_ml_model_directory,
+    _read_header_text,
     check_commercial_use_warnings,
     collect_license_metadata,
     detect_agpl_components,
@@ -155,6 +157,33 @@ def some_function():
         licenses = scan_for_license_headers("/path/that/does/not/exist")
 
         assert len(licenses) == 0
+
+    def test_binary_archive_header_probe_is_bounded(self, tmp_path: Path) -> None:
+        """Binary payloads should not be re-read as one huge text line."""
+        test_file = tmp_path / "model.pt"
+        test_file.write_bytes(
+            b"PK\x03\x04\x00" + b"A" * (_LICENSE_HEADER_MAX_BYTES * 2) + b"\nSPDX-License-Identifier: MIT\n",
+        )
+
+        content = _read_header_text(str(test_file), max_lines=50)
+        licenses = scan_for_license_headers(str(test_file))
+
+        assert content is not None
+        assert len(content) <= _LICENSE_HEADER_MAX_BYTES
+        assert "SPDX-License-Identifier: MIT" not in content
+        assert licenses == []
+
+    def test_long_one_line_text_header_still_scanned(self, tmp_path: Path) -> None:
+        """Likely text files keep line-oriented scanning beyond the binary probe cap."""
+        test_file = tmp_path / "notice.txt"
+        test_file.write_text(
+            "A" * (_LICENSE_HEADER_MAX_BYTES + 256) + " SPDX-License-Identifier: MIT\n",
+            encoding="utf-8",
+        )
+
+        licenses = scan_for_license_headers(str(test_file), max_lines=1)
+
+        assert [license_info.spdx_id for license_info in licenses] == ["MIT"]
 
 
 class TestCopyrightExtraction:
