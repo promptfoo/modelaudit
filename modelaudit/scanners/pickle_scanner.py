@@ -5,10 +5,11 @@ import os
 import pickletools
 import reprlib
 import struct
+import tempfile
 import time
 from collections.abc import Hashable, Mapping
 from dataclasses import asdict, dataclass, field
-from typing import Any, BinaryIO, ClassVar, Literal, TypedDict, TypeGuard
+from typing import Any, BinaryIO, ClassVar, Literal, TypedDict, TypeGuard, cast
 
 from modelaudit_picklescan import PickleScanner as StandalonePickleScanner
 
@@ -68,6 +69,7 @@ _POST_BUDGET_GLOBAL_SCAN_LIMIT_BYTES = 100 * 1024 * 1024
 _POST_BUDGET_GLOBAL_CONTEXT_BYTES = 4096
 _POST_BUDGET_EXPANSION_SCAN_LIMIT_BYTES = 8 * 1024 * 1024
 _POST_BUDGET_OPCODE_SCAN_LIMIT_OPCODES = 500_000
+_NON_SEEKABLE_PICKLE_COPY_CHUNK_BYTES = 1024 * 1024
 _MEMO_WRITE_OPCODES = frozenset({"PUT", "BINPUT", "LONG_BINPUT", "MEMOIZE"})
 _MEMO_READ_OPCODES = frozenset({"GET", "BINGET", "LONG_BINGET"})
 _EXPANSION_EVENT_WINDOW = 6
@@ -4675,8 +4677,13 @@ class PickleScanner(BaseScanner):
 
         try:
             stream_start = file_obj.tell()
+            file_obj.seek(stream_start)
         except (AttributeError, OSError, ValueError):
-            stream_start = None
+            return self._scan_spooled_non_seekable_pickle_stream(
+                file_obj,
+                file_size,
+                source=source,
+            )
 
         pickle_report = self._standalone_pickle_scanner.scan_stream(
             file_obj,
@@ -4689,9 +4696,6 @@ class PickleScanner(BaseScanner):
             scanner=self,
         )
 
-        if stream_start is None:
-            return package_result
-
         try:
             file_obj.seek(stream_start)
         except (AttributeError, OSError, ValueError):
@@ -4700,6 +4704,40 @@ class PickleScanner(BaseScanner):
         legacy_result = self._scan_pickle_bytes(file_obj, file_size)
         _merge_missing_pickle_checks(legacy_result, package_result)
         return legacy_result
+
+    def _scan_spooled_non_seekable_pickle_stream(
+        self,
+        file_obj: BinaryIO,
+        file_size: int,
+        *,
+        source: str,
+    ) -> ScanResult:
+        """Copy a non-seekable pickle stream to a bounded spool and scan with both engines."""
+        max_in_mem = int((self.config or {}).get("pickle_max_memory_read", 32 * 1024 * 1024))
+        result = self._create_result()
+
+        try:
+            with tempfile.SpooledTemporaryFile(max_size=max(max_in_mem, 0), mode="w+b") as spool:
+                remaining_bytes = max(file_size, 0)
+                while remaining_bytes > 0:
+                    chunk = file_obj.read(min(_NON_SEEKABLE_PICKLE_COPY_CHUNK_BYTES, remaining_bytes))
+                    if not chunk:
+                        break
+                    if len(chunk) > remaining_bytes:
+                        chunk = chunk[:remaining_bytes]
+                    spool.write(chunk)
+                    remaining_bytes -= len(chunk)
+
+                spool.seek(0)
+                return self._scan_pickle_stream_with_package_engine(
+                    cast(BinaryIO, spool),
+                    file_size,
+                    source=source,
+                )
+        except Exception as error:
+            self._record_pickle_runtime_error(result, error, location=source)
+            result.finish(success=False)
+            return result
 
     def scan(self, path: str) -> ScanResult:
         """Scan a pickle file for suspicious content"""

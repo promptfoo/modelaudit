@@ -58,6 +58,14 @@ SYSTEM_GLOBAL_VARIANTS = {"os.system", "posix.system", "nt.system"}
 # Import only what we need for the pickle scanner test
 
 
+class _NonSeekableBytesIO(BytesIO):
+    def tell(self) -> int:
+        raise OSError("tell disabled")
+
+    def seek(self, pos: int, whence: int = 0) -> int:
+        raise OSError("seek disabled")
+
+
 def _contains_system_global(text: str) -> bool:
     return any(target in text for target in SYSTEM_GLOBAL_VARIANTS)
 
@@ -118,6 +126,28 @@ def test_pickle_scanner_can_handle_detects_protocol_zero_pickle_content(tmp_path
     model_path.write_bytes(pickle.dumps({"safe": True}, protocol=0))
 
     assert PickleScanner.can_handle(str(model_path)) is True
+
+
+def test_scan_stream_preserves_legacy_findings_for_non_seekable_stream() -> None:
+    """Non-seekable streams should still run the legacy parity pass."""
+    payload = (
+        Path(__file__).resolve().parents[1] / "assets" / "exploits" / "exploit4_supply_chain_attack.pkl"
+    ).read_bytes()
+
+    scanner = PickleScanner()
+    seekable_result = scanner.scan_stream(BytesIO(payload), len(payload), source="seekable.pkl")
+    non_seekable_result = scanner.scan_stream(
+        _NonSeekableBytesIO(payload),
+        len(payload),
+        source="nonseek.pkl",
+    )
+
+    seekable_findings = {(issue.rule_code, issue.message) for issue in seekable_result.issues}
+    non_seekable_findings = {(issue.rule_code, issue.message) for issue in non_seekable_result.issues}
+
+    assert ("S310", "C&C pattern detected: backdoor") in seekable_findings
+    assert seekable_findings <= non_seekable_findings
+    assert non_seekable_result.success is seekable_result.success
 
 
 def test_pickle_scanner_can_handle_rejects_non_pickle_content(tmp_path: Path) -> None:
