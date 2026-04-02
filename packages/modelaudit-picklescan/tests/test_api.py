@@ -67,10 +67,7 @@ def test_scan_bytes_detects_reduce_invoking_os_system() -> None:
     assert report.has_security_findings is True
     assert any(finding.rule_code == "DANGEROUS_CALL" for finding in report.findings)
     assert not any(finding.rule_code == "DANGEROUS_GLOBAL" for finding in report.findings)
-    assert any(
-        any(symbol in finding.message for symbol in SYSTEM_GLOBALS)
-        for finding in report.findings
-    )
+    assert any(any(symbol in finding.message for symbol in SYSTEM_GLOBALS) for finding in report.findings)
     assert any(finding.details.get("import_reference") in SYSTEM_GLOBALS for finding in report.findings)
     assert any(
         ref["import_reference"] in SYSTEM_GLOBALS and ref["is_dangerous"] is True
