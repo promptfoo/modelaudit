@@ -1113,7 +1113,7 @@ class TorchServeMarScanner(BaseScanner):
 
         processed_uncompressed = 0
         analyzable_member_lookup: dict[str, list[zipfile.ZipInfo]] = {}
-        requirements_member_lookup = self._build_requirements_member_lookup(entries_to_process)
+        requirements_member_lookup = self._build_requirements_member_lookup(member_infos)
         for member_info in entries_to_process:
             self.check_interrupted()
 

