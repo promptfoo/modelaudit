@@ -437,7 +437,11 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
                 self.file_metadata[path] = metadata
 
         # Track scanner names (avoid duplicates)
-        for scanner in results_dict.get("scanners", []):
+        merged_scanners = [
+            *list(results_dict.get("scanners", []) or []),
+            *list(results_dict.get("scanner_names", []) or []),
+        ]
+        for scanner in merged_scanners:
             if scanner and scanner not in self.scanner_names and scanner != "unknown":
                 self.scanner_names.append(scanner)
 
