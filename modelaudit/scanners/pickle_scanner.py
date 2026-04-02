@@ -5623,6 +5623,12 @@ class PickleScanner(BaseScanner):
             ):
                 return True
 
+            if is_suspicious_global(module, function) or (
+                (normalized_mod, normalized_func) != (module, function)
+                and is_suspicious_global(normalized_mod, normalized_func)
+            ):
+                return not _is_warning_severity_ref(normalized_mod, normalized_func)
+
             return (
                 _is_dangerous_module(module)
                 or ((normalized_mod, normalized_func) != (module, function) and _is_dangerous_module(normalized_mod))

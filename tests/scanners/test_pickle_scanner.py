@@ -1677,6 +1677,35 @@ def test_post_budget_global_scan_reference_cap_preserves_late_critical_tail(
     assert result.success is False
 
 
+def test_post_budget_global_scan_reference_cap_preserves_late_suspicious_symbol_tail(
+    tmp_path: Path,
+) -> None:
+    """Warning-only cap saturation should not hide later CRITICAL refs from SUSPICIOUS_GLOBALS."""
+    pickle_path = tmp_path / "post-budget-suspicious-global-tail.pkl"
+    benign_padding = _make_opcode_padding_stream(opcode_pairs=64)
+    warning_spray = b"".join(f"cpkg{i}\nhelper\n".encode("ascii") for i in range(32))
+    pickle_path.write_bytes(benign_padding + warning_spray + b"coperator\nattrgetter\n")
+
+    result = PickleScanner(
+        {
+            "max_opcodes": 64,
+            "post_budget_global_max_reference_findings": 8,
+            "post_budget_global_scan_limit_bytes": len(benign_padding)
+            + len(warning_spray)
+            + len(b"coperator\nattrgetter\n"),
+        }
+    ).scan(str(pickle_path))
+
+    assert any(
+        check.name == "Post-Budget Global Reference Scan"
+        and check.status == CheckStatus.FAILED
+        and "operator.attrgetter" in check.message
+        for check in result.checks
+    )
+    assert "post_budget_global_reference_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+    assert result.success is False
+
+
 class TestPickleScanner(unittest.TestCase):
     def setUp(self):
         # Path to assets/samples/pickles/evil.pickle sample
