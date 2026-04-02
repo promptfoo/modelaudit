@@ -64,6 +64,7 @@ _NESTED_PICKLE_VALIDATION_WINDOW_BYTES = 8 * 1024
 _POST_BUDGET_GLOBAL_SCAN_LIMIT_BYTES = 100 * 1024 * 1024
 _POST_BUDGET_GLOBAL_CONTEXT_BYTES = 4096
 _POST_BUDGET_GLOBAL_MEMO_LIMIT_ENTRIES = 4096
+_POST_BUDGET_GLOBAL_MAX_REFERENCE_FINDINGS = 4096
 _POST_BUDGET_GLOBAL_DEADLINE_CHECK_INTERVAL_BYTES = 4096
 _POST_BUDGET_EXPANSION_SCAN_LIMIT_BYTES = 8 * 1024 * 1024
 _POST_BUDGET_OPCODE_SCAN_LIMIT_OPCODES = 500_000
@@ -4356,7 +4357,17 @@ class PickleScanner(BaseScanner):
         except (TypeError, ValueError):
             parsed_post_budget_global_memo_limit = _POST_BUDGET_GLOBAL_MEMO_LIMIT_ENTRIES
         self.post_budget_global_memo_limit_entries = max(0, parsed_post_budget_global_memo_limit)
+        configured_post_budget_global_max_findings = self.config.get(
+            "post_budget_global_max_reference_findings",
+            _POST_BUDGET_GLOBAL_MAX_REFERENCE_FINDINGS,
+        )
+        try:
+            parsed_post_budget_global_max_findings = int(configured_post_budget_global_max_findings)
+        except (TypeError, ValueError):
+            parsed_post_budget_global_max_findings = _POST_BUDGET_GLOBAL_MAX_REFERENCE_FINDINGS
+        self.post_budget_global_max_reference_findings = max(0, parsed_post_budget_global_max_findings)
         self._post_budget_global_memo_limit_exceeded = False
+        self._post_budget_global_reference_limit_exceeded = False
         self._post_budget_global_scan_deadline_exceeded = False
         configured_post_budget_expansion_limit = self.config.get(
             "post_budget_expansion_scan_limit_bytes",
@@ -5565,7 +5576,10 @@ class PickleScanner(BaseScanner):
         """Perform a post-budget raw byte scan for GLOBAL/INST/STACK_GLOBAL references."""
         findings: list[dict[str, Any]] = []
         seen: set[tuple[int, str]] = set()
+        classified_failure_refs: dict[str, tuple[bool, IssueSeverity | None, str]] = {}
+        recorded_critical_reference = False
         self._post_budget_global_memo_limit_exceeded = False
+        self._post_budget_global_reference_limit_exceeded = False
         self._post_budget_global_scan_deadline_exceeded = False
 
         minimum_offset = max(0, minimum_offset)
@@ -5579,28 +5593,88 @@ class PickleScanner(BaseScanner):
             return findings
         data_len = len(data)
 
+        def _might_be_critical_reference(module: str, function: str) -> bool:
+            if not _is_resolved_import_target(module, function):
+                return False
+
+            normalized_mod, normalized_func = _normalize_import_reference(module, function)
+            if _is_safe_ml_global(module, function) or (
+                (normalized_mod, normalized_func) != (module, function)
+                and _is_safe_ml_global(normalized_mod, normalized_func)
+            ):
+                return False
+            if (normalized_mod, normalized_func) in IMPORT_ONLY_ALWAYS_DANGEROUS_GLOBALS:
+                return True
+            if _is_copyreg_extension_ref(module) or (
+                (normalized_mod, normalized_func) != (module, function) and _is_copyreg_extension_ref(normalized_mod)
+            ):
+                return True
+            if _is_risky_ml_import(module, function) or (
+                (normalized_mod, normalized_func) != (module, function)
+                and _is_risky_ml_import(normalized_mod, normalized_func)
+            ):
+                return True
+
+            if (
+                f"{module}.{function}" in ALWAYS_DANGEROUS_FUNCTIONS
+                or function in ALWAYS_DANGEROUS_FUNCTIONS
+                or f"{normalized_mod}.{normalized_func}" in ALWAYS_DANGEROUS_FUNCTIONS
+                or normalized_func in ALWAYS_DANGEROUS_FUNCTIONS
+            ):
+                return True
+
+            return (
+                _is_dangerous_module(module)
+                or ((normalized_mod, normalized_func) != (module, function) and _is_dangerous_module(normalized_mod))
+            ) and not _is_warning_severity_ref(normalized_mod, normalized_func)
+
         def _record_reference(module: str, function: str, offset: int, opcode_name: str) -> None:
+            nonlocal recorded_critical_reference
+
             if offset < minimum_offset:
                 return
             if not module or not function or not _is_plausible_python_module(module):
-                return
-
-            is_failure, severity, classification = _classify_import_reference(
-                module,
-                function,
-                ml_context,
-                is_import_only=True,
-            )
-            if not is_failure:
-                return
-            if severity is None:
                 return
 
             import_reference = f"{module}.{function}"
             dedupe_key = (offset, import_reference)
             if dedupe_key in seen:
                 return
+
+            if len(findings) >= self.post_budget_global_max_reference_findings and recorded_critical_reference:
+                self._post_budget_global_reference_limit_exceeded = True
+                return
+            if len(findings) >= self.post_budget_global_max_reference_findings and not _might_be_critical_reference(
+                module, function
+            ):
+                self._post_budget_global_reference_limit_exceeded = True
+                return
+
+            classification_result = classified_failure_refs.get(import_reference)
+            if classification_result is None:
+                classification_result = _classify_import_reference(
+                    module,
+                    function,
+                    ml_context,
+                    is_import_only=True,
+                )
+                if classification_result[0] and (
+                    len(findings) < self.post_budget_global_max_reference_findings
+                    or classification_result[1] == IssueSeverity.CRITICAL
+                ):
+                    classified_failure_refs[import_reference] = classification_result
+            is_failure, severity, classification = classification_result
+            if not is_failure:
+                return
+            if severity is None:
+                return
+
+            if len(findings) >= self.post_budget_global_max_reference_findings and severity != IssueSeverity.CRITICAL:
+                self._post_budget_global_reference_limit_exceeded = True
+                return
             seen.add(dedupe_key)
+            if len(findings) >= self.post_budget_global_max_reference_findings:
+                self._post_budget_global_reference_limit_exceeded = True
 
             findings.append(
                 {
@@ -5614,6 +5688,8 @@ class PickleScanner(BaseScanner):
                     "rule_code": get_import_rule_code(module, function) or "S206",
                 }
             )
+            if severity == IssueSeverity.CRITICAL:
+                recorded_critical_reference = True
 
         def _decode_string_push_at(start: int) -> tuple[str, int] | None:
             if start < 0 or start >= data_len:
@@ -6333,6 +6409,30 @@ class PickleScanner(BaseScanner):
                             "The post-budget fallback bounds memo-table state to avoid attacker-controlled memory "
                             "growth. Older memoized string references may be unavailable once this limit is reached, "
                             "so the scan result is marked inconclusive."
+                        ),
+                        rule_code="S902",
+                    )
+
+                if self._post_budget_global_reference_limit_exceeded:
+                    _mark_inconclusive_scan_result(result, "post_budget_global_reference_limit_exceeded")
+                    result.add_check(
+                        name="Post-Budget Global Reference Tracking Check",
+                        passed=False,
+                        message=(
+                            "Stopped retaining post-budget import references after reaching "
+                            f"{self.post_budget_global_max_reference_findings} findings"
+                        ),
+                        severity=IssueSeverity.INFO,
+                        location=self.current_file_path,
+                        details={
+                            "max_reference_findings": self.post_budget_global_max_reference_findings,
+                            "minimum_offset": post_budget_minimum_offset,
+                            "analysis_incomplete": True,
+                        },
+                        why=(
+                            "The post-budget fallback caps retained GLOBAL/INST/STACK_GLOBAL findings so crafted "
+                            "tails cannot force unbounded result growth. The scan result is marked inconclusive "
+                            "because additional references may have been omitted after the cap was reached."
                         ),
                         rule_code="S902",
                     )

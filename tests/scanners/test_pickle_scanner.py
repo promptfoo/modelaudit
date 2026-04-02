@@ -1,3 +1,4 @@
+import logging
 import os
 import pickle
 import pickletools
@@ -1583,6 +1584,97 @@ def test_post_budget_global_scan_rechecks_deadline_before_second_pass(
 
     assert findings == []
     assert scanner._post_budget_global_scan_deadline_exceeded is True
+
+
+def test_post_budget_global_scan_caps_repeated_reference_findings_and_warning_logs(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Dense repeated GLOBAL references should not grow findings or warning logs without a cap."""
+    payload = b"cos\nsystem\n" * 128
+    scanner = PickleScanner(
+        {
+            "post_budget_global_max_reference_findings": 8,
+            "post_budget_global_scan_limit_bytes": len(payload),
+        }
+    )
+
+    with caplog.at_level(logging.WARNING, logger="modelaudit.scanners"):
+        findings = scanner._scan_global_references_unbounded(
+            BytesIO(payload),
+            file_size=len(payload),
+            minimum_offset=0,
+            ml_context={},
+        )
+
+    assert len(findings) == 8
+    assert all(finding["import_reference"] == "os.system" for finding in findings)
+    assert scanner._post_budget_global_reference_limit_exceeded is True
+    repeated_warnings = [
+        record for record in caplog.records if "Always-dangerous function detected: os.system" in record.getMessage()
+    ]
+    assert len(repeated_warnings) == 1
+
+
+def test_post_budget_global_scan_reference_cap_suppresses_warning_only_log_flood(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Once warning-level findings hit the cap, distinct warning-only refs should stop logging too."""
+    payload = b"".join(f"cglob\nhelper{i}\n".encode("ascii") for i in range(32))
+    scanner = PickleScanner(
+        {
+            "post_budget_global_max_reference_findings": 8,
+            "post_budget_global_scan_limit_bytes": len(payload),
+        }
+    )
+
+    with caplog.at_level(logging.WARNING, logger="modelaudit.scanners"):
+        findings = scanner._scan_global_references_unbounded(
+            BytesIO(payload),
+            file_size=len(payload),
+            minimum_offset=0,
+            ml_context={},
+        )
+
+    assert len(findings) == 8
+    assert all(finding["module"] == "glob" for finding in findings)
+    assert scanner._post_budget_global_reference_limit_exceeded is True
+    glob_warnings = [
+        record for record in caplog.records if "Always-dangerous module detected: glob.helper" in record.getMessage()
+    ]
+    assert len(glob_warnings) == 8
+
+
+def test_post_budget_global_scan_reference_cap_preserves_late_critical_tail(
+    tmp_path: Path,
+) -> None:
+    """A warning-reference spray should not hide a later dangerous import when the cap is reached."""
+    pickle_path = tmp_path / "post-budget-warning-spray.pkl"
+    benign_padding = _make_opcode_padding_stream(opcode_pairs=64)
+    warning_spray = b"".join(f"cpkg{i}\nhelper\n".encode("ascii") for i in range(32))
+    pickle_path.write_bytes(benign_padding + warning_spray + b"cos\nsystem\n")
+
+    result = PickleScanner(
+        {
+            "max_opcodes": 64,
+            "post_budget_global_max_reference_findings": 8,
+            "post_budget_global_scan_limit_bytes": len(benign_padding) + len(warning_spray) + len(b"cos\nsystem\n"),
+        }
+    ).scan(str(pickle_path))
+
+    reference_cap_checks = [
+        check for check in result.checks if check.name == "Post-Budget Global Reference Tracking Check"
+    ]
+    assert len(reference_cap_checks) == 1
+    assert reference_cap_checks[0].status == CheckStatus.FAILED
+    assert reference_cap_checks[0].severity == IssueSeverity.INFO
+    assert "post_budget_global_reference_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Post-Budget Global Reference Scan"
+        and check.status == CheckStatus.FAILED
+        and "os.system" in check.message
+        for check in result.checks
+    )
+    assert result.success is False
 
 
 class TestPickleScanner(unittest.TestCase):
