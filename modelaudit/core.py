@@ -26,6 +26,7 @@ from modelaudit.utils.file.detection import (
     is_executorch_archive,
     is_keras_zip_archive,
     is_pytorch_zip_archive,
+    is_skops_archive,
     is_torchserve_mar_archive,
     validate_file_type,
 )
@@ -261,6 +262,8 @@ def _select_preferred_scanner_id(path: str, header_format: str, ext: str) -> str
             return "pytorch_zip"
         if is_executorch_archive(path):
             return "executorch"
+        if is_skops_archive(path):
+            return "skops"
         if ext == ".skops":
             return "skops"
 

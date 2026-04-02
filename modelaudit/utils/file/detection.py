@@ -64,6 +64,8 @@ _KERAS_ZIP_CONFIG_MAX_BYTES = 4 * 1024 * 1024
 _KERAS_MODEL_CONFIG_KEYS = frozenset({"layers", "input_layers", "output_layers"})
 _KERAS_MODEL_TOP_LEVEL_HINTS = frozenset({"build_config", "compile_config", "module", "registered_name"})
 _PYTORCH_ZIP_METADATA_MAX_BYTES = 64
+_SKOPS_SCHEMA_ENTRIES = frozenset({"schema", "schema.json"})
+_SKOPS_SCHEMA_MAX_BYTES = 4 * 1024 * 1024
 _COMPRESSED_EXTENSION_CODECS = {
     ".gz": "gzip",
     ".bz2": "bzip2",
@@ -287,6 +289,27 @@ def _looks_like_keras_config(config_data: object) -> bool:
     return any(key in config_data for key in _KERAS_MODEL_TOP_LEVEL_HINTS)
 
 
+def _looks_like_skops_schema(schema_data: object) -> bool:
+    """Require enough schema structure to justify Skops-specific routing."""
+    if not isinstance(schema_data, dict):
+        return False
+
+    class_name = schema_data.get("__class__")
+    module_name = schema_data.get("__module__")
+    loader_name = schema_data.get("__loader__")
+    if not isinstance(class_name, str) or not class_name.strip():
+        return False
+    if not isinstance(module_name, str) or not module_name.strip():
+        return False
+    if not isinstance(loader_name, str) or not loader_name.endswith("Node"):
+        return False
+    if "content" not in schema_data:
+        return False
+
+    skops_version = schema_data.get("_skops_version")
+    return isinstance(skops_version, str) and bool(skops_version.strip())
+
+
 def _read_zip_member_text(
     archive: zipfile.ZipFile,
     member_info: zipfile.ZipInfo,
@@ -452,6 +475,35 @@ def is_executorch_archive(path: str) -> bool:
 
                 version_text = _read_zip_member_text(archive, version_info, _PYTORCH_ZIP_METADATA_MAX_BYTES)
                 if version_text is not None and re.fullmatch(r"\d+(?:\.\d+)?", version_text):
+                    return True
+    except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile):
+        return False
+
+    return False
+
+
+def is_skops_archive(path: str) -> bool:
+    """Return whether a ZIP-backed file has a Skops schema payload."""
+    file_path = Path(path)
+    if not file_path.is_file():
+        return False
+
+    try:
+        with zipfile.ZipFile(file_path, "r") as archive:
+            for info in archive.infolist():
+                if not info.filename or info.is_dir():
+                    continue
+
+                basename = PurePosixPath(_normalize_archive_member_name(info.filename)).name
+                if basename not in _SKOPS_SCHEMA_ENTRIES:
+                    continue
+
+                try:
+                    schema_data = json.loads(_read_zip_member_bounded(archive, info, _SKOPS_SCHEMA_MAX_BYTES))
+                except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+                    continue
+
+                if _looks_like_skops_schema(schema_data):
                     return True
     except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile):
         return False
