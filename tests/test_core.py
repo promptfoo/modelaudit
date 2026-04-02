@@ -116,6 +116,30 @@ def test_scan_file_does_not_route_near_match_schema_zip_to_skops(tmp_path: Path)
     assert not any("CVE-2025-" in check.name for check in result.checks)
 
 
+def test_scan_file_routes_oversized_misnamed_skops_schema_to_skops(tmp_path: Path) -> None:
+    disguised_skops = tmp_path / "oversized-schema.jpg"
+    schema = {
+        "__class__": "Pipeline",
+        "__module__": "sklearn.pipeline",
+        "__loader__": "ObjectNode",
+        "_skops_version": "0.11.0",
+        "content": {},
+        "padding": "x" * (4 * 1024 * 1024),
+    }
+    _create_misnamed_zip(
+        disguised_skops,
+        {
+            "schema.json": json.dumps(schema).encode("utf-8"),
+            "payload.pkl": _build_malicious_pickle(),
+        },
+    )
+
+    result = scan_file(str(disguised_skops))
+
+    assert result.scanner_name == "skops"
+    assert any("payload.pkl" in (issue.location or "") for issue in result.issues)
+
+
 def test_scan_file_handles_encrypted_skops_schema_without_routing_crash(tmp_path: Path) -> None:
     disguised_zip = tmp_path / "encrypted-schema.jpg"
     _create_misnamed_zip(

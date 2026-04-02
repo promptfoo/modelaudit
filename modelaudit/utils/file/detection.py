@@ -301,6 +301,7 @@ def _looks_like_skops_schema(schema_data: object) -> bool:
         return False
     if not isinstance(module_name, str) or not module_name.strip():
         return False
+    # Skops schema nodes are serialized as ObjectNode/ListNode/etc.
     if not isinstance(loader_name, str) or not loader_name.endswith("Node"):
         return False
     if "content" not in schema_data:
@@ -484,7 +485,12 @@ def is_executorch_archive(path: str) -> bool:
 
 
 def is_skops_archive(path: str) -> bool:
-    """Return whether a ZIP-backed file has a Skops schema payload."""
+    """Return whether a ZIP-backed file has a Skops schema payload.
+
+    Oversized schema members are treated as Skops to avoid failing open on
+    misnamed archives whose schema content cannot be safely parsed within the
+    bounded read limit.
+    """
     file_path = Path(path)
     if not file_path.is_file():
         return False
@@ -498,6 +504,8 @@ def is_skops_archive(path: str) -> bool:
                 basename = PurePosixPath(_normalize_archive_member_name(info.filename)).name
                 if basename not in _SKOPS_SCHEMA_ENTRIES:
                     continue
+                if info.file_size > _SKOPS_SCHEMA_MAX_BYTES:
+                    return True
 
                 try:
                     schema_data = json.loads(_read_zip_member_bounded(archive, info, _SKOPS_SCHEMA_MAX_BYTES))
