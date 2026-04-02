@@ -5576,7 +5576,8 @@ class PickleScanner(BaseScanner):
         """Perform a post-budget raw byte scan for GLOBAL/INST/STACK_GLOBAL references."""
         findings: list[dict[str, Any]] = []
         seen: set[tuple[int, str]] = set()
-        classified_failure_refs: dict[str, tuple[bool, IssueSeverity | None, str]] = {}
+        classified_refs: OrderedDict[str, tuple[bool, IssueSeverity | None, str]] = OrderedDict()
+        classification_cache_limit = max(1, self.post_budget_global_max_reference_findings)
         recorded_critical_reference = False
         self._post_budget_global_memo_limit_exceeded = False
         self._post_budget_global_reference_limit_exceeded = False
@@ -5634,6 +5635,15 @@ class PickleScanner(BaseScanner):
                 or ((normalized_mod, normalized_func) != (module, function) and _is_dangerous_module(normalized_mod))
             ) and not _is_warning_severity_ref(normalized_mod, normalized_func)
 
+        def _cache_classification(
+            import_reference: str,
+            classification_result: tuple[bool, IssueSeverity | None, str],
+        ) -> None:
+            classified_refs[import_reference] = classification_result
+            classified_refs.move_to_end(import_reference)
+            while len(classified_refs) > classification_cache_limit:
+                classified_refs.popitem(last=False)
+
         def _record_reference(module: str, function: str, offset: int, opcode_name: str) -> None:
             nonlocal recorded_critical_reference
 
@@ -5656,7 +5666,7 @@ class PickleScanner(BaseScanner):
                 self._post_budget_global_reference_limit_exceeded = True
                 return
 
-            classification_result = classified_failure_refs.get(import_reference)
+            classification_result = classified_refs.get(import_reference)
             if classification_result is None:
                 classification_result = _classify_import_reference(
                     module,
@@ -5664,11 +5674,9 @@ class PickleScanner(BaseScanner):
                     ml_context,
                     is_import_only=True,
                 )
-                if classification_result[0] and (
-                    len(findings) < self.post_budget_global_max_reference_findings
-                    or classification_result[1] == IssueSeverity.CRITICAL
-                ):
-                    classified_failure_refs[import_reference] = classification_result
+                _cache_classification(import_reference, classification_result)
+            else:
+                classified_refs.move_to_end(import_reference)
             is_failure, severity, classification = classification_result
             if not is_failure:
                 return

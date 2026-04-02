@@ -1706,6 +1706,57 @@ def test_post_budget_global_scan_reference_cap_preserves_late_suspicious_symbol_
     assert result.success is False
 
 
+def test_post_budget_global_scan_caches_benign_post_cap_classifications(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeated benign refs that pass the CRITICAL prefilter should only be classified once post-cap."""
+    pickle_scanner_module = sys.modules["modelaudit.scanners.pickle_scanner"]
+    original_classifier: Callable[..., tuple[bool, IssueSeverity | None, str]] = (
+        pickle_scanner_module._classify_import_reference
+    )
+    safe_candidate_calls = 0
+
+    def _fake_classify_import_reference(
+        mod: str,
+        func: str,
+        ml_context: dict[str, Any],
+        *,
+        is_import_only: bool,
+    ) -> tuple[bool, IssueSeverity | None, str]:
+        nonlocal safe_candidate_calls
+        if (mod, func) == ("os", "pathlike"):
+            safe_candidate_calls += 1
+            return False, None, "safe_allowlisted"
+        return original_classifier(mod, func, ml_context, is_import_only=is_import_only)
+
+    monkeypatch.setattr(
+        pickle_scanner_module,
+        "_classify_import_reference",
+        _fake_classify_import_reference,
+    )
+
+    warning_spray = b"".join(f"cglob\nhelper{i}\n".encode("ascii") for i in range(9))
+    payload = warning_spray + (b"cos\npathlike\n" * 16)
+    scanner = PickleScanner(
+        {
+            "post_budget_global_max_reference_findings": 8,
+            "post_budget_global_scan_limit_bytes": len(payload),
+        }
+    )
+
+    findings = scanner._scan_global_references_unbounded(
+        BytesIO(payload),
+        file_size=len(payload),
+        minimum_offset=0,
+        ml_context={},
+    )
+
+    assert len(findings) == 8
+    assert all(finding["module"] == "glob" for finding in findings)
+    assert safe_candidate_calls == 1
+    assert scanner._post_budget_global_reference_limit_exceeded is True
+
+
 class TestPickleScanner(unittest.TestCase):
     def setUp(self):
         # Path to assets/samples/pickles/evil.pickle sample
