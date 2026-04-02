@@ -101,7 +101,15 @@ def test_scan_file_scans_clean_skops_without_nested_false_positives(tmp_path: Pa
     _create_misnamed_zip(
         skops_archive,
         {
-            "schema.json": b'{"version": "1.0"}',
+            "schema.json": json.dumps(
+                {
+                    "__class__": "Pipeline",
+                    "__module__": "sklearn.pipeline",
+                    "__loader__": "ObjectNode",
+                    "_skops_version": "0.12.0",
+                    "content": {},
+                }
+            ).encode("utf-8"),
             "metadata.json": b'{"name": "clean_model"}',
             "weights.bin": b"model weights",
         },

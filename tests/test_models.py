@@ -505,6 +505,22 @@ class TestModelAuditResultModel:
 
         assert result.scanner_names == ["skops"]
 
+    def test_aggregate_scanner_names_wraps_scalar_strings(self) -> None:
+        """Scalar scanner fields should not be split into characters."""
+        result = create_initial_audit_result()
+
+        result.aggregate_scan_result(
+            {
+                "scanner_names": "skops",
+                "scanners": "zip",
+                "issues": [],
+                "checks": [],
+                "assets": [],
+            }
+        )
+
+        assert result.scanner_names == ["zip", "skops"]
+
     def test_finalize_statistics(self):
         """Test finalizing statistics."""
         result = create_initial_audit_result()
