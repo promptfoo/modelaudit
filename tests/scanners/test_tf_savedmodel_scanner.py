@@ -4,6 +4,7 @@ from typing import Any, Protocol, TypedDict
 
 import pytest
 
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.tf_savedmodel_scanner import TensorFlowSavedModelScanner
 
@@ -713,6 +714,38 @@ def test_savedmodel_assets_trivial_prefix_pickle_with_trailing_junk_is_flagged(t
 
     assert asset_issues
     assert any("pickle_payload" in issue.details.get("detected_content_type", "") for issue in asset_issues)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_scan_savedmodel_directory_detects_trailing_junk_pickle_asset(tmp_path: Path) -> None:
+    """Full directory scans should route junk-suffixed pickle assets into pickle analysis."""
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    asset_path = model_dir / "assets" / "payload.dat"
+    asset_path.write_bytes(b'(l0cos\nsystem\n(S"echo pwned"\ntR.JUNK')
+
+    result = scan_model_directory_or_file(str(model_dir))
+
+    assert determine_exit_code(result) == 1
+    assert any(
+        issue.rule_code == "S201"
+        and issue.location is not None
+        and str(asset_path) in issue.location
+        and "os.system" in issue.message
+        for issue in result.issues
+    )
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_scan_savedmodel_directory_benign_list_prefix_asset_stays_clean(tmp_path: Path) -> None:
+    """Plain-text near-matches should not become pickle findings in full directory scans."""
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    asset_path = model_dir / "assets" / "notes.txt"
+    asset_path.write_bytes(b"(l0.not a pickle stream")
+
+    result = scan_model_directory_or_file(str(model_dir))
+
+    assert determine_exit_code(result) == 0
+    assert all(issue.location is None or str(asset_path) not in issue.location for issue in result.issues)
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
