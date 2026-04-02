@@ -5853,6 +5853,7 @@ class PickleScanner(BaseScanner):
             last_value_end = -1
             parse_cursor += 1
 
+        next_deadline_check_cursor = 0
         cursor = 0
         while cursor < data_len:
             if _deadline_exceeded(cursor):

@@ -1510,6 +1510,36 @@ def test_post_budget_global_scan_reports_memo_tracking_cap(tmp_path: Path) -> No
     assert result.success is False
 
 
+def test_post_budget_global_scan_memo_cap_stays_quiet_for_benign_tail(tmp_path: Path) -> None:
+    """Memo-cap eviction should not invent suspicious import findings for benign tail payloads."""
+    pickle_path = tmp_path / "post-budget-benign-memo-cap.pkl"
+    benign_padding = _make_opcode_padding_stream(opcode_pairs=128)
+    memo_spray = b"\x8c\x00\x94" * 64
+    benign_stream = pickle.dumps({"safe": True, "weights": [1, 2, 3]}, protocol=4)
+    pickle_path.write_bytes(benign_padding + memo_spray + benign_stream)
+
+    result = PickleScanner(
+        {
+            "max_opcodes": 64,
+            "post_budget_global_memo_limit_entries": 8,
+            "post_budget_global_scan_limit_bytes": len(benign_padding) + len(memo_spray) + len(benign_stream),
+        }
+    ).scan(str(pickle_path))
+
+    memo_checks = [check for check in result.checks if check.name == "Post-Budget Global Memo Tracking Check"]
+    assert len(memo_checks) == 1
+    assert memo_checks[0].status == CheckStatus.FAILED
+    assert memo_checks[0].severity == IssueSeverity.INFO
+    assert not any(
+        check.name == "Post-Budget Global Reference Scan" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    ), result.checks
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "post_budget_global_memo_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+    assert result.success is False
+
+
 def test_post_budget_global_scan_honors_tail_scan_deadline() -> None:
     """The raw tail parser should stop when its own deadline expires."""
     payload = b"\x8c\x00" * 8192 + _short_binunicode(b"os") + _short_binunicode(b"system") + b"\x93"
@@ -1521,6 +1551,34 @@ def test_post_budget_global_scan_honors_tail_scan_deadline() -> None:
         minimum_offset=0,
         ml_context={},
         deadline=0.0,
+    )
+
+    assert findings == []
+    assert scanner._post_budget_global_scan_deadline_exceeded is True
+
+
+def test_post_budget_global_scan_rechecks_deadline_before_second_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The second GLOBAL/INST byte sweep should enforce the same deadline as the first parse loop."""
+    import modelaudit.scanners.pickle_scanner as pickle_scanner_module
+
+    scan_times = [0.0, 2.0]
+
+    def _fake_time() -> float:
+        if scan_times:
+            return scan_times.pop(0)
+        return 2.0
+
+    monkeypatch.setattr(pickle_scanner_module.time, "time", _fake_time)
+    scanner = PickleScanner({"post_budget_global_scan_limit_bytes": 64, "timeout": 1})
+
+    findings = scanner._scan_global_references_unbounded(
+        BytesIO(b"cos\nsystem\n"),
+        file_size=len(b"cos\nsystem\n"),
+        minimum_offset=0,
+        ml_context={},
+        deadline=1.0,
     )
 
     assert findings == []
