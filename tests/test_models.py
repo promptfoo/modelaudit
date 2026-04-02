@@ -494,6 +494,33 @@ class TestModelAuditResultModel:
         )
         assert "PickleScanner" in result.scanner_names
 
+    def test_aggregate_scanner_names_from_model_dump(self) -> None:
+        """Aggregating model_dump() output should preserve scanner_names."""
+        child = create_initial_audit_result()
+        child.scanner_names = ["skops"]
+        child.files_scanned = 1
+
+        result = create_initial_audit_result()
+        result.aggregate_scan_result(child.model_dump())
+
+        assert result.scanner_names == ["skops"]
+
+    def test_aggregate_scanner_names_wraps_scalar_strings(self) -> None:
+        """Scalar scanner fields should not be split into characters."""
+        result = create_initial_audit_result()
+
+        result.aggregate_scan_result(
+            {
+                "scanner_names": "skops",
+                "scanners": "zip",
+                "issues": [],
+                "checks": [],
+                "assets": [],
+            }
+        )
+
+        assert result.scanner_names == ["zip", "skops"]
+
     def test_finalize_statistics(self):
         """Test finalizing statistics."""
         result = create_initial_audit_result()

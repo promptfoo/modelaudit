@@ -305,3 +305,32 @@ class TestRoundTrip:
 
         assert len(restored.checks) == 1
         assert restored.checks[0].name == original.checks[0].name
+
+    def test_roundtrip_preserves_rule_codes(self) -> None:
+        """Rule codes should survive cache serialization and restoration."""
+        original = ScanResult(scanner_name="pickle")
+        original.issues.append(
+            Issue(
+                message="Found REDUCE opcode invoking dangerous global: os.system",
+                severity=IssueSeverity.CRITICAL,
+                location="/tmp/model.pkl (pos 42)",
+                timestamp=time.time(),
+                rule_code="S201",
+            )
+        )
+        original.checks.append(
+            Check(
+                name="REDUCE Opcode Safety Check",
+                status=CheckStatus.FAILED,
+                message="Found REDUCE opcode invoking dangerous global: os.system",
+                severity=IssueSeverity.CRITICAL,
+                location="/tmp/model.pkl (pos 42)",
+                timestamp=time.time(),
+                rule_code="S201",
+            )
+        )
+
+        restored = scan_result_from_dict(scan_result_to_dict(original))
+
+        assert restored.issues[0].rule_code == "S201"
+        assert restored.checks[0].rule_code == "S201"

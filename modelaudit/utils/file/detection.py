@@ -61,9 +61,17 @@ _TORCHSERVE_MANIFEST_MAX_BYTES = 1 * 1024 * 1024
 _KERAS_ZIP_REQUIRED_ENTRY = "config.json"
 _KERAS_ZIP_MARKERS = frozenset({"metadata.json", "model.weights.h5", "variables.h5"})
 _KERAS_ZIP_CONFIG_MAX_BYTES = 4 * 1024 * 1024
+_KERAS_ZIP_CONFIG_PREFIX_MAX_BYTES = 256 * 1024
 _KERAS_MODEL_CONFIG_KEYS = frozenset({"layers", "input_layers", "output_layers"})
 _KERAS_MODEL_TOP_LEVEL_HINTS = frozenset({"build_config", "compile_config", "module", "registered_name"})
+_KERAS_CONFIG_PREFIX_CLASS_NAME_RE = re.compile(r'"class_name"\s*:\s*"[^"\\]+"')
+_KERAS_CONFIG_PREFIX_CONFIG_OBJECT_RE = re.compile(r'"config"\s*:\s*\{')
+_KERAS_CONFIG_PREFIX_HINT_RE = re.compile(
+    r'"(?:layers|input_layers|output_layers|build_config|compile_config|module|registered_name)"\s*:'
+)
 _PYTORCH_ZIP_METADATA_MAX_BYTES = 64
+_SKOPS_SCHEMA_ENTRIES = frozenset({"schema", "schema.json"})
+_SKOPS_SCHEMA_MAX_BYTES = 4 * 1024 * 1024
 _COMPRESSED_EXTENSION_CODECS = {
     ".gz": "gzip",
     ".bz2": "bzip2",
@@ -82,9 +90,16 @@ MARKED_PROTOCOL0_GLOBAL_RE = re.compile(rb"^[\(\]\}]c[^\n\r]{1,64}\n[^\n\r]{1,64
 # still detect prefixed payloads (for example MARK/LIST/POP or BININT1/POP
 # before a GLOBAL/INST opcode).
 PROTO0_1_MAX_PROBE_BYTES: int = 64 * 1024
-PROTO0_1_MAX_PROBE_OPCODES: int = 4096
+# A 64 KiB probe can contain up to 64 KiB one-byte opcodes. Keep the opcode
+# budget aligned with the byte budget so trivial padding cannot hide a later
+# dangerous opcode inside the sampled prefix.
+PROTO0_1_MAX_PROBE_OPCODES: int = PROTO0_1_MAX_PROBE_BYTES
 PROTO0_1_START_BYTES: bytes = b"()]}cilp0FGIJKLMNSTUVX"
 PROTO0_1_IGNORABLE_TRAILING_BYTES: bytes = b" \t\r\n\x00"
+PROTO0_1_PREFIX_TRUNCATION_ERROR_PREFIXES: tuple[str, ...] = (
+    "pickle exhausted before seeing STOP",
+    "no newline found when trying to read ",
+)
 PROTO0_1_TRIVIAL_LEADING_OPCODES: frozenset[str] = frozenset(
     {
         "MARK",
@@ -117,7 +132,7 @@ PROTO0_1_TRIVIAL_LEADING_OPCODES: frozenset[str] = frozenset(
 SAFETENSORS_MAX_HEADER_BYTES: int = 100 * 1024 * 1024
 
 
-def _looks_like_proto0_or_1_pickle(sample: bytes) -> bool:
+def _looks_like_proto0_or_1_pickle(sample: bytes, *, sample_is_prefix: bool = False) -> bool:
     """Best-effort protocol 0/1 detection via bounded pickle opcode parsing."""
     if len(sample) < 2:
         return False
@@ -128,26 +143,47 @@ def _looks_like_proto0_or_1_pickle(sample: bytes) -> bool:
             return False
 
         opcode_count = 0
-        first_opcode_name: str | None = None
+        has_non_trivial_opcode = False
         try:
             for opcode, _arg, _pos in pickletools.genops(candidate):
                 opcode_count += 1
-                if first_opcode_name is None:
-                    first_opcode_name = opcode.name
                 if opcode.name == "STOP":
                     stop_pos = 0 if _pos is None else _pos
                     trailing = candidate[stop_pos + 1 :]
                     if not trailing or not trailing.strip(PROTO0_1_IGNORABLE_TRAILING_BYTES):
                         return opcode_count >= 2
-                    if first_opcode_name not in PROTO0_1_TRIVIAL_LEADING_OPCODES:
+                    # Python's unpickler ignores trailing bytes after STOP. Accept
+                    # junk-suffixed streams once the parsed prefix contains any
+                    # non-trivial opcode, while still rejecting scalar/container
+                    # prefixes followed by plain text near-matches.
+                    if has_non_trivial_opcode:
                         return opcode_count >= 2
                     stripped_trailing = trailing.lstrip(PROTO0_1_IGNORABLE_TRAILING_BYTES)
-                    return bool(stripped_trailing) and _looks_like_proto0_or_1_pickle(stripped_trailing)
+                    return bool(stripped_trailing) and _looks_like_proto0_or_1_pickle(
+                        stripped_trailing,
+                        sample_is_prefix=sample_is_prefix,
+                    )
+                if opcode.name not in PROTO0_1_TRIVIAL_LEADING_OPCODES:
+                    has_non_trivial_opcode = True
                 if opcode_count >= PROTO0_1_MAX_PROBE_OPCODES:
                     return False
+        except ValueError as exc:
+            exc_message = str(exc)
+            return (
+                sample_is_prefix
+                and opcode_count >= 2
+                and has_non_trivial_opcode
+                and any(
+                    exc_message.startswith(error_prefix) for error_prefix in PROTO0_1_PREFIX_TRUNCATION_ERROR_PREFIXES
+                )
+            )
         except Exception:
             return False
-        return False
+        # A cleanly parsed prefix without STOP at the probe boundary is only a
+        # pickle indicator when a non-trivial opcode has already appeared. This
+        # avoids routing large plain-text files made of scalar opcode lookalikes
+        # (for example repeated ``I0\n0``) into pickle scanning.
+        return sample_is_prefix and opcode_count >= 2 and has_non_trivial_opcode
 
     if _matches_proto_stream(sample):
         return True
@@ -234,6 +270,16 @@ def _read_zip_member_bounded(
     return bytes(data)
 
 
+def _read_zip_member_prefix(
+    archive: zipfile.ZipFile,
+    member_info: zipfile.ZipInfo,
+    max_bytes: int,
+) -> bytes:
+    """Read only a bounded prefix from a ZIP member."""
+    with archive.open(member_info, "r") as handle:
+        return handle.read(max_bytes)
+
+
 def _coerce_manifest_string_list(value: object) -> list[str]:
     """Collect non-empty string values from manifest fields."""
     if isinstance(value, str):
@@ -287,6 +333,42 @@ def _looks_like_keras_config(config_data: object) -> bool:
     return any(key in config_data for key in _KERAS_MODEL_TOP_LEVEL_HINTS)
 
 
+def _looks_like_skops_schema(schema_data: object) -> bool:
+    """Require enough schema structure to justify Skops-specific routing."""
+    if not isinstance(schema_data, dict):
+        return False
+
+    class_name = schema_data.get("__class__")
+    module_name = schema_data.get("__module__")
+    loader_name = schema_data.get("__loader__")
+    if not isinstance(class_name, str) or not class_name.strip():
+        return False
+    if not isinstance(module_name, str) or not module_name.strip():
+        return False
+    # Skops schema nodes are serialized as ObjectNode/ListNode/etc.
+    if not isinstance(loader_name, str) or not loader_name.endswith("Node"):
+        return False
+    if "content" not in schema_data:
+        return False
+
+    skops_version = schema_data.get("_skops_version")
+    return isinstance(skops_version, str) and bool(skops_version.strip())
+
+
+def _looks_like_keras_config_prefix(config_prefix: bytes) -> bool:
+    """Best-effort Keras config sniffing for oversized JSON members."""
+    try:
+        config_text = config_prefix.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return False
+
+    return (
+        bool(_KERAS_CONFIG_PREFIX_CLASS_NAME_RE.search(config_text))
+        and bool(_KERAS_CONFIG_PREFIX_CONFIG_OBJECT_RE.search(config_text))
+        and bool(_KERAS_CONFIG_PREFIX_HINT_RE.search(config_text))
+    )
+
+
 def _read_zip_member_text(
     archive: zipfile.ZipFile,
     member_info: zipfile.ZipInfo,
@@ -296,7 +378,7 @@ def _read_zip_member_text(
     try:
         data = _read_zip_member_bounded(archive, member_info, max_bytes)
         return data.decode("utf-8", errors="strict").strip()
-    except (OSError, UnicodeDecodeError, ValueError):
+    except (OSError, RuntimeError, UnicodeDecodeError, ValueError):
         return None
 
 
@@ -343,6 +425,7 @@ def is_torchserve_mar_archive(path: str) -> bool:
             return _looks_like_torchserve_manifest(manifest_data)
     except (
         OSError,
+        RuntimeError,
         ValueError,
         UnicodeDecodeError,
         json.JSONDecodeError,
@@ -385,11 +468,21 @@ def is_keras_zip_archive(path: str, *, allow_config_only: bool = False) -> bool:
 
             try:
                 config_data = json.loads(_read_zip_member_bounded(archive, config_info, _KERAS_ZIP_CONFIG_MAX_BYTES))
-            except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+            except (RuntimeError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
+                if config_info.file_size > _KERAS_ZIP_CONFIG_MAX_BYTES:
+                    try:
+                        config_prefix = _read_zip_member_prefix(
+                            archive,
+                            config_info,
+                            _KERAS_ZIP_CONFIG_PREFIX_MAX_BYTES,
+                        )
+                    except (OSError, RuntimeError):
+                        return False
+                    return _looks_like_keras_config_prefix(config_prefix)
                 return False
 
             return _looks_like_keras_config(config_data)
-    except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile):
+    except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile):
         return False
 
 
@@ -417,7 +510,7 @@ def is_pytorch_zip_archive(path: str) -> bool:
 
                 if _looks_like_pytorch_zip_metadata(archive, prefix):
                     return True
-    except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile):
+    except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile):
         return False
 
     return False
@@ -453,7 +546,43 @@ def is_executorch_archive(path: str) -> bool:
                 version_text = _read_zip_member_text(archive, version_info, _PYTORCH_ZIP_METADATA_MAX_BYTES)
                 if version_text is not None and re.fullmatch(r"\d+(?:\.\d+)?", version_text):
                     return True
-    except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile):
+    except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile):
+        return False
+
+    return False
+
+
+def is_skops_archive(path: str) -> bool:
+    """Return whether a ZIP-backed file has a Skops schema payload.
+
+    Oversized schema members are treated as Skops to avoid failing open on
+    misnamed archives whose schema content cannot be safely parsed within the
+    bounded read limit.
+    """
+    file_path = Path(path)
+    if not file_path.is_file():
+        return False
+
+    try:
+        with zipfile.ZipFile(file_path, "r") as archive:
+            for info in archive.infolist():
+                if not info.filename or info.is_dir():
+                    continue
+
+                basename = PurePosixPath(_normalize_archive_member_name(info.filename)).name
+                if basename not in _SKOPS_SCHEMA_ENTRIES:
+                    continue
+                if info.file_size > _SKOPS_SCHEMA_MAX_BYTES:
+                    return True
+
+                try:
+                    schema_data = json.loads(_read_zip_member_bounded(archive, info, _SKOPS_SCHEMA_MAX_BYTES))
+                except (RuntimeError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
+                    continue
+
+                if _looks_like_skops_schema(schema_data):
+                    return True
+    except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile):
         return False
 
     return False
@@ -753,7 +882,10 @@ def detect_file_format_from_magic(path: str) -> str:
             # Protocol 0/1 pickle payloads can evade short magic-byte checks.
             # Probe a bounded prefix and require a valid opcode stream.
             pickle_probe_sample = _read_pickle_probe_sample(file_path, size, magic16)
-            if _looks_like_proto0_or_1_pickle(pickle_probe_sample):
+            if _looks_like_proto0_or_1_pickle(
+                pickle_probe_sample,
+                sample_is_prefix=size > len(pickle_probe_sample),
+            ):
                 return "pickle"
 
             # Check for XML-based formats (OpenVINO and PMML)
@@ -863,7 +995,10 @@ def detect_file_format(path: str) -> str:
     if any(magic4.startswith(m) for m in pickle_magics):
         return "pickle"
     pickle_probe_sample = _read_pickle_probe_sample(file_path, size, magic16)
-    if _looks_like_proto0_or_1_pickle(pickle_probe_sample):
+    if _looks_like_proto0_or_1_pickle(
+        pickle_probe_sample,
+        sample_is_prefix=size > len(pickle_probe_sample),
+    ):
         return "pickle"
 
     # For .bin files, do more sophisticated detection

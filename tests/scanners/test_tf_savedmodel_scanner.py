@@ -4,8 +4,10 @@ from typing import Any, Protocol, TypedDict
 
 import pytest
 
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.tf_savedmodel_scanner import TensorFlowSavedModelScanner
+from modelaudit.utils.file.detection import PROTO0_1_MAX_PROBE_BYTES
 
 
 class _NodeCollection(Protocol):
@@ -700,6 +702,104 @@ def test_savedmodel_assets_protocol1_pickle_with_binint1_pop_prefix_is_flagged(t
 
     assert asset_issues
     assert any("pickle_payload" in issue.details.get("detected_content_type", "") for issue in asset_issues)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_assets_trivial_prefix_pickle_with_trailing_junk_is_flagged(tmp_path: Path) -> None:
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    asset_path = model_dir / "assets" / "trailing-junk-payload.dat"
+    asset_path.write_bytes(b"(l0" + _build_protocol1_pickle_payload() + b"JUNK")
+
+    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    asset_issues = [issue for issue in result.issues if issue.location == str(asset_path)]
+
+    assert asset_issues
+    assert any("pickle_payload" in issue.details.get("detected_content_type", "") for issue in asset_issues)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_scan_savedmodel_directory_detects_trailing_junk_pickle_asset(tmp_path: Path) -> None:
+    """Full directory scans should route junk-suffixed pickle assets into pickle analysis."""
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    asset_path = model_dir / "assets" / "payload.dat"
+    asset_path.write_bytes(b'(l0cos\nsystem\n(S"echo pwned"\ntR.JUNK')
+
+    result = scan_model_directory_or_file(str(model_dir))
+
+    assert determine_exit_code(result) == 1
+    assert any(
+        issue.rule_code == "S201"
+        and issue.location is not None
+        and asset_path.name in issue.location
+        and "os.system" in issue.message
+        for issue in result.issues
+    )
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_scan_savedmodel_directory_detects_opcode_budget_padded_pickle_asset(tmp_path: Path) -> None:
+    """Balanced trivial opcode padding should not suppress pickle routing in full scans."""
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    asset_path = model_dir / "assets" / "budget-padded-payload.dat"
+    asset_path.write_bytes(b"I0\n0" * 5000 + b'cos\nsystem\n(S"echo pwned"\ntR.')
+
+    result = scan_model_directory_or_file(str(model_dir))
+
+    assert determine_exit_code(result) == 1
+    assert any(
+        issue.rule_code == "S201"
+        and issue.location is not None
+        and asset_path.name in issue.location
+        and "os.system" in issue.message
+        for issue in result.issues
+    )
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_scan_savedmodel_directory_detects_probe_boundary_padded_pickle_asset(tmp_path: Path) -> None:
+    """A valid pickle prefix at the probe boundary should still route the asset into pickle analysis."""
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    asset_path = model_dir / "assets" / "probe-boundary-payload.dat"
+    asset_path.write_bytes(
+        b"(t0" + b"I0\n0" * (PROTO0_1_MAX_PROBE_BYTES // 4 + 1) + b'cos\nsystem\n(S"echo pwned"\ntR.',
+    )
+
+    result = scan_model_directory_or_file(str(model_dir))
+
+    assert determine_exit_code(result) == 1
+    assert any(
+        issue.rule_code == "S201"
+        and issue.location is not None
+        and asset_path.name in issue.location
+        and "os.system" in issue.message
+        for issue in result.issues
+    )
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_scan_savedmodel_directory_trivial_probe_boundary_padding_stays_clean(tmp_path: Path) -> None:
+    """Large trivial opcode prefixes without STOP should not be routed as pickle payloads."""
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    asset_path = model_dir / "assets" / "probe-boundary-notes.txt"
+    asset_path.write_bytes(b"I0\n0" * (PROTO0_1_MAX_PROBE_BYTES // 4 + 1))
+
+    result = scan_model_directory_or_file(str(model_dir))
+
+    assert determine_exit_code(result) == 0
+    assert all(issue.location is None or asset_path.name not in issue.location for issue in result.issues)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_scan_savedmodel_directory_benign_list_prefix_asset_stays_clean(tmp_path: Path) -> None:
+    """Plain-text near-matches should not become pickle findings in full directory scans."""
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    asset_path = model_dir / "assets" / "notes.txt"
+    asset_path.write_bytes(b"(l0.not a pickle stream")
+
+    result = scan_model_directory_or_file(str(model_dir))
+
+    assert determine_exit_code(result) == 0
+    assert all(issue.location is None or asset_path.name not in issue.location for issue in result.issues)
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")

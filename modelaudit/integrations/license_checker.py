@@ -1,3 +1,4 @@
+import itertools
 import json
 import os
 import re
@@ -115,6 +116,55 @@ UNLICENSED_INDICATORS = [
 SPDX_LICENSE_PATH = Path(__file__).parent.parent / "config" / "data" / "spdx_licenses.json"
 SPDX_LICENSE_URL = "https://raw.githubusercontent.com/spdx/license-list-data/master/json/licenses.json"
 _SPDX_LICENSES: dict[str, Any] | None = None
+_LICENSE_HEADER_MAX_BYTES = 64 * 1024
+_LICENSE_BINARY_CONTROL_BYTE_RATIO = 0.30
+_LICENSE_TEXT_CONTROL_BYTES = frozenset({0x09, 0x0A, 0x0C, 0x0D})
+
+_COMPILED_LICENSE_PATTERNS = tuple(
+    (re.compile(pattern, re.IGNORECASE | re.MULTILINE), info) for pattern, info in LICENSE_PATTERNS.items()
+)
+_COMPILED_COPYRIGHT_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE | re.MULTILINE) for pattern in COPYRIGHT_PATTERNS
+)
+
+
+def _looks_like_binary_header_sample(sample: bytes) -> bool:
+    """Return True when a bounded prefix is likely binary payload data."""
+    if not sample:
+        return False
+    if b"\x00" in sample:
+        return True
+
+    control_bytes = sum(1 for byte in sample if byte < 0x20 and byte not in _LICENSE_TEXT_CONTROL_BYTES)
+    return (control_bytes / len(sample)) >= _LICENSE_BINARY_CONTROL_BYTE_RATIO
+
+
+def _read_header_text(file_path: str, max_lines: int) -> str | None:
+    """Read a text header while bounding binary payload scans."""
+    if max_lines <= 0:
+        return ""
+
+    try:
+        with open(file_path, "rb") as f:
+            header_sample = f.read(_LICENSE_HEADER_MAX_BYTES)
+            has_more_bytes = bool(header_sample) and len(header_sample) >= _LICENSE_HEADER_MAX_BYTES and bool(f.read(1))
+    except OSError:
+        return None
+
+    if _looks_like_binary_header_sample(header_sample):
+        return header_sample.decode("utf-8", errors="ignore")
+
+    decoded_header = header_sample.decode("utf-8", errors="ignore")
+    if not has_more_bytes:
+        return "".join(decoded_header.splitlines(keepends=True)[:max_lines])
+
+    # Likely text files should keep the original line-oriented behavior so
+    # long one-line headers are not silently truncated by the binary cap.
+    try:
+        with open(file_path, encoding="utf-8", errors="ignore") as f:
+            return "".join(itertools.islice(f, max_lines))
+    except OSError:
+        return None
 
 
 def load_spdx_license_data(download: bool = False) -> dict[str, Any]:
@@ -190,26 +240,13 @@ def scan_for_license_headers(file_path: str, max_lines: int = 50) -> list[Licens
     """
     licenses: list[LicenseInfo] = []
 
-    try:
-        with open(file_path, encoding="utf-8", errors="ignore") as f:
-            content = ""
-            for i, line in enumerate(f):
-                if i >= max_lines:
-                    break
-                content += line
-    except (OSError, UnicodeDecodeError):
-        # Try reading as binary for files that might not be text
-        try:
-            with open(file_path, "rb") as f:
-                binary_content = f.read(1024 * 10)  # Read first 10KB
-                content = binary_content.decode("utf-8", errors="ignore")
-        except Exception:
-            return licenses
+    content = _read_header_text(file_path, max_lines)
+    if content is None:
+        return licenses
 
     # Search for license patterns
-    for pattern, info in LICENSE_PATTERNS.items():
-        matches = re.findall(pattern, content, re.IGNORECASE | re.MULTILINE)
-        if matches:
+    for pattern_re, info in _COMPILED_LICENSE_PATTERNS:
+        if pattern_re.search(content):
             license_info = LicenseInfo(
                 spdx_id=str(info["spdx_id"]) if info["spdx_id"] else None,
                 name=str(info["name"]) if info["name"] else None,
@@ -240,19 +277,13 @@ def extract_copyright_notices(
     """
     copyrights: list[CopyrightInfo] = []
 
-    try:
-        with open(file_path, encoding="utf-8", errors="ignore") as f:
-            content = ""
-            for i, line in enumerate(f):
-                if i >= max_lines:
-                    break
-                content += line
-    except Exception:
+    content = _read_header_text(file_path, max_lines)
+    if content is None:
         return copyrights
 
     # Search for copyright patterns
-    for pattern in COPYRIGHT_PATTERNS:
-        matches = re.findall(pattern, content, re.IGNORECASE | re.MULTILINE)
+    for pattern_re in _COMPILED_COPYRIGHT_PATTERNS:
+        matches = pattern_re.findall(content)
         for match in matches:
             if len(match) >= 2:
                 year = match[0].strip()
