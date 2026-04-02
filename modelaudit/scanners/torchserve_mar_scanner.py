@@ -1259,13 +1259,18 @@ class TorchServeMarScanner(BaseScanner):
         result: ScanResult,
     ) -> None:
         location = f"{archive_path}:{normalized_member}"
-        members_by_normalized = {
-            self._normalize_archive_member_name(info.filename): info for info in archive.infolist() if not info.is_dir()
-        }
+        members_by_normalized: dict[str, list[zipfile.ZipInfo]] = {}
+        for info in archive.infolist():
+            if info.is_dir():
+                continue
+            include_key = self._normalize_archive_member_name(info.filename)
+            members_by_normalized.setdefault(include_key, []).append(info)
+
         findings = self._collect_requirements_findings(
             archive,
             members_by_normalized,
-            self._normalize_archive_member_name(normalized_member),
+            member_info,
+            normalized_member,
             visited=set(),
         )
 
@@ -1293,7 +1298,7 @@ class TorchServeMarScanner(BaseScanner):
         )
 
     def _normalize_archive_member_name(self, member_name: str) -> str:
-        return posixpath.normpath(member_name.replace("\\", "/"))
+        return posixpath.normpath(self._normalize_member_name(member_name))
 
     def _resolve_local_requirements_reference(self, current_member: str, reference: str) -> str | None:
         stripped_reference = reference.strip().strip("'\"")
@@ -1395,18 +1400,16 @@ class TorchServeMarScanner(BaseScanner):
     def _collect_requirements_findings(
         self,
         archive: zipfile.ZipFile,
-        members_by_normalized: dict[str, zipfile.ZipInfo],
+        members_by_normalized: dict[str, list[zipfile.ZipInfo]],
+        member_info: zipfile.ZipInfo,
         normalized_member: str,
         *,
-        visited: set[str],
+        visited: set[tuple[str, int]],
     ) -> list[dict[str, Any]]:
-        if normalized_member in visited:
+        visit_key = (member_info.filename, member_info.header_offset)
+        if visit_key in visited:
             return []
-        visited.add(normalized_member)
-
-        member_info = members_by_normalized.get(normalized_member)
-        if member_info is None:
-            return []
+        visited.add(visit_key)
 
         try:
             requirements_bytes = self._read_member_bounded(archive, member_info, self.MAX_REQUIREMENTS_TXT_BYTES)
@@ -1469,15 +1472,17 @@ class TorchServeMarScanner(BaseScanner):
                     continue
 
                 resolved_include = self._resolve_local_requirements_reference(normalized_member, include_target)
-                if resolved_include and resolved_include in members_by_normalized:
-                    findings.extend(
-                        self._collect_requirements_findings(
-                            archive,
-                            members_by_normalized,
-                            resolved_include,
-                            visited=visited,
+                if resolved_include:
+                    for included_member_info in members_by_normalized.get(resolved_include, []):
+                        findings.extend(
+                            self._collect_requirements_findings(
+                                archive,
+                                members_by_normalized,
+                                included_member_info,
+                                self._normalize_member_name(included_member_info.filename),
+                                visited=visited,
+                            )
                         )
-                    )
                 continue
 
             index_url = self._extract_pip_option_value(
