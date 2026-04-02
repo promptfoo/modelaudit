@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 
 import pytest
@@ -63,3 +64,37 @@ def test_scan_fixture_surfaces_package_only_findings_as_drift(
     assert adapter_result.rule_codes == ("S999",)
     assert compare_pickle_scanners._classify_delta("safe", legacy_result, package_result) == "potential_fp"
     assert compare_pickle_scanners._classify_delta("safe", legacy_result, adapter_result) == "potential_fp"
+
+
+def test_build_report_summarizes_drift_by_fixture_label_and_preserves_safe_fp_audit() -> None:
+    report = compare_pickle_scanners._build_report()
+
+    assert report["summary_by_label"]["package"]["safe"] == {"match": 6}
+    assert report["summary_by_label"]["adapter"]["safe"] == {"match": 6}
+    assert "potential_fp" not in report["summary_by_label"]["package"]["safe"]
+    assert "potential_fp" not in report["summary_by_label"]["adapter"]["safe"]
+
+    exploit4 = next(
+        item
+        for item in report["comparisons"]
+        if item["path"] == "tests/assets/exploits/exploit4_supply_chain_attack.pkl"
+    )
+    assert exploit4["package_delta"] == "rule_drift"
+    assert exploit4["adapter_delta"] == "rule_drift"
+    assert "S310" in exploit4["legacy"]["rule_codes"]
+
+
+def test_build_report_suppresses_scanner_logs_and_restores_logging_disable_level(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    previous_disable_level = logging.root.manager.disable
+    logging.disable(logging.WARNING)
+    try:
+        report = compare_pickle_scanners._build_report()
+        captured = capsys.readouterr()
+        assert report["fixture_count"] > 0
+        assert captured.out == ""
+        assert captured.err == ""
+        assert logging.root.manager.disable == logging.WARNING
+    finally:
+        logging.disable(previous_disable_level)

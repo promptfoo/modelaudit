@@ -23,7 +23,10 @@ Demonstrates JAX/Flax model scanning capabilities including Msgpack-based checkp
 ### `compare_pickle_scanners.py`
 
 Differential harness for comparing the legacy in-repo `PickleScanner` against the
-standalone `modelaudit-picklescan` package on committed pickle fixtures.
+standalone `modelaudit-picklescan` package on committed pickle fixtures. The
+harness uses a pure legacy baseline (without package-result merging) and prints
+label-aware drift summaries so safe-fixture false-positive regressions are easy
+to spot. Use `--json` for a machine-readable report.
 
 ## Development Use Only
 

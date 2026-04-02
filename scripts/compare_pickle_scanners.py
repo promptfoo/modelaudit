@@ -68,6 +68,7 @@ VERDICT_RANK = {
     "malicious": 2,
     "unknown": -1,
 }
+FIXTURE_LABELS = ("safe", "malicious", "unknown")
 EXIT_FAILURE_DELTAS = frozenset({"potential_fp", "potential_fn", "verdict_drift"})
 
 
@@ -195,30 +196,39 @@ def _classify_delta(label: str, legacy: NormalizedResult, package: NormalizedRes
 
 
 def _build_report() -> dict[str, Any]:
-    fixtures = _discover_pickle_fixtures()
-    legacy_scanner = LegacyBaselinePickleScanner()
-    comparisons: list[dict[str, Any]] = []
+    previous_logging_disable_level = logging.root.manager.disable
+    logging.disable(logging.CRITICAL)
+    try:
+        fixtures = _discover_pickle_fixtures()
+        legacy_scanner = LegacyBaselinePickleScanner()
+        comparisons: list[dict[str, Any]] = []
 
-    for path in fixtures:
-        label = _fixture_label(path)
-        legacy_result, package_result, adapter_result = _scan_fixture(path, legacy_scanner)
-        package_delta = _classify_delta(label, legacy_result, package_result)
-        adapter_delta = _classify_delta(label, legacy_result, adapter_result)
-        comparisons.append(
-            {
-                "path": str(path.relative_to(REPO_ROOT)),
-                "label": label,
-                "package_delta": package_delta,
-                "adapter_delta": adapter_delta,
-                "legacy": legacy_result.__dict__,
-                "package": package_result.__dict__,
-                "adapter": adapter_result.__dict__,
-            }
-        )
+        for path in fixtures:
+            label = _fixture_label(path)
+            legacy_result, package_result, adapter_result = _scan_fixture(path, legacy_scanner)
+            package_delta = _classify_delta(label, legacy_result, package_result)
+            adapter_delta = _classify_delta(label, legacy_result, adapter_result)
+            comparisons.append(
+                {
+                    "path": str(path.relative_to(REPO_ROOT)),
+                    "label": label,
+                    "package_delta": package_delta,
+                    "adapter_delta": adapter_delta,
+                    "legacy": legacy_result.__dict__,
+                    "package": package_result.__dict__,
+                    "adapter": adapter_result.__dict__,
+                }
+            )
+    finally:
+        logging.disable(previous_logging_disable_level)
 
     summary: dict[str, dict[str, int]] = {
         "package": {},
         "adapter": {},
+    }
+    by_label: dict[str, dict[str, dict[str, int]]] = {
+        "package": {label: {} for label in FIXTURE_LABELS},
+        "adapter": {label: {} for label in FIXTURE_LABELS},
     }
     for comparison in comparisons:
         package_summary = summary["package"]
@@ -228,11 +238,21 @@ def _build_report() -> dict[str, Any]:
         package_summary[package_delta] = package_summary.get(package_delta, 0) + 1
         adapter_summary[adapter_delta] = adapter_summary.get(adapter_delta, 0) + 1
 
+        label = comparison["label"]
+        package_label_summary = by_label["package"][label]
+        adapter_label_summary = by_label["adapter"][label]
+        package_label_summary[package_delta] = package_label_summary.get(package_delta, 0) + 1
+        adapter_label_summary[adapter_delta] = adapter_label_summary.get(adapter_delta, 0) + 1
+
     return {
         "fixture_count": len(fixtures),
         "summary": {
             "package": dict(sorted(summary["package"].items())),
             "adapter": dict(sorted(summary["adapter"].items())),
+        },
+        "summary_by_label": {
+            engine_name: {label: dict(sorted(label_summary.items())) for label, label_summary in engine_summary.items()}
+            for engine_name, engine_summary in by_label.items()
         },
         "comparisons": comparisons,
     }
@@ -245,6 +265,17 @@ def _print_text_report(report: dict[str, Any]) -> None:
         print(f"  {engine_name}:")
         for delta, count in engine_summary.items():
             print(f"    {delta}: {count}")
+
+    print("Summary by fixture label:")
+    for engine_name, engine_summary in report["summary_by_label"].items():
+        print(f"  {engine_name}:")
+        for label in FIXTURE_LABELS:
+            label_summary = engine_summary.get(label, {})
+            if label_summary:
+                deltas = ", ".join(f"{delta}={count}" for delta, count in label_summary.items())
+            else:
+                deltas = "none"
+            print(f"    {label}: {deltas}")
 
     interesting = [
         item for item in report["comparisons"] if item["package_delta"] != "match" or item["adapter_delta"] != "match"
@@ -303,7 +334,6 @@ def main() -> int:
     parser.add_argument("--json", action="store_true", help="Print the full diff report as JSON")
     args = parser.parse_args()
 
-    logging.disable(logging.CRITICAL)
     report = _build_report()
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
