@@ -6,6 +6,7 @@ import pickletools
 import reprlib
 import struct
 import time
+from collections import OrderedDict, deque
 from dataclasses import asdict, dataclass, field
 from typing import Any, BinaryIO, ClassVar, Literal, TypedDict, TypeGuard
 
@@ -62,6 +63,9 @@ _NESTED_PICKLE_HEADER_SEARCH_LIMIT_BYTES = 64 * 1024
 _NESTED_PICKLE_VALIDATION_WINDOW_BYTES = 8 * 1024
 _POST_BUDGET_GLOBAL_SCAN_LIMIT_BYTES = 100 * 1024 * 1024
 _POST_BUDGET_GLOBAL_CONTEXT_BYTES = 4096
+_POST_BUDGET_GLOBAL_MEMO_LIMIT_ENTRIES = 4096
+_POST_BUDGET_GLOBAL_MAX_REFERENCE_FINDINGS = 4096
+_POST_BUDGET_GLOBAL_DEADLINE_CHECK_INTERVAL_BYTES = 4096
 _POST_BUDGET_EXPANSION_SCAN_LIMIT_BYTES = 8 * 1024 * 1024
 _POST_BUDGET_OPCODE_SCAN_LIMIT_OPCODES = 500_000
 _MEMO_WRITE_OPCODES = frozenset({"PUT", "BINPUT", "LONG_BINPUT", "MEMOIZE"})
@@ -4344,6 +4348,27 @@ class PickleScanner(BaseScanner):
         except (TypeError, ValueError):
             parsed_post_budget_limit = _POST_BUDGET_GLOBAL_SCAN_LIMIT_BYTES
         self.post_budget_global_scan_limit_bytes = max(0, parsed_post_budget_limit)
+        configured_post_budget_global_memo_limit = self.config.get(
+            "post_budget_global_memo_limit_entries",
+            _POST_BUDGET_GLOBAL_MEMO_LIMIT_ENTRIES,
+        )
+        try:
+            parsed_post_budget_global_memo_limit = int(configured_post_budget_global_memo_limit)
+        except (TypeError, ValueError):
+            parsed_post_budget_global_memo_limit = _POST_BUDGET_GLOBAL_MEMO_LIMIT_ENTRIES
+        self.post_budget_global_memo_limit_entries = max(0, parsed_post_budget_global_memo_limit)
+        configured_post_budget_global_max_findings = self.config.get(
+            "post_budget_global_max_reference_findings",
+            _POST_BUDGET_GLOBAL_MAX_REFERENCE_FINDINGS,
+        )
+        try:
+            parsed_post_budget_global_max_findings = int(configured_post_budget_global_max_findings)
+        except (TypeError, ValueError):
+            parsed_post_budget_global_max_findings = _POST_BUDGET_GLOBAL_MAX_REFERENCE_FINDINGS
+        self.post_budget_global_max_reference_findings = max(0, parsed_post_budget_global_max_findings)
+        self._post_budget_global_memo_limit_exceeded = False
+        self._post_budget_global_reference_limit_exceeded = False
+        self._post_budget_global_scan_deadline_exceeded = False
         configured_post_budget_expansion_limit = self.config.get(
             "post_budget_expansion_scan_limit_bytes",
             min(self.post_budget_global_scan_limit_bytes, _POST_BUDGET_EXPANSION_SCAN_LIMIT_BYTES),
@@ -5546,10 +5571,17 @@ class PickleScanner(BaseScanner):
         file_size: int,
         minimum_offset: int,
         ml_context: dict[str, Any],
+        deadline: float | None = None,
     ) -> list[dict[str, Any]]:
         """Perform a post-budget raw byte scan for GLOBAL/INST/STACK_GLOBAL references."""
         findings: list[dict[str, Any]] = []
         seen: set[tuple[int, str]] = set()
+        classified_refs: OrderedDict[str, tuple[bool, IssueSeverity | None, str]] = OrderedDict()
+        classification_cache_limit = max(1, self.post_budget_global_max_reference_findings)
+        recorded_critical_reference = False
+        self._post_budget_global_memo_limit_exceeded = False
+        self._post_budget_global_reference_limit_exceeded = False
+        self._post_budget_global_scan_deadline_exceeded = False
 
         minimum_offset = max(0, minimum_offset)
         data, scan_start, _tail_scan_bytes = self._read_post_budget_window(
@@ -5562,28 +5594,101 @@ class PickleScanner(BaseScanner):
             return findings
         data_len = len(data)
 
+        def _might_be_critical_reference(module: str, function: str) -> bool:
+            if not _is_resolved_import_target(module, function):
+                return False
+
+            normalized_mod, normalized_func = _normalize_import_reference(module, function)
+            if _is_safe_ml_global(module, function) or (
+                (normalized_mod, normalized_func) != (module, function)
+                and _is_safe_ml_global(normalized_mod, normalized_func)
+            ):
+                return False
+            if (normalized_mod, normalized_func) in IMPORT_ONLY_ALWAYS_DANGEROUS_GLOBALS:
+                return True
+            if _is_copyreg_extension_ref(module) or (
+                (normalized_mod, normalized_func) != (module, function) and _is_copyreg_extension_ref(normalized_mod)
+            ):
+                return True
+            if _is_risky_ml_import(module, function) or (
+                (normalized_mod, normalized_func) != (module, function)
+                and _is_risky_ml_import(normalized_mod, normalized_func)
+            ):
+                return True
+
+            if (
+                f"{module}.{function}" in ALWAYS_DANGEROUS_FUNCTIONS
+                or function in ALWAYS_DANGEROUS_FUNCTIONS
+                or f"{normalized_mod}.{normalized_func}" in ALWAYS_DANGEROUS_FUNCTIONS
+                or normalized_func in ALWAYS_DANGEROUS_FUNCTIONS
+            ):
+                return True
+
+            if is_suspicious_global(module, function) or (
+                (normalized_mod, normalized_func) != (module, function)
+                and is_suspicious_global(normalized_mod, normalized_func)
+            ):
+                return not _is_warning_severity_ref(normalized_mod, normalized_func)
+
+            return (
+                _is_dangerous_module(module)
+                or ((normalized_mod, normalized_func) != (module, function) and _is_dangerous_module(normalized_mod))
+            ) and not _is_warning_severity_ref(normalized_mod, normalized_func)
+
+        def _cache_classification(
+            import_reference: str,
+            classification_result: tuple[bool, IssueSeverity | None, str],
+        ) -> None:
+            classified_refs[import_reference] = classification_result
+            classified_refs.move_to_end(import_reference)
+            while len(classified_refs) > classification_cache_limit:
+                classified_refs.popitem(last=False)
+
         def _record_reference(module: str, function: str, offset: int, opcode_name: str) -> None:
+            nonlocal recorded_critical_reference
+
             if offset < minimum_offset:
                 return
             if not module or not function or not _is_plausible_python_module(module):
-                return
-
-            is_failure, severity, classification = _classify_import_reference(
-                module,
-                function,
-                ml_context,
-                is_import_only=True,
-            )
-            if not is_failure:
-                return
-            if severity is None:
                 return
 
             import_reference = f"{module}.{function}"
             dedupe_key = (offset, import_reference)
             if dedupe_key in seen:
                 return
+
+            if len(findings) >= self.post_budget_global_max_reference_findings and recorded_critical_reference:
+                self._post_budget_global_reference_limit_exceeded = True
+                return
+            if len(findings) >= self.post_budget_global_max_reference_findings and not _might_be_critical_reference(
+                module, function
+            ):
+                self._post_budget_global_reference_limit_exceeded = True
+                return
+
+            classification_result = classified_refs.get(import_reference)
+            if classification_result is None:
+                classification_result = _classify_import_reference(
+                    module,
+                    function,
+                    ml_context,
+                    is_import_only=True,
+                )
+                _cache_classification(import_reference, classification_result)
+            else:
+                classified_refs.move_to_end(import_reference)
+            is_failure, severity, classification = classification_result
+            if not is_failure:
+                return
+            if severity is None:
+                return
+
+            if len(findings) >= self.post_budget_global_max_reference_findings and severity != IssueSeverity.CRITICAL:
+                self._post_budget_global_reference_limit_exceeded = True
+                return
             seen.add(dedupe_key)
+            if len(findings) >= self.post_budget_global_max_reference_findings:
+                self._post_budget_global_reference_limit_exceeded = True
 
             findings.append(
                 {
@@ -5597,6 +5702,8 @@ class PickleScanner(BaseScanner):
                     "rule_code": get_import_rule_code(module, function) or "S206",
                 }
             )
+            if severity == IssueSeverity.CRITICAL:
+                recorded_critical_reference = True
 
         def _decode_string_push_at(start: int) -> tuple[str, int] | None:
             if start < 0 or start >= data_len:
@@ -5647,120 +5754,22 @@ class PickleScanner(BaseScanner):
             return int(digits.decode("ascii")), end + 1
 
         value_end_to_info: dict[int, tuple[str, int]] = {}
-        memo_values: dict[int, tuple[str, int]] = {}
-        stack_global_positions: list[int] = []
+        value_end_history: deque[int] = deque()
+        memo_values: OrderedDict[int, tuple[str, int]] = OrderedDict()
         next_memo_index = 0
         parse_cursor = 0
         last_value_info: tuple[str, int] | None = None
         last_value_end = -1
+        next_deadline_check_cursor = 0
 
-        while parse_cursor < data_len:
-            opcode_value = data[parse_cursor]
-            parsed_string = _decode_string_push_at(parse_cursor)
-            if parsed_string is not None:
-                value, value_end = parsed_string
-                last_value_info = (value, parse_cursor)
-                last_value_end = value_end
-                value_end_to_info[value_end] = last_value_info
-                parse_cursor = value_end
-                continue
+        def _track_value_info(value_end: int, value_info: tuple[str, int]) -> None:
+            value_end_to_info[value_end] = value_info
+            value_end_history.append(value_end)
 
-            if opcode_value == 0x94:  # MEMOIZE
-                if last_value_info is not None and last_value_end == parse_cursor:
-                    memo_values[next_memo_index] = last_value_info
-                    value_end_to_info[parse_cursor + 1] = last_value_info
-                    last_value_end = parse_cursor + 1
-                    next_memo_index += 1
-                else:
-                    last_value_info = None
-                    last_value_end = -1
-                parse_cursor += 1
-                continue
-
-            if opcode_value == 0x71 and parse_cursor + 2 <= data_len:  # BINPUT
-                if last_value_info is not None and last_value_end == parse_cursor:
-                    memo_values[data[parse_cursor + 1]] = last_value_info
-                    value_end_to_info[parse_cursor + 2] = last_value_info
-                    last_value_end = parse_cursor + 2
-                else:
-                    last_value_info = None
-                    last_value_end = -1
-                parse_cursor += 2
-                continue
-
-            if opcode_value == 0x72 and parse_cursor + 5 <= data_len:  # LONG_BINPUT
-                if last_value_info is not None and last_value_end == parse_cursor:
-                    memo_values[int.from_bytes(data[parse_cursor + 1 : parse_cursor + 5], "little")] = last_value_info
-                    value_end_to_info[parse_cursor + 5] = last_value_info
-                    last_value_end = parse_cursor + 5
-                else:
-                    last_value_info = None
-                    last_value_end = -1
-                parse_cursor += 5
-                continue
-
-            if opcode_value == 0x70:  # PUT
-                parsed_index = _parse_text_memo_index(parse_cursor)
-                if parsed_index is not None:
-                    memo_index, memo_end = parsed_index
-                    if last_value_info is not None and last_value_end == parse_cursor:
-                        memo_values[memo_index] = last_value_info
-                        value_end_to_info[memo_end] = last_value_info
-                        last_value_end = memo_end
-                    else:
-                        last_value_info = None
-                        last_value_end = -1
-                    parse_cursor = memo_end
-                    continue
-
-            if opcode_value == 0x68 and parse_cursor + 2 <= data_len:  # BINGET
-                resolved_value = memo_values.get(data[parse_cursor + 1])
-                if resolved_value is not None:
-                    value_end_to_info[parse_cursor + 2] = resolved_value
-                    last_value_info = resolved_value
-                    last_value_end = parse_cursor + 2
-                else:
-                    last_value_info = None
-                    last_value_end = -1
-                parse_cursor += 2
-                continue
-
-            if opcode_value == 0x6A and parse_cursor + 5 <= data_len:  # LONG_BINGET
-                resolved_value = memo_values.get(int.from_bytes(data[parse_cursor + 1 : parse_cursor + 5], "little"))
-                if resolved_value is not None:
-                    value_end_to_info[parse_cursor + 5] = resolved_value
-                    last_value_info = resolved_value
-                    last_value_end = parse_cursor + 5
-                else:
-                    last_value_info = None
-                    last_value_end = -1
-                parse_cursor += 5
-                continue
-
-            if opcode_value == 0x67:  # GET
-                parsed_index = _parse_text_memo_index(parse_cursor)
-                if parsed_index is not None:
-                    memo_index, memo_end = parsed_index
-                    resolved_value = memo_values.get(memo_index)
-                    if resolved_value is not None:
-                        value_end_to_info[memo_end] = resolved_value
-                        last_value_info = resolved_value
-                        last_value_end = memo_end
-                    else:
-                        last_value_info = None
-                        last_value_end = -1
-                    parse_cursor = memo_end
-                    continue
-
-            if opcode_value == 0x93:  # STACK_GLOBAL
-                stack_global_positions.append(parse_cursor)
-            elif opcode_value == 0x95 and parse_cursor + 9 <= data_len:  # FRAME
-                parse_cursor += 9
-                continue
-
-            last_value_info = None
-            last_value_end = -1
-            parse_cursor += 1
+            stale_before_or_at = value_end - _POST_BUDGET_GLOBAL_CONTEXT_BYTES
+            while value_end_history and value_end_history[0] <= stale_before_or_at:
+                stale_value_end = value_end_history.popleft()
+                value_end_to_info.pop(stale_value_end, None)
 
         def _extract_stack_global_values(stack_global_index: int) -> list[str]:
             values: list[str] = []
@@ -5780,8 +5789,166 @@ class PickleScanner(BaseScanner):
 
             return list(reversed(values))
 
+        def _track_memo_value(memo_index: int, value_info: tuple[str, int]) -> None:
+            memo_values[memo_index] = value_info
+            memo_values.move_to_end(memo_index)
+
+            while len(memo_values) > self.post_budget_global_memo_limit_entries:
+                memo_values.popitem(last=False)
+                self._post_budget_global_memo_limit_exceeded = True
+
+        def _resolve_memo_value(memo_index: int) -> tuple[str, int] | None:
+            resolved_value = memo_values.get(memo_index)
+            if resolved_value is not None:
+                memo_values.move_to_end(memo_index)
+            return resolved_value
+
+        def _deadline_exceeded(cursor: int) -> bool:
+            nonlocal next_deadline_check_cursor
+
+            if deadline is None or cursor < next_deadline_check_cursor:
+                return False
+
+            next_deadline_check_cursor = cursor + _POST_BUDGET_GLOBAL_DEADLINE_CHECK_INTERVAL_BYTES
+            if time.time() <= deadline:
+                return False
+
+            self._post_budget_global_scan_deadline_exceeded = True
+            logger.debug(
+                "Post-budget global scan stopped after exceeding timeout (%ss)",
+                self.timeout,
+            )
+            return True
+
+        while parse_cursor < data_len:
+            if _deadline_exceeded(parse_cursor):
+                break
+
+            opcode_value = data[parse_cursor]
+            parsed_string = _decode_string_push_at(parse_cursor)
+            if parsed_string is not None:
+                value, value_end = parsed_string
+                last_value_info = (value, parse_cursor)
+                last_value_end = value_end
+                _track_value_info(value_end, last_value_info)
+                parse_cursor = value_end
+                continue
+
+            if opcode_value == 0x94:  # MEMOIZE
+                if last_value_info is not None and last_value_end == parse_cursor:
+                    _track_memo_value(next_memo_index, last_value_info)
+                    _track_value_info(parse_cursor + 1, last_value_info)
+                    last_value_end = parse_cursor + 1
+                    next_memo_index += 1
+                else:
+                    last_value_info = None
+                    last_value_end = -1
+                parse_cursor += 1
+                continue
+
+            if opcode_value == 0x71 and parse_cursor + 2 <= data_len:  # BINPUT
+                if last_value_info is not None and last_value_end == parse_cursor:
+                    _track_memo_value(data[parse_cursor + 1], last_value_info)
+                    _track_value_info(parse_cursor + 2, last_value_info)
+                    last_value_end = parse_cursor + 2
+                else:
+                    last_value_info = None
+                    last_value_end = -1
+                parse_cursor += 2
+                continue
+
+            if opcode_value == 0x72 and parse_cursor + 5 <= data_len:  # LONG_BINPUT
+                if last_value_info is not None and last_value_end == parse_cursor:
+                    _track_memo_value(
+                        int.from_bytes(data[parse_cursor + 1 : parse_cursor + 5], "little"),
+                        last_value_info,
+                    )
+                    _track_value_info(parse_cursor + 5, last_value_info)
+                    last_value_end = parse_cursor + 5
+                else:
+                    last_value_info = None
+                    last_value_end = -1
+                parse_cursor += 5
+                continue
+
+            if opcode_value == 0x70:  # PUT
+                parsed_index = _parse_text_memo_index(parse_cursor)
+                if parsed_index is not None:
+                    memo_index, memo_end = parsed_index
+                    if last_value_info is not None and last_value_end == parse_cursor:
+                        _track_memo_value(memo_index, last_value_info)
+                        _track_value_info(memo_end, last_value_info)
+                        last_value_end = memo_end
+                    else:
+                        last_value_info = None
+                        last_value_end = -1
+                    parse_cursor = memo_end
+                    continue
+
+            if opcode_value == 0x68 and parse_cursor + 2 <= data_len:  # BINGET
+                resolved_value = _resolve_memo_value(data[parse_cursor + 1])
+                if resolved_value is not None:
+                    _track_value_info(parse_cursor + 2, resolved_value)
+                    last_value_info = resolved_value
+                    last_value_end = parse_cursor + 2
+                else:
+                    last_value_info = None
+                    last_value_end = -1
+                parse_cursor += 2
+                continue
+
+            if opcode_value == 0x6A and parse_cursor + 5 <= data_len:  # LONG_BINGET
+                resolved_value = _resolve_memo_value(
+                    int.from_bytes(data[parse_cursor + 1 : parse_cursor + 5], "little")
+                )
+                if resolved_value is not None:
+                    _track_value_info(parse_cursor + 5, resolved_value)
+                    last_value_info = resolved_value
+                    last_value_end = parse_cursor + 5
+                else:
+                    last_value_info = None
+                    last_value_end = -1
+                parse_cursor += 5
+                continue
+
+            if opcode_value == 0x67:  # GET
+                parsed_index = _parse_text_memo_index(parse_cursor)
+                if parsed_index is not None:
+                    memo_index, memo_end = parsed_index
+                    resolved_value = _resolve_memo_value(memo_index)
+                    if resolved_value is not None:
+                        _track_value_info(memo_end, resolved_value)
+                        last_value_info = resolved_value
+                        last_value_end = memo_end
+                    else:
+                        last_value_info = None
+                        last_value_end = -1
+                    parse_cursor = memo_end
+                    continue
+
+            if opcode_value == 0x93:  # STACK_GLOBAL
+                values = _extract_stack_global_values(parse_cursor)
+                if len(values) == 2:
+                    module, function = values
+                    _record_reference(module, function, scan_start + parse_cursor, "STACK_GLOBAL")
+                last_value_info = None
+                last_value_end = -1
+                parse_cursor += 1
+                continue
+            elif opcode_value == 0x95 and parse_cursor + 9 <= data_len:  # FRAME
+                parse_cursor += 9
+                continue
+
+            last_value_info = None
+            last_value_end = -1
+            parse_cursor += 1
+
+        next_deadline_check_cursor = 0
         cursor = 0
         while cursor < data_len:
+            if _deadline_exceeded(cursor):
+                break
+
             opcode_value = data[cursor]
             if opcode_value in (ord("c"), ord("i")):
                 module_end = data.find(b"\n", cursor + 1, min(data_len, cursor + 257))
@@ -5795,13 +5962,6 @@ class PickleScanner(BaseScanner):
                         cursor = function_end + 1
                         continue
             cursor += 1
-
-        for idx in stack_global_positions:
-            values = _extract_stack_global_values(idx)
-            if len(values) != 2:
-                continue
-            module, function = values
-            _record_reference(module, function, scan_start + idx, "STACK_GLOBAL")
 
         return findings
 
@@ -6241,7 +6401,56 @@ class PickleScanner(BaseScanner):
                     file_size=file_size,
                     minimum_offset=post_budget_minimum_offset,
                     ml_context=ml_context,
+                    deadline=deadline,
                 )
+                if self._post_budget_global_memo_limit_exceeded:
+                    _mark_inconclusive_scan_result(result, "post_budget_global_memo_limit_exceeded")
+                    result.add_check(
+                        name="Post-Budget Global Memo Tracking Check",
+                        passed=False,
+                        message=(
+                            "Stopped retaining memoized string context during the post-budget global scan after "
+                            f"reaching {self.post_budget_global_memo_limit_entries} memo entries"
+                        ),
+                        severity=IssueSeverity.INFO,
+                        location=self.current_file_path,
+                        details={
+                            "max_memo_entries": self.post_budget_global_memo_limit_entries,
+                            "minimum_offset": post_budget_minimum_offset,
+                            "analysis_incomplete": True,
+                        },
+                        why=(
+                            "The post-budget fallback bounds memo-table state to avoid attacker-controlled memory "
+                            "growth. Older memoized string references may be unavailable once this limit is reached, "
+                            "so the scan result is marked inconclusive."
+                        ),
+                        rule_code="S902",
+                    )
+
+                if self._post_budget_global_reference_limit_exceeded:
+                    _mark_inconclusive_scan_result(result, "post_budget_global_reference_limit_exceeded")
+                    result.add_check(
+                        name="Post-Budget Global Reference Tracking Check",
+                        passed=False,
+                        message=(
+                            "Stopped retaining post-budget import references after reaching "
+                            f"{self.post_budget_global_max_reference_findings} findings"
+                        ),
+                        severity=IssueSeverity.INFO,
+                        location=self.current_file_path,
+                        details={
+                            "max_reference_findings": self.post_budget_global_max_reference_findings,
+                            "minimum_offset": post_budget_minimum_offset,
+                            "analysis_incomplete": True,
+                        },
+                        why=(
+                            "The post-budget fallback caps retained GLOBAL/INST/STACK_GLOBAL findings so crafted "
+                            "tails cannot force unbounded result growth. The scan result is marked inconclusive "
+                            "because additional references may have been omitted after the cap was reached."
+                        ),
+                        rule_code="S902",
+                    )
+
                 if post_budget_global_findings:
                     critical_findings = [
                         finding
@@ -6289,6 +6498,35 @@ class PickleScanner(BaseScanner):
                     if highest_severity == IssueSeverity.CRITICAL:
                         result.success = False
 
+                if self._post_budget_global_scan_deadline_exceeded:
+                    _mark_inconclusive_scan_result(result, "scan_timeout")
+                    result.metadata["post_budget_global_scan_stopped_due_to_timeout"] = True
+                    if not any(
+                        check.name == "Scan Timeout Check" and check.status == CheckStatus.FAILED
+                        for check in result.checks
+                    ):
+                        result.add_check(
+                            name="Scan Timeout Check",
+                            passed=False,
+                            message=f"Scanning timed out after {self.timeout} seconds",
+                            severity=IssueSeverity.INFO,
+                            location=self.current_file_path,
+                            details={
+                                "opcode_count": opcode_count,
+                                "timeout": self.timeout,
+                                "analysis_incomplete": True,
+                                "post_budget_global_scan": True,
+                                "minimum_offset": post_budget_minimum_offset,
+                            },
+                            why=(
+                                "The post-budget fallback exceeded the configured time limit while scanning the "
+                                "remaining payload after opcode-budget truncation."
+                            ),
+                            rule_code="S902",
+                        )
+                    should_run_post_budget_scan = False
+
+            if should_run_post_budget_scan:
                 post_budget_opcode_findings = self._scan_post_budget_opcode_findings_unbounded(
                     file_obj,
                     file_size=file_size,
