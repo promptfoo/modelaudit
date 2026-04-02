@@ -760,7 +760,9 @@ def test_scan_savedmodel_directory_detects_probe_boundary_padded_pickle_asset(tm
     """A valid pickle prefix at the probe boundary should still route the asset into pickle analysis."""
     model_dir = Path(create_tf_savedmodel(tmp_path))
     asset_path = model_dir / "assets" / "probe-boundary-payload.dat"
-    asset_path.write_bytes(b"I0\n0" * (PROTO0_1_MAX_PROBE_BYTES // 4 + 1) + b'cos\nsystem\n(S"echo pwned"\ntR.')
+    asset_path.write_bytes(
+        b"(t0" + b"I0\n0" * (PROTO0_1_MAX_PROBE_BYTES // 4 + 1) + b'cos\nsystem\n(S"echo pwned"\ntR.',
+    )
 
     result = scan_model_directory_or_file(str(model_dir))
 
@@ -772,6 +774,19 @@ def test_scan_savedmodel_directory_detects_probe_boundary_padded_pickle_asset(tm
         and "os.system" in issue.message
         for issue in result.issues
     )
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_scan_savedmodel_directory_trivial_probe_boundary_padding_stays_clean(tmp_path: Path) -> None:
+    """Large trivial opcode prefixes without STOP should not be routed as pickle payloads."""
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    asset_path = model_dir / "assets" / "probe-boundary-notes.txt"
+    asset_path.write_bytes(b"I0\n0" * (PROTO0_1_MAX_PROBE_BYTES // 4 + 1))
+
+    result = scan_model_directory_or_file(str(model_dir))
+
+    assert determine_exit_code(result) == 0
+    assert all(issue.location is None or asset_path.name not in issue.location for issue in result.issues)
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")

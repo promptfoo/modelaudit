@@ -88,6 +88,10 @@ PROTO0_1_MAX_PROBE_BYTES: int = 64 * 1024
 PROTO0_1_MAX_PROBE_OPCODES: int = PROTO0_1_MAX_PROBE_BYTES
 PROTO0_1_START_BYTES: bytes = b"()]}cilp0FGIJKLMNSTUVX"
 PROTO0_1_IGNORABLE_TRAILING_BYTES: bytes = b" \t\r\n\x00"
+PROTO0_1_PREFIX_TRUNCATION_ERROR_PREFIXES: tuple[str, ...] = (
+    "pickle exhausted before seeing STOP",
+    "no newline found when trying to read ",
+)
 PROTO0_1_TRIVIAL_LEADING_OPCODES: frozenset[str] = frozenset(
     {
         "MARK",
@@ -156,12 +160,22 @@ def _looks_like_proto0_or_1_pickle(sample: bytes, *, sample_is_prefix: bool = Fa
                 if opcode_count >= PROTO0_1_MAX_PROBE_OPCODES:
                     return False
         except ValueError as exc:
-            return sample_is_prefix and opcode_count >= 2 and str(exc) == "pickle exhausted before seeing STOP"
+            exc_message = str(exc)
+            return (
+                sample_is_prefix
+                and opcode_count >= 2
+                and has_non_trivial_opcode
+                and any(
+                    exc_message.startswith(error_prefix) for error_prefix in PROTO0_1_PREFIX_TRUNCATION_ERROR_PREFIXES
+                )
+            )
         except Exception:
             return False
-        # A cleanly parsed prefix without STOP at the probe boundary is still a
-        # pickle indicator when the caller knows more bytes remain in the file.
-        return sample_is_prefix and opcode_count >= 2
+        # A cleanly parsed prefix without STOP at the probe boundary is only a
+        # pickle indicator when a non-trivial opcode has already appeared. This
+        # avoids routing large plain-text files made of scalar opcode lookalikes
+        # (for example repeated ``I0\n0``) into pickle scanning.
+        return sample_is_prefix and opcode_count >= 2 and has_non_trivial_opcode
 
     if _matches_proto_stream(sample):
         return True
