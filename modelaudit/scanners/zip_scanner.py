@@ -253,7 +253,7 @@ class ZipScanner(BaseScanner):
                 is_symlink = (info.external_attr >> 16) & 0o170000 == stat.S_IFLNK
                 if is_symlink:
                     try:
-                        target = z.read(name).decode("utf-8", "replace")
+                        target = z.read(info).decode("utf-8", "replace")
                     except Exception:
                         target = ""
                     target_base = os.path.dirname(resolved_name)

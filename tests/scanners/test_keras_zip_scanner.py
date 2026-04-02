@@ -380,7 +380,10 @@ class TestKerasZipScanner:
         keras_path = tmp_path / "oversized_metadata.keras"
         with zipfile.ZipFile(keras_path, "w") as zf:
             zf.writestr("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
-            zf.writestr("metadata.json", json.dumps({"keras_version": "3.0.0", "padding": "A" * (2 * 1024 * 1024)}))
+            zf.writestr(
+                "metadata.json",
+                json.dumps({"keras_version": "3.0.0", "padding": "A" * (11 * 1024 * 1024)}),
+            )
 
         result = scanner.scan(str(keras_path))
 

@@ -89,7 +89,7 @@ _WINDOWS_ABSOLUTE_PATH_PATTERN = re.compile(r"^(?:[a-zA-Z]:[\\/]|\\\\)")
 _KERAS_CONFIG_ENTRY = "config.json"
 _KERAS_CONFIG_MAX_BYTES = 10 * 1024 * 1024
 _KERAS_METADATA_ENTRY = "metadata.json"
-_KERAS_METADATA_MAX_BYTES = 1 * 1024 * 1024
+_KERAS_METADATA_MAX_BYTES = 10 * 1024 * 1024
 _KERAS_WEIGHTS_ENTRY = "model.weights.h5"
 
 try:
