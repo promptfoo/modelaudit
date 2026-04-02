@@ -150,7 +150,7 @@ def test_scan_file_content_routed_keras_zip_with_benign_extra_member_stays_clean
 
     assert result.scanner_name == "keras_zip"
     assert result.success is True
-    assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+    assert result.issues == []
 
 
 def test_scan_file_content_routed_keras_zip_with_benign_pickle_member_stays_clean(tmp_path: Path) -> None:

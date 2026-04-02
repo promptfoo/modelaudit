@@ -250,6 +250,32 @@ class TestKerasZipScanner:
             for issue in result.issues
         )
 
+    def test_scan_normalized_weights_member_checks_embedded_hdf5_external_references(self, tmp_path: Path) -> None:
+        """Normalized ./model.weights.h5 members should still receive Keras-specific HDF5 checks."""
+        scanner = KerasZipScanner()
+        keras_path = tmp_path / "normalized_weights.keras"
+        weights_path = create_external_link_weights_h5(tmp_path)
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            zf.writestr("./config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
+            zf.writestr("./metadata.json", json.dumps({"keras_version": "3.12.0"}))
+            zf.write(weights_path, "./model.weights.h5")
+
+        result = scanner.scan(str(keras_path))
+
+        assert result.metadata.get("keras_version") == "3.12.0"
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+        assert len(cve_issues) == 1
+        assert cve_issues[0].location == f"{keras_path}/./model.weights.h5"
+        assert cve_issues[0].details["keras_version"] == "3.12.0"
+        assert cve_issues[0].details["external_references"] == [
+            {
+                "kind": "ExternalLink",
+                "hdf5_path": "/linked_kernel",
+                "filename": "external_source.h5",
+                "path": "/payload",
+            },
+        ]
+
     def test_scan_prefers_exact_config_json_over_normalized_alias(self, tmp_path: Path) -> None:
         """A canonical config.json member should win over normalized aliases regardless of archive order."""
         scanner = KerasZipScanner()
