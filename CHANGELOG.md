@@ -118,6 +118,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **security:** recursively scan all members of content-routed `.keras` ZIP archives with bounded per-member extraction, prefer canonical root members over normalized aliases, and fail closed on ambiguous duplicate aliases so embedded payloads and `./config.json` entries are not skipped
 - **security:** scan duplicate ZIP entries by physical archive member instead of resolving repeated names to the final entry, preventing shadowed payloads from being skipped during recursive archive analysis
 - bound Keras `config.json` and `metadata.json` member reads before JSON parsing
+- **tar:** propagate nested critical findings and partial archive traversal to `success=False`, continue after per-entry extraction errors, and normalize malformed archive-limit configs to safe defaults
 - route oversized config-only Keras ZIP archives by bounded config-prefix sniffing instead of falling back to the generic ZIP scanner
 - preserve disguised model files during directory prefiltering without promoting document ZIPs
 - recurse into nested 7z members even when their filenames use misleading extensions

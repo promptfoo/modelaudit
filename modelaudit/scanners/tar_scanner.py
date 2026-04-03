@@ -56,12 +56,25 @@ class TarScanner(BaseScanner):
         super().__init__(config)
         self.max_depth = self.config.get("max_tar_depth", 5)
         self.max_entries = self.config.get("max_tar_entries", 10000)
-        self.max_decompressed_bytes = int(
-            self.config.get("compressed_max_decompressed_bytes", DEFAULT_MAX_DECOMPRESSED_BYTES),
+        self.max_decompressed_bytes = self._normalize_positive_int_config(
+            self.config.get("compressed_max_decompressed_bytes"),
+            DEFAULT_MAX_DECOMPRESSED_BYTES,
         )
-        self.max_decompression_ratio = float(
-            self.config.get("compressed_max_decompression_ratio", DEFAULT_MAX_DECOMPRESSION_RATIO),
+        self.max_decompression_ratio = self._normalize_positive_float_config(
+            self.config.get("compressed_max_decompression_ratio"),
+            DEFAULT_MAX_DECOMPRESSION_RATIO,
         )
+
+    @staticmethod
+    def _normalize_positive_float_config(value: Any, default: float) -> float:
+        """Return a positive float config value, or default for invalid input."""
+        if isinstance(value, bool):
+            return default
+        try:
+            normalized_value = float(value)
+        except (TypeError, ValueError):
+            return default
+        return normalized_value if normalized_value > 0 else default
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -121,7 +134,7 @@ class TarScanner(BaseScanner):
             result.finish(success=False)
             return result
 
-        result.finish(success=True)
+        result.finish(success=scan_result.success and not result.has_errors)
         result.metadata["contents"] = scan_result.metadata.get("contents", [])
         return result
 
@@ -133,12 +146,18 @@ class TarScanner(BaseScanner):
         # The top-level scan cap is the operator-facing hard stop (for example
         # CLI --max-size), so it must win when explicitly set.
         if configured_file_limit is not None and configured_file_limit != 0:
-            return int(configured_file_limit)
+            return self._normalize_positive_int_config(
+                configured_file_limit,
+                DEFAULT_MAX_TAR_ENTRY_SIZE,
+            )
 
         if configured_entry_limit is not None:
             if configured_entry_limit == 0:
                 return 1024 * 1024 * 1024 * 1024
-            return int(configured_entry_limit)
+            return self._normalize_positive_int_config(
+                configured_entry_limit,
+                DEFAULT_MAX_TAR_ENTRY_SIZE,
+            )
 
         if configured_file_limit == 0:
             return DEFAULT_MAX_TAR_ENTRY_SIZE
@@ -427,6 +446,7 @@ class TarScanner(BaseScanner):
     def _scan_tar_file(self, path: str, depth: int = 0) -> ScanResult:
         result = ScanResult(scanner_name=self.name)
         contents: list[dict[str, Any]] = []
+        scan_complete = True
 
         if depth >= self.max_depth:
             result.add_check(
@@ -438,6 +458,7 @@ class TarScanner(BaseScanner):
                 location=path,
                 details={"depth": depth, "max_depth": self.max_depth},
             )
+            result.finish(success=False)
             return result
         else:
             result.add_check(
@@ -452,7 +473,7 @@ class TarScanner(BaseScanner):
         if not self._preflight_tar_archive(path, result):
             result.metadata["contents"] = contents
             result.metadata["file_size"] = os.path.getsize(path)
-            result.finish(success=not result.has_errors)
+            result.finish(success=False)
             return result
 
         with tarfile.open(path, "r:*") as tar:
@@ -528,63 +549,67 @@ class TarScanner(BaseScanner):
                 if not member.isfile():
                     continue
 
-                # Check for compound extensions like .tar.gz
-                name_lower = name.lower()
-                is_tar_extension = any(name_lower.endswith(ext) for ext in self.supported_extensions)
-                if is_tar_extension:
-                    # Extract the full extension for the temp file
-                    for ext in self.supported_extensions:
-                        if name_lower.endswith(ext):
-                            suffix = ext
-                            break
+                try:
+                    # Check for compound extensions like .tar.gz
+                    name_lower = name.lower()
+                    is_tar_extension = any(name_lower.endswith(ext) for ext in self.supported_extensions)
+                    if is_tar_extension:
+                        # Extract the full extension for the temp file
+                        for ext in self.supported_extensions:
+                            if name_lower.endswith(ext):
+                                suffix = ext
+                                break
+                        else:
+                            suffix = ".tar"  # fallback
                     else:
-                        suffix = ".tar"  # fallback
+                        safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", os.path.basename(name))
+                        suffix = f"_{safe_name}"
+
                     tmp_path, total_size = self._extract_member_to_tempfile(tar, member, suffix=suffix)
                     try:
-                        if tarfile.is_tarfile(tmp_path):
+                        if is_tar_extension and tarfile.is_tarfile(tmp_path):
                             nested_result = self._scan_tar_file(tmp_path, depth + 1)
+                            if not nested_result.success:
+                                scan_complete = False
+
                             self._rewrite_nested_result_context(nested_result, tmp_path, path, name)
                             result.merge(nested_result)
                             asset_entry = asset_from_scan_result(f"{path}:{name}", nested_result)
-                            asset_entry.setdefault("size", member.size)
-                            contents.append(asset_entry)
                         else:
                             nested_config = dict(self.config)
                             nested_config["_archive_depth"] = depth + 1
                             file_result = core.scan_file(tmp_path, nested_config)
+                            if not file_result.success:
+                                scan_complete = False
+
                             self._rewrite_nested_result_context(file_result, tmp_path, path, name)
-
                             result.merge(file_result)
-
                             asset_entry = asset_from_scan_result(f"{path}:{name}", file_result)
-                            asset_entry.setdefault("size", member.size)
-                            contents.append(asset_entry)
 
                             if file_result.scanner_name == "unknown":
                                 result.bytes_scanned += total_size
-                    finally:
-                        os.unlink(tmp_path)
-                else:
-                    safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", os.path.basename(name))
-                    tmp_path, total_size = self._extract_member_to_tempfile(tar, member, suffix=f"_{safe_name}")
-                    try:
-                        nested_config = dict(self.config)
-                        nested_config["_archive_depth"] = depth + 1
-                        file_result = core.scan_file(tmp_path, nested_config)
-                        self._rewrite_nested_result_context(file_result, tmp_path, path, name)
 
-                        result.merge(file_result)
-
-                        asset_entry = asset_from_scan_result(f"{path}:{name}", file_result)
                         asset_entry.setdefault("size", member.size)
                         contents.append(asset_entry)
-
-                        if file_result.scanner_name == "unknown":
-                            result.bytes_scanned += total_size
                     finally:
                         os.unlink(tmp_path)
+                except Exception as exc:
+                    scan_complete = False
+                    result.add_check(
+                        name="TAR Entry Scan",
+                        passed=False,
+                        message=f"Error scanning TAR entry {name}: {exc!s}",
+                        severity=IssueSeverity.WARNING,
+                        location=f"{path}:{name}",
+                        details={
+                            "entry": name,
+                            "exception": str(exc),
+                            "exception_type": type(exc).__name__,
+                        },
+                        rule_code="S902",
+                    )
 
         result.metadata["contents"] = contents
         result.metadata["file_size"] = os.path.getsize(path)
-        result.finish(success=not result.has_errors)
+        result.finish(success=scan_complete and not result.has_errors)
         return result

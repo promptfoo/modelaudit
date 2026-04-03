@@ -8,7 +8,12 @@ import pytest
 
 from modelaudit import core
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
-from modelaudit.scanners.tar_scanner import DEFAULT_MAX_TAR_ENTRY_SIZE, TarScanner
+from modelaudit.scanners.tar_scanner import (
+    DEFAULT_MAX_DECOMPRESSED_BYTES,
+    DEFAULT_MAX_DECOMPRESSION_RATIO,
+    DEFAULT_MAX_TAR_ENTRY_SIZE,
+    TarScanner,
+)
 
 
 class TestTarScanner:
@@ -107,6 +112,7 @@ class TestTarScanner:
 
         try:
             result = self.scanner.scan(tmp_path)
+            assert result.success is False
             path_traversal_issues = [i for i in result.issues if "path traversal" in i.message.lower()]
             assert len(path_traversal_issues) > 0
             assert any(i.severity == IssueSeverity.CRITICAL for i in path_traversal_issues)
@@ -126,6 +132,7 @@ class TestTarScanner:
 
         try:
             result = self.scanner.scan(tmp_path)
+            assert result.success is False
             symlink_issues = [i for i in result.issues if "symlink" in i.message.lower()]
             assert len(symlink_issues) > 0
             assert any("outside" in i.message.lower() for i in symlink_issues)
@@ -145,6 +152,7 @@ class TestTarScanner:
 
         try:
             result = self.scanner.scan(tmp_path)
+            assert result.success is False
             symlink_issues = [i for i in result.issues if "symlink" in i.message.lower()]
             assert any("critical system" in i.message.lower() for i in symlink_issues)
         finally:
@@ -198,6 +206,7 @@ class TestTarScanner:
 
         try:
             result = self.scanner.scan(tar_paths[-1])
+            assert result.success is False
             depth_issues = [i for i in result.issues if "maximum" in i.message.lower() and "depth" in i.message.lower()]
             assert len(depth_issues) > 0
         finally:
@@ -238,7 +247,7 @@ class TestTarScanner:
 
         result = self.scanner.scan(str(archive_path))
 
-        assert result.success is True
+        assert result.success is False
         assert result.has_errors is True
         critical_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL]
         assert any(
@@ -335,6 +344,21 @@ class TestTarScanner:
         scanner = TarScanner(config={"max_file_size": 0})
         assert scanner._get_max_entry_size() == DEFAULT_MAX_TAR_ENTRY_SIZE
 
+    def test_invalid_limit_configs_fall_back_to_defaults(self) -> None:
+        """Malformed TAR limit config values should not raise during scanner initialization."""
+        scanner = TarScanner(
+            config={
+                "max_file_size": "bad",
+                "max_entry_size": "bad",
+                "compressed_max_decompressed_bytes": "bad",
+                "compressed_max_decompression_ratio": "bad",
+            }
+        )
+
+        assert scanner._get_max_entry_size() == DEFAULT_MAX_TAR_ENTRY_SIZE
+        assert scanner.max_decompressed_bytes == DEFAULT_MAX_DECOMPRESSED_BYTES
+        assert scanner.max_decompression_ratio == DEFAULT_MAX_DECOMPRESSION_RATIO
+
     def test_extract_member_to_tempfile_streams_in_chunks(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -385,7 +409,7 @@ class TestTarScanner:
         result = scanner.scan(str(archive_path))
 
         assert result.success is False
-        oversize_checks = [check for check in result.checks if check.name == "TAR File Scan"]
+        oversize_checks = [check for check in result.checks if check.name == "TAR Entry Scan"]
         assert len(oversize_checks) == 1
         assert "tar entry payload.bin exceeds maximum size of 64 bytes" in oversize_checks[0].message.lower()
 
@@ -403,9 +427,41 @@ class TestTarScanner:
         result = scanner.scan(str(archive_path))
 
         assert result.success is False
-        oversize_checks = [check for check in result.checks if check.name == "TAR File Scan"]
+        oversize_checks = [check for check in result.checks if check.name == "TAR Entry Scan"]
         assert len(oversize_checks) == 1
         assert "tar entry payload.bin exceeds maximum size of 64 bytes" in oversize_checks[0].message.lower()
+
+    def test_scan_continues_after_oversized_member_and_detects_later_payload(self, tmp_path: Path) -> None:
+        """A single oversized member should fail that entry without hiding later malicious members."""
+        scanner = TarScanner(config={"max_entry_size": 64})
+        archive_path = tmp_path / "mixed.tar"
+        payload = b'cos\nsystem\n(S"echo pwned"\ntR.'
+
+        with tarfile.open(archive_path, "w") as archive:
+            large_member = tarfile.TarInfo("huge.bin")
+            large_data = b"A" * 128
+            large_member.size = len(large_data)
+            archive.addfile(large_member, tarfile.io.BytesIO(large_data))  # type: ignore[attr-defined]
+
+            evil_member = tarfile.TarInfo("payload.txt")
+            evil_member.size = len(payload)
+            archive.addfile(evil_member, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = scanner.scan(str(archive_path))
+
+        assert result.success is False
+        assert any(
+            check.name == "TAR Entry Scan"
+            and check.status == CheckStatus.FAILED
+            and check.details.get("entry") == "huge.bin"
+            for check in result.checks
+        )
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL
+            and issue.location == f"{archive_path}:payload.txt"
+            and any(global_name in issue.message.lower() for global_name in ("os.system", "posix.system"))
+            for issue in result.issues
+        )
 
     def test_scan_skips_non_regular_tar_members(self, tmp_path: Path) -> None:
         """Valid non-file TAR members should not abort scanning later regular files."""
@@ -537,6 +593,7 @@ class TestTarScanner:
         scanner = TarScanner(config={"compressed_max_decompression_ratio": 2.0})
         result = scanner.scan(str(archive_path))
 
+        assert result.success is False
         limit_checks = [check for check in result.checks if check.name == "Compressed Wrapper Decompression Limits"]
         assert len(limit_checks) == 1
         assert limit_checks[0].status == CheckStatus.FAILED
@@ -565,6 +622,7 @@ class TestTarScanner:
         scanner = TarScanner(config={"compressed_max_decompressed_bytes": 1024})
         result = scanner.scan(str(archive_path))
 
+        assert result.success is False
         limit_checks = [check for check in result.checks if check.name == "Compressed Wrapper Decompression Limits"]
         assert len(limit_checks) == 1
         assert limit_checks[0].status == CheckStatus.FAILED
@@ -615,6 +673,7 @@ class TestTarScanner:
         scanner = TarScanner(config={"compressed_max_decompressed_bytes": 4_096})
         result = scanner.scan(str(archive_path))
 
+        assert result.success is False
         limit_checks = [check for check in result.checks if check.name == "Compressed Wrapper Decompression Limits"]
         assert len(limit_checks) == 1
         assert limit_checks[0].status == CheckStatus.FAILED
@@ -658,6 +717,7 @@ class TestTarScanner:
         scanner = TarScanner(config={"compressed_max_decompression_ratio": 2.0})
         result = scanner.scan(str(archive_path))
 
+        assert result.success is False
         limit_checks = [check for check in result.checks if check.name == "Compressed Wrapper Decompression Limits"]
         assert len(limit_checks) == 1
         assert limit_checks[0].status == CheckStatus.FAILED
@@ -678,6 +738,7 @@ class TestTarScanner:
             config={"compressed_max_decompression_ratio": 2.0},
         )
 
+        assert result.success is False
         limit_checks = [check for check in result.checks if check.name == "Compressed Wrapper Decompression Limits"]
         assert result.scanner_name == "tar"
         assert len(limit_checks) == 1
