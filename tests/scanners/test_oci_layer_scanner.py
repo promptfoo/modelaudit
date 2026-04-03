@@ -384,7 +384,7 @@ class TestOciLayerScanner:
         """Cosmetic layer-ref suffix changes should not hide a real .tar.gz payload."""
         evil_pickle = Path(__file__).parent.parent / "assets/samples/pickles/evil.pickle"
 
-        layer_path = tmp_path / "UPPER.TAR.GZ"
+        layer_path = tmp_path / "  UPPER.TAR.GZ  "
         with tarfile.open(layer_path, "w:gz") as tar:
             tar.add(evil_pickle, arcname="malicious.pkl")
 
@@ -398,6 +398,33 @@ class TestOciLayerScanner:
         assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
         assert any(
             "uppercase.manifest:  UPPER.TAR.GZ  :malicious.pkl" in (issue.location or "") for issue in result.issues
+        )
+
+    def test_scan_manifest_resolves_exact_dotted_layer_ref(self, tmp_path: Path) -> None:
+        """Manifest refs with trailing dots should resolve to the exact layer path, not a normalized sibling."""
+        evil_pickle = Path(__file__).parent.parent / "assets/samples/pickles/evil.pickle"
+
+        benign_payload = tmp_path / "safe.txt"
+        benign_payload.write_text("Safe content")
+
+        benign_layer_path = tmp_path / "layer.tar.gz"
+        with tarfile.open(benign_layer_path, "w:gz") as tar:
+            tar.add(benign_payload, arcname="safe.txt")
+
+        malicious_layer_path = tmp_path / "layer.tar.gz."
+        with tarfile.open(malicious_layer_path, "w:gz") as tar:
+            tar.add(evil_pickle, arcname="malicious.pkl")
+
+        manifest_path = tmp_path / "exact-ref.manifest"
+        manifest_path.write_text(json.dumps({"layers": ["layer.tar.gz."]}))
+
+        result = OciLayerScanner().scan(str(manifest_path))
+
+        assert result.success is False
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL
+            and "exact-ref.manifest:layer.tar.gz.:malicious.pkl" in (issue.location or "")
+            for issue in result.issues
         )
 
     def test_scan_layer_detects_member_with_trailing_space_extension(self, tmp_path: Path) -> None:

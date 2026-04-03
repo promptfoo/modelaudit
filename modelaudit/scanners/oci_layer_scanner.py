@@ -185,7 +185,7 @@ class OciLayerScanner(BaseScanner):
 
         for layer_ref in layer_paths:
             normalized_layer_ref = self._normalize_layer_ref(layer_ref)
-            layer_path, is_safe = sanitize_archive_path(normalized_layer_ref, manifest_dir)
+            layer_path, is_safe = sanitize_archive_path(layer_ref, manifest_dir)
 
             if not is_safe or not is_within_directory(manifest_dir, layer_path):
                 scan_complete = False
