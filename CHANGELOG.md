@@ -107,6 +107,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **security:** harden Keras H5 scanning by propagating CRITICAL findings to `success=False`, scanning wrapper-owned nested layers, parsing prerelease fix-boundary versions correctly, and matching suspicious module/config tokens without benign substring false positives
 - **security:** detect protocol 0/1 pickle streams with trivial opcode prefixes even when `STOP` is followed by trailing junk, while preserving plain-text near-match rejection
 - **security:** detect protocol 0/1 pickle streams whose dangerous opcode appears after large trivial padding or after a non-trivial probe-boundary prelude, reject all-trivial no-`STOP` probe prefixes, and preserve rule codes across cached scan-result round trips
 - **license:** bound binary header scans and reuse compiled patterns to avoid full-file regex passes on large model archives
