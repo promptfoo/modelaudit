@@ -106,7 +106,7 @@ class JoblibScanner(BaseScanner):
     def _safe_decompress(self, data: bytes) -> bytes:
         """Safely decompress data with bomb protection"""
         codec_attempts: list[tuple[str, Callable[[], Any]]] = [
-            ("zlib", lambda: zlib.decompressobj()),
+            ("zlib", zlib.decompressobj),
             ("gzip", lambda: zlib.decompressobj(zlib.MAX_WBITS | 16)),
             ("bz2", bz2.BZ2Decompressor),
             ("lzma", lzma.LZMADecompressor),

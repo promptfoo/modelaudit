@@ -24,7 +24,7 @@ def _has_system_reduce_failure(result: ScanResult) -> bool:
         check.status == CheckStatus.FAILED
         and check.severity == IssueSeverity.CRITICAL
         and check.name == "REDUCE Opcode Safety Check"
-        and check.details.get("associated_global") in {"os.system", "posix.system"}
+        and check.details.get("associated_global") in {"os.system", "posix.system", "nt.system"}
         for check in result.checks
     )
 
