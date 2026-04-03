@@ -572,3 +572,21 @@ class TestExternalDataSizeValidation:
         assert len(size_checks) > 0
         assert size_checks[0].severity == IssueSeverity.CRITICAL
         assert "invalid" in size_checks[0].message.lower()
+
+    def test_negative_offset_metadata_fails_size_validation(self, tmp_path: Path) -> None:
+        model_path = create_onnx_model(
+            tmp_path,
+            external=True,
+            external_path="weights.bin",
+            external_metadata={"offset": "-1"},
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        assert result.success is False
+        size_checks = [
+            c for c in result.checks if c.name == "External Data Size Validation" and c.status == CheckStatus.FAILED
+        ]
+        assert len(size_checks) > 0
+        assert size_checks[0].severity == IssueSeverity.CRITICAL
+        assert "non-negative" in size_checks[0].message.lower()
