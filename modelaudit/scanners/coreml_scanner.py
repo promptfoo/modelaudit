@@ -426,7 +426,7 @@ class CoreMLScanner(BaseScanner):
         metadata_findings = 0
         custom_findings = 0
         linked_path_findings = 0
-        for model_fields, model_path in self._iter_model_messages(top_fields):
+        for model_fields, model_path in self._iter_model_messages(top_fields, path=path, result=result):
             metadata_findings += self._analyze_description(model_fields, path, result, model_path=model_path)
             custom_findings += self._analyze_custom_blocks(model_fields, path, result, model_path=model_path)
             linked_path_findings += self._analyze_linked_model_paths(
@@ -436,7 +436,9 @@ class CoreMLScanner(BaseScanner):
                 model_path=model_path,
             )
 
-        if metadata_findings == 0:
+        traversal_truncated = bool(result.metadata.get("coreml_traversal_truncated"))
+
+        if metadata_findings == 0 and not traversal_truncated:
             result.add_check(
                 name="CoreML Metadata Security Check",
                 passed=True,
@@ -444,7 +446,7 @@ class CoreMLScanner(BaseScanner):
                 location=path,
             )
 
-        if custom_findings == 0:
+        if custom_findings == 0 and not traversal_truncated:
             result.add_check(
                 name="CoreML Custom Code Path Check",
                 passed=True,
@@ -452,7 +454,7 @@ class CoreMLScanner(BaseScanner):
                 location=path,
             )
 
-        if linked_path_findings == 0:
+        if linked_path_findings == 0 and not traversal_truncated:
             result.add_check(
                 name="CoreML Linked Model Path Check",
                 passed=True,
@@ -467,20 +469,40 @@ class CoreMLScanner(BaseScanner):
         self,
         fields: list[_ProtoField],
         *,
+        path: str,
+        result: ScanResult,
         model_path: str = "model",
-        depth: int = 0,
+        model_depth: int = 0,
+        message_depth: int = 0,
     ) -> Iterator[tuple[list[_ProtoField], str]]:
         yield fields, model_path
-        yield from self._iter_child_model_messages(fields, message_path=model_path, depth=depth)
+        yield from self._iter_child_model_messages(
+            fields,
+            path=path,
+            result=result,
+            message_path=model_path,
+            model_depth=model_depth,
+            message_depth=message_depth,
+        )
 
     def _iter_child_model_messages(
         self,
         fields: list[_ProtoField],
         *,
+        path: str,
+        result: ScanResult,
         message_path: str,
-        depth: int,
+        model_depth: int,
+        message_depth: int,
     ) -> Iterator[tuple[list[_ProtoField], str]]:
-        if depth >= self.MAX_RECURSIVE_MESSAGE_DEPTH:
+        if message_depth >= self.MAX_RECURSIVE_MESSAGE_DEPTH:
+            self._add_traversal_limit_check(
+                path=path,
+                result=result,
+                message_path=message_path,
+                model_depth=model_depth,
+                message_depth=message_depth,
+            )
             return
 
         for field_index, field in enumerate(fields):
@@ -497,17 +519,91 @@ class CoreMLScanner(BaseScanner):
 
             child_path = f"{message_path}[{field.field_number}:{field_index}]"
             if self._has_coreml_structure(nested_fields):
+                if model_depth >= self.MAX_RECURSIVE_MESSAGE_DEPTH:
+                    self._add_traversal_limit_check(
+                        path=path,
+                        result=result,
+                        message_path=child_path,
+                        model_depth=model_depth,
+                        message_depth=message_depth + 1,
+                    )
+                    continue
+
                 yield from self._iter_model_messages(
                     nested_fields,
+                    path=path,
+                    result=result,
                     model_path=child_path,
-                    depth=depth + 1,
+                    model_depth=model_depth + 1,
+                    message_depth=message_depth + 1,
                 )
             else:
                 yield from self._iter_child_model_messages(
                     nested_fields,
+                    path=path,
+                    result=result,
                     message_path=child_path,
-                    depth=depth + 1,
+                    model_depth=model_depth,
+                    message_depth=message_depth + 1,
                 )
+
+    def _add_traversal_limit_check(
+        self,
+        *,
+        path: str,
+        result: ScanResult,
+        message_path: str,
+        model_depth: int,
+        message_depth: int,
+    ) -> None:
+        if result.metadata.get("coreml_traversal_truncated"):
+            return
+
+        result.metadata["coreml_traversal_truncated"] = True
+        result.add_check(
+            name="CoreML Recursive Traversal Limit",
+            passed=False,
+            message="CoreML nested-message traversal reached the safe depth limit; scan is incomplete",
+            severity=IssueSeverity.CRITICAL,
+            location=path,
+            details={
+                "field_path": message_path,
+                "max_recursive_message_depth": self.MAX_RECURSIVE_MESSAGE_DEPTH,
+                "model_depth": model_depth,
+                "message_depth": message_depth,
+            },
+            why=(
+                "Deeply nested protobuf wrappers can hide custom models, custom layers, or linked-model paths. "
+                "Failing closed on recursion limits avoids silently skipping nested payloads."
+            ),
+        )
+
+    @staticmethod
+    def _store_model_metadata(result: ScanResult, key: str, model_path: str, value: dict[str, str]) -> None:
+        metadata_by_model = result.metadata.get(key)
+        if not isinstance(metadata_by_model, dict):
+            metadata_by_model = {}
+            result.metadata[key] = metadata_by_model
+        metadata_by_model[model_path] = value
+
+    @staticmethod
+    def _store_custom_block_stats(
+        result: ScanResult,
+        model_path: str,
+        *,
+        layer_count: int,
+        custom_layer_count: int,
+        has_custom_model: bool,
+    ) -> None:
+        stats_by_model = result.metadata.get("coreml_custom_block_stats")
+        if not isinstance(stats_by_model, dict):
+            stats_by_model = {}
+            result.metadata["coreml_custom_block_stats"] = stats_by_model
+        stats_by_model[model_path] = {
+            "layer_count": layer_count,
+            "custom_layer_count": custom_layer_count,
+            "has_custom_model": has_custom_model,
+        }
 
     def _analyze_description(
         self,
@@ -587,7 +683,9 @@ class CoreMLScanner(BaseScanner):
                 )
 
         if model_metadata:
-            result.metadata["coreml_metadata"] = model_metadata
+            self._store_model_metadata(result, "coreml_metadata_by_model", model_path, model_metadata)
+            if model_path == "model":
+                result.metadata["coreml_metadata"] = model_metadata
 
         user_defined: dict[str, str] = {}
         user_defined_fields = _len_fields(metadata_fields, 100)[: self.MAX_USER_METADATA_ENTRIES]
@@ -638,7 +736,9 @@ class CoreMLScanner(BaseScanner):
             )
 
         if user_defined:
-            result.metadata["user_defined_metadata"] = user_defined
+            self._store_model_metadata(result, "user_defined_metadata_by_model", model_path, user_defined)
+            if model_path == "model":
+                result.metadata["user_defined_metadata"] = user_defined
 
         return findings
 
@@ -923,9 +1023,18 @@ class CoreMLScanner(BaseScanner):
                 field_path=f"{model_path}[555].parameters",
             )
 
-        result.metadata["layer_count"] = layer_count
-        result.metadata["custom_layer_count"] = custom_layer_count
-        result.metadata["has_custom_model"] = bool(custom_model_fields)
+        has_custom_model = bool(custom_model_fields)
+        self._store_custom_block_stats(
+            result,
+            model_path,
+            layer_count=layer_count,
+            custom_layer_count=custom_layer_count,
+            has_custom_model=has_custom_model,
+        )
+        if model_path == "model":
+            result.metadata["layer_count"] = layer_count
+            result.metadata["custom_layer_count"] = custom_layer_count
+            result.metadata["has_custom_model"] = has_custom_model
         return findings
 
     def _scan_custom_parameter_map(

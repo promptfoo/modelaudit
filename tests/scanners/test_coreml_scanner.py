@@ -152,6 +152,57 @@ def test_coreml_scanner_benign_model(tmp_path: Path) -> None:
     assert detect_format_from_extension(str(safe_model_path)) == "coreml"
 
 
+def test_coreml_scanner_preserves_metadata_for_root_and_nested_models(tmp_path: Path) -> None:
+    nested_model = _build_model(
+        description=_build_description(
+            metadata=_build_metadata(
+                short_description="Nested model metadata",
+                user_defined={"nested_key": "nested-value"},
+            )
+        ),
+        neural_network=_build_neural_network(layers=[_build_layer("nested_dense")]),
+    )
+    model_path = _write_model(
+        tmp_path / "nested_metadata.mlmodel",
+        _build_model(
+            description=_build_description(
+                metadata=_build_metadata(
+                    short_description="Root model metadata",
+                    user_defined={"root_key": "root-value"},
+                )
+            ),
+            pipeline_wrapper=_build_pipeline_wrapper(nested_model),
+        ),
+    )
+
+    result = CoreMLScanner().scan(str(model_path))
+
+    assert result.success is True
+    root_metadata = result.metadata.get("coreml_metadata")
+    assert isinstance(root_metadata, dict)
+    assert root_metadata["shortDescription"] == "Root model metadata"
+    assert root_metadata["author"] == "ModelAudit Tests"
+    assert result.metadata.get("user_defined_metadata") == {"root_key": "root-value"}
+
+    metadata_by_model = result.metadata.get("coreml_metadata_by_model")
+    assert isinstance(metadata_by_model, dict)
+    assert metadata_by_model["model"]["shortDescription"] == "Root model metadata"
+    nested_metadata = [
+        metadata
+        for model_key, metadata in metadata_by_model.items()
+        if model_key != "model" and metadata.get("shortDescription") == "Nested model metadata"
+    ]
+    assert nested_metadata
+
+    user_metadata_by_model = result.metadata.get("user_defined_metadata_by_model")
+    assert isinstance(user_metadata_by_model, dict)
+    assert user_metadata_by_model["model"] == {"root_key": "root-value"}
+    assert any(
+        model_key != "model" and metadata.get("nested_key") == "nested-value"
+        for model_key, metadata in user_metadata_by_model.items()
+    )
+
+
 def test_coreml_scanner_detects_custom_layer_and_parameter_payload(tmp_path: Path) -> None:
     malicious_model = _write_model(
         tmp_path / "malicious_custom_layer.mlmodel",
@@ -386,6 +437,82 @@ def test_coreml_scanner_detects_custom_layers_nested_in_pipeline_models(tmp_path
         and "Custom CoreML layer detected" in issue.message
         and issue.details.get("layer_name") == "nested_custom"
         and issue.details.get("class_name") == "EvilPipelineLayer"
+        for issue in result.issues
+    )
+
+
+def test_coreml_scanner_detects_linked_model_nested_in_pipeline_models(tmp_path: Path) -> None:
+    nested_model = _build_model(
+        description=_build_description(metadata=_build_metadata()),
+        neural_network=_build_neural_network(layers=[_build_layer("nested_dense")]),
+        linked_model=_build_linked_model(file_name="../nested/escape.mlmodel"),
+    )
+    model_path = _write_model(
+        tmp_path / "pipeline_linked_model.mlmodel",
+        _build_model(
+            description=_build_description(metadata=_build_metadata()),
+            pipeline_wrapper=_build_pipeline_wrapper(nested_model),
+        ),
+    )
+
+    result = CoreMLScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and "Unsafe CoreML linked-model path reference" in issue.message
+        and "][1:0][556].linkedModelFile.linkedModelFileName.defaultValue" in issue.details.get("field_path", "")
+        and issue.details.get("reason") == "path traversal segments in linked model path"
+        for issue in result.issues
+    )
+
+
+def test_coreml_scanner_detects_custom_model_nested_in_pipeline_models(tmp_path: Path) -> None:
+    nested_model = _build_model(
+        description=_build_description(metadata=_build_metadata()),
+        neural_network=_build_neural_network(layers=[_build_layer("nested_dense")]),
+        custom_model_class="NestedPipelineRuntime",
+    )
+    model_path = _write_model(
+        tmp_path / "pipeline_custom_model.mlmodel",
+        _build_model(
+            description=_build_description(metadata=_build_metadata()),
+            pipeline_wrapper=_build_pipeline_wrapper(nested_model),
+        ),
+    )
+
+    result = CoreMLScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and "CoreML custom model class detected" in issue.message
+        and issue.details.get("class_name") == "NestedPipelineRuntime"
+        and "][1:0][555].className" in issue.details.get("field_path", "")
+        for issue in result.issues
+    )
+
+
+def test_coreml_scanner_recursion_limit_fails_closed(tmp_path: Path) -> None:
+    nested_model = _build_model(
+        description=_build_description(metadata=_build_metadata()),
+        custom_model_class="TooDeepRuntime",
+    )
+    for _ in range(CoreMLScanner.MAX_RECURSIVE_MESSAGE_DEPTH + 2):
+        nested_model = _build_model(
+            description=_build_description(metadata=_build_metadata()),
+            pipeline_wrapper=_build_pipeline_wrapper(nested_model),
+        )
+
+    model_path = _write_model(tmp_path / "deep_pipeline.mlmodel", nested_model)
+
+    result = CoreMLScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and "traversal reached the safe depth limit" in issue.message
+        and issue.details.get("max_recursive_message_depth") == CoreMLScanner.MAX_RECURSIVE_MESSAGE_DEPTH
         for issue in result.issues
     )
 
