@@ -194,7 +194,7 @@ class TestSevenZipScanner:
                 os.unlink(temp_pickle_path)
 
     @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
-    def test_scan_malicious_archive(self, scanner, temp_7z_file):
+    def test_scan_malicious_archive(self, scanner: SevenZipScanner, temp_7z_file: str) -> None:
         """Test scanning a 7z archive with malicious content"""
         import py7zr  # type: ignore[import-untyped]
 
@@ -218,12 +218,13 @@ class TestSevenZipScanner:
             ) as mock_scan_file:
                 result = scanner.scan(temp_7z_file)
 
-                assert result.success  # Scan completes successfully
+                assert result.success is False
                 assert len(result.issues) > 0  # But issues are found
                 mock_scan_file.assert_called_once()
 
                 # Check that location was adjusted for archive context
                 for issue in result.issues:
+                    assert issue.location is not None
                     assert temp_7z_file in issue.location or "malicious_model.pkl" in issue.location
 
         finally:
@@ -253,7 +254,7 @@ class TestSevenZipScanner:
             ) as mock_scan_file:
                 result = scanner.scan(temp_7z_file)
 
-            assert result.success
+            assert result.success is False
             mock_scan_file.assert_called_once()
             nested_issues = [issue for issue in result.issues if issue.message == "Nested pickle scanned"]
             assert len(nested_issues) == 1
@@ -300,7 +301,7 @@ class TestSevenZipScanner:
                 "os.system",
                 f"{os.system.__module__}.system",
             }
-            assert result.success
+            assert result.success is False
             nested_issues = [
                 issue
                 for issue in result.issues
@@ -358,7 +359,7 @@ class TestSevenZipScanner:
                 and f"{temp_7z_file}:nested.jpg:payload.pkl" in issue.location
                 and any(symbol in issue.message.lower() for symbol in system_symbols)
             ]
-            assert result.success
+            assert result.success is False
             assert len(nested_issues) > 0
             assert any(issue.severity == IssueSeverity.CRITICAL for issue in nested_issues)
 
@@ -411,7 +412,7 @@ class TestSevenZipScanner:
                 and f"{temp_7z_file}:nested.jpg:payload.pkl" in issue.location
                 and any(symbol in issue.message.lower() for symbol in system_symbols)
             ]
-            assert result.success
+            assert result.success is False
             assert len(nested_issues) > 0
             probe_limit_checks = [check for check in result.checks if check.name == "Nested Member Probe Limit"]
             assert len(probe_limit_checks) == 1
@@ -464,7 +465,7 @@ class TestSevenZipScanner:
                 and f"{temp_7z_file}:nested.txt:payload.pkl" in issue.location
                 and any(symbol in issue.message.lower() for symbol in system_symbols)
             ]
-            assert result.success
+            assert result.success is False
             assert len(nested_issues) > 0
             assert any(issue.severity == IssueSeverity.CRITICAL for issue in nested_issues)
         finally:
@@ -498,7 +499,7 @@ class TestSevenZipScanner:
 
             result = scanner.scan(temp_7z_file)
 
-            assert result.success
+            assert result.success is False
             assert result.metadata["scannable_files"] == 1
             assert not any(
                 issue.location
@@ -536,6 +537,7 @@ class TestSevenZipScanner:
             scanner = SevenZipScanner(config={"max_7z_depth": 2})
             result = scanner.scan(str(archive_paths[-1]))
 
+            assert result.success is False
             depth_issues = [issue for issue in result.issues if "maximum 7z nesting depth" in issue.message.lower()]
             assert len(depth_issues) == 1
             assert depth_issues[0].severity == IssueSeverity.WARNING
@@ -680,7 +682,7 @@ class TestSevenZipScanner:
                 and f"{temp_7z_file}:payload.joblib" in issue.location
             ]
 
-            assert result.success
+            assert result.success is False
             assert result.metadata["scannable_files"] == 1
             assert critical_issues, (
                 f"Expected critical findings for payload.joblib, got: {[i.message for i in result.issues]}"
@@ -693,7 +695,7 @@ class TestSevenZipScanner:
                 joblib_path.unlink()
 
     @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
-    def test_path_traversal_detection(self, scanner, temp_7z_file):
+    def test_path_traversal_detection(self, scanner: SevenZipScanner, temp_7z_file: str) -> None:
         """Test detection of path traversal attempts in archive"""
         import py7zr  # type: ignore[import-untyped]
 
@@ -712,18 +714,24 @@ class TestSevenZipScanner:
             result = scanner.scan(temp_7z_file)
 
             # Should detect path traversal
+            assert result.success is False
             traversal_issues = [i for i in result.issues if "path traversal" in i.message.lower()]
             assert len(traversal_issues) > 0
 
             issue = traversal_issues[0]
             assert issue.severity == IssueSeverity.CRITICAL
+            assert issue.location is not None
             assert "dangerous.pkl" in issue.location
 
         finally:
             if os.path.exists(temp_pickle_path):
                 os.unlink(temp_pickle_path)
 
-    def test_unsafe_entries_are_excluded_from_extraction_targets(self, scanner, temp_7z_file):
+    def test_unsafe_entries_are_excluded_from_extraction_targets(
+        self,
+        scanner: SevenZipScanner,
+        temp_7z_file: str,
+    ) -> None:
         """Path traversal entries should be reported but never extracted."""
         with (
             patch("modelaudit.scanners.sevenzip_scanner.HAS_PY7ZR", True),
@@ -738,6 +746,7 @@ class TestSevenZipScanner:
 
             result = scanner.scan(temp_7z_file)
 
+            assert result.success is False
             assert result.metadata["total_files"] == 3
             assert result.metadata["unsafe_entries"] == 1
             assert result.metadata["scannable_files"] == 1
@@ -771,6 +780,7 @@ class TestSevenZipScanner:
 
             result = scanner.scan(temp_7z_file)
 
+            assert result.success is False
             large_file_issues = [i for i in result.issues if "too large" in i.message]
             assert len(large_file_issues) == 1
             assert large_file_issues[0].details["extracted_size"] == 1000
@@ -917,7 +927,7 @@ class TestSevenZipScanner:
             assert check.status == CheckStatus.FAILED
             assert "Invalid 7z file format" in check.message
 
-    def test_scan_with_extraction_error(self, scanner, temp_7z_file):
+    def test_scan_with_extraction_error(self, scanner: SevenZipScanner, temp_7z_file: str) -> None:
         """Test behavior when file extraction fails"""
         with (
             patch("modelaudit.scanners.sevenzip_scanner.HAS_PY7ZR", True),
@@ -932,6 +942,7 @@ class TestSevenZipScanner:
 
             # Should handle extraction errors gracefully
             # With batch extraction, errors are caught at archive level
+            assert result.success is False
             archive_checks = [c for c in result.checks if "Archive Extraction" in c.name]
             assert len(archive_checks) > 0
 
@@ -1098,6 +1109,26 @@ class TestSevenZipScannerConfiguration:
         assert scanner.max_entries == 5000
         assert scanner.max_extract_size == 512 * 1024 * 1024
 
+    def test_invalid_configuration_values_fall_back_to_defaults(self) -> None:
+        """Malformed 7z limit configs should not raise or disable safety limits."""
+        scanner = SevenZipScanner(
+            {
+                "max_7z_depth": "bad",
+                "max_7z_entries": "bad",
+                "max_7z_extract_size": "bad",
+                "max_7z_extensionless_probes": "bad",
+                "max_7z_total_extract_size": "bad",
+                "max_7z_cumulative_entries": "bad",
+            }
+        )
+
+        assert scanner.max_depth == 5
+        assert scanner.max_entries == 10000
+        assert scanner.max_extract_size == 1024 * 1024 * 1024
+        assert scanner.max_extensionless_probes == 100
+        assert scanner.max_total_extract_size == 5 * 1024 * 1024 * 1024
+        assert scanner.max_cumulative_entries == 50000
+
     def test_nested_scans_receive_scanner_config(self, temp_7z_file: str) -> None:
         """Nested file scans should preserve the parent scanner config."""
         config = {
@@ -1129,7 +1160,7 @@ class TestSevenZipScannerConfiguration:
                 "_archive_depth": 1,
             }
 
-    def test_large_extracted_file_handling(self, scanner, temp_7z_file):
+    def test_large_extracted_file_handling(self, scanner: SevenZipScanner, temp_7z_file: str) -> None:
         """Test handling of files that are too large after extraction"""
         scanner.max_extract_size = 100  # Very small limit for testing
 
@@ -1150,6 +1181,7 @@ class TestSevenZipScannerConfiguration:
                 result = scanner.scan(temp_7z_file)
 
                 # Should warn about large file
+                assert result.success is False
                 large_file_issues = [i for i in result.issues if "too large" in i.message]
                 assert len(large_file_issues) > 0
 
@@ -1211,6 +1243,7 @@ class TestSevenZipScannerHardening:
 
             result = scanner.scan(temp_7z_file)
 
+            assert result.success is False
             symlink_checks = [c for c in result.checks if "Symlink" in c.name]
             assert len(symlink_checks) == 1
             assert symlink_checks[0].status == CheckStatus.FAILED
@@ -1255,6 +1288,7 @@ class TestSevenZipScannerHardening:
         ):
             result = scanner.scan(temp_7z_file)
 
+        assert result.success is False
         symlink_issues = [c for c in result.checks if "Symlink" in c.name]
         assert len(symlink_issues) == 1
         assert symlink_issues[0].severity == IssueSeverity.CRITICAL
@@ -1289,6 +1323,7 @@ class TestSevenZipScannerHardening:
 
             result = scanner.scan(temp_7z_file)
 
+            assert result.success is False
             assert mock_probe.call_count == 1
             assert mock_probe.call_args.args[1] == extensionless_members[:3]
             limit_checks = [c for c in result.checks if "Probe Limit" in c.name]
@@ -1435,6 +1470,80 @@ class TestSevenZipScannerHardening:
         assert scanner.max_extensionless_probes == 50
         assert scanner.max_total_extract_size == 1024
         assert scanner.max_cumulative_entries == 200
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_duplicate_archive_entries_fail_closed(
+        self,
+        scanner: SevenZipScanner,
+        tmp_path: Path,
+    ) -> None:
+        """Duplicate archive members must be treated as ambiguous and fail closed."""
+        safe_pickle = tmp_path / "safe.pkl"
+        evil_pickle = tmp_path / "evil.pkl"
+        archive_path = tmp_path / "duplicate.7z"
+
+        self._write_pickle(safe_pickle, {"safe": True})
+
+        class MaliciousClass:
+            def __reduce__(self) -> tuple[Any, tuple[str]]:
+                import os as os_module
+
+                return (os_module.system, ("echo duplicate_7z_shadow",))
+
+        self._write_pickle(evil_pickle, MaliciousClass())
+
+        import py7zr  # type: ignore[import-untyped]
+
+        with py7zr.SevenZipFile(archive_path, "w") as archive:
+            archive.write(str(safe_pickle), "dup.pkl")
+            archive.write(str(evil_pickle), "dup.pkl")
+
+        result = scanner.scan(str(archive_path))
+
+        assert result.success is False
+        duplicate_checks = [check for check in result.checks if check.name == "7z Duplicate Entry Protection"]
+        assert len(duplicate_checks) == 1
+        assert duplicate_checks[0].status == CheckStatus.FAILED
+        assert duplicate_checks[0].severity == IssueSeverity.WARNING
+        assert duplicate_checks[0].details["first_entry"] == "dup.pkl"
+        assert duplicate_checks[0].details["entry"] == "dup.pkl"
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_duplicate_archive_entry_aliases_fail_closed(
+        self,
+        scanner: SevenZipScanner,
+        tmp_path: Path,
+    ) -> None:
+        """Canonical path collisions such as subdir/../dup.pkl must fail closed."""
+        safe_pickle = tmp_path / "safe.pkl"
+        evil_pickle = tmp_path / "evil.pkl"
+        archive_path = tmp_path / "duplicate_alias.7z"
+
+        self._write_pickle(safe_pickle, {"safe": True})
+
+        class MaliciousClass:
+            def __reduce__(self) -> tuple[Any, tuple[str]]:
+                import os as os_module
+
+                return (os_module.system, ("echo duplicate_alias_7z_shadow",))
+
+        self._write_pickle(evil_pickle, MaliciousClass())
+
+        import py7zr  # type: ignore[import-untyped]
+
+        with py7zr.SevenZipFile(archive_path, "w") as archive:
+            archive.write(str(safe_pickle), "dup.pkl")
+            archive.write(str(evil_pickle), "subdir/../dup.pkl")
+
+        result = scanner.scan(str(archive_path))
+
+        assert result.success is False
+        duplicate_checks = [check for check in result.checks if check.name == "7z Duplicate Entry Protection"]
+        assert len(duplicate_checks) == 1
+        assert duplicate_checks[0].status == CheckStatus.FAILED
+        assert duplicate_checks[0].severity == IssueSeverity.WARNING
+        assert duplicate_checks[0].details["first_entry"] == "dup.pkl"
+        assert duplicate_checks[0].details["entry"] == "subdir/../dup.pkl"
 
 
 # Integration test that requires actual test assets

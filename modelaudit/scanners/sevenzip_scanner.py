@@ -176,12 +176,30 @@ class SevenZipScanner(BaseScanner):
 
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
-        self.max_depth = self.config.get("max_7z_depth", 5)
-        self.max_entries = self.config.get("max_7z_entries", 10000)
-        self.max_extract_size = self.config.get("max_7z_extract_size", 1024 * 1024 * 1024)  # 1GB
-        self.max_extensionless_probes = self.config.get("max_7z_extensionless_probes", self._MAX_EXTENSIONLESS_PROBES)
-        self.max_total_extract_size = self.config.get("max_7z_total_extract_size", self._MAX_TOTAL_EXTRACT_SIZE)
-        self.max_cumulative_entries = self.config.get("max_7z_cumulative_entries", self._MAX_CUMULATIVE_ENTRIES)
+        self.max_depth = self._normalize_positive_int_config(
+            self.config.get("max_7z_depth"),
+            5,
+        )
+        self.max_entries = self._normalize_positive_int_config(
+            self.config.get("max_7z_entries"),
+            10000,
+        )
+        self.max_extract_size = self._normalize_positive_int_config(
+            self.config.get("max_7z_extract_size"),
+            1024 * 1024 * 1024,
+        )
+        self.max_extensionless_probes = self._normalize_positive_int_config(
+            self.config.get("max_7z_extensionless_probes"),
+            self._MAX_EXTENSIONLESS_PROBES,
+        )
+        self.max_total_extract_size = self._normalize_positive_int_config(
+            self.config.get("max_7z_total_extract_size"),
+            self._MAX_TOTAL_EXTRACT_SIZE,
+        )
+        self.max_cumulative_entries = self._normalize_positive_int_config(
+            self.config.get("max_7z_cumulative_entries"),
+            self._MAX_CUMULATIVE_ENTRIES,
+        )
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -313,7 +331,7 @@ class SevenZipScanner(BaseScanner):
 
         result.metadata["file_size"] = file_size
         result.metadata["archive_type"] = "7z"
-        result.finish(success=scan_result.success)
+        result.finish(success=scan_result.success and not result.has_errors)
         return result
 
     def _scan_7z_file(
@@ -327,6 +345,7 @@ class SevenZipScanner(BaseScanner):
             budget = _RecursiveScanBudget()
 
         result = ScanResult(scanner_name=self.name, scanner=self)
+        scan_complete = True
 
         if budget.should_stop():
             result.finish(success=False)
@@ -406,10 +425,20 @@ class SevenZipScanner(BaseScanner):
 
             # Check for path traversal vulnerabilities and only keep safe entries
             safe_file_names = self._check_path_traversal(file_names, path, result)
+            if len(safe_file_names) < len(file_names):
+                scan_complete = False
 
             # Filter for scannable model files from safe entries only
             scannable_files = self._identify_scannable_files(safe_file_names)
-            scannable_files.extend(self._identify_extensionless_nested_7z_files(archive, safe_file_names, path, result))
+            nested_archive_files, probes_complete = self._identify_extensionless_nested_7z_files(
+                archive,
+                safe_file_names,
+                path,
+                result,
+            )
+            scannable_files.extend(nested_archive_files)
+            if not probes_complete:
+                scan_complete = False
 
             if not scannable_files:
                 result.add_check(
@@ -420,13 +449,16 @@ class SevenZipScanner(BaseScanner):
                 )
             else:
                 # Extract and scan scannable files
-                self._extract_and_scan_files(
-                    archive,
-                    scannable_files,
-                    path,
-                    result,
-                    depth,
-                    budget=budget,
+                scan_complete = (
+                    self._extract_and_scan_files(
+                        archive,
+                        scannable_files,
+                        path,
+                        result,
+                        depth,
+                        budget=budget,
+                    )
+                    and scan_complete
                 )
 
             result.metadata["total_files"] = len(file_names)
@@ -434,7 +466,7 @@ class SevenZipScanner(BaseScanner):
             result.metadata["unsafe_entries"] = len(file_names) - len(safe_file_names)
             result.metadata["file_size"] = os.path.getsize(path)
 
-        result.finish(success=not budget.should_stop())
+        result.finish(success=scan_complete and not budget.should_stop() and not result.has_errors)
         return result
 
     def _identify_scannable_files(self, file_names: list[str]) -> list[str]:
@@ -450,9 +482,10 @@ class SevenZipScanner(BaseScanner):
 
     def _identify_extensionless_nested_7z_files(
         self, archive: Any, file_names: list[str], archive_path: str, result: ScanResult
-    ) -> list[str]:
+    ) -> tuple[list[str], bool]:
         """Inspect likely disguised nested members and keep only confirmed 7z archives."""
         nested_archives: list[str] = []
+        probes_complete = True
         probe_candidates: list[tuple[int, int, str]] = []
         supported_extensions = self._supported_nested_core_extensions()
         for index, file_name in enumerate(file_names):
@@ -474,6 +507,7 @@ class SevenZipScanner(BaseScanner):
             probe_candidates.append((priority, index, file_name))
 
         if len(probe_candidates) > self.max_extensionless_probes:
+            probes_complete = False
             result.add_check(
                 name="Nested Member Probe Limit",
                 passed=False,
@@ -489,14 +523,14 @@ class SevenZipScanner(BaseScanner):
         probe_candidates.sort(key=lambda item: (-item[0], item[1]))
         probe_targets = [file_name for _, _, file_name in probe_candidates[: self.max_extensionless_probes]]
         if not probe_targets:
-            return nested_archives
+            return nested_archives, probes_complete
 
         try:
             probe_results = self._probe_extensionless_members(archive, probe_targets)
             for file_name in probe_targets:
                 if probe_results.get(file_name, False):
                     nested_archives.append(file_name)
-            return nested_archives
+            return nested_archives, probes_complete
         except Exception:
             # Fall back to per-member probing if the fast path fails against a
             # particular archive layout or py7zr behavior.
@@ -507,6 +541,7 @@ class SevenZipScanner(BaseScanner):
                 if self._member_has_7z_magic(archive, file_name):
                     nested_archives.append(file_name)
             except Exception as e:
+                probes_complete = False
                 result.add_check(
                     name=f"Nested 7z Probe: {file_name}",
                     passed=False,
@@ -516,7 +551,7 @@ class SevenZipScanner(BaseScanner):
                     details={"error": str(e)},
                 )
 
-        return nested_archives
+        return nested_archives, probes_complete
 
     @classmethod
     def _nested_probe_priority(cls, file_name: str) -> int:
@@ -585,9 +620,10 @@ class SevenZipScanner(BaseScanner):
     def _check_path_traversal(self, file_names: list[str], archive_path: str, result: ScanResult) -> list[str]:
         """Check for path traversal vulnerabilities and return only safe entries."""
         safe_entries: list[str] = []
+        canonical_entries: dict[str, str] = {}
+        temp_base = os.path.join(tempfile.gettempdir(), "modelaudit_7z")
+
         for file_name in file_names:
-            # Use temporary directory as base for sanitization check
-            temp_base = os.path.join(tempfile.gettempdir(), "modelaudit_7z")  # Placeholder base directory
             sanitized_path, is_safe = sanitize_archive_path(file_name, temp_base)
             if not is_safe:
                 result.add_check(
@@ -604,6 +640,27 @@ class SevenZipScanner(BaseScanner):
                 )
                 continue
 
+            canonical_entry = os.path.normcase(os.path.normpath(sanitized_path))
+            if canonical_entry in canonical_entries:
+                result.add_check(
+                    name="7z Duplicate Entry Protection",
+                    passed=False,
+                    message=(
+                        "Archive contains duplicate entries that resolve to the same extraction path: "
+                        f"{canonical_entries[canonical_entry]} and {file_name}"
+                    ),
+                    severity=IssueSeverity.WARNING,
+                    location=f"{archive_path}:{file_name}",
+                    details={
+                        "entry": file_name,
+                        "first_entry": canonical_entries[canonical_entry],
+                        "canonical_path": sanitized_path,
+                        "threat_type": "duplicate_entry_shadowing",
+                    },
+                )
+                continue
+
+            canonical_entries[canonical_entry] = file_name
             safe_entries.append(file_name)
 
         return safe_entries
@@ -616,8 +673,9 @@ class SevenZipScanner(BaseScanner):
         result: ScanResult,
         depth: int,
         budget: _RecursiveScanBudget,
-    ) -> None:
+    ) -> bool:
         """Extract scannable files and run appropriate scanners on them"""
+        scan_complete = not budget.should_stop()
         extractable_files = []
         for file_name in scannable_files:
             member_info = None
@@ -629,6 +687,7 @@ class SevenZipScanner(BaseScanner):
 
             member_size = self._get_archive_member_size(archive, file_name)
             if member_size is not None and member_size > self.max_extract_size:
+                scan_complete = False
                 result.add_check(
                     name="Extracted File Size",
                     passed=False,
@@ -642,7 +701,7 @@ class SevenZipScanner(BaseScanner):
             extractable_files.append(file_name)
 
         if not extractable_files or budget.should_stop():
-            return
+            return scan_complete and not budget.should_stop()
 
         with tempfile.TemporaryDirectory(prefix="modelaudit_7z_") as tmp_dir:
             try:
@@ -651,12 +710,13 @@ class SevenZipScanner(BaseScanner):
 
                 for file_name in extractable_files:
                     if budget.should_stop():
-                        return
+                        return False
                     try:
                         extracted_path = os.path.join(tmp_dir, file_name)
 
                         # Block symlinks — matches zip_scanner / pytorch_zip_scanner
                         if os.path.islink(extracted_path):
+                            scan_complete = False
                             result.add_check(
                                 name="7z Symlink Protection",
                                 passed=False,
@@ -674,6 +734,7 @@ class SevenZipScanner(BaseScanner):
                             # Check extracted file size
                             extracted_size = os.path.getsize(extracted_path)
                             if extracted_size > self.max_extract_size:
+                                scan_complete = False
                                 result.add_check(
                                     name="Extracted File Size",
                                     passed=False,
@@ -688,6 +749,7 @@ class SevenZipScanner(BaseScanner):
                             cumulative_extract_bytes = budget.record_extract_bytes(extracted_size)
                             if cumulative_extract_bytes > self.max_total_extract_size:
                                 budget.abort_due_to_limit()
+                                scan_complete = False
                                 result.add_check(
                                     name="Cumulative Extraction Size",
                                     passed=False,
@@ -703,10 +765,10 @@ class SevenZipScanner(BaseScanner):
                                         "potential_threat": "zip_bomb",
                                     },
                                 )
-                                return
+                                return False
 
                             # Get appropriate scanner for the extracted file
-                            self._scan_extracted_file(
+                            nested_scan_success = self._scan_extracted_file(
                                 extracted_path,
                                 file_name,
                                 archive_path,
@@ -714,10 +776,13 @@ class SevenZipScanner(BaseScanner):
                                 depth,
                                 budget=budget,
                             )
+                            if not nested_scan_success:
+                                scan_complete = False
                             if budget.should_stop():
-                                return
+                                return False
                         else:
                             # File was not extracted - log as warning
+                            scan_complete = False
                             result.add_check(
                                 name=f"File Extraction: {file_name}",
                                 passed=False,
@@ -728,6 +793,7 @@ class SevenZipScanner(BaseScanner):
                             )
 
                     except Exception as e:
+                        scan_complete = False
                         result.add_check(
                             name=f"File Extraction: {file_name}",
                             passed=False,
@@ -738,6 +804,7 @@ class SevenZipScanner(BaseScanner):
                         )
 
             except Exception as e:
+                scan_complete = False
                 result.add_check(
                     name="Archive Extraction",
                     passed=False,
@@ -746,6 +813,8 @@ class SevenZipScanner(BaseScanner):
                     location=archive_path,
                     details={"error": str(e)},
                 )
+
+        return scan_complete and not budget.should_stop()
 
     @staticmethod
     def _get_archive_member_size(archive: Any, file_name: str) -> int | None:
@@ -795,7 +864,7 @@ class SevenZipScanner(BaseScanner):
         result: ScanResult,
         depth: int,
         budget: _RecursiveScanBudget,
-    ) -> None:
+    ) -> bool:
         """Scan an individual extracted file using the appropriate scanner"""
         try:
             if original_name.lower().endswith(".7z") or self._has_7z_magic(extracted_path):
@@ -813,6 +882,7 @@ class SevenZipScanner(BaseScanner):
 
             self._rewrite_nested_result_context(file_result, extracted_path, archive_path, original_name)
             result.merge(file_result)
+            return file_result.success and not file_result.has_errors
 
         except Exception as e:
             result.add_check(
@@ -823,3 +893,4 @@ class SevenZipScanner(BaseScanner):
                 location=f"{archive_path}:{original_name}",
                 details={"error": str(e)},
             )
+            return False

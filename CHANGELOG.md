@@ -120,6 +120,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - bound Keras `config.json` and `metadata.json` member reads before JSON parsing
 - route oversized config-only Keras ZIP archives by bounded config-prefix sniffing instead of falling back to the generic ZIP scanner
 - preserve disguised model files during directory prefiltering without promoting document ZIPs
+- fail closed on duplicate 7z entries, nested critical findings, probe-limit truncation, and malformed 7z safety-limit configs
 - recurse into nested 7z members even when their filenames use misleading extensions
 - fail closed on extreme-size files when a scanner lacks bounded large-file analysis
 - harden scan-cache invalidation and skip caching operational scan failures
