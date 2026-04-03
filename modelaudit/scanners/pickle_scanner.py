@@ -87,6 +87,11 @@ _EXPANSION_TRIGGER_LABELS = {
 }
 _BINARY_PICKLE_PROTOCOLS = frozenset({2, 3, 4, 5})
 _PICKLE_OPCODE_BYTES = frozenset(ord(op.code) for op in pickletools.opcodes)
+_TEXT_PICKLE_RESYNC_START_BYTES = frozenset({ord("("), ord("c"), ord("i")})
+_TEXT_PICKLE_RESYNC_IMPORT_OPCODES = frozenset({ord("c"), ord("i")})
+_TEXT_PICKLE_RESYNC_NAME_SCAN_BYTES = 256
+_RESYNC_FAST_FORWARD_PROBE_BYTES = 64 * 1024
+_RESYNC_FAST_FORWARD_TAIL_BYTES = (2 * _TEXT_PICKLE_RESYNC_NAME_SCAN_BYTES) + 2
 
 
 StackGlobalOperandKind = Literal["string", "missing_memo", "unknown", "non_string"]
@@ -278,6 +283,60 @@ def _scan_structural_tamper_findings(file_data: bytes) -> list[dict[str, Any]]:
     return findings
 
 
+def _find_next_resync_stream_candidate_offset(search_window: bytes) -> int:
+    """Return the next likely pickle stream start in a probe window, or -1 if absent."""
+    for candidate in range(len(search_window)):
+        first_byte = search_window[candidate]
+        if first_byte == 0x80:
+            if (
+                candidate + 1 < len(search_window)
+                and search_window[candidate + 1] in _BINARY_PICKLE_PROTOCOLS
+                and (candidate + 2 >= len(search_window) or search_window[candidate + 2] in _PICKLE_OPCODE_BYTES)
+            ):
+                return candidate
+            continue
+
+        if first_byte not in _TEXT_PICKLE_RESYNC_START_BYTES:
+            continue
+
+        if first_byte in _TEXT_PICKLE_RESYNC_IMPORT_OPCODES:
+            module_end = search_window.find(
+                b"\n",
+                candidate + 1,
+                min(len(search_window), candidate + 1 + _TEXT_PICKLE_RESYNC_NAME_SCAN_BYTES),
+            )
+            if module_end == -1:
+                continue
+
+            function_end = search_window.find(
+                b"\n",
+                module_end + 1,
+                min(len(search_window), module_end + 1 + _TEXT_PICKLE_RESYNC_NAME_SCAN_BYTES),
+            )
+            if function_end == -1:
+                continue
+
+            try:
+                module_name = search_window[candidate + 1 : module_end].decode("utf-8")
+                function_name = search_window[module_end + 1 : function_end].decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+
+            if _is_plausible_python_module(module_name) and all(
+                part.isidentifier() for part in function_name.split(".")
+            ):
+                return candidate
+            continue
+
+        # MARK-prefixed protocol-0 streams such as `(cos\nsystem\n...` are
+        # validated with a bounded parser probe before rewinding the file cursor.
+        sample_end = min(len(search_window), candidate + _NESTED_PICKLE_VALIDATION_WINDOW_BYTES)
+        if _looks_like_pickle(search_window[candidate:sample_end]):
+            return candidate
+
+    return -1
+
+
 def _genops_with_fallback(
     file_obj: BinaryIO,
     *,
@@ -423,27 +482,23 @@ def _genops_with_fallback(
             if resync_skipped >= _MAX_RESYNC_BYTES:
                 # Fast-forward search for the next likely protocol header so
                 # large padding blocks cannot terminate multi-stream scanning.
+                # Probe both binary protocol headers and protocol-0/1 text
+                # stream starts so long separator gaps do not hide legacy
+                # opcode payloads.
                 previous_tail = b""
                 while True:
                     _check_budget()
                     probe_start = file_obj.tell()
-                    probe = file_obj.read(64 * 1024)
+                    probe = file_obj.read(_RESYNC_FAST_FORWARD_PROBE_BYTES)
                     if not probe:
                         return
                     search_window = previous_tail + probe
-                    candidate = next(
-                        (
-                            idx
-                            for idx in range(len(search_window) - 1)
-                            if search_window[idx] == 0x80 and search_window[idx + 1] in (2, 3, 4, 5)
-                        ),
-                        -1,
-                    )
+                    candidate = _find_next_resync_stream_candidate_offset(search_window)
                     if candidate >= 0:
                         file_obj.seek(probe_start - len(previous_tail) + candidate, 0)
                         resync_skipped = 0
                         break
-                    previous_tail = probe[-1:]
+                    previous_tail = probe[-_RESYNC_FAST_FORWARD_TAIL_BYTES:]
             continue
 
         # Found a valid stream — reset resync counter
