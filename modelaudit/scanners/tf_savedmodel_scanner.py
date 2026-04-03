@@ -859,8 +859,12 @@ class TensorFlowSavedModelScanner(BaseScanner):
         if matched_pattern is not None:
             return matched_pattern
 
-        for token in re.split(r"[^0-9A-Za-z_]+", func_name.lower()):
-            if token and token in _PYFUNC_DANGEROUS_REFERENCE_TOKENS:
+        tokens = [token for token in re.split(r"[^0-9A-Za-z_]+", func_name.lower()) if token]
+        if not tokens:
+            return None
+
+        for token in (tokens[0], tokens[-1]):
+            if token in _PYFUNC_DANGEROUS_REFERENCE_TOKENS:
                 return token
         return None
 

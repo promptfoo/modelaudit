@@ -530,6 +530,33 @@ def test_tf_savedmodel_pyfunc_reference_uses_token_boundaries(tmp_path: Path) ->
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_tf_savedmodel_pyfunc_reference_flags_direct_dangerous_refs(tmp_path: Path) -> None:
+    """Direct dangerous function references should still be detected after token-boundary narrowing."""
+    model_path = _create_test_savedmodel_with_scoped_nodes(
+        tmp_path,
+        graph_nodes=[
+            {
+                "op": "PyFunc",
+                "name": "pyfunc_node",
+                "string_attrs": {"function_name": "os.system"},
+            }
+        ],
+        model_name="malicious_pyfunc_reference",
+    )
+
+    result = TensorFlowSavedModelScanner().scan(model_path)
+
+    assert result.success is False
+    assert any(
+        issue.message
+        and "references dangerous function: os.system" in issue.message
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("function_reference") == "os.system"
+        for issue in result.issues
+    )
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 def test_scan_keras_metadata_pb_lambda_exec_sets_success_false(tmp_path: Path) -> None:
     """Standalone `keras_metadata.pb` scans should propagate CRITICAL Lambda findings to success=False."""
     encoded_code = base64.b64encode(b'exec("print(1)")').decode()
