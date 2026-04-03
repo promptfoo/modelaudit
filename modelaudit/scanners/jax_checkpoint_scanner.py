@@ -72,13 +72,20 @@ class JaxCheckpointScanner(BaseScanner):
             "BYTEARRAY8",
         }
     )
+    _PICKLE_MARKER: ClassVar[object] = object()
+    _PICKLE_STACK_STATE_LIMIT: ClassVar[int] = 4096
+    _PICKLE_MEMO_STATE_LIMIT: ClassVar[int] = 4096
     _DANGEROUS_PICKLE_GLOBALS: ClassVar[frozenset[tuple[str, str]]] = frozenset(
         {
             ("builtins", "__import__"),
             ("builtins", "compile"),
             ("builtins", "eval"),
             ("builtins", "exec"),
+            ("dill", "load"),
+            ("dill", "loads"),
             ("importlib", "import_module"),
+            ("joblib", "_pickle_load"),
+            ("joblib", "load"),
             ("nt", "system"),
             ("os", "popen"),
             ("os", "system"),
@@ -392,7 +399,7 @@ class JaxCheckpointScanner(BaseScanner):
                 self._scan_pickle_checkpoint(path, result)
             elif header.startswith(b"\x93NUMPY"):  # NumPy format
                 self._scan_numpy_checkpoint(path, result)
-            elif header.startswith(b"{"):  # JSON format
+            elif header.lstrip().startswith((b"{", b"[")):  # JSON format
                 self._scan_json_checkpoint(path, result)
             else:
                 result.add_check(
@@ -436,21 +443,73 @@ class JaxCheckpointScanner(BaseScanner):
                     rule_code="S902",
                 )
 
-            string_stack: list[str] = []
+            pickle_stack: list[Any] = []
+            pickle_memo: dict[int, Any] = {}
+
+            def _push_pickle_value(value: Any) -> None:
+                pickle_stack.append(value)
+                if len(pickle_stack) > self._PICKLE_STACK_STATE_LIMIT:
+                    del pickle_stack[: -self._PICKLE_STACK_STATE_LIMIT]
+
+            def _memo_key(value: Any) -> int | None:
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    return None
+
+            def _memoize_pickle_value(memo_index: int) -> None:
+                if not pickle_stack:
+                    return
+                if memo_index not in pickle_memo and len(pickle_memo) >= self._PICKLE_MEMO_STATE_LIMIT:
+                    return
+                pickle_memo[memo_index] = pickle_stack[-1]
+
+            def _pop_pickle_mark() -> None:
+                while pickle_stack:
+                    value = pickle_stack.pop()
+                    if value is self._PICKLE_MARKER:
+                        return
+
             for opcode, arg, pos in pickletools.genops(data):
                 if opcode.name in self._PICKLE_STRING_OPCODES and isinstance(arg, str):
-                    string_stack.append(arg)
-                    if len(string_stack) > 32:
-                        del string_stack[:-32]
+                    _push_pickle_value(arg)
+                    continue
+                if opcode.name == "MARK":
+                    _push_pickle_value(self._PICKLE_MARKER)
+                    continue
+                if opcode.name == "POP":
+                    if pickle_stack:
+                        pickle_stack.pop()
+                    continue
+                if opcode.name == "POP_MARK":
+                    _pop_pickle_mark()
+                    continue
+                if opcode.name == "DUP":
+                    if pickle_stack:
+                        _push_pickle_value(pickle_stack[-1])
+                    continue
+                if opcode.name in {"MEMOIZE", "BINPUT", "LONG_BINPUT", "PUT"}:
+                    memo_index = len(pickle_memo) if opcode.name == "MEMOIZE" else _memo_key(arg)
+                    if memo_index is not None:
+                        _memoize_pickle_value(memo_index)
+                    continue
+                if opcode.name in {"BINGET", "LONG_BINGET", "GET"}:
+                    memo_index = _memo_key(arg)
+                    if memo_index is not None and memo_index in pickle_memo:
+                        _push_pickle_value(pickle_memo[memo_index])
                     continue
 
                 parsed_global = None
                 if opcode.name in {"GLOBAL", "INST"} and isinstance(arg, str):
                     parsed_global = self._parse_pickle_global_reference(arg)
-                elif opcode.name == "STACK_GLOBAL" and len(string_stack) >= 2:
-                    global_name = string_stack.pop()
-                    module_name = string_stack.pop()
-                    parsed_global = (module_name, global_name)
+                    if parsed_global is not None:
+                        _push_pickle_value(parsed_global)
+                elif opcode.name == "STACK_GLOBAL" and len(pickle_stack) >= 2:
+                    global_name = pickle_stack.pop()
+                    module_name = pickle_stack.pop()
+                    if isinstance(module_name, str) and isinstance(global_name, str):
+                        parsed_global = (module_name, global_name)
+                        _push_pickle_value(parsed_global)
 
                 if parsed_global is not None and self._is_dangerous_pickle_global(*parsed_global):
                     module_name, global_name = parsed_global
