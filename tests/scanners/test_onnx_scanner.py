@@ -263,12 +263,46 @@ def test_onnx_scanner_camel_case_python_op_wrapper_flagged(tmp_path: Path) -> No
     )
 
 
+@pytest.mark.parametrize("custom_op_type", ["MY_PYTHON_OP", "MY_PY_FUNC"])
+def test_onnx_scanner_uppercase_snake_python_op_wrapper_flagged(tmp_path: Path, custom_op_type: str) -> None:
+    model_path = create_onnx_model(
+        tmp_path,
+        custom=True,
+        custom_domain="com.example",
+        custom_op_type=custom_op_type,
+    )
+
+    result = OnnxScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert any(
+        c.name == "Python Operator Detection"
+        and c.status == CheckStatus.FAILED
+        and c.details.get("op_type") == custom_op_type
+        for c in result.checks
+    )
+
+
 def test_onnx_scanner_python_substring_near_match_not_flagged(tmp_path: Path) -> None:
     model_path = create_onnx_model(
         tmp_path,
         custom=True,
         custom_domain="",
         custom_op_type="MyPythonOptimizer",
+    )
+
+    result = OnnxScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert not [c for c in result.checks if c.name == "Python Operator Detection" and c.status == CheckStatus.FAILED]
+
+
+def test_onnx_scanner_uppercase_snake_python_near_match_not_flagged(tmp_path: Path) -> None:
+    model_path = create_onnx_model(
+        tmp_path,
+        custom=True,
+        custom_domain="",
+        custom_op_type="MY_PYTHON_OPTIMIZER",
     )
 
     result = OnnxScanner().scan(str(model_path))

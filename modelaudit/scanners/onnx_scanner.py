@@ -71,7 +71,7 @@ _PYTHON_OPERATOR_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _OP_TYPE_TOKEN_PATTERN = re.compile(
-    r"[A-Z]+(?=[A-Z][a-z0-9]|$)|[A-Z]?[a-z0-9]+",
+    r"[A-Z]+(?=[A-Z][a-z0-9]|[^A-Za-z0-9]|$)|[A-Z]?[a-z0-9]+",
 )
 
 
