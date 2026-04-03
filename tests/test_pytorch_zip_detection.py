@@ -301,7 +301,7 @@ class TestPyTorchZipPklExtension:
         result = scan_file(str(pkl_file))
 
         assert result.scanner_name == "zip"
-        assert result.success is True
+        assert result.success is False
         assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues), (
             f"Expected CRITICAL issue but got: {[i.message for i in result.issues]}"
         )

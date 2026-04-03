@@ -343,7 +343,7 @@ class TestKerasZipScanner:
         assert len(recursive_size_checks) == 1
         assert recursive_size_checks[0].status == CheckStatus.FAILED
         assert "exceeds maximum size of 1024 bytes" in recursive_size_checks[0].message
-        assert result.success is True
+        assert result.success is False
         assert result.has_warnings is True
 
     def test_scan_fails_closed_on_oversized_config_json_and_recurses_payloads(self, tmp_path: Path) -> None:

@@ -3748,7 +3748,7 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
 
             result = scan_file(str(zip_path))
 
-            assert result.success
+            assert not result.success
             assert result.has_errors
             critical_messages = [i.message.lower() for i in result.issues if i.severity == IssueSeverity.CRITICAL]
             assert any(_contains_system_global(msg) for msg in critical_messages), (
@@ -4292,7 +4292,7 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
 
             result = scan_file(str(zip_path))
 
-            assert result.success
+            assert not result.success
             assert result.has_errors
             assert any(
                 issue.severity == IssueSeverity.CRITICAL
@@ -4438,7 +4438,7 @@ def test_picklescan_gap_detected_inside_zip_entry(tmp_path: Path) -> None:
 
     result = scan_file(str(zip_path))
 
-    assert result.success
+    assert not result.success
     assert result.has_errors
     assert any(issue.severity == IssueSeverity.CRITICAL and "numpy.load" in issue.message for issue in result.issues), (
         f"Expected CRITICAL numpy.load issue in zip entry, got: {[i.message for i in result.issues]}"
