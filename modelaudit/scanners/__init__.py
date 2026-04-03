@@ -351,7 +351,7 @@ class ScannerRegistry:
                 "module": "modelaudit.scanners.tensorrt_scanner",
                 "class": "TensorRTScanner",
                 "description": "Scans TensorRT engine files",
-                "extensions": [".engine", ".plan"],
+                "extensions": [".engine", ".plan", ".trt"],
                 "priority": 17,
                 "dependencies": [],
                 "numpy_sensitive": False,

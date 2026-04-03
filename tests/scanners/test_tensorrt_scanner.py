@@ -2,6 +2,7 @@ from pathlib import Path
 
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.tensorrt_scanner import TensorRTScanner
+from modelaudit.utils.file.detection import detect_file_format, detect_format_from_extension
 
 
 def test_tensorrt_scanner_can_handle(tmp_path: Path) -> None:
@@ -14,12 +15,24 @@ def test_tensorrt_scanner_can_handle_trt_extension(tmp_path: Path) -> None:
     path = tmp_path / "model.trt"
     path.write_bytes(b"dummy")
     assert TensorRTScanner.can_handle(str(path))
+    assert detect_file_format(str(path)) == "tensorrt"
+    assert detect_format_from_extension(str(path)) == "tensorrt"
 
 
 def test_tensorrt_scanner_cannot_handle_wrong_extension(tmp_path: Path) -> None:
     path = tmp_path / "model.txt"
     path.write_bytes(b"dummy")
     assert not TensorRTScanner.can_handle(str(path))
+
+
+def test_tensorrt_scanner_does_not_route_near_match_extensions(tmp_path: Path) -> None:
+    for filename in ("model.tr", "model.trtx"):
+        path = tmp_path / filename
+        path.write_bytes(b"dummy")
+
+        assert not TensorRTScanner.can_handle(str(path))
+        assert detect_file_format(str(path)) != "tensorrt"
+        assert detect_format_from_extension(str(path)) != "tensorrt"
 
 
 def test_tensorrt_scanner_file_not_found() -> None:
@@ -51,6 +64,16 @@ def test_tensorrt_scanner_detects_uppercase_and_shared_library_paths(tmp_path: P
 def test_tensorrt_scanner_detects_utf16_python_marker(tmp_path: Path) -> None:
     path = tmp_path / "utf16.engine"
     path.write_bytes("python".encode("utf-16le"))
+
+    result = TensorRTScanner().scan(str(path))
+
+    assert result.success is False
+    assert any(issue.details.get("pattern") == "python" for issue in result.issues)
+
+
+def test_tensorrt_scanner_detects_utf16be_python_marker(tmp_path: Path) -> None:
+    path = tmp_path / "utf16be.engine"
+    path.write_bytes("python".encode("utf-16be"))
 
     result = TensorRTScanner().scan(str(path))
 

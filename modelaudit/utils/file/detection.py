@@ -1089,6 +1089,8 @@ def detect_file_format(path: str) -> str:
         return "tflite"
     if ext == ".mlmodel":
         return "coreml"
+    if ext in (".engine", ".plan", ".trt"):
+        return "tensorrt"
     if ext == ".safetensors":
         return "safetensors"
     if ext in (".pdmodel", ".pdiparams"):
@@ -1201,6 +1203,7 @@ EXTENSION_FORMAT_MAP = {
     ".params": "mxnet",
     ".engine": "tensorrt",
     ".plan": "tensorrt",
+    ".trt": "tensorrt",
     ".msgpack": "flax_msgpack",
     ".nemo": "nemo",
     ".cbm": "catboost",
@@ -1265,7 +1268,7 @@ def detect_format_from_extension_pattern_matching(extension: FileExtension) -> F
             return "tflite"
         case ".mlmodel":
             return "coreml"
-        case ".engine":
+        case ".engine" | ".plan" | ".trt":
             return "tensorrt"
         case ".pdmodel" | ".pdiparams":
             return "paddle"
