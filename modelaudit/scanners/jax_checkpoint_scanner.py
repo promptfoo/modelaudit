@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+import pickletools
+import re
+from collections.abc import Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -32,29 +35,182 @@ class JaxCheckpointScanner(BaseScanner):
         ".orbax-checkpoint",  # Orbax checkpoint directories
         ".pickle",  # JAX models saved as pickle (when context suggests JAX)
     ]
+    _JAX_INDICATORS: ClassVar[tuple[str, ...]] = (
+        "jax",
+        "flax",
+        "haiku",
+        "orbax",
+        "arrayimpl",
+        "jaxlib",
+        "device_array",
+    )
+    _DOCUMENTATION_CONTEXT_HINTS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "description",
+            "doc",
+            "docs",
+            "documentation",
+            "comment",
+            "comments",
+            "note",
+            "notes",
+            "help",
+            "readme",
+            "example",
+            "examples",
+        }
+    )
+    _PICKLE_STRING_OPCODES: ClassVar[frozenset[str]] = frozenset(
+        {
+            "STRING",
+            "BINSTRING",
+            "SHORT_BINSTRING",
+            "UNICODE",
+            "BINUNICODE",
+            "SHORT_BINUNICODE",
+            "BINUNICODE8",
+            "BYTEARRAY8",
+        }
+    )
+    _DANGEROUS_PICKLE_GLOBALS: ClassVar[frozenset[tuple[str, str]]] = frozenset(
+        {
+            ("builtins", "__import__"),
+            ("builtins", "compile"),
+            ("builtins", "eval"),
+            ("builtins", "exec"),
+            ("importlib", "import_module"),
+            ("nt", "system"),
+            ("os", "popen"),
+            ("os", "system"),
+            ("posix", "system"),
+            ("runpy", "_run_module_as_main"),
+            ("subprocess", "call"),
+            ("subprocess", "check_call"),
+            ("subprocess", "check_output"),
+            ("subprocess", "popen"),
+            ("subprocess", "run"),
+        }
+    )
+    _DANGEROUS_RESTORE_FN_PATTERN: ClassVar[re.Pattern[str]] = re.compile(
+        r"\b(?:eval|exec|__import__|os\.system|os\.popen|subprocess\.(?:popen|run|call|check_call|check_output))\b",
+        re.IGNORECASE,
+    )
+    DEFAULT_MAX_PICKLE_SCAN_BYTES: ClassVar[int] = 16 * 1024 * 1024
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         super().__init__(config)
         self.max_file_size = self.config.get(
             "max_file_size", 100 * 1024 * 1024 * 1024
         )  # 100GB limit for large JAX models
+        self.max_pickle_scan_bytes = self._get_int_config(
+            "jax_pickle_max_scan_bytes",
+            self.DEFAULT_MAX_PICKLE_SCAN_BYTES,
+            minimum=1024,
+        )
 
         # JAX-specific suspicious patterns
         self.jax_suspicious_patterns = [
             # JAX transform misuse
-            r"jax\.experimental\.host_callback\.call",
-            r"jax\.experimental\.io_callback",
-            r"jax\.debug\.callback",
+            re.compile(r"jax\.experimental\.host_callback\.call", re.IGNORECASE),
+            re.compile(r"jax\.experimental\.io_callback", re.IGNORECASE),
+            re.compile(r"jax\.debug\.callback", re.IGNORECASE),
             # Dangerous JAX operations
-            r"jax\.lax\.stop_gradient.*eval",
-            r"jax\.lax\.cond.*exec",
+            re.compile(r"jax\.lax\.stop_gradient.*eval", re.IGNORECASE),
+            re.compile(r"jax\.lax\.cond.*exec", re.IGNORECASE),
             # Orbax-specific threats
-            r"orbax\.checkpoint\.restore.*eval",
-            r"orbax\.checkpoint\.save.*exec",
+            re.compile(r"orbax\.checkpoint\.restore.*eval", re.IGNORECASE),
+            re.compile(r"orbax\.checkpoint\.save.*exec", re.IGNORECASE),
             # JAX compilation threats
-            r"jax\.jit.*subprocess",
-            r"jax\.pmap.*os\.system",
+            re.compile(r"jax\.jit.*subprocess", re.IGNORECASE),
+            re.compile(r"jax\.pmap.*os\.system", re.IGNORECASE),
         ]
+
+    def _get_int_config(self, key: str, default: int, minimum: int = 0) -> int:
+        """Return a bounded integer config value with safe fallback."""
+        raw_value = self.config.get(key, default)
+        try:
+            parsed = int(raw_value)
+        except (TypeError, ValueError):
+            parsed = default
+        return max(parsed, minimum)
+
+    @classmethod
+    def _looks_like_documentation_context(cls, context: str) -> bool:
+        """Return True when a metadata path looks documentation-only."""
+        lowered = context.lower()
+        context_parts = [part for part in re.split(r"[.\[\]]+", lowered) if part]
+        return any(
+            part in cls._DOCUMENTATION_CONTEXT_HINTS
+            or any(doc_hint in part for doc_hint in cls._DOCUMENTATION_CONTEXT_HINTS)
+            for part in context_parts
+        )
+
+    @classmethod
+    def _iter_string_metadata(cls, value: Any, context: str = "root") -> Iterator[tuple[str, str]]:
+        """Yield string leaves from nested metadata with their traversal context."""
+        if isinstance(value, str):
+            yield context, value
+            return
+
+        if isinstance(value, dict):
+            for key, nested_value in value.items():
+                yield from cls._iter_string_metadata(nested_value, f"{context}.{key}")
+            return
+
+        if isinstance(value, (list, tuple, set)):
+            for index, nested_value in enumerate(value):
+                yield from cls._iter_string_metadata(nested_value, f"{context}[{index}]")
+
+    def _add_suspicious_pattern_checks(
+        self,
+        text: str,
+        *,
+        context: str,
+        check_name: str,
+        message_prefix: str,
+        location: str,
+        result: ScanResult,
+    ) -> None:
+        """Match suspicious JAX regexes against one metadata/text context."""
+        if self._looks_like_documentation_context(context):
+            return
+
+        for pattern in self.jax_suspicious_patterns:
+            if not pattern.search(text):
+                continue
+
+            result.add_check(
+                name=check_name,
+                passed=False,
+                message=f"{message_prefix}: {pattern.pattern}",
+                severity=IssueSeverity.CRITICAL,
+                location=location,
+                details={"pattern": pattern.pattern, "context": context},
+                rule_code="S902",
+            )
+
+    @staticmethod
+    def _parse_pickle_global_reference(arg: str) -> tuple[str, str] | None:
+        """Parse pickle GLOBAL/INST opcode args into ``(module, name)``."""
+        normalized = arg.replace("\n", " ").strip()
+        if not normalized:
+            return None
+
+        parts = normalized.split()
+        if len(parts) < 2:
+            return None
+
+        module_name = parts[0].strip()
+        global_name = " ".join(parts[1:]).strip()
+        if not module_name or not global_name:
+            return None
+        return module_name, global_name
+
+    @classmethod
+    def _is_dangerous_pickle_global(cls, module_name: str, global_name: str) -> bool:
+        """Return True for pickle globals that can launch code execution."""
+        normalized = (module_name.strip().lower(), global_name.strip().lower())
+        return normalized in cls._DANGEROUS_PICKLE_GLOBALS
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -105,14 +261,17 @@ class JaxCheckpointScanner(BaseScanner):
                         data = f.read(8192)  # Read first 8KB
                         data_str = data.decode("utf-8", errors="ignore").lower()
 
-                    jax_indicators = ["jax", "flax", "haiku", "orbax", "arrayimpl", "jaxlib", "device_array"]
-
-                    return any(indicator in data_str for indicator in jax_indicators)
+                    return any(indicator in data_str for indicator in cls._JAX_INDICATORS)
                 except Exception:
                     pass
 
-            # Check for JSON metadata files
-            if path.endswith(".json") and b"jax" in header.lower():
+            decoded_header = header.decode("utf-8", errors="ignore").lower()
+
+            # Check for JSON metadata files, including extensionful `.checkpoint`
+            # files that contain JAX/Orbax metadata rather than pickle bytes.
+            if header.lstrip().startswith((b"{", b"[")) and any(
+                indicator in decoded_header for indicator in cls._JAX_INDICATORS
+            ):
                 return True
 
             # Check for NumPy files in JAX context
@@ -172,29 +331,32 @@ class JaxCheckpointScanner(BaseScanner):
 
         # Check for suspicious restore functions
         if "restore_fn" in metadata:
+            restore_fn_value = str(metadata["restore_fn"])
+            restore_fn_is_dangerous = bool(self._DANGEROUS_RESTORE_FN_PATTERN.search(restore_fn_value))
             result.add_check(
                 name="Orbax Restore Function Check",
                 passed=False,
-                message="Custom restore function detected in Orbax metadata",
-                severity=IssueSeverity.WARNING,
+                message=(
+                    "Dangerous restore function detected in Orbax metadata"
+                    if restore_fn_is_dangerous
+                    else "Custom restore function detected in Orbax metadata"
+                ),
+                severity=IssueSeverity.CRITICAL if restore_fn_is_dangerous else IssueSeverity.WARNING,
                 location=path,
-                details={"restore_fn": str(metadata["restore_fn"])[:200]},
+                details={"restore_fn": restore_fn_value[:200]},
                 rule_code="S302",
             )
 
         # Check for code injection in metadata
-        metadata_str = str(metadata).lower()
-        for pattern in self.jax_suspicious_patterns:
-            if pattern in metadata_str:
-                result.add_check(
-                    name="Orbax Pattern Security Check",
-                    passed=False,
-                    message=f"Suspicious pattern in Orbax metadata: {pattern}",
-                    severity=IssueSeverity.CRITICAL,
-                    location=path,
-                    details={"pattern": pattern},
-                    rule_code="S902",
-                )
+        for context, text_value in self._iter_string_metadata(metadata, "orbax_metadata"):
+            self._add_suspicious_pattern_checks(
+                text_value,
+                context=context,
+                check_name="Orbax Pattern Security Check",
+                message_prefix="Suspicious pattern in Orbax metadata",
+                location=path,
+                result=result,
+            )
 
         # Extract useful metadata
         if isinstance(metadata, dict):
@@ -256,49 +418,66 @@ class JaxCheckpointScanner(BaseScanner):
     def _scan_pickle_checkpoint(self, path: str, result: ScanResult) -> None:
         """Scan pickle-based JAX checkpoint."""
         try:
-            # Use safe pickle loading practices
             with open(path, "rb") as f:
-                # Read pickle opcodes to check for dangerous operations
-                # Don't actually unpickle for security
-                data = f.read(8192)  # Read first 8KB
+                data = f.read(self.max_pickle_scan_bytes + 1)
 
-            # Check for dangerous pickle opcodes
-            dangerous_opcodes = [
-                b"R",  # REDUCE
-                b"i",  # INST
-                b"o",  # OBJ
-                b"b",  # BUILD
-                b"c",  # GLOBAL
-            ]
+            if len(data) > self.max_pickle_scan_bytes:
+                data = data[: self.max_pickle_scan_bytes]
+                result.add_check(
+                    name="Pickle Checkpoint Prefix Scan Limit",
+                    passed=False,
+                    message=(
+                        f"Only the first {self.max_pickle_scan_bytes} bytes of the pickle checkpoint were "
+                        "inspected for opcode patterns"
+                    ),
+                    severity=IssueSeverity.WARNING,
+                    location=path,
+                    details={"max_pickle_scan_bytes": self.max_pickle_scan_bytes},
+                    rule_code="S902",
+                )
 
-            for opcode in dangerous_opcodes:
-                if opcode in data:
+            string_stack: list[str] = []
+            for opcode, arg, pos in pickletools.genops(data):
+                if opcode.name in self._PICKLE_STRING_OPCODES and isinstance(arg, str):
+                    string_stack.append(arg)
+                    if len(string_stack) > 32:
+                        del string_stack[:-32]
+                    continue
+
+                parsed_global = None
+                if opcode.name in {"GLOBAL", "INST"} and isinstance(arg, str):
+                    parsed_global = self._parse_pickle_global_reference(arg)
+                elif opcode.name == "STACK_GLOBAL" and len(string_stack) >= 2:
+                    global_name = string_stack.pop()
+                    module_name = string_stack.pop()
+                    parsed_global = (module_name, global_name)
+
+                if parsed_global is not None and self._is_dangerous_pickle_global(*parsed_global):
+                    module_name, global_name = parsed_global
                     result.add_check(
                         name="Pickle Opcode Security Check",
                         passed=False,
-                        message=f"Dangerous pickle opcode detected: {opcode.decode('ascii', errors='ignore')}",
+                        message=(f"Dangerous pickle opcode detected: {opcode.name} {module_name}.{global_name}"),
                         rule_code="S902",
                         severity=IssueSeverity.CRITICAL,
                         location=path,
-                        details={"opcode": opcode.hex()},
+                        details={
+                            "opcode": opcode.name,
+                            "position": pos,
+                            "global": f"{module_name}.{global_name}",
+                        },
                     )
 
             # Check for JAX-specific suspicious content
-            try:
-                data_str = data.decode("utf-8", errors="ignore")
-                for pattern in self.jax_suspicious_patterns:
-                    if pattern in data_str:
-                        result.add_check(
-                            name="JAX Pattern Security Check",
-                            passed=False,
-                            message=f"Suspicious JAX pattern in pickle: {pattern}",
-                            severity=IssueSeverity.CRITICAL,
-                            location=path,
-                            details={"pattern": pattern},
-                            rule_code="S902",
-                        )
-            except Exception:
-                pass
+            data_str = data.decode("utf-8", errors="ignore")
+            self._add_suspicious_pattern_checks(
+                data_str,
+                context="pickle_checkpoint",
+                check_name="JAX Pattern Security Check",
+                message_prefix="Suspicious JAX pattern in pickle",
+                location=path,
+                result=result,
+            )
 
         except Exception as e:
             result.add_check(
@@ -371,18 +550,15 @@ class JaxCheckpointScanner(BaseScanner):
                 data = json.load(f)
 
             # Analyze JSON content for suspicious patterns
-            data_str = json.dumps(data).lower()
-            for pattern in self.jax_suspicious_patterns:
-                if pattern in data_str:
-                    result.add_check(
-                        name="JSON Pattern Security Check",
-                        passed=False,
-                        message=f"Suspicious pattern in JSON checkpoint: {pattern}",
-                        severity=IssueSeverity.CRITICAL,
-                        location=path,
-                        details={"pattern": pattern},
-                        rule_code="S902",
-                    )
+            for context, text_value in self._iter_string_metadata(data, "json_checkpoint"):
+                self._add_suspicious_pattern_checks(
+                    text_value,
+                    context=context,
+                    check_name="JSON Pattern Security Check",
+                    message_prefix="Suspicious pattern in JSON checkpoint",
+                    location=path,
+                    result=result,
+                )
 
         except json.JSONDecodeError as e:
             result.add_check(
