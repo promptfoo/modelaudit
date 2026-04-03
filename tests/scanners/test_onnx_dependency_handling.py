@@ -1,5 +1,6 @@
 """Regression tests for ONNX scanner dependency handling."""
 
+from pathlib import Path
 from unittest.mock import patch
 
 from modelaudit.scanners import get_scanner_for_file
@@ -7,7 +8,7 @@ from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.onnx_scanner import OnnxScanner
 
 
-def test_onnx_file_routes_to_onnx_scanner_by_extension(tmp_path):
+def test_onnx_file_routes_to_onnx_scanner_by_extension(tmp_path: Path) -> None:
     """ONNX files should route to OnnxScanner regardless of optional deps."""
     model_path = tmp_path / "model.onnx"
     model_path.write_bytes(b"not-a-real-onnx-model")
@@ -19,7 +20,7 @@ def test_onnx_file_routes_to_onnx_scanner_by_extension(tmp_path):
     assert scanner.name == "onnx"
 
 
-def test_onnx_scanner_reports_missing_dependency_as_warning(tmp_path):
+def test_onnx_scanner_reports_missing_dependency_as_warning(tmp_path: Path) -> None:
     """When ONNX runtime dependencies are missing, scan must not report clean."""
     model_path = tmp_path / "model.onnx"
     model_path.write_bytes(b"not-a-real-onnx-model")
