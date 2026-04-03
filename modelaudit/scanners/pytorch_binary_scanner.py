@@ -18,11 +18,12 @@ class PyTorchBinaryScanner(BaseScanner):
     name = "pytorch_binary"
     description = "Scans PyTorch binary tensor files for suspicious patterns"
     supported_extensions: ClassVar[list[str]] = [".bin"]
+    SHEBANG_CONTEXT_BYTES: ClassVar[int] = 50
 
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
         # Get blacklist patterns from config
-        self.blacklist_patterns = self.config.get("blacklist_patterns", [])
+        self.blacklist_patterns = self.config.get("blacklist_patterns") or []
 
     def _is_nested_archive_member(self) -> bool:
         """Return True when this scan is running on an extracted archive member."""
@@ -107,6 +108,8 @@ class PyTorchBinaryScanner(BaseScanner):
             # Read file in chunks to look for suspicious patterns
             bytes_scanned = 0
             chunk_size = 1024 * 1024  # 1MB chunks
+            previous_chunk_tail = b""
+            chunk_overlap = self._get_chunk_overlap_size(chunk_size)
 
             with open(path, "rb") as f:
                 while True:
@@ -115,28 +118,35 @@ class PyTorchBinaryScanner(BaseScanner):
                         break
 
                     bytes_scanned += len(chunk)
+                    chunk_offset = bytes_scanned - len(chunk)
+                    scan_window = previous_chunk_tail + chunk
+                    window_offset = chunk_offset - len(previous_chunk_tail)
+                    overlap_prefix_len = len(previous_chunk_tail)
 
                     # Check for embedded Python code patterns
                     self._check_for_code_patterns(
-                        chunk,
+                        scan_window,
                         result,
-                        bytes_scanned - len(chunk),
+                        window_offset,
+                        overlap_prefix_len=overlap_prefix_len,
                     )
 
                     # Check for blacklisted patterns
                     if self.blacklist_patterns:
                         self._check_for_blacklist_patterns(
-                            chunk,
+                            scan_window,
                             result,
-                            bytes_scanned - len(chunk),
+                            window_offset,
+                            overlap_prefix_len=overlap_prefix_len,
                         )
 
                     # Check for executable file signatures
                     self._check_for_executable_signatures(
                         chunk,
                         result,
-                        bytes_scanned - len(chunk),
+                        chunk_offset,
                     )
+                    previous_chunk_tail = chunk[-chunk_overlap:] if chunk_overlap else b""
 
             result.bytes_scanned = bytes_scanned
 
@@ -155,22 +165,41 @@ class PyTorchBinaryScanner(BaseScanner):
             result.finish(success=False)
             return result
 
-        result.finish(success=True)
+        result.finish(success=not result.has_errors)
         return result
+
+    def _get_chunk_overlap_size(self, chunk_size: int) -> int:
+        """Return the number of trailing bytes to carry into the next chunk scan."""
+        longest_pattern = max(
+            [
+                self.SHEBANG_CONTEXT_BYTES,
+                *(len(pattern) for pattern in BINARY_CODE_PATTERNS),
+                *(len(pattern.encode("utf-8")) for pattern in (self.blacklist_patterns or []) if pattern),
+                *(len(signature) for signature in EXECUTABLE_SIGNATURES),
+            ]
+        )
+        return max(0, min(chunk_size - 1, longest_pattern - 1))
 
     def _check_for_code_patterns(
         self,
         chunk: bytes,
         result: ScanResult,
         offset: int,
+        *,
+        overlap_prefix_len: int = 0,
     ) -> None:
         """Check for patterns that might indicate embedded code"""
         # Common patterns that might indicate embedded Python code
         found_suspicious = False
         for pattern in BINARY_CODE_PATTERNS:
-            if pattern in chunk:
-                # Find the position within the chunk
-                pos = chunk.find(pattern)
+            search_start = 0
+            while True:
+                pos = chunk.find(pattern, search_start)
+                if pos == -1:
+                    break
+                search_start = pos + 1
+                if pos + len(pattern) <= overlap_prefix_len:
+                    continue
                 result.add_check(
                     name="Embedded Code Pattern Detection",
                     passed=False,
@@ -184,6 +213,7 @@ class PyTorchBinaryScanner(BaseScanner):
                     },
                 )
                 found_suspicious = True
+                break
 
         if not found_suspicious and offset == 0:  # Only record success on first chunk
             result.add_check(
@@ -199,13 +229,24 @@ class PyTorchBinaryScanner(BaseScanner):
         chunk: bytes,
         result: ScanResult,
         offset: int,
+        *,
+        overlap_prefix_len: int = 0,
     ) -> None:
         """Check for blacklisted patterns in the binary data"""
         found_blacklisted = False
-        for pattern in self.blacklist_patterns:
+        for pattern in self.blacklist_patterns or []:
             pattern_bytes = pattern.encode("utf-8")
-            if pattern_bytes in chunk:
-                pos = chunk.find(pattern_bytes)
+            if not pattern_bytes:
+                continue
+
+            search_start = 0
+            while True:
+                pos = chunk.find(pattern_bytes, search_start)
+                if pos == -1:
+                    break
+                search_start = pos + 1
+                if pos + len(pattern_bytes) <= overlap_prefix_len:
+                    continue
                 result.add_check(
                     name="Blacklist Pattern Check",
                     passed=False,
@@ -219,6 +260,7 @@ class PyTorchBinaryScanner(BaseScanner):
                     },
                 )
                 found_blacklisted = True
+                break
 
         if not found_blacklisted and offset == 0:  # Only record success on first chunk
             result.add_check(
@@ -238,7 +280,7 @@ class PyTorchBinaryScanner(BaseScanner):
         2. Proper line ending after interpreter path
         """
         # Extract enough bytes to check full shebang line
-        max_shebang_len = 50
+        max_shebang_len = self.SHEBANG_CONTEXT_BYTES
         snippet = data[offset_in_chunk : offset_in_chunk + max_shebang_len]
 
         if len(snippet) < 10:  # Need at least #!/bin/sh

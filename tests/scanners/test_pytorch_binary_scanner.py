@@ -7,6 +7,17 @@ from modelaudit.detectors.suspicious_symbols import BINARY_CODE_PATTERNS
 from modelaudit.scanners.pytorch_binary_scanner import PyTorchBinaryScanner
 
 
+def _write_chunk_boundary_payload(
+    path: Path,
+    pattern: bytes,
+    *,
+    prefix_len: int,
+    suffix: bytes = b"\x00" * 128,
+) -> None:
+    chunk_size = 1024 * 1024
+    path.write_bytes(b"\x00" * (chunk_size - prefix_len) + pattern[:prefix_len] + pattern[prefix_len:] + suffix)
+
+
 def test_pytorch_binary_scanner_can_handle(tmp_path):
     """Test that the scanner correctly identifies pytorch binary files."""
     scanner = PyTorchBinaryScanner()
@@ -98,6 +109,19 @@ def test_pytorch_binary_scanner_code_patterns(tmp_path):
 
     assert found_import
     assert found_system
+
+
+def test_pytorch_binary_scanner_detects_code_pattern_split_across_chunk_boundary(tmp_path: Path) -> None:
+    """Suspicious code tokens split at a chunk boundary should still be detected."""
+    scanner = PyTorchBinaryScanner()
+    binary_file = tmp_path / "boundary_code_pattern.bin"
+    pattern_system = next(p for p in BINARY_CODE_PATTERNS if p.startswith(b"os.system"))
+    _write_chunk_boundary_payload(binary_file, pattern_system, prefix_len=4)
+
+    result = scanner.scan(str(binary_file))
+
+    assert result.success is True
+    assert any("os.system" in issue.message for issue in result.issues)
 
 
 @pytest.mark.skip(
@@ -193,7 +217,7 @@ def test_pytorch_binary_scanner_blacklist_patterns(tmp_path):
 
     result = scanner.scan(str(binary_file))
 
-    assert result.success
+    assert result.success is False
     assert len(result.issues) >= 2
 
     # Check that we found the blacklisted patterns
@@ -207,6 +231,42 @@ def test_pytorch_binary_scanner_blacklist_patterns(tmp_path):
 
     assert found_confidential
     assert found_secret
+
+
+def test_pytorch_binary_scanner_detects_blacklist_pattern_split_across_chunk_boundary(tmp_path: Path) -> None:
+    """Blacklisted tokens split at a chunk boundary should still fail the scan."""
+    scanner = PyTorchBinaryScanner(config={"blacklist_patterns": ["SECRET_KEY"]})
+    binary_file = tmp_path / "boundary_blacklist.bin"
+    _write_chunk_boundary_payload(binary_file, b"SECRET_KEY", prefix_len=3)
+
+    result = scanner.scan(str(binary_file))
+
+    assert result.success is False
+    assert any("SECRET_KEY" in issue.message for issue in result.issues)
+
+
+def test_pytorch_binary_scanner_rejects_boundary_near_match_without_blacklist_fp(tmp_path: Path) -> None:
+    """A near-match split across chunks must not become a noisy blacklist false positive."""
+    scanner = PyTorchBinaryScanner(config={"blacklist_patterns": ["SECRET_KEY"]})
+    binary_file = tmp_path / "boundary_blacklist_near_match.bin"
+    _write_chunk_boundary_payload(binary_file, b"SECRET_KEZ", prefix_len=3)
+
+    result = scanner.scan(str(binary_file))
+
+    assert result.success is True
+    assert not any("SECRET_KEY" in issue.message for issue in result.issues)
+
+
+def test_pytorch_binary_scanner_handles_none_blacklist_config_and_detects_pe_header(tmp_path: Path) -> None:
+    """`blacklist_patterns=None` should not crash and must preserve executable detection."""
+    scanner = PyTorchBinaryScanner(config={"blacklist_patterns": None})
+    binary_file = tmp_path / "malicious_model.bin"
+    binary_file.write_bytes(b"MZ" + b"\x90\x00" * 30 + b"This program cannot be run in DOS mode" + b"\x00" * 100)
+
+    result = scanner.scan(str(binary_file))
+
+    assert result.success is False
+    assert any("Windows executable" in issue.message for issue in result.issues)
 
 
 def test_filetype_detection_for_bin_files(tmp_path):
