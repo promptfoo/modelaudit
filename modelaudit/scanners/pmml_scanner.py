@@ -249,8 +249,25 @@ class PmmlScanner(BaseScanner):
 
             # For Extension elements, also include all child element text content and names
             if tag_name == "extension":
-                # Get all text content recursively
-                all_text = self._get_all_text_content(elem)
+                all_text, truncated = self._get_all_text_content(elem)
+                if truncated:
+                    result.add_check(
+                        name="Extension Element Completeness Check",
+                        passed=False,
+                        message=("PMML <Extension> content exceeds the safe inspection node limit; scan is incomplete"),
+                        severity=IssueSeverity.CRITICAL,
+                        location=path,
+                        details={
+                            "tag": elem.tag,
+                            "max_extension_text_nodes": self.MAX_EXTENSION_TEXT_NODES,
+                        },
+                        why=(
+                            "Attackers can pad nested Extension trees to move malicious code beyond "
+                            "a bounded traversal window. Treating truncated inspection as a hard "
+                            "failure prevents a false sense of safety."
+                        ),
+                        rule_code="S902",
+                    )
                 combined = f"{elem_text} {attr_text} {all_text}".lower()
             else:
                 combined = f"{elem_text} {attr_text}".lower()
@@ -312,13 +329,18 @@ class PmmlScanner(BaseScanner):
             return ""
         return tag.split("}")[-1].lower() if "}" in tag else tag.lower()
 
-    def _get_all_text_content(self, element: Any) -> str:
-        """Recursively get all text content from an element and its children."""
+    def _get_all_text_content(self, element: Any) -> tuple[str, bool]:
+        """Collect Extension text and report whether traversal hit the node budget."""
         text_parts: list[str] = []
         stack = [element]
         nodes_seen = 0
+        truncated = False
 
-        while stack and nodes_seen < self.MAX_EXTENSION_TEXT_NODES:
+        while stack:
+            if nodes_seen >= self.MAX_EXTENSION_TEXT_NODES:
+                truncated = True
+                break
+
             current = stack.pop()
             nodes_seen += 1
 
@@ -331,6 +353,17 @@ class PmmlScanner(BaseScanner):
             if current.tail:
                 text_parts.append(current.tail.strip())
 
-            stack.extend(reversed(list(current)))
+            try:
+                child_count = len(current)
+            except TypeError:
+                continue
 
-        return " ".join(filter(None, text_parts))
+            remaining_budget = self.MAX_EXTENSION_TEXT_NODES - nodes_seen
+            if child_count > remaining_budget:
+                truncated = True
+                child_count = max(remaining_budget, 0)
+
+            for child_index in range(child_count - 1, -1, -1):
+                stack.append(current[child_index])
+
+        return " ".join(filter(None, text_parts)), truncated

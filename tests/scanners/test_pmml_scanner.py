@@ -220,6 +220,24 @@ def test_pmml_scanner_comment_doctype_is_not_xxe(tmp_path: Path) -> None:
     )
 
 
+def test_pmml_scanner_cdata_doctype_is_not_xxe(tmp_path: Path) -> None:
+    pmml = """<?xml version='1.0'?>
+<PMML version='4.4'>
+  <Header>
+    <Extension><![CDATA[<!DOCTYPE pmml [ <!ENTITY xxe SYSTEM 'file:///etc/passwd'> ]>]]></Extension>
+  </Header>
+</PMML>"""
+    path = tmp_path / "cdata_doctype.pmml"
+    path.write_text(pmml, encoding="utf-8")
+
+    result = PmmlScanner().scan(str(path))
+
+    assert result.success is True
+    assert not any(
+        issue.severity == IssueSeverity.CRITICAL and "PMML file contains" in issue.message for issue in result.issues
+    )
+
+
 def test_pmml_scanner_deep_extension_tree_does_not_recurse_forever(tmp_path: Path) -> None:
     nested_body = "<node>" * 1200 + "payload" + "</node>" * 1200
     pmml = f"""<?xml version='1.0'?>
@@ -235,6 +253,23 @@ def test_pmml_scanner_deep_extension_tree_does_not_recurse_forever(tmp_path: Pat
 
     assert result.success is True
     assert result.bytes_scanned > 0
+
+
+def test_pmml_scanner_extension_text_truncation_fails_closed(tmp_path: Path) -> None:
+    pmml = f"""<?xml version='1.0'?>
+<PMML version='4.4'>
+  <Header>
+    <Extension>{"<node/>" * (PmmlScanner.MAX_EXTENSION_TEXT_NODES + 8)}<script>eval('x')</script></Extension>
+  </Header>
+</PMML>"""
+    path = tmp_path / "truncated_extension.pmml"
+    path.write_text(pmml, encoding="utf-8")
+
+    result = PmmlScanner().scan(str(path))
+
+    assert result.success is False
+    assert any("exceeds the safe inspection node limit" in issue.message for issue in result.issues)
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
 def test_pmml_scanner_can_handle_detection(tmp_path: Path) -> None:
