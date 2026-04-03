@@ -264,7 +264,7 @@ class KerasZipScanner(BaseScanner):
                         member_name,
                         [info.filename for info in candidate_members],
                     )
-        except ValueError as exc:
+        except (ValueError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile, OSError) as exc:
             raise _AmbiguousKerasArchiveMemberError(
                 member_name,
                 [info.filename for info in candidate_members],
