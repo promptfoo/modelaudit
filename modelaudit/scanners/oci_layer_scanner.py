@@ -39,6 +39,20 @@ class OciLayerScanner(BaseScanner):
         "gguf": ".gguf",
         "ggml": ".gguf",
     }
+    _LAYER_ARCHIVE_SUFFIX: ClassVar[str] = ".tar.gz"
+    _MANIFEST_PROBE_CHUNK_BYTES: ClassVar[int] = 8192
+    _DEFAULT_MAX_LAYER_FILE_SIZE: ClassVar[int] = 10 * 1024 * 1024 * 1024
+
+    def __init__(self, config: dict[str, Any] | None = None):
+        super().__init__(config)
+        configured_max_file_size = self.config.get("max_file_size")
+        if configured_max_file_size == 0:
+            self.max_layer_file_size = 0
+        else:
+            self.max_layer_file_size = self._normalize_positive_int_config(
+                configured_max_file_size,
+                self._DEFAULT_MAX_LAYER_FILE_SIZE,
+            )
 
     @staticmethod
     def _get_scannable_extension(member_name: str) -> str | None:
@@ -71,13 +85,25 @@ class OciLayerScanner(BaseScanner):
         ext = os.path.splitext(path)[1].lower()
         if ext not in cls.supported_extensions:
             return False
-        # Quick check for .tar.gz references to avoid conflicts with ManifestScanner
+
+        # Check for .tar.gz references case-insensitively without reading the
+        # whole file into memory at once.
         try:
+            probe_tail = ""
             with open(path, encoding="utf-8", errors="ignore") as f:
-                snippet = f.read(2048)
-            return ".tar.gz" in snippet
+                while chunk := f.read(cls._MANIFEST_PROBE_CHUNK_BYTES):
+                    haystack = f"{probe_tail}{chunk}".lower()
+                    if cls._LAYER_ARCHIVE_SUFFIX in haystack:
+                        return True
+                    probe_tail = haystack[-(len(cls._LAYER_ARCHIVE_SUFFIX) - 1) :]
+            return False
         except Exception:
             return False
+
+    @staticmethod
+    def _normalize_layer_ref(layer_ref: str) -> str:
+        """Trim manifest layer refs so cosmetic suffix whitespace cannot hide .tar.gz layers."""
+        return layer_ref.strip().rstrip(" .")
 
     @staticmethod
     def _rewrite_embedded_location(
@@ -149,17 +175,20 @@ class OciLayerScanner(BaseScanner):
             elif isinstance(obj, list):
                 for item in obj:
                     _search(item)
-            elif isinstance(obj, str) and obj.endswith(".tar.gz"):
+            elif isinstance(obj, str) and self._normalize_layer_ref(obj).lower().endswith(self._LAYER_ARCHIVE_SUFFIX):
                 layer_paths.append(obj)
 
         _search(manifest_data)
 
         manifest_dir = os.path.dirname(path)
+        scan_complete = True
 
         for layer_ref in layer_paths:
-            layer_path, is_safe = sanitize_archive_path(layer_ref, manifest_dir)
+            normalized_layer_ref = self._normalize_layer_ref(layer_ref)
+            layer_path, is_safe = sanitize_archive_path(normalized_layer_ref, manifest_dir)
 
             if not is_safe or not is_within_directory(manifest_dir, layer_path):
+                scan_complete = False
                 result.add_check(
                     name="Layer Path Traversal Protection",
                     passed=False,
@@ -172,6 +201,7 @@ class OciLayerScanner(BaseScanner):
                 continue
 
             if not os.path.exists(layer_path):
+                scan_complete = False
                 result.add_check(
                     name="Layer File Existence Check",
                     passed=False,
@@ -182,18 +212,67 @@ class OciLayerScanner(BaseScanner):
                 )
                 continue
             try:
+                layer_size = os.path.getsize(layer_path)
+                if self.max_layer_file_size > 0 and layer_size > self.max_layer_file_size:
+                    scan_complete = False
+                    result.add_check(
+                        name="Layer File Size Check",
+                        passed=False,
+                        message=(
+                            f"Layer {normalized_layer_ref} is too large to scan: "
+                            f"{layer_size} bytes (max: {self.max_layer_file_size})"
+                        ),
+                        severity=IssueSeverity.WARNING,
+                        location=f"{path}:{layer_ref}",
+                        details={
+                            "layer": layer_ref,
+                            "normalized_layer": normalized_layer_ref,
+                            "size": layer_size,
+                            "max_file_size": self.max_layer_file_size,
+                        },
+                        rule_code="S902",
+                    )
+                    continue
+
                 with tarfile.open(layer_path, "r:gz") as tar:
                     for member in tar:
                         if not member.isfile():
                             continue
                         name = member.name
                         matched_ext = self._get_scannable_extension(name)
-                        normalized_name = name.rstrip(" .")
-                        should_probe_extensionless = not Path(normalized_name).suffixes
-                        if matched_ext is None and not should_probe_extensionless:
+                        if self.max_layer_file_size > 0 and member.size > self.max_layer_file_size:
+                            scan_complete = False
+                            result.add_check(
+                                name="Layer Member Size Check",
+                                passed=False,
+                                message=(
+                                    f"Layer member {name} is too large to scan: "
+                                    f"{member.size} bytes (max: {self.max_layer_file_size})"
+                                ),
+                                severity=IssueSeverity.WARNING,
+                                location=f"{path}:{layer_ref}:{name}",
+                                details={
+                                    "layer": layer_ref,
+                                    "member": name,
+                                    "size": member.size,
+                                    "max_file_size": self.max_layer_file_size,
+                                },
+                                rule_code="S902",
+                            )
                             continue
+
                         fileobj = tar.extractfile(member)
                         if fileobj is None:
+                            scan_complete = False
+                            result.add_check(
+                                name="Layer Member Extraction",
+                                passed=False,
+                                message=f"Layer member {name} was not extracted from {layer_ref}",
+                                severity=IssueSeverity.WARNING,
+                                location=f"{path}:{layer_ref}:{name}",
+                                details={"layer": layer_ref, "member": name},
+                                rule_code="S902",
+                            )
                             continue
                         tmp_path: str | None = None
                         try:
@@ -244,11 +323,14 @@ class OciLayerScanner(BaseScanner):
                                     issue.details = {}
                                 issue.details["layer"] = layer_ref
                             result.merge(file_result)
+                            if not file_result.success or file_result.has_errors:
+                                scan_complete = False
                         finally:
                             fileobj.close()
                             if tmp_path and os.path.exists(tmp_path):
                                 os.unlink(tmp_path)
             except Exception as e:
+                scan_complete = False
                 result.add_check(
                     name="Layer Processing",
                     passed=False,
@@ -259,5 +341,5 @@ class OciLayerScanner(BaseScanner):
                     rule_code="S902",
                 )
 
-        result.finish(success=True)
+        result.finish(success=scan_complete and not result.has_errors)
         return result
