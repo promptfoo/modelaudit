@@ -14,6 +14,17 @@ except Exception:  # pragma: no cover - optional dependency
 
 _MAX_COUNT = 100000  # Guardrail for excessive tensor/operator/subgraph counts
 _MAX_DIM = 10_000_000  # Guardrail for pathological tensor dimensions
+_TFLITE_MAGIC_OFFSET = 4
+_TFLITE_MAGIC_SIZE = 4
+_TFLITE_MIN_HEADER_SIZE = _TFLITE_MAGIC_OFFSET + _TFLITE_MAGIC_SIZE
+_TFLITE_MAGIC_BYTES = b"TFL3"
+
+
+def _has_tflite_magic_bytes(data: bytes) -> bool:
+    return (
+        len(data) >= _TFLITE_MIN_HEADER_SIZE
+        and data[_TFLITE_MAGIC_OFFSET : _TFLITE_MAGIC_OFFSET + _TFLITE_MAGIC_SIZE] == _TFLITE_MAGIC_BYTES
+    )
 
 
 class TFLiteScanner(BaseScanner):
@@ -27,12 +38,26 @@ class TFLiteScanner(BaseScanner):
     def can_handle(cls, path: str) -> bool:
         if not os.path.isfile(path):
             return False
-        return os.path.splitext(path)[1].lower() in cls.supported_extensions
+
+        if os.path.splitext(path)[1].lower() in cls.supported_extensions:
+            return True
+
+        try:
+            with open(path, "rb") as f:
+                header = f.read(_TFLITE_MIN_HEADER_SIZE)
+        except OSError:
+            return False
+
+        return _has_tflite_magic_bytes(header)
 
     def scan(self, path: str) -> ScanResult:
         path_check_result = self._check_path(path)
         if path_check_result:
             return path_check_result
+
+        size_check = self._check_size_limit(path)
+        if size_check:
+            return size_check
 
         result = self._create_result()
         result.metadata["file_size"] = self.get_file_size(path)
@@ -51,20 +76,25 @@ class TFLiteScanner(BaseScanner):
             return result
 
         try:
-            with open(path, "rb") as f:
-                data = f.read()
-                result.bytes_scanned = len(data)
+            data = self._read_file_safely(path)
+            result.bytes_scanned = len(data)
 
             # Check for TFLite magic bytes "TFL3" at offset 4
             # TFLite uses FlatBuffer format: bytes 0-3 are root table offset, bytes 4-7 are file identifier
-            if len(data) < 8 or data[4:8] != b"TFL3":
+            if not _has_tflite_magic_bytes(data):
                 result.add_check(
                     name="TFLite Magic Bytes Check",
                     passed=False,
                     message="File does not have valid TFLite magic bytes (expected 'TFL3' at offset 4)",
                     severity=IssueSeverity.INFO,
                     location=path,
-                    details={"magic_bytes_at_offset_4": data[4:8].hex() if len(data) >= 8 else "file_too_short"},
+                    details={
+                        "magic_bytes_at_offset_4": data[
+                            _TFLITE_MAGIC_OFFSET : _TFLITE_MAGIC_OFFSET + _TFLITE_MAGIC_SIZE
+                        ].hex()
+                        if len(data) >= _TFLITE_MIN_HEADER_SIZE
+                        else "file_too_short"
+                    },
                     why="Valid TFLite files use FlatBuffer format with 'TFL3' identifier at bytes 4-7. "
                     "Missing or incorrect identifier may indicate file corruption or spoofing.",
                 )
@@ -84,69 +114,84 @@ class TFLiteScanner(BaseScanner):
             result.finish(success=False)
             return result
 
-        subgraph_count = model.SubgraphsLength()
-        result.metadata["subgraph_count"] = subgraph_count
-        if subgraph_count > _MAX_COUNT:
+        try:
+            subgraph_count = model.SubgraphsLength()
+            result.metadata["subgraph_count"] = subgraph_count
+            if subgraph_count > _MAX_COUNT:
+                result.add_check(
+                    name="Subgraph Count Validation",
+                    passed=False,
+                    message=f"Model declares {subgraph_count} subgraphs which exceeds the safe limit",
+                    severity=IssueSeverity.CRITICAL,
+                    location=path,
+                    details={"subgraph_count": subgraph_count, "max_allowed": _MAX_COUNT},
+                    rule_code="S902",
+                )
+                result.finish(success=False)
+                return result
+
+            for sg_index in range(subgraph_count):
+                subgraph = model.Subgraphs(sg_index)
+                tensors_len = subgraph.TensorsLength()
+                operators_len = subgraph.OperatorsLength()
+                result.metadata.setdefault("tensor_counts", []).append(tensors_len)
+                result.metadata.setdefault("operator_counts", []).append(operators_len)
+
+                if tensors_len > _MAX_COUNT or operators_len > _MAX_COUNT:
+                    result.add_check(
+                        name="Tensor/Operator Count Validation",
+                        passed=False,
+                        message="TFLite model has extremely large tensor or operator count",
+                        severity=IssueSeverity.CRITICAL,
+                        location=path,
+                        details={"tensors": tensors_len, "operators": operators_len, "max_allowed": _MAX_COUNT},
+                        rule_code="S902",
+                    )
+                    continue
+
+                for t_index in range(tensors_len):
+                    tensor = subgraph.Tensors(t_index)
+                    shape = [tensor.Shape(i) for i in range(tensor.ShapeLength())]
+                    if any(dim > _MAX_DIM for dim in shape):
+                        result.add_check(
+                            name="Tensor Dimension Validation",
+                            passed=False,
+                            message="Tensor dimension extremely large (possible overflow)",
+                            severity=IssueSeverity.CRITICAL,
+                            location=f"{path} (tensor {t_index})",
+                            details={"tensor_index": t_index, "shape": shape, "max_allowed_dim": _MAX_DIM},
+                            rule_code="S703",
+                        )
+                for o_index in range(operators_len):
+                    op = subgraph.Operators(o_index)
+                    opcode = model.OperatorCodes(op.OpcodeIndex())
+                    builtin = opcode.BuiltinCode()
+                    if builtin == tflite.BuiltinOperator.CUSTOM:
+                        custom = opcode.CustomCode()
+                        name = custom.decode("utf-8", "ignore") if custom else "unknown"
+                        result.add_check(
+                            name="Custom Operator Detection",
+                            passed=False,
+                            message=f"Model uses custom operator '{name}'",
+                            severity=IssueSeverity.CRITICAL,
+                            location=f"{path} (operator {o_index})",
+                            rule_code="S302",
+                            details={"operator_name": name, "operator_index": o_index},
+                        )
+        except Exception as e:  # pragma: no cover - malformed structure traversal
             result.add_check(
-                name="Subgraph Count Validation",
+                name="TFLite Model Structure Parse",
                 passed=False,
-                message=f"Model declares {subgraph_count} subgraphs which exceeds the safe limit",
-                severity=IssueSeverity.CRITICAL,
+                message=f"Invalid TFLite model structure or traversal error: {e}",
+                severity=IssueSeverity.INFO,
                 location=path,
-                details={"subgraph_count": subgraph_count, "max_allowed": _MAX_COUNT},
-                rule_code="S902",
+                details={"exception": str(e), "exception_type": type(e).__name__},
+                why=(
+                    "Malformed TFLite FlatBuffer tables can raise parser exceptions during subgraph/operator traversal."
+                ),
             )
             result.finish(success=False)
             return result
-
-        for sg_index in range(subgraph_count):
-            subgraph = model.Subgraphs(sg_index)
-            tensors_len = subgraph.TensorsLength()
-            operators_len = subgraph.OperatorsLength()
-            result.metadata.setdefault("tensor_counts", []).append(tensors_len)
-            result.metadata.setdefault("operator_counts", []).append(operators_len)
-
-            if tensors_len > _MAX_COUNT or operators_len > _MAX_COUNT:
-                result.add_check(
-                    name="Tensor/Operator Count Validation",
-                    passed=False,
-                    message="TFLite model has extremely large tensor or operator count",
-                    severity=IssueSeverity.CRITICAL,
-                    location=path,
-                    details={"tensors": tensors_len, "operators": operators_len, "max_allowed": _MAX_COUNT},
-                    rule_code="S902",
-                )
-                continue
-
-            for t_index in range(tensors_len):
-                tensor = subgraph.Tensors(t_index)
-                shape = [tensor.Shape(i) for i in range(tensor.ShapeLength())]
-                if any(dim > _MAX_DIM for dim in shape):
-                    result.add_check(
-                        name="Tensor Dimension Validation",
-                        passed=False,
-                        message="Tensor dimension extremely large (possible overflow)",
-                        severity=IssueSeverity.CRITICAL,
-                        location=f"{path} (tensor {t_index})",
-                        details={"tensor_index": t_index, "shape": shape, "max_allowed_dim": _MAX_DIM},
-                        rule_code="S703",
-                    )
-            for o_index in range(operators_len):
-                op = subgraph.Operators(o_index)
-                opcode = model.OperatorCodes(op.OpcodeIndex())
-                builtin = opcode.BuiltinCode()
-                if builtin == tflite.BuiltinOperator.CUSTOM:
-                    custom = opcode.CustomCode()
-                    name = custom.decode("utf-8", "ignore") if custom else "unknown"
-                    result.add_check(
-                        name="Custom Operator Detection",
-                        passed=False,
-                        message=f"Model uses custom operator '{name}'",
-                        severity=IssueSeverity.CRITICAL,
-                        location=f"{path} (operator {o_index})",
-                        rule_code="S302",
-                        details={"operator_name": name, "operator_index": o_index},
-                    )
 
         result.finish(success=not result.has_errors)
         return result
