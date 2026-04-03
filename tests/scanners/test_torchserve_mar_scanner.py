@@ -133,6 +133,51 @@ def test_scan_flags_duplicate_handler_member_even_when_benign_copy_is_last(tmp_p
     assert handler_failures[0].details["handler"] == "handler.py"
 
 
+def test_scan_detects_getattr_wrapped_handler_execution_primitive(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"import os\n\ndef handle(data, context):\n    return getattr(os, 'system')('id')\n",
+            "weights.bin": b"weights",
+        },
+        filename="getattr_handler.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
+
+    assert len(handler_failures) == 1
+    assert handler_failures[0].severity == IssueSeverity.CRITICAL
+    assert "os.system" in handler_failures[0].message
+
+
+def test_scan_allows_benign_getattr_handler_access(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": (
+                b"class Handler:\n"
+                b"    def __init__(self):\n"
+                b"        self._value = {'ok': True}\n"
+                b"\n"
+                b"    def handle(self, data, context):\n"
+                b"        return getattr(self, '_value')\n"
+            ),
+            "weights.bin": b"weights",
+        },
+        filename="benign_getattr_handler.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
+
+    assert handler_failures == []
+
+
 def test_scan_accepts_clean_duplicate_handler_members(tmp_path: Path) -> None:
     manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
     mar_path = _create_mar_archive(
@@ -636,6 +681,62 @@ def test_scan_detects_path_traversal_member_names(tmp_path: Path) -> None:
     traversal_failures = _failed_checks(result, "TorchServe MAR Path Traversal Protection")
     assert len(traversal_failures) >= 1
     assert traversal_failures[0].severity == IssueSeverity.CRITICAL
+
+
+def test_scan_detects_conflicting_duplicate_manifest_handler_entries(tmp_path: Path) -> None:
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=None,
+        entries=[
+            (
+                "MAR-INF/MANIFEST.json",
+                json.dumps({"model": {"handler": "safe_handler.py", "serializedFile": "weights.bin"}}).encode(),
+            ),
+            ("safe_handler.py", b"def handle(data, context):\n    return {'ok': True}\n"),
+            ("weights.bin", b"weights"),
+            (
+                "MAR-INF/MANIFEST.json",
+                json.dumps({"model": {"handler": "evil_handler.py", "serializedFile": "weights.bin"}}).encode(),
+            ),
+            ("evil_handler.py", b"import os\n\ndef handle(data, context):\n    return os.system('id')\n"),
+        ],
+        filename="duplicate_manifest_handler.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    collision_failures = _failed_checks(result, "TorchServe Manifest Collision")
+    handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
+    non_handler_failures = _failed_checks(result, "MAR Non-Handler Python Analysis")
+
+    assert len(collision_failures) == 1
+    assert collision_failures[0].severity == IssueSeverity.WARNING
+    assert any(
+        failure.severity == IssueSeverity.CRITICAL
+        and failure.location == f"{mar_path}:evil_handler.py"
+        and "os.system" in failure.message
+        for failure in handler_failures
+    )
+    assert not any(failure.location == f"{mar_path}:evil_handler.py" for failure in non_handler_failures)
+
+
+def test_scan_accepts_duplicate_identical_manifest_entries(tmp_path: Path) -> None:
+    manifest_bytes = json.dumps({"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}).encode()
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=None,
+        entries=[
+            ("MAR-INF/MANIFEST.json", manifest_bytes),
+            ("MAR-INF/MANIFEST.json", manifest_bytes),
+            ("handler.py", b"def handle(data, context):\n    return {'ok': True}\n"),
+            ("weights.bin", b"weights"),
+        ],
+        filename="duplicate_identical_manifest.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+
+    assert _failed_checks(result, "TorchServe Manifest Collision") == []
+    assert _failed_checks(result, "TorchServe Handler Static Analysis") == []
 
 
 def test_scan_reports_missing_manifest_when_forced(tmp_path: Path) -> None:

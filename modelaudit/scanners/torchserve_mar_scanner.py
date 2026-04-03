@@ -292,13 +292,11 @@ class TorchServeMarScanner(BaseScanner):
         }
         manifest_name = self._normalize_member_name(MANIFEST_ENTRY_PATH)
 
-        manifest_info = None
-        for info in archive.infolist():
-            if self._normalize_member_name(info.filename) == manifest_name:
-                manifest_info = info
-                break
+        manifest_infos = [
+            info for info in archive.infolist() if self._normalize_member_name(info.filename) == manifest_name
+        ]
 
-        if manifest_info is None:
+        if not manifest_infos:
             result.add_check(
                 name="TorchServe Manifest Presence",
                 passed=False,
@@ -315,45 +313,101 @@ class TorchServeMarScanner(BaseScanner):
             location=archive_path,
         )
 
-        try:
-            manifest_bytes = self._read_member_bounded(archive, manifest_info, self.MAX_MANIFEST_BYTES)
-        except ValueError as exc:
+        manifest_payloads: list[bytes] = []
+        path_references: list[tuple[str, str]] = []
+        handler_paths: list[str] = []
+        serialized_paths: list[str] = []
+        missing_required: set[str] = set()
+        parsed_manifest_count = 0
+
+        for manifest_info in manifest_infos:
+            manifest_details = self._build_member_details(
+                member_info=manifest_info,
+                normalized_member=manifest_name,
+                max_manifest_bytes=self.MAX_MANIFEST_BYTES,
+            )
+
+            try:
+                manifest_bytes = self._read_member_bounded(archive, manifest_info, self.MAX_MANIFEST_BYTES)
+            except ValueError as exc:
+                result.add_check(
+                    name="TorchServe Manifest Size Limit",
+                    passed=False,
+                    message=str(exc),
+                    severity=IssueSeverity.WARNING,
+                    location=f"{archive_path}:{MANIFEST_ENTRY_PATH}",
+                    details=manifest_details,
+                )
+                continue
+
+            manifest_payloads.append(manifest_bytes)
+
+            try:
+                manifest_data = json.loads(manifest_bytes.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                result.add_check(
+                    name="TorchServe Manifest JSON Parse",
+                    passed=False,
+                    message=f"Failed to parse TorchServe manifest JSON: {exc}",
+                    severity=IssueSeverity.WARNING,
+                    location=f"{archive_path}:{MANIFEST_ENTRY_PATH}",
+                    details={**manifest_details, "exception_type": type(exc).__name__},
+                )
+                continue
+
+            if not isinstance(manifest_data, dict):
+                result.add_check(
+                    name="TorchServe Manifest Structure",
+                    passed=False,
+                    message="TorchServe manifest must be a JSON object",
+                    severity=IssueSeverity.WARNING,
+                    location=f"{archive_path}:{MANIFEST_ENTRY_PATH}",
+                    details=manifest_details,
+                )
+                continue
+
+            parsed_manifest_count += 1
+            (
+                manifest_path_references,
+                manifest_handler_paths,
+                manifest_serialized_paths,
+                manifest_missing_required,
+            ) = self._collect_manifest_references(manifest_data)
+            path_references.extend(manifest_path_references)
+            handler_paths.extend(manifest_handler_paths)
+            serialized_paths.extend(manifest_serialized_paths)
+            missing_required.update(manifest_missing_required)
+
+        if len(manifest_infos) > 1 and (
+            parsed_manifest_count != len(manifest_infos)
+            or len(manifest_payloads) != len(manifest_infos)
+            or len(set(manifest_payloads)) > 1
+        ):
             result.add_check(
-                name="TorchServe Manifest Size Limit",
+                name="TorchServe Manifest Collision",
                 passed=False,
-                message=str(exc),
+                message="Archive contains multiple conflicting TorchServe manifest entries",
                 severity=IssueSeverity.WARNING,
                 location=f"{archive_path}:{MANIFEST_ENTRY_PATH}",
-                details={"max_manifest_bytes": self.MAX_MANIFEST_BYTES},
+                details={
+                    "manifest_entries": [
+                        self._build_member_details(
+                            member_info=manifest_info,
+                            normalized_member=manifest_name,
+                        )
+                        for manifest_info in manifest_infos
+                    ],
+                    "parsed_manifest_count": parsed_manifest_count,
+                },
             )
+
+        if parsed_manifest_count == 0:
             return manifest_context
 
-        try:
-            manifest_data = json.loads(manifest_bytes.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            result.add_check(
-                name="TorchServe Manifest JSON Parse",
-                passed=False,
-                message=f"Failed to parse TorchServe manifest JSON: {exc}",
-                severity=IssueSeverity.WARNING,
-                location=f"{archive_path}:{MANIFEST_ENTRY_PATH}",
-                details={"exception_type": type(exc).__name__},
-            )
-            return manifest_context
+        path_references = list(dict.fromkeys(path_references))
+        handler_paths = list(dict.fromkeys(handler_paths))
+        serialized_paths = list(dict.fromkeys(serialized_paths))
 
-        if not isinstance(manifest_data, dict):
-            result.add_check(
-                name="TorchServe Manifest Structure",
-                passed=False,
-                message="TorchServe manifest must be a JSON object",
-                severity=IssueSeverity.WARNING,
-                location=f"{archive_path}:{MANIFEST_ENTRY_PATH}",
-            )
-            return manifest_context
-
-        path_references, handler_paths, serialized_paths, missing_required = self._collect_manifest_references(
-            manifest_data,
-        )
         manifest_context["path_references"] = path_references
         manifest_context["handler_paths"] = handler_paths
         manifest_context["serialized_paths"] = serialized_paths
@@ -1031,6 +1085,29 @@ class TorchServeMarScanner(BaseScanner):
             return resolved_head
         return ".".join([resolved_head, *tail])
 
+    def _resolve_getattr_call_name(self, node: ast.AST, aliases: dict[str, str]) -> str | None:
+        if not isinstance(node, ast.Call) or len(node.args) < 2:
+            return None
+
+        helper_name = self._resolve_call_name(node.func)
+        if helper_name is None:
+            return None
+
+        resolved_helper_name = self._apply_alias(helper_name, aliases)
+        if resolved_helper_name not in {"getattr", "builtins.getattr"}:
+            return None
+
+        target_root = self._resolve_call_name(node.args[0])
+        if target_root is None:
+            return None
+
+        attr_name_node = node.args[1]
+        if not isinstance(attr_name_node, ast.Constant) or not isinstance(attr_name_node.value, str):
+            return None
+
+        resolved_target_root = self._apply_alias(target_root, aliases)
+        return f"{resolved_target_root}.{attr_name_node.value}"
+
     def _parse_python_source(self, source_bytes: bytes) -> tuple[ast.Module | None, str | None]:
         try:
             source = source_bytes.decode("utf-8")
@@ -1052,10 +1129,13 @@ class TorchServeMarScanner(BaseScanner):
                 continue
 
             call_name = self._resolve_call_name(node.func)
-            if call_name is None:
+            resolved_name = (
+                self._apply_alias(call_name, aliases)
+                if call_name is not None
+                else self._resolve_getattr_call_name(node.func, aliases)
+            )
+            if resolved_name is None:
                 continue
-
-            resolved_name = self._apply_alias(call_name, aliases)
             if resolved_name in HIGH_RISK_CALLS:
                 risky_calls.add(resolved_name)
                 continue
