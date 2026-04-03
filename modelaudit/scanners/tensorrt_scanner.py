@@ -15,7 +15,7 @@ SUSPICIOUS_PATTERN_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         ".so",
         re.compile(
-            r"(?<![A-Za-z0-9_.-])[A-Za-z0-9_+.-]+\.so(?:\.[A-Za-z0-9_+.-]+)?(?![A-Za-z0-9_.-])",
+            r"(?<![A-Za-z0-9_.-])(?:[A-Za-z0-9_+.-]+)?\.so(?:\.[A-Za-z0-9_+.-]+)?(?![A-Za-z0-9_.-])",
             re.IGNORECASE,
         ),
     ),
@@ -27,9 +27,9 @@ SUSPICIOUS_PATTERN_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ),
     ("eval", re.compile(r"(?<![A-Za-z0-9_])eval\s*(?:\(|$)", re.IGNORECASE)),
 )
-_ASCII_STRING_PATTERN = re.compile(rb"[\t\n\r\x20-\x7e]{4,}")
-_UTF16LE_STRING_PATTERN = re.compile(rb"(?:(?:[\t\n\r\x20-\x7e]\x00){4,})")
-_UTF16BE_STRING_PATTERN = re.compile(rb"(?:(?:\x00[\t\n\r\x20-\x7e]){4,})")
+_ASCII_STRING_PATTERN = re.compile(rb"[\t\n\r\x20-\x7e]{3,}")
+_UTF16LE_STRING_PATTERN = re.compile(rb"(?:(?:[\t\n\r\x20-\x7e]\x00){3,})")
+_UTF16BE_STRING_PATTERN = re.compile(rb"(?:(?:\x00[\t\n\r\x20-\x7e]){3,})")
 
 
 def _iter_engine_strings(data: bytes) -> Iterator[str]:

@@ -91,6 +91,18 @@ def test_tensorrt_scanner_avoids_substring_near_match_false_positives(tmp_path: 
     assert result.issues == []
 
 
+def test_tensorrt_scanner_detects_standalone_three_byte_markers(tmp_path: Path) -> None:
+    path = tmp_path / "standalone_markers.engine"
+    path.write_bytes(b"\x00../\x00.so\x00")
+
+    result = TensorRTScanner().scan(str(path))
+
+    assert result.success is False
+    matched_patterns = {issue.details.get("pattern") for issue in result.issues}
+    assert "../" in matched_patterns
+    assert ".so" in matched_patterns
+
+
 def test_tensorrt_scanner_safe_file(tmp_path: Path) -> None:
     path = tmp_path / "safe.engine"
     path.write_bytes(b"binarydata")
