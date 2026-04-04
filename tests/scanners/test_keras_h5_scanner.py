@@ -733,6 +733,64 @@ def test_lambda_module_reference_uses_token_boundaries_for_benign_modules(tmp_pa
     )
 
 
+def test_suspicious_config_string_check_detects_dunder_import_call(tmp_path: Path) -> None:
+    """Dunder-wrapped `__import__` calls must still match the `import` token check."""
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "dunder_import_model",
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "config": {"name": "dense", "initializer": "__import__('os')"},
+                    }
+                ],
+            },
+        },
+        keras_version="3.11.3",
+        file_name="dunder_import_model.h5",
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert any(
+        check.name == "Suspicious Configuration String Check"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("suspicious_term") == "import"
+        for check in result.checks
+    ), f"Expected '__import__' to match the import token check. Checks: {result.checks}"
+
+
+def test_suspicious_config_string_check_ignores_import_substring_in_identifiers(tmp_path: Path) -> None:
+    """Benign identifiers containing `import` as a substring should not be flagged."""
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "imported_model_name",
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "config": {"name": "imported_initializer", "units": 1},
+                    }
+                ],
+            },
+        },
+        keras_version="3.11.3",
+        file_name="imported_identifier_model.h5",
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert not any(
+        check.name == "Suspicious Configuration String Check" and check.details.get("suspicious_term") == "import"
+        for check in result.checks
+    ), f"Expected benign import-containing identifiers to stay quiet. Checks: {result.checks}"
+
+
 def test_wrapped_layer_config_layer_is_scanned_for_custom_inner_layers(tmp_path: Path) -> None:
     """Wrapper layers with `config.layer` must not hide nested custom classes."""
     model_path = create_custom_h5_file(

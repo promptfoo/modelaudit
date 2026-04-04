@@ -943,7 +943,11 @@ class KerasH5Scanner(BaseScanner):
 
         normalized_value = value.lower()
         if normalized_term.replace("_", "").isalnum():
-            pattern = rf"(?<![0-9A-Za-z_]){re.escape(normalized_term)}(?![0-9A-Za-z_])"
+            normalized_core_term = normalized_term.strip("_")
+            if not normalized_core_term:
+                return False
+
+            pattern = rf"(?<![0-9A-Za-z])_*{re.escape(normalized_core_term)}_*(?![0-9A-Za-z])"
             return re.search(pattern, normalized_value) is not None
 
         return normalized_term in normalized_value
