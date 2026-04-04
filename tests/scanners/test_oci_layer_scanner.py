@@ -314,8 +314,8 @@ class TestOciLayerScanner:
         assert result.success is True
         # Should have no issues since the file doesn't match any scanner
 
-    def test_scan_layer_skips_non_model_members_before_temp_copy(self, tmp_path: Path) -> None:
-        """Unknown-suffix members without model-like magic bytes should not be extracted or dispatched."""
+    def test_scan_layer_dispatches_unknown_suffix_non_model_members_without_findings(self, tmp_path: Path) -> None:
+        """Unknown-suffix members should still be dispatched so misnamed payloads cannot hide behind padding."""
         random_file = tmp_path / "picture.jpg"
         random_file.write_bytes(b"not-a-model-image-payload")
 
@@ -328,7 +328,7 @@ class TestOciLayerScanner:
         manifest_path.write_text(json.dumps(manifest))
 
         with (
-            patch("modelaudit.core.scan_file") as mock_scan,
+            patch("modelaudit.core.scan_file", return_value=ScanResult(scanner_name="unknown")) as mock_scan,
             patch(
                 "modelaudit.scanners.oci_layer_scanner.shutil.copyfileobj",
                 wraps=shutil.copyfileobj,
@@ -337,8 +337,10 @@ class TestOciLayerScanner:
             result = OciLayerScanner().scan(str(manifest_path))
 
         assert result.success is True
-        mock_scan.assert_not_called()
-        mock_copy.assert_not_called()
+        mock_scan.assert_called_once()
+        mock_copy.assert_called_once()
+        scanned_path = mock_scan.call_args.args[0]
+        assert scanned_path != "assets/picture.jpg"
 
     def test_scan_layer_dispatches_scannable_member_using_extracted_path(self, tmp_path: Path) -> None:
         """Members with registered extensions should be extracted and scanned."""
