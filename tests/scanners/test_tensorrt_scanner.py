@@ -85,7 +85,8 @@ def test_tensorrt_scanner_avoids_substring_near_match_false_positives(tmp_path: 
     path = tmp_path / "safe.engine"
     path.write_bytes(
         b"execution_metrics evaluation_score important_tensor session.socket "
-        b"attempt/tmpology LD_LIBRARY_PATH:/tmpology C:\\tmpology\\payload"
+        b"attempt/tmpology LD_LIBRARY_PATH:/tmpology C:\\tmpology\\payload "
+        b"load(/tmpbackup/safe.so.txt)"
     )
 
     result = TensorRTScanner().scan(str(path))
@@ -113,6 +114,18 @@ def test_tensorrt_scanner_detects_tmp_tokens_after_colon_and_windows_drive_prefi
 
     assert result.success is False
     assert any(issue.details.get("pattern") == "/tmp/" for issue in result.issues)
+
+
+def test_tensorrt_scanner_detects_tmp_tokens_after_punctuation_delimiters(tmp_path: Path) -> None:
+    path = tmp_path / "punctuated_tmp.engine"
+    path.write_bytes(b"load(/tmp/evil.so)\ncmd;/tmp/payload\nload(/tmp/libc.so.6)\n")
+
+    result = TensorRTScanner().scan(str(path))
+
+    assert result.success is False
+    matched_patterns = {issue.details.get("pattern") for issue in result.issues}
+    assert "/tmp/" in matched_patterns
+    assert ".so" in matched_patterns
 
 
 def test_tensorrt_scanner_detects_standalone_three_byte_markers(tmp_path: Path) -> None:

@@ -11,11 +11,11 @@ from .base import BaseScanner, IssueSeverity, ScanResult
 
 SUSPICIOUS_PATTERN_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("../", re.compile(r"(?<![A-Za-z0-9_.-])(?:\.\./|\.\.\\)", re.IGNORECASE)),
-    ("/tmp/", re.compile(r"(?:^|[\s'\"=:])(?:/tmp/|(?:[A-Za-z]:)?\\tmp\\)", re.IGNORECASE)),
+    ("/tmp/", re.compile(r"(?<![A-Za-z0-9_.-])(?:/tmp/|(?:[A-Za-z]:)?\\tmp\\)", re.IGNORECASE)),
     (
         ".so",
         re.compile(
-            r"(?<![A-Za-z0-9_.-])(?:[A-Za-z0-9_+.-]+)?\.so(?:\.[A-Za-z0-9_+.-]+)?(?![A-Za-z0-9_.-])",
+            r"(?<![A-Za-z0-9_.-])(?:[A-Za-z0-9_+.-]+)?\.so(?:\.[0-9]+(?:\.[0-9]+)*)?(?![A-Za-z0-9_.-])",
             re.IGNORECASE,
         ),
     ),
