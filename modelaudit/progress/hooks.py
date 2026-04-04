@@ -670,6 +670,18 @@ class ProgressHookManager:
         """
         return list(self._hooks.keys())
 
+    def _set_hook_enabled(self, name: str, enabled: bool) -> bool:
+        """Enable or disable a hook by name."""
+        hook = self._hooks.get(name)
+        if not hook:
+            return False
+
+        if enabled:
+            hook.enable()
+        else:
+            hook.disable()
+        return True
+
     def enable_hook(self, name: str) -> bool:
         """Enable a hook.
 
@@ -679,11 +691,7 @@ class ProgressHookManager:
         Returns:
             True if hook was enabled
         """
-        hook = self._hooks.get(name)
-        if hook:
-            hook.enable()
-            return True
-        return False
+        return self._set_hook_enabled(name, True)
 
     def disable_hook(self, name: str) -> bool:
         """Disable a hook.
@@ -694,61 +702,50 @@ class ProgressHookManager:
         Returns:
             True if hook was disabled
         """
-        hook = self._hooks.get(name)
-        if hook:
-            hook.disable()
-            return True
-        return False
+        return self._set_hook_enabled(name, False)
 
     def clear_hooks(self) -> None:
         """Remove all hooks."""
         self._hooks.clear()
         logger.debug("Cleared all progress hooks")
 
+    def _trigger_hooks(
+        self,
+        event_name: str,
+        callback: Callable[[ProgressHook], None],
+    ) -> None:
+        """Invoke a hook callback for all enabled hooks."""
+        for hook in self._hooks.values():
+            if not hook.enabled:
+                continue
+
+            try:
+                callback(hook)
+            except Exception as e:
+                logger.warning(f"Hook {hook.name} failed on {event_name}: {e}")
+
     def trigger_start(self, stats: ProgressStats) -> None:
         """Trigger start event for all hooks."""
-        for hook in self._hooks.values():
-            if hook.enabled:
-                try:
-                    hook.on_start(stats)
-                except Exception as e:
-                    logger.warning(f"Hook {hook.name} failed on start: {e}")
+        self._trigger_hooks("start", lambda hook: hook.on_start(stats))
 
     def trigger_progress(self, stats: ProgressStats) -> None:
         """Trigger progress event for all hooks."""
-        for hook in self._hooks.values():
-            if hook.enabled:
-                try:
-                    hook.on_progress(stats)
-                except Exception as e:
-                    logger.warning(f"Hook {hook.name} failed on progress: {e}")
+        self._trigger_hooks("progress", lambda hook: hook.on_progress(stats))
 
     def trigger_phase_change(self, old_phase: ProgressPhase, new_phase: ProgressPhase, stats: ProgressStats) -> None:
         """Trigger phase change event for all hooks."""
-        for hook in self._hooks.values():
-            if hook.enabled:
-                try:
-                    hook.on_phase_change(old_phase, new_phase, stats)
-                except Exception as e:
-                    logger.warning(f"Hook {hook.name} failed on phase change: {e}")
+        self._trigger_hooks(
+            "phase change",
+            lambda hook: hook.on_phase_change(old_phase, new_phase, stats),
+        )
 
     def trigger_complete(self, stats: ProgressStats) -> None:
         """Trigger complete event for all hooks."""
-        for hook in self._hooks.values():
-            if hook.enabled:
-                try:
-                    hook.on_complete(stats)
-                except Exception as e:
-                    logger.warning(f"Hook {hook.name} failed on complete: {e}")
+        self._trigger_hooks("complete", lambda hook: hook.on_complete(stats))
 
     def trigger_error(self, error: Exception, stats: ProgressStats) -> None:
         """Trigger error event for all hooks."""
-        for hook in self._hooks.values():
-            if hook.enabled:
-                try:
-                    hook.on_error(error, stats)
-                except Exception as e:
-                    logger.warning(f"Hook {hook.name} failed on error: {e}")
+        self._trigger_hooks("error", lambda hook: hook.on_error(error, stats))
 
 
 # Global hook manager instance

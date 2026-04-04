@@ -1520,21 +1520,20 @@ class BaseScanner(ABC):
 
     def add_progress_reporter(self, reporter: Any) -> None:
         """Add a progress reporter to this scanner."""
-        # Initialize progress tracker if not already done
-        if PROGRESS_AVAILABLE and self._enable_progress and not self.progress_tracker:
-            self._initialize_progress_tracker()
-
-        if self.progress_tracker:
-            self.progress_tracker.add_reporter(reporter)
+        self._add_progress_observer("add_reporter", reporter)
 
     def add_progress_callback(self, callback: Any) -> None:
         """Add a progress callback to this scanner."""
+        self._add_progress_observer("add_callback", callback)
+
+    def _add_progress_observer(self, method_name: str, observer: Any) -> None:
+        """Attach a progress reporter or callback, initializing tracking if needed."""
         # Initialize progress tracker if not already done
         if PROGRESS_AVAILABLE and self._enable_progress and not self.progress_tracker:
             self._initialize_progress_tracker()
 
         if self.progress_tracker:
-            self.progress_tracker.add_callback(callback)
+            getattr(self.progress_tracker, method_name)(observer)
 
     def extract_metadata(self, file_path: str) -> dict[str, Any]:
         """Extract metadata from model file. Override in subclasses for format-specific extraction."""

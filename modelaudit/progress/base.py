@@ -7,6 +7,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Literal
 
 logger = logging.getLogger("modelaudit.progress")
 
@@ -237,6 +238,26 @@ class ProgressTracker:
                 except Exception as e:
                     logger.warning(f"Progress reporter failed during phase change: {e}")
 
+    def _update_progress_counter(
+        self,
+        counter_name: Literal["bytes_processed", "items_processed"],
+        counter_value: int,
+        current_item: str,
+        *,
+        increment: bool,
+    ) -> None:
+        """Update one progress counter and report the new state."""
+        with self._lock:
+            if increment:
+                setattr(self.stats, counter_name, getattr(self.stats, counter_name) + counter_value)
+            else:
+                setattr(self.stats, counter_name, counter_value)
+
+            if current_item:
+                self.stats.current_item = current_item
+            self.stats.update_performance_metrics()
+            self._maybe_report_progress()
+
     def update_bytes(self, bytes_processed: int, current_item: str = "") -> None:
         """Update bytes processed.
 
@@ -244,12 +265,12 @@ class ProgressTracker:
             bytes_processed: Number of bytes processed so far
             current_item: Name of current item being processed
         """
-        with self._lock:
-            self.stats.bytes_processed = bytes_processed
-            if current_item:
-                self.stats.current_item = current_item
-            self.stats.update_performance_metrics()
-            self._maybe_report_progress()
+        self._update_progress_counter(
+            "bytes_processed",
+            bytes_processed,
+            current_item,
+            increment=False,
+        )
 
     def increment_bytes(self, bytes_delta: int, current_item: str = "") -> None:
         """Increment bytes processed by a delta.
@@ -258,12 +279,12 @@ class ProgressTracker:
             bytes_delta: Additional bytes processed
             current_item: Name of current item being processed
         """
-        with self._lock:
-            self.stats.bytes_processed += bytes_delta
-            if current_item:
-                self.stats.current_item = current_item
-            self.stats.update_performance_metrics()
-            self._maybe_report_progress()
+        self._update_progress_counter(
+            "bytes_processed",
+            bytes_delta,
+            current_item,
+            increment=True,
+        )
 
     def update_items(self, items_processed: int, current_item: str = "") -> None:
         """Update items processed.
@@ -272,12 +293,12 @@ class ProgressTracker:
             items_processed: Number of items processed so far
             current_item: Name of current item being processed
         """
-        with self._lock:
-            self.stats.items_processed = items_processed
-            if current_item:
-                self.stats.current_item = current_item
-            self.stats.update_performance_metrics()
-            self._maybe_report_progress()
+        self._update_progress_counter(
+            "items_processed",
+            items_processed,
+            current_item,
+            increment=False,
+        )
 
     def increment_items(self, items_delta: int = 1, current_item: str = "") -> None:
         """Increment items processed by a delta.
@@ -286,12 +307,12 @@ class ProgressTracker:
             items_delta: Additional items processed
             current_item: Name of current item being processed
         """
-        with self._lock:
-            self.stats.items_processed += items_delta
-            if current_item:
-                self.stats.current_item = current_item
-            self.stats.update_performance_metrics()
-            self._maybe_report_progress()
+        self._update_progress_counter(
+            "items_processed",
+            items_delta,
+            current_item,
+            increment=True,
+        )
 
     def set_status(self, message: str) -> None:
         """Set status message.
