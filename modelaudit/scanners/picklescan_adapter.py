@@ -251,29 +251,28 @@ def _to_issue_severity(severity: Severity) -> IssueSeverity:
 def _should_suppress_parse_failure_escalation(report: PickleReport) -> bool:
     """Keep known benign malformed tails as INFO notices while preserving fail-closed truncation."""
     source_ext = os.path.splitext(report.source)[1].lower()
-    if source_ext == ".bin":
-        return True
-
     if report.has_security_findings:
         return False
+
+    first_pickle_end_pos = report.metadata.get("first_pickle_end_pos")
+    has_trusted_pickle_boundary = isinstance(first_pickle_end_pos, int) and first_pickle_end_pos >= 0
 
     for notice in report.notices:
         if notice.code != "parse_incomplete":
             continue
 
-        if notice.details.get("exception_type") == "UnicodeDecodeError":
+        if has_trusted_pickle_boundary:
             return True
+
+        if notice.details.get("exception_type") == "UnicodeDecodeError":
+            return _has_only_non_dangerous_import_references(report)
 
         if notice.details.get("exception_type") != "ValueError":
             continue
 
         exception_message = str(notice.details.get("exception", ""))
-        if report.metadata.get("first_pickle_end_pos") is not None and exception_message.endswith(
-            "opcode b'\\x00' unknown"
-        ):
-            return True
         if (
-            source_ext in {".joblib", ".dill"}
+            source_ext in {".joblib", ".dill", ".bin"}
             and "opcode b'" in exception_message
             and exception_message.endswith(" unknown")
             and _has_only_benign_serialization_tail_imports(report)
@@ -300,6 +299,15 @@ def _has_only_benign_serialization_tail_imports(report: PickleReport) -> bool:
             return False
 
     return True
+
+
+def _has_only_non_dangerous_import_references(report: PickleReport) -> bool:
+    import_references = report.metadata.get("import_references")
+    if not isinstance(import_references, list) or not import_references:
+        return False
+    return all(
+        isinstance(reference, Mapping) and not bool(reference.get("is_dangerous")) for reference in import_references
+    )
 
 
 def _apply_member_context_to_record(

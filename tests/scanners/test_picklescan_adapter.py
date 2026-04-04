@@ -265,7 +265,41 @@ def test_pickle_report_to_scan_result_escalates_parse_incomplete_notices_to_pars
     )
 
 
-def test_pickle_report_to_scan_result_skips_parse_failure_escalation_for_bin_sources() -> None:
+def test_pickle_report_to_scan_result_escalates_parse_failure_for_truncated_bin_sources() -> None:
+    report = PickleReport(
+        source="truncated.bin",
+        status=ScanStatus.INCONCLUSIVE,
+        verdict=SafetyVerdict.UNKNOWN,
+        notices=(
+            Notice(
+                message="Pickle parsing stopped before the stream was fully consumed: EOFError",
+                severity=Severity.INFO,
+                location="truncated.bin (pos 57)",
+                code="parse_incomplete",
+                details={
+                    "exception": "pickle exhausted before seeing STOP",
+                    "exception_type": "EOFError",
+                    "analysis_incomplete": True,
+                },
+            ),
+        ),
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and issue.message == "Pickle parsing failed before full scan completion"
+        and issue.location == "truncated.bin (pos 57)"
+        and issue.details["parse_error"] == "pickle exhausted before seeing STOP"
+        and issue.details["failure_reason"] == "unknown_opcode_or_format_error"
+        for issue in result.issues
+    )
+
+
+def test_pickle_report_to_scan_result_keeps_trusted_bin_padding_tails_as_inconclusive_notices() -> None:
     report = PickleReport(
         source="weights.bin",
         status=ScanStatus.INCONCLUSIVE,
@@ -276,9 +310,14 @@ def test_pickle_report_to_scan_result_skips_parse_failure_escalation_for_bin_sou
                 severity=Severity.INFO,
                 location="weights.bin (pos 57)",
                 code="parse_incomplete",
-                details={"analysis_incomplete": True},
+                details={
+                    "exception": "at position 4096, opcode b'\\x00' unknown",
+                    "exception_type": "ValueError",
+                    "analysis_incomplete": True,
+                },
             ),
         ),
+        metadata={"first_pickle_end_pos": 56},
     )
 
     result = pickle_report_to_scan_result(report)
@@ -312,6 +351,7 @@ def test_pickle_report_to_scan_result_keeps_unicode_decode_tails_as_inconclusive
                 },
             ),
         ),
+        metadata={"first_pickle_end_pos": 20},
     )
 
     result = pickle_report_to_scan_result(report)
@@ -380,6 +420,7 @@ def test_pickle_report_to_scan_result_keeps_joblib_unknown_opcode_tails_as_incon
             ),
         ),
         metadata={
+            "first_pickle_end_pos": 230,
             "import_references": [
                 {
                     "import_reference": "joblib.numpy_pickle.NumpyArrayWrapper",
@@ -397,7 +438,7 @@ def test_pickle_report_to_scan_result_keeps_joblib_unknown_opcode_tails_as_incon
                     "position": 103,
                     "is_dangerous": False,
                 },
-            ]
+            ],
         },
     )
 

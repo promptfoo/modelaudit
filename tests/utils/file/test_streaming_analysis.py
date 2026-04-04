@@ -80,3 +80,37 @@ def test_stream_analyze_file_falls_back_to_bytes_to_read(tmp_path: Path, monkeyp
     assert was_complete is False
     assert result is not None
     assert result.bytes_scanned == 4
+
+
+def test_stream_analyze_file_does_not_retry_sourceful_scan_stream_typeerror(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = tmp_path / "sample.pkl"
+    file_path.write_bytes(b"\x80\x04K*\x85q\x00.")
+    url = f"file://{file_path}"
+
+    monkeypatch.setattr(streaming, "get_fs_protocol", lambda u: "file")
+    monkeypatch.setattr(fsspec, "filesystem", lambda protocol, token=None: LocalFileSystem())
+
+    call_count = 0
+
+    def fake_scan_stream(
+        self: PickleScanner,
+        file_obj: object,
+        size: int,
+        source: str = "<stream>",
+    ) -> ScanResult:
+        del self, file_obj, size, source
+        nonlocal call_count
+        call_count += 1
+        raise TypeError("simulated runtime type error")
+
+    monkeypatch.setattr(PickleScanner, "scan_stream", fake_scan_stream)
+
+    scanner = PickleScanner()
+    result, was_complete = streaming.stream_analyze_file(url, scanner)
+
+    assert call_count == 1
+    assert was_complete is True
+    assert result is not None
