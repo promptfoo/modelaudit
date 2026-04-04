@@ -228,6 +228,28 @@ def test_keras_h5_scanner_skips_cve_2026_1669_on_fixed_version(tmp_path: Path) -
     )
 
 
+@pytest.mark.parametrize("keras_version", ["3.13.x", "2.12.0-gpu"])
+def test_keras_h5_scanner_unparseable_external_reference_versions_mark_unknown_risk(
+    tmp_path: Path,
+    keras_version: str,
+) -> None:
+    model_path = create_h5_with_external_link(tmp_path, keras_version=keras_version)
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+    assert len(cve_issues) == 1
+    assert cve_issues[0].severity == IssueSeverity.WARNING
+    assert cve_issues[0].details["keras_version"] == keras_version
+    assert cve_issues[0].details["parse_status"] == "unknown"
+    assert any("is non-canonical" in issue.message for issue in cve_issues)
+
+    assert not any(
+        check.name == "HDF5 External Weight Reference Version Check" and check.status == CheckStatus.PASSED
+        for check in result.checks
+    )
+
+
 def test_keras_h5_scanner_benign_model_has_no_warning_noise(tmp_path: Path) -> None:
     """Benign H5 models should not produce warning or critical noise."""
     model_path = create_custom_h5_file(
@@ -655,7 +677,7 @@ def test_actual_keras_model_still_scans_properly(tmp_path):
     assert "layer_counts" in result.metadata
 
 
-def test_malicious_keras_model_still_detected(tmp_path):
+def test_malicious_keras_model_still_detected(tmp_path: Path) -> None:
     """Test that malicious Keras models are still properly detected."""
     # Create a malicious Keras model file
     malicious_path = create_mock_h5_file(tmp_path, malicious=True)
@@ -663,7 +685,7 @@ def test_malicious_keras_model_still_detected(tmp_path):
     scanner = KerasH5Scanner()
     result = scanner.scan(str(malicious_path))
 
-    assert result.success is True
+    assert result.success is False
 
     # Should detect the malicious patterns
     malicious_issues = [
@@ -673,6 +695,153 @@ def test_malicious_keras_model_still_detected(tmp_path):
         and any(keyword in issue.message.lower() for keyword in ["suspicious", "lambda", "eval", "malicious"])
     ]
     assert len(malicious_issues) > 0, "Malicious Keras models should still be detected"
+
+
+def test_lambda_module_reference_uses_token_boundaries_for_benign_modules(tmp_path: Path) -> None:
+    """Benign module names containing suspicious substrings should not trigger CRITICAL findings."""
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "benign_module_reference",
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {
+                            "module": "custom_package.systematic_math",
+                            "function_name": "normalize",
+                        },
+                    }
+                ],
+            },
+        },
+        keras_version="3.11.3",
+        file_name="benign_systematic_module.h5",
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert result.success is True
+    assert not any(
+        check.name == "Lambda Layer Module Reference Check" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+    assert not any(
+        check.name == "Suspicious Configuration String Check" and check.details.get("suspicious_term") == "system"
+        for check in result.checks
+    )
+
+
+def test_suspicious_config_string_check_detects_dunder_import_call(tmp_path: Path) -> None:
+    """Dunder-wrapped `__import__` calls must still match the `import` token check."""
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "dunder_import_model",
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "config": {"name": "dense", "initializer": "__import__('os')"},
+                    }
+                ],
+            },
+        },
+        keras_version="3.11.3",
+        file_name="dunder_import_model.h5",
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert any(
+        check.name == "Suspicious Configuration String Check"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("suspicious_term") == "import"
+        for check in result.checks
+    ), f"Expected '__import__' to match the import token check. Checks: {result.checks}"
+
+
+def test_suspicious_config_string_check_ignores_import_substring_in_identifiers(tmp_path: Path) -> None:
+    """Benign identifiers containing `import` as a substring should not be flagged."""
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "imported_model_name",
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "config": {"name": "imported_initializer", "units": 1},
+                    }
+                ],
+            },
+        },
+        keras_version="3.11.3",
+        file_name="imported_identifier_model.h5",
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert not any(
+        check.name == "Suspicious Configuration String Check" and check.details.get("suspicious_term") == "import"
+        for check in result.checks
+    ), f"Expected benign import-containing identifiers to stay quiet. Checks: {result.checks}"
+
+
+def test_wrapped_layer_config_layer_is_scanned_for_custom_inner_layers(tmp_path: Path) -> None:
+    """Wrapper layers with `config.layer` must not hide nested custom classes."""
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "wrapped_custom_layer",
+                "layers": [
+                    {
+                        "class_name": "TimeDistributed",
+                        "config": {
+                            "name": "wrapper",
+                            "layer": {
+                                "class_name": "MaliciousLayer",
+                                "config": {"name": "inner_bad"},
+                            },
+                        },
+                    }
+                ],
+            },
+        },
+        keras_version="3.11.3",
+        file_name="wrapped_custom_layer.h5",
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert result.success is True
+    assert any(
+        check.name == "Custom Layer Class Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("layer_class") == "MaliciousLayer"
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize("keras_version", ["3.12.1rc1", "3.13.2rc1"])
+def test_keras_h5_scanner_treats_cve_2026_1669_fix_prereleases_as_vulnerable(
+    tmp_path: Path,
+    keras_version: str,
+) -> None:
+    """Prerelease builds at the CVE-2026-1669 fix boundary should still be flagged."""
+    model_path = create_h5_with_external_link(tmp_path, keras_version=keras_version)
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+    assert len(cve_issues) == 1
+    assert cve_issues[0].severity == IssueSeverity.WARNING
+    assert cve_issues[0].details["keras_version"] == keras_version
 
 
 def test_regression_no_false_positives_for_legitimate_files(tmp_path):
@@ -1038,10 +1207,32 @@ class TestCVE20259905H5SafeMode:
         cve_issues = [i for i in result.issues if "CVE-2025-9905" in i.message]
         assert len(cve_issues) == 0, "Fixed Keras versions should not trigger CVE-2025-9905 attribution"
 
+    def test_cve_fix_prerelease_still_triggers_cve_2025_9905(self, tmp_path: Path) -> None:
+        """3.11.3 prereleases are still pre-fix builds and should remain CVE-attributed."""
+        model_path = create_custom_h5_file(
+            tmp_path,
+            {
+                "class_name": "Sequential",
+                "config": {
+                    "name": "test",
+                    "layers": [{"class_name": "Lambda", "config": {"function": "lambda x: x"}}],
+                },
+            },
+            keras_version="3.11.3rc1",
+            file_name="model_prerelease.h5",
+        )
+
+        result = KerasH5Scanner().scan(str(model_path))
+
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-9905"]
+        assert len(cve_issues) == 1
+        assert cve_issues[0].severity == IssueSeverity.CRITICAL
+        assert cve_issues[0].details["keras_version"] == "3.11.3rc1"
+
     def test_unparseable_keras_versions_mark_unknown_risk(self, tmp_path: Path) -> None:
         """Unparseable versions must not be treated as safely non-vulnerable."""
         scanner = KerasH5Scanner()
-        versions = ["3.11", "3.11.x", "not-a-version"]
+        versions = ["3.11.x", "2.12.0-gpu", "not-a-version"]
 
         for version in versions:
             h5_path = tmp_path / f"model_{version.replace('.', '_')}.h5"
@@ -1069,6 +1260,51 @@ class TestCVE20259905H5SafeMode:
 
             passed_checks = [c for c in result.checks if c.name == "H5 Lambda Version Risk Check"]
             assert len(passed_checks) == 0, f"Version {version} should not be marked as safely outside vulnerable range"
+
+    def test_cve_2024_3660_unparseable_version_marks_unknown_risk(self, tmp_path: Path) -> None:
+        model_path = create_custom_h5_file(
+            tmp_path,
+            {
+                "class_name": "Sequential",
+                "config": {
+                    "name": "test",
+                    "layers": [{"class_name": "Lambda", "config": {"function": "lambda x: x"}}],
+                },
+            },
+            keras_version="2.12.0-gpu",
+            file_name="model_noncanonical_2_12_gpu.h5",
+        )
+
+        result = KerasH5Scanner().scan(str(model_path))
+
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2024-3660"]
+        assert len(cve_issues) == 1
+        assert cve_issues[0].severity == IssueSeverity.WARNING
+        assert cve_issues[0].details["keras_version"] == "2.12.0-gpu"
+        assert cve_issues[0].details["parse_status"] == "unknown"
+        assert "is non-canonical" in cve_issues[0].message
+
+    def test_two_part_keras_versions_are_parsed_with_zero_patch(self, tmp_path: Path) -> None:
+        """Two-part versions such as 3.11 should be evaluated as 3.11.0, not unknown risk."""
+        model_path = create_custom_h5_file(
+            tmp_path,
+            {
+                "class_name": "Sequential",
+                "config": {
+                    "name": "test",
+                    "layers": [{"class_name": "Lambda", "config": {"function": "lambda x: x"}}],
+                },
+            },
+            keras_version="3.11",
+            file_name="model_3_11.h5",
+        )
+
+        result = KerasH5Scanner().scan(str(model_path))
+
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-9905"]
+        assert len(cve_issues) == 1
+        assert cve_issues[0].severity == IssueSeverity.CRITICAL
+        assert cve_issues[0].details.get("parse_status") != "unknown"
 
     def test_pep440_keras_versions_within_vulnerable_range_are_critical(self, tmp_path: Path) -> None:
         """PEP 440 prerelease/postrelease variants in vulnerable range should be attributed."""
