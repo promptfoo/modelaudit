@@ -314,6 +314,32 @@ class TestOciLayerScanner:
         assert result.success is True
         # Should have no issues since the file doesn't match any scanner
 
+    def test_scan_layer_skips_non_model_members_before_temp_copy(self, tmp_path: Path) -> None:
+        """Unknown-suffix members without model-like magic bytes should not be extracted or dispatched."""
+        random_file = tmp_path / "picture.jpg"
+        random_file.write_bytes(b"not-a-model-image-payload")
+
+        layer_path = tmp_path / "layer.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            tar.add(random_file, arcname="assets/picture.jpg")
+
+        manifest = {"layers": ["layer.tar.gz"]}
+        manifest_path = tmp_path / "skip-non-model.manifest"
+        manifest_path.write_text(json.dumps(manifest))
+
+        with (
+            patch("modelaudit.core.scan_file") as mock_scan,
+            patch(
+                "modelaudit.scanners.oci_layer_scanner.shutil.copyfileobj",
+                wraps=shutil.copyfileobj,
+            ) as mock_copy,
+        ):
+            result = OciLayerScanner().scan(str(manifest_path))
+
+        assert result.success is True
+        mock_scan.assert_not_called()
+        mock_copy.assert_not_called()
+
     def test_scan_layer_dispatches_scannable_member_using_extracted_path(self, tmp_path: Path) -> None:
         """Members with registered extensions should be extracted and scanned."""
         onnx_file = tmp_path / "model.onnx"

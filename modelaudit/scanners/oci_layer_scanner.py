@@ -9,7 +9,11 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from ..utils import is_within_directory, sanitize_archive_path
-from ..utils.file.detection import detect_file_format
+from ..utils.file.detection import (
+    MARKED_PROTOCOL0_GLOBAL_RE,
+    PROTOCOL0_GLOBAL_RE,
+    detect_file_format,
+)
 from ..utils.model_extensions import get_model_extensions
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -41,6 +45,7 @@ class OciLayerScanner(BaseScanner):
     }
     _LAYER_ARCHIVE_SUFFIX: ClassVar[str] = ".tar.gz"
     _MANIFEST_PROBE_CHUNK_BYTES: ClassVar[int] = 8192
+    _MEMBER_HEADER_PROBE_BYTES: ClassVar[int] = 64
     _DEFAULT_MAX_LAYER_FILE_SIZE: ClassVar[int] = 10 * 1024 * 1024 * 1024
 
     def __init__(self, config: dict[str, Any] | None = None):
@@ -129,6 +134,37 @@ class OciLayerScanner(BaseScanner):
         """Return a canonical suffix for detected content-based formats."""
         detected_format = detect_file_format(extracted_path)
         return cls._DETECTED_FORMAT_SUFFIXES.get(detected_format)
+
+    @staticmethod
+    def _looks_like_model_member_prefix(data: bytes) -> bool:
+        """Return True when an extensionless or misnamed member has model-like magic bytes."""
+        if len(data) >= 8 and data[4:8] == b"TFL3":
+            return True
+        if data.startswith(
+            (
+                b"\x80\x02",
+                b"\x80\x03",
+                b"\x80\x04",
+                b"\x80\x05",
+                b"\x89HDF\r\n\x1a\n",
+                b"\x93NUMPY",
+                b"GGUF",
+                b"GGML",
+                b"GGMF",
+                b"GGJT",
+                b"GGLA",
+                b"GGSA",
+                b"PK\x03\x04",
+                b"PK\x05\x06",
+                b"PK\x07\x08",
+                b"\x08\x01\x12\x00",
+                b"ONNX",
+                b"onnx",
+                b"<?xml",
+            )
+        ):
+            return True
+        return bool(PROTOCOL0_GLOBAL_RE.match(data) or MARKED_PROTOCOL0_GLOBAL_RE.match(data))
 
     def scan(self, path: str) -> ScanResult:
         path_check = self._check_path(path)
@@ -274,13 +310,21 @@ class OciLayerScanner(BaseScanner):
                                 rule_code="S902",
                             )
                             continue
+                        header_prefix = b""
                         tmp_path: str | None = None
                         try:
+                            if matched_ext is None:
+                                header_prefix = fileobj.read(self._MEMBER_HEADER_PROBE_BYTES)
+                                if not self._looks_like_model_member_prefix(header_prefix):
+                                    continue
+
                             with tempfile.NamedTemporaryFile(
                                 suffix=matched_ext or "",
                                 delete=False,
                             ) as tmp:
                                 tmp_path = tmp.name
+                                if header_prefix:
+                                    tmp.write(header_prefix)
                                 shutil.copyfileobj(fileobj, tmp)
 
                             from .. import core
