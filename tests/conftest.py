@@ -1,3 +1,5 @@
+import importlib
+import importlib.util
 import logging
 import os
 import pickle
@@ -6,33 +8,56 @@ import sys
 import tempfile
 import zipfile
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 
+from tests.xdist_status import (
+    WORKER_STATUS_DIR_KEY,
+    XdistWorkerStatusReporter,
+    clear_worker_status,
+    status_file_for_worker,
+    write_worker_status,
+)
 
 # ============================================================================
 # Framework availability detection (cached for performance)
 # ============================================================================
+_FRAMEWORK_MODULES = {
+    "tensorflow": "tensorflow",
+    "pytorch": "torch",
+    "onnx": "onnx",
+    "h5py": "h5py",
+    "msgpack": "msgpack",
+    "xgboost": "xgboost",
+    "safetensors": "safetensors",
+    "joblib": "joblib",
+    "dill": "dill",
+}
+_FRAMEWORK_AVAILABILITY: dict[str, bool] = {}
+
+
 def _check_framework(name: str) -> bool:
-    """Check if a framework can be imported successfully."""
+    """Check whether a framework package can be imported, with lazy caching."""
+    cached_result = _FRAMEWORK_AVAILABILITY.get(name)
+    if cached_result is not None:
+        return cached_result
+
     try:
-        __import__(name)
-        return True
+        is_available = importlib.util.find_spec(name) is not None
+        if is_available:
+            importlib.import_module(name)
     except Exception:
-        return False
+        is_available = False
+
+    _FRAMEWORK_AVAILABILITY[name] = is_available
+    return is_available
 
 
-# Cache framework availability at module load time
-HAS_TENSORFLOW = _check_framework("tensorflow")
-HAS_TORCH = _check_framework("torch")
-HAS_ONNX = _check_framework("onnx")
-HAS_H5PY = _check_framework("h5py")
-HAS_MSGPACK = _check_framework("msgpack")
-HAS_XGBOOST = _check_framework("xgboost")
-HAS_SAFETENSORS = _check_framework("safetensors")
-HAS_JOBLIB = _check_framework("joblib")
-HAS_DILL = _check_framework("dill")
+_xdist_status_reporter: XdistWorkerStatusReporter | None = None
+_xdist_worker_status_file: Path | None = None
+_xdist_workerid: str | None = None
 
 
 def _detect_symlink_support() -> bool:
@@ -63,6 +88,7 @@ def pytest_runtest_setup(item):
         allowed_test_files = [
             "test_xgboost_scanner.py",
             "test_pickle_scanner.py",
+            "test_joblib_scanner_codecs.py",  # Joblib raw/compressed pickle fallback regression tests
             "test_base_scanner.py",
             "test_core.py",
             "test_cli.py",
@@ -137,6 +163,7 @@ def pytest_runtest_setup(item):
             "test_large_file_handler.py",  # Large file handler regression tests
             "test_file_iterator.py",  # Streaming file iterator memory regression tests
             "test_benchmark_report.py",  # benchmark CI summary and regression gate tests
+            "test_xdist_status.py",  # xdist worker progress reporting tests
         ]
 
         # Check if this is an allowed test file
@@ -147,21 +174,9 @@ def pytest_runtest_setup(item):
             pytest.skip(f"Skipping test on Python {sys.version_info[:2]} - only core functionality tested")
 
     # Auto-skip tests based on framework markers when framework is unavailable
-    framework_markers = {
-        "tensorflow": HAS_TENSORFLOW,
-        "pytorch": HAS_TORCH,
-        "onnx": HAS_ONNX,
-        "h5py": HAS_H5PY,
-        "msgpack": HAS_MSGPACK,
-        "xgboost": HAS_XGBOOST,
-        "safetensors": HAS_SAFETENSORS,
-        "joblib": HAS_JOBLIB,
-        "dill": HAS_DILL,
-    }
-
-    for marker_name, is_available in framework_markers.items():
+    for marker_name, module_name in _FRAMEWORK_MODULES.items():
         marker = item.get_closest_marker(marker_name)
-        if marker is not None and not is_available:
+        if marker is not None and not _check_framework(module_name):
             pytest.skip(f"{marker_name} is not installed")
 
 
@@ -305,6 +320,8 @@ def performance_markers():
 # Configure pytest to handle missing optional dependencies gracefully
 def pytest_configure(config):
     """Configure pytest with custom markers."""
+    global _xdist_worker_status_file, _xdist_workerid
+
     # Test category markers
     config.addinivalue_line(
         "markers",
@@ -353,6 +370,81 @@ def pytest_configure(config):
         "markers",
         "dill: mark test as requiring dill",
     )
+
+    workerinput = getattr(config, "workerinput", None)
+    if not workerinput:
+        return
+
+    status_dir = workerinput.get(WORKER_STATUS_DIR_KEY)
+    workerid = workerinput.get("workerid")
+    if status_dir and workerid:
+        _xdist_workerid = str(workerid)
+        _xdist_worker_status_file = status_file_for_worker(Path(status_dir), _xdist_workerid)
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_configure_node(node: Any) -> None:
+    """Pass the shared xdist worker-status directory to each worker."""
+    global _xdist_status_reporter
+
+    if _xdist_status_reporter is None:
+        status_dir = node.config._tmp_path_factory.mktemp("modelaudit-pytest-xdist")  # type: ignore[attr-defined]
+        _xdist_status_reporter = XdistWorkerStatusReporter.from_environment(status_dir)
+        if _xdist_status_reporter is None:
+            return
+        _xdist_status_reporter.start()
+
+    node.workerinput[WORKER_STATUS_DIR_KEY] = str(_xdist_status_reporter.status_dir)
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_testnodedown(node: Any, error: object | None) -> None:
+    """Remove stale xdist worker-status files when a worker exits or crashes."""
+    if _xdist_status_reporter is None:
+        return
+
+    workerid = node.workerinput.get("workerid")
+    if workerid:
+        _xdist_status_reporter.remove_worker_status(str(workerid))
+
+
+def pytest_runtest_logstart(
+    nodeid: str,
+    location: tuple[str, int | None, str],
+) -> None:
+    """Record the test currently running in this worker process."""
+    if _xdist_worker_status_file is None or _xdist_workerid is None:
+        return
+
+    write_worker_status(
+        _xdist_worker_status_file,
+        _xdist_workerid,
+        nodeid,
+    )
+
+
+def pytest_runtest_logfinish(
+    nodeid: str,
+    location: tuple[str, int | None, str],
+) -> None:
+    """Clear this worker's running-test status after the test finishes."""
+    if _xdist_worker_status_file is None:
+        return
+
+    clear_worker_status(_xdist_worker_status_file)
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    """Stop controller-side xdist status reporting and clear worker status files."""
+    global _xdist_status_reporter
+
+    if _xdist_worker_status_file is not None:
+        clear_worker_status(_xdist_worker_status_file)
+
+    if _xdist_status_reporter is not None:
+        _xdist_status_reporter.stop()
+        _xdist_status_reporter = None
 
 
 def pytest_collection_modifyitems(config, items):
