@@ -102,16 +102,10 @@ class ZipScanner(BaseScanner):
 
     def scan(self, path: str) -> ScanResult:
         """Scan a ZIP file and its contents"""
-        # Check if path is valid
-        path_check_result = self._check_path(path)
-        if path_check_result:
-            return path_check_result
+        result = self._create_scan_result_after_preflight(path)
+        if not result.success:
+            return result
 
-        size_check = self._check_size_limit(path)
-        if size_check:
-            return size_check
-
-        result = self._create_result()
         file_size = self.get_file_size(path)
         result.metadata["file_size"] = file_size
 
@@ -119,9 +113,6 @@ class ZipScanner(BaseScanner):
         self.add_file_integrity_check(path, result)
 
         try:
-            # Store the file path for use in issue locations
-            self.current_file_path = path
-
             scan_result = self.scan_archive_members(path)
             result.merge(scan_result)
 
