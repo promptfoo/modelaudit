@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import base64
 import binascii
+import ntpath
 import os
 import re
+from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
 from typing import ClassVar, NamedTuple
 
@@ -20,9 +22,9 @@ _COMMAND_PATTERN = re.compile(
     r"(?i)(?:"
     r"\bos\.system\b|\bos\.popen\b|"
     r"\bsubprocess\.(?:Popen|run|call|check_call|check_output)\b|"
-    r"\b(?:bash|sh|zsh|powershell(?:\.exe)?|cmd(?:\.exe)?)\b|"
+    r"\b(?:bash|sh|zsh|pwsh(?:\.exe)?|powershell(?:\.exe)?|cmd(?:\.exe)?)\b|"
     r"\b(?:curl|wget)\b\s+https?://|"
-    r"\b(?:rm\s+-rf|chmod\s+\+x|python\s+-c)\b|"
+    r"\b(?:rm\s+-rf|chmod\s+\+x|python(?:\d+(?:\.\d+)*)?(?:\.exe)?\s+-c)\b|"
     r"/bin/(?:sh|bash)"
     r")"
 )
@@ -194,6 +196,8 @@ class CoreMLScanner(BaseScanner):
     MAX_TOP_LEVEL_FIELDS: ClassVar[int] = 10000
     MAX_NESTED_FIELDS: ClassVar[int] = 4000
     MAX_USER_METADATA_ENTRIES: ClassVar[int] = 512
+    MAX_RECURSIVE_MESSAGE_DEPTH: ClassVar[int] = 16
+    MAX_RECURSIVE_PROTOBUF_DEPTH: ClassVar[int] = 64
 
     # CoreML model oneof fields from Model.proto
     MODEL_TYPE_FIELDS: ClassVar[frozenset[int]] = frozenset(
@@ -239,6 +243,7 @@ class CoreMLScanner(BaseScanner):
     NEURAL_NETWORK_FIELDS: ClassVar[frozenset[int]] = frozenset({303, 403, 500})
     CUSTOM_MODEL_FIELD: ClassVar[int] = 555
     LINKED_MODEL_FIELD: ClassVar[int] = 556
+    RECURSIVE_CONTAINER_FIELDS: ClassVar[frozenset[int]] = MODEL_TYPE_FIELDS | frozenset({1})
 
     SAFE_USER_METADATA_KEYS: ClassVar[frozenset[str]] = frozenset(
         {
@@ -420,11 +425,22 @@ class CoreMLScanner(BaseScanner):
         )
         result.metadata["model_type_fields"] = model_type_fields
 
-        metadata_findings = self._analyze_description(top_fields, path, result)
-        custom_findings = self._analyze_custom_blocks(top_fields, path, result)
-        linked_path_findings = self._analyze_linked_model_paths(top_fields, path, result)
+        metadata_findings = 0
+        custom_findings = 0
+        linked_path_findings = 0
+        for model_fields, model_path in self._iter_model_messages(top_fields, path=path, result=result):
+            metadata_findings += self._analyze_description(model_fields, path, result, model_path=model_path)
+            custom_findings += self._analyze_custom_blocks(model_fields, path, result, model_path=model_path)
+            linked_path_findings += self._analyze_linked_model_paths(
+                model_fields,
+                path,
+                result,
+                model_path=model_path,
+            )
 
-        if metadata_findings == 0:
+        traversal_truncated = bool(result.metadata.get("coreml_traversal_truncated"))
+
+        if metadata_findings == 0 and not traversal_truncated:
             result.add_check(
                 name="CoreML Metadata Security Check",
                 passed=True,
@@ -432,7 +448,7 @@ class CoreMLScanner(BaseScanner):
                 location=path,
             )
 
-        if custom_findings == 0:
+        if custom_findings == 0 and not traversal_truncated:
             result.add_check(
                 name="CoreML Custom Code Path Check",
                 passed=True,
@@ -440,7 +456,7 @@ class CoreMLScanner(BaseScanner):
                 location=path,
             )
 
-        if linked_path_findings == 0:
+        if linked_path_findings == 0 and not traversal_truncated:
             result.add_check(
                 name="CoreML Linked Model Path Check",
                 passed=True,
@@ -451,8 +467,158 @@ class CoreMLScanner(BaseScanner):
         result.finish(success=not result.has_errors)
         return result
 
-    def _analyze_description(self, top_fields: list[_ProtoField], path: str, result: ScanResult) -> int:
+    def _iter_model_messages(
+        self,
+        fields: list[_ProtoField],
+        *,
+        path: str,
+        result: ScanResult,
+        model_path: str = "model",
+        model_depth: int = 0,
+        message_depth: int = 0,
+    ) -> Iterator[tuple[list[_ProtoField], str]]:
+        yield fields, model_path
+        yield from self._iter_child_model_messages(
+            fields,
+            path=path,
+            result=result,
+            message_path=model_path,
+            model_depth=model_depth,
+            message_depth=message_depth,
+        )
+
+    def _iter_child_model_messages(
+        self,
+        fields: list[_ProtoField],
+        *,
+        path: str,
+        result: ScanResult,
+        message_path: str,
+        model_depth: int,
+        message_depth: int,
+    ) -> Iterator[tuple[list[_ProtoField], str]]:
+        if message_depth >= self.MAX_RECURSIVE_PROTOBUF_DEPTH:
+            self._add_traversal_limit_check(
+                path=path,
+                result=result,
+                message_path=message_path,
+                model_depth=model_depth,
+                message_depth=message_depth,
+            )
+            return
+
+        for field_index, field in enumerate(fields):
+            if field.wire_type != 2 or not isinstance(field.value, bytes):
+                continue
+            if field.field_number not in self.RECURSIVE_CONTAINER_FIELDS:
+                continue
+
+            nested_fields, nested_error = _parse_message(
+                field.value,
+                max_fields=self.MAX_NESTED_FIELDS,
+                allow_truncated=True,
+            )
+            if nested_error or not nested_fields:
+                continue
+
+            child_path = f"{message_path}[{field.field_number}:{field_index}]"
+            if self._has_coreml_structure(nested_fields):
+                if model_depth >= self.MAX_RECURSIVE_MESSAGE_DEPTH:
+                    self._add_traversal_limit_check(
+                        path=path,
+                        result=result,
+                        message_path=child_path,
+                        model_depth=model_depth,
+                        message_depth=message_depth + 1,
+                    )
+                    continue
+
+                yield from self._iter_model_messages(
+                    nested_fields,
+                    path=path,
+                    result=result,
+                    model_path=child_path,
+                    model_depth=model_depth + 1,
+                    message_depth=message_depth + 1,
+                )
+            else:
+                yield from self._iter_child_model_messages(
+                    nested_fields,
+                    path=path,
+                    result=result,
+                    message_path=child_path,
+                    model_depth=model_depth,
+                    message_depth=message_depth + 1,
+                )
+
+    def _add_traversal_limit_check(
+        self,
+        *,
+        path: str,
+        result: ScanResult,
+        message_path: str,
+        model_depth: int,
+        message_depth: int,
+    ) -> None:
+        if result.metadata.get("coreml_traversal_truncated"):
+            return
+
+        result.metadata["coreml_traversal_truncated"] = True
+        result.add_check(
+            name="CoreML Recursive Traversal Limit",
+            passed=False,
+            message="CoreML nested-message traversal reached the safe depth limit; scan is incomplete",
+            severity=IssueSeverity.CRITICAL,
+            location=path,
+            details={
+                "field_path": message_path,
+                "max_recursive_message_depth": self.MAX_RECURSIVE_MESSAGE_DEPTH,
+                "model_depth": model_depth,
+                "message_depth": message_depth,
+            },
+            why=(
+                "Deeply nested protobuf wrappers can hide custom models, custom layers, or linked-model paths. "
+                "Failing closed on recursion limits avoids silently skipping nested payloads."
+            ),
+        )
+
+    @staticmethod
+    def _store_model_metadata(result: ScanResult, key: str, model_path: str, value: dict[str, str]) -> None:
+        metadata_by_model = result.metadata.get(key)
+        if not isinstance(metadata_by_model, dict):
+            metadata_by_model = {}
+            result.metadata[key] = metadata_by_model
+        metadata_by_model[model_path] = value
+
+    @staticmethod
+    def _store_custom_block_stats(
+        result: ScanResult,
+        model_path: str,
+        *,
+        layer_count: int,
+        custom_layer_count: int,
+        has_custom_model: bool,
+    ) -> None:
+        stats_by_model = result.metadata.get("coreml_custom_block_stats")
+        if not isinstance(stats_by_model, dict):
+            stats_by_model = {}
+            result.metadata["coreml_custom_block_stats"] = stats_by_model
+        stats_by_model[model_path] = {
+            "layer_count": layer_count,
+            "custom_layer_count": custom_layer_count,
+            "has_custom_model": has_custom_model,
+        }
+
+    def _analyze_description(
+        self,
+        top_fields: list[_ProtoField],
+        path: str,
+        result: ScanResult,
+        *,
+        model_path: str = "model",
+    ) -> int:
         findings = 0
+        description_path = "description" if model_path == "model" else f"{model_path}.description"
         description_messages = _len_fields(top_fields, 2)
         if not description_messages:
             return findings
@@ -467,9 +633,9 @@ class CoreMLScanner(BaseScanner):
                 name="CoreML Description Parse",
                 passed=False,
                 message=f"Unable to parse CoreML model description: {desc_error}",
-                severity=IssueSeverity.INFO,
+                severity=IssueSeverity.CRITICAL,
                 location=path,
-                details={"field_path": "description", "parse_error": desc_error},
+                details={"field_path": description_path, "parse_error": desc_error},
             )
             return findings + 1
 
@@ -487,9 +653,9 @@ class CoreMLScanner(BaseScanner):
                 name="CoreML Metadata Parse",
                 passed=False,
                 message=f"Unable to parse CoreML metadata section: {metadata_error}",
-                severity=IssueSeverity.INFO,
+                severity=IssueSeverity.CRITICAL,
                 location=path,
-                details={"field_path": "description.metadata", "parse_error": metadata_error},
+                details={"field_path": f"{description_path}.metadata", "parse_error": metadata_error},
             )
             return findings + 1
 
@@ -516,12 +682,14 @@ class CoreMLScanner(BaseScanner):
                     value=text_value,
                     path=path,
                     result=result,
-                    field_path=f"description.metadata.{field_name}",
+                    field_path=f"{description_path}.metadata.{field_name}",
                     user_defined=False,
                 )
 
         if model_metadata:
-            result.metadata["coreml_metadata"] = model_metadata
+            self._store_model_metadata(result, "coreml_metadata_by_model", model_path, model_metadata)
+            if model_path == "model":
+                result.metadata["coreml_metadata"] = model_metadata
 
         user_defined: dict[str, str] = {}
         user_defined_fields = _len_fields(metadata_fields, 100)[: self.MAX_USER_METADATA_ENTRIES]
@@ -536,10 +704,10 @@ class CoreMLScanner(BaseScanner):
                     name="CoreML User Metadata Entry Parse",
                     passed=False,
                     message=f"Malformed user-defined metadata entry at index {index}: {entry_error}",
-                    severity=IssueSeverity.INFO,
+                    severity=IssueSeverity.CRITICAL,
                     location=path,
                     details={
-                        "field_path": f"description.metadata.userDefined[{index}]",
+                        "field_path": f"{description_path}.metadata.userDefined[{index}]",
                         "parse_error": entry_error,
                     },
                 )
@@ -567,12 +735,14 @@ class CoreMLScanner(BaseScanner):
                 value=value,
                 path=path,
                 result=result,
-                field_path=f"description.metadata.userDefined[{key}]",
+                field_path=f"{description_path}.metadata.userDefined[{key}]",
                 user_defined=True,
             )
 
         if user_defined:
-            result.metadata["user_defined_metadata"] = user_defined
+            self._store_model_metadata(result, "user_defined_metadata_by_model", model_path, user_defined)
+            if model_path == "model":
+                result.metadata["user_defined_metadata"] = user_defined
 
         return findings
 
@@ -590,12 +760,17 @@ class CoreMLScanner(BaseScanner):
         key_lower = key.lower()
         value_for_scan = value.strip()
         executable_context = any(hint in key_lower for hint in self.EXECUTABLE_METADATA_KEY_HINTS)
-
-        if user_defined and key_lower in self.SAFE_USER_METADATA_KEYS and _SAFE_VALUE_PATTERN.fullmatch(value_for_scan):
-            return findings
+        safe_user_metadata = (
+            user_defined and key_lower in self.SAFE_USER_METADATA_KEYS and _SAFE_VALUE_PATTERN.fullmatch(value_for_scan)
+        )
 
         has_command_pattern = bool(_COMMAND_PATTERN.search(value_for_scan))
         has_network_pattern = bool(_NETWORK_PATTERN.search(value_for_scan))
+        decoded_payload = self._decode_base64_payload(value_for_scan)
+
+        if safe_user_metadata and not has_command_pattern and not has_network_pattern and decoded_payload is None:
+            return findings
+
         if has_command_pattern or has_network_pattern:
             severity = IssueSeverity.CRITICAL if (has_command_pattern and executable_context) else IssueSeverity.WARNING
             pattern_type = "command" if has_command_pattern else "network"
@@ -615,7 +790,6 @@ class CoreMLScanner(BaseScanner):
             )
             findings += 1
 
-        decoded_payload = self._decode_base64_payload(value_for_scan)
         if decoded_payload is not None:
             decoded_has_command = bool(_COMMAND_PATTERN.search(decoded_payload))
             decoded_has_network = bool(_NETWORK_PATTERN.search(decoded_payload))
@@ -673,7 +847,14 @@ class CoreMLScanner(BaseScanner):
 
         return text
 
-    def _analyze_custom_blocks(self, top_fields: list[_ProtoField], path: str, result: ScanResult) -> int:
+    def _analyze_custom_blocks(
+        self,
+        top_fields: list[_ProtoField],
+        path: str,
+        result: ScanResult,
+        *,
+        model_path: str = "model",
+    ) -> int:
         findings = 0
         layer_count = 0
         custom_layer_count = 0
@@ -686,9 +867,21 @@ class CoreMLScanner(BaseScanner):
                 continue
 
             network_fields, network_error = _parse_message(
-                payload, max_fields=self.MAX_NESTED_FIELDS, allow_truncated=True
+                payload, max_fields=self.MAX_NESTED_FIELDS, allow_truncated=False
             )
             if network_error:
+                result.add_check(
+                    name="CoreML Neural Network Parse",
+                    passed=False,
+                    message=f"Unable to parse CoreML neural network block: {network_error}",
+                    severity=IssueSeverity.CRITICAL,
+                    location=path,
+                    details={
+                        "field_path": f"{model_path}[{model_field.field_number}]",
+                        "parse_error": network_error,
+                    },
+                )
+                findings += 1
                 continue
 
             layer_fields = _len_fields(network_fields, 1)
@@ -698,9 +891,21 @@ class CoreMLScanner(BaseScanner):
                     continue
                 layer_count += 1
                 parsed_layer, layer_error = _parse_message(
-                    layer_payload, max_fields=self.MAX_NESTED_FIELDS, allow_truncated=True
+                    layer_payload, max_fields=self.MAX_NESTED_FIELDS, allow_truncated=False
                 )
                 if layer_error:
+                    result.add_check(
+                        name="CoreML Layer Parse",
+                        passed=False,
+                        message=f"Unable to parse CoreML layer definition: {layer_error}",
+                        severity=IssueSeverity.CRITICAL,
+                        location=path,
+                        details={
+                            "field_path": f"{model_path}[{model_field.field_number}].layers[{layer_index}]",
+                            "parse_error": layer_error,
+                        },
+                    )
+                    findings += 1
                     continue
 
                 layer_name = ""
@@ -719,9 +924,21 @@ class CoreMLScanner(BaseScanner):
                     parsed_custom, custom_error = _parse_message(
                         custom_payload,
                         max_fields=self.MAX_NESTED_FIELDS,
-                        allow_truncated=True,
+                        allow_truncated=False,
                     )
                     if custom_error:
+                        result.add_check(
+                            name="CoreML Custom Layer Parse",
+                            passed=False,
+                            message=f"Unable to parse CoreML custom layer block: {custom_error}",
+                            severity=IssueSeverity.CRITICAL,
+                            location=path,
+                            details={
+                                "field_path": f"{model_path}[{model_field.field_number}].layers[{layer_index}].custom",
+                                "parse_error": custom_error,
+                            },
+                        )
+                        findings += 1
                         continue
 
                     class_name = ""
@@ -730,9 +947,9 @@ class CoreMLScanner(BaseScanner):
                         class_name = _decode_string(class_name_fields[0].value, max_length=256)
 
                     field_path = (
-                        f"model[{model_field.field_number}].layers[{layer_index}].custom"
+                        f"{model_path}[{model_field.field_number}].layers[{layer_index}].custom"
                         if class_name
-                        else f"model[{model_field.field_number}].layers[{layer_index}].custom(<unnamed>)"
+                        else f"{model_path}[{model_field.field_number}].layers[{layer_index}].custom(<unnamed>)"
                     )
                     result.add_check(
                         name="CoreML Custom Layer Check",
@@ -767,9 +984,21 @@ class CoreMLScanner(BaseScanner):
                 continue
 
             custom_model, custom_model_error = _parse_message(
-                payload, max_fields=self.MAX_NESTED_FIELDS, allow_truncated=True
+                payload, max_fields=self.MAX_NESTED_FIELDS, allow_truncated=False
             )
             if custom_model_error:
+                result.add_check(
+                    name="CoreML Custom Model Parse",
+                    passed=False,
+                    message=f"Unable to parse CoreML custom model block: {custom_model_error}",
+                    severity=IssueSeverity.CRITICAL,
+                    location=path,
+                    details={
+                        "field_path": f"{model_path}[555]",
+                        "parse_error": custom_model_error,
+                    },
+                )
+                findings += 1
                 continue
 
             class_name = ""
@@ -784,7 +1013,7 @@ class CoreMLScanner(BaseScanner):
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={
-                    "field_path": "model[555].className",
+                    "field_path": f"{model_path}[555].className",
                     "class_name": class_name or "<unknown>",
                 },
                 why="CoreML custom models execute host application code during model use and require trust validation.",
@@ -795,12 +1024,21 @@ class CoreMLScanner(BaseScanner):
                 custom_model,
                 path=path,
                 result=result,
-                field_path="model[555].parameters",
+                field_path=f"{model_path}[555].parameters",
             )
 
-        result.metadata["layer_count"] = layer_count
-        result.metadata["custom_layer_count"] = custom_layer_count
-        result.metadata["has_custom_model"] = bool(custom_model_fields)
+        has_custom_model = bool(custom_model_fields)
+        self._store_custom_block_stats(
+            result,
+            model_path,
+            layer_count=layer_count,
+            custom_layer_count=custom_layer_count,
+            has_custom_model=has_custom_model,
+        )
+        if model_path == "model":
+            result.metadata["layer_count"] = layer_count
+            result.metadata["custom_layer_count"] = custom_layer_count
+            result.metadata["has_custom_model"] = has_custom_model
         return findings
 
     def _scan_custom_parameter_map(
@@ -819,8 +1057,20 @@ class CoreMLScanner(BaseScanner):
             if not isinstance(entry_payload, bytes):
                 continue
 
-            entry_fields, entry_error = _parse_message(entry_payload, max_fields=32, allow_truncated=True)
+            entry_fields, entry_error = _parse_message(entry_payload, max_fields=32, allow_truncated=False)
             if entry_error:
+                result.add_check(
+                    name="CoreML Custom Parameter Entry Parse",
+                    passed=False,
+                    message=f"Unable to parse CoreML custom parameter entry: {entry_error}",
+                    severity=IssueSeverity.CRITICAL,
+                    location=path,
+                    details={
+                        "field_path": f"{field_path}[{entry_index}]",
+                        "parse_error": entry_error,
+                    },
+                )
+                findings += 1
                 continue
 
             key_fields = _len_fields(entry_fields, 1)
@@ -834,8 +1084,21 @@ class CoreMLScanner(BaseScanner):
                 continue
 
             param_key = _decode_string(raw_key, max_length=256)
-            value_message_fields, value_error = _parse_message(raw_value, max_fields=32, allow_truncated=True)
+            value_message_fields, value_error = _parse_message(raw_value, max_fields=32, allow_truncated=False)
             if value_error:
+                result.add_check(
+                    name="CoreML Custom Parameter Value Parse",
+                    passed=False,
+                    message=f"Unable to parse CoreML custom parameter value: {value_error}",
+                    severity=IssueSeverity.CRITICAL,
+                    location=path,
+                    details={
+                        "field_path": f"{field_path}[{entry_index}].{param_key or '<unnamed>'}",
+                        "parameter_key": param_key or "<unnamed>",
+                        "parse_error": value_error,
+                    },
+                )
+                findings += 1
                 continue
 
             string_values = _len_fields(value_message_fields, 20)
@@ -873,7 +1136,14 @@ class CoreMLScanner(BaseScanner):
 
         return findings
 
-    def _analyze_linked_model_paths(self, top_fields: list[_ProtoField], path: str, result: ScanResult) -> int:
+    def _analyze_linked_model_paths(
+        self,
+        top_fields: list[_ProtoField],
+        path: str,
+        result: ScanResult,
+        *,
+        model_path: str = "model",
+    ) -> int:
         findings = 0
         linked_model_fields = _len_fields(top_fields, self.LINKED_MODEL_FIELD)
         if not linked_model_fields:
@@ -885,8 +1155,20 @@ class CoreMLScanner(BaseScanner):
             if not isinstance(payload, bytes):
                 continue
 
-            linked_model_message, parse_error = _parse_message(payload, max_fields=64, allow_truncated=True)
+            linked_model_message, parse_error = _parse_message(payload, max_fields=64, allow_truncated=False)
             if parse_error:
+                result.add_check(
+                    name="CoreML Linked Model Parse",
+                    passed=False,
+                    message=f"Unable to parse CoreML linked-model block: {parse_error}",
+                    severity=IssueSeverity.CRITICAL,
+                    location=path,
+                    details={
+                        "field_path": f"{model_path}[556]",
+                        "parse_error": parse_error,
+                    },
+                )
+                findings += 1
                 continue
 
             linked_model_file_fields = _len_fields(linked_model_message, 1)
@@ -895,8 +1177,20 @@ class CoreMLScanner(BaseScanner):
                 if not isinstance(file_payload, bytes):
                     continue
 
-                linked_model_file, file_error = _parse_message(file_payload, max_fields=64, allow_truncated=True)
+                linked_model_file, file_error = _parse_message(file_payload, max_fields=64, allow_truncated=False)
                 if file_error:
+                    result.add_check(
+                        name="CoreML Linked Model File Parse",
+                        passed=False,
+                        message=f"Unable to parse CoreML linked-model file entry: {file_error}",
+                        severity=IssueSeverity.CRITICAL,
+                        location=path,
+                        details={
+                            "field_path": f"{model_path}[556].linkedModelFile",
+                            "parse_error": file_error,
+                        },
+                    )
+                    findings += 1
                     continue
 
                 file_name = self._extract_string_parameter(linked_model_file, field_number=1)
@@ -905,18 +1199,20 @@ class CoreMLScanner(BaseScanner):
                 if file_name:
                     findings += self._evaluate_linked_path(
                         raw_value=file_name,
-                        field_path="model[556].linkedModelFile.linkedModelFileName.defaultValue",
+                        field_path=f"{model_path}[556].linkedModelFile.linkedModelFileName.defaultValue",
                         base_dir=base_dir,
                         path=path,
                         result=result,
                     )
 
                 if search_path:
-                    segments = [segment.strip() for segment in search_path.split(":") if segment.strip()]
+                    segments = self._split_linked_search_path(search_path)
                     for index, segment in enumerate(segments):
                         findings += self._evaluate_linked_path(
                             raw_value=segment,
-                            field_path=f"model[556].linkedModelFile.linkedModelSearchPath.defaultValue[{index}]",
+                            field_path=(
+                                f"{model_path}[556].linkedModelFile.linkedModelSearchPath.defaultValue[{index}]"
+                            ),
                             base_dir=base_dir,
                             path=path,
                             result=result,
@@ -933,7 +1229,7 @@ class CoreMLScanner(BaseScanner):
         if not isinstance(payload, bytes):
             return None
 
-        parsed_parameter, parse_error = _parse_message(payload, max_fields=16, allow_truncated=True)
+        parsed_parameter, parse_error = _parse_message(payload, max_fields=16, allow_truncated=False)
         if parse_error:
             return None
 
@@ -943,6 +1239,46 @@ class CoreMLScanner(BaseScanner):
 
         value = _decode_string(default_value_fields[0].value, max_length=512)
         return value if value else None
+
+    @staticmethod
+    def _split_linked_search_path(search_path: str) -> list[str]:
+        segments = [segment.strip() for segment in re.split(r"[:;]", search_path) if segment.strip()]
+        merged_segments: list[str] = []
+        index = 0
+        while index < len(segments):
+            segment = segments[index]
+            if (
+                len(segment) == 1
+                and segment.isalpha()
+                and index + 1 < len(segments)
+                and segments[index + 1].startswith(("\\", "/"))
+            ):
+                merged_segments.append(f"{segment}:{segments[index + 1]}")
+                index += 2
+                continue
+            merged_segments.append(segment)
+            index += 1
+        return merged_segments
+
+    @staticmethod
+    def _split_safe_linked_path_suffix(normalized_value: str) -> tuple[bool, str | None]:
+        if normalized_value.startswith("$BUNDLE_MAIN"):
+            return True, normalized_value[len("$BUNDLE_MAIN") :].lstrip("/\\")
+
+        prefix = "$BUNDLE_IDENTIFIER("
+        if not normalized_value.startswith(prefix):
+            return False, normalized_value
+
+        close_index = normalized_value.find(")", len(prefix))
+        if close_index == -1:
+            return True, None
+
+        return True, normalized_value[close_index + 1 :].lstrip("/\\")
+
+    @staticmethod
+    def _has_windows_absolute_or_drive_path(path_value: str) -> bool:
+        normalized_path = path_value.replace("/", "\\")
+        return bool(ntpath.splitdrive(normalized_path)[0]) or ntpath.isabs(normalized_path)
 
     def _evaluate_linked_path(
         self,
@@ -957,23 +1293,35 @@ class CoreMLScanner(BaseScanner):
         if not normalized_value:
             return 0
 
-        if any(normalized_value.startswith(prefix) for prefix in self.SAFE_LINKED_PATH_PREFIXES):
-            return 0
-
         severity = IssueSeverity.WARNING
         reason: str | None = None
+        has_safe_macro_prefix, suffix_value = self._split_safe_linked_path_suffix(normalized_value)
+        value_to_check = normalized_value
 
-        if normalized_value.startswith("~"):
+        if has_safe_macro_prefix:
+            if suffix_value is None:
+                severity = IssueSeverity.CRITICAL
+                reason = "malformed bundle macro in linked model path"
+            elif not suffix_value:
+                return 0
+            else:
+                value_to_check = suffix_value
+
+        if reason is None and value_to_check.startswith("~"):
+            severity = IssueSeverity.CRITICAL
             reason = "home-path expansion in linked model reference"
-        elif os.path.isabs(normalized_value):
+        elif reason is None and (
+            os.path.isabs(value_to_check) or self._has_windows_absolute_or_drive_path(value_to_check)
+        ):
+            severity = IssueSeverity.CRITICAL
             reason = "absolute linked model path"
-        else:
-            posix_parts = PurePosixPath(normalized_value).parts
+        elif reason is None:
+            posix_parts = PurePosixPath(value_to_check.replace("\\", "/")).parts
             if ".." in posix_parts:
                 severity = IssueSeverity.CRITICAL
                 reason = "path traversal segments in linked model path"
-            else:
-                resolved_path = (base_dir / normalized_value).resolve()
+            elif not has_safe_macro_prefix:
+                resolved_path = (base_dir / value_to_check).resolve()
                 if not _is_within_directory(resolved_path, base_dir):
                     severity = IssueSeverity.CRITICAL
                     reason = "linked model path resolves outside model directory"

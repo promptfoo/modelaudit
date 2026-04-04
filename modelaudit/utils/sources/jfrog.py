@@ -171,11 +171,11 @@ def download_artifact(
         raise ValueError(f"Not a JFrog URL: {url}")
 
     filename = os.path.basename(urlparse(url).path)
+    temp_dir: Path | None = None
     if cache_dir is None:
         temp_dir = Path(tempfile.mkdtemp(prefix="modelaudit_jfrog_"))
         dest_path = temp_dir / filename
     else:
-        temp_dir = cache_dir
         dest_path = cache_dir / filename
         dest_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -232,7 +232,7 @@ def download_artifact(
         return dest_path
 
     except requests.exceptions.HTTPError as e:  # type: ignore[attr-defined]
-        if cache_dir is None and temp_dir.exists():
+        if temp_dir is not None and temp_dir.exists():
             shutil.rmtree(temp_dir)
         if e.response.status_code == 401:
             raise Exception(
@@ -245,11 +245,11 @@ def download_artifact(
 
         raise Exception(f"HTTP error {e.response.status_code} downloading from {url}: {e}") from e
     except requests.exceptions.RequestException as e:  # type: ignore[attr-defined]
-        if cache_dir is None and temp_dir.exists():
+        if temp_dir is not None and temp_dir.exists():
             shutil.rmtree(temp_dir)
         raise Exception(f"Network error downloading from {url}: {e}") from e
     except Exception as e:
-        if cache_dir is None and temp_dir.exists():
+        if temp_dir is not None and temp_dir.exists():
             shutil.rmtree(temp_dir)
         raise Exception(f"Failed to download artifact from {url}: {e!s}") from e
 
