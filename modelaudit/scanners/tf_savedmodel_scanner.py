@@ -55,6 +55,32 @@ _ASSET_PYTHON_PATTERN = re.compile(
     r"|class\s+[A-Za-z_]\w*\s*[:(]"
     r"))"
 )
+_PYFUNC_DANGEROUS_REFERENCE_TOKENS = frozenset(
+    {
+        "__builtin__",
+        "__builtins__",
+        "builtins",
+        "compile",
+        "ctypes",
+        "eval",
+        "exec",
+        "importlib",
+        "marshal",
+        "nt",
+        "open",
+        "os",
+        "pickle",
+        "popen",
+        "posix",
+        "runpy",
+        "socket",
+        "spawn",
+        "subprocess",
+        "sys",
+        "system",
+        "webbrowser",
+    }
+)
 
 
 def _looks_like_pe_executable(content_head: bytes) -> bool:
@@ -128,7 +154,11 @@ class TensorFlowSavedModelScanner(BaseScanner):
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
         # Additional scanner-specific configuration
-        self.suspicious_ops = set(self.config.get("suspicious_ops", SUSPICIOUS_OPS))
+        suspicious_ops = self.config.get("suspicious_ops", SUSPICIOUS_OPS)
+        self.suspicious_ops = set(SUSPICIOUS_OPS if suspicious_ops is None else suspicious_ops)
+        self.blacklist_patterns = [
+            pattern for pattern in (self.config.get("blacklist_patterns") or []) if isinstance(pattern, str) and pattern
+        ]
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -210,7 +240,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
         if path.endswith("keras_metadata.pb"):
             # Scan it for Lambda layers
             self._scan_keras_metadata(path, result)
-            result.finish(success=True)
+            result.finish(success=not result.has_errors)
             return result
 
         try:
@@ -251,7 +281,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
             result.finish(success=False)
             return result
 
-        result.finish(success=True)
+        result.finish(success=not result.has_errors)
         return result
 
     def _scan_saved_model_directory(self, dir_path: str) -> ScanResult:
@@ -309,8 +339,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                     )
 
                 # Check for blacklist patterns in text files
-                if hasattr(self, "config") and self.config and "blacklist_patterns" in self.config:
-                    blacklist_patterns = self.config["blacklist_patterns"]
+                if self.blacklist_patterns:
                     try:
                         # Only check text files
                         if file.endswith(
@@ -330,7 +359,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                                 errors="ignore",
                             ) as f:
                                 content = f.read()
-                                for pattern in blacklist_patterns:
+                                for pattern in self.blacklist_patterns:
                                     if pattern in content:
                                         result.add_check(
                                             name="Blacklist Pattern Check",
@@ -356,7 +385,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                             },
                         )
 
-        result.finish(success=True)
+        result.finish(success=not result.has_errors)
         return result
 
     def _scan_saved_model_assets(self, model_root: Path, result: ScanResult) -> None:
@@ -823,6 +852,22 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 return pattern_name
         return None
 
+    @classmethod
+    def _match_pyfunc_reference_token(cls, func_name: str) -> str | None:
+        """Return the suspicious module/function token in a PyFunc reference, if any."""
+        matched_pattern = cls._match_suspicious_function_name(func_name)
+        if matched_pattern is not None:
+            return matched_pattern
+
+        tokens = [token for token in re.split(r"[^0-9A-Za-z_]+", func_name.lower()) if token]
+        if not tokens:
+            return None
+
+        for token in (tokens[0], tokens[-1]):
+            if token in _PYFUNC_DANGEROUS_REFERENCE_TOKENS:
+                return token
+        return None
+
     def _check_python_op(self, node_context: SavedModelNodeContext, result: ScanResult) -> None:
         """Check PyFunc/PyCall operations for embedded Python code"""
         node = node_context.node
@@ -858,9 +903,8 @@ class TensorFlowSavedModelScanner(BaseScanner):
                         attr = node.attr[attr_name]
                         if hasattr(attr, "s") and attr.s:
                             func_name = attr.s.decode("utf-8", errors="ignore")
-                            # Check if it references dangerous modules
-                            dangerous_modules = ["os", "sys", "subprocess", "eval", "exec", "__builtins__"]
-                            if any(dangerous in func_name for dangerous in dangerous_modules):
+                            matched_reference = self._match_pyfunc_reference_token(func_name)
+                            if matched_reference is not None:
                                 result.add_check(
                                     name="PyFunc Function Reference Check",
                                     passed=False,
@@ -873,6 +917,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                                         {
                                             "op_type": node.op,
                                             "function_reference": func_name,
+                                            "suspicious_pattern": matched_reference,
                                         },
                                     ),
                                     why=get_tf_op_explanation(node.op),

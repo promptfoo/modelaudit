@@ -121,6 +121,13 @@ class _NodeContext:
 
 
 @dataclass(frozen=True)
+class _AttrString:
+    attr_name: str
+    attr_value: str
+    byte_length: int
+
+
+@dataclass(frozen=True)
 class _MetaGraphStructure:
     valid: bool
     reason: str
@@ -202,20 +209,36 @@ def _iter_nodes(metagraph: Any) -> Iterable[_NodeContext]:
             )
 
 
-def _extract_attr_strings(attrs: Any) -> list[tuple[str, str]]:
-    strings: list[tuple[str, str]] = []
+def _append_attr_string(strings: list[_AttrString], attr_name: str, raw_value: bytes) -> None:
+    decoded = raw_value[:_MAX_ATTR_VALUE_BYTES].decode("utf-8", errors="ignore").strip()
+    if decoded or len(raw_value) > _MAX_ATTR_VALUE_BYTES:
+        strings.append(
+            _AttrString(
+                attr_name=attr_name,
+                attr_value=decoded,
+                byte_length=len(raw_value),
+            )
+        )
+
+
+def _extract_attr_strings(attrs: Any) -> list[_AttrString]:
+    strings: list[_AttrString] = []
 
     for attr_name, attr_value in attrs.items():
         if hasattr(attr_value, "s") and attr_value.s:
-            decoded = attr_value.s[:_MAX_ATTR_VALUE_BYTES].decode("utf-8", errors="ignore").strip()
-            if decoded:
-                strings.append((attr_name, decoded))
+            _append_attr_string(strings, attr_name, attr_value.s)
+
+        if hasattr(attr_value, "func") and attr_value.func.name:
+            _append_attr_string(strings, f"{attr_name}.func.name", attr_value.func.name.encode("utf-8"))
 
         if hasattr(attr_value, "list") and hasattr(attr_value.list, "s"):
             for item in attr_value.list.s:
-                decoded = item[:_MAX_ATTR_VALUE_BYTES].decode("utf-8", errors="ignore").strip()
-                if decoded:
-                    strings.append((attr_name, decoded))
+                _append_attr_string(strings, attr_name, item)
+
+        if hasattr(attr_value, "list") and hasattr(attr_value.list, "func"):
+            for function_attr in attr_value.list.func:
+                if function_attr.name:
+                    _append_attr_string(strings, f"{attr_name}.func.name", function_attr.name.encode("utf-8"))
 
     return strings
 
@@ -237,8 +260,10 @@ class TensorFlowMetaGraphScanner(BaseScanner):
             return False
 
         file_size = os.path.getsize(path)
-        if file_size < _MIN_PARSE_BYTES or file_size > _MAX_PARSE_BYTES:
+        if file_size < _MIN_PARSE_BYTES:
             return False
+        if file_size > _MAX_PARSE_BYTES:
+            return True
 
         try:
             content, truncated = _read_bounded(path, _MAX_PARSE_BYTES)
@@ -297,6 +322,8 @@ class TensorFlowMetaGraphScanner(BaseScanner):
         result.metadata["scan_truncated"] = truncated
 
         if truncated:
+            result.metadata["operational_error"] = True
+            result.metadata["operational_error_reason"] = "metagraph_parse_budget_exceeded"
             result.add_check(
                 name="MetaGraph Parse Budget",
                 passed=False,
@@ -380,7 +407,12 @@ class TensorFlowMetaGraphScanner(BaseScanner):
             if ctx.op not in _EXECUTABLE_CONTEXT_OPS:
                 continue
 
-            for attr_name, attr_val in _extract_attr_strings(ctx.attrs):
+            attr_strings = _extract_attr_strings(ctx.attrs)
+            has_decode_hint = any(_DECODE_HINT_RE.search(attr.attr_value.lower()) for attr in attr_strings)
+
+            for attr_string in attr_strings:
+                attr_name = attr_string.attr_name
+                attr_val = attr_string.attr_value
                 attr_lower = attr_val.lower()
 
                 if _LIBRARY_OR_PATH_RE.search(attr_val):
@@ -412,7 +444,12 @@ class TensorFlowMetaGraphScanner(BaseScanner):
                             f"{ctx.op}:{attr_name}:{attr_val[:120]}"
                         )
 
-                    severity = IssueSeverity.CRITICAL if command_match and network_match else IssueSeverity.WARNING
+                    is_function_reference = attr_name.endswith(".func.name")
+                    severity = (
+                        IssueSeverity.CRITICAL
+                        if command_match and (network_match or is_function_reference)
+                        else IssueSeverity.WARNING
+                    )
                     result.add_check(
                         name="MetaGraph Executable String Check",
                         passed=False,
@@ -429,7 +466,7 @@ class TensorFlowMetaGraphScanner(BaseScanner):
                         },
                     )
 
-                if _ENCODED_PAYLOAD_RE.search(attr_val) and _DECODE_HINT_RE.search(attr_lower):
+                if _ENCODED_PAYLOAD_RE.search(attr_val) and (has_decode_hint or _DECODE_HINT_RE.search(attr_lower)):
                     suspicious_signal_categories.add("encoded_payload")
                     if len(suspicious_signal_examples["encoded_payload"]) < _MAX_SIGNAL_EXAMPLES:
                         suspicious_signal_examples["encoded_payload"].append(f"{ctx.op}:{attr_name}:{attr_val[:120]}")
@@ -447,7 +484,7 @@ class TensorFlowMetaGraphScanner(BaseScanner):
                         },
                     )
 
-                if len(attr_val) > _MAX_ATTR_VALUE_BYTES:
+                if attr_string.byte_length > _MAX_ATTR_VALUE_BYTES:
                     result.add_check(
                         name="MetaGraph Attribute Size Anomaly",
                         passed=False,
@@ -458,7 +495,7 @@ class TensorFlowMetaGraphScanner(BaseScanner):
                             "op_type": ctx.op,
                             "node_name": ctx.node_name,
                             "attribute": attr_name,
-                            "attribute_length": len(attr_val),
+                            "attribute_length": attr_string.byte_length,
                             "max_expected": _MAX_ATTR_VALUE_BYTES,
                         },
                     )

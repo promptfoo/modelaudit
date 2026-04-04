@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import os
 import re
-from typing import ClassVar
+from collections.abc import Iterator
+from io import BytesIO
+from typing import Any, ClassVar
 
 from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_STRING_PATTERNS
 
@@ -20,12 +22,41 @@ except ImportError:  # pragma: no cover - optional dependency
     HAS_DEFUSEDXML = False
 
 
+_OPENVINO_ROOT_TAGS = frozenset({"model", "net"})
+_OPENVINO_SUSPICIOUS_STRING_PATTERNS = [
+    r"\bimportlib\b" if pattern == r"importlib" else pattern
+    for pattern in SUSPICIOUS_STRING_PATTERNS
+    if pattern != r"__[\w]+__"
+]
+_OPENVINO_SUSPICIOUS_PATTERN = (
+    re.compile("|".join(_OPENVINO_SUSPICIOUS_STRING_PATTERNS), re.IGNORECASE)
+    if _OPENVINO_SUSPICIOUS_STRING_PATTERNS
+    else None
+)
+
+
+def _local_tag_name(tag: str) -> str:
+    """Return an XML tag's namespace-stripped local name."""
+    return tag.rsplit("}", 1)[-1].lower()
+
+
+def _iter_element_attributes(layer: Any) -> Iterator[tuple[str, str, str]]:
+    """Yield normalized attributes from a layer and its nested config nodes."""
+    for element in layer.iter():
+        element_tag = _local_tag_name(str(element.tag))
+        for attr_name, attr_value in element.attrib.items():
+            normalized_value = str(attr_value).strip()
+            if normalized_value:
+                yield element_tag, attr_name.strip().lower(), normalized_value
+
+
 class OpenVinoScanner(BaseScanner):
     """Scanner for OpenVINO IR (.xml/.bin) model files."""
 
     name = "openvino"
     description = "Scans OpenVINO IR models for suspicious layers and external references"
     supported_extensions: ClassVar[list[str]] = [".xml"]
+    CAN_HANDLE_MAX_PARSE_BYTES: ClassVar[int] = 1024 * 1024
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -33,17 +64,25 @@ class OpenVinoScanner(BaseScanner):
             return False
         if os.path.splitext(path)[1].lower() != ".xml":
             return False
+
         try:
-            with open(path, "rb") as f:
-                head = f.read(256).lower()
-            return b"<net" in head or b"<model" in head
+            with open(path, "rb") as xml_file:
+                xml_prefix = xml_file.read(cls.CAN_HANDLE_MAX_PARSE_BYTES)
+                for _event, element in DefusedET.iterparse(BytesIO(xml_prefix), events=("start",)):
+                    return _local_tag_name(str(element.tag)) in _OPENVINO_ROOT_TAGS
         except Exception:
             return False
+
+        return False
 
     def scan(self, path: str) -> ScanResult:
         path_check_result = self._check_path(path)
         if path_check_result:
             return path_check_result
+
+        size_check_result = self._check_size_limit(path)
+        if size_check_result:
+            return size_check_result
 
         result = self._create_result()
         result.metadata["xml_size"] = self.get_file_size(path)
@@ -85,15 +124,8 @@ class OpenVinoScanner(BaseScanner):
         if version:
             result.metadata["ir_version"] = version
 
-        # Use only code-execution patterns for OpenVINO XML attributes.
-        # The dunder pattern (__[\w]+__) is pickle-specific and produces false
-        # positives on PyTorch operator names preserved during model conversion
-        # (e.g., aten::__and__/BitwiseAnd).
-        openvino_patterns = [p for p in SUSPICIOUS_STRING_PATTERNS if p != r"__[\w]+__"]
-        suspicious_pattern = re.compile("|".join(openvino_patterns), re.IGNORECASE) if openvino_patterns else None
-
         for layer in root.findall(".//layer"):
-            layer_type = layer.attrib.get("type", "").lower()
+            layer_type = layer.attrib.get("type", "").strip().lower()
             layer_name = layer.attrib.get("name", "")
             if layer_type in {"python", "custom"}:
                 result.add_check(
@@ -106,30 +138,38 @@ class OpenVinoScanner(BaseScanner):
                     rule_code="S902",
                 )
 
-            # Check for external library references in layer attributes
-            library = layer.attrib.get("library") or layer.attrib.get("implementation")
-            if library:
-                result.add_check(
-                    name="External Library Reference Check",
-                    passed=False,
-                    message=f"Layer '{layer_name}' references external library '{library}'",
-                    severity=IssueSeverity.CRITICAL,
-                    location=path,
-                    details={"layer_name": layer_name, "library": library},
-                    rule_code="S902",
-                )
-            if suspicious_pattern:
-                for attr_val in layer.attrib.values():
-                    if suspicious_pattern.search(str(attr_val)):
-                        result.add_check(
-                            name="Layer Attribute Security Check",
-                            passed=False,
-                            message="Suspicious content in layer attributes",
-                            severity=IssueSeverity.CRITICAL,
-                            location=path,
-                            details={"attribute": attr_val},
-                            rule_code="S902",
-                        )
+            for element_tag, attr_name, attr_val in _iter_element_attributes(layer):
+                if attr_name in {"library", "implementation"}:
+                    result.add_check(
+                        name="External Library Reference Check",
+                        passed=False,
+                        message=f"Layer '{layer_name}' references external library '{attr_val}'",
+                        severity=IssueSeverity.CRITICAL,
+                        location=path,
+                        details={
+                            "layer_name": layer_name,
+                            "attribute": attr_name,
+                            "element": element_tag,
+                            "library": attr_val,
+                        },
+                        rule_code="S902",
+                    )
+
+                if _OPENVINO_SUSPICIOUS_PATTERN and _OPENVINO_SUSPICIOUS_PATTERN.search(attr_val):
+                    result.add_check(
+                        name="Layer Attribute Security Check",
+                        passed=False,
+                        message="Suspicious content in layer attributes",
+                        severity=IssueSeverity.CRITICAL,
+                        location=path,
+                        details={
+                            "layer_name": layer_name,
+                            "attribute": attr_name,
+                            "element": element_tag,
+                            "value": attr_val,
+                        },
+                        rule_code="S902",
+                    )
 
         result.finish(success=not result.has_errors)
         return result
