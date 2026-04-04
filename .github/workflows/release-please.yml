@@ -68,6 +68,23 @@ jobs:
             echo "✓ uv.lock committed and pushed"
           fi
 
+      - name: Sync standalone package lock with pyproject.toml
+        if: steps.check-pr.outputs.has_pr == 'true'
+        working-directory: packages/modelaudit-picklescan
+        run: |
+          uv lock
+          if git diff --quiet uv.lock; then
+            echo "✓ packages/modelaudit-picklescan/uv.lock already in sync"
+          else
+            echo "→ packages/modelaudit-picklescan/uv.lock updated to match pyproject.toml"
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add uv.lock
+            git commit -m "chore: sync standalone package lock"
+            git push
+            echo "✓ packages/modelaudit-picklescan/uv.lock committed and pushed"
+          fi
+
       - name: Setup Node.js
         if: steps.check-pr.outputs.has_pr == 'true'
         uses: actions/setup-node@v6
@@ -115,18 +132,18 @@ jobs:
       - name: Sync dependencies
         run: uv sync --extra all-ci
 
-      - name: Lint with Ruff
-        run: uv run ruff check modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests tests/
+      - name: Lint root package with Ruff
+        run: uv run ruff check modelaudit/ tests/
 
-      - name: Check formatting with Ruff
-        run: uv run ruff format --check modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests tests/
+      - name: Check root package formatting with Ruff
+        run: uv run ruff format --check modelaudit/ tests/
 
-      - name: Type check with mypy
-        run: uv run mypy modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests
+      - name: Type check root package with mypy
+        run: uv run mypy modelaudit/ tests/
 
-      - name: Run tests
+      - name: Run root package tests
         run: |
-          uv run pytest -n auto -m "not slow and not integration and not performance" --tb=short
+          uv run pytest tests -n auto -m "not slow and not integration and not performance" --tb=short
 
       - name: Build package
         run: uv build
@@ -370,9 +387,83 @@ jobs:
           name: dist
           path: dist/
 
+  build-picklescan-package:
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    needs: release-please
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: packages/modelaudit-picklescan
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Pin Python version
+        run: |
+          uv python pin 3.12
+
+      - name: Check standalone package lock is in sync
+        run: |
+          uv lock --check
+
+      - name: Lint standalone package with Ruff
+        run: uv run --with ruff ruff check src tests
+
+      - name: Check standalone package formatting with Ruff
+        run: uv run --with ruff ruff format --check src tests
+
+      - name: Type check standalone package with mypy
+        run: uv run --with mypy mypy src tests
+
+      - name: Run standalone package tests
+        run: uv run --with pytest --with pytest-xdist pytest -n auto tests --tb=short
+
+      - name: Build standalone package
+        run: uv build --out-dir /tmp/modelaudit-picklescan-dist
+
+      - name: Validate standalone package metadata
+        run: uvx twine check /tmp/modelaudit-picklescan-dist/*
+
+      - name: Smoke test standalone package wheel install
+        run: |
+          set -euo pipefail
+          uv venv /tmp/modelaudit-picklescan-wheel-smoke
+
+          shopt -s nullglob
+          picklescan_wheels=(/tmp/modelaudit-picklescan-dist/modelaudit_picklescan-*.whl)
+          if [[ ${#picklescan_wheels[@]} -ne 1 ]]; then
+            echo "ERROR: Expected exactly 1 modelaudit_picklescan wheel artifact, found ${#picklescan_wheels[@]}"
+            ls -la /tmp/modelaudit-picklescan-dist/
+            exit 1
+          fi
+
+          uv pip install --python /tmp/modelaudit-picklescan-wheel-smoke/bin/python "${picklescan_wheels[0]}"
+
+          smoke_dir="$(mktemp -d)"
+          (
+            cd "$smoke_dir"
+            PYTHONPATH= /tmp/modelaudit-picklescan-wheel-smoke/bin/python -I - <<'PY'
+          import importlib.util
+
+          import modelaudit_picklescan
+
+          assert importlib.util.find_spec("modelaudit") is None
+          report = modelaudit_picklescan.scan_bytes(b"\x80\x04}q\x00.")
+          assert report.status.value == "complete", report
+          assert report.verdict.value == "clean", report
+          print("standalone modelaudit_picklescan wheel loaded without modelaudit")
+          PY
+          )
+
   publish-pypi:
     if: needs.release-please.outputs.release_created == 'true'
-    needs: [build, release-please]
+    needs: [build, build-picklescan-package, release-please]
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -395,7 +486,7 @@ jobs:
 
   provenance:
     if: needs.release-please.outputs.release_created == 'true'
-    needs: [build, publish-pypi, release-please]
+    needs: [build, build-picklescan-package, publish-pypi, release-please]
     runs-on: ubuntu-latest
     permissions:
       contents: write

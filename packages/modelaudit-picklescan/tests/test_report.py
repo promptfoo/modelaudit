@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+
 from modelaudit_picklescan import (
     CoverageSummary,
     Finding,

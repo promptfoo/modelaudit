@@ -10,6 +10,7 @@ import re
 from pathlib import Path
 
 import pytest
+
 from modelaudit_picklescan import (
     PickleScanner,
     SafetyVerdict,

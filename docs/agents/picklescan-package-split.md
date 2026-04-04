@@ -9,6 +9,8 @@ wrapper scanners and the standalone pickle analysis package in
 ```text
 packages/
   modelaudit-picklescan/
+    pyproject.toml
+    uv.lock
     src/modelaudit_picklescan/
       __init__.py
       py.typed
@@ -74,7 +76,30 @@ Report semantics keep these concepts separate:
   verdict/status drift and rule-code differences across fixture corpora.
 - CI lints, type-checks, tests, builds, and smoke-installs both the root
   `modelaudit` distribution and the standalone `modelaudit-picklescan`
-  distribution.
+  distribution in separate workflow jobs.
+
+## Validation
+
+Root package checks run from the repository root:
+
+```bash
+uv run ruff check modelaudit/ tests/
+uv run ruff format --check modelaudit/ tests/
+uv run mypy modelaudit/ tests/
+uv run pytest tests -n auto -m "not slow and not integration" --maxfail=1
+```
+
+Standalone package checks run from `packages/modelaudit-picklescan`:
+
+```bash
+uv lock --check
+uv run --with ruff ruff check src tests
+uv run --with ruff ruff format --check src tests
+uv run --with mypy mypy src tests
+uv run --with pytest --with pytest-xdist pytest -n auto tests --tb=short
+uv build --out-dir /tmp/modelaudit-picklescan-dist
+uvx twine check /tmp/modelaudit-picklescan-dist/*
+```
 
 ## Safety Invariants
 

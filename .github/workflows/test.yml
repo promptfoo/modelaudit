@@ -28,6 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       python: ${{ steps.filter.outputs.python }}
+      picklescan: ${{ steps.filter.outputs.picklescan }}
       docker: ${{ steps.filter.outputs.docker }}
       workflows: ${{ steps.filter.outputs.workflows }}
       dependencies: ${{ steps.filter.outputs.dependencies }}
@@ -41,6 +42,8 @@ jobs:
               - '**.py'
               - 'pyproject.toml'
               - 'uv.lock'
+            picklescan:
+              - 'packages/modelaudit-picklescan/**'
             docker:
               - 'Dockerfile*'
               - '.dockerignore'
@@ -88,15 +91,15 @@ jobs:
 
       - name: Lint with Ruff
         run: |
-          uv run ruff check modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests tests/
+          uv run ruff check modelaudit/ tests/
 
       - name: Check import organization with Ruff
         run: |
-          uv run ruff check --select I modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests tests/
+          uv run ruff check --select I modelaudit/ tests/
 
       - name: Check formatting with Ruff
         run: |
-          uv run ruff format --check modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests tests/
+          uv run ruff format --check modelaudit/ tests/
 
   dependency-audit:
     name: Dependency Audit
@@ -324,7 +327,7 @@ jobs:
 
       - name: Type checking
         run: |
-          uv run mypy modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests tests/
+          uv run mypy modelaudit/ tests/
 
       - name: Check for circular imports
         run: |
@@ -370,7 +373,7 @@ jobs:
 
       - name: Run fast tests with fail-fast
         run: |
-          uv run pytest -x --maxfail=1 -n auto -m "not slow and not integration and not performance" --tb=short --durations=10
+          uv run pytest tests -x --maxfail=1 -n auto -m "not slow and not integration and not performance" --tb=short --durations=10
 
   windows-tests:
     name: Windows Tests (Python 3.11)
@@ -395,7 +398,7 @@ jobs:
 
       - name: Run fast tests with fail-fast
         run: |
-          uv run pytest -x --maxfail=1 -n auto -m "not slow and not integration and not performance" --tb=short --durations=10
+          uv run pytest tests -x --maxfail=1 -n auto -m "not slow and not integration and not performance" --tb=short --durations=10
 
   test:
     name: Test Python ${{ matrix.python-version }}
@@ -443,12 +446,12 @@ jobs:
       - name: Run fast tests with fail-fast (PRs, Python 3.12 with coverage)
         if: github.event_name == 'pull_request' && matrix.python-version == '3.12'
         run: |
-          uv run pytest -x --maxfail=1 -n auto -m "not slow and not integration and not performance" --cov=modelaudit --cov-report=xml --tb=short --durations=15
+          uv run pytest tests -x --maxfail=1 -n auto -m "not slow and not integration and not performance" --cov=modelaudit --cov-report=xml --tb=short --durations=15
 
       - name: Run fast tests with fail-fast (PRs, non-3.12)
         if: github.event_name == 'pull_request' && matrix.python-version != '3.12'
         run: |
-          uv run pytest -x --maxfail=1 -n auto -m "not slow and not integration and not performance" --tb=short --durations=15
+          uv run pytest tests -x --maxfail=1 -n auto -m "not slow and not integration and not performance" --tb=short --durations=15
 
       - name: Run slow/integration tests on PR (if labeled)
         # Run slow tests on PRs when the 'run-slow-tests' label is added
@@ -457,17 +460,17 @@ jobs:
         timeout-minutes: 20
         run: |
           echo "Running slow/integration tests due to 'run-slow-tests' label"
-          uv run pytest -n auto -m "slow or integration or performance" --tb=short --durations=20
+          uv run pytest tests -n auto -m "slow or integration or performance" --tb=short --durations=20
 
       - name: Run fast tests with coverage (main branch only)
         if: github.ref == 'refs/heads/main' && matrix.python-version == '3.12'
         run: |
-          uv run pytest -n auto -m "not slow and not integration and not performance" --cov=modelaudit --cov-report=xml --tb=short --durations=15
+          uv run pytest tests -n auto -m "not slow and not integration and not performance" --cov=modelaudit --cov-report=xml --tb=short --durations=15
 
       - name: Run fast tests without coverage (main branch, non-3.12)
         if: github.ref == 'refs/heads/main' && matrix.python-version != '3.12'
         run: |
-          uv run pytest -n auto -m "not slow and not integration and not performance" --tb=short --durations=15
+          uv run pytest tests -n auto -m "not slow and not integration and not performance" --tb=short --durations=15
 
       - name: Run slow/integration tests (main branch only)
         # Run ALL slow/integration/performance tests on main branch.
@@ -477,7 +480,7 @@ jobs:
         timeout-minutes: 20
         run: |
           # Run all slow, integration, and performance tests
-          uv run pytest -n auto -m "slow or integration or performance" --tb=short --durations=20
+          uv run pytest tests -n auto -m "slow or integration or performance" --tb=short --durations=20
 
       - name: Upload coverage to Codecov
         if: matrix.python-version == '3.12'
@@ -774,10 +777,69 @@ jobs:
           PY
           )
 
-      - name: Smoke test standalone pickle package wheel
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+
+  picklescan-package:
+    name: Standalone Pickle Package
+    needs: changes
+    if: github.ref == 'refs/heads/main' || needs.changes.outputs.picklescan == 'true' || needs.changes.outputs.workflows == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: packages/modelaudit-picklescan
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Pin Python version
+        run: |
+          uv python pin 3.12
+
+      - name: Check standalone package lock is in sync
+        run: |
+          uv lock --check
+
+      - name: Lint standalone package with Ruff
+        run: |
+          uv run --with ruff ruff check src tests
+
+      - name: Check standalone package import organization with Ruff
+        run: |
+          uv run --with ruff ruff check --select I src tests
+
+      - name: Check standalone package formatting with Ruff
+        run: |
+          uv run --with ruff ruff format --check src tests
+
+      - name: Type check standalone package with mypy
+        run: |
+          uv run --with mypy mypy src tests
+
+      - name: Run standalone package tests
+        run: |
+          uv run --with pytest --with pytest-xdist pytest -n auto tests --tb=short
+
+      - name: Build standalone package
+        run: |
+          uv build --out-dir /tmp/modelaudit-picklescan-dist
+
+      - name: Validate standalone package metadata
+        run: |
+          uvx twine check /tmp/modelaudit-picklescan-dist/*
+
+      - name: Smoke test standalone package wheel install
         run: |
           set -euo pipefail
-          uv build --project packages/modelaudit-picklescan --out-dir /tmp/modelaudit-picklescan-dist
           uv venv /tmp/modelaudit-picklescan-wheel-smoke
 
           shopt -s nullglob
@@ -794,20 +856,17 @@ jobs:
           (
             cd "$smoke_dir"
             PYTHONPATH= /tmp/modelaudit-picklescan-wheel-smoke/bin/python -I - <<'PY'
+          import importlib.util
+
           import modelaudit_picklescan
 
+          assert importlib.util.find_spec("modelaudit") is None
           report = modelaudit_picklescan.scan_bytes(b"\x80\x04}q\x00.")
           assert report.status.value == "complete", report
           assert report.verdict.value == "clean", report
-          print("standalone modelaudit_picklescan wheel loaded")
+          print("standalone modelaudit_picklescan wheel loaded without modelaudit")
           PY
           )
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v7
-        with:
-          name: dist
-          path: dist/
 
   # Summary job to ensure all required checks pass
   ci-success:
@@ -828,6 +887,7 @@ jobs:
         test-proto-reproducibility,
         test-extras-smoke,
         build,
+        picklescan-package,
       ]
     if: always()
     runs-on: ubuntu-latest
@@ -849,12 +909,15 @@ jobs:
           PROTO_REPRO_RESULT="${{ needs.test-proto-reproducibility.result }}"
           EXTRAS_RESULT="${{ needs.test-extras-smoke.result }}"
           BUILD_RESULT="${{ needs.build.result }}"
+          PICKLESCAN_RESULT="${{ needs.picklescan-package.result }}"
           CHANGES_RESULT="${{ needs.changes.result }}"
 
           # Check if conditional jobs should have run
           ON_MAIN_BRANCH="${{ github.ref == 'refs/heads/main' }}"
           DEPENDENCIES_CHANGED="${{ needs.changes.outputs.dependencies == 'true' }}"
+          PICKLESCAN_CHANGED="${{ needs.changes.outputs.picklescan == 'true' }}"
           PYTHON_CHANGED="${{ needs.changes.outputs.python == 'true' }}"
+          WORKFLOWS_CHANGED="${{ needs.changes.outputs.workflows == 'true' }}"
           echo "Job results:"
           echo "  quick-feedback: $QUICK_FEEDBACK_RESULT"
           echo "  lint: $LINT_RESULT"
@@ -869,6 +932,7 @@ jobs:
           echo "  test-proto-reproducibility: $PROTO_REPRO_RESULT"
           echo "  test-extras-smoke: $EXTRAS_RESULT"
           echo "  build: $BUILD_RESULT"
+          echo "  picklescan-package: $PICKLESCAN_RESULT"
           echo "  changes: $CHANGES_RESULT"
 
           # Check if any job failed or was cancelled
@@ -885,7 +949,7 @@ jobs:
 
           # Conditional jobs: only fail if they should have run
           # License/lock checks run on main or when dependencies change
-          if [[ "$ON_MAIN_BRANCH" == "true" || "$DEPENDENCIES_CHANGED" == "true" ]]; then
+          if [[ "$ON_MAIN_BRANCH" == "true" || "$DEPENDENCIES_CHANGED" == "true" || "$WORKFLOWS_CHANGED" == "true" ]]; then
             [[ "$LICENSE_RESULT" == "failure" || "$LICENSE_RESULT" == "cancelled" ]] && FAILED=true
             [[ "$UV_LOCK_RESULT" == "failure" || "$UV_LOCK_RESULT" == "cancelled" ]] && FAILED=true
             [[ "$NUMPY_RESULT" == "failure" || "$NUMPY_RESULT" == "cancelled" ]] && FAILED=true
@@ -893,9 +957,13 @@ jobs:
           fi
 
           # Vendored protos jobs run on main or when python/dependencies change
-          if [[ "$ON_MAIN_BRANCH" == "true" || "$PYTHON_CHANGED" == "true" || "$DEPENDENCIES_CHANGED" == "true" ]]; then
+          if [[ "$ON_MAIN_BRANCH" == "true" || "$PYTHON_CHANGED" == "true" || "$DEPENDENCIES_CHANGED" == "true" || "$WORKFLOWS_CHANGED" == "true" ]]; then
             [[ "$PROTOS_RESULT" == "failure" || "$PROTOS_RESULT" == "cancelled" ]] && FAILED=true
             [[ "$PROTO_REPRO_RESULT" == "failure" || "$PROTO_REPRO_RESULT" == "cancelled" ]] && FAILED=true
+          fi
+
+          if [[ "$ON_MAIN_BRANCH" == "true" || "$PICKLESCAN_CHANGED" == "true" || "$WORKFLOWS_CHANGED" == "true" ]]; then
+            [[ "$PICKLESCAN_RESULT" == "failure" || "$PICKLESCAN_RESULT" == "cancelled" ]] && FAILED=true
           fi
 
           if [[ "$FAILED" == "true" ]]; then
