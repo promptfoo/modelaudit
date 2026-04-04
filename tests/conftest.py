@@ -1,3 +1,4 @@
+import importlib
 import importlib.util
 import logging
 import os
@@ -20,28 +21,39 @@ from tests.xdist_status import (
     write_worker_status,
 )
 
-
 # ============================================================================
 # Framework availability detection (cached for performance)
 # ============================================================================
+_FRAMEWORK_MODULES = {
+    "tensorflow": "tensorflow",
+    "pytorch": "torch",
+    "onnx": "onnx",
+    "h5py": "h5py",
+    "msgpack": "msgpack",
+    "xgboost": "xgboost",
+    "safetensors": "safetensors",
+    "joblib": "joblib",
+    "dill": "dill",
+}
+_FRAMEWORK_AVAILABILITY: dict[str, bool] = {}
+
+
 def _check_framework(name: str) -> bool:
-    """Check whether a framework package is installed without importing it."""
+    """Check whether a framework package can be imported, with lazy caching."""
+    cached_result = _FRAMEWORK_AVAILABILITY.get(name)
+    if cached_result is not None:
+        return cached_result
+
     try:
-        return importlib.util.find_spec(name) is not None
+        is_available = importlib.util.find_spec(name) is not None
+        if is_available:
+            importlib.import_module(name)
     except Exception:
-        return False
+        is_available = False
 
+    _FRAMEWORK_AVAILABILITY[name] = is_available
+    return is_available
 
-# Cache framework availability at module load time
-HAS_TENSORFLOW = _check_framework("tensorflow")
-HAS_TORCH = _check_framework("torch")
-HAS_ONNX = _check_framework("onnx")
-HAS_H5PY = _check_framework("h5py")
-HAS_MSGPACK = _check_framework("msgpack")
-HAS_XGBOOST = _check_framework("xgboost")
-HAS_SAFETENSORS = _check_framework("safetensors")
-HAS_JOBLIB = _check_framework("joblib")
-HAS_DILL = _check_framework("dill")
 
 _xdist_status_reporter: XdistWorkerStatusReporter | None = None
 _xdist_worker_status_file: Path | None = None
@@ -160,21 +172,9 @@ def pytest_runtest_setup(item):
             pytest.skip(f"Skipping test on Python {sys.version_info[:2]} - only core functionality tested")
 
     # Auto-skip tests based on framework markers when framework is unavailable
-    framework_markers = {
-        "tensorflow": HAS_TENSORFLOW,
-        "pytorch": HAS_TORCH,
-        "onnx": HAS_ONNX,
-        "h5py": HAS_H5PY,
-        "msgpack": HAS_MSGPACK,
-        "xgboost": HAS_XGBOOST,
-        "safetensors": HAS_SAFETENSORS,
-        "joblib": HAS_JOBLIB,
-        "dill": HAS_DILL,
-    }
-
-    for marker_name, is_available in framework_markers.items():
+    for marker_name, module_name in _FRAMEWORK_MODULES.items():
         marker = item.get_closest_marker(marker_name)
-        if marker is not None and not is_available:
+        if marker is not None and not _check_framework(module_name):
             pytest.skip(f"{marker_name} is not installed")
 
 
@@ -386,7 +386,8 @@ def pytest_configure_node(node: Any) -> None:
     global _xdist_status_reporter
 
     if _xdist_status_reporter is None:
-        _xdist_status_reporter = XdistWorkerStatusReporter.from_environment()
+        status_dir = node.config._tmp_path_factory.mktemp("modelaudit-pytest-xdist")  # type: ignore[attr-defined]
+        _xdist_status_reporter = XdistWorkerStatusReporter.from_environment(status_dir)
         if _xdist_status_reporter is None:
             return
         _xdist_status_reporter.start()

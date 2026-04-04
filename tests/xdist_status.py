@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import sys
-import tempfile
 import threading
 import time
 from collections.abc import Iterable
@@ -36,7 +36,7 @@ def _parse_non_negative_seconds(raw_value: str | None, default: float) -> float:
     except ValueError:
         return default
 
-    return parsed if parsed >= 0 else default
+    return parsed if parsed >= 0 and math.isfinite(parsed) else default
 
 
 def status_file_for_worker(status_dir: Path, workerid: str) -> Path:
@@ -93,9 +93,11 @@ def collect_long_running_worker_statuses(
             started_at = float(payload["started_at"])
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
             continue
+        if not math.isfinite(started_at):
+            continue
 
         elapsed_seconds = current_time - started_at
-        if elapsed_seconds < min_elapsed_seconds:
+        if not math.isfinite(elapsed_seconds) or elapsed_seconds < min_elapsed_seconds:
             continue
 
         statuses.append(
@@ -143,7 +145,10 @@ class XdistWorkerStatusReporter:
         self._thread: threading.Thread | None = None
 
     @classmethod
-    def from_environment(cls) -> XdistWorkerStatusReporter | None:
+    def from_environment(
+        cls,
+        status_dir: Path,
+    ) -> XdistWorkerStatusReporter | None:
         report_interval_seconds = _parse_non_negative_seconds(
             os.environ.get(REPORT_INTERVAL_ENV),
             DEFAULT_REPORT_INTERVAL_SECONDS,
@@ -156,7 +161,6 @@ class XdistWorkerStatusReporter:
         if report_interval_seconds == 0:
             return None
 
-        status_dir = Path(tempfile.mkdtemp(prefix="modelaudit-pytest-xdist-"))
         return cls(
             status_dir,
             report_interval_seconds=report_interval_seconds,
