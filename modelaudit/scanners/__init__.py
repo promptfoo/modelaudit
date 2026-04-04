@@ -579,7 +579,6 @@ class ScannerRegistry:
 
             except Exception as e:
                 # Unexpected error - provide detailed information
-                scanner_deps = scanner_info.get("dependencies", [])
                 is_numpy_sensitive = scanner_info.get("numpy_sensitive", False)
 
                 if _is_numpy_compatibility_error(e):
