@@ -721,8 +721,13 @@ class TorchServeMarScanner(BaseScanner):
         analyzed_handler = False
         handler_trees: dict[str, list[ast.Module]] = {}
         member_lookup = self._build_member_lookup(archive.infolist())
+        processed_handler_entries = 0
+        processed_handler_uncompressed = 0
+        handler_budget_exceeded = False
 
         for handler_path in handler_paths:
+            if handler_budget_exceeded:
+                break
             resolved_candidates = self._resolve_handler_member_candidates(handler_path)
             normalized_handlers = [
                 candidate
@@ -733,11 +738,55 @@ class TorchServeMarScanner(BaseScanner):
                 continue
 
             for normalized_handler in normalized_handlers:
+                if handler_budget_exceeded:
+                    break
                 handler_infos = member_lookup.get(normalized_handler, [])
                 if not handler_infos:
                     continue
 
                 for handler_info in handler_infos:
+                    if processed_handler_entries >= self.max_entries:
+                        result.add_check(
+                            name="TorchServe Handler Entry Limit",
+                            passed=False,
+                            message=(
+                                "Handler static analysis reached the max processed entry budget "
+                                f"({self.max_entries}); later handler files were skipped and scan results "
+                                "are incomplete"
+                            ),
+                            severity=IssueSeverity.CRITICAL,
+                            location=f"{archive_path}:{normalized_handler}",
+                            details={
+                                "processed_handler_entries": processed_handler_entries,
+                                "max_entries": self.max_entries,
+                                "skipped_handler": normalized_handler,
+                            },
+                        )
+                        handler_budget_exceeded = True
+                        break
+
+                    processed_handler_entries += 1
+                    processed_handler_uncompressed += max(handler_info.file_size, 0)
+                    if processed_handler_uncompressed > self.max_uncompressed_bytes:
+                        result.add_check(
+                            name="TorchServe Handler Uncompressed Size Budget",
+                            passed=False,
+                            message=(
+                                "Handler static analysis uncompressed byte budget exceeded "
+                                f"({processed_handler_uncompressed} > {self.max_uncompressed_bytes}); "
+                                "later handler files were skipped and scan results are incomplete"
+                            ),
+                            severity=IssueSeverity.CRITICAL,
+                            location=f"{archive_path}:{normalized_handler}",
+                            details={
+                                "processed_uncompressed": processed_handler_uncompressed,
+                                "max_uncompressed_bytes": self.max_uncompressed_bytes,
+                                "handler": normalized_handler,
+                            },
+                        )
+                        handler_budget_exceeded = True
+                        break
+
                     analyzed_handler = True
                     handler_details = self._build_member_details(
                         member_info=handler_info,
@@ -1139,6 +1188,9 @@ class TorchServeMarScanner(BaseScanner):
         return ".".join([resolved_head, *tail])
 
     def _resolve_getattr_call_name(self, node: ast.AST, aliases: dict[str, str]) -> str | None:
+        if isinstance(node, ast.Attribute) and node.attr == "__call__":
+            return self._resolve_getattr_call_name(node.value, aliases)
+
         if not isinstance(node, ast.Call):
             return None
 
