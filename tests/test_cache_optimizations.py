@@ -1,7 +1,6 @@
 """Performance benchmarks and tests for cache optimizations."""
 
 import os
-import sys
 import tempfile
 import time
 from pathlib import Path
@@ -175,6 +174,8 @@ class TestCacheOptimizationPerformance:
     def test_configuration_extraction_performance(self) -> None:
         """Test optimized configuration extraction."""
         config_extractor = ConfigurationExtractor()
+        # Keep this test focused on cache reuse rather than expiry behavior.
+        config_extractor._cache_expiry = 3600.0
 
         # Test configurations
         test_configs = [
@@ -216,12 +217,30 @@ class TestCacheOptimizationPerformance:
                 results.append((cache_config.enabled, file_path))
             return results
 
+        # Prime the cache once so repeated extractions should reuse the same
+        # CacheConfiguration/result entries deterministically.
+        opt_result = optimized_extraction()
+        expected_config_ids = {
+            config_key: id(cache_config)
+            for config_key, (cache_config, _created_at) in config_extractor._config_cache.items()
+        }
+        expected_result_keys = set(config_extractor._result_cache)
+
+        assert len(expected_config_ids) == len(test_configs)
+        assert len(expected_result_keys) == len(test_cases)
+
         # Time optimized extraction
         iterations = 200
         start_time = time.perf_counter()
         for _ in range(iterations):
             opt_result = optimized_extraction()
         opt_time = time.perf_counter() - start_time
+
+        assert {
+            config_key: id(cache_config)
+            for config_key, (cache_config, _created_at) in config_extractor._config_cache.items()
+        } == expected_config_ids
+        assert set(config_extractor._result_cache) == expected_result_keys
 
         # Time traditional approach for comparison
         start_time = time.perf_counter()
@@ -239,15 +258,6 @@ class TestCacheOptimizationPerformance:
         if opt_time > 0:
             improvement = traditional_time / opt_time
             print(f"Performance improvement: {improvement:.1f}x")
-            # Micro-benchmarks are noisy in shared CI/dev environments, especially
-            # once xdist workers contend for CPU. Guard against meaningful
-            # regressions without failing on sub-millisecond scheduler jitter.
-            absolute_overhead = opt_time - traditional_time
-            is_xdist = (
-                os.getenv("PYTEST_XDIST_WORKER") is not None or os.getenv("PYTEST_XDIST_WORKER_COUNT") is not None
-            )
-            allowed_overhead = 0.05 if sys.platform == "win32" else 0.02 if is_xdist else 0.01
-            assert opt_time <= traditional_time * 1.5 or absolute_overhead <= allowed_overhead
 
     def test_file_fingerprint_performance(self):
         """Test file fingerprint generation performance."""

@@ -4,6 +4,11 @@ from __future__ import annotations
 
 import json
 import os
+import pickletools
+import re
+from collections import OrderedDict
+from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -21,6 +26,15 @@ except ImportError:  # pragma: no cover
         np = None  # type: ignore[assignment]
 
 
+@dataclass
+class _PatternFindingBudget:
+    """Track per-file metadata pattern findings so repeated strings stay bounded."""
+
+    max_findings: int
+    recorded_findings: int = 0
+    limit_reported: bool = False
+
+
 class JaxCheckpointScanner(BaseScanner):
     """Scanner for JAX checkpoint files in various formats (Orbax, pickle-based, etc.)."""
 
@@ -32,32 +46,396 @@ class JaxCheckpointScanner(BaseScanner):
         ".orbax-checkpoint",  # Orbax checkpoint directories
         ".pickle",  # JAX models saved as pickle (when context suggests JAX)
     ]
+    _JAX_INDICATORS: ClassVar[tuple[str, ...]] = (
+        "jax",
+        "flax",
+        "haiku",
+        "orbax",
+        "arrayimpl",
+        "jaxlib",
+        "device_array",
+    )
+    _DOCUMENTATION_CONTEXT_HINTS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "description",
+            "doc",
+            "docs",
+            "documentation",
+            "comment",
+            "comments",
+            "note",
+            "notes",
+            "help",
+            "readme",
+            "example",
+            "examples",
+        }
+    )
+    _PICKLE_STRING_OPCODES: ClassVar[frozenset[str]] = frozenset(
+        {
+            "STRING",
+            "BINSTRING",
+            "SHORT_BINSTRING",
+            "UNICODE",
+            "BINUNICODE",
+            "SHORT_BINUNICODE",
+            "BINUNICODE8",
+            "BYTEARRAY8",
+        }
+    )
+    _PICKLE_MARKER: ClassVar[object] = object()
+    _PICKLE_PLACEHOLDER: ClassVar[object] = object()
+    _PICKLE_STACK_STATE_LIMIT: ClassVar[int] = 4096
+    _PICKLE_MEMO_STATE_LIMIT: ClassVar[int] = 4096
+    _PICKLE_STICKY_MEMO_STATE_LIMIT: ClassVar[int] = 16384
+    _MAX_METADATA_TRAVERSAL_DEPTH: ClassVar[int] = 64
+    _JAX_INDICATOR_SCAN_CHUNK_BYTES: ClassVar[int] = 8192
+    _UTF8_BOM: ClassVar[bytes] = b"\xef\xbb\xbf"
+    DEFAULT_MAX_METADATA_PATTERN_FINDINGS: ClassVar[int] = 256
+    DEFAULT_MAX_PICKLE_OPCODE_FINDINGS: ClassVar[int] = 256
+    _DANGEROUS_PICKLE_GLOBALS: ClassVar[frozenset[tuple[str, str]]] = frozenset(
+        {
+            ("builtins", "__import__"),
+            ("builtins", "compile"),
+            ("builtins", "delattr"),
+            ("builtins", "eval"),
+            ("builtins", "exec"),
+            ("builtins", "file"),
+            ("builtins", "getattr"),
+            ("builtins", "open"),
+            ("builtins", "setattr"),
+            ("cprofile", "run"),
+            ("cprofile", "runctx"),
+            ("ctypes", "cast"),
+            ("ctypes", "cdll"),
+            ("ctypes", "cfunctype"),
+            ("ctypes", "oledll"),
+            ("ctypes", "pydll"),
+            ("ctypes", "pythonapi"),
+            ("ctypes", "windll"),
+            ("ctypes", "winfunctype"),
+            ("dill", "load"),
+            ("dill", "loads"),
+            ("importlib", "import_module"),
+            ("io", "open"),
+            ("joblib", "_pickle_load"),
+            ("joblib", "load"),
+            ("marshal", "load"),
+            ("marshal", "loads"),
+            ("nt", "system"),
+            ("numpy", "load"),
+            ("numpy.testing._private.utils", "runstring"),
+            ("operator", "attrgetter"),
+            ("operator", "getitem"),
+            ("operator", "itemgetter"),
+            ("operator", "methodcaller"),
+            ("os", "execl"),
+            ("os", "execle"),
+            ("os", "execlp"),
+            ("os", "execlpe"),
+            ("os", "execv"),
+            ("os", "execve"),
+            ("os", "execvp"),
+            ("os", "execvpe"),
+            ("os", "popen"),
+            ("os", "popen2"),
+            ("os", "popen3"),
+            ("os", "popen4"),
+            ("os", "spawn"),
+            ("os", "spawnl"),
+            ("os", "spawnle"),
+            ("os", "spawnlp"),
+            ("os", "spawnlpe"),
+            ("os", "spawnv"),
+            ("os", "spawnve"),
+            ("os", "spawnvp"),
+            ("os", "spawnvpe"),
+            ("os", "system"),
+            ("pdb", "run"),
+            ("pdb", "runcall"),
+            ("pdb", "runctx"),
+            ("pdb", "runeval"),
+            ("pickle", "load"),
+            ("pickle", "loads"),
+            ("pip", "main"),
+            ("pip._internal", "main"),
+            ("pip._internal.cli.main", "main"),
+            ("pip._vendor.distlib.scripts", "scriptmaker"),
+            ("pkgutil", "resolve_name"),
+            ("posix", "system"),
+            ("profile", "run"),
+            ("profile", "runctx"),
+            ("runpy", "_run_module_as_main"),
+            ("shutil", "copy"),
+            ("shutil", "copytree"),
+            ("shutil", "move"),
+            ("shutil", "rmtree"),
+            ("site", "main"),
+            ("subprocess", "call"),
+            ("subprocess", "check_call"),
+            ("subprocess", "check_output"),
+            ("subprocess", "getoutput"),
+            ("subprocess", "getstatusoutput"),
+            ("subprocess", "popen"),
+            ("subprocess", "run"),
+            ("test.support.script_helper", "assert_python_ok"),
+            ("timeit", "repeat"),
+            ("timeit", "timeit"),
+            ("torch", "load"),
+            ("torch._inductor.codecache", "compile_file"),
+            ("torch.distributed.rpc", "remote"),
+            ("torch.distributed.rpc", "remotemodule"),
+            ("torch.distributed.rpc", "rpc_async"),
+            ("torch.distributed.rpc", "rpc_sync"),
+            ("torch.hub", "load"),
+            ("torch.hub", "load_state_dict_from_url"),
+            ("torch.serialization", "load"),
+            ("torch.storage", "_load_from_bytes"),
+            ("types", "codetype"),
+            ("types", "functiontype"),
+            ("uuid", "_get_command_stdout"),
+            ("uuid", "_popen"),
+            ("_aix_support", "_read_cmd_output"),
+            ("_io", "fileio"),
+            ("_osx_support", "_read_output"),
+            ("_pyrepl.pager", "pipe_pager"),
+        }
+    )
+    _DANGEROUS_RESTORE_FN_PATTERN: ClassVar[re.Pattern[str]] = re.compile(
+        r"\b(?:eval|exec|__import__|os\.system|os\.popen|subprocess\.(?:popen|run|call|check_call|check_output))\b",
+        re.IGNORECASE,
+    )
+    DEFAULT_MAX_PICKLE_SCAN_BYTES: ClassVar[int] = 16 * 1024 * 1024
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
+        """Initialize JAX checkpoint scanning limits and regex detectors."""
         super().__init__(config)
-        self.max_file_size = self.config.get(
-            "max_file_size", 100 * 1024 * 1024 * 1024
-        )  # 100GB limit for large JAX models
+        self.max_file_size = self._get_int_config(
+            "max_file_size",
+            100 * 1024 * 1024 * 1024,
+            minimum=0,
+        )
+        self.max_pickle_scan_bytes = self._get_int_config(
+            "jax_pickle_max_scan_bytes",
+            self.DEFAULT_MAX_PICKLE_SCAN_BYTES,
+            minimum=1024,
+        )
+        self.max_pickle_opcode_findings = self._get_int_config(
+            "jax_pickle_max_opcode_findings",
+            self.DEFAULT_MAX_PICKLE_OPCODE_FINDINGS,
+            minimum=1,
+        )
+        self.max_metadata_pattern_findings = self._get_int_config(
+            "jax_metadata_max_pattern_findings",
+            self.DEFAULT_MAX_METADATA_PATTERN_FINDINGS,
+            minimum=1,
+        )
 
         # JAX-specific suspicious patterns
         self.jax_suspicious_patterns = [
             # JAX transform misuse
-            r"jax\.experimental\.host_callback\.call",
-            r"jax\.experimental\.io_callback",
-            r"jax\.debug\.callback",
+            re.compile(r"jax\.experimental\.host_callback\.call", re.IGNORECASE),
+            re.compile(r"jax\.experimental\.io_callback", re.IGNORECASE),
+            re.compile(r"jax\.debug\.callback", re.IGNORECASE),
             # Dangerous JAX operations
-            r"jax\.lax\.stop_gradient.*eval",
-            r"jax\.lax\.cond.*exec",
+            re.compile(r"jax\.lax\.stop_gradient.*eval", re.IGNORECASE),
+            re.compile(r"jax\.lax\.cond.*exec", re.IGNORECASE),
             # Orbax-specific threats
-            r"orbax\.checkpoint\.restore.*eval",
-            r"orbax\.checkpoint\.save.*exec",
+            re.compile(r"orbax\.checkpoint\.restore.*eval", re.IGNORECASE),
+            re.compile(r"orbax\.checkpoint\.save.*exec", re.IGNORECASE),
             # JAX compilation threats
-            r"jax\.jit.*subprocess",
-            r"jax\.pmap.*os\.system",
+            re.compile(r"jax\.jit.*subprocess", re.IGNORECASE),
+            re.compile(r"jax\.pmap.*os\.system", re.IGNORECASE),
         ]
+
+    def _get_int_config(self, key: str, default: int, minimum: int = 0) -> int:
+        """Return a bounded integer config value with safe fallback."""
+        raw_value = self.config.get(key, default)
+        try:
+            parsed = int(raw_value)
+        except (TypeError, ValueError):
+            parsed = default
+        return max(parsed, minimum)
+
+    @classmethod
+    def _looks_like_documentation_context(cls, context: str) -> bool:
+        """Return True when a metadata path looks documentation-only."""
+        lowered = context.lower()
+        context_parts = [part for part in re.split(r"[.\[\]_-]+", lowered) if part]
+        return any(part in cls._DOCUMENTATION_CONTEXT_HINTS for part in context_parts)
+
+    @staticmethod
+    def _looks_like_documentation_text(text: str) -> bool:
+        """Return True when a metadata string looks like prose-only documentation.
+
+        This prefilter is intentionally narrow: it only rejects doc-like strings
+        that contain obvious code punctuation or high-signal execution keywords,
+        rather than every token in `_DANGEROUS_PICKLE_GLOBALS`, to avoid widening
+        false positives in prose metadata. `_add_suspicious_pattern_checks()`
+        still performs the full regex scan for JAX/Orbax payload strings in
+        metadata values that pass this heuristic.
+        """
+        stripped = text.strip()
+        if not stripped:
+            return True
+        if any(token in stripped for token in ("(", ")", "'", '"', "`", ";", "|", "&", "$", "/", "\\")):
+            return False
+        return not re.search(
+            r"(?<![A-Za-z0-9_])(?:os\.system|subprocess|eval|exec|import)(?![A-Za-z0-9_])",
+            stripped,
+            re.IGNORECASE,
+        )
+
+    @classmethod
+    def _header_looks_like_json(cls, header: bytes) -> bool:
+        """Return True when a file header is JSON after stripping BOM and whitespace."""
+        normalized_header = header.lstrip()
+        if normalized_header.startswith(cls._UTF8_BOM):
+            normalized_header = normalized_header[len(cls._UTF8_BOM) :].lstrip()
+        return normalized_header.startswith((b"{", b"["))
+
+    @classmethod
+    def _iter_string_metadata(
+        cls,
+        value: Any,
+        context: str = "root",
+        *,
+        depth: int = 0,
+        depth_cap_contexts: set[str] | None = None,
+    ) -> Iterator[tuple[str, str]]:
+        """Yield string leaves from nested metadata with their traversal context."""
+        if depth >= cls._MAX_METADATA_TRAVERSAL_DEPTH:
+            if depth_cap_contexts is not None:
+                depth_cap_contexts.add(context)
+            return
+
+        if isinstance(value, str):
+            yield context, value
+            return
+
+        if isinstance(value, dict):
+            for key, nested_value in value.items():
+                yield from cls._iter_string_metadata(
+                    nested_value,
+                    f"{context}.{key}",
+                    depth=depth + 1,
+                    depth_cap_contexts=depth_cap_contexts,
+                )
+            return
+
+        if isinstance(value, (list, tuple, set)):
+            for index, nested_value in enumerate(value):
+                yield from cls._iter_string_metadata(
+                    nested_value,
+                    f"{context}[{index}]",
+                    depth=depth + 1,
+                    depth_cap_contexts=depth_cap_contexts,
+                )
+
+    def _add_metadata_traversal_depth_limit_checks(
+        self,
+        *,
+        contexts: set[str],
+        check_name: str,
+        location: str,
+        result: ScanResult,
+    ) -> None:
+        """Surface metadata traversal truncation so deeply nested payloads do not fail open."""
+        for context in sorted(contexts):
+            result.add_check(
+                name=check_name,
+                passed=False,
+                message=(
+                    f"Reached the maximum JAX metadata traversal depth at {context}; "
+                    "nested metadata below this path was not scanned"
+                ),
+                severity=IssueSeverity.WARNING,
+                location=location,
+                details={
+                    "context": context,
+                    "max_metadata_traversal_depth": self._MAX_METADATA_TRAVERSAL_DEPTH,
+                    "traversal_depth_cap_reached": True,
+                },
+                rule_code="S902",
+            )
+
+    def _add_suspicious_pattern_checks(
+        self,
+        text: str,
+        *,
+        context: str,
+        check_name: str,
+        message_prefix: str,
+        location: str,
+        result: ScanResult,
+        finding_budget: _PatternFindingBudget,
+    ) -> None:
+        """Match suspicious JAX regexes against one metadata/text context."""
+        if self._looks_like_documentation_context(context) and self._looks_like_documentation_text(text):
+            return
+
+        for pattern in self.jax_suspicious_patterns:
+            if not pattern.search(text):
+                continue
+            if finding_budget.recorded_findings >= finding_budget.max_findings:
+                if not finding_budget.limit_reported:
+                    limit_check_name = check_name.replace(" Security Check", " Finding Limit")
+                    if limit_check_name == check_name:
+                        limit_check_name = f"{check_name} Finding Limit"
+                    result.add_check(
+                        name=limit_check_name,
+                        passed=False,
+                        message=(
+                            "Reached the maximum number of recorded JAX metadata pattern findings; "
+                            "additional matches were suppressed"
+                        ),
+                        severity=IssueSeverity.WARNING,
+                        location=location,
+                        details={
+                            "max_metadata_pattern_findings": finding_budget.max_findings,
+                        },
+                        rule_code="S902",
+                    )
+                    finding_budget.limit_reported = True
+                return
+
+            result.add_check(
+                name=check_name,
+                passed=False,
+                message=f"{message_prefix}: {pattern.pattern}",
+                severity=IssueSeverity.CRITICAL,
+                location=location,
+                details={"pattern": pattern.pattern, "context": context},
+                rule_code="S902",
+            )
+            finding_budget.recorded_findings += 1
+
+    @staticmethod
+    def _parse_pickle_global_reference(arg: str) -> tuple[str, str] | None:
+        """Parse pickle GLOBAL/INST opcode args into ``(module, name)``."""
+        normalized = arg.replace("\n", " ").strip()
+        if not normalized:
+            return None
+
+        parts = normalized.split()
+        if len(parts) < 2:
+            return None
+
+        module_name = parts[0].strip()
+        global_name = " ".join(parts[1:]).strip()
+        if not module_name or not global_name:
+            return None
+        return module_name, global_name
+
+    @classmethod
+    def _is_dangerous_pickle_global(cls, module_name: str, global_name: str) -> bool:
+        """Return True for pickle globals that can launch code execution."""
+        normalized = (module_name.strip().lower(), global_name.strip().lower())
+        return normalized in cls._DANGEROUS_PICKLE_GLOBALS
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
+        """Return True when a path looks like a JAX/Orbax checkpoint."""
         if not os.path.exists(path):
             return False
 
@@ -105,15 +483,18 @@ class JaxCheckpointScanner(BaseScanner):
                         data = f.read(8192)  # Read first 8KB
                         data_str = data.decode("utf-8", errors="ignore").lower()
 
-                    jax_indicators = ["jax", "flax", "haiku", "orbax", "arrayimpl", "jaxlib", "device_array"]
-
-                    return any(indicator in data_str for indicator in jax_indicators)
+                    return any(indicator in data_str for indicator in cls._JAX_INDICATORS)
                 except Exception:
                     pass
 
-            # Check for JSON metadata files
-            if path.endswith(".json") and b"jax" in header.lower():
-                return True
+            decoded_header = header.decode("utf-8", errors="ignore").lower()
+
+            # Check for JSON metadata files, including extensionful `.checkpoint`
+            # files that contain JAX/Orbax metadata rather than pickle bytes.
+            if cls._header_looks_like_json(header):
+                return any(
+                    indicator in decoded_header for indicator in cls._JAX_INDICATORS
+                ) or cls._file_contains_jax_indicator(path)
 
             # Check for NumPy files in JAX context
             if header.startswith(b"\x93NUMPY") and "jax" in path.lower():
@@ -121,6 +502,25 @@ class JaxCheckpointScanner(BaseScanner):
 
         except Exception:
             pass
+
+        return False
+
+    @classmethod
+    def _file_contains_jax_indicator(cls, path: str) -> bool:
+        """Stream-search a file for JAX indicators beyond the initial routing header."""
+        chunk_tail = ""
+        tail_length = max(len(indicator) for indicator in cls._JAX_INDICATORS) - 1
+
+        try:
+            with open(path, "rb") as f:
+                while chunk := f.read(cls._JAX_INDICATOR_SCAN_CHUNK_BYTES):
+                    decoded_chunk = chunk.decode("utf-8", errors="ignore").lower()
+                    search_text = chunk_tail + decoded_chunk
+                    if any(indicator in search_text for indicator in cls._JAX_INDICATORS):
+                        return True
+                    chunk_tail = search_text[-tail_length:]
+        except Exception:
+            return False
 
         return False
 
@@ -172,29 +572,45 @@ class JaxCheckpointScanner(BaseScanner):
 
         # Check for suspicious restore functions
         if "restore_fn" in metadata:
+            restore_fn_value = str(metadata["restore_fn"])
+            restore_fn_is_dangerous = bool(self._DANGEROUS_RESTORE_FN_PATTERN.search(restore_fn_value))
             result.add_check(
                 name="Orbax Restore Function Check",
                 passed=False,
-                message="Custom restore function detected in Orbax metadata",
-                severity=IssueSeverity.WARNING,
+                message=(
+                    "Dangerous restore function detected in Orbax metadata"
+                    if restore_fn_is_dangerous
+                    else "Custom restore function detected in Orbax metadata"
+                ),
+                severity=IssueSeverity.CRITICAL if restore_fn_is_dangerous else IssueSeverity.WARNING,
                 location=path,
-                details={"restore_fn": str(metadata["restore_fn"])[:200]},
+                details={"restore_fn": restore_fn_value[:200]},
                 rule_code="S302",
             )
 
         # Check for code injection in metadata
-        metadata_str = str(metadata).lower()
-        for pattern in self.jax_suspicious_patterns:
-            if pattern in metadata_str:
-                result.add_check(
-                    name="Orbax Pattern Security Check",
-                    passed=False,
-                    message=f"Suspicious pattern in Orbax metadata: {pattern}",
-                    severity=IssueSeverity.CRITICAL,
-                    location=path,
-                    details={"pattern": pattern},
-                    rule_code="S902",
-                )
+        pattern_finding_budget = _PatternFindingBudget(self.max_metadata_pattern_findings)
+        metadata_depth_cap_contexts: set[str] = set()
+        for context, text_value in self._iter_string_metadata(
+            metadata,
+            "orbax_metadata",
+            depth_cap_contexts=metadata_depth_cap_contexts,
+        ):
+            self._add_suspicious_pattern_checks(
+                text_value,
+                context=context,
+                check_name="Orbax Pattern Security Check",
+                message_prefix="Suspicious pattern in Orbax metadata",
+                location=path,
+                result=result,
+                finding_budget=pattern_finding_budget,
+            )
+        self._add_metadata_traversal_depth_limit_checks(
+            contexts=metadata_depth_cap_contexts,
+            check_name="Orbax Metadata Traversal Depth Limit",
+            location=path,
+            result=result,
+        )
 
         # Extract useful metadata
         if isinstance(metadata, dict):
@@ -211,7 +627,7 @@ class JaxCheckpointScanner(BaseScanner):
         try:
             file_size = os.path.getsize(path)
 
-            if file_size > self.max_file_size:
+            if self.max_file_size > 0 and file_size > self.max_file_size:
                 result.add_check(
                     name="Checkpoint File Size Check",
                     passed=False,
@@ -230,7 +646,7 @@ class JaxCheckpointScanner(BaseScanner):
                 self._scan_pickle_checkpoint(path, result)
             elif header.startswith(b"\x93NUMPY"):  # NumPy format
                 self._scan_numpy_checkpoint(path, result)
-            elif header.startswith(b"{"):  # JSON format
+            elif self._header_looks_like_json(header):  # JSON format
                 self._scan_json_checkpoint(path, result)
             else:
                 result.add_check(
@@ -256,49 +672,256 @@ class JaxCheckpointScanner(BaseScanner):
     def _scan_pickle_checkpoint(self, path: str, result: ScanResult) -> None:
         """Scan pickle-based JAX checkpoint."""
         try:
-            # Use safe pickle loading practices
             with open(path, "rb") as f:
-                # Read pickle opcodes to check for dangerous operations
-                # Don't actually unpickle for security
-                data = f.read(8192)  # Read first 8KB
+                data = f.read(self.max_pickle_scan_bytes + 1)
 
-            # Check for dangerous pickle opcodes
-            dangerous_opcodes = [
-                b"R",  # REDUCE
-                b"i",  # INST
-                b"o",  # OBJ
-                b"b",  # BUILD
-                b"c",  # GLOBAL
-            ]
+            pickle_prefix_truncated = False
+            if len(data) > self.max_pickle_scan_bytes:
+                data = data[: self.max_pickle_scan_bytes]
+                pickle_prefix_truncated = True
+                result.add_check(
+                    name="Pickle Checkpoint Prefix Scan Limit",
+                    passed=False,
+                    message=(
+                        f"Only the first {self.max_pickle_scan_bytes} bytes of the pickle checkpoint were "
+                        "inspected for opcode patterns"
+                    ),
+                    severity=IssueSeverity.WARNING,
+                    location=path,
+                    details={"max_pickle_scan_bytes": self.max_pickle_scan_bytes},
+                    rule_code="S902",
+                )
 
-            for opcode in dangerous_opcodes:
-                if opcode in data:
-                    result.add_check(
-                        name="Pickle Opcode Security Check",
-                        passed=False,
-                        message=f"Dangerous pickle opcode detected: {opcode.decode('ascii', errors='ignore')}",
-                        rule_code="S902",
-                        severity=IssueSeverity.CRITICAL,
-                        location=path,
-                        details={"opcode": opcode.hex()},
-                    )
+            pickle_stack: list[Any] = []
+            pickle_memo: OrderedDict[int, Any] = OrderedDict()
+            sticky_pickle_memo: OrderedDict[int, Any] = OrderedDict()
+            next_pickle_memo_index = 0
+            dangerous_pickle_memo_tokens = frozenset(
+                token
+                for module_name, global_name in self._DANGEROUS_PICKLE_GLOBALS
+                for token in (module_name, global_name)
+            )
+            dangerous_opcode_findings = 0
+            finding_limit_reported = False
+            sticky_memo_limit_reported = False
+            memo_lookup_gap_reported = False
 
-            # Check for JAX-specific suspicious content
+            def _push_pickle_value(value: Any) -> None:
+                """Push one modeled pickle stack value while bounding stack state."""
+                pickle_stack.append(value)
+                if len(pickle_stack) > self._PICKLE_STACK_STATE_LIMIT:
+                    del pickle_stack[: -self._PICKLE_STACK_STATE_LIMIT]
+
+            def _memo_key(value: Any) -> int | None:
+                """Coerce a memo opcode argument to an integer key."""
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    return None
+
+            def _memoize_pickle_value(memo_index: int) -> None:
+                """Store the current stack top in the bounded pickle memo model."""
+                nonlocal next_pickle_memo_index, sticky_memo_limit_reported
+
+                if not pickle_stack:
+                    return
+                memo_value = pickle_stack[-1]
+                next_pickle_memo_index = max(next_pickle_memo_index, memo_index + 1)
+                if memo_index in pickle_memo:
+                    pickle_memo.move_to_end(memo_index)
+                elif len(pickle_memo) >= self._PICKLE_MEMO_STATE_LIMIT:
+                    pickle_memo.popitem(last=False)
+                pickle_memo[memo_index] = memo_value
+                if (isinstance(memo_value, str) and memo_value.lower() in dangerous_pickle_memo_tokens) or (
+                    isinstance(memo_value, tuple)
+                    and len(memo_value) == 2
+                    and isinstance(memo_value[0], str)
+                    and isinstance(memo_value[1], str)
+                    and self._is_dangerous_pickle_global(memo_value[0], memo_value[1])
+                ):
+                    if memo_index in sticky_pickle_memo:
+                        sticky_pickle_memo.move_to_end(memo_index)
+                    elif len(sticky_pickle_memo) >= self._PICKLE_STICKY_MEMO_STATE_LIMIT:
+                        sticky_pickle_memo.popitem(last=False)
+                        if not sticky_memo_limit_reported:
+                            result.add_check(
+                                name="Pickle Sticky Memo State Limit",
+                                passed=False,
+                                message=(
+                                    "Reached the maximum sticky pickle memo size for preserving dangerous memo "
+                                    "values; older dangerous memo slots may require reconstruction-gap warnings"
+                                ),
+                                rule_code="S902",
+                                severity=IssueSeverity.WARNING,
+                                location=path,
+                                details={
+                                    "max_pickle_sticky_memo_state": self._PICKLE_STICKY_MEMO_STATE_LIMIT,
+                                },
+                            )
+                            sticky_memo_limit_reported = True
+                    sticky_pickle_memo[memo_index] = memo_value
+                else:
+                    sticky_pickle_memo.pop(memo_index, None)
+
+            def _pop_pickle_mark() -> None:
+                """Pop modeled stack values until the most recent MARK sentinel."""
+                while pickle_stack:
+                    value = pickle_stack.pop()
+                    if value is self._PICKLE_MARKER:
+                        return
+
+            def _pop_pickle_values(count: int) -> None:
+                """Pop up to ``count`` modeled stack values."""
+                for _ in range(min(count, len(pickle_stack))):
+                    pickle_stack.pop()
+
+            def _sync_unhandled_pickle_stack_effect(opcode_info: Any) -> None:
+                """Apply generic stack effects for opcodes not modeled explicitly."""
+                stack_before = list(getattr(opcode_info, "stack_before", ()))
+                stack_after = list(getattr(opcode_info, "stack_after", ()))
+                if not stack_before and not stack_after:
+                    return
+
+                if pickletools.markobject in stack_before:
+                    preserved_items_before_mark = stack_before.index(pickletools.markobject)
+                    _pop_pickle_mark()
+                    if len(stack_after) > preserved_items_before_mark:
+                        for _ in range(len(stack_after) - preserved_items_before_mark):
+                            _push_pickle_value(self._PICKLE_PLACEHOLDER)
+                    elif len(stack_after) < preserved_items_before_mark:
+                        _pop_pickle_values(preserved_items_before_mark - len(stack_after))
+                    return
+
+                _pop_pickle_values(len(stack_before))
+                for _ in stack_after:
+                    _push_pickle_value(self._PICKLE_PLACEHOLDER)
+
             try:
-                data_str = data.decode("utf-8", errors="ignore")
-                for pattern in self.jax_suspicious_patterns:
-                    if pattern in data_str:
+                for opcode, arg, pos in pickletools.genops(data):
+                    if opcode.name in self._PICKLE_STRING_OPCODES and isinstance(arg, str):
+                        _push_pickle_value(arg)
+                        continue
+                    if opcode.name == "MARK":
+                        _push_pickle_value(self._PICKLE_MARKER)
+                        continue
+                    if opcode.name == "POP":
+                        if pickle_stack:
+                            pickle_stack.pop()
+                        continue
+                    if opcode.name == "POP_MARK":
+                        _pop_pickle_mark()
+                        continue
+                    if opcode.name == "DUP":
+                        if pickle_stack:
+                            _push_pickle_value(pickle_stack[-1])
+                        continue
+                    if opcode.name == "MEMOIZE":
+                        _memoize_pickle_value(next_pickle_memo_index)
+                        continue
+                    if opcode.name in {"BINPUT", "LONG_BINPUT", "PUT"}:
+                        memo_index = _memo_key(arg)
+                        if memo_index is not None:
+                            _memoize_pickle_value(memo_index)
+                        continue
+                    if opcode.name in {"BINGET", "LONG_BINGET", "GET"}:
+                        memo_index = _memo_key(arg)
+                        if memo_index is None:
+                            continue
+                        if memo_index in pickle_memo:
+                            _push_pickle_value(pickle_memo[memo_index])
+                        elif memo_index in sticky_pickle_memo:
+                            _push_pickle_value(sticky_pickle_memo[memo_index])
+                        else:
+                            _push_pickle_value(self._PICKLE_PLACEHOLDER)
+                            if memo_index < next_pickle_memo_index and not memo_lookup_gap_reported:
+                                result.add_check(
+                                    name="Pickle Memo Reconstruction Gap",
+                                    passed=False,
+                                    message=(
+                                        "Unable to resolve a pickle memo reference from the bounded scanner state; "
+                                        "STACK_GLOBAL reconstruction may be incomplete for evicted memo slots"
+                                    ),
+                                    rule_code="S902",
+                                    severity=IssueSeverity.WARNING,
+                                    location=path,
+                                    details={
+                                        "opcode": opcode.name,
+                                        "position": pos,
+                                        "memo_index": memo_index,
+                                        "max_pickle_memo_state": self._PICKLE_MEMO_STATE_LIMIT,
+                                    },
+                                )
+                                memo_lookup_gap_reported = True
+                        continue
+
+                    parsed_global = None
+                    if opcode.name in {"GLOBAL", "INST"} and isinstance(arg, str):
+                        parsed_global = self._parse_pickle_global_reference(arg)
+                        if parsed_global is not None:
+                            _push_pickle_value(parsed_global)
+                    elif opcode.name == "STACK_GLOBAL" and len(pickle_stack) >= 2:
+                        global_name = pickle_stack.pop()
+                        module_name = pickle_stack.pop()
+                        if isinstance(module_name, str) and isinstance(global_name, str):
+                            parsed_global = (module_name, global_name)
+                            _push_pickle_value(parsed_global)
+
+                    if parsed_global is not None and self._is_dangerous_pickle_global(*parsed_global):
+                        module_name, global_name = parsed_global
+                        if dangerous_opcode_findings >= self.max_pickle_opcode_findings:
+                            if not finding_limit_reported:
+                                result.add_check(
+                                    name="Pickle Opcode Finding Limit",
+                                    passed=False,
+                                    message=(
+                                        "Reached the maximum number of recorded dangerous pickle opcode findings; "
+                                        "additional matches were suppressed"
+                                    ),
+                                    rule_code="S902",
+                                    severity=IssueSeverity.WARNING,
+                                    location=path,
+                                    details={
+                                        "max_pickle_opcode_findings": self.max_pickle_opcode_findings,
+                                    },
+                                )
+                                finding_limit_reported = True
+                            continue
+
                         result.add_check(
-                            name="JAX Pattern Security Check",
+                            name="Pickle Opcode Security Check",
                             passed=False,
-                            message=f"Suspicious JAX pattern in pickle: {pattern}",
+                            message=(f"Dangerous pickle opcode detected: {opcode.name} {module_name}.{global_name}"),
+                            rule_code="S902",
                             severity=IssueSeverity.CRITICAL,
                             location=path,
-                            details={"pattern": pattern},
-                            rule_code="S902",
+                            details={
+                                "opcode": opcode.name,
+                                "position": pos,
+                                "global": f"{module_name}.{global_name}",
+                            },
                         )
-            except Exception:
-                pass
+                        dangerous_opcode_findings += 1
+                        continue
+
+                    if parsed_global is not None:
+                        continue
+
+                    _sync_unhandled_pickle_stack_effect(opcode)
+            except ValueError:
+                if not pickle_prefix_truncated:
+                    raise
+
+            # Check for JAX-specific suspicious content
+            data_str = data.decode("utf-8", errors="ignore")
+            self._add_suspicious_pattern_checks(
+                data_str,
+                context="pickle_checkpoint",
+                check_name="JAX Pattern Security Check",
+                message_prefix="Suspicious JAX pattern in pickle",
+                location=path,
+                result=result,
+                finding_budget=_PatternFindingBudget(self.max_metadata_pattern_findings),
+            )
 
         except Exception as e:
             result.add_check(
@@ -367,22 +990,32 @@ class JaxCheckpointScanner(BaseScanner):
     def _scan_json_checkpoint(self, path: str, result: ScanResult) -> None:
         """Scan JSON-based checkpoint metadata."""
         try:
-            with open(path, encoding="utf-8") as f:
+            with open(path, encoding="utf-8-sig") as f:
                 data = json.load(f)
 
             # Analyze JSON content for suspicious patterns
-            data_str = json.dumps(data).lower()
-            for pattern in self.jax_suspicious_patterns:
-                if pattern in data_str:
-                    result.add_check(
-                        name="JSON Pattern Security Check",
-                        passed=False,
-                        message=f"Suspicious pattern in JSON checkpoint: {pattern}",
-                        severity=IssueSeverity.CRITICAL,
-                        location=path,
-                        details={"pattern": pattern},
-                        rule_code="S902",
-                    )
+            pattern_finding_budget = _PatternFindingBudget(self.max_metadata_pattern_findings)
+            metadata_depth_cap_contexts: set[str] = set()
+            for context, text_value in self._iter_string_metadata(
+                data,
+                "json_checkpoint",
+                depth_cap_contexts=metadata_depth_cap_contexts,
+            ):
+                self._add_suspicious_pattern_checks(
+                    text_value,
+                    context=context,
+                    check_name="JSON Pattern Security Check",
+                    message_prefix="Suspicious pattern in JSON checkpoint",
+                    location=path,
+                    result=result,
+                    finding_budget=pattern_finding_budget,
+                )
+            self._add_metadata_traversal_depth_limit_checks(
+                contexts=metadata_depth_cap_contexts,
+                check_name="JSON Metadata Traversal Depth Limit",
+                location=path,
+                result=result,
+            )
 
         except json.JSONDecodeError as e:
             result.add_check(

@@ -187,6 +187,19 @@ class PyTorchZipScanner(BaseScanner):
         """Return the archive member name for a string or ZipInfo."""
         return name.filename if isinstance(name, zipfile.ZipInfo) else name
 
+    @classmethod
+    def _get_zip_member_names(cls, entries: list[zipfile.ZipInfo]) -> list[str]:
+        """Return archive member names while preserving duplicate entries."""
+        return [cls._get_zip_member_name(entry) for entry in entries]
+
+    @staticmethod
+    def _find_zip_entry(entries: list[zipfile.ZipInfo], member_name: str) -> zipfile.ZipInfo | None:
+        """Return the first matching ZipInfo entry for a member name, or None."""
+        for entry in entries:
+            if entry.filename == member_name:
+                return entry
+        return None
+
     @staticmethod
     def _is_crc_mismatch_error(error: Exception) -> bool:
         """Return True when the error indicates a ZIP member CRC mismatch."""
@@ -432,16 +445,24 @@ class PyTorchZipScanner(BaseScanner):
 
         return result
 
-    def _validate_zip_entries(self, zip_file: zipfile.ZipFile, result: ScanResult, path: str) -> list[str]:
+    def _validate_zip_entries(
+        self,
+        zip_file: zipfile.ZipFile,
+        result: ScanResult,
+        path: str,
+    ) -> list[zipfile.ZipInfo]:
         """Validate ZIP entries and check for path traversal, symlinks, and archive manipulation attacks"""
-        safe_entries: list[str] = []
+        archive_entries = zip_file.infolist()
+        safe_entries: list[zipfile.ZipInfo] = []
+        seen_entries: dict[str, zipfile.ZipInfo] = {}
         path_traversal_found = False
         symlink_issues_found = False
         compression_issues_found = False
+        duplicate_entry_collisions_found = False
         temp_base = os.path.join(tempfile.gettempdir(), "extract")
 
         # Check entry count limit (decompression bomb indicator)
-        entry_count = len(zip_file.namelist())
+        entry_count = len(archive_entries)
         if entry_count > self.max_archive_entries:
             result.add_check(
                 name="Archive Entry Limit",
@@ -465,8 +486,50 @@ class PyTorchZipScanner(BaseScanner):
                 details={"entry_count": entry_count, "max_entries": self.max_archive_entries},
             )
 
-        for name in zip_file.namelist():
-            info = zip_file.getinfo(name)
+        for info in archive_entries:
+            name = info.filename
+            previous_info = seen_entries.get(name)
+            if previous_info is None:
+                seen_entries[name] = info
+            else:
+                previous_signature = (
+                    previous_info.CRC,
+                    previous_info.file_size,
+                    (previous_info.external_attr >> 16) & 0o170000,
+                )
+                current_signature = (
+                    info.CRC,
+                    info.file_size,
+                    (info.external_attr >> 16) & 0o170000,
+                )
+                if current_signature != previous_signature:
+                    result.add_check(
+                        name="Duplicate ZIP Entry Collision",
+                        passed=False,
+                        message=(
+                            f"Duplicate archive entry {name} has conflicting metadata; "
+                            "all copies will be scanned explicitly"
+                        ),
+                        severity=IssueSeverity.INFO,
+                        location=f"{path}:{name}",
+                        details={
+                            "entry": name,
+                            "first_header_offset": previous_info.header_offset,
+                            "duplicate_header_offset": info.header_offset,
+                            "first_crc": previous_info.CRC,
+                            "duplicate_crc": info.CRC,
+                            "first_file_size": previous_info.file_size,
+                            "duplicate_file_size": info.file_size,
+                        },
+                        why=(
+                            "Duplicate ZIP members with the same path can shadow earlier payloads "
+                            "when readers resolve by filename. The scanner now preserves every ZipInfo "
+                            "entry and scans all copies explicitly, so divergent duplicates are reported "
+                            "for visibility without turning benign-but-conflicting archives into warning-level "
+                            "findings by themselves."
+                        ),
+                    )
+                    duplicate_entry_collisions_found = True
 
             # Check for path traversal
             _, is_safe = sanitize_archive_path(name, temp_base)
@@ -516,7 +579,7 @@ class PyTorchZipScanner(BaseScanner):
 
             # Skip directories for content checks
             if name.endswith("/"):
-                safe_entries.append(name)
+                safe_entries.append(info)
                 continue
 
             # Check compression ratio (decompression bomb detection)
@@ -544,19 +607,19 @@ class PyTorchZipScanner(BaseScanner):
                     compression_issues_found = True
                     continue
 
-            safe_entries.append(name)
+            safe_entries.append(info)
 
         # Summary checks for clean archives
-        if not path_traversal_found and zip_file.namelist():
+        if not path_traversal_found and archive_entries:
             result.add_check(
                 name="Path Traversal Protection",
                 passed=True,
                 message="All archive entries have safe paths",
                 location=path,
-                details={"entries_checked": len(zip_file.namelist())},
+                details={"entries_checked": len(archive_entries)},
             )
 
-        if not symlink_issues_found and zip_file.namelist():
+        if not symlink_issues_found and archive_entries:
             result.add_check(
                 name="Symlink Safety Validation",
                 passed=True,
@@ -564,7 +627,7 @@ class PyTorchZipScanner(BaseScanner):
                 location=path,
             )
 
-        if not compression_issues_found and zip_file.namelist():
+        if not compression_issues_found and archive_entries:
             result.add_check(
                 name="Compression Ratio Check",
                 passed=True,
@@ -573,26 +636,39 @@ class PyTorchZipScanner(BaseScanner):
                 details={"threshold": self.max_compression_ratio},
             )
 
+        if not duplicate_entry_collisions_found and archive_entries:
+            result.add_check(
+                name="Duplicate ZIP Entry Collision",
+                passed=True,
+                message="No conflicting duplicate archive entries found",
+                location=path,
+                details={"entries_checked": len(archive_entries)},
+            )
+
         return safe_entries
 
     def _discover_pickle_files(
-        self, zip_file: zipfile.ZipFile, safe_entries: list[str], result: ScanResult
-    ) -> list[str]:
+        self,
+        zip_file: zipfile.ZipFile,
+        safe_entries: list[zipfile.ZipInfo],
+        result: ScanResult,
+    ) -> list[zipfile.ZipInfo]:
         """Discover pickle files in the ZIP archive"""
-        pickle_files = []
+        pickle_files: list[zipfile.ZipInfo] = []
 
         # First pass: Look for common pickle file patterns
-        for name in safe_entries:
+        for entry in safe_entries:
+            name = self._get_zip_member_name(entry)
             if name.endswith(".pkl") or name == "data.pkl" or name.endswith("/data.pkl"):
-                pickle_files.append(name)
+                pickle_files.append(entry)
 
         # Second pass: If no obvious pickle files found, check for pickle magic bytes
         if not pickle_files:
-            for name in safe_entries:
+            for entry in safe_entries:
                 try:
                     data_start = self._read_member_prefix(
                         zip_file,
-                        name,
+                        entry,
                         8,
                         phase="pickle_discovery",
                         result=result,
@@ -605,15 +681,19 @@ class PyTorchZipScanner(BaseScanner):
                     if any(data_start.startswith(m) for m in pickle_magics) or any(
                         data_start.startswith(op) for op in ascii_pickle_opcodes
                     ):
-                        pickle_files.append(name)
+                        pickle_files.append(entry)
                 except Exception:
                     pass
 
-        result.metadata["pickle_files"] = pickle_files
+        result.metadata["pickle_files"] = self._get_zip_member_names(pickle_files)
         return pickle_files
 
     def _check_pytorch_vulnerabilities(
-        self, zip_file: zipfile.ZipFile, safe_entries: list[str], result: ScanResult, path: str
+        self,
+        zip_file: zipfile.ZipFile,
+        safe_entries: list[zipfile.ZipInfo],
+        result: ScanResult,
+        path: str,
     ) -> None:
         """Extract PyTorch version info and check for CVE vulnerabilities"""
         pytorch_version_info = self._extract_pytorch_version_info(zip_file, safe_entries, result)
@@ -625,7 +705,11 @@ class PyTorchZipScanner(BaseScanner):
         self._check_cve_2024_48063_vulnerability(pytorch_version_info, result, path)
 
     def _scan_pickle_files(
-        self, zip_file: zipfile.ZipFile, pickle_files: list[str], result: ScanResult, path: str
+        self,
+        zip_file: zipfile.ZipFile,
+        pickle_files: list[zipfile.ZipInfo],
+        result: ScanResult,
+        path: str,
     ) -> int:
         """Scan all discovered pickle files for malicious content"""
         bytes_scanned = 0
@@ -639,8 +723,8 @@ class PyTorchZipScanner(BaseScanner):
             except OSError:
                 original_file_size = 1  # Avoid divide-by-zero in density calculations
 
-        for name in pickle_files:
-            info = zip_file.getinfo(name)
+        for info in pickle_files:
+            name = self._get_zip_member_name(info)
             pickle_data_size = info.file_size
 
             # Set the current file path on the pickle scanner for proper error reporting
@@ -652,7 +736,7 @@ class PyTorchZipScanner(BaseScanner):
             if pickle_data_size <= max_in_mem:
                 data = self._read_member_bytes(
                     zip_file,
-                    name,
+                    info,
                     phase="pickle_scan",
                     result=result,
                 )
@@ -665,7 +749,7 @@ class PyTorchZipScanner(BaseScanner):
                 # Stream to a spooled temp file to avoid OOM and provide seek()
                 with self._read_member_to_spooled_file(
                     zip_file,
-                    name,
+                    info,
                     phase="pickle_scan",
                     result=result,
                     max_size=max_in_mem,
@@ -700,14 +784,19 @@ class PyTorchZipScanner(BaseScanner):
         return bytes_scanned
 
     def _scan_for_jit_patterns(
-        self, zip_file: zipfile.ZipFile, safe_entries: list[str], result: ScanResult, path: str
+        self,
+        zip_file: zipfile.ZipFile,
+        safe_entries: list[zipfile.ZipInfo],
+        result: ScanResult,
+        path: str,
     ) -> int:
         """Check for JIT/Script code execution risks and network communication patterns"""
         bytes_scanned = 0
         all_jit_findings = []
         all_network_findings = []
 
-        for name in safe_entries:
+        for entry in safe_entries:
+            name = self._get_zip_member_name(entry)
             try:
                 # Skip numeric tensor data files to support different versions of PyTorch ZIP files
                 # These are binary weight files that cause performance issues when scanned
@@ -716,7 +805,7 @@ class PyTorchZipScanner(BaseScanner):
 
                 file_data = self._read_member_bytes(
                     zip_file,
-                    name,
+                    entry,
                     phase="jit_script_scan",
                     result=result,
                 )
@@ -766,12 +855,18 @@ class PyTorchZipScanner(BaseScanner):
 
         return bytes_scanned
 
-    def _detect_suspicious_files(self, safe_entries: list[str], result: ScanResult, path: str) -> None:
+    def _detect_suspicious_files(
+        self,
+        safe_entries: list[zipfile.ZipInfo],
+        result: ScanResult,
+        path: str,
+    ) -> None:
         """Detect suspicious non-pickle files in the archive"""
         python_files_found = False
         executable_files_found = False
 
-        for name in safe_entries:
+        for entry in safe_entries:
+            name = self._get_zip_member_name(entry)
             # Check for Python code files
             if name.endswith(".py"):
                 result.add_check(
@@ -814,9 +909,10 @@ class PyTorchZipScanner(BaseScanner):
                 location=path,
             )
 
-    def _validate_pytorch_structure(self, pickle_files: list[str], result: ScanResult) -> None:
+    def _validate_pytorch_structure(self, pickle_files: list[zipfile.ZipInfo], result: ScanResult) -> None:
         """Validate that the PyTorch model has expected structure"""
-        if not pickle_files or "data.pkl" not in [os.path.basename(f) for f in pickle_files]:
+        pickle_names = self._get_zip_member_names(pickle_files)
+        if not pickle_files or "data.pkl" not in [os.path.basename(f) for f in pickle_names]:
             result.add_check(
                 name="PyTorch Structure Validation",
                 passed=False,
@@ -831,10 +927,15 @@ class PyTorchZipScanner(BaseScanner):
                 passed=True,
                 message="PyTorch model has expected structure with data.pkl",
                 location=self.current_file_path,
-                details={"pickle_files": pickle_files},
+                details={"pickle_files": pickle_names},
             )
 
-    def _check_blacklist_patterns(self, zip_file: zipfile.ZipFile, safe_entries: list[str], result: ScanResult) -> None:
+    def _check_blacklist_patterns(
+        self,
+        zip_file: zipfile.ZipFile,
+        safe_entries: list[zipfile.ZipInfo],
+        result: ScanResult,
+    ) -> None:
         """Check for blacklisted patterns in all files"""
         blacklist_patterns = self.config.get("blacklist_patterns") if self.config else None
 
@@ -853,14 +954,19 @@ class PyTorchZipScanner(BaseScanner):
                 )
 
     def _scan_blacklist_patterns(
-        self, zip_file: zipfile.ZipFile, safe_entries: list[str], blacklist_patterns: list[str], result: ScanResult
+        self,
+        zip_file: zipfile.ZipFile,
+        safe_entries: list[zipfile.ZipInfo],
+        blacklist_patterns: list[str],
+        result: ScanResult,
     ) -> None:
         """Scan files for blacklisted patterns"""
         max_blacklist_scan_size = self.config.get("max_blacklist_scan_size", 100 * 1024 * 1024)  # 100MB default
 
-        for name in safe_entries:
+        for entry in safe_entries:
+            name = self._get_zip_member_name(entry)
             try:
-                info = zip_file.getinfo(name)
+                info = entry
 
                 # Skip files that are too large
                 if info.file_size > max_blacklist_scan_size:
@@ -884,21 +990,26 @@ class PyTorchZipScanner(BaseScanner):
 
                 # Choose scanning method based on file size
                 if info.file_size > 10 * 1024 * 1024:  # 10MB threshold for streaming
-                    self._scan_large_file_for_patterns(zip_file, name, blacklist_patterns, result)
+                    self._scan_large_file_for_patterns(zip_file, entry, blacklist_patterns, result)
                 else:
-                    self._scan_small_file_for_patterns(zip_file, name, blacklist_patterns, result)
+                    self._scan_small_file_for_patterns(zip_file, entry, blacklist_patterns, result)
 
             except Exception as e:
                 self._handle_blacklist_scan_error(name, e, result)
 
     def _scan_large_file_for_patterns(
-        self, zip_file: zipfile.ZipFile, name: str, blacklist_patterns: list[str], result: ScanResult
+        self,
+        zip_file: zipfile.ZipFile,
+        entry: zipfile.ZipInfo,
+        blacklist_patterns: list[str],
+        result: ScanResult,
     ) -> None:
         """Stream large files and check patterns in chunks"""
+        name = self._get_zip_member_name(entry)
         found_patterns = []
         with self._read_member_to_spooled_file(
             zip_file,
-            name,
+            entry,
             phase="blacklist_check",
             result=result,
             max_size=8 * 1024 * 1024,
@@ -956,12 +1067,17 @@ class PyTorchZipScanner(BaseScanner):
             )
 
     def _scan_small_file_for_patterns(
-        self, zip_file: zipfile.ZipFile, name: str, blacklist_patterns: list[str], result: ScanResult
+        self,
+        zip_file: zipfile.ZipFile,
+        entry: zipfile.ZipInfo,
+        blacklist_patterns: list[str],
+        result: ScanResult,
     ) -> None:
         """Scan small files for blacklisted patterns"""
+        name = self._get_zip_member_name(entry)
         file_data = self._read_member_bytes(
             zip_file,
-            name,
+            entry,
             phase="blacklist_check",
             result=result,
         )
@@ -1079,7 +1195,7 @@ class PyTorchZipScanner(BaseScanner):
     def _extract_pytorch_version_info(
         self,
         zipfile_obj: zipfile.ZipFile,
-        safe_entries: list[str],
+        safe_entries: list[zipfile.ZipInfo],
         result: ScanResult,
     ) -> dict[str, Any]:
         """Extract PyTorch version information from model archive for CVE-2025-32434 detection"""
@@ -1091,11 +1207,13 @@ class PyTorchZipScanner(BaseScanner):
 
         try:
             # Check for PyTorch archive version file
-            if "version" in safe_entries:
+            version_entry = self._find_zip_entry(safe_entries, "version")
+            archive_version_entry = self._find_zip_entry(safe_entries, "archive/version")
+            if version_entry is not None:
                 version_data = (
                     self._read_member_bytes(
                         zipfile_obj,
-                        "version",
+                        version_entry,
                         phase="version_probe",
                         result=result,
                     )
@@ -1104,11 +1222,11 @@ class PyTorchZipScanner(BaseScanner):
                 )
                 version_info["pytorch_archive_version"] = version_data
                 version_info["pytorch_version_source"] = "version"
-            elif "archive/version" in safe_entries:
+            elif archive_version_entry is not None:
                 version_data = (
                     self._read_member_bytes(
                         zipfile_obj,
-                        "archive/version",
+                        archive_version_entry,
                         phase="version_probe",
                         result=result,
                     )
@@ -1120,7 +1238,8 @@ class PyTorchZipScanner(BaseScanner):
 
             # Try to extract PyTorch framework version from pickle files
             # Look for torch.__version__ references in pickle GLOBAL opcodes
-            for name in safe_entries:
+            for entry in safe_entries:
+                name = self._get_zip_member_name(entry)
                 if name.endswith(".pkl"):
                     try:
                         # Cap read for version probing to 1MB; adjust via config if needed
@@ -1128,7 +1247,7 @@ class PyTorchZipScanner(BaseScanner):
                         probe_bytes = cfg.get("version_probe_bytes", 1024 * 1024)  # 1MB default
                         pickle_data = self._read_member_prefix(
                             zipfile_obj,
-                            name,
+                            entry,
                             probe_bytes,
                             phase="version_probe",
                             result=result,
@@ -1145,14 +1264,15 @@ class PyTorchZipScanner(BaseScanner):
             # Look for version information in other metadata files
             metadata_files = ["meta.json", "config.json", "pytorch_model.bin.index.json"]
             for meta_file in metadata_files:
-                if meta_file in safe_entries:
+                meta_entry = self._find_zip_entry(safe_entries, meta_file)
+                if meta_entry is not None:
                     try:
                         import json
 
                         meta_data = json.loads(
                             self._read_member_bytes(
                                 zipfile_obj,
-                                meta_file,
+                                meta_entry,
                                 phase="version_probe",
                                 result=result,
                             ).decode("utf-8")
@@ -1611,8 +1731,8 @@ class PyTorchZipScanner(BaseScanner):
     def _validate_tensor_metadata_consistency(
         self,
         zip_file: zipfile.ZipFile,
-        safe_entries: list[str],
-        pickle_files: list[str],
+        safe_entries: list[zipfile.ZipInfo],
+        pickle_files: list[zipfile.ZipInfo],
         result: ScanResult,
         path: str,
     ) -> None:
@@ -1624,13 +1744,10 @@ class PyTorchZipScanner(BaseScanner):
 
         # Collect actual blob sizes from data/ directory
         data_blob_sizes: dict[str, int] = {}
-        for name in safe_entries:
+        for entry in safe_entries:
+            name = self._get_zip_member_name(entry)
             if re.match(r"^(?:.+/)?data/\d+$", name):
-                try:
-                    info = zip_file.getinfo(name)
-                    data_blob_sizes[name] = info.file_size
-                except KeyError:
-                    continue
+                data_blob_sizes[name] = entry.file_size
 
         if not data_blob_sizes:
             return  # No tensor blobs to validate
@@ -1638,13 +1755,13 @@ class PyTorchZipScanner(BaseScanner):
         # Parse pickle to look for tensor rebuild patterns and cross-reference storage
         # Use bounded reads to avoid memory spikes on large pickle entries
         max_pkl_read = 10 * 1024 * 1024  # 10 MB limit for metadata validation
-        for pkl_name in pickle_files:
+        for pkl_info in pickle_files:
+            pkl_name = self._get_zip_member_name(pkl_info)
             try:
-                pkl_info = zip_file.getinfo(pkl_name)
                 if pkl_info.file_size > max_pkl_read:
                     pkl_data = self._read_member_prefix(
                         zip_file,
-                        pkl_name,
+                        pkl_info,
                         max_pkl_read,
                         phase="tensor_metadata_validation",
                         result=result,
@@ -1652,7 +1769,7 @@ class PyTorchZipScanner(BaseScanner):
                 else:
                     pkl_data = self._read_member_bytes(
                         zip_file,
-                        pkl_name,
+                        pkl_info,
                         phase="tensor_metadata_validation",
                         result=result,
                     )
