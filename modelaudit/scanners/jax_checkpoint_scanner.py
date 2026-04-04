@@ -596,7 +596,8 @@ class JaxCheckpointScanner(BaseScanner):
 
             pickle_stack: list[Any] = []
             pickle_memo: OrderedDict[int, Any] = OrderedDict()
-            sticky_pickle_memo: dict[int, Any] = {}
+            sticky_pickle_memo: OrderedDict[int, Any] = OrderedDict()
+            seen_pickle_memo_indices: set[int] = set()
             dangerous_pickle_memo_tokens = frozenset(
                 token
                 for module_name, global_name in self._DANGEROUS_PICKLE_GLOBALS
@@ -604,7 +605,6 @@ class JaxCheckpointScanner(BaseScanner):
             )
             dangerous_opcode_findings = 0
             finding_limit_reported = False
-            next_memoize_index = 0
 
             def _push_pickle_value(value: Any) -> None:
                 """Push one modeled pickle stack value while bounding stack state."""
@@ -624,22 +624,23 @@ class JaxCheckpointScanner(BaseScanner):
                 if not pickle_stack:
                     return
                 memo_value = pickle_stack[-1]
+                seen_pickle_memo_indices.add(memo_index)
                 if memo_index in pickle_memo:
                     pickle_memo.move_to_end(memo_index)
                 elif len(pickle_memo) >= self._PICKLE_MEMO_STATE_LIMIT:
                     pickle_memo.popitem(last=False)
                 pickle_memo[memo_index] = memo_value
-                if (
-                    (isinstance(memo_value, str)
-                    and memo_value.lower() in dangerous_pickle_memo_tokens)
-                    or (
-                        isinstance(memo_value, tuple)
-                        and len(memo_value) == 2
-                        and isinstance(memo_value[0], str)
-                        and isinstance(memo_value[1], str)
-                        and self._is_dangerous_pickle_global(memo_value[0], memo_value[1])
-                    )
+                if (isinstance(memo_value, str) and memo_value.lower() in dangerous_pickle_memo_tokens) or (
+                    isinstance(memo_value, tuple)
+                    and len(memo_value) == 2
+                    and isinstance(memo_value[0], str)
+                    and isinstance(memo_value[1], str)
+                    and self._is_dangerous_pickle_global(memo_value[0], memo_value[1])
                 ):
+                    if memo_index in sticky_pickle_memo:
+                        sticky_pickle_memo.move_to_end(memo_index)
+                    elif len(sticky_pickle_memo) >= self._PICKLE_MEMO_STATE_LIMIT:
+                        sticky_pickle_memo.popitem(last=False)
                     sticky_pickle_memo[memo_index] = memo_value
                 else:
                     sticky_pickle_memo.pop(memo_index, None)
@@ -671,16 +672,12 @@ class JaxCheckpointScanner(BaseScanner):
                             _push_pickle_value(pickle_stack[-1])
                         continue
                     if opcode.name == "MEMOIZE":
-                        _memoize_pickle_value(next_memoize_index)
-                        next_memoize_index += 1
+                        _memoize_pickle_value(len(seen_pickle_memo_indices))
                         continue
                     if opcode.name in {"BINPUT", "LONG_BINPUT", "PUT"}:
                         memo_index = _memo_key(arg)
                         if memo_index is not None:
-                            memo_index_is_new = memo_index not in pickle_memo
                             _memoize_pickle_value(memo_index)
-                            if memo_index_is_new:
-                                next_memoize_index += 1
                         continue
                     if opcode.name in {"BINGET", "LONG_BINGET", "GET"}:
                         memo_index = _memo_key(arg)
