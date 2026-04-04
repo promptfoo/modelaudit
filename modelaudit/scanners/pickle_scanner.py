@@ -250,7 +250,26 @@ def _should_skip_fallback_pickle_issue(target: ScanResult, issue: Any) -> bool:
 
 
 def _should_propagate_fallback_scan_outcome(fallback: ScanResult) -> bool:
-    """Return True when fallback incompleteness should affect merged metadata/success."""
+    """Return True when fallback inconclusive metadata should be preserved on the merged result."""
+    return fallback.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+
+
+def _has_trusted_incomplete_tail_context(result: ScanResult) -> bool:
+    """Return True when pickle incompleteness has trusted benign-tail context."""
+    first_pickle_end_pos = result.metadata.get("first_pickle_end_pos")
+    if isinstance(first_pickle_end_pos, int) and first_pickle_end_pos >= 0:
+        return True
+
+    import_references = result.metadata.get("import_references")
+    if not isinstance(import_references, list) or not import_references:
+        return False
+    return all(
+        isinstance(reference, Mapping) and not bool(reference.get("is_dangerous")) for reference in import_references
+    )
+
+
+def _should_fallback_incompleteness_block_success(fallback: ScanResult) -> bool:
+    """Return True when fallback incompleteness should flip a clean merged result to failed."""
     if fallback.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME:
         return False
     if any(check.name == "Standalone Pickle Parse Failure" for check in fallback.checks):
@@ -259,7 +278,9 @@ def _should_propagate_fallback_scan_outcome(fallback: ScanResult) -> bool:
     scan_outcome_reasons = fallback.metadata.get("scan_outcome_reasons")
     if not isinstance(scan_outcome_reasons, list):
         return True
-    return any(reason != "pickle_analysis_incomplete" for reason in scan_outcome_reasons)
+    if any(reason != "pickle_analysis_incomplete" for reason in scan_outcome_reasons):
+        return True
+    return not _has_trusted_incomplete_tail_context(fallback)
 
 
 def _merge_missing_pickle_checks(target: ScanResult, fallback: ScanResult) -> None:
@@ -348,7 +369,7 @@ def _merge_missing_pickle_checks(target: ScanResult, fallback: ScanResult) -> No
             target.metadata["operational_error_reason"] = fallback_error_reason
 
     fallback_blocks_success = not fallback.success and (
-        propagate_fallback_scan_outcome or bool(fallback.metadata.get("operational_error"))
+        _should_fallback_incompleteness_block_success(fallback) or bool(fallback.metadata.get("operational_error"))
     )
     merged_success = target.success and not fallback_blocks_success
     if fallback_blocks_success and _scan_result_has_security_findings(target):
@@ -376,7 +397,11 @@ def _finish_with_inconclusive_contract(
 ) -> None:
     """Finalize success so inconclusive/no-finding scans fail closed."""
     has_security_findings = _scan_result_has_security_findings(result)
-    if result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME and not has_security_findings:
+    if (
+        result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+        and not has_security_findings
+        and not _has_trusted_incomplete_tail_context(result)
+    ):
         result.finish(success=False)
         return
 

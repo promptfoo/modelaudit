@@ -744,6 +744,48 @@ def test_merge_missing_pickle_checks_preserves_bin_parse_failures_and_fails_clos
     )
 
 
+def test_merge_missing_pickle_checks_fails_closed_for_inconclusive_notice_only_fallback() -> None:
+    """Package-only inconclusive notices must still propagate fail-closed metadata and success."""
+    scanner = PickleScanner()
+    target = ScanResult(scanner_name="pickle", scanner=scanner)
+    target.add_check(
+        name="Pickle Protocol Version Check",
+        passed=True,
+        message="Valid pickle protocol version 4",
+        location="numpy_arrays.joblib",
+    )
+    target.finish(success=True)
+
+    fallback = ScanResult(scanner_name="pickle", scanner=scanner)
+    fallback.add_check(
+        name="Standalone Pickle Notice",
+        passed=False,
+        message="Pickle parsing stopped before the stream was fully consumed: ValueError",
+        severity=IssueSeverity.INFO,
+        location="numpy_arrays.joblib (decompressed) (pos 231)",
+        details={
+            "pickle_source": "numpy_arrays.joblib (decompressed)",
+            "notice_code": "parse_incomplete",
+            "exception": "at position 230, opcode b'\\t' unknown",
+            "exception_type": "ValueError",
+            "analysis_incomplete": True,
+        },
+        rule_code="S902",
+    )
+    fallback.metadata["pickle_source"] = "numpy_arrays.joblib (decompressed)"
+    fallback.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+    fallback.metadata["scan_outcome_reasons"] = ["pickle_analysis_incomplete"]
+    fallback.metadata["analysis_incomplete"] = True
+    fallback.finish(success=False)
+
+    _merge_missing_pickle_checks(target, fallback)
+
+    assert target.success is False
+    assert target.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert target.metadata["scan_outcome_reasons"] == ["pickle_analysis_incomplete"]
+    assert target.metadata["analysis_incomplete"] is True
+
+
 @pytest.mark.parametrize(
     ("exception_type", "message"),
     [
