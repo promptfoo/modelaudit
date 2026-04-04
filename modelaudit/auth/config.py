@@ -9,6 +9,13 @@ from uuid import uuid4
 import yaml
 from platformdirs import user_config_dir
 
+from ..utils._path_hardening import (
+    _ensure_secure_directory,
+    _has_symlink_component,
+    _is_secure_directory,
+    _tighten_permissions,
+)
+
 # Environment variable for API host (matches promptfoo)
 API_HOST = os.getenv("API_HOST", "https://api.promptfoo.app")
 
@@ -115,54 +122,6 @@ def _config_dir_candidates() -> list[Path]:
         unique_candidates.append(candidate)
         seen.add(key)
     return unique_candidates
-
-
-def _tighten_permissions(path: Path, mode: int) -> None:
-    """Best-effort permission hardening for sensitive config paths."""
-    if os.name == "nt":
-        return
-
-    with suppress(OSError):
-        path.chmod(mode)
-
-
-def _has_symlink_component(path: Path) -> bool:
-    """Return True when path or any ancestor is a symlink."""
-    current = path
-    while True:
-        try:
-            if current.is_symlink():
-                return True
-        except OSError:
-            return True
-        if current == current.parent:
-            return False
-        current = current.parent
-
-
-def _is_secure_directory(path: Path) -> bool:
-    """Return True when the path is a usable non-symlink directory."""
-    try:
-        return path.exists() and path.is_dir() and not _has_symlink_component(path)
-    except OSError:
-        return False
-
-
-def _ensure_secure_directory(path: Path) -> bool:
-    """Create a directory when possible and reject symlinked targets."""
-    if _has_symlink_component(path):
-        return False
-
-    try:
-        path.mkdir(parents=True, mode=0o700, exist_ok=True)
-    except OSError:
-        return False
-
-    if not _is_secure_directory(path):
-        return False
-
-    _tighten_permissions(path, 0o700)
-    return True
 
 
 def _select_config_directory(create_if_not_exists: bool = False) -> Path:

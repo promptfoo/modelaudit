@@ -11,6 +11,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from ..config.local_config import LocalConfigCandidate
+from ..utils._path_hardening import _ensure_secure_directory, _has_symlink_component, _tighten_permissions
 
 TRUST_STORE_VERSION = 1
 
@@ -128,43 +129,3 @@ class TrustedConfigStore:
     def _is_secure_target(self, path: Path) -> bool:
         """Return True when the parent path is suitable for reads and writes."""
         return not _has_symlink_component(path)
-
-
-def _tighten_permissions(path: Path, mode: int) -> None:
-    """Best-effort permission hardening for cache trust paths."""
-    if os.name == "nt":
-        return
-
-    with suppress(OSError):
-        path.chmod(mode)
-
-
-def _has_symlink_component(path: Path) -> bool:
-    """Return True when path or an ancestor is a symlink."""
-    current = path
-    while True:
-        try:
-            if current.is_symlink():
-                return True
-        except OSError:
-            return True
-        if current == current.parent:
-            return False
-        current = current.parent
-
-
-def _ensure_secure_directory(path: Path) -> bool:
-    """Create a directory when possible and reject symlinked targets."""
-    if _has_symlink_component(path):
-        return False
-
-    try:
-        path.mkdir(parents=True, mode=0o700, exist_ok=True)
-    except OSError:
-        return False
-
-    if not path.is_dir() or _has_symlink_component(path):
-        return False
-
-    _tighten_permissions(path, 0o700)
-    return True
