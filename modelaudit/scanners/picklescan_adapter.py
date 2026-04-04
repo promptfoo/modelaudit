@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import math
-import os
 import re
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 from modelaudit_picklescan import Finding, PickleReport, ScanOptions, ScanStatus, Severity
@@ -29,6 +29,7 @@ _LEGACY_SCAN_OUTCOME_REASONS = {
     "parse_incomplete": "pickle_analysis_incomplete",
     "timeout": "scan_timeout",
 }
+_INT_TEXT_RE = re.compile(r"[+-]?\d+")
 _LEGACY_RULE_CODE_RE = re.compile(r"^S\d+$")
 _LOCATION_POSITION_RE = re.compile(r"\(pos\s+(?P<position>\d+)\)\s*$")
 _BENIGN_SERIALIZATION_TAIL_MODULE_PREFIXES = frozenset(
@@ -54,9 +55,14 @@ def _parse_positive_float(value: Any, default: float) -> float:
 def _parse_min_int(value: Any, default: int, *, minimum: int) -> int:
     if isinstance(value, bool):
         return default
+    if isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            return default
+    elif isinstance(value, str) and _INT_TEXT_RE.fullmatch(value.strip()) is None:
+        return default
     try:
         parsed = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
     return parsed if parsed >= minimum else default
 
@@ -286,7 +292,7 @@ def _pickle_source_extension(source: str) -> str:
     """Return the pickle payload extension, ignoring synthetic wrapper suffixes."""
     if source.endswith(" (decompressed)"):
         source = source[: -len(" (decompressed)")]
-    return os.path.splitext(source)[1].lower()
+    return Path(source).suffix.lower()
 
 
 def _has_only_benign_serialization_tail_imports(report: PickleReport) -> bool:
@@ -405,8 +411,20 @@ def _legacy_rule_code_for_finding(finding: Finding) -> str | None:
 def _finding_reference_keys(findings: tuple[Finding, ...]) -> set[tuple[str, int | None]]:
     keys: set[tuple[str, int | None]] = set()
     for finding in findings:
+        import_references: set[str] = set()
         import_reference = finding.details.get("import_reference")
-        if not isinstance(import_reference, str):
+        if isinstance(import_reference, str):
+            import_references.add(import_reference)
+        else:
+            module = finding.details.get("module")
+            name = finding.details.get("name")
+            if isinstance(module, str) and isinstance(name, str):
+                import_references.add(f"{module}.{name}")
+                aliased_module = _IMPORT_MODULE_ALIASES.get(module.lower())
+                if aliased_module is not None:
+                    import_references.add(f"{aliased_module}.{name}")
+
+        if not import_references:
             continue
 
         positions = {
@@ -419,9 +437,9 @@ def _finding_reference_keys(findings: tuple[Finding, ...]) -> set[tuple[str, int
             if isinstance(value, int)
         }
         if positions:
-            keys.update((import_reference, position) for position in positions)
+            keys.update((reference, position) for reference in import_references for position in positions)
         else:
-            keys.add((import_reference, None))
+            keys.update((reference, None) for reference in import_references)
     return keys
 
 

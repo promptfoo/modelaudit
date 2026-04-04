@@ -1,3 +1,4 @@
+import json
 import logging
 from pathlib import Path
 
@@ -103,6 +104,22 @@ def test_fixture_label_marks_clear_malicious_paths_without_overlabeling_license_
 def test_fixture_label_rejects_missing_manifest_entries() -> None:
     with pytest.raises(KeyError, match="missing pickle fixture label"):
         compare_pickle_scanners._fixture_label(Path("tests/assets/samples/pickles/new_fixture.pkl"))
+
+
+def test_fixture_label_loads_manifest_lazily(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = tmp_path / "fixture-labels.json"
+    manifest.write_text(
+        json.dumps({"tests/assets/samples/pickles/new_fixture.pkl": "safe"}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(compare_pickle_scanners, "FIXTURE_LABELS_MANIFEST", manifest)
+    monkeypatch.setattr(compare_pickle_scanners, "_FIXTURE_LABELS_BY_PATH", None)
+
+    assert compare_pickle_scanners._fixture_label(Path("tests/assets/samples/pickles/new_fixture.pkl")) == "safe"
 
 
 def test_build_report_suppresses_scanner_logs_and_restores_logging_disable_level(

@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO
 
-from modelaudit_picklescan import PickleReport, ScanStatus
+from modelaudit_picklescan import PickleReport, ScanStatus, Severity
 from modelaudit_picklescan import scan_file as package_scan_file
 
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity, ScanResult
@@ -82,7 +82,14 @@ def _load_fixture_labels_manifest() -> dict[str, str]:
     return {str(path): str(label) for path, label in manifest.items()}
 
 
-_FIXTURE_LABELS_BY_PATH = _load_fixture_labels_manifest()
+_FIXTURE_LABELS_BY_PATH: dict[str, str] | None = None
+
+
+def _fixture_labels_by_path() -> dict[str, str]:
+    global _FIXTURE_LABELS_BY_PATH
+    if _FIXTURE_LABELS_BY_PATH is None:
+        _FIXTURE_LABELS_BY_PATH = _load_fixture_labels_manifest()
+    return _FIXTURE_LABELS_BY_PATH
 
 
 def _fixture_label(path: Path) -> str:
@@ -91,7 +98,7 @@ def _fixture_label(path: Path) -> str:
         fixture_path = path.relative_to(REPO_ROOT)
 
     fixture_key = fixture_path.as_posix()
-    label = _FIXTURE_LABELS_BY_PATH.get(fixture_key)
+    label = _fixture_labels_by_path().get(fixture_key)
     if label is None:
         raise KeyError(f"missing pickle fixture label for {fixture_key} in {FIXTURE_LABELS_MANIFEST}")
     return label
@@ -138,8 +145,8 @@ def _normalize_package_report(report: PickleReport) -> NormalizedResult:
         verdict=report.verdict.value,
         success=report.status == ScanStatus.COMPLETE
         or (report.status == ScanStatus.INCONCLUSIVE and report.has_security_findings),
-        warning_count=sum(1 for finding in report.findings if finding.severity.value == "warning"),
-        critical_count=sum(1 for finding in report.findings if finding.severity.value == "critical"),
+        warning_count=sum(1 for finding in report.findings if finding.severity == Severity.WARNING),
+        critical_count=sum(1 for finding in report.findings if finding.severity == Severity.CRITICAL),
         info_count=len(report.notices),
         rule_codes=tuple(sorted(finding.rule_code for finding in report.findings if finding.rule_code)),
         messages=tuple(sorted(finding.message for finding in report.findings)),

@@ -55,6 +55,15 @@ def test_scan_options_from_config_parses_string_values_and_falls_back_for_bad_va
     nan_fallback = scan_options_from_config({"timeout": "nan"})
     assert nan_fallback.timeout_s == defaults.timeout_s
 
+    non_integral_fallback = scan_options_from_config(
+        {
+            "max_opcodes": 1.9,
+            "post_budget_global_scan_limit_bytes": "4.5",
+        }
+    )
+    assert non_integral_fallback.max_opcodes == defaults.max_opcodes
+    assert non_integral_fallback.post_budget_scan_bytes == defaults.post_budget_scan_bytes
+
 
 def test_pickle_report_to_scan_result_maps_clean_report_to_successful_result() -> None:
     report = PickleReport(
@@ -196,6 +205,44 @@ def test_pickle_report_to_scan_result_suppresses_passed_import_checks_for_refere
     assert [check.name for check in result.checks].count("Standalone Pickle Import") == 0
     assert len(result.issues) == 1
     assert result.issues[0].rule_code == "S203"
+
+
+def test_pickle_report_to_scan_result_suppresses_passed_import_checks_for_module_name_findings() -> None:
+    report = PickleReport(
+        source="danger.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.MALICIOUS,
+        findings=(
+            Finding(
+                message="Found dangerous global reference: posix.system",
+                severity=Severity.CRITICAL,
+                location="danger.pkl (pos 3)",
+                rule_code="DANGEROUS_GLOBAL",
+                details={
+                    "module": "posix",
+                    "name": "system",
+                },
+            ),
+        ),
+        metadata={
+            "import_references": [
+                {
+                    "import_reference": "posix.system",
+                    "module": "posix",
+                    "name": "system",
+                    "opcode": "GLOBAL",
+                    "position": 3,
+                    "is_dangerous": False,
+                }
+            ]
+        },
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert [check.name for check in result.checks].count("Standalone Pickle Import") == 0
+    assert len(result.issues) == 1
+    assert result.issues[0].rule_code == "S101"
 
 
 def test_pickle_report_to_scan_result_fails_closed_for_inconclusive_report_without_findings() -> None:

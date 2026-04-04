@@ -11,6 +11,7 @@ import time
 from collections import OrderedDict, deque
 from collections.abc import Hashable, Mapping
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any, BinaryIO, ClassVar, Literal, TypedDict, TypeGuard, cast
 
 from modelaudit_picklescan import PickleScanner as StandalonePickleScanner
@@ -183,7 +184,13 @@ def _scan_result_has_security_findings(result: ScanResult) -> bool:
 def _is_operational_pickle_issue(issue: Any) -> bool:
     """Return whether a WARNING/CRITICAL issue represents incomplete analysis, not a malicious finding."""
     details = issue.details if isinstance(issue.details, Mapping) else {}
-    if details.get("category") in {"parse_error", "short_read", "io_error"}:
+    if details.get("category") in {
+        "parse_error",
+        "short_read",
+        "io_error",
+        "pickle_file_open_failed",
+        "pickle_scan_runtime_failed",
+    }:
         return True
     return details.get("failure_reason") == "unknown_opcode_or_format_error" and bool(
         details.get("parsing_failed") or details.get("analysis_incomplete")
@@ -270,6 +277,8 @@ def _has_trusted_incomplete_tail_context(result: ScanResult) -> bool:
 
 def _should_fallback_incompleteness_block_success(fallback: ScanResult) -> bool:
     """Return True when fallback incompleteness should flip a clean merged result to failed."""
+    if any(_is_operational_pickle_issue(issue) for issue in fallback.issues):
+        return True
     if fallback.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME:
         return False
     if any(check.name == "Standalone Pickle Parse Failure" for check in fallback.checks):
@@ -4864,7 +4873,11 @@ class PickleScanner(BaseScanner):
             message=message,
             severity=IssueSeverity.CRITICAL,
             location=location,
-            details={"exception": str(error), "exception_type": type(error).__name__},
+            details={
+                "category": reason,
+                "exception": str(error),
+                "exception_type": type(error).__name__,
+            },
         )
         result.metadata["operational_error"] = True
         result.metadata["operational_error_reason"] = reason
@@ -4928,14 +4941,22 @@ class PickleScanner(BaseScanner):
         except (AttributeError, OSError, ValueError):
             return package_result
 
-        if reuse_seekable_stream_for_legacy:
-            legacy_result = self._scan_pickle_bytes(file_obj, file_size)
-        else:
-            max_in_mem = int((self.config or {}).get("pickle_max_memory_read", 32 * 1024 * 1024))
-            with tempfile.SpooledTemporaryFile(max_size=max(max_in_mem, 0), mode="w+b") as spool:
-                self._copy_pickle_stream_to_spool(file_obj, file_size, cast(BinaryIO, spool))
-                spool.seek(0)
-                legacy_result = self._scan_pickle_bytes(cast(BinaryIO, spool), file_size)
+        try:
+            if reuse_seekable_stream_for_legacy:
+                legacy_result = self._scan_pickle_bytes(file_obj, file_size)
+            else:
+                max_in_mem = int((self.config or {}).get("pickle_max_memory_read", 32 * 1024 * 1024))
+                with tempfile.SpooledTemporaryFile(max_size=max(max_in_mem, 0), mode="w+b") as spool:
+                    self._copy_pickle_stream_to_spool(file_obj, file_size, cast(BinaryIO, spool))
+                    spool.seek(0)
+                    legacy_result = self._scan_pickle_bytes(cast(BinaryIO, spool), file_size)
+        except Exception as error:
+            if isinstance(error, RecursionError) or self._is_pickle_parse_failure(error):
+                raise
+            self._record_pickle_runtime_error(package_result, error, location=source)
+            package_result.finish(success=False)
+            return package_result
+
         with contextlib.suppress(AttributeError, OSError, ValueError):
             file_obj.seek(stream_start)
         _merge_missing_pickle_checks(legacy_result, package_result)
@@ -4975,12 +4996,27 @@ class PickleScanner(BaseScanner):
             with tempfile.SpooledTemporaryFile(max_size=max(max_in_mem, 0), mode="w+b") as spool:
                 self._copy_pickle_stream_to_spool(file_obj, file_size, cast(BinaryIO, spool))
                 spool.seek(0)
-                return self._scan_pickle_stream_with_package_engine(
+                result = self._scan_pickle_stream_with_package_engine(
                     cast(BinaryIO, spool),
                     file_size,
                     source=source,
                     reuse_seekable_stream_for_legacy=True,
                 )
+                try:
+                    self._scan_remaining_bin_tail_if_needed(
+                        cast(BinaryIO, spool),
+                        result,
+                        file_size=file_size,
+                        scan_bin_tail=Path(source).suffix.lower() == ".bin",
+                    )
+                except Exception as error:
+                    self._record_pickle_runtime_error(result, error, location=source)
+                    _finish_with_inconclusive_contract(
+                        result,
+                        default_success=False,
+                        allow_security_findings_override=True,
+                    )
+                return result
         except Exception as error:
             self._record_pickle_runtime_error(result, error, location=source)
             result.finish(success=False)
@@ -5338,7 +5374,7 @@ class PickleScanner(BaseScanner):
             _finish_with_inconclusive_contract(
                 result,
                 default_success=scan_result.success,
-                allow_security_findings_override=True,
+                allow_security_findings_override=not bool(result.metadata.get("operational_error")),
             )
         return result
 
@@ -5411,16 +5447,39 @@ class PickleScanner(BaseScanner):
         size_check = self._check_scan_stream_size_limit(file_size, source)
         if size_check:
             return size_check
+        scan_bin_tail = Path(source).suffix.lower() == ".bin"
+        can_scan_tail_from_input = False
+        if scan_bin_tail:
+            with contextlib.suppress(AttributeError, OSError, ValueError):
+                stream_start = file_obj.tell()
+                file_obj.seek(stream_start)
+                can_scan_tail_from_input = True
         try:
-            return self._scan_pickle_stream_with_package_engine(
+            result = self._scan_pickle_stream_with_package_engine(
                 file_obj,
                 file_size,
                 source=source,
             )
+            if can_scan_tail_from_input:
+                try:
+                    self._scan_remaining_bin_tail_if_needed(
+                        file_obj,
+                        result,
+                        file_size=file_size,
+                        scan_bin_tail=scan_bin_tail,
+                    )
+                except Exception as error:
+                    self._record_pickle_runtime_error(result, error, location=source)
+                    _finish_with_inconclusive_contract(
+                        result,
+                        default_success=False,
+                        allow_security_findings_override=True,
+                    )
+            return result
         except Exception as error:
             result = self._create_result()
             if self._is_pickle_parse_failure(error):
-                file_ext = os.path.splitext(source)[1].lower()
+                file_ext = Path(source).suffix.lower()
                 if file_ext == ".bin":
                     result.add_check(
                         name="Pickle Format Check",

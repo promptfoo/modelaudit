@@ -84,6 +84,7 @@ _SUSPICIOUS_STRING_PATTERNS = frozenset(
         "subprocess.",
     }
 )
+_SUSPICIOUS_STRING_PATTERNS_SORTED = tuple(sorted(_SUSPICIOUS_STRING_PATTERNS))
 _NESTED_PICKLE_SCAN_LIMIT_BYTES = 2 * 1024 * 1024
 _MAX_BASE64_NESTED_PICKLE_CHARS = ((_NESTED_PICKLE_SCAN_LIMIT_BYTES + 2) // 3) * 4
 _MAX_HEX_NESTED_PICKLE_CHARS = _NESTED_PICKLE_SCAN_LIMIT_BYTES * 2
@@ -752,7 +753,7 @@ class _ScanState:
 
     def _scan_string_literal(self, value: str, *, op_name: str, position: int) -> None:
         normalized = value.lower()
-        for matched_pattern in sorted(_SUSPICIOUS_STRING_PATTERNS):
+        for matched_pattern in _SUSPICIOUS_STRING_PATTERNS_SORTED:
             if matched_pattern not in normalized:
                 continue
 
