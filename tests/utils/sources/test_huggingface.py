@@ -130,6 +130,37 @@ class TestExtractModelIdFromPath:
 
         assert extract_model_id_from_path(str(model_path)) == ("Qwen/Qwen2.5-0.5B", "huggingface_cache")
 
+    def test_extract_model_id_from_hf_home_cache_path(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """HF_HOME relocation should still be recognized as HuggingFace cache provenance."""
+        monkeypatch.setenv("HF_HOME", str(tmp_path / "custom-hf-home"))
+        model_path = (
+            tmp_path / "custom-hf-home" / "hub" / "models--Qwen--Qwen2.5-0.5B" / "snapshots" / "abc123" / "weights.bin"
+        )
+        model_path.parent.mkdir(parents=True)
+        model_path.write_bytes(b"weights")
+
+        assert extract_model_id_from_path(str(model_path)) == ("Qwen/Qwen2.5-0.5B", "huggingface_cache")
+
+    def test_extract_model_id_from_hf_hub_cache_path(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """HF_HUB_CACHE relocation should override the default HuggingFace cache root."""
+        monkeypatch.setenv("HF_HOME", str(tmp_path / "ignored-home"))
+        monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "custom-hub-root"))
+        model_path = (
+            tmp_path / "custom-hub-root" / "models--Qwen--Qwen2.5-0.5B" / "snapshots" / "abc123" / "weights.bin"
+        )
+        model_path.parent.mkdir(parents=True)
+        model_path.write_bytes(b"weights")
+
+        assert extract_model_id_from_path(str(model_path)) == ("Qwen/Qwen2.5-0.5B", "huggingface_cache")
+
     def test_extract_model_id_rejects_spoofed_models_directory(self, tmp_path: Path) -> None:
         """A local models--* directory without HF cache layout should not be treated as HuggingFace."""
         model_path = tmp_path / "models--Qwen--Qwen2.5-0.5B" / "weights.bin"

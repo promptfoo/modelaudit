@@ -43,6 +43,14 @@ def _ensure_secure_directory(path: Path) -> bool:
     if _has_symlink_component(path):
         return False
 
+    missing_directories: list[Path] = []
+    current = path
+    while not current.exists():
+        missing_directories.append(current)
+        if current == current.parent:
+            break
+        current = current.parent
+
     try:
         path.mkdir(parents=True, mode=0o700, exist_ok=True)
     except OSError:
@@ -51,5 +59,7 @@ def _ensure_secure_directory(path: Path) -> bool:
     if not _is_secure_directory(path):
         return False
 
+    for created_dir in missing_directories:
+        _tighten_permissions(created_dir, 0o700)
     _tighten_permissions(path, 0o700)
     return True

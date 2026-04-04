@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 
 def rewrite_extracted_member_location(
     location: str | None,
@@ -14,10 +16,15 @@ def rewrite_extracted_member_location(
     if not location:
         return archive_location
 
+    if location == extracted_path:
+        return archive_location
+
     if location.startswith(extracted_path):
         suffix = location[len(extracted_path) :]
-        if preserve_non_delimited_suffix or suffix.startswith(":"):
-            return f"{archive_location}{suffix}"
-        return archive_location
+        suffix_prefix = suffix[:1]
+        if suffix_prefix in {":", ".", " ", os.sep, os.altsep}:
+            if preserve_non_delimited_suffix or suffix.startswith(":"):
+                return f"{archive_location}{suffix}"
+            return archive_location
 
     return f"{archive_location} {location}"

@@ -302,9 +302,13 @@ def has_tensorflow_protobuf_stubs() -> bool:
     global _HAS_PROTOBUF_STUBS
 
     if _HAS_PROTOBUF_STUBS is None:
-        import modelaudit.protos
+        try:
+            import modelaudit.protos
 
-        _HAS_PROTOBUF_STUBS = modelaudit.protos._check_vendored_protos()
+            _HAS_PROTOBUF_STUBS = bool(modelaudit.protos._check_vendored_protos())
+        except Exception as exc:
+            logger.debug("TensorFlow protobuf stubs probe failed: %s", exc)
+            _HAS_PROTOBUF_STUBS = False
     return _HAS_PROTOBUF_STUBS
 
 

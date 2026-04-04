@@ -562,6 +562,7 @@ def test_detect_file_format_rejects_invalid_zlib_header_near_match(tmp_path: Pat
 
     assert detect_file_format(str(zlib_path)) == "unknown"
     assert detect_file_format_from_magic(str(zlib_path)) == "unknown"
+    assert validate_file_type(str(zlib_path)) is False
 
 
 def test_detect_file_format_tar_wrappers_preserve_tar_routing(tmp_path: Path) -> None:

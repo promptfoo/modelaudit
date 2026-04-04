@@ -41,6 +41,15 @@ def test_rewrite_extracted_member_location_preserves_scanner_specific_suffix_pol
         )
         == "/archive.7z:model.pkl.extra"
     )
+    assert (
+        rewrite_extracted_member_location(
+            "/tmp/extracted.pkl2",
+            "/tmp/extracted.pkl",
+            "/archive.zip:model.pkl",
+            preserve_non_delimited_suffix=False,
+        )
+        == "/archive.zip:model.pkl /tmp/extracted.pkl2"
+    )
 
 
 class TestZipScanner:

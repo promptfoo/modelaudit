@@ -9,6 +9,7 @@ from typing import IO
 
 import pytest
 
+from modelaudit.detectors.suspicious_symbols import CVE_COMBINED_PATTERNS
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.pytorch_zip_scanner import PyTorchZipScanner
 from tests.helpers import create_mock_pytorch_zip
@@ -55,6 +56,19 @@ def _write_zip_with_duplicate_data_pkl(zip_path: Path, first_payload: bytes, sec
             zipf.writestr("version", "3")
             zipf.writestr("data.pkl", first_payload)
             zipf.writestr("data.pkl", second_payload)
+
+
+def _assert_standard_cve_details(details: dict[str, object], cve_id: str, detected_version: str) -> None:
+    cve_info = CVE_COMBINED_PATTERNS[cve_id]
+    assert details["cve_id"] == cve_id
+    assert details["detected_pytorch_version"] == detected_version
+    assert "installed_pytorch_version" in details
+    assert details["description"] == cve_info["description"]
+    assert details["remediation"] == cve_info["remediation"]
+    assert details["cvss"] == cve_info["cvss"]
+    assert details["cwe"] == cve_info["cwe"]
+    assert details["vulnerability_description"] == cve_info["description"]
+    assert details["recommendation"] == cve_info["remediation"]
 
 
 def test_pytorch_zip_scanner_can_handle(tmp_path):
@@ -1005,6 +1019,7 @@ def test_pytorch_zip_cve_2022_45907_version_check(tmp_path: Path) -> None:
     )
     assert failed_checks[0].details.get("detected_pytorch_version") == "1.13.0"
     assert failed_checks[0].details.get("pytorch_version_source") == "metadata:config.json:pytorch_version"
+    _assert_standard_cve_details(failed_checks[0].details, "CVE-2022-45907", "1.13.0")
 
 
 def test_pytorch_zip_cve_2022_45907_fixed_version(tmp_path: Path) -> None:
@@ -1036,6 +1051,7 @@ def test_pytorch_zip_cve_2024_5480_version_check(tmp_path: Path) -> None:
     )
     assert failed_checks[0].details.get("detected_pytorch_version") == "2.2.2"
     assert failed_checks[0].details.get("pytorch_version_source") == "metadata:config.json:pytorch_version"
+    _assert_standard_cve_details(failed_checks[0].details, "CVE-2024-5480", "2.2.2")
 
 
 def test_pytorch_zip_cve_2024_5480_fixed_version(tmp_path: Path) -> None:
@@ -1067,6 +1083,7 @@ def test_pytorch_zip_cve_2024_48063_version_check(tmp_path: Path) -> None:
     )
     assert failed_checks[0].details.get("detected_pytorch_version") == "2.4.1"
     assert failed_checks[0].details.get("pytorch_version_source") == "metadata:config.json:pytorch_version"
+    _assert_standard_cve_details(failed_checks[0].details, "CVE-2024-48063", "2.4.1")
 
 
 def test_pytorch_zip_cve_2024_48063_fixed_version(tmp_path: Path) -> None:
@@ -1090,8 +1107,14 @@ def test_version_suffix_handling_for_cve_checks() -> None:
     assert scanner._is_vulnerable_pytorch_version_for("2.2.3.post1", 2, 2, 3) is False
 
     # Known pre-release suffixes on fix version are still vulnerable
+    assert scanner._is_vulnerable_pytorch_version_for("2.2.3a1", 2, 2, 3) is True
+    assert scanner._is_vulnerable_pytorch_version_for("2.2.3b1", 2, 2, 3) is True
     assert scanner._is_vulnerable_pytorch_version_for("2.2.3rc1", 2, 2, 3) is True
     assert scanner._is_vulnerable_pytorch_version_for("2.2.3.dev0", 2, 2, 3) is True
+
+    # Short prereleases above the fix release should not become false positives
+    assert scanner._is_vulnerable_pytorch_version_for("2.5.1a1", 2, 2, 3) is False
+    assert scanner._is_vulnerable_pytorch_version_for("2.5.1b1", 2, 2, 3) is False
 
     # Unknown suffix semantics -> conservative vulnerable
     assert scanner._is_vulnerable_pytorch_version_for("2.2.3foobar", 2, 2, 3) is True

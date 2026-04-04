@@ -9,7 +9,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, ClassVar, Final
+from typing import Any, ClassVar, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_serializer
 
@@ -1526,7 +1526,11 @@ class BaseScanner(ABC):
         """Add a progress callback to this scanner."""
         self._add_progress_observer("add_callback", callback)
 
-    def _add_progress_observer(self, method_name: str, observer: Any) -> None:
+    def _add_progress_observer(
+        self,
+        method_name: Literal["add_reporter", "add_callback"],
+        observer: Any,
+    ) -> None:
         """Attach a progress reporter or callback, initializing tracking if needed."""
         # Initialize progress tracker if not already done
         if PROGRESS_AVAILABLE and self._enable_progress and not self.progress_tracker:
