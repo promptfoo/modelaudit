@@ -52,7 +52,7 @@ def test_joblib_scanner_fails_closed_on_incomplete_pickle_without_dangerous_find
 
     result = JoblibScanner().scan(str(path))
 
-    assert result.success is True
+    assert result.success is False
     assert result.metadata["scan_outcome"] == "inconclusive"
     assert result.metadata["analysis_incomplete"] is True
     assert any(

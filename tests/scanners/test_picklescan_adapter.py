@@ -455,6 +455,59 @@ def test_pickle_report_to_scan_result_keeps_joblib_unknown_opcode_tails_as_incon
     )
 
 
+def test_pickle_report_to_scan_result_ignores_decompressed_wrapper_suffix_for_joblib_tail_suppression() -> None:
+    report = PickleReport(
+        source="numpy_arrays.joblib (decompressed)",
+        status=ScanStatus.INCONCLUSIVE,
+        verdict=SafetyVerdict.UNKNOWN,
+        notices=(
+            Notice(
+                message="Pickle parsing stopped before the stream was fully consumed: ValueError",
+                severity=Severity.INFO,
+                location="numpy_arrays.joblib (decompressed) (pos 231)",
+                code="parse_incomplete",
+                details={
+                    "exception": "at position 230, opcode b'\\t' unknown",
+                    "exception_type": "ValueError",
+                    "analysis_incomplete": True,
+                },
+            ),
+        ),
+        metadata={
+            "import_references": [
+                {
+                    "import_reference": "joblib.numpy_pickle.NumpyArrayWrapper",
+                    "module": "joblib.numpy_pickle",
+                    "name": "NumpyArrayWrapper",
+                    "opcode": "STACK_GLOBAL",
+                    "position": 66,
+                    "is_dangerous": False,
+                },
+                {
+                    "import_reference": "numpy.ndarray",
+                    "module": "numpy",
+                    "name": "ndarray",
+                    "opcode": "STACK_GLOBAL",
+                    "position": 103,
+                    "is_dangerous": False,
+                },
+            ],
+        },
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert not any(issue.message == "Pickle parsing failed before full scan completion" for issue in result.issues)
+    assert any(
+        issue.severity == IssueSeverity.INFO
+        and issue.rule_code == "S902"
+        and issue.message == "Pickle parsing stopped before the stream was fully consumed: ValueError"
+        for issue in result.issues
+    )
+
+
 def test_pickle_report_to_scan_result_keeps_parse_errors_non_operational() -> None:
     report = PickleReport(
         source="bad.bin",

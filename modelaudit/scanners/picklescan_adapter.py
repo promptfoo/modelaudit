@@ -250,7 +250,7 @@ def _to_issue_severity(severity: Severity) -> IssueSeverity:
 
 def _should_suppress_parse_failure_escalation(report: PickleReport) -> bool:
     """Keep known benign malformed tails as INFO notices while preserving fail-closed truncation."""
-    source_ext = os.path.splitext(report.source)[1].lower()
+    source_ext = _pickle_source_extension(report.source)
     if report.has_security_findings:
         return False
 
@@ -280,6 +280,13 @@ def _should_suppress_parse_failure_escalation(report: PickleReport) -> bool:
             return True
 
     return False
+
+
+def _pickle_source_extension(source: str) -> str:
+    """Return the pickle payload extension, ignoring synthetic wrapper suffixes."""
+    if source.endswith(" (decompressed)"):
+        source = source[: -len(" (decompressed)")]
+    return os.path.splitext(source)[1].lower()
 
 
 def _has_only_benign_serialization_tail_imports(report: PickleReport) -> bool:
