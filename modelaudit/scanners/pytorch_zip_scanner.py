@@ -9,6 +9,7 @@ import stat
 import tempfile
 import zipfile
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any, ClassVar
 
 from ..utils import sanitize_archive_path
@@ -17,6 +18,20 @@ from .pickle_scanner import PickleScanner
 
 logger = logging.getLogger(__name__)
 _INSTALLED_PYTORCH_VERSION_UNSET = object()
+
+
+@dataclass(frozen=True)
+class _PyTorchVersionCveMetadata:
+    """Metadata for PyTorch version-gated CVE checks."""
+
+    cve_id: str
+    check_name: str
+    fix_version: str
+    fix_version_parts: tuple[int, int, int]
+    vulnerable_message_suffix: str
+    vulnerability_description: str
+    recommendation: str
+    why: str
 
 
 class PyTorchZipScanner(BaseScanner):
@@ -57,6 +72,59 @@ class PyTorchZipScanner(BaseScanner):
     CVE_2024_48063_ID: ClassVar[str] = "CVE-2024-48063"
     CVE_2024_48063_FIX_VERSION: ClassVar[str] = "2.5.0"
     CVE_2024_48063_DESCRIPTION: ClassVar[str] = "torch.distributed.rpc.RemoteModule deserialization RCE via pickle"
+
+    _PYTORCH_VERSION_CVE_METADATA: ClassVar[dict[str, _PyTorchVersionCveMetadata]] = {
+        CVE_2022_45907_ID: _PyTorchVersionCveMetadata(
+            cve_id=CVE_2022_45907_ID,
+            check_name="CVE-2022-45907 PyTorch Version Check",
+            fix_version=CVE_2022_45907_FIX_VERSION,
+            fix_version_parts=(1, 13, 1),
+            vulnerable_message_suffix="(unsafe eval() in torch.jit.annotations.parse_type_line)",
+            vulnerability_description=CVE_2022_45907_DESCRIPTION,
+            recommendation=(
+                "Update to PyTorch 1.13.1 or later, avoid loading untrusted "
+                "TorchScript models or type annotations from untrusted sources"
+            ),
+            why=(
+                "CVE-2022-45907 (CVSS 9.8) allows arbitrary code execution via crafted type "
+                "annotations processed by torch.jit.annotations.parse_type_line, which passes "
+                "user-controlled strings to Python's eval()."
+            ),
+        ),
+        CVE_2024_5480_ID: _PyTorchVersionCveMetadata(
+            cve_id=CVE_2024_5480_ID,
+            check_name="CVE-2024-5480 PyTorch Version Check",
+            fix_version=CVE_2024_5480_FIX_VERSION,
+            fix_version_parts=(2, 2, 3),
+            vulnerable_message_suffix="(RPC framework arbitrary function execution via PythonUDF)",
+            vulnerability_description=CVE_2024_5480_DESCRIPTION,
+            recommendation=(
+                "Update to PyTorch 2.2.3 or later, restrict RPC access to "
+                "trusted nodes only, never expose RPC endpoints to untrusted networks"
+            ),
+            why=(
+                "CVE-2024-5480 (CVSS 10.0) allows remote code execution because "
+                "torch.distributed.rpc does not validate function calls, enabling an "
+                "attacker to send eval/exec as PythonUDF payloads."
+            ),
+        ),
+        CVE_2024_48063_ID: _PyTorchVersionCveMetadata(
+            cve_id=CVE_2024_48063_ID,
+            check_name="CVE-2024-48063 PyTorch Version Check",
+            fix_version=CVE_2024_48063_FIX_VERSION,
+            fix_version_parts=(2, 5, 0),
+            vulnerable_message_suffix="(RemoteModule deserialization RCE via pickle)",
+            vulnerability_description=CVE_2024_48063_DESCRIPTION,
+            recommendation=(
+                "Update to PyTorch 2.5.0 or later, avoid deserializing RemoteModule objects from untrusted sources"
+            ),
+            why=(
+                "CVE-2024-48063 (CVSS 9.8) allows RCE through deserialization of "
+                "torch.distributed.rpc.RemoteModule objects, which use pickle internally. "
+                "Disputed as 'intended behavior' but still poses a critical risk."
+            ),
+        ),
+    }
 
     # Security limits for archive manipulation protection
     MAX_COMPRESSION_RATIO: ClassVar[int] = 100  # 100:1 compression ratio threshold
@@ -1605,128 +1673,74 @@ class PyTorchZipScanner(BaseScanner):
         except Exception:
             return True
 
-    def _check_cve_2022_45907_vulnerability(self, version_info: dict[str, Any], result: ScanResult, path: str) -> None:
-        """Check for CVE-2022-45907 using conservative PyTorch version evidence."""
+    def _check_metadata_driven_pytorch_version_vulnerability(
+        self,
+        version_info: dict[str, Any],
+        result: ScanResult,
+        path: str,
+        cve_metadata: _PyTorchVersionCveMetadata,
+    ) -> None:
+        """Check for a version-gated PyTorch CVE using shared declarative metadata."""
+
+        def is_vulnerable(version: str) -> bool:
+            return self._is_vulnerable_pytorch_version_for(version, *cve_metadata.fix_version_parts)
+
         detected_version, version_source = self._select_pytorch_version_for_check(
             version_info,
-            lambda version: self._is_vulnerable_pytorch_version_for(version, 1, 13, 1),
+            is_vulnerable,
         )
-        if not detected_version:
+        if not detected_version or not is_vulnerable(detected_version):
             return
 
-        is_vulnerable = self._is_vulnerable_pytorch_version_for(detected_version, 1, 13, 1)
         source_prefix = self._format_pytorch_version_source(version_source)
-        if is_vulnerable:
-            result.add_check(
-                name="CVE-2022-45907 PyTorch Version Check",
-                passed=False,
-                message=(
-                    f"{source_prefix} {detected_version} is vulnerable to CVE-2022-45907 "
-                    f"(unsafe eval() in torch.jit.annotations.parse_type_line). "
-                    f"Upgrade to PyTorch {self.CVE_2022_45907_FIX_VERSION} or later."
-                ),
-                severity=IssueSeverity.CRITICAL,
-                location=path,
-                details={
-                    "cve_id": self.CVE_2022_45907_ID,
-                    "detected_pytorch_version": detected_version,
-                    "pytorch_version_source": version_source,
-                    "installed_pytorch_version": self._get_installed_pytorch_version(),
-                    "vulnerability_description": self.CVE_2022_45907_DESCRIPTION,
-                    "fixed_in": f"PyTorch {self.CVE_2022_45907_FIX_VERSION}",
-                    "recommendation": (
-                        "Update to PyTorch 1.13.1 or later, avoid loading untrusted "
-                        "TorchScript models or type annotations from untrusted sources"
-                    ),
-                },
-                why=(
-                    "CVE-2022-45907 (CVSS 9.8) allows arbitrary code execution via crafted type "
-                    "annotations processed by torch.jit.annotations.parse_type_line, which passes "
-                    "user-controlled strings to Python's eval()."
-                ),
-            )
+        result.add_check(
+            name=cve_metadata.check_name,
+            passed=False,
+            message=(
+                f"{source_prefix} {detected_version} is vulnerable to {cve_metadata.cve_id} "
+                f"{cve_metadata.vulnerable_message_suffix}. "
+                f"Upgrade to PyTorch {cve_metadata.fix_version} or later."
+            ),
+            severity=IssueSeverity.CRITICAL,
+            location=path,
+            details={
+                "cve_id": cve_metadata.cve_id,
+                "detected_pytorch_version": detected_version,
+                "pytorch_version_source": version_source,
+                "installed_pytorch_version": self._get_installed_pytorch_version(),
+                "vulnerability_description": cve_metadata.vulnerability_description,
+                "fixed_in": f"PyTorch {cve_metadata.fix_version}",
+                "recommendation": cve_metadata.recommendation,
+            },
+            why=cve_metadata.why,
+        )
+
+    def _check_cve_2022_45907_vulnerability(self, version_info: dict[str, Any], result: ScanResult, path: str) -> None:
+        """Check for CVE-2022-45907 using conservative PyTorch version evidence."""
+        self._check_metadata_driven_pytorch_version_vulnerability(
+            version_info,
+            result,
+            path,
+            self._PYTORCH_VERSION_CVE_METADATA[self.CVE_2022_45907_ID],
+        )
 
     def _check_cve_2024_5480_vulnerability(self, version_info: dict[str, Any], result: ScanResult, path: str) -> None:
         """Check for CVE-2024-5480 using conservative PyTorch version evidence."""
-        detected_version, version_source = self._select_pytorch_version_for_check(
+        self._check_metadata_driven_pytorch_version_vulnerability(
             version_info,
-            lambda version: self._is_vulnerable_pytorch_version_for(version, 2, 2, 3),
+            result,
+            path,
+            self._PYTORCH_VERSION_CVE_METADATA[self.CVE_2024_5480_ID],
         )
-        if not detected_version:
-            return
-
-        is_vulnerable = self._is_vulnerable_pytorch_version_for(detected_version, 2, 2, 3)
-        source_prefix = self._format_pytorch_version_source(version_source)
-        if is_vulnerable:
-            result.add_check(
-                name="CVE-2024-5480 PyTorch Version Check",
-                passed=False,
-                message=(
-                    f"{source_prefix} {detected_version} is vulnerable to CVE-2024-5480 "
-                    f"(RPC framework arbitrary function execution via PythonUDF). "
-                    f"Upgrade to PyTorch {self.CVE_2024_5480_FIX_VERSION} or later."
-                ),
-                severity=IssueSeverity.CRITICAL,
-                location=path,
-                details={
-                    "cve_id": self.CVE_2024_5480_ID,
-                    "detected_pytorch_version": detected_version,
-                    "pytorch_version_source": version_source,
-                    "installed_pytorch_version": self._get_installed_pytorch_version(),
-                    "vulnerability_description": self.CVE_2024_5480_DESCRIPTION,
-                    "fixed_in": f"PyTorch {self.CVE_2024_5480_FIX_VERSION}",
-                    "recommendation": (
-                        "Update to PyTorch 2.2.3 or later, restrict RPC access to "
-                        "trusted nodes only, never expose RPC endpoints to untrusted networks"
-                    ),
-                },
-                why=(
-                    "CVE-2024-5480 (CVSS 10.0) allows remote code execution because "
-                    "torch.distributed.rpc does not validate function calls, enabling an "
-                    "attacker to send eval/exec as PythonUDF payloads."
-                ),
-            )
 
     def _check_cve_2024_48063_vulnerability(self, version_info: dict[str, Any], result: ScanResult, path: str) -> None:
         """Check for CVE-2024-48063 using conservative PyTorch version evidence."""
-        detected_version, version_source = self._select_pytorch_version_for_check(
+        self._check_metadata_driven_pytorch_version_vulnerability(
             version_info,
-            lambda version: self._is_vulnerable_pytorch_version_for(version, 2, 5, 0),
+            result,
+            path,
+            self._PYTORCH_VERSION_CVE_METADATA[self.CVE_2024_48063_ID],
         )
-        if not detected_version:
-            return
-
-        is_vulnerable = self._is_vulnerable_pytorch_version_for(detected_version, 2, 5, 0)
-        source_prefix = self._format_pytorch_version_source(version_source)
-        if is_vulnerable:
-            result.add_check(
-                name="CVE-2024-48063 PyTorch Version Check",
-                passed=False,
-                message=(
-                    f"{source_prefix} {detected_version} is vulnerable to CVE-2024-48063 "
-                    f"(RemoteModule deserialization RCE via pickle). "
-                    f"Upgrade to PyTorch {self.CVE_2024_48063_FIX_VERSION} or later."
-                ),
-                severity=IssueSeverity.CRITICAL,
-                location=path,
-                details={
-                    "cve_id": self.CVE_2024_48063_ID,
-                    "detected_pytorch_version": detected_version,
-                    "pytorch_version_source": version_source,
-                    "installed_pytorch_version": self._get_installed_pytorch_version(),
-                    "vulnerability_description": self.CVE_2024_48063_DESCRIPTION,
-                    "fixed_in": f"PyTorch {self.CVE_2024_48063_FIX_VERSION}",
-                    "recommendation": (
-                        "Update to PyTorch 2.5.0 or later, avoid deserializing "
-                        "RemoteModule objects from untrusted sources"
-                    ),
-                },
-                why=(
-                    "CVE-2024-48063 (CVSS 9.8) allows RCE through deserialization of "
-                    "torch.distributed.rpc.RemoteModule objects, which use pickle internally. "
-                    "Disputed as 'intended behavior' but still poses a critical risk."
-                ),
-            )
 
     def _validate_tensor_metadata_consistency(
         self,
