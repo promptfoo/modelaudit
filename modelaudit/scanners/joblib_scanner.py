@@ -134,6 +134,7 @@ class JoblibScanner(BaseScanner):
         """Analyze a raw or decompressed pickle payload with CVE and opcode checks."""
         self._detect_cve_patterns(payload, result, context)
         self._scan_for_joblib_specific_threats(payload, result, context)
+        self.pickle_scanner.current_file_path = context
 
         with io.BytesIO(payload) as file_like:
             sub_result = self.pickle_scanner._scan_pickle_bytes(
@@ -162,6 +163,11 @@ class JoblibScanner(BaseScanner):
             return False
 
         return False
+
+    def _record_joblib_operational_error(self, result: ScanResult, reason: str) -> None:
+        """Mark a Joblib scan as operationally incomplete for CLI exit-code aggregation."""
+        result.metadata["operational_error"] = True
+        result.metadata["operational_error_reason"] = reason
 
     def _detect_cve_patterns(self, data: bytes, result: ScanResult, context: str) -> None:
         """Detect CVE-specific patterns in joblib file data."""
@@ -327,6 +333,7 @@ class JoblibScanner(BaseScanner):
                         details={"security_check": "compression_bomb_detection"},
                         rule_code="S902",
                     )
+                    self._record_joblib_operational_error(result, "joblib_wrapper_decode_failed")
                     result.finish(success=False)
                     return result
                 except Exception as e:
@@ -342,6 +349,7 @@ class JoblibScanner(BaseScanner):
                         },
                         rule_code="S902",
                     )
+                    self._record_joblib_operational_error(result, "joblib_decompression_failed")
                     result.finish(success=False)
                     return result
                 self._scan_pickle_payload(decompressed, result, f"{path} (decompressed)")
@@ -358,6 +366,7 @@ class JoblibScanner(BaseScanner):
                 },
                 rule_code="S902",
             )
+            self._record_joblib_operational_error(result, "joblib_scan_failed")
             result.finish(success=False)
             return result
 

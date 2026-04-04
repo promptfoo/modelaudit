@@ -8,6 +8,7 @@ import pickle
 import zlib
 from pathlib import Path
 
+from modelaudit.core import scan_file
 from modelaudit.scanners.base import Check, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.joblib_scanner import JoblibScanner
 
@@ -73,12 +74,21 @@ def test_scan_accepts_raw_protocol0_int_pickle_joblib(tmp_path: Path) -> None:
 
 
 def test_scan_detects_gzip_compressed_pickle_joblib(tmp_path: Path) -> None:
-    payload = gzip.compress(pickle.dumps(_Payload(), protocol=4))
+    path = tmp_path / "gzip_protocol4.joblib"
+    path.write_bytes(gzip.compress(pickle.dumps(_Payload(), protocol=4)))
 
-    result = _scan_payload(tmp_path, payload, "gzip_protocol4.joblib")
+    result = JoblibScanner().scan(str(path))
 
     assert result.success is False
     assert _has_system_reduce_failure(result)
+    reduce_failures = [
+        check
+        for check in result.checks
+        if check.name == "REDUCE Opcode Safety Check" and check.status == CheckStatus.FAILED
+    ]
+    assert reduce_failures
+    assert reduce_failures[0].location is not None
+    assert reduce_failures[0].location.startswith(f"{path} (decompressed)")
 
 
 def test_scan_detects_bz2_compressed_pickle_joblib(tmp_path: Path) -> None:
@@ -97,6 +107,8 @@ def test_scan_detects_zlib_trailer_after_compressed_joblib_stream(tmp_path: Path
 
     compression_failures = _compression_failures(result)
     assert result.success is False
+    assert result.metadata.get("operational_error") is True
+    assert result.metadata.get("operational_error_reason") == "joblib_wrapper_decode_failed"
     assert len(compression_failures) == 1
     assert "Trailing data found after compressed joblib stream" in compression_failures[0].message
     assert not _has_system_reduce_failure(result)
@@ -107,6 +119,35 @@ def test_scan_reports_plain_text_joblib_without_critical_pickle_noise(tmp_path: 
 
     compression_failures = _compression_failures(result)
     assert result.success is False
+    assert result.metadata.get("operational_error") is True
+    assert result.metadata.get("operational_error_reason") == "joblib_wrapper_decode_failed"
+    assert len(compression_failures) == 1
+    assert compression_failures[0].severity == IssueSeverity.INFO
+    assert not _has_system_reduce_failure(result)
+
+
+def test_scan_file_routes_gzip_joblib_to_joblib_scanner(tmp_path: Path) -> None:
+    path = tmp_path / "gzip_protocol4.joblib"
+    path.write_bytes(gzip.compress(pickle.dumps(_Payload(), protocol=4)))
+
+    result = scan_file(str(path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "joblib"
+    assert result.success is False
+    assert _has_system_reduce_failure(result)
+
+
+def test_scan_file_routes_plain_text_joblib_to_joblib_scanner(tmp_path: Path) -> None:
+    path = tmp_path / "plain_text.joblib"
+    path.write_bytes(b"not a pickle")
+
+    result = scan_file(str(path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "joblib"
+    compression_failures = _compression_failures(result)
+    assert result.success is False
+    assert result.metadata.get("operational_error") is True
+    assert result.metadata.get("operational_error_reason") == "joblib_wrapper_decode_failed"
     assert len(compression_failures) == 1
     assert compression_failures[0].severity == IssueSeverity.INFO
     assert not _has_system_reduce_failure(result)
