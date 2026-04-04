@@ -1,6 +1,6 @@
 # modelaudit-picklescan
 
-Standalone pickle security scanner package extracted from ModelAudit.
+Standalone pickle security scanner package used by ModelAudit's pickle scanners.
 
 This package is intentionally small: it exposes pickle byte/stream analysis,
 safety verdicts, and typed findings without importing the broader ModelAudit
@@ -8,9 +8,8 @@ scanner framework.
 
 ## Installation
 
-The package is currently bundled in the root `modelaudit` wheel while standalone
-publishing is staged. For local package work from a checkout, install the
-package directory directly:
+The root `modelaudit` wheel bundles `modelaudit_picklescan` as an import package.
+For local package work from a checkout, install the package directory directly:
 
 ```bash
 python -m pip install packages/modelaudit-picklescan
@@ -47,6 +46,7 @@ report = scan_bytes(
 routing, SARIF export, CLI behavior, and `ScanResult` adaptation stay in the
 root `modelaudit` package.
 
-The engine is still being migrated toward full parity with the legacy
-`modelaudit.scanners.pickle_scanner.PickleScanner`, so use the differential
-harness in `scripts/compare_pickle_scanners.py` when changing detection logic.
+The root `modelaudit.scanners.pickle_scanner.PickleScanner` keeps a compatibility
+fallback path and merges legacy-only checks into standalone package results.
+Use `scripts/compare_pickle_scanners.py` when changing detection logic to verify
+that verdict/status semantics stay aligned across fixture corpora.
