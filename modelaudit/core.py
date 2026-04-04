@@ -281,6 +281,9 @@ def _select_preferred_scanner_id(path: str, header_format: str, ext: str) -> str
     if ext == ".joblib" and header_format in {"compressed", "pickle"}:
         return "joblib"
 
+    if header_format == "tar" and ext == ".nemo":
+        return "nemo"
+
     return HEADER_FORMAT_TO_SCANNER_ID.get(header_format)
 
 

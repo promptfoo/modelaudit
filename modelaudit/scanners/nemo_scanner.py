@@ -7,6 +7,7 @@ Python callables, enabling RCE when loaded via hydra.utils.instantiate().
 
 import logging
 import os
+import re
 import tarfile
 from typing import Any, ClassVar
 
@@ -92,10 +93,30 @@ _SUSPICIOUS_TARGET_PATTERNS = (
     "locals",
     "vars",
 )
+_TARGET_TOKEN_RE = re.compile(r"__import__|[A-Z]+(?=[A-Z][a-z0-9]|[0-9_]|$)|[A-Z]?[a-z0-9]+")
 
 CVE_2025_23304_ID = "CVE-2025-23304"
 CVE_2025_23304_CVSS = 7.6
 CVE_2025_23304_CWE = "CWE-94"
+CVE_2025_23304_DESCRIPTION = (
+    "NeMo Hydra _target_ specifies a suspicious or dangerous callable that may enable RCE when instantiated"
+)
+CVE_2025_23304_REMEDIATION = (
+    "Update to NeMo >= 2.3.2 which validates _target_ values. Do not load untrusted .nemo files."
+)
+
+
+def _find_suspicious_target_pattern(target: str) -> str | None:
+    """Return a suspicious identifier token if a target contains one."""
+    for component in target.split("."):
+        for token in _TARGET_TOKEN_RE.findall(component):
+            token_lower = token.lower()
+            if token_lower in _SUSPICIOUS_TARGET_PATTERNS:
+                return token_lower
+            for pattern in _SUSPICIOUS_TARGET_PATTERNS:
+                if token_lower.startswith(pattern) and token_lower[len(pattern) :].isdigit():
+                    return pattern
+    return None
 
 
 class NemoScanner(BaseScanner):
@@ -162,7 +183,7 @@ class NemoScanner(BaseScanner):
         yaml_configs_found = 0
 
         with tarfile.open(path, "r:*") as tar:
-            for member in tar.getmembers():
+            for member in tar:
                 self.check_interrupted()
 
                 if not member.isfile():
@@ -183,13 +204,22 @@ class NemoScanner(BaseScanner):
 
                 # Parse YAML config files
                 if name_lower.endswith((".yaml", ".yml")):
+                    if member.size > self.MAX_CONFIG_SIZE:
+                        result.add_check(
+                            name="NeMo Config Size Check",
+                            passed=False,
+                            message=(f"Config file too large: {member.name} ({member.size} bytes)"),
+                            severity=IssueSeverity.WARNING,
+                            location=f"{path}:{member.name}",
+                        )
+                        continue
+
                     f = tar.extractfile(member)
                     if f is None:
                         continue
                     with f:
                         try:
-                            raw = f.read()
-                            # Safety: limit size to avoid YAML bomb
+                            raw = f.read(self.MAX_CONFIG_SIZE + 1)
                             if len(raw) > self.MAX_CONFIG_SIZE:
                                 result.add_check(
                                     name="NeMo Config Size Check",
@@ -276,12 +306,8 @@ class NemoScanner(BaseScanner):
                     "cve_id": CVE_2025_23304_ID,
                     "cvss": CVE_2025_23304_CVSS,
                     "cwe": CVE_2025_23304_CWE,
-                    "description": (
-                        "NeMo Hydra _target_ specifies a dangerous callable that enables RCE when instantiated"
-                    ),
-                    "remediation": (
-                        "Update to NeMo >= 2.3.2 which validates _target_ values. Do not load untrusted .nemo files."
-                    ),
+                    "description": CVE_2025_23304_DESCRIPTION,
+                    "remediation": CVE_2025_23304_REMEDIATION,
                 },
                 why=(
                     f"The _target_ field '{target}' in this NeMo "
@@ -306,30 +332,31 @@ class NemoScanner(BaseScanner):
             return
 
         # Check for suspicious patterns in target (only for non-safe targets)
-        target_lower = target.lower()
-        for pattern in _SUSPICIOUS_TARGET_PATTERNS:
-            if pattern in target_lower:
-                result.add_check(
-                    name=f"{CVE_2025_23304_ID}: Suspicious Hydra _target_",
-                    passed=False,
-                    message=(
-                        f"{CVE_2025_23304_ID}: Suspicious _target_ "
-                        f"'{target}' (contains '{pattern}') at "
-                        f"{config_path} in {config_name}"
-                    ),
-                    severity=IssueSeverity.CRITICAL,
-                    location=f"{archive_path}:{config_name}",
-                    details={
-                        "target": target,
-                        "pattern": pattern,
-                        "config_path": config_path,
-                        "config_file": config_name,
-                        "cve_id": CVE_2025_23304_ID,
-                        "cvss": CVE_2025_23304_CVSS,
-                        "cwe": CVE_2025_23304_CWE,
-                    },
-                )
-                return
+        pattern = _find_suspicious_target_pattern(target)
+        if pattern is not None:
+            result.add_check(
+                name=f"{CVE_2025_23304_ID}: Suspicious Hydra _target_",
+                passed=False,
+                message=(
+                    f"{CVE_2025_23304_ID}: Suspicious _target_ "
+                    f"'{target}' (contains '{pattern}') at "
+                    f"{config_path} in {config_name}"
+                ),
+                severity=IssueSeverity.CRITICAL,
+                location=f"{archive_path}:{config_name}",
+                details={
+                    "target": target,
+                    "pattern": pattern,
+                    "config_path": config_path,
+                    "config_file": config_name,
+                    "cve_id": CVE_2025_23304_ID,
+                    "cvss": CVE_2025_23304_CVSS,
+                    "cwe": CVE_2025_23304_CWE,
+                    "description": CVE_2025_23304_DESCRIPTION,
+                    "remediation": CVE_2025_23304_REMEDIATION,
+                },
+            )
+            return
 
         # Unknown target - flag for review
         result.add_check(
