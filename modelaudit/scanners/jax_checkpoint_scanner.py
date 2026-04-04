@@ -258,6 +258,20 @@ class JaxCheckpointScanner(BaseScanner):
         context_parts = [part for part in re.split(r"[.\[\]_-]+", lowered) if part]
         return any(part in cls._DOCUMENTATION_CONTEXT_HINTS for part in context_parts)
 
+    @staticmethod
+    def _looks_like_documentation_text(text: str) -> bool:
+        """Return True when a metadata string looks like prose-only documentation."""
+        stripped = text.strip()
+        if not stripped:
+            return True
+        if any(token in stripped for token in ("(", ")", "'", '"', "`", ";", "|", "&", "$", "/", "\\")):
+            return False
+        return not re.search(
+            r"(?<![A-Za-z0-9_])(?:os\.system|subprocess|eval|exec|import)(?![A-Za-z0-9_])",
+            stripped,
+            re.IGNORECASE,
+        )
+
     @classmethod
     def _iter_string_metadata(
         cls,
@@ -303,7 +317,7 @@ class JaxCheckpointScanner(BaseScanner):
         finding_budget: _PatternFindingBudget,
     ) -> None:
         """Match suspicious JAX regexes against one metadata/text context."""
-        if self._looks_like_documentation_context(context):
+        if self._looks_like_documentation_context(context) and self._looks_like_documentation_text(text):
             return
 
         for pattern in self.jax_suspicious_patterns:

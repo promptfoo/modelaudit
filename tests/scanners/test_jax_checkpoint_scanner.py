@@ -96,6 +96,31 @@ def test_orbax_metadata_doc_substrings_do_not_bypass_pattern_checks(tmp_path: Pa
     assert "orbax_metadata.notebook.restore_hook" in failed_contexts
 
 
+def test_orbax_metadata_doc_like_keys_with_executable_content_do_not_bypass_pattern_checks(
+    tmp_path: Path,
+) -> None:
+    checkpoint_dir = tmp_path / "orbax_checkpoint"
+    _write_orbax_metadata(
+        checkpoint_dir,
+        {
+            "version": "0.1.0",
+            "type": "orbax_checkpoint",
+            "notes": "jax.experimental.host_callback.call(os.system, 'id')",
+        },
+    )
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert result.success
+    assert any(
+        check.name == "Orbax Pattern Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.details["context"] == "orbax_metadata.notes"
+        and check.details["pattern"] == r"jax\.experimental\.host_callback\.call"
+        for check in result.checks
+    )
+
+
 def test_orbax_metadata_pattern_findings_are_capped_for_repeated_strings(tmp_path: Path) -> None:
     checkpoint_dir = tmp_path / "orbax_checkpoint"
     _write_orbax_metadata(
