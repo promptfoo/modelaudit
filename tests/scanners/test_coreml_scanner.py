@@ -517,6 +517,28 @@ def test_coreml_scanner_recursion_limit_fails_closed(tmp_path: Path) -> None:
     )
 
 
+def test_coreml_scanner_recursion_limit_succeeds_just_below_limit(tmp_path: Path) -> None:
+    nested_model = _build_model(
+        description=_build_description(metadata=_build_metadata()),
+        neural_network=_build_neural_network(layers=[_build_layer("leaf_dense")]),
+    )
+    for _ in range(CoreMLScanner.MAX_RECURSIVE_MESSAGE_DEPTH):
+        nested_model = _build_model(
+            description=_build_description(metadata=_build_metadata()),
+            pipeline_wrapper=_build_pipeline_wrapper(nested_model),
+        )
+
+    model_path = _write_model(tmp_path / "just_below_limit_pipeline.mlmodel", nested_model)
+
+    result = CoreMLScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert not any(
+        issue.severity == IssueSeverity.CRITICAL and "traversal reached the safe depth limit" in issue.message
+        for issue in result.issues
+    )
+
+
 def test_coreml_scanner_malformed_custom_model_fails_closed(tmp_path: Path) -> None:
     model_path = _write_model(
         tmp_path / "malformed_custom_model.mlmodel",
@@ -532,6 +554,29 @@ def test_coreml_scanner_malformed_custom_model_fails_closed(tmp_path: Path) -> N
         issue.severity == IssueSeverity.CRITICAL
         and "Unable to parse CoreML custom model block" in issue.message
         and issue.details.get("field_path") == "model[555]"
+        for issue in result.issues
+    )
+
+
+def test_coreml_scanner_truncated_linked_model_file_fails_closed(tmp_path: Path) -> None:
+    malformed_linked_model = _field_bytes(1, b"\x0a\x05abc")
+    model_path = _write_model(
+        tmp_path / "malformed_linked_model_file.mlmodel",
+        _build_model(
+            description=_build_description(metadata=_build_metadata()),
+            neural_network=_build_neural_network(layers=[_build_layer("dense_1")]),
+            linked_model=malformed_linked_model,
+        ),
+    )
+
+    result = CoreMLScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and "Unable to parse CoreML linked-model file entry" in issue.message
+        and issue.details.get("field_path") == "model[556].linkedModelFile"
+        and issue.details.get("parse_error") == "truncated length-delimited field 1"
         for issue in result.issues
     )
 
