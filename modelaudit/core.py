@@ -47,6 +47,7 @@ from modelaudit.utils.helpers.types import (
     ProgressCallback,
 )
 from modelaudit.utils.lfs import check_lfs_pointer, get_lfs_issue_details, get_lfs_remediation_steps
+from modelaudit.utils.sources._huggingface_cache import _find_hf_cache_root, _path_has_part
 
 logger = logging.getLogger("modelaudit.core")
 
@@ -399,24 +400,6 @@ def _group_files_by_content(file_paths: list[str]) -> dict[str, list[str]]:
                 logger.debug(f"  - {path}")
 
     return dict(content_groups)
-
-
-def _path_has_part(path: Path, part: str) -> bool:
-    """Return True if any path segment matches part (case-insensitive)."""
-    part_lower = part.lower()
-    return any(segment.lower() == part_lower for segment in path.parts)
-
-
-def _find_hf_cache_root(path: Path) -> Path | None:
-    """Return the HuggingFace cache root containing models--* if present."""
-    for index, segment in enumerate(path.parts):
-        if (
-            segment.lower().startswith("models--")
-            and index >= 3
-            and [part.lower() for part in path.parts[index - 3 : index]] == [".cache", "huggingface", "hub"]
-        ):
-            return Path(*path.parts[: index + 1])
-    return None
 
 
 def _resolve_directory_scan_target(

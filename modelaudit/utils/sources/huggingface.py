@@ -9,6 +9,7 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 
 from ..helpers.disk_space import check_disk_space
+from ._huggingface_cache import _find_hf_cache_root
 
 logger = logging.getLogger(__name__)
 
@@ -527,24 +528,6 @@ def download_file_from_hf(url: str, cache_dir: Path | None = None) -> Path:
         return Path(local_path)
     except Exception as e:
         raise Exception(f"Failed to download file from {url}: {e!s}") from e
-
-
-def _path_has_part(path: Path, part: str) -> bool:
-    """Return True if any path segment matches part (case-insensitive)."""
-    part_lower = part.lower()
-    return any(segment.lower() == part_lower for segment in path.parts)
-
-
-def _find_hf_cache_root(path: Path) -> Path | None:
-    """Return the HuggingFace cache root containing models--* if present."""
-    for index, segment in enumerate(path.parts):
-        if (
-            segment.lower().startswith("models--")
-            and index >= 3
-            and [part.lower() for part in path.parts[index - 3 : index]] == [".cache", "huggingface", "hub"]
-        ):
-            return Path(*path.parts[: index + 1])
-    return None
 
 
 def is_huggingface_cache_path(path: str | Path) -> bool:
