@@ -1382,6 +1382,11 @@ def validate_file_type(path: str) -> bool:
         if ext_format == "pmml" and header_format == "pmml":
             return True
 
+        # OpenVINO IR XML can be identified structurally by the dedicated scanner
+        # even when bounded magic-byte detection returns unknown for normal XML.
+        if ext_format == "openvino":
+            return header_format in {"openvino", "unknown"}
+
         if ext_format == "torchserve_mar":
             return header_format == "torchserve_mar"
 

@@ -40,6 +40,77 @@ def _local_tag_name(tag: str) -> str:
     return tag.rsplit("}", 1)[-1].lower()
 
 
+def _skip_doctype_declaration(xml_prefix: bytes, start_offset: int) -> int | None:
+    """Skip a DOCTYPE declaration without expanding entities."""
+    index = start_offset + len(b"<!DOCTYPE")
+    bracket_depth = 0
+    quote_char: int | None = None
+
+    while index < len(xml_prefix):
+        byte = xml_prefix[index]
+        if quote_char is not None:
+            if byte == quote_char:
+                quote_char = None
+        elif byte in {ord("'"), ord('"')}:
+            quote_char = byte
+        elif byte == ord("["):
+            bracket_depth += 1
+        elif byte == ord("]") and bracket_depth > 0:
+            bracket_depth -= 1
+        elif byte == ord(">") and bracket_depth == 0:
+            return index + 1
+        index += 1
+
+    return None
+
+
+def _looks_like_openvino_xml_prefix(xml_prefix: bytes) -> bool:
+    """Sniff the first root element without relying on entity-expanding XML parsing."""
+    index = 3 if xml_prefix.startswith(b"\xef\xbb\xbf") else 0
+    prefix_length = len(xml_prefix)
+
+    while index < prefix_length:
+        while index < prefix_length and chr(xml_prefix[index]).isspace():
+            index += 1
+
+        if xml_prefix.startswith(b"<?", index):
+            end_offset = xml_prefix.find(b"?>", index + 2)
+            if end_offset == -1:
+                return False
+            index = end_offset + 2
+            continue
+
+        if xml_prefix.startswith(b"<!--", index):
+            end_offset = xml_prefix.find(b"-->", index + 4)
+            if end_offset == -1:
+                return False
+            index = end_offset + 3
+            continue
+
+        if xml_prefix[index : index + len(b"<!DOCTYPE")].upper() == b"<!DOCTYPE":
+            next_index = _skip_doctype_declaration(xml_prefix, index)
+            if next_index is None:
+                return False
+            index = next_index
+            continue
+
+        break
+
+    if index >= prefix_length or xml_prefix[index : index + 1] != b"<":
+        return False
+    if xml_prefix[index + 1 : index + 2] in {b"/", b"!", b"?"}:
+        return False
+
+    tag_end = index + 1
+    while tag_end < prefix_length and xml_prefix[tag_end : tag_end + 1] not in b" \t\r\n\f/>":
+        tag_end += 1
+    if tag_end == index + 1:
+        return False
+
+    root_tag = xml_prefix[index + 1 : tag_end].decode("utf-8", "ignore")
+    return _local_tag_name(root_tag) in _OPENVINO_ROOT_TAGS
+
+
 def _iter_element_attributes(layer: Any) -> Iterator[tuple[str, str, str]]:
     """Yield normalized attributes from a layer and its nested config nodes."""
     for element in layer.iter():
@@ -68,8 +139,11 @@ class OpenVinoScanner(BaseScanner):
         try:
             with open(path, "rb") as xml_file:
                 xml_prefix = xml_file.read(cls.CAN_HANDLE_MAX_PARSE_BYTES)
-                for _event, element in DefusedET.iterparse(BytesIO(xml_prefix), events=("start",)):
-                    return _local_tag_name(str(element.tag)) in _OPENVINO_ROOT_TAGS
+                try:
+                    for _event, element in DefusedET.iterparse(BytesIO(xml_prefix), events=("start",)):
+                        return _local_tag_name(str(element.tag)) in _OPENVINO_ROOT_TAGS
+                except Exception:
+                    return _looks_like_openvino_xml_prefix(xml_prefix)
         except Exception:
             return False
 
@@ -105,6 +179,8 @@ class OpenVinoScanner(BaseScanner):
             tree = DefusedET.parse(path)
             root = tree.getroot()
         except Exception as e:  # pragma: no cover - parse errors
+            result.metadata["operational_error"] = True
+            result.metadata["operational_error_reason"] = "openvino_xml_parse_failed"
             result.add_check(
                 name="OpenVINO XML Parse",
                 passed=False,

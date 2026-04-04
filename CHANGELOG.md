@@ -123,6 +123,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **security:** detect protocol 0/1 pickle streams whose dangerous opcode appears after large trivial padding or after a non-trivial probe-boundary prelude, reject all-trivial no-`STOP` probe prefixes, and preserve rule codes across cached scan-result round trips
 - **license:** bound binary header scans and reuse compiled patterns to avoid full-file regex passes on large model archives
 - **security:** stop iterating malformed TFLite models after excessive subgraph counts are detected
+- **openvino:** route forbidden-DOCTYPE IR XML into the OpenVINO scanner, fail closed on XML parse errors, and suppress warning-level format-validation noise for benign `.xml` models with no distinctive magic bytes
 - **security:** fail closed on conflicting duplicate or alias Keras root members so benign trailing `config.json` entries cannot hide malicious earlier configs, while accepting byte-identical duplicates without warning noise
 - **security:** detect PyTorch binary code and blacklist patterns that straddle chunk boundaries, avoid duplicate overlap reports, and return `success=False` when CRITICAL findings are present
 - **security:** scan every duplicate PyTorch ZIP member by physical archive entry and report conflicting duplicate names at INFO severity so benign trailing `data.pkl` entries cannot shadow malicious earlier payloads without making benign-but-conflicting duplicates warning-fail by themselves
