@@ -293,11 +293,11 @@ class TorchServeMarScanner(BaseScanner):
         }
         manifest_name = self._normalize_member_name(MANIFEST_ENTRY_PATH)
 
-        manifest_infos = [
+        all_manifest_infos = [
             info for info in archive.infolist() if self._normalize_member_name(info.filename) == manifest_name
         ]
 
-        if not manifest_infos:
+        if not all_manifest_infos:
             result.add_check(
                 name="TorchServe Manifest Presence",
                 passed=False,
@@ -314,9 +314,30 @@ class TorchServeMarScanner(BaseScanner):
             location=archive_path,
         )
 
+        manifest_infos = all_manifest_infos
+        if len(all_manifest_infos) > self.max_entries:
+            manifest_infos = all_manifest_infos[: self.max_entries]
+            result.add_check(
+                name="TorchServe Manifest Entry Limit",
+                passed=False,
+                message=(
+                    "Archive contains "
+                    f"{len(all_manifest_infos)} manifest entries, exceeding max processed entries "
+                    f"({self.max_entries})"
+                ),
+                severity=IssueSeverity.WARNING,
+                location=f"{archive_path}:{MANIFEST_ENTRY_PATH}",
+                details={
+                    "manifest_entry_count": len(all_manifest_infos),
+                    "max_entries": self.max_entries,
+                },
+            )
+
         manifest_payload_count = 0
         first_manifest_digest: bytes | None = None
         has_conflicting_manifest_payloads = False
+        scanned_manifest_count = 0
+        processed_manifest_uncompressed = 0
         path_references: list[tuple[str, str]] = []
         handler_paths: list[str] = []
         serialized_paths: list[str] = []
@@ -329,6 +350,26 @@ class TorchServeMarScanner(BaseScanner):
                 normalized_member=manifest_name,
                 max_manifest_bytes=self.MAX_MANIFEST_BYTES,
             )
+
+            processed_manifest_uncompressed += max(manifest_info.file_size, 0)
+            if processed_manifest_uncompressed > self.max_uncompressed_bytes:
+                result.add_check(
+                    name="TorchServe Manifest Uncompressed Size Budget",
+                    passed=False,
+                    message=(
+                        "Manifest parsing uncompressed byte budget exceeded "
+                        f"({processed_manifest_uncompressed} > {self.max_uncompressed_bytes})"
+                    ),
+                    severity=IssueSeverity.WARNING,
+                    location=f"{archive_path}:{MANIFEST_ENTRY_PATH}",
+                    details={
+                        "processed_uncompressed": processed_manifest_uncompressed,
+                        "max_uncompressed_bytes": self.max_uncompressed_bytes,
+                    },
+                )
+                break
+
+            scanned_manifest_count += 1
 
             try:
                 manifest_bytes = self._read_member_bounded(archive, manifest_info, self.MAX_MANIFEST_BYTES)
@@ -386,9 +427,9 @@ class TorchServeMarScanner(BaseScanner):
             serialized_paths.extend(manifest_serialized_paths)
             missing_required.update(manifest_missing_required)
 
-        if len(manifest_infos) > 1 and (
-            parsed_manifest_count != len(manifest_infos)
-            or manifest_payload_count != len(manifest_infos)
+        if scanned_manifest_count > 1 and (
+            parsed_manifest_count != scanned_manifest_count
+            or manifest_payload_count != scanned_manifest_count
             or has_conflicting_manifest_payloads
         ):
             result.add_check(
@@ -403,9 +444,10 @@ class TorchServeMarScanner(BaseScanner):
                             member_info=manifest_info,
                             normalized_member=manifest_name,
                         )
-                        for manifest_info in manifest_infos
+                        for manifest_info in manifest_infos[:scanned_manifest_count]
                     ],
                     "parsed_manifest_count": parsed_manifest_count,
+                    "scanned_manifest_count": scanned_manifest_count,
                 },
             )
 
