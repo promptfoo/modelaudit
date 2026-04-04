@@ -677,7 +677,7 @@ def test_actual_keras_model_still_scans_properly(tmp_path):
     assert "layer_counts" in result.metadata
 
 
-def test_malicious_keras_model_still_detected(tmp_path):
+def test_malicious_keras_model_still_detected(tmp_path: Path) -> None:
     """Test that malicious Keras models are still properly detected."""
     # Create a malicious Keras model file
     malicious_path = create_mock_h5_file(tmp_path, malicious=True)
