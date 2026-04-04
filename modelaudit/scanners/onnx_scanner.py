@@ -2,7 +2,9 @@
 
 import logging
 import math
+import ntpath
 import os
+import re
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -28,6 +30,8 @@ def _get_onnx_mapping() -> Any:
 
         if hasattr(onnx, "mapping"):
             return onnx.mapping
+        if hasattr(onnx, "_mapping"):
+            return onnx._mapping
     except (ImportError, AttributeError):
         pass
 
@@ -53,6 +57,22 @@ STANDARD_ONNX_DOMAINS: frozenset[str] = frozenset(
         "ai.onnx.preview.training",
     }
 )
+_PYTHON_OPERATOR_TYPES: frozenset[str] = frozenset(
+    {
+        "pyfunc",
+        "pyfuncstateless",
+        "eagerpyfunc",
+        "python",
+        "pythonop",
+    }
+)
+_PYTHON_OPERATOR_PATTERN = re.compile(
+    r"^(?:pyfunc(?:stateless)?|eagerpyfunc|python(?:op)?)(?:v[0-9]+)?$",
+    re.IGNORECASE,
+)
+_OP_TYPE_TOKEN_PATTERN = re.compile(
+    r"[A-Z]+(?=[A-Z][a-z0-9]|[^A-Za-z0-9]|$)|[A-Z]?[a-z0-9]+",
+)
 
 
 def _check_onnx() -> bool:
@@ -69,6 +89,68 @@ def _check_onnx() -> bool:
             HAS_ONNX = False
             mapping = None
     return HAS_ONNX
+
+
+def _is_python_operator(op_type: str) -> bool:
+    """Return True for known Python-backed ONNX operator names."""
+    normalized_op_type = "".join(char.lower() for char in op_type if char.isalnum())
+    if normalized_op_type in _PYTHON_OPERATOR_TYPES or _PYTHON_OPERATOR_PATTERN.fullmatch(normalized_op_type):
+        return True
+
+    tokens = [token.lower() for token in _OP_TYPE_TOKEN_PATTERN.findall(op_type)]
+    for index, token in enumerate(tokens):
+        next_token = tokens[index + 1] if index + 1 < len(tokens) else ""
+        if token == "python" and next_token in {"op", "func"}:
+            return True
+        if token == "py" and next_token in {"op", "func"}:
+            return True
+    return False
+
+
+def _is_windows_absolute_path(path: str) -> bool:
+    """Return True when a serialized path is absolute in Windows syntax."""
+    return ntpath.isabs(path.replace("/", "\\"))
+
+
+def _resolve_external_location(model_dir: Path, location: str) -> Path:
+    """Resolve an ONNX external_data location for checks and reporting."""
+    if _is_windows_absolute_path(location):
+        return Path(location)
+    return (model_dir / location).resolve()
+
+
+def _tensor_data_type_to_np_dtype(data_type: int) -> Any:
+    """Resolve an ONNX tensor dtype across current and legacy ONNX APIs."""
+    import numpy as np
+    import onnx
+
+    try:
+        return np.dtype(onnx.helper.tensor_dtype_to_np_dtype(data_type))
+    except Exception:
+        pass
+
+    if mapping is None:
+        raise ValueError(f"ONNX tensor dtype mapping unavailable for data_type={data_type}")
+
+    if hasattr(mapping, "TENSOR_TYPE_TO_NP_TYPE"):
+        return np.dtype(mapping.TENSOR_TYPE_TO_NP_TYPE[data_type])
+
+    if hasattr(mapping, "TENSOR_TYPE_MAP"):
+        return np.dtype(mapping.TENSOR_TYPE_MAP[data_type].np_dtype)
+
+    raise ValueError(f"Unsupported ONNX tensor dtype mapping API for data_type={data_type}")
+
+
+def _parse_external_data_extent(info: dict[str, str], key: str) -> int | None:
+    """Parse an optional non-negative integer from external_data metadata."""
+    value = info.get(key)
+    if value is None:
+        return None
+
+    parsed = int(value)
+    if parsed < 0:
+        raise ValueError(f"{key} must be non-negative, got {parsed}")
+    return parsed
 
 
 class OnnxScanner(BaseScanner):
@@ -205,7 +287,7 @@ class OnnxScanner(BaseScanner):
         self._check_tensor_sizes(model, path, result)
         self._check_weight_distribution(model, path, result)
 
-        result.finish(success=True)
+        result.finish(success=not result.has_errors)
         return result
 
     def _check_custom_ops(self, model: Any, path: str, result: ScanResult) -> None:
@@ -216,6 +298,7 @@ class OnnxScanner(BaseScanner):
         for node in model.graph.node:
             # Check for interrupts periodically during node processing
             self.check_interrupted()
+            is_python_operator = _is_python_operator(node.op_type or "")
             if node.domain and node.domain not in STANDARD_ONNX_DOMAINS:
                 custom_domains.add(node.domain)
 
@@ -242,7 +325,8 @@ class OnnxScanner(BaseScanner):
                         ),
                     },
                 )
-            elif "python" in node.op_type.lower():
+
+            if is_python_operator:
                 python_ops_found = True
                 result.add_check(
                     name="Python Operator Detection",
@@ -253,7 +337,7 @@ class OnnxScanner(BaseScanner):
                     rule_code="S902",
                     details={"op_type": node.op_type, "domain": node.domain},
                 )
-            else:
+            elif not node.domain or node.domain in STANDARD_ONNX_DOMAINS:
                 safe_nodes += 1
 
         # Record successful checks for safe operators
@@ -295,7 +379,7 @@ class OnnxScanner(BaseScanner):
             if tensor.data_location == onnx.TensorProto.EXTERNAL:
                 info = {entry.key: entry.value for entry in tensor.external_data}
                 location = info.get("location")
-                if location is None:
+                if not location:
                     result.add_check(
                         name="External Data Location Check",
                         passed=False,
@@ -306,14 +390,15 @@ class OnnxScanner(BaseScanner):
                         rule_code="S703",
                     )
                     continue
-                external_path = (model_dir / location).resolve()
+                has_windows_absolute_path = _is_windows_absolute_path(location)
+                external_path = _resolve_external_location(model_dir, location)
                 # CVE-2024-27318: Detect nested path traversal (e.g.
                 # "subdir/../../etc/passwd") which bypasses naive lstrip
                 # sanitization.  Check the raw location for ".." BEFORE
                 # the existence check so traversal attempts against
                 # non-existent targets are still flagged.
                 has_traversal_raw = ".." in location.replace("\\", "/").split("/")
-                escapes_model_dir = not _is_contained_in(external_path, model_dir)
+                escapes_model_dir = has_windows_absolute_path or not _is_contained_in(external_path, model_dir)
                 if escapes_model_dir:
                     # Track for per-file CVE-2025-51480 (write direction) reporting
                     traversal_files.setdefault(location, []).append(tensor.name)
@@ -384,11 +469,11 @@ class OnnxScanner(BaseScanner):
                             location=str(external_path),
                             details={"file": location},
                         )
-                    self._validate_external_size(tensor, external_path, result)
+                    self._validate_external_size(tensor, info, external_path, result)
 
         # Report missing files once per file (not per tensor)
         for location, tensors in missing_files.items():
-            external_path = (model_dir / location).resolve()
+            external_path = _resolve_external_location(model_dir, location)
             result.add_check(
                 name="External Data Reference Check",
                 passed=False,
@@ -407,7 +492,7 @@ class OnnxScanner(BaseScanner):
 
         # Path traversal is a genuine security issue -- keep CRITICAL
         for location, tensors in traversal_files.items():
-            external_path = (model_dir / location).resolve()
+            external_path = _resolve_external_location(model_dir, location)
             result.add_check(
                 name="CVE-2025-51480: External Data Write Path Traversal",
                 passed=False,
@@ -448,21 +533,44 @@ class OnnxScanner(BaseScanner):
     def _validate_external_size(
         self,
         tensor: Any,
+        info: dict[str, str],
         external_path: Path,
         result: ScanResult,
     ) -> None:
         try:
-            import numpy as np
+            offset = _parse_external_data_extent(info, "offset") or 0
+            declared_length = _parse_external_data_extent(info, "length")
+        except ValueError as e:
+            result.add_check(
+                name="External Data Size Validation",
+                passed=False,
+                message=f"External data metadata is invalid: {e}",
+                severity=IssueSeverity.CRITICAL,
+                location=str(external_path),
+                rule_code="S902",
+                details={
+                    "tensor": tensor.name,
+                    "offset": info.get("offset"),
+                    "length": info.get("length"),
+                    "exception": str(e),
+                    "exception_type": type(e).__name__,
+                },
+            )
+            return
 
-            if mapping is None:
-                return  # Skip if mapping is not available
-            dtype = np.dtype(mapping.TENSOR_TYPE_TO_NP_TYPE[tensor.data_type])
+        try:
+            dtype = _tensor_data_type_to_np_dtype(tensor.data_type)
             num_elem = 1
             for d in tensor.dims:
                 num_elem *= d
             expected_size = int(num_elem) * int(dtype.itemsize)
+            required_end = offset + (declared_length if declared_length is not None else expected_size)
             actual_size = external_path.stat().st_size
-            if actual_size < expected_size:
+            if (
+                offset > actual_size
+                or required_end > actual_size
+                or (declared_length is not None and declared_length < expected_size)
+            ):
                 result.add_check(
                     name="External Data Size Validation",
                     passed=False,
@@ -474,6 +582,9 @@ class OnnxScanner(BaseScanner):
                         "tensor": tensor.name,
                         "expected_size": expected_size,
                         "actual_size": actual_size,
+                        "offset": offset,
+                        "length": declared_length,
+                        "required_end": required_end,
                     },
                 )
             else:
@@ -485,6 +596,8 @@ class OnnxScanner(BaseScanner):
                     details={
                         "tensor": tensor.name,
                         "size": actual_size,
+                        "offset": offset,
+                        "length": declared_length,
                     },
                 )
         except Exception as e:
@@ -507,11 +620,7 @@ class OnnxScanner(BaseScanner):
                 continue
             if tensor.raw_data:
                 try:
-                    import numpy as np
-
-                    if mapping is None:
-                        continue  # Skip if mapping is not available
-                    dtype = np.dtype(mapping.TENSOR_TYPE_TO_NP_TYPE[tensor.data_type])
+                    dtype = _tensor_data_type_to_np_dtype(tensor.data_type)
                     num_elem = 1
                     for d in tensor.dims:
                         num_elem *= d

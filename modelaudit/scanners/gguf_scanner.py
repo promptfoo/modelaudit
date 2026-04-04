@@ -27,23 +27,6 @@ _GGML_TYPE_INFO = {
     15: (256, 292),  # Q8_K
 }
 
-# Type sizes for metadata parsing
-_TYPE_SIZES = {
-    0: 1,  # UINT8
-    1: 1,  # INT8
-    2: 2,  # UINT16
-    3: 2,  # INT16
-    4: 4,  # UINT32
-    5: 4,  # INT32
-    6: 4,  # FLOAT32
-    7: 1,  # BOOL
-    8: 8,  # STRING
-    9: 0,  # ARRAY (variable size)
-    10: 8,  # UINT64
-    11: 8,  # INT64
-    12: 8,  # FLOAT64
-}
-
 # Accepted GGML variant magic bytes
 GGML_VARIANT_MAGICS = {
     b"GGML",
@@ -247,12 +230,19 @@ class GgufScanner(BaseScanner):
         # Note: general.alignment may be absent in files created by some tools (e.g., llama.cpp).
         # Only apply alignment if explicitly specified in metadata.
         metadata_end = f.tell()
+        tensor_data_alignment = 32
         alignment = metadata.get("general.alignment")
 
         if alignment is not None:
             # Accept only positive power-of-two integers
-            if isinstance(alignment, int) and alignment > 0 and (alignment & (alignment - 1)) == 0:
+            if (
+                isinstance(alignment, int)
+                and not isinstance(alignment, bool)
+                and alignment > 0
+                and (alignment & (alignment - 1)) == 0
+            ):
                 # Explicit alignment specified - apply it
+                tensor_data_alignment = alignment
                 pad = (alignment - (metadata_end % alignment)) % alignment
                 if pad:
                     f.seek(pad, os.SEEK_CUR)
@@ -266,7 +256,6 @@ class GgufScanner(BaseScanner):
                     details={"alignment": alignment, "requirement": "power-of-two positive integer"},
                     rule_code="S902",
                 )
-                alignment = None
 
         # Parse tensor information
         tensors = []
@@ -332,7 +321,6 @@ class GgufScanner(BaseScanner):
         # According to GGUF spec, tensor data is aligned after tensor info section
         tensor_info_end = f.tell()
         # Use default 32-byte alignment if not specified (GGUF spec default)
-        tensor_data_alignment = metadata.get("general.alignment", 32)
         pad_to_tensor_data = (tensor_data_alignment - (tensor_info_end % tensor_data_alignment)) % tensor_data_alignment
         tensor_data_start = tensor_info_end + pad_to_tensor_data
         # Only check bounds if there are tensors (empty models don't have tensor data)

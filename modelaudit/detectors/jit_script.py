@@ -366,7 +366,11 @@ class JITScriptDetector:
             )
 
         # Check for Python operators (ONNX-Script)
-        if b"PythonOp" in data or b"PyOp" in data:
+        python_op_pattern = re.compile(
+            rb"(?<![A-Za-z0-9_])(?:PyFunc(?:Stateless)?|EagerPyFunc|PythonOp|PyOp)(?:V[0-9]+)?(?![A-Za-z0-9_])",
+            re.IGNORECASE,
+        )
+        if python_op_pattern.search(data):
             findings.append(
                 create_jit_finding(
                     message="Python operator in ONNX model - can execute arbitrary code",

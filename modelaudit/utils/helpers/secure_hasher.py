@@ -252,8 +252,6 @@ class SecureFileHasher:
 class HashVerificationError(Exception):
     """Raised when hash verification fails."""
 
-    pass
-
 
 def hash_file_secure(file_path: str, threshold: int | None = None) -> str:
     """

@@ -146,7 +146,7 @@ class TestPerformanceCharacteristics:
         # Should be very fast (no heavy dependencies)
         assert access_time < 0.5
 
-    def test_heavy_scanner_access_expected_slow(self):
+    def test_heavy_scanner_access_expected_slow(self) -> None:
         """Test that heavy scanners are slower but only when accessed."""
         _registry._loaded_scanners.clear()
 
@@ -155,13 +155,9 @@ class TestPerformanceCharacteristics:
 
         _ = "tensorflow" in sys.modules
 
-        start_time = time.time()
-
         try:
             # This might be slow due to tensorflow import
             from modelaudit.scanners import TensorFlowSavedModelScanner
-
-            _access_time = time.time() - start_time
 
             # This is expected to be slower due to tensorflow
             # But we can't assert exact time since it depends on system

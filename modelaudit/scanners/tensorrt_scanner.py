@@ -3,19 +3,48 @@
 from __future__ import annotations
 
 import os
+import re
+from collections.abc import Iterator
 from typing import ClassVar
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
-SUSPICIOUS_PATTERNS = [
-    b"/tmp/",
-    b"../",
-    b".so",
-    b"python",
-    b"import",
-    b"exec",
-    b"eval",
-]
+SUSPICIOUS_PATTERN_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("../", re.compile(r"(?<![A-Za-z0-9_.-])(?:\.\./|\.\.\\)", re.IGNORECASE)),
+    ("/tmp/", re.compile(r"(?:^|[\s'\"=:])(?:/tmp/|(?:[A-Za-z]:)?\\tmp\\)", re.IGNORECASE)),
+    (
+        ".so",
+        re.compile(
+            r"(?<![A-Za-z0-9_.-])(?:[A-Za-z0-9_+.-]+)?\.so(?:\.[A-Za-z0-9_+.-]+)?(?![A-Za-z0-9_.-])",
+            re.IGNORECASE,
+        ),
+    ),
+    ("python", re.compile(r"(?<![A-Za-z0-9_])python(?:[0-9.]+)?(?:\.exe)?(?![A-Za-z0-9_])", re.IGNORECASE)),
+    ("import", re.compile(r"(?<![A-Za-z0-9_])import(?![A-Za-z0-9_])", re.IGNORECASE)),
+    (
+        "exec",
+        re.compile(
+            r"(?<![A-Za-z0-9_])(?:execvpe|execvp|execve|execlpe|execlp|execle|execl|execv|exec)(?![A-Za-z0-9_])",
+            re.IGNORECASE,
+        ),
+    ),
+    ("eval", re.compile(r"(?<![A-Za-z0-9_])eval(?![A-Za-z0-9_])", re.IGNORECASE)),
+)
+_ASCII_STRING_PATTERN = re.compile(rb"[\t\n\r\x20-\x7e]{3,}")
+_UTF16LE_STRING_PATTERN = re.compile(rb"(?:(?:[\t\n\r\x20-\x7e]\x00){3,})")
+_UTF16BE_STRING_PATTERN = re.compile(rb"(?:(?:\x00[\t\n\r\x20-\x7e]){3,})")
+
+
+def _iter_engine_strings(data: bytes) -> Iterator[str]:
+    """Yield printable ASCII and UTF-16 strings extracted from engine bytes."""
+    for match in _ASCII_STRING_PATTERN.finditer(data):
+        yield match.group(0).decode("utf-8", "ignore")
+
+    for match in _UTF16LE_STRING_PATTERN.finditer(data):
+        yield match.group(0).decode("utf-16le", "ignore")
+
+    for match in _UTF16BE_STRING_PATTERN.finditer(data):
+        yield match.group(0).decode("utf-16be", "ignore")
 
 
 class TensorRTScanner(BaseScanner):
@@ -23,7 +52,7 @@ class TensorRTScanner(BaseScanner):
 
     name = "tensorrt"
     description = "Scans TensorRT engine files for suspicious strings"
-    supported_extensions: ClassVar[list[str]] = [".engine", ".plan"]
+    supported_extensions: ClassVar[list[str]] = [".engine", ".plan", ".trt"]
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -57,15 +86,22 @@ class TensorRTScanner(BaseScanner):
             result.finish(success=False)
             return result
 
-        for pattern in SUSPICIOUS_PATTERNS:
-            if pattern in data:
+        matched_patterns: set[str] = set()
+        for engine_string in _iter_engine_strings(data):
+            for pattern_name, pattern_regex in SUSPICIOUS_PATTERN_RULES:
+                if pattern_name in matched_patterns:
+                    continue
+                if not pattern_regex.search(engine_string):
+                    continue
+
+                matched_patterns.add(pattern_name)
                 result.add_check(
                     name="Suspicious Pattern Detection",
                     passed=False,
-                    message=f"Suspicious pattern '{pattern.decode('utf-8', 'ignore')}' found",
+                    message=f"Suspicious pattern '{pattern_name}' found",
                     severity=IssueSeverity.CRITICAL,
                     location=path,
-                    details={"pattern": pattern.decode("utf-8", "ignore")},
+                    details={"pattern": pattern_name},
                     rule_code="S902",
                 )
 

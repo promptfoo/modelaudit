@@ -107,10 +107,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **onnx:** fail closed on CRITICAL findings, detect `PyFunc` operators and Windows absolute external-data paths, validate external tensor slices with the current ONNX dtype API, and avoid Python-op substring false positives
+- **tensorrt:** route `.trt` engines, detect case-variant and UTF-16 suspicious strings, and avoid substring false positives in benign engine metadata
+- **coreml:** detect Python 3 command metadata, Windows and bundle-macro linked-model escapes, malformed custom-code protobuf blocks, and custom layers nested under pipeline wrappers while preserving safe-key metadata URL inspection
+- **pmml:** enforce max-file-size limits, inspect namespaced Extension/script tags, ignore DOCTYPE/ENTITY text inside XML comments/CDATA, avoid recursive text-walk crashes on deeply nested Extension trees, and fail closed when CRITICAL PMML findings are present
+- **gguf:** fall back to the GGUF spec default tensor-data alignment after rejecting invalid `general.alignment` metadata values
+- **security:** detect protocol 0/1 pickle streams hidden behind long separator gaps after an initial safe pickle stream
+- **security:** preserve failed status for malicious Skops CVE detections and avoid CVE-2025-54886 false positives on benign README/model-card text such as "download"
+- **security:** enforce Flax msgpack scanner file-size limits before full reads, scan trailing msgpack stream objects with a bounded object-count cap, downgrade benign container-like trailing-object findings to INFO, and preserve failed status when CRITICAL findings are reported
+- **security:** route `.joblib` files through the Joblib scanner, scan raw protocol-0/1 payloads directly, support gzip/bzip2/lzma/zlib wrappers with bounded output and trailing-data checks, preserve embedded Pickle finding locations, and fail closed on undecodable/trailing-wrapper errors
+- **security:** detect direct `getattr(module, "dangerous")` handler calls in TorchServe MAR archives, parse conflicting duplicate manifests without silently downgrading hidden handlers, and suppress collision warnings for byte-identical duplicate manifests
+- **security:** reduce NeMo Hydra `_target_` false positives by matching suspicious identifiers on token boundaries, preserve CVE-2025-23304 details on suspicious-target findings, and reject oversized YAML members before parsing
 - **security:** detect protocol 0/1 pickle streams with trivial opcode prefixes even when `STOP` is followed by trailing junk, while preserving plain-text near-match rejection
 - **security:** detect protocol 0/1 pickle streams whose dangerous opcode appears after large trivial padding or after a non-trivial probe-boundary prelude, reject all-trivial no-`STOP` probe prefixes, and preserve rule codes across cached scan-result round trips
 - **license:** bound binary header scans and reuse compiled patterns to avoid full-file regex passes on large model archives
 - **security:** stop iterating malformed TFLite models after excessive subgraph counts are detected
+- **security:** fail closed on conflicting duplicate or alias Keras root members so benign trailing `config.json` entries cannot hide malicious earlier configs, while accepting byte-identical duplicates without warning noise
+- **security:** detect PyTorch binary code and blacklist patterns that straddle chunk boundaries, avoid duplicate overlap reports, and return `success=False` when CRITICAL findings are present
+- **security:** scan every duplicate PyTorch ZIP member by physical archive entry and report conflicting duplicate names at INFO severity so benign trailing `data.pkl` entries cannot shadow malicious earlier payloads without making benign-but-conflicting duplicates warning-fail by themselves
 - **security:** route misnamed Skops ZIPs by bounded schema sniffing, treat encrypted Skops-like schema members as non-matches instead of crashing routing, recurse into embedded members while preserving Skops-specific CVE checks, avoid tiny nested `.bin` false positives on clean archive members, preserve nested-member byte accounting, and preserve CLI `scanner_names` in aggregated JSON output
 - **pickle:** bound post-budget global fallback state, retained findings, and deadline checks to prevent crafted pickle tails from exhausting scanner memory or flooding logs
 - **pickle:** mark timeout-, budget-, recursion-, and resource-limited pickle scans as inconclusive so clean-looking partial analysis returns exit code 2 unless real security findings were reported
@@ -119,8 +133,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **security:** scan duplicate ZIP entries by physical archive member instead of resolving repeated names to the final entry, preventing shadowed payloads from being skipped during recursive archive analysis
 - bound Keras `config.json` and `metadata.json` member reads before JSON parsing
 - **openvino:** parse XML roots for long-prolog routing, enforce size limits before parsing, scan nested layer attributes for external library references, and avoid importlib substring false positives
+- **zip:** propagate nested critical findings and incomplete archive traversal to `success=False`, and bound symlink-target reads before path validation
+- **tar:** propagate nested critical findings and partial archive traversal to `success=False`, continue after per-entry extraction errors, and normalize malformed archive-limit configs to safe defaults
 - route oversized config-only Keras ZIP archives by bounded config-prefix sniffing instead of falling back to the generic ZIP scanner
 - preserve disguised model files during directory prefiltering without promoting document ZIPs
+- fail closed on duplicate 7z entries, nested critical findings, probe-limit truncation, and malformed 7z safety-limit configs
+- **oci:** fail closed on nested findings and partial layer traversal, content-sniff misnamed layer members, normalize cosmetic layer-ref suffix changes, and reject oversized members before temp extraction
 - recurse into nested 7z members even when their filenames use misleading extensions
 - fail closed on extreme-size files when a scanner lacks bounded large-file analysis
 - harden scan-cache invalidation and skip caching operational scan failures
@@ -128,11 +146,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - avoid materializing streaming directory iterators in memory
 - fail closed when JFrog folder downloads return only partial results
 - **keras:** anchor safe Lambda normalization regexes in H5 scanning so appended statements (for example `; __import__(...)`) cannot bypass dangerous-code analysis
+- **keras:** harden Keras H5 scanning by propagating CRITICAL findings to `success=False`, scanning wrapper-owned nested layers, parsing prerelease fix-boundary versions correctly, and matching suspicious module/config tokens without benign substring false positives
 - complete primary header-format routing in `core.py` so all registered model formats map to scanner IDs (including OpenVINO/PMML/CNTK/LightGBM/Torch7/CatBoost/RKNN/MXNet/NeMo/Llamafile/TFLite/CoreML/Paddle/TensorRT/Flax/R/ExecuTorch/7z/compressed/skops/joblib/xgboost/jax_checkpoint), add `.skops` extension detection coverage without spurious ZIP mismatch noise, and route ZIP-backed PyTorch `.ckpt`/`.pkl` containers through the PyTorch ZIP path
 - **security:** track pickle `BUILD`-driven `__setstate__` mutation on non-safe globals and block tree-model opcode-threshold escalation when dangerous globals are present in-stream
 - **safetensors:** include BOOL, BF16, F8_E4M3, and F8_E5M2 dtypes in tensor-size validation so malformed offsets are no longer skipped
 - harden pickle symbolic stack simulation by ignoring stack-neutral opcodes and using unknown sentinels for unhandled stack pushes
 - **security:** scan TensorFlow SavedModel `assets/` and `assets.extra/` directories for executable-like content (shebang scripts, ELF/Mach-O binaries, pickle magic, and embedded Python source patterns)
+- **security:** make TensorFlow SavedModel scans fail closed on CRITICAL findings, avoid substring false positives in PyFunc function references, and treat `blacklist_patterns=None` as disabled instead of emitting DEBUG read errors
 - **security:** enforce SafeTensors `MAX_HEADER_BYTES` during `scan()` and skip regex-heavy metadata-content analysis when headers exceed the configured limit to reduce header-based DoS risk
 - emit a one-time warning when the HuggingFace whitelist snapshot is older than 90 days while preserving existing whitelist severity downgrades
 - treat pickle scan timeouts as unsuccessful while preserving post-budget tail scans after opcode truncation
@@ -183,6 +203,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **security:** harden TensorFlow weight extraction limits to bound actual tensor payload materialization, including malformed `tensor_content` and string-backed tensors, and continue scanning past oversized `Const` nodes
 - **security:** stream TAR members to temp files under size limits instead of buffering whole entries in memory during scan
 - **security:** inspect TensorFlow SavedModel function definitions when scanning for dangerous ops and protobuf string abuse, with function-aware finding locations
+- **security:** route oversized TensorFlow MetaGraph files to fail-closed parse-budget scans, inspect `AttrValue.func.name` references in executable ops, and restore oversized-attribute anomaly detection after bounded string decoding
 - **cli:** include streamed artifacts as SBOM components when `scan --stream --sbom` is used
 - **cli:** exclude HuggingFace download cache bookkeeping files from remote SBOMs and asset lists
 - **cli:** add `--no-whitelist` and `--strict` whitelist/caching hardening so CI scans can disable HF severity downgrades and force uncached analysis

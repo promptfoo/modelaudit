@@ -30,7 +30,6 @@ class ProgressHook(ABC):
         Args:
             stats: Initial progress statistics
         """
-        pass
 
     @abstractmethod
     def on_progress(self, stats: ProgressStats) -> None:
@@ -39,7 +38,6 @@ class ProgressHook(ABC):
         Args:
             stats: Current progress statistics
         """
-        pass
 
     @abstractmethod
     def on_phase_change(self, old_phase: ProgressPhase, new_phase: ProgressPhase, stats: ProgressStats) -> None:
@@ -50,7 +48,6 @@ class ProgressHook(ABC):
             new_phase: New phase
             stats: Current progress statistics
         """
-        pass
 
     @abstractmethod
     def on_complete(self, stats: ProgressStats) -> None:
@@ -59,7 +56,6 @@ class ProgressHook(ABC):
         Args:
             stats: Final progress statistics
         """
-        pass
 
     @abstractmethod
     def on_error(self, error: Exception, stats: ProgressStats) -> None:
@@ -69,7 +65,6 @@ class ProgressHook(ABC):
             error: The error that occurred
             stats: Progress statistics at time of error
         """
-        pass
 
     def enable(self) -> None:
         """Enable this hook."""
@@ -366,7 +361,6 @@ class EmailProgressHook(ProgressHook):
     def on_phase_change(self, old_phase: ProgressPhase, new_phase: ProgressPhase, stats: ProgressStats) -> None:
         """Called when phase changes."""
         # Could optionally send phase change notifications
-        pass
 
     def on_complete(self, stats: ProgressStats) -> None:
         """Called when scanning completes."""
