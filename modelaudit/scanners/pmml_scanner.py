@@ -24,15 +24,18 @@ if not HAS_DEFUSEDXML:
 
 SUSPICIOUS_PATTERNS = [
     r"<script",
-    r"exec\(",
-    r"eval\(",
+    r"exec\s*\(",
+    r"eval\s*\(",
     r"import\s+os",
     r"subprocess",
     r"__import__",
-    r"system\(",
+    r"system\s*\(",
 ]
 URL_PATTERNS = ["http://", "https://", "file://", "ftp://"]
 DANGEROUS_ENTITIES = ["<!DOCTYPE", "<!ENTITY", "<!ELEMENT", "<!ATTLIST"]
+XML_COMMENT_PATTERN = re.compile(r"<!--.*?-->", re.DOTALL)
+XML_CDATA_PATTERN = re.compile(r"<!\[CDATA\[.*?\]\]>", re.DOTALL)
+SUSPICIOUS_ELEMENT_NAMES = frozenset({"script", "javascript", "python", "exec", "eval"})
 
 
 class PmmlScanner(BaseScanner):
@@ -53,6 +56,13 @@ class PmmlScanner(BaseScanner):
     name = "pmml"
     description = "Scans PMML files for XML security issues and suspicious content"
     supported_extensions: ClassVar[list[str]] = [".pmml"]
+    MAX_EXTENSION_TEXT_NODES: ClassVar[int] = 20000
+
+    def __init__(self, config: dict[str, Any] | None = None) -> None:
+        pmml_config = dict(config or {})
+        if "max_file_read_size" not in pmml_config and "max_file_size" in pmml_config:
+            pmml_config["max_file_read_size"] = pmml_config["max_file_size"]
+        super().__init__(config=pmml_config)
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -72,6 +82,10 @@ class PmmlScanner(BaseScanner):
         path_check_result = self._check_path(path)
         if path_check_result:
             return path_check_result
+
+        size_check = self._check_size_limit(path)
+        if size_check:
+            return size_check
 
         result = self._create_result()
         file_size = self.get_file_size(path)
@@ -166,7 +180,7 @@ class PmmlScanner(BaseScanner):
         # Check for suspicious content in the parsed XML
         self._check_suspicious_content(root, result, path)
 
-        result.finish(success=True)
+        result.finish(success=not result.has_errors)
         return result
 
     def _check_dangerous_xml_constructs(
@@ -176,7 +190,9 @@ class PmmlScanner(BaseScanner):
         path: str,
     ) -> None:
         """Check for dangerous XML constructs that could enable XXE attacks."""
-        text_upper = text.upper()
+        scrubbed_text = XML_COMMENT_PATTERN.sub("", text)
+        scrubbed_text = XML_CDATA_PATTERN.sub("", scrubbed_text)
+        text_upper = scrubbed_text.upper()
 
         for construct in DANGEROUS_ENTITIES:
             if construct in text_upper:
@@ -196,7 +212,7 @@ class PmmlScanner(BaseScanner):
         """Validate basic PMML structure and extract metadata."""
         # Extract local tag name (without namespace)
         # Tags can be "{http://namespace}PMML" or just "PMML"
-        tag_name = root.tag.split("}")[-1].lower() if "}" in root.tag else root.tag.lower()
+        tag_name = self._local_tag_name(root.tag)
 
         if tag_name != "pmml":
             result.add_check(
@@ -225,14 +241,33 @@ class PmmlScanner(BaseScanner):
     def _check_suspicious_content(self, root: Any, result: ScanResult, path: str) -> None:
         """Check for suspicious patterns and external references in PMML content."""
         for elem in root.iter():
+            tag_name = self._local_tag_name(elem.tag)
+
             # Combine element text content with attributes for comprehensive scanning
             elem_text = elem.text or ""
             attr_text = " ".join(f"{k}={v}" for k, v in elem.attrib.items())
 
             # For Extension elements, also include all child element text content and names
-            if elem.tag.lower() == "extension":
-                # Get all text content recursively
-                all_text = self._get_all_text_content(elem)
+            if tag_name == "extension":
+                all_text, truncated = self._get_all_text_content(elem)
+                if truncated:
+                    result.add_check(
+                        name="Extension Element Completeness Check",
+                        passed=False,
+                        message=("PMML <Extension> content exceeds the safe inspection node limit; scan is incomplete"),
+                        severity=IssueSeverity.CRITICAL,
+                        location=path,
+                        details={
+                            "tag": elem.tag,
+                            "max_extension_text_nodes": self.MAX_EXTENSION_TEXT_NODES,
+                        },
+                        why=(
+                            "Attackers can pad nested Extension trees to move malicious code beyond "
+                            "a bounded traversal window. Treating truncated inspection as a hard "
+                            "failure prevents a false sense of safety."
+                        ),
+                        rule_code="S902",
+                    )
                 combined = f"{elem_text} {attr_text} {all_text}".lower()
             else:
                 combined = f"{elem_text} {attr_text}".lower()
@@ -256,7 +291,7 @@ class PmmlScanner(BaseScanner):
                     break
 
             # Check for suspicious element names (like <script>)
-            if elem.tag.lower() in ["script", "javascript", "python", "exec", "eval"]:
+            if tag_name in SUSPICIOUS_ELEMENT_NAMES:
                 result.add_check(
                     name="Suspicious XML Element Check",
                     passed=False,
@@ -269,7 +304,7 @@ class PmmlScanner(BaseScanner):
                 )
 
             # Special attention to Extension elements which can contain arbitrary content
-            if elem.tag.lower() == "extension":
+            if tag_name == "extension":
                 for pattern in SUSPICIOUS_PATTERNS:
                     if re.search(pattern, combined, re.IGNORECASE):
                         result.add_check(
@@ -287,23 +322,48 @@ class PmmlScanner(BaseScanner):
                         )
                         break
 
-    def _get_all_text_content(self, element: Any) -> str:
-        """Recursively get all text content from an element and its children."""
-        text_parts = []
+    @staticmethod
+    def _local_tag_name(tag: Any) -> str:
+        """Extract a lowercase local tag name from namespaced ElementTree tags."""
+        if not isinstance(tag, str):
+            return ""
+        return tag.split("}")[-1].lower() if "}" in tag else tag.lower()
 
-        # Add element name as it might be suspicious (e.g., <script>)
-        text_parts.append(element.tag)
+    def _get_all_text_content(self, element: Any) -> tuple[str, bool]:
+        """Collect Extension text and report whether traversal hit the node budget."""
+        text_parts: list[str] = []
+        stack = [element]
+        nodes_seen = 0
+        truncated = False
 
-        # Add element text
-        if element.text:
-            text_parts.append(element.text.strip())
+        while stack:
+            if nodes_seen >= self.MAX_EXTENSION_TEXT_NODES:
+                truncated = True
+                break
 
-        # Add tail text (text after the element)
-        if element.tail:
-            text_parts.append(element.tail.strip())
+            current = stack.pop()
+            nodes_seen += 1
 
-        # Recursively process children
-        for child in element:
-            text_parts.append(self._get_all_text_content(child))
+            tag_name = self._local_tag_name(current.tag)
+            if tag_name:
+                text_parts.append(tag_name)
 
-        return " ".join(filter(None, text_parts))
+            if current.text:
+                text_parts.append(current.text.strip())
+            if current.tail:
+                text_parts.append(current.tail.strip())
+
+            try:
+                child_count = len(current)
+            except TypeError:
+                continue
+
+            remaining_budget = self.MAX_EXTENSION_TEXT_NODES - nodes_seen
+            if child_count > remaining_budget:
+                truncated = True
+                child_count = max(remaining_budget, 0)
+
+            for child_index in range(child_count - 1, -1, -1):
+                stack.append(current[child_index])
+
+        return " ".join(filter(None, text_parts)), truncated

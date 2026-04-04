@@ -110,6 +110,7 @@ def test_scanner_registry_file_extension_coverage():
         ".mar",
         ".engine",
         ".plan",
+        ".trt",
         ".gz",
         ".bz2",
         ".xz",

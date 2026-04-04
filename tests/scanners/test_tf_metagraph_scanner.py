@@ -6,6 +6,7 @@ from typing import Any, cast
 
 import pytest
 
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.tf_metagraph_scanner import (
     _MAX_ATTR_VALUE_BYTES,
@@ -107,7 +108,13 @@ def test_tf_metagraph_scanner_can_handle_oversized_meta_for_fail_closed_scan(tmp
     result = TensorFlowMetaGraphScanner().scan(str(oversized_meta))
 
     assert result.success is False
+    assert result.metadata["operational_error"] is True
+    assert result.metadata["operational_error_reason"] == "metagraph_parse_budget_exceeded"
     assert any(issue.message and "MetaGraph exceeds bounded parse budget" in issue.message for issue in result.issues)
+
+    audit_result = scan_model_directory_or_file(str(oversized_meta))
+
+    assert determine_exit_code(audit_result) == 2
 
 
 def test_tf_metagraph_scanner_benign_graph_has_no_security_findings(tmp_path: Path) -> None:

@@ -322,6 +322,8 @@ class TensorFlowMetaGraphScanner(BaseScanner):
         result.metadata["scan_truncated"] = truncated
 
         if truncated:
+            result.metadata["operational_error"] = True
+            result.metadata["operational_error_reason"] = "metagraph_parse_budget_exceeded"
             result.add_check(
                 name="MetaGraph Parse Budget",
                 passed=False,

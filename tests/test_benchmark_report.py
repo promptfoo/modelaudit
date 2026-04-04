@@ -322,6 +322,8 @@ def test_benchmark_report_top_improvements_and_mixed_metadata_fallback(tmp_path:
                 improved_name,
                 0.080,
                 0.081,
+                # Boolean `bytes` is intentional invalid metadata; this verifies
+                # that the report falls back to the baseline size value.
                 extra_info={"path": "current_dir", "bytes": True, "files": 2},
             ),
             _benchmark_entry(new_name, 0.050, 0.051),

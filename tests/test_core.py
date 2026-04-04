@@ -130,6 +130,52 @@ def test_scan_file_routes_misnamed_skops_archive_by_schema_content(tmp_path: Pat
     assert any("payload.pkl" in (issue.location or "") for issue in result.issues)
 
 
+def test_scan_file_routes_misnamed_skops_archive_by_bare_schema_content(tmp_path: Path) -> None:
+    disguised_skops = tmp_path / "payload-no-ext-schema.jpg"
+    _create_misnamed_zip(
+        disguised_skops,
+        {
+            "nested/schema": json.dumps(
+                {
+                    "__class__": "Pipeline",
+                    "__module__": "sklearn.pipeline",
+                    "__loader__": "ObjectNode",
+                    "_skops_version": "0.11.0",
+                    "content": {},
+                }
+            ).encode("utf-8"),
+            "payload.pkl": _build_malicious_pickle(),
+        },
+    )
+
+    result = scan_file(str(disguised_skops))
+
+    assert result.scanner_name == "skops"
+    _assert_system_pickle_detected(result, "payload.pkl")
+
+
+def test_scan_file_does_not_route_nested_bare_schema_near_match_to_skops(tmp_path: Path) -> None:
+    disguised_zip = tmp_path / "nested-schema-near-match.jpg"
+    _create_misnamed_zip(
+        disguised_zip,
+        {
+            "nested/schema": json.dumps(
+                {
+                    "__class__": "Pipeline",
+                    "__module__": "sklearn.pipeline",
+                    "__loader__": "ObjectNode",
+                    "content": {},
+                }
+            ).encode("utf-8"),
+        },
+    )
+
+    result = scan_file(str(disguised_zip))
+
+    assert result.scanner_name == "zip"
+    assert not any("CVE-2025-" in check.name for check in result.checks)
+
+
 def test_scan_file_does_not_route_near_match_schema_zip_to_skops(tmp_path: Path) -> None:
     disguised_zip = tmp_path / "schema.jpg"
     _create_misnamed_zip(
