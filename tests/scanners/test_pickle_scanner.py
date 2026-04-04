@@ -28,6 +28,7 @@ from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.pickle_scanner import (
     _NESTED_PICKLE_HEADER_SEARCH_LIMIT_BYTES,
     _RAW_PATTERN_SCAN_LIMIT_BYTES,
+    _RESYNC_FAST_FORWARD_PROBE_BYTES,
     PickleScanner,
     _find_nested_pickle_match,
     _genops_with_fallback,
@@ -6617,6 +6618,47 @@ def test_long_padding_before_protocol0_follow_on_stream_still_flags_reduce(tmp_p
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
+def test_import_shaped_padding_before_protocol0_follow_on_stream_still_flags_reduce(tmp_path: Path) -> None:
+    """Identifier-shaped GLOBAL text in separators must not become a false resync target."""
+    safe_stream = pickle.dumps({"weights": [1, 2, 3]}, protocol=2)
+    malicious_stream = b"(cos\nsystem\n(S'echo pwned'\ntR."
+
+    path = tmp_path / "safe_then_import_shaped_padding.pkl"
+    path.write_bytes(safe_stream + b"cfoo\nbar\n" + (b"(" * 40_000) + malicious_stream)
+
+    result = PickleScanner().scan(str(path))
+
+    assert any(
+        check.name == "REDUCE Opcode Safety Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("associated_global") in SYSTEM_GLOBAL_VARIANTS
+        for check in result.checks
+    ), f"Expected os.system detection after import-shaped MARK padding. Checks: {result.checks}"
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def test_probe_boundary_protocol0_follow_on_stream_still_flags_reduce(tmp_path: Path) -> None:
+    """Fast-forward resync must retain enough overlap for protocol-0 validation across probe boundaries."""
+    safe_stream = pickle.dumps({"weights": [1, 2, 3]}, protocol=2)
+    boundary_gap = _RESYNC_FAST_FORWARD_PROBE_BYTES - 768
+    malicious_stream = b"(cos\nsystem\n(S'" + (b"A" * 2048) + b"'\ntR."
+
+    path = tmp_path / "safe_then_probe_boundary_protocol0.pkl"
+    path.write_bytes(safe_stream + (b"\x00" * boundary_gap) + malicious_stream)
+
+    result = PickleScanner().scan(str(path))
+
+    assert any(
+        check.name == "REDUCE Opcode Safety Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("associated_global") in SYSTEM_GLOBAL_VARIANTS
+        for check in result.checks
+    ), f"Expected probe-boundary protocol-0 os.system detection. Checks: {result.checks}"
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
 def test_long_padding_before_benign_protocol0_follow_on_stream_stays_non_failing(tmp_path: Path) -> None:
     """Long-gap protocol-0 resync should not invent findings on benign follow-on streams."""
     safe_stream = pickle.dumps({"weights": [1, 2, 3]}, protocol=2)
@@ -6626,9 +6668,29 @@ def test_long_padding_before_benign_protocol0_follow_on_stream_stays_non_failing
     path.write_bytes(safe_stream + (b"\x00" * 9000) + benign_stream)
 
     result = PickleScanner().scan(str(path))
+    assert result.success is True, (
+        f"Expected successful scan for a benign padded follow-on stream. Checks: {result.checks}"
+    )
 
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues), (
         f"Expected no warning/critical findings for a benign padded follow-on stream. Issues: {result.issues}"
+    )
+
+
+def test_mark_padding_before_benign_protocol0_follow_on_stream_stays_successful(tmp_path: Path) -> None:
+    """MARK-only separator blocks should not trigger inconclusive scans before a benign tail stream."""
+    safe_stream = pickle.dumps({"weights": [1, 2, 3]}, protocol=2)
+    benign_stream = b"ccollections\nOrderedDict\n."
+
+    path = tmp_path / "safe_then_mark_padded_benign_protocol0.pkl"
+    path.write_bytes(safe_stream + (b"(" * 40_000) + benign_stream)
+
+    result = PickleScanner().scan(str(path))
+    assert result.success is True, (
+        f"Expected successful scan after MARK-only padding before benign protocol-0 tail. Checks: {result.checks}"
+    )
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues), (
+        f"Expected no warning/critical findings after MARK-only padding before a benign tail. Issues: {result.issues}"
     )
 
 

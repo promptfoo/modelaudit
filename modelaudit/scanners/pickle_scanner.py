@@ -90,8 +90,13 @@ _PICKLE_OPCODE_BYTES = frozenset(ord(op.code) for op in pickletools.opcodes)
 _TEXT_PICKLE_RESYNC_START_BYTES = frozenset({ord("("), ord("c"), ord("i")})
 _TEXT_PICKLE_RESYNC_IMPORT_OPCODES = frozenset({ord("c"), ord("i")})
 _TEXT_PICKLE_RESYNC_NAME_SCAN_BYTES = 256
+_TEXT_PICKLE_RESYNC_STRUCTURE_PROBE_OPCODES = 20
+_TEXT_PICKLE_RESYNC_NON_STRUCTURAL_OPCODES = frozenset({"GLOBAL", "INST", "MARK"})
 _RESYNC_FAST_FORWARD_PROBE_BYTES = 64 * 1024
-_RESYNC_FAST_FORWARD_TAIL_BYTES = (2 * _TEXT_PICKLE_RESYNC_NAME_SCAN_BYTES) + 2
+_RESYNC_FAST_FORWARD_TAIL_BYTES = max(
+    _NESTED_PICKLE_VALIDATION_WINDOW_BYTES,
+    (2 * _TEXT_PICKLE_RESYNC_NAME_SCAN_BYTES) + 2,
+)
 
 
 StackGlobalOperandKind = Literal["string", "missing_memo", "unknown", "non_string"]
@@ -287,6 +292,9 @@ def _find_next_resync_stream_candidate_offset(search_window: bytes) -> int:
     """Return the next likely pickle stream start in a probe window, or -1 if absent."""
     for candidate in range(len(search_window)):
         first_byte = search_window[candidate]
+        sample_end = min(len(search_window), candidate + _NESTED_PICKLE_VALIDATION_WINDOW_BYTES)
+        candidate_probe = search_window[candidate:sample_end]
+
         if first_byte == 0x80:
             if (
                 candidate + 1 < len(search_window)
@@ -322,16 +330,17 @@ def _find_next_resync_stream_candidate_offset(search_window: bytes) -> int:
             except UnicodeDecodeError:
                 continue
 
-            if _is_plausible_python_module(module_name) and all(
-                part.isidentifier() for part in function_name.split(".")
+            if (
+                _is_plausible_python_module(module_name)
+                and all(part.isidentifier() for part in function_name.split("."))
+                and _looks_like_pickle(candidate_probe)
             ):
                 return candidate
             continue
 
         # MARK-prefixed protocol-0 streams such as `(cos\nsystem\n...` are
         # validated with a bounded parser probe before rewinding the file cursor.
-        sample_end = min(len(search_window), candidate + _NESTED_PICKLE_VALIDATION_WINDOW_BYTES)
-        if _looks_like_pickle(search_window[candidate:sample_end]):
+        if _looks_like_pickle(candidate_probe):
             return candidate
 
     return -1
@@ -423,7 +432,13 @@ def _genops_with_fallback(
             # (e.g. binary tensor data misinterpreted as opcodes) don't
             # produce false positives.
             buffered: list[Any] = []
+            needs_text_structure_probe = False
+            has_text_structure = False
             try:
+                current_byte = file_obj.read(1)
+                file_obj.seek(stream_start, 0)
+                needs_text_structure_probe = bool(current_byte and current_byte[0] in _TEXT_PICKLE_RESYNC_START_BYTES)
+
                 op_iter = pickletools.genops(file_obj)
                 while True:
                     # Do not emit buffered follow-on stream opcodes until the
@@ -436,9 +451,21 @@ def _genops_with_fallback(
                         break
                     had_opcodes = True
                     buffered.append(item)
+
+                    if needs_text_structure_probe and not has_text_structure:
+                        opcode_name = item[0].name
+                        has_text_structure = opcode_name not in _TEXT_PICKLE_RESYNC_NON_STRUCTURAL_OPCODES
+                        if not has_text_structure and len(buffered) >= _TEXT_PICKLE_RESYNC_STRUCTURE_PROBE_OPCODES:
+                            buffered.clear()
+                            stream_error = True
+                            break
             except ValueError:
                 # Any ValueError on a subsequent stream means we hit
                 # non-pickle data or a junk separator byte.
+                stream_error = True
+
+            if needs_text_structure_probe and not has_text_structure:
+                buffered.clear()
                 stream_error = True
 
             if stream_error and had_opcodes:
@@ -3186,14 +3213,34 @@ def _looks_like_pickle(data: bytes) -> bool:
         stream = io.BytesIO(data)
         opcode_count = 0
         valid_opcodes = 0
+        has_non_mark_structure = False
 
         for opcode_count, (opcode, _arg, _pos) in enumerate(pickletools.genops(stream), 1):
             # Count opcodes that are definitely pickle-specific
-            if opcode.name in {"MARK", "STOP", "TUPLE", "LIST", "DICT", "SETITEM", "BUILD", "REDUCE"}:
+            if opcode.name in {
+                "GLOBAL",
+                "INST",
+                "MARK",
+                "STOP",
+                "TUPLE",
+                "LIST",
+                "DICT",
+                "SETITEM",
+                "BUILD",
+                "REDUCE",
+            }:
                 valid_opcodes += 1
+            if opcode.name not in {"GLOBAL", "INST", "MARK"}:
+                has_non_mark_structure = True
 
-            # Need multiple valid opcodes to be confident
-            if opcode_count >= 3 and valid_opcodes >= 2:
+            # Minimal protocol-0 import streams such as `ccollections\nOrderedDict\n.`
+            # only contain GLOBAL + STOP, so accept them once STOP is observed.
+            if opcode.name == "STOP" and valid_opcodes >= 2 and has_non_mark_structure:
+                return True
+
+            # Need multiple valid opcodes plus at least one non-MARK structure
+            # opcode so repeated `(` padding is never accepted as a stream.
+            if opcode_count >= 3 and valid_opcodes >= 2 and has_non_mark_structure:
                 return True
 
             # Prevent infinite loops on malformed data
