@@ -90,6 +90,7 @@ class JaxCheckpointScanner(BaseScanner):
     _PICKLE_STICKY_MEMO_STATE_LIMIT: ClassVar[int] = 16384
     _MAX_METADATA_TRAVERSAL_DEPTH: ClassVar[int] = 64
     _JAX_INDICATOR_SCAN_CHUNK_BYTES: ClassVar[int] = 8192
+    _UTF8_BOM: ClassVar[bytes] = b"\xef\xbb\xbf"
     DEFAULT_MAX_METADATA_PATTERN_FINDINGS: ClassVar[int] = 256
     DEFAULT_MAX_PICKLE_OPCODE_FINDINGS: ClassVar[int] = 256
     _DANGEROUS_PICKLE_GLOBALS: ClassVar[frozenset[tuple[str, str]]] = frozenset(
@@ -209,9 +210,11 @@ class JaxCheckpointScanner(BaseScanner):
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         """Initialize JAX checkpoint scanning limits and regex detectors."""
         super().__init__(config)
-        self.max_file_size = self.config.get(
-            "max_file_size", 100 * 1024 * 1024 * 1024
-        )  # 100GB limit for large JAX models
+        self.max_file_size = self._get_int_config(
+            "max_file_size",
+            100 * 1024 * 1024 * 1024,
+            minimum=0,
+        )
         self.max_pickle_scan_bytes = self._get_int_config(
             "jax_pickle_max_scan_bytes",
             self.DEFAULT_MAX_PICKLE_SCAN_BYTES,
@@ -263,7 +266,15 @@ class JaxCheckpointScanner(BaseScanner):
 
     @staticmethod
     def _looks_like_documentation_text(text: str) -> bool:
-        """Return True when a metadata string looks like prose-only documentation."""
+        """Return True when a metadata string looks like prose-only documentation.
+
+        This prefilter is intentionally narrow: it only rejects doc-like strings
+        that contain obvious code punctuation or high-signal execution keywords,
+        rather than every token in `_DANGEROUS_PICKLE_GLOBALS`, to avoid widening
+        false positives in prose metadata. `_add_suspicious_pattern_checks()`
+        still performs the full regex scan for JAX/Orbax payload strings in
+        metadata values that pass this heuristic.
+        """
         stripped = text.strip()
         if not stripped:
             return True
@@ -274,6 +285,14 @@ class JaxCheckpointScanner(BaseScanner):
             stripped,
             re.IGNORECASE,
         )
+
+    @classmethod
+    def _header_looks_like_json(cls, header: bytes) -> bool:
+        """Return True when a file header is JSON after stripping BOM and whitespace."""
+        normalized_header = header.lstrip()
+        if normalized_header.startswith(cls._UTF8_BOM):
+            normalized_header = normalized_header[len(cls._UTF8_BOM) :].lstrip()
+        return normalized_header.startswith((b"{", b"["))
 
     @classmethod
     def _iter_string_metadata(
@@ -472,7 +491,7 @@ class JaxCheckpointScanner(BaseScanner):
 
             # Check for JSON metadata files, including extensionful `.checkpoint`
             # files that contain JAX/Orbax metadata rather than pickle bytes.
-            if header.lstrip().startswith((b"{", b"[")):
+            if cls._header_looks_like_json(header):
                 return any(
                     indicator in decoded_header for indicator in cls._JAX_INDICATORS
                 ) or cls._file_contains_jax_indicator(path)
@@ -608,7 +627,7 @@ class JaxCheckpointScanner(BaseScanner):
         try:
             file_size = os.path.getsize(path)
 
-            if file_size > self.max_file_size:
+            if self.max_file_size > 0 and file_size > self.max_file_size:
                 result.add_check(
                     name="Checkpoint File Size Check",
                     passed=False,
@@ -627,7 +646,7 @@ class JaxCheckpointScanner(BaseScanner):
                 self._scan_pickle_checkpoint(path, result)
             elif header.startswith(b"\x93NUMPY"):  # NumPy format
                 self._scan_numpy_checkpoint(path, result)
-            elif header.lstrip().startswith((b"{", b"[")):  # JSON format
+            elif self._header_looks_like_json(header):  # JSON format
                 self._scan_json_checkpoint(path, result)
             else:
                 result.add_check(
@@ -971,7 +990,7 @@ class JaxCheckpointScanner(BaseScanner):
     def _scan_json_checkpoint(self, path: str, result: ScanResult) -> None:
         """Scan JSON-based checkpoint metadata."""
         try:
-            with open(path, encoding="utf-8") as f:
+            with open(path, encoding="utf-8-sig") as f:
                 data = json.load(f)
 
             # Analyze JSON content for suspicious patterns

@@ -50,6 +50,52 @@ def test_orbax_metadata_regex_patterns_are_detected(tmp_path: Path) -> None:
     )
 
 
+def test_orbax_dangerous_restore_fn_is_flagged_as_critical(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "orbax_checkpoint"
+    _write_orbax_metadata(
+        checkpoint_dir,
+        {
+            "version": "0.1.0",
+            "type": "orbax_checkpoint",
+            "restore_fn": "lambda x: eval(x.decode())",
+        },
+    )
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert result.success
+    assert any(
+        check.name == "Orbax Restore Function Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details["restore_fn"] == "lambda x: eval(x.decode())"
+        for check in result.checks
+    )
+
+
+def test_orbax_benign_restore_fn_is_flagged_as_warning(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "orbax_checkpoint"
+    _write_orbax_metadata(
+        checkpoint_dir,
+        {
+            "version": "0.1.0",
+            "type": "orbax_checkpoint",
+            "restore_fn": "custom_deserialize",
+        },
+    )
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert result.success
+    assert any(
+        check.name == "Orbax Restore Function Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.WARNING
+        and check.details["restore_fn"] == "custom_deserialize"
+        for check in result.checks
+    )
+
+
 def test_orbax_documentation_only_mentions_do_not_trigger_pattern_check(tmp_path: Path) -> None:
     checkpoint_dir = tmp_path / "orbax_checkpoint"
     _write_orbax_metadata(
@@ -603,6 +649,24 @@ def test_can_handle_json_checkpoint_with_jax_metadata(tmp_path: Path) -> None:
     assert result.metadata["checkpoint_type"] == "file"
 
 
+def test_zero_max_file_size_config_does_not_flag_small_json_checkpoint_as_too_large(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "small_model.checkpoint"
+    checkpoint_path.write_text(
+        json.dumps({"framework": "jax", "orbax_version": "0.1.0"}),
+        encoding="utf-8",
+    )
+
+    scanner = JaxCheckpointScanner(config={"max_file_size": 0})
+    assert scanner.can_handle(str(checkpoint_path))
+
+    result = scanner.scan(str(checkpoint_path))
+
+    assert result.success
+    assert all(
+        check.name != "Checkpoint File Size Check" or check.status != CheckStatus.FAILED for check in result.checks
+    )
+
+
 def test_can_handle_json_checkpoint_with_jax_marker_after_initial_header(tmp_path: Path) -> None:
     checkpoint_path = tmp_path / "late_marker_model.checkpoint"
     checkpoint_path.write_text(
@@ -624,6 +688,32 @@ def test_can_handle_json_checkpoint_with_jax_marker_after_initial_header(tmp_pat
     assert any(
         check.name == "JSON Pattern Security Check"
         and check.status == CheckStatus.FAILED
+        and check.details["context"] == "json_checkpoint.payload"
+        for check in result.checks
+    )
+
+
+def test_can_handle_json_checkpoint_with_utf8_bom_prefix_and_jax_payload(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "bom_model.checkpoint"
+    checkpoint_path.write_bytes(
+        b"\xef\xbb\xbf"
+        + json.dumps(
+            {
+                "framework": "jax",
+                "payload": "jax.experimental.host_callback.call(os.system, 'id')",
+            }
+        ).encode("utf-8")
+    )
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_path))
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_path))
+
+    assert result.success
+    assert any(
+        check.name == "JSON Pattern Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
         and check.details["context"] == "json_checkpoint.payload"
         for check in result.checks
     )
@@ -660,6 +750,15 @@ def test_can_handle_json_checkpoint_rejects_non_jax_near_match(tmp_path: Path) -
     checkpoint_path.write_text(
         json.dumps({"framework": "pytorch", "format": "checkpoint"}),
         encoding="utf-8",
+    )
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_path)) is False
+
+
+def test_can_handle_bom_json_checkpoint_rejects_non_jax_near_match(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "bom_generic_model.checkpoint"
+    checkpoint_path.write_bytes(
+        b"\xef\xbb\xbf" + json.dumps({"framework": "pytorch", "format": "checkpoint"}).encode("utf-8")
     )
 
     assert JaxCheckpointScanner.can_handle(str(checkpoint_path)) is False
