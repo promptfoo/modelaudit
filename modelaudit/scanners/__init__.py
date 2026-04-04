@@ -342,8 +342,8 @@ class ScannerRegistry:
                 "module": "modelaudit.scanners.tflite_scanner",
                 "class": "TFLiteScanner",
                 "description": "Scans TensorFlow Lite model files",
-                "extensions": [".tflite"],
-                "priority": 16,
+                "extensions": [".tflite", ".bin"],
+                "priority": 2,
                 "dependencies": ["tflite"],  # Heavy dependency
                 "numpy_sensitive": True,  # TensorFlow Lite can be sensitive
             },
