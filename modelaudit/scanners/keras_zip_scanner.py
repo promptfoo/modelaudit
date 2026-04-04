@@ -124,6 +124,7 @@ class KerasZipScanner(BaseScanner):
     """Scanner for ZIP-based Keras .keras model files"""
 
     MAX_EMBEDDED_WEIGHTS_BYTES: ClassVar[int] = 100 * 1024 * 1024
+    MAX_DUPLICATE_MEMBER_COMPARE_CANDIDATES: ClassVar[int] = 16
 
     name = "keras_zip"
     description = "Scans ZIP-based Keras model files for suspicious configurations and Lambda layers"
@@ -225,30 +226,68 @@ class KerasZipScanner(BaseScanner):
         except Exception:
             return False
 
-    @staticmethod
     def _get_archive_member_info(
+        self,
         archive: zipfile.ZipFile,
         member_name: str,
     ) -> zipfile.ZipInfo | None:
         """Return a canonical ZIP member deterministically by normalized archive-relative name."""
-        exact_info = archive.NameToInfo.get(member_name)
-        if exact_info is not None and exact_info.filename and not exact_info.is_dir():
-            return exact_info
-
+        exact_matches: list[zipfile.ZipInfo] = []
         normalized_matches: list[zipfile.ZipInfo] = []
         for info in archive.infolist():
             if not info.filename or info.is_dir():
                 continue
-            if _normalize_archive_member_name(info.filename) == member_name:
+            if info.filename == member_name:
+                exact_matches.append(info)
+            elif _normalize_archive_member_name(info.filename) == member_name:
                 normalized_matches.append(info)
 
-        if len(normalized_matches) > 1:
+        if not exact_matches and not normalized_matches:
+            return None
+
+        if exact_matches:
+            candidate_members = [*exact_matches, *normalized_matches]
+            preferred_info = exact_matches[0]
+        else:
+            candidate_members = normalized_matches
+            preferred_info = normalized_matches[0]
+
+        if len(candidate_members) == 1:
+            return preferred_info
+
+        if len(candidate_members) > self.MAX_DUPLICATE_MEMBER_COMPARE_CANDIDATES:
             raise _AmbiguousKerasArchiveMemberError(
                 member_name,
-                [info.filename for info in normalized_matches],
+                [info.filename for info in candidate_members],
             )
 
-        return normalized_matches[0] if normalized_matches else None
+        compare_limit = self._get_duplicate_member_compare_limit(member_name)
+        try:
+            preferred_data = _read_zip_member_bounded(archive, preferred_info, compare_limit)
+            for candidate_info in candidate_members[1:]:
+                candidate_data = _read_zip_member_bounded(archive, candidate_info, compare_limit)
+                if candidate_data != preferred_data:
+                    raise _AmbiguousKerasArchiveMemberError(
+                        member_name,
+                        [info.filename for info in candidate_members],
+                    )
+        except (ValueError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile, OSError) as exc:
+            raise _AmbiguousKerasArchiveMemberError(
+                member_name,
+                [info.filename for info in candidate_members],
+            ) from exc
+
+        return preferred_info
+
+    def _get_duplicate_member_compare_limit(self, member_name: str) -> int:
+        """Return a bounded duplicate-content comparison limit for Keras root members."""
+        if member_name == _KERAS_CONFIG_ENTRY:
+            return _KERAS_CONFIG_MAX_BYTES
+        if member_name == _KERAS_METADATA_ENTRY:
+            return _KERAS_METADATA_MAX_BYTES
+        if member_name == _KERAS_WEIGHTS_ENTRY:
+            return self.max_embedded_weights_bytes
+        return _KERAS_CONFIG_MAX_BYTES
 
     def _get_recursive_archive_scan_config(self) -> dict[str, Any]:
         """Return a ZIP scanner config with an explicit bounded per-member extraction limit."""

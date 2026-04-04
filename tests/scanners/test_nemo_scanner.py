@@ -2,6 +2,8 @@
 
 import io
 import tarfile
+from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -12,20 +14,41 @@ try:
 except ImportError:
     HAS_YAML = False
 
+from modelaudit.core import scan_file
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.nemo_scanner import NemoScanner
 
 
-def _create_nemo_file(tmp_path, config_dict, filename="model.nemo", config_name="model_config.yaml"):
+def _create_nemo_file_from_bytes(
+    tmp_path: Path,
+    config_bytes: bytes,
+    filename: str = "model.nemo",
+    config_name: str = "model_config.yaml",
+) -> Path:
     """Helper to create a .nemo tar file with the given YAML config."""
     nemo_path = tmp_path / filename
     with tarfile.open(nemo_path, "w") as tar:
-        if config_dict is not None:
-            config_bytes = yaml.dump(config_dict).encode() if HAS_YAML else b"{}"
-            info = tarfile.TarInfo(name=config_name)
-            info.size = len(config_bytes)
-            tar.addfile(info, io.BytesIO(config_bytes))
+        info = tarfile.TarInfo(name=config_name)
+        info.size = len(config_bytes)
+        tar.addfile(info, io.BytesIO(config_bytes))
     return nemo_path
+
+
+def _create_nemo_file(
+    tmp_path: Path,
+    config_dict: dict[str, Any] | None,
+    filename: str = "model.nemo",
+    config_name: str = "model_config.yaml",
+) -> Path:
+    """Helper to create a .nemo tar file with the given YAML config."""
+    if config_dict is None:
+        nemo_path = tmp_path / filename
+        with tarfile.open(nemo_path, "w"):
+            pass
+        return nemo_path
+
+    config_bytes = yaml.safe_dump(config_dict).encode() if HAS_YAML else b"{}"
+    return _create_nemo_file_from_bytes(tmp_path, config_bytes, filename=filename, config_name=config_name)
 
 
 class TestNemoScannerBasic:
@@ -104,6 +127,27 @@ class TestCVE202523304HydraTarget:
         assert cve_checks[0].details.get("cve_id") == "CVE-2025-23304"
         assert cve_checks[0].details.get("target") == "os.system"
 
+    def test_core_scan_file_routes_nemo_archive_to_nemo_scanner(self, tmp_path: Path) -> None:
+        """Real .nemo scans should use NemoScanner, not the generic TAR scanner."""
+        config = {
+            "model": {
+                "_target_": "os.system",
+                "command": "echo pwned",
+            }
+        }
+        path = _create_nemo_file(tmp_path, config)
+
+        result = scan_file(str(path), config={"cache_scan_results": False})
+
+        assert result.scanner_name == "nemo"
+        assert any(
+            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+            and check.details["target"] == "os.system"
+            for check in result.checks
+        )
+
     def test_dangerous_subprocess_detected(self, tmp_path):
         """subprocess.Popen _target_ should trigger CVE-2025-23304."""
         config = {"trainer": {"callbacks": [{"_target_": "subprocess.Popen", "args": ["whoami"]}]}}
@@ -125,7 +169,7 @@ class TestCVE202523304HydraTarget:
         cve_checks = [c for c in result.checks if "CVE-2025-23304" in c.name]
         assert len(cve_checks) > 0, "Should detect builtins.eval"
 
-    def test_suspicious_pattern_detected(self, tmp_path):
+    def test_suspicious_pattern_detected(self, tmp_path: Path) -> None:
         """Unknown target containing 'eval' pattern should be flagged."""
         config = {"model": {"_target_": "custom_module.eval_function"}}
         path = _create_nemo_file(tmp_path, config)
@@ -134,6 +178,59 @@ class TestCVE202523304HydraTarget:
 
         suspicious_checks = [c for c in result.checks if "Suspicious" in c.name and "CVE-2025-23304" in c.name]
         assert len(suspicious_checks) > 0, f"Should flag suspicious pattern. Checks: {[c.name for c in result.checks]}"
+        details = suspicious_checks[0].details
+        assert details["description"]
+        assert details["remediation"]
+
+    def test_suspicious_target_with_numeric_suffix_detected(self, tmp_path: Path) -> None:
+        """Suffix-number variants like eval2 should still be treated as suspicious."""
+        config = {"model": {"_target_": "custom_module.eval2"}}
+        path = _create_nemo_file(tmp_path, config)
+
+        result = NemoScanner().scan(str(path))
+
+        suspicious_checks = [c for c in result.checks if c.name == "CVE-2025-23304: Suspicious Hydra _target_"]
+        assert len(suspicious_checks) == 1
+        assert suspicious_checks[0].details["pattern"] == "eval"
+
+    def test_benign_embedded_keyword_target_is_review_only(self, tmp_path: Path) -> None:
+        """Benign near-match words like 'systematic' should not trigger CVE-2025-23304."""
+        config = {
+            "model": {"_target_": "custom_package.systematic_factory.Builder"},
+        }
+        path = _create_nemo_file(tmp_path, config)
+
+        result = NemoScanner().scan(str(path))
+
+        cve_checks = [c for c in result.checks if "CVE-2025-23304" in c.name]
+        assert len(cve_checks) == 0, (
+            f"Benign near-match should not trigger CVE. Checks: {[c.message for c in result.checks]}"
+        )
+
+        review_checks = [c for c in result.checks if c.name == "Hydra _target_ Review"]
+        assert len(review_checks) == 1
+        assert review_checks[0].severity == IssueSeverity.INFO
+
+    def test_oversized_yaml_config_is_rejected_before_parse(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Oversized YAML members should be rejected without parsing the full config payload."""
+
+        def fail_safe_load(_: bytes) -> Any:
+            raise AssertionError("safe_load should not be called for oversized configs")
+
+        monkeypatch.setattr(yaml, "safe_load", fail_safe_load)
+        oversized_config = b"notes: '" + (b"A" * (NemoScanner.MAX_CONFIG_SIZE + 1)) + b"'\n"
+        path = _create_nemo_file_from_bytes(tmp_path, oversized_config)
+
+        result = NemoScanner().scan(str(path))
+
+        size_checks = [c for c in result.checks if c.name == "NeMo Config Size Check"]
+        assert len(size_checks) == 1
+        assert size_checks[0].status == CheckStatus.FAILED
+        assert size_checks[0].severity == IssueSeverity.WARNING
 
     def test_safe_nemo_target_passes(self, tmp_path):
         """Known-safe NeMo/PyTorch targets should pass."""

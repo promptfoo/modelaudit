@@ -463,9 +463,9 @@ class TestXGBoostPickleIntegration:
 class TestXGBoostScannerIntegration:
     """Integration tests requiring actual XGBoost/ubjson libraries."""
 
-    def test_real_xgboost_model_creation_and_scan(self, temp_dir):
+    def test_real_xgboost_model_creation_and_scan(self, temp_dir: Path) -> None:
         """Test scanning of a real XGBoost model."""
-        xgboost = pytest.importorskip("xgboost", minversion="1.0")
+        pytest.importorskip("xgboost", minversion="1.0")
         import numpy as np
         import xgboost as xgb
 

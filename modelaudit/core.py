@@ -266,6 +266,8 @@ def _select_preferred_scanner_id(path: str, header_format: str, ext: str) -> str
             return "skops"
         if ext == ".skops":
             return "skops"
+        if ext == ".joblib":
+            return "joblib"
 
         if ext == ".bin":
             # ZIP-backed torch.save() .bin files are routed through the pickle scanner,
@@ -275,6 +277,12 @@ def _select_preferred_scanner_id(path: str, header_format: str, ext: str) -> str
 
     if header_format == "hdf5":
         return "keras_h5"
+
+    if ext == ".joblib" and header_format in {"compressed", "pickle"}:
+        return "joblib"
+
+    if header_format == "tar" and ext == ".nemo":
+        return "nemo"
 
     return HEADER_FORMAT_TO_SCANNER_ID.get(header_format)
 
@@ -1134,9 +1142,6 @@ def scan_model_directory_or_file(
                                 details={"exception_type": type(e).__name__},
                             )
                             _add_error_asset_to_results(results, file_path)
-
-                # This section is now handled by the content grouping logic above
-                pass
 
             # Final progress update for directory scan
             if progress_callback and not limit_reached and total_files is not None and total_files > 0:
