@@ -107,7 +107,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **security:** harden Keras H5 scanning by propagating CRITICAL findings to `success=False`, scanning wrapper-owned nested layers, parsing prerelease fix-boundary versions correctly, and matching suspicious module/config tokens without benign substring false positives
+- **pmml:** enforce max-file-size limits, inspect namespaced Extension/script tags, ignore DOCTYPE/ENTITY text inside XML comments/CDATA, avoid recursive text-walk crashes on deeply nested Extension trees, and fail closed when CRITICAL PMML findings are present
 - **gguf:** fall back to the GGUF spec default tensor-data alignment after rejecting invalid `general.alignment` metadata values
 - **security:** detect protocol 0/1 pickle streams hidden behind long separator gaps after an initial safe pickle stream
 - **security:** preserve failed status for malicious Skops CVE detections and avoid CVE-2025-54886 false positives on benign README/model-card text such as "download"
@@ -138,6 +138,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - avoid materializing streaming directory iterators in memory
 - fail closed when JFrog folder downloads return only partial results
 - **keras:** anchor safe Lambda normalization regexes in H5 scanning so appended statements (for example `; __import__(...)`) cannot bypass dangerous-code analysis
+- **keras:** harden Keras H5 scanning by propagating CRITICAL findings to `success=False`, scanning wrapper-owned nested layers, parsing prerelease fix-boundary versions correctly, and matching suspicious module/config tokens without benign substring false positives
 - complete primary header-format routing in `core.py` so all registered model formats map to scanner IDs (including OpenVINO/PMML/CNTK/LightGBM/Torch7/CatBoost/RKNN/MXNet/NeMo/Llamafile/TFLite/CoreML/Paddle/TensorRT/Flax/R/ExecuTorch/7z/compressed/skops/joblib/xgboost/jax_checkpoint), add `.skops` extension detection coverage without spurious ZIP mismatch noise, and route ZIP-backed PyTorch `.ckpt`/`.pkl` containers through the PyTorch ZIP path
 - **security:** track pickle `BUILD`-driven `__setstate__` mutation on non-safe globals and block tree-model opcode-threshold escalation when dangerous globals are present in-stream
 - **safetensors:** include BOOL, BF16, F8_E4M3, and F8_E5M2 dtypes in tensor-size validation so malformed offsets are no longer skipped
