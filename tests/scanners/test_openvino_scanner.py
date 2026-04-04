@@ -92,6 +92,21 @@ def test_openvino_scanner_can_handle_forbidden_doctype_openvino_xml(tmp_path: Pa
     assert OpenVinoScanner.can_handle(str(xml_path)) is True
 
 
+def test_openvino_scanner_can_handle_rejects_unterminated_doctype(tmp_path: Path) -> None:
+    """Malformed DOCTYPE prologs should fail closed during bounded prefix sniffing."""
+    xml_path = tmp_path / "model.xml"
+    xml_path.write_text(
+        """<?xml version='1.0'?>
+        <!DOCTYPE net [
+          <!ENTITY payload SYSTEM 'file:///tmp/secret'>
+        <net version='10'><layers><layer id='0' name='data' type='Input'/></layers></net>
+        """,
+        encoding="utf-8",
+    )
+
+    assert OpenVinoScanner.can_handle(str(xml_path)) is False
+
+
 def test_openvino_scanner_missing_bin(tmp_path: Path) -> None:
     xml_path = tmp_path / "model.xml"
     xml_path.write_text("<net version='10'></net>", encoding="utf-8")
