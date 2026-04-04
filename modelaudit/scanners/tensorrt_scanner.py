@@ -23,9 +23,12 @@ SUSPICIOUS_PATTERN_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("import", re.compile(r"(?<![A-Za-z0-9_])import(?![A-Za-z0-9_])", re.IGNORECASE)),
     (
         "exec",
-        re.compile(r"(?<![A-Za-z0-9_])(?:exec|execv|execve|execl|execle|execlp|execlpe)\s*(?:\(|$)", re.IGNORECASE),
+        re.compile(
+            r"(?<![A-Za-z0-9_])(?:execve|execlpe|execlp|execle|execl|execv|exec)(?![A-Za-z0-9_])",
+            re.IGNORECASE,
+        ),
     ),
-    ("eval", re.compile(r"(?<![A-Za-z0-9_])eval\s*(?:\(|$)", re.IGNORECASE)),
+    ("eval", re.compile(r"(?<![A-Za-z0-9_])eval(?![A-Za-z0-9_])", re.IGNORECASE)),
 )
 _ASCII_STRING_PATTERN = re.compile(rb"[\t\n\r\x20-\x7e]{3,}")
 _UTF16LE_STRING_PATTERN = re.compile(rb"(?:(?:[\t\n\r\x20-\x7e]\x00){3,})")

@@ -83,12 +83,23 @@ def test_tensorrt_scanner_detects_utf16be_python_marker(tmp_path: Path) -> None:
 
 def test_tensorrt_scanner_avoids_substring_near_match_false_positives(tmp_path: Path) -> None:
     path = tmp_path / "safe.engine"
-    path.write_bytes(b"execution_metrics important_tensor session.socket")
+    path.write_bytes(b"execution_metrics evaluation_score important_tensor session.socket")
 
     result = TensorRTScanner().scan(str(path))
 
     assert result.success is True
     assert result.issues == []
+
+
+def test_tensorrt_scanner_detects_exec_and_eval_tokens_with_arguments(tmp_path: Path) -> None:
+    path = tmp_path / "malicious.engine"
+    path.write_bytes(b"execve /bin/sh\nEVAL payload\n")
+
+    result = TensorRTScanner().scan(str(path))
+
+    assert result.success is False
+    matched_patterns = {issue.details.get("pattern") for issue in result.issues}
+    assert {"exec", "eval"}.issubset(matched_patterns)
 
 
 def test_tensorrt_scanner_detects_standalone_three_byte_markers(tmp_path: Path) -> None:
