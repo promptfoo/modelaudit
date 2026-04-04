@@ -7,6 +7,7 @@ import re
 from pathlib import Path
 from typing import Any, ClassVar
 
+from ._string_extraction import extract_bounded_printable_strings
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 TORCH7_SIGNATURE_READ_BYTES = 4096
@@ -178,15 +179,11 @@ class Torch7Scanner(BaseScanner):
         return result
 
     def _extract_strings(self, payload: bytes) -> list[str]:
-        strings: list[str] = []
-        for match in PRINTABLE_TEXT_PATTERN.finditer(payload):
-            text = match.group(0).decode("utf-8", errors="ignore").strip()
-            if not text:
-                continue
-            strings.append(text)
-            if len(strings) >= self.max_extracted_strings:
-                break
-        return strings
+        return extract_bounded_printable_strings(
+            payload,
+            PRINTABLE_TEXT_PATTERN,
+            self.max_extracted_strings,
+        )
 
     @staticmethod
     def _snippet(text: str, max_chars: int = 180) -> str:

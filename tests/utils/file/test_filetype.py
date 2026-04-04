@@ -561,6 +561,14 @@ def test_detect_file_format_compressed_wrappers(tmp_path: Path) -> None:
     assert detect_file_format_from_magic(str(zlib_path)) == "zlib"
 
 
+def test_detect_file_format_rejects_invalid_zlib_header_near_match(tmp_path: Path) -> None:
+    zlib_path = tmp_path / "model.bin.zlib"
+    zlib_path.write_bytes(b"\x78\x00not-a-zlib-stream")
+
+    assert detect_file_format(str(zlib_path)) == "unknown"
+    assert detect_file_format_from_magic(str(zlib_path)) == "unknown"
+
+
 def test_detect_file_format_tar_wrappers_preserve_tar_routing(tmp_path: Path) -> None:
     tar_gz = tmp_path / "archive.tar.gz"
     tar_gz.write_bytes(gzip.compress(b"fake tar payload"))

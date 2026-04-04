@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from .. import core
+from ..utils.file._compression import is_zlib_header
+from ._archive_config import get_archive_depth
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 
@@ -71,18 +73,6 @@ class CompressedScanner(BaseScanner):
         extension = Path(path).suffix.lower()
         return cls._EXTENSION_TO_CODEC.get(extension)
 
-    @staticmethod
-    def _is_zlib_header(data: bytes) -> bool:
-        if len(data) < 2:
-            return False
-        cmf = data[0]
-        flg = data[1]
-        if (cmf & 0x0F) != 8:
-            return False
-        if (cmf >> 4) > 7:
-            return False
-        return ((cmf << 8) + flg) % 31 == 0
-
     @classmethod
     def _detect_codec_from_header(cls, header: bytes) -> str | None:
         if header.startswith(cls._CODEC_MAGIC_PREFIXES["gzip"]):
@@ -93,7 +83,7 @@ class CompressedScanner(BaseScanner):
             return "xz"
         if header.startswith(cls._CODEC_MAGIC_PREFIXES["lz4"]):
             return "lz4"
-        if cls._is_zlib_header(header[:2]):
+        if is_zlib_header(header[:2]):
             return "zlib"
         return None
 
@@ -363,10 +353,7 @@ class CompressedScanner(BaseScanner):
         result.metadata["file_size"] = self.get_file_size(path)
         self.add_file_integrity_check(path, result)
 
-        try:
-            archive_depth = int(self.config.get("_archive_depth", 0))
-        except (TypeError, ValueError):
-            archive_depth = 0
+        archive_depth = get_archive_depth(self.config)
         depth = max(int(self.config.get("_compressed_depth", 0)), archive_depth)
         if depth >= self.max_depth:
             result.add_check(

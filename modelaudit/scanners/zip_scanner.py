@@ -7,6 +7,7 @@ from typing import Any, ClassVar
 
 from ..utils import is_absolute_archive_path, is_critical_system_path, sanitize_archive_path
 from ..utils.helpers.assets import asset_from_scan_result
+from ._archive_config import get_archive_depth
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 CRITICAL_SYSTEM_PATHS = [
@@ -53,12 +54,7 @@ class ZipScanner(BaseScanner):
 
     def _get_archive_depth(self) -> int:
         """Return the current shared archive depth from config."""
-        raw_depth = self.config.get("_archive_depth", 0)
-        try:
-            depth = int(raw_depth)
-        except (TypeError, ValueError):
-            return 0
-        return max(depth, 0)
+        return get_archive_depth(self.config)
 
     def _get_max_entry_size(self) -> int:
         """Return the configured per-entry extraction limit with a safe unlimited fallback."""
