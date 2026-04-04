@@ -100,6 +100,11 @@ def test_fixture_label_marks_clear_malicious_paths_without_overlabeling_license_
     )
 
 
+def test_fixture_label_rejects_missing_manifest_entries() -> None:
+    with pytest.raises(KeyError, match="missing pickle fixture label"):
+        compare_pickle_scanners._fixture_label(Path("tests/assets/samples/pickles/new_fixture.pkl"))
+
+
 def test_build_report_suppresses_scanner_logs_and_restores_logging_disable_level(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

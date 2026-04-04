@@ -31,3 +31,14 @@ dependencies = []
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/modelaudit_picklescan"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/modelaudit_picklescan/py.typed" = "modelaudit_picklescan/py.typed"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "pyproject.toml",
+    "README.md",
+    "src/modelaudit_picklescan",
+    "src/modelaudit_picklescan/py.typed",
+]

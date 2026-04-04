@@ -110,6 +110,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **security:** detect protocol 0/1 pickle streams with trivial opcode prefixes even when `STOP` is followed by trailing junk, while preserving plain-text near-match rejection
 - **security:** detect protocol 0/1 pickle streams whose dangerous opcode appears after large trivial padding or after a non-trivial probe-boundary prelude, reject all-trivial no-`STOP` probe prefixes, and preserve rule codes across cached scan-result round trips
+- **pickle:** propagate standalone fallback parse and stream-read failures into merged scan success, preserve truncated `.bin` fail-closed behavior, reuse non-seekable stream spools for the legacy parity pass, clamp negative stream sizes, and reset post-budget scan state between reused scanner runs
 - **license:** bound binary header scans and reuse compiled patterns to avoid full-file regex passes on large model archives
 - **security:** stop iterating malformed TFLite models after excessive subgraph counts are detected
 - **security:** route misnamed Skops ZIPs by bounded schema sniffing, treat encrypted Skops-like schema members as non-matches instead of crashing routing, recurse into embedded members while preserving Skops-specific CVE checks, avoid tiny nested `.bin` false positives on clean archive members, preserve nested-member byte accounting, and preserve CLI `scanner_names` in aggregated JSON output

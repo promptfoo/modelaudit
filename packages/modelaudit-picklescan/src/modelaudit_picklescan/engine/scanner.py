@@ -200,7 +200,7 @@ class _BoundedPickleStream:
             return requested_size
 
         remaining = max(self._byte_limit - self._position, 0)
-        if requested_size is None or requested_size < 0:
+        if requested_size is None:
             return remaining
         return min(requested_size, remaining)
 
@@ -1009,7 +1009,7 @@ def _decode_possible_encoded_pickle(value: str) -> list[tuple[str, bytes]]:
         if _looks_like_pickle_payload(decoded):
             decoded_values.append(("base64", decoded))
 
-    hex_candidate = stripped[: _MAX_HEX_NESTED_PICKLE_CHARS * 2].replace("\\x", "")
+    hex_candidate = stripped[:_MAX_HEX_NESTED_PICKLE_CHARS].replace("\\x", "")
     if (
         len(hex_candidate) >= 16
         and len(hex_candidate) % 2 == 0

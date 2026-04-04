@@ -11,6 +11,7 @@ packages/
   modelaudit-picklescan/
     src/modelaudit_picklescan/
       __init__.py
+      py.typed
       api.py
       options.py
       report.py
@@ -81,6 +82,9 @@ Report semantics must keep these concepts separate:
 - Do not weaken detections during extraction.
 - Add one malicious positive and one benign negative regression for each moved
   detector or routing rule.
+- Treat verdict/status drift as a blocker in the differential harness. Legacy
+  and standalone rule identifiers may differ during migration, but the safety
+  decision and scan-completeness contract must not.
 - Treat inconclusive analysis as a first-class status instead of encoding it as
   a hidden success boolean.
 - Keep per-scan state isolated so one scan cannot leak source/location context

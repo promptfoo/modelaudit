@@ -28,41 +28,7 @@ from modelaudit.scanners.picklescan_adapter import pickle_report_to_scan_result
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ASSETS_DIR = REPO_ROOT / "tests" / "assets"
-
-SAFE_FIXTURE_NAMES = {
-    "safe_data.pkl",
-    "safe_large_model.pkl",
-    "safe_model_with_binary.pkl",
-    "safe_model_with_encoding.pkl",
-    "safe_model_with_tokens.pkl",
-    "safe_nested_structure.pkl",
-}
-
-MALICIOUS_FIXTURE_NAMES = {
-    "dill_func.pkl",
-    "decode_exec_chain.pkl",
-    "evil.pickle",
-    "exploit1_basic_torch_bypass.pkl",
-    "exploit2_advanced_torch_bypass.pkl",
-    "exploit3_sophisticated_hybrid.pkl",
-    "exploit4_supply_chain_attack.pkl",
-    "exploit5_ultra_high_confidence.pkl",
-    "exploit6_ordereddict_bypass.pkl",
-    "exploit7_nested_collections.pkl",
-    "exploit9_manual_construction.pkl",
-    "exploit_ultimate_50pct.pkl",
-    "malicious_model_realistic.pkl",
-    "malicious_system_call.pkl",
-    "memo_attack.pkl",
-    "multiple_stream_attack.pkl",
-    "nested_pickle_base64.pkl",
-    "nested_pickle_hex.pkl",
-    "nested_pickle_multistage.pkl",
-    "nested_pickle_raw.pkl",
-    "nt_alias_attack.pkl",
-    "posix_alias_attack.pkl",
-    "stack_global_attack.pkl",
-}
+FIXTURE_LABELS_MANIFEST = REPO_ROOT / "scripts" / "compare_pickle_scanners_fixture_labels.json"
 
 VERDICT_RANK = {
     "clean": 0,
@@ -108,20 +74,27 @@ def _discover_pickle_fixtures() -> list[Path]:
     )
 
 
-def _fixture_label(path: Path) -> str:
-    if path.name in SAFE_FIXTURE_NAMES or path.name.startswith("safe_"):
-        return "safe"
+def _load_fixture_labels_manifest() -> dict[str, str]:
+    with FIXTURE_LABELS_MANIFEST.open("r", encoding="utf-8") as manifest_file:
+        manifest = json.load(manifest_file)
+    if not isinstance(manifest, dict):
+        raise ValueError(f"fixture label manifest must be a JSON object: {FIXTURE_LABELS_MANIFEST}")
+    return {str(path): str(label) for path, label in manifest.items()}
 
-    path_text = path.as_posix().lower()
-    if (
-        path.name in MALICIOUS_FIXTURE_NAMES
-        or "exploit" in path_text
-        or "malicious" in path_text
-        or "evil" in path.name.lower()
-        or "security_scenarios" in path_text
-    ):
-        return "malicious"
-    return "unknown"
+
+_FIXTURE_LABELS_BY_PATH = _load_fixture_labels_manifest()
+
+
+def _fixture_label(path: Path) -> str:
+    fixture_path = path
+    if path.is_absolute():
+        fixture_path = path.relative_to(REPO_ROOT)
+
+    fixture_key = fixture_path.as_posix()
+    label = _FIXTURE_LABELS_BY_PATH.get(fixture_key)
+    if label is None:
+        raise KeyError(f"missing pickle fixture label for {fixture_key} in {FIXTURE_LABELS_MANIFEST}")
+    return label
 
 
 def _legacy_status(result: ScanResult) -> str:

@@ -10,7 +10,7 @@ def test_standalone_package_does_not_import_modelaudit() -> None:
     forbidden_imports: list[str] = []
 
     for path in PACKAGE_SRC.rglob("*.py"):
-        source = path.read_text()
+        source = path.read_text(encoding="utf-8")
         try:
             tree = ast.parse(source, filename=str(path))
         except SyntaxError:
@@ -30,3 +30,7 @@ def test_standalone_package_does_not_import_modelaudit() -> None:
                 break
 
     assert forbidden_imports == []
+
+
+def test_standalone_package_declares_typed_marker() -> None:
+    assert (PACKAGE_SRC / "py.typed").is_file()
