@@ -173,42 +173,12 @@ class CompressedScanner(BaseScanner):
         decompressor = zlib.decompressobj()
         total_out = 0
 
-        def _remaining_decompressed_budget() -> int:
-            return max(max_decompressed_bytes - total_out, 0)
+        def _write_decompressed_output(output: bytes) -> None:
+            nonlocal total_out
+            if not output:
+                return
 
-        def _probe_limit() -> int:
-            remaining_budget = _remaining_decompressed_budget()
-            return remaining_budget + 1 if remaining_budget > 0 else 1
-
-        while True:
-            chunk = source.read(chunk_size)
-            if not chunk:
-                break
-
-            try:
-                out = decompressor.decompress(chunk, max_length=_probe_limit())
-            except zlib.error as exc:
-                raise _CorruptStreamError(f"Invalid zlib stream: {exc}") from exc
-
-            if out:
-                total_out += len(out)
-                if total_out > max_decompressed_bytes:
-                    raise _DecompressionLimitExceeded(
-                        f"Decompressed size exceeded limit ({total_out} > {max_decompressed_bytes})",
-                    )
-                if compressed_size > 0 and (total_out / compressed_size) > max_ratio:
-                    raise _DecompressionLimitExceeded(
-                        f"Decompression ratio exceeded limit ({total_out / compressed_size:.1f}x > {max_ratio:.1f}x)",
-                    )
-                destination.write(out)
-
-        try:
-            final = decompressor.flush(_probe_limit())
-        except zlib.error as exc:
-            raise _CorruptStreamError(f"Invalid zlib stream flush: {exc}") from exc
-
-        if final:
-            total_out += len(final)
+            total_out += len(output)
             if total_out > max_decompressed_bytes:
                 raise _DecompressionLimitExceeded(
                     f"Decompressed size exceeded limit ({total_out} > {max_decompressed_bytes})",
@@ -217,7 +187,53 @@ class CompressedScanner(BaseScanner):
                 raise _DecompressionLimitExceeded(
                     f"Decompression ratio exceeded limit ({total_out / compressed_size:.1f}x > {max_ratio:.1f}x)",
                 )
-            destination.write(final)
+            destination.write(output)
+
+        def _remaining_decompressed_budget() -> int:
+            return max(max_decompressed_bytes - total_out, 0)
+
+        def _probe_limit() -> int:
+            remaining_budget = _remaining_decompressed_budget()
+            return remaining_budget + 1 if remaining_budget > 0 else 1
+
+        while True:
+            pending = source.read(chunk_size)
+            if not pending:
+                break
+
+            while pending:
+                try:
+                    out = decompressor.decompress(pending, max_length=_probe_limit())
+                except zlib.error as exc:
+                    raise _CorruptStreamError(f"Invalid zlib stream: {exc}") from exc
+
+                _write_decompressed_output(out)
+
+                if decompressor.unconsumed_tail:
+                    pending = decompressor.unconsumed_tail
+                    continue
+
+                if decompressor.eof and decompressor.unused_data:
+                    # Support concatenated zlib members while rejecting raw
+                    # trailer bytes that could hide an unscanned payload.
+                    pending = decompressor.unused_data
+                    decompressor = zlib.decompressobj()
+                    continue
+
+                pending = b""
+
+        try:
+            final = decompressor.flush(_probe_limit())
+        except zlib.error as exc:
+            raise _CorruptStreamError(f"Invalid zlib stream flush: {exc}") from exc
+
+        _write_decompressed_output(final)
+
+        if not decompressor.eof:
+            raise _CorruptStreamError("Invalid zlib stream: missing end-of-stream marker")
+
+        if decompressor.unused_data:
+            raise _CorruptStreamError("Invalid zlib stream: unexpected trailing bytes after compressed payload")
 
         return total_out
 
