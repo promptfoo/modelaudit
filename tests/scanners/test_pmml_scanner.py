@@ -102,7 +102,7 @@ def test_pmml_scanner_benign_subprocess_prose_is_not_flagged(tmp_path: Path) -> 
         issue.details.get("pattern")
         in {
             r"\b(?:from\s+subprocess\s+import|import\s+subprocess)\b",
-            r"\bsubprocess\s*\.\s*(?:popen|run|call|check_call|check_output)\s*\(",
+            r"\bsubprocess\s*\.\s*(?:popen|run|call|check_call|check_output|getoutput|getstatusoutput)\s*\(",
         }
         for issue in result.issues
     )
@@ -129,8 +129,32 @@ def test_pmml_scanner_code_shaped_subprocess_extension_is_flagged(tmp_path: Path
         issue.details.get("pattern")
         in {
             r"\b(?:from\s+subprocess\s+import|import\s+subprocess)\b",
-            r"\bsubprocess\s*\.\s*(?:popen|run|call|check_call|check_output)\s*\(",
+            r"\bsubprocess\s*\.\s*(?:popen|run|call|check_call|check_output|getoutput|getstatusoutput)\s*\(",
         }
+        and "Suspicious content in <Extension> element" in issue.message
+        for issue in result.issues
+    )
+
+
+def test_pmml_scanner_subprocess_getoutput_call_is_flagged_without_import(
+    tmp_path: Path,
+) -> None:
+    pmml = """<?xml version='1.0'?>
+<PMML version='4.4'>
+  <Header>
+    <Extension>subprocess.getoutput('id')</Extension>
+  </Header>
+  <DataDictionary numberOfFields='0'/>
+</PMML>"""
+    path = tmp_path / "subprocess_getoutput.pmml"
+    path.write_text(pmml, encoding="utf-8")
+
+    result = PmmlScanner().scan(str(path))
+
+    assert result.success is True
+    assert any(
+        issue.details.get("pattern")
+        == r"\bsubprocess\s*\.\s*(?:popen|run|call|check_call|check_output|getoutput|getstatusoutput)\s*\("
         and "Suspicious content in <Extension> element" in issue.message
         for issue in result.issues
     )
