@@ -6,6 +6,7 @@ import json
 import os
 import pickletools
 import re
+from collections import OrderedDict
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -85,29 +86,115 @@ class JaxCheckpointScanner(BaseScanner):
     _PICKLE_MARKER: ClassVar[object] = object()
     _PICKLE_STACK_STATE_LIMIT: ClassVar[int] = 4096
     _PICKLE_MEMO_STATE_LIMIT: ClassVar[int] = 4096
+    _MAX_METADATA_TRAVERSAL_DEPTH: ClassVar[int] = 64
     DEFAULT_MAX_METADATA_PATTERN_FINDINGS: ClassVar[int] = 256
     DEFAULT_MAX_PICKLE_OPCODE_FINDINGS: ClassVar[int] = 256
     _DANGEROUS_PICKLE_GLOBALS: ClassVar[frozenset[tuple[str, str]]] = frozenset(
         {
             ("builtins", "__import__"),
             ("builtins", "compile"),
+            ("builtins", "delattr"),
             ("builtins", "eval"),
             ("builtins", "exec"),
+            ("builtins", "file"),
+            ("builtins", "getattr"),
+            ("builtins", "open"),
+            ("builtins", "setattr"),
+            ("cprofile", "run"),
+            ("cprofile", "runctx"),
+            ("ctypes", "cast"),
+            ("ctypes", "cdll"),
+            ("ctypes", "cfunctype"),
+            ("ctypes", "oledll"),
+            ("ctypes", "pydll"),
+            ("ctypes", "pythonapi"),
+            ("ctypes", "windll"),
+            ("ctypes", "winfunctype"),
             ("dill", "load"),
             ("dill", "loads"),
             ("importlib", "import_module"),
+            ("io", "open"),
             ("joblib", "_pickle_load"),
             ("joblib", "load"),
+            ("marshal", "load"),
+            ("marshal", "loads"),
             ("nt", "system"),
+            ("numpy", "load"),
+            ("numpy.testing._private.utils", "runstring"),
+            ("operator", "attrgetter"),
+            ("operator", "getitem"),
+            ("operator", "itemgetter"),
+            ("operator", "methodcaller"),
+            ("os", "execl"),
+            ("os", "execle"),
+            ("os", "execlp"),
+            ("os", "execlpe"),
+            ("os", "execv"),
+            ("os", "execve"),
+            ("os", "execvp"),
+            ("os", "execvpe"),
             ("os", "popen"),
+            ("os", "popen2"),
+            ("os", "popen3"),
+            ("os", "popen4"),
+            ("os", "spawn"),
+            ("os", "spawnl"),
+            ("os", "spawnle"),
+            ("os", "spawnlp"),
+            ("os", "spawnlpe"),
+            ("os", "spawnv"),
+            ("os", "spawnve"),
+            ("os", "spawnvp"),
+            ("os", "spawnvpe"),
             ("os", "system"),
+            ("pdb", "run"),
+            ("pdb", "runcall"),
+            ("pdb", "runctx"),
+            ("pdb", "runeval"),
+            ("pickle", "load"),
+            ("pickle", "loads"),
+            ("pip", "main"),
+            ("pip._internal", "main"),
+            ("pip._internal.cli.main", "main"),
+            ("pip._vendor.distlib.scripts", "scriptmaker"),
+            ("pkgutil", "resolve_name"),
             ("posix", "system"),
+            ("profile", "run"),
+            ("profile", "runctx"),
             ("runpy", "_run_module_as_main"),
+            ("shutil", "copy"),
+            ("shutil", "copytree"),
+            ("shutil", "move"),
+            ("shutil", "rmtree"),
+            ("site", "main"),
             ("subprocess", "call"),
             ("subprocess", "check_call"),
             ("subprocess", "check_output"),
+            ("subprocess", "getoutput"),
+            ("subprocess", "getstatusoutput"),
             ("subprocess", "popen"),
             ("subprocess", "run"),
+            ("test.support.script_helper", "assert_python_ok"),
+            ("timeit", "repeat"),
+            ("timeit", "timeit"),
+            ("torch", "load"),
+            ("torch._inductor.codecache", "compile_file"),
+            ("torch.distributed.rpc", "remote"),
+            ("torch.distributed.rpc", "remotemodule"),
+            ("torch.distributed.rpc", "rpc_async"),
+            ("torch.distributed.rpc", "rpc_sync"),
+            ("torch.hub", "load"),
+            ("torch.hub", "load_state_dict_from_url"),
+            ("torch.serialization", "load"),
+            ("torch.storage", "_load_from_bytes"),
+            ("types", "codetype"),
+            ("types", "functiontype"),
+            ("uuid", "_get_command_stdout"),
+            ("uuid", "_popen"),
+            ("_aix_support", "_read_cmd_output"),
+            ("_io", "fileio"),
+            ("_osx_support", "_read_output"),
+            ("_pyrepl.pager", "pipe_pager"),
         }
     )
     _DANGEROUS_RESTORE_FN_PATTERN: ClassVar[re.Pattern[str]] = re.compile(
@@ -172,20 +259,37 @@ class JaxCheckpointScanner(BaseScanner):
         return any(part in cls._DOCUMENTATION_CONTEXT_HINTS for part in context_parts)
 
     @classmethod
-    def _iter_string_metadata(cls, value: Any, context: str = "root") -> Iterator[tuple[str, str]]:
+    def _iter_string_metadata(
+        cls,
+        value: Any,
+        context: str = "root",
+        *,
+        depth: int = 0,
+    ) -> Iterator[tuple[str, str]]:
         """Yield string leaves from nested metadata with their traversal context."""
+        if depth >= cls._MAX_METADATA_TRAVERSAL_DEPTH:
+            return
+
         if isinstance(value, str):
             yield context, value
             return
 
         if isinstance(value, dict):
             for key, nested_value in value.items():
-                yield from cls._iter_string_metadata(nested_value, f"{context}.{key}")
+                yield from cls._iter_string_metadata(
+                    nested_value,
+                    f"{context}.{key}",
+                    depth=depth + 1,
+                )
             return
 
         if isinstance(value, (list, tuple, set)):
             for index, nested_value in enumerate(value):
-                yield from cls._iter_string_metadata(nested_value, f"{context}[{index}]")
+                yield from cls._iter_string_metadata(
+                    nested_value,
+                    f"{context}[{index}]",
+                    depth=depth + 1,
+                )
 
     def _add_suspicious_pattern_checks(
         self,
@@ -491,9 +595,10 @@ class JaxCheckpointScanner(BaseScanner):
                 )
 
             pickle_stack: list[Any] = []
-            pickle_memo: dict[int, Any] = {}
+            pickle_memo: OrderedDict[int, Any] = OrderedDict()
             dangerous_opcode_findings = 0
             finding_limit_reported = False
+            next_memoize_index = 0
 
             def _push_pickle_value(value: Any) -> None:
                 """Push one modeled pickle stack value while bounding stack state."""
@@ -512,8 +617,10 @@ class JaxCheckpointScanner(BaseScanner):
                 """Store the current stack top in the bounded pickle memo model."""
                 if not pickle_stack:
                     return
-                if memo_index not in pickle_memo and len(pickle_memo) >= self._PICKLE_MEMO_STATE_LIMIT:
-                    return
+                if memo_index in pickle_memo:
+                    pickle_memo.move_to_end(memo_index)
+                elif len(pickle_memo) >= self._PICKLE_MEMO_STATE_LIMIT:
+                    pickle_memo.popitem(last=False)
                 pickle_memo[memo_index] = pickle_stack[-1]
 
             def _pop_pickle_mark() -> None:
@@ -542,10 +649,17 @@ class JaxCheckpointScanner(BaseScanner):
                         if pickle_stack:
                             _push_pickle_value(pickle_stack[-1])
                         continue
-                    if opcode.name in {"MEMOIZE", "BINPUT", "LONG_BINPUT", "PUT"}:
-                        memo_index = len(pickle_memo) if opcode.name == "MEMOIZE" else _memo_key(arg)
+                    if opcode.name == "MEMOIZE":
+                        _memoize_pickle_value(next_memoize_index)
+                        next_memoize_index += 1
+                        continue
+                    if opcode.name in {"BINPUT", "LONG_BINPUT", "PUT"}:
+                        memo_index = _memo_key(arg)
                         if memo_index is not None:
+                            memo_index_is_new = memo_index not in pickle_memo
                             _memoize_pickle_value(memo_index)
+                            if memo_index_is_new:
+                                next_memoize_index += 1
                         continue
                     if opcode.name in {"BINGET", "LONG_BINGET", "GET"}:
                         memo_index = _memo_key(arg)

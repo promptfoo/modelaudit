@@ -215,6 +215,46 @@ def test_memoized_stack_global_opcode_is_detected(tmp_path: Path) -> None:
     )
 
 
+def test_high_index_memoized_stack_global_opcode_is_detected_after_memo_eviction(tmp_path: Path) -> None:
+    pickle_path = tmp_path / "high_index_memoized_stack_global_state.pickle"
+    filler_count = JaxCheckpointScanner._PICKLE_MEMO_STATE_LIMIT + 16
+    module_memo_index = filler_count + 1
+    class_memo_index = filler_count + 2
+    payload = bytearray(b"\x80\x04")
+    payload.extend(_proto4_short_unicode("jax"))
+    payload.extend(b"\x94")
+    payload.extend(b"0")
+    for filler_index in range(filler_count):
+        payload.extend(_proto4_short_unicode(f"safe-{filler_index % 32}"))
+        payload.extend(b"\x94")
+        payload.extend(b"0")
+    payload.extend(_proto4_short_unicode("os"))
+    payload.extend(b"\x94")
+    payload.extend(b"0")
+    payload.extend(_proto4_short_unicode("system"))
+    payload.extend(b"\x94")
+    payload.extend(b"0")
+    payload.extend(b"j")
+    payload.extend(module_memo_index.to_bytes(4, "little"))
+    payload.extend(b"j")
+    payload.extend(class_memo_index.to_bytes(4, "little"))
+    payload.extend(b"\x93.")
+    pickle_path.write_bytes(bytes(payload))
+
+    assert JaxCheckpointScanner.can_handle(str(pickle_path))
+
+    result = JaxCheckpointScanner().scan(str(pickle_path))
+
+    assert result.success
+    assert any(
+        check.name == "Pickle Opcode Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.details["opcode"] == "STACK_GLOBAL"
+        and check.details["global"] == "os.system"
+        for check in result.checks
+    )
+
+
 def test_pickle_opcode_findings_are_capped_for_repeated_dangerous_globals(tmp_path: Path) -> None:
     pickle_path = tmp_path / "repeated_dangerous_globals.pickle"
     payload = bytearray(b"\x80\x04")
@@ -306,10 +346,16 @@ def test_truncated_benign_large_pickle_prefix_does_not_emit_scan_error(tmp_path:
 @pytest.mark.parametrize(
     ("module_name", "global_name"),
     [
+        ("_io", "FileIO"),
+        ("builtins", "getattr"),
         ("dill", "load"),
         ("dill", "loads"),
         ("joblib", "load"),
         ("joblib", "_pickle_load"),
+        ("marshal", "loads"),
+        ("operator", "attrgetter"),
+        ("subprocess", "getoutput"),
+        ("types", "CodeType"),
     ],
 )
 def test_dangerous_loader_globals_are_detected(tmp_path: Path, module_name: str, global_name: str) -> None:
@@ -389,3 +435,11 @@ def test_can_handle_json_checkpoint_rejects_non_jax_near_match(tmp_path: Path) -
     )
 
     assert JaxCheckpointScanner.can_handle(str(checkpoint_path)) is False
+
+
+def test_metadata_traversal_stops_at_depth_limit_without_recursing_unbounded() -> None:
+    nested_metadata: object = "jax.experimental.host_callback.call(os.system, 'id')"
+    for _ in range(2 * JaxCheckpointScanner._MAX_METADATA_TRAVERSAL_DEPTH):
+        nested_metadata = {"nested": nested_metadata}
+
+    assert list(JaxCheckpointScanner._iter_string_metadata(nested_metadata)) == []
