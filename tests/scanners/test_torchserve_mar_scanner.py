@@ -798,9 +798,12 @@ def test_manifest_parsing_respects_entry_limit_for_duplicate_manifest_floods(
 
     result = scanner.scan(str(mar_path))
 
-    assert result.success
+    assert result.success is False
     assert manifest_read_count == 2
-    assert len(_failed_checks(result, "TorchServe Manifest Entry Limit")) == 1
+    entry_limit_failures = _failed_checks(result, "TorchServe Manifest Entry Limit")
+    assert len(entry_limit_failures) == 1
+    assert entry_limit_failures[0].severity == IssueSeverity.CRITICAL
+    assert entry_limit_failures[0].details.get("dropped_manifest_count") == 6
     assert _failed_checks(result, "TorchServe Manifest Collision") == []
 
 
@@ -840,12 +843,45 @@ def test_manifest_parsing_respects_uncompressed_budget_for_duplicate_manifest_fl
 
     result = scanner.scan(str(mar_path))
 
-    assert result.success
+    assert result.success is False
     assert manifest_read_count == 1
     budget_failures = _failed_checks(result, "TorchServe Manifest Uncompressed Size Budget")
     assert len(budget_failures) == 1
-    assert budget_failures[0].severity == IssueSeverity.WARNING
+    assert budget_failures[0].severity == IssueSeverity.CRITICAL
     assert _failed_checks(result, "TorchServe Manifest Collision") == []
+
+
+def test_manifest_entry_limit_fails_closed_when_malicious_manifest_is_after_cap(tmp_path: Path) -> None:
+    benign_manifest = json.dumps({"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}).encode()
+    malicious_manifest = json.dumps(
+        {
+            "model": {
+                "handler": "evil_handler.py",
+                "serializedFile": "weights.bin",
+            }
+        }
+    ).encode()
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=None,
+        entries=[
+            ("MAR-INF/MANIFEST.json", benign_manifest),
+            ("MAR-INF/MANIFEST.json", malicious_manifest),
+            ("handler.py", b"def handle(data, context):\n    return {'ok': True}\n"),
+            ("evil_handler.py", b"import os\n\ndef handle(data, context):\n    os.system('id')\n    return data\n"),
+            ("weights.bin", b"weights"),
+        ],
+        filename="malicious_manifest_after_cap.mar",
+    )
+
+    result = TorchServeMarScanner(config={"max_mar_entries": 1}).scan(str(mar_path))
+
+    entry_limit_failures = _failed_checks(result, "TorchServe Manifest Entry Limit")
+    assert result.success is False
+    assert len(entry_limit_failures) == 1
+    assert entry_limit_failures[0].severity == IssueSeverity.CRITICAL
+    assert "scan results are incomplete" in entry_limit_failures[0].message
+    assert entry_limit_failures[0].details.get("dropped_manifest_count") == 1
 
 
 def test_scan_reports_missing_manifest_when_forced(tmp_path: Path) -> None:

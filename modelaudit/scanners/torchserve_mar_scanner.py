@@ -323,13 +323,15 @@ class TorchServeMarScanner(BaseScanner):
                 message=(
                     "Archive contains "
                     f"{len(all_manifest_infos)} manifest entries, exceeding max processed entries "
-                    f"({self.max_entries})"
+                    f"({self.max_entries}); manifest declarations after the entry cap were skipped and "
+                    "scan results are incomplete"
                 ),
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.CRITICAL,
                 location=f"{archive_path}:{MANIFEST_ENTRY_PATH}",
                 details={
                     "manifest_entry_count": len(all_manifest_infos),
                     "max_entries": self.max_entries,
+                    "dropped_manifest_count": len(all_manifest_infos) - self.max_entries,
                 },
             )
 
@@ -358,9 +360,10 @@ class TorchServeMarScanner(BaseScanner):
                     passed=False,
                     message=(
                         "Manifest parsing uncompressed byte budget exceeded "
-                        f"({processed_manifest_uncompressed} > {self.max_uncompressed_bytes})"
+                        f"({processed_manifest_uncompressed} > {self.max_uncompressed_bytes}); "
+                        "later manifest declarations were skipped and scan results are incomplete"
                     ),
-                    severity=IssueSeverity.WARNING,
+                    severity=IssueSeverity.CRITICAL,
                     location=f"{archive_path}:{MANIFEST_ENTRY_PATH}",
                     details={
                         "processed_uncompressed": processed_manifest_uncompressed,
