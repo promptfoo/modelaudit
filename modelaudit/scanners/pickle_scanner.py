@@ -96,11 +96,10 @@ _TEXT_PICKLE_RESYNC_START_BYTES = frozenset(
         ord("]"),
         ord("c"),
         ord("i"),
-        ord("q"),
     }
 )
 _TEXT_PICKLE_RESYNC_IMPORT_OPCODES = frozenset({ord("c"), ord("i")})
-_TEXT_PICKLE_RESYNC_NAME_SCAN_BYTES = 256
+_TEXT_PICKLE_RESYNC_NAME_SCAN_BYTES = 128 * 1024
 _TEXT_PICKLE_RESYNC_STRUCTURE_PROBE_OPCODES = 20
 _TEXT_PICKLE_RESYNC_NON_STRUCTURAL_OPCODES = frozenset({"GLOBAL", "INST", "MARK"})
 _RESYNC_FAST_FORWARD_PROBE_BYTES = 64 * 1024
@@ -3206,7 +3205,6 @@ def _looks_like_pickle(data: bytes) -> bool:
         ord("d"),
         ord("t"),
         ord("p"),
-        ord("q"),
         ord("g"),
         ord("I"),
         ord("L"),
