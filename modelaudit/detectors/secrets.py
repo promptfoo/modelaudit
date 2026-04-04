@@ -276,8 +276,10 @@ class SecretsDetector:
             "AKIAIOSFODNN7EXAMPLE",  # AWS example access key
             "bPxRfiCYEXAMPLEKEY",  # AWS example secret key
             # JWT.io example token (without signature part)
-            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
-            "eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ",
+            (
+                "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+                "eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ"
+            ),
             "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",  # JWT.io example signature
         ]
         if any(example in text for example in example_secrets):

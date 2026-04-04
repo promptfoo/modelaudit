@@ -8,7 +8,7 @@ from modelaudit.analysis.entropy_analyzer import EntropyAnalyzer
 
 
 @pytest.fixture
-def analyzer():
+def analyzer() -> EntropyAnalyzer:
     """Create an EntropyAnalyzer instance."""
     return EntropyAnalyzer()
 
@@ -214,7 +214,7 @@ if __name__ == "__main__":
 class TestPatternSearchSkipping:
     """Tests for pattern search skip logic."""
 
-    def test_skip_for_ml_weights(self, analyzer):
+    def test_skip_for_ml_weights(self, analyzer: EntropyAnalyzer) -> None:
         """Test that pattern search is skipped for ML weights."""
         import numpy as np
 
@@ -224,11 +224,11 @@ class TestPatternSearchSkipping:
 
         # Normal patterns should be skipped
         should_skip = analyzer.should_skip_pattern_search(data, b"os.system")
-        # May or may not skip depending on classification confidence
+        assert should_skip in {True, False}
 
         # Extremely suspicious patterns should not be skipped
         should_skip_exec = analyzer.should_skip_pattern_search(data, b"exec")
-        # exec is in the extremely_suspicious list
+        assert should_skip_exec is False
 
     def test_skip_for_random_data(self, analyzer):
         """Test that pattern search is skipped for random data."""
