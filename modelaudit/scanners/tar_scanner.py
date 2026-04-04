@@ -12,6 +12,7 @@ from typing import Any, ClassVar
 from .. import core
 from ..utils import is_absolute_archive_path, is_critical_system_path, sanitize_archive_path
 from ..utils.helpers.assets import asset_from_scan_result
+from ._archive_locations import rewrite_extracted_member_location
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 CRITICAL_SYSTEM_PATHS = [
@@ -196,16 +197,12 @@ class TarScanner(BaseScanner):
 
     @staticmethod
     def _rewrite_archive_location(location: str | None, tmp_path: str, archive_location: str) -> str:
-        if not location:
-            return archive_location
-
-        if location.startswith(tmp_path):
-            suffix = location[len(tmp_path) :]
-            if suffix.startswith(":"):
-                return f"{archive_location}{suffix}"
-            return archive_location
-
-        return f"{archive_location} {location}"
+        return rewrite_extracted_member_location(
+            location,
+            tmp_path,
+            archive_location,
+            preserve_non_delimited_suffix=False,
+        )
 
     def _extract_member_to_tempfile(
         self,

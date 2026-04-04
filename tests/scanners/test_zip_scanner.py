@@ -8,8 +8,39 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+from modelaudit.scanners._archive_locations import rewrite_extracted_member_location
 from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.zip_scanner import ZipScanner
+
+
+def test_rewrite_extracted_member_location_preserves_scanner_specific_suffix_policy() -> None:
+    assert (
+        rewrite_extracted_member_location(
+            "/tmp/extracted.pkl:nested.pkl",
+            "/tmp/extracted.pkl",
+            "/archive.zip:model.pkl",
+            preserve_non_delimited_suffix=False,
+        )
+        == "/archive.zip:model.pkl:nested.pkl"
+    )
+    assert (
+        rewrite_extracted_member_location(
+            "/tmp/extracted.pkl.extra",
+            "/tmp/extracted.pkl",
+            "/archive.zip:model.pkl",
+            preserve_non_delimited_suffix=False,
+        )
+        == "/archive.zip:model.pkl"
+    )
+    assert (
+        rewrite_extracted_member_location(
+            "/tmp/extracted.pkl.extra",
+            "/tmp/extracted.pkl",
+            "/archive.7z:model.pkl",
+            preserve_non_delimited_suffix=True,
+        )
+        == "/archive.7z:model.pkl.extra"
+    )
 
 
 class TestZipScanner:

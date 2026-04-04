@@ -15,6 +15,7 @@ from ..utils.file.detection import (
     detect_file_format,
 )
 from ..utils.model_extensions import get_model_extensions
+from ._archive_locations import rewrite_extracted_member_location
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 # Try to import yaml for YAML manifests
@@ -155,13 +156,12 @@ class OciLayerScanner(BaseScanner):
     ) -> str:
         """Replace temporary extraction paths with the original OCI member location."""
         member_location = f"{manifest_path}:{layer_ref}:{member_name}"
-        if not location:
-            return member_location
-        if location == extracted_path:
-            return member_location
-        if location.startswith(extracted_path):
-            return f"{member_location}{location[len(extracted_path) :]}"
-        return f"{member_location} {location}"
+        return rewrite_extracted_member_location(
+            location,
+            extracted_path,
+            member_location,
+            preserve_non_delimited_suffix=True,
+        )
 
     @classmethod
     def _get_detected_format_suffix(cls, extracted_path: str) -> str | None:

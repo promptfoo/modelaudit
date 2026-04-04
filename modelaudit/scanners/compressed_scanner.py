@@ -15,6 +15,7 @@ from typing import Any, ClassVar
 from .. import core
 from ..utils.file._compression import is_zlib_header
 from ._archive_config import get_archive_depth
+from ._archive_locations import rewrite_extracted_member_location
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 
@@ -311,16 +312,12 @@ class CompressedScanner(BaseScanner):
 
     @staticmethod
     def _rewrite_wrapper_location(location: str | None, temp_path: str, provenance: str) -> str:
-        if not location:
-            return provenance
-
-        if location.startswith(temp_path):
-            suffix = location[len(temp_path) :]
-            if suffix.startswith(":"):
-                return f"{provenance}{suffix}"
-            return provenance
-
-        return f"{provenance} {location}"
+        return rewrite_extracted_member_location(
+            location,
+            temp_path,
+            provenance,
+            preserve_non_delimited_suffix=False,
+        )
 
     @staticmethod
     def _rewrite_inner_locations(inner_result: ScanResult, temp_path: str, provenance: str) -> None:
