@@ -87,7 +87,18 @@ _EXPANSION_TRIGGER_LABELS = {
 }
 _BINARY_PICKLE_PROTOCOLS = frozenset({2, 3, 4, 5})
 _PICKLE_OPCODE_BYTES = frozenset(ord(op.code) for op in pickletools.opcodes)
-_TEXT_PICKLE_RESYNC_START_BYTES = frozenset({ord("("), ord("c"), ord("i")})
+_TEXT_PICKLE_RESYNC_START_BYTES = frozenset(
+    {
+        ord("("),
+        ord("."),
+        ord("0"),
+        ord("N"),
+        ord("]"),
+        ord("c"),
+        ord("i"),
+        ord("q"),
+    }
+)
 _TEXT_PICKLE_RESYNC_IMPORT_OPCODES = frozenset({ord("c"), ord("i")})
 _TEXT_PICKLE_RESYNC_NAME_SCAN_BYTES = 256
 _TEXT_PICKLE_RESYNC_STRUCTURE_PROBE_OPCODES = 20
@@ -292,8 +303,7 @@ def _find_next_resync_stream_candidate_offset(search_window: bytes) -> int:
     """Return the next likely pickle stream start in a probe window, or -1 if absent."""
     for candidate in range(len(search_window)):
         first_byte = search_window[candidate]
-        sample_end = min(len(search_window), candidate + _NESTED_PICKLE_VALIDATION_WINDOW_BYTES)
-        candidate_probe = search_window[candidate:sample_end]
+        candidate_probe = search_window[candidate:]
 
         if first_byte == 0x80:
             if (
@@ -3218,9 +3228,13 @@ def _looks_like_pickle(data: bytes) -> bool:
         for opcode_count, (opcode, _arg, _pos) in enumerate(pickletools.genops(stream), 1):
             # Count opcodes that are definitely pickle-specific
             if opcode.name in {
+                "BINPUT",
+                "EMPTY_LIST",
                 "GLOBAL",
                 "INST",
                 "MARK",
+                "NONE",
+                "POP",
                 "STOP",
                 "TUPLE",
                 "LIST",
@@ -3235,7 +3249,11 @@ def _looks_like_pickle(data: bytes) -> bool:
 
             # Minimal protocol-0 import streams such as `ccollections\nOrderedDict\n.`
             # only contain GLOBAL + STOP, so accept them once STOP is observed.
-            if opcode.name == "STOP" and valid_opcodes >= 2 and has_non_mark_structure:
+            if (
+                opcode.name == "STOP"
+                and has_non_mark_structure
+                and (valid_opcodes >= 2 or data[0] not in {ord("("), ord("c"), ord("i")})
+            ):
                 return True
 
             # Need multiple valid opcodes plus at least one non-MARK structure

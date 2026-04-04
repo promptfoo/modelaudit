@@ -6659,6 +6659,48 @@ def test_probe_boundary_protocol0_follow_on_stream_still_flags_reduce(tmp_path: 
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
+def test_oversized_text_operand_before_protocol0_follow_on_stream_still_flags_reduce(tmp_path: Path) -> None:
+    """Text resync must tolerate large first operands that exceed the legacy 8 KiB validation slice."""
+    safe_stream = pickle.dumps({"weights": [1, 2, 3]}, protocol=2)
+    malicious_stream = b"cposix\nsystem\n(V" + (b"A" * 9_216) + b"\ntR."
+
+    path = tmp_path / "safe_then_oversized_operand_protocol0.pkl"
+    path.write_bytes(safe_stream + (b"\x00" * 9000) + malicious_stream)
+
+    result = PickleScanner().scan(str(path))
+
+    assert any(
+        check.name == "REDUCE Opcode Safety Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("associated_global") in SYSTEM_GLOBAL_VARIANTS
+        for check in result.checks
+    ), f"Expected os.system detection with oversized first protocol-0 operand. Checks: {result.checks}"
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def test_long_padding_before_protocol1_follow_on_stream_starting_with_list_still_flags_reduce(
+    tmp_path: Path,
+) -> None:
+    """Protocol-1 text tails that start with EMPTY_LIST must survive long-gap resync."""
+    safe_stream = pickle.dumps({"weights": [1, 2, 3]}, protocol=2)
+    malicious_stream = b"]0cos\nsystem\n(S'echo pwned'\ntR."
+
+    path = tmp_path / "safe_then_padded_protocol1_list.pkl"
+    path.write_bytes(safe_stream + (b"\x00" * 9000) + malicious_stream)
+
+    result = PickleScanner().scan(str(path))
+
+    assert any(
+        check.name == "REDUCE Opcode Safety Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("associated_global") in SYSTEM_GLOBAL_VARIANTS
+        for check in result.checks
+    ), f"Expected protocol-1 os.system detection after a long separator gap. Checks: {result.checks}"
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
 def test_long_padding_before_benign_protocol0_follow_on_stream_stays_non_failing(tmp_path: Path) -> None:
     """Long-gap protocol-0 resync should not invent findings on benign follow-on streams."""
     safe_stream = pickle.dumps({"weights": [1, 2, 3]}, protocol=2)
@@ -6691,6 +6733,26 @@ def test_mark_padding_before_benign_protocol0_follow_on_stream_stays_successful(
     )
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues), (
         f"Expected no warning/critical findings after MARK-only padding before a benign tail. Issues: {result.issues}"
+    )
+
+
+@pytest.mark.parametrize("benign_stream", [b"N.", b"]q0."])
+def test_long_padding_before_benign_protocol1_follow_on_stream_stays_successful(
+    tmp_path: Path,
+    benign_stream: bytes,
+) -> None:
+    """Minimal protocol-1 tails should be resynced without inventing failures."""
+    safe_stream = pickle.dumps({"weights": [1, 2, 3]}, protocol=2)
+
+    path = tmp_path / "safe_then_padded_protocol1.pkl"
+    path.write_bytes(safe_stream + (b"\x00" * 9000) + benign_stream)
+
+    result = PickleScanner().scan(str(path))
+    assert result.success is True, (
+        f"Expected successful scan for a benign protocol-1 follow-on stream. Checks: {result.checks}"
+    )
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues), (
+        f"Expected no warning/critical findings for a benign protocol-1 tail. Issues: {result.issues}"
     )
 
 
