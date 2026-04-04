@@ -256,42 +256,12 @@ def _check_cve_2024_34997_multiline(content: str, binary_content: bytes) -> list
 
 def _create_cve_2020_13092_attribution(matches: list[str]) -> CVEAttribution:
     """Create CVE-2020-13092 attribution with matched patterns."""
-    cve_info = CVE_COMBINED_PATTERNS["CVE-2020-13092"]
-
-    # Calculate confidence based on pattern complexity and number of matches
-    confidence = min(1.0, 0.7 + (len(matches) * 0.1))
-
-    return CVEAttribution(
-        cve_id="CVE-2020-13092",
-        description=str(cve_info["description"]),
-        severity=str(cve_info["severity"]),
-        cvss=float(cve_info.get("cvss", 0.0)),  # type: ignore[arg-type]
-        cwe=str(cve_info["cwe"]),
-        affected_versions=str(cve_info["affected_versions"]),
-        remediation=str(cve_info["remediation"]),
-        confidence=confidence,
-        patterns_matched=matches,
-    )
+    return _create_cve_attribution("CVE-2020-13092", matches)
 
 
 def _create_cve_2024_34997_attribution(matches: list[str]) -> CVEAttribution:
     """Create CVE-2024-34997 attribution with matched patterns."""
-    cve_info = CVE_COMBINED_PATTERNS["CVE-2024-34997"]
-
-    # Calculate confidence based on pattern complexity and number of matches
-    confidence = min(1.0, 0.7 + (len(matches) * 0.1))
-
-    return CVEAttribution(
-        cve_id="CVE-2024-34997",
-        description=str(cve_info["description"]),
-        severity=str(cve_info["severity"]),
-        cvss=float(cve_info.get("cvss", 0.0)),  # type: ignore[arg-type]
-        cwe=str(cve_info["cwe"]),
-        affected_versions=str(cve_info["affected_versions"]),
-        remediation=str(cve_info["remediation"]),
-        confidence=confidence,
-        patterns_matched=matches,
-    )
+    return _create_cve_attribution("CVE-2024-34997", matches)
 
 
 def _check_cve_2026_24747_multiline(content: str, binary_content: bytes) -> list[str]:
@@ -365,22 +335,7 @@ def _check_cve_2026_24747_multiline(content: str, binary_content: bytes) -> list
 
 def _create_cve_2026_24747_attribution(matches: list[str]) -> CVEAttribution:
     """Create CVE-2026-24747 attribution with matched patterns."""
-    cve_info = CVE_COMBINED_PATTERNS["CVE-2026-24747"]
-
-    # Calculate confidence based on pattern complexity and number of matches
-    confidence = min(1.0, 0.7 + (len(matches) * 0.1))
-
-    return CVEAttribution(
-        cve_id="CVE-2026-24747",
-        description=str(cve_info["description"]),
-        severity=str(cve_info["severity"]),
-        cvss=float(cve_info.get("cvss", 0.0)),  # type: ignore[arg-type]
-        cwe=str(cve_info["cwe"]),
-        affected_versions=str(cve_info["affected_versions"]),
-        remediation=str(cve_info["remediation"]),
-        confidence=confidence,
-        patterns_matched=matches,
-    )
+    return _create_cve_attribution("CVE-2026-24747", matches)
 
 
 def _check_cve_2022_45907_multiline(content: str, binary_content: bytes) -> list[str]:
@@ -424,21 +379,7 @@ def _check_cve_2022_45907_multiline(content: str, binary_content: bytes) -> list
 
 def _create_cve_2022_45907_attribution(matches: list[str]) -> CVEAttribution:
     """Create CVE-2022-45907 attribution with matched patterns."""
-    cve_info = CVE_COMBINED_PATTERNS["CVE-2022-45907"]
-
-    confidence = min(1.0, 0.7 + (len(matches) * 0.1))
-
-    return CVEAttribution(
-        cve_id="CVE-2022-45907",
-        description=str(cve_info["description"]),
-        severity=str(cve_info["severity"]),
-        cvss=float(cve_info.get("cvss", 0.0)),  # type: ignore[arg-type]
-        cwe=str(cve_info["cwe"]),
-        affected_versions=str(cve_info["affected_versions"]),
-        remediation=str(cve_info["remediation"]),
-        confidence=confidence,
-        patterns_matched=matches,
-    )
+    return _create_cve_attribution("CVE-2022-45907", matches)
 
 
 def _check_cve_2024_5480_multiline(content: str, binary_content: bytes) -> list[str]:
@@ -492,21 +433,7 @@ def _check_cve_2024_5480_multiline(content: str, binary_content: bytes) -> list[
 
 def _create_cve_2024_5480_attribution(matches: list[str]) -> CVEAttribution:
     """Create CVE-2024-5480 attribution with matched patterns."""
-    cve_info = CVE_COMBINED_PATTERNS["CVE-2024-5480"]
-
-    confidence = min(1.0, 0.7 + (len(matches) * 0.1))
-
-    return CVEAttribution(
-        cve_id="CVE-2024-5480",
-        description=str(cve_info["description"]),
-        severity=str(cve_info["severity"]),
-        cvss=float(cve_info.get("cvss", 0.0)),  # type: ignore[arg-type]
-        cwe=str(cve_info["cwe"]),
-        affected_versions=str(cve_info["affected_versions"]),
-        remediation=str(cve_info["remediation"]),
-        confidence=confidence,
-        patterns_matched=matches,
-    )
+    return _create_cve_attribution("CVE-2024-5480", matches)
 
 
 def _check_cve_2024_48063_multiline(content: str, binary_content: bytes) -> list[str]:
@@ -550,12 +477,16 @@ def _check_cve_2024_48063_multiline(content: str, binary_content: bytes) -> list
 
 def _create_cve_2024_48063_attribution(matches: list[str]) -> CVEAttribution:
     """Create CVE-2024-48063 attribution with matched patterns."""
-    cve_info = CVE_COMBINED_PATTERNS["CVE-2024-48063"]
+    return _create_cve_attribution("CVE-2024-48063", matches)
 
+
+def _create_cve_attribution(cve_id: str, matches: list[str]) -> CVEAttribution:
+    """Create CVE attribution from registry metadata and matched patterns."""
+    cve_info = CVE_COMBINED_PATTERNS[cve_id]
     confidence = min(1.0, 0.7 + (len(matches) * 0.1))
 
     return CVEAttribution(
-        cve_id="CVE-2024-48063",
+        cve_id=cve_id,
         description=str(cve_info["description"]),
         severity=str(cve_info["severity"]),
         cvss=float(cve_info.get("cvss", 0.0)),  # type: ignore[arg-type]
