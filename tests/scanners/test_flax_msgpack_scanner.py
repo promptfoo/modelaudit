@@ -492,32 +492,23 @@ def test_flax_msgpack_trailing_data(tmp_path):
     assert result.success or trailing_detected
 
 
-def test_flax_msgpack_large_binary_blob(tmp_path):
-    """Test detection of suspiciously large binary blobs.
+def test_flax_msgpack_large_binary_blob(tmp_path: Path) -> None:
+    """Test oversized blob detection with a small custom threshold.
 
-    Uses smaller sizes in CI environments for faster test execution.
-    GitHub Actions automatically sets CI=true.
+    Keep this fixture tiny so the regular xdist lane does not stall on one
+    worker while still exercising the exact size-threshold check.
     """
-    import os
-
-    # In CI, use smaller sizes for faster tests
-    if os.getenv("CI") == "true":
-        # Use 1MB threshold and 2MB blob for CI
-        threshold_mb = 1
-        blob_size_mb = 2
-    else:
-        # Use production-like sizes for local testing
-        threshold_mb = 500
-        blob_size_mb = 550
+    threshold_bytes = 1024
+    blob_size_bytes = 2 * threshold_bytes
 
     path = tmp_path / "large_blob.msgpack"
     # Create large binary blob (exceeds threshold)
-    large_blob = b"X" * (blob_size_mb * 1024 * 1024)
+    large_blob = b"X" * blob_size_bytes
     data = {"params": {"normal_param": [1, 2, 3]}, "suspicious_blob": large_blob}
     create_msgpack_file(path, data)
 
     # Configure scanner with appropriate threshold
-    config = {"max_blob_bytes": threshold_mb * 1024 * 1024}
+    config = {"max_blob_bytes": threshold_bytes}
     scanner = FlaxMsgpackScanner(config=config)
     result = scanner.scan(str(path))
 
