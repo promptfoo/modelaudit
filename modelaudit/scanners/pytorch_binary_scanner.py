@@ -1,5 +1,6 @@
 """Scanner for raw PyTorch binary model files (.bin, .pt)."""
 
+import math
 import os
 import struct
 from typing import Any, ClassVar
@@ -448,7 +449,7 @@ class PyTorchBinaryScanner(BaseScanner):
                 try:
                     value = struct.unpack("d", header[:8])[0]
                     # Validate float value is within reasonable bounds
-                    if not (-1e100 < value < 1e100) or value != value:  # NaN check
+                    if not (-1e100 < value < 1e100) or math.isnan(value):
                         result.metadata["tensor_validation"] = "unusual_float_values"
                 except struct.error as e:
                     result.add_check(

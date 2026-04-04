@@ -3219,7 +3219,6 @@ def _looks_like_pickle(data: bytes) -> bool:
 
     try:
         stream = io.BytesIO(data)
-        opcode_count = 0
         valid_opcodes = 0
         has_non_mark_structure = False
 
@@ -4168,13 +4167,6 @@ def check_opcode_sequence(
     # BUILD opcodes restore state on the previously-constructed object via
     # __setstate__ and are benign when the object comes from a safe ML class.
     last_construction_safe = False
-
-    # Track pickle memo: maps memo index -> True if the stored value is a safe
-    # ML global.  This lets us recognise BINGET → REDUCE patterns where the
-    # callable was stored once via GLOBAL + BINPUT and then recalled many times.
-    _safe_memo: dict[int, bool] = {}
-    # Track next auto-assigned memo index for MEMOIZE opcodes (protocol 4+)
-    _next_memo_idx = 0
 
     # Fixed baseline threshold for dangerous opcode detection.
     # Only execution-related opcodes are counted (memo/framing excluded),

@@ -1143,9 +1143,6 @@ def scan_model_directory_or_file(
                             )
                             _add_error_asset_to_results(results, file_path)
 
-                # This section is now handled by the content grouping logic above
-                pass
-
             # Final progress update for directory scan
             if progress_callback and not limit_reached and total_files is not None and total_files > 0:
                 progress_callback(
