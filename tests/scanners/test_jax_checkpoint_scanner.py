@@ -205,6 +205,34 @@ def test_malicious_pickle_global_opcode_is_detected(tmp_path: Path) -> None:
     )
 
 
+def test_stack_global_opcode_is_detected_after_interleaved_unhandled_stack_push(tmp_path: Path) -> None:
+    pickle_path = tmp_path / "interleaved_empty_list_stack_global_state.pickle"
+    payload = (
+        b"\x80\x04"
+        + _proto4_short_unicode("jax")
+        + b"0"
+        + _proto4_short_unicode("os")
+        + _proto4_short_unicode("system")
+        + b"]"
+        + b"0"
+        + b"\x93."
+    )
+    pickle_path.write_bytes(payload)
+
+    assert JaxCheckpointScanner.can_handle(str(pickle_path))
+
+    result = JaxCheckpointScanner().scan(str(pickle_path))
+
+    assert result.success
+    assert any(
+        check.name == "Pickle Opcode Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.details["opcode"] == "STACK_GLOBAL"
+        and check.details["global"] == "os.system"
+        for check in result.checks
+    )
+
+
 def test_memoized_stack_global_opcode_is_detected(tmp_path: Path) -> None:
     pickle_path = tmp_path / "memoized_stack_global_state.pickle"
     payload = (
@@ -294,6 +322,41 @@ def test_old_memoized_stack_global_opcode_is_detected_after_filler_memo_eviction
     payload.extend(b"0")
     for filler_index in range(JaxCheckpointScanner._PICKLE_MEMO_STATE_LIMIT + 16):
         payload.extend(_proto4_short_unicode(f"safe-{filler_index % 32}"))
+        payload.extend(b"\x94")
+        payload.extend(b"0")
+    payload.extend(b"h\x01")
+    payload.extend(b"h\x02")
+    payload.extend(b"\x93.")
+    pickle_path.write_bytes(bytes(payload))
+
+    assert JaxCheckpointScanner.can_handle(str(pickle_path))
+
+    result = JaxCheckpointScanner().scan(str(pickle_path))
+
+    assert result.success
+    assert any(
+        check.name == "Pickle Opcode Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.details["opcode"] == "STACK_GLOBAL"
+        and check.details["global"] == "os.system"
+        for check in result.checks
+    )
+
+
+def test_old_memoized_stack_global_opcode_is_detected_after_dangerous_token_flood(tmp_path: Path) -> None:
+    pickle_path = tmp_path / "dangerous_token_flood_memoized_stack_global_state.pickle"
+    payload = bytearray(b"\x80\x04")
+    payload.extend(_proto4_short_unicode("jax"))
+    payload.extend(b"\x94")
+    payload.extend(b"0")
+    payload.extend(_proto4_short_unicode("os"))
+    payload.extend(b"\x94")
+    payload.extend(b"0")
+    payload.extend(_proto4_short_unicode("system"))
+    payload.extend(b"\x94")
+    payload.extend(b"0")
+    for _ in range(JaxCheckpointScanner._PICKLE_MEMO_STATE_LIMIT + 16):
+        payload.extend(_proto4_short_unicode("run"))
         payload.extend(b"\x94")
         payload.extend(b"0")
     payload.extend(b"h\x01")
@@ -581,4 +644,70 @@ def test_metadata_traversal_stops_at_depth_limit_without_recursing_unbounded() -
     for _ in range(2 * JaxCheckpointScanner._MAX_METADATA_TRAVERSAL_DEPTH):
         nested_metadata = {"nested": nested_metadata}
 
-    assert list(JaxCheckpointScanner._iter_string_metadata(nested_metadata)) == []
+    depth_cap_contexts: set[str] = set()
+    assert (
+        list(
+            JaxCheckpointScanner._iter_string_metadata(
+                nested_metadata,
+                depth_cap_contexts=depth_cap_contexts,
+            )
+        )
+        == []
+    )
+    assert depth_cap_contexts == {
+        "root" + (".nested" * JaxCheckpointScanner._MAX_METADATA_TRAVERSAL_DEPTH),
+    }
+
+
+def test_deep_orbax_metadata_reports_depth_limit_without_silent_truncation(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "deep_orbax_checkpoint"
+    nested_metadata: object = "jax.experimental.host_callback.call(os.system, 'id')"
+    for _ in range(2 * JaxCheckpointScanner._MAX_METADATA_TRAVERSAL_DEPTH):
+        nested_metadata = {"nested": nested_metadata}
+    _write_orbax_metadata(
+        checkpoint_dir,
+        {
+            "version": "0.1.0",
+            "type": "orbax_checkpoint",
+            "payload": nested_metadata,
+        },
+    )
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert result.success
+    assert any(
+        check.name == "Orbax Metadata Traversal Depth Limit"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.WARNING
+        and check.details["traversal_depth_cap_reached"] is True
+        and check.details["max_metadata_traversal_depth"] == JaxCheckpointScanner._MAX_METADATA_TRAVERSAL_DEPTH
+        and check.details["context"].startswith("orbax_metadata.payload")
+        for check in result.checks
+    )
+
+
+def test_deep_json_checkpoint_reports_depth_limit_without_silent_truncation(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "deep_model.checkpoint"
+    nested_metadata: object = "jax.experimental.host_callback.call(os.system, 'id')"
+    for _ in range(2 * JaxCheckpointScanner._MAX_METADATA_TRAVERSAL_DEPTH):
+        nested_metadata = {"nested": nested_metadata}
+    checkpoint_path.write_text(
+        json.dumps({"framework": "jax", "payload": nested_metadata}),
+        encoding="utf-8",
+    )
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_path))
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_path))
+
+    assert result.success
+    assert any(
+        check.name == "JSON Metadata Traversal Depth Limit"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.WARNING
+        and check.details["traversal_depth_cap_reached"] is True
+        and check.details["max_metadata_traversal_depth"] == JaxCheckpointScanner._MAX_METADATA_TRAVERSAL_DEPTH
+        and check.details["context"].startswith("json_checkpoint.payload")
+        for check in result.checks
+    )

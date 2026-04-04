@@ -84,8 +84,10 @@ class JaxCheckpointScanner(BaseScanner):
         }
     )
     _PICKLE_MARKER: ClassVar[object] = object()
+    _PICKLE_PLACEHOLDER: ClassVar[object] = object()
     _PICKLE_STACK_STATE_LIMIT: ClassVar[int] = 4096
     _PICKLE_MEMO_STATE_LIMIT: ClassVar[int] = 4096
+    _PICKLE_STICKY_MEMO_STATE_LIMIT: ClassVar[int] = 16384
     _MAX_METADATA_TRAVERSAL_DEPTH: ClassVar[int] = 64
     DEFAULT_MAX_METADATA_PATTERN_FINDINGS: ClassVar[int] = 256
     DEFAULT_MAX_PICKLE_OPCODE_FINDINGS: ClassVar[int] = 256
@@ -279,9 +281,12 @@ class JaxCheckpointScanner(BaseScanner):
         context: str = "root",
         *,
         depth: int = 0,
+        depth_cap_contexts: set[str] | None = None,
     ) -> Iterator[tuple[str, str]]:
         """Yield string leaves from nested metadata with their traversal context."""
         if depth >= cls._MAX_METADATA_TRAVERSAL_DEPTH:
+            if depth_cap_contexts is not None:
+                depth_cap_contexts.add(context)
             return
 
         if isinstance(value, str):
@@ -294,6 +299,7 @@ class JaxCheckpointScanner(BaseScanner):
                     nested_value,
                     f"{context}.{key}",
                     depth=depth + 1,
+                    depth_cap_contexts=depth_cap_contexts,
                 )
             return
 
@@ -303,7 +309,35 @@ class JaxCheckpointScanner(BaseScanner):
                     nested_value,
                     f"{context}[{index}]",
                     depth=depth + 1,
+                    depth_cap_contexts=depth_cap_contexts,
                 )
+
+    def _add_metadata_traversal_depth_limit_checks(
+        self,
+        *,
+        contexts: set[str],
+        check_name: str,
+        location: str,
+        result: ScanResult,
+    ) -> None:
+        """Surface metadata traversal truncation so deeply nested payloads do not fail open."""
+        for context in sorted(contexts):
+            result.add_check(
+                name=check_name,
+                passed=False,
+                message=(
+                    f"Reached the maximum JAX metadata traversal depth at {context}; "
+                    "nested metadata below this path was not scanned"
+                ),
+                severity=IssueSeverity.WARNING,
+                location=location,
+                details={
+                    "context": context,
+                    "max_metadata_traversal_depth": self._MAX_METADATA_TRAVERSAL_DEPTH,
+                    "traversal_depth_cap_reached": True,
+                },
+                rule_code="S902",
+            )
 
     def _add_suspicious_pattern_checks(
         self,
@@ -517,7 +551,12 @@ class JaxCheckpointScanner(BaseScanner):
 
         # Check for code injection in metadata
         pattern_finding_budget = _PatternFindingBudget(self.max_metadata_pattern_findings)
-        for context, text_value in self._iter_string_metadata(metadata, "orbax_metadata"):
+        metadata_depth_cap_contexts: set[str] = set()
+        for context, text_value in self._iter_string_metadata(
+            metadata,
+            "orbax_metadata",
+            depth_cap_contexts=metadata_depth_cap_contexts,
+        ):
             self._add_suspicious_pattern_checks(
                 text_value,
                 context=context,
@@ -527,6 +566,12 @@ class JaxCheckpointScanner(BaseScanner):
                 result=result,
                 finding_budget=pattern_finding_budget,
             )
+        self._add_metadata_traversal_depth_limit_checks(
+            contexts=metadata_depth_cap_contexts,
+            check_name="Orbax Metadata Traversal Depth Limit",
+            location=path,
+            result=result,
+        )
 
         # Extract useful metadata
         if isinstance(metadata, dict):
@@ -619,6 +664,8 @@ class JaxCheckpointScanner(BaseScanner):
             )
             dangerous_opcode_findings = 0
             finding_limit_reported = False
+            sticky_memo_limit_reported = False
+            memo_lookup_gap_reported = False
 
             def _push_pickle_value(value: Any) -> None:
                 """Push one modeled pickle stack value while bounding stack state."""
@@ -635,7 +682,7 @@ class JaxCheckpointScanner(BaseScanner):
 
             def _memoize_pickle_value(memo_index: int) -> None:
                 """Store the current stack top in the bounded pickle memo model."""
-                nonlocal next_pickle_memo_index
+                nonlocal next_pickle_memo_index, sticky_memo_limit_reported
 
                 if not pickle_stack:
                     return
@@ -655,8 +702,24 @@ class JaxCheckpointScanner(BaseScanner):
                 ):
                     if memo_index in sticky_pickle_memo:
                         sticky_pickle_memo.move_to_end(memo_index)
-                    elif len(sticky_pickle_memo) >= self._PICKLE_MEMO_STATE_LIMIT:
+                    elif len(sticky_pickle_memo) >= self._PICKLE_STICKY_MEMO_STATE_LIMIT:
                         sticky_pickle_memo.popitem(last=False)
+                        if not sticky_memo_limit_reported:
+                            result.add_check(
+                                name="Pickle Sticky Memo State Limit",
+                                passed=False,
+                                message=(
+                                    "Reached the maximum sticky pickle memo size for preserving dangerous memo "
+                                    "values; older dangerous memo slots may require reconstruction-gap warnings"
+                                ),
+                                rule_code="S902",
+                                severity=IssueSeverity.WARNING,
+                                location=path,
+                                details={
+                                    "max_pickle_sticky_memo_state": self._PICKLE_STICKY_MEMO_STATE_LIMIT,
+                                },
+                            )
+                            sticky_memo_limit_reported = True
                     sticky_pickle_memo[memo_index] = memo_value
                 else:
                     sticky_pickle_memo.pop(memo_index, None)
@@ -667,6 +730,32 @@ class JaxCheckpointScanner(BaseScanner):
                     value = pickle_stack.pop()
                     if value is self._PICKLE_MARKER:
                         return
+
+            def _pop_pickle_values(count: int) -> None:
+                """Pop up to ``count`` modeled stack values."""
+                for _ in range(min(count, len(pickle_stack))):
+                    pickle_stack.pop()
+
+            def _sync_unhandled_pickle_stack_effect(opcode_info: Any) -> None:
+                """Apply generic stack effects for opcodes not modeled explicitly."""
+                stack_before = list(getattr(opcode_info, "stack_before", ()))
+                stack_after = list(getattr(opcode_info, "stack_after", ()))
+                if not stack_before and not stack_after:
+                    return
+
+                if pickletools.markobject in stack_before:
+                    preserved_items_before_mark = stack_before.index(pickletools.markobject)
+                    _pop_pickle_mark()
+                    if len(stack_after) > preserved_items_before_mark:
+                        for _ in range(len(stack_after) - preserved_items_before_mark):
+                            _push_pickle_value(self._PICKLE_PLACEHOLDER)
+                    elif len(stack_after) < preserved_items_before_mark:
+                        _pop_pickle_values(preserved_items_before_mark - len(stack_after))
+                    return
+
+                _pop_pickle_values(len(stack_before))
+                for _ in stack_after:
+                    _push_pickle_value(self._PICKLE_PLACEHOLDER)
 
             try:
                 for opcode, arg, pos in pickletools.genops(data):
@@ -703,6 +792,27 @@ class JaxCheckpointScanner(BaseScanner):
                             _push_pickle_value(pickle_memo[memo_index])
                         elif memo_index in sticky_pickle_memo:
                             _push_pickle_value(sticky_pickle_memo[memo_index])
+                        else:
+                            _push_pickle_value(self._PICKLE_PLACEHOLDER)
+                            if memo_index < next_pickle_memo_index and not memo_lookup_gap_reported:
+                                result.add_check(
+                                    name="Pickle Memo Reconstruction Gap",
+                                    passed=False,
+                                    message=(
+                                        "Unable to resolve a pickle memo reference from the bounded scanner state; "
+                                        "STACK_GLOBAL reconstruction may be incomplete for evicted memo slots"
+                                    ),
+                                    rule_code="S902",
+                                    severity=IssueSeverity.WARNING,
+                                    location=path,
+                                    details={
+                                        "opcode": opcode.name,
+                                        "position": pos,
+                                        "memo_index": memo_index,
+                                        "max_pickle_memo_state": self._PICKLE_MEMO_STATE_LIMIT,
+                                    },
+                                )
+                                memo_lookup_gap_reported = True
                         continue
 
                     parsed_global = None
@@ -752,6 +862,12 @@ class JaxCheckpointScanner(BaseScanner):
                             },
                         )
                         dangerous_opcode_findings += 1
+                        continue
+
+                    if parsed_global is not None:
+                        continue
+
+                    _sync_unhandled_pickle_stack_effect(opcode)
             except ValueError:
                 if not pickle_prefix_truncated:
                     raise
@@ -840,7 +956,12 @@ class JaxCheckpointScanner(BaseScanner):
 
             # Analyze JSON content for suspicious patterns
             pattern_finding_budget = _PatternFindingBudget(self.max_metadata_pattern_findings)
-            for context, text_value in self._iter_string_metadata(data, "json_checkpoint"):
+            metadata_depth_cap_contexts: set[str] = set()
+            for context, text_value in self._iter_string_metadata(
+                data,
+                "json_checkpoint",
+                depth_cap_contexts=metadata_depth_cap_contexts,
+            ):
                 self._add_suspicious_pattern_checks(
                     text_value,
                     context=context,
@@ -850,6 +971,12 @@ class JaxCheckpointScanner(BaseScanner):
                     result=result,
                     finding_budget=pattern_finding_budget,
                 )
+            self._add_metadata_traversal_depth_limit_checks(
+                contexts=metadata_depth_cap_contexts,
+                check_name="JSON Metadata Traversal Depth Limit",
+                location=path,
+                result=result,
+            )
 
         except json.JSONDecodeError as e:
             result.add_check(
