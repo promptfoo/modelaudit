@@ -83,7 +83,10 @@ def test_tensorrt_scanner_detects_utf16be_python_marker(tmp_path: Path) -> None:
 
 def test_tensorrt_scanner_avoids_substring_near_match_false_positives(tmp_path: Path) -> None:
     path = tmp_path / "safe.engine"
-    path.write_bytes(b"execution_metrics evaluation_score important_tensor session.socket")
+    path.write_bytes(
+        b"execution_metrics evaluation_score important_tensor session.socket "
+        b"attempt/tmpology LD_LIBRARY_PATH:/tmpology C:\\tmpology\\payload"
+    )
 
     result = TensorRTScanner().scan(str(path))
 
@@ -100,6 +103,16 @@ def test_tensorrt_scanner_detects_exec_and_eval_tokens_with_arguments(tmp_path: 
     assert result.success is False
     matched_patterns = {issue.details.get("pattern") for issue in result.issues}
     assert {"exec", "eval"}.issubset(matched_patterns)
+
+
+def test_tensorrt_scanner_detects_tmp_tokens_after_colon_and_windows_drive_prefix(tmp_path: Path) -> None:
+    path = tmp_path / "tmp_paths.plan"
+    path.write_bytes(b"LD_LIBRARY_PATH:/tmp/evil\nC:\\tmp\\payload\n")
+
+    result = TensorRTScanner().scan(str(path))
+
+    assert result.success is False
+    assert any(issue.details.get("pattern") == "/tmp/" for issue in result.issues)
 
 
 def test_tensorrt_scanner_detects_standalone_three_byte_markers(tmp_path: Path) -> None:

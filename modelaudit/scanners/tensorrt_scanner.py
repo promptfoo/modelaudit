@@ -11,7 +11,7 @@ from .base import BaseScanner, IssueSeverity, ScanResult
 
 SUSPICIOUS_PATTERN_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("../", re.compile(r"(?<![A-Za-z0-9_.-])(?:\.\./|\.\.\\)", re.IGNORECASE)),
-    ("/tmp/", re.compile(r"(?:^|[\s'\"=])(?:/tmp/|\\tmp\\)", re.IGNORECASE)),
+    ("/tmp/", re.compile(r"(?:^|[\s'\"=:])(?:/tmp/|(?:[A-Za-z]:)?\\tmp\\)", re.IGNORECASE)),
     (
         ".so",
         re.compile(
