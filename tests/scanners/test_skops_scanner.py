@@ -55,6 +55,7 @@ class TestSkopsScannerCVE2025_54412:
         scanner = SkopsScanner()
         result = scanner.scan(str(skops_file))
 
+        assert result.success is False
         cve_checks = [c for c in result.checks if "CVE-2025-54412" in c.name]
         assert len(cve_checks) > 0
         assert cve_checks[0].status == CheckStatus.FAILED
@@ -111,6 +112,7 @@ class TestSkopsScannerCVE2025_54413:
         scanner = SkopsScanner()
         result = scanner.scan(str(skops_file))
 
+        assert result.success is False
         cve_checks = [c for c in result.checks if "CVE-2025-54413" in c.name]
         assert len(cve_checks) > 0
         assert cve_checks[0].status == CheckStatus.FAILED
@@ -126,6 +128,7 @@ class TestSkopsScannerCVE2025_54413:
         scanner = SkopsScanner()
         result = scanner.scan(str(skops_file))
 
+        assert result.success is False
         cve_checks = [c for c in result.checks if "CVE-2025-54413" in c.name]
         assert len(cve_checks) > 0
         assert cve_checks[0].status == CheckStatus.FAILED
@@ -150,6 +153,7 @@ class TestSkopsScannerCVE2025_54886:
         scanner = SkopsScanner()
         result = scanner.scan(str(skops_file))
 
+        assert result.success is False
         cve_checks = [c for c in result.checks if "CVE-2025-54886" in c.name]
         assert len(cve_checks) > 0
         assert cve_checks[0].status == CheckStatus.FAILED
@@ -169,10 +173,25 @@ class TestSkopsScannerCVE2025_54886:
         scanner = SkopsScanner()
         result = scanner.scan(str(skops_file))
 
+        assert result.success is False
         cve_checks = [c for c in result.checks if "CVE-2025-54886" in c.name]
         assert len(cve_checks) > 0
         assert cve_checks[0].status == CheckStatus.FAILED
         assert cve_checks[0].severity == IssueSeverity.CRITICAL
+
+    def test_download_text_in_readme_is_not_cve_54886(self, tmp_path: Path) -> None:
+        """Benign README prose containing 'download' must not trigger CVE-2025-54886."""
+        skops_file = tmp_path / "benign_readme.skops"
+        with zipfile.ZipFile(skops_file, "w") as zf:
+            zf.writestr("README.md", "# Model Card\nDownload this safe model from the release page.\n")
+            zf.writestr("schema.json", '{"version": "1.0"}')
+
+        scanner = SkopsScanner()
+        result = scanner.scan(str(skops_file))
+
+        assert result.success is True
+        cve_checks = [c for c in result.checks if "CVE-2025-54886" in c.name and c.status == CheckStatus.FAILED]
+        assert len(cve_checks) == 0
 
 
 class TestSkopsScannerJoblibFallback:
@@ -402,6 +421,7 @@ class TestSkopsScannerMultipleCVEs:
         scanner = SkopsScanner()
         result = scanner.scan(str(skops_file))
 
+        assert result.success is False
         # Should detect all three CVEs
         cve_54412 = [c for c in result.checks if "CVE-2025-54412" in c.name]
         cve_54413 = [c for c in result.checks if "CVE-2025-54413" in c.name]

@@ -7,6 +7,7 @@ contain critical vulnerabilities (CVE-2025-54412, CVE-2025-54413, CVE-2025-54886
 from __future__ import annotations
 
 import os
+import re
 import zipfile
 from typing import Any, ClassVar
 
@@ -208,8 +209,9 @@ class SkopsScanner(BaseScanner):
                         continue
 
                     content = raw_content.decode("utf-8", errors="ignore")
-                    # Check for get_model or joblib references
-                    if "get_model" in content or "joblib" in content or "load" in content:
+                    # Require explicit joblib/pickle fallback evidence; avoid generic
+                    # substrings such as "download" in benign card/readme prose.
+                    if self._contains_card_joblib_fallback_signal(content):
                         suspicious_files.append(file_info.filename)
                 except Exception:
                     pass
@@ -284,6 +286,15 @@ class SkopsScanner(BaseScanner):
             "schema",
         }
     )
+    _CARD_GET_MODEL_PATTERN: ClassVar[re.Pattern[str]] = re.compile(r"\bget_model\b", re.IGNORECASE)
+    _CARD_JOBLIB_FALLBACK_PATTERN: ClassVar[re.Pattern[str]] = re.compile(
+        r"\bjoblib(?:\.load)?\b|\bpickle\.load\b",
+        re.IGNORECASE,
+    )
+    _CARD_DIRECT_FALLBACK_PATTERN: ClassVar[re.Pattern[str]] = re.compile(
+        r"\b(?:joblib|pickle)\.load\b",
+        re.IGNORECASE,
+    )
 
     @classmethod
     def _is_skops_metadata(cls, filename: str) -> bool:
@@ -294,6 +305,14 @@ class SkopsScanner(BaseScanner):
         """
         basename = os.path.basename(filename).lower()
         return basename in cls._SKOPS_METADATA_FILES
+
+    @classmethod
+    def _contains_card_joblib_fallback_signal(cls, content: str) -> bool:
+        """Return True when model-card text references an explicit joblib/pickle fallback."""
+        if cls._CARD_DIRECT_FALLBACK_PATTERN.search(content):
+            return True
+
+        return bool(cls._CARD_GET_MODEL_PATTERN.search(content) and cls._CARD_JOBLIB_FALLBACK_PATTERN.search(content))
 
     def _check_unsafe_joblib_fallback(self, zip_file: zipfile.ZipFile, result: ScanResult, zip_path: str) -> None:
         """Check for unsafe joblib fallback patterns in skops files."""
@@ -481,5 +500,5 @@ class SkopsScanner(BaseScanner):
             result.finish(success=False)
             return result
 
-        result.finish(success=True)
+        result.finish(success=not result.has_errors)
         return result

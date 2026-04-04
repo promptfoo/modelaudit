@@ -266,6 +266,8 @@ def _select_preferred_scanner_id(path: str, header_format: str, ext: str) -> str
             return "skops"
         if ext == ".skops":
             return "skops"
+        if ext == ".joblib":
+            return "joblib"
 
         if ext == ".bin":
             # ZIP-backed torch.save() .bin files are routed through the pickle scanner,
@@ -275,6 +277,9 @@ def _select_preferred_scanner_id(path: str, header_format: str, ext: str) -> str
 
     if header_format == "hdf5":
         return "keras_h5"
+
+    if ext == ".joblib" and header_format in {"compressed", "pickle"}:
+        return "joblib"
 
     if header_format == "tar" and ext == ".nemo":
         return "nemo"

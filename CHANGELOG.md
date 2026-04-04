@@ -107,12 +107,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **security:** detect protocol 0/1 pickle streams hidden behind long separator gaps after an initial safe pickle stream
+- **security:** preserve failed status for malicious Skops CVE detections and avoid CVE-2025-54886 false positives on benign README/model-card text such as "download"
+- **security:** enforce Flax msgpack scanner file-size limits before full reads, scan trailing msgpack stream objects with a bounded object-count cap, downgrade benign container-like trailing-object findings to INFO, and preserve failed status when CRITICAL findings are reported
+- **security:** route `.joblib` files through the Joblib scanner, scan raw protocol-0/1 payloads directly, support gzip/bzip2/lzma/zlib wrappers with bounded output and trailing-data checks, preserve embedded Pickle finding locations, and fail closed on undecodable/trailing-wrapper errors
 - **security:** detect direct `getattr(module, "dangerous")` handler calls in TorchServe MAR archives, parse conflicting duplicate manifests without silently downgrading hidden handlers, and suppress collision warnings for byte-identical duplicate manifests
 - **security:** reduce NeMo Hydra `_target_` false positives by matching suspicious identifiers on token boundaries, preserve CVE-2025-23304 details on suspicious-target findings, and reject oversized YAML members before parsing
 - **security:** detect protocol 0/1 pickle streams with trivial opcode prefixes even when `STOP` is followed by trailing junk, while preserving plain-text near-match rejection
 - **security:** detect protocol 0/1 pickle streams whose dangerous opcode appears after large trivial padding or after a non-trivial probe-boundary prelude, reject all-trivial no-`STOP` probe prefixes, and preserve rule codes across cached scan-result round trips
 - **license:** bound binary header scans and reuse compiled patterns to avoid full-file regex passes on large model archives
 - **security:** stop iterating malformed TFLite models after excessive subgraph counts are detected
+- **security:** scan every duplicate PyTorch ZIP member by physical archive entry and report conflicting duplicate names at INFO severity so benign trailing `data.pkl` entries cannot shadow malicious earlier payloads without making benign-but-conflicting duplicates warning-fail by themselves
 - **security:** route misnamed Skops ZIPs by bounded schema sniffing, treat encrypted Skops-like schema members as non-matches instead of crashing routing, recurse into embedded members while preserving Skops-specific CVE checks, avoid tiny nested `.bin` false positives on clean archive members, preserve nested-member byte accounting, and preserve CLI `scanner_names` in aggregated JSON output
 - **pickle:** bound post-budget global fallback state, retained findings, and deadline checks to prevent crafted pickle tails from exhausting scanner memory or flooding logs
 - **pickle:** mark timeout-, budget-, recursion-, and resource-limited pickle scans as inconclusive so clean-looking partial analysis returns exit code 2 unless real security findings were reported
