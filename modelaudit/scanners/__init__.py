@@ -6,6 +6,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, Optional
 
+from ..scanner_registry_metadata import get_scanner_registry_metadata
 from .base import BaseScanner, Check, CheckStatus, Issue, IssueSeverity, ScanResult
 
 logger = logging.getLogger(__name__)
@@ -93,6 +94,10 @@ class ScannerRegistry:
 
     def _init_registry(self) -> None:
         """Initialize the scanner registry with metadata"""
+        self._scanners = get_scanner_registry_metadata()
+        if self._scanners:
+            return
+
         # Order matters - more specific scanners should come before generic ones
         self._scanners = {
             "pickle": {

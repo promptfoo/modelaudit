@@ -2,6 +2,7 @@
 Tests for lazy loading functionality in the scanner registry.
 """
 
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -221,6 +222,22 @@ class TestBackwardsCompatibility:
 
         assert PickleScanner is not None
         assert issubclass(PickleScanner, BaseScanner)
+
+
+def test_telemetry_import_does_not_load_scanners_package() -> None:
+    """Importing telemetry should not pull in the scanner package through __version__."""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys, modelaudit.telemetry; print('modelaudit.scanners' in sys.modules)",
+        ],
+        capture_output=True,
+        check=True,
+        text=True,
+    )
+
+    assert result.stdout.strip() == "False"
 
     def test_scanner_registry_usage(self):
         """Test that SCANNER_REGISTRY still works as expected."""
