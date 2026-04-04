@@ -302,7 +302,6 @@ def _find_next_resync_stream_candidate_offset(search_window: bytes) -> int:
     """Return the next likely pickle stream start in a probe window, or -1 if absent."""
     for candidate in range(len(search_window)):
         first_byte = search_window[candidate]
-        candidate_probe = search_window[candidate:]
 
         if first_byte == 0x80:
             if (
@@ -342,14 +341,14 @@ def _find_next_resync_stream_candidate_offset(search_window: bytes) -> int:
             if (
                 _is_plausible_python_module(module_name)
                 and all(part.isidentifier() for part in function_name.split("."))
-                and _looks_like_pickle(candidate_probe)
+                and _looks_like_pickle(search_window[candidate:])
             ):
                 return candidate
             continue
 
         # MARK-prefixed protocol-0 streams such as `(cos\nsystem\n...` are
         # validated with a bounded parser probe before rewinding the file cursor.
-        if _looks_like_pickle(candidate_probe):
+        if _looks_like_pickle(search_window[candidate:]):
             return candidate
 
     return -1

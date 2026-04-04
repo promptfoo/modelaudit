@@ -10,7 +10,7 @@ from collections import Counter
 from collections.abc import Callable, Iterator
 from io import BytesIO
 from pathlib import Path
-from typing import Any, BinaryIO, ClassVar
+from typing import Any, BinaryIO, ClassVar, cast
 
 import pytest
 
@@ -31,6 +31,7 @@ from modelaudit.scanners.pickle_scanner import (
     _RESYNC_FAST_FORWARD_PROBE_BYTES,
     PickleScanner,
     _find_nested_pickle_match,
+    _find_next_resync_stream_candidate_offset,
     _genops_with_fallback,
     _GenopsBudgetExceeded,
     _is_actually_dangerous_global,
@@ -107,6 +108,23 @@ def _make_dup_heavy_pickle(iterations: int) -> bytes:
         payload += b"h\x002a0"
     payload += b"."
     return bytes(payload)
+
+
+class _SliceCountingSearchWindow:
+    def __init__(self, payload: bytes) -> None:
+        self._payload = payload
+        self.full_suffix_slice_count = 0
+
+    def __len__(self) -> int:
+        return len(self._payload)
+
+    def __getitem__(self, item: int | slice) -> int | bytes:
+        if isinstance(item, slice) and item.stop is None and item.step is None:
+            self.full_suffix_slice_count += 1
+        return self._payload[item]
+
+    def find(self, sub: bytes, start: int = 0, end: int | None = None) -> int:
+        return self._payload.find(sub, start, len(self._payload) if end is None else end)
 
 
 @pytest.mark.parametrize("suffix", [".pkl", ".pickle", ".dill", ".joblib"])
@@ -6617,6 +6635,14 @@ def test_long_padding_before_protocol0_follow_on_stream_still_flags_reduce(tmp_p
         for check in result.checks
     ), f"Expected protocol-0 os.system detection after a long separator gap. Checks: {result.checks}"
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def test_resync_candidate_search_does_not_copy_every_suffix_for_non_candidate_padding() -> None:
+    """Non-candidate padding should be filtered before candidate-suffix validation."""
+    search_window = _SliceCountingSearchWindow(b"\x00" * (2 * _RESYNC_FAST_FORWARD_PROBE_BYTES))
+
+    assert _find_next_resync_stream_candidate_offset(cast(bytes, search_window)) == -1
+    assert search_window.full_suffix_slice_count == 0
 
 
 def test_import_shaped_padding_before_protocol0_follow_on_stream_still_flags_reduce(tmp_path: Path) -> None:
