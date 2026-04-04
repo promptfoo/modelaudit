@@ -386,6 +386,16 @@ class TorchServeMarScanner(BaseScanner):
                     details=manifest_details,
                 )
                 continue
+            except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
+                result.add_check(
+                    name="TorchServe Manifest Read",
+                    passed=False,
+                    message=f"Unable to read TorchServe manifest entry: {exc}",
+                    severity=IssueSeverity.WARNING,
+                    location=f"{archive_path}:{MANIFEST_ENTRY_PATH}",
+                    details={**manifest_details, "exception_type": type(exc).__name__},
+                )
+                continue
 
             manifest_payload_count += 1
             manifest_digest = hashlib.sha256(manifest_bytes).digest()
@@ -803,6 +813,16 @@ class TorchServeMarScanner(BaseScanner):
                             severity=IssueSeverity.WARNING,
                             location=f"{archive_path}:{normalized_handler}",
                             details=handler_details,
+                        )
+                        continue
+                    except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
+                        result.add_check(
+                            name="TorchServe Handler Static Analysis",
+                            passed=False,
+                            message=f"Unable to read handler source for static analysis: {exc}",
+                            severity=IssueSeverity.WARNING,
+                            location=f"{archive_path}:{normalized_handler}",
+                            details={**handler_details, "analysis_kind": "read", "exception_type": type(exc).__name__},
                         )
                         continue
 

@@ -133,6 +133,55 @@ def test_scan_flags_duplicate_handler_member_even_when_benign_copy_is_last(tmp_p
     assert handler_failures[0].details["handler"] == "handler.py"
 
 
+def test_scan_analyzes_readable_duplicate_handler_when_later_duplicate_is_unreadable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries=[
+            ("handler.py", b"import os\n\ndef handle(data, context):\n    return os.system('echo owned')\n"),
+            ("handler.py", b"def handle(data, context):\n    return {'ok': True}\n"),
+            ("weights.bin", b"weights"),
+        ],
+        filename="unreadable_duplicate_handler.mar",
+    )
+
+    scanner = TorchServeMarScanner()
+    real_read_member_bounded = scanner._read_member_bounded
+    handler_read_count = 0
+
+    def flaky_read_member_bounded(
+        archive: zipfile.ZipFile,
+        member_info: zipfile.ZipInfo,
+        max_bytes: int,
+    ) -> bytes:
+        nonlocal handler_read_count
+        if member_info.filename == "handler.py":
+            handler_read_count += 1
+            if handler_read_count == 2:
+                raise OSError("handler CRC mismatch")
+        return real_read_member_bounded(archive, member_info, max_bytes)
+
+    monkeypatch.setattr(scanner, "_read_member_bounded", flaky_read_member_bounded)
+
+    result = scanner.scan(str(mar_path))
+
+    handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
+    assert result.success is False
+    assert any(
+        failure.severity == IssueSeverity.CRITICAL and "os.system" in failure.message for failure in handler_failures
+    )
+    assert any(
+        failure.severity == IssueSeverity.WARNING
+        and "Unable to read handler source for static analysis: handler CRC mismatch" in failure.message
+        and failure.details.get("analysis_kind") == "read"
+        for failure in handler_failures
+    )
+
+
 def test_scan_detects_getattr_wrapped_handler_execution_primitive(tmp_path: Path) -> None:
     manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
     mar_path = _create_mar_archive(
@@ -794,6 +843,54 @@ def test_scan_detects_conflicting_duplicate_manifest_handler_entries(tmp_path: P
         for failure in handler_failures
     )
     assert not any(failure.location == f"{mar_path}:evil_handler.py" for failure in non_handler_failures)
+
+
+def test_manifest_parsing_keeps_readable_manifest_when_later_duplicate_is_unreadable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest_bytes = json.dumps({"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}).encode()
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=None,
+        entries=[
+            ("MAR-INF/MANIFEST.json", manifest_bytes),
+            ("MAR-INF/MANIFEST.json", manifest_bytes),
+            ("handler.py", b"import os\n\ndef handle(data, context):\n    return os.system('id')\n"),
+            ("weights.bin", b"weights"),
+        ],
+        filename="unreadable_duplicate_manifest.mar",
+    )
+
+    scanner = TorchServeMarScanner()
+    real_read_member_bounded = scanner._read_member_bounded
+    manifest_read_count = 0
+
+    def flaky_read_member_bounded(
+        archive: zipfile.ZipFile,
+        member_info: zipfile.ZipInfo,
+        max_bytes: int,
+    ) -> bytes:
+        nonlocal manifest_read_count
+        if member_info.filename == "MAR-INF/MANIFEST.json":
+            manifest_read_count += 1
+            if manifest_read_count == 2:
+                raise OSError("manifest CRC mismatch")
+        return real_read_member_bounded(archive, member_info, max_bytes)
+
+    monkeypatch.setattr(scanner, "_read_member_bounded", flaky_read_member_bounded)
+
+    result = scanner.scan(str(mar_path))
+
+    assert result.success is False
+    manifest_read_failures = _failed_checks(result, "TorchServe Manifest Read")
+    assert len(manifest_read_failures) == 1
+    assert manifest_read_failures[0].severity == IssueSeverity.WARNING
+    assert "manifest CRC mismatch" in manifest_read_failures[0].message
+    handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
+    assert any(
+        failure.severity == IssueSeverity.CRITICAL and "os.system" in failure.message for failure in handler_failures
+    )
 
 
 def test_scan_accepts_duplicate_identical_manifest_entries(tmp_path: Path) -> None:
