@@ -24,7 +24,7 @@ SUSPICIOUS_PATTERN_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "exec",
         re.compile(
-            r"(?<![A-Za-z0-9_])(?:execve|execlpe|execlp|execle|execl|execv|exec)(?![A-Za-z0-9_])",
+            r"(?<![A-Za-z0-9_])(?:execvpe|execvp|execve|execlpe|execlp|execle|execl|execv|exec)(?![A-Za-z0-9_])",
             re.IGNORECASE,
         ),
     ),

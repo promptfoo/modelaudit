@@ -96,7 +96,7 @@ def test_tensorrt_scanner_avoids_substring_near_match_false_positives(tmp_path: 
 
 def test_tensorrt_scanner_detects_exec_and_eval_tokens_with_arguments(tmp_path: Path) -> None:
     path = tmp_path / "malicious.engine"
-    path.write_bytes(b"execve /bin/sh\nEVAL payload\n")
+    path.write_bytes(b"execve /bin/sh\nexecvp /bin/sh\nexecvpe /bin/sh\nEVAL payload\n")
 
     result = TensorRTScanner().scan(str(path))
 
