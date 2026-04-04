@@ -14,6 +14,7 @@ try:
 except ImportError:
     HAS_YAML = False
 
+from modelaudit.core import scan_file
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.nemo_scanner import NemoScanner
 
@@ -125,6 +126,27 @@ class TestCVE202523304HydraTarget:
         assert cve_checks[0].severity == IssueSeverity.CRITICAL
         assert cve_checks[0].details.get("cve_id") == "CVE-2025-23304"
         assert cve_checks[0].details.get("target") == "os.system"
+
+    def test_core_scan_file_routes_nemo_archive_to_nemo_scanner(self, tmp_path: Path) -> None:
+        """Real .nemo scans should use NemoScanner, not the generic TAR scanner."""
+        config = {
+            "model": {
+                "_target_": "os.system",
+                "command": "echo pwned",
+            }
+        }
+        path = _create_nemo_file(tmp_path, config)
+
+        result = scan_file(str(path), config={"cache_scan_results": False})
+
+        assert result.scanner_name == "nemo"
+        assert any(
+            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+            and check.details["target"] == "os.system"
+            for check in result.checks
+        )
 
     def test_dangerous_subprocess_detected(self, tmp_path):
         """subprocess.Popen _target_ should trigger CVE-2025-23304."""
