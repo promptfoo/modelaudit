@@ -1,6 +1,5 @@
 """Scanner for PyTorch zip-archived model files (.pt, .pth)."""
 
-import contextlib
 import io
 import logging
 import os
@@ -14,6 +13,16 @@ from typing import Any, ClassVar
 from ..utils import sanitize_archive_path
 from .base import BaseScanner, IssueSeverity, ScanResult
 from .pickle_scanner import PickleScanner
+from .pytorch_zip_support import (
+    RelaxedZipCrcTracker,
+    find_zip_entry,
+    get_zip_member_name,
+    get_zip_member_names,
+    read_member_bytes,
+    read_member_prefix,
+    read_member_to_spooled_file,
+    read_zip_header,
+)
 
 logger = logging.getLogger(__name__)
 _INSTALLED_PYTORCH_VERSION_UNSET = object()
@@ -67,20 +76,10 @@ class PyTorchZipScanner(BaseScanner):
         # Initialize a pickle scanner for embedded pickles
         self.pickle_scanner: PickleScanner = PickleScanner(config)
         self.current_file_path = ""  # Will be set when scanning files
-        self._relaxed_crc_reads: dict[str, set[str]] = {}
-        self._relaxed_crc_check_indices: dict[str, tuple[int, int]] = {}
+        self._relaxed_crc_tracker = RelaxedZipCrcTracker()
         # Configurable limits (can override class defaults via config)
         self.max_compression_ratio = self.config.get("max_compression_ratio", self.MAX_COMPRESSION_RATIO)
         self.max_archive_entries = self.config.get("max_archive_entries", self.MAX_ARCHIVE_ENTRIES)
-
-    @staticmethod
-    def _read_header(path: str, length: int = 4) -> bytes:
-        """Return the first few bytes of a file."""
-        try:
-            with open(path, "rb") as f:
-                return f.read(length)
-        except Exception:
-            return b""
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -118,8 +117,7 @@ class PyTorchZipScanner(BaseScanner):
 
         # Start timeout tracking
         self._start_scan_timer()
-        self._relaxed_crc_reads = {}
-        self._relaxed_crc_check_indices = {}
+        self._relaxed_crc_tracker.reset()
 
         try:
             # Initial validation and setup
@@ -185,96 +183,17 @@ class PyTorchZipScanner(BaseScanner):
     @staticmethod
     def _get_zip_member_name(name: str | zipfile.ZipInfo) -> str:
         """Return the archive member name for a string or ZipInfo."""
-        return name.filename if isinstance(name, zipfile.ZipInfo) else name
+        return get_zip_member_name(name)
 
     @classmethod
     def _get_zip_member_names(cls, entries: list[zipfile.ZipInfo]) -> list[str]:
         """Return archive member names while preserving duplicate entries."""
-        return [cls._get_zip_member_name(entry) for entry in entries]
+        return get_zip_member_names(entries)
 
     @staticmethod
     def _find_zip_entry(entries: list[zipfile.ZipInfo], member_name: str) -> zipfile.ZipInfo | None:
         """Return the first matching ZipInfo entry for a member name, or None."""
-        for entry in entries:
-            if entry.filename == member_name:
-                return entry
-        return None
-
-    @staticmethod
-    def _is_crc_mismatch_error(error: Exception) -> bool:
-        """Return True when the error indicates a ZIP member CRC mismatch."""
-        return isinstance(error, zipfile.BadZipFile) and "Bad CRC-32" in str(error)
-
-    @staticmethod
-    def _open_zip_member(
-        zip_file: zipfile.ZipFile,
-        name: str | zipfile.ZipInfo,
-        *,
-        relaxed_crc: bool = False,
-    ) -> Any:
-        """Open a ZIP member, optionally disabling CRC enforcement on the stream."""
-        handle: Any = zip_file.open(name, "r")
-        if relaxed_crc and hasattr(handle, "_expected_crc"):
-            # PyTorch-generated archives can have incorrect member CRCs. Disable
-            # per-member CRC enforcement only after a strict read failed so the
-            # scanner can still inspect the payload.
-            handle._expected_crc = None
-        return handle
-
-    def _record_relaxed_crc_usage(
-        self,
-        member_name: str,
-        phase: str,
-        result: ScanResult,
-        error: Exception | None = None,
-    ) -> None:
-        """Record that a member needed relaxed CRC handling during scanning."""
-        is_new_member = member_name not in self._relaxed_crc_reads
-        phases = self._relaxed_crc_reads.setdefault(member_name, set())
-        phases.add(phase)
-        phase_list = sorted(phases)
-        result.metadata["relaxed_crc_members"] = {
-            name: sorted(recorded_phases) for name, recorded_phases in self._relaxed_crc_reads.items()
-        }
-        result.metadata["relaxed_crc_used"] = True
-
-        existing_indices = self._relaxed_crc_check_indices.get(member_name)
-        if existing_indices is not None:
-            check_index, issue_index = existing_indices
-            for details_dict in (
-                result.checks[check_index].details,
-                result.issues[issue_index].details,
-            ):
-                details_dict["scan_phases"] = phase_list
-
-        if not is_new_member:
-            return
-
-        archive_path = self.current_file_path or member_name
-        result.add_check(
-            name="PyTorch ZIP CRC Handling",
-            passed=False,
-            message=(
-                f"CRC validation failed for archive member {member_name}; "
-                "continuing scan with relaxed CRC handling for content analysis"
-            ),
-            severity=IssueSeverity.WARNING,
-            location=f"{archive_path}:{member_name}",
-            details={
-                "zip_entry": member_name,
-                "scan_phases": phase_list,
-                "relaxed_crc": True,
-                "exception": str(error) if error else None,
-                "exception_type": type(error).__name__ if error else None,
-            },
-            why=(
-                "Some PyTorch ZIP archives contain member-level CRC mismatches. "
-                "The scanner retries those member reads with CRC enforcement "
-                "relaxed so payload analysis can continue, but surfaces the "
-                "integrity anomaly for review."
-            ),
-        )
-        self._relaxed_crc_check_indices[member_name] = (len(result.checks) - 1, len(result.issues) - 1)
+        return find_zip_entry(entries, member_name)
 
     def _read_member_prefix(
         self,
@@ -286,20 +205,15 @@ class PyTorchZipScanner(BaseScanner):
         result: ScanResult,
     ) -> bytes:
         """Read up to ``limit`` bytes from a ZIP member with guarded CRC fallback."""
-        member_name = self._get_zip_member_name(name)
-        relaxed_crc = member_name in self._relaxed_crc_reads
-        if relaxed_crc:
-            self._record_relaxed_crc_usage(member_name, phase, result)
-
-        try:
-            with self._open_zip_member(zip_file, name, relaxed_crc=relaxed_crc) as handle:
-                return handle.read(limit)
-        except zipfile.BadZipFile as exc:
-            if relaxed_crc or not self._is_crc_mismatch_error(exc):
-                raise
-            self._record_relaxed_crc_usage(member_name, phase, result, exc)
-        with self._open_zip_member(zip_file, name, relaxed_crc=True) as handle:
-            return handle.read(limit)
+        return read_member_prefix(
+            zip_file,
+            name,
+            limit,
+            phase=phase,
+            result=result,
+            archive_path=self.current_file_path or self._get_zip_member_name(name),
+            crc_tracker=self._relaxed_crc_tracker,
+        )
 
     def _read_member_bytes(
         self,
@@ -311,35 +225,15 @@ class PyTorchZipScanner(BaseScanner):
         max_bytes: int | None = None,
     ) -> bytes:
         """Read an entire ZIP member with optional bounded size and guarded CRC fallback."""
-        member_name = self._get_zip_member_name(name)
-        member_info = name if isinstance(name, zipfile.ZipInfo) else zip_file.getinfo(name)
-        if max_bytes is not None and member_info.file_size > max_bytes:
-            raise ValueError(
-                f"Archive member {member_name} exceeds bounded read limit ({member_info.file_size} > {max_bytes})",
-            )
-
-        def read_all(*, relaxed_crc: bool) -> bytes:
-            with self._open_zip_member(zip_file, member_info, relaxed_crc=relaxed_crc) as handle:
-                data = bytearray()
-                while True:
-                    chunk = handle.read(64 * 1024)
-                    if not chunk:
-                        break
-                    data.extend(chunk)
-                    if max_bytes is not None and len(data) > max_bytes:
-                        raise ValueError(f"Archive member {member_name} exceeded bounded read limit ({max_bytes})")
-                return bytes(data)
-
-        relaxed_crc = member_name in self._relaxed_crc_reads
-        if relaxed_crc:
-            self._record_relaxed_crc_usage(member_name, phase, result)
-        try:
-            return read_all(relaxed_crc=relaxed_crc)
-        except zipfile.BadZipFile as exc:
-            if relaxed_crc or not self._is_crc_mismatch_error(exc):
-                raise
-            self._record_relaxed_crc_usage(member_name, phase, result, exc)
-        return read_all(relaxed_crc=True)
+        return read_member_bytes(
+            zip_file,
+            name,
+            phase=phase,
+            result=result,
+            archive_path=self.current_file_path or self._get_zip_member_name(name),
+            crc_tracker=self._relaxed_crc_tracker,
+            max_bytes=max_bytes,
+        )
 
     def _read_member_to_spooled_file(
         self,
@@ -352,42 +246,16 @@ class PyTorchZipScanner(BaseScanner):
         max_bytes: int | None = None,
     ) -> tuple[Any, int]:
         """Copy a ZIP member into a spooled temp file with guarded CRC fallback."""
-        member_name = self._get_zip_member_name(name)
-        member_info = name if isinstance(name, zipfile.ZipInfo) else zip_file.getinfo(name)
-        if max_bytes is not None and member_info.file_size > max_bytes:
-            raise ValueError(
-                f"Archive member {member_name} exceeds bounded read limit ({member_info.file_size} > {max_bytes})",
-            )
-
-        def copy_to_spool(*, relaxed_crc: bool) -> tuple[Any, int]:
-            with contextlib.ExitStack() as stack:
-                spool = stack.enter_context(tempfile.SpooledTemporaryFile(max_size=max_size))
-                total_bytes = 0
-                with self._open_zip_member(zip_file, member_info, relaxed_crc=relaxed_crc) as handle:
-                    while True:
-                        chunk = handle.read(64 * 1024)
-                        if not chunk:
-                            break
-                        total_bytes += len(chunk)
-                        if max_bytes is not None and total_bytes > max_bytes:
-                            raise ValueError(
-                                f"Archive member {member_name} exceeded bounded read limit ({max_bytes})",
-                            )
-                        spool.write(chunk)
-                spool.seek(0)
-                stack.pop_all()
-                return spool, total_bytes
-
-        relaxed_crc = member_name in self._relaxed_crc_reads
-        if relaxed_crc:
-            self._record_relaxed_crc_usage(member_name, phase, result)
-        try:
-            return copy_to_spool(relaxed_crc=relaxed_crc)
-        except zipfile.BadZipFile as exc:
-            if relaxed_crc or not self._is_crc_mismatch_error(exc):
-                raise
-            self._record_relaxed_crc_usage(member_name, phase, result, exc)
-        return copy_to_spool(relaxed_crc=True)
+        return read_member_to_spooled_file(
+            zip_file,
+            name,
+            phase=phase,
+            result=result,
+            archive_path=self.current_file_path or self._get_zip_member_name(name),
+            crc_tracker=self._relaxed_crc_tracker,
+            max_size=max_size,
+            max_bytes=max_bytes,
+        )
 
     def _initialize_scan(self, path: str) -> ScanResult:
         """Initialize scan with basic validation and setup"""
@@ -404,7 +272,7 @@ class PyTorchZipScanner(BaseScanner):
         self.add_file_integrity_check(path, result)
 
         # Validate ZIP format
-        header = self._read_header(path)
+        header = read_zip_header(path)
         if not header.startswith(b"PK"):
             result.add_check(
                 name="ZIP Format Validation",

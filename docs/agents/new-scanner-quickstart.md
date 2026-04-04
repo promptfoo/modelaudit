@@ -19,6 +19,10 @@ Create `modelaudit/scanners/<format>_scanner.py` with:
 - `scan()` that uses `result.add_check(...)` with clear severity and rationale
 - Path/size validation via base helpers before heavy parsing
 
+For large scanners, move reusable parser/state helpers into
+`modelaudit/scanners/<format>_support/` and keep `<format>_scanner.py` as the
+public class entrypoint plus orchestration layer.
+
 Skeleton:
 
 ```python
