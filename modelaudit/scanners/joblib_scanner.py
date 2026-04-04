@@ -6,6 +6,7 @@ import bz2
 import io
 import lzma
 import os
+import pickletools
 import zlib
 from collections.abc import Callable
 from typing import Any, ClassVar
@@ -24,6 +25,7 @@ class JoblibScanner(BaseScanner):
     supported_extensions: ClassVar[list[str]] = [".joblib"]
 
     def __init__(self, config: dict[str, Any] | None = None):
+        """Initialize Joblib scanning limits and the embedded Pickle scanner."""
         super().__init__(config)
         self.pickle_scanner = PickleScanner(config)
         # Security limits
@@ -36,6 +38,7 @@ class JoblibScanner(BaseScanner):
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
+        """Return True for existing `.joblib` files."""
         if not os.path.isfile(path):
             return False
         ext = os.path.splitext(path)[1].lower()
@@ -46,18 +49,21 @@ class JoblibScanner(BaseScanner):
         return super()._read_file_safely(path)
 
     def _max_decompressed_output_bytes(self, compressed_size: int) -> int:
+        """Compute the effective decompression output cap for one compressed payload."""
         max_by_ratio = self.max_decompressed_size
         if compressed_size > 0:
             max_by_ratio = int(self.max_decompression_ratio * compressed_size)
         return min(self.max_decompressed_size, max_by_ratio)
 
     def _check_decompressed_size(self, decompressed_size: int) -> None:
+        """Fail when the decompressed payload exceeds the absolute size limit."""
         if decompressed_size > self.max_decompressed_size:
             raise ValueError(
                 f"Decompressed size too large: {decompressed_size} bytes (max: {self.max_decompressed_size})",
             )
 
     def _check_decompression_ratio(self, decompressed_size: int, compressed_size: int) -> None:
+        """Fail when decompression expands beyond the configured ratio limit."""
         if compressed_size <= 0:
             return
 
@@ -69,6 +75,7 @@ class JoblibScanner(BaseScanner):
             )
 
     def _decompress_with_limited_output(self, decompressor: Any, data: bytes) -> bytes:
+        """Decompress one stream while enforcing absolute-size and ratio budgets."""
         compressed_size = len(data)
         max_output_bytes = self._max_decompressed_output_bytes(compressed_size)
         output_limit = max_output_bytes + 1
@@ -124,6 +131,7 @@ class JoblibScanner(BaseScanner):
         )
 
     def _scan_pickle_payload(self, payload: bytes, result: ScanResult, context: str) -> None:
+        """Analyze a raw or decompressed pickle payload with CVE and opcode checks."""
         self._detect_cve_patterns(payload, result, context)
         self._scan_for_joblib_specific_threats(payload, result, context)
 
@@ -134,6 +142,26 @@ class JoblibScanner(BaseScanner):
             )
         result.merge(sub_result)
         result.bytes_scanned = len(payload)
+
+    def _looks_like_raw_pickle_payload(self, data: bytes) -> bool:
+        """Return True when `.joblib` bytes should be scanned directly as pickle."""
+        if _looks_like_pickle(data):
+            return True
+
+        if len(data) >= 2 and data[0] == 0x80 and data[1] <= 5:
+            return True
+
+        try:
+            probe = io.BytesIO(data[:4096])
+            for _opcode_count, (opcode, _arg, _pos) in enumerate(pickletools.genops(probe), 1):
+                if opcode.name == "STOP":
+                    return True
+                if _opcode_count >= 16:
+                    break
+        except Exception:
+            return False
+
+        return False
 
     def _detect_cve_patterns(self, data: bytes, result: ScanResult, context: str) -> None:
         """Detect CVE-specific patterns in joblib file data."""
@@ -233,6 +261,7 @@ class JoblibScanner(BaseScanner):
                     )
 
     def scan(self, path: str) -> ScanResult:
+        """Scan one Joblib file as direct pickle, compressed pickle, or zip-backed content."""
         path_check_result = self._check_path(path)
         if path_check_result:
             return path_check_result
@@ -262,7 +291,7 @@ class JoblibScanner(BaseScanner):
                 result.finish(success=sub_result.success)
                 return result
 
-            if _looks_like_pickle(data):
+            if self._looks_like_raw_pickle_payload(data):
                 self._scan_pickle_payload(data, result, path)
             else:
                 # Try safe decompression

@@ -8,7 +8,7 @@ import pickle
 import zlib
 from pathlib import Path
 
-from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
+from modelaudit.scanners.base import Check, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.joblib_scanner import JoblibScanner
 
 
@@ -35,6 +35,14 @@ def _scan_payload(tmp_path: Path, payload: bytes, filename: str) -> ScanResult:
     return JoblibScanner().scan(str(path))
 
 
+def _compression_failures(result: ScanResult) -> list[Check]:
+    return [
+        check
+        for check in result.checks
+        if check.name == "Compression Bomb Detection" and check.status == CheckStatus.FAILED
+    ]
+
+
 def test_scan_detects_raw_protocol0_pickle_joblib(tmp_path: Path) -> None:
     payload = pickle.dumps(_Payload(), protocol=0)
 
@@ -42,6 +50,26 @@ def test_scan_detects_raw_protocol0_pickle_joblib(tmp_path: Path) -> None:
 
     assert result.success is False
     assert _has_system_reduce_failure(result)
+
+
+def test_scan_accepts_raw_protocol4_primitive_pickle_joblib(tmp_path: Path) -> None:
+    payload = pickle.dumps(7, protocol=4)
+
+    result = _scan_payload(tmp_path, payload, "raw_protocol4_primitive.joblib")
+
+    assert result.success is True
+    assert _compression_failures(result) == []
+    assert not _has_system_reduce_failure(result)
+
+
+def test_scan_accepts_raw_protocol0_int_pickle_joblib(tmp_path: Path) -> None:
+    payload = pickle.dumps(7, protocol=0)
+
+    result = _scan_payload(tmp_path, payload, "raw_protocol0_int.joblib")
+
+    assert result.success is True
+    assert _compression_failures(result) == []
+    assert not _has_system_reduce_failure(result)
 
 
 def test_scan_detects_gzip_compressed_pickle_joblib(tmp_path: Path) -> None:
@@ -67,11 +95,7 @@ def test_scan_detects_zlib_trailer_after_compressed_joblib_stream(tmp_path: Path
 
     result = _scan_payload(tmp_path, payload, "zlib_trailer.joblib")
 
-    compression_failures = [
-        check
-        for check in result.checks
-        if check.name == "Compression Bomb Detection" and check.status == CheckStatus.FAILED
-    ]
+    compression_failures = _compression_failures(result)
     assert result.success is False
     assert len(compression_failures) == 1
     assert "Trailing data found after compressed joblib stream" in compression_failures[0].message
@@ -81,11 +105,7 @@ def test_scan_detects_zlib_trailer_after_compressed_joblib_stream(tmp_path: Path
 def test_scan_reports_plain_text_joblib_without_critical_pickle_noise(tmp_path: Path) -> None:
     result = _scan_payload(tmp_path, b"not a pickle", "plain_text.joblib")
 
-    compression_failures = [
-        check
-        for check in result.checks
-        if check.name == "Compression Bomb Detection" and check.status == CheckStatus.FAILED
-    ]
+    compression_failures = _compression_failures(result)
     assert result.success is False
     assert len(compression_failures) == 1
     assert compression_failures[0].severity == IssueSeverity.INFO
