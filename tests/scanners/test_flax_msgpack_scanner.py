@@ -135,6 +135,46 @@ def test_flax_msgpack_scans_trailing_msgpack_objects(tmp_path: Path) -> None:
     )
 
 
+def test_flax_msgpack_benign_trailing_dict_object_is_info_only(tmp_path: Path) -> None:
+    """Valid trailing dict objects should be scanned without warning-level stream noise."""
+    path = tmp_path / "benign_two_objects.msgpack"
+    payload = msgpack.packb({"params": {"a": [1, 2]}}, use_bin_type=True)
+    payload += msgpack.packb({"params": {"b": [3, 4]}}, use_bin_type=True)
+    path.write_bytes(payload)
+
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    assert result.success is True
+    assert result.metadata.get("msgpack_object_count") == 2
+    stream_checks = [
+        check
+        for check in result.checks
+        if check.name == "Msgpack Stream Integrity Check" and check.status == CheckStatus.FAILED
+    ]
+    assert len(stream_checks) == 1
+    assert stream_checks[0].severity == IssueSeverity.INFO
+    assert stream_checks[0].details["trailing_objects_are_container_like"] is True
+
+
+def test_flax_msgpack_scalar_trailing_junk_stays_warning(tmp_path: Path) -> None:
+    """Scalar trailing bytes are still surfaced as warning-level stream integrity findings."""
+    path = tmp_path / "scalar_trailing_junk.msgpack"
+    payload = msgpack.packb({"params": {"w": [1, 2, 3]}}, use_bin_type=True) + b"garbage"
+    path.write_bytes(payload)
+
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    assert result.success is True
+    stream_checks = [
+        check
+        for check in result.checks
+        if check.name == "Msgpack Stream Integrity Check" and check.status == CheckStatus.FAILED
+    ]
+    assert len(stream_checks) == 1
+    assert stream_checks[0].severity == IssueSeverity.WARNING
+    assert stream_checks[0].details["trailing_objects_are_container_like"] is False
+
+
 def test_flax_msgpack_large_containers(tmp_path):
     """Test detection of containers with excessive items."""
     path = tmp_path / "large.msgpack"

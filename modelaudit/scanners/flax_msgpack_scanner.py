@@ -899,16 +899,6 @@ class FlaxMsgpackScanner(BaseScanner):
                 extra_data_detected = True
 
             if extra_data_detected:
-                result.add_check(
-                    name="Msgpack Stream Integrity Check",
-                    passed=False,
-                    message="Extra trailing data found after msgpack content",
-                    severity=IssueSeverity.WARNING,
-                    location=path,
-                    details={"has_trailing_data": True},
-                    rule_code="S902",
-                )
-
                 unpacker = msgpack.Unpacker(None, raw=False, strict_map_key=False)
                 unpacker.feed(file_data)
                 try:
@@ -927,6 +917,23 @@ class FlaxMsgpackScanner(BaseScanner):
                     return None
 
                 if objects:
+                    trailing_objects_are_container_like = all(
+                        isinstance(stream_obj, (dict, list, tuple)) for stream_obj in objects[1:]
+                    )
+                    result.add_check(
+                        name="Msgpack Stream Integrity Check",
+                        passed=False,
+                        message="Extra trailing data found after msgpack content",
+                        severity=(IssueSeverity.INFO if trailing_objects_are_container_like else IssueSeverity.WARNING),
+                        location=path,
+                        details={
+                            "has_trailing_data": True,
+                            "trailing_object_count": len(objects) - 1,
+                            "trailing_object_types": [type(stream_obj).__name__ for stream_obj in objects[1:9]],
+                            "trailing_objects_are_container_like": trailing_objects_are_container_like,
+                        },
+                        rule_code="S902",
+                    )
                     return objects
 
                 result.add_check(
