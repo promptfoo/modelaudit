@@ -1,3 +1,4 @@
+import importlib.util
 import logging
 import os
 import pickle
@@ -24,10 +25,9 @@ from tests.xdist_status import (
 # Framework availability detection (cached for performance)
 # ============================================================================
 def _check_framework(name: str) -> bool:
-    """Check if a framework can be imported successfully."""
+    """Check whether a framework package is installed without importing it."""
     try:
-        __import__(name)
-        return True
+        return importlib.util.find_spec(name) is not None
     except Exception:
         return False
 
