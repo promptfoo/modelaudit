@@ -351,7 +351,7 @@ class ScannerRegistry:
                 "module": "modelaudit.scanners.tensorrt_scanner",
                 "class": "TensorRTScanner",
                 "description": "Scans TensorRT engine files",
-                "extensions": [".engine", ".plan"],
+                "extensions": [".engine", ".plan", ".trt"],
                 "priority": 17,
                 "dependencies": [],
                 "numpy_sensitive": False,
@@ -579,7 +579,6 @@ class ScannerRegistry:
 
             except Exception as e:
                 # Unexpected error - provide detailed information
-                scanner_deps = scanner_info.get("dependencies", [])
                 is_numpy_sensitive = scanner_info.get("numpy_sensitive", False)
 
                 if _is_numpy_compatibility_error(e):

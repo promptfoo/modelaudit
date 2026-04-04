@@ -1,6 +1,8 @@
 """Integration tests for enhanced JAX/Flax scanning functionality."""
 
 import json
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -18,7 +20,7 @@ from modelaudit.scanners.jax_checkpoint_scanner import JaxCheckpointScanner
 class TestJaxFlaxIntegration:
     """Integration tests for JAX/Flax model scanning."""
 
-    def create_clean_flax_model(self):
+    def create_clean_flax_model(self) -> dict[str, Any]:
         """Create a clean, legitimate Flax model."""
         return {
             "params": {
@@ -60,7 +62,7 @@ class TestJaxFlaxIntegration:
             },
         }
 
-    def create_malicious_jax_model(self):
+    def create_malicious_jax_model(self) -> dict[str, Any]:
         """Create a malicious JAX/Flax model with security threats."""
         return {
             "params": {
@@ -87,7 +89,7 @@ class TestJaxFlaxIntegration:
             },
         }
 
-    def test_clean_flax_model_no_false_positives(self, tmp_path):
+    def test_clean_flax_model_no_false_positives(self, tmp_path: Path) -> None:
         """Test that clean Flax models don't trigger false positives."""
         clean_model = self.create_clean_flax_model()
         model_path = tmp_path / "clean_model.msgpack"
@@ -111,7 +113,7 @@ class TestJaxFlaxIntegration:
         estimated_params = result.metadata.get("estimated_parameters")
         assert estimated_params is not None and estimated_params > 300000
 
-    def test_malicious_jax_model_detection(self, tmp_path):
+    def test_malicious_jax_model_detection(self, tmp_path: Path) -> None:
         """Test that malicious JAX models trigger security warnings."""
         malicious_model = self.create_malicious_jax_model()
         model_path = tmp_path / "malicious_model.jax"
@@ -122,22 +124,22 @@ class TestJaxFlaxIntegration:
         scanner = FlaxMsgpackScanner()
         result = scanner.scan(str(model_path))
 
-        assert result.success
+        assert result.success is False
 
         # Should trigger multiple critical issues
         critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
         assert len(critical_issues) >= 10, f"Expected many critical issues, got {len(critical_issues)}"
 
         # Check for specific threat patterns
-        issue_messages = [i.message.lower() for i in critical_issues]
+        issue_contexts = [f"{i.location} {i.message}".lower() for i in critical_issues]
 
         # These patterns are consistently detected; "negative dimensions" may not be implemented
-        expected_patterns = ["jax_array", "orbax", "eval", "exec", "subprocess"]
+        expected_patterns = ["jax_array", "restore_fn", "eval", "exec", "subprocess"]
 
         for pattern in expected_patterns:
-            assert any(pattern in msg for msg in issue_messages), f"Missing detection of {pattern}"
+            assert any(pattern in context for context in issue_contexts), f"Missing detection of {pattern}"
 
-    def test_file_extension_support(self, tmp_path):
+    def test_file_extension_support(self, tmp_path: Path) -> None:
         """Test support for various JAX/Flax file extensions."""
         simple_model = {"params": {"layer": b"\x00" * 100}, "step": 1000}
 
@@ -157,7 +159,7 @@ class TestJaxFlaxIntegration:
             assert result.success, f"Failed to scan {ext} file"
 
     @pytest.mark.slow
-    def test_large_model_support(self, tmp_path):
+    def test_large_model_support(self, tmp_path: Path) -> None:
         """Test support for large JAX/Flax models."""
         # Create a model with substantial data; keep size reasonable in fast runs
         large_embedding = np.random.normal(0, 0.1, (10000, 512)).astype(np.float32).tobytes()
@@ -184,7 +186,7 @@ class TestJaxFlaxIntegration:
         estimated_params = result.metadata.get("estimated_parameters")
         assert estimated_params is not None and estimated_params > 1000000
 
-    def test_clean_orbax_checkpoint(self, tmp_path):
+    def test_clean_orbax_checkpoint(self, tmp_path: Path) -> None:
         """Test scanning of clean Orbax checkpoint directories."""
         orbax_dir = tmp_path / "clean_orbax"
         orbax_dir.mkdir()
@@ -225,7 +227,7 @@ class TestJaxFlaxIntegration:
             f"Clean Orbax checkpoint triggered critical issues: {[i.message for i in critical_issues]}"
         )
 
-    def test_malicious_orbax_checkpoint(self, tmp_path):
+    def test_malicious_orbax_checkpoint(self, tmp_path: Path) -> None:
         """Test detection of malicious Orbax checkpoints."""
         orbax_dir = tmp_path / "malicious_orbax"
         orbax_dir.mkdir()
@@ -264,7 +266,7 @@ class TestJaxFlaxIntegration:
         assert any("pickle opcode" in msg for msg in issue_messages), "Should detect dangerous pickle opcodes"
 
     @pytest.mark.slow
-    def test_jax_specific_architecture_detection(self, tmp_path):
+    def test_jax_specific_architecture_detection(self, tmp_path: Path) -> None:
         """Test JAX-specific model architecture detection."""
         test_cases = [
             {
@@ -317,7 +319,7 @@ class TestJaxFlaxIntegration:
             actual_arch = result.metadata.get("model_architecture")
             assert actual_arch in expected_archs, f"Expected one of {expected_archs}, got {actual_arch}"
 
-    def test_integration_with_cli(self, tmp_path):
+    def test_integration_with_cli(self, tmp_path: Path) -> None:
         """Test that enhanced JAX/Flax scanning works through CLI."""
         clean_model = self.create_clean_flax_model()
         model_path = tmp_path / "integration_test.jax"

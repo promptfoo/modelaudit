@@ -11,9 +11,11 @@ import base64
 import json
 import os
 import tempfile
+import warnings
 import zipfile
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 
@@ -278,10 +280,27 @@ class TestKerasZipScanner:
             },
         ]
 
-    def test_scan_prefers_exact_config_json_over_normalized_alias(self, tmp_path: Path) -> None:
-        """A canonical config.json member should win over normalized aliases regardless of archive order."""
+    def test_scan_accepts_identical_config_json_aliases_without_warning_noise(self, tmp_path: Path) -> None:
+        """Byte-identical canonical and normalized config aliases should stay non-noisy."""
         scanner = KerasZipScanner()
-        keras_path = tmp_path / "duplicate_root.keras"
+        keras_path = tmp_path / "identical_config_alias.keras"
+        benign_config = {"class_name": "Sequential", "config": {"layers": []}}
+
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            zf.writestr("./config.json", json.dumps(benign_config))
+            zf.writestr("config.json", json.dumps(benign_config))
+            zf.writestr("metadata.json", json.dumps({"keras_version": "3.13.2"}))
+
+        result = scanner.scan(str(keras_path))
+
+        assert result.success is True
+        assert not any(check.name == "Keras ZIP Member Path Validation" for check in result.checks)
+        assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+
+    def test_scan_fails_closed_on_conflicting_exact_and_alias_config_members(self, tmp_path: Path) -> None:
+        """A benign canonical config.json must not suppress a malicious normalized alias."""
+        scanner = KerasZipScanner()
+        keras_path = tmp_path / "conflicting_exact_and_alias_config.keras"
         malicious_code = "exec(\"print('Malicious!')\")"
         encoded_code = base64.b64encode(malicious_code.encode()).decode()
         benign_config = {"class_name": "Sequential", "config": {"layers": []}}
@@ -299,14 +318,51 @@ class TestKerasZipScanner:
         }
 
         with zipfile.ZipFile(keras_path, "w") as zf:
-            zf.writestr("./config.json", json.dumps(benign_config))
-            zf.writestr("config.json", json.dumps(malicious_config))
+            zf.writestr("config.json", json.dumps(benign_config))
+            zf.writestr("./config.json", json.dumps(malicious_config))
 
         result = scanner.scan(str(keras_path))
 
-        assert result.success is True
-        assert any("lambda" in issue.message.lower() for issue in result.issues)
-        assert not any(check.name == "Keras ZIP Member Path Validation" for check in result.checks)
+        ambiguity_checks = [check for check in result.checks if check.name == "Keras ZIP Member Path Validation"]
+        assert len(ambiguity_checks) == 1
+        assert ambiguity_checks[0].status == CheckStatus.FAILED
+        assert sorted(ambiguity_checks[0].details["candidate_filenames"]) == ["./config.json", "config.json"]
+        assert result.success is False
+
+    def test_scan_fails_closed_on_conflicting_exact_duplicate_config_members(self, tmp_path: Path) -> None:
+        """A benign trailing duplicate config.json must not hide a malicious earlier duplicate."""
+        scanner = KerasZipScanner()
+        keras_path = tmp_path / "conflicting_duplicate_config.keras"
+        malicious_code = "exec(\"print('Malicious!')\")"
+        encoded_code = base64.b64encode(malicious_code.encode()).decode()
+        malicious_config = {
+            "class_name": "Functional",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "lambda_1",
+                        "config": {"function": [encoded_code, None, None], "function_type": "lambda"},
+                    }
+                ]
+            },
+        }
+        benign_config = {"class_name": "Sequential", "config": {"layers": []}}
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            with zipfile.ZipFile(keras_path, "w") as zf:
+                zf.writestr("config.json", json.dumps(malicious_config))
+                zf.writestr("config.json", json.dumps(benign_config))
+
+        result = scanner.scan(str(keras_path))
+
+        ambiguity_checks = [check for check in result.checks if check.name == "Keras ZIP Member Path Validation"]
+        assert len(ambiguity_checks) == 1
+        assert ambiguity_checks[0].status == CheckStatus.FAILED
+        assert ambiguity_checks[0].details["member_name"] == "config.json"
+        assert ambiguity_checks[0].details["candidate_filenames"] == ["config.json", "config.json"]
+        assert result.success is False
 
     def test_scan_fails_closed_on_ambiguous_normalized_config_aliases(self, tmp_path: Path) -> None:
         """Multiple non-canonical aliases for config.json should fail closed instead of depending on ZIP order."""
@@ -323,6 +379,33 @@ class TestKerasZipScanner:
         assert ambiguity_checks[0].status == CheckStatus.FAILED
         assert ambiguity_checks[0].details["member_name"] == "config.json"
         assert sorted(ambiguity_checks[0].details["candidate_filenames"]) == ["./config.json", "/config.json"]
+        assert result.success is False
+
+    def test_scan_fails_closed_when_duplicate_config_alias_count_exceeds_cap(self, tmp_path: Path) -> None:
+        """Too many duplicate config candidates should fail before decompressing every alias."""
+        scanner = KerasZipScanner()
+        keras_path = tmp_path / "too_many_duplicate_aliases.keras"
+        benign_config = json.dumps({"class_name": "Sequential", "config": {"layers": []}})
+
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            zf.writestr("config.json", benign_config)
+            for index in range(scanner.MAX_DUPLICATE_MEMBER_COMPARE_CANDIDATES):
+                zf.writestr(f"{'./' * (index + 1)}config.json", benign_config)
+
+        with patch.object(
+            keras_zip_scanner_module,
+            "_read_zip_member_bounded",
+            wraps=keras_zip_scanner_module._read_zip_member_bounded,
+        ) as mock_read_member:
+            result = scanner.scan(str(keras_path))
+
+        ambiguity_checks = [check for check in result.checks if check.name == "Keras ZIP Member Path Validation"]
+        assert len(ambiguity_checks) == 1
+        assert ambiguity_checks[0].status == CheckStatus.FAILED
+        assert len(ambiguity_checks[0].details["candidate_filenames"]) == (
+            scanner.MAX_DUPLICATE_MEMBER_COMPARE_CANDIDATES + 1
+        )
+        assert mock_read_member.call_count == 0
         assert result.success is False
 
     def test_scan_bounds_recursive_member_rescans_with_embedded_weight_limit(self, tmp_path: Path) -> None:
