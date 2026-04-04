@@ -6681,6 +6681,32 @@ def test_oversized_text_operand_before_protocol0_follow_on_stream_still_flags_re
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
+def test_oversized_text_operand_spanning_multiple_probes_still_flags_follow_on_reduce(
+    tmp_path: Path,
+) -> None:
+    """Fast-forward resync must preserve a stream start until a >128 KiB text operand can be validated."""
+    safe_stream = pickle.dumps({"weights": [1, 2, 3]}, protocol=2)
+    oversized_text = b"A" * ((2 * _RESYNC_FAST_FORWARD_PROBE_BYTES) + 4096)
+    assert len(oversized_text) > 2 * _RESYNC_FAST_FORWARD_PROBE_BYTES, (
+        "Test precondition failed: payload must exceed two probe windows."
+    )
+    malicious_stream = b"cposix\nsystem\n(V" + oversized_text + b"\ntR."
+
+    path = tmp_path / "safe_then_multi_probe_oversized_operand_protocol0.pkl"
+    path.write_bytes(safe_stream + (b"\x00" * 9000) + malicious_stream)
+
+    result = PickleScanner().scan(str(path))
+
+    assert any(
+        check.name == "REDUCE Opcode Safety Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("associated_global") in SYSTEM_GLOBAL_VARIANTS
+        for check in result.checks
+    ), f"Expected os.system detection with a multi-probe oversized protocol-0 operand. Checks: {result.checks}"
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
 def test_long_import_name_crossing_probe_window_still_flags_follow_on_reduce(tmp_path: Path) -> None:
     """Protocol-0 resync must preserve `c` starts whose first newline appears after the first probe."""
     safe_stream = pickle.dumps({"weights": [1, 2, 3]}, protocol=2)

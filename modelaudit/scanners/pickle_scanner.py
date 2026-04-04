@@ -534,7 +534,7 @@ def _genops_with_fallback(
                         file_obj.seek(probe_start - len(previous_tail) + candidate, 0)
                         resync_skipped = 0
                         break
-                    previous_tail = probe[-_RESYNC_FAST_FORWARD_TAIL_BYTES:]
+                    previous_tail = search_window[-_RESYNC_FAST_FORWARD_TAIL_BYTES:]
             continue
 
         # Found a valid stream — reset resync counter
