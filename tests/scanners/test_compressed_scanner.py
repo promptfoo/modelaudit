@@ -235,6 +235,9 @@ def test_read_zlib_stream_uses_bounded_decompression(monkeypatch: pytest.MonkeyP
         def __init__(self) -> None:
             self.max_lengths: list[int] = []
             self.flush_lengths: list[int] = []
+            self.eof = True
+            self.unconsumed_tail = b""
+            self.unused_data = b""
 
         def decompress(self, _chunk: bytes, max_length: int = 0) -> bytes:
             self.max_lengths.append(max_length)
@@ -281,6 +284,41 @@ def test_read_zlib_stream_allows_exact_limit_real_stream() -> None:
 
     assert total_out == len(payload)
     assert destination.getvalue() == payload
+
+
+def test_compressed_scanner_rejects_raw_trailer_after_zlib_member(tmp_path: Path) -> None:
+    """A raw trailer after a valid zlib stream must not hide an unscanned pickle payload."""
+    safe_pickle = pickle.dumps({"safe": [1, 2, 3]})
+    malicious_pickle_trailer = b'cos\nsystem\n(S"echo owned"\ntR.'
+
+    path = tmp_path / "payload.pkl.zlib"
+    path.write_bytes(zlib.compress(safe_pickle) + malicious_pickle_trailer)
+
+    result = CompressedScanner().scan(str(path))
+
+    decode_checks = [check for check in result.checks if check.name == "Compressed Wrapper Stream Decode"]
+    assert decode_checks and decode_checks[0].status == CheckStatus.FAILED
+    assert "invalid zlib stream" in decode_checks[0].message.lower()
+    assert result.success is False
+    assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def test_compressed_scanner_allows_concatenated_zlib_members(tmp_path: Path) -> None:
+    """Concatenated zlib members should remain a supported benign encoding shape."""
+    payload_a = pickle.dumps({"weights": [1, 2, 3]}, protocol=4)
+    payload_b = pickle.dumps({"bias": [4, 5, 6]}, protocol=4)
+
+    path = tmp_path / "safe_multi_stream.pkl.zlib"
+    path.write_bytes(zlib.compress(payload_a) + zlib.compress(payload_b))
+
+    result = CompressedScanner().scan(str(path))
+
+    assert result.success is True
+    assert not any(
+        check.name == "Compressed Wrapper Stream Decode" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+    assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
 def test_compressed_scanner_missing_lz4_dependency_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
