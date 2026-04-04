@@ -128,7 +128,7 @@ When adding CVE detections to existing scanners, follow these rules distilled fr
 - **Doc/comment guards:** Use majority-line analysis (>50% doc lines via `_is_primarily_documentation()`), not substring checks — `"#" in content` is trivially bypassable by embedding a comment token in a payload.
 - **`STACK_GLOBAL` handling:** These opcodes have `arg=None` in pickletools; reconstruct `module.class` by walking backwards to find preceding `SHORT_BINUNICODE`/`BINUNICODE` ops.
 - **Dict short-circuit scope:** Track which op produces the `SETITEM` target — an unrelated `EMPTY_DICT` in the lookback window must not suppress detection of a `SETITEM` targeting a `REDUCE`/`NEWOBJ` result.
-- **Version comparison:** Handle PEP 440 prerelease tags (`a`, `b`, `rc`, `dev`) — `2.10.0a0` is still vulnerable, not the fix.
+- **Version comparison:** Handle PEP 440 prerelease tags (`a`, `b`, `rc`, `dev`) — for a framework/library version gate, a prerelease like `2.10.0a0` is still vulnerable, not the fix.
 - **Bounded reads:** Cap archive member reads for metadata validation (10 MB) to prevent memory spikes on large pickles.
 - **Pattern registration:** New CVE pattern lists must be added to `validate_patterns()` in `suspicious_symbols.py`.
 
