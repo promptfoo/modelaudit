@@ -276,6 +276,9 @@ def _select_preferred_scanner_id(path: str, header_format: str, ext: str) -> str
     if header_format == "hdf5":
         return "keras_h5"
 
+    if header_format == "tar" and ext == ".nemo":
+        return "nemo"
+
     return HEADER_FORMAT_TO_SCANNER_ID.get(header_format)
 
 
