@@ -611,7 +611,7 @@ class JaxCheckpointScanner(BaseScanner):
             pickle_stack: list[Any] = []
             pickle_memo: OrderedDict[int, Any] = OrderedDict()
             sticky_pickle_memo: OrderedDict[int, Any] = OrderedDict()
-            seen_pickle_memo_indices: set[int] = set()
+            next_pickle_memo_index = 0
             dangerous_pickle_memo_tokens = frozenset(
                 token
                 for module_name, global_name in self._DANGEROUS_PICKLE_GLOBALS
@@ -635,10 +635,12 @@ class JaxCheckpointScanner(BaseScanner):
 
             def _memoize_pickle_value(memo_index: int) -> None:
                 """Store the current stack top in the bounded pickle memo model."""
+                nonlocal next_pickle_memo_index
+
                 if not pickle_stack:
                     return
                 memo_value = pickle_stack[-1]
-                seen_pickle_memo_indices.add(memo_index)
+                next_pickle_memo_index = max(next_pickle_memo_index, memo_index + 1)
                 if memo_index in pickle_memo:
                     pickle_memo.move_to_end(memo_index)
                 elif len(pickle_memo) >= self._PICKLE_MEMO_STATE_LIMIT:
@@ -686,7 +688,7 @@ class JaxCheckpointScanner(BaseScanner):
                             _push_pickle_value(pickle_stack[-1])
                         continue
                     if opcode.name == "MEMOIZE":
-                        _memoize_pickle_value(len(seen_pickle_memo_indices))
+                        _memoize_pickle_value(next_pickle_memo_index)
                         continue
                     if opcode.name in {"BINPUT", "LONG_BINPUT", "PUT"}:
                         memo_index = _memo_key(arg)

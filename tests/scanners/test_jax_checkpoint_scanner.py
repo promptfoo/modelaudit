@@ -354,6 +354,46 @@ def test_memoize_index_stays_aligned_after_rewriting_evicted_explicit_memo_slot(
     )
 
 
+def test_many_memoize_events_keep_high_memo_index_resolution_bounded(tmp_path: Path) -> None:
+    pickle_path = tmp_path / "many_memoize_events_state.pickle"
+    filler_count = (JaxCheckpointScanner._PICKLE_MEMO_STATE_LIMIT * 8) + 32
+    module_memo_index = filler_count + 1
+    class_memo_index = filler_count + 2
+    payload = bytearray(b"\x80\x04")
+    payload.extend(_proto4_short_unicode("jax"))
+    payload.extend(b"\x94")
+    payload.extend(b"0")
+    for filler_index in range(filler_count):
+        payload.extend(_proto4_short_unicode(f"safe-{filler_index % 32}"))
+        payload.extend(b"\x94")
+        payload.extend(b"0")
+    payload.extend(_proto4_short_unicode("os"))
+    payload.extend(b"\x94")
+    payload.extend(b"0")
+    payload.extend(_proto4_short_unicode("system"))
+    payload.extend(b"\x94")
+    payload.extend(b"0")
+    payload.extend(b"j")
+    payload.extend(module_memo_index.to_bytes(4, "little"))
+    payload.extend(b"j")
+    payload.extend(class_memo_index.to_bytes(4, "little"))
+    payload.extend(b"\x93.")
+    pickle_path.write_bytes(bytes(payload))
+
+    assert JaxCheckpointScanner.can_handle(str(pickle_path))
+
+    result = JaxCheckpointScanner().scan(str(pickle_path))
+
+    assert result.success
+    assert any(
+        check.name == "Pickle Opcode Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.details["opcode"] == "STACK_GLOBAL"
+        and check.details["global"] == "os.system"
+        for check in result.checks
+    )
+
+
 def test_pickle_opcode_findings_are_capped_for_repeated_dangerous_globals(tmp_path: Path) -> None:
     pickle_path = tmp_path / "repeated_dangerous_globals.pickle"
     payload = bytearray(b"\x80\x04")
