@@ -198,6 +198,7 @@ class CoreMLScanner(BaseScanner):
     MAX_USER_METADATA_ENTRIES: ClassVar[int] = 512
     MAX_RECURSIVE_MESSAGE_DEPTH: ClassVar[int] = 16
     MAX_RECURSIVE_PROTOBUF_DEPTH: ClassVar[int] = 64
+    _allow_truncated_field_parse = False
 
     # CoreML model oneof fields from Model.proto
     MODEL_TYPE_FIELDS: ClassVar[frozenset[int]] = frozenset(
@@ -339,6 +340,7 @@ class CoreMLScanner(BaseScanner):
         result = self._create_result()
         self.current_file_path = path
         file_size = self.get_file_size(path)
+        self._allow_truncated_field_parse = file_size > self.MAX_PARSE_BYTES
         result.metadata["file_size"] = file_size
 
         # Add file integrity check for compliance.
@@ -612,8 +614,8 @@ class CoreMLScanner(BaseScanner):
             "has_custom_model": has_custom_model,
         }
 
-    @staticmethod
     def _parse_field_message(
+        self,
         field: _ProtoField,
         *,
         max_fields: int,
@@ -625,7 +627,7 @@ class CoreMLScanner(BaseScanner):
         return _parse_message(
             payload,
             max_fields=max_fields,
-            allow_truncated=field.truncated,
+            allow_truncated=self._allow_truncated_field_parse and field.truncated,
         )
 
     def _analyze_description(

@@ -605,6 +605,35 @@ def test_coreml_scanner_truncated_linked_model_file_fails_closed(tmp_path: Path)
     )
 
 
+def test_coreml_scanner_truncated_nested_linked_model_fails_closed_without_bounded_read(tmp_path: Path) -> None:
+    malformed_nested_model = (
+        _field_varint(1, 8)
+        + _field_bytes(2, _build_description(metadata=_build_metadata()))
+        + _encode_varint((556 << 3) | 2)
+        + _encode_varint(8)
+        + b"\x0a\x05abc"
+    )
+    model_path = _write_model(
+        tmp_path / "nested_malformed_linked_model.mlmodel",
+        _build_model(
+            description=_build_description(metadata=_build_metadata()),
+            pipeline_wrapper=_build_pipeline_wrapper(malformed_nested_model),
+        ),
+    )
+
+    result = CoreMLScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert result.metadata.get("coreml_bounded_read_truncated") is not True
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and "Unable to parse CoreML linked-model block" in issue.message
+        and "][1:0][556]" in issue.details.get("field_path", "")
+        and issue.details.get("parse_error") == "truncated length-delimited field 1"
+        for issue in result.issues
+    )
+
+
 def test_coreml_scanner_corrupt_protobuf_handling(tmp_path: Path) -> None:
     corrupt_path = tmp_path / "corrupt.mlmodel"
     # Truncated length-delimited field
