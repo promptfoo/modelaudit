@@ -367,7 +367,7 @@ class JITScriptDetector:
 
         # Check for Python operators (ONNX-Script)
         python_op_pattern = re.compile(
-            rb"(?<![A-Za-z0-9_])(?:PyFunc(?:Stateless)?|EagerPyFunc|Python(?:Op)?|PyOp)(?:V[0-9]+)?(?![A-Za-z0-9_])",
+            rb"(?<![A-Za-z0-9_])(?:PyFunc(?:Stateless)?|EagerPyFunc|PythonOp|PyOp)(?:V[0-9]+)?(?![A-Za-z0-9_])",
             re.IGNORECASE,
         )
         if python_op_pattern.search(data):
