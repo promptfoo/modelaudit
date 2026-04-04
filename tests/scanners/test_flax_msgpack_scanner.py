@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -8,11 +9,11 @@ pytest.importorskip("msgpack")
 
 import msgpack
 
-from modelaudit.scanners.base import IssueSeverity
+from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.flax_msgpack_scanner import FlaxMsgpackScanner
 
 
-def create_msgpack_file(path, data):
+def create_msgpack_file(path: Path, data: Any) -> None:
     """Helper to create msgpack files with specific data."""
     with open(path, "wb") as f:
         f.write(msgpack.packb(data, use_bin_type=True))
@@ -79,6 +80,120 @@ def test_flax_msgpack_suspicious_content(tmp_path):
         "__reduce__" in msg or "os.system" in msg or "suspicious" in msg.lower() for msg in issue_messages
     )
     assert found_threats, f"Expected to detect threats but got messages: {issue_messages}"
+
+
+def test_flax_msgpack_malicious_content_marks_scan_unsuccessful(tmp_path: Path) -> None:
+    """CRITICAL msgpack findings should make the scan unsuccessful."""
+    path = tmp_path / "malicious.msgpack"
+    create_msgpack_file(path, {"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"})
+
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    assert result.success is False
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.message == "Suspicious object attribute detected: __reduce__"
+        for issue in result.issues
+    )
+
+
+def test_flax_msgpack_respects_file_size_limit(tmp_path: Path) -> None:
+    """Scanner should fail closed before reading files larger than max_file_read_size."""
+    path = tmp_path / "too_large.msgpack"
+    create_msgpack_file(path, {"params": {"w": list(range(64))}})
+
+    result = FlaxMsgpackScanner(config={"max_file_read_size": 10}).scan(str(path))
+
+    assert result.success is False
+    size_checks = [
+        check for check in result.checks if check.name == "File Size Limit" and check.status == CheckStatus.FAILED
+    ]
+    assert len(size_checks) == 1
+
+
+def test_flax_msgpack_scans_trailing_msgpack_objects(tmp_path: Path) -> None:
+    """A malicious second msgpack object after a benign first object must still be scanned."""
+    path = tmp_path / "trailing_malicious.msgpack"
+    payload = msgpack.packb({"params": {"w": [1, 2, 3]}}, use_bin_type=True)
+    payload += msgpack.packb({"__reduce__": "os.system"}, use_bin_type=True)
+    path.write_bytes(payload)
+
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    assert result.success is False
+    assert result.metadata.get("msgpack_object_count") == 2
+    stream_checks = [
+        check
+        for check in result.checks
+        if check.name == "Msgpack Stream Integrity Check" and check.status == CheckStatus.FAILED
+    ]
+    assert len(stream_checks) == 1
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and issue.message == "Suspicious object attribute detected: __reduce__"
+        and issue.location == "root[msgpack_object_1]/__reduce__"
+        for issue in result.issues
+    )
+
+
+def test_flax_msgpack_benign_trailing_dict_object_is_info_only(tmp_path: Path) -> None:
+    """Valid trailing dict objects should be scanned without warning-level stream noise."""
+    path = tmp_path / "benign_two_objects.msgpack"
+    payload = msgpack.packb({"params": {"a": [1, 2]}}, use_bin_type=True)
+    payload += msgpack.packb({"params": {"b": [3, 4]}}, use_bin_type=True)
+    path.write_bytes(payload)
+
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    assert result.success is True
+    assert result.metadata.get("msgpack_object_count") == 2
+    stream_checks = [
+        check
+        for check in result.checks
+        if check.name == "Msgpack Stream Integrity Check" and check.status == CheckStatus.FAILED
+    ]
+    assert len(stream_checks) == 1
+    assert stream_checks[0].severity == IssueSeverity.INFO
+    assert stream_checks[0].details["trailing_objects_are_container_like"] is True
+
+
+def test_flax_msgpack_scalar_trailing_junk_stays_warning(tmp_path: Path) -> None:
+    """Scalar trailing bytes are still surfaced as warning-level stream integrity findings."""
+    path = tmp_path / "scalar_trailing_junk.msgpack"
+    payload = msgpack.packb({"params": {"w": [1, 2, 3]}}, use_bin_type=True) + b"garbage"
+    path.write_bytes(payload)
+
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    assert result.success is True
+    stream_checks = [
+        check
+        for check in result.checks
+        if check.name == "Msgpack Stream Integrity Check" and check.status == CheckStatus.FAILED
+    ]
+    assert len(stream_checks) == 1
+    assert stream_checks[0].severity == IssueSeverity.WARNING
+    assert stream_checks[0].details["trailing_objects_are_container_like"] is False
+
+
+def test_flax_msgpack_caps_trailing_stream_object_count(tmp_path: Path) -> None:
+    """Too many trailing msgpack objects should fail closed without materializing the full stream."""
+    path = tmp_path / "many_objects.msgpack"
+    payload = msgpack.packb({"params": {"root": [1]}}, use_bin_type=True)
+    payload += b"".join(msgpack.packb({"params": {"n": [index]}}, use_bin_type=True) for index in range(8))
+    path.write_bytes(payload)
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_stream_objects": 4}).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata.get("operational_error") is True
+    assert result.metadata.get("operational_error_reason") == "msgpack_stream_object_limit_exceeded"
+    object_limit_checks = [
+        check
+        for check in result.checks
+        if check.name == "Msgpack Stream Object Limit" and check.status == CheckStatus.FAILED
+    ]
+    assert len(object_limit_checks) == 1
+    assert object_limit_checks[0].details["max_msgpack_stream_objects"] == 4
 
 
 def test_flax_msgpack_large_containers(tmp_path):

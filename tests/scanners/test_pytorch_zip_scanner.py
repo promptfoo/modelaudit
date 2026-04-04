@@ -2,6 +2,7 @@ import json
 import pickle
 import struct
 import time
+import warnings
 import zipfile
 from pathlib import Path
 from typing import IO
@@ -37,6 +38,23 @@ def _corrupt_zip_member_crc(zip_path: Path, member_name: str) -> None:
         cursor = filename_end + extra_len + comment_len
 
     raise AssertionError(f"Unable to locate central directory entry for {member_name}")
+
+
+def _malicious_eval_pickle_payload() -> bytes:
+    class MaliciousClass:
+        def __reduce__(self) -> tuple[object, tuple[str]]:
+            return (eval, ("print('pwned')",))
+
+    return pickle.dumps({"payload": MaliciousClass()})
+
+
+def _write_zip_with_duplicate_data_pkl(zip_path: Path, first_payload: bytes, second_payload: bytes) -> None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        with zipfile.ZipFile(zip_path, "w") as zipf:
+            zipf.writestr("version", "3")
+            zipf.writestr("data.pkl", first_payload)
+            zipf.writestr("data.pkl", second_payload)
 
 
 def test_pytorch_zip_scanner_can_handle(tmp_path):
@@ -110,6 +128,61 @@ def test_pytorch_zip_scanner_normal_archive_skips_relaxed_crc_signal(tmp_path: P
     assert result.success is True
     assert "relaxed_crc_members" not in result.metadata
     assert not [check for check in result.checks if check.name == "PyTorch ZIP CRC Handling"]
+
+
+def test_pytorch_zip_scanner_scans_shadowed_duplicate_data_pkl(tmp_path: Path) -> None:
+    """A benign last-write duplicate must not hide a malicious earlier data.pkl entry."""
+    model_path = tmp_path / "duplicate_data_pkl.pt"
+    safe_payload = pickle.dumps({"weights": [1, 2, 3]})
+    _write_zip_with_duplicate_data_pkl(model_path, _malicious_eval_pickle_payload(), safe_payload)
+
+    scanner = PyTorchZipScanner()
+    result = scanner.scan(str(model_path))
+
+    duplicate_collision_checks = [check for check in result.checks if check.name == "Duplicate ZIP Entry Collision"]
+    critical_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL]
+
+    assert any("eval" in issue.message.lower() for issue in critical_issues)
+    assert any(check.status == CheckStatus.FAILED for check in duplicate_collision_checks)
+    assert result.metadata["pickle_files"] == ["data.pkl", "data.pkl"]
+
+
+def test_pytorch_zip_scanner_allows_identical_duplicate_data_pkl(tmp_path: Path) -> None:
+    """Identical duplicate data.pkl entries should both be scanned without collision noise."""
+    model_path = tmp_path / "identical_duplicate_data_pkl.pt"
+    safe_payload = pickle.dumps({"weights": [1, 2, 3]})
+    _write_zip_with_duplicate_data_pkl(model_path, safe_payload, safe_payload)
+
+    scanner = PyTorchZipScanner()
+    result = scanner.scan(str(model_path))
+
+    duplicate_collision_checks = [check for check in result.checks if check.name == "Duplicate ZIP Entry Collision"]
+
+    assert result.success is True
+    assert not [issue for issue in result.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}]
+    assert len(duplicate_collision_checks) == 1
+    assert duplicate_collision_checks[0].status == CheckStatus.PASSED
+    assert result.metadata["pickle_files"] == ["data.pkl", "data.pkl"]
+
+
+def test_pytorch_zip_scanner_conflicting_duplicate_data_pkl_is_info_only(tmp_path: Path) -> None:
+    """Conflicting duplicate data.pkl entries should stay non-failing when every copy is benign."""
+    model_path = tmp_path / "conflicting_duplicate_data_pkl.pt"
+    first_payload = pickle.dumps({"weights": [1, 2, 3]})
+    second_payload = pickle.dumps({"weights": [4, 5, 6]})
+    _write_zip_with_duplicate_data_pkl(model_path, first_payload, second_payload)
+
+    scanner = PyTorchZipScanner()
+    result = scanner.scan(str(model_path))
+
+    duplicate_collision_checks = [check for check in result.checks if check.name == "Duplicate ZIP Entry Collision"]
+
+    assert result.success is True
+    assert not [issue for issue in result.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}]
+    assert len(duplicate_collision_checks) == 1
+    assert duplicate_collision_checks[0].status == CheckStatus.FAILED
+    assert duplicate_collision_checks[0].severity == IssueSeverity.INFO
+    assert result.metadata["pickle_files"] == ["data.pkl", "data.pkl"]
 
 
 def test_pytorch_zip_scanner_invalid_zip(tmp_path):
