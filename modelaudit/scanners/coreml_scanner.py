@@ -362,6 +362,7 @@ class CoreMLScanner(BaseScanner):
             return result
 
         if file_size > self.MAX_PARSE_BYTES:
+            result.metadata["coreml_bounded_read_truncated"] = True
             result.add_check(
                 name="CoreML Bounded Parse Window",
                 passed=True,
@@ -438,9 +439,11 @@ class CoreMLScanner(BaseScanner):
                 model_path=model_path,
             )
 
-        traversal_truncated = bool(result.metadata.get("coreml_traversal_truncated"))
+        scan_truncated = bool(
+            result.metadata.get("coreml_bounded_read_truncated") or result.metadata.get("coreml_traversal_truncated")
+        )
 
-        if metadata_findings == 0 and not traversal_truncated:
+        if metadata_findings == 0 and not scan_truncated:
             result.add_check(
                 name="CoreML Metadata Security Check",
                 passed=True,
@@ -448,7 +451,7 @@ class CoreMLScanner(BaseScanner):
                 location=path,
             )
 
-        if custom_findings == 0 and not traversal_truncated:
+        if custom_findings == 0 and not scan_truncated:
             result.add_check(
                 name="CoreML Custom Code Path Check",
                 passed=True,
@@ -456,7 +459,7 @@ class CoreMLScanner(BaseScanner):
                 location=path,
             )
 
-        if linked_path_findings == 0 and not traversal_truncated:
+        if linked_path_findings == 0 and not scan_truncated:
             result.add_check(
                 name="CoreML Linked Model Path Check",
                 passed=True,
@@ -609,6 +612,22 @@ class CoreMLScanner(BaseScanner):
             "has_custom_model": has_custom_model,
         }
 
+    @staticmethod
+    def _parse_field_message(
+        field: _ProtoField,
+        *,
+        max_fields: int,
+    ) -> tuple[list[_ProtoField], str | None]:
+        payload = field.value
+        if not isinstance(payload, bytes):
+            return [], None
+
+        return _parse_message(
+            payload,
+            max_fields=max_fields,
+            allow_truncated=field.truncated,
+        )
+
     def _analyze_description(
         self,
         top_fields: list[_ProtoField],
@@ -623,11 +642,10 @@ class CoreMLScanner(BaseScanner):
         if not description_messages:
             return findings
 
-        description_payload = description_messages[0].value
-        if not isinstance(description_payload, bytes):
-            return findings
-
-        desc_fields, desc_error = _parse_message(description_payload, max_fields=self.MAX_NESTED_FIELDS)
+        desc_fields, desc_error = self._parse_field_message(
+            description_messages[0],
+            max_fields=self.MAX_NESTED_FIELDS,
+        )
         if desc_error:
             result.add_check(
                 name="CoreML Description Parse",
@@ -643,11 +661,10 @@ class CoreMLScanner(BaseScanner):
         if not metadata_messages:
             return findings
 
-        metadata_payload = metadata_messages[0].value
-        if not isinstance(metadata_payload, bytes):
-            return findings
-
-        metadata_fields, metadata_error = _parse_message(metadata_payload, max_fields=self.MAX_NESTED_FIELDS)
+        metadata_fields, metadata_error = self._parse_field_message(
+            metadata_messages[0],
+            max_fields=self.MAX_NESTED_FIELDS,
+        )
         if metadata_error:
             result.add_check(
                 name="CoreML Metadata Parse",
@@ -694,11 +711,7 @@ class CoreMLScanner(BaseScanner):
         user_defined: dict[str, str] = {}
         user_defined_fields = _len_fields(metadata_fields, 100)[: self.MAX_USER_METADATA_ENTRIES]
         for index, entry_field in enumerate(user_defined_fields):
-            entry_payload = entry_field.value
-            if not isinstance(entry_payload, bytes):
-                continue
-
-            entry_fields, entry_error = _parse_message(entry_payload, max_fields=32)
+            entry_fields, entry_error = self._parse_field_message(entry_field, max_fields=32)
             if entry_error:
                 result.add_check(
                     name="CoreML User Metadata Entry Parse",
@@ -862,12 +875,9 @@ class CoreMLScanner(BaseScanner):
         for model_field in top_fields:
             if model_field.field_number not in self.NEURAL_NETWORK_FIELDS or model_field.wire_type != 2:
                 continue
-            payload = model_field.value
-            if not isinstance(payload, bytes):
-                continue
-
-            network_fields, network_error = _parse_message(
-                payload, max_fields=self.MAX_NESTED_FIELDS, allow_truncated=False
+            network_fields, network_error = self._parse_field_message(
+                model_field,
+                max_fields=self.MAX_NESTED_FIELDS,
             )
             if network_error:
                 result.add_check(
@@ -886,12 +896,10 @@ class CoreMLScanner(BaseScanner):
 
             layer_fields = _len_fields(network_fields, 1)
             for layer_index, layer_field in enumerate(layer_fields):
-                layer_payload = layer_field.value
-                if not isinstance(layer_payload, bytes):
-                    continue
                 layer_count += 1
-                parsed_layer, layer_error = _parse_message(
-                    layer_payload, max_fields=self.MAX_NESTED_FIELDS, allow_truncated=False
+                parsed_layer, layer_error = self._parse_field_message(
+                    layer_field,
+                    max_fields=self.MAX_NESTED_FIELDS,
                 )
                 if layer_error:
                     result.add_check(
@@ -917,14 +925,10 @@ class CoreMLScanner(BaseScanner):
 
                 custom_fields = _len_fields(parsed_layer, 500)
                 for custom_field in custom_fields:
-                    custom_payload = custom_field.value
-                    if not isinstance(custom_payload, bytes):
-                        continue
                     custom_layer_count += 1
-                    parsed_custom, custom_error = _parse_message(
-                        custom_payload,
+                    parsed_custom, custom_error = self._parse_field_message(
+                        custom_field,
                         max_fields=self.MAX_NESTED_FIELDS,
-                        allow_truncated=False,
                     )
                     if custom_error:
                         result.add_check(
@@ -979,12 +983,9 @@ class CoreMLScanner(BaseScanner):
 
         custom_model_fields = _len_fields(top_fields, self.CUSTOM_MODEL_FIELD)
         for custom_model_field in custom_model_fields:
-            payload = custom_model_field.value
-            if not isinstance(payload, bytes):
-                continue
-
-            custom_model, custom_model_error = _parse_message(
-                payload, max_fields=self.MAX_NESTED_FIELDS, allow_truncated=False
+            custom_model, custom_model_error = self._parse_field_message(
+                custom_model_field,
+                max_fields=self.MAX_NESTED_FIELDS,
             )
             if custom_model_error:
                 result.add_check(
@@ -1053,11 +1054,7 @@ class CoreMLScanner(BaseScanner):
 
         parameter_entries = _len_fields(message_fields, 30)
         for entry_index, parameter_entry in enumerate(parameter_entries):
-            entry_payload = parameter_entry.value
-            if not isinstance(entry_payload, bytes):
-                continue
-
-            entry_fields, entry_error = _parse_message(entry_payload, max_fields=32, allow_truncated=False)
+            entry_fields, entry_error = self._parse_field_message(parameter_entry, max_fields=32)
             if entry_error:
                 result.add_check(
                     name="CoreML Custom Parameter Entry Parse",
@@ -1079,12 +1076,11 @@ class CoreMLScanner(BaseScanner):
                 continue
 
             raw_key = key_fields[0].value
-            raw_value = value_fields[0].value
-            if not isinstance(raw_key, bytes) or not isinstance(raw_value, bytes):
+            if not isinstance(raw_key, bytes):
                 continue
 
             param_key = _decode_string(raw_key, max_length=256)
-            value_message_fields, value_error = _parse_message(raw_value, max_fields=32, allow_truncated=False)
+            value_message_fields, value_error = self._parse_field_message(value_fields[0], max_fields=32)
             if value_error:
                 result.add_check(
                     name="CoreML Custom Parameter Value Parse",
@@ -1151,11 +1147,7 @@ class CoreMLScanner(BaseScanner):
 
         base_dir = Path(path).resolve().parent
         for linked_model_field in linked_model_fields:
-            payload = linked_model_field.value
-            if not isinstance(payload, bytes):
-                continue
-
-            linked_model_message, parse_error = _parse_message(payload, max_fields=64, allow_truncated=False)
+            linked_model_message, parse_error = self._parse_field_message(linked_model_field, max_fields=64)
             if parse_error:
                 result.add_check(
                     name="CoreML Linked Model Parse",
@@ -1173,11 +1165,10 @@ class CoreMLScanner(BaseScanner):
 
             linked_model_file_fields = _len_fields(linked_model_message, 1)
             for linked_model_file_field in linked_model_file_fields:
-                file_payload = linked_model_file_field.value
-                if not isinstance(file_payload, bytes):
-                    continue
-
-                linked_model_file, file_error = _parse_message(file_payload, max_fields=64, allow_truncated=False)
+                linked_model_file, file_error = self._parse_field_message(
+                    linked_model_file_field,
+                    max_fields=64,
+                )
                 if file_error:
                     result.add_check(
                         name="CoreML Linked Model File Parse",
@@ -1225,11 +1216,7 @@ class CoreMLScanner(BaseScanner):
         if not parameter_fields:
             return None
 
-        payload = parameter_fields[0].value
-        if not isinstance(payload, bytes):
-            return None
-
-        parsed_parameter, parse_error = _parse_message(payload, max_fields=16, allow_truncated=False)
+        parsed_parameter, parse_error = self._parse_field_message(parameter_fields[0], max_fields=16)
         if parse_error:
             return None
 

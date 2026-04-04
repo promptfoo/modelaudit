@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- avoid CoreML nested parse failures on bounded-read truncation
 - detect punctuation-delimited TensorRT `/tmp` plugin paths
 
 ## [0.2.31](https://github.com/promptfoo/modelaudit/compare/v0.2.30...v0.2.31) (2026-04-04)

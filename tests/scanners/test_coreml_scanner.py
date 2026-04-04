@@ -539,6 +539,30 @@ def test_coreml_scanner_recursion_limit_succeeds_just_below_limit(tmp_path: Path
     )
 
 
+def test_coreml_scanner_oversized_truncated_benign_layers_do_not_fail_closed(tmp_path: Path) -> None:
+    oversized_layer = _build_layer("safe_layer_" + "A" * (CoreMLScanner.MAX_PARSE_BYTES + 2048))
+    model_path = _write_model(
+        tmp_path / "oversized_truncated_benign.mlmodel",
+        _build_model(
+            description=_build_description(metadata=_build_metadata()),
+            neural_network=_build_neural_network(layers=[oversized_layer]),
+        ),
+    )
+
+    result = CoreMLScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert result.metadata.get("coreml_bounded_read_truncated") is True
+    assert not any(
+        issue.severity == IssueSeverity.CRITICAL and "Unable to parse CoreML neural network block" in issue.message
+        for issue in result.issues
+    )
+    assert any(
+        check.name == "CoreML Bounded Parse Window" and check.status.value == "passed" for check in result.checks
+    )
+    assert not any(check.name == "CoreML Custom Code Path Check" for check in result.checks)
+
+
 def test_coreml_scanner_malformed_custom_model_fails_closed(tmp_path: Path) -> None:
     model_path = _write_model(
         tmp_path / "malformed_custom_model.mlmodel",
