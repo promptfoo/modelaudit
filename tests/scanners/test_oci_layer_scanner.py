@@ -388,6 +388,30 @@ class TestOciLayerScanner:
         assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
         assert any("extensionless.manifest:layer.tar.gz:payload" in (issue.location or "") for issue in result.issues)
 
+    def test_scan_layer_detects_extensionless_protocol0_pickle_member_with_non_magic_prefix(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Extensionless protocol-0 pickles should still be scanned when the first 64-byte probe is inconclusive."""
+        protocol0_payload = tmp_path / "payload"
+        protocol0_payload.write_bytes(b"I1\n0cos\nsystem\n(S'echo oci-owned'\ntR.")
+
+        layer_path = tmp_path / "layer.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            tar.add(protocol0_payload, arcname="payload")
+
+        manifest = {"layers": ["layer.tar.gz"]}
+        manifest_path = tmp_path / "extensionless-protocol0.manifest"
+        manifest_path.write_text(json.dumps(manifest))
+
+        result = OciLayerScanner().scan(str(manifest_path))
+
+        assert result.success is False
+        assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+        assert any(
+            "extensionless-protocol0.manifest:layer.tar.gz:payload" in (issue.location or "") for issue in result.issues
+        )
+
     def test_scan_layer_detects_misnamed_pickle_member(self, tmp_path: Path) -> None:
         """Unsupported member suffixes should still be content-routed when payload bytes are model-like."""
         evil_pickle = Path(__file__).parent.parent / "assets/samples/pickles/evil.pickle"

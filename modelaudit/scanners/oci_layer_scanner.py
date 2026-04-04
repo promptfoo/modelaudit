@@ -276,6 +276,7 @@ class OciLayerScanner(BaseScanner):
                             continue
                         name = member.name
                         matched_ext = self._get_scannable_extension(name)
+                        member_has_suffix = bool(Path(name.rstrip(" .")).suffixes)
                         if self.max_layer_file_size > 0 and member.size > self.max_layer_file_size:
                             scan_complete = False
                             result.add_check(
@@ -315,7 +316,7 @@ class OciLayerScanner(BaseScanner):
                         try:
                             if matched_ext is None:
                                 header_prefix = fileobj.read(self._MEMBER_HEADER_PROBE_BYTES)
-                                if not self._looks_like_model_member_prefix(header_prefix):
+                                if member_has_suffix and not self._looks_like_model_member_prefix(header_prefix):
                                     continue
 
                             with tempfile.NamedTemporaryFile(
