@@ -696,6 +696,11 @@ def _enhance_explanation_with_context(message: str, base_explanation: str, conte
     return None
 
 
+def _get_explanation_with_default(explanations: dict[str, str], explanation_type: str, default: str) -> str:
+    """Return a mapped explanation or a deterministic fallback string."""
+    return explanations.get(explanation_type, default)
+
+
 # CVE-2025-32434 Specific Explanations
 def get_cve_2025_32434_explanation(vulnerability_type: str) -> str:
     """Get specific explanation for CVE-2025-32434 vulnerability types"""
@@ -739,7 +744,8 @@ def get_cve_2025_32434_explanation(vulnerability_type: str) -> str:
         ),
     }
 
-    return explanations.get(
+    return _get_explanation_with_default(
+        explanations,
         vulnerability_type,
         "This issue is related to CVE-2025-32434, a critical PyTorch vulnerability. "
         "Review the CVE documentation and update to PyTorch 2.6.0+ immediately.",
@@ -778,7 +784,8 @@ def get_cve_2026_24747_explanation(vulnerability_type: str) -> str:
         ),
     }
 
-    return explanations.get(
+    return _get_explanation_with_default(
+        explanations,
         vulnerability_type,
         "This issue is related to CVE-2026-24747, a high-severity PyTorch vulnerability "
         "that bypasses weights_only=True via SETITEM abuse. Update to PyTorch 2.10.0+.",
@@ -807,7 +814,8 @@ def get_cve_2025_51480_explanation(vulnerability_type: str) -> str:
         ),
     }
 
-    return explanations.get(
+    return _get_explanation_with_default(
+        explanations,
         vulnerability_type,
         "CVE-2025-51480: ONNX external_data path traversal can enable arbitrary file overwrite during save operations.",
     )
@@ -836,7 +844,8 @@ def get_cve_2022_45907_explanation(vulnerability_type: str) -> str:
         ),
     }
 
-    return explanations.get(
+    return _get_explanation_with_default(
+        explanations,
         vulnerability_type,
         "This issue is related to CVE-2022-45907, a critical PyTorch vulnerability "
         "involving unsafe eval() in type annotation parsing. Update to PyTorch 1.13.1+.",
@@ -866,7 +875,8 @@ def get_cve_2024_5480_explanation(vulnerability_type: str) -> str:
         ),
     }
 
-    return explanations.get(
+    return _get_explanation_with_default(
+        explanations,
         vulnerability_type,
         "This issue is related to CVE-2024-5480, a maximum-severity PyTorch vulnerability "
         "in the RPC framework. Update to PyTorch 2.2.3+ and restrict RPC access.",
@@ -898,7 +908,8 @@ def get_cve_2024_48063_explanation(vulnerability_type: str) -> str:
         ),
     }
 
-    return explanations.get(
+    return _get_explanation_with_default(
+        explanations,
         vulnerability_type,
         "This issue is related to CVE-2024-48063, a critical PyTorch vulnerability "
         "involving RemoteModule deserialization. Update to PyTorch 2.5.0+.",
@@ -959,7 +970,8 @@ def get_cve_2025_9906_explanation(issue_type: str) -> str:
         ),
     }
 
-    return explanations.get(
+    return _get_explanation_with_default(
+        explanations,
         issue_type,
         "CVE-2025-9906: config.json can disable safe_mode via enable_unsafe_deserialization. "
         "Upgrade to Keras >= 3.11.0.",
@@ -983,7 +995,8 @@ def get_cve_2025_49655_explanation(issue_type: str) -> str:
         ),
     }
 
-    return explanations.get(
+    return _get_explanation_with_default(
+        explanations,
         issue_type,
         "CVE-2025-49655: TorchModuleWrapper uses unsafe torch.load deserialization. Upgrade to Keras >= 3.11.3.",
     )
@@ -1007,7 +1020,8 @@ def get_cve_2025_12058_explanation(issue_type: str) -> str:
         ),
     }
 
-    return explanations.get(
+    return _get_explanation_with_default(
+        explanations,
         issue_type,
         "CVE-2025-12058: StringLookup vocabulary paths can load local files or remote URLs. "
         "Upgrade to Keras >= 3.12.0.",
@@ -1038,7 +1052,8 @@ def get_cve_2025_1550_explanation(issue_type: str) -> str:
         ),
     }
 
-    return explanations.get(
+    return _get_explanation_with_default(
+        explanations,
         issue_type,
         "CVE-2025-1550: Keras config.json module references may bypass safe_mode. Upgrade to Keras >= 3.9.0.",
     )
@@ -1061,7 +1076,8 @@ def get_cve_2025_8747_explanation(issue_type: str) -> str:
         ),
     }
 
-    return explanations.get(
+    return _get_explanation_with_default(
+        explanations,
         issue_type,
         "CVE-2025-8747: keras.utils.get_file can be abused as a gadget to bypass safe_mode. "
         "Upgrade to Keras >= 3.11.0.",
@@ -1085,7 +1101,8 @@ def get_cve_2025_9905_explanation(issue_type: str) -> str:
         ),
     }
 
-    return explanations.get(
+    return _get_explanation_with_default(
+        explanations,
         issue_type,
         "CVE-2025-9905: H5 format ignores safe_mode=True for Lambda layers. Upgrade to Keras >= 3.11.3.",
     )
@@ -1109,7 +1126,8 @@ def get_cve_2024_3660_explanation(issue_type: str) -> str:
         ),
     }
 
-    return explanations.get(
+    return _get_explanation_with_default(
+        explanations,
         issue_type,
         "CVE-2024-3660: Lambda layers enable arbitrary code injection during model loading. Upgrade to Keras >= 2.13.",
     )
@@ -1140,7 +1158,8 @@ def get_cve_2022_25882_explanation(vulnerability_type: str) -> str:
         ),
     }
 
-    return explanations.get(
+    return _get_explanation_with_default(
+        explanations,
         vulnerability_type,
         "CVE-2022-25882: ONNX external_data path traversal vulnerability. "
         "Validate that external_data paths do not escape the model directory.",
@@ -1165,7 +1184,8 @@ def get_cve_2024_27318_explanation(vulnerability_type: str) -> str:
         ),
     }
 
-    return explanations.get(
+    return _get_explanation_with_default(
+        explanations,
         vulnerability_type,
         "CVE-2024-27318: ONNX nested path traversal bypasses CVE-2022-25882 "
         "sanitization via paths like 'subdir/../../etc/passwd'. Validate "
@@ -1199,7 +1219,8 @@ def get_cve_2019_6446_explanation(vulnerability_type: str) -> str:
         ),
     }
 
-    return explanations.get(
+    return _get_explanation_with_default(
+        explanations,
         vulnerability_type,
         "CVE-2019-6446: NumPy allow_pickle enables RCE via object dtype arrays. "
         "Use NumPy >= 1.16.3 and never allow_pickle=True with untrusted files.",
@@ -1231,7 +1252,8 @@ def get_cve_2025_23304_explanation(vulnerability_type: str) -> str:
         ),
     }
 
-    return explanations.get(
+    return _get_explanation_with_default(
+        explanations,
         vulnerability_type,
         "CVE-2025-23304: NeMo Hydra _target_ injection enables RCE via malicious "
         "model metadata. Update to NeMo >= 2.3.2.",
@@ -1258,7 +1280,8 @@ def get_cve_2026_1669_explanation(vulnerability_type: str) -> str:
         ),
     }
 
-    return explanations.get(
+    return _get_explanation_with_default(
+        explanations,
         vulnerability_type,
         "CVE-2026-1669: Keras HDF5 weight loading can follow external references "
         "and disclose host file contents. Upgrade to Keras >= 3.12.1 or >= 3.13.2.",
