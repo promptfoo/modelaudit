@@ -186,9 +186,9 @@ class MemoryMappedHandler:
         return result
 
     def _analyze_window(self, data: bytes, offset: int) -> "ScanResult":
+        """Analyze a window of data using the actual scanner's checks."""
         from ...scanners.base import IssueSeverity, ScanResult
 
-        """Analyze a window of data using the actual scanner's checks."""
         result = ScanResult(scanner_name=self.scanner.name)
 
         # First, run scanner-specific analysis if available

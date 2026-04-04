@@ -1,6 +1,7 @@
 """Comprehensive tests for the GGUF scanner."""
 
 import struct
+from pathlib import Path
 
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.gguf_scanner import GgufScanner
@@ -130,6 +131,42 @@ def test_gguf_scanner_comprehensive_scan(tmp_path):
     assert result.metadata["n_tensors"] == 1
     assert len(result.metadata["tensors"]) == 1
     assert result.metadata["tensors"][0]["name"] == "weight"
+
+
+def test_gguf_scanner_invalid_alignment_falls_back_to_default(tmp_path: Path) -> None:
+    """Invalid alignment metadata should warn but still use the GGUF default."""
+    path = tmp_path / "invalid_alignment.gguf"
+    with path.open("wb") as f:
+        f.write(b"GGUF")
+        f.write(struct.pack("<I", 3))
+        f.write(struct.pack("<Q", 1))  # tensor count
+        f.write(struct.pack("<Q", 1))  # kv count
+
+        key = b"general.alignment"
+        f.write(struct.pack("<Q", len(key)))
+        f.write(key)
+        f.write(struct.pack("<I", 4))  # UINT32
+        f.write(struct.pack("<I", 48))  # invalid: not a power of two
+
+        name = b"weights8"
+        f.write(struct.pack("<Q", len(name)))
+        f.write(name)
+        f.write(struct.pack("<I", 1))
+        f.write(struct.pack("<Q", 8))
+        f.write(struct.pack("<I", 0))
+        f.write(struct.pack("<Q", 0))
+
+        pad_to_tensor_data = (32 - (f.tell() % 32)) % 32
+        if pad_to_tensor_data:
+            f.write(b"\0" * pad_to_tensor_data)
+        f.write(b"\0" * 32)
+
+    result = GgufScanner().scan(str(path))
+
+    assert result.success
+    assert len(result.metadata["tensors"]) == 1
+    assert any(check.name == "GGUF Alignment Validation" and check.status.value == "failed" for check in result.checks)
+    assert not any("size mismatch" in issue.message.lower() for issue in result.issues)
 
 
 def test_gguf_scanner_large_kv_count(tmp_path):

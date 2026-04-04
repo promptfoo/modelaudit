@@ -5,6 +5,7 @@ This module provides utilities to detect when binary data appears to be ML model
 or other legitimate ML content, helping to reduce false positives in security scanning.
 """
 
+import math
 import struct
 from typing import Any
 
@@ -170,7 +171,7 @@ def _analyze_float_patterns(data: bytes) -> dict[str, float]:
 
             # Check if it's a reasonable float value
             if (
-                value == value  # Not NaN
+                not math.isnan(value)
                 and abs(value) < 1e10  # Not extremely large
                 and (value == 0.0 or abs(value) > 1e-10)  # Not extremely small (unless zero)
             ):
@@ -193,7 +194,7 @@ def _detect_weight_characteristics(data: bytes) -> dict[str, float]:
     for i in range(0, min(len(data) - 4, 1000), 8):  # Sample every 8 bytes, max 125 samples
         try:
             value = struct.unpack("f", data[i : i + 4])[0]
-            if value == value and abs(value) < 1e6:  # Filter out NaN and extreme values
+            if not math.isnan(value) and abs(value) < 1e6:
                 values.append(value)
         except (struct.error, OverflowError):
             continue

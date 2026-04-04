@@ -545,7 +545,6 @@ class BaseScanner(ABC):
     @abstractmethod
     def scan(self, path: str) -> ScanResult:
         """Scan the model file or directory at the given path"""
-        pass
 
     def scan_with_cache(self, path: str) -> ScanResult:
         """

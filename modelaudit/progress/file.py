@@ -322,7 +322,6 @@ class CSVProgressReporter(ProgressReporter):
     def report_phase_change(self, old_phase: ProgressPhase, new_phase: ProgressPhase) -> None:
         """Report phase change."""
         # Phase changes are captured in regular progress updates
-        pass
 
     def report_completion(self, stats: ProgressStats) -> None:
         """Report scan completion."""

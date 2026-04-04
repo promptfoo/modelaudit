@@ -1397,7 +1397,8 @@ class TestSevenZipScannerHardening:
         from modelaudit.scanners.sevenzip_scanner import _HeaderProbeBuffer
 
         buf = _HeaderProbeBuffer(limit=6)
-        assert buf.write(b"") == 0
+        written = buf.write(b"")
+        assert written == 0
         assert buf.size() == 0
 
     def test_header_probe_buffer_normal_flow(self) -> None:

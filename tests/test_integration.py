@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from typing import Any
 
 from click.testing import CliRunner
 
@@ -8,7 +9,7 @@ from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from tests.helpers import create_mock_pytorch_zip
 
 
-def test_scan_directory_with_multiple_models(temp_model_dir, mock_progress_callback):
+def test_scan_directory_with_multiple_models(temp_model_dir: Path, mock_progress_callback: Any) -> None:
     """Test scanning a directory with multiple model types."""
     # Scan the directory with all models
     results = scan_model_directory_or_file(
@@ -26,14 +27,6 @@ def test_scan_directory_with_multiple_models(temp_model_dir, mock_progress_callb
     assert len(mock_progress_callback.percentages) > 0
     assert any("Scanning directory" in msg for msg in mock_progress_callback.messages)
     assert 100.0 in mock_progress_callback.percentages  # Should reach 100%
-
-    # Check that issues were found for each model type
-    [
-        str(temp_model_dir / "model1.pkl"),
-        str(temp_model_dir / "model2.pt"),
-        str(temp_model_dir / "tf_model"),
-        str(temp_model_dir / "subdir" / "model3.h5"),
-    ]
 
     # Should have found some issues overall (but not necessarily for each file)
     # Clean models might not have any issues, which is correct behavior
@@ -261,7 +254,7 @@ def test_small_file_no_false_positives(tmp_path):
     assert len(validation_issues) == 0
 
 
-def test_tensorflow_savedmodel_integration(tmp_path):
+def test_tensorflow_savedmodel_integration(tmp_path: Path) -> None:
     """Test integration of TensorFlow SavedModel scanning with the main workflow."""
     import pytest
 
@@ -330,14 +323,6 @@ def test_tensorflow_savedmodel_integration(tmp_path):
 
     # Verify the path appears in the output (the scanner handled the directory)
     assert str(savedmodel_path) in str(output_json) or str(savedmodel_path.name) in str(output_json)
-
-    # Test that weight distribution scanner was used
-    # Look for evidence that weight analysis was performed
-    found_weight_analysis = False
-    for issue in output_json.get("issues", []):
-        if "weight" in issue.get("message", "").lower():
-            found_weight_analysis = True
-            break
 
     # It's okay if no weight analysis issues were found (clean model)
     # The important thing is that the scanning completed successfully

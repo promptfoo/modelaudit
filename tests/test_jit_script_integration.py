@@ -1,6 +1,7 @@
 """Integration tests for JIT/Script detection in scanners."""
 
 import pickle
+from pathlib import Path
 
 import pytest
 
@@ -131,7 +132,7 @@ class TestONNXScannerJITIntegration:
         jit_checks = [c for c in result.checks if "JIT/Script" in c.name or "Python" in c.name]
         assert len(jit_checks) > 0, "Should detect Python operator risks"
 
-    def test_onnx_no_false_positive_torchscript_warnings(self, tmp_path):
+    def test_onnx_no_false_positive_torchscript_warnings(self, tmp_path: Path) -> None:
         """Test that ONNX files with PyTorch metadata don't trigger false JIT/Script warnings.
 
         Regression test for bug where ONNX files exported from PyTorch contain
@@ -194,10 +195,4 @@ class TestONNXScannerJITIntegration:
             f"Found: {[i.message for i in torchscript_obfuscation_issues]}"
         )
 
-        # Should still perform legitimate ONNX checks (custom domain warnings are OK)
-        # But severity should be INFO for well-known domains, not WARNING
-        custom_domain_checks = [
-            c for c in result.checks if "Custom Operator Domain" in c.name or "custom" in str(c.details)
-        ]
-        # Having custom domain checks is fine - we just want to ensure no TorchScript false positives
-        assert len(torchscript_obfuscation_issues) == 0, "No TorchScript false positives"
+        # Legitimate ONNX checks may still run; the key regression guard is no TorchScript false positives.

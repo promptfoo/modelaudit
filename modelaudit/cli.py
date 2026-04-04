@@ -297,13 +297,11 @@ class DefaultCommandGroup(click.Group):
 @click.version_option(__version__)
 def cli() -> None:
     """Static scanner for ML models"""
-    pass
 
 
 @cli.group()
 def auth() -> None:
     """Manage authentication"""
-    pass
 
 
 @auth.command()
@@ -430,7 +428,6 @@ def whoami() -> None:
 @cli.group()
 def cache() -> None:
     """Manage scan results cache"""
-    pass
 
 
 @cache.command()

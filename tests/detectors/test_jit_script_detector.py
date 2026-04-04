@@ -151,26 +151,26 @@ class TestJITScriptDetector:
         assert any("os command" in getattr(f, "pattern", "").lower() for f in findings)
         assert any("socket" in getattr(f, "pattern", "").lower() for f in findings)
 
-    def test_auto_detect_model_type(self):
+    def test_auto_detect_model_type(self) -> None:
         """Test automatic model type detection."""
         detector = JITScriptDetector()
 
         # Test PyTorch detection
         pytorch_data = b"TorchScript model data"
-        findings = detector.scan_model(pytorch_data, "unknown")
-        # Should attempt TorchScript scanning
+        pytorch_findings = detector.scan_model(pytorch_data, "unknown")
+        assert isinstance(pytorch_findings, list)
 
         # Test TensorFlow detection
         tf_data = b"saved_model.pb tensorflow data"
-        findings = detector.scan_model(tf_data, "unknown")
-        # Should attempt TensorFlow scanning
+        tf_findings = detector.scan_model(tf_data, "unknown")
+        assert isinstance(tf_findings, list)
 
         # Test ONNX detection
         onnx_data = b"ai.onnx model data"
-        findings = detector.scan_model(onnx_data, "unknown")
-        # Should attempt ONNX scanning
+        onnx_findings = detector.scan_model(onnx_data, "unknown")
+        assert isinstance(onnx_findings, list)
 
-    def test_strict_mode(self):
+    def test_strict_mode(self) -> None:
         """Test strict mode flags any JIT usage."""
         detector_normal = JITScriptDetector({"strict_mode": False})
         detector_strict = JITScriptDetector({"strict_mode": True})
@@ -180,6 +180,7 @@ class TestJITScriptDetector:
         findings_normal = detector_normal.scan_torchscript(data)
         findings_strict = detector_strict.scan_torchscript(data)
 
+        assert not any(f.type == "jit_usage" for f in findings_normal)
         # Strict mode should flag JIT usage
         assert any(f.type == "jit_usage" for f in findings_strict)
         # Normal mode might not flag it as severely

@@ -5,6 +5,48 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any, Literal, Protocol, TypeAlias, TypedDict
 
+__all__ = [
+    "CacheKey",
+    "CacheValue",
+    "CheckDetails",
+    "CheckStatusType",
+    "ConfigDict",
+    "ConfigValue",
+    "FileExtension",
+    "FileFormat",
+    "FileHandlerProtocol",
+    "FilePath",
+    "FileSize",
+    "HashString",
+    "Headers",
+    "IssueDataTypedDict",
+    "IssueDict",
+    "LayerInfo",
+    "LogLevelType",
+    "MagicBytes",
+    "ModelWeights",
+    "NestedDict",
+    "PathList",
+    "PatternMatch",
+    "ProgressCallback",
+    "ProgressTrackerProtocol",
+    "ProgressValue",
+    "QueryParams",
+    "RiskScore",
+    "SARIFArtifact",
+    "SARIFResult",
+    "SARIFRule",
+    "ScanConfigTypedDict",
+    "ScanFormatType",
+    "ScanMetadata",
+    "ScanResultMetadataTypedDict",
+    "ScannerProtocol",
+    "SecurityFinding",
+    "SeverityLevel",
+    "TensorShape",
+    "URLString",
+]
+
 # Configuration types
 ConfigValue: TypeAlias = str | int | bool | list[str] | dict[str, Any]
 ConfigDict: TypeAlias = dict[str, ConfigValue]
