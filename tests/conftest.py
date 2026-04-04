@@ -6,9 +6,18 @@ import sys
 import tempfile
 import zipfile
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
+
+from tests.xdist_status import (
+    WORKER_STATUS_DIR_KEY,
+    XdistWorkerStatusReporter,
+    clear_worker_status,
+    status_file_for_worker,
+    write_worker_status,
+)
 
 
 # ============================================================================
@@ -33,6 +42,10 @@ HAS_XGBOOST = _check_framework("xgboost")
 HAS_SAFETENSORS = _check_framework("safetensors")
 HAS_JOBLIB = _check_framework("joblib")
 HAS_DILL = _check_framework("dill")
+
+_xdist_status_reporter: XdistWorkerStatusReporter | None = None
+_xdist_worker_status_file: Path | None = None
+_xdist_workerid: str | None = None
 
 
 def _detect_symlink_support() -> bool:
@@ -136,6 +149,7 @@ def pytest_runtest_setup(item):
             "test_large_file_handler.py",  # Large file handler regression tests
             "test_file_iterator.py",  # Streaming file iterator memory regression tests
             "test_benchmark_report.py",  # benchmark CI summary and regression gate tests
+            "test_xdist_status.py",  # xdist worker progress reporting tests
         ]
 
         # Check if this is an allowed test file
@@ -304,6 +318,8 @@ def performance_markers():
 # Configure pytest to handle missing optional dependencies gracefully
 def pytest_configure(config):
     """Configure pytest with custom markers."""
+    global _xdist_worker_status_file, _xdist_workerid
+
     # Test category markers
     config.addinivalue_line(
         "markers",
@@ -352,6 +368,80 @@ def pytest_configure(config):
         "markers",
         "dill: mark test as requiring dill",
     )
+
+    workerinput = getattr(config, "workerinput", None)
+    if not workerinput:
+        return
+
+    status_dir = workerinput.get(WORKER_STATUS_DIR_KEY)
+    workerid = workerinput.get("workerid")
+    if status_dir and workerid:
+        _xdist_workerid = str(workerid)
+        _xdist_worker_status_file = status_file_for_worker(Path(status_dir), _xdist_workerid)
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_configure_node(node: Any) -> None:
+    """Pass the shared xdist worker-status directory to each worker."""
+    global _xdist_status_reporter
+
+    if _xdist_status_reporter is None:
+        _xdist_status_reporter = XdistWorkerStatusReporter.from_environment()
+        if _xdist_status_reporter is None:
+            return
+        _xdist_status_reporter.start()
+
+    node.workerinput[WORKER_STATUS_DIR_KEY] = str(_xdist_status_reporter.status_dir)
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_testnodedown(node: Any, error: object | None) -> None:
+    """Remove stale xdist worker-status files when a worker exits or crashes."""
+    if _xdist_status_reporter is None:
+        return
+
+    workerid = node.workerinput.get("workerid")
+    if workerid:
+        _xdist_status_reporter.remove_worker_status(str(workerid))
+
+
+def pytest_runtest_logstart(
+    nodeid: str,
+    location: tuple[str, int | None, str],
+) -> None:
+    """Record the test currently running in this worker process."""
+    if _xdist_worker_status_file is None or _xdist_workerid is None:
+        return
+
+    write_worker_status(
+        _xdist_worker_status_file,
+        _xdist_workerid,
+        nodeid,
+    )
+
+
+def pytest_runtest_logfinish(
+    nodeid: str,
+    location: tuple[str, int | None, str],
+) -> None:
+    """Clear this worker's running-test status after the test finishes."""
+    if _xdist_worker_status_file is None:
+        return
+
+    clear_worker_status(_xdist_worker_status_file)
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    """Stop controller-side xdist status reporting and clear worker status files."""
+    global _xdist_status_reporter
+
+    if _xdist_worker_status_file is not None:
+        clear_worker_status(_xdist_worker_status_file)
+
+    if _xdist_status_reporter is not None:
+        _xdist_status_reporter.stop()
+        _xdist_status_reporter = None
 
 
 def pytest_collection_modifyitems(config, items):
