@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import hashlib
 import json
 import os
 import posixpath
@@ -292,13 +293,11 @@ class TorchServeMarScanner(BaseScanner):
         }
         manifest_name = self._normalize_member_name(MANIFEST_ENTRY_PATH)
 
-        manifest_info = None
-        for info in archive.infolist():
-            if self._normalize_member_name(info.filename) == manifest_name:
-                manifest_info = info
-                break
+        all_manifest_infos = [
+            info for info in archive.infolist() if self._normalize_member_name(info.filename) == manifest_name
+        ]
 
-        if manifest_info is None:
+        if not all_manifest_infos:
             result.add_check(
                 name="TorchServe Manifest Presence",
                 passed=False,
@@ -315,45 +314,163 @@ class TorchServeMarScanner(BaseScanner):
             location=archive_path,
         )
 
-        try:
-            manifest_bytes = self._read_member_bounded(archive, manifest_info, self.MAX_MANIFEST_BYTES)
-        except ValueError as exc:
+        manifest_infos = all_manifest_infos
+        if len(all_manifest_infos) > self.max_entries:
+            manifest_infos = all_manifest_infos[: self.max_entries]
             result.add_check(
-                name="TorchServe Manifest Size Limit",
+                name="TorchServe Manifest Entry Limit",
                 passed=False,
-                message=str(exc),
+                message=(
+                    "Archive contains "
+                    f"{len(all_manifest_infos)} manifest entries, exceeding max processed entries "
+                    f"({self.max_entries}); manifest declarations after the entry cap were skipped and "
+                    "scan results are incomplete"
+                ),
+                severity=IssueSeverity.CRITICAL,
+                location=f"{archive_path}:{MANIFEST_ENTRY_PATH}",
+                details={
+                    "manifest_entry_count": len(all_manifest_infos),
+                    "max_entries": self.max_entries,
+                    "dropped_manifest_count": len(all_manifest_infos) - self.max_entries,
+                },
+            )
+
+        manifest_payload_count = 0
+        first_manifest_digest: bytes | None = None
+        has_conflicting_manifest_payloads = False
+        scanned_manifest_count = 0
+        processed_manifest_uncompressed = 0
+        path_references: list[tuple[str, str]] = []
+        handler_paths: list[str] = []
+        serialized_paths: list[str] = []
+        missing_required: set[str] = set()
+        parsed_manifest_count = 0
+
+        for manifest_info in manifest_infos:
+            manifest_details = self._build_member_details(
+                member_info=manifest_info,
+                normalized_member=manifest_name,
+                max_manifest_bytes=self.MAX_MANIFEST_BYTES,
+            )
+
+            processed_manifest_uncompressed += max(manifest_info.file_size, 0)
+            if processed_manifest_uncompressed > self.max_uncompressed_bytes:
+                result.add_check(
+                    name="TorchServe Manifest Uncompressed Size Budget",
+                    passed=False,
+                    message=(
+                        "Manifest parsing uncompressed byte budget exceeded "
+                        f"({processed_manifest_uncompressed} > {self.max_uncompressed_bytes}); "
+                        "later manifest declarations were skipped and scan results are incomplete"
+                    ),
+                    severity=IssueSeverity.CRITICAL,
+                    location=f"{archive_path}:{MANIFEST_ENTRY_PATH}",
+                    details={
+                        "processed_uncompressed": processed_manifest_uncompressed,
+                        "max_uncompressed_bytes": self.max_uncompressed_bytes,
+                    },
+                )
+                break
+
+            scanned_manifest_count += 1
+
+            try:
+                manifest_bytes = self._read_member_bounded(archive, manifest_info, self.MAX_MANIFEST_BYTES)
+            except ValueError as exc:
+                result.add_check(
+                    name="TorchServe Manifest Size Limit",
+                    passed=False,
+                    message=str(exc),
+                    severity=IssueSeverity.WARNING,
+                    location=f"{archive_path}:{MANIFEST_ENTRY_PATH}",
+                    details=manifest_details,
+                )
+                continue
+            except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
+                result.add_check(
+                    name="TorchServe Manifest Read",
+                    passed=False,
+                    message=f"Unable to read TorchServe manifest entry: {exc}",
+                    severity=IssueSeverity.WARNING,
+                    location=f"{archive_path}:{MANIFEST_ENTRY_PATH}",
+                    details={**manifest_details, "exception_type": type(exc).__name__},
+                )
+                continue
+
+            manifest_payload_count += 1
+            manifest_digest = hashlib.sha256(manifest_bytes).digest()
+            if first_manifest_digest is None:
+                first_manifest_digest = manifest_digest
+            elif manifest_digest != first_manifest_digest:
+                has_conflicting_manifest_payloads = True
+
+            try:
+                manifest_data = json.loads(manifest_bytes.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                result.add_check(
+                    name="TorchServe Manifest JSON Parse",
+                    passed=False,
+                    message=f"Failed to parse TorchServe manifest JSON: {exc}",
+                    severity=IssueSeverity.WARNING,
+                    location=f"{archive_path}:{MANIFEST_ENTRY_PATH}",
+                    details={**manifest_details, "exception_type": type(exc).__name__},
+                )
+                continue
+
+            if not isinstance(manifest_data, dict):
+                result.add_check(
+                    name="TorchServe Manifest Structure",
+                    passed=False,
+                    message="TorchServe manifest must be a JSON object",
+                    severity=IssueSeverity.WARNING,
+                    location=f"{archive_path}:{MANIFEST_ENTRY_PATH}",
+                    details=manifest_details,
+                )
+                continue
+
+            parsed_manifest_count += 1
+            (
+                manifest_path_references,
+                manifest_handler_paths,
+                manifest_serialized_paths,
+                manifest_missing_required,
+            ) = self._collect_manifest_references(manifest_data)
+            path_references.extend(manifest_path_references)
+            handler_paths.extend(manifest_handler_paths)
+            serialized_paths.extend(manifest_serialized_paths)
+            missing_required.update(manifest_missing_required)
+
+        if scanned_manifest_count > 1 and (
+            parsed_manifest_count != scanned_manifest_count
+            or manifest_payload_count != scanned_manifest_count
+            or has_conflicting_manifest_payloads
+        ):
+            result.add_check(
+                name="TorchServe Manifest Collision",
+                passed=False,
+                message="Archive contains multiple conflicting TorchServe manifest entries",
                 severity=IssueSeverity.WARNING,
                 location=f"{archive_path}:{MANIFEST_ENTRY_PATH}",
-                details={"max_manifest_bytes": self.MAX_MANIFEST_BYTES},
+                details={
+                    "manifest_entries": [
+                        self._build_member_details(
+                            member_info=manifest_info,
+                            normalized_member=manifest_name,
+                        )
+                        for manifest_info in manifest_infos[:scanned_manifest_count]
+                    ],
+                    "parsed_manifest_count": parsed_manifest_count,
+                    "scanned_manifest_count": scanned_manifest_count,
+                },
             )
+
+        if parsed_manifest_count == 0:
             return manifest_context
 
-        try:
-            manifest_data = json.loads(manifest_bytes.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            result.add_check(
-                name="TorchServe Manifest JSON Parse",
-                passed=False,
-                message=f"Failed to parse TorchServe manifest JSON: {exc}",
-                severity=IssueSeverity.WARNING,
-                location=f"{archive_path}:{MANIFEST_ENTRY_PATH}",
-                details={"exception_type": type(exc).__name__},
-            )
-            return manifest_context
+        path_references = list(dict.fromkeys(path_references))
+        handler_paths = list(dict.fromkeys(handler_paths))
+        serialized_paths = list(dict.fromkeys(serialized_paths))
 
-        if not isinstance(manifest_data, dict):
-            result.add_check(
-                name="TorchServe Manifest Structure",
-                passed=False,
-                message="TorchServe manifest must be a JSON object",
-                severity=IssueSeverity.WARNING,
-                location=f"{archive_path}:{MANIFEST_ENTRY_PATH}",
-            )
-            return manifest_context
-
-        path_references, handler_paths, serialized_paths, missing_required = self._collect_manifest_references(
-            manifest_data,
-        )
         manifest_context["path_references"] = path_references
         manifest_context["handler_paths"] = handler_paths
         manifest_context["serialized_paths"] = serialized_paths
@@ -614,8 +731,13 @@ class TorchServeMarScanner(BaseScanner):
         analyzed_handler = False
         handler_trees: dict[str, list[ast.Module]] = {}
         member_lookup = self._build_member_lookup(archive.infolist())
+        processed_handler_entries = 0
+        processed_handler_uncompressed = 0
+        handler_budget_exceeded = False
 
         for handler_path in handler_paths:
+            if handler_budget_exceeded:
+                break
             resolved_candidates = self._resolve_handler_member_candidates(handler_path)
             normalized_handlers = [
                 candidate
@@ -626,11 +748,55 @@ class TorchServeMarScanner(BaseScanner):
                 continue
 
             for normalized_handler in normalized_handlers:
+                if handler_budget_exceeded:
+                    break
                 handler_infos = member_lookup.get(normalized_handler, [])
                 if not handler_infos:
                     continue
 
                 for handler_info in handler_infos:
+                    if processed_handler_entries >= self.max_entries:
+                        result.add_check(
+                            name="TorchServe Handler Entry Limit",
+                            passed=False,
+                            message=(
+                                "Handler static analysis reached the max processed entry budget "
+                                f"({self.max_entries}); later handler files were skipped and scan results "
+                                "are incomplete"
+                            ),
+                            severity=IssueSeverity.CRITICAL,
+                            location=f"{archive_path}:{normalized_handler}",
+                            details={
+                                "processed_handler_entries": processed_handler_entries,
+                                "max_entries": self.max_entries,
+                                "skipped_handler": normalized_handler,
+                            },
+                        )
+                        handler_budget_exceeded = True
+                        break
+
+                    processed_handler_entries += 1
+                    processed_handler_uncompressed += max(handler_info.file_size, 0)
+                    if processed_handler_uncompressed > self.max_uncompressed_bytes:
+                        result.add_check(
+                            name="TorchServe Handler Uncompressed Size Budget",
+                            passed=False,
+                            message=(
+                                "Handler static analysis uncompressed byte budget exceeded "
+                                f"({processed_handler_uncompressed} > {self.max_uncompressed_bytes}); "
+                                "later handler files were skipped and scan results are incomplete"
+                            ),
+                            severity=IssueSeverity.CRITICAL,
+                            location=f"{archive_path}:{normalized_handler}",
+                            details={
+                                "processed_uncompressed": processed_handler_uncompressed,
+                                "max_uncompressed_bytes": self.max_uncompressed_bytes,
+                                "handler": normalized_handler,
+                            },
+                        )
+                        handler_budget_exceeded = True
+                        break
+
                     analyzed_handler = True
                     handler_details = self._build_member_details(
                         member_info=handler_info,
@@ -647,6 +813,16 @@ class TorchServeMarScanner(BaseScanner):
                             severity=IssueSeverity.WARNING,
                             location=f"{archive_path}:{normalized_handler}",
                             details=handler_details,
+                        )
+                        continue
+                    except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
+                        result.add_check(
+                            name="TorchServe Handler Static Analysis",
+                            passed=False,
+                            message=f"Unable to read handler source for static analysis: {exc}",
+                            severity=IssueSeverity.WARNING,
+                            location=f"{archive_path}:{normalized_handler}",
+                            details={**handler_details, "analysis_kind": "read", "exception_type": type(exc).__name__},
                         )
                         continue
 
@@ -1031,6 +1207,42 @@ class TorchServeMarScanner(BaseScanner):
             return resolved_head
         return ".".join([resolved_head, *tail])
 
+    def _resolve_getattr_call_name(self, node: ast.AST, aliases: dict[str, str]) -> str | None:
+        if isinstance(node, ast.Attribute) and node.attr == "__call__":
+            return self._resolve_getattr_call_name(node.value, aliases)
+
+        if not isinstance(node, ast.Call):
+            return None
+
+        helper_name = self._resolve_call_name(node.func)
+        if helper_name is None:
+            return None
+
+        resolved_helper_name = self._apply_alias(helper_name, aliases)
+        if resolved_helper_name not in {"getattr", "builtins.getattr"}:
+            return None
+
+        target_root_node: ast.AST | None = node.args[0] if node.args else None
+        attr_name_node: ast.AST | None = node.args[1] if len(node.args) >= 2 else None
+        for keyword in node.keywords:
+            if keyword.arg == "object" and target_root_node is None:
+                target_root_node = keyword.value
+            elif keyword.arg == "name" and attr_name_node is None:
+                attr_name_node = keyword.value
+
+        if target_root_node is None or attr_name_node is None:
+            return None
+
+        target_root = self._resolve_call_name(target_root_node)
+        if target_root is None:
+            return None
+
+        if not isinstance(attr_name_node, ast.Constant) or not isinstance(attr_name_node.value, str):
+            return None
+
+        resolved_target_root = self._apply_alias(target_root, aliases)
+        return f"{resolved_target_root}.{attr_name_node.value}"
+
     def _parse_python_source(self, source_bytes: bytes) -> tuple[ast.Module | None, str | None]:
         try:
             source = source_bytes.decode("utf-8")
@@ -1052,10 +1264,13 @@ class TorchServeMarScanner(BaseScanner):
                 continue
 
             call_name = self._resolve_call_name(node.func)
-            if call_name is None:
+            resolved_name = (
+                self._apply_alias(call_name, aliases)
+                if call_name is not None
+                else self._resolve_getattr_call_name(node.func, aliases)
+            )
+            if resolved_name is None:
                 continue
-
-            resolved_name = self._apply_alias(call_name, aliases)
             if resolved_name in HIGH_RISK_CALLS:
                 risky_calls.add(resolved_name)
                 continue
