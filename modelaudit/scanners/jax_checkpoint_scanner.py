@@ -89,6 +89,7 @@ class JaxCheckpointScanner(BaseScanner):
     _PICKLE_MEMO_STATE_LIMIT: ClassVar[int] = 4096
     _PICKLE_STICKY_MEMO_STATE_LIMIT: ClassVar[int] = 16384
     _MAX_METADATA_TRAVERSAL_DEPTH: ClassVar[int] = 64
+    _JAX_INDICATOR_SCAN_CHUNK_BYTES: ClassVar[int] = 8192
     DEFAULT_MAX_METADATA_PATTERN_FINDINGS: ClassVar[int] = 256
     DEFAULT_MAX_PICKLE_OPCODE_FINDINGS: ClassVar[int] = 256
     _DANGEROUS_PICKLE_GLOBALS: ClassVar[frozenset[tuple[str, str]]] = frozenset(
@@ -471,10 +472,10 @@ class JaxCheckpointScanner(BaseScanner):
 
             # Check for JSON metadata files, including extensionful `.checkpoint`
             # files that contain JAX/Orbax metadata rather than pickle bytes.
-            if header.lstrip().startswith((b"{", b"[")) and any(
-                indicator in decoded_header for indicator in cls._JAX_INDICATORS
-            ):
-                return True
+            if header.lstrip().startswith((b"{", b"[")):
+                return any(
+                    indicator in decoded_header for indicator in cls._JAX_INDICATORS
+                ) or cls._file_contains_jax_indicator(path)
 
             # Check for NumPy files in JAX context
             if header.startswith(b"\x93NUMPY") and "jax" in path.lower():
@@ -482,6 +483,25 @@ class JaxCheckpointScanner(BaseScanner):
 
         except Exception:
             pass
+
+        return False
+
+    @classmethod
+    def _file_contains_jax_indicator(cls, path: str) -> bool:
+        """Stream-search a file for JAX indicators beyond the initial routing header."""
+        chunk_tail = ""
+        tail_length = max(len(indicator) for indicator in cls._JAX_INDICATORS) - 1
+
+        try:
+            with open(path, "rb") as f:
+                while chunk := f.read(cls._JAX_INDICATOR_SCAN_CHUNK_BYTES):
+                    decoded_chunk = chunk.decode("utf-8", errors="ignore").lower()
+                    search_text = chunk_tail + decoded_chunk
+                    if any(indicator in search_text for indicator in cls._JAX_INDICATORS):
+                        return True
+                    chunk_tail = search_text[-tail_length:]
+        except Exception:
+            return False
 
         return False
 

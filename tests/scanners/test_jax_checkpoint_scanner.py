@@ -603,6 +603,32 @@ def test_can_handle_json_checkpoint_with_jax_metadata(tmp_path: Path) -> None:
     assert result.metadata["checkpoint_type"] == "file"
 
 
+def test_can_handle_json_checkpoint_with_jax_marker_after_initial_header(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "late_marker_model.checkpoint"
+    checkpoint_path.write_text(
+        json.dumps(
+            {
+                "padding": "x" * 1024,
+                "framework": "jax",
+                "payload": "jax.experimental.host_callback.call(os.system, 'id')",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_path))
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_path))
+
+    assert result.success
+    assert any(
+        check.name == "JSON Pattern Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.details["context"] == "json_checkpoint.payload"
+        for check in result.checks
+    )
+
+
 def test_scan_json_checkpoint_with_leading_whitespace_array_metadata(tmp_path: Path) -> None:
     checkpoint_path = tmp_path / "array_metadata.checkpoint"
     checkpoint_path.write_text(
