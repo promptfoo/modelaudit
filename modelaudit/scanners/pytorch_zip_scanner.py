@@ -510,7 +510,7 @@ class PyTorchZipScanner(BaseScanner):
                             f"Duplicate archive entry {name} has conflicting metadata; "
                             "all copies will be scanned explicitly"
                         ),
-                        severity=IssueSeverity.WARNING,
+                        severity=IssueSeverity.INFO,
                         location=f"{path}:{name}",
                         details={
                             "entry": name,
@@ -523,8 +523,10 @@ class PyTorchZipScanner(BaseScanner):
                         },
                         why=(
                             "Duplicate ZIP members with the same path can shadow earlier payloads "
-                            "when readers resolve by filename. The scanner preserves every ZipInfo "
-                            "entry and reports conflicting duplicates for review."
+                            "when readers resolve by filename. The scanner now preserves every ZipInfo "
+                            "entry and scans all copies explicitly, so divergent duplicates are reported "
+                            "for visibility without turning benign-but-conflicting archives into warning-level "
+                            "findings by themselves."
                         ),
                     )
                     duplicate_entry_collisions_found = True

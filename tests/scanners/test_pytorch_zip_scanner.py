@@ -165,6 +165,26 @@ def test_pytorch_zip_scanner_allows_identical_duplicate_data_pkl(tmp_path: Path)
     assert result.metadata["pickle_files"] == ["data.pkl", "data.pkl"]
 
 
+def test_pytorch_zip_scanner_conflicting_duplicate_data_pkl_is_info_only(tmp_path: Path) -> None:
+    """Conflicting duplicate data.pkl entries should stay non-failing when every copy is benign."""
+    model_path = tmp_path / "conflicting_duplicate_data_pkl.pt"
+    first_payload = pickle.dumps({"weights": [1, 2, 3]})
+    second_payload = pickle.dumps({"weights": [4, 5, 6]})
+    _write_zip_with_duplicate_data_pkl(model_path, first_payload, second_payload)
+
+    scanner = PyTorchZipScanner()
+    result = scanner.scan(str(model_path))
+
+    duplicate_collision_checks = [check for check in result.checks if check.name == "Duplicate ZIP Entry Collision"]
+
+    assert result.success is True
+    assert not [issue for issue in result.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}]
+    assert len(duplicate_collision_checks) == 1
+    assert duplicate_collision_checks[0].status == CheckStatus.FAILED
+    assert duplicate_collision_checks[0].severity == IssueSeverity.INFO
+    assert result.metadata["pickle_files"] == ["data.pkl", "data.pkl"]
+
+
 def test_pytorch_zip_scanner_invalid_zip(tmp_path):
     """Test scanning an invalid ZIP file."""
     # Create an invalid ZIP file
