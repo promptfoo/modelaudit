@@ -164,7 +164,39 @@ class OciLayerScanner(BaseScanner):
             )
         ):
             return True
-        return bool(PROTOCOL0_GLOBAL_RE.match(data) or MARKED_PROTOCOL0_GLOBAL_RE.match(data))
+        if PROTOCOL0_GLOBAL_RE.match(data) or MARKED_PROTOCOL0_GLOBAL_RE.match(data):
+            return True
+
+        for offset in range(1, len(data)):
+            shifted_prefix = data[offset:]
+            if shifted_prefix.startswith(
+                (
+                    b"\x80\x02",
+                    b"\x80\x03",
+                    b"\x80\x04",
+                    b"\x80\x05",
+                    b"\x89HDF\r\n\x1a\n",
+                    b"\x93NUMPY",
+                    b"GGUF",
+                    b"GGML",
+                    b"GGMF",
+                    b"GGJT",
+                    b"GGLA",
+                    b"GGSA",
+                    b"PK\x03\x04",
+                    b"PK\x05\x06",
+                    b"PK\x07\x08",
+                    b"\x08\x01\x12\x00",
+                    b"ONNX",
+                    b"onnx",
+                    b"<?xml",
+                )
+            ):
+                return True
+            if PROTOCOL0_GLOBAL_RE.match(shifted_prefix) or MARKED_PROTOCOL0_GLOBAL_RE.match(shifted_prefix):
+                return True
+
+        return False
 
     def scan(self, path: str) -> ScanResult:
         path_check = self._check_path(path)

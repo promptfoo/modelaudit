@@ -430,6 +430,30 @@ class TestOciLayerScanner:
         assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
         assert any("misnamed.manifest:layer.tar.gz:payload.jpg" in (issue.location or "") for issue in result.issues)
 
+    def test_scan_layer_detects_misnamed_protocol0_pickle_member_with_non_magic_prefix(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Misnamed protocol-0 pickle members should still be scanned when the first probe bytes are inconclusive."""
+        protocol0_payload = tmp_path / "payload.jpg"
+        protocol0_payload.write_bytes(b"I1\n0cos\nsystem\n(S'echo oci-owned'\ntR.")
+
+        layer_path = tmp_path / "layer.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            tar.add(protocol0_payload, arcname="payload.jpg")
+
+        manifest = {"layers": ["layer.tar.gz"]}
+        manifest_path = tmp_path / "misnamed-protocol0.manifest"
+        manifest_path.write_text(json.dumps(manifest))
+
+        result = OciLayerScanner().scan(str(manifest_path))
+
+        assert result.success is False
+        assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+        assert any(
+            "misnamed-protocol0.manifest:layer.tar.gz:payload.jpg" in (issue.location or "") for issue in result.issues
+        )
+
     def test_scan_manifest_normalizes_layer_refs_with_uppercase_and_trailing_space(self, tmp_path: Path) -> None:
         """Cosmetic layer-ref suffix changes should not hide a real .tar.gz payload."""
         evil_pickle = Path(__file__).parent.parent / "assets/samples/pickles/evil.pickle"
