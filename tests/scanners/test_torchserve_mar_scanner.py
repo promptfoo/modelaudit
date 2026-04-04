@@ -739,6 +739,28 @@ def test_scan_accepts_duplicate_identical_manifest_entries(tmp_path: Path) -> No
     assert _failed_checks(result, "TorchServe Handler Static Analysis") == []
 
 
+def test_scan_accepts_many_duplicate_identical_manifest_entries(tmp_path: Path) -> None:
+    manifest_bytes = json.dumps({"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}).encode()
+    entries: list[tuple[str, bytes]] = [("MAR-INF/MANIFEST.json", manifest_bytes) for _ in range(128)]
+    entries.extend(
+        [
+            ("handler.py", b"def handle(data, context):\n    return {'ok': True}\n"),
+            ("weights.bin", b"weights"),
+        ]
+    )
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=None,
+        entries=entries,
+        filename="many_duplicate_identical_manifest.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+
+    assert _failed_checks(result, "TorchServe Manifest Collision") == []
+    assert _failed_checks(result, "TorchServe Handler Static Analysis") == []
+
+
 def test_scan_reports_missing_manifest_when_forced(tmp_path: Path) -> None:
     mar_path = _create_mar_archive(
         tmp_path,

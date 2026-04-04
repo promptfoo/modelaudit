@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import hashlib
 import json
 import os
 import posixpath
@@ -313,7 +314,9 @@ class TorchServeMarScanner(BaseScanner):
             location=archive_path,
         )
 
-        manifest_payloads: list[bytes] = []
+        manifest_payload_count = 0
+        first_manifest_digest: bytes | None = None
+        has_conflicting_manifest_payloads = False
         path_references: list[tuple[str, str]] = []
         handler_paths: list[str] = []
         serialized_paths: list[str] = []
@@ -340,7 +343,12 @@ class TorchServeMarScanner(BaseScanner):
                 )
                 continue
 
-            manifest_payloads.append(manifest_bytes)
+            manifest_payload_count += 1
+            manifest_digest = hashlib.sha256(manifest_bytes).digest()
+            if first_manifest_digest is None:
+                first_manifest_digest = manifest_digest
+            elif manifest_digest != first_manifest_digest:
+                has_conflicting_manifest_payloads = True
 
             try:
                 manifest_data = json.loads(manifest_bytes.decode("utf-8"))
@@ -380,8 +388,8 @@ class TorchServeMarScanner(BaseScanner):
 
         if len(manifest_infos) > 1 and (
             parsed_manifest_count != len(manifest_infos)
-            or len(manifest_payloads) != len(manifest_infos)
-            or len(set(manifest_payloads)) > 1
+            or manifest_payload_count != len(manifest_infos)
+            or has_conflicting_manifest_payloads
         ):
             result.add_check(
                 name="TorchServe Manifest Collision",
