@@ -56,6 +56,10 @@ _BZIP2_MAGIC = b"BZh"
 _XZ_MAGIC = b"\xfd7zXZ\x00"
 _SEVENZIP_MAGIC = b"7z\xbc\xaf\x27\x1c"
 _LZ4_FRAME_MAGIC = b"\x04\x22\x4d\x18"
+_TFLITE_MAGIC_OFFSET = 4
+_TFLITE_MAGIC_SIZE = 4
+_TFLITE_MIN_HEADER_SIZE = _TFLITE_MAGIC_OFFSET + _TFLITE_MAGIC_SIZE
+_TFLITE_MAGIC_BYTES = b"TFL3"
 _TORCHSERVE_MANIFEST_PATH = "MAR-INF/MANIFEST.json"
 _TORCHSERVE_MANIFEST_MAX_BYTES = 1 * 1024 * 1024
 _KERAS_ZIP_REQUIRED_ENTRY = "config.json"
@@ -199,6 +203,14 @@ def _read_pickle_probe_sample(path: Path, size: int, header16: bytes) -> bytes:
         return header16
     with path.open("rb") as f:
         return f.read(min(size, PROTO0_1_MAX_PROBE_BYTES))
+
+
+def _looks_like_tflite_header(header: bytes) -> bool:
+    """Return True when the FlatBuffer identifier is `TFL3` at bytes 4-7."""
+    return (
+        len(header) >= _TFLITE_MIN_HEADER_SIZE
+        and header[_TFLITE_MAGIC_OFFSET : _TFLITE_MAGIC_OFFSET + _TFLITE_MAGIC_SIZE] == _TFLITE_MAGIC_BYTES
+    )
 
 
 def _looks_like_safetensors_structure(path: Path | None, magic8: bytes, file_size: int) -> bool:
@@ -853,6 +865,9 @@ def detect_file_format_from_magic(path: str) -> str:
             magic8 = header[:8]
             magic16 = header[:16]
 
+            if _looks_like_tflite_header(magic8):
+                return "tflite"
+
             if _is_executorch_binary_signature(magic8) and _is_valid_executorch_binary(file_path):
                 return "executorch"
 
@@ -905,6 +920,9 @@ def detect_file_format_from_magic(path: str) -> str:
     magic4 = header[:4]
     magic8 = header[:8]
     magic16 = header[:16]
+
+    if _looks_like_tflite_header(magic8):
+        return "tflite"
 
     if _looks_like_safetensors_structure(file_path, magic8, size):
         return "safetensors"
@@ -1004,6 +1022,8 @@ def detect_file_format(path: str) -> str:
     # For .bin files, do more sophisticated detection
     if ext == ".bin":
         magic64 = read_magic_bytes(path, 64)
+        if _looks_like_tflite_header(magic8):
+            return "tflite"
         # IMPORTANT: Check ZIP format first (PyTorch models saved with torch.save())
         if magic4.startswith(b"PK"):
             return "zip"
@@ -1341,6 +1361,7 @@ def validate_file_type(path: str) -> bool:
         if ext_format == "pytorch_binary" and header_format in {
             "pytorch_binary",
             "pickle",
+            "tflite",
             "zip",
             "unknown",  # .bin files can contain arbitrary binary data
         }:

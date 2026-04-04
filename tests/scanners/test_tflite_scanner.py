@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from modelaudit import core
 from modelaudit.scanners import _registry
 from modelaudit.scanners.tflite_scanner import _MAX_COUNT, TFLiteScanner
 
@@ -46,13 +47,22 @@ def test_tflite_scanner_can_handle_renamed_model_by_magic_bytes(tmp_path: Path) 
     assert TFLiteScanner.can_handle(str(path)) is True
 
 
-@pytest.mark.skipif(not HAS_TFLITE, reason="tflite not installed")
 def test_tflite_scanner_registry_routes_renamed_model_by_magic_bytes(tmp_path: Path) -> None:
     """Registry extension prefiltering should still route renamed TFLite binaries by magic bytes."""
     path = tmp_path / "model.bin"
     path.write_bytes(b"\x00\x00\x00\x00TFL3" + b"\x00" * 100)
 
     assert _registry.get_scanner_for_path(str(path)) is TFLiteScanner
+
+
+def test_core_scan_file_routes_renamed_tflite_bin_to_tflite_scanner(tmp_path: Path) -> None:
+    """End-to-end routing should prefer TFLite over PyTorch binary when `.bin` magic bytes are `TFL3`."""
+    path = tmp_path / "model.bin"
+    path.write_bytes(b"\x00\x00\x00\x00TFL3" + b"\x00" * 100)
+
+    result = core.scan_file(str(path))
+
+    assert result.scanner_name == "tflite"
 
 
 def test_tflite_scanner_can_handle_magic_near_match_requires_exact_offset(tmp_path: Path) -> None:
