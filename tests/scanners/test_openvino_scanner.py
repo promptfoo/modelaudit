@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.openvino_scanner import OpenVinoScanner
 
@@ -39,6 +41,18 @@ def test_openvino_scanner_can_handle_long_xml_prolog(tmp_path: Path) -> None:
     )
 
     assert OpenVinoScanner.can_handle(str(xml_path)) is True
+
+
+def test_openvino_scanner_can_handle_uses_bounded_xml_prefix(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Root tags beyond the bounded routing prefix should fail closed instead of forcing full-file parsing."""
+    xml_path = tmp_path / "model.xml"
+    xml_path.write_text(
+        f"<?xml version='1.0'?><!--{'x' * 512}--><net name='test' version='10'></net>",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(OpenVinoScanner, "CAN_HANDLE_MAX_PARSE_BYTES", 128)
+
+    assert OpenVinoScanner.can_handle(str(xml_path)) is False
 
 
 def test_openvino_scanner_can_handle_rejects_non_openvino_xml(tmp_path: Path) -> None:

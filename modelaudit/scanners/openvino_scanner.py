@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 from collections.abc import Iterator
+from io import BytesIO
 from typing import Any, ClassVar
 
 from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_STRING_PATTERNS
@@ -55,6 +56,7 @@ class OpenVinoScanner(BaseScanner):
     name = "openvino"
     description = "Scans OpenVINO IR models for suspicious layers and external references"
     supported_extensions: ClassVar[list[str]] = [".xml"]
+    CAN_HANDLE_MAX_PARSE_BYTES: ClassVar[int] = 1024 * 1024
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -65,7 +67,8 @@ class OpenVinoScanner(BaseScanner):
 
         try:
             with open(path, "rb") as xml_file:
-                for _event, element in DefusedET.iterparse(xml_file, events=("start",)):
+                xml_prefix = xml_file.read(cls.CAN_HANDLE_MAX_PARSE_BYTES)
+                for _event, element in DefusedET.iterparse(BytesIO(xml_prefix), events=("start",)):
                     return _local_tag_name(str(element.tag)) in _OPENVINO_ROOT_TAGS
         except Exception:
             return False
