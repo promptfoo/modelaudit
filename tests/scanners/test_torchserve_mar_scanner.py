@@ -153,6 +153,36 @@ def test_scan_detects_getattr_wrapped_handler_execution_primitive(tmp_path: Path
     assert "os.system" in handler_failures[0].message
 
 
+@pytest.mark.parametrize(
+    "handler_source",
+    [
+        b"import os\n\ndef handle(data, context):\n    return getattr(os, name='system')('id')\n",
+        b"import os\n\ndef handle(data, context):\n    return getattr(object=os, name='system')('id')\n",
+    ],
+)
+def test_scan_detects_keyword_getattr_wrapped_handler_execution_primitive(
+    tmp_path: Path,
+    handler_source: bytes,
+) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": handler_source,
+            "weights.bin": b"weights",
+        },
+        filename="keyword_getattr_handler.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
+
+    assert len(handler_failures) == 1
+    assert handler_failures[0].severity == IssueSeverity.CRITICAL
+    assert "os.system" in handler_failures[0].message
+
+
 def test_scan_allows_benign_getattr_handler_access(tmp_path: Path) -> None:
     manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
     mar_path = _create_mar_archive(
@@ -165,7 +195,7 @@ def test_scan_allows_benign_getattr_handler_access(tmp_path: Path) -> None:
                 b"        self._value = {'ok': True}\n"
                 b"\n"
                 b"    def handle(self, data, context):\n"
-                b"        return getattr(self, '_value')\n"
+                b"        return getattr(object=self, name='_value')\n"
             ),
             "weights.bin": b"weights",
         },

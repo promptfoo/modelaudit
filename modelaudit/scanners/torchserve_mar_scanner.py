@@ -1139,7 +1139,7 @@ class TorchServeMarScanner(BaseScanner):
         return ".".join([resolved_head, *tail])
 
     def _resolve_getattr_call_name(self, node: ast.AST, aliases: dict[str, str]) -> str | None:
-        if not isinstance(node, ast.Call) or len(node.args) < 2:
+        if not isinstance(node, ast.Call):
             return None
 
         helper_name = self._resolve_call_name(node.func)
@@ -1150,11 +1150,21 @@ class TorchServeMarScanner(BaseScanner):
         if resolved_helper_name not in {"getattr", "builtins.getattr"}:
             return None
 
-        target_root = self._resolve_call_name(node.args[0])
+        target_root_node: ast.AST | None = node.args[0] if node.args else None
+        attr_name_node: ast.AST | None = node.args[1] if len(node.args) >= 2 else None
+        for keyword in node.keywords:
+            if keyword.arg == "object" and target_root_node is None:
+                target_root_node = keyword.value
+            elif keyword.arg == "name" and attr_name_node is None:
+                attr_name_node = keyword.value
+
+        if target_root_node is None or attr_name_node is None:
+            return None
+
+        target_root = self._resolve_call_name(target_root_node)
         if target_root is None:
             return None
 
-        attr_name_node = node.args[1]
         if not isinstance(attr_name_node, ast.Constant) or not isinstance(attr_name_node.value, str):
             return None
 
