@@ -7,6 +7,7 @@ import os
 import pickletools
 import re
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -22,6 +23,15 @@ except ImportError:  # pragma: no cover
         import numpy as np  # type: ignore[no-redef]
     else:
         np = None  # type: ignore[assignment]
+
+
+@dataclass
+class _PatternFindingBudget:
+    """Track per-file metadata pattern findings so repeated strings stay bounded."""
+
+    max_findings: int
+    recorded_findings: int = 0
+    limit_reported: bool = False
 
 
 class JaxCheckpointScanner(BaseScanner):
@@ -75,6 +85,7 @@ class JaxCheckpointScanner(BaseScanner):
     _PICKLE_MARKER: ClassVar[object] = object()
     _PICKLE_STACK_STATE_LIMIT: ClassVar[int] = 4096
     _PICKLE_MEMO_STATE_LIMIT: ClassVar[int] = 4096
+    DEFAULT_MAX_METADATA_PATTERN_FINDINGS: ClassVar[int] = 256
     DEFAULT_MAX_PICKLE_OPCODE_FINDINGS: ClassVar[int] = 256
     _DANGEROUS_PICKLE_GLOBALS: ClassVar[frozenset[tuple[str, str]]] = frozenset(
         {
@@ -121,6 +132,11 @@ class JaxCheckpointScanner(BaseScanner):
             self.DEFAULT_MAX_PICKLE_OPCODE_FINDINGS,
             minimum=1,
         )
+        self.max_metadata_pattern_findings = self._get_int_config(
+            "jax_metadata_max_pattern_findings",
+            self.DEFAULT_MAX_METADATA_PATTERN_FINDINGS,
+            minimum=1,
+        )
 
         # JAX-specific suspicious patterns
         self.jax_suspicious_patterns = [
@@ -152,12 +168,8 @@ class JaxCheckpointScanner(BaseScanner):
     def _looks_like_documentation_context(cls, context: str) -> bool:
         """Return True when a metadata path looks documentation-only."""
         lowered = context.lower()
-        context_parts = [part for part in re.split(r"[.\[\]]+", lowered) if part]
-        return any(
-            part in cls._DOCUMENTATION_CONTEXT_HINTS
-            or any(doc_hint in part for doc_hint in cls._DOCUMENTATION_CONTEXT_HINTS)
-            for part in context_parts
-        )
+        context_parts = [part for part in re.split(r"[.\[\]_-]+", lowered) if part]
+        return any(part in cls._DOCUMENTATION_CONTEXT_HINTS for part in context_parts)
 
     @classmethod
     def _iter_string_metadata(cls, value: Any, context: str = "root") -> Iterator[tuple[str, str]]:
@@ -184,6 +196,7 @@ class JaxCheckpointScanner(BaseScanner):
         message_prefix: str,
         location: str,
         result: ScanResult,
+        finding_budget: _PatternFindingBudget,
     ) -> None:
         """Match suspicious JAX regexes against one metadata/text context."""
         if self._looks_like_documentation_context(context):
@@ -192,6 +205,27 @@ class JaxCheckpointScanner(BaseScanner):
         for pattern in self.jax_suspicious_patterns:
             if not pattern.search(text):
                 continue
+            if finding_budget.recorded_findings >= finding_budget.max_findings:
+                if not finding_budget.limit_reported:
+                    limit_check_name = check_name.replace(" Security Check", " Finding Limit")
+                    if limit_check_name == check_name:
+                        limit_check_name = f"{check_name} Finding Limit"
+                    result.add_check(
+                        name=limit_check_name,
+                        passed=False,
+                        message=(
+                            "Reached the maximum number of recorded JAX metadata pattern findings; "
+                            "additional matches were suppressed"
+                        ),
+                        severity=IssueSeverity.WARNING,
+                        location=location,
+                        details={
+                            "max_metadata_pattern_findings": finding_budget.max_findings,
+                        },
+                        rule_code="S902",
+                    )
+                    finding_budget.limit_reported = True
+                return
 
             result.add_check(
                 name=check_name,
@@ -202,6 +236,7 @@ class JaxCheckpointScanner(BaseScanner):
                 details={"pattern": pattern.pattern, "context": context},
                 rule_code="S902",
             )
+            finding_budget.recorded_findings += 1
 
     @staticmethod
     def _parse_pickle_global_reference(arg: str) -> tuple[str, str] | None:
@@ -363,6 +398,7 @@ class JaxCheckpointScanner(BaseScanner):
             )
 
         # Check for code injection in metadata
+        pattern_finding_budget = _PatternFindingBudget(self.max_metadata_pattern_findings)
         for context, text_value in self._iter_string_metadata(metadata, "orbax_metadata"):
             self._add_suspicious_pattern_checks(
                 text_value,
@@ -371,6 +407,7 @@ class JaxCheckpointScanner(BaseScanner):
                 message_prefix="Suspicious pattern in Orbax metadata",
                 location=path,
                 result=result,
+                finding_budget=pattern_finding_budget,
             )
 
         # Extract useful metadata
@@ -576,6 +613,7 @@ class JaxCheckpointScanner(BaseScanner):
                 message_prefix="Suspicious JAX pattern in pickle",
                 location=path,
                 result=result,
+                finding_budget=_PatternFindingBudget(self.max_metadata_pattern_findings),
             )
 
         except Exception as e:
@@ -649,6 +687,7 @@ class JaxCheckpointScanner(BaseScanner):
                 data = json.load(f)
 
             # Analyze JSON content for suspicious patterns
+            pattern_finding_budget = _PatternFindingBudget(self.max_metadata_pattern_findings)
             for context, text_value in self._iter_string_metadata(data, "json_checkpoint"):
                 self._add_suspicious_pattern_checks(
                     text_value,
@@ -657,6 +696,7 @@ class JaxCheckpointScanner(BaseScanner):
                     message_prefix="Suspicious pattern in JSON checkpoint",
                     location=path,
                     result=result,
+                    finding_budget=pattern_finding_budget,
                 )
 
         except json.JSONDecodeError as e:

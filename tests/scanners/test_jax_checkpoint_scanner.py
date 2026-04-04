@@ -68,6 +68,68 @@ def test_orbax_documentation_only_mentions_do_not_trigger_pattern_check(tmp_path
     assert all(issue.severity != IssueSeverity.CRITICAL for issue in result.issues)
 
 
+def test_orbax_metadata_doc_substrings_do_not_bypass_pattern_checks(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "orbax_checkpoint"
+    _write_orbax_metadata(
+        checkpoint_dir,
+        {
+            "version": "0.1.0",
+            "type": "orbax_checkpoint",
+            "production": {
+                "runtime_hook": "jax.experimental.host_callback.call(os.system, 'id')",
+            },
+            "notebook": {
+                "restore_hook": "orbax.checkpoint.restore(... eval(payload))",
+            },
+        },
+    )
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert result.success
+    failed_contexts = {
+        check.details["context"]
+        for check in result.checks
+        if check.name == "Orbax Pattern Security Check" and check.status == CheckStatus.FAILED
+    }
+    assert "orbax_metadata.production.runtime_hook" in failed_contexts
+    assert "orbax_metadata.notebook.restore_hook" in failed_contexts
+
+
+def test_orbax_metadata_pattern_findings_are_capped_for_repeated_strings(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "orbax_checkpoint"
+    _write_orbax_metadata(
+        checkpoint_dir,
+        {
+            "version": "0.1.0",
+            "type": "orbax_checkpoint",
+            "jax_config": {
+                "runtime_hooks": ["jax.experimental.host_callback.call(os.system, 'id')" for _ in range(12)],
+            },
+        },
+    )
+
+    scanner = JaxCheckpointScanner(config={"jax_metadata_max_pattern_findings": 3})
+    result = scanner.scan(str(checkpoint_dir))
+
+    pattern_findings = [
+        check
+        for check in result.checks
+        if check.name == "Orbax Pattern Security Check" and check.status == CheckStatus.FAILED
+    ]
+    limit_checks = [
+        check
+        for check in result.checks
+        if check.name == "Orbax Pattern Finding Limit" and check.status == CheckStatus.FAILED
+    ]
+
+    assert result.success
+    assert len(pattern_findings) == 3
+    assert len(limit_checks) == 1
+    assert limit_checks[0].severity == IssueSeverity.WARNING
+    assert limit_checks[0].details["max_metadata_pattern_findings"] == 3
+
+
 class _SafeJaxState:
     def __init__(self) -> None:
         self.framework = "jax"
