@@ -596,6 +596,12 @@ class JaxCheckpointScanner(BaseScanner):
 
             pickle_stack: list[Any] = []
             pickle_memo: OrderedDict[int, Any] = OrderedDict()
+            sticky_pickle_memo: dict[int, Any] = {}
+            dangerous_pickle_memo_tokens = frozenset(
+                token
+                for module_name, global_name in self._DANGEROUS_PICKLE_GLOBALS
+                for token in (module_name, global_name)
+            )
             dangerous_opcode_findings = 0
             finding_limit_reported = False
             next_memoize_index = 0
@@ -617,11 +623,26 @@ class JaxCheckpointScanner(BaseScanner):
                 """Store the current stack top in the bounded pickle memo model."""
                 if not pickle_stack:
                     return
+                memo_value = pickle_stack[-1]
                 if memo_index in pickle_memo:
                     pickle_memo.move_to_end(memo_index)
                 elif len(pickle_memo) >= self._PICKLE_MEMO_STATE_LIMIT:
                     pickle_memo.popitem(last=False)
-                pickle_memo[memo_index] = pickle_stack[-1]
+                pickle_memo[memo_index] = memo_value
+                if (
+                    (isinstance(memo_value, str)
+                    and memo_value.lower() in dangerous_pickle_memo_tokens)
+                    or (
+                        isinstance(memo_value, tuple)
+                        and len(memo_value) == 2
+                        and isinstance(memo_value[0], str)
+                        and isinstance(memo_value[1], str)
+                        and self._is_dangerous_pickle_global(memo_value[0], memo_value[1])
+                    )
+                ):
+                    sticky_pickle_memo[memo_index] = memo_value
+                else:
+                    sticky_pickle_memo.pop(memo_index, None)
 
             def _pop_pickle_mark() -> None:
                 """Pop modeled stack values until the most recent MARK sentinel."""
@@ -663,8 +684,12 @@ class JaxCheckpointScanner(BaseScanner):
                         continue
                     if opcode.name in {"BINGET", "LONG_BINGET", "GET"}:
                         memo_index = _memo_key(arg)
-                        if memo_index is not None and memo_index in pickle_memo:
+                        if memo_index is None:
+                            continue
+                        if memo_index in pickle_memo:
                             _push_pickle_value(pickle_memo[memo_index])
+                        elif memo_index in sticky_pickle_memo:
+                            _push_pickle_value(sticky_pickle_memo[memo_index])
                         continue
 
                     parsed_global = None
