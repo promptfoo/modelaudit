@@ -251,6 +251,21 @@ class TestBackwardsCompatibility:
         assert hasattr(scanner, "scan")
         assert hasattr(scanner, "can_handle")
 
+    def test_registry_metadata_drives_lazy_scanner_exports(self) -> None:
+        """Test that lazy class exports resolve from scanner registry descriptors."""
+        from modelaudit import scanners
+
+        for scanner_id, scanner_info in _registry._scanners.items():
+            class_name = scanner_info["class"]
+            assert _registry.has_scanner_class(class_name)
+            assert _registry._get_scanner_id_for_class(class_name) == scanner_id
+
+        for scanner_id in ("pickle", "pytorch_zip", "manifest"):
+            class_name = _registry._scanners[scanner_id]["class"]
+            scanner_class = getattr(scanners, class_name)
+            assert issubclass(scanner_class, BaseScanner)
+            assert scanner_class.__name__ == class_name
+
 
 class TestPerformanceCharacteristics:
     """Test performance characteristics of lazy loading."""

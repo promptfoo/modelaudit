@@ -54,46 +54,7 @@ _OPERATIONAL_ERROR_METADATA_KEY = "operational_error"
 _OPERATIONAL_ERROR_REASON_METADATA_KEY = "operational_error_reason"
 _SCAN_OUTCOME_METADATA_KEY = "scan_outcome"
 
-HEADER_FORMAT_TO_SCANNER_ID = {
-    "pickle": "pickle",
-    "pytorch_binary": "pytorch_binary",
-    "hdf5": "keras_h5",
-    "keras": "keras_h5",
-    "safetensors": "safetensors",
-    "tensorflow_directory": "tf_savedmodel",
-    "protobuf": "tf_savedmodel",
-    "tf_metagraph": "tf_metagraph",
-    "tar": "tar",
-    "zip": "zip",
-    "onnx": "onnx",
-    "gguf": "gguf",
-    "ggml": "gguf",
-    "numpy": "numpy",
-    "openvino": "openvino",
-    "pmml": "pmml",
-    "cntk": "cntk",
-    "lightgbm": "lightgbm",
-    "torch7": "torch7",
-    "catboost": "catboost",
-    "rknn": "rknn",
-    "mxnet": "mxnet",
-    "nemo": "nemo",
-    "llamafile": "llamafile",
-    "tflite": "tflite",
-    "coreml": "coreml",
-    "paddle": "paddle",
-    "tensorrt": "tensorrt",
-    "flax_msgpack": "flax_msgpack",
-    "r_serialized": "r_serialized",
-    "executorch": "executorch",
-    "compressed": "compressed",
-    "sevenzip": "sevenzip",
-    "skops": "skops",
-    "torchserve_mar": "torchserve_mar",
-    "joblib": "joblib",
-    "xgboost": "xgboost",
-    "jax_checkpoint": "jax_checkpoint",
-}
+HEADER_FORMAT_TO_SCANNER_ID = _registry.get_header_format_to_scanner_ids()
 
 
 def _mark_operational_scan_error(scan_result: ScanResult, reason: str) -> None:
@@ -275,16 +236,13 @@ def _select_preferred_scanner_id(path: str, header_format: str, ext: str) -> str
             return "pickle"
         return "zip"
 
-    if header_format == "hdf5":
-        return "keras_h5"
-
     if ext == ".joblib" and header_format in {"compressed", "pickle"}:
         return "joblib"
 
     if header_format == "tar" and ext == ".nemo":
         return "nemo"
 
-    return HEADER_FORMAT_TO_SCANNER_ID.get(header_format)
+    return _registry.get_scanner_id_for_header_format(header_format)
 
 
 def _add_issue_to_model(

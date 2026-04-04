@@ -13,6 +13,7 @@ import pytest
 
 from modelaudit.core import scan_file
 from modelaudit.scanners.base import IssueSeverity, ScanResult
+from tests.helpers import create_mock_pytorch_zip
 
 _SYSTEM_GLOBAL_NAMES = ("os.system", "posix.system", "nt.system")
 
@@ -501,6 +502,44 @@ def test_scan_file_routes_misnamed_pytorch_zip_by_content(tmp_path: Path) -> Non
     assert any("data.pkl" in (issue.location or "") for issue in result.issues)
 
 
+@pytest.mark.parametrize("suffix", [".pt", ".pth", ".ckpt", ".bin", ".pkl"])
+def test_scan_file_routes_zip_backed_torch_suffix_collisions_to_pytorch_zip(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / f"weights{suffix}")
+
+    result = scan_file(str(model_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "pytorch_zip"
+    assert result.success is True
+    assert result.metadata.get("pickle_files")
+
+
+@pytest.mark.parametrize("suffix", [".pt", ".pth", ".ckpt", ".pkl"])
+def test_scan_file_routes_raw_pickle_torch_suffix_collisions_to_pickle(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    model_path = tmp_path / f"weights{suffix}"
+    model_path.write_bytes(pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+
+    result = scan_file(str(model_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "pickle"
+    assert result.success is True
+
+
+def test_scan_file_routes_raw_bin_without_zip_structure_to_pytorch_binary(tmp_path: Path) -> None:
+    model_path = tmp_path / "weights.bin"
+    model_path.write_bytes(b"\x00" * 128)
+
+    result = scan_file(str(model_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "pytorch_binary"
+    assert result.success is True
+
+
 def test_scan_file_routes_misnamed_executorch_archive_by_content(tmp_path: Path) -> None:
     disguised_exec = tmp_path / "model.jpg"
     _create_misnamed_zip(
@@ -617,3 +656,31 @@ def test_scan_file_routes_misnamed_sevenzip_by_header(tmp_path: Path) -> None:
 
     assert result.scanner_name == "sevenzip"
     assert any("payload.pkl" in (issue.location or "") for issue in result.issues)
+
+
+def test_scan_file_routes_readme_documentation_to_metadata_scanner(tmp_path: Path) -> None:
+    readme_path = tmp_path / "README.md"
+    readme_path.write_text("# Model Card\n\nThis README is benign.\n")
+
+    result = scan_file(str(readme_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "metadata"
+    assert result.success is True
+
+
+def test_scan_file_routes_model_config_json_to_manifest_scanner(tmp_path: Path) -> None:
+    manifest_path = tmp_path / "config.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "model_type": "bert",
+                "architectures": ["BertModel"],
+                "hidden_size": 768,
+            }
+        )
+    )
+
+    result = scan_file(str(manifest_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "manifest"
+    assert result.success is True

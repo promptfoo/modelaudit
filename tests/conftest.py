@@ -88,6 +88,9 @@ def pytest_runtest_setup(item):
         allowed_test_files = [
             "test_xgboost_scanner.py",
             "test_pickle_scanner.py",
+            "test_scanner_registry.py",  # Scanner registry routing and metadata tests
+            "test_lazy_loading.py",  # Lazy scanner descriptor/catalog tests
+            "test_graceful_degradation.py",  # Scanner dependency degradation tests
             "test_joblib_scanner_codecs.py",  # Joblib raw/compressed pickle fallback regression tests
             "test_base_scanner.py",
             "test_core.py",

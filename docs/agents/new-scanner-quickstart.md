@@ -58,10 +58,11 @@ class ExampleScanner(BaseScanner):
 
 Update `modelaudit/scanners/__init__.py` in `ScannerRegistry._init_registry`:
 
-- Add module/class metadata
-- Set priority and extensions carefully
+- Add one scanner descriptor entry with module/class metadata
+- Set priority, direct extensions, and any descriptor-owned `header_formats` / `content_routed_extensions` carefully
 - Declare dependency names for load-time diagnostics
-- Add class mapping in `__getattr__` if needed
+- Document intentional descriptor/class extension differences with `scanner_only_extensions` instead of leaving silent drift
+- Do not add a second class map in `__getattr__`; lazy exports are resolved from descriptor metadata
 
 ## 4. Dependency handling rules
 
@@ -78,6 +79,7 @@ Add focused tests under `tests/`:
 - Corrupt input: parser errors are handled cleanly
 - Missing dependency path (if optional)
 - Regression tests for edge cases and previously reported bypasses
+- Registry/routing regressions: add `scan_file()` and `ScannerRegistry.get_scanner_for_path()` positives/negatives for extension collisions, header aliases, and content-routed archive names
 
 ## 6. Validation before PR
 
