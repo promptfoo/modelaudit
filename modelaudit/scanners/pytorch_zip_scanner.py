@@ -88,24 +88,19 @@ class PyTorchZipScanner(BaseScanner):
         if not os.path.isfile(path):
             return False
 
+        try:
+            from modelaudit.utils.file.detection import is_pytorch_zip_archive
+        except Exception:
+            return False
+
         ext = os.path.splitext(path)[1].lower()
         if ext not in cls.supported_extensions:
-            try:
-                from modelaudit.utils.file.detection import is_pytorch_zip_archive
-
-                return is_pytorch_zip_archive(path)
-            except Exception:
-                return False
+            return is_pytorch_zip_archive(path)
 
         # For .bin, .pkl, and .ckpt files, only handle ZIP-backed containers.
         # torch.save() uses ZIP format by default since PyTorch 1.6 (_use_new_zipfile_serialization=True)
         if ext in [".bin", ".pkl", ".ckpt"]:
-            try:
-                from modelaudit.utils.file.detection import detect_file_format
-
-                return detect_file_format(path) == "zip"
-            except Exception:
-                return False
+            return is_pytorch_zip_archive(path)
 
         # For .pt and .pth, always try to handle.
         return True
