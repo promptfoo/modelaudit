@@ -75,6 +75,7 @@ class JaxCheckpointScanner(BaseScanner):
     _PICKLE_MARKER: ClassVar[object] = object()
     _PICKLE_STACK_STATE_LIMIT: ClassVar[int] = 4096
     _PICKLE_MEMO_STATE_LIMIT: ClassVar[int] = 4096
+    DEFAULT_MAX_PICKLE_OPCODE_FINDINGS: ClassVar[int] = 256
     _DANGEROUS_PICKLE_GLOBALS: ClassVar[frozenset[tuple[str, str]]] = frozenset(
         {
             ("builtins", "__import__"),
@@ -105,6 +106,7 @@ class JaxCheckpointScanner(BaseScanner):
     DEFAULT_MAX_PICKLE_SCAN_BYTES: ClassVar[int] = 16 * 1024 * 1024
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
+        """Initialize JAX checkpoint scanning limits and regex detectors."""
         super().__init__(config)
         self.max_file_size = self.config.get(
             "max_file_size", 100 * 1024 * 1024 * 1024
@@ -113,6 +115,11 @@ class JaxCheckpointScanner(BaseScanner):
             "jax_pickle_max_scan_bytes",
             self.DEFAULT_MAX_PICKLE_SCAN_BYTES,
             minimum=1024,
+        )
+        self.max_pickle_opcode_findings = self._get_int_config(
+            "jax_pickle_max_opcode_findings",
+            self.DEFAULT_MAX_PICKLE_OPCODE_FINDINGS,
+            minimum=1,
         )
 
         # JAX-specific suspicious patterns
@@ -221,6 +228,7 @@ class JaxCheckpointScanner(BaseScanner):
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
+        """Return True when a path looks like a JAX/Orbax checkpoint."""
         if not os.path.exists(path):
             return False
 
@@ -445,19 +453,24 @@ class JaxCheckpointScanner(BaseScanner):
 
             pickle_stack: list[Any] = []
             pickle_memo: dict[int, Any] = {}
+            dangerous_opcode_findings = 0
+            finding_limit_reported = False
 
             def _push_pickle_value(value: Any) -> None:
+                """Push one modeled pickle stack value while bounding stack state."""
                 pickle_stack.append(value)
                 if len(pickle_stack) > self._PICKLE_STACK_STATE_LIMIT:
                     del pickle_stack[: -self._PICKLE_STACK_STATE_LIMIT]
 
             def _memo_key(value: Any) -> int | None:
+                """Coerce a memo opcode argument to an integer key."""
                 try:
                     return int(value)
                 except (TypeError, ValueError):
                     return None
 
             def _memoize_pickle_value(memo_index: int) -> None:
+                """Store the current stack top in the bounded pickle memo model."""
                 if not pickle_stack:
                     return
                 if memo_index not in pickle_memo and len(pickle_memo) >= self._PICKLE_MEMO_STATE_LIMIT:
@@ -465,6 +478,7 @@ class JaxCheckpointScanner(BaseScanner):
                 pickle_memo[memo_index] = pickle_stack[-1]
 
             def _pop_pickle_mark() -> None:
+                """Pop modeled stack values until the most recent MARK sentinel."""
                 while pickle_stack:
                     value = pickle_stack.pop()
                     if value is self._PICKLE_MARKER:
@@ -513,6 +527,25 @@ class JaxCheckpointScanner(BaseScanner):
 
                 if parsed_global is not None and self._is_dangerous_pickle_global(*parsed_global):
                     module_name, global_name = parsed_global
+                    if dangerous_opcode_findings >= self.max_pickle_opcode_findings:
+                        if not finding_limit_reported:
+                            result.add_check(
+                                name="Pickle Opcode Finding Limit",
+                                passed=False,
+                                message=(
+                                    "Reached the maximum number of recorded dangerous pickle opcode findings; "
+                                    "additional matches were suppressed"
+                                ),
+                                rule_code="S902",
+                                severity=IssueSeverity.WARNING,
+                                location=path,
+                                details={
+                                    "max_pickle_opcode_findings": self.max_pickle_opcode_findings,
+                                },
+                            )
+                            finding_limit_reported = True
+                        continue
+
                     result.add_check(
                         name="Pickle Opcode Security Check",
                         passed=False,
@@ -526,6 +559,7 @@ class JaxCheckpointScanner(BaseScanner):
                             "global": f"{module_name}.{global_name}",
                         },
                     )
+                    dangerous_opcode_findings += 1
 
             # Check for JAX-specific suspicious content
             data_str = data.decode("utf-8", errors="ignore")

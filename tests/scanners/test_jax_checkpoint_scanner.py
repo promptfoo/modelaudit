@@ -148,6 +148,42 @@ def test_memoized_stack_global_opcode_is_detected(tmp_path: Path) -> None:
     )
 
 
+def test_pickle_opcode_findings_are_capped_for_repeated_dangerous_globals(tmp_path: Path) -> None:
+    pickle_path = tmp_path / "repeated_dangerous_globals.pickle"
+    payload = bytearray(b"\x80\x04")
+    payload.extend(_proto4_short_unicode("jax"))
+    payload.extend(b"0")
+    for _ in range(12):
+        payload.extend(_proto4_short_unicode("os"))
+        payload.extend(_proto4_short_unicode("system"))
+        payload.extend(b"\x93")
+        payload.extend(b"0")
+    payload.extend(b".")
+    pickle_path.write_bytes(bytes(payload))
+
+    scanner = JaxCheckpointScanner(config={"jax_pickle_max_opcode_findings": 3})
+    assert scanner.can_handle(str(pickle_path))
+
+    result = scanner.scan(str(pickle_path))
+
+    opcode_findings = [
+        check
+        for check in result.checks
+        if check.name == "Pickle Opcode Security Check" and check.status == CheckStatus.FAILED
+    ]
+    finding_limit_checks = [
+        check
+        for check in result.checks
+        if check.name == "Pickle Opcode Finding Limit" and check.status == CheckStatus.FAILED
+    ]
+
+    assert result.success
+    assert len(opcode_findings) == 3
+    assert all(check.details["global"] == "os.system" for check in opcode_findings)
+    assert len(finding_limit_checks) == 1
+    assert finding_limit_checks[0].severity == IssueSeverity.WARNING
+
+
 @pytest.mark.parametrize(
     ("module_name", "global_name"),
     [
