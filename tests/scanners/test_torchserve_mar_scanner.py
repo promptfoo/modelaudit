@@ -133,6 +133,177 @@ def test_scan_flags_duplicate_handler_member_even_when_benign_copy_is_last(tmp_p
     assert handler_failures[0].details["handler"] == "handler.py"
 
 
+def test_scan_analyzes_readable_duplicate_handler_when_later_duplicate_is_unreadable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries=[
+            ("handler.py", b"import os\n\ndef handle(data, context):\n    return os.system('echo owned')\n"),
+            ("handler.py", b"def handle(data, context):\n    return {'ok': True}\n"),
+            ("weights.bin", b"weights"),
+        ],
+        filename="unreadable_duplicate_handler.mar",
+    )
+
+    scanner = TorchServeMarScanner()
+    real_read_member_bounded = scanner._read_member_bounded
+    handler_read_count = 0
+
+    def flaky_read_member_bounded(
+        archive: zipfile.ZipFile,
+        member_info: zipfile.ZipInfo,
+        max_bytes: int,
+    ) -> bytes:
+        nonlocal handler_read_count
+        if member_info.filename == "handler.py":
+            handler_read_count += 1
+            if handler_read_count == 2:
+                raise OSError("handler CRC mismatch")
+        return real_read_member_bounded(archive, member_info, max_bytes)
+
+    monkeypatch.setattr(scanner, "_read_member_bounded", flaky_read_member_bounded)
+
+    result = scanner.scan(str(mar_path))
+
+    handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
+    assert result.success is False
+    assert any(
+        failure.severity == IssueSeverity.CRITICAL and "os.system" in failure.message for failure in handler_failures
+    )
+    assert any(
+        failure.severity == IssueSeverity.WARNING
+        and "Unable to read handler source for static analysis: handler CRC mismatch" in failure.message
+        and failure.details.get("analysis_kind") == "read"
+        for failure in handler_failures
+    )
+
+
+def test_scan_detects_getattr_wrapped_handler_execution_primitive(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"import os\n\ndef handle(data, context):\n    return getattr(os, 'system')('id')\n",
+            "weights.bin": b"weights",
+        },
+        filename="getattr_handler.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
+
+    assert len(handler_failures) == 1
+    assert handler_failures[0].severity == IssueSeverity.CRITICAL
+    assert "os.system" in handler_failures[0].message
+
+
+@pytest.mark.parametrize(
+    "handler_source",
+    [
+        b"import os\n\ndef handle(data, context):\n    return getattr(os, name='system')('id')\n",
+        b"import os\n\ndef handle(data, context):\n    return getattr(object=os, name='system')('id')\n",
+    ],
+)
+def test_scan_detects_keyword_getattr_wrapped_handler_execution_primitive(
+    tmp_path: Path,
+    handler_source: bytes,
+) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": handler_source,
+            "weights.bin": b"weights",
+        },
+        filename="keyword_getattr_handler.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
+
+    assert len(handler_failures) == 1
+    assert handler_failures[0].severity == IssueSeverity.CRITICAL
+    assert "os.system" in handler_failures[0].message
+
+
+def test_scan_detects_dunder_call_getattr_wrapped_handler_execution_primitive(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": (
+                b"import os\n\ndef handle(data, context):\n    return getattr(os, 'system').__call__('id')\n"
+            ),
+            "weights.bin": b"weights",
+        },
+        filename="dunder_call_getattr_handler.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
+
+    assert len(handler_failures) == 1
+    assert handler_failures[0].severity == IssueSeverity.CRITICAL
+    assert "os.system" in handler_failures[0].message
+
+
+def test_scan_allows_benign_getattr_handler_access(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": (
+                b"class Handler:\n"
+                b"    def __init__(self):\n"
+                b"        self._value = {'ok': True}\n"
+                b"\n"
+                b"    def handle(self, data, context):\n"
+                b"        return getattr(object=self, name='_value')\n"
+            ),
+            "weights.bin": b"weights",
+        },
+        filename="benign_getattr_handler.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
+
+    assert handler_failures == []
+
+
+def test_scan_allows_benign_dunder_call_getattr_handler_access(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": (
+                b"class Handler:\n"
+                b"    def _safe_value(self):\n"
+                b"        return {'ok': True}\n"
+                b"\n"
+                b"    def handle(self, data, context):\n"
+                b"        return getattr(self, '_safe_value').__call__()\n"
+            ),
+            "weights.bin": b"weights",
+        },
+        filename="benign_dunder_call_getattr_handler.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
+
+    assert handler_failures == []
+
+
 def test_scan_accepts_clean_duplicate_handler_members(tmp_path: Path) -> None:
     manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
     mar_path = _create_mar_archive(
@@ -636,6 +807,355 @@ def test_scan_detects_path_traversal_member_names(tmp_path: Path) -> None:
     traversal_failures = _failed_checks(result, "TorchServe MAR Path Traversal Protection")
     assert len(traversal_failures) >= 1
     assert traversal_failures[0].severity == IssueSeverity.CRITICAL
+
+
+def test_scan_detects_conflicting_duplicate_manifest_handler_entries(tmp_path: Path) -> None:
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=None,
+        entries=[
+            (
+                "MAR-INF/MANIFEST.json",
+                json.dumps({"model": {"handler": "safe_handler.py", "serializedFile": "weights.bin"}}).encode(),
+            ),
+            ("safe_handler.py", b"def handle(data, context):\n    return {'ok': True}\n"),
+            ("weights.bin", b"weights"),
+            (
+                "MAR-INF/MANIFEST.json",
+                json.dumps({"model": {"handler": "evil_handler.py", "serializedFile": "weights.bin"}}).encode(),
+            ),
+            ("evil_handler.py", b"import os\n\ndef handle(data, context):\n    return os.system('id')\n"),
+        ],
+        filename="duplicate_manifest_handler.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    collision_failures = _failed_checks(result, "TorchServe Manifest Collision")
+    handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
+    non_handler_failures = _failed_checks(result, "MAR Non-Handler Python Analysis")
+
+    assert len(collision_failures) == 1
+    assert collision_failures[0].severity == IssueSeverity.WARNING
+    assert any(
+        failure.severity == IssueSeverity.CRITICAL
+        and failure.location == f"{mar_path}:evil_handler.py"
+        and "os.system" in failure.message
+        for failure in handler_failures
+    )
+    assert not any(failure.location == f"{mar_path}:evil_handler.py" for failure in non_handler_failures)
+
+
+def test_manifest_parsing_keeps_readable_manifest_when_later_duplicate_is_unreadable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest_bytes = json.dumps({"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}).encode()
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=None,
+        entries=[
+            ("MAR-INF/MANIFEST.json", manifest_bytes),
+            ("MAR-INF/MANIFEST.json", manifest_bytes),
+            ("handler.py", b"import os\n\ndef handle(data, context):\n    return os.system('id')\n"),
+            ("weights.bin", b"weights"),
+        ],
+        filename="unreadable_duplicate_manifest.mar",
+    )
+
+    scanner = TorchServeMarScanner()
+    real_read_member_bounded = scanner._read_member_bounded
+    manifest_read_count = 0
+
+    def flaky_read_member_bounded(
+        archive: zipfile.ZipFile,
+        member_info: zipfile.ZipInfo,
+        max_bytes: int,
+    ) -> bytes:
+        nonlocal manifest_read_count
+        if member_info.filename == "MAR-INF/MANIFEST.json":
+            manifest_read_count += 1
+            if manifest_read_count == 2:
+                raise OSError("manifest CRC mismatch")
+        return real_read_member_bounded(archive, member_info, max_bytes)
+
+    monkeypatch.setattr(scanner, "_read_member_bounded", flaky_read_member_bounded)
+
+    result = scanner.scan(str(mar_path))
+
+    assert result.success is False
+    manifest_read_failures = _failed_checks(result, "TorchServe Manifest Read")
+    assert len(manifest_read_failures) == 1
+    assert manifest_read_failures[0].severity == IssueSeverity.WARNING
+    assert "manifest CRC mismatch" in manifest_read_failures[0].message
+    handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
+    assert any(
+        failure.severity == IssueSeverity.CRITICAL and "os.system" in failure.message for failure in handler_failures
+    )
+
+
+def test_scan_accepts_duplicate_identical_manifest_entries(tmp_path: Path) -> None:
+    manifest_bytes = json.dumps({"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}).encode()
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=None,
+        entries=[
+            ("MAR-INF/MANIFEST.json", manifest_bytes),
+            ("MAR-INF/MANIFEST.json", manifest_bytes),
+            ("handler.py", b"def handle(data, context):\n    return {'ok': True}\n"),
+            ("weights.bin", b"weights"),
+        ],
+        filename="duplicate_identical_manifest.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+
+    assert _failed_checks(result, "TorchServe Manifest Collision") == []
+    assert _failed_checks(result, "TorchServe Handler Static Analysis") == []
+
+
+def test_scan_accepts_many_duplicate_identical_manifest_entries(tmp_path: Path) -> None:
+    manifest_bytes = json.dumps({"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}).encode()
+    entries: list[tuple[str, bytes]] = [("MAR-INF/MANIFEST.json", manifest_bytes) for _ in range(128)]
+    entries.extend(
+        [
+            ("handler.py", b"def handle(data, context):\n    return {'ok': True}\n"),
+            ("weights.bin", b"weights"),
+        ]
+    )
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=None,
+        entries=entries,
+        filename="many_duplicate_identical_manifest.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+
+    assert _failed_checks(result, "TorchServe Manifest Collision") == []
+    assert _failed_checks(result, "TorchServe Handler Static Analysis") == []
+
+
+def test_manifest_parsing_respects_entry_limit_for_duplicate_manifest_floods(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest_bytes = json.dumps({"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}).encode()
+    entries: list[tuple[str, bytes]] = [("MAR-INF/MANIFEST.json", manifest_bytes) for _ in range(8)]
+    entries.extend(
+        [
+            ("handler.py", b"def handle(data, context):\n    return {'ok': True}\n"),
+            ("weights.bin", b"weights"),
+        ]
+    )
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=None,
+        entries=entries,
+        filename="manifest_entry_budget.mar",
+    )
+
+    scanner = TorchServeMarScanner(config={"max_mar_entries": 2})
+    real_read_member_bounded = scanner._read_member_bounded
+    manifest_read_count = 0
+
+    def counting_read_member_bounded(
+        archive: zipfile.ZipFile,
+        member_info: zipfile.ZipInfo,
+        max_bytes: int,
+    ) -> bytes:
+        nonlocal manifest_read_count
+        if member_info.filename == "MAR-INF/MANIFEST.json":
+            manifest_read_count += 1
+        return real_read_member_bounded(archive, member_info, max_bytes)
+
+    monkeypatch.setattr(scanner, "_read_member_bounded", counting_read_member_bounded)
+
+    result = scanner.scan(str(mar_path))
+
+    assert result.success is False
+    assert manifest_read_count == 2
+    entry_limit_failures = _failed_checks(result, "TorchServe Manifest Entry Limit")
+    assert len(entry_limit_failures) == 1
+    assert entry_limit_failures[0].severity == IssueSeverity.CRITICAL
+    assert entry_limit_failures[0].details.get("dropped_manifest_count") == 6
+    assert _failed_checks(result, "TorchServe Manifest Collision") == []
+
+
+def test_manifest_parsing_respects_uncompressed_budget_for_duplicate_manifest_floods(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest_bytes = json.dumps({"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}).encode()
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=None,
+        entries=[
+            ("MAR-INF/MANIFEST.json", manifest_bytes),
+            ("MAR-INF/MANIFEST.json", manifest_bytes),
+            ("MAR-INF/MANIFEST.json", manifest_bytes),
+            ("handler.py", b"def handle(data, context):\n    return {'ok': True}\n"),
+            ("weights.bin", b"weights"),
+        ],
+        filename="manifest_uncompressed_budget.mar",
+    )
+
+    scanner = TorchServeMarScanner(config={"max_mar_uncompressed_bytes": len(manifest_bytes)})
+    real_read_member_bounded = scanner._read_member_bounded
+    manifest_read_count = 0
+
+    def counting_read_member_bounded(
+        archive: zipfile.ZipFile,
+        member_info: zipfile.ZipInfo,
+        max_bytes: int,
+    ) -> bytes:
+        nonlocal manifest_read_count
+        if member_info.filename == "MAR-INF/MANIFEST.json":
+            manifest_read_count += 1
+        return real_read_member_bounded(archive, member_info, max_bytes)
+
+    monkeypatch.setattr(scanner, "_read_member_bounded", counting_read_member_bounded)
+
+    result = scanner.scan(str(mar_path))
+
+    assert result.success is False
+    assert manifest_read_count == 1
+    budget_failures = _failed_checks(result, "TorchServe Manifest Uncompressed Size Budget")
+    assert len(budget_failures) == 1
+    assert budget_failures[0].severity == IssueSeverity.CRITICAL
+    assert _failed_checks(result, "TorchServe Manifest Collision") == []
+
+
+def test_manifest_entry_limit_fails_closed_when_malicious_manifest_is_after_cap(tmp_path: Path) -> None:
+    benign_manifest = json.dumps({"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}).encode()
+    malicious_manifest = json.dumps(
+        {
+            "model": {
+                "handler": "evil_handler.py",
+                "serializedFile": "weights.bin",
+            }
+        }
+    ).encode()
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=None,
+        entries=[
+            ("MAR-INF/MANIFEST.json", benign_manifest),
+            ("MAR-INF/MANIFEST.json", malicious_manifest),
+            ("handler.py", b"def handle(data, context):\n    return {'ok': True}\n"),
+            ("evil_handler.py", b"import os\n\ndef handle(data, context):\n    os.system('id')\n    return data\n"),
+            ("weights.bin", b"weights"),
+        ],
+        filename="malicious_manifest_after_cap.mar",
+    )
+
+    result = TorchServeMarScanner(config={"max_mar_entries": 1}).scan(str(mar_path))
+
+    entry_limit_failures = _failed_checks(result, "TorchServe Manifest Entry Limit")
+    assert result.success is False
+    assert len(entry_limit_failures) == 1
+    assert entry_limit_failures[0].severity == IssueSeverity.CRITICAL
+    assert "scan results are incomplete" in entry_limit_failures[0].message
+    assert entry_limit_failures[0].details.get("dropped_manifest_count") == 1
+
+
+def test_handler_analysis_respects_entry_limit_for_manifest_handler_fanout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = {
+        "model": {
+            "handler": [f"handlers/handler_{index}.py" for index in range(5)],
+            "serializedFile": "weights.bin",
+        }
+    }
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            **{
+                f"handlers/handler_{index}.py": b"def handle(data, context):\n    return {'ok': True}\n"
+                for index in range(5)
+            },
+            "weights.bin": b"weights",
+        },
+        filename="handler_entry_budget.mar",
+    )
+
+    scanner = TorchServeMarScanner(config={"max_mar_entries": 2})
+    real_read_member_bounded = scanner._read_member_bounded
+    handler_read_count = 0
+
+    def counting_read_member_bounded(
+        archive: zipfile.ZipFile,
+        member_info: zipfile.ZipInfo,
+        max_bytes: int,
+    ) -> bytes:
+        nonlocal handler_read_count
+        if member_info.filename.startswith("handlers/"):
+            handler_read_count += 1
+        return real_read_member_bounded(archive, member_info, max_bytes)
+
+    monkeypatch.setattr(scanner, "_read_member_bounded", counting_read_member_bounded)
+
+    result = scanner.scan(str(mar_path))
+
+    assert result.success is False
+    assert handler_read_count == 2
+    entry_limit_failures = _failed_checks(result, "TorchServe Handler Entry Limit")
+    assert len(entry_limit_failures) == 1
+    assert entry_limit_failures[0].severity == IssueSeverity.CRITICAL
+    assert "scan results are incomplete" in entry_limit_failures[0].message
+    assert entry_limit_failures[0].details["processed_handler_entries"] == 2
+    assert entry_limit_failures[0].details["max_entries"] == 2
+
+
+def test_handler_analysis_respects_uncompressed_budget_for_manifest_handler_fanout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handler_source = b"def handle(data, context):\n    return {'ok': True}\n" + (b"#" * 256) + b"\n"
+    manifest = {
+        "model": {
+            "handler": ["handlers/handler_0.py", "handlers/handler_1.py"],
+            "serializedFile": "weights.bin",
+        }
+    }
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handlers/handler_0.py": handler_source,
+            "handlers/handler_1.py": handler_source,
+            "weights.bin": b"weights",
+        },
+        filename="handler_uncompressed_budget.mar",
+    )
+
+    scanner = TorchServeMarScanner(config={"max_mar_uncompressed_bytes": len(handler_source)})
+    real_read_member_bounded = scanner._read_member_bounded
+    handler_read_count = 0
+
+    def counting_read_member_bounded(
+        archive: zipfile.ZipFile,
+        member_info: zipfile.ZipInfo,
+        max_bytes: int,
+    ) -> bytes:
+        nonlocal handler_read_count
+        if member_info.filename.startswith("handlers/"):
+            handler_read_count += 1
+        return real_read_member_bounded(archive, member_info, max_bytes)
+
+    monkeypatch.setattr(scanner, "_read_member_bounded", counting_read_member_bounded)
+
+    result = scanner.scan(str(mar_path))
+
+    assert result.success is False
+    assert handler_read_count == 1
+    budget_failures = _failed_checks(result, "TorchServe Handler Uncompressed Size Budget")
+    assert len(budget_failures) == 1
+    assert budget_failures[0].severity == IssueSeverity.CRITICAL
+    assert "scan results are incomplete" in budget_failures[0].message
+    assert budget_failures[0].details["max_uncompressed_bytes"] == len(handler_source)
 
 
 def test_scan_reports_missing_manifest_when_forced(tmp_path: Path) -> None:

@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import bz2
 import io
 import lzma
 import os
+import pickletools
 import zlib
+from collections.abc import Callable
 from typing import Any, ClassVar
 
 from ..detectors.cve_patterns import analyze_cve_patterns, enhance_scan_result_with_cve
 from ..utils.file.detection import read_magic_bytes
 from .base import BaseScanner, IssueSeverity, ScanResult
-from .pickle_scanner import PickleScanner
+from .pickle_scanner import PickleScanner, _looks_like_pickle
 
 
 class JoblibScanner(BaseScanner):
@@ -22,6 +25,7 @@ class JoblibScanner(BaseScanner):
     supported_extensions: ClassVar[list[str]] = [".joblib"]
 
     def __init__(self, config: dict[str, Any] | None = None):
+        """Initialize Joblib scanning limits and the embedded Pickle scanner."""
         super().__init__(config)
         self.pickle_scanner = PickleScanner(config)
         # Security limits
@@ -34,6 +38,7 @@ class JoblibScanner(BaseScanner):
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
+        """Return True for existing `.joblib` files."""
         if not os.path.isfile(path):
             return False
         ext = os.path.splitext(path)[1].lower()
@@ -43,37 +48,126 @@ class JoblibScanner(BaseScanner):
         """Read file in chunks using the base class helper."""
         return super()._read_file_safely(path)
 
-    def _safe_decompress(self, data: bytes) -> bytes:
-        """Safely decompress data with bomb protection"""
-        compressed_size = len(data)
-
-        # Try zlib first
-        decompressed = None
-        try:
-            decompressed = zlib.decompress(data)
-        except Exception:
-            # Try lzma
-            try:
-                decompressed = lzma.decompress(data)
-            except Exception as e:
-                raise ValueError(f"Unable to decompress joblib file: {e}") from e
-
-        # Check decompression ratio for compression bomb detection
+    def _max_decompressed_output_bytes(self, compressed_size: int) -> int:
+        """Compute the effective decompression output cap for one compressed payload."""
+        max_by_ratio = self.max_decompressed_size
         if compressed_size > 0:
-            ratio = len(decompressed) / compressed_size
-            if ratio > self.max_decompression_ratio:
-                raise ValueError(
-                    f"Suspicious compression ratio: {ratio:.1f}x (max: {self.max_decompression_ratio}x) - "
-                    f"possible compression bomb"
-                )
+            max_by_ratio = int(self.max_decompression_ratio * compressed_size)
+        return min(self.max_decompressed_size, max_by_ratio)
 
-        # Check absolute decompressed size
-        if len(decompressed) > self.max_decompressed_size:
+    def _check_decompressed_size(self, decompressed_size: int) -> None:
+        """Fail when the decompressed payload exceeds the absolute size limit."""
+        if decompressed_size > self.max_decompressed_size:
             raise ValueError(
-                f"Decompressed size too large: {len(decompressed)} bytes (max: {self.max_decompressed_size})",
+                f"Decompressed size too large: {decompressed_size} bytes (max: {self.max_decompressed_size})",
             )
 
-        return decompressed
+    def _check_decompression_ratio(self, decompressed_size: int, compressed_size: int) -> None:
+        """Fail when decompression expands beyond the configured ratio limit."""
+        if compressed_size <= 0:
+            return
+
+        ratio = decompressed_size / compressed_size
+        if ratio > self.max_decompression_ratio:
+            raise ValueError(
+                f"Suspicious compression ratio: {ratio:.1f}x (max: {self.max_decompression_ratio}x) - "
+                f"possible compression bomb"
+            )
+
+    def _decompress_with_limited_output(self, decompressor: Any, data: bytes) -> bytes:
+        """Decompress one stream while enforcing absolute-size and ratio budgets."""
+        compressed_size = len(data)
+        max_output_bytes = self._max_decompressed_output_bytes(compressed_size)
+        output_limit = max_output_bytes + 1
+
+        decompressed = bytearray(decompressor.decompress(data, output_limit))
+        if len(decompressed) > output_limit:
+            raise ValueError("Internal decompression limit exceeded")
+
+        self._check_decompressed_size(len(decompressed))
+        self._check_decompression_ratio(len(decompressed), compressed_size)
+
+        if len(decompressed) == output_limit:
+            raise ValueError(
+                f"Decompressed size too large: {len(decompressed)} bytes (max: {max_output_bytes})",
+            )
+
+        remaining_output_budget = output_limit - len(decompressed)
+        if remaining_output_budget > 0 and hasattr(decompressor, "flush"):
+            decompressed.extend(decompressor.flush(remaining_output_budget))
+            self._check_decompressed_size(len(decompressed))
+            self._check_decompression_ratio(len(decompressed), compressed_size)
+            if len(decompressed) > output_limit:
+                raise ValueError(
+                    f"Decompressed size too large: {len(decompressed)} bytes (max: {max_output_bytes})",
+                )
+
+        if getattr(decompressor, "unused_data", b""):
+            raise ValueError("Trailing data found after compressed joblib stream")
+
+        if not getattr(decompressor, "eof", True):
+            raise ValueError("Incomplete compressed joblib stream")
+
+        return bytes(decompressed)
+
+    def _safe_decompress(self, data: bytes) -> bytes:
+        """Safely decompress data with bomb protection"""
+        codec_attempts: list[tuple[str, Callable[[], Any]]] = [
+            ("zlib", zlib.decompressobj),
+            ("gzip", lambda: zlib.decompressobj(zlib.MAX_WBITS | 16)),
+            ("bz2", bz2.BZ2Decompressor),
+            ("lzma", lzma.LZMADecompressor),
+        ]
+        decode_errors: list[str] = []
+
+        for codec_name, decompressor_factory in codec_attempts:
+            try:
+                return self._decompress_with_limited_output(decompressor_factory(), data)
+            except (OSError, EOFError, lzma.LZMAError, zlib.error) as exc:
+                decode_errors.append(f"{codec_name}: {exc}")
+
+        raise ValueError(
+            "Unable to decompress joblib file: " + "; ".join(decode_errors or ["no supported decoder matched"]),
+        )
+
+    def _scan_pickle_payload(self, payload: bytes, result: ScanResult, context: str) -> None:
+        """Analyze a raw or decompressed pickle payload with CVE and opcode checks."""
+        self._detect_cve_patterns(payload, result, context)
+        self._scan_for_joblib_specific_threats(payload, result, context)
+        self.pickle_scanner.current_file_path = context
+
+        with io.BytesIO(payload) as file_like:
+            sub_result = self.pickle_scanner._scan_pickle_bytes(
+                file_like,
+                len(payload),
+            )
+        result.merge(sub_result)
+        result.bytes_scanned = len(payload)
+
+    def _looks_like_raw_pickle_payload(self, data: bytes) -> bool:
+        """Return True when `.joblib` bytes should be scanned directly as pickle."""
+        if _looks_like_pickle(data):
+            return True
+
+        if len(data) >= 2 and data[0] == 0x80 and data[1] <= 5:
+            return True
+
+        try:
+            probe = io.BytesIO(data[:4096])
+            for _opcode_count, (opcode, _arg, _pos) in enumerate(pickletools.genops(probe), 1):
+                if opcode.name == "STOP":
+                    return True
+                if _opcode_count >= 16:
+                    break
+        except Exception:
+            return False
+
+        return False
+
+    def _record_joblib_operational_error(self, result: ScanResult, reason: str) -> None:
+        """Mark a Joblib scan as operationally incomplete for CLI exit-code aggregation."""
+        result.metadata["operational_error"] = True
+        result.metadata["operational_error_reason"] = reason
 
     def _detect_cve_patterns(self, data: bytes, result: ScanResult, context: str) -> None:
         """Detect CVE-specific patterns in joblib file data."""
@@ -173,6 +267,7 @@ class JoblibScanner(BaseScanner):
                     )
 
     def scan(self, path: str) -> ScanResult:
+        """Scan one Joblib file as direct pickle, compressed pickle, or zip-backed content."""
         path_check_result = self._check_path(path)
         if path_check_result:
             return path_check_result
@@ -202,18 +297,8 @@ class JoblibScanner(BaseScanner):
                 result.finish(success=sub_result.success)
                 return result
 
-            if magic.startswith(b"\x80"):
-                # Scan for CVE patterns in raw pickle data
-                self._detect_cve_patterns(data, result, path)
-                self._scan_for_joblib_specific_threats(data, result, path)
-
-                with io.BytesIO(data) as file_like:
-                    sub_result = self.pickle_scanner._scan_pickle_bytes(
-                        file_like,
-                        len(data),
-                    )
-                result.merge(sub_result)
-                result.bytes_scanned = len(data)
+            if self._looks_like_raw_pickle_payload(data):
+                self._scan_pickle_payload(data, result, path)
             else:
                 # Try safe decompression
                 try:
@@ -248,6 +333,7 @@ class JoblibScanner(BaseScanner):
                         details={"security_check": "compression_bomb_detection"},
                         rule_code="S902",
                     )
+                    self._record_joblib_operational_error(result, "joblib_wrapper_decode_failed")
                     result.finish(success=False)
                     return result
                 except Exception as e:
@@ -263,19 +349,10 @@ class JoblibScanner(BaseScanner):
                         },
                         rule_code="S902",
                     )
+                    self._record_joblib_operational_error(result, "joblib_decompression_failed")
                     result.finish(success=False)
                     return result
-                # Scan decompressed data for CVE patterns
-                self._detect_cve_patterns(decompressed, result, f"{path} (decompressed)")
-                self._scan_for_joblib_specific_threats(decompressed, result, f"{path} (decompressed)")
-
-                with io.BytesIO(decompressed) as file_like:
-                    sub_result = self.pickle_scanner._scan_pickle_bytes(
-                        file_like,
-                        len(decompressed),
-                    )
-                result.merge(sub_result)
-                result.bytes_scanned = len(decompressed)
+                self._scan_pickle_payload(decompressed, result, f"{path} (decompressed)")
         except Exception as e:  # pragma: no cover
             result.add_check(
                 name="Joblib File Scan",
@@ -289,10 +366,11 @@ class JoblibScanner(BaseScanner):
                 },
                 rule_code="S902",
             )
+            self._record_joblib_operational_error(result, "joblib_scan_failed")
             result.finish(success=False)
             return result
 
-        result.finish(success=True)
+        result.finish(success=not result.has_errors)
         return result
 
     def extract_metadata(self, file_path: str) -> dict[str, Any]:

@@ -48,6 +48,7 @@ class FlaxMsgpackScanner(BaseScanner):
         )
         self.max_recursion_depth = self.config.get("max_recursion_depth", 100)
         self.max_items_per_container = self.config.get("max_items_per_container", 50000)  # Increased for large models
+        self.max_msgpack_stream_objects = self.config.get("max_msgpack_stream_objects", 4096)
 
         # Enhanced suspicious patterns for JAX/Flax specific threats
         self.suspicious_patterns = self.config.get(
@@ -110,7 +111,6 @@ class FlaxMsgpackScanner(BaseScanner):
                 "eval_fn",
                 "exec_fn",
                 # Orbax specific
-                "__orbax_metadata__",
                 "restore_fn",
                 "transform_fn",
             },
@@ -885,10 +885,112 @@ class FlaxMsgpackScanner(BaseScanner):
                 rule_code="S902",
             )
 
+    def _unpack_msgpack_objects(self, file_data: bytes, result: ScanResult, path: str) -> list[Any] | None:
+        """Unpack all msgpack objects in the stream and preserve trailing-object warnings."""
+        try:
+            return [msgpack.unpackb(file_data, raw=False, strict_map_key=False)]
+        except Exception as e:
+            extra_data_detected = False
+            if (
+                HAS_MSGPACK_EXCEPTIONS
+                and msgpack_exceptions
+                and hasattr(msgpack_exceptions, "ExtraData")
+                and isinstance(e, msgpack_exceptions.ExtraData)
+            ):
+                extra_data_detected = True
+
+            if extra_data_detected:
+                unpacker = msgpack.Unpacker(raw=False, strict_map_key=False)
+                unpacker.feed(file_data)
+                try:
+                    objects: list[Any] = []
+                    for stream_obj in unpacker:
+                        if len(objects) >= self.max_msgpack_stream_objects:
+                            result.add_check(
+                                name="Msgpack Stream Object Limit",
+                                passed=False,
+                                message=(
+                                    "Msgpack stream object count exceeds configured limit "
+                                    f"({self.max_msgpack_stream_objects})"
+                                ),
+                                severity=IssueSeverity.WARNING,
+                                location=path,
+                                details={
+                                    "max_msgpack_stream_objects": self.max_msgpack_stream_objects,
+                                    "parsed_object_count": len(objects),
+                                },
+                                rule_code="S902",
+                            )
+                            result.metadata["operational_error"] = True
+                            result.metadata["operational_error_reason"] = "msgpack_stream_object_limit_exceeded"
+                            result.finish(success=False)
+                            return None
+                        objects.append(stream_obj)
+                except Exception as unpack_e:
+                    result.add_check(
+                        name="Msgpack Parse Check",
+                        passed=False,
+                        message=f"Failed to parse msgpack data: {unpack_e}",
+                        severity=IssueSeverity.WARNING,
+                        location=path,
+                        details={"parse_error": str(unpack_e)},
+                        rule_code="S902",
+                    )
+                    result.finish(success=False)
+                    return None
+
+                if objects:
+                    trailing_objects_are_container_like = all(
+                        isinstance(stream_obj, (dict, list, tuple)) for stream_obj in objects[1:]
+                    )
+                    result.add_check(
+                        name="Msgpack Stream Integrity Check",
+                        passed=False,
+                        message="Extra trailing data found after msgpack content",
+                        severity=(IssueSeverity.INFO if trailing_objects_are_container_like else IssueSeverity.WARNING),
+                        location=path,
+                        details={
+                            "has_trailing_data": True,
+                            "trailing_object_count": len(objects) - 1,
+                            "trailing_object_types": [type(stream_obj).__name__ for stream_obj in objects[1:9]],
+                            "trailing_objects_are_container_like": trailing_objects_are_container_like,
+                        },
+                        rule_code="S902",
+                    )
+                    return objects
+
+                result.add_check(
+                    name="Msgpack Parse Check",
+                    passed=False,
+                    message="Failed to parse msgpack data: stream contained trailing bytes but no decodable objects",
+                    severity=IssueSeverity.WARNING,
+                    location=path,
+                    details={"parse_error": "no decodable objects"},
+                    rule_code="S902",
+                )
+                result.finish(success=False)
+                return None
+
+            result.add_check(
+                name="Msgpack Format Validation",
+                passed=False,
+                message=f"Invalid msgpack format: {e!s}",
+                severity=IssueSeverity.INFO,
+                location=path,
+                details={"msgpack_error": str(e)},
+                rule_code="S902",
+            )
+            result.finish(success=False)
+            return None
+
     def scan(self, path: str) -> ScanResult:
         path_check_result = self._check_path(path)
         if path_check_result:
             return path_check_result
+
+        size_check = self._check_size_limit(path)
+        if size_check:
+            return size_check
 
         result = self._create_result()
         file_size = self.get_file_size(path)
@@ -919,67 +1021,19 @@ class FlaxMsgpackScanner(BaseScanner):
             with open(path, "rb") as f:
                 file_data = f.read()
 
-            # Try to unpack and detect trailing data
-            try:
-                obj = msgpack.unpackb(file_data, raw=False, strict_map_key=False)
-                # If we get here, the entire file was valid msgpack - no trailing data
-            except Exception as e:
-                # Check if this is the specific ExtraData exception we're looking for
-                extra_data_detected = False
-                if (
-                    HAS_MSGPACK_EXCEPTIONS
-                    and msgpack_exceptions
-                    and hasattr(msgpack_exceptions, "ExtraData")
-                    and isinstance(e, msgpack_exceptions.ExtraData)
-                ):
-                    extra_data_detected = True
+            objects = self._unpack_msgpack_objects(file_data, result, path)
+            if objects is None:
+                return result
 
-                if extra_data_detected:
-                    # This means there's extra data after valid msgpack
-                    result.add_check(
-                        name="Msgpack Stream Integrity Check",
-                        passed=False,
-                        message="Extra trailing data found after msgpack content",
-                        severity=IssueSeverity.WARNING,
-                        location=path,
-                        details={"has_trailing_data": True},
-                        rule_code="S902",
-                    )
-                    # Unpack just the first object
-                    unpacker = msgpack.Unpacker(None, raw=False, strict_map_key=False)
-                    unpacker.feed(file_data)
-                    try:
-                        obj = unpacker.unpack()
-                    except Exception as unpack_e:
-                        result.add_check(
-                            name="Msgpack Parse Check",
-                            passed=False,
-                            message=f"Failed to parse msgpack data: {unpack_e}",
-                            severity=IssueSeverity.WARNING,
-                            location=path,
-                            details={"parse_error": str(unpack_e)},
-                            rule_code="S902",
-                        )
-                        return result
-                else:
-                    # Handle other msgpack exceptions
-                    result.add_check(
-                        name="Msgpack Format Validation",
-                        passed=False,
-                        message=f"Invalid msgpack format: {e!s}",
-                        severity=IssueSeverity.INFO,
-                        location=path,
-                        details={"msgpack_error": str(e)},
-                        rule_code="S902",
-                    )
-                    result.finish(success=False)
-                    return result
+            obj = objects[0]
 
             # Record metadata
             result.metadata["top_level_type"] = type(obj).__name__
             if isinstance(obj, dict):
                 result.metadata["top_level_keys"] = list(obj.keys())[:50]  # Limit for large dicts
                 result.metadata["key_count"] = len(obj.keys())
+            if len(objects) > 1:
+                result.metadata["msgpack_object_count"] = len(objects)
 
             # Extract JAX/Flax specific metadata and architecture information
             self._extract_jax_metadata(obj, result)
@@ -992,6 +1046,10 @@ class FlaxMsgpackScanner(BaseScanner):
 
             # Perform deep security analysis
             self._analyze_content(obj, "root", result)
+
+            for object_index, stream_obj in enumerate(objects[1:], start=1):
+                self._check_jax_specific_threats(stream_obj, result)
+                self._analyze_content(stream_obj, f"root[msgpack_object_{object_index}]", result)
 
             result.bytes_scanned = file_size
         except MemoryError:
@@ -1018,5 +1076,5 @@ class FlaxMsgpackScanner(BaseScanner):
             result.finish(success=False)
             return result
 
-        result.finish(success=True)
+        result.finish(success=not result.has_errors)
         return result
