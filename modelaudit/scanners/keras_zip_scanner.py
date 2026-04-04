@@ -124,6 +124,7 @@ class KerasZipScanner(BaseScanner):
     """Scanner for ZIP-based Keras .keras model files"""
 
     MAX_EMBEDDED_WEIGHTS_BYTES: ClassVar[int] = 100 * 1024 * 1024
+    MAX_DUPLICATE_MEMBER_COMPARE_CANDIDATES: ClassVar[int] = 16
 
     name = "keras_zip"
     description = "Scans ZIP-based Keras model files for suspicious configurations and Lambda layers"
@@ -254,10 +255,16 @@ class KerasZipScanner(BaseScanner):
         if len(candidate_members) == 1:
             return preferred_info
 
+        if len(candidate_members) > self.MAX_DUPLICATE_MEMBER_COMPARE_CANDIDATES:
+            raise _AmbiguousKerasArchiveMemberError(
+                member_name,
+                [info.filename for info in candidate_members],
+            )
+
         compare_limit = self._get_duplicate_member_compare_limit(member_name)
         try:
             preferred_data = _read_zip_member_bounded(archive, preferred_info, compare_limit)
-            for candidate_info in candidate_members:
+            for candidate_info in candidate_members[1:]:
                 candidate_data = _read_zip_member_bounded(archive, candidate_info, compare_limit)
                 if candidate_data != preferred_data:
                     raise _AmbiguousKerasArchiveMemberError(

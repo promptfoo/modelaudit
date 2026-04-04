@@ -15,6 +15,7 @@ import warnings
 import zipfile
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 
@@ -378,6 +379,33 @@ class TestKerasZipScanner:
         assert ambiguity_checks[0].status == CheckStatus.FAILED
         assert ambiguity_checks[0].details["member_name"] == "config.json"
         assert sorted(ambiguity_checks[0].details["candidate_filenames"]) == ["./config.json", "/config.json"]
+        assert result.success is False
+
+    def test_scan_fails_closed_when_duplicate_config_alias_count_exceeds_cap(self, tmp_path: Path) -> None:
+        """Too many duplicate config candidates should fail before decompressing every alias."""
+        scanner = KerasZipScanner()
+        keras_path = tmp_path / "too_many_duplicate_aliases.keras"
+        benign_config = json.dumps({"class_name": "Sequential", "config": {"layers": []}})
+
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            zf.writestr("config.json", benign_config)
+            for index in range(scanner.MAX_DUPLICATE_MEMBER_COMPARE_CANDIDATES):
+                zf.writestr(f"{'./' * (index + 1)}config.json", benign_config)
+
+        with patch.object(
+            keras_zip_scanner_module,
+            "_read_zip_member_bounded",
+            wraps=keras_zip_scanner_module._read_zip_member_bounded,
+        ) as mock_read_member:
+            result = scanner.scan(str(keras_path))
+
+        ambiguity_checks = [check for check in result.checks if check.name == "Keras ZIP Member Path Validation"]
+        assert len(ambiguity_checks) == 1
+        assert ambiguity_checks[0].status == CheckStatus.FAILED
+        assert len(ambiguity_checks[0].details["candidate_filenames"]) == (
+            scanner.MAX_DUPLICATE_MEMBER_COMPARE_CANDIDATES + 1
+        )
+        assert mock_read_member.call_count == 0
         assert result.success is False
 
     def test_scan_bounds_recursive_member_rescans_with_embedded_weight_limit(self, tmp_path: Path) -> None:
