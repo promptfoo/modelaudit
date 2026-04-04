@@ -306,7 +306,8 @@ class KerasH5Scanner(BaseScanner):
             "external_references": findings,
         }
 
-        if isinstance(keras_version, str) and self._is_vulnerable_to_cve_2026_1669(keras_version):
+        vuln_status = self._is_vulnerable_to_cve_2026_1669(keras_version) if isinstance(keras_version, str) else None
+        if vuln_status is True:
             details["keras_version"] = keras_version
             result.add_check(
                 name="CVE-2026-1669: HDF5 External Weight Reference",
@@ -322,7 +323,7 @@ class KerasH5Scanner(BaseScanner):
             )
             return
 
-        if isinstance(keras_version, str):
+        if vuln_status is False and isinstance(keras_version, str):
             result.add_check(
                 name="HDF5 External Weight Reference Version Check",
                 passed=True,
@@ -335,18 +336,23 @@ class KerasH5Scanner(BaseScanner):
             )
             return
 
+        if isinstance(keras_version, str):
+            details["keras_version"] = keras_version
+
         result.add_check(
             name="HDF5 External Weight Reference Risk (Version Unknown)",
             passed=False,
             message=(
-                "HDF5 external references detected in weights, but keras_version is unavailable; cannot "
-                "confidently attribute CVE-2026-1669 without version context"
+                "HDF5 external references detected in weights, but "
+                f"{self._format_keras_version_context(keras_version)}; cannot confidently attribute "
+                "CVE-2026-1669 without reliable version context"
             ),
             severity=IssueSeverity.WARNING,
             location=location,
             details=details
             | {
                 "affected_versions": "Keras >= 3.0.0, < 3.12.1 and >= 3.13.0, < 3.13.2",
+                "parse_status": "unknown",
             },
         )
 
@@ -476,7 +482,10 @@ class KerasH5Scanner(BaseScanner):
                     keras_version = result.metadata.get("keras_version")
 
                     # CVE-2024-3660: Lambda layers enable arbitrary code injection
-                    if isinstance(keras_version, str) and self._is_vulnerable_to_cve_2024_3660(keras_version):
+                    cve_2024_3660_status = (
+                        self._is_vulnerable_to_cve_2024_3660(keras_version) if isinstance(keras_version, str) else None
+                    )
+                    if cve_2024_3660_status is True:
                         result.add_check(
                             name="CVE-2024-3660: Lambda Layer Code Injection",
                             passed=False,
@@ -497,6 +506,30 @@ class KerasH5Scanner(BaseScanner):
                                 "remediation": "Remove Lambda layers or upgrade Keras to >= 2.13",
                             },
                             why=get_cve_2024_3660_explanation("lambda_code_injection"),
+                        )
+                    elif cve_2024_3660_status is None:
+                        result.add_check(
+                            name="Lambda Layer Code Injection Risk (Version Unknown)",
+                            passed=False,
+                            message=(
+                                f"Lambda layer '{layer_name}' detected in H5 model but "
+                                f"{self._format_keras_version_context(keras_version)}; cannot confidently "
+                                "attribute CVE-2024-3660 without reliable version context"
+                            ),
+                            severity=IssueSeverity.WARNING,
+                            location=f"{self.current_file_path} (layer: {layer_name})",
+                            details={
+                                "layer_name": layer_name,
+                                "layer_class": "Lambda",
+                                "keras_version": keras_version,
+                                "parse_status": "unknown",
+                                "cve_id": "CVE-2024-3660",
+                                "cvss": 9.8,
+                                "cwe": "CWE-94",
+                                "description": "Lambda layer deserialization can enable arbitrary code injection.",
+                                "affected_versions": "Keras < 2.13",
+                                "remediation": "Remove Lambda layers or upgrade Keras to >= 2.13",
+                            },
                         )
 
                     # CVE-2025-9905: safe_mode=True is silently ignored for H5 format
@@ -542,7 +575,7 @@ class KerasH5Scanner(BaseScanner):
                         )
                     elif vuln_status is None:
                         version_context = (
-                            f"keras_version '{keras_version}' is non-canonical"
+                            self._format_keras_version_context(keras_version)
                             if isinstance(keras_version, str)
                             else "keras_version is unavailable"
                         )
@@ -772,24 +805,24 @@ class KerasH5Scanner(BaseScanner):
         # Don't flag Lambda layers without code - they might just be placeholders
 
     @staticmethod
-    def _is_vulnerable_to_cve_2024_3660(version: str) -> bool:
-        """Return True for Keras versions lower than 2.13.0.
+    def _is_vulnerable_to_cve_2024_3660(version: str) -> bool | None:
+        """Return True/False for parseable Keras versions, else None.
 
         Handles two-part versions (e.g. "2.10") by treating missing patch as 0.
         """
         parsed_version = KerasH5Scanner._parse_keras_version_components(version)
         if parsed_version is None:
-            return False
+            return None
 
         version_tuple, is_prerelease = parsed_version
         return version_tuple < (2, 13, 0) or (version_tuple == (2, 13, 0) and is_prerelease)
 
     @staticmethod
-    def _is_vulnerable_to_cve_2026_1669(version: str) -> bool:
-        """Return True for Keras versions in the known CVE-2026-1669 affected ranges."""
+    def _is_vulnerable_to_cve_2026_1669(version: str) -> bool | None:
+        """Return True/False for parseable Keras versions, else None."""
         parsed_version = KerasH5Scanner._parse_keras_version_components(version)
         if parsed_version is None:
-            return False
+            return None
 
         version_tuple, is_prerelease = parsed_version
         return (
@@ -798,6 +831,12 @@ class KerasH5Scanner(BaseScanner):
             or (3, 13, 0) <= version_tuple < (3, 13, 2)
             or (version_tuple == (3, 13, 2) and is_prerelease)
         )
+
+    @staticmethod
+    def _format_keras_version_context(keras_version: Any) -> str:
+        if isinstance(keras_version, str):
+            return f"keras_version '{keras_version}' is non-canonical"
+        return "keras_version is unavailable"
 
     @staticmethod
     def _is_vulnerable_to_cve_2025_9905(version: str) -> bool | None:

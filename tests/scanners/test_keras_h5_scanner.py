@@ -228,6 +228,28 @@ def test_keras_h5_scanner_skips_cve_2026_1669_on_fixed_version(tmp_path: Path) -
     )
 
 
+@pytest.mark.parametrize("keras_version", ["3.13.x", "2.12.0-gpu"])
+def test_keras_h5_scanner_unparseable_external_reference_versions_mark_unknown_risk(
+    tmp_path: Path,
+    keras_version: str,
+) -> None:
+    model_path = create_h5_with_external_link(tmp_path, keras_version=keras_version)
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+    assert len(cve_issues) == 1
+    assert cve_issues[0].severity == IssueSeverity.WARNING
+    assert cve_issues[0].details["keras_version"] == keras_version
+    assert cve_issues[0].details["parse_status"] == "unknown"
+    assert any("is non-canonical" in issue.message for issue in cve_issues)
+
+    assert not any(
+        check.name == "HDF5 External Weight Reference Version Check" and check.status == CheckStatus.PASSED
+        for check in result.checks
+    )
+
+
 def test_keras_h5_scanner_benign_model_has_no_warning_noise(tmp_path: Path) -> None:
     """Benign H5 models should not produce warning or critical noise."""
     model_path = create_custom_h5_file(
@@ -1152,7 +1174,7 @@ class TestCVE20259905H5SafeMode:
     def test_unparseable_keras_versions_mark_unknown_risk(self, tmp_path: Path) -> None:
         """Unparseable versions must not be treated as safely non-vulnerable."""
         scanner = KerasH5Scanner()
-        versions = ["3.11.x", "not-a-version"]
+        versions = ["3.11.x", "2.12.0-gpu", "not-a-version"]
 
         for version in versions:
             h5_path = tmp_path / f"model_{version.replace('.', '_')}.h5"
@@ -1180,6 +1202,29 @@ class TestCVE20259905H5SafeMode:
 
             passed_checks = [c for c in result.checks if c.name == "H5 Lambda Version Risk Check"]
             assert len(passed_checks) == 0, f"Version {version} should not be marked as safely outside vulnerable range"
+
+    def test_cve_2024_3660_unparseable_version_marks_unknown_risk(self, tmp_path: Path) -> None:
+        model_path = create_custom_h5_file(
+            tmp_path,
+            {
+                "class_name": "Sequential",
+                "config": {
+                    "name": "test",
+                    "layers": [{"class_name": "Lambda", "config": {"function": "lambda x: x"}}],
+                },
+            },
+            keras_version="2.12.0-gpu",
+            file_name="model_noncanonical_2_12_gpu.h5",
+        )
+
+        result = KerasH5Scanner().scan(str(model_path))
+
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2024-3660"]
+        assert len(cve_issues) == 1
+        assert cve_issues[0].severity == IssueSeverity.WARNING
+        assert cve_issues[0].details["keras_version"] == "2.12.0-gpu"
+        assert cve_issues[0].details["parse_status"] == "unknown"
+        assert "is non-canonical" in cve_issues[0].message
 
     def test_two_part_keras_versions_are_parsed_with_zero_patch(self, tmp_path: Path) -> None:
         """Two-part versions such as 3.11 should be evaluated as 3.11.0, not unknown risk."""
