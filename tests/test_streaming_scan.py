@@ -642,7 +642,7 @@ def test_scan_model_streaming_progress_callback(temp_test_files):
         assert any("Scanning" in msg for msg in messages)
 
 
-def test_scan_model_streaming_asset_creation(temp_test_files):
+def test_scan_model_streaming_asset_creation(temp_test_files: list[Path]) -> None:
     """Test that assets are created during streaming scan."""
 
     def file_generator():
@@ -669,4 +669,6 @@ def test_scan_model_streaming_asset_creation(temp_test_files):
         )
 
         # asset_from_scan_result should be called for each file
+        assert result.success is True
+        assert result.files_scanned == len(temp_test_files)
         assert mock_asset.call_count == 3

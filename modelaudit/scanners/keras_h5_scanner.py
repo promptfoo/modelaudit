@@ -45,6 +45,46 @@ class KerasH5Scanner(BaseScanner):
     name = "keras_h5"
     description = "Scans Keras H5 model files for suspicious layer configurations"
     supported_extensions: ClassVar[list[str]] = [".h5", ".hdf5", ".keras"]
+    _SAFE_LAMBDA_PATTERNS: ClassVar[tuple[re.Pattern[str], ...]] = (
+        re.compile(r"^lambda\s+x\s*:\s*x\s*/\s*\d+$"),
+        re.compile(r"^lambda\s+x\s*:\s*x\s*\*\s*\d+$"),
+        re.compile(r"^lambda\s+x\s*:\s*tf\.nn\.\w+\(x\)$"),
+        re.compile(r"^lambda\s+x\s*:\s*K\.\w+\(x\)$"),
+        re.compile(r"^lambda\s+x\s*:\s*\(x\s*-\s*\d+\)\s*/\s*\d+$"),
+    )
+    _DANGEROUS_LAMBDA_MODULE_TOKENS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "__builtin__",
+            "__builtins__",
+            "builtins",
+            "ctypes",
+            "importlib",
+            "marshal",
+            "nt",
+            "operator",
+            "os",
+            "pickle",
+            "posix",
+            "runpy",
+            "socket",
+            "subprocess",
+            "sys",
+        }
+    )
+    _DANGEROUS_LAMBDA_FUNCTION_NAMES: ClassVar[frozenset[str]] = frozenset(
+        {
+            "__import__",
+            "attrgetter",
+            "compile",
+            "eval",
+            "exec",
+            "open",
+            "popen",
+            "spawn",
+            "system",
+        }
+    )
+    _WRAPPED_LAYER_SCAN_MODEL: ClassVar[dict[str, Any]] = {"class_name": "Sequential", "config": {"layers": []}}
 
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
@@ -210,7 +250,7 @@ class KerasH5Scanner(BaseScanner):
             result.finish(success=False)
             return result
 
-        result.finish(success=True)
+        result.finish(success=not result.has_errors)
         return result
 
     def _check_hdf5_external_references(self, h5_file: Any, result: ScanResult, source_path: str) -> None:
@@ -266,7 +306,8 @@ class KerasH5Scanner(BaseScanner):
             "external_references": findings,
         }
 
-        if isinstance(keras_version, str) and self._is_vulnerable_to_cve_2026_1669(keras_version):
+        vuln_status = self._is_vulnerable_to_cve_2026_1669(keras_version) if isinstance(keras_version, str) else None
+        if vuln_status is True:
             details["keras_version"] = keras_version
             result.add_check(
                 name="CVE-2026-1669: HDF5 External Weight Reference",
@@ -282,7 +323,7 @@ class KerasH5Scanner(BaseScanner):
             )
             return
 
-        if isinstance(keras_version, str):
+        if vuln_status is False and isinstance(keras_version, str):
             result.add_check(
                 name="HDF5 External Weight Reference Version Check",
                 passed=True,
@@ -295,18 +336,23 @@ class KerasH5Scanner(BaseScanner):
             )
             return
 
+        if isinstance(keras_version, str):
+            details["keras_version"] = keras_version
+
         result.add_check(
             name="HDF5 External Weight Reference Risk (Version Unknown)",
             passed=False,
             message=(
-                "HDF5 external references detected in weights, but keras_version is unavailable; cannot "
-                "confidently attribute CVE-2026-1669 without version context"
+                "HDF5 external references detected in weights, but "
+                f"{self._format_keras_version_context(keras_version)}; cannot confidently attribute "
+                "CVE-2026-1669 without reliable version context"
             ),
             severity=IssueSeverity.WARNING,
             location=location,
             details=details
             | {
                 "affected_versions": "Keras >= 3.0.0, < 3.12.1 and >= 3.13.0, < 3.13.2",
+                "parse_status": "unknown",
             },
         )
 
@@ -436,7 +482,10 @@ class KerasH5Scanner(BaseScanner):
                     keras_version = result.metadata.get("keras_version")
 
                     # CVE-2024-3660: Lambda layers enable arbitrary code injection
-                    if isinstance(keras_version, str) and self._is_vulnerable_to_cve_2024_3660(keras_version):
+                    cve_2024_3660_status = (
+                        self._is_vulnerable_to_cve_2024_3660(keras_version) if isinstance(keras_version, str) else None
+                    )
+                    if cve_2024_3660_status is True:
                         result.add_check(
                             name="CVE-2024-3660: Lambda Layer Code Injection",
                             passed=False,
@@ -457,6 +506,30 @@ class KerasH5Scanner(BaseScanner):
                                 "remediation": "Remove Lambda layers or upgrade Keras to >= 2.13",
                             },
                             why=get_cve_2024_3660_explanation("lambda_code_injection"),
+                        )
+                    elif cve_2024_3660_status is None:
+                        result.add_check(
+                            name="Lambda Layer Code Injection Risk (Version Unknown)",
+                            passed=False,
+                            message=(
+                                f"Lambda layer '{layer_name}' detected in H5 model but "
+                                f"{self._format_keras_version_context(keras_version)}; cannot confidently "
+                                "attribute CVE-2024-3660 without reliable version context"
+                            ),
+                            severity=IssueSeverity.WARNING,
+                            location=f"{self.current_file_path} (layer: {layer_name})",
+                            details={
+                                "layer_name": layer_name,
+                                "layer_class": "Lambda",
+                                "keras_version": keras_version,
+                                "parse_status": "unknown",
+                                "cve_id": "CVE-2024-3660",
+                                "cvss": 9.8,
+                                "cwe": "CWE-94",
+                                "description": "Lambda layer deserialization can enable arbitrary code injection.",
+                                "affected_versions": "Keras < 2.13",
+                                "remediation": "Remove Lambda layers or upgrade Keras to >= 2.13",
+                            },
                         )
 
                     # CVE-2025-9905: safe_mode=True is silently ignored for H5 format
@@ -502,7 +575,7 @@ class KerasH5Scanner(BaseScanner):
                         )
                     elif vuln_status is None:
                         version_context = (
-                            f"keras_version '{keras_version}' is non-canonical"
+                            self._format_keras_version_context(keras_version)
                             if isinstance(keras_version, str)
                             else "keras_version is unavailable"
                         )
@@ -580,13 +653,38 @@ class KerasH5Scanner(BaseScanner):
             ):
                 self._scan_model_config(layer, result)
 
+            if isinstance(layer, dict):
+                self._scan_wrapped_layer_config(layer.get("config"), result)
+
         # Add layer counts to metadata
         result.metadata["layer_counts"] = layer_counts
 
+    def _scan_wrapped_layer_config(self, layer_config: Any, result: ScanResult) -> None:
+        """Scan wrapper-owned nested layer payloads such as `TimeDistributed.config.layer`."""
+        if not isinstance(layer_config, dict) or "layer" not in layer_config:
+            return
+
+        nested_layer = layer_config.get("layer")
+        if isinstance(nested_layer, dict):
+            synthetic_model_config = {
+                "class_name": self._WRAPPED_LAYER_SCAN_MODEL["class_name"],
+                "config": {"layers": [nested_layer]},
+            }
+            self._scan_model_config(synthetic_model_config, result)
+            return
+
+        result.add_check(
+            name="Wrapped Layer Type Validation",
+            passed=False,
+            message=f"Invalid wrapped layer type: expected dict, got {type(nested_layer).__name__}",
+            rule_code="S902",
+            severity=IssueSeverity.INFO,
+            location=self.current_file_path,
+            details={"actual_type": type(nested_layer).__name__, "expected_type": "dict"},
+        )
+
     def _check_lambda_layer(self, layer_config: dict[str, Any], result: ScanResult) -> None:
         """Check Lambda layer for executable Python code with validation"""
-        import re
-
         # Lambda layers can contain Python code in several forms:
         # 1. As a string in 'function' field (serialized Python code)
         # 2. As a module + function reference
@@ -597,19 +695,10 @@ class KerasH5Scanner(BaseScanner):
         module_name = layer_config.get("module")
         function_name = layer_config.get("function_name")
 
-        # Common safe Lambda patterns for normalization
-        SAFE_LAMBDA_PATTERNS = [
-            r"lambda\s+x\s*:\s*x\s*/\s*\d+$",  # lambda x: x / 255
-            r"lambda\s+x\s*:\s*x\s*\*\s*\d+$",  # lambda x: x * 2
-            r"lambda\s+x\s*:\s*tf\.nn\.\w+\(x\)$",  # lambda x: tf.nn.softmax(x)
-            r"lambda\s+x\s*:\s*K\.\w+\(x\)$",  # lambda x: K.softmax(x)
-            r"lambda\s+x\s*:\s*\(x\s*-\s*\d+\)\s*/\s*\d+$",  # lambda x: (x - 128) / 128
-        ]
-
         # Check if there's actual Python code to validate
         if function_str and isinstance(function_str, str):
             # First check if it matches safe patterns
-            is_safe_pattern = any(re.match(pattern, function_str.strip()) for pattern in SAFE_LAMBDA_PATTERNS)
+            is_safe_pattern = any(pattern.match(function_str.strip()) for pattern in self._SAFE_LAMBDA_PATTERNS)
 
             if is_safe_pattern:
                 result.add_check(
@@ -681,8 +770,7 @@ class KerasH5Scanner(BaseScanner):
                     )
         elif module_name or function_name:
             # Module/function reference - check for dangerous imports
-            dangerous_modules = ["os", "sys", "subprocess", "eval", "exec", "__builtins__"]
-            if module_name and any(dangerous in module_name for dangerous in dangerous_modules):
+            if self._is_lambda_module_reference_dangerous(module_name, function_name):
                 result.add_check(
                     name="Lambda Layer Module Reference Check",
                     passed=False,
@@ -717,84 +805,87 @@ class KerasH5Scanner(BaseScanner):
         # Don't flag Lambda layers without code - they might just be placeholders
 
     @staticmethod
-    def _is_vulnerable_to_cve_2024_3660(version: str) -> bool:
-        """Return True for Keras versions lower than 2.13.0.
+    def _is_vulnerable_to_cve_2024_3660(version: str) -> bool | None:
+        """Return True/False for parseable Keras versions, else None.
 
         Handles two-part versions (e.g. "2.10") by treating missing patch as 0.
         """
-        parts = version.split(".", 2)
-        if len(parts) < 2:
-            return False
-        try:
-            major = int(parts[0])
-            minor = int(parts[1])
-            patch = 0
-            if len(parts) == 3:
-                patch_digits = "".join(ch for ch in parts[2] if ch.isdigit())
-                if patch_digits:
-                    patch = int(patch_digits)
-            return (major, minor, patch) < (2, 13, 0)
-        except ValueError:
-            return False
+        parsed_version = KerasH5Scanner._parse_keras_version_components(version)
+        if parsed_version is None:
+            return None
+
+        version_tuple, is_prerelease = parsed_version
+        return version_tuple < (2, 13, 0) or (version_tuple == (2, 13, 0) and is_prerelease)
 
     @staticmethod
-    def _is_vulnerable_to_cve_2026_1669(version: str) -> bool:
-        """Return True for Keras versions in the known CVE-2026-1669 affected ranges."""
-        parts = version.split(".", 2)
-        if len(parts) < 2:
-            return False
+    def _is_vulnerable_to_cve_2026_1669(version: str) -> bool | None:
+        """Return True/False for parseable Keras versions, else None."""
+        parsed_version = KerasH5Scanner._parse_keras_version_components(version)
+        if parsed_version is None:
+            return None
 
-        try:
-            major = int(parts[0])
-            minor = int(parts[1])
-            patch = 0
-            if len(parts) == 3:
-                patch_digits = "".join(ch for ch in parts[2] if ch.isdigit())
-                if patch_digits:
-                    patch = int(patch_digits)
-        except ValueError:
-            return False
+        version_tuple, is_prerelease = parsed_version
+        return (
+            (3, 0, 0) <= version_tuple < (3, 12, 1)
+            or (version_tuple == (3, 12, 1) and is_prerelease)
+            or (3, 13, 0) <= version_tuple < (3, 13, 2)
+            or (version_tuple == (3, 13, 2) and is_prerelease)
+        )
 
-        parsed = (major, minor, patch)
-        return (3, 0, 0) <= parsed < (3, 12, 1) or (3, 13, 0) <= parsed < (3, 13, 2)
+    @staticmethod
+    def _format_keras_version_context(keras_version: Any) -> str:
+        if isinstance(keras_version, str):
+            return f"keras_version '{keras_version}' is non-canonical"
+        return "keras_version is unavailable"
 
     @staticmethod
     def _is_vulnerable_to_cve_2025_9905(version: str) -> bool | None:
         """Return True/False for parseable Keras versions, else None."""
-        version_match = re.match(r"^(\d+)\.(\d+)\.(\d+)(.*)$", version.strip())
+        parsed_version = KerasH5Scanner._parse_keras_version_components(version)
+        if parsed_version is None:
+            return None
+
+        version_tuple, is_prerelease = parsed_version
+        if version_tuple[0] != 3 or version_tuple < (3, 0, 0):
+            return False
+
+        fix_version = (3, 11, 3)
+        return version_tuple < fix_version or (version_tuple == fix_version and is_prerelease)
+
+    @staticmethod
+    def _parse_keras_version_components(version: str) -> tuple[tuple[int, int, int], bool] | None:
+        """Parse a Keras version and preserve prerelease status for fix-boundary comparisons."""
+        version_match = re.match(r"^(\d+)\.(\d+)(?:\.(\d+))?(.*)$", version.strip())
         if not version_match:
             return None
 
-        try:
-            major, minor, patch = map(int, version_match.groups()[:3])
-            suffix = (version_match.group(4) or "").strip().lower()
+        major = int(version_match.group(1))
+        minor = int(version_match.group(2))
+        patch = int(version_match.group(3) or "0")
+        suffix = (version_match.group(4) or "").strip().lower()
 
-            is_prerelease = False
-            if suffix:
-                # PEP 440-like prerelease/dev identifiers should be treated as pre-fix builds.
-                if re.search(r"(?:^|[.\-])(dev|rc|a|b|alpha|beta|pre|preview)\d*", suffix):
-                    is_prerelease = True
-                elif suffix.startswith("+") or suffix.startswith(".post") or suffix.startswith("post"):
-                    is_prerelease = False
-                else:
-                    return None
+        if not suffix:
+            return (major, minor, patch), False
 
-            if major != 3:
-                return False
+        if re.search(r"(?:^|[.\-])(dev|rc|a|b|alpha|beta|pre|preview)\d*", suffix):
+            return (major, minor, patch), True
 
-            if (major, minor, patch) < (3, 0, 0):
-                return False
+        if suffix.startswith("+") or suffix.startswith(".post") or suffix.startswith("post"):
+            return (major, minor, patch), False
 
-            fix_version = (3, 11, 3)
-            if (major, minor, patch) < fix_version:
-                return True
-            if (major, minor, patch) > fix_version:
-                return False
+        return None
 
-            # Equal to the fix release: prerelease variants are still vulnerable.
-            return is_prerelease
-        except ValueError:
+    @classmethod
+    def _is_lambda_module_reference_dangerous(cls, module_name: Any, function_name: Any) -> bool:
+        """Return True when a Lambda module/function reference resolves to a risky symbol."""
+        if isinstance(function_name, str) and function_name.strip().lower() in cls._DANGEROUS_LAMBDA_FUNCTION_NAMES:
+            return True
+
+        if not isinstance(module_name, str):
             return False
+
+        module_tokens = {token.strip().lower() for token in re.split(r"[^0-9A-Za-z_]+", module_name) if token.strip()}
+        return bool(module_tokens & cls._DANGEROUS_LAMBDA_MODULE_TOKENS)
 
     def _check_config_for_suspicious_strings(
         self,
@@ -813,7 +904,7 @@ class KerasH5Scanner(BaseScanner):
             if isinstance(value, str):
                 # Check for suspicious strings
                 for suspicious_term in self.suspicious_config_props:
-                    if suspicious_term in value.lower():
+                    if self._contains_suspicious_config_term(value, suspicious_term):
                         result.add_check(
                             name="Suspicious Configuration String Check",
                             passed=False,
@@ -842,6 +933,24 @@ class KerasH5Scanner(BaseScanner):
                             result,
                             f"{context}.{key}[{i}]",
                         )
+
+    @staticmethod
+    def _contains_suspicious_config_term(value: str, suspicious_term: str) -> bool:
+        """Match suspicious config terms without substring hits inside benign identifiers."""
+        normalized_term = suspicious_term.strip().lower()
+        if not normalized_term:
+            return False
+
+        normalized_value = value.lower()
+        if normalized_term.replace("_", "").isalnum():
+            normalized_core_term = normalized_term.strip("_")
+            if not normalized_core_term:
+                return False
+
+            pattern = rf"(?<![0-9A-Za-z])_*{re.escape(normalized_core_term)}_*(?![0-9A-Za-z])"
+            return re.search(pattern, normalized_value) is not None
+
+        return normalized_term in normalized_value
 
     def extract_metadata(self, file_path: str) -> dict[str, Any]:
         """Extract Keras H5 model metadata."""

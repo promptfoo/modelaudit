@@ -141,7 +141,6 @@ class ProgressReporter(ABC):
         Args:
             stats: Current progress statistics
         """
-        pass
 
     @abstractmethod
     def report_phase_change(self, old_phase: ProgressPhase, new_phase: ProgressPhase) -> None:
@@ -151,7 +150,6 @@ class ProgressReporter(ABC):
             old_phase: Previous phase
             new_phase: New phase
         """
-        pass
 
     @abstractmethod
     def report_completion(self, stats: ProgressStats) -> None:
@@ -160,7 +158,6 @@ class ProgressReporter(ABC):
         Args:
             stats: Final progress statistics
         """
-        pass
 
     @abstractmethod
     def report_error(self, error: Exception, stats: ProgressStats) -> None:
@@ -170,7 +167,6 @@ class ProgressReporter(ABC):
             error: The error that occurred
             stats: Progress statistics at time of error
         """
-        pass
 
     def should_update(self) -> bool:
         """Check if enough time has passed for an update."""
