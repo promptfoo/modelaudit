@@ -107,7 +107,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **security:** enforce Flax msgpack scanner file-size limits before full reads, scan trailing msgpack stream objects for malicious payloads, downgrade benign container-like trailing-object findings to INFO, and preserve failed status when CRITICAL findings are reported
+- **security:** enforce Flax msgpack scanner file-size limits before full reads, scan trailing msgpack stream objects with a bounded object-count cap, downgrade benign container-like trailing-object findings to INFO, and preserve failed status when CRITICAL findings are reported
 - **security:** route `.joblib` files through the Joblib scanner, scan raw protocol-0/1 payloads directly, support gzip/bzip2/lzma/zlib wrappers with bounded output and trailing-data checks, preserve embedded Pickle finding locations, and fail closed on undecodable/trailing-wrapper errors
 - **security:** detect direct `getattr(module, "dangerous")` handler calls in TorchServe MAR archives, parse conflicting duplicate manifests without silently downgrading hidden handlers, and suppress collision warnings for byte-identical duplicate manifests
 - **security:** reduce NeMo Hydra `_target_` false positives by matching suspicious identifiers on token boundaries, preserve CVE-2025-23304 details on suspicious-target findings, and reject oversized YAML members before parsing

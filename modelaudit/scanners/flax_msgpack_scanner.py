@@ -48,6 +48,7 @@ class FlaxMsgpackScanner(BaseScanner):
         )
         self.max_recursion_depth = self.config.get("max_recursion_depth", 100)
         self.max_items_per_container = self.config.get("max_items_per_container", 50000)  # Increased for large models
+        self.max_msgpack_stream_objects = self.config.get("max_msgpack_stream_objects", 4096)
 
         # Enhanced suspicious patterns for JAX/Flax specific threats
         self.suspicious_patterns = self.config.get(
@@ -899,10 +900,32 @@ class FlaxMsgpackScanner(BaseScanner):
                 extra_data_detected = True
 
             if extra_data_detected:
-                unpacker = msgpack.Unpacker(None, raw=False, strict_map_key=False)
+                unpacker = msgpack.Unpacker(raw=False, strict_map_key=False)
                 unpacker.feed(file_data)
                 try:
-                    objects = list(unpacker)
+                    objects: list[Any] = []
+                    for stream_obj in unpacker:
+                        if len(objects) >= self.max_msgpack_stream_objects:
+                            result.add_check(
+                                name="Msgpack Stream Object Limit",
+                                passed=False,
+                                message=(
+                                    "Msgpack stream object count exceeds configured limit "
+                                    f"({self.max_msgpack_stream_objects})"
+                                ),
+                                severity=IssueSeverity.WARNING,
+                                location=path,
+                                details={
+                                    "max_msgpack_stream_objects": self.max_msgpack_stream_objects,
+                                    "parsed_object_count": len(objects),
+                                },
+                                rule_code="S902",
+                            )
+                            result.metadata["operational_error"] = True
+                            result.metadata["operational_error_reason"] = "msgpack_stream_object_limit_exceeded"
+                            result.finish(success=False)
+                            return None
+                        objects.append(stream_obj)
                 except Exception as unpack_e:
                     result.add_check(
                         name="Msgpack Parse Check",

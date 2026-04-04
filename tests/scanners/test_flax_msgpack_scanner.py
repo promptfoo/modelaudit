@@ -175,6 +175,27 @@ def test_flax_msgpack_scalar_trailing_junk_stays_warning(tmp_path: Path) -> None
     assert stream_checks[0].details["trailing_objects_are_container_like"] is False
 
 
+def test_flax_msgpack_caps_trailing_stream_object_count(tmp_path: Path) -> None:
+    """Too many trailing msgpack objects should fail closed without materializing the full stream."""
+    path = tmp_path / "many_objects.msgpack"
+    payload = msgpack.packb({"params": {"root": [1]}}, use_bin_type=True)
+    payload += b"".join(msgpack.packb({"params": {"n": [index]}}, use_bin_type=True) for index in range(8))
+    path.write_bytes(payload)
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_stream_objects": 4}).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata.get("operational_error") is True
+    assert result.metadata.get("operational_error_reason") == "msgpack_stream_object_limit_exceeded"
+    object_limit_checks = [
+        check
+        for check in result.checks
+        if check.name == "Msgpack Stream Object Limit" and check.status == CheckStatus.FAILED
+    ]
+    assert len(object_limit_checks) == 1
+    assert object_limit_checks[0].details["max_msgpack_stream_objects"] == 4
+
+
 def test_flax_msgpack_large_containers(tmp_path):
     """Test detection of containers with excessive items."""
     path = tmp_path / "large.msgpack"
