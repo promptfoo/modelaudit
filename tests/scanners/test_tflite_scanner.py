@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from modelaudit import core
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners import _registry
 from modelaudit.scanners.tflite_scanner import _MAX_COUNT, TFLiteScanner
 
@@ -279,6 +280,22 @@ def test_tflite_scanner_model_structure_parse_errors_do_not_escape(tmp_path: Pat
             issue.message and "Invalid TFLite model structure or traversal error" in issue.message
             for issue in result.issues
         )
+
+
+@pytest.mark.skipif(not HAS_TFLITE, reason="tflite not installed")
+def test_tflite_scanner_malformed_root_offset_fails_closed_with_exit_2(tmp_path: Path) -> None:
+    """Real malformed FlatBuffer offsets should fail closed at the CLI boundary."""
+    path = tmp_path / "malformed.tflite"
+    path.write_bytes((1024).to_bytes(4, "little") + b"TFL3" + b"\x00" * 32)
+
+    result = TFLiteScanner().scan(str(path))
+    cli_result = scan_model_directory_or_file(str(path))
+
+    assert result.success is False
+    assert result.metadata["operational_error"] is True
+    assert result.metadata["operational_error_reason"] == "tflite_structure_parse_failed"
+    assert any(check.name == "TFLite Model Structure Parse" for check in result.checks)
+    assert determine_exit_code(cli_result) == 2
 
 
 def test_tflite_metadata_extraction_excessive_subgraph_count_stops_early(tmp_path: Path) -> None:

@@ -103,6 +103,8 @@ class TFLiteScanner(BaseScanner):
 
             model = tflite.Model.GetRootAsModel(data, 0)
         except Exception as e:  # pragma: no cover - parse errors
+            result.metadata["operational_error"] = True
+            result.metadata["operational_error_reason"] = "tflite_parse_failed"
             result.add_check(
                 name="TFLite File Parse",
                 passed=False,
@@ -179,6 +181,8 @@ class TFLiteScanner(BaseScanner):
                             details={"operator_name": name, "operator_index": o_index},
                         )
         except Exception as e:  # pragma: no cover - malformed structure traversal
+            result.metadata["operational_error"] = True
+            result.metadata["operational_error_reason"] = "tflite_structure_parse_failed"
             result.add_check(
                 name="TFLite Model Structure Parse",
                 passed=False,
