@@ -1033,6 +1033,39 @@ def test_training_config_safe_aliases_do_not_trigger_custom_object_checks(tmp_pa
     assert all(check.name != "Custom Loss Detection" for check in result.checks)
 
 
+def test_training_config_deduplicates_custom_object_identifiers_by_normalized_name(tmp_path: Path) -> None:
+    """Repeated custom metric/loss aliases with case or spacing drift should only emit once."""
+    model_config = {
+        "class_name": "Sequential",
+        "config": {
+            "name": "dedupe_training_config",
+            "layers": [{"class_name": "Dense", "config": {"units": 4}}],
+        },
+    }
+    training_config = {
+        "loss": {"output_1": ["malicious_loss", " MALICIOUS_LOSS "]},
+        "metrics": [
+            "MaliciousMetric",
+            " maliciousmetric ",
+            {"class_name": "MALICIOUSMETRIC", "config": {}},
+        ],
+    }
+    model_path = create_custom_h5_file(
+        tmp_path,
+        model_config,
+        training_config=training_config,
+        file_name="dedupe_custom_objects.h5",
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    custom_metric_checks = [check for check in result.checks if check.name == "Custom Metric Detection"]
+    custom_loss_checks = [check for check in result.checks if check.name == "Custom Loss Detection"]
+
+    assert [check.details.get("identifier") for check in custom_metric_checks] == ["MaliciousMetric"]
+    assert [check.details.get("identifier") for check in custom_loss_checks] == ["malicious_loss"]
+
+
 def test_builtin_random_preprocessing_layers_do_not_trigger_custom_layer_warning(tmp_path: Path) -> None:
     """Built-in preprocessing layers should not be mislabeled as custom layers."""
     model_config = {

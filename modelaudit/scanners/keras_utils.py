@@ -2,7 +2,7 @@
 
 import base64
 import re
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Any
 
 from modelaudit.detectors.suspicious_symbols import (
@@ -166,6 +166,64 @@ def iter_keras_serialized_identifiers(value: Any) -> Iterator[tuple[str, Any]]:
     if isinstance(value, (list, tuple, set)):
         for item in value:
             yield from iter_keras_serialized_identifiers(item)
+
+
+def _check_custom_object_config(
+    config_value: Any,
+    result: ScanResult,
+    location: str,
+    *,
+    check_name: str,
+    object_kind: str,
+    details_key: str,
+    is_known_safe_identifier: Callable[[Any], bool],
+) -> None:
+    """Flag custom serialized Keras objects while deduplicating normalized identifiers."""
+    seen_identifiers: set[str] = set()
+
+    for identifier, raw_object in iter_keras_serialized_identifiers(config_value):
+        normalized_identifier = _normalize_keras_identifier(identifier)
+        if not normalized_identifier or is_known_safe_identifier(identifier):
+            continue
+        if normalized_identifier in seen_identifiers:
+            continue
+        seen_identifiers.add(normalized_identifier)
+
+        result.add_check(
+            name=check_name,
+            passed=False,
+            message=f"Model contains custom {object_kind}: {identifier}",
+            severity=IssueSeverity.WARNING,
+            location=location,
+            details={details_key: raw_object, "identifier": identifier},
+            rule_code="S305",
+        )
+
+
+def check_custom_metric_config(metrics_config: Any, result: ScanResult, location: str) -> None:
+    """Flag custom metrics embedded anywhere in a serialized metric tree."""
+    _check_custom_object_config(
+        metrics_config,
+        result,
+        location,
+        check_name="Custom Metric Detection",
+        object_kind="metric",
+        details_key="metric",
+        is_known_safe_identifier=is_known_safe_keras_metric,
+    )
+
+
+def check_custom_loss_config(loss_config: Any, result: ScanResult, location: str) -> None:
+    """Flag custom losses embedded anywhere in a serialized loss tree."""
+    _check_custom_object_config(
+        loss_config,
+        result,
+        location,
+        check_name="Custom Loss Detection",
+        object_kind="loss",
+        details_key="loss",
+        is_known_safe_identifier=is_known_safe_keras_loss,
+    )
 
 
 def check_lambda_dict_function(

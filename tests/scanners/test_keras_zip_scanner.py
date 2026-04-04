@@ -1109,6 +1109,41 @@ __import__('pickle').loads(data)
         assert all(check.name != "Custom Metric Detection" for check in result.checks)
         assert all(check.name != "Custom Loss Detection" for check in result.checks)
 
+    def test_compile_config_deduplicates_custom_object_identifiers_by_normalized_name(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Repeated custom metric/loss aliases with case or spacing drift should only emit once."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "name": "dense_1",
+                        "config": {"units": 4},
+                    },
+                ]
+            },
+            "compile_config": {
+                "loss": {"output_1": ["malicious_loss", " MALICIOUS_LOSS "]},
+                "metrics": [
+                    "MaliciousMetric",
+                    " maliciousmetric ",
+                    {"class_name": "MALICIOUSMETRIC", "config": {}},
+                ],
+            },
+        }
+
+        result = scanner.scan(str(create_configured_keras_zip(tmp_path, config, file_name="dedupe_compile.keras")))
+
+        custom_metric_checks = [check for check in result.checks if check.name == "Custom Metric Detection"]
+        custom_loss_checks = [check for check in result.checks if check.name == "Custom Loss Detection"]
+
+        assert [check.details.get("identifier") for check in custom_metric_checks] == ["MaliciousMetric"]
+        assert [check.details.get("identifier") for check in custom_loss_checks] == ["malicious_loss"]
+
     def test_registered_builtin_layer_does_not_false_positive(self, tmp_path: Path) -> None:
         """Built-in layers with registered_name metadata should remain clean."""
         scanner = KerasZipScanner()
