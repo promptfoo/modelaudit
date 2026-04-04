@@ -12,12 +12,7 @@ from typing import Any
 import pytest
 
 from modelaudit.metadata_extractor import ModelMetadataExtractor
-
-
-def _has_tf_protos() -> bool:
-    import modelaudit.protos
-
-    return modelaudit.protos._check_vendored_protos()
+from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
 
 
 class TestModelMetadataExtractor:

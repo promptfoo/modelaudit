@@ -10,6 +10,7 @@ from typing import Any, ClassVar
 
 from modelaudit.config.explanations import get_tf_op_explanation
 from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_OPS, TENSORFLOW_DANGEROUS_OPS
+from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -25,8 +26,6 @@ DISCOVERY_ASSUMPTIONS = [
     "Scanner uses vendored TensorFlow protobuf stubs and does not require TensorFlow runtime imports.",
     "High-severity command/network/path findings require executable op context.",
 ]
-
-HAS_PROTOS: bool | None = None
 
 _MAX_PARSE_BYTES = 20 * 1024 * 1024
 _MIN_PARSE_BYTES = 8
@@ -82,16 +81,6 @@ _NETWORK_RE = re.compile(r"(?i)(?:https?://|wss?://|ftp://|tcp://|udp://|\bsocke
 _ENCODED_PAYLOAD_RE = re.compile(r"\b[A-Za-z0-9+/]{120,}={0,2}\b")
 _DECODE_HINT_RE = re.compile(r"(?i)(?:base64|b64decode|frombase64string|decode\(|eval\(|exec\()")
 _BENIGN_CHECKPOINT_IO_OPS = frozenset({"SaveV2", "RestoreV2"})
-
-
-def _check_protos() -> bool:
-    """Check if TensorFlow protobuf stubs are available (vendored or native)."""
-    global HAS_PROTOS
-    if HAS_PROTOS is None:
-        import modelaudit.protos
-
-        HAS_PROTOS = modelaudit.protos._check_vendored_protos()
-    return HAS_PROTOS
 
 
 def _read_bounded(path: str, max_bytes: int) -> tuple[bytes, bool]:
@@ -256,7 +245,7 @@ class TensorFlowMetaGraphScanner(BaseScanner):
             return False
         if os.path.splitext(path)[1].lower() not in cls.supported_extensions:
             return False
-        if not _check_protos():
+        if not has_tensorflow_protobuf_stubs():
             return False
 
         file_size = os.path.getsize(path)
@@ -292,7 +281,7 @@ class TensorFlowMetaGraphScanner(BaseScanner):
         result.metadata["max_function_nodes"] = _MAX_FUNCTION_NODES
         result.metadata["discovery_assumptions"] = DISCOVERY_ASSUMPTIONS
 
-        if not _check_protos():
+        if not has_tensorflow_protobuf_stubs():
             result.add_check(
                 name="TensorFlow Protobuf Availability",
                 passed=False,

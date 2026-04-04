@@ -22,6 +22,7 @@ from modelaudit.utils.file.detection import (
     is_zipfile,
     validate_file_type,
 )
+from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
 
 
 def _create_mar_archive(
@@ -37,12 +38,6 @@ def _create_mar_archive(
         archive.writestr("handler.py", b"def handle(data, context):\n    return data\n")
         archive.writestr("weights.bin", b"weights")
     return mar_path
-
-
-def _has_tf_protos() -> bool:
-    import modelaudit.protos
-
-    return modelaudit.protos._check_vendored_protos()
 
 
 def _build_tf_metagraph_bytes() -> bytes:

@@ -17,6 +17,7 @@ from modelaudit.utils.helpers.code_validation import (
     is_code_potentially_dangerous,
     validate_python_syntax,
 )
+from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -32,8 +33,6 @@ DANGEROUS_TF_OPERATIONS = {
 # Python operations that require special handling
 PYTHON_OPS = ("PyFunc", "PyCall", "PyFuncStateless", "EagerPyFunc")
 
-# Defer protobuf availability check to avoid module-level imports
-HAS_PROTOS: bool | None = None
 _ASSET_SCRIPT_SHEBANG = b"#!"
 _ASSET_ELF_HEADER = b"\x7fELF"
 _ASSET_MACHO_HEADERS = (
@@ -92,16 +91,6 @@ def _looks_like_pe_executable(content_head: bytes) -> bool:
     if pe_offset < 0x40 or pe_offset + 4 > len(content_head):
         return False
     return content_head[pe_offset : pe_offset + 4] == b"PE\x00\x00"
-
-
-def _check_protos() -> bool:
-    """Check if TensorFlow protobuf stubs are available (vendored or from TensorFlow)."""
-    global HAS_PROTOS
-    if HAS_PROTOS is None:
-        import modelaudit.protos
-
-        HAS_PROTOS = modelaudit.protos._check_vendored_protos()
-    return HAS_PROTOS
 
 
 def _strip_leading_comment_lines(content: bytes) -> bytes:
@@ -163,7 +152,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
     @classmethod
     def can_handle(cls, path: str) -> bool:
         """Check if this scanner can handle the given path"""
-        if not _check_protos():
+        if not has_tensorflow_protobuf_stubs():
             return False
 
         if os.path.isfile(path):
@@ -190,7 +179,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
         self.current_file_path = path
 
         # Check if TensorFlow protos are available (vendored or from TensorFlow)
-        if not _check_protos():
+        if not has_tensorflow_protobuf_stubs():
             result = self._create_result()
             result.add_check(
                 name="TensorFlow Protos Check",
@@ -1373,7 +1362,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
             metadata["reason"] = "Deserialization disabled for metadata extraction"
             return metadata
 
-        if not _check_protos():
+        if not has_tensorflow_protobuf_stubs():
             metadata["extraction_error"] = "TensorFlow protobuf stubs unavailable for metadata extraction"
             return metadata
 
