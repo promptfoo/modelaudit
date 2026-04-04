@@ -436,8 +436,10 @@ class JaxCheckpointScanner(BaseScanner):
             with open(path, "rb") as f:
                 data = f.read(self.max_pickle_scan_bytes + 1)
 
+            pickle_prefix_truncated = False
             if len(data) > self.max_pickle_scan_bytes:
                 data = data[: self.max_pickle_scan_bytes]
+                pickle_prefix_truncated = True
                 result.add_check(
                     name="Pickle Checkpoint Prefix Scan Limit",
                     passed=False,
@@ -484,82 +486,86 @@ class JaxCheckpointScanner(BaseScanner):
                     if value is self._PICKLE_MARKER:
                         return
 
-            for opcode, arg, pos in pickletools.genops(data):
-                if opcode.name in self._PICKLE_STRING_OPCODES and isinstance(arg, str):
-                    _push_pickle_value(arg)
-                    continue
-                if opcode.name == "MARK":
-                    _push_pickle_value(self._PICKLE_MARKER)
-                    continue
-                if opcode.name == "POP":
-                    if pickle_stack:
-                        pickle_stack.pop()
-                    continue
-                if opcode.name == "POP_MARK":
-                    _pop_pickle_mark()
-                    continue
-                if opcode.name == "DUP":
-                    if pickle_stack:
-                        _push_pickle_value(pickle_stack[-1])
-                    continue
-                if opcode.name in {"MEMOIZE", "BINPUT", "LONG_BINPUT", "PUT"}:
-                    memo_index = len(pickle_memo) if opcode.name == "MEMOIZE" else _memo_key(arg)
-                    if memo_index is not None:
-                        _memoize_pickle_value(memo_index)
-                    continue
-                if opcode.name in {"BINGET", "LONG_BINGET", "GET"}:
-                    memo_index = _memo_key(arg)
-                    if memo_index is not None and memo_index in pickle_memo:
-                        _push_pickle_value(pickle_memo[memo_index])
-                    continue
-
-                parsed_global = None
-                if opcode.name in {"GLOBAL", "INST"} and isinstance(arg, str):
-                    parsed_global = self._parse_pickle_global_reference(arg)
-                    if parsed_global is not None:
-                        _push_pickle_value(parsed_global)
-                elif opcode.name == "STACK_GLOBAL" and len(pickle_stack) >= 2:
-                    global_name = pickle_stack.pop()
-                    module_name = pickle_stack.pop()
-                    if isinstance(module_name, str) and isinstance(global_name, str):
-                        parsed_global = (module_name, global_name)
-                        _push_pickle_value(parsed_global)
-
-                if parsed_global is not None and self._is_dangerous_pickle_global(*parsed_global):
-                    module_name, global_name = parsed_global
-                    if dangerous_opcode_findings >= self.max_pickle_opcode_findings:
-                        if not finding_limit_reported:
-                            result.add_check(
-                                name="Pickle Opcode Finding Limit",
-                                passed=False,
-                                message=(
-                                    "Reached the maximum number of recorded dangerous pickle opcode findings; "
-                                    "additional matches were suppressed"
-                                ),
-                                rule_code="S902",
-                                severity=IssueSeverity.WARNING,
-                                location=path,
-                                details={
-                                    "max_pickle_opcode_findings": self.max_pickle_opcode_findings,
-                                },
-                            )
-                            finding_limit_reported = True
+            try:
+                for opcode, arg, pos in pickletools.genops(data):
+                    if opcode.name in self._PICKLE_STRING_OPCODES and isinstance(arg, str):
+                        _push_pickle_value(arg)
+                        continue
+                    if opcode.name == "MARK":
+                        _push_pickle_value(self._PICKLE_MARKER)
+                        continue
+                    if opcode.name == "POP":
+                        if pickle_stack:
+                            pickle_stack.pop()
+                        continue
+                    if opcode.name == "POP_MARK":
+                        _pop_pickle_mark()
+                        continue
+                    if opcode.name == "DUP":
+                        if pickle_stack:
+                            _push_pickle_value(pickle_stack[-1])
+                        continue
+                    if opcode.name in {"MEMOIZE", "BINPUT", "LONG_BINPUT", "PUT"}:
+                        memo_index = len(pickle_memo) if opcode.name == "MEMOIZE" else _memo_key(arg)
+                        if memo_index is not None:
+                            _memoize_pickle_value(memo_index)
+                        continue
+                    if opcode.name in {"BINGET", "LONG_BINGET", "GET"}:
+                        memo_index = _memo_key(arg)
+                        if memo_index is not None and memo_index in pickle_memo:
+                            _push_pickle_value(pickle_memo[memo_index])
                         continue
 
-                    result.add_check(
-                        name="Pickle Opcode Security Check",
-                        passed=False,
-                        message=(f"Dangerous pickle opcode detected: {opcode.name} {module_name}.{global_name}"),
-                        rule_code="S902",
-                        severity=IssueSeverity.CRITICAL,
-                        location=path,
-                        details={
-                            "opcode": opcode.name,
-                            "position": pos,
-                            "global": f"{module_name}.{global_name}",
-                        },
-                    )
-                    dangerous_opcode_findings += 1
+                    parsed_global = None
+                    if opcode.name in {"GLOBAL", "INST"} and isinstance(arg, str):
+                        parsed_global = self._parse_pickle_global_reference(arg)
+                        if parsed_global is not None:
+                            _push_pickle_value(parsed_global)
+                    elif opcode.name == "STACK_GLOBAL" and len(pickle_stack) >= 2:
+                        global_name = pickle_stack.pop()
+                        module_name = pickle_stack.pop()
+                        if isinstance(module_name, str) and isinstance(global_name, str):
+                            parsed_global = (module_name, global_name)
+                            _push_pickle_value(parsed_global)
+
+                    if parsed_global is not None and self._is_dangerous_pickle_global(*parsed_global):
+                        module_name, global_name = parsed_global
+                        if dangerous_opcode_findings >= self.max_pickle_opcode_findings:
+                            if not finding_limit_reported:
+                                result.add_check(
+                                    name="Pickle Opcode Finding Limit",
+                                    passed=False,
+                                    message=(
+                                        "Reached the maximum number of recorded dangerous pickle opcode findings; "
+                                        "additional matches were suppressed"
+                                    ),
+                                    rule_code="S902",
+                                    severity=IssueSeverity.WARNING,
+                                    location=path,
+                                    details={
+                                        "max_pickle_opcode_findings": self.max_pickle_opcode_findings,
+                                    },
+                                )
+                                finding_limit_reported = True
+                            continue
+
+                        result.add_check(
+                            name="Pickle Opcode Security Check",
+                            passed=False,
+                            message=(f"Dangerous pickle opcode detected: {opcode.name} {module_name}.{global_name}"),
+                            rule_code="S902",
+                            severity=IssueSeverity.CRITICAL,
+                            location=path,
+                            details={
+                                "opcode": opcode.name,
+                                "position": pos,
+                                "global": f"{module_name}.{global_name}",
+                            },
+                        )
+                        dangerous_opcode_findings += 1
+            except ValueError:
+                if not pickle_prefix_truncated:
+                    raise
 
             # Check for JAX-specific suspicious content
             data_str = data.decode("utf-8", errors="ignore")

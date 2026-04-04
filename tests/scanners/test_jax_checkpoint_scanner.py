@@ -20,6 +20,11 @@ def _proto4_short_unicode(value: str) -> bytes:
     return b"\x8c" + bytes([len(encoded)]) + encoded
 
 
+def _proto4_binunicode(value: str) -> bytes:
+    encoded = value.encode("utf-8")
+    return b"X" + len(encoded).to_bytes(4, "little") + encoded
+
+
 def test_orbax_metadata_regex_patterns_are_detected(tmp_path: Path) -> None:
     checkpoint_dir = tmp_path / "orbax_checkpoint"
     _write_orbax_metadata(
@@ -182,6 +187,58 @@ def test_pickle_opcode_findings_are_capped_for_repeated_dangerous_globals(tmp_pa
     assert all(check.details["global"] == "os.system" for check in opcode_findings)
     assert len(finding_limit_checks) == 1
     assert finding_limit_checks[0].severity == IssueSeverity.WARNING
+
+
+def test_truncated_large_pickle_prefix_keeps_dangerous_global_without_scan_error(tmp_path: Path) -> None:
+    pickle_path = tmp_path / "truncated_dangerous_prefix.pickle"
+    payload = (
+        b"\x80\x04"
+        + _proto4_short_unicode("jax")
+        + b"0"
+        + _proto4_short_unicode("os")
+        + _proto4_short_unicode("system")
+        + b"\x93"
+        + b"0"
+        + _proto4_binunicode("a" * 4096)
+    )
+    pickle_path.write_bytes(payload)
+
+    scanner = JaxCheckpointScanner(config={"jax_pickle_max_scan_bytes": 1024})
+    assert scanner.can_handle(str(pickle_path))
+
+    result = scanner.scan(str(pickle_path))
+
+    assert result.success
+    assert any(
+        check.name == "Pickle Checkpoint Prefix Scan Limit"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.WARNING
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Pickle Opcode Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.details["global"] == "os.system"
+        for check in result.checks
+    )
+    assert all(check.name != "Pickle Checkpoint Scan" for check in result.checks)
+
+
+def test_truncated_benign_large_pickle_prefix_does_not_emit_scan_error(tmp_path: Path) -> None:
+    pickle_path = tmp_path / "truncated_benign_prefix.pickle"
+    payload = b"\x80\x04" + _proto4_short_unicode("jax") + b"0" + _proto4_binunicode("safe" * 1024)
+    pickle_path.write_bytes(payload)
+
+    scanner = JaxCheckpointScanner(config={"jax_pickle_max_scan_bytes": 1024})
+    assert scanner.can_handle(str(pickle_path))
+
+    result = scanner.scan(str(pickle_path))
+
+    assert result.success
+    assert all(check.name != "Pickle Checkpoint Scan" for check in result.checks)
+    assert all(
+        check.name != "Pickle Opcode Security Check" or check.status != CheckStatus.FAILED for check in result.checks
+    )
 
 
 @pytest.mark.parametrize(
