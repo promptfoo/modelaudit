@@ -27,6 +27,7 @@ SUSPICIOUS_PATTERNS = [
     r"exec\s*\(",
     r"eval\s*\(",
     r"import\s+os",
+    r"\b(?:importlib\s*\.\s*)?import_module\s*\(\s*['\"]subprocess['\"]\s*\)",
     r"\b(?:from\s+subprocess\s+import|import\s+subprocess)\b",
     r"\bsubprocess\s*\.\s*(?:popen|run|call|check_call|check_output|getoutput|getstatusoutput)\s*\(",
     r"__import__",

@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - avoid CoreML nested parse failures on bounded-read truncation
 - detect punctuation-delimited TensorRT `/tmp` plugin paths
-- avoid PMML `<Extension>` false positives for benign `subprocess` prose while preserving `subprocess.getoutput()` and `subprocess.getstatusoutput()` detections
+- avoid PMML `<Extension>` false positives for benign `subprocess` prose while preserving `subprocess.getoutput()`, `subprocess.getstatusoutput()`, and `importlib.import_module("subprocess")` detections
 
 ## [0.2.31](https://github.com/promptfoo/modelaudit/compare/v0.2.30...v0.2.31) (2026-04-04)
 
