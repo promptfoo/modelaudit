@@ -110,6 +110,40 @@ class OciLayerScanner(BaseScanner):
         """Trim manifest layer refs so cosmetic suffix whitespace cannot hide .tar.gz layers."""
         return layer_ref.strip().rstrip(" .")
 
+    @classmethod
+    def _collect_layer_paths(cls, manifest_data: Any) -> list[str]:
+        """Collect layer refs from manifest layer fields without treating arbitrary strings as layers."""
+        layer_paths: list[str] = []
+
+        def _append_layer_ref(value: Any) -> None:
+            if isinstance(value, str) and cls._normalize_layer_ref(value).lower().endswith(cls._LAYER_ARCHIVE_SUFFIX):
+                layer_paths.append(value)
+
+        def _collect_layer_value(value: Any) -> None:
+            if isinstance(value, str):
+                _append_layer_ref(value)
+            elif isinstance(value, list):
+                for item in value:
+                    _collect_layer_value(item)
+            elif isinstance(value, dict):
+                for key, item in value.items():
+                    if str(key).lower() in {"layers", "urls"}:
+                        _collect_layer_value(item)
+
+        def _walk_manifest(obj: Any) -> None:
+            if isinstance(obj, dict):
+                for key, value in obj.items():
+                    if str(key).lower() == "layers":
+                        _collect_layer_value(value)
+                    elif isinstance(value, (dict, list)):
+                        _walk_manifest(value)
+            elif isinstance(obj, list):
+                for item in obj:
+                    _walk_manifest(item)
+
+        _walk_manifest(manifest_data)
+        return layer_paths
+
     @staticmethod
     def _rewrite_embedded_location(
         location: str | None,
@@ -233,20 +267,7 @@ class OciLayerScanner(BaseScanner):
             result.finish(success=False)
             return result
 
-        # Find layer paths ending with .tar.gz
-        layer_paths: list[str] = []
-
-        def _search(obj: Any) -> None:
-            if isinstance(obj, dict):
-                for v in obj.values():
-                    _search(v)
-            elif isinstance(obj, list):
-                for item in obj:
-                    _search(item)
-            elif isinstance(obj, str) and self._normalize_layer_ref(obj).lower().endswith(self._LAYER_ARCHIVE_SUFFIX):
-                layer_paths.append(obj)
-
-        _search(manifest_data)
+        layer_paths = self._collect_layer_paths(manifest_data)
 
         manifest_dir = os.path.dirname(path)
         scan_complete = True

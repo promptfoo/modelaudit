@@ -294,6 +294,33 @@ class TestOciLayerScanner:
 
         assert result.success is True
 
+    def test_scan_manifest_ignores_non_layer_tar_gz_metadata_strings(self, tmp_path: Path) -> None:
+        """Metadata URLs ending in .tar.gz should not be treated as required local layer files."""
+        safe_file = tmp_path / "safe.txt"
+        safe_file.write_text("Safe content")
+
+        layer_path = tmp_path / "layer.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            tar.add(safe_file, arcname="safe.txt")
+
+        manifest = {
+            "layers": ["layer.tar.gz"],
+            "homepage": "https://cdn.example.com/not-a-local-layer.tar.gz",
+            "metadata": {
+                "release_notes": "https://cdn.example.com/docs.tar.gz",
+                "labels": ["stable", "https://cdn.example.com/archive.tar.gz"],
+            },
+        }
+        manifest_path = tmp_path / "metadata-url.manifest"
+        manifest_path.write_text(json.dumps(manifest))
+
+        result = OciLayerScanner().scan(str(manifest_path))
+
+        assert result.success is True
+        assert not any("not-a-local-layer.tar.gz" in issue.message for issue in result.issues)
+        assert not any("docs.tar.gz" in issue.message for issue in result.issues)
+        assert not any("archive.tar.gz" in issue.message for issue in result.issues)
+
     def test_scan_layer_with_non_scannable_files(self, tmp_path):
         """Test scanning layer containing files that don't match any scanner."""
         # Create a random binary file
