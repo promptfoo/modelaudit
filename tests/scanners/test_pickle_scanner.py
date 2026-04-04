@@ -6707,6 +6707,33 @@ def test_binput_headed_fragment_is_not_a_standalone_pickle_prefix() -> None:
     assert _looks_like_pickle(b"q0.") is False
 
 
+def test_inst_headed_fragment_is_a_standalone_pickle_prefix() -> None:
+    """`i` is a protocol-0 callable constructor opcode and must remain valid for resync probes."""
+    assert _looks_like_pickle(b"ios\nsystem\n.") is True
+
+
+def test_long_padding_before_protocol0_follow_on_stream_starting_with_inst_still_flags_constructor(
+    tmp_path: Path,
+) -> None:
+    """Protocol-0 `INST` tails must survive long-gap resync after a safe first stream."""
+    safe_stream = pickle.dumps({"weights": [1, 2, 3]}, protocol=2)
+    malicious_stream = b"ios\nsystem\n."
+
+    path = tmp_path / "safe_then_padded_protocol0_inst.pkl"
+    path.write_bytes(safe_stream + (b"\x00" * 9000) + malicious_stream)
+
+    result = PickleScanner().scan(str(path))
+
+    assert any(
+        check.name == "INST/OBJ/NEWOBJ/NEWOBJ_EX Opcode Safety Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("associated_class") in SYSTEM_GLOBAL_VARIANTS
+        for check in result.checks
+    ), f"Expected protocol-0 INST os.system detection after a long separator gap. Checks: {result.checks}"
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
 def test_long_padding_before_protocol1_follow_on_stream_starting_with_list_still_flags_reduce(
     tmp_path: Path,
 ) -> None:

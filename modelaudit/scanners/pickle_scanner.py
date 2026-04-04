@@ -3201,6 +3201,7 @@ def _looks_like_pickle(data: bytes) -> bool:
         ord("]"),
         ord("}"),
         ord("c"),
+        ord("i"),
         ord("l"),
         ord("d"),
         ord("t"),
