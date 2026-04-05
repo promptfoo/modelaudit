@@ -7,6 +7,7 @@ import tarfile
 import tempfile
 from pathlib import Path
 from typing import Any, ClassVar
+from urllib.parse import urlparse
 
 from ..utils import is_within_directory, sanitize_archive_path
 from ..utils.file.detection import (
@@ -110,13 +111,23 @@ class OciLayerScanner(BaseScanner):
         """Trim manifest layer refs so cosmetic suffix whitespace cannot hide .tar.gz layers."""
         return layer_ref.strip().rstrip(" .")
 
+    @staticmethod
+    def _is_remote_layer_ref(layer_ref: str) -> bool:
+        """Return True when a layer reference points to a remote URL-like location."""
+        parsed = urlparse(layer_ref.strip())
+        return bool(parsed.scheme and parsed.netloc)
+
     @classmethod
     def _collect_layer_paths(cls, manifest_data: Any) -> list[str]:
         """Collect layer refs from manifest layer fields without treating arbitrary strings as layers."""
         layer_paths: list[str] = []
 
         def _append_layer_ref(value: Any) -> None:
-            if isinstance(value, str) and cls._normalize_layer_ref(value).lower().endswith(cls._LAYER_ARCHIVE_SUFFIX):
+            if (
+                isinstance(value, str)
+                and cls._normalize_layer_ref(value).lower().endswith(cls._LAYER_ARCHIVE_SUFFIX)
+                and not cls._is_remote_layer_ref(value)
+            ):
                 layer_paths.append(value)
 
         def _collect_layer_value(value: Any) -> None:

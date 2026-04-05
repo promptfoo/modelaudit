@@ -321,6 +321,26 @@ class TestOciLayerScanner:
         assert not any("docs.tar.gz" in issue.message for issue in result.issues)
         assert not any("archive.tar.gz" in issue.message for issue in result.issues)
 
+    def test_scan_manifest_ignores_remote_layer_urls(self, tmp_path: Path) -> None:
+        """Remote layer URLs under layers[].urls should not be treated as local files."""
+        manifest = {
+            "schemaVersion": 2,
+            "layers": [
+                {
+                    "digest": "sha256:abc123",
+                    "urls": ["https://cdn.example.com/layer.tar.gz"],
+                }
+            ],
+        }
+        manifest_path = tmp_path / "remote-layer-url.manifest"
+        manifest_path.write_text(json.dumps(manifest))
+
+        result = OciLayerScanner().scan(str(manifest_path))
+
+        assert result.success is True
+        assert not any("Layer not found" in issue.message for issue in result.issues)
+        assert not any("https://cdn.example.com/layer.tar.gz" in issue.message for issue in result.issues)
+
     def test_scan_layer_with_non_scannable_files(self, tmp_path):
         """Test scanning layer containing files that don't match any scanner."""
         # Create a random binary file
