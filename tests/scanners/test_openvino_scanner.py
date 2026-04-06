@@ -92,14 +92,35 @@ def test_openvino_scanner_can_handle_forbidden_doctype_openvino_xml(tmp_path: Pa
     assert OpenVinoScanner.can_handle(str(xml_path)) is True
 
 
-def test_openvino_scanner_can_handle_rejects_unterminated_doctype(tmp_path: Path) -> None:
-    """Malformed DOCTYPE prologs should fail closed during bounded prefix sniffing."""
+def test_openvino_scanner_routes_unterminated_doctype_to_parse_failure(tmp_path: Path) -> None:
+    """Malformed OpenVINO DOCTYPE prologs should fail closed as explicit parse errors."""
     xml_path = tmp_path / "model.xml"
     xml_path.write_text(
         """<?xml version='1.0'?>
         <!DOCTYPE net [
           <!ENTITY payload SYSTEM 'file:///tmp/secret'>
         <net version='10'><layers><layer id='0' name='data' type='Input'/></layers></net>
+        """,
+        encoding="utf-8",
+    )
+    (tmp_path / "model.bin").write_bytes(b"\x00")
+
+    cli_result = scan_model_directory_or_file(str(xml_path))
+
+    assert OpenVinoScanner.can_handle(str(xml_path)) is True
+    assert cli_result.scanner_names == ["openvino"]
+    assert determine_exit_code(cli_result) == 2
+    assert any(check.name == "OpenVINO XML Parse" for check in cli_result.checks)
+
+
+def test_openvino_scanner_can_handle_rejects_unterminated_non_openvino_doctype(tmp_path: Path) -> None:
+    """Malformed non-OpenVINO DOCTYPE prologs should not route to OpenVINO."""
+    xml_path = tmp_path / "document.xml"
+    xml_path.write_text(
+        """<?xml version='1.0'?>
+        <!DOCTYPE html [
+          <!ENTITY payload SYSTEM 'file:///tmp/secret'>
+        <html><body>not an OpenVINO model</body></html>
         """,
         encoding="utf-8",
     )
