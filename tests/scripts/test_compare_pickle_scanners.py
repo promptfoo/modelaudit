@@ -31,6 +31,23 @@ def test_legacy_baseline_pickle_scanner_bypasses_package_engine(
     assert not result.issues
 
 
+def test_legacy_baseline_pickle_scanner_accepts_reuse_seekable_keyword(tmp_path: Path) -> None:
+    path = tmp_path / "safe.pkl"
+    path.write_bytes(b"\x80\x04}q\x00.")
+    scanner = compare_pickle_scanners.LegacyBaselinePickleScanner()
+
+    with path.open("rb") as handle:
+        result = scanner._scan_pickle_stream_with_package_engine(
+            handle,
+            path.stat().st_size,
+            source=str(path),
+            reuse_seekable_stream_for_legacy=True,
+        )
+
+    assert result.success is True
+    assert not result.issues
+
+
 def test_scan_fixture_surfaces_package_only_findings_as_drift(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

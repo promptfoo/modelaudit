@@ -63,7 +63,9 @@ class LegacyBaselinePickleScanner(PickleScanner):
         file_size: int,
         *,
         source: str,
+        reuse_seekable_stream_for_legacy: bool = False,
     ) -> ScanResult:
+        del reuse_seekable_stream_for_legacy
         self.current_file_path = source
         return self._scan_pickle_bytes(file_obj, file_size)
 
