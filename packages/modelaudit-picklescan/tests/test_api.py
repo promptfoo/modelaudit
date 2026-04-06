@@ -398,7 +398,7 @@ def test_scan_bytes_flags_raw_nested_pickle_payloads() -> None:
     assert any(finding.rule_code == "S213" for finding in report.findings)
 
 
-@pytest.mark.parametrize("fragment", [b"q\x00.", b"t."])
+@pytest.mark.parametrize("fragment", [b"q\x00.", b"t.", b"cfoo\nbar\n0."])
 def test_scan_bytes_does_not_flag_stack_invalid_nested_pickle_fragments(fragment: bytes) -> None:
     report = scan_bytes(pickle.dumps({"outer": fragment}, protocol=4), source="nested-fragment.pkl")
 
@@ -407,7 +407,7 @@ def test_scan_bytes_does_not_flag_stack_invalid_nested_pickle_fragments(fragment
     assert all(finding.rule_code != "S213" for finding in report.findings)
 
 
-@pytest.mark.parametrize("fragment", [b"q\x00.", b"t."])
+@pytest.mark.parametrize("fragment", [b"q\x00.", b"t.", b"cfoo\nbar\n0."])
 def test_scan_bytes_does_not_flag_stack_invalid_encoded_pickle_fragments(fragment: bytes) -> None:
     encoded = base64.b64encode(fragment).decode("ascii")
     report = scan_bytes(pickle.dumps({"outer": encoded}, protocol=4), source="nested-fragment.pkl")

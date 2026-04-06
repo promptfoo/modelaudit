@@ -8,7 +8,7 @@ import pickletools
 import re
 import time
 from dataclasses import dataclass
-from io import BytesIO
+from io import BytesIO, StringIO
 from typing import Any, BinaryIO, cast
 
 from ..options import ScanOptions
@@ -1063,12 +1063,17 @@ def _looks_like_pickle_payload(value: bytes) -> bool:
         return False
 
     try:
+        saw_stop = False
         for opcode, _arg, _pos in pickletools.genops(BytesIO(value)):
             if opcode.name == "STOP":
-                return True
+                saw_stop = True
+                break
+        if not saw_stop:
+            return False
+        pickletools.dis(value, out=StringIO())
     except Exception:
         return False
-    return False
+    return True
 
 
 def _location_position(location: str | None) -> int | None:
