@@ -1,9 +1,12 @@
 import json
+import os
 import shutil
 import tarfile
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
+
+import pytest
 
 from modelaudit.scanners.base import IssueSeverity, ScanResult
 from modelaudit.scanners.oci_layer_scanner import OciLayerScanner
@@ -320,6 +323,103 @@ class TestOciLayerScanner:
         assert not any("not-a-local-layer.tar.gz" in issue.message for issue in result.issues)
         assert not any("docs.tar.gz" in issue.message for issue in result.issues)
         assert not any("archive.tar.gz" in issue.message for issue in result.issues)
+
+    def test_scan_manifest_ignores_remote_layer_urls(self, tmp_path: Path) -> None:
+        """Remote layer URLs under layers[].urls should not mask local layer refs."""
+        missing_local_layer = "missing-local-layer.tar.gz"
+        manifest = {
+            "schemaVersion": 2,
+            "layers": [
+                {
+                    "digest": "sha256:abc123",
+                    "urls": [
+                        "https://cdn.example.com/layer.tar.gz",
+                        missing_local_layer,
+                    ],
+                }
+            ],
+        }
+        manifest_path = tmp_path / "remote-layer-url.manifest"
+        manifest_path.write_text(json.dumps(manifest))
+
+        result = OciLayerScanner().scan(str(manifest_path))
+
+        assert result.success is False
+        assert any(
+            "Layer not found" in issue.message and missing_local_layer in issue.message for issue in result.issues
+        )
+        assert any(
+            "Remote layer was not scanned" in issue.message and "https://cdn.example.com/layer.tar.gz" in issue.message
+            for issue in result.issues
+        )
+
+    def test_scan_manifest_remote_only_layer_url_marks_scan_incomplete(self, tmp_path: Path) -> None:
+        """Remote-only layer refs should not produce a clean scan when no local layer was inspected."""
+        remote_layer_ref = "https://cdn.example.com/layer.tar.gz"
+        manifest = {"schemaVersion": 2, "layers": [{"digest": "sha256:abc123", "urls": [remote_layer_ref]}]}
+        manifest_path = tmp_path / "remote-only-layer-url.manifest"
+        manifest_path.write_text(json.dumps(manifest))
+
+        result = OciLayerScanner().scan(str(manifest_path))
+
+        assert result.success is False
+        assert any(
+            issue.severity == IssueSeverity.WARNING
+            and "Remote layer was not scanned" in issue.message
+            and remote_layer_ref in issue.message
+            for issue in result.issues
+        )
+
+    def test_scan_manifest_scans_url_like_layer_ref_when_local_path_exists(self, tmp_path: Path) -> None:
+        """URL-like layer refs should still scan when they map to a safe local path."""
+        if os.name == "nt":
+            pytest.skip("URL-scheme path components use ':' and are not representable on Windows")
+
+        evil_pickle = Path(__file__).parent.parent / "assets/samples/pickles/evil.pickle"
+        url_layer_ref = "https://cdn.example.com/layer.tar.gz"
+        local_layer_path = tmp_path / "https:" / "cdn.example.com" / "layer.tar.gz"
+        local_layer_path.parent.mkdir(parents=True)
+        with tarfile.open(local_layer_path, "w:gz") as tar:
+            tar.add(evil_pickle, arcname="malicious.pkl")
+
+        manifest = {"schemaVersion": 2, "layers": [{"digest": "sha256:abc123", "urls": [url_layer_ref]}]}
+        manifest_path = tmp_path / "local-url-layer.manifest"
+        manifest_path.write_text(json.dumps(manifest))
+
+        result = OciLayerScanner().scan(str(manifest_path))
+
+        assert result.success is False
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL
+            and f"local-url-layer.manifest:{url_layer_ref}:malicious.pkl" in (issue.location or "")
+            for issue in result.issues
+        )
+
+    def test_scan_manifest_validates_file_url_like_layer_refs(self, tmp_path: Path) -> None:
+        """URL-like local refs should still pass through path traversal validation."""
+        malformed_layer_ref = "file://../../outside/layer.tar.gz"
+        manifest = {
+            "schemaVersion": 2,
+            "layers": [
+                {"digest": "sha256:abc123", "urls": ["https://cdn.example.com/layer.tar.gz", malformed_layer_ref]}
+            ],
+        }
+        manifest_path = tmp_path / "file-url-layer.manifest"
+        manifest_path.write_text(json.dumps(manifest))
+
+        result = OciLayerScanner().scan(str(manifest_path))
+
+        assert result.success is False
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL
+            and "path traversal" in issue.message
+            and malformed_layer_ref in issue.message
+            for issue in result.issues
+        )
+        assert any(
+            "Remote layer was not scanned" in issue.message and "https://cdn.example.com/layer.tar.gz" in issue.message
+            for issue in result.issues
+        )
 
     def test_scan_layer_with_non_scannable_files(self, tmp_path):
         """Test scanning layer containing files that don't match any scanner."""
