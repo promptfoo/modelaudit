@@ -3657,6 +3657,7 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
                 if candidate not in inverted_registry:
                     return candidate
             pytest.skip(f"No free copyreg extension code available in range {start}-{end}")
+            raise AssertionError("pytest.skip should not return")
 
         cases = [
             ("EXT1", b"\x82", _pick_free_code(1, 255), lambda code: bytes([code])),
@@ -3703,6 +3704,7 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
                 if candidate not in inverted_registry:
                     return candidate
             pytest.skip(f"No unregistered copyreg code in range {start}-{end}")
+            raise AssertionError("pytest.skip should not return")
 
         cases = [
             ("EXT1", b"\x82", _pick_unregistered_code(1, 255), lambda code: bytes([code])),

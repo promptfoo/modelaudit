@@ -1305,8 +1305,8 @@ def detect_format_from_extension_pattern_matching(extension: FileExtension) -> F
             return "r_serialized"
         case ".7z":
             return "sevenzip"
-        case _:
-            return "unknown"
+
+    return "unknown"
 
 
 def detect_format_from_extension(path: FilePath) -> FileFormat:

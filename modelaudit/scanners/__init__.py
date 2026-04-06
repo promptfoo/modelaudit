@@ -104,8 +104,11 @@ class ScannerRegistry:
             "pickle": {
                 "module": "modelaudit.scanners.pickle_scanner",
                 "class": "PickleScanner",
-                "description": "Scans pickle files for malicious code",
-                "extensions": [".pkl", ".pickle", ".dill", ".pt", ".pth", ".ckpt"],
+                "description": "Scans Python pickle files for suspicious code references",
+                "extensions": [".pkl", ".pickle", ".dill", ".bin", ".pt", ".pth", ".ckpt"],
+                # Joblib routing is intentionally reserved for JoblibScanner, even though
+                # PickleScanner.can_handle() can process raw pickle-backed `.joblib` files.
+                "scanner_only_extensions": [".joblib"],
                 "priority": 1,
                 "dependencies": [],  # No heavy dependencies
                 "numpy_sensitive": False,
@@ -122,8 +125,9 @@ class ScannerRegistry:
             "tf_savedmodel": {
                 "module": "modelaudit.scanners.tf_savedmodel_scanner",
                 "class": "TensorFlowSavedModelScanner",
-                "description": "Scans TensorFlow SavedModel files",
+                "description": "Scans TensorFlow SavedModel for suspicious operations",
                 "extensions": [".pb", ""],  # Empty string for directories
+                "header_formats": ["tensorflow_directory", "protobuf"],
                 "priority": 4,
                 "dependencies": ["tensorflow"],  # Heavy dependency
                 "numpy_sensitive": True,  # TensorFlow is sensitive to NumPy version
@@ -140,8 +144,9 @@ class ScannerRegistry:
             "keras_zip": {
                 "module": "modelaudit.scanners.keras_zip_scanner",
                 "class": "KerasZipScanner",
-                "description": "Scans ZIP-based Keras model files",
+                "description": "Scans ZIP-based Keras model files for suspicious configurations and Lambda layers",
                 "extensions": [".keras"],
+                "content_routed_extensions": [".zip"],
                 "priority": 4,  # Higher priority than keras_h5 to check ZIP format first
                 "dependencies": [],  # No heavy dependencies
                 "numpy_sensitive": False,
@@ -151,6 +156,7 @@ class ScannerRegistry:
                 "class": "KerasH5Scanner",
                 "description": "Scans Keras H5 model files",
                 "extensions": [".h5", ".hdf5", ".keras"],
+                "header_formats": ["hdf5", "keras"],
                 "priority": 5,
                 "dependencies": ["h5py"],  # Heavy dependency
                 "numpy_sensitive": True,  # H5py can be sensitive to NumPy version
@@ -185,14 +191,8 @@ class ScannerRegistry:
             "pytorch_zip": {
                 "module": "modelaudit.scanners.pytorch_zip_scanner",
                 "class": "PyTorchZipScanner",
-                "description": "Scans PyTorch ZIP-based model files",
-                "extensions": [
-                    ".pt",
-                    ".pth",
-                    ".ckpt",
-                    ".pkl",
-                    ".bin",
-                ],  # Include torch.save() ZIP-backed checkpoints/pickles.
+                "description": "Scans PyTorch model files for suspicious code in embedded pickles",
+                "extensions": [".pt", ".pth", ".ckpt", ".pkl", ".bin"],
                 "priority": 2,  # Higher priority than pytorch_binary to check ZIP format first
                 "dependencies": [],  # No heavy dependencies
                 "numpy_sensitive": False,
@@ -211,6 +211,7 @@ class ScannerRegistry:
                 "class": "GgufScanner",
                 "description": "Scans GGUF/GGML model files",
                 "extensions": [".gguf", ".ggml"],
+                "header_formats": ["ggml"],
                 "priority": 7,
                 "dependencies": [],  # No heavy dependencies
                 "numpy_sensitive": False,
@@ -218,7 +219,7 @@ class ScannerRegistry:
             "joblib": {
                 "module": "modelaudit.scanners.joblib_scanner",
                 "class": "JoblibScanner",
-                "description": "Scans joblib serialized files",
+                "description": "Scans joblib files by decompressing and analyzing embedded pickle",
                 "extensions": [".joblib"],
                 "priority": 8,
                 "dependencies": [],  # No heavy dependencies
@@ -236,8 +237,9 @@ class ScannerRegistry:
             "skops": {
                 "module": "modelaudit.scanners.skops_scanner",
                 "class": "SkopsScanner",
-                "description": "Scans skops files for CVE-2025-54412, CVE-2025-54413, CVE-2025-54886",
+                "description": ("Scans skops files for CVE-2025-54412, CVE-2025-54413, CVE-2025-54886 vulnerabilities"),
                 "extensions": [".skops"],
+                "content_routed_extensions": [".zip"],
                 "priority": 8,  # Same priority as joblib
                 "dependencies": [],  # No heavy dependencies (uses standard zipfile)
                 "numpy_sensitive": False,
@@ -272,7 +274,7 @@ class ScannerRegistry:
             "manifest": {
                 "module": "modelaudit.scanners.manifest_scanner",
                 "class": "ManifestScanner",
-                "description": "Scans manifest and configuration files",
+                "description": "Scans model manifest files for blacklisted names and terms",
                 "extensions": [
                     ".json",
                     ".yaml",
@@ -407,7 +409,7 @@ class ScannerRegistry:
             "tar": {
                 "module": "modelaudit.scanners.tar_scanner",
                 "class": "TarScanner",
-                "description": "Scans TAR archive files",
+                "description": "Scans TAR archive files and their contents recursively",
                 "extensions": [
                     ".tar",
                     ".tar.gz",
@@ -433,8 +435,12 @@ class ScannerRegistry:
             "metadata": {
                 "module": "modelaudit.scanners.metadata_scanner",
                 "class": "MetadataScanner",
-                "description": "Scans model metadata files for security issues",
-                "extensions": [".json", ".md", ".markdown", ".rst", ".yml", ".yaml"],
+                "description": "Scans model documentation files for security issues",
+                "extensions": [".md", ".markdown", ".rst", ".txt", ".yml", ".yaml"],
+                "content_routed_filenames": [
+                    "readme",
+                    "model_card",
+                ],
                 "priority": 1,  # High priority for security-focused metadata scanning
                 "dependencies": [],  # No heavy dependencies
                 "numpy_sensitive": False,
@@ -514,7 +520,7 @@ class ScannerRegistry:
             "compressed": {
                 "module": "modelaudit.scanners.compressed_scanner",
                 "class": "CompressedScanner",
-                "description": "Scans standalone compressed wrappers and forwards decompressed payloads",
+                "description": "Scans standalone compressed wrappers and routes inner payloads to existing scanners",
                 "extensions": [".gz", ".bz2", ".xz", ".lz4", ".zlib"],
                 "priority": 95,  # Before generic TAR/ZIP scanners
                 "dependencies": [],  # lz4 is optional and handled in scanner
@@ -623,7 +629,33 @@ class ScannerRegistry:
         Returns:
             True if the scanner is registered and can potentially be loaded
         """
-        return any(scanner_info.get("class") == class_name for scanner_info in self._scanners.values())
+        return self._get_scanner_id_for_class(class_name) is not None
+
+    def _get_scanner_id_for_class(self, class_name: str) -> str | None:
+        """Resolve a scanner class name from the registry's descriptor catalog."""
+        for scanner_id, scanner_info in self._scanners.items():
+            if scanner_info.get("class") == class_name:
+                return scanner_id
+        return None
+
+    def get_scanner_id_for_header_format(self, header_format: str) -> str | None:
+        """Resolve a detected header format to a scanner ID from descriptor metadata."""
+        if header_format in self._scanners:
+            return header_format
+
+        for scanner_id, scanner_info in self._scanners.items():
+            if header_format in scanner_info.get("header_formats", ()):
+                return scanner_id
+
+        return None
+
+    def get_header_format_to_scanner_ids(self) -> dict[str, str]:
+        """Return all descriptor-owned header-format routes without loading scanners."""
+        header_format_to_scanner_id = {scanner_id: scanner_id for scanner_id in self._scanners}
+        for scanner_id, scanner_info in self._scanners.items():
+            for header_format in scanner_info.get("header_formats", ()):
+                header_format_to_scanner_id[header_format] = scanner_id
+        return header_format_to_scanner_id
 
     def get_scanner_classes(self) -> list[type[BaseScanner]]:
         """Get all available scanner classes in priority order"""
@@ -667,36 +699,40 @@ class ScannerRegistry:
         if file_ext and file_ext not in candidate_extensions:
             candidate_extensions.append(file_ext)
 
+        is_zip_file = False
+        try:
+            is_zip_file = os.path.isfile(path) and zipfile.is_zipfile(path)
+        except OSError:
+            return None
+
         for candidate_extension in candidate_extensions:
             for scanner_id, scanner_info in sorted_scanners:
                 extensions = scanner_info.get("extensions", [])
-                if candidate_extension not in extensions:
+                content_routed_extensions = scanner_info.get("content_routed_extensions", [])
+                if candidate_extension not in extensions and candidate_extension not in content_routed_extensions:
                     continue
 
                 scanner_class = self._load_scanner(scanner_id)
                 if scanner_class and scanner_class.can_handle(path):
                     return scanner_class
 
+        # Some ZIP-backed artifacts intentionally use pickle/checkpoint suffixes.
+        # If stricter extension-specific scanners all decline, fall back to the
+        # generic ZIP scanner so helper-level routing does not drop coverage.
+        if is_zip_file:
+            scanner_class = self._load_scanner("zip")
+            if scanner_class and scanner_class.can_handle(path):
+                return scanner_class
+
         # Manifest-like config files sometimes intentionally use generic or
-        # missing extensions, so keep the filename-pattern fallback.
-        for scanner_id, _scanner_info in sorted_scanners:
-            if scanner_id != "manifest" or not self._is_aiml_manifest_file(filename):
+        # missing extensions, so keep the descriptor-owned filename fallback.
+        for scanner_id, scanner_info in sorted_scanners:
+            if not self._is_content_routed_filename(filename, scanner_info):
                 continue
 
             scanner_class = self._load_scanner(scanner_id)
             if scanner_class and scanner_class.can_handle(path):
                 return scanner_class
-
-        # Some ZIP-backed artifacts intentionally use pickle/checkpoint suffixes.
-        # If stricter extension-specific scanners all decline, fall back to the
-        # generic ZIP scanner so helper-level routing does not drop coverage.
-        try:
-            if os.path.isfile(path) and zipfile.is_zipfile(path):
-                scanner_class = self._load_scanner("zip")
-                if scanner_class and scanner_class.can_handle(path):
-                    return scanner_class
-        except OSError:
-            return None
 
         return None
 
@@ -771,6 +807,36 @@ class ScannerRegistry:
         # Use exact filename matching to avoid false positives like "config.json.backup"
         return any(filename == pattern or filename.endswith(f"/{pattern}") for pattern in self._AIML_MANIFEST_PATTERNS)
 
+    @staticmethod
+    def _is_model_metadata_file(filename: str, scanner_info: dict[str, Any]) -> bool:
+        """Check descriptor-declared model metadata filename routes."""
+        return ScannerRegistry._is_content_routed_filename(filename, scanner_info)
+
+    @staticmethod
+    def _is_content_routed_filename(filename: str, scanner_info: dict[str, Any]) -> bool:
+        """Check descriptor-declared filename routes without arbitrary suffix fallback."""
+        if not filename:
+            return False
+
+        content_routed_filenames = {
+            str(routed_name).lower() for routed_name in scanner_info.get("content_routed_filenames", [])
+        }
+        if filename in content_routed_filenames:
+            return True
+
+        allowed_extensions = {str(extension).lower() for extension in scanner_info.get("extensions", [])}
+        allowed_extensions.discard("")
+        if not allowed_extensions:
+            return False
+
+        for routed_name in content_routed_filenames:
+            if "".join(Path(routed_name).suffixes):
+                continue
+            if any(filename == f"{routed_name}{extension}" for extension in allowed_extensions):
+                return True
+
+        return False
+
 
 # Global registry instance
 _registry = ScannerRegistry()
@@ -815,56 +881,9 @@ SCANNER_REGISTRY = _LazyList(_registry)
 
 # Export scanner classes with lazy loading
 def __getattr__(name: str) -> Any:
-    """Lazy loading for scanner classes"""
-    # Map class names to scanner IDs
-    class_to_id = {
-        "PickleScanner": "pickle",
-        "PyTorchBinaryScanner": "pytorch_binary",
-        "TensorFlowSavedModelScanner": "tf_savedmodel",
-        "TensorFlowMetaGraphScanner": "tf_metagraph",
-        "KerasH5Scanner": "keras_h5",
-        "OnnxScanner": "onnx",
-        "CoreMLScanner": "coreml",
-        "OpenVinoScanner": "openvino",
-        "PyTorchZipScanner": "pytorch_zip",
-        "ExecuTorchScanner": "executorch",
-        "GgufScanner": "gguf",
-        "JoblibScanner": "joblib",
-        "RSerializedScanner": "r_serialized",
-        "SkopsScanner": "skops",
-        "NumPyScanner": "numpy",
-        "OciLayerScanner": "oci_layer",
-        "ManifestScanner": "manifest",
-        "PmmlScanner": "pmml",
-        "WeightDistributionScanner": "weight_distribution",
-        "SafeTensorsScanner": "safetensors",
-        "FlaxMsgpackScanner": "flax_msgpack",
-        "JaxCheckpointScanner": "jax_checkpoint",
-        "TFLiteScanner": "tflite",
-        "TensorRTScanner": "tensorrt",
-        "PaddleScanner": "paddle",
-        "CntkScanner": "cntk",
-        "RknnScanner": "rknn",
-        "Torch7Scanner": "torch7",
-        "TarScanner": "tar",
-        "Jinja2TemplateScanner": "jinja2_template",
-        "MetadataScanner": "metadata",
-        "KerasZipScanner": "keras_zip",
-        "SevenZipScanner": "sevenzip",
-        "TextScanner": "text",
-        "LightGBMScanner": "lightgbm",
-        "LlamafileScanner": "llamafile",
-        "XGBoostScanner": "xgboost",
-        "MXNetScanner": "mxnet",
-        "CatBoostScanner": "catboost",
-        "NemoScanner": "nemo",
-        "TorchServeMarScanner": "torchserve_mar",
-        "CompressedScanner": "compressed",
-        "ZipScanner": "zip",
-    }
-
-    if name in class_to_id:
-        scanner_id = class_to_id[name]
+    """Lazy-load scanner classes from the registry's descriptor catalog."""
+    scanner_id = _registry._get_scanner_id_for_class(name)
+    if scanner_id is not None:
         scanner_class = _registry.load_scanner_by_id(scanner_id)
         if scanner_class:
             return scanner_class

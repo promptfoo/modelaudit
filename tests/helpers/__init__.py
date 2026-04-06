@@ -13,6 +13,7 @@ from tests.helpers.file_creators import (
     create_mock_pytorch_zip,
     create_mock_safetensors,
     create_safe_pickle,
+    write_mock_pytorch_zip_metadata,
 )
 from tests.helpers.frameworks import (
     requires_dill,
@@ -43,4 +44,5 @@ __all__ = [
     "requires_safetensors",
     "requires_tensorflow",
     "requires_xgboost",
+    "write_mock_pytorch_zip_metadata",
 ]

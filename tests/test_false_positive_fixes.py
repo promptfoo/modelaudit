@@ -372,22 +372,21 @@ class TestFalsePositiveFixes:
             assert result["has_warnings"] is True or result["has_errors"] is True, "Malicious Keras should have issues"
 
         # Test 3: Real executable at beginning of .bin file should still be detected
-        if True:  # Always run this test
-            exe_bin_path = tmp_path / "malicious_model.bin"
-            # Create a file that starts with a Windows executable
-            # This simulates someone renaming an .exe to .bin
-            with open(exe_bin_path, "wb") as f:
-                # Write actual PE header structure
-                f.write(b"MZ")  # DOS header
-                f.write(b"\x90\x00" * 30)  # DOS stub
-                f.write(b"This program cannot be run in DOS mode")
-                f.write(b"\x00" * 100)
+        exe_bin_path = tmp_path / "malicious_model.bin"
+        # Create a file that starts with a Windows executable
+        # This simulates someone renaming an .exe to .bin
+        with open(exe_bin_path, "wb") as f:
+            # Write actual PE header structure
+            f.write(b"MZ")  # DOS header
+            f.write(b"\x90\x00" * 30)  # DOS stub
+            f.write(b"This program cannot be run in DOS mode")
+            f.write(b"\x00" * 100)
 
-            result = self._run_cli_scan(str(exe_bin_path))
-            assert result["exit_code"] == 1, "Real executable disguised as .bin should be detected"
-            assert any("Windows executable" in issue.get("message", "") for issue in result["issues"]), (
-                "Should detect Windows executable at start of file"
-            )
+        result = self._run_cli_scan(str(exe_bin_path))
+        assert result["exit_code"] == 1, "Real executable disguised as .bin should be detected"
+        assert any("Windows executable" in issue.get("message", "") for issue in result["issues"]), (
+            "Should detect Windows executable at start of file"
+        )
 
         # Test 4: Malicious manifest file (use ML-specific filename to ensure it's scanned)
         evil_manifest_path = tmp_path / "config.json"  # Use standard config.json name

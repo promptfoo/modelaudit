@@ -7,6 +7,7 @@ import tarfile
 import tempfile
 from pathlib import Path
 from typing import Any, ClassVar
+from urllib.parse import urlparse
 
 from ..utils import is_within_directory, sanitize_archive_path
 from ..utils.file.detection import (
@@ -48,6 +49,7 @@ class OciLayerScanner(BaseScanner):
     _MANIFEST_PROBE_CHUNK_BYTES: ClassVar[int] = 8192
     _MEMBER_HEADER_PROBE_BYTES: ClassVar[int] = 64
     _DEFAULT_MAX_LAYER_FILE_SIZE: ClassVar[int] = 10 * 1024 * 1024 * 1024
+    _REMOTE_LAYER_REF_SCHEMES: ClassVar[frozenset[str]] = frozenset({"http", "https", "s3", "gs", "oci"})
 
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
@@ -110,6 +112,12 @@ class OciLayerScanner(BaseScanner):
     def _normalize_layer_ref(layer_ref: str) -> str:
         """Trim manifest layer refs so cosmetic suffix whitespace cannot hide .tar.gz layers."""
         return layer_ref.strip().rstrip(" .")
+
+    @staticmethod
+    def _is_remote_layer_ref(layer_ref: str) -> bool:
+        """Return True when a layer reference points to a remote URL-like location."""
+        parsed = urlparse(layer_ref.strip())
+        return parsed.scheme.lower() in OciLayerScanner._REMOTE_LAYER_REF_SCHEMES and bool(parsed.netloc)
 
     @classmethod
     def _collect_layer_paths(cls, manifest_data: Any) -> list[str]:
@@ -290,6 +298,21 @@ class OciLayerScanner(BaseScanner):
                 continue
 
             if not os.path.exists(layer_path):
+                if self._is_remote_layer_ref(layer_ref):
+                    scan_complete = False
+                    result.add_check(
+                        name="Remote Layer Resolution Check",
+                        passed=False,
+                        message=f"Remote layer was not scanned because it is not available locally: {layer_ref}",
+                        severity=IssueSeverity.WARNING,
+                        location=f"{path}:{layer_ref}",
+                        details={
+                            "layer": layer_ref,
+                            "resolved_path": layer_path,
+                        },
+                        rule_code="S902",
+                    )
+                    continue
                 scan_complete = False
                 result.add_check(
                     name="Layer File Existence Check",

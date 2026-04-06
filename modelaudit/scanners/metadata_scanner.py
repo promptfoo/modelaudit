@@ -2,6 +2,7 @@
 
 import logging
 from pathlib import Path
+from typing import ClassVar
 from urllib.parse import unquote, urlparse
 
 from .base import BaseScanner, Issue, IssueSeverity, ScanResult
@@ -27,6 +28,7 @@ class MetadataScanner(BaseScanner):
 
     name = "metadata"
     description = "Scans model documentation files for security issues"
+    supported_extensions: ClassVar[list[str]] = [".md", ".markdown", ".rst", ".txt", ".yml", ".yaml"]
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
