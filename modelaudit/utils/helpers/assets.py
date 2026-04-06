@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from modelaudit.scanners.base import ScanResult
+    from modelaudit.scanner_results import ScanResult
 
 
 def asset_from_scan_result(
