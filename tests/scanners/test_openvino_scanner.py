@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
-from modelaudit.scanners.base import IssueSeverity
+from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.openvino_scanner import OpenVinoScanner
 
 
@@ -110,7 +110,10 @@ def test_openvino_scanner_routes_unterminated_doctype_to_parse_failure(tmp_path:
     assert OpenVinoScanner.can_handle(str(xml_path)) is True
     assert cli_result.scanner_names == ["openvino"]
     assert determine_exit_code(cli_result) == 2
-    assert any(check.name == "OpenVINO XML Parse" for check in cli_result.checks)
+    parse_checks = [check for check in cli_result.checks if check.name == "OpenVINO XML Parse"]
+    assert parse_checks
+    assert all(check.status == CheckStatus.FAILED for check in parse_checks)
+    assert any("Invalid OpenVINO XML" in check.message for check in parse_checks)
 
 
 def test_openvino_scanner_can_handle_rejects_unterminated_non_openvino_doctype(tmp_path: Path) -> None:
