@@ -5,12 +5,11 @@ JSON structure that ModelAudit currently outputs for backward compatibility.
 """
 
 import time
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
 
-if TYPE_CHECKING:
-    from .scanners.base import Check, Issue
+from .scanner_results import Check, CheckStatus, Issue, IssueSeverity, ScanResult
 
 # We'll use forward references and rebuild models after imports
 
@@ -466,9 +465,6 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
 
         This is more efficient than converting to dict first and provides better type safety.
         """
-        # Import here to avoid circular import
-        from .scanners.base import ScanResult
-
         if not isinstance(scan_result, ScanResult):
             raise TypeError(f"Expected ScanResult, got {type(scan_result)}")
 
@@ -536,7 +532,6 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
         Only counts security-relevant checks (excludes failed INFO/DEBUG from total).
         This ensures the success rate reflects actual security status, not informational notes.
         """
-        from .scanners.base import CheckStatus, IssueSeverity
 
         # Exclude only failed INFO/DEBUG checks from success rate calculation
         # Include: passed checks, skipped checks, and failed WARNING/CRITICAL checks
@@ -571,8 +566,6 @@ def create_audit_result_model(aggregated_results: dict[str, Any]) -> ModelAuditR
     This function converts the internal aggregated_results dict to a validated
     Pydantic model that matches the exact current JSON output format.
     """
-    from .scanners.base import Check, Issue
-
     # Convert issues to Issue instances
     issues = []
     for issue in aggregated_results.get("issues", []):
@@ -628,8 +621,6 @@ def convert_issues_to_models(issues: list[Any]) -> list["Issue"]:
     """Convert list of issue dicts or objects to Issue instances."""
     import time
 
-    from .scanners.base import Issue
-
     result = []
     for issue in issues:
         if isinstance(issue, dict):
@@ -651,8 +642,6 @@ def convert_issues_to_models(issues: list[Any]) -> list["Issue"]:
 def convert_checks_to_models(checks: list[Any]) -> list["Check"]:
     """Convert list of check dicts or objects to Check instances."""
     import time
-
-    from .scanners.base import Check
 
     result = []
     for check in checks:
@@ -824,9 +813,6 @@ class ScannerPerformanceMetrics(BaseModel):
 def rebuild_models() -> None:
     """Rebuild models with proper type references after all imports are available."""
     try:
-        # Import the scanner models
-        from .scanners.base import Check, Issue
-
         # Update the global namespace so forward references work
         globals()["Issue"] = Issue
         globals()["Check"] = Check

@@ -1,5 +1,8 @@
 """Tests for centralized MODEL_EXTENSIONS in HuggingFace downloads."""
 
+import subprocess
+import sys
+
 from modelaudit.utils.sources.huggingface import _get_model_extensions
 
 # Get extensions once for all tests
@@ -99,6 +102,27 @@ def test_model_extensions_all_lowercase():
     for ext in MODEL_EXTENSIONS:
         assert ext.startswith("."), f"Extension {ext} should start with a dot"
         assert ext == ext.lower(), f"Extension {ext} should be lowercase"
+
+
+def test_get_model_extensions_does_not_import_scanners_package() -> None:
+    """The model-extension helper should read leaf metadata without importing scanners."""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; "
+                "from modelaudit.utils.model_extensions import get_all_scannable_extensions; "
+                "get_all_scannable_extensions(); "
+                "print('modelaudit.scanners' in sys.modules)"
+            ),
+        ],
+        capture_output=True,
+        check=True,
+        text=True,
+    )
+
+    assert result.stdout.strip() == "False"
 
 
 def test_gguf_repo_file_filtering():

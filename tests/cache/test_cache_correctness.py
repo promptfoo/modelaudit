@@ -15,6 +15,7 @@ from modelaudit.cache.optimized_config import (
     ConfigurationExtractor,
     build_cache_version_context,
     get_config_extractor,
+    normalize_material_scan_config,
 )
 from modelaudit.cache.scan_results_cache import ScanResultsCache
 from modelaudit.config.rule_config import ModelAuditConfig, get_config, reset_config, set_config
@@ -88,6 +89,18 @@ def test_cached_scan_invalidates_on_material_scan_config_change(tmp_path: Path) 
     assert second == {"call_count": 2, "timeout": 5}
     assert third == second
     assert calls["count"] == 2
+
+
+def test_normalize_material_scan_config_ignores_nested_scan_callback() -> None:
+    def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> None:
+        return None
+
+    assert normalize_material_scan_config(
+        {
+            "timeout": 30,
+            "_archive_nested_scan_callback": scan_nested_file,
+        }
+    ) == {"timeout": 30}
 
 
 def test_cached_scan_invalidates_on_rule_config_change(tmp_path: Path) -> None:
