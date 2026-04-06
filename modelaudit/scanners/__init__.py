@@ -2,6 +2,7 @@ import importlib
 import logging
 import threading
 import warnings
+import zipfile
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, Optional
@@ -185,7 +186,13 @@ class ScannerRegistry:
                 "module": "modelaudit.scanners.pytorch_zip_scanner",
                 "class": "PyTorchZipScanner",
                 "description": "Scans PyTorch ZIP-based model files",
-                "extensions": [".pt", ".pth", ".bin"],  # Include .bin for torch.save() outputs
+                "extensions": [
+                    ".pt",
+                    ".pth",
+                    ".ckpt",
+                    ".pkl",
+                    ".bin",
+                ],  # Include torch.save() ZIP-backed checkpoints/pickles.
                 "priority": 2,  # Higher priority than pytorch_binary to check ZIP format first
                 "dependencies": [],  # No heavy dependencies
                 "numpy_sensitive": False,
@@ -679,6 +686,17 @@ class ScannerRegistry:
             scanner_class = self._load_scanner(scanner_id)
             if scanner_class and scanner_class.can_handle(path):
                 return scanner_class
+
+        # Some ZIP-backed artifacts intentionally use pickle/checkpoint suffixes.
+        # If stricter extension-specific scanners all decline, fall back to the
+        # generic ZIP scanner so helper-level routing does not drop coverage.
+        try:
+            if os.path.isfile(path) and zipfile.is_zipfile(path):
+                scanner_class = self._load_scanner("zip")
+                if scanner_class and scanner_class.can_handle(path):
+                    return scanner_class
+        except OSError:
+            return None
 
         return None
 

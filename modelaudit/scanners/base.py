@@ -283,6 +283,38 @@ class BaseScanner(ABC):
 
         return result
 
+    def _run_preflight_checks(
+        self,
+        path: str,
+        *,
+        check_size_limit: bool = True,
+    ) -> ScanResult | None:
+        """Run shared path and optional size validation before a scanner's heavy parsing starts."""
+        path_check_result = self._check_path(path)
+        if path_check_result:
+            return path_check_result
+
+        if check_size_limit:
+            size_check_result = self._check_size_limit(path)
+            if size_check_result:
+                return size_check_result
+
+        return None
+
+    def _create_scan_result_after_preflight(
+        self,
+        path: str,
+        *,
+        check_size_limit: bool = True,
+    ) -> ScanResult:
+        """Create a scan result after shared preflight, or return the failing preflight result."""
+        preflight_result = self._run_preflight_checks(path, check_size_limit=check_size_limit)
+        if preflight_result:
+            return preflight_result
+
+        self.current_file_path = path
+        return self._create_result()
+
     def _start_scan_timer(self) -> None:
         """Start the scan timer for timeout tracking"""
         self.scan_start_time = time.time()
@@ -1112,6 +1144,24 @@ class BaseScanner(ABC):
 
             self.progress_tracker.set_phase(ProgressPhase.INITIALIZING, f"Starting scan: {path}")
 
+    def _prepare_progress_for_scan(self, path: str) -> None:
+        """Initialize progress tracking and set up file-level progress state."""
+        self.current_file_path = path
+
+        if PROGRESS_AVAILABLE and self._enable_progress and not self.progress_tracker:
+            self._initialize_progress_tracker()
+
+        if self.progress_tracker:
+            self._setup_progress_for_file(path)
+
+    def _finalize_progress_for_scan(self, error: Exception | None = None) -> None:
+        """Complete progress tracking or report a scan error."""
+        if error is None:
+            self._complete_progress()
+            return
+
+        self._report_progress_error(error)
+
     # All progress tracking methods disabled to fix CI circular import issues
     def _update_progress_bytes(self, bytes_processed: int, current_item: str = "") -> None:
         """Update progress with bytes processed."""
@@ -1165,21 +1215,14 @@ class BaseScanner(ABC):
         This is a wrapper around the scan method that provides progress tracking.
         Subclasses should override scan() but can call this method for progress support.
         """
-        self.current_file_path = path
-
-        # Initialize progress tracking for this file
-        if PROGRESS_AVAILABLE and self._enable_progress and not self.progress_tracker:
-            self._initialize_progress_tracker()
-
-        if self.progress_tracker:
-            self._setup_progress_for_file(path)
+        self._prepare_progress_for_scan(path)
 
         try:
             result = self.scan(path)
-            self._complete_progress()
+            self._finalize_progress_for_scan()
             return result
         except Exception as e:
-            self._report_progress_error(e)
+            self._finalize_progress_for_scan(e)
             raise
 
     def get_progress_stats(self) -> dict[str, Any] | None:
