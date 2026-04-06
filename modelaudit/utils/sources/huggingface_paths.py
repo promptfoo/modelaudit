@@ -128,7 +128,8 @@ def extract_model_id_from_path(path: str) -> tuple[str | None, str | None]:
                     model_id = config.get("_name_or_path") or config.get("model_name") or config.get("name")
                     if model_id and "/" in model_id:
                         return model_id, "local"
-            except Exception:
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                # Optional local metadata may be absent or malformed; continue walking parent directories.
                 pass
 
         model_index = current_path / "model_index.json"
@@ -139,7 +140,8 @@ def extract_model_id_from_path(path: str) -> tuple[str | None, str | None]:
                     model_id = config.get("_name_or_path") or config.get("name")
                     if model_id and "/" in model_id:
                         return model_id, "local"
-            except Exception:
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                # Optional local metadata may be absent or malformed; continue walking parent directories.
                 pass
 
         if current_path.parent == current_path:
