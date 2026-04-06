@@ -299,6 +299,19 @@ class OciLayerScanner(BaseScanner):
 
             if not os.path.exists(layer_path):
                 if self._is_remote_layer_ref(layer_ref):
+                    scan_complete = False
+                    result.add_check(
+                        name="Remote Layer Resolution Check",
+                        passed=False,
+                        message=f"Remote layer was not scanned because it is not available locally: {layer_ref}",
+                        severity=IssueSeverity.WARNING,
+                        location=f"{path}:{layer_ref}",
+                        details={
+                            "layer": layer_ref,
+                            "resolved_path": layer_path,
+                        },
+                        rule_code="S902",
+                    )
                     continue
                 scan_complete = False
                 result.add_check(

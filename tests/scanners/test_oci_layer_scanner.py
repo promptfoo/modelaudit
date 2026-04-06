@@ -348,7 +348,27 @@ class TestOciLayerScanner:
         assert any(
             "Layer not found" in issue.message and missing_local_layer in issue.message for issue in result.issues
         )
-        assert not any("https://cdn.example.com/layer.tar.gz" in issue.message for issue in result.issues)
+        assert any(
+            "Remote layer was not scanned" in issue.message and "https://cdn.example.com/layer.tar.gz" in issue.message
+            for issue in result.issues
+        )
+
+    def test_scan_manifest_remote_only_layer_url_marks_scan_incomplete(self, tmp_path: Path) -> None:
+        """Remote-only layer refs should not produce a clean scan when no local layer was inspected."""
+        remote_layer_ref = "https://cdn.example.com/layer.tar.gz"
+        manifest = {"schemaVersion": 2, "layers": [{"digest": "sha256:abc123", "urls": [remote_layer_ref]}]}
+        manifest_path = tmp_path / "remote-only-layer-url.manifest"
+        manifest_path.write_text(json.dumps(manifest))
+
+        result = OciLayerScanner().scan(str(manifest_path))
+
+        assert result.success is False
+        assert any(
+            issue.severity == IssueSeverity.WARNING
+            and "Remote layer was not scanned" in issue.message
+            and remote_layer_ref in issue.message
+            for issue in result.issues
+        )
 
     def test_scan_manifest_scans_url_like_layer_ref_when_local_path_exists(self, tmp_path: Path) -> None:
         """URL-like layer refs should still scan when they map to a safe local path."""
@@ -396,7 +416,10 @@ class TestOciLayerScanner:
             and malformed_layer_ref in issue.message
             for issue in result.issues
         )
-        assert not any("https://cdn.example.com/layer.tar.gz" in issue.message for issue in result.issues)
+        assert any(
+            "Remote layer was not scanned" in issue.message and "https://cdn.example.com/layer.tar.gz" in issue.message
+            for issue in result.issues
+        )
 
     def test_scan_layer_with_non_scannable_files(self, tmp_path):
         """Test scanning layer containing files that don't match any scanner."""
