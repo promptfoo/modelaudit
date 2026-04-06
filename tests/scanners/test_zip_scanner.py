@@ -432,25 +432,30 @@ class TestZipScanner:
         finally:
             os.unlink(tmp_path)
 
-    def test_zip_bomb_detection(self):
-        """Test detection of potential zip bombs (high compression ratio)"""
-        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
-            with zipfile.ZipFile(tmp.name, "w", compression=zipfile.ZIP_DEFLATED) as z:
-                # Create a highly compressible file (potential zip bomb indicator)
-                # Keep highly compressible but smaller to speed CI
-                large_content = "A" * 300000  # 300KB of repeated 'A's
-                z.writestr("suspicious.txt", large_content)
-            tmp_path = tmp.name
+    def test_zip_bomb_detection(self, tmp_path: Path) -> None:
+        """High compression-ratio entries should be reported without extracting them."""
+        archive_path = tmp_path / "suspicious.zip"
+        with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+            # Keep highly compressible but smaller to speed CI.
+            z.writestr("suspicious.txt", "A" * 300000)
 
-        try:
-            result = self.scanner.scan(tmp_path)
-            assert result.success is True
+        nested_scan_paths: list[str] = []
 
-            # Should detect high compression ratio
-            compression_issues = [i for i in result.issues if "compression ratio" in i.message.lower()]
-            assert len(compression_issues) >= 1
-        finally:
-            os.unlink(tmp_path)
+        def nested_scan(path: str, _config: dict[str, Any]) -> ScanResult:
+            nested_scan_paths.append(path)
+            return ScanResult(scanner_name="test")
+
+        scanner = ZipScanner(config={NESTED_SCAN_CALLBACK_CONFIG_KEY: nested_scan})
+        result = scanner.scan(str(archive_path))
+
+        assert result.success is False
+        assert nested_scan_paths == []
+
+        compression_issues = [i for i in result.issues if "compression ratio" in i.message.lower()]
+        assert len(compression_issues) == 1
+        assert compression_issues[0].rule_code == "S410"
+        assert compression_issues[0].details["entry"] == "suspicious.txt"
+        assert "skipping extraction" in compression_issues[0].message
 
     def test_max_depth_limit(self):
         """Test that maximum nesting depth is enforced"""
