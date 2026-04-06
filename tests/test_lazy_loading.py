@@ -2,6 +2,7 @@
 Tests for lazy loading functionality in the scanner registry.
 """
 
+import pickle
 import sys
 import tempfile
 from pathlib import Path
@@ -89,13 +90,14 @@ class TestScannerRegistry:
         assert scanner1 is scanner2
         assert len(_registry._loaded_scanners) == 1
 
-    def test_get_scanner_for_path_extension_filtering(self):
+    def test_get_scanner_for_path_extension_filtering(self) -> None:
         """Test that get_scanner_for_path filters by extension before loading."""
         # Reset loaded scanners
         _registry._loaded_scanners.clear()
 
         # Create temporary files with different extensions
         with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
+            f.write(pickle.dumps({"safe": True}))
             pkl_path = f.name
 
         try:
@@ -234,13 +236,19 @@ class TestBackwardsCompatibility:
         for scanner in scanner_list:
             assert issubclass(scanner, BaseScanner)
 
-    def test_scanner_can_handle_method(self):
+    def test_scanner_can_handle_method(self) -> None:
         """Test that scanner can_handle methods work correctly."""
         from modelaudit.scanners import PickleScanner
 
         # Create temporary pickle file
-        with tempfile.NamedTemporaryFile(suffix=".pkl") as f:
-            assert PickleScanner.can_handle(f.name)
+        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
+            f.write(pickle.dumps({"safe": True}))
+            pickle_path = f.name
+
+        try:
+            assert PickleScanner.can_handle(pickle_path)
+        finally:
+            Path(pickle_path).unlink(missing_ok=True)
 
     def test_scanner_instantiation(self):
         """Test that scanners can be instantiated correctly."""
@@ -357,17 +365,23 @@ class TestSpecificFileTypes:
             finally:
                 Path(f.name).unlink(missing_ok=True)
 
-    def test_pickle_file_loading(self):
+    def test_pickle_file_loading(self) -> None:
         """Test that pickle files load pickle scanner efficiently."""
         _registry._loaded_scanners.clear()
 
-        with tempfile.NamedTemporaryFile(suffix=".pkl") as f:
-            scanner = _registry.get_scanner_for_path(f.name)
+        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
+            f.write(pickle.dumps({"safe": True}))
+            pkl_path = f.name
+
+        try:
+            scanner = _registry.get_scanner_for_path(pkl_path)
             assert scanner is not None
             assert scanner.name == "pickle"
 
             # Should have loaded pickle scanner
             assert "pickle" in _registry._loaded_scanners
+        finally:
+            Path(pkl_path).unlink(missing_ok=True)
 
     def test_unknown_extension_handling(self):
         """Test handling of files with unknown extensions."""

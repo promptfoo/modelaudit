@@ -1,5 +1,11 @@
+import zipfile
+from pathlib import Path
+
 from modelaudit.scanners import SCANNER_REGISTRY, _registry
 from modelaudit.scanners.base import BaseScanner
+from modelaudit.scanners.pytorch_zip_scanner import PyTorchZipScanner
+from modelaudit.scanners.zip_scanner import ZipScanner
+from tests.helpers import create_mock_pytorch_zip
 
 
 def test_scanner_registry_contains_all_scanners():
@@ -159,3 +165,32 @@ def test_numpy_compatibility_detection():
 
     # Should provide helpful information
     assert len(numpy_status) > 10
+
+
+def test_get_scanner_for_file_routes_zip_backed_ckpt_to_pytorch_zip(tmp_path: Path) -> None:
+    """ZIP-backed `.ckpt` files should use PyTorchZipScanner, not fall through to None."""
+    model_path = create_mock_pytorch_zip(tmp_path / "model.ckpt")
+
+    scanner = _registry.get_scanner_for_path(str(model_path))
+
+    assert scanner is PyTorchZipScanner
+
+
+def test_get_scanner_for_file_routes_zip_backed_pkl_to_pytorch_zip(tmp_path: Path) -> None:
+    """PyTorch ZIP `.pkl` files should use the dedicated PyTorch archive scanner."""
+    model_path = create_mock_pytorch_zip(tmp_path / "model.pkl")
+
+    scanner = _registry.get_scanner_for_path(str(model_path))
+
+    assert scanner is PyTorchZipScanner
+
+
+def test_get_scanner_for_file_falls_back_to_generic_zip_for_non_pytorch_zip_pkl(tmp_path: Path) -> None:
+    """Generic `.pkl` ZIPs should still be scanned through ZipScanner when PyTorch markers are absent."""
+    model_path = tmp_path / "generic.pkl"
+    with zipfile.ZipFile(model_path, "w") as archive:
+        archive.writestr("payload.txt", "not a pytorch archive")
+
+    scanner = _registry.get_scanner_for_path(str(model_path))
+
+    assert scanner is ZipScanner

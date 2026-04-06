@@ -86,6 +86,19 @@ def test_pytorch_zip_scanner_can_handle(tmp_path):
     assert PyTorchZipScanner.can_handle(str(test_file)) is False
 
 
+@pytest.mark.parametrize("suffix", [".ckpt", ".pkl", ".bin"])
+def test_pytorch_zip_scanner_can_handle_requires_pytorch_zip_markers_for_ambiguous_suffixes(
+    suffix: str,
+    tmp_path: Path,
+) -> None:
+    """Generic ZIP files with ambiguous PyTorch suffixes should not route to PyTorchZipScanner."""
+    model_path = tmp_path / f"generic{suffix}"
+    with zipfile.ZipFile(model_path, "w") as archive:
+        archive.writestr("payload.txt", "not a pytorch archive")
+
+    assert PyTorchZipScanner.can_handle(str(model_path)) is False
+
+
 def test_pytorch_zip_scanner_safe_model(tmp_path):
     """Test scanning a safe PyTorch ZIP model."""
     model_path = create_mock_pytorch_zip(tmp_path / "model.pt")
