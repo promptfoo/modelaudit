@@ -414,13 +414,17 @@ class TestProgressHooks:
         manager.trigger_progress(stats)
         assert len(calls) == 1
 
+        # Unknown hooks should report failure
+        assert manager.disable_hook("missing-hook") is False
+        assert manager.enable_hook("missing-hook") is False
+
         # Disable hook
-        manager.disable_hook("test")
+        assert manager.disable_hook("test") is True
         manager.trigger_progress(stats)
         assert len(calls) == 1  # No new calls
 
         # Re-enable hook
-        manager.enable_hook("test")
+        assert manager.enable_hook("test") is True
         manager.trigger_progress(stats)
         assert len(calls) == 2
 
