@@ -9,7 +9,7 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 
 from ..helpers.disk_space import check_disk_space
-from ._huggingface_cache import _find_hf_cache_root
+from ._huggingface_cache import _find_hf_cache_root, _resolve_hf_cache_path
 
 logger = logging.getLogger(__name__)
 
@@ -538,7 +538,7 @@ def is_huggingface_cache_path(path: str | Path) -> bool:
         return False
 
     try:
-        relative_parts = path_obj.relative_to(cache_root).parts
+        relative_parts = _resolve_hf_cache_path(path_obj).relative_to(cache_root).parts
     except ValueError:
         return False
 

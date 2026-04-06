@@ -59,6 +59,32 @@ class TestHuggingFaceSymlinks:
         ]
         assert len(path_traversal_issues) == 0
 
+    def test_hf_home_cache_symlinks_no_path_traversal_warnings(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Custom HF_HOME cache roots should preserve allowed snapshot-to-blob symlinks."""
+        monkeypatch.setenv("HF_HOME", str(tmp_path / "custom-hf-home"))
+        cache_dir = tmp_path / "custom-hf-home" / "hub" / "models--test-model"
+        snapshots_dir = cache_dir / "snapshots" / "abc123"
+        blobs_dir = cache_dir / "blobs"
+        snapshots_dir.mkdir(parents=True)
+        blobs_dir.mkdir(parents=True)
+
+        blob_path = blobs_dir / "blob1234567890"
+        blob_path.write_text("Model data")
+        model_link = snapshots_dir / "model.safetensors"
+        os.symlink("../../blobs/blob1234567890", model_link)
+
+        results = scan_model_directory_or_file(str(snapshots_dir))
+
+        path_traversal_issues = [
+            issue for issue in results.issues if "path traversal" in getattr(issue, "message", "").lower()
+        ]
+        assert results.files_scanned == 1
+        assert len(path_traversal_issues) == 0
+
     def test_malicious_symlink_outside_cache(self, tmp_path):
         """Test that symlinks pointing outside the cache structure are still caught."""
         # Create a directory structure

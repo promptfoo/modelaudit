@@ -145,6 +145,27 @@ class TestExtractModelIdFromPath:
 
         assert extract_model_id_from_path(str(model_path)) == ("Qwen/Qwen2.5-0.5B", "huggingface_cache")
 
+    def test_extract_model_id_from_symlinked_hf_home_cache_path(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Resolved cache roots should still match paths reached through symlinked HF_HOME."""
+        real_home = tmp_path / "real-hf-home"
+        link_home = tmp_path / "link-hf-home"
+        real_home.mkdir()
+        try:
+            link_home.symlink_to(real_home, target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"symlink creation unavailable: {exc}")
+
+        monkeypatch.setenv("HF_HOME", str(link_home))
+        model_path = link_home / "hub" / "models--Qwen--Qwen2.5-0.5B" / "snapshots" / "abc123" / "weights.bin"
+        model_path.parent.mkdir(parents=True)
+        model_path.write_bytes(b"weights")
+
+        assert extract_model_id_from_path(str(model_path)) == ("Qwen/Qwen2.5-0.5B", "huggingface_cache")
+
     def test_extract_model_id_from_hf_hub_cache_path(
         self,
         tmp_path: Path,

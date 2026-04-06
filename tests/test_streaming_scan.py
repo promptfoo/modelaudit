@@ -224,6 +224,39 @@ def test_scan_model_streaming_hf_cache_symlink_allowed(
     assert len(path_traversal_issues) == 0
 
 
+def test_scan_model_streaming_hf_home_cache_symlink_allowed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requires_symlinks: None,
+) -> None:
+    """Custom HF_HOME cache roots should preserve symlink handling in streaming scans."""
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "custom-hf-home"))
+    cache_dir = tmp_path / "custom-hf-home" / "hub" / "models--test-model"
+    snapshots_dir = cache_dir / "snapshots" / "abc123"
+    blobs_dir = cache_dir / "blobs"
+    snapshots_dir.mkdir(parents=True)
+    blobs_dir.mkdir(parents=True)
+
+    blob_path = blobs_dir / "blob123"
+    with blob_path.open("wb") as f:
+        pickle.dump({"data": "safe"}, f)
+
+    model_link = snapshots_dir / "model.pkl"
+    os.symlink(os.path.relpath(blob_path, model_link.parent), model_link)
+
+    result = scan_model_streaming(
+        file_generator=iterate_files_streaming(snapshots_dir),
+        timeout=30,
+        delete_after_scan=False,
+        scan_root=str(snapshots_dir),
+        cache_enabled=False,
+    )
+
+    path_traversal_issues = [i for i in result.issues if "path traversal" in i.message.lower()]
+    assert result.files_scanned == 1
+    assert len(path_traversal_issues) == 0
+
+
 def test_scan_model_streaming_symlink_reports_source_path_consistently(
     tmp_path: Path,
     requires_symlinks: None,
