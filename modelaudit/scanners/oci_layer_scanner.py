@@ -124,11 +124,7 @@ class OciLayerScanner(BaseScanner):
         layer_paths: list[str] = []
 
         def _append_layer_ref(value: Any) -> None:
-            if (
-                isinstance(value, str)
-                and cls._normalize_layer_ref(value).lower().endswith(cls._LAYER_ARCHIVE_SUFFIX)
-                and not cls._is_remote_layer_ref(value)
-            ):
+            if isinstance(value, str) and cls._normalize_layer_ref(value).lower().endswith(cls._LAYER_ARCHIVE_SUFFIX):
                 layer_paths.append(value)
 
         def _collect_layer_value(value: Any) -> None:
@@ -302,6 +298,8 @@ class OciLayerScanner(BaseScanner):
                 continue
 
             if not os.path.exists(layer_path):
+                if self._is_remote_layer_ref(layer_ref):
+                    continue
                 scan_complete = False
                 result.add_check(
                     name="Layer File Existence Check",
