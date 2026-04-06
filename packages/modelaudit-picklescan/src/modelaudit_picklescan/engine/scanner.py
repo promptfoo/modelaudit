@@ -107,6 +107,11 @@ class _GlobalRef:
 class _OpcodeBudgetExceeded(Exception):
     """Raised when opcode analysis reaches the configured opcode limit."""
 
+    def __init__(self, stream_offset: int, tail_prefix: bytes = b"") -> None:
+        super().__init__("opcode budget exceeded")
+        self.stream_offset = stream_offset
+        self.tail_prefix = tail_prefix
+
 
 class _ScanTimeout(Exception):
     """Raised when opcode analysis exceeds the configured timeout."""
@@ -342,10 +347,10 @@ class _ScanState:
                 parsed_opcode = False
 
                 for opcode, arg, pos in pickletools.genops(cast(BinaryIO, self.stream)):
-                    parsed_opcode = True
-                    self._check_limits()
-
                     stream_position = int(pos or 0)
+                    self._check_limits(opcode.name, arg, stream_position)
+                    parsed_opcode = True
+
                     position = self.position_offset + stream_position
                     self.bytes_scanned = max(self.bytes_scanned, self.stream.tell(), stream_position + 1)
                     self.opcode_count += 1
@@ -368,7 +373,7 @@ class _ScanState:
 
                 if self.stream.tell() <= stream_start:
                     break
-        except _OpcodeBudgetExceeded:
+        except _OpcodeBudgetExceeded as error:
             self.status = ScanStatus.INCONCLUSIVE
             self.notices.append(
                 Notice(
@@ -383,7 +388,7 @@ class _ScanState:
                     },
                 )
             )
-            self._scan_post_budget_tail(self.stream.tell())
+            self._scan_post_budget_tail(error.stream_offset, tail_prefix=error.tail_prefix)
         except _ScanTimeout:
             self.status = ScanStatus.INCONCLUSIVE
             self.notices.append(
@@ -521,9 +526,9 @@ class _ScanState:
             duration_s=duration_s,
         )
 
-    def _check_limits(self) -> None:
+    def _check_limits(self, op_name: str, arg: Any, stream_offset: int) -> None:
         if self.opcode_count >= self.options.max_opcodes:
-            raise _OpcodeBudgetExceeded()
+            raise _OpcodeBudgetExceeded(stream_offset, _post_budget_opcode_prefix(op_name, arg, self.stack))
         if time.monotonic() > self.deadline:
             raise _ScanTimeout()
 
@@ -747,8 +752,6 @@ class _ScanState:
     def _resolve_global_operand(value: Any) -> str | None:
         if isinstance(value, str):
             return value
-        if isinstance(value, _GlobalRef) and not value.malformed:
-            return value.symbol
         return None
 
     def _scan_string_literal(self, value: str, *, op_name: str, position: int) -> None:
@@ -908,12 +911,13 @@ class _ScanState:
         ]
         self._seen_finding_keys = {(finding.message, finding.location, finding.rule_code) for finding in self.findings}
 
-    def _scan_post_budget_tail(self, stream_offset: int) -> None:
+    def _scan_post_budget_tail(self, stream_offset: int, *, tail_prefix: bytes = b"") -> None:
         if self.options.post_budget_scan_bytes <= 0:
             return
 
         try:
-            tail = self.stream.read(self.options.post_budget_scan_bytes)
+            read_size = max(self.options.post_budget_scan_bytes - len(tail_prefix), 0)
+            tail = tail_prefix + self.stream.read(read_size)
         except _StreamReadError as error:
             self.status = ScanStatus.ERROR
             self.errors.append(
@@ -931,7 +935,14 @@ class _ScanState:
             return
 
         self.bytes_scanned = max(self.bytes_scanned, stream_offset + len(tail))
-        for needle in (b"os\nsystem", b"posix\nsystem", b"subprocess\nPopen", b"builtins\neval", b"__builtin__\neval"):
+        for needle in (
+            b"nt\nsystem",
+            b"os\nsystem",
+            b"posix\nsystem",
+            b"subprocess\nPopen",
+            b"builtins\neval",
+            b"__builtin__\neval",
+        ):
             offset = tail.find(needle)
             if offset >= 0:
                 self._add_finding(
@@ -985,6 +996,23 @@ def _global_severity(module: str, name: str) -> Severity | None:
     return None
 
 
+def _post_budget_opcode_prefix(op_name: str, arg: Any, stack: list[Any]) -> bytes:
+    """Reconstruct simple text opcode bytes already consumed at the budget boundary."""
+    if op_name == "STACK_GLOBAL" and len(stack) >= 2:
+        module, name = stack[-2], stack[-1]
+        if isinstance(module, str) and isinstance(name, str):
+            return module.encode("utf-8", errors="ignore") + b"\n" + name.encode("utf-8", errors="ignore")
+
+    if op_name not in {"GLOBAL", "INST"}:
+        return b""
+
+    module, _, name = str(arg).partition(" ")
+    if not module or not name:
+        return b""
+    opcode_byte = b"c" if op_name == "GLOBAL" else b"i"
+    return opcode_byte + module.encode("utf-8", errors="ignore") + b"\n" + name.encode("utf-8", errors="ignore") + b"\n"
+
+
 def _coerce_text_value(value: Any) -> str:
     if isinstance(value, str):
         return value
@@ -1031,7 +1059,7 @@ def _decode_possible_encoded_pickle(value: str) -> list[tuple[str, bytes]]:
 def _looks_like_pickle_payload(value: bytes) -> bool:
     if len(value) < 2 or len(value) > _NESTED_PICKLE_SCAN_LIMIT_BYTES:
         return False
-    if not (value[:1] == b"\x80" or value[:1] in {b"(", b"c", b"d", b"l", b"i", b"I", b"S", b"V", b"q", b"t", b"u"}):
+    if not (value[:1] == b"\x80" or value[:1] in {b"(", b"c", b"d", b"l", b"i", b"I", b"S", b"V"}):
         return False
 
     try:

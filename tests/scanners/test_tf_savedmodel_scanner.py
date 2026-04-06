@@ -1,3 +1,4 @@
+import base64
 import pickle
 from pathlib import Path
 from typing import Any, Protocol, TypedDict
@@ -174,6 +175,8 @@ def test_tf_savedmodel_scanner_malicious_model(tmp_path: Path) -> None:
 
     scanner = TensorFlowSavedModelScanner()
     result = scanner.scan(str(model_dir))
+
+    assert result.success is False
 
     # The scanner should detect errors from:
     # 1. Malicious pickle files in the directory, OR
@@ -479,9 +482,96 @@ def test_tf_savedmodel_scanner_with_blacklist(tmp_path: Path) -> None:
     )
     result = scanner.scan(str(model_dir))
 
+    assert result.success is False
+
     # Should detect our blacklisted pattern
     blacklist_issues = [issue for issue in result.issues if "suspicious_function" in issue.message.lower()]
     assert len(blacklist_issues) > 0
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_tf_savedmodel_scanner_none_blacklist_config_stays_quiet(tmp_path: Path) -> None:
+    """`blacklist_patterns=None` should disable blacklist scanning without DEBUG noise."""
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    (model_dir / "custom_file.txt").write_text("contains harmless text\n", encoding="utf-8")
+
+    result = TensorFlowSavedModelScanner(config={"blacklist_patterns": None}).scan(str(model_dir))
+
+    assert result.success is True
+    assert not any(check.name == "File Read Check" for check in result.checks)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_tf_savedmodel_pyfunc_reference_uses_token_boundaries(tmp_path: Path) -> None:
+    """Benign function references containing suspicious substrings should not be mislabeled."""
+    model_path = _create_test_savedmodel_with_scoped_nodes(
+        tmp_path,
+        graph_nodes=[
+            {
+                "op": "PyFunc",
+                "name": "pyfunc_node",
+                "string_attrs": {"function_name": "custom_package.systematic_math"},
+            }
+        ],
+        model_name="benign_pyfunc_reference",
+    )
+
+    result = TensorFlowSavedModelScanner().scan(model_path)
+
+    assert result.success is False
+    assert not any(
+        issue.message and "references dangerous function: custom_package.systematic_math" in issue.message
+        for issue in result.issues
+    )
+    assert any(
+        issue.message and "PyFunc operation detected (unable to extract Python code)" in issue.message
+        for issue in result.issues
+    )
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_tf_savedmodel_pyfunc_reference_flags_direct_dangerous_refs(tmp_path: Path) -> None:
+    """Direct dangerous function references should still be detected after token-boundary narrowing."""
+    model_path = _create_test_savedmodel_with_scoped_nodes(
+        tmp_path,
+        graph_nodes=[
+            {
+                "op": "PyFunc",
+                "name": "pyfunc_node",
+                "string_attrs": {"function_name": "os.system"},
+            }
+        ],
+        model_name="malicious_pyfunc_reference",
+    )
+
+    result = TensorFlowSavedModelScanner().scan(model_path)
+
+    assert result.success is False
+    assert any(
+        issue.message
+        and "references dangerous function: os.system" in issue.message
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("function_reference") == "os.system"
+        for issue in result.issues
+    )
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_scan_keras_metadata_pb_lambda_exec_sets_success_false(tmp_path: Path) -> None:
+    """Standalone `keras_metadata.pb` scans should propagate CRITICAL Lambda findings to success=False."""
+    encoded_code = base64.b64encode(b'exec("print(1)")').decode()
+    metadata_path = tmp_path / "keras_metadata.pb"
+    metadata_path.write_bytes(f'"class_name": "Lambda", "function": {{"items": ["{encoded_code}"]}}'.encode())
+
+    result = TensorFlowSavedModelScanner().scan(str(metadata_path))
+
+    assert result.success is False
+    assert any(
+        issue.message
+        and "Lambda layer contains dangerous code" in issue.message
+        and issue.severity == IssueSeverity.CRITICAL
+        for issue in result.issues
+    )
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")

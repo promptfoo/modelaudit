@@ -56,6 +56,7 @@ def create_mock_pytorch_zip(
     with_pickle: bool = True,
     malicious: bool = False,
     data: dict[str, Any] | None = None,
+    prefix: str = "",
 ) -> Path:
     """Create a mock PyTorch ZIP model file.
 
@@ -64,12 +65,14 @@ def create_mock_pytorch_zip(
         with_pickle: Whether to include a pickle file inside
         malicious: Whether to include malicious code (for testing detection)
         data: Optional custom data dict to pickle
+        prefix: Optional ZIP member prefix for PyTorch archive-style files
 
     Returns:
         Path to created file
     """
     with zipfile.ZipFile(path, "w") as zf:
-        zf.writestr("version", "3")
+        write_mock_pytorch_zip_metadata(zf, prefix=prefix)
+        member_prefix = _mock_pytorch_zip_member_prefix(prefix)
         if with_pickle:
             if data is None:
                 data = {"weights": [1, 2, 3], "bias": [0.1, 0.2]}
@@ -83,11 +86,23 @@ def create_mock_pytorch_zip(
                 data["malicious"] = MaliciousClass()
 
             pickled_data = pickle.dumps(data)
-            zf.writestr("data.pkl", pickled_data)
+            zf.writestr(f"{member_prefix}data.pkl", pickled_data)
 
         # Add a model config file
-        zf.writestr("model.json", '{"name": "test_model"}')
+        zf.writestr(f"{member_prefix}model.json", '{"name": "test_model"}')
     return path
+
+
+def _mock_pytorch_zip_member_prefix(prefix: str) -> str:
+    normalized_prefix = prefix.strip("/")
+    return f"{normalized_prefix}/" if normalized_prefix else ""
+
+
+def write_mock_pytorch_zip_metadata(zf: zipfile.ZipFile, *, prefix: str = "") -> None:
+    """Write shared PyTorch ZIP metadata markers used by routing tests."""
+    member_prefix = _mock_pytorch_zip_member_prefix(prefix)
+    zf.writestr(f"{member_prefix}version", "3\n")
+    zf.writestr(f"{member_prefix}byteorder", "little")
 
 
 def create_mock_gguf(path: Path, *, version: int = 3) -> Path:

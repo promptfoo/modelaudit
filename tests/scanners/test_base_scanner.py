@@ -369,6 +369,36 @@ def test_base_scanner_size_limit_fail(tmp_path):
     assert result.success is False
 
 
+def test_base_scanner_create_scan_result_after_preflight_merges_checks(tmp_path: Path) -> None:
+    """The preflight template should merge deferred path/size checks into the scanner result."""
+    scanner = MockScanner(config={"max_file_read_size": 100})
+    file_path = tmp_path / "model.test"
+    file_path.write_bytes(b"content")
+
+    result = scanner._create_scan_result_after_preflight(str(file_path))
+
+    assert result.success is True
+    assert scanner.current_file_path == str(file_path)
+    check_names = {check.name for check in result.checks}
+    assert {"Path Exists", "Path Readable", "File Type Validation", "File Size Limit"}.issubset(check_names)
+    assert result.metadata["file_size"] == len(b"content")
+
+
+def test_base_scanner_create_scan_result_after_preflight_can_skip_size_gate(tmp_path: Path) -> None:
+    """Scanners with custom size policies should be able to skip the shared size-limit gate."""
+    scanner = MockScanner(config={"max_file_read_size": 1})
+    file_path = tmp_path / "model.test"
+    file_path.write_bytes(b"content")
+
+    result = scanner._create_scan_result_after_preflight(str(file_path), check_size_limit=False)
+
+    assert result.success is True
+    check_names = {check.name for check in result.checks}
+    assert "Path Exists" in check_names
+    assert "Path Readable" in check_names
+    assert "File Size Limit" not in check_names
+
+
 def test_whitelist_downgrade_warning_to_info():
     """Test that whitelisted models have warnings downgraded to INFO."""
     from modelaudit.whitelists import POPULAR_MODELS

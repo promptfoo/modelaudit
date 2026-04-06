@@ -37,7 +37,7 @@ VERDICT_RANK = {
     "unknown": -1,
 }
 FIXTURE_LABELS = ("safe", "malicious", "unknown")
-EXIT_FAILURE_DELTAS = frozenset({"potential_fp", "potential_fn", "verdict_drift"})
+EXIT_FAILURE_DELTAS = frozenset({"potential_fp", "potential_fn", "verdict_drift", "status_drift"})
 
 
 @dataclass(frozen=True)
@@ -174,7 +174,7 @@ def _classify_delta(label: str, legacy: NormalizedResult, package: NormalizedRes
     legacy_rank = VERDICT_RANK[legacy.verdict]
     package_rank = VERDICT_RANK[package.verdict]
 
-    if label == "safe" and package_rank > legacy_rank:
+    if label == "safe" and package.verdict in {"suspicious", "malicious"} and package_rank > legacy_rank:
         return "potential_fp"
     if label == "malicious" and package_rank < legacy_rank:
         return "potential_fn"

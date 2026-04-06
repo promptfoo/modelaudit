@@ -19,6 +19,10 @@ Create `modelaudit/scanners/<format>_scanner.py` with:
 - `scan()` that uses `result.add_check(...)` with clear severity and rationale
 - Path/size validation via base helpers before heavy parsing
 
+For large scanners, move reusable parser/state helpers into
+`modelaudit/scanners/<format>_support/` and keep `<format>_scanner.py` as the
+public class entrypoint plus orchestration layer.
+
 Skeleton:
 
 ```python
@@ -40,15 +44,10 @@ class ExampleScanner(BaseScanner):
         ...
 
     def scan(self, path: str) -> ScanResult:
-        path_check = self._check_path(path)
-        if path_check:
-            return path_check
+        result = self._create_scan_result_after_preflight(path)
+        if not result.success:
+            return result
 
-        size_check = self._check_size_limit(path)
-        if size_check:
-            return size_check
-
-        result = self._create_result()
         # Add checks here
         result.finish(success=not result.has_errors)
         return result
@@ -58,10 +57,11 @@ class ExampleScanner(BaseScanner):
 
 Update `modelaudit/scanners/__init__.py` in `ScannerRegistry._init_registry`:
 
-- Add module/class metadata
-- Set priority and extensions carefully
+- Add one scanner descriptor entry with module/class metadata
+- Set priority, direct extensions, and any descriptor-owned `header_formats` / `content_routed_extensions` carefully
 - Declare dependency names for load-time diagnostics
-- Add class mapping in `__getattr__` if needed
+- Document intentional descriptor/class extension differences with `scanner_only_extensions` instead of leaving silent drift
+- Do not add a second class map in `__getattr__`; lazy exports are resolved from descriptor metadata
 
 ## 4. Dependency handling rules
 
@@ -78,6 +78,7 @@ Add focused tests under `tests/`:
 - Corrupt input: parser errors are handled cleanly
 - Missing dependency path (if optional)
 - Regression tests for edge cases and previously reported bypasses
+- Registry/routing regressions: add `scan_file()` and `ScannerRegistry.get_scanner_for_path()` positives/negatives for extension collisions, header aliases, and content-routed archive names
 
 ## 6. Validation before PR
 

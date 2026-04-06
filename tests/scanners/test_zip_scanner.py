@@ -6,8 +6,8 @@ import zipfile
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
 
+from modelaudit.scanners.archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY
 from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.zip_scanner import ZipScanner
 
@@ -258,7 +258,7 @@ class TestZipScanner:
 
         result = self.scanner.scan(str(archive_path))
 
-        assert result.success is True
+        assert result.success is False
         assert result.has_errors is True
         assert any(
             check.details.get("zip_entry") == "nested:payload.pkl"
@@ -276,8 +276,8 @@ class TestZipScanner:
             f"{[(i.location, i.message, i.details) for i in result.issues]}"
         )
 
-    def test_nested_keras_member_routes_through_core_dispatch(self, tmp_path: Path) -> None:
-        """Nested ZIP-based model members should keep ZIP depth and use core dispatch."""
+    def test_nested_keras_member_routes_through_nested_scan_callback(self, tmp_path: Path) -> None:
+        """Nested ZIP-based members should preserve ZIP depth and use the injected callback."""
         nested_keras = io.BytesIO()
         with zipfile.ZipFile(nested_keras, "w"):
             pass
@@ -290,14 +290,21 @@ class TestZipScanner:
         dispatched_result.metadata["file_size"] = len(nested_keras.getvalue())
         dispatched_result.finish(success=True)
 
-        with patch("modelaudit.core.scan_file", return_value=dispatched_result) as mock_scan_file:
-            result = self.scanner.scan(str(archive_path))
+        callback_calls: list[tuple[str, dict[str, Any] | None]] = []
+
+        def scan_nested_member(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+            callback_calls.append((path, config))
+            return dispatched_result
+
+        scanner = ZipScanner(config={NESTED_SCAN_CALLBACK_CONFIG_KEY: scan_nested_member})
+        result = scanner.scan(str(archive_path))
 
         assert result.success is True
-        assert mock_scan_file.call_count == 1
+        assert len(callback_calls) == 1
 
-        scan_path, scan_config = mock_scan_file.call_args.args
+        scan_path, scan_config = callback_calls[0]
         assert scan_path.endswith(".keras")
+        assert scan_config is not None
         assert scan_config["_zip_depth"] == 1
 
         assert result.metadata["contents"] == [
@@ -325,7 +332,7 @@ class TestZipScanner:
 
         result = ZipScanner(config={"max_zip_depth": 2}).scan(str(archive_path))
 
-        assert result.success is True
+        assert result.success is False
         assert any(
             issue.message == "Maximum ZIP nesting depth (2) exceeded"
             and issue.location == f"{archive_path}:level0:level1"
@@ -352,7 +359,7 @@ class TestZipScanner:
 
         try:
             result = self.scanner.scan(tmp_path)
-            assert result.success is True
+            assert result.success is False
 
             # Should have detected directory traversal attempts
             traversal_issues = [
@@ -428,7 +435,7 @@ class TestZipScanner:
             scanner = ZipScanner(config={"max_zip_depth": 3})
             result = scanner.scan(current_path)
 
-            assert result.success is True
+            assert result.success is False
             # Should have a warning about max depth
             depth_issues = [i for i in result.issues if "depth" in i.message.lower()]
             assert len(depth_issues) >= 1
@@ -436,6 +443,45 @@ class TestZipScanner:
             for path in paths_to_delete:
                 if os.path.exists(path):
                     os.unlink(path)
+
+    def test_max_entries_limit_fails_closed_on_partial_scan(self, tmp_path: Path) -> None:
+        """Entry-count truncation should make the archive scan unsuccessful."""
+        archive_path = tmp_path / "many_entries.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("one.txt", "one")
+            archive.writestr("two.txt", "two")
+
+        result = ZipScanner(config={"max_zip_entries": 1}).scan(str(archive_path))
+
+        assert result.success is False
+        assert any(
+            check.name == "Entry Count Limit Check"
+            and check.status == CheckStatus.FAILED
+            and "too many entries" in check.message.lower()
+            for check in result.checks
+        )
+
+    def test_oversized_symlink_target_fails_closed(self, tmp_path: Path) -> None:
+        """Symlink targets should be read with a bounded cap instead of being silently trusted."""
+        import stat
+
+        archive_path = tmp_path / "oversized_symlink.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            info = zipfile.ZipInfo("link.txt")
+            info.create_system = 3
+            info.external_attr = (stat.S_IFLNK | 0o777) << 16
+            archive.writestr(info, "a" * (ZipScanner.MAX_SYMLINK_TARGET_BYTES + 1))
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert result.success is False
+        assert any(
+            check.name == "Symlink Safety Validation"
+            and check.status == CheckStatus.FAILED
+            and "symlink target exceeds maximum size" in check.message.lower()
+            and check.details.get("entry") == "link.txt"
+            for check in result.checks
+        )
 
     def test_scan_zip_with_dangerous_pickle(self):
         """Test scanning a ZIP file containing a dangerous pickle"""
@@ -456,8 +502,9 @@ class TestZipScanner:
 
         try:
             result = self.scanner.scan(tmp_path)
-            # The scan should complete even if there are errors in the pickle scanner
-            assert result.success is True
+            # Security findings in nested members should propagate to top-level success.
+            assert result.success is False
+            assert result.has_errors is True
 
             # Check that we at least tried to scan the pickle
             assert result.bytes_scanned > 0
@@ -475,7 +522,7 @@ class TestZipScanner:
             z.writestr("payload.txt", b'cos\nsystem\n(S"echo pwned"\ntR.')
 
         result = self.scanner.scan(str(archive_path))
-        assert result.success is True
+        assert result.success is False
         assert result.has_errors is True
 
         critical_messages = [
@@ -492,7 +539,7 @@ class TestZipScanner:
             z.writestr("payload.txt", b'(lp0\n0cos\nsystem\n(S"echo pwned"\ntR.')
 
         result = self.scanner.scan(str(archive_path))
-        assert result.success is True
+        assert result.success is False
         assert result.has_errors is True
 
         critical_messages = [
@@ -513,7 +560,7 @@ class TestZipScanner:
         np.savez(archive_path, safe=np.arange(3), payload=np.array([_ExecPayload()], dtype=object))
 
         result = self.scanner.scan(str(archive_path))
-        assert result.success is True
+        assert result.success is False
 
         failed_checks = [c for c in result.checks if c.status.value == "failed"]
         assert any("cve-2019-6446" in (c.name + c.message).lower() for c in failed_checks)
@@ -580,7 +627,7 @@ class TestZipScanner:
             z.writestr("payload.txt", payload)
 
         result = self.scanner.scan(str(archive_path))
-        assert result.success is True
+        assert result.success is False
         assert result.has_errors is True
 
         critical_messages = [

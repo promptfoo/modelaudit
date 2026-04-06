@@ -5,6 +5,67 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.32](https://github.com/promptfoo/modelaudit/compare/v0.2.31...v0.2.32) (2026-04-05)
+
+### Bug Fixes
+
+- detect punctuated TensorRT tmp paths ([#867](https://github.com/promptfoo/modelaudit/issues/867)) ([9607530](https://github.com/promptfoo/modelaudit/commit/96075302de2d71b228be97e49698d6a1ad6b35bf))
+- fail closed on OpenVINO DOCTYPE parse errors ([#864](https://github.com/promptfoo/modelaudit/issues/864)) ([f5b19c4](https://github.com/promptfoo/modelaudit/commit/f5b19c48c7eab876e29f1f474c555b902fa9b6ce))
+- ignore OCI metadata URLs during layer discovery ([#866](https://github.com/promptfoo/modelaudit/issues/866)) ([0b24e3f](https://github.com/promptfoo/modelaudit/commit/0b24e3f7a0e013541bce100b64f1d69558bd807d))
+- reduce PMML subprocess extension false positives ([#869](https://github.com/promptfoo/modelaudit/issues/869)) ([5e6f79d](https://github.com/promptfoo/modelaudit/commit/5e6f79dc134267202b5a4b841a8946af865ebd15))
+- tolerate bounded CoreML custom block truncation ([#868](https://github.com/promptfoo/modelaudit/issues/868)) ([34df06d](https://github.com/promptfoo/modelaudit/commit/34df06dd2c12b69815a2a15f1273085856bebf64))
+
+## [Unreleased]
+
+### Bug Fixes
+
+- avoid CoreML nested parse failures on bounded-read truncation
+- detect punctuation-delimited TensorRT `/tmp` plugin paths
+- ignore remote OCI `layers[].urls` entries during local layer discovery
+- fail closed on unterminated OpenVINO DOCTYPE declarations
+- avoid PMML `<Extension>` false positives for benign `subprocess` prose while preserving `subprocess.getoutput()`, `subprocess.getstatusoutput()`, and `importlib.import_module("subprocess")` detections
+- route helper-level ZIP-backed `.ckpt`/`.pkl` checkpoints through archive scanners
+
+## [0.2.31](https://github.com/promptfoo/modelaudit/compare/v0.2.30...v0.2.31) (2026-04-04)
+
+### Bug Fixes
+
+- clean up CodeQL quality findings ([#862](https://github.com/promptfoo/modelaudit/issues/862)) ([5fbcb10](https://github.com/promptfoo/modelaudit/commit/5fbcb101322791831fbf6159bab454231a7f01f0))
+- detect long-gap protocol-0 pickle tails ([#844](https://github.com/promptfoo/modelaudit/issues/844)) ([cbc24b2](https://github.com/promptfoo/modelaudit/commit/cbc24b2af187055622b3776b3e49cca0c43ce9b7))
+- detect protocol 0/1 pickles with trailing junk ([#827](https://github.com/promptfoo/modelaudit/issues/827)) ([d07869d](https://github.com/promptfoo/modelaudit/commit/d07869dadc80de567db894dd8ceda9de53038a71))
+- fail closed on conflicting Keras ZIP config aliases ([#847](https://github.com/promptfoo/modelaudit/issues/847)) ([ab426b8](https://github.com/promptfoo/modelaudit/commit/ab426b8230b1766b4a7678803c90c45256bcdf54))
+- harden content-routed .keras ZIP recursive scans ([#828](https://github.com/promptfoo/modelaudit/issues/828)) ([a607df7](https://github.com/promptfoo/modelaudit/commit/a607df7e8f94623c7802ef3af90896e1b4c564cc))
+- harden CoreML scanner ([#859](https://github.com/promptfoo/modelaudit/issues/859)) ([50da953](https://github.com/promptfoo/modelaudit/commit/50da95393c6b0be318cb33535e12d16a361663ac))
+- harden Flax msgpack stream scanning ([#842](https://github.com/promptfoo/modelaudit/issues/842)) ([34e4595](https://github.com/promptfoo/modelaudit/commit/34e4595b2017f272c951a45c6f89a0fa8997f8d5))
+- harden JAX checkpoint scanner heuristics ([#837](https://github.com/promptfoo/modelaudit/issues/837)) ([1042c20](https://github.com/promptfoo/modelaudit/commit/1042c20c48ce09613125967623c715babc7b9da8))
+- harden Joblib raw/compressed pickle analysis ([#841](https://github.com/promptfoo/modelaudit/issues/841)) ([9d16470](https://github.com/promptfoo/modelaudit/commit/9d164701345aebef8ad03421ac66cbcca6c61aed))
+- harden Keras H5 scanner ([#848](https://github.com/promptfoo/modelaudit/issues/848)) ([aa0ef28](https://github.com/promptfoo/modelaudit/commit/aa0ef2878593e639a5b868a4be2d5de7a6c9c23b))
+- harden MAR duplicate-member analysis ([#830](https://github.com/promptfoo/modelaudit/issues/830)) ([8d4e056](https://github.com/promptfoo/modelaudit/commit/8d4e0567f1df15405f429cefe3cd894aada3b712))
+- harden NeMo target checks and YAML bounds ([#839](https://github.com/promptfoo/modelaudit/issues/839)) ([63ff67d](https://github.com/promptfoo/modelaudit/commit/63ff67d45aa7d454e63781c71039839c35e74892))
+- harden OCI layer scanner ([#856](https://github.com/promptfoo/modelaudit/issues/856)) ([637a4da](https://github.com/promptfoo/modelaudit/commit/637a4daa72047c15598660320f2f12de6a43e627))
+- harden ONNX scanner ([#857](https://github.com/promptfoo/modelaudit/issues/857)) ([de304a7](https://github.com/promptfoo/modelaudit/commit/de304a77513abf551e96a1828f57fdfdd11150c2))
+- harden OpenVINO scanner ([#852](https://github.com/promptfoo/modelaudit/issues/852)) ([a97b76e](https://github.com/promptfoo/modelaudit/commit/a97b76efc44940d70b6cc0f485485d5c5ff7b550))
+- harden PMML scanner ([#860](https://github.com/promptfoo/modelaudit/issues/860)) ([cbcd88a](https://github.com/promptfoo/modelaudit/commit/cbcd88a91cc8b3f9986554b255be366fcae672a8))
+- harden post-budget pickle tail scan bounds ([16d6db3](https://github.com/promptfoo/modelaudit/commit/16d6db39a6263bc923415d34f7501765550e3564))
+- harden PyTorch binary chunk scanning ([#846](https://github.com/promptfoo/modelaudit/issues/846)) ([930c0bf](https://github.com/promptfoo/modelaudit/commit/930c0bf32b53fbc32252c1b2d98aa1f30716eece))
+- harden SevenZip scanner ([#855](https://github.com/promptfoo/modelaudit/issues/855)) ([8d0c362](https://github.com/promptfoo/modelaudit/commit/8d0c362770f4261eefd7461309e7de09b923587d))
+- harden skops archive routing, recursion, and scanner reporting ([#829](https://github.com/promptfoo/modelaudit/issues/829)) ([fb13f68](https://github.com/promptfoo/modelaudit/commit/fb13f6880fdf80e2e78f5f3f30d9b31c2cff17a3))
+- harden Skops CVE status and card fallback detection ([#843](https://github.com/promptfoo/modelaudit/issues/843)) ([9dd964f](https://github.com/promptfoo/modelaudit/commit/9dd964f0aff86092178578f5b952418a6ec52200))
+- harden TAR scanner ([#854](https://github.com/promptfoo/modelaudit/issues/854)) ([219ce54](https://github.com/promptfoo/modelaudit/commit/219ce54446385e87739beacb2b9a8629cde31abb))
+- harden TensorFlow MetaGraph scanner ([#850](https://github.com/promptfoo/modelaudit/issues/850)) ([2dacc9d](https://github.com/promptfoo/modelaudit/commit/2dacc9dcf844ff8ecd335ad1604519b07fc95432))
+- harden TensorFlow SavedModel scanner ([#849](https://github.com/promptfoo/modelaudit/issues/849)) ([f42b7f2](https://github.com/promptfoo/modelaudit/commit/f42b7f2aa560ff72f495a330870478f9028d4fc3))
+- harden TensorRT scanner ([#858](https://github.com/promptfoo/modelaudit/issues/858)) ([c923b55](https://github.com/promptfoo/modelaudit/commit/c923b55df6e8101f40728cbad254d708eea515c5))
+- harden TFLite scanner ([#851](https://github.com/promptfoo/modelaudit/issues/851)) ([b1b1060](https://github.com/promptfoo/modelaudit/commit/b1b1060ae746047becec36356c6a3d3c8227c723))
+- harden TorchServe MAR handler and manifest analysis ([#840](https://github.com/promptfoo/modelaudit/issues/840)) ([6fc0437](https://github.com/promptfoo/modelaudit/commit/6fc04375fd4709869766418e1873231623458e59))
+- harden ZIP scanner ([#853](https://github.com/promptfoo/modelaudit/issues/853)) ([4ccec1a](https://github.com/promptfoo/modelaudit/commit/4ccec1afcd66b2bac3c75f6bd635f34b446090ea))
+- reject raw trailers in zlib wrappers ([#838](https://github.com/promptfoo/modelaudit/issues/838)) ([3b15e2e](https://github.com/promptfoo/modelaudit/commit/3b15e2e1d148d1c700c6d5300655b5e4bb388d70))
+- scan duplicate PyTorch ZIP members ([#845](https://github.com/promptfoo/modelaudit/issues/845)) ([4f63b22](https://github.com/promptfoo/modelaudit/commit/4f63b2277b8d843411d833d00bcf33615b8fb17b))
+
+### Documentation
+
+- remove Claude-specific commit trailer ([#834](https://github.com/promptfoo/modelaudit/issues/834)) ([d891025](https://github.com/promptfoo/modelaudit/commit/d891025791128245f293057f4849b481806292c7))
+- simplify CLAUDE shim ([#835](https://github.com/promptfoo/modelaudit/issues/835)) ([616ee31](https://github.com/promptfoo/modelaudit/commit/616ee318019e188f90ee1d41b2a2aaaee9c9444e))
+
 ## [0.2.30](https://github.com/promptfoo/modelaudit/compare/v0.2.29...v0.2.30) (2026-03-30)
 
 ### Bug Fixes
@@ -108,6 +169,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **security:** route renamed TFLite FlatBuffers by magic bytes, enforce scanner file-size limits before model reads, and fail closed instead of propagating malformed structure traversal exceptions
+- **onnx:** fail closed on CRITICAL findings, detect `PyFunc` operators and Windows absolute external-data paths, validate external tensor slices with the current ONNX dtype API, and avoid Python-op substring false positives
+- **tensorrt:** route `.trt` engines, detect case-variant and UTF-16 suspicious strings, and avoid substring false positives in benign engine metadata
+- **coreml:** detect Python 3 command metadata, Windows and bundle-macro linked-model escapes, malformed custom-code protobuf blocks, and custom layers nested under pipeline wrappers while preserving safe-key metadata URL inspection
+- **pmml:** enforce max-file-size limits, inspect namespaced Extension/script tags, ignore DOCTYPE/ENTITY text inside XML comments/CDATA, avoid recursive text-walk crashes on deeply nested Extension trees, and fail closed when CRITICAL PMML findings are present
+- **gguf:** fall back to the GGUF spec default tensor-data alignment after rejecting invalid `general.alignment` metadata values
 - **security:** detect protocol 0/1 pickle streams hidden behind long separator gaps after an initial safe pickle stream
 - **security:** preserve failed status for malicious Skops CVE detections and avoid CVE-2025-54886 false positives on benign README/model-card text such as "download"
 - **security:** enforce Flax msgpack scanner file-size limits before full reads, scan trailing msgpack stream objects with a bounded object-count cap, downgrade benign container-like trailing-object findings to INFO, and preserve failed status when CRITICAL findings are reported
@@ -119,6 +186,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **pickle:** propagate standalone fallback parse and stream-read failures into merged scan success, preserve truncated `.bin` fail-closed behavior, reuse non-seekable stream spools for the legacy parity pass, clamp negative stream sizes, and reset post-budget scan state between reused scanner runs
 - **license:** bound binary header scans and reuse compiled patterns to avoid full-file regex passes on large model archives
 - **security:** stop iterating malformed TFLite models after excessive subgraph counts are detected
+- **openvino:** route forbidden-DOCTYPE IR XML into the OpenVINO scanner, fail closed on XML parse errors, and suppress warning-level format-validation noise for benign `.xml` models with no distinctive magic bytes
+- **security:** fail closed on conflicting duplicate or alias Keras root members so benign trailing `config.json` entries cannot hide malicious earlier configs, while accepting byte-identical duplicates without warning noise
+- **security:** detect PyTorch binary code and blacklist patterns that straddle chunk boundaries, avoid duplicate overlap reports, and return `success=False` when CRITICAL findings are present
 - **security:** scan every duplicate PyTorch ZIP member by physical archive entry and report conflicting duplicate names at INFO severity so benign trailing `data.pkl` entries cannot shadow malicious earlier payloads without making benign-but-conflicting duplicates warning-fail by themselves
 - **security:** route misnamed Skops ZIPs by bounded schema sniffing, treat encrypted Skops-like schema members as non-matches instead of crashing routing, recurse into embedded members while preserving Skops-specific CVE checks, avoid tiny nested `.bin` false positives on clean archive members, preserve nested-member byte accounting, and preserve CLI `scanner_names` in aggregated JSON output
 - **pickle:** bound post-budget global fallback state, retained findings, and deadline checks to prevent crafted pickle tails from exhausting scanner memory or flooding logs
@@ -127,8 +197,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **security:** recursively scan all members of content-routed `.keras` ZIP archives with bounded per-member extraction, prefer canonical root members over normalized aliases, and fail closed on ambiguous duplicate aliases so embedded payloads and `./config.json` entries are not skipped
 - **security:** scan duplicate ZIP entries by physical archive member instead of resolving repeated names to the final entry, preventing shadowed payloads from being skipped during recursive archive analysis
 - bound Keras `config.json` and `metadata.json` member reads before JSON parsing
+- **openvino:** parse XML roots for long-prolog routing, enforce size limits before parsing, scan nested layer attributes for external library references, and avoid importlib substring false positives
+- **zip:** propagate nested critical findings and incomplete archive traversal to `success=False`, and bound symlink-target reads before path validation
+- **tar:** propagate nested critical findings and partial archive traversal to `success=False`, continue after per-entry extraction errors, and normalize malformed archive-limit configs to safe defaults
 - route oversized config-only Keras ZIP archives by bounded config-prefix sniffing instead of falling back to the generic ZIP scanner
 - preserve disguised model files during directory prefiltering without promoting document ZIPs
+- fail closed on duplicate 7z entries, nested critical findings, probe-limit truncation, and malformed 7z safety-limit configs
+- **oci:** fail closed on nested findings and partial layer traversal, content-sniff misnamed layer members, normalize cosmetic layer-ref suffix changes, and reject oversized members before temp extraction
+- **oci:** ignore non-layer metadata strings ending in `.tar.gz` when collecting manifest layer refs so benign URLs do not become false missing-layer failures
 - recurse into nested 7z members even when their filenames use misleading extensions
 - fail closed on extreme-size files when a scanner lacks bounded large-file analysis
 - harden scan-cache invalidation and skip caching operational scan failures
@@ -136,11 +212,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - avoid materializing streaming directory iterators in memory
 - fail closed when JFrog folder downloads return only partial results
 - **keras:** anchor safe Lambda normalization regexes in H5 scanning so appended statements (for example `; __import__(...)`) cannot bypass dangerous-code analysis
+- **keras:** harden Keras H5 scanning by propagating CRITICAL findings to `success=False`, scanning wrapper-owned nested layers, parsing prerelease fix-boundary versions correctly, and matching suspicious module/config tokens without benign substring false positives
 - complete primary header-format routing in `core.py` so all registered model formats map to scanner IDs (including OpenVINO/PMML/CNTK/LightGBM/Torch7/CatBoost/RKNN/MXNet/NeMo/Llamafile/TFLite/CoreML/Paddle/TensorRT/Flax/R/ExecuTorch/7z/compressed/skops/joblib/xgboost/jax_checkpoint), add `.skops` extension detection coverage without spurious ZIP mismatch noise, and route ZIP-backed PyTorch `.ckpt`/`.pkl` containers through the PyTorch ZIP path
 - **security:** track pickle `BUILD`-driven `__setstate__` mutation on non-safe globals and block tree-model opcode-threshold escalation when dangerous globals are present in-stream
 - **safetensors:** include BOOL, BF16, F8_E4M3, and F8_E5M2 dtypes in tensor-size validation so malformed offsets are no longer skipped
 - harden pickle symbolic stack simulation by ignoring stack-neutral opcodes and using unknown sentinels for unhandled stack pushes
 - **security:** scan TensorFlow SavedModel `assets/` and `assets.extra/` directories for executable-like content (shebang scripts, ELF/Mach-O binaries, pickle magic, and embedded Python source patterns)
+- **security:** make TensorFlow SavedModel scans fail closed on CRITICAL findings, avoid substring false positives in PyFunc function references, and treat `blacklist_patterns=None` as disabled instead of emitting DEBUG read errors
 - **security:** enforce SafeTensors `MAX_HEADER_BYTES` during `scan()` and skip regex-heavy metadata-content analysis when headers exceed the configured limit to reduce header-based DoS risk
 - emit a one-time warning when the HuggingFace whitelist snapshot is older than 90 days while preserving existing whitelist severity downgrades
 - treat pickle scan timeouts as unsuccessful while preserving post-budget tail scans after opcode truncation
@@ -191,6 +269,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **security:** harden TensorFlow weight extraction limits to bound actual tensor payload materialization, including malformed `tensor_content` and string-backed tensors, and continue scanning past oversized `Const` nodes
 - **security:** stream TAR members to temp files under size limits instead of buffering whole entries in memory during scan
 - **security:** inspect TensorFlow SavedModel function definitions when scanning for dangerous ops and protobuf string abuse, with function-aware finding locations
+- **security:** route oversized TensorFlow MetaGraph files to fail-closed parse-budget scans, inspect `AttrValue.func.name` references in executable ops, and restore oversized-attribute anomaly detection after bounded string decoding
 - **cli:** include streamed artifacts as SBOM components when `scan --stream --sbom` is used
 - **cli:** exclude HuggingFace download cache bookkeeping files from remote SBOMs and asset lists
 - **cli:** add `--no-whitelist` and `--strict` whitelist/caching hardening so CI scans can disable HF severity downgrades and force uncached analysis

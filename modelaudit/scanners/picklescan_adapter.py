@@ -47,7 +47,7 @@ def _parse_positive_float(value: Any, default: float) -> float:
         return default
     try:
         parsed = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
     return parsed if parsed > 0 and math.isfinite(parsed) else default
 
@@ -105,6 +105,8 @@ def pickle_report_to_scan_result(
     result.metadata["pickle_source"] = report.source
     result.metadata["pickle_coverage"] = report.coverage.to_dict()
     suppress_parse_failure_escalation = _should_suppress_parse_failure_escalation(report)
+    if suppress_parse_failure_escalation:
+        result.metadata["trusted_incomplete_tail"] = True
 
     if report.status == ScanStatus.INCONCLUSIVE:
         result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
@@ -262,12 +264,17 @@ def _should_suppress_parse_failure_escalation(report: PickleReport) -> bool:
 
     first_pickle_end_pos = report.metadata.get("first_pickle_end_pos")
     has_trusted_pickle_boundary = isinstance(first_pickle_end_pos, int) and first_pickle_end_pos >= 0
+    if not has_trusted_pickle_boundary:
+        return False
 
     for notice in report.notices:
         if notice.code != "parse_incomplete":
             continue
 
-        if has_trusted_pickle_boundary:
+        if source_ext in {".bin", ".pkl", ".pickle"} and notice.details.get("exception_type") in {
+            "UnicodeDecodeError",
+            "ValueError",
+        }:
             return True
 
         if notice.details.get("exception_type") == "UnicodeDecodeError":

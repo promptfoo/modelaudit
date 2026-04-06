@@ -43,10 +43,5 @@ report = scan_bytes(
 ## Package Boundary
 
 `modelaudit-picklescan` only analyzes pickle payloads. Archive/container
-routing, SARIF export, CLI behavior, and `ScanResult` adaptation stay in the
-root `modelaudit` package.
-
-The root `modelaudit.scanners.pickle_scanner.PickleScanner` keeps a compatibility
-fallback path and merges legacy-only checks into standalone package results.
-Use `scripts/compare_pickle_scanners.py` when changing detection logic to verify
-that verdict/status semantics stay aligned across fixture corpora.
+routing, SARIF export, CLI behavior, and ModelAudit result adaptation stay in
+the root `modelaudit` package.

@@ -15,8 +15,10 @@ from modelaudit.integrations.license_checker import (
     collect_license_metadata,
 )
 from modelaudit.models import ModelAuditResultModel, ScanConfigModel, create_initial_audit_result
+from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, Check, Issue, IssueSeverity, ScanResult
 from modelaudit.scanners import _registry
-from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
+from modelaudit.scanners.archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY
+from modelaudit.scanners.base import BaseScanner
 from modelaudit.telemetry import record_file_type_detected, record_issue_found, record_scanner_used
 from modelaudit.utils import is_within_directory, resolve_dvc_file, should_skip_file
 from modelaudit.utils.file.detection import (
@@ -54,46 +56,7 @@ _OPERATIONAL_ERROR_METADATA_KEY = "operational_error"
 _OPERATIONAL_ERROR_REASON_METADATA_KEY = "operational_error_reason"
 _SCAN_OUTCOME_METADATA_KEY = "scan_outcome"
 
-HEADER_FORMAT_TO_SCANNER_ID = {
-    "pickle": "pickle",
-    "pytorch_binary": "pytorch_binary",
-    "hdf5": "keras_h5",
-    "keras": "keras_h5",
-    "safetensors": "safetensors",
-    "tensorflow_directory": "tf_savedmodel",
-    "protobuf": "tf_savedmodel",
-    "tf_metagraph": "tf_metagraph",
-    "tar": "tar",
-    "zip": "zip",
-    "onnx": "onnx",
-    "gguf": "gguf",
-    "ggml": "gguf",
-    "numpy": "numpy",
-    "openvino": "openvino",
-    "pmml": "pmml",
-    "cntk": "cntk",
-    "lightgbm": "lightgbm",
-    "torch7": "torch7",
-    "catboost": "catboost",
-    "rknn": "rknn",
-    "mxnet": "mxnet",
-    "nemo": "nemo",
-    "llamafile": "llamafile",
-    "tflite": "tflite",
-    "coreml": "coreml",
-    "paddle": "paddle",
-    "tensorrt": "tensorrt",
-    "flax_msgpack": "flax_msgpack",
-    "r_serialized": "r_serialized",
-    "executorch": "executorch",
-    "compressed": "compressed",
-    "sevenzip": "sevenzip",
-    "skops": "skops",
-    "torchserve_mar": "torchserve_mar",
-    "joblib": "joblib",
-    "xgboost": "xgboost",
-    "jax_checkpoint": "jax_checkpoint",
-}
+HEADER_FORMAT_TO_SCANNER_ID = _registry.get_header_format_to_scanner_ids()
 
 
 def _mark_operational_scan_error(scan_result: ScanResult, reason: str) -> None:
@@ -204,7 +167,6 @@ def _add_scan_result_to_model(
     """Helper function to add scan result data to Pydantic model."""
 
     from .models import FileMetadataModel
-    from .scanners.base import Check, Issue
 
     # Update byte counts
     results.bytes_scanned += file_result.bytes_scanned
@@ -275,16 +237,13 @@ def _select_preferred_scanner_id(path: str, header_format: str, ext: str) -> str
             return "pickle"
         return "zip"
 
-    if header_format == "hdf5":
-        return "keras_h5"
-
     if ext == ".joblib" and header_format in {"compressed", "pickle"}:
         return "joblib"
 
     if header_format == "tar" and ext == ".nemo":
         return "nemo"
 
-    return HEADER_FORMAT_TO_SCANNER_ID.get(header_format)
+    return _registry.get_scanner_id_for_header_format(header_format)
 
 
 def _add_issue_to_model(
@@ -297,8 +256,6 @@ def _add_issue_to_model(
 ) -> None:
     """Helper function to add an issue directly to the Pydantic model."""
     import time
-
-    from .scanners.base import Issue
 
     # Convert string severity to enum
     severity_enum = {
@@ -1048,8 +1005,6 @@ def scan_model_directory_or_file(
                             results.scanner_names.append(scanner_name)
 
                         # Add issues for each file path that shares this content using Pydantic models
-                        from .scanners.base import Issue
-
                         for issue in file_result.issues:
                             issue_dict = issue.to_dict() if hasattr(issue, "to_dict") else issue
                             if isinstance(issue_dict, dict):
@@ -1142,9 +1097,6 @@ def scan_model_directory_or_file(
                                 details={"exception_type": type(e).__name__},
                             )
                             _add_error_asset_to_results(results, file_path)
-
-                # This section is now handled by the content grouping logic above
-                pass
 
             # Final progress update for directory scan
             if progress_callback and not limit_reached and total_files is not None and total_files > 0:
@@ -1378,8 +1330,8 @@ def scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
     Returns:
         ScanResult object with the scan results
     """
-    if config is None:
-        config = {}
+    config = {} if config is None else dict(config)
+    config.setdefault(NESTED_SCAN_CALLBACK_CONFIG_KEY, scan_file)
     validate_scan_config(config)
 
     # Delegate to internal implementation - cache decorator handles caching

@@ -1,6 +1,9 @@
 from pathlib import Path
 
-from modelaudit.scanners.base import IssueSeverity
+import pytest
+
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.openvino_scanner import OpenVinoScanner
 
 
@@ -24,10 +27,108 @@ def test_openvino_scanner_basic(tmp_path: Path) -> None:
     assert result.metadata["xml_size"] == xml_path.stat().st_size
     assert result.metadata.get("bin_size") == (tmp_path / "model.bin").stat().st_size
 
-    # Should have file type validation info for minimal XML
+    # Benign OpenVINO XML should not produce file-type validation noise.
     file_type_issues = [i for i in result.issues if "File type validation failed" in i.message]
-    assert len(file_type_issues) == 1
-    assert file_type_issues[0].severity.value == "info"
+    assert file_type_issues == []
+
+
+def test_openvino_scanner_basic_model_has_zero_cli_exit(tmp_path: Path) -> None:
+    """Benign OpenVINO XML should not produce a warning-level format-validation exit."""
+    xml_path = create_basic_model(tmp_path)
+
+    cli_result = scan_model_directory_or_file(str(xml_path))
+
+    assert cli_result.scanner_names == ["openvino"]
+    assert determine_exit_code(cli_result) == 0
+    assert not any(
+        check.name == "Format Validation" and check.severity == IssueSeverity.WARNING for check in cli_result.checks
+    )
+
+
+def test_openvino_scanner_can_handle_long_xml_prolog(tmp_path: Path) -> None:
+    """OpenVINO XML routing should not depend on finding the root tag in the first 256 bytes."""
+    xml_path = tmp_path / "model.xml"
+    xml_path.write_text(
+        f"<?xml version='1.0'?><!--{'x' * 512}--><net name='test' version='10'></net>",
+        encoding="utf-8",
+    )
+
+    assert OpenVinoScanner.can_handle(str(xml_path)) is True
+
+
+def test_openvino_scanner_can_handle_uses_bounded_xml_prefix(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Root tags beyond the bounded routing prefix should fail closed instead of forcing full-file parsing."""
+    xml_path = tmp_path / "model.xml"
+    xml_path.write_text(
+        f"<?xml version='1.0'?><!--{'x' * 512}--><net name='test' version='10'></net>",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(OpenVinoScanner, "CAN_HANDLE_MAX_PARSE_BYTES", 128)
+
+    assert OpenVinoScanner.can_handle(str(xml_path)) is False
+
+
+def test_openvino_scanner_can_handle_rejects_non_openvino_xml(tmp_path: Path) -> None:
+    """Non-OpenVINO XML should not be routed to this scanner just because it has a .xml suffix."""
+    xml_path = tmp_path / "document.xml"
+    xml_path.write_text("<project><model name='not-openvino'/></project>", encoding="utf-8")
+
+    assert OpenVinoScanner.can_handle(str(xml_path)) is False
+
+
+def test_openvino_scanner_can_handle_forbidden_doctype_openvino_xml(tmp_path: Path) -> None:
+    """OpenVINO XML with forbidden DOCTYPE declarations should still route to this scanner."""
+    xml_path = tmp_path / "model.xml"
+    xml_path.write_text(
+        """<?xml version='1.0'?>
+        <!DOCTYPE net [
+          <!ENTITY payload SYSTEM 'file:///tmp/secret'>
+        ]>
+        <net version='10'><layers><layer id='0' name='data' type='Input'/></layers></net>
+        """,
+        encoding="utf-8",
+    )
+
+    assert OpenVinoScanner.can_handle(str(xml_path)) is True
+
+
+def test_openvino_scanner_routes_unterminated_doctype_to_parse_failure(tmp_path: Path) -> None:
+    """Malformed OpenVINO DOCTYPE prologs should fail closed as explicit parse errors."""
+    xml_path = tmp_path / "model.xml"
+    xml_path.write_text(
+        """<?xml version='1.0'?>
+        <!DOCTYPE net [
+          <!ENTITY payload SYSTEM 'file:///tmp/secret'>
+        <net version='10'><layers><layer id='0' name='data' type='Input'/></layers></net>
+        """,
+        encoding="utf-8",
+    )
+    (tmp_path / "model.bin").write_bytes(b"\x00")
+
+    cli_result = scan_model_directory_or_file(str(xml_path))
+
+    assert OpenVinoScanner.can_handle(str(xml_path)) is True
+    assert cli_result.scanner_names == ["openvino"]
+    assert determine_exit_code(cli_result) == 2
+    parse_checks = [check for check in cli_result.checks if check.name == "OpenVINO XML Parse"]
+    assert parse_checks
+    assert all(check.status == CheckStatus.FAILED for check in parse_checks)
+    assert any("Invalid OpenVINO XML" in check.message for check in parse_checks)
+
+
+def test_openvino_scanner_can_handle_rejects_unterminated_non_openvino_doctype(tmp_path: Path) -> None:
+    """Malformed non-OpenVINO DOCTYPE prologs should not route to OpenVINO."""
+    xml_path = tmp_path / "document.xml"
+    xml_path.write_text(
+        """<?xml version='1.0'?>
+        <!DOCTYPE html [
+          <!ENTITY payload SYSTEM 'file:///tmp/secret'>
+        <html><body>not an OpenVINO model</body></html>
+        """,
+        encoding="utf-8",
+    )
+
+    assert OpenVinoScanner.can_handle(str(xml_path)) is False
 
 
 def test_openvino_scanner_missing_bin(tmp_path: Path) -> None:
@@ -39,6 +140,30 @@ def test_openvino_scanner_missing_bin(tmp_path: Path) -> None:
     assert any("weights file not found" in m for m in messages)
     # Missing weights file is INFO severity (not a security concern)
     assert any(i.severity == IssueSeverity.INFO for i in result.issues)
+
+
+def test_openvino_scanner_forbidden_doctype_fails_closed_with_exit_2(tmp_path: Path) -> None:
+    """Forbidden DOCTYPE payloads should produce an explicit OpenVINO parse failure and exit 2."""
+    xml_path = tmp_path / "model.xml"
+    xml_path.write_text(
+        """<?xml version='1.0'?>
+        <!DOCTYPE net [
+          <!ENTITY payload SYSTEM 'file:///tmp/secret'>
+        ]>
+        <net version='10'><layers><layer id='0' name='data' type='Input' value='&payload;'/></layers></net>
+        """,
+        encoding="utf-8",
+    )
+    (tmp_path / "model.bin").write_bytes(b"\x00")
+
+    result = OpenVinoScanner().scan(str(xml_path))
+    cli_result = scan_model_directory_or_file(str(xml_path))
+
+    assert result.success is False
+    assert result.metadata["operational_error"] is True
+    assert result.metadata["operational_error_reason"] == "openvino_xml_parse_failed"
+    assert any(check.name == "OpenVINO XML Parse" for check in result.checks)
+    assert determine_exit_code(cli_result) == 2
 
 
 def test_openvino_scanner_custom_layer(tmp_path: Path) -> None:
@@ -59,3 +184,78 @@ def test_openvino_scanner_custom_layer(tmp_path: Path) -> None:
         i for i in result.issues if "python layer" in i.message.lower() or "external library" in i.message.lower()
     ]
     assert all(i.severity == IssueSeverity.CRITICAL for i in security_issues)
+
+
+def test_openvino_scanner_respects_configured_file_size_limit(tmp_path: Path) -> None:
+    """scan() should fail closed before parsing XML that exceeds max_file_read_size."""
+    xml_path = create_basic_model(tmp_path)
+
+    result = OpenVinoScanner(config={"max_file_read_size": 8}).scan(str(xml_path))
+
+    assert result.success is False
+    assert any(check.name == "File Size Limit" for check in result.checks)
+
+
+def test_openvino_scanner_detects_nested_external_library_references(tmp_path: Path) -> None:
+    """Nested layer config nodes should be checked for implementation/library references."""
+    xml_path = tmp_path / "model.xml"
+    xml_path.write_text(
+        """
+        <net version='10'>
+          <layers>
+            <layer id='1' name='conv' type='Convolution'>
+              <data implementation='evil.so'/>
+            </layer>
+          </layers>
+        </net>
+        """,
+        encoding="utf-8",
+    )
+    (tmp_path / "model.bin").write_bytes(b"\x00")
+
+    result = OpenVinoScanner().scan(str(xml_path))
+
+    assert result.success is False
+    assert any("external library 'evil.so'" in issue.message for issue in result.issues)
+
+
+def test_openvino_scanner_layer_attribute_importlib_false_positive_control(tmp_path: Path) -> None:
+    """Benign names containing importlib as a substring should not be flagged."""
+    xml_path = tmp_path / "model.xml"
+    xml_path.write_text(
+        """
+        <net version='10'>
+          <layers>
+            <layer id='2' name='custom_importlib_feature' type='Input'/>
+          </layers>
+        </net>
+        """,
+        encoding="utf-8",
+    )
+    (tmp_path / "model.bin").write_bytes(b"\x00")
+
+    result = OpenVinoScanner().scan(str(xml_path))
+
+    assert result.success is True
+    assert not any(check.name == "Layer Attribute Security Check" for check in result.checks)
+
+
+def test_openvino_scanner_layer_attribute_detects_direct_importlib_reference(tmp_path: Path) -> None:
+    """The importlib false-positive guard should still flag direct dangerous references."""
+    xml_path = tmp_path / "model.xml"
+    xml_path.write_text(
+        """
+        <net version='10'>
+          <layers>
+            <layer id='3' name='importlib.import_module' type='Input'/>
+          </layers>
+        </net>
+        """,
+        encoding="utf-8",
+    )
+    (tmp_path / "model.bin").write_bytes(b"\x00")
+
+    result = OpenVinoScanner().scan(str(xml_path))
+
+    assert result.success is False
+    assert any(check.name == "Layer Attribute Security Check" for check in result.checks)

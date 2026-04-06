@@ -36,6 +36,7 @@ def test_pmml_scanner_xxe(tmp_path: Path) -> None:
 
     result = PmmlScanner().scan(str(path))
     messages = [i.message.lower() for i in result.issues]
+    assert result.success is False
     assert any("doctype" in m or "entity" in m for m in messages)
     assert any(i.severity == IssueSeverity.CRITICAL for i in result.issues)
 
@@ -61,6 +62,125 @@ def test_pmml_scanner_suspicious_extension_content(tmp_path: Path) -> None:
     suspicious_issues = [i for i in result.issues if "suspicious content" in i.message.lower()]
     assert len(suspicious_issues) >= 1
     assert all(i.severity == IssueSeverity.WARNING for i in suspicious_issues)
+
+
+def test_pmml_scanner_namespaced_extension_content(tmp_path: Path) -> None:
+    """Test namespaced Extension and script tags are inspected."""
+    pmml = """<?xml version='1.0'?>
+<PMML xmlns='https://example.test/pmml' version='4.4'>
+  <Header>
+    <Extension>
+      <script>exec ('dangerous code')</script>
+    </Extension>
+  </Header>
+</PMML>"""
+    path = tmp_path / "namespaced_suspicious.pmml"
+    path.write_text(pmml, encoding="utf-8")
+
+    result = PmmlScanner().scan(str(path))
+
+    assert result.success is True
+    assert any("Suspicious XML element found" in issue.message for issue in result.issues)
+    assert any("Suspicious content in <Extension> element" in issue.message for issue in result.issues)
+
+
+def test_pmml_scanner_benign_subprocess_prose_is_not_flagged(tmp_path: Path) -> None:
+    pmml = """<?xml version='1.0'?>
+<PMML version='4.4'>
+  <Header>
+    <Extension extender='metrics'>subprocess latency summary</Extension>
+  </Header>
+  <DataDictionary numberOfFields='0'/>
+</PMML>"""
+    path = tmp_path / "subprocess_metrics.pmml"
+    path.write_text(pmml, encoding="utf-8")
+
+    result = PmmlScanner().scan(str(path))
+
+    assert result.success is True
+    assert not any(
+        issue.details.get("pattern")
+        in {
+            r"\b(?:importlib\s*\.\s*)?import_module\s*\(\s*['\"]subprocess['\"]\s*\)",
+            r"\b(?:from\s+subprocess\s+import|import\s+subprocess)\b",
+            r"\bsubprocess\s*\.\s*(?:popen|run|call|check_call|check_output|getoutput|getstatusoutput)\s*\(",
+        }
+        for issue in result.issues
+    )
+
+
+def test_pmml_scanner_code_shaped_subprocess_extension_is_flagged(tmp_path: Path) -> None:
+    pmml = """<?xml version='1.0'?>
+<PMML version='4.4'>
+  <Header>
+    <Extension>
+      import subprocess
+      subprocess.run('id')
+    </Extension>
+  </Header>
+  <DataDictionary numberOfFields='0'/>
+</PMML>"""
+    path = tmp_path / "subprocess_code.pmml"
+    path.write_text(pmml, encoding="utf-8")
+
+    result = PmmlScanner().scan(str(path))
+
+    assert result.success is True
+    assert any(
+        issue.details.get("pattern")
+        in {
+            r"\b(?:importlib\s*\.\s*)?import_module\s*\(\s*['\"]subprocess['\"]\s*\)",
+            r"\b(?:from\s+subprocess\s+import|import\s+subprocess)\b",
+            r"\bsubprocess\s*\.\s*(?:popen|run|call|check_call|check_output|getoutput|getstatusoutput)\s*\(",
+        }
+        and "Suspicious content in <Extension> element" in issue.message
+        for issue in result.issues
+    )
+
+
+def test_pmml_scanner_subprocess_getoutput_call_is_flagged_without_import(
+    tmp_path: Path,
+) -> None:
+    pmml = """<?xml version='1.0'?>
+<PMML version='4.4'>
+  <Header>
+    <Extension>subprocess.getoutput('id')</Extension>
+  </Header>
+  <DataDictionary numberOfFields='0'/>
+</PMML>"""
+    path = tmp_path / "subprocess_getoutput.pmml"
+    path.write_text(pmml, encoding="utf-8")
+
+    result = PmmlScanner().scan(str(path))
+
+    assert result.success is True
+    assert any(
+        issue.details.get("pattern")
+        == r"\bsubprocess\s*\.\s*(?:popen|run|call|check_call|check_output|getoutput|getstatusoutput)\s*\("
+        and "Suspicious content in <Extension> element" in issue.message
+        for issue in result.issues
+    )
+
+
+def test_pmml_scanner_importlib_subprocess_call_is_flagged(tmp_path: Path) -> None:
+    pmml = """<?xml version='1.0'?>
+<PMML version='4.4'>
+  <Header>
+    <Extension>importlib.import_module('subprocess').run('id')</Extension>
+  </Header>
+  <DataDictionary numberOfFields='0'/>
+</PMML>"""
+    path = tmp_path / "importlib_subprocess.pmml"
+    path.write_text(pmml, encoding="utf-8")
+
+    result = PmmlScanner().scan(str(path))
+
+    assert result.success is True
+    assert any(
+        issue.details.get("pattern") == r"\b(?:importlib\s*\.\s*)?import_module\s*\(\s*['\"]subprocess['\"]\s*\)"
+        and "Suspicious content in <Extension> element" in issue.message
+        for issue in result.issues
+    )
 
 
 def test_pmml_scanner_external_references(tmp_path: Path) -> None:
@@ -166,6 +286,89 @@ def test_pmml_scanner_utf8_with_replacement(tmp_path: Path) -> None:
     assert result.success
     assert any("non utf-8" in i.message.lower() for i in result.issues)
     assert any(i.severity == IssueSeverity.WARNING for i in result.issues)
+
+
+def test_pmml_scanner_enforces_size_limit(tmp_path: Path) -> None:
+    pmml = """<?xml version='1.0'?>
+<PMML version='4.4'>
+  <Header/>
+</PMML>"""
+    path = tmp_path / "oversized.pmml"
+    path.write_text(pmml, encoding="utf-8")
+
+    result = PmmlScanner(config={"max_file_size": 16}).scan(str(path))
+
+    assert result.success is False
+    assert any("file too large" in issue.message.lower() for issue in result.issues)
+
+
+def test_pmml_scanner_comment_doctype_is_not_xxe(tmp_path: Path) -> None:
+    pmml = """<?xml version='1.0'?>
+<!-- <!DOCTYPE pmml [ <!ENTITY xxe SYSTEM 'file:///etc/passwd'> ]> -->
+<PMML version='4.4'>
+  <Header/>
+</PMML>"""
+    path = tmp_path / "commented_doctype.pmml"
+    path.write_text(pmml, encoding="utf-8")
+
+    result = PmmlScanner().scan(str(path))
+
+    assert result.success is True
+    assert not any(
+        issue.severity == IssueSeverity.CRITICAL and "PMML file contains" in issue.message for issue in result.issues
+    )
+
+
+def test_pmml_scanner_cdata_doctype_is_not_xxe(tmp_path: Path) -> None:
+    pmml = """<?xml version='1.0'?>
+<PMML version='4.4'>
+  <Header>
+    <Extension><![CDATA[<!DOCTYPE pmml [ <!ENTITY xxe SYSTEM 'file:///etc/passwd'> ]>]]></Extension>
+  </Header>
+</PMML>"""
+    path = tmp_path / "cdata_doctype.pmml"
+    path.write_text(pmml, encoding="utf-8")
+
+    result = PmmlScanner().scan(str(path))
+
+    assert result.success is True
+    assert not any(
+        issue.severity == IssueSeverity.CRITICAL and "PMML file contains" in issue.message for issue in result.issues
+    )
+
+
+def test_pmml_scanner_deep_extension_tree_does_not_recurse_forever(tmp_path: Path) -> None:
+    nested_body = "<node>" * 1200 + "payload" + "</node>" * 1200
+    pmml = f"""<?xml version='1.0'?>
+<PMML version='4.4'>
+  <Header>
+    <Extension>{nested_body}</Extension>
+  </Header>
+</PMML>"""
+    path = tmp_path / "deep_extension.pmml"
+    path.write_text(pmml, encoding="utf-8")
+
+    result = PmmlScanner().scan(str(path))
+
+    assert result.success is True
+    assert result.bytes_scanned > 0
+
+
+def test_pmml_scanner_extension_text_truncation_fails_closed(tmp_path: Path) -> None:
+    pmml = f"""<?xml version='1.0'?>
+<PMML version='4.4'>
+  <Header>
+    <Extension>{"<node/>" * (PmmlScanner.MAX_EXTENSION_TEXT_NODES + 8)}<script>eval('x')</script></Extension>
+  </Header>
+</PMML>"""
+    path = tmp_path / "truncated_extension.pmml"
+    path.write_text(pmml, encoding="utf-8")
+
+    result = PmmlScanner().scan(str(path))
+
+    assert result.success is False
+    assert any("exceeds the safe inspection node limit" in issue.message for issue in result.issues)
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
 def test_pmml_scanner_can_handle_detection(tmp_path: Path) -> None:

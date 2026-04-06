@@ -47,6 +47,8 @@ def _create_mar_archive(
 def _build_malicious_pickle() -> bytes:
     import os as os_module
 
+    # This helper intentionally builds a malicious pickle for scanner coverage.
+    # The payload command is a harmless `echo` so test fixtures stay safe.
     class DangerousPayload:
         def __reduce__(self):
             return (os_module.system, ("echo torchserve-mar-test",))
@@ -1351,7 +1353,7 @@ def test_scan_detects_suspicious_compression_ratio_in_valid_mar(tmp_path: Path) 
 
 
 def test_core_mar_fallback_bounds_python_handler_analysis_size(tmp_path: Path) -> None:
-    oversized_handler = b"#" + (b"a" * ZipScanner.MAX_MAR_PYTHON_ANALYSIS_BYTES)
+    oversized_handler = b"a" * (ZipScanner.MAX_MAR_PYTHON_ANALYSIS_BYTES + 1)
     mar_path = _create_mar_archive(
         tmp_path,
         manifest=None,

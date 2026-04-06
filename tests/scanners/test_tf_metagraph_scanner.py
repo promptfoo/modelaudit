@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import importlib
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners.base import IssueSeverity
-from modelaudit.scanners.tf_metagraph_scanner import DISCOVERY_ASSUMPTIONS, TensorFlowMetaGraphScanner
+from modelaudit.scanners.tf_metagraph_scanner import (
+    _MAX_ATTR_VALUE_BYTES,
+    _MAX_PARSE_BYTES,
+    DISCOVERY_ASSUMPTIONS,
+    TensorFlowMetaGraphScanner,
+)
 
 
 def _has_tf_protos() -> bool:
@@ -38,11 +44,7 @@ def _build_metagraph(
     metagraph.meta_info_def.meta_graph_version = "modelaudit_test_meta_graph"
     metagraph.meta_info_def.tags.append("serve")
 
-    for node_spec in graph_nodes:
-        node = metagraph.graph_def.node.add()
-        node.name = str(node_spec["name"])
-        node.op = str(node_spec["op"])
-
+    def add_node_attrs(node: Any, node_spec: dict[str, object]) -> None:
         attrs = node_spec.get("attrs", {})
         if isinstance(attrs, dict):
             for attr_name, attr_value in attrs.items():
@@ -51,6 +53,16 @@ def _build_metagraph(
                 else:
                     node.attr[str(attr_name)].s = str(attr_value).encode("utf-8")
 
+        function_ref = node_spec.get("function_ref")
+        if isinstance(function_ref, str):
+            node.attr["f"].func.name = function_ref
+
+    for node_spec in graph_nodes:
+        node = metagraph.graph_def.node.add()
+        node.name = str(node_spec["name"])
+        node.op = str(node_spec["op"])
+        add_node_attrs(node, node_spec)
+
     if function_nodes:
         function = metagraph.graph_def.library.function.add()
         function.signature.name = "test_function"
@@ -58,13 +70,7 @@ def _build_metagraph(
             node = function.node_def.add()
             node.name = str(node_spec["name"])
             node.op = str(node_spec["op"])
-            attrs = node_spec.get("attrs", {})
-            if isinstance(attrs, dict):
-                for attr_name, attr_value in attrs.items():
-                    if isinstance(attr_value, bytes):
-                        node.attr[str(attr_name)].s = attr_value
-                    else:
-                        node.attr[str(attr_name)].s = str(attr_value).encode("utf-8")
+            add_node_attrs(node, node_spec)
 
     if collection_bytes:
         for key, values in collection_bytes.items():
@@ -90,6 +96,25 @@ def test_tf_metagraph_scanner_can_handle_strict(tmp_path: Path) -> None:
     assert TensorFlowMetaGraphScanner.can_handle(str(valid_meta)) is True
     assert TensorFlowMetaGraphScanner.can_handle(str(renamed_non_meta)) is False
     assert TensorFlowMetaGraphScanner.can_handle(str(wrong_extension)) is False
+
+
+def test_tf_metagraph_scanner_can_handle_oversized_meta_for_fail_closed_scan(tmp_path: Path) -> None:
+    oversized_meta = tmp_path / "oversized.meta"
+    seed = _build_metagraph(graph_nodes=[{"name": "pyfunc_node", "op": "PyFunc"}])
+    oversized_meta.write_bytes(seed + b"A" * (_MAX_PARSE_BYTES + 1 - len(seed)))
+
+    assert TensorFlowMetaGraphScanner.can_handle(str(oversized_meta)) is True
+
+    result = TensorFlowMetaGraphScanner().scan(str(oversized_meta))
+
+    assert result.success is False
+    assert result.metadata["operational_error"] is True
+    assert result.metadata["operational_error_reason"] == "metagraph_parse_budget_exceeded"
+    assert any(issue.message and "MetaGraph exceeds bounded parse budget" in issue.message for issue in result.issues)
+
+    audit_result = scan_model_directory_or_file(str(oversized_meta))
+
+    assert determine_exit_code(audit_result) == 2
 
 
 def test_tf_metagraph_scanner_benign_graph_has_no_security_findings(tmp_path: Path) -> None:
@@ -200,6 +225,90 @@ def test_tf_metagraph_scanner_false_positive_control_substring_op_name(tmp_path:
 
     assert result.success is True
     assert all(issue.severity not in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+def test_tf_metagraph_scanner_detects_func_references_in_executable_attr_values(tmp_path: Path) -> None:
+    function_ref_meta = tmp_path / "func-ref.meta"
+    function_ref_meta.write_bytes(
+        _build_metagraph(
+            graph_nodes=[
+                {
+                    "name": "dangerous_call",
+                    "op": "StatefulPartitionedCall",
+                    "function_ref": "os.system",
+                }
+            ]
+        )
+    )
+
+    result = TensorFlowMetaGraphScanner().scan(str(function_ref_meta))
+
+    assert result.success is False
+    assert any(
+        issue.message
+        and "Suspicious command/network string found in executable TensorFlow op attribute" in issue.message
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("attribute") == "f.func.name"
+        and issue.details.get("value_preview") == "os.system"
+        for issue in result.issues
+    )
+
+
+def test_tf_metagraph_scanner_func_reference_false_positive_control(tmp_path: Path) -> None:
+    benign_function_ref_meta = tmp_path / "benign-func-ref.meta"
+    benign_function_ref_meta.write_bytes(
+        _build_metagraph(
+            graph_nodes=[
+                {
+                    "name": "benign_call",
+                    "op": "StatefulPartitionedCall",
+                    "function_ref": "custom_package.systematic_math",
+                }
+            ]
+        )
+    )
+
+    result = TensorFlowMetaGraphScanner().scan(str(benign_function_ref_meta))
+
+    assert result.success is True
+    assert not any(
+        issue.message
+        and "custom_package.systematic_math" in issue.message
+        and "command/network string" in issue.message
+        for issue in result.issues
+    )
+
+
+def test_tf_metagraph_scanner_detects_split_encoded_payload_and_oversized_attrs(tmp_path: Path) -> None:
+    suspicious_meta = tmp_path / "split-payload.meta"
+    encoded_blob = "A" * 192
+    suspicious_meta.write_bytes(
+        _build_metagraph(
+            graph_nodes=[
+                {
+                    "name": "pyfunc_node",
+                    "op": "PyFunc",
+                    "attrs": {
+                        "decoder": "base64.b64decode",
+                        "payload": encoded_blob,
+                        "script": "A" * (_MAX_ATTR_VALUE_BYTES + 512),
+                    },
+                }
+            ]
+        )
+    )
+
+    result = TensorFlowMetaGraphScanner().scan(str(suspicious_meta))
+
+    assert result.success is False
+    assert any(issue.message and "Encoded payload indicator found" in issue.message for issue in result.issues)
+    assert any(
+        issue.message
+        and "Large executable-context attribute detected" in issue.message
+        and issue.details.get("attribute") == "script"
+        and issue.details.get("attribute_length") == _MAX_ATTR_VALUE_BYTES + 512
+        for issue in result.issues
+    )
 
 
 def test_tf_metagraph_scanner_checkpoint_io_ops_not_critical(tmp_path: Path) -> None:

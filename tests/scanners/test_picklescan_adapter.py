@@ -202,7 +202,7 @@ def test_pickle_report_to_scan_result_suppresses_passed_import_checks_for_refere
 
     result = pickle_report_to_scan_result(report)
 
-    assert [check.name for check in result.checks].count("Standalone Pickle Import") == 0
+    assert not any(check.name == "Standalone Pickle Import" for check in result.checks)
     assert len(result.issues) == 1
     assert result.issues[0].rule_code == "S203"
 
@@ -240,7 +240,7 @@ def test_pickle_report_to_scan_result_suppresses_passed_import_checks_for_module
 
     result = pickle_report_to_scan_result(report)
 
-    assert [check.name for check in result.checks].count("Standalone Pickle Import") == 0
+    assert not any(check.name == "Standalone Pickle Import" for check in result.checks)
     assert len(result.issues) == 1
     assert result.issues[0].rule_code == "S101"
 
@@ -521,6 +521,7 @@ def test_pickle_report_to_scan_result_ignores_decompressed_wrapper_suffix_for_jo
             ),
         ),
         metadata={
+            "first_pickle_end_pos": 230,
             "import_references": [
                 {
                     "import_reference": "joblib.numpy_pickle.NumpyArrayWrapper",
@@ -546,11 +547,54 @@ def test_pickle_report_to_scan_result_ignores_decompressed_wrapper_suffix_for_jo
 
     assert result.success is False
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["trusted_incomplete_tail"] is True
     assert not any(issue.message == "Pickle parsing failed before full scan completion" for issue in result.issues)
     assert any(
         issue.severity == IssueSeverity.INFO
         and issue.rule_code == "S902"
         and issue.message == "Pickle parsing stopped before the stream was fully consumed: ValueError"
+        for issue in result.issues
+    )
+
+
+def test_pickle_report_to_scan_result_requires_boundary_for_tail_suppression() -> None:
+    report = PickleReport(
+        source="numpy_arrays.joblib",
+        status=ScanStatus.INCONCLUSIVE,
+        verdict=SafetyVerdict.UNKNOWN,
+        notices=(
+            Notice(
+                message="Pickle parsing stopped before the stream was fully consumed: ValueError",
+                severity=Severity.INFO,
+                location="numpy_arrays.joblib (pos 231)",
+                code="parse_incomplete",
+                details={
+                    "exception": "at position 230, opcode b'\\t' unknown",
+                    "exception_type": "ValueError",
+                    "analysis_incomplete": True,
+                },
+            ),
+        ),
+        metadata={
+            "import_references": [
+                {
+                    "import_reference": "joblib.numpy_pickle.NumpyArrayWrapper",
+                    "module": "joblib.numpy_pickle",
+                    "name": "NumpyArrayWrapper",
+                    "opcode": "STACK_GLOBAL",
+                    "position": 66,
+                    "is_dangerous": False,
+                },
+            ],
+        },
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert "trusted_incomplete_tail" not in result.metadata
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and issue.message == "Pickle parsing failed before full scan completion"
         for issue in result.issues
     )
 

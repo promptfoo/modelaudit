@@ -7,6 +7,7 @@ from typing import Any, ClassVar
 
 from ..utils import is_absolute_archive_path, is_critical_system_path, sanitize_archive_path
 from ..utils.helpers.assets import asset_from_scan_result
+from .archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY, scan_nested_file
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 CRITICAL_SYSTEM_PATHS = [
@@ -32,6 +33,7 @@ class ZipScanner(BaseScanner):
     # Include .mar so non-TorchServe archives still receive generic ZIP scanning.
     supported_extensions: ClassVar[list[str]] = [".zip", ".npz", ".mar"]
     MAX_MAR_PYTHON_ANALYSIS_BYTES: ClassVar[int] = 10 * 1024 * 1024
+    MAX_SYMLINK_TARGET_BYTES: ClassVar[int] = 64 * 1024
 
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
@@ -59,6 +61,29 @@ class ZipScanner(BaseScanner):
             return 0
         return max(depth, 0)
 
+    def _get_max_entry_size(self) -> int:
+        """Return the configured per-entry extraction limit with a safe unlimited fallback."""
+        default_limit = 10 * 1024 * 1024 * 1024
+        max_entry_size = self.config.get("max_file_size", self.config.get("max_entry_size", default_limit))
+        if max_entry_size == 0:
+            return 1024 * 1024 * 1024 * 1024
+        return self._normalize_positive_int_config(max_entry_size, default_limit)
+
+    def _read_symlink_target(self, archive: zipfile.ZipFile, info: zipfile.ZipInfo) -> str:
+        """Read a symlink target with a hard cap to avoid materializing large archive members."""
+        target_bytes = bytearray()
+        with archive.open(info) as entry:
+            while True:
+                chunk = entry.read(4096)
+                if not chunk:
+                    break
+
+                target_bytes.extend(chunk)
+                if len(target_bytes) > self.MAX_SYMLINK_TARGET_BYTES:
+                    raise ValueError(f"symlink target exceeds maximum size of {self.MAX_SYMLINK_TARGET_BYTES} bytes")
+
+        return target_bytes.decode("utf-8", "replace")
+
     @classmethod
     def can_handle(cls, path: str) -> bool:
         """Check if this scanner can handle the given path"""
@@ -78,16 +103,10 @@ class ZipScanner(BaseScanner):
 
     def scan(self, path: str) -> ScanResult:
         """Scan a ZIP file and its contents"""
-        # Check if path is valid
-        path_check_result = self._check_path(path)
-        if path_check_result:
-            return path_check_result
+        result = self._create_scan_result_after_preflight(path)
+        if not result.success:
+            return result
 
-        size_check = self._check_size_limit(path)
-        if size_check:
-            return size_check
-
-        result = self._create_result()
         file_size = self.get_file_size(path)
         result.metadata["file_size"] = file_size
 
@@ -95,9 +114,6 @@ class ZipScanner(BaseScanner):
         self.add_file_integrity_check(path, result)
 
         try:
-            # Store the file path for use in issue locations
-            self.current_file_path = path
-
             scan_result = self.scan_archive_members(path)
             result.merge(scan_result)
 
@@ -126,7 +142,7 @@ class ZipScanner(BaseScanner):
             result.finish(success=False)
             return result
 
-        result.finish(success=True)
+        result.finish(success=scan_result.success and not result.has_errors)
         result.metadata["contents"] = scan_result.metadata.get("contents", [])
         result.metadata["file_size"] = os.path.getsize(path)
         return result
@@ -178,11 +194,19 @@ class ZipScanner(BaseScanner):
                 else entry_name
             )
 
+    def _scan_nested_archive_entry(self, path: str, nested_config: dict[str, Any]) -> ScanResult:
+        """Dispatch a nested archive member through an injected callback or registry fallback."""
+        nested_scan_callback = self.config.get(NESTED_SCAN_CALLBACK_CONFIG_KEY)
+        if callable(nested_scan_callback):
+            return nested_scan_callback(path, nested_config)
+        return scan_nested_file(path, nested_config)
+
     def _scan_zip_file(self, path: str, depth: int = 0) -> ScanResult:
         """Recursively scan a ZIP file and its contents"""
         result = ScanResult(scanner_name=self.name)
         contents: list[dict[str, Any]] = []
         archive_ext = os.path.splitext(path)[1].lower()
+        scan_complete = True
 
         # Check depth to prevent zip bomb attacks
         if depth >= self.max_depth:
@@ -195,6 +219,7 @@ class ZipScanner(BaseScanner):
                 location=path,
                 details={"depth": depth, "max_depth": self.max_depth},
             )
+            result.finish(success=False)
             return result
         else:
             result.add_check(
@@ -222,6 +247,7 @@ class ZipScanner(BaseScanner):
                         "max_entries": self.max_entries,
                     },
                 )
+                result.finish(success=False)
                 return result
             else:
                 result.add_check(
@@ -258,9 +284,24 @@ class ZipScanner(BaseScanner):
                 is_symlink = (info.external_attr >> 16) & 0o170000 == stat.S_IFLNK
                 if is_symlink:
                     try:
-                        target = z.read(info).decode("utf-8", "replace")
-                    except Exception:
-                        target = ""
+                        target = self._read_symlink_target(z, info)
+                    except Exception as exc:
+                        scan_complete = False
+                        result.add_check(
+                            name="Symlink Safety Validation",
+                            passed=False,
+                            message=f"Unable to read symlink target for {name}: {exc!s}",
+                            severity=IssueSeverity.WARNING,
+                            rule_code="S902",
+                            location=f"{path}:{name}",
+                            details={
+                                "entry": name,
+                                "exception": str(exc),
+                                "exception_type": type(exc).__name__,
+                            },
+                        )
+                        continue
+
                     target_base = os.path.dirname(resolved_name)
                     _target_resolved, target_safe = sanitize_archive_path(
                         target,
@@ -345,13 +386,7 @@ class ZipScanner(BaseScanner):
 
                 # Extract and scan the file
                 try:
-                    # Use max_file_size from CLI, fallback to max_entry_size, then default
-                    max_entry_size = self.config.get(
-                        "max_file_size", self.config.get("max_entry_size", 10 * 1024 * 1024 * 1024)
-                    )  # Use CLI max_file_size, then max_entry_size, then 10GB default
-                    # If max_file_size is 0 (unlimited), use a reasonable default for safety
-                    if max_entry_size == 0:
-                        max_entry_size = 1024 * 1024 * 1024 * 1024  # 1TB for unlimited case
+                    max_entry_size = self._get_max_entry_size()
 
                     if name.lower().endswith(".zip"):
                         suffix = ".zip"
@@ -384,18 +419,18 @@ class ZipScanner(BaseScanner):
                             if mar_python_result is not None:
                                 result.merge(mar_python_result)
 
-                        # Import core here to avoid circular import
-                        from .. import core
-
                         nested_config = dict(self.config)
                         nested_config["_archive_depth"] = depth + 1
                         if zipfile.is_zipfile(tmp_path):
                             nested_config["_zip_depth"] = depth + 1
 
-                        # Use core.scan_file so ZIP-based formats still reach their
-                        # specialized scanners, while shared archive depth remains
-                        # consistent across mixed ZIP/TAR/MAR recursion.
-                        file_result = core.scan_file(tmp_path, nested_config)
+                        # Dispatch nested members through the injected callback
+                        # so production scans preserve core routing while direct
+                        # ZipScanner usage still falls back to registry routing.
+                        file_result = self._scan_nested_archive_entry(tmp_path, nested_config)
+                        if not file_result.success:
+                            scan_complete = False
+
                         self._rewrite_nested_result_context(file_result, tmp_path, path, name)
 
                         result.merge(file_result)
@@ -414,6 +449,7 @@ class ZipScanner(BaseScanner):
                         os.unlink(tmp_path)
 
                 except Exception as e:
+                    scan_complete = False
                     result.add_check(
                         name="ZIP Entry Scan",
                         passed=False,
@@ -426,7 +462,7 @@ class ZipScanner(BaseScanner):
 
         result.metadata["contents"] = contents
         result.metadata["file_size"] = os.path.getsize(path)
-        result.finish(success=not result.has_errors)
+        result.finish(success=scan_complete and not result.has_errors)
         return result
 
     def _scan_mar_python_entry(

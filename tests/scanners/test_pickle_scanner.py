@@ -6,6 +6,7 @@ import struct
 import sys
 import tempfile
 import unittest
+import zipfile
 from collections import Counter
 from collections.abc import Callable, Iterator
 from io import BytesIO
@@ -70,6 +71,15 @@ class _NonSeekableBytesIO(BytesIO):
 
     def seek(self, pos: int, whence: int = 0) -> int:
         raise OSError("seek disabled")
+
+
+def test_pickle_scanner_star_import_exports_scanner_class() -> None:
+    """Wildcard imports should still expose the scanner class after helper extraction."""
+    namespace: dict[str, object] = {}
+
+    exec("from modelaudit.scanners.pickle_scanner import *", namespace)
+
+    assert namespace["PickleScanner"] is PickleScanner
 
 
 def _contains_system_global(text: str) -> bool:
@@ -457,6 +467,30 @@ def test_scan_stream_parse_failure_fails_closed_for_pickle_stream(
     )
 
 
+def test_scan_stream_non_seekable_parse_failure_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scanner = PickleScanner()
+
+    def _raise_parse_error(self: PickleScanner, _file_obj: BinaryIO, _file_size: int) -> ScanResult:
+        del self, _file_obj, _file_size
+        raise ValueError("at position 2, opcode b'\\xff' unknown")
+
+    monkeypatch.setattr(PickleScanner, "_scan_pickle_bytes", _raise_parse_error)
+
+    result = scanner.scan_stream(
+        _NonSeekableBytesIO(b"\x80\x04K\x01."),
+        5,
+        source="truncated.pkl",
+    )
+
+    assert result.success is False
+    assert result.metadata["file_type"] == "pickle"
+    assert result.metadata["parsing_failed"] is True
+    assert result.metadata["failure_reason"] == "unknown_opcode_or_format_error"
+    assert any(check.name == "Pickle Format Check" and check.status == CheckStatus.FAILED for check in result.checks)
+
+
 def test_pickle_scanner_can_handle_rejects_non_pickle_content(tmp_path: Path) -> None:
     """Unknown extensions should be rejected when neither extension nor content match."""
     model_path = tmp_path / "model.weights"
@@ -465,10 +499,23 @@ def test_pickle_scanner_can_handle_rejects_non_pickle_content(tmp_path: Path) ->
     assert PickleScanner.can_handle(str(model_path)) is False
 
 
-@pytest.mark.parametrize("suffix", [".bin", ".pt", ".pth"])
+@pytest.mark.parametrize("suffix", [".bin", ".pt", ".pth", ".ckpt", ".pkl"])
 def test_pickle_scanner_can_handle_rejects_zip_backed_pytorch_extensions(suffix: str, tmp_path: Path) -> None:
     """ZIP-backed PyTorch containers should not route through PickleScanner.can_handle()."""
     model_path = create_mock_pytorch_zip(tmp_path / f"model{suffix}")
+
+    assert PickleScanner.can_handle(str(model_path)) is False
+
+
+@pytest.mark.parametrize("suffix", [".pkl", ".pickle", ".dill", ".joblib"])
+def test_pickle_scanner_can_handle_rejects_existing_generic_zip_pickle_extensions(
+    suffix: str,
+    tmp_path: Path,
+) -> None:
+    """Existing ZIP archives with pickle-like suffixes should not be claimed as raw pickle."""
+    model_path = tmp_path / f"archive{suffix}"
+    with zipfile.ZipFile(model_path, "w") as archive:
+        archive.writestr("payload.txt", "not a pickle stream")
 
     assert PickleScanner.can_handle(str(model_path)) is False
 
@@ -4165,6 +4212,7 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
                 if candidate not in inverted_registry:
                     return candidate
             pytest.skip(f"No free copyreg extension code available in range {start}-{end}")
+            raise AssertionError("pytest.skip should not return")
 
         cases = [
             ("EXT1", b"\x82", _pick_free_code(1, 255), lambda code: bytes([code])),
@@ -4211,6 +4259,7 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
                 if candidate not in inverted_registry:
                     return candidate
             pytest.skip(f"No unregistered copyreg code in range {start}-{end}")
+            raise AssertionError("pytest.skip should not return")
 
         cases = [
             ("EXT1", b"\x82", _pick_unregistered_code(1, 255), lambda code: bytes([code])),
@@ -4299,7 +4348,7 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
 
             result = scan_file(str(zip_path))
 
-            assert result.success
+            assert not result.success
             assert result.has_errors
             critical_messages = [i.message.lower() for i in result.issues if i.severity == IssueSeverity.CRITICAL]
             assert any(_contains_system_global(msg) for msg in critical_messages), (
@@ -4325,15 +4374,18 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
             f"Expected CRITICAL __import__ detection, got: {critical_messages}"
         )
 
-    def test_malformed_unicode_tail_with_benign_prefix_does_not_raise_critical(self) -> None:
-        """Malformed tails after benign opcodes should not create CRITICAL findings."""
+    def test_malformed_unicode_tail_with_benign_prefix_fails_closed(self) -> None:
+        """Malformed tails without a trusted pickle boundary should fail closed."""
         payload = b"\x80\x02cbuiltins\nlen\nq\x00c\xff\n"
 
         result = self._scan_bytes(payload)
 
-        assert result.success
-        critical_messages = [i.message.lower() for i in result.issues if i.severity == IssueSeverity.CRITICAL]
-        assert not critical_messages, f"Unexpected CRITICAL benign detection: {critical_messages}"
+        assert not result.success
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL
+            and issue.message == "Pickle parsing failed before full scan completion"
+            for issue in result.issues
+        )
 
     # ------------------------------------------------------------------
     # Fix 3: joblib.load loader trampoline bypass
@@ -4843,7 +4895,7 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
 
             result = scan_file(str(zip_path))
 
-            assert result.success
+            assert not result.success
             assert result.has_errors
             assert any(
                 issue.severity == IssueSeverity.CRITICAL
@@ -4989,7 +5041,7 @@ def test_picklescan_gap_detected_inside_zip_entry(tmp_path: Path) -> None:
 
     result = scan_file(str(zip_path))
 
-    assert result.success
+    assert not result.success
     assert result.has_errors
     assert any(issue.severity == IssueSeverity.CRITICAL and "numpy.load" in issue.message for issue in result.issues), (
         f"Expected CRITICAL numpy.load issue in zip entry, got: {[i.message for i in result.issues]}"

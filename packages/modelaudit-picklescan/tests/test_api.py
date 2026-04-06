@@ -240,6 +240,24 @@ def test_scan_bytes_reports_inconclusive_status_when_opcode_budget_is_reached() 
     assert any(notice.code == "opcode_budget" for notice in report.notices)
 
 
+def test_scan_bytes_post_budget_tail_starts_at_budget_boundary() -> None:
+    payload = b"\x80\x04cos\nsystem\n."
+
+    report = scan_bytes(payload, source="budget-tail.pkl", options=ScanOptions(max_opcodes=1))
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert any(finding.rule_code == "POST_BUDGET_GLOBAL" for finding in report.findings)
+
+
+def test_scan_bytes_post_budget_tail_handles_stack_global_at_boundary() -> None:
+    payload = b"\x80\x04\x8c\x05posix\x94\x8c\x06system\x94\x93."
+
+    report = scan_bytes(payload, source="budget-stack-global.pkl", options=ScanOptions(max_opcodes=5))
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert any(finding.rule_code == "POST_BUDGET_GLOBAL" for finding in report.findings)
+
+
 def test_scan_bytes_handles_multiple_pickle_streams() -> None:
     payload = pickle.dumps({"a": 1}, protocol=4) + pickle.dumps(MaliciousPayload(), protocol=4)
 
@@ -378,6 +396,25 @@ def test_scan_bytes_flags_raw_nested_pickle_payloads() -> None:
     assert report.status == ScanStatus.COMPLETE
     assert report.verdict == SafetyVerdict.MALICIOUS
     assert any(finding.rule_code == "S213" for finding in report.findings)
+
+
+@pytest.mark.parametrize("fragment", [b"q\x00.", b"t."])
+def test_scan_bytes_does_not_flag_stack_invalid_nested_pickle_fragments(fragment: bytes) -> None:
+    report = scan_bytes(pickle.dumps({"outer": fragment}, protocol=4), source="nested-fragment.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert all(finding.rule_code != "S213" for finding in report.findings)
+
+
+@pytest.mark.parametrize("fragment", [b"q\x00.", b"t."])
+def test_scan_bytes_does_not_flag_stack_invalid_encoded_pickle_fragments(fragment: bytes) -> None:
+    encoded = base64.b64encode(fragment).decode("ascii")
+    report = scan_bytes(pickle.dumps({"outer": encoded}, protocol=4), source="nested-fragment.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert all(finding.rule_code != "S601" for finding in report.findings)
 
 
 def test_scan_bytes_flags_base64_encoded_nested_pickle_payloads() -> None:

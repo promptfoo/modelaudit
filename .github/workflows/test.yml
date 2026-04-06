@@ -716,8 +716,8 @@ jobs:
   build:
     name: Build and Package
     needs: changes
-    # Always build on main, otherwise only if Python files changed
-    if: github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.dependencies == 'true'
+    # Always build on main, otherwise only if Python/dependency/workflow files changed
+    if: github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

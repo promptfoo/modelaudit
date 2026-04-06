@@ -84,6 +84,48 @@ def test_scan_fixture_surfaces_package_only_findings_as_drift(
     assert compare_pickle_scanners._classify_delta("safe", legacy_result, adapter_result) == "potential_fp"
 
 
+def test_classify_delta_does_not_treat_unknown_to_clean_as_false_positive() -> None:
+    legacy_result = compare_pickle_scanners.NormalizedResult(
+        engine="legacy",
+        status="inconclusive",
+        verdict="unknown",
+        success=False,
+        warning_count=0,
+        critical_count=0,
+        info_count=0,
+        rule_codes=(),
+        messages=(),
+        metadata={},
+    )
+    package_result = compare_pickle_scanners.NormalizedResult(
+        engine="package",
+        status="complete",
+        verdict="clean",
+        success=True,
+        warning_count=0,
+        critical_count=0,
+        info_count=0,
+        rule_codes=(),
+        messages=(),
+        metadata={},
+    )
+
+    assert compare_pickle_scanners._classify_delta("safe", legacy_result, package_result) == "verdict_drift"
+
+
+def test_status_drift_fails_harness_exit_gate() -> None:
+    report = {
+        "comparisons": [
+            {
+                "package_delta": "status_drift",
+                "adapter_delta": "match",
+            }
+        ]
+    }
+
+    assert compare_pickle_scanners._has_exit_failure_drift(report) is True
+
+
 def test_build_report_summarizes_drift_by_fixture_label_and_preserves_safe_fp_audit() -> None:
     report = compare_pickle_scanners._build_report()
 

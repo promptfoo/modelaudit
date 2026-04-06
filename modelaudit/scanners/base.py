@@ -1,5 +1,4 @@
 import hashlib
-import json
 import logging
 import os
 
@@ -8,13 +7,17 @@ import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from enum import Enum
 from typing import Any, ClassVar, Final
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer
-
 from ..analysis.unified_context import UnifiedMLContext
-from ..config.explanations import get_message_explanation
+from ..scanner_results import (
+    INCONCLUSIVE_SCAN_OUTCOME,
+    Check,
+    CheckStatus,
+    Issue,
+    IssueSeverity,
+    ScanResult,
+)
 from ..utils.helpers.interrupt_handler import check_interrupted
 from .rule_mapper import get_embedded_code_rule_code, get_network_rule_code, get_secret_rule_code
 
@@ -35,11 +38,21 @@ except (ImportError, RecursionError):
 # Configure logging
 logger = logging.getLogger("modelaudit.scanners")
 
+__all__ = [
+    "INCONCLUSIVE_SCAN_OUTCOME",
+    "BaseScanner",
+    "Check",
+    "CheckStatus",
+    "Issue",
+    "IssueSeverity",
+    "ScanResult",
+    "make_trusted_source_provenance",
+]
+
 TRUSTED_HUGGINGFACE_SOURCES = frozenset({"huggingface"})
 _TRUSTED_SOURCE_PROVENANCE_TOKEN: Final[object] = object()
 _WHITELIST_STALE_WARNING_THRESHOLD_DAYS: Final[int] = 90
 _has_logged_stale_whitelist_warning = False
-INCONCLUSIVE_SCAN_OUTCOME: Final[str] = "inconclusive"
 
 
 @dataclass(frozen=True)
@@ -58,349 +71,6 @@ def make_trusted_source_provenance(model_id: str, model_source: str) -> object:
         model_source=model_source,
         token=_TRUSTED_SOURCE_PROVENANCE_TOKEN,
     )
-
-
-class IssueSeverity(Enum):
-    """Enum for issue severity levels"""
-
-    DEBUG = "debug"  # Debug information
-    INFO = "info"  # Informational, not a security concern
-    WARNING = "warning"  # Potential issue, needs review
-    CRITICAL = "critical"  # Definite security concern
-
-
-class CheckStatus(Enum):
-    """Enum for check status"""
-
-    PASSED = "passed"  # Check passed successfully
-    FAILED = "failed"  # Check failed (issue found)
-    SKIPPED = "skipped"  # Check was skipped
-
-
-class Check(BaseModel):
-    """Pydantic model representing a single security check performed during scanning"""
-
-    model_config = ConfigDict(
-        validate_assignment=True,
-        extra="allow",  # Allow extra fields for extensibility
-    )
-
-    name: str = Field(..., description="Name of the check performed")
-    status: CheckStatus = Field(..., description="Whether the check passed or failed")
-    message: str = Field(..., description="Description of what was checked")
-    severity: IssueSeverity | None = Field(None, description="Severity (only for failed checks)")
-    location: str | None = Field(None, description="File position, line number, etc.")
-    details: dict[str, Any] = Field(default_factory=dict, description="Additional check details")
-    why: str | None = Field(None, description="Explanation (mainly for failed checks)")
-    rule_code: str | None = Field(default=None, description="Rule code associated with this check")
-    timestamp: float = Field(default_factory=time.time, description="Timestamp when check was performed")
-
-    @field_serializer("status")
-    def serialize_status(self, status: CheckStatus) -> str:
-        """Serialize status enum to string value"""
-        return status.value
-
-    @field_serializer("severity")
-    def serialize_severity(self, severity: IssueSeverity | None) -> str | None:
-        """Serialize severity enum to string value"""
-        return severity.value if severity else None
-
-    def to_dict(self) -> dict[str, Any]:
-        """Convert the check to a dictionary for serialization (backward compatibility)"""
-        return self.model_dump(exclude_none=True, mode="json")
-
-    def __str__(self) -> str:
-        """String representation of the check"""
-        status_symbol = "✓" if self.status == CheckStatus.PASSED else "✗"
-        prefix = f"[{status_symbol}] {self.name}"
-        if self.rule_code:
-            prefix = f"[{self.rule_code}] {prefix}"
-        if self.location:
-            prefix += f" ({self.location})"
-        return f"{prefix}: {self.message}"
-
-
-class Issue(BaseModel):
-    """Pydantic model representing a single issue found during scanning"""
-
-    model_config = ConfigDict(
-        validate_assignment=True,
-        extra="allow",  # Allow extra fields for extensibility
-    )
-
-    message: str = Field(..., description="Description of the issue")
-    severity: IssueSeverity = Field(default=IssueSeverity.WARNING, description="Issue severity level")
-    location: str | None = Field(None, description="File position, line number, etc.")
-    details: dict[str, Any] = Field(default_factory=dict, description="Additional details about the issue")
-    why: str | None = Field(None, description="Explanation of why this is a security concern")
-    timestamp: float = Field(default_factory=time.time, description="Timestamp when issue was detected")
-    type: str | None = Field(None, description="Type of issue for categorization")
-    rule_code: str | None = Field(default=None, description="Rule code associated with this issue")
-
-    @field_serializer("severity")
-    def serialize_severity(self, severity: IssueSeverity) -> str:
-        """Serialize severity enum to string value"""
-        return severity.value
-
-    def to_dict(self) -> dict[str, Any]:
-        """Convert the issue to a dictionary for serialization (backward compatibility)"""
-        return self.model_dump(exclude_none=True, mode="json")
-
-    def __str__(self) -> str:
-        """String representation of the issue"""
-        severity_str = self.severity.value if hasattr(self.severity, "value") else str(self.severity)
-        prefix = f"[{severity_str.upper()}]"
-        if self.rule_code:
-            prefix = f"[{self.rule_code}] {prefix}"
-        if self.location:
-            prefix += f" ({self.location})"
-        return f"{prefix}: {self.message}"
-
-
-class ScanResult:
-    """Collects and manages issues found during scanning"""
-
-    def __init__(self, scanner_name: str = "unknown", scanner: "BaseScanner | None" = None):
-        self.scanner_name = scanner_name
-        self.scanner = scanner  # Reference to the scanner for whitelist checks
-        self.issues: list[Issue] = []
-        self.checks: list[Check] = []  # All checks performed (passed and failed)
-        self.start_time = time.time()
-        self.end_time: float | None = None
-        self.bytes_scanned: int = 0
-        self.success: bool = True
-        self.metadata: dict[str, Any] = {}
-
-    def add_check(
-        self,
-        name: str,
-        passed: bool,
-        message: str,
-        severity: IssueSeverity | None = None,
-        location: str | None = None,
-        details: dict[str, Any] | None = None,
-        why: str | None = None,
-        rule_code: str | None = None,
-    ) -> None:
-        """Add a check result (passed or failed) with rule support and rule-based severity."""
-        from ..config import get_config
-        from ..rules import RuleRegistry, Severity
-
-        severity_map = {
-            Severity.CRITICAL: IssueSeverity.CRITICAL,
-            Severity.HIGH: IssueSeverity.CRITICAL,
-            Severity.MEDIUM: IssueSeverity.WARNING,
-            Severity.LOW: IssueSeverity.INFO,
-            Severity.INFO: IssueSeverity.INFO,
-        }
-
-        # Auto-detect rule code if not provided.
-        # Preserve scanner-provided severity semantics by only attaching the
-        # code here, not remapping severity from rule defaults.
-        if not rule_code and not passed:
-            match = RuleRegistry.find_matching_rule(message)
-            if match:
-                rule_code, _rule = match
-
-        config = get_config()
-
-        # Check if rule is suppressed
-        if rule_code and config.is_suppressed(rule_code, location):
-            logger.debug(f"Suppressed {rule_code}: {message}")
-            return
-
-        # Apply severity override only when explicitly configured by the user.
-        if rule_code and rule_code in config.severity:
-            configured_severity = config.get_severity(rule_code, Severity.MEDIUM)
-            mapped = severity_map.get(configured_severity)
-            if mapped is not None:
-                severity = mapped
-
-        status = CheckStatus.PASSED if passed else CheckStatus.FAILED
-
-        # For failed checks, ensure we have a severity
-        if not passed and severity is None:
-            severity = IssueSeverity.WARNING
-
-        # Apply whitelist downgrading logic for failed checks if scanner is available
-        if not passed and self.scanner:
-            # At this point severity cannot be None due to the check above
-            assert severity is not None
-            severity, details = self.scanner._apply_whitelist_downgrade(severity, details)
-
-        check = Check(
-            name=name,
-            status=status,
-            message=message,
-            severity=severity,
-            location=location,
-            details=details or {},
-            why=why,
-            rule_code=rule_code,
-        )
-        self.checks.append(check)
-
-        # If the check failed, also add it as an issue for backward compatibility
-        if not passed:
-            if why is None:
-                why = get_message_explanation(message, context=self.scanner_name)
-            # Severity should never be None here due to check above, but add assertion for type checker
-            assert severity is not None
-
-            # Note: whitelist downgrading was already applied above (lines 160-163)
-            # before creating the Check, so we use the same downgraded severity here
-
-            issue = Issue(
-                message=message,
-                severity=severity,
-                location=location,
-                details=details or {},
-                why=why,
-                type=f"{self.scanner_name}_check",
-                rule_code=rule_code,
-            )
-            self.issues.append(issue)
-
-            log_level = (
-                logging.CRITICAL
-                if severity == IssueSeverity.CRITICAL
-                else (
-                    logging.WARNING
-                    if severity == IssueSeverity.WARNING
-                    else (logging.INFO if severity == IssueSeverity.INFO else logging.DEBUG)
-                )
-            )
-            logger.log(log_level, str(issue))
-        else:
-            # Log successful checks at DEBUG level
-            logger.debug(f"Check passed: {name} - {message}")
-
-    def _add_issue(
-        self,
-        message: str,
-        severity: IssueSeverity = IssueSeverity.WARNING,
-        location: str | None = None,
-        details: dict[str, Any] | None = None,
-        why: str | None = None,
-        rule_code: str | None = None,
-    ) -> None:
-        """Add an issue to the result with rule support"""
-        # For backward compatibility: INFO/DEBUG severities are treated as passing checks
-        passed = severity in (IssueSeverity.DEBUG, IssueSeverity.INFO)
-        self.add_check(
-            name="Legacy Security Check",
-            passed=passed,
-            message=message,
-            severity=severity,
-            location=location,
-            details=details,
-            why=why,
-            rule_code=rule_code,
-        )
-        if passed:
-            return
-
-    def add_issue(
-        self,
-        message: str,
-        severity: IssueSeverity = IssueSeverity.WARNING,
-        location: str | None = None,
-        details: dict[str, Any] | None = None,
-        why: str | None = None,
-        rule_code: str | None = None,
-    ) -> None:
-        """Backward-compatible public issue adder."""
-        self._add_issue(message, severity=severity, location=location, details=details, why=why, rule_code=rule_code)
-
-    def merge(self, other: "ScanResult") -> None:
-        """Merge another scan result into this one"""
-        self.issues.extend(other.issues)
-        self.checks.extend(other.checks)  # Merge checks as well
-        self.bytes_scanned += other.bytes_scanned
-        # Merge metadata dictionaries
-        for key, value in other.metadata.items():
-            if key in self.metadata and isinstance(self.metadata[key], dict) and isinstance(value, dict):
-                self.metadata[key].update(value)
-            else:
-                self.metadata[key] = value
-
-    def finish(self, success: bool = True) -> None:
-        """Mark the scan as finished"""
-        self.end_time = time.time()
-        self.success = success
-
-    @property
-    def duration(self) -> float:
-        """Return the duration of the scan in seconds"""
-        if self.end_time is None:
-            return time.time() - self.start_time
-        return self.end_time - self.start_time
-
-    @property
-    def has_errors(self) -> bool:
-        """Return True if there are any critical-level issues"""
-        return any(issue.severity == IssueSeverity.CRITICAL for issue in self.issues)
-
-    @property
-    def has_warnings(self) -> bool:
-        """Return True if there are any warning-level issues"""
-        return any(issue.severity == IssueSeverity.WARNING for issue in self.issues)
-
-    def to_dict(self) -> dict[str, Any]:
-        """Convert the scan result to a dictionary for serialization"""
-        # Only count WARNING and CRITICAL severity checks as failures
-        # INFO and DEBUG are informational - they should not count as failures
-        failed_checks_count = sum(
-            1
-            for c in self.checks
-            if c.status == CheckStatus.FAILED and c.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL)
-        )
-
-        return {
-            "scanner": self.scanner_name,
-            "success": self.success,
-            "duration": self.duration,
-            "bytes_scanned": self.bytes_scanned,
-            "issues": [issue.to_dict() for issue in self.issues],
-            "checks": [check.to_dict() for check in self.checks],  # Include all checks
-            "metadata": self.metadata,
-            "has_errors": self.has_errors,
-            "has_warnings": self.has_warnings,
-            "total_checks": len(self.checks),
-            "passed_checks": sum(1 for c in self.checks if c.status == CheckStatus.PASSED),
-            "failed_checks": failed_checks_count,
-        }
-
-    def to_json(self, indent: int = 2) -> str:
-        """Convert the scan result to a JSON string"""
-        return json.dumps(self.to_dict(), indent=indent)
-
-    def summary(self) -> str:
-        """Return a human-readable summary of the scan result"""
-        error_count = sum(1 for issue in self.issues if issue.severity == IssueSeverity.CRITICAL)
-        warning_count = sum(1 for issue in self.issues if issue.severity == IssueSeverity.WARNING)
-        info_count = sum(1 for issue in self.issues if issue.severity == IssueSeverity.INFO)
-
-        result = []
-        result.append(f"Scan completed in {self.duration:.2f}s")
-        result.append(
-            f"Scanned {self.bytes_scanned} bytes with scanner '{self.scanner_name}'",
-        )
-        result.append(
-            f"Found {len(self.issues)} issues ({error_count} critical, {warning_count} warnings, {info_count} info)",
-        )
-
-        # If there are any issues, show them
-        if self.issues:
-            result.append("\nIssues:")
-            for issue in self.issues:
-                result.append(f"  {issue}")
-
-        return "\n".join(result)
-
-    def __str__(self) -> str:
-        """String representation of the scan result"""
-        return self.summary()
 
 
 class BaseScanner(ABC):
@@ -545,7 +215,6 @@ class BaseScanner(ABC):
     @abstractmethod
     def scan(self, path: str) -> ScanResult:
         """Scan the model file or directory at the given path"""
-        pass
 
     def scan_with_cache(self, path: str) -> ScanResult:
         """
@@ -573,7 +242,7 @@ class BaseScanner(ABC):
         """Initialize the unified context for the current file."""
         from pathlib import Path as PathlibPath
 
-        from modelaudit.utils.sources.huggingface import extract_model_id_from_path
+        from modelaudit.utils.sources.huggingface_paths import extract_model_id_from_path
 
         path_obj = PathlibPath(path)
         file_size = self.get_file_size(path)
@@ -613,6 +282,38 @@ class BaseScanner(ABC):
             self._path_validation_result = None
 
         return result
+
+    def _run_preflight_checks(
+        self,
+        path: str,
+        *,
+        check_size_limit: bool = True,
+    ) -> ScanResult | None:
+        """Run shared path and optional size validation before a scanner's heavy parsing starts."""
+        path_check_result = self._check_path(path)
+        if path_check_result:
+            return path_check_result
+
+        if check_size_limit:
+            size_check_result = self._check_size_limit(path)
+            if size_check_result:
+                return size_check_result
+
+        return None
+
+    def _create_scan_result_after_preflight(
+        self,
+        path: str,
+        *,
+        check_size_limit: bool = True,
+    ) -> ScanResult:
+        """Create a scan result after shared preflight, or return the failing preflight result."""
+        preflight_result = self._run_preflight_checks(path, check_size_limit=check_size_limit)
+        if preflight_result:
+            return preflight_result
+
+        self.current_file_path = path
+        return self._create_result()
 
     def _start_scan_timer(self) -> None:
         """Start the scan timer for timeout tracking"""
@@ -1443,6 +1144,24 @@ class BaseScanner(ABC):
 
             self.progress_tracker.set_phase(ProgressPhase.INITIALIZING, f"Starting scan: {path}")
 
+    def _prepare_progress_for_scan(self, path: str) -> None:
+        """Initialize progress tracking and set up file-level progress state."""
+        self.current_file_path = path
+
+        if PROGRESS_AVAILABLE and self._enable_progress and not self.progress_tracker:
+            self._initialize_progress_tracker()
+
+        if self.progress_tracker:
+            self._setup_progress_for_file(path)
+
+    def _finalize_progress_for_scan(self, error: Exception | None = None) -> None:
+        """Complete progress tracking or report a scan error."""
+        if error is None:
+            self._complete_progress()
+            return
+
+        self._report_progress_error(error)
+
     # All progress tracking methods disabled to fix CI circular import issues
     def _update_progress_bytes(self, bytes_processed: int, current_item: str = "") -> None:
         """Update progress with bytes processed."""
@@ -1496,21 +1215,14 @@ class BaseScanner(ABC):
         This is a wrapper around the scan method that provides progress tracking.
         Subclasses should override scan() but can call this method for progress support.
         """
-        self.current_file_path = path
-
-        # Initialize progress tracking for this file
-        if PROGRESS_AVAILABLE and self._enable_progress and not self.progress_tracker:
-            self._initialize_progress_tracker()
-
-        if self.progress_tracker:
-            self._setup_progress_for_file(path)
+        self._prepare_progress_for_scan(path)
 
         try:
             result = self.scan(path)
-            self._complete_progress()
+            self._finalize_progress_for_scan()
             return result
         except Exception as e:
-            self._report_progress_error(e)
+            self._finalize_progress_for_scan(e)
             raise
 
     def get_progress_stats(self) -> dict[str, Any] | None:
