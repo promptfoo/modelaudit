@@ -62,6 +62,15 @@ SYSTEM_GLOBAL_VARIANTS = {"os.system", "posix.system", "nt.system"}
 # Import only what we need for the pickle scanner test
 
 
+def test_pickle_scanner_star_import_exports_scanner_class() -> None:
+    """Wildcard imports should still expose the scanner class after helper extraction."""
+    namespace: dict[str, object] = {}
+
+    exec("from modelaudit.scanners.pickle_scanner import *", namespace)
+
+    assert namespace["PickleScanner"] is PickleScanner
+
+
 def _contains_system_global(text: str) -> bool:
     return any(target in text for target in SYSTEM_GLOBAL_VARIANTS)
 

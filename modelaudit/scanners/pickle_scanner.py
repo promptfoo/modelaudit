@@ -2,7 +2,7 @@
 
 import io
 import os
-import pickletools
+import pickletools as pickletools
 import struct
 import time
 from collections import OrderedDict, deque
@@ -59,7 +59,6 @@ from .pickle_support import (
     _POST_BUDGET_GLOBAL_SCAN_LIMIT_BYTES,
     _POST_BUDGET_OPCODE_SCAN_LIMIT_OPCODES,
     _RAW_PATTERN_SCAN_LIMIT_BYTES,
-    _RESYNC_FAST_FORWARD_PROBE_BYTES,
     MalformedStackGlobalDetails,
     MalformedStackGlobalReason,
     StackGlobalOperandKind,
@@ -68,7 +67,6 @@ from .pickle_support import (
     _ExpansionHeuristicFinding,
     _ExpansionHeuristicStreamState,
     _find_nested_pickle_match,
-    _find_next_resync_stream_candidate_offset,
     _finish_with_inconclusive_contract,
     _format_stack_global_operand_preview,
     _format_stack_global_string_preview,
@@ -88,6 +86,12 @@ from .pickle_support import (
     _severity_priority,
     _should_ignore_opcode_sequence,
 )
+from .pickle_support import (
+    _RESYNC_FAST_FORWARD_PROBE_BYTES as _RESYNC_FAST_FORWARD_PROBE_BYTES,
+)
+from .pickle_support import (
+    _find_next_resync_stream_candidate_offset as _find_next_resync_stream_candidate_offset,
+)
 from .rule_mapper import (
     get_embedded_code_rule_code,
     get_encoding_rule_code,
@@ -98,13 +102,6 @@ from .rule_mapper import (
 
 COPYREG_EXTENSION_MODULE = "__copyreg_extension__"
 COPYREG_EXTENSION_PREFIX = "code_"
-
-__all__ = [
-    "_RESYNC_FAST_FORWARD_PROBE_BYTES",
-    "_find_next_resync_stream_candidate_offset",
-    "pickletools",
-]
-
 
 # ============================================================================
 # ML CONTEXT FILTERING SYSTEM
