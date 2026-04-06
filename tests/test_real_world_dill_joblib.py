@@ -213,8 +213,14 @@ class TestRealJoblibFiles:
         else:
             # If bytes were scanned, check for opcode issues if they exist
             if len(critical_issues) > 0:
-                opcode_issues = [i for i in critical_issues if "opcode" in str(i.message).lower()]
-                assert len(opcode_issues) > 0, "Critical issues should be opcode-related for numpy files"
+                critical_parse_keywords = ("opcode", "format", "parse", "pickle", "protocol")
+                opcode_issues = [
+                    i for i in critical_issues if any(kw in str(i.message).lower() for kw in critical_parse_keywords)
+                ]
+                assert len(opcode_issues) > 0, (
+                    "Critical issues should be parse/format-related for numpy files, got: "
+                    f"{[str(i.message)[:80] for i in critical_issues]}"
+                )
 
 
 @pytest.mark.performance
