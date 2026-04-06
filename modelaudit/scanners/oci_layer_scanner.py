@@ -48,6 +48,7 @@ class OciLayerScanner(BaseScanner):
     _MANIFEST_PROBE_CHUNK_BYTES: ClassVar[int] = 8192
     _MEMBER_HEADER_PROBE_BYTES: ClassVar[int] = 64
     _DEFAULT_MAX_LAYER_FILE_SIZE: ClassVar[int] = 10 * 1024 * 1024 * 1024
+    _REMOTE_LAYER_REF_SCHEMES: ClassVar[frozenset[str]] = frozenset({"http", "https", "s3", "gs", "oci"})
 
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
@@ -115,7 +116,7 @@ class OciLayerScanner(BaseScanner):
     def _is_remote_layer_ref(layer_ref: str) -> bool:
         """Return True when a layer reference points to a remote URL-like location."""
         parsed = urlparse(layer_ref.strip())
-        return bool(parsed.scheme and parsed.netloc)
+        return parsed.scheme.lower() in OciLayerScanner._REMOTE_LAYER_REF_SCHEMES and bool(parsed.netloc)
 
     @classmethod
     def _collect_layer_paths(cls, manifest_data: Any) -> list[str]:

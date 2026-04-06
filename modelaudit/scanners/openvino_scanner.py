@@ -64,6 +64,22 @@ def _skip_doctype_declaration(xml_prefix: bytes, start_offset: int) -> int | Non
     return None
 
 
+def _get_doctype_root_tag(xml_prefix: bytes, start_offset: int) -> str | None:
+    """Return the root element name declared by a DOCTYPE declaration."""
+    index = start_offset + len(b"<!DOCTYPE")
+    prefix_length = len(xml_prefix)
+    while index < prefix_length and chr(xml_prefix[index]).isspace():
+        index += 1
+
+    name_start = index
+    while index < prefix_length and xml_prefix[index : index + 1] not in b" \t\r\n\f[>":
+        index += 1
+
+    if index == name_start:
+        return None
+    return _local_tag_name(xml_prefix[name_start:index].decode("utf-8", "ignore"))
+
+
 def _looks_like_openvino_xml_prefix(xml_prefix: bytes) -> bool:
     """Sniff the first root element without relying on entity-expanding XML parsing."""
     index = 3 if xml_prefix.startswith(b"\xef\xbb\xbf") else 0
@@ -88,9 +104,10 @@ def _looks_like_openvino_xml_prefix(xml_prefix: bytes) -> bool:
             continue
 
         if xml_prefix[index : index + len(b"<!DOCTYPE")].upper() == b"<!DOCTYPE":
+            doctype_root_tag = _get_doctype_root_tag(xml_prefix, index)
             next_index = _skip_doctype_declaration(xml_prefix, index)
             if next_index is None:
-                return False
+                return doctype_root_tag in _OPENVINO_ROOT_TAGS
             index = next_index
             continue
 

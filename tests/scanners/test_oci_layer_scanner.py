@@ -347,6 +347,29 @@ class TestOciLayerScanner:
         )
         assert not any("https://cdn.example.com/layer.tar.gz" in issue.message for issue in result.issues)
 
+    def test_scan_manifest_validates_file_url_like_layer_refs(self, tmp_path: Path) -> None:
+        """URL-like local refs should still pass through path traversal validation."""
+        malformed_layer_ref = "file://../../outside/layer.tar.gz"
+        manifest = {
+            "schemaVersion": 2,
+            "layers": [
+                {"digest": "sha256:abc123", "urls": ["https://cdn.example.com/layer.tar.gz", malformed_layer_ref]}
+            ],
+        }
+        manifest_path = tmp_path / "file-url-layer.manifest"
+        manifest_path.write_text(json.dumps(manifest))
+
+        result = OciLayerScanner().scan(str(manifest_path))
+
+        assert result.success is False
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL
+            and "path traversal" in issue.message
+            and malformed_layer_ref in issue.message
+            for issue in result.issues
+        )
+        assert not any("https://cdn.example.com/layer.tar.gz" in issue.message for issue in result.issues)
+
     def test_scan_layer_with_non_scannable_files(self, tmp_path):
         """Test scanning layer containing files that don't match any scanner."""
         # Create a random binary file
