@@ -19,6 +19,10 @@ Create `modelaudit/scanners/<format>_scanner.py` with:
 - `scan()` that uses `result.add_check(...)` with clear severity and rationale
 - Path/size validation via base helpers before heavy parsing
 
+For large scanners, move reusable parser/state helpers into
+`modelaudit/scanners/<format>_support/` and keep `<format>_scanner.py` as the
+public class entrypoint plus orchestration layer.
+
 Skeleton:
 
 ```python
@@ -40,15 +44,10 @@ class ExampleScanner(BaseScanner):
         ...
 
     def scan(self, path: str) -> ScanResult:
-        path_check = self._check_path(path)
-        if path_check:
-            return path_check
+        result = self._create_scan_result_after_preflight(path)
+        if not result.success:
+            return result
 
-        size_check = self._check_size_limit(path)
-        if size_check:
-            return size_check
-
-        result = self._create_result()
         # Add checks here
         result.finish(success=not result.has_errors)
         return result
