@@ -969,6 +969,136 @@ def test_merge_missing_pickle_checks_fails_closed_for_inconclusive_notice_only_f
     assert target.metadata["analysis_incomplete"] is True
 
 
+def test_merge_missing_pickle_checks_trusts_legacy_boundary_for_benign_joblib_tail() -> None:
+    """A complete legacy joblib parse should keep benign package tail limitations from failing the scan."""
+    scanner = PickleScanner()
+    target = ScanResult(scanner_name="pickle", scanner=scanner)
+    target.add_check(
+        name="Pickle Protocol Version Check",
+        passed=True,
+        message="Valid pickle protocol version 5",
+        location="numpy_arrays.joblib (decompressed)",
+    )
+    target.metadata["first_pickle_end_pos"] = 282
+    target.bytes_scanned = 282
+    target.finish(success=True)
+
+    fallback = ScanResult(scanner_name="pickle", scanner=scanner)
+    fallback.add_check(
+        name="Standalone Pickle Notice",
+        passed=False,
+        message="Pickle parsing stopped before the stream was fully consumed: ValueError",
+        severity=IssueSeverity.INFO,
+        location="numpy_arrays.joblib (decompressed) (pos 227)",
+        details={
+            "pickle_source": "numpy_arrays.joblib (decompressed)",
+            "notice_code": "parse_incomplete",
+            "exception": "at position 226, opcode b'\\r' unknown",
+            "exception_type": "ValueError",
+            "analysis_incomplete": True,
+        },
+        rule_code="S902",
+    )
+    fallback.add_check(
+        name="Standalone Pickle Parse Failure",
+        passed=False,
+        message="Pickle parsing failed before full scan completion",
+        severity=IssueSeverity.CRITICAL,
+        location="numpy_arrays.joblib (decompressed) (pos 227)",
+        details={
+            "pickle_source": "numpy_arrays.joblib (decompressed)",
+            "parse_error": "at position 226, opcode b'\\r' unknown",
+            "failure_reason": "unknown_opcode_or_format_error",
+            "analysis_incomplete": True,
+        },
+        rule_code=None,
+    )
+    fallback.metadata["pickle_source"] = "numpy_arrays.joblib (decompressed)"
+    fallback.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+    fallback.metadata["scan_outcome_reasons"] = ["pickle_analysis_incomplete"]
+    fallback.metadata["analysis_incomplete"] = True
+    fallback.metadata["import_references"] = [
+        {
+            "import_reference": "joblib.numpy_pickle.NumpyArrayWrapper",
+            "module": "joblib.numpy_pickle",
+            "name": "NumpyArrayWrapper",
+            "opcode": "STACK_GLOBAL",
+            "position": 59,
+            "is_dangerous": False,
+        },
+        {
+            "import_reference": "numpy.ndarray",
+            "module": "numpy",
+            "name": "ndarray",
+            "opcode": "STACK_GLOBAL",
+            "position": 96,
+            "is_dangerous": False,
+        },
+    ]
+    fallback.finish(success=False)
+
+    _merge_missing_pickle_checks(target, fallback)
+
+    assert target.success is True
+    assert target.metadata["trusted_incomplete_tail"] is True
+    assert target.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert not any(check.name == "Standalone Pickle Parse Failure" for check in target.checks)
+    assert not any(issue.message == "Pickle parsing failed before full scan completion" for issue in target.issues)
+    assert any(issue.rule_code == "S902" for issue in target.issues)
+
+
+def test_merge_missing_pickle_checks_does_not_trust_boundary_for_dangerous_joblib_tail() -> None:
+    """A legacy boundary must not suppress package incompleteness when dangerous refs were observed."""
+    scanner = PickleScanner()
+    target = ScanResult(scanner_name="pickle", scanner=scanner)
+    target.add_check(
+        name="Pickle Protocol Version Check",
+        passed=True,
+        message="Valid pickle protocol version 5",
+        location="dangerous.joblib (decompressed)",
+    )
+    target.metadata["first_pickle_end_pos"] = 282
+    target.bytes_scanned = 282
+    target.finish(success=True)
+
+    fallback = ScanResult(scanner_name="pickle", scanner=scanner)
+    fallback.add_check(
+        name="Standalone Pickle Parse Failure",
+        passed=False,
+        message="Pickle parsing failed before full scan completion",
+        severity=IssueSeverity.CRITICAL,
+        location="dangerous.joblib (decompressed) (pos 227)",
+        details={
+            "pickle_source": "dangerous.joblib (decompressed)",
+            "parse_error": "at position 226, opcode b'\\r' unknown",
+            "failure_reason": "unknown_opcode_or_format_error",
+            "analysis_incomplete": True,
+        },
+        rule_code=None,
+    )
+    fallback.metadata["pickle_source"] = "dangerous.joblib (decompressed)"
+    fallback.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+    fallback.metadata["scan_outcome_reasons"] = ["pickle_analysis_incomplete"]
+    fallback.metadata["analysis_incomplete"] = True
+    fallback.metadata["import_references"] = [
+        {
+            "import_reference": "posix.system",
+            "module": "posix",
+            "name": "system",
+            "opcode": "GLOBAL",
+            "position": 59,
+            "is_dangerous": True,
+        },
+    ]
+    fallback.finish(success=False)
+
+    _merge_missing_pickle_checks(target, fallback)
+
+    assert target.success is False
+    assert "trusted_incomplete_tail" not in target.metadata
+    assert any(issue.message == "Pickle parsing failed before full scan completion" for issue in target.issues)
+
+
 @pytest.mark.parametrize(
     ("exception_type", "message"),
     [
