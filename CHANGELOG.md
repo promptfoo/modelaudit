@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.32](https://github.com/promptfoo/modelaudit/compare/v0.2.31...v0.2.32) (2026-04-05)
+
+### Bug Fixes
+
+- detect punctuated TensorRT tmp paths ([#867](https://github.com/promptfoo/modelaudit/issues/867)) ([9607530](https://github.com/promptfoo/modelaudit/commit/96075302de2d71b228be97e49698d6a1ad6b35bf))
+- fail closed on OpenVINO DOCTYPE parse errors ([#864](https://github.com/promptfoo/modelaudit/issues/864)) ([f5b19c4](https://github.com/promptfoo/modelaudit/commit/f5b19c48c7eab876e29f1f474c555b902fa9b6ce))
+- ignore OCI metadata URLs during layer discovery ([#866](https://github.com/promptfoo/modelaudit/issues/866)) ([0b24e3f](https://github.com/promptfoo/modelaudit/commit/0b24e3f7a0e013541bce100b64f1d69558bd807d))
+- reduce PMML subprocess extension false positives ([#869](https://github.com/promptfoo/modelaudit/issues/869)) ([5e6f79d](https://github.com/promptfoo/modelaudit/commit/5e6f79dc134267202b5a4b841a8946af865ebd15))
+- tolerate bounded CoreML custom block truncation ([#868](https://github.com/promptfoo/modelaudit/issues/868)) ([34df06d](https://github.com/promptfoo/modelaudit/commit/34df06dd2c12b69815a2a15f1273085856bebf64))
+
 ## [Unreleased]
 
 ### Bug Fixes
