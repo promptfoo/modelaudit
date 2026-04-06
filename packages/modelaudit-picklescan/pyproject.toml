@@ -1,0 +1,104 @@
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "modelaudit-picklescan"
+version = "0.1.0"
+description = "Standalone pickle security scanner extracted from ModelAudit"
+authors = [
+    { name = "Ian Webster", email = "ian@promptfoo.dev" },
+    { name = "Michael D'Angelo", email = "michael@promptfoo.dev" },
+    { name = "Yash Chhabria", email = "yash@promptfoo.dev" },
+]
+license = { text = "MIT" }
+readme = "README.md"
+keywords = ["pickle", "security", "model-scanning", "ml"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Security",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/modelaudit_picklescan"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/modelaudit_picklescan/py.typed" = "modelaudit_picklescan/py.typed"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "pyproject.toml",
+    "README.md",
+    "src/modelaudit_picklescan",
+    "src/modelaudit_picklescan/py.typed",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+extend-select = [
+    "I",
+    "W",
+    "E",
+    "Q",
+    "COM",
+    "UP",
+    "B",
+    "C4",
+    "SIM",
+    "RUF",
+]
+ignore = [
+    "COM812",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
+"tests/**/*.py" = ["S101", "F841"]
+
+[tool.ruff.lint.flake8-quotes]
+inline-quotes = "double"
+multiline-quotes = "double"
+docstring-quotes = "double"
+avoid-escape = true
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+    "--disable-warnings",
+    "--tb=short",
+]
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unreachable = true
+no_implicit_optional = true
+strict_equality = true
+show_error_codes = true
+show_column_numbers = true
+pretty = true
+check_untyped_defs = true
+disallow_incomplete_defs = true
+ignore_missing_imports = true

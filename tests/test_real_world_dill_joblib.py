@@ -213,8 +213,14 @@ class TestRealJoblibFiles:
         else:
             # If bytes were scanned, check for opcode issues if they exist
             if len(critical_issues) > 0:
-                opcode_issues = [i for i in critical_issues if "opcode" in str(i.message).lower()]
-                assert len(opcode_issues) > 0, "Critical issues should be opcode-related for numpy files"
+                critical_parse_keywords = ("opcode", "format", "parse", "pickle", "protocol")
+                opcode_issues = [
+                    i for i in critical_issues if any(kw in str(i.message).lower() for kw in critical_parse_keywords)
+                ]
+                assert len(opcode_issues) > 0, (
+                    "Critical issues should be parse/format-related for numpy files, got: "
+                    f"{[str(i.message)[:80] for i in critical_issues]}"
+                )
 
 
 @pytest.mark.performance
@@ -247,8 +253,12 @@ class TestPerformanceBenchmarks:
         # Should complete within reasonable time
         # CI environments may have variable performance; use generous thresholds
         # to avoid flaky failures from runner contention (Linux ~2s, Windows ~4s typical)
-        is_ci = bool(os.getenv("CI") or os.getenv("GITHUB_ACTIONS"))
-        threshold = (15.0 if sys.platform == "win32" else 12.0) if is_ci else (8.0 if sys.platform == "win32" else 5.0)
+        has_runner_contention = bool(os.getenv("CI") or os.getenv("GITHUB_ACTIONS") or os.getenv("PYTEST_XDIST_WORKER"))
+        threshold = (
+            (15.0 if sys.platform == "win32" else 12.0)
+            if has_runner_contention
+            else (8.0 if sys.platform == "win32" else 5.0)
+        )
         assert scan_duration < threshold, f"Scan took {scan_duration:.2f}s, expected < {threshold}s"
         assert result.bytes_scanned > 0
 

@@ -27,7 +27,7 @@ class JoblibScanner(BaseScanner):
     def __init__(self, config: dict[str, Any] | None = None):
         """Initialize Joblib scanning limits and the embedded Pickle scanner."""
         super().__init__(config)
-        self.pickle_scanner = PickleScanner(config)
+        self.pickle_scanner = PickleScanner(config=self.config)
         # Security limits
         self.max_decompression_ratio = self.config.get("max_decompression_ratio", 100.0)
         self.max_decompressed_size = self.config.get(
@@ -134,12 +134,12 @@ class JoblibScanner(BaseScanner):
         """Analyze a raw or decompressed pickle payload with CVE and opcode checks."""
         self._detect_cve_patterns(payload, result, context)
         self._scan_for_joblib_specific_threats(payload, result, context)
-        self.pickle_scanner.current_file_path = context
 
         with io.BytesIO(payload) as file_like:
-            sub_result = self.pickle_scanner._scan_pickle_bytes(
+            sub_result = self.pickle_scanner.scan_stream(
                 file_like,
                 len(payload),
+                source=context,
             )
         result.merge(sub_result)
         result.bytes_scanned = len(payload)

@@ -97,8 +97,11 @@ class NumPyScanner(BaseScanner):
     ) -> ScanResult:
         """Reuse PickleScanner analysis for object-dtype NumPy payloads."""
         pickle_scanner = PickleScanner(config=self.config)
-        pickle_scanner.current_file_path = context_path
-        return pickle_scanner._scan_pickle_bytes(file_obj, payload_size)
+        return pickle_scanner.scan_stream(
+            file_obj,
+            payload_size,
+            source=context_path,
+        )
 
     def _validate_dtype(self, dtype: Any) -> None:
         """Validate numpy dtype for security"""

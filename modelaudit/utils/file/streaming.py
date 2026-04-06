@@ -1,5 +1,6 @@
 """Streaming analysis support for cloud-hosted model files."""
 
+import inspect
 import io
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -21,6 +22,23 @@ def can_stream_analyze(url: str, scanner: "BaseScanner") -> bool:
     path = Path(parsed.path)
     suffix = path.suffix.lower()
     return suffix in {".pkl", ".pickle", ".joblib"}
+
+
+def _scan_stream_accepts_source_keyword(method: Any) -> bool:
+    """Return True when a scan_stream-like method accepts `source=` explicitly or via `**kwargs`."""
+    try:
+        signature = inspect.signature(method)
+    except (TypeError, ValueError):
+        return False
+
+    source_parameter = signature.parameters.get("source")
+    if source_parameter is not None:
+        return source_parameter.kind in {
+            inspect.Parameter.KEYWORD_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        }
+
+    return any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values())
 
 
 def stream_analyze_file(
@@ -87,6 +105,7 @@ def stream_analyze_file(
 
         if scan_result is None:
             partial_methods = [
+                ("scan_stream", True),
                 ("scan_bytes", False),
                 ("scan_fileobj", False),
                 ("_scan_pickle_bytes", True),
@@ -96,7 +115,13 @@ def stream_analyze_file(
                     method = getattr(scanner, method_name)
                     try:
                         temp_file.seek(0)
-                        scan_result = method(temp_file, bytes_to_read) if needs_size else method(temp_file)
+                        if method_name == "scan_stream" and needs_size:
+                            if _scan_stream_accepts_source_keyword(method):
+                                scan_result = method(temp_file, bytes_to_read, source=url)
+                            else:
+                                scan_result = method(temp_file, bytes_to_read)
+                        else:
+                            scan_result = method(temp_file, bytes_to_read) if needs_size else method(temp_file)
                         break
                     except Exception:
                         scan_result = None

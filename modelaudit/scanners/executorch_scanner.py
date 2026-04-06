@@ -1,10 +1,9 @@
 """Scanner for ExecuTorch model files (.pte)."""
 
-import io
 import os
 import tempfile
 import zipfile
-from typing import Any, ClassVar
+from typing import Any, BinaryIO, ClassVar, cast
 
 from ..utils import sanitize_archive_path
 from ..utils.file.detection import (
@@ -14,6 +13,9 @@ from ..utils.file.detection import (
 )
 from .base import BaseScanner, IssueSeverity, ScanResult
 from .pickle_scanner import PickleScanner
+from .picklescan_adapter import (
+    apply_pickle_member_context,
+)
 
 
 class ExecuTorchScanner(BaseScanner):
@@ -25,7 +27,7 @@ class ExecuTorchScanner(BaseScanner):
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         super().__init__(config)
-        self.pickle_scanner = PickleScanner(config)
+        self.pickle_scanner = PickleScanner(config=self.config)
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -118,19 +120,15 @@ class ExecuTorchScanner(BaseScanner):
                 bytes_scanned = 0
 
                 for name in pickle_files:
-                    data = z.read(name)
-                    bytes_scanned += len(data)
-                    with io.BytesIO(data) as file_like:
-                        sub_result = self.pickle_scanner._scan_pickle_bytes(file_like, len(data))
-                    for issue in sub_result.issues:
-                        if issue.details:
-                            issue.details["pickle_filename"] = name
-                        else:
-                            issue.details = {"pickle_filename": name}
-                        if not issue.location:
-                            issue.location = f"{path}:{name}"
-                        elif "pos" in issue.location:
-                            issue.location = f"{path}:{name} {issue.location}"
+                    member_info = z.getinfo(name)
+                    bytes_scanned += member_info.file_size
+                    with z.open(name, "r") as file_like:
+                        sub_result = self.pickle_scanner.scan_stream(
+                            cast(BinaryIO, file_like),
+                            member_info.file_size,
+                            source=f"{path}:{name}",
+                        )
+                    apply_pickle_member_context(sub_result, archive_path=path, member_name=name)
                     result.merge(sub_result)
 
                 for name in safe_entries:

@@ -170,6 +170,12 @@ dev = [
     "ty>=0.0.1a20",
 ]
 
+[tool.hatch.build.targets.wheel]
+packages = [
+    "modelaudit",
+    "packages/modelaudit-picklescan/src/modelaudit_picklescan",
+]
+
 [tool.uv]
 # Exclude platform-specific extras from universal lock file resolution
 # tensorrt only supports Linux and Windows
@@ -227,7 +233,7 @@ addopts = [
     "--disable-warnings",
     "--tb=short",
 ]
-testpaths = ["tests"]
+testpaths = ["tests", "packages/modelaudit-picklescan/tests"]
 markers = [
     # Test category markers
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
@@ -253,7 +259,7 @@ filterwarnings = [
 ]
 
 [tool.coverage.run]
-source = ["modelaudit"]
+source = ["modelaudit", "modelaudit_picklescan"]
 branch = true
 parallel = true
 omit = [
