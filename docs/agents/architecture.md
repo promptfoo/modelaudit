@@ -92,6 +92,7 @@ result.add_check(
 ## Key Files
 
 - `modelaudit/scanners/base.py`: Scanner interface and base classes
+- `modelaudit/scanners/<scanner>_support/`: Extracted helper modules for large scanners while preserving public `<scanner>_scanner.py` entrypoints
 - `modelaudit/core.py`: Main scanning orchestration logic
 - `modelaudit/cli.py`: Command-line interface
 - `pyproject.toml`: Dependencies and project configuration

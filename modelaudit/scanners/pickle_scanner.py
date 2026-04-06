@@ -2,13 +2,12 @@
 
 import io
 import os
-import pickletools
-import reprlib
+import pickletools as pickletools
 import struct
 import time
 from collections import OrderedDict, deque
-from dataclasses import asdict, dataclass, field
-from typing import Any, BinaryIO, ClassVar, Literal, TypedDict, TypeGuard
+from dataclasses import asdict
+from typing import Any, BinaryIO, ClassVar, TypeGuard
 
 from modelaudit.analysis.enhanced_pattern_detector import EnhancedPatternDetector, PatternMatch
 from modelaudit.analysis.entropy_analyzer import EntropyAnalyzer
@@ -37,6 +36,62 @@ from ..config.explanations import (
 from ..detectors.cve_patterns import analyze_cve_patterns, enhance_scan_result_with_cve
 from ..detectors.suspicious_symbols import DANGEROUS_OPCODES
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult, logger
+from .pickle_support import (
+    _EXPANSION_DUP_COUNT_THRESHOLD,
+    _EXPANSION_DUP_DENSITY_THRESHOLD,
+    _EXPANSION_EVENT_WINDOW,
+    _EXPANSION_GET_PUT_MIN_READS,
+    _EXPANSION_GET_PUT_RATIO_THRESHOLD,
+    _EXPANSION_GROWTH_BUILDERS,
+    _EXPANSION_MEMO_GROWTH_MIN_WRITES,
+    _EXPANSION_MEMO_GROWTH_STEPS_THRESHOLD,
+    _EXPANSION_RATIO_SUPPORTING_DUP_THRESHOLD,
+    _EXPANSION_RATIO_SUPPORTING_GROWTH_THRESHOLD,
+    _EXPANSION_TRIGGER_LABELS,
+    _MEMO_READ_OPCODES,
+    _MEMO_WRITE_OPCODES,
+    _NESTED_PICKLE_HEADER_SEARCH_LIMIT_BYTES,
+    _POST_BUDGET_EXPANSION_SCAN_LIMIT_BYTES,
+    _POST_BUDGET_GLOBAL_CONTEXT_BYTES,
+    _POST_BUDGET_GLOBAL_DEADLINE_CHECK_INTERVAL_BYTES,
+    _POST_BUDGET_GLOBAL_MAX_REFERENCE_FINDINGS,
+    _POST_BUDGET_GLOBAL_MEMO_LIMIT_ENTRIES,
+    _POST_BUDGET_GLOBAL_SCAN_LIMIT_BYTES,
+    _POST_BUDGET_OPCODE_SCAN_LIMIT_OPCODES,
+    _RAW_PATTERN_SCAN_LIMIT_BYTES,
+    MalformedStackGlobalDetails,
+    MalformedStackGlobalReason,
+    StackGlobalOperandKind,
+    _compute_pickle_length,
+    _decode_string_to_bytes,
+    _ExpansionHeuristicFinding,
+    _ExpansionHeuristicStreamState,
+    _find_nested_pickle_match,
+    _finish_with_inconclusive_contract,
+    _format_stack_global_operand_preview,
+    _format_stack_global_string_preview,
+    _genops_with_fallback,
+    _GenopsBudgetExceeded,
+    _get_context_aware_severity,
+    _is_plausible_python_module,
+    _is_short_period_repetition,
+    _looks_like_pickle,
+    _mark_inconclusive_scan_result,
+    _MutationTargetRef,
+    _PickleOpcodeAnalysis,
+    _PrimaryRefFinding,
+    _ResolvedImportRef,
+    _scan_result_has_security_findings,
+    _scan_structural_tamper_findings,
+    _severity_priority,
+    _should_ignore_opcode_sequence,
+)
+from .pickle_support import (
+    _RESYNC_FAST_FORWARD_PROBE_BYTES as _RESYNC_FAST_FORWARD_PROBE_BYTES,
+)
+from .pickle_support import (
+    _find_next_resync_stream_candidate_offset as _find_next_resync_stream_candidate_offset,
+)
 from .rule_mapper import (
     get_embedded_code_rule_code,
     get_encoding_rule_code,
@@ -45,528 +100,8 @@ from .rule_mapper import (
     get_pickle_opcode_rule_code,
 )
 
-_RESYNC_BUDGET = 8192  # Max bytes to scan forward when resyncing after an unknown opcode
 COPYREG_EXTENSION_MODULE = "__copyreg_extension__"
 COPYREG_EXTENSION_PREFIX = "code_"
-_STACK_GLOBAL_OPERAND_PREVIEW_MAX = 128
-_STACK_GLOBAL_BINARY_PREVIEW_BYTES = 8
-_STACK_GLOBAL_OPERAND_PREVIEWER = reprlib.Repr()
-_STACK_GLOBAL_OPERAND_PREVIEWER.maxstring = _STACK_GLOBAL_OPERAND_PREVIEW_MAX
-_STACK_GLOBAL_OPERAND_PREVIEWER.maxother = _STACK_GLOBAL_OPERAND_PREVIEW_MAX
-_STACK_GLOBAL_OPERAND_PREVIEWER.maxlist = 4
-_STACK_GLOBAL_OPERAND_PREVIEWER.maxtuple = 4
-_STACK_GLOBAL_OPERAND_PREVIEWER.maxset = 4
-_STACK_GLOBAL_OPERAND_PREVIEWER.maxfrozenset = 4
-_STACK_GLOBAL_OPERAND_PREVIEWER.maxdict = 4
-_RAW_PATTERN_SCAN_LIMIT_BYTES = 10 * 1024 * 1024
-_NESTED_PICKLE_HEADER_SEARCH_LIMIT_BYTES = 64 * 1024
-_NESTED_PICKLE_VALIDATION_WINDOW_BYTES = 8 * 1024
-_POST_BUDGET_GLOBAL_SCAN_LIMIT_BYTES = 100 * 1024 * 1024
-_POST_BUDGET_GLOBAL_CONTEXT_BYTES = 4096
-_POST_BUDGET_GLOBAL_MEMO_LIMIT_ENTRIES = 4096
-_POST_BUDGET_GLOBAL_MAX_REFERENCE_FINDINGS = 4096
-_POST_BUDGET_GLOBAL_DEADLINE_CHECK_INTERVAL_BYTES = 4096
-_POST_BUDGET_EXPANSION_SCAN_LIMIT_BYTES = 8 * 1024 * 1024
-_POST_BUDGET_OPCODE_SCAN_LIMIT_OPCODES = 500_000
-_MEMO_WRITE_OPCODES = frozenset({"PUT", "BINPUT", "LONG_BINPUT", "MEMOIZE"})
-_MEMO_READ_OPCODES = frozenset({"GET", "BINGET", "LONG_BINGET"})
-_EXPANSION_EVENT_WINDOW = 6
-_EXPANSION_GROWTH_BUILDERS = frozenset({"TUPLE", "TUPLE1", "TUPLE2", "TUPLE3", "LIST", "APPENDS", "APPEND"})
-_EXPANSION_DUP_COUNT_THRESHOLD = 128
-_EXPANSION_DUP_DENSITY_THRESHOLD = 0.10
-_EXPANSION_GET_PUT_RATIO_THRESHOLD = 32.0
-_EXPANSION_GET_PUT_MIN_READS = 128
-_EXPANSION_MEMO_GROWTH_MIN_WRITES = 64
-_EXPANSION_MEMO_GROWTH_STEPS_THRESHOLD = 32
-_EXPANSION_RATIO_SUPPORTING_DUP_THRESHOLD = 64
-_EXPANSION_RATIO_SUPPORTING_GROWTH_THRESHOLD = 16
-_EXPANSION_TRIGGER_LABELS = {
-    "suspicious_get_put_ratio": "high memo GET/PUT ratio",
-    "excessive_dup_usage": "dense DUP usage",
-    "memo_growth_chain": "iterative memo growth chain",
-}
-_BINARY_PICKLE_PROTOCOLS = frozenset({2, 3, 4, 5})
-_PICKLE_OPCODE_BYTES = frozenset(ord(op.code) for op in pickletools.opcodes)
-_TEXT_PICKLE_RESYNC_START_BYTES = frozenset(
-    {
-        ord("("),
-        ord("."),
-        ord("0"),
-        ord("N"),
-        ord("]"),
-        ord("c"),
-        ord("i"),
-    }
-)
-_TEXT_PICKLE_RESYNC_IMPORT_OPCODES = frozenset({ord("c"), ord("i")})
-_TEXT_PICKLE_RESYNC_NAME_SCAN_BYTES = 128 * 1024
-_TEXT_PICKLE_RESYNC_STRUCTURE_PROBE_OPCODES = 20
-_TEXT_PICKLE_RESYNC_NON_STRUCTURAL_OPCODES = frozenset({"GLOBAL", "INST", "MARK"})
-_RESYNC_FAST_FORWARD_PROBE_BYTES = 64 * 1024
-_RESYNC_FAST_FORWARD_TAIL_BYTES = max(
-    _NESTED_PICKLE_VALIDATION_WINDOW_BYTES,
-    (2 * _TEXT_PICKLE_RESYNC_NAME_SCAN_BYTES) + 2,
-)
-
-
-StackGlobalOperandKind = Literal["string", "missing_memo", "unknown", "non_string"]
-MalformedStackGlobalReason = Literal["insufficient_context", "missing_memo", "mixed_or_non_string"]
-
-
-class MalformedStackGlobalDetails(TypedDict):
-    module_kind: StackGlobalOperandKind
-    module: str
-    function_kind: StackGlobalOperandKind
-    function: str
-    reason: MalformedStackGlobalReason
-
-
-class _GenopsBudgetExceeded(Exception):
-    """Signal that opcode iteration stopped due to an explicit resource budget."""
-
-    def __init__(self, reason: str) -> None:
-        super().__init__(reason)
-        self.reason = reason
-
-
-@dataclass(frozen=True)
-class _NestedPickleMatch:
-    offset: int
-    sample_size: int
-    searched_bytes: int
-
-
-def _mark_inconclusive_scan_result(result: ScanResult, reason: str) -> None:
-    """Mark a scan result as inconclusive when analysis could not complete."""
-    existing_reasons = result.metadata.get("scan_outcome_reasons")
-    reasons = existing_reasons if isinstance(existing_reasons, list) else []
-
-    if reason not in reasons:
-        reasons.append(reason)
-
-    result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
-    result.metadata["scan_outcome_reasons"] = reasons
-    result.metadata["analysis_incomplete"] = True
-
-
-def _scan_result_has_security_findings(result: ScanResult) -> bool:
-    """Return True when the result includes WARNING/CRITICAL findings."""
-    return any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
-
-
-def _finish_with_inconclusive_contract(
-    result: ScanResult,
-    *,
-    default_success: bool,
-    allow_security_findings_override: bool = False,
-) -> None:
-    """Finalize success so inconclusive/no-finding scans fail closed."""
-    has_security_findings = _scan_result_has_security_findings(result)
-    if result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME and not has_security_findings:
-        result.finish(success=False)
-        return
-
-    result.finish(success=default_success or (allow_security_findings_override and has_security_findings))
-
-
-def _format_stack_global_string_preview(value: str) -> str:
-    """Return a bounded preview for malformed STACK_GLOBAL string operands."""
-    preview = _STACK_GLOBAL_OPERAND_PREVIEWER.repr(value)
-    if len(preview) >= 2 and preview[0] == preview[-1] and preview[0] in {"'", '"'}:
-        preview = preview[1:-1]
-    return preview
-
-
-def _format_stack_global_operand_preview(value: Any) -> str:
-    """Return a bounded diagnostic preview for malformed STACK_GLOBAL operands."""
-    if isinstance(value, (bytes, bytearray, memoryview)):
-        value_len = value.nbytes if isinstance(value, memoryview) else len(value)
-        prefix_bytes = bytes(value[:_STACK_GLOBAL_BINARY_PREVIEW_BYTES])
-        suffix = "..." if value_len > _STACK_GLOBAL_BINARY_PREVIEW_BYTES else ""
-        return f"{type(value).__name__}(len={value_len}, hex=0x{prefix_bytes.hex()}{suffix})"
-
-    preview = _STACK_GLOBAL_OPERAND_PREVIEWER.repr(value)
-    if len(preview) > _STACK_GLOBAL_OPERAND_PREVIEW_MAX:
-        preview = preview[:_STACK_GLOBAL_OPERAND_PREVIEW_MAX] + "...<truncated>"
-
-    preview_value_len: int | None
-    try:
-        preview_value_len = len(value)
-    except Exception:
-        preview_value_len = None
-
-    length_suffix = f" (len={preview_value_len})" if preview_value_len is not None else ""
-    return f"{type(value).__name__}:{preview}{length_suffix}"
-
-
-def _scan_structural_tamper_findings(file_data: bytes) -> list[dict[str, Any]]:
-    """Detect structurally suspicious pickle stream patterns.
-
-    This scanner intentionally focuses on true pickle-structure violations and keeps
-    severity low so malformed/truncated payloads are visible without overshadowing
-    direct code-execution signals.
-    """
-
-    findings: list[dict[str, Any]] = []
-    if not file_data:
-        return findings
-
-    offset = 0
-    max_separator_skip = 256
-
-    while offset < len(file_data):
-        stream = file_data[offset:]
-        bio = io.BytesIO(stream)
-        stream_opcode_count = 0
-        stream_had_stop = False
-        seen_proto_version: int | None = None
-
-        try:
-            for opcode, arg, pos in pickletools.genops(bio):
-                stream_opcode_count += 1
-                opcode_pos = int(pos) if pos is not None else 0
-                absolute_pos = offset + opcode_pos
-
-                if opcode.name == "PROTO":
-                    if stream_opcode_count > 1:
-                        findings.append(
-                            {
-                                "kind": "misplaced_proto",
-                                "stream_offset": offset,
-                                "position": absolute_pos,
-                                "protocol": arg,
-                            }
-                        )
-
-                    if seen_proto_version is not None:
-                        findings.append(
-                            {
-                                "kind": "duplicate_proto",
-                                "stream_offset": offset,
-                                "position": absolute_pos,
-                                "protocol": arg,
-                                "previous_protocol": seen_proto_version,
-                            }
-                        )
-                    seen_proto_version = int(arg) if isinstance(arg, int) else None
-
-                if opcode.name == "STOP":
-                    stream_had_stop = True
-                    offset = absolute_pos + 1
-                    break
-        except ValueError:
-            # Do not emit standalone invalid-opcode findings here. Legitimate
-            # pickle-adjacent formats can contain binary tails or protocol/
-            # opcode mismatches that trigger parser errors after a valid
-            # prefix, and surfacing those as tamper findings is too noisy.
-            # Instead, resync to the next likely binary pickle stream and
-            # continue looking for true structural violations.
-            probe_start = min(offset + 1, len(file_data))
-            probe_end = min(offset + _RESYNC_BUDGET, len(file_data))
-            next_offset = -1
-            for idx in range(probe_start, probe_end - 1):
-                if file_data[idx] == 0x80 and file_data[idx + 1] in (2, 3, 4, 5):
-                    next_offset = idx
-                    break
-
-            if next_offset >= 0:
-                offset = next_offset
-                continue
-
-            # If there is no next stream candidate, treat remaining bytes as non-pickle tail.
-            break
-        except Exception:
-            # Structural tamper detection is opportunistic and must not change
-            # the scanner's existing error-handling behavior for parse limits
-            # or framework-specific edge cases.
-            break
-
-        if stream_had_stop:
-            skipped = 0
-            while offset < len(file_data) and skipped < max_separator_skip:
-                if file_data[offset] == 0x80 and offset + 1 < len(file_data) and file_data[offset + 1] in (2, 3, 4, 5):
-                    break
-                offset += 1
-                skipped += 1
-            if skipped >= max_separator_skip and offset < len(file_data):
-                break
-            continue
-
-        # No STOP and no exception means empty parse; advance to avoid infinite loop.
-        offset += 1
-
-    return findings
-
-
-def _find_next_resync_stream_candidate_offset(search_window: bytes) -> int:
-    """Return the next likely pickle stream start in a probe window, or -1 if absent."""
-    for candidate in range(len(search_window)):
-        first_byte = search_window[candidate]
-
-        if first_byte == 0x80:
-            if (
-                candidate + 1 < len(search_window)
-                and search_window[candidate + 1] in _BINARY_PICKLE_PROTOCOLS
-                and (candidate + 2 >= len(search_window) or search_window[candidate + 2] in _PICKLE_OPCODE_BYTES)
-            ):
-                return candidate
-            continue
-
-        if first_byte not in _TEXT_PICKLE_RESYNC_START_BYTES:
-            continue
-
-        if first_byte in _TEXT_PICKLE_RESYNC_IMPORT_OPCODES:
-            module_end = search_window.find(
-                b"\n",
-                candidate + 1,
-                min(len(search_window), candidate + 1 + _TEXT_PICKLE_RESYNC_NAME_SCAN_BYTES),
-            )
-            if module_end == -1:
-                continue
-
-            function_end = search_window.find(
-                b"\n",
-                module_end + 1,
-                min(len(search_window), module_end + 1 + _TEXT_PICKLE_RESYNC_NAME_SCAN_BYTES),
-            )
-            if function_end == -1:
-                continue
-
-            try:
-                module_name = search_window[candidate + 1 : module_end].decode("utf-8")
-                function_name = search_window[module_end + 1 : function_end].decode("utf-8")
-            except UnicodeDecodeError:
-                continue
-
-            if (
-                _is_plausible_python_module(module_name)
-                and all(part.isidentifier() for part in function_name.split("."))
-                and _looks_like_pickle(search_window[candidate:])
-            ):
-                return candidate
-            continue
-
-        # MARK-prefixed protocol-0 streams such as `(cos\nsystem\n...` are
-        # validated with a bounded parser probe before rewinding the file cursor.
-        if _looks_like_pickle(search_window[candidate:]):
-            return candidate
-
-    return -1
-
-
-def _genops_with_fallback(
-    file_obj: BinaryIO,
-    *,
-    multi_stream: bool = False,
-    max_items: int | None = None,
-    deadline: float | None = None,
-) -> Any:
-    """
-    Wrapper around pickletools.genops that handles protocol mismatches.
-
-    Some files (especially joblib) may declare protocol 4 but use protocol 5 opcodes
-    like READONLY_BUFFER (0x0f). This function attempts to parse as much as possible
-    before hitting unknown opcodes, then tries to resync and continue scanning
-    rather than terminating on partial stream errors.
-
-    When *multi_stream* is True the generator continues parsing after the first STOP
-    opcode so that malicious payloads hidden in a second pickle stream are not missed.
-    Non-pickle separator bytes between streams are skipped (up to a limit) so that a
-    single junk byte cannot bypass detection.
-
-    Yields: (opcode, arg, pos) tuples from pickletools.genops
-    """
-    # Maximum number of consecutive non-pickle bytes to skip when resyncing
-    _MAX_RESYNC_BYTES = 256
-    resync_skipped = 0
-    # Track whether we've successfully parsed at least one complete stream
-    parsed_any_stream = False
-    yielded_items = 0
-
-    def _check_budget(*, pending_items: int = 0) -> None:
-        if max_items is not None and (yielded_items + pending_items) >= max_items:
-            raise _GenopsBudgetExceeded("max_items")
-        if deadline is not None and time.time() > deadline:
-            raise _GenopsBudgetExceeded("deadline")
-
-    while True:
-        stream_start = file_obj.tell()
-        had_opcodes = False
-        stream_error = False
-
-        if not parsed_any_stream:
-            # First stream: yield opcodes directly (no buffering needed)
-            try:
-                op_iter = pickletools.genops(file_obj)
-                while True:
-                    _check_budget()
-                    try:
-                        item = next(op_iter)
-                    except StopIteration:
-                        break
-                    had_opcodes = True
-                    yield item
-                    yielded_items += 1
-            except ValueError as e:
-                error_str = str(e).lower()
-                is_unknown_opcode = "opcode" in error_str and "unknown" in error_str
-                is_decode_or_text_error = (
-                    isinstance(e, UnicodeDecodeError)
-                    or "unicode" in error_str
-                    or "codec can't decode" in error_str
-                    or "no newline found" in error_str
-                )
-
-                if is_unknown_opcode or is_decode_or_text_error:
-                    if had_opcodes:
-                        logger.info(
-                            "Pickle stream parsing interrupted after partial opcode extraction; "
-                            "continuing with partial security analysis"
-                        )
-                        stream_error = True
-                    elif is_unknown_opcode:
-                        # Keep prior behavior for joblib-style protocol/opcode mismatches.
-                        logger.info(
-                            f"Protocol mismatch in pickle (joblib may use protocol 5 opcodes in protocol 4 files): {e}"
-                        )
-                    else:
-                        # No opcodes were parsed; allow outer error handling to report
-                        # malformed payloads instead of silently treating as empty.
-                        raise
-                else:
-                    raise
-        else:
-            # Subsequent streams: buffer opcodes so that partial streams
-            # (e.g. binary tensor data misinterpreted as opcodes) don't
-            # produce false positives.
-            buffered: list[Any] = []
-            needs_text_structure_probe = False
-            has_text_structure = False
-            try:
-                current_byte = file_obj.read(1)
-                file_obj.seek(stream_start, 0)
-                needs_text_structure_probe = bool(current_byte and current_byte[0] in _TEXT_PICKLE_RESYNC_START_BYTES)
-
-                op_iter = pickletools.genops(file_obj)
-                while True:
-                    # Do not emit buffered follow-on stream opcodes until the
-                    # stream has completed successfully. If the budget expires
-                    # here, let the caller surface the analysis truncation.
-                    _check_budget(pending_items=len(buffered))
-                    try:
-                        item = next(op_iter)
-                    except StopIteration:
-                        break
-                    had_opcodes = True
-                    buffered.append(item)
-
-                    if needs_text_structure_probe and not has_text_structure:
-                        opcode_name = item[0].name
-                        has_text_structure = opcode_name not in _TEXT_PICKLE_RESYNC_NON_STRUCTURAL_OPCODES
-                        if not has_text_structure and len(buffered) >= _TEXT_PICKLE_RESYNC_STRUCTURE_PROBE_OPCODES:
-                            buffered.clear()
-                            stream_error = True
-                            break
-            except ValueError:
-                # Any ValueError on a subsequent stream means we hit
-                # non-pickle data or a junk separator byte.
-                stream_error = True
-
-            if needs_text_structure_probe and not has_text_structure:
-                buffered.clear()
-                stream_error = True
-
-            if stream_error and had_opcodes:
-                # Partial stream: binary data was misinterpreted as opcodes.
-                # Discard the buffer but keep scanning — a valid malicious
-                # stream may follow.
-                if multi_stream:
-                    continue
-                return
-
-            if not stream_error:
-                # Stream completed successfully — yield buffered opcodes
-                for buffered_item in buffered:
-                    _check_budget()
-                    yield buffered_item
-                    yielded_items += 1
-
-        if stream_error and had_opcodes:
-            # First stream parse interruption after yielding some opcodes.
-            if multi_stream:
-                # Mark as parsed so subsequent streams are buffered, and
-                # keep scanning — a malicious payload may follow.
-                parsed_any_stream = True
-                continue
-            # Single-stream mode: return the parsed prefix for security analysis.
-            return
-
-        if not multi_stream:
-            return
-
-        if had_opcodes and not stream_error:
-            parsed_any_stream = True
-
-        if not had_opcodes:
-            # Resync: the current byte was not a valid pickle start.
-            # Skip one byte and keep searching for the next stream, up to a limit.
-            file_obj.seek(stream_start, 0)
-            if not file_obj.read(1):
-                return  # EOF
-            resync_skipped += 1
-            if resync_skipped >= _MAX_RESYNC_BYTES:
-                # Fast-forward search for the next likely protocol header so
-                # large padding blocks cannot terminate multi-stream scanning.
-                # Probe both binary protocol headers and protocol-0/1 text
-                # stream starts so long separator gaps do not hide legacy
-                # opcode payloads.
-                previous_tail = b""
-                while True:
-                    _check_budget()
-                    probe_start = file_obj.tell()
-                    probe = file_obj.read(_RESYNC_FAST_FORWARD_PROBE_BYTES)
-                    if not probe:
-                        return
-                    search_window = previous_tail + probe
-                    candidate = _find_next_resync_stream_candidate_offset(search_window)
-                    if candidate >= 0:
-                        file_obj.seek(probe_start - len(previous_tail) + candidate, 0)
-                        resync_skipped = 0
-                        break
-                    previous_tail = search_window[-_RESYNC_FAST_FORWARD_TAIL_BYTES:]
-            continue
-
-        # Found a valid stream — reset resync counter
-        resync_skipped = 0
-        # Check if there is another pickle stream after STOP
-        next_byte = file_obj.read(1)
-        if not next_byte:
-            return  # EOF
-        file_obj.seek(-1, 1)  # put the byte back for the next genops call
-
-
-def _compute_pickle_length(path: str) -> int:
-    """
-    Compute the exact length of pickle data by finding the STOP opcode position.
-
-    Args:
-        path: Path to the file containing pickle data
-
-    Returns:
-        The byte position where pickle data ends, or a fallback estimate
-    """
-    try:
-        with open(path, "rb") as f:
-            for opcode, _arg, pos in pickletools.genops(f):
-                if opcode.name == "STOP" and pos is not None:
-                    return pos + 1  # Include the STOP opcode itself
-        # If no STOP found, fallback to file size (malformed pickle)
-        return os.path.getsize(path)
-    except Exception:
-        # Fallback to conservative estimate on any error
-        file_size = os.path.getsize(path)
-        return min(file_size // 2, 64)
-
 
 # ============================================================================
 # ML CONTEXT FILTERING SYSTEM
@@ -2133,44 +1668,6 @@ def _detect_ml_context(
     return context
 
 
-def _is_plausible_python_module(name: str) -> bool:
-    """
-    Check whether *name* looks like a real Python module/package path.
-
-    Legitimate module names follow Python identifier rules:
-    - Each dotted segment is an ASCII Python identifier.
-    - Segments normally contain lowercase characters, may be all-uppercase
-      ASCII names, or appear in a short explicit allowlist for case-sensitive
-      imports such as ``PIL``.
-
-    Keep obviously malformed names rejected so arbitrary data strings are less
-    likely to be treated as imports, while still allowing valid mixed-case
-    segments such as ``EvilPkg`` and ``MyOrg.InternalPkg``.
-
-    Returns:
-        True if *name* plausibly refers to a real Python module.
-    """
-    if not name:
-        return False
-
-    # Fast reject: real module paths never contain whitespace.
-    if " " in name or "\t" in name:
-        return False
-
-    # Split on dots; each segment must be an ASCII Python identifier.
-    segments = name.split(".")
-    if not segments or any(s == "" or not s.isascii() or not s.isidentifier() for s in segments):
-        return False
-
-    return all(
-        any(char.islower() for char in seg)
-        or seg in _CASE_SENSITIVE_IMPORT_SEGMENTS
-        or (seg.isupper() and seg.isalpha())
-        for seg in segments
-    )
-
-
-_CASE_SENSITIVE_IMPORT_SEGMENTS: frozenset[str] = frozenset({"PIL", "Cython"})
 IMPORT_ONLY_ALWAYS_DANGEROUS_GLOBALS = frozenset(
     {
         ("dill", "load"),
@@ -2343,96 +1840,6 @@ def _is_risky_ml_module_prefix(mod: str) -> bool:
 def _is_copyreg_extension_ref(mod: str) -> bool:
     """Return True when a reference came from an EXT opcode extension lookup."""
     return mod == COPYREG_EXTENSION_MODULE
-
-
-@dataclass(frozen=True)
-class _ResolvedImportRef:
-    module: str
-    function: str
-    origin_index: int
-    origin_is_ext: bool = False
-
-
-@dataclass(frozen=True)
-class _MutationTargetRef:
-    kind: Literal["dict", "object"]
-    callable_ref: tuple[str, str] | None = None
-
-
-@dataclass
-class _ExpansionHeuristicStreamState:
-    stream_id: int
-    opcode_count: int = 0
-    memo_reads: int = 0
-    memo_writes: int = 0
-    dup_count: int = 0
-    memo_growth_steps: int = 0
-    max_memo_index: int = -1
-    next_memo_index: int = 0
-    last_written_index: int | None = None
-    last_position: int = 0
-    event_window: list[tuple[str, int | str]] = field(default_factory=list)
-
-
-@dataclass(frozen=True)
-class _ExpansionHeuristicFinding:
-    stream_id: int
-    position: int
-    opcode_count: int
-    memo_reads: int
-    memo_writes: int
-    get_put_ratio: float
-    dup_count: int
-    dup_density: float
-    memo_growth_steps: int
-    memo_slots_used: int
-    triggers: tuple[str, ...]
-
-
-@dataclass
-class _PrimaryRefFinding:
-    check_index: int
-    issue_index: int
-
-
-@dataclass
-class _PickleOpcodeAnalysis:
-    opcodes: list[tuple[Any, Any, int | None]] = field(default_factory=list)
-    globals_found: set[tuple[str, str, str]] = field(default_factory=set)
-    sequence_results: list[Any] = field(default_factory=list)
-    stack_global_refs: dict[int, tuple[str, str]] = field(default_factory=dict)
-    callable_refs: dict[int, tuple[str, str]] = field(default_factory=dict)
-    callable_origin_refs: dict[int, int] = field(default_factory=dict)
-    callable_origin_is_ext: dict[int, bool] = field(default_factory=dict)
-    malformed_stack_globals: dict[int, MalformedStackGlobalDetails] = field(default_factory=dict)
-    mutation_target_refs: dict[int, _MutationTargetRef] = field(default_factory=dict)
-    executed_import_origins: set[int] = field(default_factory=set)
-    executed_ref_keys: set[tuple[str, str]] = field(default_factory=set)
-    max_analyzed_end_offset: int = 0
-    max_analyzed_offset: int = -1
-    first_pickle_end_pos: int | None = None
-    opcode_count: int = 0
-    max_stack_depth: int = 0
-    stack_depth_warnings: list[dict[str, int | str]] = field(default_factory=list)
-    extreme_stack_depth_event: dict[str, int | str] | None = None
-    opcode_budget_exceeded: bool = False
-    timeout_exceeded: bool = False
-    error: Exception | None = None
-
-
-_SEVERITY_PRIORITY = {
-    IssueSeverity.DEBUG: 0,
-    IssueSeverity.INFO: 1,
-    IssueSeverity.WARNING: 2,
-    IssueSeverity.CRITICAL: 3,
-}
-
-
-def _severity_priority(severity: IssueSeverity | None) -> int:
-    """Return an ordering key for failed-check severity comparisons."""
-    if severity is None:
-        return -1
-    return _SEVERITY_PRIORITY.get(severity, -1)
 
 
 def _resolve_copyreg_extension(code: Any, origin_index: int) -> _ResolvedImportRef:
@@ -3159,239 +2566,6 @@ def _is_actually_dangerous_string(s: str, ml_context: dict) -> str | None:
                 return "potential_base64"
 
     return None
-
-
-def _is_short_period_repetition(s: str, max_period: int = 16) -> bool:
-    """Return True for strings made by repeating a short token like ``ABCD1234``."""
-    if len(s) < max_period * 2:
-        return False
-    if len(s) > 10 * 1024 * 1024:
-        return False
-
-    for period in range(2, min(max_period, len(s) // 2) + 1):
-        if len(s) % period == 0:
-            unit = s[:period]
-            if all(s[i : i + period] == unit for i in range(0, len(s), period)):
-                return True
-
-    return False
-
-
-def _looks_like_pickle(data: bytes) -> bool:
-    """Check if the given bytes resemble a pickle payload with robust validation."""
-    import io
-
-    if not data or len(data) < 2:
-        return False
-
-    # Quick validation: Check for valid pickle protocol markers
-    first_byte = data[0]
-
-    # Protocol 2+ starts with \x80 followed by protocol number
-    if first_byte == 0x80:
-        if len(data) < 2:
-            return False
-        protocol = data[1]
-        if protocol not in (2, 3, 4, 5):
-            return False
-    # Protocol 0/1 must start with valid opcodes
-    elif first_byte not in (
-        ord("("),
-        ord("]"),
-        ord("}"),
-        ord("c"),
-        ord("i"),
-        ord("l"),
-        ord("d"),
-        ord("t"),
-        ord("p"),
-        ord("g"),
-        ord("I"),
-        ord("L"),
-        ord("F"),
-        ord("S"),
-        ord("U"),
-        ord("N"),
-        ord("V"),
-        ord("M"),  # Additional valid opcodes
-    ):
-        return False
-
-    try:
-        stream = io.BytesIO(data)
-        valid_opcodes = 0
-        has_non_mark_structure = False
-
-        for opcode_count, (opcode, _arg, _pos) in enumerate(pickletools.genops(stream), 1):
-            # Count opcodes that are definitely pickle-specific
-            if opcode.name in {
-                "BINPUT",
-                "EMPTY_LIST",
-                "GLOBAL",
-                "INST",
-                "MARK",
-                "NONE",
-                "POP",
-                "STOP",
-                "TUPLE",
-                "LIST",
-                "DICT",
-                "SETITEM",
-                "BUILD",
-                "REDUCE",
-            }:
-                valid_opcodes += 1
-            if opcode.name not in {"GLOBAL", "INST", "MARK"}:
-                has_non_mark_structure = True
-
-            # Minimal protocol-0 import streams such as `ccollections\nOrderedDict\n.`
-            # only contain GLOBAL + STOP, so accept them once STOP is observed.
-            if (
-                opcode.name == "STOP"
-                and has_non_mark_structure
-                and (valid_opcodes >= 2 or data[0] not in {ord("("), ord("c"), ord("i")})
-            ):
-                return True
-
-            # Need multiple valid opcodes plus at least one non-MARK structure
-            # opcode so repeated `(` padding is never accepted as a stream.
-            if opcode_count >= 3 and valid_opcodes >= 2 and has_non_mark_structure:
-                return True
-
-            # Prevent infinite loops on malformed data
-            if opcode_count > 20:
-                break
-
-    except Exception as e:
-        logger.debug("Error analyzing pickle structure: %s", e)
-        return False
-
-    return False
-
-
-def _find_nested_pickle_match(data: bytes | bytearray) -> _NestedPickleMatch | None:
-    """Find a nested pickle within a bounded search window.
-
-    The scanner previously only checked the first 1024 bytes of embedded blobs,
-    which let attackers hide inner pickle streams behind padding. This helper
-    keeps the work bounded while scanning for plausible binary pickle headers
-    within the first search window.
-    """
-    data_bytes = bytes(data)
-    if len(data_bytes) < 2:
-        return None
-
-    search_limit = min(len(data_bytes), _NESTED_PICKLE_HEADER_SEARCH_LIMIT_BYTES)
-    validation_limit = min(len(data_bytes), _NESTED_PICKLE_VALIDATION_WINDOW_BYTES)
-
-    # Fast path: payload starts with a pickle stream (also covers protocol 0/1).
-    if _looks_like_pickle(data_bytes[:validation_limit]):
-        return _NestedPickleMatch(
-            offset=0,
-            sample_size=validation_limit,
-            searched_bytes=search_limit,
-        )
-
-    if search_limit < 3:
-        return None
-
-    cursor = 0
-    # Binary pickle headers need three readable bytes: PROTO, protocol, opcode.
-    max_header_start = search_limit - 3
-
-    # Scan the full bounded window. A fixed candidate cap is bypassable because
-    # valid-looking header triplets can be packed densely ahead of the real stream.
-    while cursor <= max_header_start:
-        header_offset = data_bytes.find(b"\x80", cursor, max_header_start + 1)
-        if header_offset == -1:
-            break
-        cursor = header_offset + 1
-
-        protocol = data_bytes[header_offset + 1]
-        next_opcode = data_bytes[header_offset + 2]
-        if protocol not in _BINARY_PICKLE_PROTOCOLS or next_opcode not in _PICKLE_OPCODE_BYTES:
-            continue
-
-        sample_end = min(len(data_bytes), header_offset + _NESTED_PICKLE_VALIDATION_WINDOW_BYTES)
-        if _looks_like_pickle(data_bytes[header_offset:sample_end]):
-            return _NestedPickleMatch(
-                offset=header_offset,
-                sample_size=sample_end - header_offset,
-                searched_bytes=search_limit,
-            )
-
-    return None
-
-
-def _decode_string_to_bytes(s: str) -> list[tuple[str, bytes]]:
-    """Attempt to decode a string from common encodings with stricter validation."""
-    import base64
-    import binascii
-    import re
-
-    candidates: list[tuple[str, bytes]] = []
-
-    # More strict base64 validation
-    try:
-        # Must be reasonable length and proper base64 format
-        if (
-            16 <= len(s) <= 10000  # Reasonable length bounds
-            and len(s) % 4 == 0
-            and re.fullmatch(r"[A-Za-z0-9+/]+=*", s)  # Proper base64 chars with padding
-            and s.count("=") <= 2  # At most 2 padding chars
-            and not s.replace("=", "").endswith("=")  # Padding only at end
-        ):
-            decoded = base64.b64decode(s)
-            # Additional validation: decoded should be reasonable binary data
-            if len(decoded) >= 8:  # At least 8 bytes for meaningful content
-                candidates.append(("base64", decoded))
-    except Exception as e:
-        logger.debug("Failed to decode potential base64 string: %s", e)
-
-    # More strict hex validation
-    try:
-        hex_str = s
-        if "\\x" in s:
-            hex_str = s.replace("\\x", "")
-        if (
-            16 <= len(hex_str) <= 5000  # Reasonable length
-            and len(hex_str) % 2 == 0
-            and re.fullmatch(r"[0-9a-fA-F]+", hex_str)
-            and not re.match(r"^(.)\1*$", hex_str)  # Not all same character
-        ):
-            decoded = binascii.unhexlify(hex_str)
-            if len(decoded) >= 8:  # At least 8 bytes
-                candidates.append(("hex", decoded))
-    except Exception as e:
-        logger.debug("Failed to decode potential hex string: %s", e)
-
-    return candidates
-
-
-def _should_ignore_opcode_sequence(opcodes: list[tuple], ml_context: dict) -> bool:
-    """
-    Determine if an opcode sequence should be ignored based on ML context.
-
-    SECURITY: Never skip opcode analysis entirely. ML context can reduce
-    sensitivity but critical security checks must always run.
-    """
-    # NEVER skip opcode analysis, regardless of ML confidence
-    # Opcode sequence analysis is a critical security check
-    return False
-
-
-def _get_context_aware_severity(
-    base_severity: IssueSeverity,
-    ml_context: dict,
-    issue_type: str = "",
-) -> IssueSeverity:
-    """
-    Return base severity without adjustments.
-
-    Confidence-based severity downgrading has been removed to prevent security bypasses.
-    All issues are reported at their base severity level.
-    """
-    return base_severity
 
 
 # ============================================================================
