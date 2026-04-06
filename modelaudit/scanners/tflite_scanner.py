@@ -51,15 +51,10 @@ class TFLiteScanner(BaseScanner):
         return _has_tflite_magic_bytes(header)
 
     def scan(self, path: str) -> ScanResult:
-        path_check_result = self._check_path(path)
-        if path_check_result:
-            return path_check_result
+        result = self._create_scan_result_after_preflight(path)
+        if not result.success:
+            return result
 
-        size_check = self._check_size_limit(path)
-        if size_check:
-            return size_check
-
-        result = self._create_result()
         result.metadata["file_size"] = self.get_file_size(path)
 
         if not HAS_TFLITE:

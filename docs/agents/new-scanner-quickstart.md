@@ -40,15 +40,10 @@ class ExampleScanner(BaseScanner):
         ...
 
     def scan(self, path: str) -> ScanResult:
-        path_check = self._check_path(path)
-        if path_check:
-            return path_check
+        result = self._create_scan_result_after_preflight(path)
+        if not result.success:
+            return result
 
-        size_check = self._check_size_limit(path)
-        if size_check:
-            return size_check
-
-        result = self._create_result()
         # Add checks here
         result.finish(success=not result.has_errors)
         return result

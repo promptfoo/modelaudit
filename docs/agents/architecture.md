@@ -33,7 +33,9 @@ class MyScanner(BaseScanner):
 
     def scan(self, path: str) -> ScanResult:
         """Scan the file and return results."""
-        result = self._create_result()
+        result = self._create_scan_result_after_preflight(path)
+        if not result.success:
+            return result
         # Scanning logic here
         result.finish(success=not result.has_errors)
         return result
