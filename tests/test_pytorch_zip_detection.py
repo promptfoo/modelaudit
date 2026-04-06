@@ -18,8 +18,10 @@ from modelaudit.utils.file.detection import detect_file_format
 
 
 def _write_pytorch_zip_metadata(zf: zipfile.ZipFile, prefix: str = "archive") -> None:
-    zf.writestr(f"{prefix}/version", "3\n")
-    zf.writestr(f"{prefix}/byteorder", "little")
+    normalized_prefix = prefix.strip("/")
+    member_prefix = f"{normalized_prefix}/" if normalized_prefix else ""
+    zf.writestr(f"{member_prefix}version", "3\n")
+    zf.writestr(f"{member_prefix}byteorder", "little")
 
 
 class TestPyTorchZipDetection:
