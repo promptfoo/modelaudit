@@ -5,6 +5,8 @@ Dynamically extracts all scannable file extensions from the scanner registry
 to ensure we always know what ModelAudit can scan.
 """
 
+from ..scanner_registry_metadata import SCANNER_REGISTRY_METADATA
+
 
 def get_all_scannable_extensions() -> set[str]:
     """
@@ -27,10 +29,8 @@ def get_all_scannable_extensions() -> set[str]:
         >>> '.zip' in extensions  # Zip scanner
         True
     """
-    from ..scanners import _registry
-
     all_extensions = set()
-    for scanner_info in _registry._scanners.values():
+    for scanner_info in SCANNER_REGISTRY_METADATA.values():
         extensions = scanner_info.get("extensions", [])
         all_extensions.update(extensions)
 

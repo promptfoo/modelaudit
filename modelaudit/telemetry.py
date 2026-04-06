@@ -23,7 +23,7 @@ from urllib.parse import urlparse
 
 import yaml
 
-from . import __version__
+from .version import __version__
 
 # Type variable for generic function decoration
 F = TypeVar("F", bound=Callable[..., Any])

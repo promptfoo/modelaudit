@@ -3,6 +3,7 @@ Tests for lazy loading functionality in the scanner registry.
 """
 
 import pickle
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -268,11 +269,33 @@ class TestBackwardsCompatibility:
             assert _registry.has_scanner_class(class_name)
             assert _registry._get_scanner_id_for_class(class_name) == scanner_id
 
-        for scanner_id in ("pickle", "pytorch_zip", "manifest"):
-            class_name = _registry._scanners[scanner_id]["class"]
+        for scanner_id, scanner_info in _registry._scanners.items():
+            if scanner_info.get("dependencies"):
+                continue
+            class_name = scanner_info["class"]
             scanner_class = getattr(scanners, class_name)
+            registry_class = _registry.load_scanner_by_id(scanner_id)
+            assert scanner_class is not None
+            assert registry_class is not None
+            assert registry_class is scanner_class
             assert issubclass(scanner_class, BaseScanner)
             assert scanner_class.__name__ == class_name
+
+
+def test_telemetry_import_does_not_load_scanners_package() -> None:
+    """Importing telemetry should not pull in the scanner package through __version__."""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys, modelaudit.telemetry; print('modelaudit.scanners' in sys.modules)",
+        ],
+        capture_output=True,
+        check=True,
+        text=True,
+    )
+
+    assert result.stdout.strip() == "False"
 
 
 class TestPerformanceCharacteristics:

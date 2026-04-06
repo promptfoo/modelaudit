@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 # Lazy import to avoid circular dependency
 if TYPE_CHECKING:
-    from ...scanners.base import ScanResult
+    from ...scanner_results import ScanResult
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +101,7 @@ class LargeFileHandler:
             return self._scan_optimized()
 
     def _scan_normal(self) -> "ScanResult":
-        from ...scanners.base import ScanResult
+        from ...scanner_results import ScanResult
 
         """Normal scanning for small files."""
         self._report_progress(f"Scanning {self.file_name}", 0)
@@ -113,7 +113,7 @@ class LargeFileHandler:
         return result
 
     def _scan_chunked(self) -> "ScanResult":
-        from ...scanners.base import IssueSeverity, ScanResult
+        from ...scanner_results import IssueSeverity, ScanResult
 
         """Chunked scanning for medium files."""
         result = ScanResult(scanner_name=self.scanner.name)

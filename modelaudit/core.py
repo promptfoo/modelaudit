@@ -15,8 +15,10 @@ from modelaudit.integrations.license_checker import (
     collect_license_metadata,
 )
 from modelaudit.models import ModelAuditResultModel, ScanConfigModel, create_initial_audit_result
+from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, Check, Issue, IssueSeverity, ScanResult
 from modelaudit.scanners import _registry
-from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
+from modelaudit.scanners.archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY
+from modelaudit.scanners.base import BaseScanner
 from modelaudit.telemetry import record_file_type_detected, record_issue_found, record_scanner_used
 from modelaudit.utils import is_within_directory, resolve_dvc_file, should_skip_file
 from modelaudit.utils.file.detection import (
@@ -165,7 +167,6 @@ def _add_scan_result_to_model(
     """Helper function to add scan result data to Pydantic model."""
 
     from .models import FileMetadataModel
-    from .scanners.base import Check, Issue
 
     # Update byte counts
     results.bytes_scanned += file_result.bytes_scanned
@@ -255,8 +256,6 @@ def _add_issue_to_model(
 ) -> None:
     """Helper function to add an issue directly to the Pydantic model."""
     import time
-
-    from .scanners.base import Issue
 
     # Convert string severity to enum
     severity_enum = {
@@ -1006,8 +1005,6 @@ def scan_model_directory_or_file(
                             results.scanner_names.append(scanner_name)
 
                         # Add issues for each file path that shares this content using Pydantic models
-                        from .scanners.base import Issue
-
                         for issue in file_result.issues:
                             issue_dict = issue.to_dict() if hasattr(issue, "to_dict") else issue
                             if isinstance(issue_dict, dict):
@@ -1333,8 +1330,8 @@ def scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
     Returns:
         ScanResult object with the scan results
     """
-    if config is None:
-        config = {}
+    config = {} if config is None else dict(config)
+    config.setdefault(NESTED_SCAN_CALLBACK_CONFIG_KEY, scan_file)
     validate_scan_config(config)
 
     # Delegate to internal implementation - cache decorator handles caching

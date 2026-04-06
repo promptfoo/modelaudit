@@ -12,8 +12,9 @@ from typing import Literal
 
 import pytest
 
+from modelaudit.core import scan_file
 from modelaudit.scanners import SCANNER_REGISTRY, ScannerRegistry, _registry
-from modelaudit.scanners.base import BaseScanner
+from modelaudit.scanners.base import BaseScanner, IssueSeverity
 from tests.helpers import create_mock_pytorch_zip
 
 TarWriteMode = Literal["w:gz", "w:bz2", "w:xz"]
@@ -234,14 +235,16 @@ def test_representative_scanner_descriptors_match_scanner_class_metadata(scanner
     assert scanner_info["class"] == scanner_class.__name__
     assert scanner_info["description"] == scanner_class.description
 
-    descriptor_extensions = set(scanner_info["extensions"])
+    explicitly_routed_extensions = set(scanner_info["extensions"])
     scanner_extensions = set(scanner_class.supported_extensions)
     scanner_only_extensions = set(scanner_info.get("scanner_only_extensions", []))
     content_routed_extensions = set(scanner_info.get("content_routed_extensions", []))
+    descriptor_extensions = explicitly_routed_extensions | content_routed_extensions
 
-    assert scanner_extensions == descriptor_extensions | scanner_only_extensions
-    assert not (scanner_only_extensions & descriptor_extensions)
+    assert scanner_extensions == explicitly_routed_extensions | scanner_only_extensions
+    assert not (scanner_only_extensions & explicitly_routed_extensions)
     assert not (scanner_only_extensions & content_routed_extensions)
+    assert content_routed_extensions <= descriptor_extensions
 
 
 @pytest.mark.parametrize(
@@ -447,6 +450,31 @@ def test_get_scanner_for_path_routes_extensionless_readme_to_metadata_scanner(tm
     readme_path.write_text("# Model Card\n\nSafe documentation.\n")
 
     _assert_scanner_for_path(readme_path, "metadata")
+
+
+@pytest.mark.parametrize("filename", ["README.md.bak", "model_card.tmp"])
+def test_get_scanner_for_path_does_not_route_metadata_near_match_suffixes(
+    tmp_path: Path,
+    filename: str,
+) -> None:
+    metadata_near_match = tmp_path / filename
+    metadata_near_match.write_text("# Safe near-match documentation.\n")
+
+    scanner_class = ScannerRegistry().get_scanner_for_path(str(metadata_near_match))
+
+    assert scanner_class is None or scanner_class.name != "metadata"
+
+
+def test_get_scanner_for_path_routes_extensionless_readme_zip_to_zip_and_scans_payload(tmp_path: Path) -> None:
+    evil_pickle = Path(__file__).parent.parent / "assets/samples/pickles/evil.pickle"
+    disguised_readme = _write_zip_archive(tmp_path / "README", {"payload.pkl": evil_pickle.read_bytes()})
+
+    _assert_scanner_for_path(disguised_readme, "zip")
+
+    result = scan_file(str(disguised_readme))
+
+    assert result.scanner_name == "zip"
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
 def test_get_scanner_for_path_routes_model_manifest_json_to_manifest_scanner(tmp_path: Path) -> None:

@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
 if TYPE_CHECKING:
-    from ...scanners.base import ScanResult
+    from ...scanner_results import ScanResult
 
 logger = logging.getLogger(__name__)
 
@@ -130,7 +130,7 @@ class MemoryMappedHandler:
         Returns:
             ScanResult with findings
         """
-        from ...scanners.base import IssueSeverity, ScanResult
+        from ...scanner_results import IssueSeverity, ScanResult
 
         result = ScanResult(scanner_name=self.scanner.name)
         bytes_scanned = 0
@@ -187,7 +187,7 @@ class MemoryMappedHandler:
 
     def _analyze_window(self, data: bytes, offset: int) -> "ScanResult":
         """Analyze a window of data using the actual scanner's checks."""
-        from ...scanners.base import IssueSeverity, ScanResult
+        from ...scanner_results import IssueSeverity, ScanResult
 
         result = ScanResult(scanner_name=self.scanner.name)
 
@@ -254,7 +254,7 @@ class ParallelShardHandler:
         self.scanner_class = scanner_class
 
     def scan_shards(self, progress_callback: Callable[[str, float], None] | None = None) -> "ScanResult":
-        from ...scanners.base import IssueSeverity, ScanResult
+        from ...scanner_results import IssueSeverity, ScanResult
 
         """
         Scan all shards in parallel.
@@ -314,7 +314,7 @@ class ParallelShardHandler:
         return result
 
     def _scan_single_shard(self, shard_path: str) -> "ScanResult":
-        from ...scanners.base import ScanResult
+        from ...scanner_results import ScanResult
 
         """Scan a single shard file."""
         scanner = self.scanner_class()
@@ -386,7 +386,7 @@ class AdvancedFileHandler:
         return any(hasattr(self.scanner, attr) for attr in ("_scan_with_mmap", "_analyze_chunk", "_analyze_bytes"))
 
     def _fail_closed_large_file_coverage(self, *, threshold_bytes: int) -> "ScanResult":
-        from ...scanners.base import IssueSeverity, ScanResult
+        from ...scanner_results import IssueSeverity, ScanResult
 
         """Abort with an operational-style result when large-file coverage would be partial."""
         result = ScanResult(scanner_name=self.scanner.name)
@@ -423,7 +423,7 @@ class AdvancedFileHandler:
         return result
 
     def _scan_sharded_model(self) -> "ScanResult":
-        from ...scanners.base import IssueSeverity, ScanResult
+        from ...scanner_results import IssueSeverity, ScanResult
 
         """Scan a sharded model."""
         result = ScanResult(scanner_name=self.scanner.name)
@@ -465,7 +465,7 @@ class AdvancedFileHandler:
         return mmap_scanner.scan_with_mmap(self.progress_callback)
 
     def _scan_large_file_distributed(self) -> "ScanResult":
-        from ...scanners.base import IssueSeverity, ScanResult
+        from ...scanner_results import IssueSeverity, ScanResult
 
         """Scan very large files using only bounded, scanner-aware analysis."""
         logger.debug(f"Scanning file ({self.total_size:,} bytes) with bounded large-file analysis")

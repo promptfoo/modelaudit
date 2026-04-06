@@ -7,6 +7,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, Optional
 
+from ..scanner_registry_metadata import get_scanner_registry_metadata
 from .base import BaseScanner, Check, CheckStatus, Issue, IssueSeverity, ScanResult
 
 logger = logging.getLogger(__name__)
@@ -94,6 +95,10 @@ class ScannerRegistry:
 
     def _init_registry(self) -> None:
         """Initialize the scanner registry with metadata"""
+        self._scanners = get_scanner_registry_metadata()
+        if self._scanners:
+            return
+
         # Order matters - more specific scanners should come before generic ones
         self._scanners = {
             "pickle": {
@@ -694,6 +699,12 @@ class ScannerRegistry:
         if file_ext and file_ext not in candidate_extensions:
             candidate_extensions.append(file_ext)
 
+        is_zip_file = False
+        try:
+            is_zip_file = os.path.isfile(path) and zipfile.is_zipfile(path)
+        except OSError:
+            return None
+
         for candidate_extension in candidate_extensions:
             for scanner_id, scanner_info in sorted_scanners:
                 extensions = scanner_info.get("extensions", [])
@@ -705,32 +716,23 @@ class ScannerRegistry:
                 if scanner_class and scanner_class.can_handle(path):
                     return scanner_class
 
+        # Some ZIP-backed artifacts intentionally use pickle/checkpoint suffixes.
+        # If stricter extension-specific scanners all decline, fall back to the
+        # generic ZIP scanner so helper-level routing does not drop coverage.
+        if is_zip_file:
+            scanner_class = self._load_scanner("zip")
+            if scanner_class and scanner_class.can_handle(path):
+                return scanner_class
+
         # Manifest-like config files sometimes intentionally use generic or
-        # missing extensions, so keep the filename-pattern fallback.
+        # missing extensions, so keep the descriptor-owned filename fallback.
         for scanner_id, scanner_info in sorted_scanners:
-            if scanner_id == "metadata":
-                if not self._is_model_metadata_file(filename, scanner_info):
-                    continue
-            elif scanner_id == "manifest":
-                if not self._is_aiml_manifest_file(filename):
-                    continue
-            else:
+            if not self._is_content_routed_filename(filename, scanner_info):
                 continue
 
             scanner_class = self._load_scanner(scanner_id)
             if scanner_class and scanner_class.can_handle(path):
                 return scanner_class
-
-        # Some ZIP-backed artifacts intentionally use pickle/checkpoint suffixes.
-        # If stricter extension-specific scanners all decline, fall back to the
-        # generic ZIP scanner so helper-level routing does not drop coverage.
-        try:
-            if os.path.isfile(path) and zipfile.is_zipfile(path):
-                scanner_class = self._load_scanner("zip")
-                if scanner_class and scanner_class.can_handle(path):
-                    return scanner_class
-        except OSError:
-            return None
 
         return None
 
@@ -808,14 +810,32 @@ class ScannerRegistry:
     @staticmethod
     def _is_model_metadata_file(filename: str, scanner_info: dict[str, Any]) -> bool:
         """Check descriptor-declared model metadata filename routes."""
+        return ScannerRegistry._is_content_routed_filename(filename, scanner_info)
+
+    @staticmethod
+    def _is_content_routed_filename(filename: str, scanner_info: dict[str, Any]) -> bool:
+        """Check descriptor-declared filename routes without arbitrary suffix fallback."""
         if not filename:
             return False
 
-        content_routed_filenames = scanner_info.get("content_routed_filenames", [])
-        return any(
-            filename == routed_name or filename.startswith(f"{routed_name}.")
-            for routed_name in content_routed_filenames
-        )
+        content_routed_filenames = {
+            str(routed_name).lower() for routed_name in scanner_info.get("content_routed_filenames", [])
+        }
+        if filename in content_routed_filenames:
+            return True
+
+        allowed_extensions = {str(extension).lower() for extension in scanner_info.get("extensions", [])}
+        allowed_extensions.discard("")
+        if not allowed_extensions:
+            return False
+
+        for routed_name in content_routed_filenames:
+            if "".join(Path(routed_name).suffixes):
+                continue
+            if any(filename == f"{routed_name}{extension}" for extension in allowed_extensions):
+                return True
+
+        return False
 
 
 # Global registry instance

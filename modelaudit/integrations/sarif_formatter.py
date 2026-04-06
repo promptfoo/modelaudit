@@ -12,7 +12,7 @@ from urllib.parse import quote
 
 from modelaudit import __version__
 from modelaudit.models import ModelAuditResultModel
-from modelaudit.scanners.base import IssueSeverity
+from modelaudit.scanner_results import IssueSeverity
 
 
 def format_sarif_output(
