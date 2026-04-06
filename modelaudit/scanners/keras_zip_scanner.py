@@ -29,6 +29,7 @@ from ..config.explanations import (
     get_pattern_explanation,
 )
 from ..utils.file.detection import _normalize_archive_member_name, _read_zip_member_bounded
+from .archive_member_security import is_executable_archive_member_name
 from .base import BaseScanner, IssueSeverity, ScanResult
 from .keras_utils import (
     check_custom_loss_config,
@@ -85,20 +86,6 @@ _GET_FILE_PATTERN = re.compile(r"get_file", re.IGNORECASE)
 _URL_PATTERN = re.compile(r"https?://", re.IGNORECASE)
 _URL_SCHEME_PATTERN = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
 _WINDOWS_ABSOLUTE_PATH_PATTERN = re.compile(r"^(?:[a-zA-Z]:[\\/]|\\\\)")
-_EXECUTABLE_ARCHIVE_EXTENSIONS = (
-    ".sh",
-    ".bash",
-    ".cmd",
-    ".exe",
-    ".dll",
-    ".so",
-    ".dylib",
-    ".scr",
-    ".com",
-    ".bat",
-    ".ps1",
-)
-_VERSIONED_SHARED_OBJECT_EXTENSION_RE = re.compile(r"\.so(?:\.[0-9]+)+$")
 _KERAS_CONFIG_ENTRY = "config.json"
 _KERAS_CONFIG_MAX_BYTES = 10 * 1024 * 1024
 _KERAS_METADATA_ENTRY = "metadata.json"
@@ -131,12 +118,6 @@ class _AmbiguousKerasArchiveMemberError(Exception):
         )
         self.member_name = member_name
         self.candidate_filenames = candidate_filenames
-
-
-def _is_executable_archive_member(normalized_name: str) -> bool:
-    return normalized_name.endswith(_EXECUTABLE_ARCHIVE_EXTENSIONS) or bool(
-        _VERSIONED_SHARED_OBJECT_EXTENSION_RE.search(normalized_name)
-    )
 
 
 class KerasZipScanner(BaseScanner):
@@ -454,7 +435,7 @@ class KerasZipScanner(BaseScanner):
                             location=f"{path}/{filename}",
                             details={"filename": filename},
                         )
-                    elif _is_executable_archive_member(normalized_name):
+                    elif is_executable_archive_member_name(normalized_name):
                         result.add_check(
                             name="Executable File Detection",
                             passed=False,

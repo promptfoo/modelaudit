@@ -140,7 +140,12 @@ def test_pytorch_zip_scanner_detects_case_insensitive_native_library_members(tmp
     executable_issues = [
         issue for issue in result.issues if issue.message and "Executable file found in PyTorch model" in issue.message
     ]
-    assert len(executable_issues) >= 3
+    executable_files = {issue.details.get("file") for issue in executable_issues}
+    assert {
+        "archive/data/MALICIOUS.SO",
+        "archive/data/libpayload.SO.6",
+        "archive/data/plugin.Dylib",
+    }.issubset(executable_files)
     assert all(issue.severity == IssueSeverity.CRITICAL for issue in executable_issues)
 
 

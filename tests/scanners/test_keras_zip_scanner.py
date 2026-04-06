@@ -861,13 +861,13 @@ __import__('pickle').loads(data)
             zf.writestr("plugin.Dylib", b"\xfe\xed\xfa\xcf")
 
         result = scanner.scan(str(archive_path))
-        suspicious_files = [
-            check.message
+        suspicious_filenames = {
+            check.details.get("filename")
             for check in result.checks
             if "Python file found in Keras ZIP" in check.message
             or "Executable file found in Keras ZIP" in check.message
-        ]
-        assert len(suspicious_files) >= 5, f"Should detect uppercase suspicious files, found: {suspicious_files}"
+        }
+        assert {"MALWARE.PY", "run.SH", "plugin.SO", "libpayload.SO.6", "plugin.Dylib"}.issubset(suspicious_filenames)
 
     def test_native_library_near_match_extension_stays_clean(self, tmp_path: Path) -> None:
         """Native-library extension near matches should not be treated as executable archive members."""
