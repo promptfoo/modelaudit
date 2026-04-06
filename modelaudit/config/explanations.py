@@ -484,8 +484,8 @@ def get_explanation(category: str, specific_item: str | None = None) -> str | No
             return PATTERN_EXPLANATIONS[specific_item]
         case "tf_op" if specific_item in TF_OP_EXPLANATIONS:
             return TF_OP_EXPLANATIONS[specific_item]
-        case _:
-            return None
+
+    return None
 
 
 # Convenience functions for common use cases
