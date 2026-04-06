@@ -8,8 +8,9 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = {
     "pickle": {
         "module": "modelaudit.scanners.pickle_scanner",
         "class": "PickleScanner",
-        "description": "Scans pickle files for malicious code",
-        "extensions": [".pkl", ".pickle", ".dill", ".pt", ".pth", ".ckpt"],
+        "description": "Scans Python pickle files for suspicious code references",
+        "extensions": [".pkl", ".pickle", ".dill", ".bin", ".pt", ".pth", ".ckpt"],
+        "scanner_only_extensions": [".joblib"],
         "priority": 1,
         "dependencies": [],
         "numpy_sensitive": False,
@@ -26,8 +27,9 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = {
     "tf_savedmodel": {
         "module": "modelaudit.scanners.tf_savedmodel_scanner",
         "class": "TensorFlowSavedModelScanner",
-        "description": "Scans TensorFlow SavedModel files",
+        "description": "Scans TensorFlow SavedModel for suspicious operations",
         "extensions": [".pb", ""],
+        "header_formats": ["tensorflow_directory", "protobuf"],
         "priority": 4,
         "dependencies": ["tensorflow"],
         "numpy_sensitive": True,
@@ -44,8 +46,9 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = {
     "keras_zip": {
         "module": "modelaudit.scanners.keras_zip_scanner",
         "class": "KerasZipScanner",
-        "description": "Scans ZIP-based Keras model files",
+        "description": "Scans ZIP-based Keras model files for suspicious configurations and Lambda layers",
         "extensions": [".keras"],
+        "content_routed_extensions": [".zip"],
         "priority": 4,
         "dependencies": [],
         "numpy_sensitive": False,
@@ -53,8 +56,9 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = {
     "keras_h5": {
         "module": "modelaudit.scanners.keras_h5_scanner",
         "class": "KerasH5Scanner",
-        "description": "Scans Keras H5 model files",
+        "description": "Scans Keras H5 model files for suspicious layer configurations",
         "extensions": [".h5", ".hdf5", ".keras"],
+        "header_formats": ["hdf5", "keras"],
         "priority": 5,
         "dependencies": ["h5py"],
         "numpy_sensitive": True,
@@ -89,7 +93,7 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = {
     "pytorch_zip": {
         "module": "modelaudit.scanners.pytorch_zip_scanner",
         "class": "PyTorchZipScanner",
-        "description": "Scans PyTorch ZIP-based model files",
+        "description": "Scans PyTorch model files for suspicious code in embedded pickles",
         "extensions": [".pt", ".pth", ".ckpt", ".pkl", ".bin"],
         "priority": 2,
         "dependencies": [],
@@ -107,8 +111,9 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = {
     "gguf": {
         "module": "modelaudit.scanners.gguf_scanner",
         "class": "GgufScanner",
-        "description": "Scans GGUF/GGML model files",
-        "extensions": [".gguf", ".ggml"],
+        "description": "Validates GGUF/GGML model file headers, metadata, and tensor integrity",
+        "extensions": [".gguf", ".ggml", ".ggmf", ".ggjt", ".ggla", ".ggsa"],
+        "header_formats": ["gguf", "ggml"],
         "priority": 7,
         "dependencies": [],
         "numpy_sensitive": False,
@@ -116,7 +121,7 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = {
     "joblib": {
         "module": "modelaudit.scanners.joblib_scanner",
         "class": "JoblibScanner",
-        "description": "Scans joblib serialized files",
+        "description": "Scans joblib files by decompressing and analyzing embedded pickle",
         "extensions": [".joblib"],
         "priority": 8,
         "dependencies": [],
@@ -134,8 +139,9 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = {
     "skops": {
         "module": "modelaudit.scanners.skops_scanner",
         "class": "SkopsScanner",
-        "description": "Scans skops files for CVE-2025-54412, CVE-2025-54413, CVE-2025-54886",
+        "description": "Scans skops files for CVE-2025-54412, CVE-2025-54413, CVE-2025-54886 vulnerabilities",
         "extensions": [".skops"],
+        "content_routed_extensions": [".zip"],
         "priority": 8,
         "dependencies": [],
         "numpy_sensitive": False,
@@ -170,7 +176,7 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = {
     "manifest": {
         "module": "modelaudit.scanners.manifest_scanner",
         "class": "ManifestScanner",
-        "description": "Scans manifest and configuration files",
+        "description": "Scans model manifest files for blacklisted names and terms",
         "extensions": [
             ".json",
             ".yaml",
@@ -183,6 +189,22 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = {
             ".manifest",
             ".model",
             ".metadata",
+        ],
+        "content_routed_filenames": [
+            "config.json",
+            "model.json",
+            "tokenizer.json",
+            "params.json",
+            "hyperparams.yaml",
+            "training_args.json",
+            "dataset_info.json",
+            "environment.yml",
+            "conda.yaml",
+            "requirements.txt",
+            "metadata.json",
+            "index.json",
+            "tokenizer_config.json",
+            "model_config.json",
         ],
         "priority": 12,
         "dependencies": [],
@@ -298,7 +320,7 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = {
     "tar": {
         "module": "modelaudit.scanners.tar_scanner",
         "class": "TarScanner",
-        "description": "Scans TAR archive files",
+        "description": "Scans TAR archive files and their contents recursively",
         "extensions": [".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz"],
         "priority": 98,
         "dependencies": [],
@@ -316,8 +338,9 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = {
     "metadata": {
         "module": "modelaudit.scanners.metadata_scanner",
         "class": "MetadataScanner",
-        "description": "Scans model metadata files for security issues",
-        "extensions": [".json", ".md", ".markdown", ".rst", ".yml", ".yaml"],
+        "description": "Scans model documentation files for security issues",
+        "extensions": [".md", ".markdown", ".rst", ".txt", ".yml", ".yaml"],
+        "content_routed_filenames": ["readme", "model_card"],
         "priority": 1,
         "dependencies": [],
         "numpy_sensitive": False,
@@ -397,7 +420,7 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = {
     "compressed": {
         "module": "modelaudit.scanners.compressed_scanner",
         "class": "CompressedScanner",
-        "description": "Scans standalone compressed wrappers and forwards decompressed payloads",
+        "description": "Scans standalone compressed wrappers and routes inner payloads to existing scanners",
         "extensions": [".gz", ".bz2", ".xz", ".lz4", ".zlib"],
         "priority": 95,
         "dependencies": [],
@@ -421,13 +444,17 @@ def get_scanner_registry_metadata() -> dict[str, dict[str, Any]]:
     for scanner_id, scanner_info in SCANNER_REGISTRY_METADATA.items():
         copied_info = dict(scanner_info)
 
-        extensions = copied_info.get("extensions")
-        if isinstance(extensions, list):
-            copied_info["extensions"] = list(extensions)
-
-        dependencies = copied_info.get("dependencies")
-        if isinstance(dependencies, list):
-            copied_info["dependencies"] = list(dependencies)
+        for list_key in (
+            "content_routed_extensions",
+            "content_routed_filenames",
+            "dependencies",
+            "extensions",
+            "header_formats",
+            "scanner_only_extensions",
+        ):
+            values = copied_info.get(list_key)
+            if isinstance(values, list):
+                copied_info[list_key] = list(values)
 
         metadata[scanner_id] = copied_info
 

@@ -15,6 +15,7 @@
 ## Routing & Coverage Invariants
 
 - Prefer trusted file structure and bounded content sniffing over extension-only routing, especially for ZIP-like containers and nested archives.
+- Keep scanner routing metadata descriptor-owned in `ScannerRegistry`; header-format aliases, content-routed extensions, and lazy class exports should come from one descriptor entry, with `can_handle()` as the final content gate.
 - For routing, prefiltering, or archive-recursion changes, add one malicious positive regression and one benign near-match negative regression.
 - If a scanner aborts to avoid partial coverage, make the result operationally explicit (`success=False` with a clear error message) and preserve consistent exit-code and cache behavior.
 
@@ -55,6 +56,10 @@ Scanners are registered lazily via `ScannerRegistry` in `modelaudit/scanners/__i
     "class": "MyScanner",
     "description": "Scans My format",
     "extensions": [".my"],
+    "header_formats": ["my_magic"],  # Optional aliases from detect_file_format()
+    "content_routed_extensions": [".zip"],  # Optional suffixes gated by can_handle()
+    "scanner_only_extensions": [".alt"],  # Optional intentional class-vs-routing differences
+    "content_routed_filenames": ["readme"],  # Optional extensionless filename routes
     "priority": 10,
     "dependencies": [],
     "numpy_sensitive": False,
