@@ -6,6 +6,7 @@ import struct
 import sys
 import tempfile
 import unittest
+import zipfile
 from collections import Counter
 from collections.abc import Callable, Iterator
 from io import BytesIO
@@ -149,10 +150,23 @@ def test_pickle_scanner_can_handle_rejects_non_pickle_content(tmp_path: Path) ->
     assert PickleScanner.can_handle(str(model_path)) is False
 
 
-@pytest.mark.parametrize("suffix", [".bin", ".pt", ".pth"])
+@pytest.mark.parametrize("suffix", [".bin", ".pt", ".pth", ".ckpt", ".pkl"])
 def test_pickle_scanner_can_handle_rejects_zip_backed_pytorch_extensions(suffix: str, tmp_path: Path) -> None:
     """ZIP-backed PyTorch containers should not route through PickleScanner.can_handle()."""
     model_path = create_mock_pytorch_zip(tmp_path / f"model{suffix}")
+
+    assert PickleScanner.can_handle(str(model_path)) is False
+
+
+@pytest.mark.parametrize("suffix", [".pkl", ".pickle", ".dill", ".joblib"])
+def test_pickle_scanner_can_handle_rejects_existing_generic_zip_pickle_extensions(
+    suffix: str,
+    tmp_path: Path,
+) -> None:
+    """Existing ZIP archives with pickle-like suffixes should not be claimed as raw pickle."""
+    model_path = tmp_path / f"archive{suffix}"
+    with zipfile.ZipFile(model_path, "w") as archive:
+        archive.writestr("payload.txt", "not a pickle stream")
 
     assert PickleScanner.can_handle(str(model_path)) is False
 

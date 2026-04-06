@@ -4505,9 +4505,13 @@ class PickleScanner(BaseScanner):
     def can_handle(cls, path: str) -> bool:
         """Check if the file is a pickle based on extension and content"""
         file_ext = os.path.splitext(path)[1].lower()
+        known_pickle_extensions = {".pkl", ".pickle", ".dill", ".joblib"}
 
-        # For known pickle extensions, always handle
-        if file_ext in [".pkl", ".pickle", ".dill", ".joblib"]:
+        # Keep the extension fast path for missing files so direct scanner
+        # callers can still select this scanner and surface a path error during
+        # `scan()`. Existing files with pickle-like suffixes still need content
+        # sniffing so ZIP-backed containers can route to archive scanners.
+        if file_ext in known_pickle_extensions and not os.path.isfile(path):
             return True
 
         try:
@@ -4525,7 +4529,12 @@ class PickleScanner(BaseScanner):
                 with open(path, "rb") as handle:
                     return _looks_like_pickle(handle.read(_NESTED_PICKLE_HEADER_SEARCH_LIMIT_BYTES))
             except OSError:
-                return False
+                return file_ext in known_pickle_extensions
+
+        # ZIP-backed pickle/joblib/PyTorch containers should be handled by
+        # archive scanners, not parsed as raw pickle streams.
+        if file_format == "zip":
+            return False
 
         # For security-sensitive pickle files, also validate file type.
         # Validation errors must not override a positive pickle detection.
@@ -4543,12 +4552,12 @@ class PickleScanner(BaseScanner):
                 )
             return True
 
-        # Handle both pickle and zip formats (PyTorch .bin files are often zip).
-        # PyTorch files saved with torch.save() are ZIP archives containing pickled data.
-        if file_format == "zip" and file_ext in [".bin", ".pt", ".pth"]:
-            # PyTorch ZIP files should be handled by PyTorchZipScanner or PyTorchBinaryScanner
-            # The pickle scanner shouldn't try to parse them as regular pickle files
-            return False
+        if file_ext in known_pickle_extensions:
+            try:
+                with open(path, "rb") as handle:
+                    return _looks_like_pickle(handle.read(_NESTED_PICKLE_HEADER_SEARCH_LIMIT_BYTES))
+            except OSError:
+                return True
 
         return False
 
