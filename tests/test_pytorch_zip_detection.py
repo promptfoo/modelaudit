@@ -17,6 +17,11 @@ from modelaudit.scanners.base import IssueSeverity
 from modelaudit.utils.file.detection import detect_file_format
 
 
+def _write_pytorch_zip_metadata(zf: zipfile.ZipFile, prefix: str = "archive") -> None:
+    zf.writestr(f"{prefix}/version", "3\n")
+    zf.writestr(f"{prefix}/byteorder", "little")
+
+
 class TestPyTorchZipDetection:
     """Test PyTorch ZIP file detection and scanning."""
 
@@ -68,6 +73,7 @@ class TestPyTorchZipDetection:
         bin_file = tmp_path / "malicious_model.bin"
         with zipfile.ZipFile(bin_file, "w") as zf:
             # PyTorch models typically have data.pkl in archive/ directory
+            _write_pytorch_zip_metadata(zf)
             pickle_data = io.BytesIO()
             pickle.dump({"model": MaliciousClass()}, pickle_data)
             zf.writestr("archive/data.pkl", pickle_data.getvalue())
@@ -106,6 +112,9 @@ class TestPyTorchZipDetection:
         # Create a ZIP with multiple pickle files
         bin_file = tmp_path / "multi_pickle.bin"
         with zipfile.ZipFile(bin_file, "w") as zf:
+            _write_pytorch_zip_metadata(zf, prefix="")
+            _write_pytorch_zip_metadata(zf)
+
             # Add multiple pickle files
             safe_data = {"weights": [1, 2, 3]}
             pickle_data = pickle.dumps(safe_data)
@@ -126,11 +135,14 @@ class TestPyTorchZipDetection:
         # Create a ZIP with pickle data in non-.pkl files
         bin_file = tmp_path / "no_pkl_ext.bin"
         with zipfile.ZipFile(bin_file, "w") as zf:
+            _write_pytorch_zip_metadata(zf)
+
             # PyTorch sometimes uses files without .pkl extension
             model_data = {"tensor": torch.tensor([1.0, 2.0])}
             pickle_data = pickle.dumps(model_data)
 
             # Add pickle data with various names
+            zf.writestr("archive/data.pkl", pickle_data)
             zf.writestr("data", pickle_data)  # No extension
             zf.writestr("archive/data", pickle_data)
             zf.writestr("archive/constants", pickle_data)
@@ -147,6 +159,8 @@ class TestPyTorchZipDetection:
         # Create a ZIP with exec pattern
         bin_file = tmp_path / "exec_model.bin"
         with zipfile.ZipFile(bin_file, "w") as zf:
+            _write_pytorch_zip_metadata(zf)
+
             # Create pickle with exec pattern in the data
             malicious_data = {"code": "exec('import os; os.system(\"ls\")')", "weights": [1, 2, 3]}
             pickle_data = pickle.dumps(malicious_data)
