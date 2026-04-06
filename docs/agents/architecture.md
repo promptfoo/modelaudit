@@ -34,7 +34,9 @@ class MyScanner(BaseScanner):
 
     def scan(self, path: str) -> ScanResult:
         """Scan the file and return results."""
-        result = self._create_result()
+        result = self._create_scan_result_after_preflight(path)
+        if not result.success:
+            return result
         # Scanning logic here
         result.finish(success=not result.has_errors)
         return result
@@ -95,6 +97,7 @@ result.add_check(
 ## Key Files
 
 - `modelaudit/scanners/base.py`: Scanner interface and base classes
+- `modelaudit/scanners/<scanner>_support/`: Extracted helper modules for large scanners while preserving public `<scanner>_scanner.py` entrypoints
 - `modelaudit/core.py`: Main scanning orchestration logic
 - `modelaudit/cli.py`: Command-line interface
 - `pyproject.toml`: Dependencies and project configuration

@@ -274,7 +274,7 @@ def test_get_scanner_id_for_header_format_resolves_descriptor_owned_routes(
         (".pth", "pytorch_zip"),
         (".ckpt", "pytorch_zip"),
         (".bin", "pytorch_zip"),
-        (".pkl", "pickle"),
+        (".pkl", "pytorch_zip"),
     ],
 )
 def test_get_scanner_for_path_preserves_zip_backed_pytorch_suffix_collision_dispatch(
@@ -454,3 +454,9 @@ def test_get_scanner_for_path_routes_model_manifest_json_to_manifest_scanner(tmp
     manifest_path.write_text(json.dumps({"model_type": "bert", "architectures": ["BertModel"]}))
 
     _assert_scanner_for_path(manifest_path, "manifest")
+
+
+def test_get_scanner_for_path_routes_generic_pkl_zip_without_pytorch_markers_to_zip(tmp_path: Path) -> None:
+    model_path = _write_zip_archive(tmp_path / "generic.pkl", {"payload.txt": b"not a pytorch archive"})
+
+    _assert_scanner_for_path(model_path, "zip")
