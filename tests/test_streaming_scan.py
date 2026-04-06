@@ -4,6 +4,7 @@ import os
 import pickle
 import tempfile
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import patch
 
@@ -16,9 +17,9 @@ from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
 
 
 @pytest.fixture
-def temp_test_files():
+def temp_test_files() -> Iterator[list[Path]]:
     """Create temporary test files for streaming."""
-    files = []
+    files: list[Path] = []
     for i in range(3):
         with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".txt") as tmp:
             tmp.write(f"Test content {i}")
@@ -92,10 +93,10 @@ def test_scan_model_directory_or_file_streaming_path() -> None:
         assert determine_exit_code(result) == 0
 
 
-def test_scan_model_streaming_basic(temp_test_files):
+def test_scan_model_streaming_basic(temp_test_files: list[Path]) -> None:
     """Test basic streaming scan functionality."""
 
-    def file_generator():
+    def file_generator() -> Iterator[tuple[Path, bool]]:
         """Generator that yields (path, is_last) tuples."""
         for i, file_path in enumerate(temp_test_files):
             is_last = i == len(temp_test_files) - 1
@@ -103,7 +104,7 @@ def test_scan_model_streaming_basic(temp_test_files):
 
     with patch("modelaudit.core.scan_file") as mock_scan:
         # Mock scan_file to return scan results
-        mock_scan.side_effect = [create_mock_scan_result(bytes_scanned=100) for f in temp_test_files]
+        mock_scan.side_effect = [create_mock_scan_result(bytes_scanned=100) for _ in temp_test_files]
 
         # Run streaming scan (don't delete for this test)
         result = scan_model_streaming(
@@ -309,16 +310,16 @@ def test_scan_model_streaming_hf_cache_symlink_reports_snapshot_path(
     assert check_locations["Layout Inspection"] == f"{model_link}:tensor"
 
 
-def test_scan_model_streaming_with_deletion(temp_test_files):
+def test_scan_model_streaming_with_deletion(temp_test_files: list[Path]) -> None:
     """Test that files are deleted after scanning in streaming mode."""
 
-    def file_generator():
+    def file_generator() -> Iterator[tuple[Path, bool]]:
         for i, file_path in enumerate(temp_test_files):
             is_last = i == len(temp_test_files) - 1
             yield (file_path, is_last)
 
     with patch("modelaudit.core.scan_file") as mock_scan:
-        mock_scan.side_effect = [create_mock_scan_result(bytes_scanned=100) for f in temp_test_files]
+        mock_scan.side_effect = [create_mock_scan_result(bytes_scanned=100) for _ in temp_test_files]
 
         # Verify files exist before scan
         for f in temp_test_files:
@@ -613,19 +614,19 @@ def test_compute_aggregate_hash_order_independence():
     assert result1 == result2
 
 
-def test_scan_model_streaming_progress_callback(temp_test_files):
+def test_scan_model_streaming_progress_callback(temp_test_files: list[Path]) -> None:
     """Test that progress callback is called during streaming scan."""
-    progress_calls = []
+    progress_calls: list[tuple[str, float]] = []
 
-    def progress_callback(message, percentage):
+    def progress_callback(message: str, percentage: float) -> None:
         progress_calls.append((message, percentage))
 
-    def file_generator():
+    def file_generator() -> Iterator[tuple[Path, bool]]:
         for i, file_path in enumerate(temp_test_files):
             yield (file_path, i == len(temp_test_files) - 1)
 
     with patch("modelaudit.core.scan_file") as mock_scan:
-        mock_scan.side_effect = [create_mock_scan_result() for f in temp_test_files]
+        mock_scan.side_effect = [create_mock_scan_result() for _ in temp_test_files]
 
         scan_model_streaming(
             file_generator=file_generator(),
@@ -645,7 +646,7 @@ def test_scan_model_streaming_progress_callback(temp_test_files):
 def test_scan_model_streaming_asset_creation(temp_test_files: list[Path]) -> None:
     """Test that assets are created during streaming scan."""
 
-    def file_generator():
+    def file_generator() -> Iterator[tuple[Path, bool]]:
         for i, file_path in enumerate(temp_test_files):
             yield (file_path, i == len(temp_test_files) - 1)
 
@@ -653,7 +654,7 @@ def test_scan_model_streaming_asset_creation(temp_test_files: list[Path]) -> Non
         patch("modelaudit.core.scan_file") as mock_scan,
         patch("modelaudit.utils.helpers.assets.asset_from_scan_result") as mock_asset,
     ):
-        mock_scan.side_effect = [create_mock_scan_result() for f in temp_test_files]
+        mock_scan.side_effect = [create_mock_scan_result() for _ in temp_test_files]
 
         # Mock asset creation
         mock_asset.return_value = {
