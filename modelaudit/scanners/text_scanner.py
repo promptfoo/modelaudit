@@ -45,11 +45,9 @@ class TextScanner(BaseScanner):
 
     def scan(self, path: str) -> ScanResult:
         """Scan a text file for security issues."""
-        path_check_result = self._check_path(path)
-        if path_check_result:
-            return path_check_result
-
-        result = self._create_result()
+        result = self._create_scan_result_after_preflight(path, check_size_limit=False)
+        if not result.success:
+            return result
 
         try:
             # Get file size

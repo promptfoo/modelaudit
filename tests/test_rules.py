@@ -8,6 +8,7 @@ import pytest
 from modelaudit.cache.trusted_config_store import TrustedConfigStore
 from modelaudit.config import ModelAuditConfig, reset_config, set_config
 from modelaudit.config.local_config import find_local_config_for_paths
+from modelaudit.rule_catalog import RULE_CATALOG
 from modelaudit.rules import RuleRegistry, Severity
 from modelaudit.scanners.base import Issue, IssueSeverity, ScanResult
 
@@ -72,6 +73,29 @@ class TestRuleRegistry:
         assert all(200 <= int(code[1:]) <= 299 for code in rules)
         assert "S201" in rules
         assert "S101" not in rules
+
+    def test_initialize_loads_catalog_order_and_clears_cache(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Catalog order and cache reset behavior should be preserved."""
+        monkeypatch.setattr(RuleRegistry, "_rules", {})
+        monkeypatch.setattr(RuleRegistry, "_message_match_cache", {"import os": None})
+        monkeypatch.setattr(RuleRegistry, "_initialized", False)
+
+        RuleRegistry.initialize()
+        loaded_rules = RuleRegistry.get_all_rules()
+
+        assert list(loaded_rules) == [entry.code for entry in RULE_CATALOG]
+        assert len(loaded_rules) == len(RULE_CATALOG)
+        assert RuleRegistry._message_match_cache == {}
+
+        RuleRegistry.initialize()
+
+        assert list(RuleRegistry.get_all_rules()) == [entry.code for entry in RULE_CATALOG]
+
+    def test_rule_catalog_codes_are_unique(self) -> None:
+        """Declarative catalog entries should not duplicate rule codes."""
+        codes = [entry.code for entry in RULE_CATALOG]
+
+        assert len(codes) == len(set(codes))
 
 
 class TestConfiguration:
