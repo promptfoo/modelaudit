@@ -14,6 +14,7 @@ from modelaudit.utils.sources.huggingface import (
     extract_model_id_from_path,
     get_model_info,
     get_model_size,
+    is_huggingface_cache_path,
     is_huggingface_file_url,
     is_huggingface_url,
     parse_huggingface_file_url,
@@ -113,22 +114,89 @@ class TestExtractModelIdFromPath:
 
         assert extract_model_id_from_path(str(model_path)) == ("Qwen/Qwen2.5-0.5B", "local")
 
-    def test_extract_model_id_from_hf_cache_path(self, tmp_path: Path) -> None:
+    def test_extract_model_id_from_hf_cache_path(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         """Local HuggingFace cache paths should use distinct cache provenance."""
+        hf_home = tmp_path / ".cache" / "huggingface"
+        monkeypatch.setenv("HF_HOME", str(hf_home))
+        model_path = hf_home / "hub" / "models--Qwen--Qwen2.5-0.5B" / "snapshots" / "abc123" / "weights.bin"
+        model_path.parent.mkdir(parents=True)
+        model_path.write_bytes(b"weights")
+
+        assert extract_model_id_from_path(str(model_path)) == ("Qwen/Qwen2.5-0.5B", "huggingface_cache")
+
+    def test_extract_model_id_from_hf_home_cache_path(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """HF_HOME relocation should still be recognized as HuggingFace cache provenance."""
+        monkeypatch.setenv("HF_HOME", str(tmp_path / "custom-hf-home"))
         model_path = (
-            tmp_path
-            / ".cache"
-            / "huggingface"
-            / "hub"
-            / "models--Qwen--Qwen2.5-0.5B"
-            / "snapshots"
-            / "abc123"
-            / "weights.bin"
+            tmp_path / "custom-hf-home" / "hub" / "models--Qwen--Qwen2.5-0.5B" / "snapshots" / "abc123" / "weights.bin"
         )
         model_path.parent.mkdir(parents=True)
         model_path.write_bytes(b"weights")
 
         assert extract_model_id_from_path(str(model_path)) == ("Qwen/Qwen2.5-0.5B", "huggingface_cache")
+
+    def test_extract_model_id_from_symlinked_hf_home_cache_path(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Resolved cache roots should still match paths reached through symlinked HF_HOME."""
+        real_home = tmp_path / "real-hf-home"
+        link_home = tmp_path / "link-hf-home"
+        real_home.mkdir()
+        try:
+            link_home.symlink_to(real_home, target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"symlink creation unavailable: {exc}")
+
+        monkeypatch.setenv("HF_HOME", str(link_home))
+        model_path = link_home / "hub" / "models--Qwen--Qwen2.5-0.5B" / "snapshots" / "abc123" / "weights.bin"
+        model_path.parent.mkdir(parents=True)
+        model_path.write_bytes(b"weights")
+
+        assert extract_model_id_from_path(str(model_path)) == ("Qwen/Qwen2.5-0.5B", "huggingface_cache")
+
+    def test_extract_model_id_from_hf_hub_cache_path(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """HF_HUB_CACHE relocation should override the default HuggingFace cache root."""
+        monkeypatch.setenv("HF_HOME", str(tmp_path / "ignored-home"))
+        monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "custom-hub-root"))
+        model_path = (
+            tmp_path / "custom-hub-root" / "models--Qwen--Qwen2.5-0.5B" / "snapshots" / "abc123" / "weights.bin"
+        )
+        model_path.parent.mkdir(parents=True)
+        model_path.write_bytes(b"weights")
+
+        assert extract_model_id_from_path(str(model_path)) == ("Qwen/Qwen2.5-0.5B", "huggingface_cache")
+
+    def test_hf_cache_path_resolution_handles_symlink_loop(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        requires_symlinks: None,
+    ) -> None:
+        """Looped cache symlinks should not abort HuggingFace cache provenance checks."""
+        hf_home = tmp_path / "hf-home"
+        monkeypatch.setenv("HF_HOME", str(hf_home))
+        model_root = hf_home / "hub" / "models--Qwen--Qwen2.5-0.5B"
+        model_root.mkdir(parents=True)
+        loop_path = model_root / "snapshots"
+        loop_path.symlink_to(loop_path, target_is_directory=True)
+
+        looped_metadata_path = loop_path / "abc123" / "model.metadata"
+
+        assert is_huggingface_cache_path(looped_metadata_path) is True
 
     def test_extract_model_id_rejects_spoofed_models_directory(self, tmp_path: Path) -> None:
         """A local models--* directory without HF cache layout should not be treated as HuggingFace."""

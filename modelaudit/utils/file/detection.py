@@ -7,6 +7,7 @@ import zipfile
 from pathlib import Path, PurePosixPath
 
 from ..helpers.types import FileExtension, FileFormat, FilePath, MagicBytes
+from ._compression import is_zlib_header
 
 # Known GGML header variants (older formats like GGMF and GGJT)
 GGML_MAGIC_VARIANTS = {
@@ -742,18 +743,6 @@ def _is_valid_executorch_binary(path: str | Path) -> bool:
     return True
 
 
-def _is_zlib_header(prefix: bytes) -> bool:
-    if len(prefix) < 2:
-        return False
-    cmf = prefix[0]
-    flg = prefix[1]
-    if (cmf & 0x0F) != 8:
-        return False
-    if (cmf >> 4) > 7:
-        return False
-    return ((cmf << 8) + flg) % 31 == 0
-
-
 def _detect_compression_format(prefix: bytes) -> str | None:
     if prefix.startswith(_GZIP_MAGIC):
         return "gzip"
@@ -763,7 +752,7 @@ def _detect_compression_format(prefix: bytes) -> str | None:
         return "xz"
     if prefix.startswith(_LZ4_FRAME_MAGIC):
         return "lz4"
-    if _is_zlib_header(prefix[:2]):
+    if is_zlib_header(prefix[:2]):
         return "zlib"
     return None
 

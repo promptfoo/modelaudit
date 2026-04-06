@@ -5,6 +5,8 @@ import re
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
+from ._huggingface_cache import _find_hf_cache_root, _resolve_hf_cache_path
+
 
 def is_huggingface_url(url: str) -> bool:
     """Check if a URL is a HuggingFace model URL."""
@@ -66,24 +68,6 @@ def parse_huggingface_url(url: str) -> tuple[str, str]:
     raise ValueError(f"Invalid HuggingFace URL format: {url}")
 
 
-def _path_has_part(path: Path, part: str) -> bool:
-    """Return True if any path segment matches part (case-insensitive)."""
-    part_lower = part.lower()
-    return any(segment.lower() == part_lower for segment in path.parts)
-
-
-def _find_hf_cache_root(path: Path) -> Path | None:
-    """Return the HuggingFace cache root containing models--* if present."""
-    for index, segment in enumerate(path.parts):
-        if (
-            segment.lower().startswith("models--")
-            and index >= 3
-            and [part.lower() for part in path.parts[index - 3 : index]] == [".cache", "huggingface", "hub"]
-        ):
-            return Path(*path.parts[: index + 1])
-    return None
-
-
 def is_huggingface_cache_path(path: str | Path) -> bool:
     """Return True if a path is inside a HuggingFace cache layout."""
     path_obj = Path(path)
@@ -92,7 +76,7 @@ def is_huggingface_cache_path(path: str | Path) -> bool:
         return False
 
     try:
-        relative_parts = path_obj.relative_to(cache_root).parts
+        relative_parts = _resolve_hf_cache_path(path_obj).relative_to(cache_root).parts
     except ValueError:
         return False
 

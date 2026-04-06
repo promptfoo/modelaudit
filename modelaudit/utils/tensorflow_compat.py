@@ -19,6 +19,7 @@ from typing import Any
 import numpy as np
 
 logger = logging.getLogger(__name__)
+_HAS_PROTOBUF_STUBS: bool | None = None
 
 
 # TensorFlow DataType enum values (from types.proto)
@@ -283,9 +284,7 @@ def get_protobuf_classes() -> tuple[Any, Any]:
     Raises:
         ImportError: If neither vendored protos nor TensorFlow are available
     """
-    import modelaudit.protos
-
-    if not modelaudit.protos._check_vendored_protos():
+    if not has_tensorflow_protobuf_stubs():
         raise ImportError(
             "TensorFlow protobuf stubs not available. "
             "Vendored protos may be missing or corrupted. "
@@ -296,6 +295,21 @@ def get_protobuf_classes() -> tuple[Any, Any]:
     from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
 
     return SavedModel, GraphDef
+
+
+def has_tensorflow_protobuf_stubs() -> bool:
+    """Return True when TensorFlow protobuf stubs are available from native or vendored protos."""
+    global _HAS_PROTOBUF_STUBS
+
+    if _HAS_PROTOBUF_STUBS is None:
+        try:
+            import modelaudit.protos
+
+            _HAS_PROTOBUF_STUBS = bool(modelaudit.protos._check_vendored_protos())
+        except Exception as exc:
+            logger.debug("TensorFlow protobuf stubs probe failed: %s", exc)
+            _HAS_PROTOBUF_STUBS = False
+    return _HAS_PROTOBUF_STUBS
 
 
 # Checkpoint reading requires full TensorFlow (no lightweight alternative)

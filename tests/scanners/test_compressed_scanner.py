@@ -34,6 +34,13 @@ def test_compressed_scanner_can_handle_requires_matching_signature(tmp_path: Pat
     assert CompressedScanner.can_handle(str(invalid_gzip_path)) is False
 
 
+def test_compressed_scanner_can_handle_rejects_invalid_zlib_header_near_match(tmp_path: Path) -> None:
+    zlib_path = tmp_path / "payload.bin.zlib"
+    zlib_path.write_bytes(b"\x78\x00" + b"not-a-valid-zlib-stream")
+
+    assert CompressedScanner.can_handle(str(zlib_path)) is False
+
+
 @pytest.mark.parametrize(
     ("filename", "mode"),
     [
@@ -148,6 +155,21 @@ def test_compressed_scanner_surfaces_malicious_inner_findings(tmp_path: Path) ->
     malicious_pickle = pickle.dumps({"payload": _MaliciousPayload()})
     path = tmp_path / "malicious.pkl.gz"
     path.write_bytes(gzip.compress(malicious_pickle))
+
+    scanner = CompressedScanner()
+    result = scanner.scan(str(path))
+
+    critical_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL]
+
+    assert critical_issues
+    assert any("eval" in issue.message.lower() for issue in critical_issues)
+    assert any(issue.location == f"{path} -> malicious.pkl" for issue in critical_issues)
+
+
+def test_compressed_scanner_surfaces_malicious_inner_findings_from_zlib_wrapper(tmp_path: Path) -> None:
+    malicious_pickle = pickle.dumps({"payload": _MaliciousPayload()})
+    path = tmp_path / "malicious.pkl.zlib"
+    path.write_bytes(zlib.compress(malicious_pickle))
 
     scanner = CompressedScanner()
     result = scanner.scan(str(path))

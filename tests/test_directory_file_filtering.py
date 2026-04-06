@@ -252,8 +252,14 @@ class TestDirectoryFileFiltering:
 
         assert results["files_scanned"] == 0
 
-    def test_only_huggingface_bookkeeping_metadata_is_skipped(self, tmp_path: Path) -> None:
+    def test_only_huggingface_bookkeeping_metadata_is_skipped(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         """Local .metadata files should be scanned unless they are in HuggingFace cache layouts."""
+        hf_home = tmp_path / ".cache" / "huggingface"
+        monkeypatch.setenv("HF_HOME", str(hf_home))
         local_metadata = tmp_path / "model.metadata"
         local_cache_shaped_metadata = (
             tmp_path / "project" / "huggingface" / "hub" / "models--org--repo" / "model.metadata"
@@ -261,23 +267,33 @@ class TestDirectoryFileFiltering:
         local_snapshots_metadata = (
             tmp_path / "project" / "hub" / "models--org--repo" / "snapshots" / "abc123" / "model.metadata"
         )
-        hf_cache_metadata = (
-            tmp_path
-            / ".cache"
-            / "huggingface"
-            / "hub"
-            / "models--org--repo"
-            / "snapshots"
-            / "abc123"
-            / "model.metadata"
-        )
-        hf_download_metadata = tmp_path / ".cache" / "huggingface" / "download" / "model.metadata"
+        hf_cache_metadata = hf_home / "hub" / "models--org--repo" / "snapshots" / "abc123" / "model.metadata"
+        hf_download_metadata = hf_home / "download" / "model.metadata"
 
         assert _is_huggingface_cache_file(str(local_metadata)) is False
         assert _is_huggingface_cache_file(str(local_cache_shaped_metadata)) is False
         assert _is_huggingface_cache_file(str(local_snapshots_metadata)) is False
         assert _is_huggingface_cache_file(str(hf_cache_metadata)) is True
         assert _is_huggingface_cache_file(str(hf_download_metadata)) is True
+
+    def test_huggingface_cache_metadata_skip_uses_resolved_cache_root(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        requires_symlinks: None,
+    ) -> None:
+        """HF bookkeeping under a symlinked HF_HOME should still be recognized."""
+        real_home = tmp_path / "real-hf-home"
+        link_home = tmp_path / "link-hf-home"
+        real_home.mkdir()
+        link_home.symlink_to(real_home, target_is_directory=True)
+        monkeypatch.setenv("HF_HOME", str(link_home))
+
+        metadata_path = link_home / "hub" / "models--org--repo" / "snapshots" / "abc123" / "config.json.metadata"
+        metadata_path.parent.mkdir(parents=True)
+        metadata_path.write_text("{}")
+
+        assert _is_huggingface_cache_file(str(metadata_path)) is True
 
     def test_hf_cache_layout_spoofing_does_not_suppress_metadata_scan(self, tmp_path: Path) -> None:
         """An attacker-crafted HF cache layout must not suppress scanning of .metadata files."""

@@ -22,6 +22,7 @@ from modelaudit.utils.file.detection import (
     is_zipfile,
     validate_file_type,
 )
+from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
 
 
 def _create_mar_archive(
@@ -37,12 +38,6 @@ def _create_mar_archive(
         archive.writestr("handler.py", b"def handle(data, context):\n    return data\n")
         archive.writestr("weights.bin", b"weights")
     return mar_path
-
-
-def _has_tf_protos() -> bool:
-    import modelaudit.protos
-
-    return modelaudit.protos._check_vendored_protos()
 
 
 def _build_tf_metagraph_bytes() -> bytes:
@@ -559,6 +554,15 @@ def test_detect_file_format_compressed_wrappers(tmp_path: Path) -> None:
     zlib_path.write_bytes(zlib.compress(b"weights"))
     assert detect_file_format(str(zlib_path)) == "compressed"
     assert detect_file_format_from_magic(str(zlib_path)) == "zlib"
+
+
+def test_detect_file_format_rejects_invalid_zlib_header_near_match(tmp_path: Path) -> None:
+    zlib_path = tmp_path / "model.bin.zlib"
+    zlib_path.write_bytes(b"\x78\x00not-a-zlib-stream")
+
+    assert detect_file_format(str(zlib_path)) == "unknown"
+    assert detect_file_format_from_magic(str(zlib_path)) == "unknown"
+    assert validate_file_type(str(zlib_path)) is False
 
 
 def test_detect_file_format_tar_wrappers_preserve_tar_routing(tmp_path: Path) -> None:

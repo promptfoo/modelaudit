@@ -49,6 +49,7 @@ from modelaudit.utils.helpers.types import (
     ProgressCallback,
 )
 from modelaudit.utils.lfs import check_lfs_pointer, get_lfs_issue_details, get_lfs_remediation_steps
+from modelaudit.utils.sources._huggingface_cache import _find_hf_cache_root, _path_has_part, _resolve_hf_cache_path
 
 logger = logging.getLogger("modelaudit.core")
 
@@ -356,24 +357,6 @@ def _group_files_by_content(file_paths: list[str]) -> dict[str, list[str]]:
                 logger.debug(f"  - {path}")
 
     return dict(content_groups)
-
-
-def _path_has_part(path: Path, part: str) -> bool:
-    """Return True if any path segment matches part (case-insensitive)."""
-    part_lower = part.lower()
-    return any(segment.lower() == part_lower for segment in path.parts)
-
-
-def _find_hf_cache_root(path: Path) -> Path | None:
-    """Return the HuggingFace cache root containing models--* if present."""
-    for index, segment in enumerate(path.parts):
-        if (
-            segment.lower().startswith("models--")
-            and index >= 3
-            and [part.lower() for part in path.parts[index - 3 : index]] == [".cache", "huggingface", "hub"]
-        ):
-            return Path(*path.parts[: index + 1])
-    return None
 
 
 def _resolve_directory_scan_target(
@@ -867,11 +850,7 @@ def scan_model_directory_or_file(
 
             base_dir = Path(path).resolve()
             hf_cache_root = _find_hf_cache_root(base_dir)
-            is_hf_cache = (
-                hf_cache_root is not None
-                and _path_has_part(base_dir, "huggingface")
-                and _path_has_part(base_dir, "hub")
-            )
+            is_hf_cache = hf_cache_root is not None
             scanned_paths: set[str] = set()
 
             # First pass: collect all file paths that need scanning
@@ -1296,7 +1275,7 @@ def _is_huggingface_cache_file(path: str) -> bool:
         hf_cache_root = _find_hf_cache_root(path_obj)
         if hf_cache_root is not None and hf_cache_root.parent.name.lower() == "hub":
             try:
-                relative_parts = path_obj.relative_to(hf_cache_root).parts
+                relative_parts = _resolve_hf_cache_path(path_obj).relative_to(hf_cache_root).parts
             except ValueError:
                 relative_parts = ()
 
@@ -1683,12 +1662,7 @@ def scan_model_streaming(
 
     base_dir = Path(scan_root).resolve() if scan_root is not None else None
     hf_cache_root = _find_hf_cache_root(base_dir) if base_dir is not None else None
-    is_hf_cache = (
-        base_dir is not None
-        and hf_cache_root is not None
-        and _path_has_part(base_dir, "huggingface")
-        and _path_has_part(base_dir, "hub")
-    )
+    is_hf_cache = base_dir is not None and hf_cache_root is not None
 
     try:
         for file_path, _is_last in file_generator:

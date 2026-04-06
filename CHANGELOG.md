@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - avoid CoreML nested parse failures on bounded-read truncation
 - detect punctuation-delimited TensorRT `/tmp` plugin paths
+- preserve HuggingFace cache provenance for symlinked custom cache roots
 - ignore remote OCI `layers[].urls` entries during local layer discovery
 - fail closed on unterminated OpenVINO DOCTYPE declarations
 - avoid PMML `<Extension>` false positives for benign `subprocess` prose while preserving `subprocess.getoutput()`, `subprocess.getstatusoutput()`, and `importlib.import_module("subprocess")` detections

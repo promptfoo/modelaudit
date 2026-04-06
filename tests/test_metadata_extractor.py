@@ -12,12 +12,23 @@ from typing import Any
 import pytest
 
 from modelaudit.metadata_extractor import ModelMetadataExtractor
+from modelaudit.utils import tensorflow_compat
+from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
 
 
-def _has_tf_protos() -> bool:
+def test_has_tensorflow_protobuf_stubs_fails_closed_on_probe_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Probe failures should return False instead of raising into scanner routing."""
     import modelaudit.protos
 
-    return modelaudit.protos._check_vendored_protos()
+    monkeypatch.setattr(tensorflow_compat, "_HAS_PROTOBUF_STUBS", None)
+
+    def _raise_probe_error() -> bool:
+        raise RuntimeError("broken vendored protos")
+
+    monkeypatch.setattr(modelaudit.protos, "_check_vendored_protos", _raise_probe_error)
+
+    assert tensorflow_compat.has_tensorflow_protobuf_stubs() is False
+    assert tensorflow_compat._HAS_PROTOBUF_STUBS is False
 
 
 class TestModelMetadataExtractor:

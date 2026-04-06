@@ -14,6 +14,8 @@ else:
     _py7zr = None
 
 from ..utils import sanitize_archive_path
+from ._archive_config import get_archive_depth
+from ._archive_locations import rewrite_extracted_member_location
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 # Try to import py7zr with graceful fallback
@@ -214,12 +216,7 @@ class SevenZipScanner(BaseScanner):
 
     def _get_archive_depth(self) -> int:
         """Return the current shared archive depth from config."""
-        raw_depth = self.config.get("_archive_depth", 0)
-        try:
-            depth = int(raw_depth)
-        except (TypeError, ValueError):
-            return 0
-        return max(depth, 0)
+        return get_archive_depth(self.config)
 
     @classmethod
     def _supported_nested_core_extensions(cls) -> frozenset[str]:
@@ -836,25 +833,23 @@ class SevenZipScanner(BaseScanner):
         archive_location = f"{archive_path}:{original_name}"
 
         for issue in file_result.issues:
-            if issue.location:
-                if issue.location.startswith(extracted_path):
-                    issue.location = issue.location.replace(extracted_path, archive_location, 1)
-                else:
-                    issue.location = f"{archive_location} {issue.location}"
-            else:
-                issue.location = archive_location
+            issue.location = rewrite_extracted_member_location(
+                issue.location,
+                extracted_path,
+                archive_location,
+                preserve_non_delimited_suffix=True,
+            )
 
             issue.details["archive_path"] = archive_path
             issue.details["extracted_from"] = original_name
 
         for check in file_result.checks:
-            if check.location:
-                if check.location.startswith(extracted_path):
-                    check.location = check.location.replace(extracted_path, archive_location, 1)
-                else:
-                    check.location = f"{archive_location} {check.location}"
-            else:
-                check.location = archive_location
+            check.location = rewrite_extracted_member_location(
+                check.location,
+                extracted_path,
+                archive_location,
+                preserve_non_delimited_suffix=True,
+            )
 
     def _scan_extracted_file(
         self,

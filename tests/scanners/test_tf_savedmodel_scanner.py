@@ -9,6 +9,7 @@ from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.tf_savedmodel_scanner import TensorFlowSavedModelScanner
 from modelaudit.utils.file.detection import PROTO0_1_MAX_PROBE_BYTES
+from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as has_tf_protos
 
 
 class _NodeCollection(Protocol):
@@ -35,13 +36,6 @@ def has_tensorflow():
         return bool(getattr(tf, "__version__", None)) and hasattr(tf, "constant")
     except Exception:
         return False
-
-
-def has_tf_protos() -> bool:
-    """Check if TensorFlow protobuf stubs are available (vendored or from TensorFlow)."""
-    import modelaudit.protos
-
-    return modelaudit.protos._check_vendored_protos()
 
 
 def test_tf_savedmodel_scanner_can_handle(tmp_path: Path) -> None:

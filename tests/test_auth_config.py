@@ -41,6 +41,7 @@ def test_get_config_directory_path_falls_back_to_private_home_dir(
     assert not config_dir.is_symlink()
     if os.name != "nt":
         assert stat.S_IMODE(config_dir.stat().st_mode) == 0o700
+        assert stat.S_IMODE(config_dir.parent.stat().st_mode) == 0o700
 
 
 def test_write_global_config_replaces_symlink_instead_of_following_target(

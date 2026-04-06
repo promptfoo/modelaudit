@@ -14,10 +14,12 @@ class TestHuggingFaceSymlinks:
     """Test that HuggingFace cache symlinks are handled correctly."""
 
     @pytest.fixture
-    def mock_hf_cache(self, tmp_path):
+    def mock_hf_cache(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         """Create a mock HuggingFace cache structure with symlinks."""
+        hf_home = tmp_path / ".cache" / "huggingface"
+        monkeypatch.setenv("HF_HOME", str(hf_home))
         # Create HuggingFace cache structure
-        cache_dir = tmp_path / ".cache" / "huggingface" / "hub" / "models--test-model"
+        cache_dir = hf_home / "hub" / "models--test-model"
         snapshots_dir = cache_dir / "snapshots" / "abc123"
         blobs_dir = cache_dir / "blobs"
 
@@ -59,6 +61,32 @@ class TestHuggingFaceSymlinks:
         ]
         assert len(path_traversal_issues) == 0
 
+    def test_hf_home_cache_symlinks_no_path_traversal_warnings(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Custom HF_HOME cache roots should preserve allowed snapshot-to-blob symlinks."""
+        monkeypatch.setenv("HF_HOME", str(tmp_path / "custom-hf-home"))
+        cache_dir = tmp_path / "custom-hf-home" / "hub" / "models--test-model"
+        snapshots_dir = cache_dir / "snapshots" / "abc123"
+        blobs_dir = cache_dir / "blobs"
+        snapshots_dir.mkdir(parents=True)
+        blobs_dir.mkdir(parents=True)
+
+        blob_path = blobs_dir / "blob1234567890"
+        blob_path.write_text("Model data")
+        model_link = snapshots_dir / "model.safetensors"
+        os.symlink("../../blobs/blob1234567890", model_link)
+
+        results = scan_model_directory_or_file(str(snapshots_dir))
+
+        path_traversal_issues = [
+            issue for issue in results.issues if "path traversal" in getattr(issue, "message", "").lower()
+        ]
+        assert results.files_scanned == 1
+        assert len(path_traversal_issues) == 0
+
     def test_malicious_symlink_outside_cache(self, tmp_path):
         """Test that symlinks pointing outside the cache structure are still caught."""
         # Create a directory structure
@@ -83,10 +111,12 @@ class TestHuggingFaceSymlinks:
         ]
         assert len(path_traversal_issues) == 1
 
-    def test_nested_hf_cache_structure(self, tmp_path):
+    def test_nested_hf_cache_structure(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Test more complex nested HuggingFace cache structures."""
+        hf_home = tmp_path / ".cache" / "huggingface"
+        monkeypatch.setenv("HF_HOME", str(hf_home))
         # Create nested cache structure
-        cache_dir = tmp_path / ".cache" / "huggingface" / "hub" / "models--org--model-name"
+        cache_dir = hf_home / "hub" / "models--org--model-name"
         snapshots_dir = cache_dir / "snapshots" / "commit123456"
         blobs_dir = cache_dir / "blobs"
         refs_dir = cache_dir / "refs"
@@ -129,9 +159,11 @@ class TestHuggingFaceSymlinks:
         ]
         assert len(path_traversal_issues) == 0
 
-    def test_broken_symlink_warning(self, tmp_path, monkeypatch):
+    def test_broken_symlink_warning(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Broken HuggingFace symlinks should produce a warning."""
-        cache_root = tmp_path / ".cache" / "huggingface" / "hub" / "models--test"
+        hf_home = tmp_path / ".cache" / "huggingface"
+        monkeypatch.setenv("HF_HOME", str(hf_home))
+        cache_root = hf_home / "hub" / "models--test"
         snapshots = cache_root / "snapshots" / "abc"
         snapshots.mkdir(parents=True)
 

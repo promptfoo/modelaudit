@@ -7,6 +7,8 @@ from typing import Any, ClassVar
 
 from ..utils import is_absolute_archive_path, is_critical_system_path, sanitize_archive_path
 from ..utils.helpers.assets import asset_from_scan_result
+from ._archive_config import get_archive_depth
+from ._archive_locations import rewrite_extracted_member_location
 from .archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY, scan_nested_file
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -54,12 +56,7 @@ class ZipScanner(BaseScanner):
 
     def _get_archive_depth(self) -> int:
         """Return the current shared archive depth from config."""
-        raw_depth = self.config.get("_archive_depth", 0)
-        try:
-            depth = int(raw_depth)
-        except (TypeError, ValueError):
-            return 0
-        return max(depth, 0)
+        return get_archive_depth(self.config)
 
     def _get_max_entry_size(self) -> int:
         """Return the configured per-entry extraction limit with a safe unlimited fallback."""
@@ -163,19 +160,13 @@ class ZipScanner(BaseScanner):
         """Rewrite nested result locations so archive members, not temp files, are reported."""
         archive_location = f"{archive_path}:{entry_name}"
 
-        def _rewrite_archive_location(location: str | None) -> str:
-            """Map temp-file paths back to the archive member location."""
-            if not location:
-                return archive_location
-            if location.startswith(tmp_path):
-                suffix = location[len(tmp_path) :]
-                if suffix.startswith(":"):
-                    return f"{archive_location}{suffix}"
-                return archive_location
-            return f"{archive_location} {location}"
-
         for issue in scan_result.issues:
-            issue.location = _rewrite_archive_location(issue.location)
+            issue.location = rewrite_extracted_member_location(
+                issue.location,
+                tmp_path,
+                archive_location,
+                preserve_non_delimited_suffix=False,
+            )
 
             existing_issue_entry = issue.details.get("zip_entry")
             issue.details["zip_entry"] = (
@@ -185,7 +176,12 @@ class ZipScanner(BaseScanner):
             )
 
         for check in scan_result.checks:
-            check.location = _rewrite_archive_location(check.location)
+            check.location = rewrite_extracted_member_location(
+                check.location,
+                tmp_path,
+                archive_location,
+                preserve_non_delimited_suffix=False,
+            )
 
             existing_check_entry = check.details.get("zip_entry")
             check.details["zip_entry"] = (

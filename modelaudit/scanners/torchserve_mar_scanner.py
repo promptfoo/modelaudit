@@ -19,6 +19,7 @@ from urllib.parse import urlparse
 
 from ..utils import is_absolute_archive_path, is_critical_system_path, sanitize_archive_path
 from ..utils.helpers.assets import asset_from_scan_result
+from ._archive_locations import rewrite_extracted_member_location
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 CRITICAL_SYSTEM_PATHS = [
@@ -2002,23 +2003,21 @@ class TorchServeMarScanner(BaseScanner):
         archive_location = f"{archive_path}:{member_name}"
 
         for issue in file_result.issues:
-            if issue.location:
-                if issue.location.startswith(temp_path):
-                    issue.location = issue.location.replace(temp_path, archive_location, 1)
-                else:
-                    issue.location = f"{archive_location} {issue.location}"
-            else:
-                issue.location = archive_location
+            issue.location = rewrite_extracted_member_location(
+                issue.location,
+                temp_path,
+                archive_location,
+                preserve_non_delimited_suffix=True,
+            )
             issue.details = dict(issue.details or {})
             issue.details.setdefault("mar_entry", member_name)
 
         for check in file_result.checks:
-            if check.location:
-                if check.location.startswith(temp_path):
-                    check.location = check.location.replace(temp_path, archive_location, 1)
-                else:
-                    check.location = f"{archive_location} {check.location}"
-            else:
-                check.location = archive_location
+            check.location = rewrite_extracted_member_location(
+                check.location,
+                temp_path,
+                archive_location,
+                preserve_non_delimited_suffix=True,
+            )
             check.details = dict(check.details or {})
             check.details.setdefault("mar_entry", member_name)

@@ -6,6 +6,8 @@ import tempfile
 from modelaudit.config.explanations import (
     COMMON_MESSAGE_EXPLANATIONS,
     TF_OP_EXPLANATIONS,
+    get_cve_2024_5480_explanation,
+    get_cve_2025_32434_explanation,
     get_import_explanation,
     get_message_explanation,
     get_opcode_explanation,
@@ -581,3 +583,19 @@ def test_ml_specific_message_patterns():
                 "vulnerabilities",
             ]
         ), f"ML explanation should focus on security: '{explanation}'"
+
+
+def test_cve_explanations_preserve_specific_and_default_lookups() -> None:
+    """CVE helpers should preserve specific lookups and deterministic fallbacks."""
+    pytorch_opcode_explanation = get_cve_2025_32434_explanation("dangerous_opcodes")
+    assert "CVE-2025-32434" in pytorch_opcode_explanation
+    assert "REDUCE" in pytorch_opcode_explanation
+
+    pytorch_fallback_explanation = get_cve_2025_32434_explanation("unknown_issue_type")
+    assert pytorch_fallback_explanation == (
+        "This issue is related to CVE-2025-32434, a critical PyTorch vulnerability. "
+        "Review the CVE documentation and update to PyTorch 2.6.0+ immediately."
+    )
+
+    rpc_explanation = get_cve_2024_5480_explanation("rpc_function_injection")
+    assert "torch.distributed.rpc" in rpc_explanation
