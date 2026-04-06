@@ -113,18 +113,15 @@ class TestExtractModelIdFromPath:
 
         assert extract_model_id_from_path(str(model_path)) == ("Qwen/Qwen2.5-0.5B", "local")
 
-    def test_extract_model_id_from_hf_cache_path(self, tmp_path: Path) -> None:
+    def test_extract_model_id_from_hf_cache_path(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         """Local HuggingFace cache paths should use distinct cache provenance."""
-        model_path = (
-            tmp_path
-            / ".cache"
-            / "huggingface"
-            / "hub"
-            / "models--Qwen--Qwen2.5-0.5B"
-            / "snapshots"
-            / "abc123"
-            / "weights.bin"
-        )
+        hf_home = tmp_path / ".cache" / "huggingface"
+        monkeypatch.setenv("HF_HOME", str(hf_home))
+        model_path = hf_home / "hub" / "models--Qwen--Qwen2.5-0.5B" / "snapshots" / "abc123" / "weights.bin"
         model_path.parent.mkdir(parents=True)
         model_path.write_bytes(b"weights")
 

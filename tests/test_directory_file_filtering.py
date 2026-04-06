@@ -252,8 +252,14 @@ class TestDirectoryFileFiltering:
 
         assert results["files_scanned"] == 0
 
-    def test_only_huggingface_bookkeeping_metadata_is_skipped(self, tmp_path: Path) -> None:
+    def test_only_huggingface_bookkeeping_metadata_is_skipped(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         """Local .metadata files should be scanned unless they are in HuggingFace cache layouts."""
+        hf_home = tmp_path / ".cache" / "huggingface"
+        monkeypatch.setenv("HF_HOME", str(hf_home))
         local_metadata = tmp_path / "model.metadata"
         local_cache_shaped_metadata = (
             tmp_path / "project" / "huggingface" / "hub" / "models--org--repo" / "model.metadata"
@@ -261,17 +267,8 @@ class TestDirectoryFileFiltering:
         local_snapshots_metadata = (
             tmp_path / "project" / "hub" / "models--org--repo" / "snapshots" / "abc123" / "model.metadata"
         )
-        hf_cache_metadata = (
-            tmp_path
-            / ".cache"
-            / "huggingface"
-            / "hub"
-            / "models--org--repo"
-            / "snapshots"
-            / "abc123"
-            / "model.metadata"
-        )
-        hf_download_metadata = tmp_path / ".cache" / "huggingface" / "download" / "model.metadata"
+        hf_cache_metadata = hf_home / "hub" / "models--org--repo" / "snapshots" / "abc123" / "model.metadata"
+        hf_download_metadata = hf_home / "download" / "model.metadata"
 
         assert _is_huggingface_cache_file(str(local_metadata)) is False
         assert _is_huggingface_cache_file(str(local_cache_shaped_metadata)) is False

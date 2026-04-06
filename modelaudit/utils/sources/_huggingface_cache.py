@@ -34,6 +34,7 @@ def _get_hf_cache_roots() -> tuple[Path, ...]:
 
         roots.append(_resolve_hf_cache_path(Path(HF_HUB_CACHE)))
     except Exception:
+        # huggingface_hub is optional and may be unavailable or misconfigured.
         pass
 
     default_root = _resolve_hf_cache_path(Path.home() / ".cache" / "huggingface" / "hub")
@@ -53,7 +54,6 @@ def _find_hf_cache_root(path: Path) -> Path | None:
     """Return the HuggingFace cache root containing models--* if present."""
     resolved_path = _resolve_hf_cache_path(path)
     cache_roots = _get_hf_cache_roots()
-    default_layout_suffix = (".cache", "huggingface", "hub")
 
     for index, segment in enumerate(resolved_path.parts):
         if not segment.lower().startswith("models--"):
@@ -61,7 +61,7 @@ def _find_hf_cache_root(path: Path) -> Path | None:
 
         candidate = Path(*resolved_path.parts[: index + 1])
         hub_root = candidate.parent
-        if hub_root in cache_roots or hub_root.parts[-3:] == default_layout_suffix:
+        if hub_root in cache_roots:
             return candidate
 
     return None

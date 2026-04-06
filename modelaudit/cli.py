@@ -33,7 +33,8 @@ from .integrations.jfrog import scan_jfrog_artifact
 from .integrations.sarif_formatter import format_sarif_output
 from .models import ModelAuditResultModel
 from .rules import Rule, RuleRegistry, Severity
-from .scanners.base import IssueSeverity, make_trusted_source_provenance
+from .scanner_results import IssueSeverity
+from .scanners.base import make_trusted_source_provenance
 from .telemetry import (
     flush_telemetry,
     record_command_used,
@@ -2178,7 +2179,7 @@ def scan_command(
                 if interrupt_handler.is_interrupted():
                     logger.debug("Scan interrupted by user")
                     if not any(issue.message == "Scan interrupted by user" for issue in audit_result.issues):
-                        from .scanners.base import Issue
+                        from .scanner_results import Issue
 
                         interruption_issue = Issue(
                             message="Scan interrupted by user",

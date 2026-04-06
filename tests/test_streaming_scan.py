@@ -195,10 +195,13 @@ def test_scan_model_streaming_symlink_outside_directory_without_safe_files_retur
 
 def test_scan_model_streaming_hf_cache_symlink_allowed(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     requires_symlinks: None,
 ) -> None:
     """Local streaming scans should preserve HuggingFace cache symlink handling."""
-    cache_dir = tmp_path / ".cache" / "huggingface" / "hub" / "models--test-model"
+    hf_home = tmp_path / ".cache" / "huggingface"
+    monkeypatch.setenv("HF_HOME", str(hf_home))
+    cache_dir = hf_home / "hub" / "models--test-model"
     snapshots_dir = cache_dir / "snapshots" / "abc123"
     blobs_dir = cache_dir / "blobs"
     snapshots_dir.mkdir(parents=True)
@@ -301,10 +304,13 @@ def test_scan_model_streaming_symlink_reports_source_path_consistently(
 
 def test_scan_model_streaming_hf_cache_symlink_reports_snapshot_path(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     requires_symlinks: None,
 ) -> None:
     """HuggingFace cache symlinks should keep snapshot paths in streamed results."""
-    cache_dir = tmp_path / ".cache" / "huggingface" / "hub" / "models--test-model"
+    hf_home = tmp_path / ".cache" / "huggingface"
+    monkeypatch.setenv("HF_HOME", str(hf_home))
+    cache_dir = hf_home / "hub" / "models--test-model"
     snapshots_dir = cache_dir / "snapshots" / "abc123"
     blobs_dir = cache_dir / "blobs"
     snapshots_dir.mkdir(parents=True)

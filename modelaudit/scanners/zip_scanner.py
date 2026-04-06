@@ -9,6 +9,7 @@ from ..utils import is_absolute_archive_path, is_critical_system_path, sanitize_
 from ..utils.helpers.assets import asset_from_scan_result
 from ._archive_config import get_archive_depth
 from ._archive_locations import rewrite_extracted_member_location
+from .archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY, scan_nested_file
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 CRITICAL_SYSTEM_PATHS = [
@@ -188,6 +189,13 @@ class ZipScanner(BaseScanner):
                 if isinstance(existing_check_entry, str) and existing_check_entry
                 else entry_name
             )
+
+    def _scan_nested_archive_entry(self, path: str, nested_config: dict[str, Any]) -> ScanResult:
+        """Dispatch a nested archive member through an injected callback or registry fallback."""
+        nested_scan_callback = self.config.get(NESTED_SCAN_CALLBACK_CONFIG_KEY)
+        if callable(nested_scan_callback):
+            return nested_scan_callback(path, nested_config)
+        return scan_nested_file(path, nested_config)
 
     def _scan_zip_file(self, path: str, depth: int = 0) -> ScanResult:
         """Recursively scan a ZIP file and its contents"""
@@ -407,18 +415,15 @@ class ZipScanner(BaseScanner):
                             if mar_python_result is not None:
                                 result.merge(mar_python_result)
 
-                        # Import core here to avoid circular import
-                        from .. import core
-
                         nested_config = dict(self.config)
                         nested_config["_archive_depth"] = depth + 1
                         if zipfile.is_zipfile(tmp_path):
                             nested_config["_zip_depth"] = depth + 1
 
-                        # Use core.scan_file so ZIP-based formats still reach their
-                        # specialized scanners, while shared archive depth remains
-                        # consistent across mixed ZIP/TAR/MAR recursion.
-                        file_result = core.scan_file(tmp_path, nested_config)
+                        # Dispatch nested members through the injected callback
+                        # so production scans preserve core routing while direct
+                        # ZipScanner usage still falls back to registry routing.
+                        file_result = self._scan_nested_archive_entry(tmp_path, nested_config)
                         if not file_result.success:
                             scan_complete = False
 

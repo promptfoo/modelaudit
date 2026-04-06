@@ -8,7 +8,8 @@ from urllib.parse import urlparse
 import click
 
 if TYPE_CHECKING:
-    from modelaudit.scanners.base import BaseScanner, ScanResult
+    from modelaudit.scanner_results import ScanResult
+    from modelaudit.scanners.base import BaseScanner
 from modelaudit.utils.sources.cloud_storage import get_fs_protocol
 
 
@@ -27,7 +28,7 @@ def stream_analyze_file(
     scanner: "BaseScanner",
     max_bytes: int = 1024 * 1024 * 1024 * 1024,  # 1TB default
 ) -> tuple["ScanResult | None", bool]:
-    from modelaudit.scanners.base import Issue, IssueSeverity, ScanResult
+    from modelaudit.scanner_results import Issue, IssueSeverity, ScanResult
 
     """Stream analyze a file from cloud storage.
 

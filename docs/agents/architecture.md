@@ -5,8 +5,12 @@
 - `cli.py`: Click-based CLI interface
 - `core.py`: Main scanning logic and file traversal
 - `metadata_extractor.py`: Metadata extraction command backend (`modelaudit metadata`)
+- `scanner_results.py`: Leaf result/check/issue contracts re-exported by `scanners/base.py`
+- `scanner_registry_metadata.py`: Static scanner metadata consumed by registry loading and extension utilities
 - `scanners/`: Format-specific scanner implementations
 - `utils/file/detection.py`: File type and content detection utilities
+- `utils/sources/huggingface_paths.py`: Leaf HuggingFace URL/cache provenance parsing
+- `version.py`: Leaf package-version lookup used by package init and telemetry
 
 ## Routing & Coverage Invariants
 
@@ -43,10 +47,10 @@ class MyScanner(BaseScanner):
 
 ## Scanner Registration
 
-Scanners are registered lazily via `ScannerRegistry` in `modelaudit/scanners/__init__.py`. Add to `_scanners` dict in `ScannerRegistry._init_registry`:
+Scanners are registered lazily via `ScannerRegistry` in `modelaudit/scanners/__init__.py`. Add static metadata to `modelaudit/scanner_registry_metadata.py`:
 
 ```python
-self._scanners["my_scanner"] = {
+"my_scanner": {
     "module": "modelaudit.scanners.my_scanner",
     "class": "MyScanner",
     "description": "Scans My format",
