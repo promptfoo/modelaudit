@@ -98,6 +98,7 @@ _EXECUTABLE_ARCHIVE_EXTENSIONS = (
     ".bat",
     ".ps1",
 )
+_VERSIONED_SHARED_OBJECT_EXTENSION_RE = re.compile(r"\.so(?:\.[0-9]+)+$")
 _KERAS_CONFIG_ENTRY = "config.json"
 _KERAS_CONFIG_MAX_BYTES = 10 * 1024 * 1024
 _KERAS_METADATA_ENTRY = "metadata.json"
@@ -130,6 +131,12 @@ class _AmbiguousKerasArchiveMemberError(Exception):
         )
         self.member_name = member_name
         self.candidate_filenames = candidate_filenames
+
+
+def _is_executable_archive_member(normalized_name: str) -> bool:
+    return normalized_name.endswith(_EXECUTABLE_ARCHIVE_EXTENSIONS) or bool(
+        _VERSIONED_SHARED_OBJECT_EXTENSION_RE.search(normalized_name)
+    )
 
 
 class KerasZipScanner(BaseScanner):
@@ -447,7 +454,7 @@ class KerasZipScanner(BaseScanner):
                             location=f"{path}/{filename}",
                             details={"filename": filename},
                         )
-                    elif normalized_name.endswith(_EXECUTABLE_ARCHIVE_EXTENSIONS):
+                    elif _is_executable_archive_member(normalized_name):
                         result.add_check(
                             name="Executable File Detection",
                             passed=False,

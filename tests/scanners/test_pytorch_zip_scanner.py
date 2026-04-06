@@ -132,6 +132,7 @@ def test_pytorch_zip_scanner_detects_case_insensitive_native_library_members(tmp
     model_path = create_mock_pytorch_zip(tmp_path / "native_libs.pt")
     with zipfile.ZipFile(model_path, "a") as zip_file:
         zip_file.writestr("archive/data/MALICIOUS.SO", b"\x7fELF")
+        zip_file.writestr("archive/data/libpayload.SO.6", b"\x7fELF")
         zip_file.writestr("archive/data/plugin.Dylib", b"\xfe\xed\xfa\xcf")
 
     result = PyTorchZipScanner().scan(str(model_path))
@@ -139,7 +140,7 @@ def test_pytorch_zip_scanner_detects_case_insensitive_native_library_members(tmp
     executable_issues = [
         issue for issue in result.issues if issue.message and "Executable file found in PyTorch model" in issue.message
     ]
-    assert len(executable_issues) >= 2
+    assert len(executable_issues) >= 3
     assert all(issue.severity == IssueSeverity.CRITICAL for issue in executable_issues)
 
 
@@ -147,6 +148,8 @@ def test_pytorch_zip_scanner_native_library_near_match_extension_stays_clean(tmp
     model_path = create_mock_pytorch_zip(tmp_path / "near_match.pt")
     with zipfile.ZipFile(model_path, "a") as zip_file:
         zip_file.writestr("archive/data/plugin.sology", b"not a shared object")
+        zip_file.writestr("archive/data/plugin.so.version", b"not a versioned shared object")
+        zip_file.writestr("archive/data/plugin.so.6cache", b"not a versioned shared object")
         zip_file.writestr("archive/data/plugin.dllcache", b"not a dll")
 
     result = PyTorchZipScanner().scan(str(model_path))

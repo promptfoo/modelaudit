@@ -29,6 +29,26 @@ from .pytorch_zip_support import (
 
 logger = logging.getLogger(__name__)
 _INSTALLED_PYTORCH_VERSION_UNSET = object()
+_EXECUTABLE_ARCHIVE_EXTENSIONS = (
+    ".sh",
+    ".bash",
+    ".cmd",
+    ".exe",
+    ".dll",
+    ".so",
+    ".dylib",
+    ".scr",
+    ".com",
+    ".bat",
+    ".ps1",
+)
+_VERSIONED_SHARED_OBJECT_EXTENSION_RE = re.compile(r"\.so(?:\.[0-9]+)+$")
+
+
+def _is_executable_archive_member(normalized_name: str) -> bool:
+    return normalized_name.endswith(_EXECUTABLE_ARCHIVE_EXTENSIONS) or bool(
+        _VERSIONED_SHARED_OBJECT_EXTENSION_RE.search(normalized_name)
+    )
 
 
 @dataclass(frozen=True)
@@ -811,9 +831,7 @@ class PyTorchZipScanner(BaseScanner):
                 )
                 python_files_found = True
             # Check for shell scripts or other executable files
-            elif normalized_name.endswith(
-                (".sh", ".bash", ".cmd", ".exe", ".dll", ".so", ".dylib", ".scr", ".com", ".bat", ".ps1")
-            ):
+            elif _is_executable_archive_member(normalized_name):
                 result.add_check(
                     name="Executable File Detection",
                     passed=False,

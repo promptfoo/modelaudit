@@ -845,33 +845,29 @@ __import__('pickle').loads(data)
         finally:
             os.unlink(temp_path)
 
-    def test_case_insensitive_suspicious_extension_detection(self) -> None:
+    def test_case_insensitive_suspicious_extension_detection(self, tmp_path: Path) -> None:
         """Uppercase/mixed-case executable extensions should be detected."""
         scanner = KerasZipScanner()
 
         config = {"class_name": "Sequential", "config": {"layers": []}}
+        archive_path = tmp_path / "suspicious_extensions.keras"
 
-        with tempfile.NamedTemporaryFile(suffix=".keras", delete=False) as f:
-            with zipfile.ZipFile(f, "w") as zf:
-                zf.writestr("config.json", json.dumps(config))
-                zf.writestr("MALWARE.PY", "print('evil')")
-                zf.writestr("run.SH", "#!/bin/bash\necho evil")
-                zf.writestr("plugin.SO", b"\x7fELF")
-                zf.writestr("plugin.Dylib", b"\xfe\xed\xfa\xcf")
-            temp_path = f.name
+        with zipfile.ZipFile(archive_path, "w") as zf:
+            zf.writestr("config.json", json.dumps(config))
+            zf.writestr("MALWARE.PY", "print('evil')")
+            zf.writestr("run.SH", "#!/bin/bash\necho evil")
+            zf.writestr("plugin.SO", b"\x7fELF")
+            zf.writestr("libpayload.SO.6", b"\x7fELF")
+            zf.writestr("plugin.Dylib", b"\xfe\xed\xfa\xcf")
 
-        try:
-            result = scanner.scan(temp_path)
-            suspicious_files = [
-                check.message
-                for check in result.checks
-                if "Python file found in Keras ZIP" in check.message
-                or "Executable file found in Keras ZIP" in check.message
-            ]
-            assert len(suspicious_files) >= 4, f"Should detect uppercase suspicious files, found: {suspicious_files}"
-
-        finally:
-            os.unlink(temp_path)
+        result = scanner.scan(str(archive_path))
+        suspicious_files = [
+            check.message
+            for check in result.checks
+            if "Python file found in Keras ZIP" in check.message
+            or "Executable file found in Keras ZIP" in check.message
+        ]
+        assert len(suspicious_files) >= 5, f"Should detect uppercase suspicious files, found: {suspicious_files}"
 
     def test_native_library_near_match_extension_stays_clean(self, tmp_path: Path) -> None:
         """Native-library extension near matches should not be treated as executable archive members."""
@@ -880,6 +876,8 @@ __import__('pickle').loads(data)
         with zipfile.ZipFile(archive_path, "w") as zf:
             zf.writestr("config.json", json.dumps(config))
             zf.writestr("plugin.sology", "not a shared object")
+            zf.writestr("plugin.so.version", "not a versioned shared object")
+            zf.writestr("plugin.so.6cache", "not a versioned shared object")
             zf.writestr("plugin.dllcache", "not a dll")
 
         result = KerasZipScanner().scan(str(archive_path))

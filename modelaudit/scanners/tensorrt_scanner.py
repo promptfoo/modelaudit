@@ -50,7 +50,9 @@ _PE_MIN_HEADER_OFFSET = 0x40
 _PE_MAX_HEADER_OFFSET = 1024 * 1024
 _PE_SIGNATURE = b"PE\x00\x00"
 _ELF_SIGNATURE = b"\x7fELF"
+_ELF_TYPE_EXECUTABLE = 2
 _ELF_TYPE_SHARED_OBJECT = 3
+_ELF_EXECUTABLE_TYPES = {_ELF_TYPE_EXECUTABLE, _ELF_TYPE_SHARED_OBJECT}
 _ELF_SUPPORTED_MACHINES = {3, 40, 62, 183}
 
 
@@ -88,8 +90,8 @@ def _find_embedded_pe_header(data: bytes) -> int | None:
         start = mz_offset + 1
 
 
-def _find_embedded_elf_shared_object(data: bytes) -> int | None:
-    """Return the offset of a validated embedded ELF shared object, if present."""
+def _find_embedded_elf_executable(data: bytes) -> int | None:
+    """Return the offset of a validated embedded ELF executable, if present."""
     start = 0
     while True:
         elf_offset = data.find(_ELF_SIGNATURE, start)
@@ -105,11 +107,7 @@ def _find_embedded_elf_shared_object(data: bytes) -> int | None:
                 object_type = int.from_bytes(data[elf_offset + 16 : elf_offset + 18], endian)
                 machine = int.from_bytes(data[elf_offset + 18 : elf_offset + 20], endian)
                 object_version = int.from_bytes(data[elf_offset + 20 : elf_offset + 24], endian)
-                if (
-                    object_type == _ELF_TYPE_SHARED_OBJECT
-                    and machine in _ELF_SUPPORTED_MACHINES
-                    and object_version == 1
-                ):
+                if object_type in _ELF_EXECUTABLE_TYPES and machine in _ELF_SUPPORTED_MACHINES and object_version == 1:
                     return elf_offset
 
         start = elf_offset + 1
@@ -185,12 +183,12 @@ class TensorRTScanner(BaseScanner):
                 rule_code="S902",
             )
 
-        elf_header_offset = _find_embedded_elf_shared_object(data)
+        elf_header_offset = _find_embedded_elf_executable(data)
         if elf_header_offset is not None:
             result.add_check(
                 name="Embedded ELF Detection",
                 passed=False,
-                message="Embedded Linux ELF shared-object header found",
+                message="Embedded Linux ELF executable/shared-object header found",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={"pattern": "embedded ELF", "offset": elf_header_offset},

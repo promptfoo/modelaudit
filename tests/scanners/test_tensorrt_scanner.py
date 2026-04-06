@@ -14,12 +14,20 @@ def _minimal_pe_header() -> bytes:
 
 
 def _minimal_elf_shared_object() -> bytes:
+    return _minimal_elf_header(object_type=3)
+
+
+def _minimal_elf_executable() -> bytes:
+    return _minimal_elf_header(object_type=2)
+
+
+def _minimal_elf_header(*, object_type: int) -> bytes:
     data = bytearray(b"\x00" * 0x80)
     data[0:4] = b"\x7fELF"
     data[4] = 2  # ELFCLASS64
     data[5] = 1  # ELFDATA2LSB
     data[6] = 1  # EV_CURRENT
-    data[16:18] = (3).to_bytes(2, "little")  # ET_DYN
+    data[16:18] = object_type.to_bytes(2, "little")
     data[18:20] = (62).to_bytes(2, "little")  # x86_64
     data[20:24] = (1).to_bytes(4, "little")  # EV_CURRENT
     return bytes(data)
@@ -110,6 +118,20 @@ def test_tensorrt_scanner_detects_embedded_elf_shared_object(tmp_path: Path) -> 
     path = tmp_path / "embedded_elf.engine"
     prefix = b"tensorrt engine prefix\x00"
     path.write_bytes(prefix + _minimal_elf_shared_object())
+
+    result = TensorRTScanner().scan(str(path))
+
+    assert result.success is False
+    assert any(
+        issue.details.get("pattern") == "embedded ELF" and issue.details.get("offset") == len(prefix)
+        for issue in result.issues
+    )
+
+
+def test_tensorrt_scanner_detects_embedded_elf_executable(tmp_path: Path) -> None:
+    path = tmp_path / "embedded_elf_exec.engine"
+    prefix = b"tensorrt engine prefix\x00"
+    path.write_bytes(prefix + _minimal_elf_executable())
 
     result = TensorRTScanner().scan(str(path))
 
