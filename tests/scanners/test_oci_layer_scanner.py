@@ -322,13 +322,17 @@ class TestOciLayerScanner:
         assert not any("archive.tar.gz" in issue.message for issue in result.issues)
 
     def test_scan_manifest_ignores_remote_layer_urls(self, tmp_path: Path) -> None:
-        """Remote layer URLs under layers[].urls should not be treated as local files."""
+        """Remote layer URLs under layers[].urls should not mask local layer refs."""
+        missing_local_layer = "missing-local-layer.tar.gz"
         manifest = {
             "schemaVersion": 2,
             "layers": [
                 {
                     "digest": "sha256:abc123",
-                    "urls": ["https://cdn.example.com/layer.tar.gz"],
+                    "urls": [
+                        "https://cdn.example.com/layer.tar.gz",
+                        missing_local_layer,
+                    ],
                 }
             ],
         }
@@ -337,8 +341,10 @@ class TestOciLayerScanner:
 
         result = OciLayerScanner().scan(str(manifest_path))
 
-        assert result.success is True
-        assert not any("Layer not found" in issue.message for issue in result.issues)
+        assert result.success is False
+        assert any(
+            "Layer not found" in issue.message and missing_local_layer in issue.message for issue in result.issues
+        )
         assert not any("https://cdn.example.com/layer.tar.gz" in issue.message for issue in result.issues)
 
     def test_scan_layer_with_non_scannable_files(self, tmp_path):
