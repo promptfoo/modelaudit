@@ -83,11 +83,13 @@ class PyTorchZipScanner(BaseScanner):
     # CVE-2025-32434 constants
     CVE_2025_32434_ID: ClassVar[str] = "CVE-2025-32434"
     CVE_2025_32434_FIX_VERSION: ClassVar[str] = "2.6.0"
+    CVE_2025_32434_FIX_VERSION_PARTS: ClassVar[tuple[int, int, int]] = (2, 6, 0)
     CVE_2025_32434_DESCRIPTION: ClassVar[str] = "RCE when loading models with torch.load(weights_only=True)"
 
     # CVE-2026-24747 constants
     CVE_2026_24747_ID: ClassVar[str] = "CVE-2026-24747"
     CVE_2026_24747_FIX_VERSION: ClassVar[str] = "2.10.0"
+    CVE_2026_24747_FIX_VERSION_PARTS: ClassVar[tuple[int, int, int]] = (2, 10, 0)
     CVE_2026_24747_DESCRIPTION: ClassVar[str] = (
         "weights_only=True bypass via SETITEM abuse and tensor metadata mismatch"
     )
@@ -1281,9 +1283,13 @@ class PyTorchZipScanner(BaseScanner):
         """Check if a string looks like a version number"""
         import re
 
-        # Match patterns like 2.5.1, 1.13.0+cu117, 2.0.0.dev20230101
-        version_pattern = r"^\d+\.\d+\.\d+(?:\+\w+)?(?:\.dev\d+)?$"
-        return bool(re.match(version_pattern, text.strip()))
+        # Match patterns like 2.5.1, 2.10.0a0, 2.2.3rc1, 1.13.0+cu117, 2.0.0.dev20230101.
+        version_pattern = (
+            r"^\d+\.\d+\.\d+"
+            r"(?:(?:a|b|rc|alpha|beta|pre|preview)\d*|(?:\.?dev|\.?post)\d*)?"
+            r"(?:\+[-.0-9A-Za-z]+)?$"
+        )
+        return bool(re.match(version_pattern, text.strip(), flags=re.IGNORECASE))
 
     def _looks_like_pytorch_version(self, text: str) -> bool:
         """Check if a string looks specifically like a PyTorch version"""
@@ -1395,40 +1401,7 @@ class PyTorchZipScanner(BaseScanner):
 
     def _is_vulnerable_pytorch_version(self, version: str) -> bool:
         """Check if a PyTorch version is vulnerable to CVE-2025-32434 (≤2.5.1)"""
-        try:
-            import re
-
-            # Parse version string
-            vstr = version.strip()
-            # Match PEP 440 prerelease tags: a0, b1, rc1, dev0, alpha, beta
-            is_prerelease = bool(re.search(r"(\.dev|rc|alpha|beta|\d+a\d+|\d+b\d+)", vstr, re.IGNORECASE))
-            version_match = re.match(r"^(\d+)\.(\d+)\.(\d+)", vstr)
-            if not version_match:
-                # If we can't parse it, assume vulnerable for safety
-                return True
-
-            major, minor, patch = map(int, version_match.groups())
-
-            # CVE-2025-32434 affects PyTorch ≤2.5.1
-            if major < 2:
-                return True  # All 1.x versions are vulnerable
-            elif major == 2:
-                if minor < 5:
-                    return True  # 2.0.x through 2.4.x are vulnerable
-                elif minor == 5:
-                    return patch <= 1  # 2.5.0 and 2.5.1 are vulnerable
-                elif minor >= 6:
-                    # For 2.6.0+, treat pre-releases conservatively as vulnerable
-                    return is_prerelease
-                else:
-                    return False  # 2.6.0+ stable releases are fixed
-            else:
-                # For 3.x+, treat pre-releases conservatively as vulnerable
-                return is_prerelease
-
-        except Exception:
-            # If version parsing fails, assume vulnerable for safety
-            return True
+        return self._is_vulnerable_pytorch_version_for(version, *self.CVE_2025_32434_FIX_VERSION_PARTS)
 
     def _check_cve_2026_24747_vulnerability(self, version_info: dict[str, Any], result: ScanResult, path: str) -> None:
         """Check for CVE-2026-24747 using conservative PyTorch version evidence."""
@@ -1483,31 +1456,7 @@ class PyTorchZipScanner(BaseScanner):
 
     def _is_vulnerable_pytorch_version_2026(self, version: str) -> bool:
         """Check if a PyTorch version is vulnerable to CVE-2026-24747 (< 2.10.0)."""
-        try:
-            # Parse version string
-            vstr = version.strip()
-            # Match PEP 440 prerelease tags: a0, b1, rc1, dev0, alpha, beta
-            is_prerelease = bool(re.search(r"(\.dev|rc|alpha|beta|\d+a\d+|\d+b\d+)", vstr, re.IGNORECASE))
-            version_match = re.match(r"^(\d+)\.(\d+)\.(\d+)", vstr)
-            if not version_match:
-                return True  # Can't parse, assume vulnerable
-
-            major, minor, _patch = map(int, version_match.groups())
-
-            if major < 2:
-                return True  # All 1.x versions are vulnerable
-            elif major == 2:
-                if minor < 10:
-                    return True  # 2.0.x through 2.9.x are vulnerable
-                elif minor == 10:
-                    return is_prerelease  # 2.10.0-dev still vulnerable
-                else:
-                    return False  # 2.11.0+ are fixed
-            else:
-                return is_prerelease  # 3.x+ stable releases are fixed
-
-        except Exception:
-            return True
+        return self._is_vulnerable_pytorch_version_for(version, *self.CVE_2026_24747_FIX_VERSION_PARTS)
 
     @staticmethod
     def _is_vulnerable_pytorch_version_for(version: str, fix_major: int, fix_minor: int, fix_patch: int) -> bool:
