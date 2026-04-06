@@ -90,7 +90,7 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = {
         "module": "modelaudit.scanners.pytorch_zip_scanner",
         "class": "PyTorchZipScanner",
         "description": "Scans PyTorch ZIP-based model files",
-        "extensions": [".pt", ".pth", ".bin"],
+        "extensions": [".pt", ".pth", ".ckpt", ".pkl", ".bin"],
         "priority": 2,
         "dependencies": [],
         "numpy_sensitive": False,
