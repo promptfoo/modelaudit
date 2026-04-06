@@ -179,6 +179,32 @@ def test_tf_metagraph_scanner_detects_unsafe_ops_and_executable_payload_signals(
     )
 
 
+@pytest.mark.parametrize("op_name", ["LoadLibrary", "LoadLibraryV2"])
+def test_tf_metagraph_scanner_flags_loadlibrary_ops_without_path_attributes(tmp_path: Path, op_name: str) -> None:
+    loadlibrary_meta = tmp_path / f"{op_name.lower()}.meta"
+    loadlibrary_meta.write_bytes(
+        _build_metagraph(
+            graph_nodes=[
+                {
+                    "name": "plugin_loader",
+                    "op": op_name,
+                }
+            ]
+        )
+    )
+
+    result = TensorFlowMetaGraphScanner().scan(str(loadlibrary_meta))
+
+    assert result.success is False
+    assert any(
+        issue.message
+        and f"Dangerous TensorFlow operation: {op_name}" in issue.message
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("op_type") == op_name
+        for issue in result.issues
+    )
+
+
 def test_tf_metagraph_scanner_comment_token_does_not_suppress_malicious_detection(tmp_path: Path) -> None:
     malicious_meta = tmp_path / "malicious-comment.meta"
     malicious_meta.write_bytes(

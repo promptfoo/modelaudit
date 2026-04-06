@@ -798,8 +798,9 @@ class PyTorchZipScanner(BaseScanner):
 
         for entry in safe_entries:
             name = self._get_zip_member_name(entry)
+            normalized_name = name.lower()
             # Check for Python code files
-            if name.endswith(".py"):
+            if normalized_name.endswith(".py"):
                 result.add_check(
                     name="Python Code File Detection",
                     passed=False,
@@ -810,7 +811,7 @@ class PyTorchZipScanner(BaseScanner):
                 )
                 python_files_found = True
             # Check for shell scripts or other executable files
-            elif name.endswith(
+            elif normalized_name.endswith(
                 (".sh", ".bash", ".cmd", ".exe", ".dll", ".so", ".dylib", ".scr", ".com", ".bat", ".ps1")
             ):
                 result.add_check(
