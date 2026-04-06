@@ -12,8 +12,11 @@ def _resolve_hf_cache_path(path: Path) -> Path:
     try:
         return expanded_path.resolve(strict=False)
     except TypeError:
-        return expanded_path.resolve()
-    except OSError:
+        try:
+            return expanded_path.resolve()
+        except (OSError, RuntimeError):
+            return expanded_path.absolute()
+    except (OSError, RuntimeError):
         return expanded_path.absolute()
 
 

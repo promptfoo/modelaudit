@@ -698,9 +698,13 @@ def test_whitelist_no_downgrade_local_spoofed_config(tmp_path: Path) -> None:
     assert result.issues[0].details.get("whitelist_downgrade") is None
 
 
-def test_whitelist_no_downgrade_hf_cache_path_without_explicit_provenance(tmp_path: Path) -> None:
+def test_whitelist_no_downgrade_hf_cache_path_without_explicit_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Cache-shaped local paths alone should not qualify for whitelist downgrades."""
     whitelisted_model = "Qwen/Qwen2.5-0.5B"
+    monkeypatch.setenv("HF_HOME", str(tmp_path / ".cache" / "huggingface"))
     model_path = _create_hf_cache_model_path(tmp_path, whitelisted_model)
 
     scanner = MockScanner()
@@ -718,9 +722,13 @@ def test_whitelist_no_downgrade_hf_cache_path_without_explicit_provenance(tmp_pa
     assert result.issues[0].details.get("whitelist_downgrade") is None
 
 
-def test_whitelist_downgrade_explicit_hf_provenance(tmp_path: Path) -> None:
+def test_whitelist_downgrade_explicit_hf_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Explicit upstream HuggingFace provenance should still permit downgrades."""
     whitelisted_model = "Qwen/Qwen2.5-0.5B"
+    monkeypatch.setenv("HF_HOME", str(tmp_path / ".cache" / "huggingface"))
     model_path = _create_hf_cache_model_path(tmp_path, whitelisted_model)
 
     scanner = MockScanner(
@@ -796,8 +804,12 @@ def test_whitelist_no_downgrade_spoofed_hf_cache_layout(tmp_path: Path) -> None:
     assert result.issues[0].details.get("whitelist_downgrade") is None
 
 
-def test_whitelist_no_downgrade_non_whitelisted_hf_cache_model(tmp_path: Path) -> None:
+def test_whitelist_no_downgrade_non_whitelisted_hf_cache_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Real HF cache paths should not downgrade findings for non-whitelisted models."""
+    monkeypatch.setenv("HF_HOME", str(tmp_path / ".cache" / "huggingface"))
     model_path = _create_hf_cache_model_path(tmp_path, "unknown-author/unknown-model-12345")
 
     scanner = MockScanner()

@@ -14,6 +14,7 @@ from modelaudit.utils.sources.huggingface import (
     extract_model_id_from_path,
     get_model_info,
     get_model_size,
+    is_huggingface_cache_path,
     is_huggingface_file_url,
     is_huggingface_url,
     parse_huggingface_file_url,
@@ -178,6 +179,24 @@ class TestExtractModelIdFromPath:
         model_path.write_bytes(b"weights")
 
         assert extract_model_id_from_path(str(model_path)) == ("Qwen/Qwen2.5-0.5B", "huggingface_cache")
+
+    def test_hf_cache_path_resolution_handles_symlink_loop(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        requires_symlinks: None,
+    ) -> None:
+        """Looped cache symlinks should not abort HuggingFace cache provenance checks."""
+        hf_home = tmp_path / "hf-home"
+        monkeypatch.setenv("HF_HOME", str(hf_home))
+        model_root = hf_home / "hub" / "models--Qwen--Qwen2.5-0.5B"
+        model_root.mkdir(parents=True)
+        loop_path = model_root / "snapshots"
+        loop_path.symlink_to(loop_path, target_is_directory=True)
+
+        looped_metadata_path = loop_path / "abc123" / "model.metadata"
+
+        assert is_huggingface_cache_path(looped_metadata_path) is True
 
     def test_extract_model_id_rejects_spoofed_models_directory(self, tmp_path: Path) -> None:
         """A local models--* directory without HF cache layout should not be treated as HuggingFace."""
