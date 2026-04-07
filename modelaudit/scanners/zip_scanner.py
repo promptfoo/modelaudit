@@ -351,7 +351,10 @@ class ZipScanner(BaseScanner):
                         result.add_check(
                             name="Compression Ratio Check",
                             passed=False,
-                            message=f"Suspicious compression ratio ({compression_ratio:.1f}x) in entry: {name}",
+                            message=(
+                                f"Suspicious compression ratio ({compression_ratio:.1f}x) in entry: {name}; "
+                                "skipping extraction"
+                            ),
                             severity=IssueSeverity.WARNING,
                             rule_code="S410",  # Archive bomb
                             location=f"{path}:{name}",
@@ -363,6 +366,8 @@ class ZipScanner(BaseScanner):
                                 "threshold": 100,
                             },
                         )
+                        scan_complete = False
+                        continue
                     else:
                         # Record safe compression ratio
                         result.add_check(
