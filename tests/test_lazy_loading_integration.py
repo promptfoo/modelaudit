@@ -70,6 +70,7 @@ class TestCoreIntegration:
         # Create a pickle file (should prefer pickle scanner)
         with tempfile.NamedTemporaryFile(suffix=".pkl") as f:
             f.write(b"\x80\x02]q\x00.")  # Simple pickle data
+            f.flush()
 
             result = core.scan_file(f.name)
 
