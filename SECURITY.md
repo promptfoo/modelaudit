@@ -6,18 +6,18 @@ A security vulnerability is any bug that threatens the safety of ModelAudit user
 
 **Vulnerability categories:**
 
-| Category                      | Examples                                                                                                                                                                       |
-| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Code execution in the scanner | A crafted model file causes ModelAudit itself to execute arbitrary code during scanning                                                                                        |
-| Detection bypass              | Security-relevant malicious behavior goes undetected within a format or attack class that ModelAudit claims to cover, even if unrelated detectors still produce other findings |
-| Denial of service             | A crafted file causes an out-of-memory condition, infinite loop, or crash in ModelAudit                                                                                        |
-| Information disclosure        | Scan results or error output leak host filesystem paths, environment variables, or API keys                                                                                    |
-| Supply chain compromise       | Malicious code introduced through the PyPI package, Docker images, or GitHub Actions workflows                                                                                 |
+| Category                      | Examples                                                                                                                              |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| Code execution in the scanner | A crafted model file causes ModelAudit itself to execute arbitrary code during scanning                                               |
+| Material detection bypass     | A practical evasion defeats a documented, security-relevant detection guarantee or broad attack class that ModelAudit claims to cover |
+| Denial of service             | A crafted file causes an out-of-memory condition, infinite loop, or crash in ModelAudit                                               |
+| Information disclosure        | Scan results or error output leak host filesystem paths, environment variables, or API keys                                           |
+| Supply chain compromise       | Malicious code introduced through the PyPI package, Docker images, or GitHub Actions workflows                                        |
 
 **Not considered a vulnerability:**
 
 - Malicious content that ModelAudit **correctly detects** — that is working as designed.
-- False positives and **non-security** false negatives (e.g., a new obfuscation technique not yet covered, or a heuristic that needs tuning) — these are detection quality issues. Report them via [GitHub Issues](https://github.com/promptfoo/modelaudit/issues) using the bug report template, or see [CONTRIBUTING.md](CONTRIBUTING.md) for guidance. **However**, if a false negative causes security-relevant malicious behavior to go undetected within a format or attack class that ModelAudit claims to cover — even if unrelated detectors still produce other findings — that is a detection bypass and should be reported privately as a vulnerability. See [How to report](#how-to-report-a-vulnerability).
+- False positives and **non-security** false negatives (for example, a new malware variant, signature gap, obfuscation technique not yet covered, or heuristic that needs tuning) — these are detection quality issues. Report them via [GitHub Issues](https://github.com/promptfoo/modelaudit/issues) using the bug report template, or see [CONTRIBUTING.md](CONTRIBUTING.md) for guidance. A false negative becomes a security vulnerability only when it materially defeats a documented security guarantee, common malicious-model attack class, or enforcement boundary that users reasonably rely on. Narrow misses in niche formats or runtime-specific paths may still be accepted privately during triage, but they are not automatically High severity and may be closed as detection-quality improvements if the practical security impact is low.
 - Bugs in third-party dependencies that are not reachable through ModelAudit's own code paths — report those to the respective upstream maintainers.
 - Issues that require the attacker to already have equivalent privilege on the scanning host **and** do not enable privilege escalation, lateral movement, persistence, or additional data access. (Bugs exploitable in shared CI runners or multi-tenant environments where the attacker starts with limited access are in scope.)
 
@@ -76,7 +76,7 @@ We assess severity using [CVSS v3.1](https://www.first.org/cvss/v3.1/specificati
 **ModelAudit-specific severity factors:**
 
 - A crafted model file that causes arbitrary code execution in the scanner is treated as **Critical**.
-- A bypass that causes security-relevant malicious behavior to go undetected within a format or attack class that ModelAudit claims to cover is treated as at least **High**.
+- Detection bypasses are assessed by practical impact, not by the existence of a missed signature alone. Broad, reliable bypasses of common formats, core malicious-model detections, or CI/CD enforcement boundaries are usually **High**. Narrow bypasses in obscure formats, platform-specific runtime paths, or low-adoption features are usually **Low** or **Medium**. Ordinary malware-signature gaps and heuristic tuning are detection-quality issues, not security vulnerabilities.
 - Exposure of host secrets or credentials during scanning is treated as at least **High**.
 - A vulnerability reachable only through an optional dependency not installed by default may be reduced by one tier.
 
@@ -99,7 +99,7 @@ We request CVE IDs through [GitHub's CVE Numbering Authority (CNA)](https://docs
 **CVE issued:**
 
 - Remote code execution in ModelAudit when scanning untrusted input.
-- Detection bypass with broad or material security impact — security-relevant malicious behavior goes undetected within a format or attack class that ModelAudit covers (see [claimed coverage](#claimed-coverage)).
+- Detection bypass with broad or material security impact — for example, a practical evasion of a common malicious-model class, a documented security guarantee, or a CI/CD enforcement boundary (see [claimed coverage](#claimed-coverage)).
 - Supply chain compromise of the PyPI package, Docker images, or release pipeline.
 - Information disclosure of sensitive host data during a scan.
 
@@ -107,14 +107,14 @@ We request CVE IDs through [GitHub's CVE Numbering Authority (CNA)](https://docs
 
 - Denial of service that only affects local interactive CLI usage, cannot be triggered remotely, and does not suppress or bypass scanning enforcement in automated pipelines.
 - Crashes with no security impact beyond terminating a single interactive scan.
-- Detection quality improvements (heuristic tuning, new signatures, coverage gaps for novel techniques).
+- Detection quality improvements (heuristic tuning, new signatures, coverage gaps for novel techniques, or narrow false negatives with low practical security impact).
 - Issues requiring the attacker to already control the scanning host's configuration with equivalent privilege (see exclusion above).
 
 **CVE-eligible (assess on impact):**
 
 - Denial of service that can suppress, abort, or bypass scanning in automated CI/CD pipelines or gating systems — effectively disabling security enforcement.
 - Denial of service when ModelAudit is used as a library in a network-facing service.
-- Detection bypass affecting a single format with limited real-world adoption, where the practical security impact is narrow. (Bypasses with broader impact fall under "CVE issued" above.)
+- Detection bypass affecting a single format with limited real-world adoption, where the practical security impact is narrow. These may be fixed in a normal release without a CVE when the impact is Low. Bypasses with broader impact fall under "CVE issued" above.
 
 When in doubt, we err toward issuing a CVE.
 
@@ -169,7 +169,7 @@ References to what ModelAudit "claims to cover" throughout this policy mean the 
 - [Security model and limitations](docs/user/security-model.md) — what ModelAudit is designed to catch and what it does not guarantee.
 - [Compatibility matrix](docs/user/compatibility-matrix.md) — supported file formats and the detectors applied to each.
 
-If a format or attack class is listed in these documents, bypasses against it are treated as security-relevant under this policy. If documentation is stale or ambiguous relative to implemented scanner behavior, we triage in favor of security handling.
+If a format or attack class is listed in these documents, bypass reports against it should be triaged carefully and privately when details would help attackers evade users' scans. Claimed coverage is not an automatic severity floor: impact depends on how broad, practical, and security-relevant the bypass is. If documentation is stale or ambiguous relative to implemented scanner behavior, we triage in favor of private review, then downgrade or close the report if it is only a low-impact detection-quality issue.
 
 ## Related documentation
 
