@@ -286,6 +286,50 @@ class TestZipScanner:
         assert "maximum .mar recursion depth (1) exceeded" in depth_checks[0].message.lower()
         assert depth_checks[0].location == f"{outer_zip}:model.mar"
 
+    def test_scan_manifestless_mar_runs_python_handler_static_analysis(self, tmp_path: Path) -> None:
+        """Manifest-less .mar archives should still statically analyze Python handlers."""
+        mar_path = tmp_path / "handler_only.mar"
+        with zipfile.ZipFile(mar_path, "w") as archive:
+            archive.writestr(
+                "handler.py",
+                "import subprocess\nsubprocess.Popen(['echo', 'pwned'])\n",
+            )
+
+        result = self.scanner.scan(str(mar_path))
+
+        handler_failures = [
+            check
+            for check in result.checks
+            if check.name == "TorchServe Handler Static Analysis" and check.status == CheckStatus.FAILED
+        ]
+        assert len(handler_failures) == 1
+        assert "high-risk execution primitives" in handler_failures[0].message.lower()
+        assert handler_failures[0].details.get("entry") == "handler.py"
+        assert handler_failures[0].details.get("risky_calls") == ["subprocess.Popen"]
+        assert handler_failures[0].location == f"{mar_path}:handler.py"
+
+    def test_scan_manifestless_mar_skips_oversized_python_handler_analysis(self, tmp_path: Path) -> None:
+        """Oversized .mar Python handlers should fail closed without full materialization."""
+        mar_path = tmp_path / "oversized_handler.mar"
+        oversized_handler_source = "print('x')\n" * 100
+        with zipfile.ZipFile(mar_path, "w") as archive:
+            archive.writestr("handler.py", oversized_handler_source)
+
+        scanner = ZipScanner(config={"max_mar_python_analysis_bytes": 16})
+        result = scanner.scan(str(mar_path))
+
+        handler_failures = [
+            check
+            for check in result.checks
+            if check.name == "TorchServe Handler Static Analysis" and check.status == CheckStatus.FAILED
+        ]
+        assert len(handler_failures) == 1
+        assert "oversized entry" in handler_failures[0].message.lower()
+        assert "limit is 16 bytes" in handler_failures[0].message.lower()
+        assert handler_failures[0].details.get("entry") == "handler.py"
+        assert handler_failures[0].details.get("size_limit") == 16
+        assert handler_failures[0].location == f"{mar_path}:handler.py"
+
     def test_scan_extensionless_nested_zip_recurses(self, tmp_path: Path) -> None:
         """Extensionless ZIP members should be recursively scanned by content."""
         inner_zip = io.BytesIO()
