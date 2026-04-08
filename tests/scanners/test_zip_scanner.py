@@ -297,6 +297,9 @@ class TestZipScanner:
 
         result = self.scanner.scan(str(mar_path))
 
+        assert result.success is False
+        assert result.has_errors is True
+
         handler_failures = [
             check
             for check in result.checks
@@ -309,7 +312,7 @@ class TestZipScanner:
         assert handler_failures[0].location == f"{mar_path}:handler.py"
 
     def test_scan_manifestless_mar_skips_oversized_python_handler_analysis(self, tmp_path: Path) -> None:
-        """Oversized .mar Python handlers should fail closed without full materialization."""
+        """Oversized .mar Python handlers should report skipped bounded analysis."""
         mar_path = tmp_path / "oversized_handler.mar"
         oversized_handler_source = "print('x')\n" * 100
         with zipfile.ZipFile(mar_path, "w") as archive:
@@ -318,15 +321,13 @@ class TestZipScanner:
         scanner = ZipScanner(config={"max_mar_python_analysis_bytes": 16})
         result = scanner.scan(str(mar_path))
 
-        assert result.success is False
-        assert result.has_errors is True
-
         handler_failures = [
             check
             for check in result.checks
             if check.name == "TorchServe Handler Static Analysis" and check.status == CheckStatus.FAILED
         ]
         assert len(handler_failures) == 1
+        assert handler_failures[0].severity == IssueSeverity.WARNING
         assert "oversized entry" in handler_failures[0].message.lower()
         assert "limit is 16 bytes" in handler_failures[0].message.lower()
         assert handler_failures[0].details.get("entry") == "handler.py"
