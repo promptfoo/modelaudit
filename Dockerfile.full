@@ -29,6 +29,10 @@ RUN pip install --no-cache-dir \
 RUN pip install --no-cache-dir \
     "torch>=2.6.0,<3.0" --index-url https://download.pytorch.org/whl/cpu
 
+# The PyTorch CPU index currently carries an older setuptools wheel; restore a
+# PyPI build that satisfies torch's <82 constraint and clears image scanners.
+RUN pip install --no-cache-dir "setuptools>=78.1.1,<82"
+
 # For CI testing purposes, we'll run as root to avoid volume mount permission issues
 # In production, users can override with --user flag if needed
 
