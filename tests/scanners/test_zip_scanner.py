@@ -318,6 +318,9 @@ class TestZipScanner:
         scanner = ZipScanner(config={"max_mar_python_analysis_bytes": 16})
         result = scanner.scan(str(mar_path))
 
+        assert result.success is False
+        assert result.has_errors is True
+
         handler_failures = [
             check
             for check in result.checks
