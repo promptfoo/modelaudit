@@ -457,6 +457,30 @@ class TestZipScanner:
         assert compression_issues[0].details["entry"] == "suspicious.txt"
         assert "skipping extraction" in compression_issues[0].message
 
+    def test_zip_bomb_detection_skips_only_suspicious_entry(self, tmp_path: Path) -> None:
+        """Suspicious entries should be skipped while safe entries still route to nested scanning."""
+        archive_path = tmp_path / "mixed.zip"
+        with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+            z.writestr("suspicious.txt", "A" * 300000)
+            z.writestr("safe.bin", os.urandom(4096))
+
+        nested_scan_paths: list[str] = []
+
+        def nested_scan(path: str, _config: dict[str, Any]) -> ScanResult:
+            nested_scan_paths.append(path)
+            return ScanResult(scanner_name="test")
+
+        scanner = ZipScanner(config={NESTED_SCAN_CALLBACK_CONFIG_KEY: nested_scan})
+        result = scanner.scan(str(archive_path))
+
+        assert result.success is False
+        assert not any(path.endswith("_suspicious.txt") for path in nested_scan_paths)
+        assert any(path.endswith("_safe.bin") for path in nested_scan_paths)
+
+        compression_issues = [i for i in result.issues if i.rule_code == "S410"]
+        assert len(compression_issues) == 1
+        assert compression_issues[0].details["entry"] == "suspicious.txt"
+
     def test_max_depth_limit(self):
         """Test that maximum nesting depth is enforced"""
         # Create deeply nested zips
