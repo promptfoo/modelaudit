@@ -7,22 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.2.33](https://github.com/promptfoo/modelaudit/compare/v0.2.32...v0.2.33) (2026-04-09)
 
-
 ### Features
 
-* extract standalone pickle scanner package with parity harness ([#832](https://github.com/promptfoo/modelaudit/issues/832)) ([e2986cd](https://github.com/promptfoo/modelaudit/commit/e2986cddaa592306cc10541865f011b3dc99a0ba))
-
+- extract standalone pickle scanner package with parity harness ([#832](https://github.com/promptfoo/modelaudit/issues/832)) ([e2986cd](https://github.com/promptfoo/modelaudit/commit/e2986cddaa592306cc10541865f011b3dc99a0ba))
 
 ### Bug Fixes
 
-* harden helper routing for zip-backed pickle checkpoints ([#870](https://github.com/promptfoo/modelaudit/issues/870)) ([3ebe0c0](https://github.com/promptfoo/modelaudit/commit/3ebe0c04f02f51274b9c9588200212ad2cffe70b))
-* make return paths explicit ([#884](https://github.com/promptfoo/modelaudit/issues/884)) ([e31c254](https://github.com/promptfoo/modelaudit/commit/e31c254b820c78278289cf06acdf17f3f81d49b2))
-* skip extraction for suspicious ZIP entries ([358aa44](https://github.com/promptfoo/modelaudit/commit/358aa4498ce9d6a091340c6f23289523f98f3a55))
-
+- harden helper routing for zip-backed pickle checkpoints ([#870](https://github.com/promptfoo/modelaudit/issues/870)) ([3ebe0c0](https://github.com/promptfoo/modelaudit/commit/3ebe0c04f02f51274b9c9588200212ad2cffe70b))
+- make return paths explicit ([#884](https://github.com/promptfoo/modelaudit/issues/884)) ([e31c254](https://github.com/promptfoo/modelaudit/commit/e31c254b820c78278289cf06acdf17f3f81d49b2))
+- skip extraction for suspicious ZIP entries ([358aa44](https://github.com/promptfoo/modelaudit/commit/358aa4498ce9d6a091340c6f23289523f98f3a55))
 
 ### Documentation
 
-* clarify detection bypass severity policy ([d8117a1](https://github.com/promptfoo/modelaudit/commit/d8117a14b4f8ef3e1a93cb1d48eeba8d8af92677))
+- clarify detection bypass severity policy ([d8117a1](https://github.com/promptfoo/modelaudit/commit/d8117a14b4f8ef3e1a93cb1d48eeba8d8af92677))
 
 ## [0.2.32](https://github.com/promptfoo/modelaudit/compare/v0.2.31...v0.2.32) (2026-04-05)
 
