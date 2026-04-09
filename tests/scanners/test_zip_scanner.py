@@ -341,6 +341,7 @@ class TestZipScanner:
             archive.writestr("handler.py", "def handle(data, context)\n    return data\n")
 
         result = self.scanner.scan(str(mar_path))
+        assert result.success is False
 
         handler_failures = [
             check

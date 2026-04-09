@@ -419,6 +419,8 @@ class ZipScanner(BaseScanner):
                             mar_python_result = self._scan_mar_python_entry(path, name, tmp_path, total_size)
                             if mar_python_result is not None:
                                 result.merge(mar_python_result)
+                                if not mar_python_result.success:
+                                    scan_complete = False
 
                         nested_config = dict(self.config)
                         nested_config["_archive_depth"] = depth + 1
