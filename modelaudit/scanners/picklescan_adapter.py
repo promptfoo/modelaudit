@@ -14,7 +14,15 @@ from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, Check, Issue, IssueSev
 from .rule_mapper import get_generic_rule_code, get_import_rule_code, get_pickle_opcode_rule_code
 
 _INCONCLUSIVE_NOTICE_CODES = frozenset(
-    {"encoded_nested_payload_truncated", "literal_scan_truncated", "opcode_budget", "parse_incomplete", "timeout"}
+    {
+        "encoded_nested_payload_truncated",
+        "literal_scan_truncated",
+        "nested_payload_truncated",
+        "nested_pickle_incomplete",
+        "opcode_budget",
+        "parse_incomplete",
+        "timeout",
+    }
 )
 _DEFAULT_SCAN_OPTIONS = ScanOptions()
 _IMPORT_MODULE_ALIASES = {
@@ -24,6 +32,8 @@ _IMPORT_MODULE_ALIASES = {
 _LEGACY_NOTICE_RULE_CODES = {
     "encoded_nested_payload_truncated": "S902",
     "literal_scan_truncated": "S902",
+    "nested_payload_truncated": "S902",
+    "nested_pickle_incomplete": "S902",
     "opcode_budget": "S902",
     "parse_incomplete": "S902",
     "timeout": "S902",
@@ -31,6 +41,8 @@ _LEGACY_NOTICE_RULE_CODES = {
 _LEGACY_SCAN_OUTCOME_REASONS = {
     "encoded_nested_payload_truncated": "encoded_nested_payload_truncated",
     "literal_scan_truncated": "literal_scan_truncated",
+    "nested_payload_truncated": "nested_payload_truncated",
+    "nested_pickle_incomplete": "nested_pickle_incomplete",
     "opcode_budget": "opcode_budget_exceeded",
     "parse_incomplete": "pickle_analysis_incomplete",
     "timeout": "scan_timeout",
