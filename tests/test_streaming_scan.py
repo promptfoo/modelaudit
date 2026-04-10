@@ -110,7 +110,7 @@ def test_scan_model_directory_or_file_partial_streaming_path_returns_exit_code_2
 
         result = scan_model_directory_or_file(f"stream://{stream_url}")
 
-    metadata = result.file_metadata[stream_url]
+    metadata = result.file_metadata[stream_url].model_dump()
     assert metadata["scan_outcome"] == "inconclusive"
     assert metadata["analysis_incomplete"] is True
     assert "streaming_analysis_incomplete" in metadata["scan_outcome_reasons"]
@@ -144,7 +144,7 @@ def test_scan_model_directory_or_file_partial_streaming_security_finding_returns
 
         result = scan_model_directory_or_file(f"stream://{stream_url}")
 
-    metadata = result.file_metadata[stream_url]
+    metadata = result.file_metadata[stream_url].model_dump()
     assert metadata["scan_outcome"] == "inconclusive"
     assert result.success is True
     assert determine_exit_code(result) == 1

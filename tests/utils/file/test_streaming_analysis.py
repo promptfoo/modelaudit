@@ -4,9 +4,17 @@ import fsspec
 import pytest
 from fsspec.implementations.local import LocalFileSystem
 
-from modelaudit.scanners.base import IssueSeverity, ScanResult
+from modelaudit.scanners.base import BaseScanner, IssueSeverity, ScanResult
 from modelaudit.scanners.pickle_scanner import PickleScanner
 from modelaudit.utils.file import streaming
+
+
+class HeaderOnlyScanner(BaseScanner):
+    name = "header_only"
+
+    def scan(self, path: str) -> ScanResult:
+        del path
+        raise RuntimeError("full scan is not available for streaming fallback")
 
 
 def test_stream_analyze_file_uses_scanner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -118,6 +126,35 @@ def test_stream_analyze_file_returns_clean_partial_scanner_result(
     assert result.success is False
     assert result.metadata["scan_outcome"] == "inconclusive"
     assert result.metadata["analysis_incomplete"] is True
+    assert "streaming_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert "failed closed" in result.metadata["scan_outcome_message"]
+
+
+def test_stream_analyze_file_returns_clean_partial_header_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = tmp_path / "sample.joblib"
+    file_path.write_bytes(b"model-header-only" * 2)
+    url = f"file://{file_path}"
+
+    monkeypatch.setattr(streaming, "get_fs_protocol", lambda u: "file")
+    monkeypatch.setattr(fsspec, "filesystem", lambda protocol, token=None: LocalFileSystem())
+
+    result, was_complete = streaming.stream_analyze_file(url, HeaderOnlyScanner(), max_bytes=4)
+
+    assert was_complete is False
+    assert result is not None
+    assert result.issues == []
+    assert result.bytes_scanned == 4
+    assert result.success is False
+    assert result.has_warnings is False
+    assert result.has_errors is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert result.metadata["analysis_incomplete"] is True
+    assert result.metadata["streaming_analysis"] is True
+    assert result.metadata["bytes_analyzed"] == 4
+    assert result.metadata["analysis_complete"] is False
     assert "streaming_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
     assert "failed closed" in result.metadata["scan_outcome_message"]
 

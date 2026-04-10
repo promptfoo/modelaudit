@@ -217,27 +217,25 @@ def stream_analyze_file(
                         )
                     )
 
-        # Create scan result
-        if scan_result is not None or issues or was_complete:
-            result = ScanResult(scanner_name="streaming")
-            scanned = getattr(scan_result, "bytes_scanned", 0) if scan_result is not None else 0
-            result.bytes_scanned = scanned or bytes_to_read
-            result.issues = issues
-            result.metadata = {
-                "streaming_analysis": True,
-                "bytes_analyzed": bytes_to_read,
-                "analysis_complete": was_complete,
-                "file_size": file_size,
-            }
-            result.metadata.update(metadata)
-            if not was_complete:
-                _mark_streaming_analysis_incomplete(result)
-            scanner_success = bool(getattr(scan_result, "success", True)) if scan_result is not None else True
-            result.finish(success=was_complete and scanner_success)
-            return result, was_complete
-        else:
-            # Partial analysis with no findings
-            return None, was_complete
+        # Create a result for any successful streamed read; reserve None for
+        # transport/setup failures so callers can distinguish fallback from an
+        # inconclusive partial analysis.
+        result = ScanResult(scanner_name="streaming")
+        scanned = getattr(scan_result, "bytes_scanned", 0) if scan_result is not None else 0
+        result.bytes_scanned = scanned or bytes_to_read
+        result.issues = issues
+        result.metadata = {
+            "streaming_analysis": True,
+            "bytes_analyzed": bytes_to_read,
+            "analysis_complete": was_complete,
+            "file_size": file_size,
+        }
+        result.metadata.update(metadata)
+        if not was_complete:
+            _mark_streaming_analysis_incomplete(result)
+        scanner_success = bool(getattr(scan_result, "success", True)) if scan_result is not None else True
+        result.finish(success=was_complete and scanner_success)
+        return result, was_complete
 
     except Exception as e:
         # If streaming fails, return None to fall back to regular download
