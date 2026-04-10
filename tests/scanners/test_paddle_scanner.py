@@ -36,15 +36,18 @@ def test_paddle_scanner_detects_suspicious_pattern(tmp_path: Path) -> None:
 
 
 def test_paddle_suspicious_pdmodel_aggregate_exit_code_is_security_finding(tmp_path: Path) -> None:
+    """Suspicious .pdmodel patterns should be warning-level security findings."""
     path = tmp_path / "model.pdmodel"
     path.write_bytes(b"os.system('ls')")
 
     with patch("modelaudit.scanners.paddle_scanner.HAS_PADDLE", True):
         result = scan_model_directory_or_file(str(path), cache_scan_results=False)
 
+    warning_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.WARNING]
     assert result.success is True
+    assert result.has_errors is False
     assert determine_exit_code(result) == 1
-    assert any(issue.severity == IssueSeverity.WARNING for issue in result.issues)
+    assert warning_issues
 
 
 def test_paddle_scanner_missing_dependency(tmp_path: Path) -> None:
@@ -124,15 +127,18 @@ def test_pdiparams_real_threats_still_detected(tmp_path: Path) -> None:
 
 
 def test_paddle_suspicious_pdiparams_aggregate_exit_code_is_security_finding(tmp_path: Path) -> None:
+    """Suspicious .pdiparams patterns should be warning-level security findings."""
     path = tmp_path / "bad_weights.pdiparams"
     path.write_bytes(b"padding " + b"import os" + b" eval(payload) " + b"os.system('rm -rf /')")
 
     with patch("modelaudit.scanners.paddle_scanner.HAS_PADDLE", True):
         result = scan_model_directory_or_file(str(path), cache_scan_results=False)
 
+    warning_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.WARNING]
     assert result.success is True
+    assert result.has_errors is False
     assert determine_exit_code(result) == 1
-    assert any(issue.severity == IssueSeverity.WARNING for issue in result.issues)
+    assert warning_issues
 
 
 def test_pdmodel_hex_escape_still_flagged(tmp_path: Path) -> None:
