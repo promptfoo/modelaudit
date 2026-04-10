@@ -96,6 +96,41 @@ def test_scan_bytes_attributes_reduce_calls_to_the_callable_operand_not_nested_a
     )
 
 
+@pytest.mark.parametrize(
+    ("payload", "source"),
+    [
+        (b"cbuiltins\nlen\n}cos\nsystem\nK\x01s\x85R.", "setitem-args.pkl"),
+        (b"cbuiltins\nlen\n}(cos\nsystem\nK\x01u\x85R.", "setitems-args.pkl"),
+    ],
+)
+def test_scan_bytes_dict_mutation_operands_do_not_become_reduce_call_targets(payload: bytes, source: str) -> None:
+    report = scan_bytes(payload, source=source)
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "DANGEROUS_GLOBAL" and finding.details.get("import_reference") in SYSTEM_GLOBALS
+        for finding in report.findings
+    )
+    assert not any(
+        finding.rule_code == "DANGEROUS_CALL" and finding.details.get("import_reference") in SYSTEM_GLOBALS
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_memoize_index_advances_after_explicit_memo_write() -> None:
+    payload = b"\x80\x04cbuiltins\nlen\nq\x00cos\nsystem\n\x94h\x01\x8c\x04echo\x85R."
+
+    report = scan_bytes(payload, source="memoize-after-put.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL" and finding.details.get("import_reference") in SYSTEM_GLOBALS
+        for finding in report.findings
+    )
+
+
 def test_scan_stream_uses_explicit_source_and_does_not_leak_prior_scan_state() -> None:
     scanner = PickleScanner()
 

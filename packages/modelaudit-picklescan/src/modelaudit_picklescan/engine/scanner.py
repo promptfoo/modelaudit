@@ -571,6 +571,11 @@ class _ScanState:
                 self.stack.pop()
             return
 
+        if op_name == "DUP":
+            if self.stack:
+                self.stack.append(self.stack[-1])
+            return
+
         if op_name == "POP_MARK":
             self._pop_to_mark()
             return
@@ -595,9 +600,22 @@ class _ScanState:
             self._collapse_top_n(3)
             return
 
+        if op_name in {"APPEND", "SETITEM"}:
+            if self.stack:
+                self.stack.pop()
+            if op_name == "SETITEM" and self.stack:
+                self.stack.pop()
+            return
+
+        if op_name in {"APPENDS", "SETITEMS", "ADDITEMS"}:
+            self._pop_to_mark()
+            return
+
         if op_name in _MEMO_WRITE_OPCODES:
             if self.stack:
                 self.memo[arg] = self.stack[-1]
+            if isinstance(arg, int):
+                self.next_memo_index = max(self.next_memo_index, arg + 1)
             return
 
         if op_name == "MEMOIZE":
