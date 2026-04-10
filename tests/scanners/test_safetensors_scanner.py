@@ -14,7 +14,8 @@ pytest.importorskip("safetensors")
 
 from safetensors.numpy import save_file
 
-from modelaudit.scanners.base import CheckStatus
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.safetensors_scanner import SafeTensorsScanner
 
 
@@ -41,6 +42,11 @@ def create_safetensors_with_dtype_size_mismatch(path: Path, dtype: str) -> None:
 
     new_header_bytes = json.dumps(header).encode("utf-8")
     path.write_bytes(struct.pack("<Q", len(new_header_bytes)) + new_header_bytes + data_bytes)
+
+
+def write_raw_safetensors(path: Path, header: dict[str, Any], data: bytes) -> None:
+    header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    path.write_bytes(struct.pack("<Q", len(header_bytes)) + header_bytes + data)
 
 
 def test_valid_safetensors_file(tmp_path: Path) -> None:
@@ -94,6 +100,8 @@ def test_oversized_header_triggers_limit_check(tmp_path: Path) -> None:
     assert "exceeds maximum allowed size" in header_limit_check.message
     assert result.success is True
     assert result.metadata["analysis_incomplete"] is True
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "safetensors_header_size_limit_exceeded" in result.metadata["scan_outcome_reasons"]
     assert result.bytes_scanned == file_path.stat().st_size
 
 
@@ -117,6 +125,7 @@ def test_oversized_header_skips_metadata_content_analysis(tmp_path: Path, monkey
     assert header_limit_check is not None
     assert header_limit_check.status.value == "failed"
     assert result.metadata["analysis_incomplete"] is True
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert result.success is True
 
 
@@ -229,6 +238,71 @@ def test_bad_offsets(tmp_path: Path) -> None:
     assert any("offset" in issue.message.lower() for issue in result.issues)
 
 
+def test_unclaimed_safetensors_data_is_inconclusive_not_clean(tmp_path: Path) -> None:
+    file_path = tmp_path / "trailing.safetensors"
+    header = {"t": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}
+    write_raw_safetensors(file_path, header, b"\x00" * 8)
+
+    scanner = SafeTensorsScanner()
+    result = scanner.scan(str(file_path))
+
+    assert result.success is False
+    assert result.has_errors is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "safetensors_structure_validation_failed" in result.metadata["scan_outcome_reasons"]
+    assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+    assert any(
+        check.name == "Tensor Data Coverage Check" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+def test_unclaimed_safetensors_data_returns_exit2(tmp_path: Path) -> None:
+    file_path = tmp_path / "trailing.safetensors"
+    header = {"t": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}
+    write_raw_safetensors(file_path, header, b"\x00" * 8)
+
+    result = scan_model_directory_or_file(str(file_path))
+
+    assert determine_exit_code(result) == 2
+    assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def test_malformed_data_offsets_are_inconclusive_not_scanner_crash(tmp_path: Path) -> None:
+    file_path = tmp_path / "bad_offsets_shape.safetensors"
+    header = {"t": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4, 8]}}
+    write_raw_safetensors(file_path, header, b"\x00" * 8)
+
+    scanner = SafeTensorsScanner()
+    result = scanner.scan(str(file_path))
+
+    assert result.success is False
+    assert result.has_errors is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "safetensors_structure_validation_failed" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Tensor Offset Structure Validation" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+    assert not any("Error scanning SafeTensors file" in issue.message for issue in result.issues)
+
+
+def test_safetensors_security_finding_takes_precedence_over_inconclusive_structure(tmp_path: Path) -> None:
+    file_path = tmp_path / "malicious_metadata_trailing.safetensors"
+    header = {
+        "__metadata__": {"description": "<script>alert('xss')</script>"},
+        "t": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+    }
+    write_raw_safetensors(file_path, header, b"\x00" * 8)
+
+    direct = SafeTensorsScanner().scan(str(file_path))
+    aggregate = scan_model_directory_or_file(str(file_path))
+
+    assert direct.has_errors is True
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in direct.issues)
+    assert determine_exit_code(aggregate) == 1
+
+
 @pytest.mark.parametrize(
     ("dtype", "expected_size"),
     [("BOOL", 4), ("BF16", 8), ("F8_E4M3", 4), ("F8_E5M2", 4), ("F16", 8), ("F32", 16), ("F64", 32)],
@@ -275,7 +349,7 @@ def test_deeply_nested_header(tmp_path: Path) -> None:
     scanner = SafeTensorsScanner()
     result = scanner.scan(str(file_path))
 
-    assert result.has_errors
+    assert result.has_errors or result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
     # Check that either RecursionError was caught OR the header was marked as invalid/deeply nested
     # Also check for generic JSON error since deeply nested JSON might fail differently
     # Include tensor validation errors as acceptable since deeply nested but valid JSON
@@ -286,6 +360,7 @@ def test_deeply_nested_header(tmp_path: Path) -> None:
         or "recursion" in check.message.lower()
         or "invalid json" in check.message.lower()
         or "offsets out of bounds" in check.message.lower()  # Acceptable for this test
+        or "invalid data_offsets structure" in check.message.lower()
         for check in result.checks
     )
 
