@@ -875,6 +875,7 @@ class _ScanState:
             nested_depth=self.nested_depth + 1,
         )
         for nested_finding in nested_report.findings:
+            nested_finding_details = nested_finding.to_dict()["details"]
             self._add_finding(
                 Finding(
                     message=f"Nested pickle finding: {nested_finding.message}",
@@ -885,7 +886,7 @@ class _ScanState:
                         "nested_encoding": encoding,
                         "nested_source": nested_source,
                         "nested_rule_code": nested_finding.rule_code,
-                        "nested_details": dict(nested_finding.details),
+                        "nested_details": nested_finding_details,
                     },
                     why=nested_finding.why,
                 )
