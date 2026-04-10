@@ -37,11 +37,33 @@ class Severity(str, Enum):
 
 
 def _immutable_mapping(value: Mapping[str, Any]) -> Mapping[str, Any]:
-    return MappingProxyType(dict(value))
+    frozen = _deep_freeze(deepcopy(dict(value)))
+    assert isinstance(frozen, Mapping)
+    return frozen
 
 
 def _mapping_to_dict(value: Mapping[str, Any]) -> dict[str, Any]:
-    return deepcopy(dict(value))
+    return {key: _deep_mutable_copy(item) for key, item in value.items()}
+
+
+def _deep_freeze(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _deep_freeze(item) for key, item in value.items()})
+    if isinstance(value, list | tuple):
+        return tuple(_deep_freeze(item) for item in value)
+    if isinstance(value, set | frozenset):
+        return frozenset(_deep_freeze(item) for item in value)
+    return value
+
+
+def _deep_mutable_copy(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _deep_mutable_copy(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_deep_mutable_copy(item) for item in value]
+    if isinstance(value, frozenset):
+        return [_deep_mutable_copy(item) for item in value]
+    return deepcopy(value)
 
 
 @dataclass(frozen=True, slots=True)

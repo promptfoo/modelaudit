@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -127,9 +127,11 @@ def pickle_report_to_scan_result(
     scanner: BaseScanner | None = None,
 ) -> ScanResult:
     """Convert a standalone PickleReport into the repository's ScanResult model."""
+    report_dict = report.to_dict()
+    report_metadata = report_dict["metadata"]
     result = ScanResult(scanner_name=scanner_name, scanner=scanner)
     result.bytes_scanned = report.coverage.bytes_scanned
-    result.metadata.update(report.metadata)
+    result.metadata.update(report_metadata)
     result.metadata["pickle_report_status"] = report.status.value
     result.metadata["pickle_verdict"] = report.verdict.value
     result.metadata["pickle_source"] = report.source
@@ -151,7 +153,7 @@ def pickle_report_to_scan_result(
         details = _add_legacy_detail_aliases(
             {
                 "pickle_source": report.source,
-                **finding.details,
+                **finding.to_dict()["details"],
             }
         )
         if finding.rule_code:
@@ -171,7 +173,7 @@ def pickle_report_to_scan_result(
         details = {
             "pickle_source": report.source,
             "notice_code": notice.code,
-            **notice.details,
+            **notice.to_dict()["details"],
         }
         details.setdefault("pickle_notice_code", notice.code)
         result.add_check(
@@ -205,9 +207,9 @@ def pickle_report_to_scan_result(
                 ),
             )
 
-    import_references = report.metadata.get("import_references", [])
+    import_references = report_metadata.get("import_references", [])
     finding_ref_keys = _finding_reference_keys(report.findings)
-    if isinstance(import_references, list):
+    if _is_reference_sequence(import_references):
         for reference in import_references:
             if not isinstance(reference, Mapping):
                 continue
@@ -248,7 +250,7 @@ def pickle_report_to_scan_result(
                 "pickle_source": report.source,
                 "category": error.category,
                 "exception_type": error.exception_type,
-                **error.details,
+                **error.to_dict()["details"],
             },
         )
 
@@ -334,7 +336,7 @@ def _pickle_source_extension(source: str) -> str:
 
 def _has_only_benign_serialization_tail_imports(report: PickleReport) -> bool:
     import_references = report.metadata.get("import_references")
-    if not isinstance(import_references, list) or not import_references:
+    if not _is_reference_sequence(import_references) or not import_references:
         return False
 
     for reference in import_references:
@@ -353,11 +355,15 @@ def _has_only_benign_serialization_tail_imports(report: PickleReport) -> bool:
 
 def _has_only_non_dangerous_import_references(report: PickleReport) -> bool:
     import_references = report.metadata.get("import_references")
-    if not isinstance(import_references, list) or not import_references:
+    if not _is_reference_sequence(import_references) or not import_references:
         return False
     return all(
         isinstance(reference, Mapping) and not bool(reference.get("is_dangerous")) for reference in import_references
     )
+
+
+def _is_reference_sequence(value: object) -> bool:
+    return isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray)
 
 
 def _apply_member_context_to_record(

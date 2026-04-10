@@ -21,6 +21,7 @@ def _decode_possible_encoded_pickle(value: str, *, max_nested_pickle_bytes: int)
     decoded_values: list[tuple[str, bytes]] = []
     max_base64_nested_pickle_chars = ((max_nested_pickle_bytes + 2) // 3) * 4
     max_hex_nested_pickle_chars = max_nested_pickle_bytes * 2
+    max_escaped_hex_nested_pickle_chars = max_nested_pickle_bytes * 4
 
     if _BASE64_CANDIDATE_RE.fullmatch(stripped):
         bounded = stripped[:max_base64_nested_pickle_chars]
@@ -32,7 +33,7 @@ def _decode_possible_encoded_pickle(value: str, *, max_nested_pickle_bytes: int)
         if _looks_like_pickle_payload(decoded, max_bytes=max_nested_pickle_bytes):
             decoded_values.append(("base64", decoded))
 
-    hex_candidate = stripped[:max_hex_nested_pickle_chars].replace("\\x", "")
+    hex_candidate = stripped[:max_escaped_hex_nested_pickle_chars].replace("\\x", "")
     if (
         len(hex_candidate) >= 16
         and len(hex_candidate) % 2 == 0

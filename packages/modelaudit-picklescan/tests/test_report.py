@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import MutableMapping
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -110,14 +110,19 @@ def test_findings_and_notices_reject_the_wrong_severity_band() -> None:
 
 
 def test_report_mappings_are_read_only_after_construction() -> None:
-    finding = Finding(message="Suspicious reference", severity=Severity.WARNING, details={"symbol": "os.system"})
+    details: dict[str, Any] = {"symbol": "os.system", "nested": {"symbols": ["os.system"]}}
+    metadata: dict[str, Any] = {"opcode_count": 3, "nested": {"globals": ["os.system"]}}
+    finding = Finding(message="Suspicious reference", severity=Severity.WARNING, details=details)
     report = PickleReport(
         source="payload.pkl",
         status=ScanStatus.COMPLETE,
         verdict=SafetyVerdict.SUSPICIOUS,
         findings=(finding,),
-        metadata={"opcode_count": 3},
+        metadata=metadata,
     )
+
+    details["nested"]["symbols"][0] = "builtins.eval"
+    metadata["nested"]["globals"][0] = "builtins.eval"
 
     with pytest.raises(TypeError):
         cast(MutableMapping[str, object], finding.details)["symbol"] = "builtins.eval"
@@ -125,5 +130,16 @@ def test_report_mappings_are_read_only_after_construction() -> None:
     with pytest.raises(TypeError):
         cast(MutableMapping[str, object], report.metadata)["opcode_count"] = 4
 
-    assert finding.to_dict()["details"] == {"symbol": "os.system"}
-    assert report.to_dict()["metadata"] == {"opcode_count": 3}
+    with pytest.raises(TypeError):
+        cast(MutableMapping[str, object], finding.details["nested"])["symbols"] = []
+
+    with pytest.raises(TypeError):
+        cast(MutableMapping[str, object], report.metadata["nested"])["globals"] = []
+
+    serialized_finding = finding.to_dict()["details"]
+    serialized_metadata = report.to_dict()["metadata"]
+    serialized_finding["nested"]["symbols"].append("mutated")
+    serialized_metadata["nested"]["globals"].append("mutated")
+
+    assert finding.to_dict()["details"] == {"symbol": "os.system", "nested": {"symbols": ["os.system"]}}
+    assert report.to_dict()["metadata"] == {"opcode_count": 3, "nested": {"globals": ["os.system"]}}

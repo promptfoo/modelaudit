@@ -393,7 +393,7 @@ def test_scan_bytes_resolves_short_binstring_stack_global_operands() -> None:
     assert report.status == ScanStatus.COMPLETE
     assert report.verdict == SafetyVerdict.CLEAN
     assert report.findings == ()
-    assert report.metadata["import_references"] == [
+    assert report.to_dict()["metadata"]["import_references"] == [
         {
             "import_reference": "collections.OrderedDict",
             "module": "collections",
@@ -536,6 +536,24 @@ def test_scan_bytes_flags_escaped_hex_encoded_nested_pickle_payloads() -> None:
     assert report.status == ScanStatus.COMPLETE
     assert report.verdict == SafetyVerdict.MALICIOUS
     assert any(finding.rule_code == "S602" for finding in report.findings)
+
+
+def test_scan_bytes_applies_nested_byte_budget_after_unescaping_hex_literals() -> None:
+    nested_payload = pickle.dumps({"inner": "data"}, protocol=4)
+    escaped_hex_payload = "".join(f"\\x{byte:02x}" for byte in nested_payload)
+
+    report = scan_bytes(
+        pickle.dumps({"outer": escaped_hex_payload}, protocol=4),
+        source="nested-escaped-hex-budget.pkl",
+        options=ScanOptions(max_nested_pickle_bytes=len(nested_payload)),
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "S602" and finding.details.get("analysis_incomplete") is not True
+        for finding in report.findings
+    )
 
 
 def test_scan_bytes_records_truncated_literal_scan_notice() -> None:
