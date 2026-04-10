@@ -52,6 +52,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - avoid PMML `<Extension>` false positives for benign `subprocess` prose while preserving `subprocess.getoutput()`, `subprocess.getstatusoutput()`, and `importlib.import_module("subprocess")` detections
 - route helper-level ZIP-backed `.ckpt`/`.pkl` checkpoints through archive scanners
 - route gzip/bzip2/xz/lz4/zlib wrappers by magic bytes even when they use misleading extensions
+- reject raw trailers after bzip2 and xz compressed-wrapper payloads
+- reject raw trailers after lz4 compressed-wrapper frames and bound lz4 decompression output probes
 
 ## [0.2.31](https://github.com/promptfoo/modelaudit/compare/v0.2.30...v0.2.31) (2026-04-04)
 

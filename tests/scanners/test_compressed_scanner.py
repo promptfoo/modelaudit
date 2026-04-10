@@ -23,6 +23,98 @@ class _MaliciousPayload:
         return (eval, ("print('owned')",))
 
 
+_LZ4_FRAME_MAGIC = b"\x04\x22\x4d\x18"
+
+
+class _FakeLz4FrameDecompressor:
+    def __init__(self, frames: dict[bytes, bytes], error_type: type[RuntimeError]) -> None:
+        self.frames = frames
+        self.error_type = error_type
+        self.max_lengths: list[int] = []
+        self.eof = False
+        self.needs_input = True
+        self.unused_data = b""
+
+    def decompress(self, data: bytes, max_length: int = -1) -> bytes:
+        self.max_lengths.append(max_length)
+        if not data.startswith(_LZ4_FRAME_MAGIC):
+            raise self.error_type("Invalid lz4 frame")
+
+        marker_start = len(_LZ4_FRAME_MAGIC)
+        marker = data[marker_start : marker_start + 1]
+        if marker not in self.frames:
+            raise self.error_type("Invalid lz4 frame")
+
+        output = self.frames[marker]
+        if max_length >= 0 and len(output) > max_length:
+            raise AssertionError("Fake lz4 frame output exceeded max_length")
+
+        self.eof = True
+        self.needs_input = True
+        self.unused_data = data[marker_start + 1 :]
+        return output
+
+
+class _FakeLz4FrameModule:
+    class LZ4FrameError(RuntimeError):
+        pass
+
+    def __init__(self, frames: dict[bytes, bytes]) -> None:
+        self.frames = frames
+        self.decompressors: list[_FakeLz4FrameDecompressor] = []
+        self.LZ4FrameDecompressor: Callable[[], _FakeLz4FrameDecompressor] = self._create_decompressor
+
+    def _create_decompressor(self) -> _FakeLz4FrameDecompressor:
+        decompressor = _FakeLz4FrameDecompressor(self.frames, self.LZ4FrameError)
+        self.decompressors.append(decompressor)
+        return decompressor
+
+
+class _FakeLz4ChunkContext:
+    def __init__(self, frames: dict[bytes, bytes], error_type: type[RuntimeError]) -> None:
+        self.frames = frames
+        self.error_type = error_type
+        self.max_lengths: list[int] = []
+
+    def decompress_chunk(self, data: bytes, max_length: int = -1) -> tuple[bytes, int, bool]:
+        self.max_lengths.append(max_length)
+        if not data.startswith(_LZ4_FRAME_MAGIC):
+            raise self.error_type("Invalid lz4 frame")
+
+        marker_start = len(_LZ4_FRAME_MAGIC)
+        marker = data[marker_start : marker_start + 1]
+        if marker not in self.frames:
+            raise self.error_type("Invalid lz4 frame")
+
+        output = self.frames[marker]
+        if max_length >= 0 and len(output) > max_length:
+            raise AssertionError("Fake lz4 frame output exceeded max_length")
+
+        return output, marker_start + 1, True
+
+
+class _FakeLz4ChunkModule:
+    class LZ4FrameError(RuntimeError):
+        pass
+
+    def __init__(self, frames: dict[bytes, bytes]) -> None:
+        self.frames = frames
+        self.contexts: list[_FakeLz4ChunkContext] = []
+
+    def create_decompression_context(self) -> _FakeLz4ChunkContext:
+        context = _FakeLz4ChunkContext(self.frames, self.LZ4FrameError)
+        self.contexts.append(context)
+        return context
+
+    def decompress_chunk(
+        self,
+        context: _FakeLz4ChunkContext,
+        data: bytes,
+        max_length: int = -1,
+    ) -> tuple[bytes, int, bool]:
+        return context.decompress_chunk(data, max_length=max_length)
+
+
 def test_compressed_scanner_can_handle_requires_matching_signature(tmp_path: Path) -> None:
     valid_gzip_path = tmp_path / "model.pkl.gz"
     valid_gzip_path.write_bytes(gzip.compress(pickle.dumps({"weights": [1, 2, 3]})))
@@ -297,8 +389,82 @@ def test_read_zlib_stream_uses_bounded_decompression(monkeypatch: pytest.MonkeyP
     )
 
     assert fake_decompressor.max_lengths
-    assert fake_decompressor.max_lengths == [1025, 769, 513]
-    assert fake_decompressor.flush_lengths == [257]
+    assert fake_decompressor.max_lengths == [4, 4, 4]
+    assert fake_decompressor.flush_lengths == [4]
+
+
+def test_read_concatenated_stream_uses_chunk_bounded_decompression() -> None:
+    class _FakeDecompressor:
+        def __init__(self) -> None:
+            self.max_lengths: list[int] = []
+            self.eof = False
+            self.needs_input = True
+            self.unused_data = b""
+
+        def decompress(self, _chunk: bytes, max_length: int = 0) -> bytes:
+            self.max_lengths.append(max_length)
+            self.eof = True
+            return b"x" * max_length
+
+    fake_decompressors: list[_FakeDecompressor] = []
+
+    def _factory() -> _FakeDecompressor:
+        fake_decompressor = _FakeDecompressor()
+        fake_decompressors.append(fake_decompressor)
+        return fake_decompressor
+
+    total_out = CompressedScanner._read_concatenated_stream_with_limits(
+        source=io.BytesIO(b"x"),
+        destination=io.BytesIO(),
+        decompressor_factory=_factory,
+        error_types=(ValueError,),
+        codec="fake",
+        max_decompressed_bytes=512 * 1024 * 1024,
+        max_ratio=1000.0,
+        compressed_size=1,
+        chunk_size=8,
+    )
+
+    assert total_out == 8
+    assert [length for fake in fake_decompressors for length in fake.max_lengths] == [8]
+
+
+def test_read_lz4_stream_uses_chunk_bounded_decompression() -> None:
+    fake_lz4_frame = _FakeLz4FrameModule({b"S": b"12345678"})
+    destination = io.BytesIO()
+
+    total_out = CompressedScanner._read_lz4_stream_with_limits(
+        source=io.BytesIO(_LZ4_FRAME_MAGIC + b"S"),
+        destination=destination,
+        lz4_frame=fake_lz4_frame,
+        max_decompressed_bytes=512 * 1024 * 1024,
+        max_ratio=1000.0,
+        compressed_size=1,
+        chunk_size=8,
+    )
+
+    assert total_out == 8
+    assert destination.getvalue() == b"12345678"
+    assert [length for fake in fake_lz4_frame.decompressors for length in fake.max_lengths] == [8]
+
+
+def test_read_lz4_stream_falls_back_to_chunk_api_when_decompressor_class_missing() -> None:
+    fake_lz4_frame = _FakeLz4ChunkModule({b"S": b"12345678"})
+    destination = io.BytesIO()
+
+    total_out = CompressedScanner._read_lz4_stream_with_limits(
+        source=io.BytesIO(_LZ4_FRAME_MAGIC + b"S"),
+        destination=destination,
+        lz4_frame=fake_lz4_frame,
+        max_decompressed_bytes=512 * 1024 * 1024,
+        max_ratio=1000.0,
+        compressed_size=1,
+        chunk_size=8,
+    )
+
+    assert total_out == 8
+    assert destination.getvalue() == b"12345678"
+    assert [length for context in fake_lz4_frame.contexts for length in context.max_lengths] == [8]
 
 
 def test_read_zlib_stream_allows_exact_limit_real_stream() -> None:
@@ -336,6 +502,34 @@ def test_compressed_scanner_rejects_raw_trailer_after_zlib_member(tmp_path: Path
     assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
+@pytest.mark.parametrize(
+    ("filename", "compressor"),
+    [
+        ("payload.pkl.bz2", bz2.compress),
+        ("payload.pkl.xz", lzma.compress),
+    ],
+)
+def test_compressed_scanner_rejects_raw_trailer_after_bzip2_or_xz_member(
+    tmp_path: Path,
+    filename: str,
+    compressor: Callable[[bytes], bytes],
+) -> None:
+    """A raw trailer after a valid stream must not hide an unscanned pickle payload."""
+    safe_pickle = pickle.dumps({"safe": [1, 2, 3]})
+    malicious_pickle_trailer = b'cos\nsystem\n(S"echo owned"\ntR.'
+
+    path = tmp_path / filename
+    path.write_bytes(compressor(safe_pickle) + malicious_pickle_trailer)
+
+    result = CompressedScanner().scan(str(path))
+
+    decode_checks = [check for check in result.checks if check.name == "Compressed Wrapper Stream Decode"]
+    assert decode_checks and decode_checks[0].status == CheckStatus.FAILED
+    assert "invalid" in decode_checks[0].message.lower()
+    assert result.success is False
+    assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
 def test_compressed_scanner_allows_concatenated_zlib_members(tmp_path: Path) -> None:
     """Concatenated zlib members should remain a supported benign encoding shape."""
     payload_a = pickle.dumps({"weights": [1, 2, 3]}, protocol=4)
@@ -343,6 +537,129 @@ def test_compressed_scanner_allows_concatenated_zlib_members(tmp_path: Path) -> 
 
     path = tmp_path / "safe_multi_stream.pkl.zlib"
     path.write_bytes(zlib.compress(payload_a) + zlib.compress(payload_b))
+
+    result = CompressedScanner().scan(str(path))
+
+    assert result.success is True
+    assert not any(
+        check.name == "Compressed Wrapper Stream Decode" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+    assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+@pytest.mark.parametrize(
+    ("filename", "compressor"),
+    [
+        ("safe_multi_stream.pkl.bz2", bz2.compress),
+        ("safe_multi_stream.pkl.xz", lzma.compress),
+    ],
+)
+def test_compressed_scanner_allows_concatenated_bzip2_and_xz_members(
+    tmp_path: Path,
+    filename: str,
+    compressor: Callable[[bytes], bytes],
+) -> None:
+    """Concatenated valid members should remain supported for bzip2 and xz."""
+    payload_a = pickle.dumps({"weights": [1, 2, 3]}, protocol=4)
+    payload_b = pickle.dumps({"bias": [4, 5, 6]}, protocol=4)
+
+    path = tmp_path / filename
+    path.write_bytes(compressor(payload_a) + compressor(payload_b))
+
+    result = CompressedScanner().scan(str(path))
+
+    assert result.success is True
+    assert not any(
+        check.name == "Compressed Wrapper Stream Decode" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+    assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def test_compressed_scanner_rejects_raw_trailer_after_lz4_frame(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A raw trailer after a valid lz4 frame must not hide an unscanned pickle payload."""
+    safe_pickle = pickle.dumps({"safe": [1, 2, 3]})
+    malicious_pickle_trailer = b'cos\nsystem\n(S"echo owned"\ntR.'
+    fake_lz4_frame = _FakeLz4FrameModule({b"S": safe_pickle})
+
+    monkeypatch.setattr(CompressedScanner, "_get_lz4_frame_module", staticmethod(lambda: fake_lz4_frame))
+
+    path = tmp_path / "payload.pkl.lz4"
+    path.write_bytes(_LZ4_FRAME_MAGIC + b"S" + malicious_pickle_trailer)
+
+    result = CompressedScanner().scan(str(path))
+
+    decode_checks = [check for check in result.checks if check.name == "Compressed Wrapper Stream Decode"]
+    assert decode_checks and decode_checks[0].status == CheckStatus.FAILED
+    assert "invalid lz4 stream" in decode_checks[0].message.lower()
+    assert result.success is False
+    assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def test_compressed_scanner_rejects_raw_trailer_after_lz4_chunk_api_frame(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The legacy chunk API fallback must also fail closed on raw trailer bytes."""
+    safe_pickle = pickle.dumps({"safe": [1, 2, 3]})
+    malicious_pickle_trailer = b'cos\nsystem\n(S"echo owned"\ntR.'
+    fake_lz4_frame = _FakeLz4ChunkModule({b"S": safe_pickle})
+
+    monkeypatch.setattr(CompressedScanner, "_get_lz4_frame_module", staticmethod(lambda: fake_lz4_frame))
+
+    path = tmp_path / "payload.pkl.lz4"
+    path.write_bytes(_LZ4_FRAME_MAGIC + b"S" + malicious_pickle_trailer)
+
+    result = CompressedScanner().scan(str(path))
+
+    decode_checks = [check for check in result.checks if check.name == "Compressed Wrapper Stream Decode"]
+    assert decode_checks and decode_checks[0].status == CheckStatus.FAILED
+    assert "invalid lz4 stream" in decode_checks[0].message.lower()
+    assert result.success is False
+    assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def test_compressed_scanner_allows_concatenated_lz4_frames(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Concatenated valid lz4 frames should remain supported when lz4 is installed."""
+    payload_a = pickle.dumps({"weights": [1, 2, 3]}, protocol=4)
+    payload_b = pickle.dumps({"bias": [4, 5, 6]}, protocol=4)
+    fake_lz4_frame = _FakeLz4FrameModule({b"A": payload_a, b"B": payload_b})
+
+    monkeypatch.setattr(CompressedScanner, "_get_lz4_frame_module", staticmethod(lambda: fake_lz4_frame))
+
+    path = tmp_path / "safe_multi_frame.pkl.lz4"
+    path.write_bytes(_LZ4_FRAME_MAGIC + b"A" + _LZ4_FRAME_MAGIC + b"B")
+
+    result = CompressedScanner().scan(str(path))
+
+    assert result.success is True
+    assert not any(
+        check.name == "Compressed Wrapper Stream Decode" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+    assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def test_compressed_scanner_allows_concatenated_lz4_chunk_api_frames(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The legacy chunk API fallback should preserve valid concatenated lz4 frames."""
+    payload_a = pickle.dumps({"weights": [1, 2, 3]}, protocol=4)
+    payload_b = pickle.dumps({"bias": [4, 5, 6]}, protocol=4)
+    fake_lz4_frame = _FakeLz4ChunkModule({b"A": payload_a, b"B": payload_b})
+
+    monkeypatch.setattr(CompressedScanner, "_get_lz4_frame_module", staticmethod(lambda: fake_lz4_frame))
+
+    path = tmp_path / "safe_multi_frame.pkl.lz4"
+    path.write_bytes(_LZ4_FRAME_MAGIC + b"A" + _LZ4_FRAME_MAGIC + b"B")
 
     result = CompressedScanner().scan(str(path))
 
