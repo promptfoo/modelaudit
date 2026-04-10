@@ -111,8 +111,8 @@ E4 is the target. Most components start below E4.
 | `gguf` | `.gguf`, `.ggml`, related | E3, PR #914 | metadata value type matrix and tensor offset checks |
 | `xgboost` | `.bst`, `.model`, `.json`, `.ubj` | E1 | JSON/UBJSON malformed root, subprocess isolation |
 | `lightgbm` | `.model`, `.txt`, `.lgb`, `.lightgbm` | E1 | text parser bounds and native-library indicators |
-| `catboost` | `.cbm` | E1 | binary marker bounds and metadata strings |
-| `mxnet` | `*-symbol.json`, `*-NNNN.params` | E1 | malformed JSON roots and graph reference traversal |
+| `catboost` | `.cbm` | E3, PR #924 | binary marker bounds and metadata strings |
+| `mxnet` | `*-symbol.json`, `*-NNNN.params` | E3, PR #923 | graph reference traversal and metadata payload recovery |
 | `nemo` | `.nemo` tar archives | E3, PR #919 | multi-config precedence and malformed member combinations |
 | `jinja2_template` | tokenizer configs, YAML, templates, GGUF metadata | E3, PR #920 | cache preservation and GGUF metadata extraction failures |
 | `skops` | `.skops` ZIP archives | E3 | JSON schema variations and duplicate member precedence |
@@ -122,11 +122,11 @@ E4 is the target. Most components start below E4.
 | `tar` | tar families | E3 | unsupported member failure semantics and cleanup |
 | `sevenzip` | `.7z` | E3 | nested routing parity with ZIP/TAR |
 | `compressed` | `.gz`, `.bz2`, `.xz`, `.lz4`, `.zlib` | E3 | wrapper extension inference and temporary cleanup |
-| `manifest` | model/config manifests | E1 | JSON/YAML/TOML malformed roots and nested scanning |
+| `manifest` | model/config manifests | E3, PR #922 | JSON/YAML/TOML malformed roots and nested scanning |
 | `metadata` | model cards/docs/text | E1 | secret/security pattern false positives and truncation |
 | `text` | general text docs | E0 | duplicate responsibility with metadata/manifest |
 | `pmml` | `.pmml` | E3 | XML parse boundaries and extension payload recovery |
-| `paddle` | `.pdmodel`, `.pdiparams` | E1 | protobuf/op descriptor parse failures |
+| `paddle` | `.pdmodel`, `.pdiparams` | E3, PR #925 | protobuf/op descriptor parse failures |
 | `cntk` | `.dnn`, `.cmf` | E3 | split reference tracking and malformed binary handling |
 | `rknn` | `.rknn` | E1 | marker and string extraction bounds |
 | `torch7` | `.t7`, `.th`, `.net` | E1 | legacy serialization parse failures |
@@ -142,14 +142,19 @@ Recent concrete fixes from this audit stream:
 
 | PR | Component | Finding | Status |
 | --- | --- | --- | --- |
-| #917 | Keras H5 | Malformed config/training config could be treated as clean or wrong security failure instead of inconclusive coverage | Open, auto-merge armed |
-| #918 | Keras ZIP | Malformed `config.json` structures could scan clean or crash as the wrong failure type | Open, auto-merge armed |
-| #919 | NeMo | Top-level YAML lists were not traversed for Hydra `_target_`; malformed/scalar configs looked like missing config | Open, auto-merge armed |
-| #920 | Jinja2 template | Malformed tokenizer/YAML configs swallowed parse failures and returned "No templates found"; raw visible SSTI payloads were missed | Open, auto-merge armed |
+| #917 | Keras H5 | Malformed config/training config could be treated as clean or wrong security failure instead of inconclusive coverage | Open, review pending |
+| #918 | Keras ZIP | Malformed `config.json` structures could scan clean or crash as the wrong failure type | Open, review pending |
+| #919 | NeMo | Top-level YAML lists were not traversed for Hydra `_target_`; malformed/scalar configs looked like missing config | Open, review pending |
+| #920 | Jinja2 template | Malformed tokenizer/YAML configs swallowed parse failures and returned "No templates found"; raw visible SSTI payloads were missed | Open, review pending |
+| #922 | Manifest | `.config` INI manifests with section headers could skip structured parsing and lose URL/hash checks | Open, review pending |
+| #923 | MXNet | Malformed symbol artifacts needed routing into fail-closed scanner outcomes instead of aggregate clean/unknown results | Open, review pending |
+| #924 | CatBoost | Corrupt declared-section scans fail closed as inconclusive instead of returning incomplete coverage as clean | Open, review pending |
+| #925 | Paddle | Suspicious Paddle code indicators are warnings, preserving signal without escalating review-only findings to errors | Open, review pending |
+| #926 | Native code tests | Expanded native-code detection regression coverage and benign executable-suffix near-match negatives | Open, review pending |
 
 Earlier open PRs from the same boundary-hardening campaign include #901 and
-#907 through #916. Those remain part of the evidence ledger but still require
-CI/review completion before being treated as landed.
+#907 through #916. All open PR entries remain provisional until CI and review
+complete; treat them as evidence of audited findings, not landed behavior.
 
 ## Audit Workflow
 
