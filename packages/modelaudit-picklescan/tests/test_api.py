@@ -462,6 +462,26 @@ def test_scan_bytes_surfaces_nested_pickle_inner_findings() -> None:
     )
 
 
+def test_scan_bytes_marks_parent_inconclusive_when_nested_analysis_is_incomplete() -> None:
+    nested_payload = pickle.dumps({"code": "A" * 128}, protocol=4)
+
+    report = scan_bytes(
+        pickle.dumps({"outer": nested_payload}, protocol=4),
+        source="nested-incomplete.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=8),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(finding.rule_code == "S213" for finding in report.findings)
+    assert any(
+        notice.code == "nested_pickle_incomplete"
+        and notice.details.get("nested_status") == ScanStatus.INCONCLUSIVE.value
+        and notice.details.get("analysis_incomplete") is True
+        for notice in report.notices
+    )
+
+
 def test_scan_bytes_flags_oversized_nested_pickle_prefix_without_deep_parse() -> None:
     nested_payload = b"\x80\x04" + (b"A" * 64)
 

@@ -892,6 +892,8 @@ class _ScanState:
             )
 
         if nested_report.status != ScanStatus.COMPLETE:
+            if self.status == ScanStatus.COMPLETE:
+                self.status = ScanStatus.INCONCLUSIVE
             self._add_notice(
                 Notice(
                     message="Nested pickle analysis did not complete",
