@@ -75,9 +75,12 @@ Report semantics keep these concepts separate:
 
 ## Current Integration
 
-- `modelaudit.scanners.pickle_scanner.PickleScanner` scans through the
-  standalone package first, adapts the `PickleReport` into a `ScanResult`, and
-  merges in any legacy-only checks that are still needed for compatibility.
+- `modelaudit.scanners.pickle_scanner.PickleScanner` scans through both engines.
+  The default root result is still legacy-primary for compatibility while the
+  migration is in progress. Set `use_standalone_pickle_primary=True` in scanner
+  config to exercise the intended standalone-primary merge path, where the
+  adapted `PickleReport` owns the result and legacy-only checks are merged as
+  compatibility evidence.
 - Embedded-pickle wrapper scanners (`pytorch_zip`, `joblib`, `numpy`, and
   `executorch`) call the public `scan_stream(..., source=...)` API and preserve
   archive-member context in result locations/details.

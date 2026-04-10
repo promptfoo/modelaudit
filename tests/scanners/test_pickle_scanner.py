@@ -364,6 +364,77 @@ def test_scan_stream_uses_single_timeout_budget_for_package_and_legacy_fallback(
     assert legacy_remaining_budget[0] == pytest.approx(1.0)
 
 
+def test_scan_stream_defaults_to_legacy_primary_during_package_migration() -> None:
+    payload = pickle.dumps({"safe": True}, protocol=4)
+
+    result = PickleScanner().scan_stream(BytesIO(payload), len(payload), source="legacy-primary.pkl")
+
+    assert result.success is True
+    assert result.metadata["pickle_primary_engine"] == "legacy"
+    assert result.metadata["pickle_report_status"] == "complete"
+
+
+def test_scan_stream_can_use_standalone_package_as_primary_for_migration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = pickle.dumps({"safe": True}, protocol=4)
+    scanner = PickleScanner(config={"use_standalone_pickle_primary": True})
+    package_report = PickleReport(
+        source="package-primary.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.MALICIOUS,
+        findings=(
+            Finding(
+                message="package-primary synthetic finding",
+                severity=Severity.CRITICAL,
+                location="package-primary.pkl (pos 2)",
+                rule_code="S999",
+                details={"source_engine": "standalone"},
+            ),
+        ),
+        metadata={"first_pickle_end_pos": len(payload), "package_only_metadata": True},
+    )
+
+    def fake_package_scan_stream(
+        file_obj: BinaryIO,
+        *,
+        source: str,
+        size: int | None = None,
+    ) -> PickleReport:
+        del file_obj, source, size
+        return package_report
+
+    def fake_legacy_scan_pickle_bytes(file_obj: BinaryIO, file_size: int) -> ScanResult:
+        del file_obj, file_size
+        legacy_result = scanner._create_result()
+        legacy_result.metadata["legacy_only_metadata"] = True
+        legacy_result.add_check(
+            name="Legacy Compatibility Check",
+            passed=False,
+            message="legacy-only synthetic finding",
+            severity=IssueSeverity.WARNING,
+            location="package-primary.pkl (legacy)",
+            rule_code="S777",
+        )
+        legacy_result.finish(success=True)
+        return legacy_result
+
+    monkeypatch.setattr(scanner._standalone_pickle_scanner, "scan_stream", fake_package_scan_stream)
+    monkeypatch.setattr(scanner, "_scan_pickle_bytes", fake_legacy_scan_pickle_bytes)
+
+    result = scanner.scan_stream(BytesIO(payload), len(payload), source="package-primary.pkl")
+
+    assert result.success is True
+    assert result.metadata["pickle_primary_engine"] == "standalone"
+    assert result.metadata["pickle_report_status"] == "complete"
+    assert result.metadata["pickle_verdict"] == "malicious"
+    assert result.metadata["package_only_metadata"] is True
+    assert result.metadata["legacy_only_metadata"] is True
+    assert any(check.name == "Standalone Pickle Finding" for check in result.checks)
+    assert any(check.name == "Legacy Compatibility Check" for check in result.checks)
+    assert {issue.rule_code for issue in result.issues} >= {"S777", "S999"}
+
+
 def test_scan_stream_resets_post_budget_global_state_before_reused_scanner_scan() -> None:
     """Stale post-budget flags from one scan should not leak into the next scan."""
     scanner = PickleScanner()

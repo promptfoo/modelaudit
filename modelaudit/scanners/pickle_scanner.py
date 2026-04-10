@@ -3997,6 +3997,7 @@ class PickleScanner(BaseScanner):
         self._standalone_pickle_scanner = StandalonePickleScanner(
             options=scan_options_from_config(self.config),
         )
+        self.use_standalone_pickle_primary = self._get_bool_config("use_standalone_pickle_primary", False)
 
     def _prepare_scan_context(self, source: str) -> None:
         """Reset per-scan timeout/context/analyzer state for a new pickle scan."""
@@ -4206,10 +4207,19 @@ class PickleScanner(BaseScanner):
 
         with contextlib.suppress(AttributeError, OSError, ValueError):
             file_obj.seek(stream_start)
+        if self.use_standalone_pickle_primary:
+            _merge_missing_pickle_checks(package_result, legacy_result)
+            first_pickle_end_pos = package_result.metadata.get("first_pickle_end_pos")
+            if isinstance(first_pickle_end_pos, int):
+                package_result.metadata["first_pickle_end_pos"] = first_pickle_end_pos
+            package_result.metadata["pickle_primary_engine"] = "standalone"
+            return package_result
+
         _merge_missing_pickle_checks(legacy_result, package_result)
         first_pickle_end_pos = package_result.metadata.get("first_pickle_end_pos")
         if isinstance(first_pickle_end_pos, int):
             legacy_result.metadata["first_pickle_end_pos"] = first_pickle_end_pos
+        legacy_result.metadata["pickle_primary_engine"] = "legacy"
         return legacy_result
 
     def _copy_pickle_stream_to_spool(self, file_obj: BinaryIO, file_size: int, spool: BinaryIO) -> None:
