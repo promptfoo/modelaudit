@@ -291,14 +291,24 @@ def test_keras_h5_scanner_benign_model_has_no_warning_noise(tmp_path: Path) -> N
     assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
 
 
-def _assert_inconclusive_keras_h5_scan(model_path: Path, reason: str, expected_check_name: str) -> None:
+def _assert_inconclusive_keras_h5_scan(
+    model_path: Path,
+    reason: str,
+    expected_check_name: str,
+    expected_message_substring: str,
+) -> None:
     result = KerasH5Scanner().scan(str(model_path))
 
     assert result.success is False
     assert result.has_errors is False
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert reason in result.metadata["scan_outcome_reasons"]
-    assert any(check.name == expected_check_name and check.status == CheckStatus.FAILED for check in result.checks)
+    assert any(
+        check.name == expected_check_name
+        and check.status == CheckStatus.FAILED
+        and expected_message_substring in check.message
+        for check in result.checks
+    )
 
     audit_result = scan_model_directory_or_file(str(model_path))
     metadata = audit_result.file_metadata[str(model_path)]
@@ -310,24 +320,51 @@ def _assert_inconclusive_keras_h5_scan(model_path: Path, reason: str, expected_c
 
 
 @pytest.mark.parametrize(
-    ("model_config", "reason", "expected_check_name"),
+    ("model_config", "reason", "expected_check_name", "expected_message_substring"),
     [
-        (None, "keras_h5_model_config_invalid_type", "Model Config Type Validation"),
-        ([], "keras_h5_model_config_invalid_type", "Model Config Type Validation"),
+        (None, "keras_h5_model_config_invalid_type", "Model Config Type Validation", "Invalid model config type"),
+        ([], "keras_h5_model_config_invalid_type", "Model Config Type Validation", "Invalid model config type"),
+        (
+            {"class_name": "Sequential"},
+            "keras_h5_model_layers_missing",
+            "Layers Presence Validation",
+            "missing required layers list",
+        ),
+        (
+            {"class_name": "Sequential", "config": {}},
+            "keras_h5_model_layers_missing",
+            "Layers Presence Validation",
+            "missing required layers list",
+        ),
         (
             {"class_name": "Sequential", "config": "layers hidden in wrong type"},
             "keras_h5_model_config_structure_invalid",
             "Model Config Structure Validation",
+            "Invalid model config.config type",
         ),
         (
             {"class_name": "Sequential", "config": {"layers": "layers hidden in wrong type"}},
             "keras_h5_model_layers_invalid_type",
             "Layers Type Validation",
+            "Invalid layers type",
         ),
         (
             {"class_name": "Sequential", "config": {"layers": ["not a layer dict"]}},
             "keras_h5_model_layer_invalid_type",
             "Layer Type Validation",
+            "Invalid layer type",
+        ),
+        (
+            {"class_name": "Sequential", "config": {"layers": [{"class_name": "TimeDistributed", "config": "..."}]}},
+            "keras_h5_layer_config_invalid_type",
+            "Layer Config Type Validation",
+            "Invalid layer config type",
+        ),
+        (
+            {"class_name": "Sequential", "config": {"layers": [{"class_name": "Functional", "config": {}}]}},
+            "keras_h5_nested_model_layers_missing",
+            "Nested Model Layers Presence Validation",
+            "missing required layers list",
         ),
     ],
 )
@@ -336,6 +373,7 @@ def test_keras_h5_invalid_model_config_structure_returns_inconclusive_exit2(
     model_config: Any,
     reason: str,
     expected_check_name: str,
+    expected_message_substring: str,
 ) -> None:
     """Keras H5 model_config that cannot be fully traversed should fail closed."""
     model_path = create_custom_h5_file(
@@ -344,7 +382,7 @@ def test_keras_h5_invalid_model_config_structure_returns_inconclusive_exit2(
         file_name=f"{reason}.h5",
     )
 
-    _assert_inconclusive_keras_h5_scan(model_path, reason, expected_check_name)
+    _assert_inconclusive_keras_h5_scan(model_path, reason, expected_check_name, expected_message_substring)
 
 
 def test_keras_h5_malformed_model_config_json_returns_inconclusive_exit2(tmp_path: Path) -> None:
@@ -359,17 +397,28 @@ def test_keras_h5_malformed_model_config_json_returns_inconclusive_exit2(tmp_pat
         model_path,
         "keras_h5_model_config_parse_failed",
         "Keras H5 Config Parse",
+        "Malformed Keras H5 model_config",
     )
     result = KerasH5Scanner().scan(str(model_path))
     assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
 @pytest.mark.parametrize(
-    ("training_config", "reason", "expected_check_name"),
+    ("training_config", "reason", "expected_check_name", "expected_message_substring"),
     [
-        ("{", "keras_h5_training_config_parse_failed", "Keras H5 Config Parse"),
-        ("null", "keras_h5_training_config_invalid_type", "Training Config Type Validation"),
-        (["not", "a", "dict"], "keras_h5_training_config_invalid_type", "Training Config Type Validation"),
+        ("{", "keras_h5_training_config_parse_failed", "Keras H5 Config Parse", "Malformed Keras H5 training_config"),
+        (
+            "null",
+            "keras_h5_training_config_invalid_type",
+            "Training Config Type Validation",
+            "Invalid training config type",
+        ),
+        (
+            ["not", "a", "dict"],
+            "keras_h5_training_config_invalid_type",
+            "Training Config Type Validation",
+            "Invalid training config type",
+        ),
     ],
 )
 def test_keras_h5_invalid_training_config_returns_inconclusive_exit2(
@@ -377,6 +426,7 @@ def test_keras_h5_invalid_training_config_returns_inconclusive_exit2(
     training_config: Any,
     reason: str,
     expected_check_name: str,
+    expected_message_substring: str,
 ) -> None:
     """Unreadable training_config can hide custom metrics/losses, so it must fail closed."""
     model_path = (
@@ -403,7 +453,7 @@ def test_keras_h5_invalid_training_config_returns_inconclusive_exit2(
         )
     )
 
-    _assert_inconclusive_keras_h5_scan(model_path, reason, expected_check_name)
+    _assert_inconclusive_keras_h5_scan(model_path, reason, expected_check_name, expected_message_substring)
 
 
 def test_keras_h5_inconclusive_training_config_preserves_security_exit1(tmp_path: Path) -> None:

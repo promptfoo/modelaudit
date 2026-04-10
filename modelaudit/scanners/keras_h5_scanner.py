@@ -84,6 +84,7 @@ class KerasH5Scanner(BaseScanner):
             "system",
         }
     )
+    _MODEL_CONTAINER_CLASSES: ClassVar[frozenset[str]] = frozenset({"Model", "Functional", "Sequential"})
     _WRAPPED_LAYER_SCAN_MODEL: ClassVar[dict[str, Any]] = {"class_name": "Sequential", "config": {"layers": []}}
 
     def __init__(self, config: dict[str, Any] | None = None):
@@ -460,13 +461,25 @@ class KerasH5Scanner(BaseScanner):
         layers = []
         config_value = model_config.get("config")
         if config_value is None:
-            result.add_check(
-                name="Model Config Structure Validation",
-                passed=True,
-                message="Keras model config has no layer configuration",
-                location=self.current_file_path,
-                details={"model_class": model_class},
-            )
+            if model_class in self._MODEL_CONTAINER_CLASSES:
+                self._mark_inconclusive_scan_result(result, "keras_h5_model_layers_missing")
+                result.add_check(
+                    name="Layers Presence Validation",
+                    passed=False,
+                    message=f"Model config for {model_class} is missing required layers list",
+                    rule_code="S902",
+                    severity=IssueSeverity.INFO,
+                    location=self.current_file_path,
+                    details={"model_class": model_class, "expected_key": "config.layers"},
+                )
+            else:
+                result.add_check(
+                    name="Model Config Structure Validation",
+                    passed=True,
+                    message="Keras model config has no layer configuration",
+                    location=self.current_file_path,
+                    details={"model_class": model_class},
+                )
         elif not isinstance(config_value, dict):
             self._mark_inconclusive_scan_result(result, "keras_h5_model_config_structure_invalid")
             result.add_check(
@@ -493,6 +506,17 @@ class KerasH5Scanner(BaseScanner):
                     location=self.current_file_path,
                     details={"actual_type": type(layers_value).__name__, "expected_type": "list"},
                 )
+        elif model_class in self._MODEL_CONTAINER_CLASSES:
+            self._mark_inconclusive_scan_result(result, "keras_h5_model_layers_missing")
+            result.add_check(
+                name="Layers Presence Validation",
+                passed=False,
+                message=f"Model config for {model_class} is missing required layers list",
+                rule_code="S902",
+                severity=IssueSeverity.INFO,
+                location=self.current_file_path,
+                details={"model_class": model_class, "expected_key": "config.layers"},
+            )
 
         # Count of each layer type
         layer_counts: dict[str, int] = {}
@@ -512,6 +536,19 @@ class KerasH5Scanner(BaseScanner):
                 )
                 continue
             layer_class = layer.get("class_name", "")
+            layer_config = layer.get("config", {})
+            if not isinstance(layer_config, dict):
+                self._mark_inconclusive_scan_result(result, "keras_h5_layer_config_invalid_type")
+                result.add_check(
+                    name="Layer Config Type Validation",
+                    passed=False,
+                    message=f"Invalid layer config type: expected dict, got {type(layer_config).__name__}",
+                    rule_code="S902",
+                    severity=IssueSeverity.INFO,
+                    location=self.current_file_path,
+                    details={"actual_type": type(layer_config).__name__, "expected_type": "dict"},
+                )
+                layer_config = {}
 
             # Update layer count
             if layer_class in layer_counts:
@@ -521,20 +558,6 @@ class KerasH5Scanner(BaseScanner):
 
             # Check for suspicious layer types
             if layer_class in self.suspicious_layer_types:
-                layer_config = layer.get("config", {})
-                if not isinstance(layer_config, dict):
-                    self._mark_inconclusive_scan_result(result, "keras_h5_layer_config_invalid_type")
-                    result.add_check(
-                        name="Layer Config Type Validation",
-                        passed=False,
-                        message=f"Invalid layer config type: expected dict, got {type(layer_config).__name__}",
-                        rule_code="S902",
-                        severity=IssueSeverity.INFO,
-                        location=self.current_file_path,
-                        details={"actual_type": type(layer_config).__name__, "expected_type": "dict"},
-                    )
-                    layer_config = {}
-
                 # Special handling for Lambda layers - validate Python code
                 if layer_class == "Lambda":
                     raw_layer_name = layer.get("name")
@@ -702,30 +725,29 @@ class KerasH5Scanner(BaseScanner):
 
             # Check layer configuration for suspicious strings
             self._check_config_for_suspicious_strings(
-                layer.get("config", {}),
+                layer_config,
                 result,
                 layer_class,
             )
 
             # If there are nested models, scan them recursively
-            if layer_class in {"Model", "Functional", "Sequential"} and isinstance(layer, dict) and "config" in layer:
-                nested_config = layer["config"]
+            if layer_class in self._MODEL_CONTAINER_CLASSES and "config" in layer:
+                nested_config = layer.get("config")
                 if isinstance(nested_config, dict) and "layers" in nested_config:
                     self._scan_model_config(layer, result)
-                elif not isinstance(nested_config, dict):
-                    self._mark_inconclusive_scan_result(result, "keras_h5_nested_model_config_invalid_type")
+                elif isinstance(nested_config, dict):
+                    self._mark_inconclusive_scan_result(result, "keras_h5_nested_model_layers_missing")
                     result.add_check(
-                        name="Nested Model Config Type Validation",
+                        name="Nested Model Layers Presence Validation",
                         passed=False,
-                        message=f"Invalid nested model config type: expected dict, got {type(nested_config).__name__}",
+                        message=f"Nested model config for {layer_class} is missing required layers list",
                         rule_code="S902",
                         severity=IssueSeverity.INFO,
                         location=self.current_file_path,
-                        details={"actual_type": type(nested_config).__name__, "expected_type": "dict"},
+                        details={"layer_class": layer_class, "expected_key": "config.layers"},
                     )
 
-            if isinstance(layer, dict):
-                self._scan_wrapped_layer_config(layer.get("config"), result)
+            self._scan_wrapped_layer_config(layer_config, result)
 
         # Add layer counts to metadata
         result.metadata["layer_counts"] = layer_counts
