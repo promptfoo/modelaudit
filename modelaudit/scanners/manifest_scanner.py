@@ -1,12 +1,23 @@
 """Scanner for model manifest and configuration files."""
 
+import configparser
+import importlib
 import json
 import os
 import re
-from typing import Any
+from types import ModuleType
+from typing import Any, Final
 from urllib.parse import urlparse
 
-from .base import BaseScanner, IssueSeverity, ScanResult, logger
+from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult, logger
+
+try:
+    _tomllib: ModuleType | None = importlib.import_module("tomllib")
+except ImportError:  # pragma: no cover - Python 3.10 compatibility
+    try:
+        _tomllib = importlib.import_module("tomli")
+    except ImportError:
+        _tomllib = None
 
 # Try to import the name policies module
 try:
@@ -403,6 +414,12 @@ _TRUSTED_S3_ENDPOINT_HOST_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(rf"^{_S3_BUCKET_HOST_PREFIX_PATTERN}\.s3\.{_AWS_S3_REGION_PATTERN}\.amazonaws\.com$"),
     re.compile(rf"^{_S3_BUCKET_HOST_PREFIX_PATTERN}\.s3-{_AWS_S3_REGION_PATTERN}\.amazonaws\.com$"),
 )
+_PARSE_FAILED: Final = object()
+
+
+def _scan_result_has_security_findings(result: ScanResult) -> bool:
+    """Return True when the manifest result includes WARNING/CRITICAL findings."""
+    return any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
 def _is_trusted_s3_endpoint_host(host: str) -> bool:
@@ -560,9 +577,28 @@ class ManifestScanner(BaseScanner):
             content = self._parse_file(path, ext, result)
             self._check_timeout()
 
-            if content:
+            if content is _PARSE_FAILED:
+                result.add_check(
+                    name="Manifest Parse Coverage",
+                    passed=False,
+                    message=f"Unable to complete manifest analysis because the file could not be parsed: {path}",
+                    severity=IssueSeverity.INFO,
+                    location=path,
+                    details={
+                        "reason": "manifest_parse_failed",
+                        "file_path": path,
+                    },
+                    why=(
+                        "Model manifest parsing did not complete, so structured security checks for model names, "
+                        "URLs, and integrity hashes could not be applied."
+                    ),
+                    rule_code="S902",
+                )
+                self._mark_inconclusive_scan_result(result, "manifest_parse_failed")
+            elif isinstance(content, (dict, list)):
                 result.bytes_scanned = file_size
                 if isinstance(content, dict):
+                    result.metadata["root_type"] = "dict"
                     result.metadata["keys"] = list(content.keys())
 
                     # Extract model metadata for HuggingFace config files
@@ -576,27 +612,40 @@ class ManifestScanner(BaseScanner):
                     if license_info:
                         result.metadata["license"] = license_info
 
-                    # Check for blacklisted model names in config values
-                    self._check_model_name_policies(content, result)
-                    self._check_timeout()
+                else:
+                    result.metadata["root_type"] = "list"
+                    result.metadata["entry_count"] = len(content)
 
-                    # Check for suspicious URLs in config values
-                    self._check_suspicious_urls(content, result)
-                    self._check_timeout()
+                # Check for blacklisted model names in config values
+                self._check_model_name_policies(content, result)
+                self._check_timeout()
 
-                    # Check for weak hash algorithms used for integrity verification
-                    self._check_weak_hashes(content, result)
-                    self._check_timeout()
+                # Check for suspicious URLs in config values
+                self._check_suspicious_urls(content, result)
+                self._check_timeout()
+
+                # Check for weak hash algorithms used for integrity verification
+                self._check_weak_hashes(content, result)
+                self._check_timeout()
 
             else:
                 result.add_check(
-                    name="Manifest Parse Attempt",
+                    name="Manifest Structure",
                     passed=False,
-                    message=f"Unable to parse file as a manifest or configuration: {path}",
-                    severity=IssueSeverity.DEBUG,
+                    message=f"Unsupported manifest root type: {type(content).__name__}",
+                    severity=IssueSeverity.INFO,
                     location=path,
+                    details={
+                        "reason": "manifest_unsupported_root_type",
+                        "root_type": type(content).__name__,
+                    },
+                    why=(
+                        "The file parsed successfully, but the parsed value is not an object or list, so structured "
+                        "manifest security checks could not be applied."
+                    ),
                     rule_code="S902",
                 )
+                self._mark_inconclusive_scan_result(result, "manifest_unsupported_root_type")
 
         except TimeoutError as e:
             result.add_check(
@@ -621,8 +670,30 @@ class ManifestScanner(BaseScanner):
             result.finish(success=False)
             return result
 
-        result.finish(success=True)
+        self._finish_manifest_result(result)
         return result
+
+    def _mark_inconclusive_scan_result(self, result: ScanResult, reason: str) -> None:
+        """Mark a manifest scan as inconclusive when structured analysis is incomplete."""
+        existing_reasons = result.metadata.get("scan_outcome_reasons")
+        reasons = existing_reasons if isinstance(existing_reasons, list) else []
+
+        if reason not in reasons:
+            reasons.append(reason)
+
+        result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+        result.metadata["scan_outcome_reasons"] = reasons
+        result.metadata["analysis_incomplete"] = True
+
+    def _finish_manifest_result(self, result: ScanResult) -> None:
+        """Fail closed for inconclusive manifests unless real security findings were recovered."""
+        if result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME and not _scan_result_has_security_findings(
+            result
+        ):
+            result.finish(success=False)
+            return
+
+        result.finish(success=True)
 
     def _check_file_for_blacklist(self, path: str, result: ScanResult) -> None:
         """Check the entire file content for blacklisted terms"""
@@ -680,11 +751,21 @@ class ManifestScanner(BaseScanner):
         path: str,
         ext: str,
         result: ScanResult | None = None,
-    ) -> dict[str, Any] | None:
+    ) -> Any:
         """Parse the file based on its extension"""
         try:
             with open(path, encoding="utf-8") as f:
                 content = f.read()
+
+            stripped_content = content.strip()
+
+            if ext == ".toml":
+                if _tomllib is None:
+                    raise ValueError("TOML parsing requires Python 3.11+ or the tomli package")
+                return _tomllib.loads(content)
+
+            if ext in [".ini", ".cfg"] or (ext == ".config" and not stripped_content.startswith(("{", "["))):
+                return self._parse_ini_file(content)
 
             # Try JSON format first
             if ext in [
@@ -692,11 +773,11 @@ class ManifestScanner(BaseScanner):
                 ".manifest",
                 ".model",
                 ".metadata",
-            ] or content.strip().startswith(("{", "[")):
+            ] or stripped_content.startswith(("{", "[")):
                 return json.loads(content)
 
             # Try YAML format if available
-            if HAS_YAML and (ext in [".yaml", ".yml"] or content.strip().startswith("---")):
+            if HAS_YAML and (ext in [".yaml", ".yml"] or stripped_content.startswith("---")):
                 return yaml.safe_load(content)
 
             # For other formats, try JSON and then YAML if available
@@ -726,7 +807,22 @@ class ManifestScanner(BaseScanner):
                     rule_code="S902",
                 )
 
-        return None
+        return _PARSE_FAILED
+
+    def _parse_ini_file(self, content: str) -> dict[str, Any]:
+        """Parse INI-style manifests into nested dictionaries."""
+        parser = configparser.ConfigParser()
+        parser.read_string(content)
+
+        parsed: dict[str, Any] = {}
+        defaults = dict(parser.defaults())
+        if defaults:
+            parsed["DEFAULT"] = defaults
+
+        for section in parser.sections():
+            parsed[section] = dict(parser.items(section))
+
+        return parsed
 
     def _extract_model_metadata(self, content: dict[str, Any]) -> dict[str, Any]:
         """Extract model metadata from HuggingFace config files"""
@@ -766,63 +862,58 @@ class ManifestScanner(BaseScanner):
 
         return None
 
-    def _check_model_name_policies(self, content: dict[str, Any], result: ScanResult) -> None:
+    def _check_model_name_policies(self, content: Any, result: ScanResult) -> None:
         """Check for blacklisted model names in config values"""
 
-        def check_dict(d: Any, prefix: str = "") -> None:
+        def check_value(value: Any, prefix: str = "") -> None:
             self._check_timeout()
-            if not isinstance(d, dict):
-                return
 
-            for key, value in d.items():
-                key_lower = key.lower()
-                full_key = f"{prefix}.{key}" if prefix else key
+            if isinstance(value, dict):
+                for key, nested_value in value.items():
+                    key_lower = key.lower()
+                    full_key = f"{prefix}.{key}" if prefix else key
 
-                # Check if this key might contain a model name
-                if key_lower in MODEL_NAME_KEYS_LOWER:
-                    blocked, reason = check_model_name_policies(
-                        str(value),
-                        self.blacklist_patterns,
-                    )
-                    if blocked:
-                        result.add_check(
-                            name="Model Name Policy Check",
-                            passed=False,
-                            message=f"Model name blocked by policy: {value}",
-                            severity=IssueSeverity.CRITICAL,
-                            location=self.current_file_path,
-                            details={
-                                "model_name": str(value),
-                                "reason": reason,
-                                "key": full_key,
-                            },
-                            why=(
-                                "This model name matches a blacklist pattern. Organizations use model name "
-                                "blacklists to prevent use of banned, malicious, or policy-violating models."
-                            ),
+                    # Check if this key might contain a model name
+                    if key_lower in MODEL_NAME_KEYS_LOWER:
+                        blocked, reason = check_model_name_policies(
+                            str(nested_value),
+                            self.blacklist_patterns,
                         )
-                    else:
-                        result.add_check(
-                            name="Model Name Policy Check",
-                            passed=True,
-                            message=f"Model name '{value}' passed policy check",
-                            location=self.current_file_path,
-                            details={
-                                "model_name": str(value),
-                                "key": full_key,
-                            },
-                        )
+                        if blocked:
+                            result.add_check(
+                                name="Model Name Policy Check",
+                                passed=False,
+                                message=f"Model name blocked by policy: {nested_value}",
+                                severity=IssueSeverity.CRITICAL,
+                                location=self.current_file_path,
+                                details={
+                                    "model_name": str(nested_value),
+                                    "reason": reason,
+                                    "key": full_key,
+                                },
+                                why=(
+                                    "This model name matches a blacklist pattern. Organizations use model name "
+                                    "blacklists to prevent use of banned, malicious, or policy-violating models."
+                                ),
+                            )
+                        else:
+                            result.add_check(
+                                name="Model Name Policy Check",
+                                passed=True,
+                                message=f"Model name '{nested_value}' passed policy check",
+                                location=self.current_file_path,
+                                details={
+                                    "model_name": str(nested_value),
+                                    "key": full_key,
+                                },
+                            )
 
-                # ALWAYS recursively check nested structures,
-                # regardless of pattern matches
-                if isinstance(value, dict):
-                    check_dict(value, full_key)
-                elif isinstance(value, list):
-                    for i, item in enumerate(value):
-                        if isinstance(item, dict):
-                            check_dict(item, f"{full_key}[{i}]")
+                    check_value(nested_value, full_key)
+            elif isinstance(value, list):
+                for i, item in enumerate(value):
+                    check_value(item, f"{prefix}[{i}]")
 
-        check_dict(content)
+        check_value(content)
 
     def _check_cloud_storage_urls(self, path: str, result: ScanResult) -> None:
         """Check for cloud storage URLs (external resource references).
@@ -884,7 +975,7 @@ class ManifestScanner(BaseScanner):
         except Exception as e:
             logger.debug(f"Error checking cloud storage URLs in {path}: {e}")
 
-    def _check_suspicious_urls(self, content: dict[str, Any], result: ScanResult) -> None:
+    def _check_suspicious_urls(self, content: Any, result: ScanResult) -> None:
         """Check for untrusted URLs in config values using allowlist approach.
 
         Only URLs from trusted domains (huggingface, github, pytorch, etc.) are allowed.
@@ -939,7 +1030,7 @@ class ManifestScanner(BaseScanner):
 
         extract_urls_from_value(content, "")
 
-    def _check_weak_hashes(self, content: dict[str, Any], result: ScanResult) -> None:
+    def _check_weak_hashes(self, content: Any, result: ScanResult) -> None:
         """Check for weak hash algorithms (MD5, SHA1) used for integrity verification.
 
         MD5 and SHA1 are cryptographically broken and should not be used for
@@ -967,7 +1058,7 @@ class ManifestScanner(BaseScanner):
             }
             return length_to_algorithm.get(len(value))
 
-        def check_value(key: str, value: Any, path: str) -> None:
+        def check_hash_value(key: str, value: Any, path: str) -> None:
             """Check a single key-value pair for weak hash usage."""
             if not isinstance(value, str):
                 return
@@ -1015,24 +1106,18 @@ class ManifestScanner(BaseScanner):
                     },
                 )
 
-        def traverse_for_hashes(d: Any, prefix: str = "") -> None:
-            """Recursively check dictionary for weak hashes."""
+        def traverse_for_hashes(value: Any, prefix: str = "", parent_key: str = "") -> None:
+            """Recursively check parsed manifest content for weak hashes."""
             self._check_timeout()
-            if not isinstance(d, dict):
-                return
-
-            for key, value in d.items():
-                full_key = f"{prefix}.{key}" if prefix else key
-
-                if isinstance(value, str):
-                    check_value(key, value, full_key)
-                elif isinstance(value, dict):
-                    traverse_for_hashes(value, full_key)
-                elif isinstance(value, list):
-                    for i, item in enumerate(value):
-                        if isinstance(item, dict):
-                            traverse_for_hashes(item, f"{full_key}[{i}]")
-                        elif isinstance(item, str):
-                            check_value(f"{key}[{i}]", item, f"{full_key}[{i}]")
+            if isinstance(value, dict):
+                for key, nested_value in value.items():
+                    full_key = f"{prefix}.{key}" if prefix else key
+                    traverse_for_hashes(nested_value, full_key, key)
+            elif isinstance(value, list):
+                for i, item in enumerate(value):
+                    item_path = f"{prefix}[{i}]"
+                    traverse_for_hashes(item, item_path, parent_key)
+            elif isinstance(value, str) and parent_key:
+                check_hash_value(parent_key, value, prefix)
 
         traverse_for_hashes(content)
