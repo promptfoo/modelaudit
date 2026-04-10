@@ -626,9 +626,21 @@ ALWAYS_DANGEROUS_FUNCTIONS: set[str] = {
     "shutil.copytree",
     # Dynamic resolution trampolines (can resolve arbitrary callables)
     "pkgutil.resolve_name",
-    # uuid internal functions that call subprocess.Popen
+    # functools.reduce can drive arbitrary callable invocation chains.
+    "functools.reduce",
+    # logging configuration loaders can resolve and instantiate attacker-controlled callables.
+    "logging.config.dictConfig",
+    "logging.config.fileConfig",
+    "logging.config.listen",
+    # uuid.getnode can dispatch into platform helpers that call subprocess.Popen.
+    "uuid._arp_getnode",
     "uuid._get_command_stdout",
+    "uuid._ifconfig_getnode",
+    "uuid._ip_getnode",
+    "uuid._lanscan_getnode",
+    "uuid._netstat_getnode",
     "uuid._popen",
+    "uuid.getnode",
     # Profiling/debugging modules that execute arbitrary Python code
     "cProfile.run",
     "cProfile.runctx",
@@ -735,9 +747,8 @@ ALWAYS_DANGEROUS_MODULES: set[str] = {
     "types",
     "compileall",
     "py_compile",
-    # Operator / functools bypasses
+    # Operator bypasses
     "_operator",
-    "functools",
     # Pickle recursion
     "pickle",
     "_pickle",
@@ -745,10 +756,8 @@ ALWAYS_DANGEROUS_MODULES: set[str] = {
     "cloudpickle",
     "joblib",
     # Filesystem / shell
-    "tempfile",
     "filecmp",
     "fileinput",
-    "glob",
     "distutils",
     "pydoc",
     "pexpect",
@@ -761,7 +770,6 @@ ALWAYS_DANGEROUS_MODULES: set[str] = {
     "mmap",
     "select",
     "selectors",
-    "logging",
     "syslog",
     "tarfile",
     "zipfile",
@@ -771,10 +779,9 @@ ALWAYS_DANGEROUS_MODULES: set[str] = {
     "doctest",
     "idlelib",
     "lib2to3",
-    # uuid — _get_command_stdout internally calls subprocess.Popen
-    "uuid",
-    # NOTE: linecache and logging.config are intentionally NOT in this set.
-    # - linecache.getline: file read (not code execution), flagged as WARNING
+    # NOTE: broad linecache/logging/uuid/tempfile/functools/glob imports are
+    # intentionally NOT in this set. Exact risky helpers are handled by
+    # ALWAYS_DANGEROUS_FUNCTIONS or SUSPICIOUS_GLOBALS.
 }
 
 # Modules that are suspicious but should only be flagged at WARNING severity.
@@ -788,6 +795,8 @@ WARNING_SEVERITY_MODULES: dict[str, set[str] | None] = {
     # glob.glob / glob.iglob are common in dataset loading pipelines and
     # cannot directly execute code.
     "glob": None,
+    # tempfile.mktemp is race-prone but does not execute code by itself.
+    "tempfile": {"mktemp"},
 }
 
 # Risky ML-specific import surfaces that must be flagged even when they appear
