@@ -6,7 +6,7 @@ from typing import Any
 import numpy as np
 
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
-from modelaudit.scanners.base import Check, IssueSeverity, ScanResult
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, Check, IssueSeverity, ScanResult
 from modelaudit.scanners.numpy_scanner import NumPyScanner
 
 
@@ -346,12 +346,29 @@ def test_object_dtype_numpy_trailing_bytes_fail_integrity(tmp_path: Path) -> Non
     result = scanner.scan(str(path))
 
     assert result.success is False
+    assert result.has_errors is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["analysis_incomplete"] is True
+    assert "numpy_object_pickle_trailing_bytes" in result.metadata["scan_outcome_reasons"]
+    assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
     assert any(
         check.name == "File Integrity Check"
         and check.status.value == "failed"
         and "trailing bytes" in check.message.lower()
         for check in result.checks
     ), f"Expected trailing-byte integrity failure, got: {[c.message for c in result.checks]}"
+
+
+def test_object_dtype_numpy_trailing_bytes_exit2_not_security_finding(tmp_path: Path) -> None:
+    arr = np.array([{"k": "v"}], dtype=object)
+    path = tmp_path / "trailing.npy"
+    np.save(path, arr, allow_pickle=True)
+    path.write_bytes(path.read_bytes() + b"TRAILINGJUNK")
+
+    result = scan_model_directory_or_file(str(path))
+
+    assert determine_exit_code(result) == 2
+    assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
 def test_corrupted_npz_fails_safely(tmp_path: Path) -> None:
