@@ -41,6 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - detect Linux/macOS native-library members in Keras archives and uppercase native-library members in PyTorch ZIPs
 - detect embedded Windows DLL/PE, Linux ELF shared-object, and TensorRT plugin entry-point markers in TensorRT engines
 - detect punctuation-delimited TensorRT `/tmp` plugin paths
+- clean up temporary ZIP entry files when extraction fails on entry size limits
 - preserve HuggingFace cache provenance for symlinked custom cache roots
 - ignore remote OCI `layers[].urls` entries during local layer discovery
 - fail closed on unterminated OpenVINO DOCTYPE declarations

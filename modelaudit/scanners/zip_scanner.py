@@ -1,3 +1,4 @@
+import contextlib
 import os
 import re
 import stat
@@ -386,6 +387,7 @@ class ZipScanner(BaseScanner):
                         )
 
                 # Extract and scan the file
+                tmp_path: str | None = None
                 try:
                     max_entry_size = self._get_max_entry_size()
 
@@ -399,22 +401,22 @@ class ZipScanner(BaseScanner):
                         )
                         suffix = f"_{safe_name}"
 
-                    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-                        tmp_path = tmp.name
-                        total_size = 0
-                        with z.open(info) as entry:
-                            while True:
-                                chunk = entry.read(4096)
-                                if not chunk:
-                                    break
-                                total_size += len(chunk)
-                                if total_size > max_entry_size:
-                                    raise ValueError(
-                                        f"ZIP entry {name} exceeds maximum size of {max_entry_size} bytes",
-                                    )
-                                tmp.write(chunk)
-
                     try:
+                        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                            tmp_path = tmp.name
+                            total_size = 0
+                            with z.open(info) as entry:
+                                while True:
+                                    chunk = entry.read(4096)
+                                    if not chunk:
+                                        break
+                                    total_size += len(chunk)
+                                    if total_size > max_entry_size:
+                                        raise ValueError(
+                                            f"ZIP entry {name} exceeds maximum size of {max_entry_size} bytes",
+                                        )
+                                    tmp.write(chunk)
+
                         if archive_ext == ".mar" and name.lower().endswith(".py"):
                             mar_python_result = self._scan_mar_python_entry(path, name, tmp_path, total_size)
                             if mar_python_result is not None:
@@ -447,7 +449,9 @@ class ZipScanner(BaseScanner):
                         if file_result.scanner_name == "unknown":
                             result.bytes_scanned += total_size
                     finally:
-                        os.unlink(tmp_path)
+                        if tmp_path is not None:
+                            with contextlib.suppress(FileNotFoundError):
+                                os.unlink(tmp_path)
 
                 except Exception as e:
                     scan_complete = False
