@@ -9,10 +9,11 @@ import tarfile
 import tempfile
 from typing import Any, ClassVar
 
-from .. import core
 from ..utils import is_absolute_archive_path, is_critical_system_path, sanitize_archive_path
 from ..utils.helpers.assets import asset_from_scan_result
 from ._archive_locations import rewrite_extracted_member_location
+from ._archive_outcomes import mark_archive_scan_incomplete
+from .archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY, scan_nested_file
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 CRITICAL_SYSTEM_PATHS = [
@@ -121,6 +122,7 @@ class TarScanner(BaseScanner):
                 details={"path": path},
                 rule_code="S902",
             )
+            mark_archive_scan_incomplete(result, "tar_analysis_incomplete")
             result.finish(success=False)
             return result
         except Exception as e:
@@ -132,6 +134,7 @@ class TarScanner(BaseScanner):
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )
+            mark_archive_scan_incomplete(result, "tar_analysis_incomplete")
             result.finish(success=False)
             return result
 
@@ -194,6 +197,13 @@ class TarScanner(BaseScanner):
                 if isinstance(existing_check_entry, str) and existing_check_entry
                 else entry_name
             )
+
+    def _scan_nested_archive_entry(self, path: str, nested_config: dict[str, Any]) -> ScanResult:
+        """Dispatch a nested archive member through an injected callback or registry fallback."""
+        nested_scan_callback = self.config.get(NESTED_SCAN_CALLBACK_CONFIG_KEY)
+        if callable(nested_scan_callback):
+            return nested_scan_callback(path, nested_config)
+        return scan_nested_file(path, nested_config)
 
     @staticmethod
     def _rewrite_archive_location(location: str | None, tmp_path: str, archive_location: str) -> str:
@@ -455,6 +465,7 @@ class TarScanner(BaseScanner):
                 location=path,
                 details={"depth": depth, "max_depth": self.max_depth},
             )
+            mark_archive_scan_incomplete(result, "tar_analysis_incomplete")
             result.finish(success=False)
             return result
         else:
@@ -470,6 +481,7 @@ class TarScanner(BaseScanner):
         if not self._preflight_tar_archive(path, result):
             result.metadata["contents"] = contents
             result.metadata["file_size"] = os.path.getsize(path)
+            mark_archive_scan_incomplete(result, "tar_analysis_incomplete")
             result.finish(success=False)
             return result
 
@@ -575,7 +587,7 @@ class TarScanner(BaseScanner):
                         else:
                             nested_config = dict(self.config)
                             nested_config["_archive_depth"] = depth + 1
-                            file_result = core.scan_file(tmp_path, nested_config)
+                            file_result = self._scan_nested_archive_entry(tmp_path, nested_config)
                             if not file_result.success:
                                 scan_complete = False
 
@@ -608,5 +620,7 @@ class TarScanner(BaseScanner):
 
         result.metadata["contents"] = contents
         result.metadata["file_size"] = os.path.getsize(path)
+        if not scan_complete:
+            mark_archive_scan_incomplete(result, "tar_analysis_incomplete")
         result.finish(success=scan_complete and not result.has_errors)
         return result

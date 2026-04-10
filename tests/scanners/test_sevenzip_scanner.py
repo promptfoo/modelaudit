@@ -19,7 +19,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.sevenzip_scanner import HAS_PY7ZR, SevenZipScanner
 
 # Skip all tests if py7zr is not available for asset generation
@@ -112,6 +112,9 @@ class TestSevenZipScanner:
         assert issue.severity == IssueSeverity.WARNING
         assert "py7zr library not installed" in issue.message
         assert "pip install py7zr" in issue.message
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert result.metadata["analysis_incomplete"] is True
+        assert "sevenzip_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
 
     @patch("modelaudit.scanners.sevenzip_scanner.HAS_PY7ZR", False)
     def test_scan_mocked_unavailable(self, scanner, temp_7z_file):
@@ -125,6 +128,9 @@ class TestSevenZipScanner:
         # Missing optional dependency is a WARNING, not CRITICAL
         assert issue.severity == IssueSeverity.WARNING
         assert "py7zr library not installed" in issue.message
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert result.metadata["analysis_incomplete"] is True
+        assert "sevenzip_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
 
     @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
     def test_can_handle_valid_7z_magic_bytes(self, temp_7z_file):
