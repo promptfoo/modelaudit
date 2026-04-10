@@ -12,6 +12,7 @@ import re
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -32,6 +33,19 @@ MMAP_MAX_WINDOW = 500 * 1024 * 1024  # 500MB max window size
 # Parallel scanning parameters
 MAX_PARALLEL_WORKERS = 4
 SHARD_SCAN_TIMEOUT = 600  # 10 minutes per shard
+
+
+def _mark_inconclusive_scan_outcome(result: "ScanResult", reason: str) -> None:
+    """Mark a scan result as incomplete while preserving existing reasons."""
+    from ...scanner_results import INCONCLUSIVE_SCAN_OUTCOME
+
+    result.metadata["analysis_incomplete"] = True
+    result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+    existing_reasons = result.metadata.get("scan_outcome_reasons")
+    reasons = existing_reasons if isinstance(existing_reasons, list) else []
+    if reason not in reasons:
+        reasons.append(reason)
+    result.metadata["scan_outcome_reasons"] = reasons
 
 
 class ShardedModelDetector:
@@ -62,18 +76,38 @@ class ShardedModelDetector:
         dir_path = Path(file_path).parent
 
         for pattern in cls.SHARD_PATTERNS:
-            match = re.match(pattern, file_name)
+            match = re.fullmatch(pattern, file_name)
             if match:
                 # Found a sharded model
                 shard_info: dict[str, Any] = {"pattern": pattern, "current_file": file_path, "shards": []}
+                expected_totals: set[int] = set()
+                present_indices: set[int] = set()
 
                 # Find all related shards
                 for file in dir_path.glob("*"):
-                    if re.match(pattern, file.name):
+                    file_match = re.fullmatch(pattern, file.name)
+                    if file_match:
                         shard_info["shards"].append(str(file))
+                        if file_match.lastindex:
+                            with suppress(IndexError, ValueError):
+                                present_indices.add(int(file_match.group(1)))
+                        if (file_match.lastindex or 0) >= 2:
+                            with suppress(IndexError, ValueError):
+                                expected_totals.add(int(file_match.group(2)))
 
                 shard_info["shards"].sort()
                 shard_info["total_shards"] = len(shard_info["shards"])
+                if expected_totals:
+                    expected_total = max(expected_totals)
+                    shard_info["expected_total_shards"] = expected_total
+                    if len(expected_totals) > 1:
+                        shard_info["inconsistent_expected_total_shards"] = sorted(expected_totals)
+                    if present_indices:
+                        missing_indices = [
+                            index for index in range(1, expected_total + 1) if index not in present_indices
+                        ]
+                        if missing_indices:
+                            shard_info["missing_shard_indices"] = missing_indices
 
                 # Calculate total size
                 total_size = sum(os.path.getsize(s) for s in shard_info["shards"])
@@ -269,6 +303,7 @@ class ParallelShardHandler:
         shards = self.shard_info["shards"]
         total_shards = len(shards)
         completed_shards = 0
+        success = True
 
         # Add info about sharded model
         result.add_check(
@@ -295,6 +330,7 @@ class ParallelShardHandler:
                 try:
                     shard_result = future.result(timeout=SHARD_SCAN_TIMEOUT)
                     result.merge(shard_result)
+                    success = success and bool(shard_result.success)
 
                     if progress_callback:
                         percentage = (completed_shards / total_shards) * 100
@@ -302,15 +338,23 @@ class ParallelShardHandler:
 
                 except Exception as e:
                     logger.error(f"Error scanning shard {shard}: {e}")
+                    success = False
+                    _mark_inconclusive_scan_outcome(result, "shard_scan_error")
                     result.add_check(
                         name="Shard Scan",
                         passed=False,
                         message=f"Error scanning shard: {Path(shard).name}",
-                        severity=IssueSeverity.WARNING,
+                        severity=IssueSeverity.INFO,
                         location=shard,
-                        details={"error": str(e)},
+                        details={
+                            "error": str(e),
+                            "analysis_incomplete": True,
+                            "scan_outcome": "inconclusive",
+                            "scan_outcome_reason": "shard_scan_error",
+                        },
                     )
 
+        result.finish(success=success and not result.has_errors and "scan_outcome" not in result.metadata)
         return result
 
     def _scan_single_shard(self, shard_path: str) -> "ScanResult":
@@ -453,7 +497,25 @@ class AdvancedFileHandler:
             parallel_scanner = ParallelShardHandler(self.shard_info, self.scanner.__class__)
             shard_results = parallel_scanner.scan_shards(self.progress_callback)
             result.merge(shard_results)
+            missing_indices = self.shard_info.get("missing_shard_indices")
+            if isinstance(missing_indices, list) and missing_indices:
+                _mark_inconclusive_scan_outcome(result, "missing_model_shards")
+                result.add_check(
+                    name="Sharded Model Coverage Check",
+                    passed=False,
+                    message=(f"Missing {len(missing_indices)} expected model shard(s); scan coverage is incomplete."),
+                    severity=IssueSeverity.INFO,
+                    details={
+                        "expected_total_shards": self.shard_info.get("expected_total_shards"),
+                        "present_total_shards": self.shard_info.get("total_shards"),
+                        "missing_shard_indices": missing_indices,
+                        "analysis_incomplete": True,
+                        "scan_outcome": "inconclusive",
+                        "scan_outcome_reason": "missing_model_shards",
+                    },
+                )
 
+        result.finish(success=not result.has_errors and "scan_outcome" not in result.metadata)
         return result
 
     def _scan_with_mmap(self) -> "ScanResult":

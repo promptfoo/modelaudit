@@ -36,6 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - avoid CoreML nested parse failures on bounded-read truncation
+- mark incomplete sharded-model scans as inconclusive, ignore shard-name prefix matches, and skip caching explicit incomplete outcomes
 - flag TensorFlow `LoadLibrary` and `LoadLibraryV2` graph ops as dangerous native-library loading
 - detect split CNTK native-user-function and native-library references
 - detect Linux/macOS native-library members in Keras archives and uppercase native-library members in PyTorch ZIPs

@@ -2,6 +2,8 @@
 
 from typing import Any
 
+from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME
+
 _OPERATIONAL_ERROR_INDICATORS = (
     "error during scan",
     "error checking file size",
@@ -33,6 +35,14 @@ _OPERATIONAL_ERROR_INDICATORS = (
 
 def should_cache_scan_result(scan_result: dict[str, Any]) -> bool:
     """Return True when a scan result is stable enough to cache safely."""
+    metadata = scan_result.get("metadata")
+    if isinstance(metadata, dict) and (
+        bool(metadata.get("operational_error"))
+        or bool(metadata.get("analysis_incomplete"))
+        or metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    ):
+        return False
+
     for collection_name in ("issues", "checks"):
         collection = scan_result.get(collection_name)
         if not isinstance(collection, list):
