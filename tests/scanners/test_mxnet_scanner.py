@@ -5,8 +5,9 @@ import json
 import struct
 from pathlib import Path
 
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners import get_scanner_for_file
-from modelaudit.scanners.base import IssueSeverity
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity
 from modelaudit.scanners.mxnet_scanner import MXNetScanner
 
 
@@ -150,7 +151,52 @@ def test_mxnet_scanner_handles_corrupt_params_file(tmp_path: Path) -> None:
     result = MXNetScanner().scan(str(params_path))
 
     assert not result.success
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == ["mxnet_params_empty"]
     assert any("MXNet params blob is empty" in issue.message for issue in result.issues)
+
+
+def test_mxnet_corrupt_params_aggregate_exit_code_is_inconclusive(tmp_path: Path) -> None:
+    params_path = tmp_path / "corrupt-0000.params"
+    params_path.write_bytes(b"")
+
+    result = scan_model_directory_or_file(str(params_path), cache_scan_results=False)
+
+    metadata = result.file_metadata[str(params_path)]
+    assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "mxnet_params_empty" in metadata["scan_outcome_reasons"]
+    assert result.success is False
+    assert determine_exit_code(result) == 2
+
+
+def test_mxnet_truncated_params_aggregate_exit_code_is_inconclusive(tmp_path: Path) -> None:
+    params_path = tmp_path / "truncated-0000.params"
+    params_path.write_bytes(b"short")
+
+    direct_result = MXNetScanner().scan(str(params_path))
+    aggregate_result = scan_model_directory_or_file(str(params_path), cache_scan_results=False)
+
+    assert direct_result.success is False
+    assert direct_result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert direct_result.metadata["scan_outcome_reasons"] == ["mxnet_params_truncated"]
+
+    metadata = aggregate_result.file_metadata[str(params_path)]
+    assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "mxnet_params_truncated" in metadata["scan_outcome_reasons"]
+    assert aggregate_result.success is False
+    assert determine_exit_code(aggregate_result) == 2
+
+
+def test_mxnet_malformed_symbol_scan_is_inconclusive(tmp_path: Path) -> None:
+    symbol_path = tmp_path / "broken-symbol.json"
+    symbol_path.write_text('{"nodes": [', encoding="utf-8")
+
+    result = MXNetScanner().scan(str(symbol_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == ["mxnet_symbol_parse_failed"]
+    assert any(check.name == "MXNet Symbol Parse" for check in result.checks)
 
 
 def test_mxnet_params_numeric_blob_does_not_trigger_false_positives(tmp_path: Path) -> None:
