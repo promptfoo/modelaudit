@@ -132,6 +132,23 @@ def _failed_checks(result: ScanResult) -> list[Check]:
     return [c for c in result.checks if c.status.value == "failed"]
 
 
+def _assert_no_trailing_pickle_parse_noise(result: ScanResult) -> None:
+    parse_noise_terms = (
+        "parse_incomplete",
+        "pickle parsing failed before full scan completion",
+        "pickle parsing stopped before the stream was fully consumed",
+        "stream was fully consumed",
+    )
+    check_text = " ".join(f"{check.name} {check.message}" for check in result.checks).lower()
+    issue_text = " ".join(issue.message for issue in result.issues).lower()
+    reasons = result.metadata.get("scan_outcome_reasons", [])
+
+    assert not any(term in check_text for term in parse_noise_terms)
+    assert not any(term in issue_text for term in parse_noise_terms)
+    assert isinstance(reasons, list)
+    assert "parse_incomplete" not in reasons
+
+
 def _inject_comment_token_into_npy_payload(path: Path) -> None:
     with path.open("rb") as handle:
         major, minor = np.lib.format.read_magic(handle)
@@ -351,6 +368,7 @@ def test_object_dtype_numpy_trailing_bytes_fail_integrity(tmp_path: Path) -> Non
     assert result.metadata["analysis_incomplete"] is True
     assert "numpy_object_pickle_trailing_bytes" in result.metadata["scan_outcome_reasons"]
     assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+    _assert_no_trailing_pickle_parse_noise(result)
     assert any(
         check.name == "File Integrity Check"
         and check.status.value == "failed"
@@ -366,9 +384,27 @@ def test_object_dtype_numpy_trailing_bytes_exit2_not_security_finding(tmp_path: 
     path.write_bytes(path.read_bytes() + b"TRAILINGJUNK")
 
     result = scan_model_directory_or_file(str(path))
+    metadata = next(iter(result.file_metadata.values()))
 
+    assert result.success is False
+    assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert "numpy_object_pickle_trailing_bytes" in metadata.get("scan_outcome_reasons", [])
     assert determine_exit_code(result) == 2
     assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def test_object_dtype_numpy_trailing_bytes_malicious_exit1(tmp_path: Path) -> None:
+    arr = np.array([_ExecPayload()], dtype=object)
+    path = tmp_path / "malicious_trailing.npy"
+    np.save(path, arr, allow_pickle=True)
+    path.write_bytes(path.read_bytes() + b"TRAILINGJUNK")
+
+    result = scan_model_directory_or_file(str(path))
+    metadata = next(iter(result.file_metadata.values()))
+
+    assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert determine_exit_code(result) == 1
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
 def test_corrupted_npz_fails_safely(tmp_path: Path) -> None:

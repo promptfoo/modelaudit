@@ -6,8 +6,9 @@ import sys
 import warnings
 from typing import TYPE_CHECKING, Any, BinaryIO, ClassVar
 
-from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, Check, Issue, IssueSeverity, ScanResult
+from .base import BaseScanner, Check, Issue, IssueSeverity, ScanResult
 from .pickle_scanner import PickleScanner
+from .pickle_support import _finish_with_inconclusive_contract, _mark_inconclusive_scan_result
 
 # Import NumPy with compatibility handling
 try:
@@ -366,12 +367,8 @@ class NumPyScanner(BaseScanner):
                                         "dtype": str(dtype),
                                     },
                                 )
-                                result.metadata["analysis_incomplete"] = True
-                                result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
-                                result.metadata["scan_outcome_reasons"] = [
-                                    "numpy_object_pickle_trailing_bytes",
-                                ]
-                                result.finish(success=False)
+                                _mark_inconclusive_scan_result(result, "numpy_object_pickle_trailing_bytes")
+                                _finish_with_inconclusive_contract(result, default_success=True)
                                 return result
 
                             result.issues.extend(embedded_result.issues)
