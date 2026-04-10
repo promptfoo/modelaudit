@@ -34,6 +34,17 @@ def test_compressed_scanner_can_handle_requires_matching_signature(tmp_path: Pat
     assert CompressedScanner.can_handle(str(invalid_gzip_path)) is False
 
 
+def test_compressed_scanner_can_handle_header_routed_misnamed_wrapper(tmp_path: Path) -> None:
+    disguised_gzip_path = tmp_path / "model.jpg"
+    disguised_gzip_path.write_bytes(gzip.compress(pickle.dumps({"weights": [1, 2, 3]})))
+
+    near_match_path = tmp_path / "near-match.jpg"
+    near_match_path.write_bytes(b"\x1f\x00not-a-gzip-stream")
+
+    assert CompressedScanner.can_handle(str(disguised_gzip_path)) is True
+    assert CompressedScanner.can_handle(str(near_match_path)) is False
+
+
 def test_compressed_scanner_can_handle_rejects_invalid_zlib_header_near_match(tmp_path: Path) -> None:
     zlib_path = tmp_path / "payload.bin.zlib"
     zlib_path.write_bytes(b"\x78\x00" + b"not-a-valid-zlib-stream")

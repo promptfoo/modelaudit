@@ -58,6 +58,8 @@ _OPERATIONAL_ERROR_REASON_METADATA_KEY = "operational_error_reason"
 _SCAN_OUTCOME_METADATA_KEY = "scan_outcome"
 
 HEADER_FORMAT_TO_SCANNER_ID = _registry.get_header_format_to_scanner_ids()
+_COMPRESSED_HEADER_FORMATS = frozenset({"compressed", "gzip", "bzip2", "xz", "lz4", "zlib"})
+_R_SERIALIZED_EXTENSIONS = frozenset({".rds", ".rda", ".rdata"})
 
 
 def _mark_operational_scan_error(scan_result: ScanResult, reason: str) -> None:
@@ -238,8 +240,11 @@ def _select_preferred_scanner_id(path: str, header_format: str, ext: str) -> str
             return "pickle"
         return "zip"
 
-    if ext == ".joblib" and header_format in {"compressed", "pickle"}:
+    if ext == ".joblib" and header_format in _COMPRESSED_HEADER_FORMATS | {"pickle"}:
         return "joblib"
+
+    if ext in _R_SERIALIZED_EXTENSIONS and header_format in _COMPRESSED_HEADER_FORMATS | {"r_serialized"}:
+        return "r_serialized"
 
     if header_format == "tar" and ext == ".nemo":
         return "nemo"

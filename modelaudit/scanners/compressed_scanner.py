@@ -75,6 +75,10 @@ class CompressedScanner(BaseScanner):
         return cls._EXTENSION_TO_CODEC.get(extension)
 
     @classmethod
+    def _has_declared_wrapper_extension(cls, path: str) -> bool:
+        return Path(path).suffix.lower() in cls._EXTENSION_TO_CODEC
+
+    @classmethod
     def _detect_codec_from_header(cls, header: bytes) -> str | None:
         if header.startswith(cls._CODEC_MAGIC_PREFIXES["gzip"]):
             return "gzip"
@@ -93,10 +97,6 @@ class CompressedScanner(BaseScanner):
         if not os.path.isfile(path):
             return False
 
-        expected_codec = cls._expected_codec_for_path(path)
-        if expected_codec is None:
-            return False
-
         try:
             with open(path, "rb") as handle:
                 header = handle.read(8)
@@ -104,11 +104,17 @@ class CompressedScanner(BaseScanner):
             return False
 
         detected_codec = cls._detect_codec_from_header(header)
+        expected_codec = cls._expected_codec_for_path(path)
+        if expected_codec is None:
+            return detected_codec is not None
         return detected_codec == expected_codec
 
     @staticmethod
     def _derive_inner_suffix(path: str) -> str:
         wrapper_path = Path(path)
+        if not CompressedScanner._has_declared_wrapper_extension(path):
+            return wrapper_path.suffix or ".bin"
+
         stem_without_wrapper = (
             wrapper_path.name[: -len(wrapper_path.suffix)] if wrapper_path.suffix else wrapper_path.name
         )
@@ -118,7 +124,7 @@ class CompressedScanner(BaseScanner):
     @staticmethod
     def _derive_inner_display_name(path: str) -> str:
         wrapper_path = Path(path)
-        if wrapper_path.suffix:
+        if wrapper_path.suffix and CompressedScanner._has_declared_wrapper_extension(path):
             return wrapper_path.name[: -len(wrapper_path.suffix)]
         return f"{wrapper_path.name}.inner"
 
@@ -372,18 +378,6 @@ class CompressedScanner(BaseScanner):
             details={"depth": depth, "max_depth": self.max_depth},
         )
 
-        expected_codec = self._expected_codec_for_path(path)
-        if expected_codec is None:
-            result.add_check(
-                name="Compressed Wrapper Signature Validation",
-                passed=False,
-                message="Unsupported compressed wrapper extension",
-                severity=IssueSeverity.INFO,
-                location=path,
-            )
-            result.finish(success=False)
-            return result
-
         try:
             with open(path, "rb") as handle:
                 header = handle.read(8)
@@ -399,8 +393,21 @@ class CompressedScanner(BaseScanner):
             result.finish(success=False)
             return result
 
+        expected_codec = self._expected_codec_for_path(path)
         detected_codec = self._detect_codec_from_header(header)
-        if detected_codec != expected_codec:
+        if expected_codec is None:
+            if detected_codec is None:
+                result.add_check(
+                    name="Compressed Wrapper Signature Validation",
+                    passed=False,
+                    message="Unsupported compressed wrapper extension and no compressed magic bytes detected",
+                    severity=IssueSeverity.INFO,
+                    location=path,
+                )
+                result.finish(success=False)
+                return result
+            expected_codec = detected_codec
+        elif detected_codec != expected_codec:
             result.add_check(
                 name="Compressed Wrapper Signature Validation",
                 passed=False,
