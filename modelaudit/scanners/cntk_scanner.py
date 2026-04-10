@@ -39,11 +39,26 @@ _ASCII_STRING_RE = re.compile(rb"[ -~]{6,512}")
 _UTF16LE_STRING_RE = re.compile(rb"(?:[\x20-\x7e]\x00){6,256}")
 
 _PATH_OR_LIBRARY_RE = re.compile(
-    r"(?:\b[a-z]:\\[^\s\"']+|\.{2}[/\\][^\s\"']+|(?:/[^\s\"']+){2,}|[^\s\"']+\.(?:dll|so|dylib)\b|https?://[^\s\"']+)",
+    r"(?:\b[a-z]:\\(?:[^\s\"'\\]+\\)*[^\s\"'\\]+|"
+    r"\.{2}[/\\](?:[^\s\"'/\\]+[/\\])*[^\s\"'/\\]+|"
+    r"/(?:[^\s\"'/]+/)+[^\s\"'/]+|"
+    r"(?:[^\s\"'/\\]+[/\\])*[^\s\"'/\\]+\.(?:dll|so|dylib)\b|"
+    r"https?://[^\s\"']+)",
     re.IGNORECASE,
 )
 _LOAD_CONTEXT_RE = re.compile(
     r"(?:loadlibrary|dlopen|native_user_function|plugin|importlib|__import__|module|library)",
+    re.IGNORECASE,
+)
+_STRONG_LOAD_CONTEXT_RE = re.compile(
+    r"(?:loadlibrary|dlopen|native_user_function|register_native_user_function|plugin|importlib|__import__)",
+    re.IGNORECASE,
+)
+_NATIVE_LIBRARY_REFERENCE_RE = re.compile(
+    r"(?:\b[a-z]:\\(?:[^\s\"'\\]+\\)*[^\s\"'\\]+\.(?:dll|so|dylib)\b|"
+    r"\.{2}[/\\](?:[^\s\"'/\\]+[/\\])*[^\s\"'/\\]+\.(?:dll|so|dylib)\b|"
+    r"/(?:[^\s\"'/]+/)*[^\s\"'/]+\.(?:dll|so|dylib)\b|"
+    r"(?:[^\s\"'/\\]+[/\\])*[^\s\"'/\\]+\.(?:dll|so|dylib)\b)",
     re.IGNORECASE,
 )
 _COMMAND_CONTEXT_RE = re.compile(
@@ -173,6 +188,38 @@ def _has_external_load_reference(text: str) -> bool:
     return bool(_PATH_OR_LIBRARY_RE.search(text) and _LOAD_CONTEXT_RE.search(text))
 
 
+def _collect_split_external_load_references(strings: list[str]) -> list[str]:
+    load_context_examples: list[str] = []
+    library_reference_examples: list[str] = []
+
+    for text in strings:
+        if _is_known_safe_metadata_entry(text):
+            continue
+
+        if (
+            _STRONG_LOAD_CONTEXT_RE.search(text)
+            and not _NATIVE_LIBRARY_REFERENCE_RE.search(text)
+            and len(load_context_examples) < _MAX_EVIDENCE_PER_CATEGORY
+        ):
+            load_context_examples.append(_snippet(text))
+        if (
+            _NATIVE_LIBRARY_REFERENCE_RE.search(text)
+            and not _STRONG_LOAD_CONTEXT_RE.search(text)
+            and len(library_reference_examples) < _MAX_EVIDENCE_PER_CATEGORY
+        ):
+            library_reference_examples.append(_snippet(text))
+
+    if not load_context_examples or not library_reference_examples:
+        return []
+
+    evidence: list[str] = []
+    for context, library_reference in zip(load_context_examples, library_reference_examples, strict=False):
+        evidence.append(f"context={context}; library_reference={library_reference}")
+        if len(evidence) >= _MAX_EVIDENCE_PER_CATEGORY:
+            break
+    return evidence
+
+
 def _has_command_network_execution(text: str) -> bool:
     if not _COMMAND_CONTEXT_RE.search(text):
         return False
@@ -208,6 +255,9 @@ def _collect_security_evidence(strings: list[str]) -> dict[str, list[str]]:
             and len(evidence["obfuscated_payload_indicator"]) < _MAX_EVIDENCE_PER_CATEGORY
         ):
             evidence["obfuscated_payload_indicator"].append(_snippet(text))
+
+    if not evidence["external_load_reference"]:
+        evidence["external_load_reference"].extend(_collect_split_external_load_references(strings))
 
     return evidence
 

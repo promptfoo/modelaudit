@@ -13,6 +13,7 @@ from typing import Any, ClassVar
 
 from ..detectors.suspicious_symbols import CVE_COMBINED_PATTERNS
 from ..utils import sanitize_archive_path
+from .archive_member_security import is_executable_archive_member_name
 from .base import BaseScanner, IssueSeverity, ScanResult
 from .pickle_scanner import PickleScanner
 from .picklescan_adapter import apply_pickle_member_context
@@ -798,8 +799,9 @@ class PyTorchZipScanner(BaseScanner):
 
         for entry in safe_entries:
             name = self._get_zip_member_name(entry)
+            normalized_name = name.lower()
             # Check for Python code files
-            if name.endswith(".py"):
+            if normalized_name.endswith(".py"):
                 result.add_check(
                     name="Python Code File Detection",
                     passed=False,
@@ -810,9 +812,7 @@ class PyTorchZipScanner(BaseScanner):
                 )
                 python_files_found = True
             # Check for shell scripts or other executable files
-            elif name.endswith(
-                (".sh", ".bash", ".cmd", ".exe", ".dll", ".so", ".dylib", ".scr", ".com", ".bat", ".ps1")
-            ):
+            elif is_executable_archive_member_name(normalized_name):
                 result.add_check(
                     name="Executable File Detection",
                     passed=False,

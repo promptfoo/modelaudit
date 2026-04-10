@@ -38,6 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - avoid CoreML nested parse failures on bounded-read truncation
 - harden standalone pickle scanner dangerous global coverage, literal scan
   bounds, nested pickle reporting, and report immutability
+- flag TensorFlow `LoadLibrary` and `LoadLibraryV2` graph ops as dangerous native-library loading
+- detect split CNTK native-user-function and native-library references
+- detect Linux/macOS native-library members in Keras archives and uppercase native-library members in PyTorch ZIPs
+- detect embedded Windows DLL/PE, Linux ELF shared-object, and TensorRT plugin entry-point markers in TensorRT engines
 - detect punctuation-delimited TensorRT `/tmp` plugin paths
 - preserve HuggingFace cache provenance for symlinked custom cache roots
 - ignore remote OCI `layers[].urls` entries during local layer discovery

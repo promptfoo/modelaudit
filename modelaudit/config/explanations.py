@@ -326,7 +326,8 @@ PATTERN_EXPLANATIONS = {
 # Explanations for suspicious TensorFlow operations
 #
 # Risk Categories:
-# - CRITICAL: Code execution (PyFunc, PyCall, ExecuteOp, ShellExecute) & System access (SystemConfig)
+# - CRITICAL: Code execution (PyFunc, PyCall, ExecuteOp, ShellExecute), native library loading
+#   (LoadLibrary/LoadLibraryV2), & System access (SystemConfig)
 # - HIGH: File system operations (ReadFile, WriteFile, Save, SaveV2, MergeV2Checkpoints)
 # - MEDIUM: Data processing with potential exploits (DecodeRaw, DecodeJpeg, DecodePng)
 #
@@ -359,6 +360,14 @@ TF_OP_EXPLANATIONS = {
     "ShellExecute": (
         "ShellExecute runs shell commands from the TensorFlow graph, posing severe security risks by enabling "
         "arbitrary command execution, potentially compromising the host system."
+    ),
+    "LoadLibrary": (
+        "LoadLibrary loads native TensorFlow op libraries from the graph, creating dangerous security risks "
+        "because an untrusted model can point runtime execution at attacker-controlled native code."
+    ),
+    "LoadLibraryV2": (
+        "LoadLibraryV2 loads native TensorFlow op libraries from the graph, creating dangerous security risks "
+        "because an untrusted model can point runtime execution at attacker-controlled native code."
     ),
     "SystemConfig": (
         "SystemConfig operations access or modify system configuration, creating dangerous security risks "
