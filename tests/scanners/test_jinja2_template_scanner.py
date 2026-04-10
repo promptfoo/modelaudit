@@ -363,6 +363,52 @@ class TestJinja2TemplateScannerEdgeCases:
         )
         assert determine_exit_code(aggregate_result) == 1
 
+    def test_malformed_large_json_raw_template_fallback_detects_ssti_in_prefix(self, tmp_path: Path) -> None:
+        """Large malformed configs should scan bounded raw windows instead of bailing out."""
+        tokenizer_file = tmp_path / "tokenizer_config.json"
+        payload = "{{ lipsum.__globals__.os.popen('id').read() }}"
+        tokenizer_file.write_text(
+            '{"chat_template":"' + ("a" * 70000) + payload + ("b" * 220000),
+            encoding="utf-8",
+        )
+
+        result = Jinja2TemplateScanner().scan(str(tokenizer_file))
+
+        assert result.metadata["scan_outcome"] == "inconclusive"
+        assert "jinja2_json_parse_failed" in result.metadata["scan_outcome_reasons"]
+        failed_checks = [c for c in result.checks if c.name == "Jinja2 Template Injection Detection"]
+        assert failed_checks
+        assert any(str(c.details.get("template_location")).startswith("raw_json_parse_fallback") for c in failed_checks)
+
+        aggregate_result = scan_model_directory_or_file(
+            str(tokenizer_file),
+            config={"cache_scan_results": False},
+        )
+        assert determine_exit_code(aggregate_result) == 1
+
+    def test_malformed_large_json_benign_raw_template_stays_inconclusive_only(self, tmp_path: Path) -> None:
+        """Benign raw-template recovery should not create security findings."""
+        tokenizer_file = tmp_path / "tokenizer_config.json"
+        tokenizer_file.write_text(
+            '{"chat_template":"' + ("a" * 70000) + "{{ content }}" + ("b" * 220000),
+            encoding="utf-8",
+        )
+
+        aggregate_result = scan_model_directory_or_file(
+            str(tokenizer_file),
+            config={"cache_scan_results": False},
+        )
+
+        metadata = aggregate_result.file_metadata[str(tokenizer_file)]
+        security_checks = [
+            issue
+            for issue in aggregate_result.issues
+            if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        ]
+        assert metadata.get("scan_outcome") == "inconclusive"
+        assert security_checks == []
+        assert determine_exit_code(aggregate_result) == 2
+
     def test_malformed_yaml_raw_template_fallback_detects_ssti(self, tmp_path: Path) -> None:
         """Malformed YAML configs should use the same bounded raw template fallback."""
         pytest.importorskip("yaml")
