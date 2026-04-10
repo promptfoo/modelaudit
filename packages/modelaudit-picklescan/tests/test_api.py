@@ -20,6 +20,7 @@ from modelaudit_picklescan import (
     scan_bytes,
     scan_file,
 )
+from modelaudit_picklescan.engine import nested as engine_nested
 from modelaudit_picklescan.engine import scanner as engine_scanner
 
 SYSTEM_GLOBALS = frozenset({"nt.system", "os.system", "posix.system"})
@@ -278,6 +279,26 @@ def test_scan_bytes_flags_suspicious_exec_string_literals() -> None:
     assert any(finding.rule_code == "SUSPICIOUS_STRING" and "exec(" in finding.message for finding in report.findings)
 
 
+@pytest.mark.parametrize(
+    ("literal", "expected_pattern"),
+    [
+        ("os.popen('id')", "os.popen"),
+        ("subprocess.run(['id'])", "subprocess call"),
+        ("getattr(os, 'system')('id')", "getattr system"),
+        ("base64.b64decode(blob)", "base64.b64decode"),
+    ],
+)
+def test_scan_bytes_flags_expanded_suspicious_string_patterns(literal: str, expected_pattern: str) -> None:
+    report = scan_bytes(pickle.dumps({"code": literal}), source="string-pattern.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == expected_pattern
+        for finding in report.findings
+    )
+
+
 def test_scan_bytes_can_decode_stack_global_from_memoized_operands() -> None:
     payload = b"\x80\x04\x8c\x05posix\x94\x8c\x06system\x94h\x00h\x01\x93."
 
@@ -323,6 +344,29 @@ def test_scan_bytes_flags_dill_loads_as_dangerous() -> None:
         finding.rule_code == "DANGEROUS_GLOBAL"
         and finding.severity == Severity.CRITICAL
         and finding.details.get("import_reference") == "dill.loads"
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_reference"),
+    [
+        (b"cpip\nmain\n(tR.", "pip.main"),
+        (b"cnumpy\nload\n(tR.", "numpy.load"),
+        (b"cshutil\nrmtree\n(tR.", "shutil.rmtree"),
+        (b"cwebbrowser\nopen\n(tR.", "webbrowser.open"),
+        (b"cbuiltins\nglobals\n(tR.", "builtins.globals"),
+    ],
+)
+def test_scan_bytes_flags_expanded_high_risk_callables(payload: bytes, expected_reference: str) -> None:
+    report = scan_bytes(payload, source=f"{expected_reference}.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.severity == Severity.CRITICAL
+        and finding.details.get("import_reference") == expected_reference
         for finding in report.findings
     )
 
@@ -398,6 +442,45 @@ def test_scan_bytes_flags_raw_nested_pickle_payloads() -> None:
     assert any(finding.rule_code == "S213" for finding in report.findings)
 
 
+def test_scan_bytes_surfaces_nested_pickle_inner_findings() -> None:
+    nested_payload = pickle.dumps(MaliciousPayload(), protocol=4)
+
+    report = scan_bytes(
+        pickle.dumps({"outer": nested_payload}, protocol=4),
+        source="nested-malicious.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(finding.rule_code == "S213" for finding in report.findings)
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.message.startswith("Nested pickle finding:")
+        and finding.details.get("nested_encoding") == "raw"
+        and finding.details.get("nested_details", {}).get("import_reference") in SYSTEM_GLOBALS
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_flags_oversized_nested_pickle_prefix_without_deep_parse() -> None:
+    nested_payload = b"\x80\x04" + (b"A" * 64)
+
+    report = scan_bytes(
+        pickle.dumps({"outer": nested_payload}, protocol=4),
+        source="nested-oversized.pkl",
+        options=ScanOptions(max_nested_pickle_bytes=8),
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "S213"
+        and finding.details.get("analysis_incomplete") is True
+        and finding.details.get("payload_size") == len(nested_payload)
+        for finding in report.findings
+    )
+
+
 @pytest.mark.parametrize("fragment", [b"q\x00.", b"t.", b"cfoo\nbar\n0."])
 def test_scan_bytes_does_not_flag_stack_invalid_nested_pickle_fragments(fragment: bytes) -> None:
     report = scan_bytes(pickle.dumps({"outer": fragment}, protocol=4), source="nested-fragment.pkl")
@@ -455,11 +538,27 @@ def test_scan_bytes_flags_escaped_hex_encoded_nested_pickle_payloads() -> None:
     assert any(finding.rule_code == "S602" for finding in report.findings)
 
 
+def test_scan_bytes_records_truncated_literal_scan_notice() -> None:
+    report = scan_bytes(
+        pickle.dumps({"code": "A" * 128}, protocol=4),
+        source="large-string.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=8),
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert any(
+        notice.code == "literal_scan_truncated"
+        and notice.details.get("literal_length") == 128
+        and notice.details.get("analysis_incomplete") is True
+        for notice in report.notices
+    )
+
+
 def test_decode_possible_encoded_pickle_bounds_base64_decode_input(monkeypatch: pytest.MonkeyPatch) -> None:
     decoded_payload = pickle.dumps({"inner": "data"}, protocol=4)
-    oversized_literal = base64.b64encode(decoded_payload).decode("ascii") + (
-        "A" * (engine_scanner._MAX_BASE64_NESTED_PICKLE_CHARS * 4)
-    )
+    max_nested_pickle_bytes = len(decoded_payload)
+    max_base64_chars = ((max_nested_pickle_bytes + 2) // 3) * 4
+    oversized_literal = base64.b64encode(decoded_payload).decode("ascii") + ("A" * (max_base64_chars * 4))
     seen_lengths: list[int] = []
 
     def fake_b64decode(value: str, *, validate: bool = False) -> bytes:
@@ -467,32 +566,40 @@ def test_decode_possible_encoded_pickle_bounds_base64_decode_input(monkeypatch: 
         seen_lengths.append(len(value))
         return decoded_payload
 
-    monkeypatch.setattr(engine_scanner.base64, "b64decode", fake_b64decode)
+    monkeypatch.setattr(engine_nested.base64, "b64decode", fake_b64decode)
 
-    decoded = engine_scanner._decode_possible_encoded_pickle(oversized_literal)
+    decoded = engine_nested._decode_possible_encoded_pickle(
+        oversized_literal,
+        max_nested_pickle_bytes=max_nested_pickle_bytes,
+    )
 
     assert decoded == [("base64", decoded_payload)]
     assert seen_lengths
-    assert max(seen_lengths) <= engine_scanner._MAX_BASE64_NESTED_PICKLE_CHARS
+    assert max(seen_lengths) <= max_base64_chars
 
 
 def test_decode_possible_encoded_pickle_bounds_hex_decode_input(monkeypatch: pytest.MonkeyPatch) -> None:
     decoded_payload = pickle.dumps({"inner": "data"}, protocol=4)
+    max_nested_pickle_bytes = len(decoded_payload) * 2
+    max_hex_chars = max_nested_pickle_bytes * 2
     escaped_hex_payload = "".join(f"\\x{byte:02x}" for byte in decoded_payload)
-    oversized_literal = escaped_hex_payload + ("\\x41" * engine_scanner._MAX_HEX_NESTED_PICKLE_CHARS)
+    oversized_literal = escaped_hex_payload + ("\\x41" * max_hex_chars)
     seen_lengths: list[int] = []
 
     def fake_unhexlify(value: str) -> bytes:
         seen_lengths.append(len(value))
         return decoded_payload
 
-    monkeypatch.setattr(engine_scanner.binascii, "unhexlify", fake_unhexlify)
+    monkeypatch.setattr(engine_nested.binascii, "unhexlify", fake_unhexlify)
 
-    decoded = engine_scanner._decode_possible_encoded_pickle(oversized_literal)
+    decoded = engine_nested._decode_possible_encoded_pickle(
+        oversized_literal,
+        max_nested_pickle_bytes=max_nested_pickle_bytes,
+    )
 
     assert decoded == [("hex", decoded_payload)]
     assert seen_lengths
-    assert max(seen_lengths) <= engine_scanner._MAX_HEX_NESTED_PICKLE_CHARS
+    assert max(seen_lengths) <= max_hex_chars
 
 
 def test_scan_stream_preserves_absolute_offsets_from_current_stream_position() -> None:

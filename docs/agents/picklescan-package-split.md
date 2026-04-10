@@ -36,6 +36,10 @@ modelaudit/
 - `modelaudit` owns file routing, archive/container orchestration, CLI, cache,
   telemetry, SARIF/export integrations, and `PickleReport -> ScanResult`
   adaptation.
+- During the migration period, `modelaudit.scanners.pickle_scanner.PickleScanner`
+  still merges legacy-only checks after the standalone pass. Keep this fallback
+  until the parity harness shows that standalone verdict, status, and required
+  rule coverage are sufficient for the root scanner to depend on it alone.
 - Wrapper scanners in `modelaudit` pass embedded pickle streams into
   `modelaudit-picklescan`; archive parsing stays in `modelaudit`.
 - The root `modelaudit` wheel bundles `modelaudit_picklescan` as a second import
@@ -56,6 +60,9 @@ scanner = PickleScanner(options=ScanOptions(timeout_s=30.0, max_opcodes=1_000_00
 report = scanner.scan_stream(stream, source="archive.pt:data.pkl", size=pickle_size)
 ```
 
+Resource controls include opcode and wall-clock limits, post-budget tail bytes,
+string-literal scan characters, nested-pickle bytes, and nested scan depth.
+
 Report semantics keep these concepts separate:
 
 - `status`: scan completeness (`complete`, `inconclusive`, `error`)
@@ -63,6 +70,8 @@ Report semantics keep these concepts separate:
 - `findings`: `WARNING`/`CRITICAL` security findings only
 - `notices`: `DEBUG`/`INFO` coverage or explainability notes
 - `errors`: operational failures
+- report mappings are read-only after construction; call `to_dict()` for mutable
+  serialized data
 
 ## Current Integration
 

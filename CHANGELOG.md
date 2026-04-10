@@ -36,6 +36,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - avoid CoreML nested parse failures on bounded-read truncation
+- harden standalone pickle scanner dangerous global coverage, literal scan
+  bounds, nested pickle reporting, and report immutability
 - detect punctuation-delimited TensorRT `/tmp` plugin paths
 - preserve HuggingFace cache provenance for symlinked custom cache roots
 - ignore remote OCI `layers[].urls` entries during local layer discovery

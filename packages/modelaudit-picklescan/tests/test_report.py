@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import MutableMapping
+from typing import cast
+
 import pytest
 
 from modelaudit_picklescan import (
@@ -104,3 +107,23 @@ def test_findings_and_notices_reject_the_wrong_severity_band() -> None:
 
     with pytest.raises(ValueError, match="notice severity must be debug/info"):
         Notice(message="actual security issue", severity=Severity.WARNING)
+
+
+def test_report_mappings_are_read_only_after_construction() -> None:
+    finding = Finding(message="Suspicious reference", severity=Severity.WARNING, details={"symbol": "os.system"})
+    report = PickleReport(
+        source="payload.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.SUSPICIOUS,
+        findings=(finding,),
+        metadata={"opcode_count": 3},
+    )
+
+    with pytest.raises(TypeError):
+        cast(MutableMapping[str, object], finding.details)["symbol"] = "builtins.eval"
+
+    with pytest.raises(TypeError):
+        cast(MutableMapping[str, object], report.metadata)["opcode_count"] = 4
+
+    assert finding.to_dict()["details"] == {"symbol": "os.system"}
+    assert report.to_dict()["metadata"] == {"opcode_count": 3}
