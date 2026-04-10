@@ -189,9 +189,10 @@ class CompressedScanner(BaseScanner):
         return max(max_decompressed_bytes - total_out, 0)
 
     @staticmethod
-    def _probe_limit(total_out: int, max_decompressed_bytes: int) -> int:
+    def _probe_limit(total_out: int, max_decompressed_bytes: int, chunk_size: int) -> int:
         remaining_budget = CompressedScanner._remaining_decompressed_budget(total_out, max_decompressed_bytes)
-        return remaining_budget + 1 if remaining_budget > 0 else 1
+        budget_probe = remaining_budget + 1 if remaining_budget > 0 else 1
+        return min(budget_probe, max(chunk_size, 1))
 
     @staticmethod
     def _read_concatenated_stream_with_limits(
@@ -219,7 +220,7 @@ class CompressedScanner(BaseScanner):
                 try:
                     output = decompressor.decompress(
                         pending,
-                        max_length=CompressedScanner._probe_limit(total_out, max_decompressed_bytes),
+                        max_length=CompressedScanner._probe_limit(total_out, max_decompressed_bytes, chunk_size),
                     )
                 except error_types as exc:
                     raise _CorruptStreamError(f"Invalid {codec} stream: {exc}") from exc

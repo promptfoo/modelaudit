@@ -301,6 +301,42 @@ def test_read_zlib_stream_uses_bounded_decompression(monkeypatch: pytest.MonkeyP
     assert fake_decompressor.flush_lengths == [257]
 
 
+def test_read_concatenated_stream_uses_chunk_bounded_decompression() -> None:
+    class _FakeDecompressor:
+        def __init__(self) -> None:
+            self.max_lengths: list[int] = []
+            self.eof = False
+            self.needs_input = True
+            self.unused_data = b""
+
+        def decompress(self, _chunk: bytes, max_length: int = 0) -> bytes:
+            self.max_lengths.append(max_length)
+            self.eof = True
+            return b"x" * max_length
+
+    fake_decompressors: list[_FakeDecompressor] = []
+
+    def _factory() -> _FakeDecompressor:
+        fake_decompressor = _FakeDecompressor()
+        fake_decompressors.append(fake_decompressor)
+        return fake_decompressor
+
+    total_out = CompressedScanner._read_concatenated_stream_with_limits(
+        source=io.BytesIO(b"x"),
+        destination=io.BytesIO(),
+        decompressor_factory=_factory,
+        error_types=(ValueError,),
+        codec="fake",
+        max_decompressed_bytes=512 * 1024 * 1024,
+        max_ratio=1000.0,
+        compressed_size=1,
+        chunk_size=8,
+    )
+
+    assert total_out == 8
+    assert [length for fake in fake_decompressors for length in fake.max_lengths] == [8]
+
+
 def test_read_zlib_stream_allows_exact_limit_real_stream() -> None:
     payload = b"A" * 1024
     compressed = zlib.compress(payload)
