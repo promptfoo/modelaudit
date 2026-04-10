@@ -202,7 +202,7 @@ class SafeTensorsScanner(BaseScanner):
 
                 try:
                     header = json.loads(header_bytes.decode("utf-8"))
-                except json.JSONDecodeError as e:
+                except (UnicodeDecodeError, json.JSONDecodeError) as e:
                     result.add_check(
                         name="SafeTensors JSON Parse",
                         passed=False,
@@ -215,7 +215,6 @@ class SafeTensorsScanner(BaseScanner):
                     self._mark_inconclusive(result, SAFETENSORS_HEADER_INCONCLUSIVE_REASON)
                     result.finish(success=False)
                     return result
-
                 tensor_names = [k for k in header if k != "__metadata__"]
                 result.metadata["tensor_count"] = len(tensor_names)
                 result.metadata["tensors"] = tensor_names

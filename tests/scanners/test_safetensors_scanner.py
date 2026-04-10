@@ -49,6 +49,10 @@ def write_raw_safetensors(path: Path, header: dict[str, Any], data: bytes) -> No
     path.write_bytes(struct.pack("<Q", len(header_bytes)) + header_bytes + data)
 
 
+def write_raw_safetensors_header(path: Path, header_bytes: bytes, data: bytes = b"") -> None:
+    path.write_bytes(struct.pack("<Q", len(header_bytes)) + header_bytes + data)
+
+
 def test_valid_safetensors_file(tmp_path: Path) -> None:
     file_path = tmp_path / "model.safetensors"
     create_safetensors_file(file_path)
@@ -212,6 +216,36 @@ def test_corrupted_header(tmp_path: Path) -> None:
     all_messages = [issue.message.lower() for issue in result.issues]
     all_messages.extend([check.message.lower() for check in result.checks])
     assert any("json" in msg or "header" in msg or "invalid" in msg or "corrupt" in msg for msg in all_messages)
+
+
+def test_non_object_header_is_inconclusive_not_clean(tmp_path: Path) -> None:
+    file_path = tmp_path / "array_header.safetensors"
+    write_raw_safetensors_header(file_path, b"[]")
+
+    direct = SafeTensorsScanner().scan(str(file_path))
+
+    assert direct.success is False
+    assert direct.has_errors is False
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "safetensors_header_validation_failed" in direct.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Header Format Validation" and check.status == CheckStatus.FAILED for check in direct.checks
+    )
+    assert not any(issue.severity == IssueSeverity.CRITICAL for issue in direct.issues)
+
+
+def test_invalid_utf8_header_is_inconclusive_not_scanner_crash(tmp_path: Path) -> None:
+    file_path = tmp_path / "invalid_utf8_header.safetensors"
+    write_raw_safetensors_header(file_path, b"{\xff}")
+
+    direct = SafeTensorsScanner().scan(str(file_path))
+
+    assert direct.success is False
+    assert direct.has_errors is False
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "safetensors_header_validation_failed" in direct.metadata["scan_outcome_reasons"]
+    assert any(check.name == "SafeTensors JSON Parse" and check.status == CheckStatus.FAILED for check in direct.checks)
+    assert not any(issue.severity == IssueSeverity.CRITICAL for issue in direct.issues)
 
 
 def test_bad_offsets(tmp_path: Path) -> None:
