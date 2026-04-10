@@ -859,6 +859,11 @@ __import__('pickle').loads(data)
             zf.writestr("plugin.SO", b"\x7fELF")
             zf.writestr("libpayload.SO.6", b"\x7fELF")
             zf.writestr("plugin.Dylib", b"\xfe\xed\xfa\xcf")
+            zf.writestr("launcher.BASH", "#!/usr/bin/env bash\necho evil")
+            zf.writestr("runner.Cmd", "@echo off")
+            zf.writestr("screensaver.SCR", b"MZ")
+            zf.writestr("payload.COM", b"MZ")
+            zf.writestr("dropper.PS1", "Start-Process calc.exe")
 
         result = scanner.scan(str(archive_path))
         suspicious_filenames = {
@@ -867,7 +872,18 @@ __import__('pickle').loads(data)
             if "Python file found in Keras ZIP" in check.message
             or "Executable file found in Keras ZIP" in check.message
         }
-        assert {"MALWARE.PY", "run.SH", "plugin.SO", "libpayload.SO.6", "plugin.Dylib"}.issubset(suspicious_filenames)
+        assert {
+            "MALWARE.PY",
+            "run.SH",
+            "plugin.SO",
+            "libpayload.SO.6",
+            "plugin.Dylib",
+            "launcher.BASH",
+            "runner.Cmd",
+            "screensaver.SCR",
+            "payload.COM",
+            "dropper.PS1",
+        }.issubset(suspicious_filenames)
 
     def test_native_library_near_match_extension_stays_clean(self, tmp_path: Path) -> None:
         """Native-library extension near matches should not be treated as executable archive members."""
