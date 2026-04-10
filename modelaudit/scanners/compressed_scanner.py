@@ -369,6 +369,127 @@ class CompressedScanner(BaseScanner):
         except Exception as exc:
             raise _MissingOptionalDependencyError("Optional dependency 'lz4' is not installed") from exc
 
+    @staticmethod
+    def _lz4_error_types(lz4_frame: Any) -> tuple[type[BaseException], ...]:
+        error_types: list[type[BaseException]] = [OSError, EOFError, RuntimeError]
+        frame_error = getattr(lz4_frame, "LZ4FrameError", None)
+        if isinstance(frame_error, type) and issubclass(frame_error, BaseException):
+            error_types.append(frame_error)
+        return tuple(error_types)
+
+    @staticmethod
+    def _read_lz4_stream_with_limits(
+        source: Any,
+        destination: Any,
+        lz4_frame: Any,
+        max_decompressed_bytes: int,
+        max_ratio: float,
+        compressed_size: int,
+        chunk_size: int,
+    ) -> int:
+        try:
+            decompressor_factory = lz4_frame.LZ4FrameDecompressor
+        except AttributeError:
+            return CompressedScanner._read_lz4_chunk_stream_with_limits(
+                source=source,
+                destination=destination,
+                lz4_frame=lz4_frame,
+                max_decompressed_bytes=max_decompressed_bytes,
+                max_ratio=max_ratio,
+                compressed_size=compressed_size,
+                chunk_size=chunk_size,
+            )
+
+        return CompressedScanner._read_concatenated_stream_with_limits(
+            source=source,
+            destination=destination,
+            decompressor_factory=decompressor_factory,
+            error_types=CompressedScanner._lz4_error_types(lz4_frame),
+            codec="lz4",
+            max_decompressed_bytes=max_decompressed_bytes,
+            max_ratio=max_ratio,
+            compressed_size=compressed_size,
+            chunk_size=chunk_size,
+        )
+
+    @staticmethod
+    def _read_lz4_chunk_stream_with_limits(
+        source: Any,
+        destination: Any,
+        lz4_frame: Any,
+        max_decompressed_bytes: int,
+        max_ratio: float,
+        compressed_size: int,
+        chunk_size: int,
+    ) -> int:
+        create_context = getattr(lz4_frame, "create_decompression_context", None)
+        decompress_chunk = getattr(lz4_frame, "decompress_chunk", None)
+        if not callable(create_context) or not callable(decompress_chunk):
+            raise _CorruptStreamError("Invalid lz4 stream: lz4.frame lacks supported incremental decompression APIs")
+
+        context = create_context()
+        error_types = CompressedScanner._lz4_error_types(lz4_frame)
+        total_out = 0
+        frame_eof = False
+        pending = b""
+        probe_buffered_output = False
+
+        while True:
+            if not pending and not probe_buffered_output:
+                pending = source.read(chunk_size)
+                if not pending:
+                    break
+
+                if frame_eof:
+                    context = create_context()
+                    frame_eof = False
+
+            max_length = CompressedScanner._probe_limit(total_out, max_decompressed_bytes, chunk_size)
+            try:
+                output, bytes_read, frame_eof = decompress_chunk(
+                    context,
+                    pending,
+                    max_length=max_length,
+                )
+            except error_types as exc:
+                raise _CorruptStreamError(f"Invalid lz4 stream: {exc}") from exc
+
+            if not isinstance(bytes_read, int) or bytes_read < 0 or bytes_read > len(pending):
+                raise _CorruptStreamError("Invalid lz4 stream: decompressor reported invalid consumed byte count")
+
+            total_out = CompressedScanner._write_decompressed_output_with_limits(
+                output=output,
+                destination=destination,
+                total_out=total_out,
+                max_decompressed_bytes=max_decompressed_bytes,
+                max_ratio=max_ratio,
+                compressed_size=compressed_size,
+            )
+
+            pending = pending[bytes_read:]
+            if frame_eof:
+                if pending:
+                    context = create_context()
+                    frame_eof = False
+                probe_buffered_output = False
+                continue
+
+            if pending and bytes_read == 0 and not output:
+                next_chunk = source.read(chunk_size)
+                if not next_chunk:
+                    break
+                pending += next_chunk
+                continue
+
+            probe_buffered_output = not pending and bool(output) and len(output) >= max_length
+            if pending or probe_buffered_output:
+                continue
+
+        if not frame_eof:
+            raise _CorruptStreamError("Invalid lz4 stream: missing end-of-stream marker")
+
+        return total_out
+
     def _decompress_to_tempfile(self, path: str, codec: str) -> tuple[str, int]:
         compressed_size = self.get_file_size(path)
         suffix = self._derive_inner_suffix(path)
@@ -410,18 +531,15 @@ class CompressedScanner(BaseScanner):
                     )
                 elif codec == "lz4":
                     lz4_frame = self._get_lz4_frame_module()
-                    try:
-                        with lz4_frame.open(source, "rb") as reader:
-                            total_out = self._copy_stream_with_limits(
-                                source=reader,
-                                destination=temp_file,
-                                max_decompressed_bytes=self.max_decompressed_bytes,
-                                max_ratio=self.max_decompression_ratio,
-                                compressed_size=compressed_size,
-                                chunk_size=self.chunk_size,
-                            )
-                    except (OSError, EOFError, RuntimeError) as exc:
-                        raise _CorruptStreamError(f"Invalid lz4 stream: {exc}") from exc
+                    total_out = self._read_lz4_stream_with_limits(
+                        source=source,
+                        destination=temp_file,
+                        lz4_frame=lz4_frame,
+                        max_decompressed_bytes=self.max_decompressed_bytes,
+                        max_ratio=self.max_decompression_ratio,
+                        compressed_size=compressed_size,
+                        chunk_size=self.chunk_size,
+                    )
                 elif codec == "zlib":
                     total_out = self._read_zlib_stream_with_limits(
                         source=source,
