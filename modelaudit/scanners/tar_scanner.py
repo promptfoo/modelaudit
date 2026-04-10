@@ -12,7 +12,7 @@ from typing import Any, ClassVar
 from ..utils import is_absolute_archive_path, is_critical_system_path, sanitize_archive_path
 from ..utils.helpers.assets import asset_from_scan_result
 from ._archive_locations import rewrite_extracted_member_location
-from ._archive_outcomes import mark_archive_scan_incomplete
+from ._archive_outcomes import mark_archive_scan_incomplete, member_scan_incomplete
 from .archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY, scan_nested_file
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -578,7 +578,7 @@ class TarScanner(BaseScanner):
                     try:
                         if is_tar_extension and tarfile.is_tarfile(tmp_path):
                             nested_result = self._scan_tar_file(tmp_path, depth + 1)
-                            if not nested_result.success:
+                            if member_scan_incomplete(nested_result):
                                 scan_complete = False
 
                             self._rewrite_nested_result_context(nested_result, tmp_path, path, name)
@@ -588,7 +588,7 @@ class TarScanner(BaseScanner):
                             nested_config = dict(self.config)
                             nested_config["_archive_depth"] = depth + 1
                             file_result = self._scan_nested_archive_entry(tmp_path, nested_config)
-                            if not file_result.success:
+                            if member_scan_incomplete(file_result):
                                 scan_complete = False
 
                             self._rewrite_nested_result_context(file_result, tmp_path, path, name)

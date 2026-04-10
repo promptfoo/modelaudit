@@ -19,8 +19,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from modelaudit.scanners.archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
-from modelaudit.scanners.sevenzip_scanner import HAS_PY7ZR, SevenZipScanner
+from modelaudit.scanners.sevenzip_scanner import HAS_PY7ZR, SevenZipScanner, _RecursiveScanBudget
 
 # Skip all tests if py7zr is not available for asset generation
 pytest_plugins: list[str] = []
@@ -112,6 +113,8 @@ class TestSevenZipScanner:
         assert issue.severity == IssueSeverity.WARNING
         assert "py7zr library not installed" in issue.message
         assert "pip install py7zr" in issue.message
+        assert result.has_warnings is True
+        assert result.has_errors is False
         assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
         assert result.metadata["analysis_incomplete"] is True
         assert "sevenzip_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
@@ -128,6 +131,8 @@ class TestSevenZipScanner:
         # Missing optional dependency is a WARNING, not CRITICAL
         assert issue.severity == IssueSeverity.WARNING
         assert "py7zr library not installed" in issue.message
+        assert result.has_warnings is True
+        assert result.has_errors is False
         assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
         assert result.metadata["analysis_incomplete"] is True
         assert "sevenzip_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
@@ -761,6 +766,41 @@ class TestSevenZipScanner:
             ]
             assert ["safe.pkl"] in extract_targets
             assert all("../../../escape.pkl" not in targets for targets in extract_targets)
+
+    def test_nested_critical_scan_does_not_mark_7z_extraction_incomplete(self, tmp_path: Path) -> None:
+        """A nested CRITICAL finding is complete analysis, not partial archive traversal."""
+        extracted_path = tmp_path / "model.pkl"
+        extracted_path.write_bytes(b"payload")
+        archive_path = tmp_path / "model.7z"
+        archive_result = ScanResult(scanner_name="sevenzip")
+
+        def nested_scan(path: str, _config: dict[str, Any]) -> ScanResult:
+            nested_result = ScanResult(scanner_name="test_nested")
+            nested_result.add_check(
+                name="Nested Critical Finding",
+                passed=False,
+                message="Nested member is malicious",
+                severity=IssueSeverity.CRITICAL,
+                location=path,
+            )
+            nested_result.finish(success=False)
+            return nested_result
+
+        scanner = SevenZipScanner(config={NESTED_SCAN_CALLBACK_CONFIG_KEY: nested_scan})
+        scan_complete = scanner._scan_extracted_file(
+            str(extracted_path),
+            "model.pkl",
+            str(archive_path),
+            archive_result,
+            depth=0,
+            budget=_RecursiveScanBudget(),
+        )
+
+        assert scan_complete is True
+        assert archive_result.has_errors is True
+        assert "scan_outcome" not in archive_result.metadata
+        assert archive_result.metadata.get("analysis_incomplete") is not True
+        assert any(check.name == "Nested Critical Finding" for check in archive_result.checks)
 
     def test_oversized_entries_are_skipped_before_extraction(
         self,

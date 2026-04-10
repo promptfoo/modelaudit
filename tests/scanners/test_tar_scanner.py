@@ -734,7 +734,7 @@ class TestTarScanner:
             info.size = len(payload)
             archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
 
-        def nested_scan(_path: str, _config: dict[str, Any] | None) -> ScanResult:
+        def nested_scan(_path: str, _config: dict[str, Any]) -> ScanResult:
             nested_result = ScanResult(scanner_name="test_nested")
             nested_result.finish(success=False)
             return nested_result
@@ -751,6 +751,35 @@ class TestTarScanner:
         assert metadata["analysis_incomplete"] is True
         assert audit_result.success is False
         assert core.determine_exit_code(audit_result) == 2
+
+    def test_tar_nested_critical_finding_does_not_mark_archive_incomplete(self, tmp_path: Path) -> None:
+        """Real nested findings should fail the archive without claiming partial traversal."""
+        archive_path = tmp_path / "nested_critical.tar"
+        with tarfile.open(archive_path, "w") as archive:
+            payload = b"payload"
+            info = tarfile.TarInfo("model.pkl")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        def nested_scan(path: str, _config: dict[str, Any]) -> ScanResult:
+            nested_result = ScanResult(scanner_name="test_nested")
+            nested_result.add_check(
+                name="Nested Critical Finding",
+                passed=False,
+                message="Nested member is malicious",
+                severity=IssueSeverity.CRITICAL,
+                location=path,
+            )
+            nested_result.finish(success=False)
+            return nested_result
+
+        result = TarScanner(config={NESTED_SCAN_CALLBACK_CONFIG_KEY: nested_scan}).scan(str(archive_path))
+
+        assert result.success is False
+        assert result.has_errors is True
+        assert "scan_outcome" not in result.metadata
+        assert result.metadata.get("analysis_incomplete") is not True
+        assert any(check.name == "Nested Critical Finding" for check in result.checks)
 
     def test_scan_compressed_tar_detects_wrapper_by_content_not_suffix(self, tmp_path: Path) -> None:
         """Compressed TARs with plain .tar suffix should still enforce wrapper limits by magic bytes."""

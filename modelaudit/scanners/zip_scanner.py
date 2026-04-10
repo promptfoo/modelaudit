@@ -9,7 +9,7 @@ from ..utils import is_absolute_archive_path, is_critical_system_path, sanitize_
 from ..utils.helpers.assets import asset_from_scan_result
 from ._archive_config import get_archive_depth
 from ._archive_locations import rewrite_extracted_member_location
-from ._archive_outcomes import mark_archive_scan_incomplete
+from ._archive_outcomes import mark_archive_scan_incomplete, member_scan_incomplete
 from .archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY, scan_nested_file
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -434,7 +434,7 @@ class ZipScanner(BaseScanner):
                         # so production scans preserve core routing while direct
                         # ZipScanner usage still falls back to registry routing.
                         file_result = self._scan_nested_archive_entry(tmp_path, nested_config)
-                        if not file_result.success:
+                        if member_scan_incomplete(file_result):
                             scan_complete = False
 
                         self._rewrite_nested_result_context(file_result, tmp_path, path, name)

@@ -588,7 +588,7 @@ class TestZipScanner:
         with zipfile.ZipFile(archive_path, "w") as archive:
             archive.writestr("member.bin", b"payload")
 
-        def nested_scan(_path: str, _config: dict[str, Any] | None) -> ScanResult:
+        def nested_scan(_path: str, _config: dict[str, Any]) -> ScanResult:
             nested_result = ScanResult(scanner_name="test_nested")
             nested_result.finish(success=False)
             return nested_result
@@ -605,6 +605,32 @@ class TestZipScanner:
         assert metadata["analysis_incomplete"] is True
         assert audit_result.success is False
         assert core.determine_exit_code(audit_result) == 2
+
+    def test_zip_nested_critical_finding_does_not_mark_archive_incomplete(self, tmp_path: Path) -> None:
+        """Real nested findings should fail the archive without claiming partial traversal."""
+        archive_path = tmp_path / "nested_critical.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("model.pkl", b"payload")
+
+        def nested_scan(path: str, _config: dict[str, Any]) -> ScanResult:
+            nested_result = ScanResult(scanner_name="test_nested")
+            nested_result.add_check(
+                name="Nested Critical Finding",
+                passed=False,
+                message="Nested member is malicious",
+                severity=IssueSeverity.CRITICAL,
+                location=path,
+            )
+            nested_result.finish(success=False)
+            return nested_result
+
+        result = ZipScanner(config={NESTED_SCAN_CALLBACK_CONFIG_KEY: nested_scan}).scan(str(archive_path))
+
+        assert result.success is False
+        assert result.has_errors is True
+        assert "scan_outcome" not in result.metadata
+        assert result.metadata.get("analysis_incomplete") is not True
+        assert any(check.name == "Nested Critical Finding" for check in result.checks)
 
     def test_zip_incomplete_metadata_survives_cache_roundtrip(self, tmp_path: Path) -> None:
         """Cache conversion should preserve explicit partial-archive outcome metadata."""

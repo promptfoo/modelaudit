@@ -16,7 +16,7 @@ else:
 from ..utils import sanitize_archive_path
 from ._archive_config import get_archive_depth
 from ._archive_locations import rewrite_extracted_member_location
-from ._archive_outcomes import mark_archive_scan_incomplete
+from ._archive_outcomes import mark_archive_scan_incomplete, member_scan_incomplete
 from .archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -895,7 +895,7 @@ class SevenZipScanner(BaseScanner):
 
             self._rewrite_nested_result_context(file_result, extracted_path, archive_path, original_name)
             result.merge(file_result)
-            return file_result.success and not file_result.has_errors
+            return not member_scan_incomplete(file_result)
 
         except Exception as e:
             result.add_check(
