@@ -50,6 +50,57 @@ def _decode_possible_encoded_pickle(value: str, *, max_nested_pickle_bytes: int)
     return decoded_values
 
 
+def _detect_oversized_encoded_pickle_prefixes(
+    value: str,
+    *,
+    max_nested_pickle_bytes: int,
+) -> list[tuple[str, int]]:
+    stripped = value.strip()
+    if len(stripped) < 16:
+        return []
+
+    detected: list[tuple[str, int]] = []
+    probe_decoded_bytes = max(max_nested_pickle_bytes + 1, 2)
+
+    if _BASE64_CANDIDATE_RE.fullmatch(stripped):
+        max_base64_probe_chars = max(16, ((probe_decoded_bytes + 2) // 3) * 4)
+        bounded = stripped[:max_base64_probe_chars]
+        padded = bounded + ("=" * (-len(bounded) % 4))
+        try:
+            decoded = base64.b64decode(padded, validate=True)
+        except (binascii.Error, ValueError):
+            decoded = b""
+        if len(decoded) > max_nested_pickle_bytes and _has_pickle_prefix(decoded):
+            detected.append(("base64", _estimate_base64_decoded_size(stripped)))
+
+    max_hex_probe_chars = max(16, probe_decoded_bytes * 4)
+    hex_candidate = stripped[:max_hex_probe_chars].replace("\\x", "")
+    if len(hex_candidate) % 2:
+        hex_candidate = hex_candidate[:-1]
+    if (
+        len(hex_candidate) >= 16
+        and _HEX_CANDIDATE_RE.fullmatch(hex_candidate)
+        and not re.fullmatch(r"(.)\1*", hex_candidate)
+    ):
+        try:
+            decoded = binascii.unhexlify(hex_candidate)
+        except (binascii.Error, ValueError):
+            decoded = b""
+        if len(decoded) > max_nested_pickle_bytes and _has_pickle_prefix(decoded):
+            detected.append(("hex", _estimate_hex_decoded_size(stripped)))
+
+    return detected
+
+
+def _estimate_base64_decoded_size(value: str) -> int:
+    padding_chars = len(value) - len(value.rstrip("="))
+    return max(0, (len(value) * 3) // 4 - padding_chars)
+
+
+def _estimate_hex_decoded_size(value: str) -> int:
+    return max(0, len(value.replace("\\x", "")) // 2)
+
+
 def _has_pickle_prefix(value: bytes) -> bool:
     return len(value) >= 2 and (value[:1] == b"\x80" or value[:1] in _PICKLE_PREFIX_BYTES)
 

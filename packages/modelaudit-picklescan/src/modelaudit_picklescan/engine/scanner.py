@@ -10,7 +10,12 @@ from typing import Any, BinaryIO, cast
 
 from ..options import ScanOptions
 from ..report import CoverageSummary, Finding, Notice, PickleReport, SafetyVerdict, ScanError, ScanStatus, Severity
-from .nested import _decode_possible_encoded_pickle, _has_pickle_prefix, _looks_like_pickle_payload
+from .nested import (
+    _decode_possible_encoded_pickle,
+    _detect_oversized_encoded_pickle_prefixes,
+    _has_pickle_prefix,
+    _looks_like_pickle_payload,
+)
 from .policy import _GlobalRef, global_severity, suspicious_string_matches
 from .stream import _BoundedPickleStream, _StreamReadError
 
@@ -632,28 +637,95 @@ class _ScanState:
             values = self._bounded_encoded_nested_windows(value)
 
         for candidate in values:
+            decoded_payload_found = False
             for encoding, decoded in _decode_possible_encoded_pickle(
                 candidate,
                 max_nested_pickle_bytes=self.options.max_nested_pickle_bytes,
             ):
-                rule_code = "S601" if encoding == "base64" else "S602"
-                self._add_finding(
-                    Finding(
-                        message="Encoded pickle payload detected",
-                        severity=Severity.CRITICAL,
-                        location=f"{self.source} (pos {position})",
-                        rule_code=rule_code,
-                        details={
-                            "encoding": encoding,
-                            "payload_size": len(decoded),
-                        },
-                        why=(
-                            "Encoded nested pickle payloads can hide deserialization gadgets "
-                            "inside apparently inert metadata strings."
-                        ),
-                    )
+                decoded_payload_found = True
+                self._add_encoded_nested_payload_finding(
+                    encoding=encoding,
+                    payload_size=len(decoded),
+                    position=position,
                 )
                 self._surface_nested_pickle_findings(decoded, encoding=encoding, position=position)
+            if decoded_payload_found:
+                continue
+
+            for encoding, payload_size in _detect_oversized_encoded_pickle_prefixes(
+                candidate,
+                max_nested_pickle_bytes=self.options.max_nested_pickle_bytes,
+            ):
+                self._add_encoded_nested_payload_finding(
+                    encoding=encoding,
+                    payload_size=payload_size,
+                    position=position,
+                    analysis_incomplete=True,
+                )
+                self._record_encoded_nested_payload_truncated(
+                    encoding=encoding,
+                    payload_size=payload_size,
+                    position=position,
+                )
+
+    def _add_encoded_nested_payload_finding(
+        self,
+        *,
+        encoding: str,
+        payload_size: int,
+        position: int,
+        analysis_incomplete: bool = False,
+    ) -> None:
+        rule_code = "S601" if encoding == "base64" else "S602"
+        details: dict[str, Any] = {
+            "encoding": encoding,
+            "payload_size": payload_size,
+        }
+        if analysis_incomplete:
+            details["max_nested_pickle_bytes"] = self.options.max_nested_pickle_bytes
+            details["analysis_incomplete"] = True
+
+        self._add_finding(
+            Finding(
+                message=(
+                    "Encoded pickle payload detected"
+                    if not analysis_incomplete
+                    else "Encoded pickle payload exceeds deep-scan byte limit"
+                ),
+                severity=Severity.CRITICAL,
+                location=f"{self.source} (pos {position})",
+                rule_code=rule_code,
+                details=details,
+                why=(
+                    "Encoded nested pickle payloads can hide deserialization gadgets "
+                    "inside apparently inert metadata strings."
+                ),
+            )
+        )
+
+    def _record_encoded_nested_payload_truncated(
+        self,
+        *,
+        encoding: str,
+        payload_size: int,
+        position: int,
+    ) -> None:
+        if self.status == ScanStatus.COMPLETE:
+            self.status = ScanStatus.INCONCLUSIVE
+        self._add_notice(
+            Notice(
+                message="Encoded pickle payload exceeds configured deep-scan byte limit",
+                severity=Severity.INFO,
+                location=f"{self.source} (pos {position})",
+                code="encoded_nested_payload_truncated",
+                details={
+                    "encoding": encoding,
+                    "payload_size": payload_size,
+                    "max_nested_pickle_bytes": self.options.max_nested_pickle_bytes,
+                    "analysis_incomplete": True,
+                },
+            )
+        )
 
     def _record_global_ref(self, ref: _GlobalRef, *, op_name: str) -> None:
         if ref.malformed:

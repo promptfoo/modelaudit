@@ -309,6 +309,47 @@ def test_pickle_report_to_scan_result_fails_closed_for_truncated_literal_scan_no
     )
 
 
+def test_pickle_report_to_scan_result_fails_closed_for_encoded_nested_truncation_notice() -> None:
+    report = PickleReport(
+        source="oversized-encoded.pkl",
+        status=ScanStatus.INCONCLUSIVE,
+        verdict=SafetyVerdict.MALICIOUS,
+        findings=(
+            Finding(
+                message="Encoded pickle payload exceeds deep-scan byte limit",
+                severity=Severity.CRITICAL,
+                location="oversized-encoded.pkl (pos 16)",
+                rule_code="S601",
+                details={"analysis_incomplete": True},
+            ),
+        ),
+        notices=(
+            Notice(
+                message="Encoded pickle payload exceeds configured deep-scan byte limit",
+                severity=Severity.INFO,
+                location="oversized-encoded.pkl (pos 16)",
+                code="encoded_nested_payload_truncated",
+                details={"analysis_incomplete": True},
+            ),
+        ),
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert result.success is True
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == ["encoded_nested_payload_truncated"]
+    assert result.metadata["analysis_incomplete"] is True
+    assert any(
+        check.name == "Standalone Pickle Notice"
+        and check.status.value == "failed"
+        and check.severity == IssueSeverity.INFO
+        and check.rule_code == "S902"
+        and check.details["pickle_notice_code"] == "encoded_nested_payload_truncated"
+        for check in result.checks
+    )
+
+
 def test_pickle_report_to_scan_result_escalates_parse_incomplete_notices_to_parse_failures() -> None:
     report = PickleReport(
         source="truncated.pkl",

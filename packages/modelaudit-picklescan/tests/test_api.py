@@ -589,6 +589,41 @@ def test_scan_bytes_still_checks_bounded_encoded_nested_windows_for_truncated_li
     assert any(notice.code == "literal_scan_truncated" for notice in report.notices)
 
 
+@pytest.mark.parametrize(
+    ("literal", "encoding", "rule_code"),
+    [
+        (base64.b64encode(pickle.dumps({"inner": "data"}, protocol=4)).decode("ascii"), "base64", "S601"),
+        (binascii.hexlify(pickle.dumps({"inner": "data"}, protocol=4)).decode("ascii"), "hex", "S602"),
+    ],
+)
+def test_scan_bytes_fails_closed_for_encoded_nested_payload_over_byte_limit(
+    literal: str,
+    encoding: str,
+    rule_code: str,
+) -> None:
+    report = scan_bytes(
+        pickle.dumps({"outer": literal}, protocol=4),
+        source=f"oversized-{encoding}-nested.pkl",
+        options=ScanOptions(max_nested_pickle_bytes=4),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == rule_code
+        and finding.details.get("encoding") == encoding
+        and finding.details.get("analysis_incomplete") is True
+        and finding.details.get("max_nested_pickle_bytes") == 4
+        for finding in report.findings
+    )
+    assert any(
+        notice.code == "encoded_nested_payload_truncated"
+        and notice.details.get("encoding") == encoding
+        and notice.details.get("analysis_incomplete") is True
+        for notice in report.notices
+    )
+
+
 def test_decode_possible_encoded_pickle_bounds_base64_decode_input(monkeypatch: pytest.MonkeyPatch) -> None:
     decoded_payload = pickle.dumps({"inner": "data"}, protocol=4)
     max_nested_pickle_bytes = len(decoded_payload)

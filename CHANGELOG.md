@@ -38,7 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - avoid CoreML nested parse failures on bounded-read truncation
 - harden standalone pickle scanner dangerous global coverage, literal scan
   bounds, nested pickle reporting, and report immutability
-- fail closed when standalone pickle string-literal scans exceed configured bounds
+- fail closed when standalone pickle string-literal and encoded nested-payload scans exceed configured bounds
 - flag TensorFlow `LoadLibrary` and `LoadLibraryV2` graph ops as dangerous native-library loading
 - detect split CNTK native-user-function and native-library references
 - detect Linux/macOS native-library members in Keras archives and uppercase native-library members in PyTorch ZIPs
