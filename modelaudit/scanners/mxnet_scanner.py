@@ -145,27 +145,13 @@ class MXNetScanner(BaseScanner):
         if suffix == ".params":
             return cls._is_mxnet_params_filename(path_obj.name)
 
-        if suffix == ".json" and path_obj.name.lower().endswith("-symbol.json"):
-            return cls._is_mxnet_symbol_graph(path_obj)
-
-        return False
+        # Route MXNet symbol artifacts by their framework filename convention so
+        # malformed graphs reach scan() and fail closed as inconclusive.
+        return suffix == ".json" and path_obj.name.lower().endswith("-symbol.json")
 
     @classmethod
     def _is_mxnet_params_filename(cls, filename: str) -> bool:
         return bool(PARAMS_NAME_RE.match(filename))
-
-    @classmethod
-    def _is_mxnet_symbol_graph(cls, path: Path) -> bool:
-        try:
-            raw_bytes, truncated = cls._read_bounded_bytes(path, MAX_SYMBOL_READ_BYTES)
-            if truncated:
-                return False
-
-            payload = json.loads(raw_bytes.decode("utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError):
-            return False
-
-        return cls._has_valid_symbol_structure(payload)
 
     @classmethod
     def _has_valid_symbol_structure(cls, payload: Any) -> bool:
