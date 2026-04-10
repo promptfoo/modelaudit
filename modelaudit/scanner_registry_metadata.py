@@ -422,6 +422,7 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = {
         "class": "CompressedScanner",
         "description": "Scans standalone compressed wrappers and routes inner payloads to existing scanners",
         "extensions": [".gz", ".bz2", ".xz", ".lz4", ".zlib"],
+        "header_formats": ["gzip", "bzip2", "xz", "lz4", "zlib"],
         "priority": 95,
         "dependencies": [],
         "numpy_sensitive": False,
