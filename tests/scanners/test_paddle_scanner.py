@@ -2,6 +2,7 @@ import struct
 from pathlib import Path
 from unittest.mock import patch
 
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.paddle_scanner import PaddleScanner
 from modelaudit.utils.file.detection import validate_file_type
@@ -28,7 +29,22 @@ def test_paddle_scanner_detects_suspicious_pattern(tmp_path: Path) -> None:
     with patch("modelaudit.scanners.paddle_scanner.HAS_PADDLE", True):
         scanner = PaddleScanner()
         result = scanner.scan(str(path))
-        assert any("suspicious" in i.message.lower() for i in result.issues)
+        suspicious_issues = [i for i in result.issues if "suspicious" in i.message.lower()]
+
+    assert suspicious_issues
+    assert all(issue.severity == IssueSeverity.WARNING for issue in suspicious_issues)
+
+
+def test_paddle_suspicious_pdmodel_aggregate_exit_code_is_security_finding(tmp_path: Path) -> None:
+    path = tmp_path / "model.pdmodel"
+    path.write_bytes(b"os.system('ls')")
+
+    with patch("modelaudit.scanners.paddle_scanner.HAS_PADDLE", True):
+        result = scan_model_directory_or_file(str(path), cache_scan_results=False)
+
+    assert result.success is True
+    assert determine_exit_code(result) == 1
+    assert any(issue.severity == IssueSeverity.WARNING for issue in result.issues)
 
 
 def test_paddle_scanner_missing_dependency(tmp_path: Path) -> None:
@@ -104,6 +120,19 @@ def test_pdiparams_real_threats_still_detected(tmp_path: Path) -> None:
     assert any("import os" in p for p in patterns_found), "import os should be detected"
     assert any("eval(" in p for p in patterns_found), "eval( should be detected"
     assert any("os.system" in p for p in patterns_found), "os.system should be detected"
+    assert all(i.severity == IssueSeverity.WARNING for i in result.issues)
+
+
+def test_paddle_suspicious_pdiparams_aggregate_exit_code_is_security_finding(tmp_path: Path) -> None:
+    path = tmp_path / "bad_weights.pdiparams"
+    path.write_bytes(b"padding " + b"import os" + b" eval(payload) " + b"os.system('rm -rf /')")
+
+    with patch("modelaudit.scanners.paddle_scanner.HAS_PADDLE", True):
+        result = scan_model_directory_or_file(str(path), cache_scan_results=False)
+
+    assert result.success is True
+    assert determine_exit_code(result) == 1
+    assert any(issue.severity == IssueSeverity.WARNING for issue in result.issues)
 
 
 def test_pdmodel_hex_escape_still_flagged(tmp_path: Path) -> None:
