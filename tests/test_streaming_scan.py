@@ -114,6 +114,9 @@ def test_scan_model_directory_or_file_partial_streaming_path_returns_exit_code_2
     assert metadata["scan_outcome"] == "inconclusive"
     assert metadata["analysis_incomplete"] is True
     assert "streaming_analysis_incomplete" in metadata["scan_outcome_reasons"]
+    assert "failed closed" in metadata["scan_outcome_message"]
+    assert any(issue.message == "Streaming analysis was partial - only analyzed file header" for issue in result.issues)
+    assert result.has_errors is False
     assert result.files_scanned == 1
     assert result.success is False
     assert determine_exit_code(result) == 2

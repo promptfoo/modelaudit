@@ -46,6 +46,10 @@ def _mark_streaming_analysis_incomplete(result: "ScanResult") -> None:
 
     result.metadata["analysis_incomplete"] = True
     result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+    result.metadata.setdefault(
+        "scan_outcome_message",
+        "Streaming analysis incomplete; failed closed after analyzing only a bounded prefix.",
+    )
 
     existing_reasons = result.metadata.get("scan_outcome_reasons")
     reasons = existing_reasons if isinstance(existing_reasons, list) else []
@@ -214,7 +218,7 @@ def stream_analyze_file(
                     )
 
         # Create scan result
-        if issues or was_complete:
+        if scan_result is not None or issues or was_complete:
             result = ScanResult(scanner_name="streaming")
             scanned = getattr(scan_result, "bytes_scanned", 0) if scan_result is not None else 0
             result.bytes_scanned = scanned or bytes_to_read

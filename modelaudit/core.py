@@ -70,6 +70,10 @@ def _mark_inconclusive_scan_outcome(scan_result: ScanResult, reason: str) -> Non
     """Mark a scan result as explicitly inconclusive for exit-code aggregation."""
     scan_result.metadata["analysis_incomplete"] = True
     scan_result.metadata[_SCAN_OUTCOME_METADATA_KEY] = INCONCLUSIVE_SCAN_OUTCOME
+    scan_result.metadata.setdefault(
+        "scan_outcome_message",
+        "Scan analysis incomplete; failed closed because full coverage was not available.",
+    )
 
     existing_reasons = scan_result.metadata.get("scan_outcome_reasons")
     reasons = existing_reasons if isinstance(existing_reasons, list) else []
