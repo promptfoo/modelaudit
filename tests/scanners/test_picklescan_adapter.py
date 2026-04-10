@@ -277,6 +277,38 @@ def test_pickle_report_to_scan_result_fails_closed_for_inconclusive_report_witho
     )
 
 
+def test_pickle_report_to_scan_result_fails_closed_for_truncated_literal_scan_notice() -> None:
+    report = PickleReport(
+        source="large-string.pkl",
+        status=ScanStatus.INCONCLUSIVE,
+        verdict=SafetyVerdict.UNKNOWN,
+        notices=(
+            Notice(
+                message="String literal scan truncated at configured limit",
+                severity=Severity.INFO,
+                location="large-string.pkl (pos 16)",
+                code="literal_scan_truncated",
+                details={"analysis_incomplete": True},
+            ),
+        ),
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == ["literal_scan_truncated"]
+    assert result.metadata["analysis_incomplete"] is True
+    assert any(
+        check.name == "Standalone Pickle Notice"
+        and check.status.value == "failed"
+        and check.severity == IssueSeverity.INFO
+        and check.rule_code == "S902"
+        and check.details["pickle_notice_code"] == "literal_scan_truncated"
+        for check in result.checks
+    )
+
+
 def test_pickle_report_to_scan_result_escalates_parse_incomplete_notices_to_parse_failures() -> None:
     report = PickleReport(
         source="truncated.pkl",

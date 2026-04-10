@@ -545,13 +545,48 @@ def test_scan_bytes_records_truncated_literal_scan_notice() -> None:
         options=ScanOptions(max_string_literal_scan_chars=8),
     )
 
-    assert report.status == ScanStatus.COMPLETE
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.is_clean is False
+    assert report.coverage.opcode_scan_complete is False
     assert any(
         notice.code == "literal_scan_truncated"
         and notice.details.get("literal_length") == 128
         and notice.details.get("analysis_incomplete") is True
         for notice in report.notices
     )
+
+
+def test_scan_bytes_fails_closed_when_suspicious_literal_content_is_outside_scan_windows() -> None:
+    hidden_payload = "A" * 32 + "os.system('id')" + "B" * 32
+
+    report = scan_bytes(
+        pickle.dumps({"code": hidden_payload}, protocol=4),
+        source="hidden-large-string.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=8),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.is_clean is False
+    assert not any(finding.rule_code == "SUSPICIOUS_STRING" for finding in report.findings)
+    assert any(notice.code == "literal_scan_truncated" for notice in report.notices)
+
+
+def test_scan_bytes_still_checks_bounded_encoded_nested_windows_for_truncated_literals() -> None:
+    nested_payload = pickle.dumps({"inner": "data"}, protocol=4)
+    padded_encoded_payload = base64.b64encode(nested_payload).decode("ascii") + ("A" * 128)
+
+    report = scan_bytes(
+        pickle.dumps({"outer": padded_encoded_payload}, protocol=4),
+        source="padded-encoded-nested.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=8),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(finding.rule_code == "S601" for finding in report.findings)
+    assert any(notice.code == "literal_scan_truncated" for notice in report.notices)
 
 
 def test_decode_possible_encoded_pickle_bounds_base64_decode_input(monkeypatch: pytest.MonkeyPatch) -> None:
