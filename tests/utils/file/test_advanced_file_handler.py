@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity, ScanResult
 from modelaudit.utils.file.handlers import (
+    MAX_RECORDED_MISSING_SHARD_INDICES,
     AdvancedFileHandler,
     MemoryMappedHandler,
     ParallelShardHandler,
@@ -92,7 +93,21 @@ class TestShardedModelDetector:
         assert shard_info is not None
         assert shard_info["total_shards"] == 2
         assert shard_info["expected_total_shards"] == 3
+        assert shard_info["missing_shard_count"] == 1
         assert shard_info["missing_shard_indices"] == [2]
+
+    def test_detect_shards_bounds_missing_expected_indices(self, tmp_path: Path) -> None:
+        """Huge declared shard totals should not expand into huge missing-index lists."""
+        shard_one = tmp_path / "model-00001-of-999999999999.safetensors"
+        shard_one.write_bytes(b"test")
+
+        shard_info = ShardedModelDetector.detect_shards(str(shard_one))
+
+        assert shard_info is not None
+        assert shard_info["expected_total_shards"] == 999999999999
+        assert shard_info["missing_shard_count"] == 999999999998
+        assert len(shard_info["missing_shard_indices"]) == MAX_RECORDED_MISSING_SHARD_INDICES
+        assert shard_info["missing_shard_indices_truncated"] is True
 
     def test_detect_shards_ignores_suffix_near_matches(self, tmp_path: Path) -> None:
         """Shard routing should not count files that only prefix-match a shard name."""
@@ -275,7 +290,9 @@ class TestAdvancedFileHandler:
         coverage_checks = [check for check in result.checks if check.name == "Sharded Model Coverage Check"]
         assert len(coverage_checks) == 1
         assert coverage_checks[0].severity == IssueSeverity.INFO
+        assert coverage_checks[0].details["missing_shard_count"] == 1
         assert coverage_checks[0].details["missing_shard_indices"] == [2]
+        assert coverage_checks[0].details["missing_shard_indices_truncated"] is False
 
     def test_parallel_shard_errors_mark_scan_inconclusive(self, tmp_path: Path) -> None:
         """Shard scan exceptions are incomplete coverage, not security findings."""

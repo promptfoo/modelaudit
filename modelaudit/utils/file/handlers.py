@@ -33,6 +33,7 @@ MMAP_MAX_WINDOW = 500 * 1024 * 1024  # 500MB max window size
 # Parallel scanning parameters
 MAX_PARALLEL_WORKERS = 4
 SHARD_SCAN_TIMEOUT = 600  # 10 minutes per shard
+MAX_RECORDED_MISSING_SHARD_INDICES = 1000
 
 
 def _mark_inconclusive_scan_outcome(result: "ScanResult", reason: str) -> None:
@@ -46,6 +47,33 @@ def _mark_inconclusive_scan_outcome(result: "ScanResult", reason: str) -> None:
     if reason not in reasons:
         reasons.append(reason)
     result.metadata["scan_outcome_reasons"] = reasons
+
+
+def _summarize_missing_shard_indices(
+    present_indices: set[int],
+    expected_total: int,
+) -> tuple[list[int], int, bool]:
+    """Return a bounded sample, total count, and truncation flag for missing shards."""
+    bounded_present_indices = {index for index in present_indices if 1 <= index <= expected_total}
+    missing_count = max(expected_total - len(bounded_present_indices), 0)
+    if missing_count == 0:
+        return [], 0, False
+
+    missing_indices: list[int] = []
+    next_candidate = 1
+    for present_index in sorted(bounded_present_indices):
+        while next_candidate < present_index and len(missing_indices) < MAX_RECORDED_MISSING_SHARD_INDICES:
+            missing_indices.append(next_candidate)
+            next_candidate += 1
+        if len(missing_indices) >= MAX_RECORDED_MISSING_SHARD_INDICES:
+            break
+        next_candidate = present_index + 1
+
+    while next_candidate <= expected_total and len(missing_indices) < MAX_RECORDED_MISSING_SHARD_INDICES:
+        missing_indices.append(next_candidate)
+        next_candidate += 1
+
+    return missing_indices, missing_count, missing_count > len(missing_indices)
 
 
 class ShardedModelDetector:
@@ -103,11 +131,14 @@ class ShardedModelDetector:
                     if len(expected_totals) > 1:
                         shard_info["inconsistent_expected_total_shards"] = sorted(expected_totals)
                     if present_indices:
-                        missing_indices = [
-                            index for index in range(1, expected_total + 1) if index not in present_indices
-                        ]
-                        if missing_indices:
+                        missing_indices, missing_count, missing_indices_truncated = _summarize_missing_shard_indices(
+                            present_indices,
+                            expected_total,
+                        )
+                        if missing_count:
+                            shard_info["missing_shard_count"] = missing_count
                             shard_info["missing_shard_indices"] = missing_indices
+                            shard_info["missing_shard_indices_truncated"] = missing_indices_truncated
 
                 # Calculate total size
                 total_size = sum(os.path.getsize(s) for s in shard_info["shards"])
@@ -497,18 +528,22 @@ class AdvancedFileHandler:
             parallel_scanner = ParallelShardHandler(self.shard_info, self.scanner.__class__)
             shard_results = parallel_scanner.scan_shards(self.progress_callback)
             result.merge(shard_results)
-            missing_indices = self.shard_info.get("missing_shard_indices")
-            if isinstance(missing_indices, list) and missing_indices:
+            missing_count = self.shard_info.get("missing_shard_count")
+            if isinstance(missing_count, int) and missing_count > 0:
                 _mark_inconclusive_scan_outcome(result, "missing_model_shards")
                 result.add_check(
                     name="Sharded Model Coverage Check",
                     passed=False,
-                    message=(f"Missing {len(missing_indices)} expected model shard(s); scan coverage is incomplete."),
+                    message=(f"Missing {missing_count} expected model shard(s); scan coverage is incomplete."),
                     severity=IssueSeverity.INFO,
                     details={
                         "expected_total_shards": self.shard_info.get("expected_total_shards"),
                         "present_total_shards": self.shard_info.get("total_shards"),
-                        "missing_shard_indices": missing_indices,
+                        "missing_shard_count": missing_count,
+                        "missing_shard_indices": self.shard_info.get("missing_shard_indices", []),
+                        "missing_shard_indices_truncated": self.shard_info.get(
+                            "missing_shard_indices_truncated", False
+                        ),
                         "analysis_incomplete": True,
                         "scan_outcome": "inconclusive",
                         "scan_outcome_reason": "missing_model_shards",
