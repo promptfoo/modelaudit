@@ -45,6 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ignore remote OCI `layers[].urls` entries during local layer discovery
 - fail closed on unterminated OpenVINO DOCTYPE declarations
 - avoid PMML `<Extension>` false positives for benign `subprocess` prose while preserving `subprocess.getoutput()`, `subprocess.getstatusoutput()`, and `importlib.import_module("subprocess")` detections
+- mark partial streaming analyses as inconclusive in scan metadata
 - route helper-level ZIP-backed `.ckpt`/`.pkl` checkpoints through archive scanners
 
 ## [0.2.31](https://github.com/promptfoo/modelaudit/compare/v0.2.30...v0.2.31) (2026-04-04)

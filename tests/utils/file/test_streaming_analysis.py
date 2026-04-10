@@ -80,6 +80,10 @@ def test_stream_analyze_file_falls_back_to_bytes_to_read(tmp_path: Path, monkeyp
     assert was_complete is False
     assert result is not None
     assert result.bytes_scanned == 4
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert result.metadata["analysis_incomplete"] is True
+    assert "streaming_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
 
 
 def test_stream_analyze_file_does_not_retry_sourceful_scan_stream_typeerror(

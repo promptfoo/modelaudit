@@ -41,6 +41,19 @@ def _scan_stream_accepts_source_keyword(method: Any) -> bool:
     return any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values())
 
 
+def _mark_streaming_analysis_incomplete(result: "ScanResult") -> None:
+    from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME
+
+    result.metadata["analysis_incomplete"] = True
+    result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+
+    existing_reasons = result.metadata.get("scan_outcome_reasons")
+    reasons = existing_reasons if isinstance(existing_reasons, list) else []
+    if "streaming_analysis_incomplete" not in reasons:
+        reasons.append("streaming_analysis_incomplete")
+    result.metadata["scan_outcome_reasons"] = reasons
+
+
 def stream_analyze_file(
     url: str,
     scanner: "BaseScanner",
@@ -213,7 +226,10 @@ def stream_analyze_file(
                 "file_size": file_size,
             }
             result.metadata.update(metadata)
-            result.finish(success=True)
+            if not was_complete:
+                _mark_streaming_analysis_incomplete(result)
+            scanner_success = bool(getattr(scan_result, "success", True)) if scan_result is not None else True
+            result.finish(success=was_complete and scanner_success)
             return result, was_complete
         else:
             # Partial analysis with no findings
