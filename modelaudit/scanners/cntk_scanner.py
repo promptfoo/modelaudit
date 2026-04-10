@@ -39,7 +39,11 @@ _ASCII_STRING_RE = re.compile(rb"[ -~]{6,512}")
 _UTF16LE_STRING_RE = re.compile(rb"(?:[\x20-\x7e]\x00){6,256}")
 
 _PATH_OR_LIBRARY_RE = re.compile(
-    r"(?:\b[a-z]:\\[^\s\"']+|\.{2}[/\\][^\s\"']+|(?:/[^\s\"']+){2,}|[^\s\"']+\.(?:dll|so|dylib)\b|https?://[^\s\"']+)",
+    r"(?:\b[a-z]:\\(?:[^\s\"'\\]+\\)*[^\s\"'\\]+|"
+    r"\.{2}[/\\](?:[^\s\"'/\\]+[/\\])*[^\s\"'/\\]+|"
+    r"/(?:[^\s\"'/]+/)+[^\s\"'/]+|"
+    r"(?:[^\s\"'/\\]+[/\\])*[^\s\"'/\\]+\.(?:dll|so|dylib)\b|"
+    r"https?://[^\s\"']+)",
     re.IGNORECASE,
 )
 _LOAD_CONTEXT_RE = re.compile(
@@ -51,8 +55,10 @@ _STRONG_LOAD_CONTEXT_RE = re.compile(
     re.IGNORECASE,
 )
 _NATIVE_LIBRARY_REFERENCE_RE = re.compile(
-    r"(?:\b[a-z]:\\[^\s\"']+\.(?:dll|so|dylib)\b|\.{2}[/\\][^\s\"']+\.(?:dll|so|dylib)\b|"
-    r"(?:/[^\s\"']+)+\.(?:dll|so|dylib)\b|[^\s\"']+\.(?:dll|so|dylib)\b)",
+    r"(?:\b[a-z]:\\(?:[^\s\"'\\]+\\)*[^\s\"'\\]+\.(?:dll|so|dylib)\b|"
+    r"\.{2}[/\\](?:[^\s\"'/\\]+[/\\])*[^\s\"'/\\]+\.(?:dll|so|dylib)\b|"
+    r"/(?:[^\s\"'/]+/)*[^\s\"'/]+\.(?:dll|so|dylib)\b|"
+    r"(?:[^\s\"'/\\]+[/\\])*[^\s\"'/\\]+\.(?:dll|so|dylib)\b)",
     re.IGNORECASE,
 )
 _COMMAND_CONTEXT_RE = re.compile(
