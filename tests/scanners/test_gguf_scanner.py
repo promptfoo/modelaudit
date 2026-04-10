@@ -2,7 +2,11 @@
 
 import struct
 from pathlib import Path
+from typing import Any
 
+import pytest
+
+from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity
 from modelaudit.scanners.gguf_scanner import GgufScanner
@@ -100,6 +104,52 @@ def _write_gguf_with_tensor_type(path: Path, tensor_type: int) -> None:
         if pad_to_tensor_data:
             f.write(b"\0" * pad_to_tensor_data)
         f.write(b"\0" * 32)
+
+
+def _single_file_metadata(aggregate: Any) -> Any:
+    return next(iter(aggregate.file_metadata.values()))
+
+
+def _assert_inconclusive_exit2(aggregate: Any, reason: str) -> None:
+    metadata = _single_file_metadata(aggregate)
+    assert aggregate.success is False
+    assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert reason in metadata.get("scan_outcome_reasons", [])
+    assert determine_exit_code(aggregate) == 2
+    assert not any(issue.severity == IssueSeverity.CRITICAL for issue in aggregate.issues)
+
+
+def _assert_cached_rerun_preserves_inconclusive_exit2(
+    path: Path,
+    cache_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reason: str,
+) -> None:
+    reset_cache_manager()
+    try:
+        first = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+
+        def fail_if_rescanned(self: GgufScanner, scan_path: str) -> Any:
+            raise AssertionError(f"cached rerun unexpectedly rescanned {scan_path}")
+
+        monkeypatch.setattr(GgufScanner, "scan", fail_if_rescanned)
+        second = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+
+        _assert_inconclusive_exit2(first, reason)
+        _assert_inconclusive_exit2(second, reason)
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] > 0
+    finally:
+        reset_cache_manager()
 
 
 def test_gguf_scanner_can_handle_gguf(tmp_path):
@@ -255,6 +305,25 @@ def test_gguf_truncated_metadata_returns_exit2(tmp_path: Path) -> None:
     assert not any(issue.severity == IssueSeverity.CRITICAL for issue in aggregate.issues)
 
 
+def test_gguf_truncated_metadata_cached_rerun_preserves_exit2(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "truncated_metadata.gguf"
+    with path.open("wb") as f:
+        f.write(b"GGUF")
+        f.write(struct.pack("<I", 3))
+        f.write(struct.pack("<Q", 0))
+        f.write(struct.pack("<Q", 5))
+
+    _assert_cached_rerun_preserves_inconclusive_exit2(
+        path,
+        tmp_path / "cache",
+        monkeypatch,
+        "gguf_parse_incomplete",
+    )
+
+
 def test_gguf_unknown_tensor_type_is_inconclusive(tmp_path: Path) -> None:
     path = tmp_path / "unknown_tensor_type.gguf"
     _write_gguf_with_tensor_type(path, tensor_type=999)
@@ -268,6 +337,21 @@ def test_gguf_unknown_tensor_type_is_inconclusive(tmp_path: Path) -> None:
     assert "gguf_structure_validation_failed" in direct.metadata["scan_outcome_reasons"]
     assert any("unknown ggml type" in issue.message.lower() for issue in direct.issues)
     assert determine_exit_code(aggregate) == 2
+
+
+def test_gguf_unknown_tensor_type_cached_rerun_preserves_exit2(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "unknown_tensor_type.gguf"
+    _write_gguf_with_tensor_type(path, tensor_type=999)
+
+    _assert_cached_rerun_preserves_inconclusive_exit2(
+        path,
+        tmp_path / "cache",
+        monkeypatch,
+        "gguf_structure_validation_failed",
+    )
 
 
 def test_gguf_scanner_suspicious_key_paths(tmp_path):
