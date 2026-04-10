@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from modelaudit_picklescan import (
+    PickleReport,
     PickleScanner,
     SafetyVerdict,
     ScanOptions,
@@ -554,6 +555,46 @@ def test_scan_bytes_surfaces_deep_nested_pickle_findings_without_parse_incomplet
     )
 
 
+def test_scan_bytes_reuses_outer_deadline_for_nested_scans(monkeypatch: pytest.MonkeyPatch) -> None:
+    nested_payload = pickle.dumps({"inner": "data"}, protocol=4)
+    captured_deadlines: list[float | None] = []
+    original_scan_pickle_payload = engine_scanner.scan_pickle_payload
+
+    def spy_scan_pickle_payload(
+        payload: bytes,
+        *,
+        source: str,
+        options: ScanOptions,
+        bytes_total: int | None = None,
+        position_offset: int = 0,
+        nested_depth: int = 0,
+        deadline: float | None = None,
+    ) -> PickleReport:
+        captured_deadlines.append(deadline)
+        return original_scan_pickle_payload(
+            payload,
+            source=source,
+            options=options,
+            bytes_total=bytes_total,
+            position_offset=position_offset,
+            nested_depth=nested_depth,
+            deadline=deadline,
+        )
+
+    monkeypatch.setattr(engine_scanner.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(engine_scanner, "scan_pickle_payload", spy_scan_pickle_payload)
+
+    report = scan_bytes(
+        pickle.dumps({"outer": nested_payload}, protocol=4),
+        source="nested-deadline.pkl",
+        options=ScanOptions(timeout_s=3.0),
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert len(captured_deadlines) == 1
+    assert captured_deadlines[0] == pytest.approx(103.0)
+
+
 def test_scan_bytes_marks_parent_inconclusive_when_nested_analysis_is_incomplete() -> None:
     nested_payload = pickle.dumps({"code": "A" * 128}, protocol=4)
 
@@ -717,6 +758,57 @@ def test_scan_bytes_still_checks_bounded_encoded_nested_windows_for_truncated_li
     assert report.verdict == SafetyVerdict.MALICIOUS
     assert any(finding.rule_code == "S601" for finding in report.findings)
     assert any(notice.code == "literal_scan_truncated" for notice in report.notices)
+
+
+@pytest.mark.parametrize(
+    ("literal", "expected_max_chars"),
+    [
+        ("Z" * 128, 16),
+        ("a" * 128, 24),
+        ("not encoded!" * 16, 16),
+    ],
+)
+def test_scan_bytes_uses_encoding_sized_windows_for_truncated_encoded_literals(
+    literal: str,
+    expected_max_chars: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen_candidates: list[str] = []
+
+    def fake_decode_possible_encoded_pickle(
+        candidate: str,
+        *,
+        max_nested_pickle_bytes: int,
+    ) -> list[tuple[str, bytes]]:
+        assert max_nested_pickle_bytes == 12
+        seen_candidates.append(candidate)
+        return []
+
+    def fake_detect_oversized_encoded_pickle_prefixes(
+        candidate: str,
+        *,
+        max_nested_pickle_bytes: int,
+    ) -> list[tuple[str, int]]:
+        assert max_nested_pickle_bytes == 12
+        del candidate
+        return []
+
+    monkeypatch.setattr(engine_scanner, "_decode_possible_encoded_pickle", fake_decode_possible_encoded_pickle)
+    monkeypatch.setattr(
+        engine_scanner,
+        "_detect_oversized_encoded_pickle_prefixes",
+        fake_detect_oversized_encoded_pickle_prefixes,
+    )
+
+    report = scan_bytes(
+        pickle.dumps({"outer": literal}, protocol=4),
+        source="bounded-encoded-window.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=8, max_nested_pickle_bytes=12),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert seen_candidates
+    assert max(len(candidate) for candidate in seen_candidates) <= expected_max_chars
 
 
 @pytest.mark.parametrize(

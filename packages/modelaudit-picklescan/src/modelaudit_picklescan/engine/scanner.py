@@ -34,6 +34,9 @@ _STACK_GLOBAL_STRING_OPCODES = frozenset(
 )
 _MEMO_WRITE_OPCODES = frozenset({"PUT", "BINPUT", "LONG_BINPUT"})
 _MEMO_READ_OPCODES = frozenset({"GET", "BINGET", "LONG_BINGET"})
+_BASE64_LITERAL_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=")
+_HEX_LITERAL_CHARS = frozenset("0123456789abcdefABCDEF")
+_ENCODED_LITERAL_PROBE_CHARS = 64
 
 
 class _OpcodeBudgetExceeded(Exception):
@@ -57,6 +60,7 @@ def scan_pickle_payload(
     bytes_total: int | None = None,
     position_offset: int = 0,
     nested_depth: int = 0,
+    deadline: float | None = None,
 ) -> PickleReport:
     """Scan pickle bytes and return a standalone report."""
 
@@ -68,6 +72,7 @@ def scan_pickle_payload(
         bytes_total=bytes_total,
         position_offset=position_offset,
         nested_depth=nested_depth,
+        deadline=deadline,
     )
 
 
@@ -79,6 +84,7 @@ def scan_pickle_stream(
     bytes_total: int | None = None,
     position_offset: int = 0,
     nested_depth: int = 0,
+    deadline: float | None = None,
 ) -> PickleReport:
     """Scan pickle bytes directly from a binary stream and return a standalone report."""
 
@@ -90,6 +96,7 @@ def scan_pickle_stream(
         bytes_total=bytes_total,
         position_offset=position_offset,
         nested_depth=nested_depth,
+        deadline=deadline,
     )
     scan.run()
     return scan.to_report(duration_s=time.monotonic() - started_at)
@@ -105,6 +112,7 @@ class _ScanState:
         bytes_total: int | None,
         position_offset: int,
         nested_depth: int,
+        deadline: float | None,
     ) -> None:
         self.source = source
         self.stream = stream
@@ -112,7 +120,7 @@ class _ScanState:
         self.bytes_total = bytes_total
         self.position_offset = position_offset
         self.nested_depth = nested_depth
-        self.deadline = time.monotonic() + options.timeout_s
+        self.deadline = deadline if deadline is not None else time.monotonic() + options.timeout_s
         self.stack: list[Any] = []
         self.memo: dict[int | str, Any] = {}
         self.next_memo_index = 0
@@ -851,9 +859,7 @@ class _ScanState:
         )
 
     def _bounded_encoded_nested_windows(self, value: str) -> tuple[str, ...]:
-        max_base64_chars = ((self.options.max_nested_pickle_bytes + 2) // 3) * 4
-        max_hex_chars = self.options.max_nested_pickle_bytes * 4
-        max_chars = max(16, max_base64_chars, max_hex_chars)
+        max_chars = _encoded_nested_window_char_limit(value, self.options.max_nested_pickle_bytes)
         if len(value) <= max_chars:
             return (value,)
 
@@ -873,6 +879,7 @@ class _ScanState:
             source=nested_source,
             options=self.options,
             nested_depth=self.nested_depth + 1,
+            deadline=self.deadline,
         )
         for nested_finding in nested_report.findings:
             nested_finding_details = nested_finding.to_dict()["details"]
@@ -1002,6 +1009,32 @@ class _ScanState:
 
 def global_severity_for_ref(ref: _GlobalRef) -> Severity | None:
     return global_severity(ref.module, ref.name)
+
+
+def _encoded_nested_window_char_limit(value: str, max_nested_pickle_bytes: int) -> int:
+    max_base64_chars = ((max_nested_pickle_bytes + 2) // 3) * 4
+    max_plain_hex_chars = max_nested_pickle_bytes * 2
+    max_escaped_hex_chars = max_nested_pickle_bytes * 4
+    probe = _encoded_literal_probe(value)
+    if "\\x" in probe:
+        return max(16, max_escaped_hex_chars)
+    if _chars_are_in_alphabet(probe, _HEX_LITERAL_CHARS):
+        return max(16, max_plain_hex_chars)
+    if _chars_are_in_alphabet(probe, _BASE64_LITERAL_CHARS):
+        return max(16, max_base64_chars)
+    return 16
+
+
+def _encoded_literal_probe(value: str) -> str:
+    stripped = value.strip()
+    max_probe_chars = _ENCODED_LITERAL_PROBE_CHARS * 2
+    if len(stripped) <= max_probe_chars:
+        return stripped
+    return stripped[:_ENCODED_LITERAL_PROBE_CHARS] + stripped[-_ENCODED_LITERAL_PROBE_CHARS:]
+
+
+def _chars_are_in_alphabet(value: str, alphabet: frozenset[str]) -> bool:
+    return bool(value) and all(char in alphabet for char in value)
 
 
 def _post_budget_opcode_prefix(op_name: str, arg: Any, stack: list[Any]) -> bytes:
