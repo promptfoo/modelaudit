@@ -435,6 +435,68 @@ def test_scan_stream_can_use_standalone_package_as_primary_for_migration(
     assert {issue.rule_code for issue in result.issues} >= {"S777", "S999"}
 
 
+def test_scan_stream_standalone_primary_does_not_inherit_legacy_operational_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = pickle.dumps({"safe": True}, protocol=4)
+    scanner = PickleScanner(config={"use_standalone_pickle_primary": True})
+    package_report = PickleReport(
+        source="standalone-clean.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.CLEAN,
+        metadata={"first_pickle_end_pos": len(payload)},
+    )
+
+    def fake_package_scan_stream(
+        file_obj: BinaryIO,
+        *,
+        source: str,
+        size: int | None = None,
+    ) -> PickleReport:
+        del file_obj, source, size
+        return package_report
+
+    def fake_legacy_scan_pickle_bytes(file_obj: BinaryIO, file_size: int) -> ScanResult:
+        del file_obj, file_size
+        legacy_result = scanner._create_result()
+        legacy_result.add_check(
+            name="Legacy Pickle Parse Failure",
+            passed=False,
+            message="Legacy pickle parsing failed before full scan completion",
+            severity=IssueSeverity.CRITICAL,
+            location="standalone-clean.pkl (legacy)",
+            details={
+                "category": "parse_error",
+                "exception_type": "ValueError",
+                "analysis_incomplete": True,
+            },
+            rule_code=None,
+        )
+        legacy_result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+        legacy_result.metadata["scan_outcome_reasons"] = ["pickle_analysis_incomplete"]
+        legacy_result.metadata["analysis_incomplete"] = True
+        legacy_result.metadata["operational_error"] = True
+        legacy_result.metadata["operational_error_reason"] = "parse_error"
+        legacy_result.finish(success=False)
+        return legacy_result
+
+    monkeypatch.setattr(scanner._standalone_pickle_scanner, "scan_stream", fake_package_scan_stream)
+    monkeypatch.setattr(scanner, "_scan_pickle_bytes", fake_legacy_scan_pickle_bytes)
+
+    result = scanner.scan_stream(BytesIO(payload), len(payload), source="standalone-clean.pkl")
+
+    assert result.success is True
+    assert result.metadata["pickle_primary_engine"] == "standalone"
+    assert result.metadata["pickle_report_status"] == "complete"
+    assert "scan_outcome" not in result.metadata
+    assert "analysis_incomplete" not in result.metadata
+    assert "operational_error" not in result.metadata
+    assert not any(check.name == "Legacy Pickle Parse Failure" for check in result.checks)
+    assert not any(
+        issue.message == "Legacy pickle parsing failed before full scan completion" for issue in result.issues
+    )
+
+
 def test_scan_stream_resets_post_budget_global_state_before_reused_scanner_scan() -> None:
     """Stale post-budget flags from one scan should not leak into the next scan."""
     scanner = PickleScanner()
@@ -910,6 +972,62 @@ def test_merge_missing_pickle_checks_propagates_fallback_operational_errors_and_
     assert target.metadata["operational_error_reason"] == "short_read"
     assert any(
         check.name == "Pickle Protocol Version Check" and check.status == CheckStatus.PASSED for check in target.checks
+    )
+
+
+def test_merge_missing_pickle_checks_can_ignore_fallback_operational_state() -> None:
+    """Standalone-primary migration should merge legacy evidence without inheriting legacy scan failure state."""
+    scanner = PickleScanner()
+    target = ScanResult(scanner_name="pickle", scanner=scanner)
+    target.add_check(
+        name="Pickle Protocol Version Check",
+        passed=True,
+        message="Valid pickle protocol version 4",
+        location="standalone-clean.pkl",
+    )
+    target.finish(success=True)
+
+    fallback = ScanResult(scanner_name="pickle", scanner=scanner)
+    fallback.add_check(
+        name="Legacy Compatibility Check",
+        passed=False,
+        message="legacy-only synthetic finding",
+        severity=IssueSeverity.WARNING,
+        location="standalone-clean.pkl (legacy)",
+        details={"source_engine": "legacy"},
+        rule_code="S777",
+    )
+    fallback.add_check(
+        name="Legacy Pickle Parse Failure",
+        passed=False,
+        message="Legacy pickle parsing failed before full scan completion",
+        severity=IssueSeverity.CRITICAL,
+        location="standalone-clean.pkl (legacy)",
+        details={
+            "category": "parse_error",
+            "exception_type": "ValueError",
+            "analysis_incomplete": True,
+        },
+        rule_code=None,
+    )
+    fallback.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+    fallback.metadata["scan_outcome_reasons"] = ["pickle_analysis_incomplete"]
+    fallback.metadata["analysis_incomplete"] = True
+    fallback.metadata["operational_error"] = True
+    fallback.metadata["operational_error_reason"] = "parse_error"
+    fallback.finish(success=False)
+
+    _merge_missing_pickle_checks(target, fallback, propagate_fallback_state=False)
+
+    assert target.success is True
+    assert "scan_outcome" not in target.metadata
+    assert "analysis_incomplete" not in target.metadata
+    assert "operational_error" not in target.metadata
+    assert any(check.name == "Legacy Compatibility Check" for check in target.checks)
+    assert any(issue.rule_code == "S777" for issue in target.issues)
+    assert not any(check.name == "Legacy Pickle Parse Failure" for check in target.checks)
+    assert not any(
+        issue.message == "Legacy pickle parsing failed before full scan completion" for issue in target.issues
     )
 
 

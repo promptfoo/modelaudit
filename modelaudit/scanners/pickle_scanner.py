@@ -316,7 +316,12 @@ def _should_fallback_incompleteness_block_success(
     return not _has_trusted_incomplete_tail_context(fallback)
 
 
-def _merge_missing_pickle_checks(target: ScanResult, fallback: ScanResult) -> None:
+def _merge_missing_pickle_checks(
+    target: ScanResult,
+    fallback: ScanResult,
+    *,
+    propagate_fallback_state: bool = True,
+) -> None:
     """Merge only compatibility fallback checks that are absent from the primary result."""
     target_confirms_trusted_incomplete_tail = _target_confirms_trusted_incomplete_tail(target, fallback)
     existing_check_signatures = {_pickle_check_signature(check) for check in target.checks}
@@ -341,6 +346,8 @@ def _merge_missing_pickle_checks(target: ScanResult, fallback: ScanResult) -> No
     for check in fallback.checks:
         if target_confirms_trusted_incomplete_tail and _is_parse_incomplete_pickle_issue(check):
             continue
+        if not propagate_fallback_state and _is_operational_pickle_issue(check):
+            continue
         if check.name in _STANDALONE_PICKLE_NON_FINDING_CHECKS:
             continue
 
@@ -356,6 +363,8 @@ def _merge_missing_pickle_checks(target: ScanResult, fallback: ScanResult) -> No
         target.checks.append(check)
 
     for issue in fallback.issues:
+        if not propagate_fallback_state and _is_operational_pickle_issue(issue):
+            continue
         if _should_skip_fallback_pickle_issue(
             target,
             issue,
@@ -382,6 +391,10 @@ def _merge_missing_pickle_checks(target: ScanResult, fallback: ScanResult) -> No
             target.metadata[key].update(value)
         elif key not in target.metadata:
             target.metadata[key] = value
+
+    if not propagate_fallback_state:
+        target.finish(success=target.success)
+        return
 
     propagate_fallback_scan_outcome = _should_propagate_fallback_scan_outcome(fallback)
     if propagate_fallback_scan_outcome:
@@ -4208,7 +4221,7 @@ class PickleScanner(BaseScanner):
         with contextlib.suppress(AttributeError, OSError, ValueError):
             file_obj.seek(stream_start)
         if self.use_standalone_pickle_primary:
-            _merge_missing_pickle_checks(package_result, legacy_result)
+            _merge_missing_pickle_checks(package_result, legacy_result, propagate_fallback_state=False)
             first_pickle_end_pos = package_result.metadata.get("first_pickle_end_pos")
             if isinstance(first_pickle_end_pos, int):
                 package_result.metadata["first_pickle_end_pos"] = first_pickle_end_pos
