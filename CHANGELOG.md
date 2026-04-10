@@ -35,6 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- traverse top-level NeMo YAML lists for Hydra `_target_` detections and mark malformed configs inconclusive
 - avoid CoreML nested parse failures on bounded-read truncation
 - flag TensorFlow `LoadLibrary` and `LoadLibraryV2` graph ops as dangerous native-library loading
 - detect split CNTK native-user-function and native-library references
