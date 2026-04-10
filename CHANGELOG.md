@@ -7,10 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.2.34](https://github.com/promptfoo/modelaudit/compare/v0.2.33...v0.2.34) (2026-04-10)
 
-
 ### Bug Fixes
 
-* harden native code detection in model scanners ([#897](https://github.com/promptfoo/modelaudit/issues/897)) ([f4f661a](https://github.com/promptfoo/modelaudit/commit/f4f661a09be0032e15aa8895864413e3878233f8))
+- harden native code detection in model scanners ([#897](https://github.com/promptfoo/modelaudit/issues/897)) ([f4f661a](https://github.com/promptfoo/modelaudit/commit/f4f661a09be0032e15aa8895864413e3878233f8))
 
 ## [0.2.33](https://github.com/promptfoo/modelaudit/compare/v0.2.32...v0.2.33) (2026-04-09)
 
