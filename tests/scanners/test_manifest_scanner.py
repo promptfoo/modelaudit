@@ -665,6 +665,43 @@ def test_manifest_scanner_parses_ini_manifest_for_weak_hash(tmp_path: Path) -> N
     assert failed_hash_checks[0].details["algorithm"] == "SHA1"
 
 
+def test_manifest_scanner_parses_config_ini_manifest_for_weak_hash(tmp_path: Path) -> None:
+    """INI-style .config manifests should not be mistaken for JSON arrays."""
+    test_file = tmp_path / "model.config"
+    test_file.write_text("[model]\nmodel_type = bert\nchecksum = 0000000000000000000000000000000000000000\n")
+
+    scanner = ManifestScanner()
+    result = scanner.scan(str(test_file))
+
+    failed_hash_checks = [
+        check for check in result.checks if check.name == "Weak Hash Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert result.success is True
+    assert result.metadata["root_type"] == "dict"
+    assert len(failed_hash_checks) == 1
+    assert failed_hash_checks[0].details["key"] == "model.checksum"
+    assert failed_hash_checks[0].details["algorithm"] == "SHA1"
+
+
+def test_manifest_scanner_parses_config_json_array_for_weak_hash(tmp_path: Path) -> None:
+    """JSON array .config manifests should continue using JSON parsing."""
+    test_file = tmp_path / "model.config"
+    sha1_hash = "0" * 40
+    test_file.write_text(json.dumps([{"model_type": "bert", "checksum": sha1_hash}]))
+
+    scanner = ManifestScanner()
+    result = scanner.scan(str(test_file))
+
+    failed_hash_checks = [
+        check for check in result.checks if check.name == "Weak Hash Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert result.success is True
+    assert result.metadata["root_type"] == "list"
+    assert len(failed_hash_checks) == 1
+    assert failed_hash_checks[0].details["key"] == "[0].checksum"
+    assert failed_hash_checks[0].details["algorithm"] == "SHA1"
+
+
 def test_manifest_scanner_enforces_size_limit(tmp_path):
     """Manifest scans should stop when max_file_read_size is exceeded."""
     test_file = tmp_path / "config.json"

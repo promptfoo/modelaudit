@@ -415,6 +415,7 @@ _TRUSTED_S3_ENDPOINT_HOST_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(rf"^{_S3_BUCKET_HOST_PREFIX_PATTERN}\.s3-{_AWS_S3_REGION_PATTERN}\.amazonaws\.com$"),
 )
 _PARSE_FAILED: Final = object()
+_INI_SECTION_HEADER_RE = re.compile(r"^\s*\[[A-Za-z0-9_. -]+\]\s*(?:[#;].*)?(?:\r?\n|$)")
 
 
 def _scan_result_has_security_findings(result: ScanResult) -> bool:
@@ -764,7 +765,7 @@ class ManifestScanner(BaseScanner):
                     raise ValueError("TOML parsing requires Python 3.11+ or the tomli package")
                 return _tomllib.loads(content)
 
-            if ext in [".ini", ".cfg"] or (ext == ".config" and not stripped_content.startswith(("{", "["))):
+            if ext in [".ini", ".cfg"] or (ext == ".config" and self._looks_like_ini_file(stripped_content)):
                 return self._parse_ini_file(content)
 
             # Try JSON format first
@@ -823,6 +824,11 @@ class ManifestScanner(BaseScanner):
             parsed[section] = dict(parser.items(section))
 
         return parsed
+
+    @staticmethod
+    def _looks_like_ini_file(stripped_content: str) -> bool:
+        """Return True when stripped content starts with an INI section header."""
+        return bool(_INI_SECTION_HEADER_RE.match(stripped_content))
 
     def _extract_model_metadata(self, content: dict[str, Any]) -> dict[str, Any]:
         """Extract model metadata from HuggingFace config files"""
