@@ -524,9 +524,11 @@ class AdvancedFileHandler:
                 logger.warning(f"Failed to read config file: {e}")
 
         # Scan shards in parallel
+        shard_scan_success = True
         if self.shard_info:
             parallel_scanner = ParallelShardHandler(self.shard_info, self.scanner.__class__)
             shard_results = parallel_scanner.scan_shards(self.progress_callback)
+            shard_scan_success = bool(shard_results.success)
             result.merge(shard_results)
             missing_count = self.shard_info.get("missing_shard_count")
             if isinstance(missing_count, int) and missing_count > 0:
@@ -550,7 +552,7 @@ class AdvancedFileHandler:
                     },
                 )
 
-        result.finish(success=not result.has_errors and "scan_outcome" not in result.metadata)
+        result.finish(success=shard_scan_success and not result.has_errors and "scan_outcome" not in result.metadata)
         return result
 
     def _scan_with_mmap(self) -> "ScanResult":

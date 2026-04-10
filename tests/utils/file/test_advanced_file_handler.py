@@ -38,6 +38,24 @@ class FailingShardScanner:
         raise RuntimeError(f"cannot scan {Path(shard_path).name}")
 
 
+class IncompleteShardScanner:
+    """Scanner that returns an unsuccessful non-critical shard result."""
+
+    name = "incomplete_shard_scanner"
+
+    def scan(self, shard_path: str) -> ScanResult:
+        result = ScanResult(scanner_name=self.name)
+        result.add_check(
+            name="Shard Parse Coverage",
+            passed=False,
+            message=f"Shard could not be fully parsed: {Path(shard_path).name}",
+            severity=IssueSeverity.INFO,
+            location=shard_path,
+        )
+        result.finish(success=False)
+        return result
+
+
 class TestShardedModelDetector:
     """Test sharded model detection."""
 
@@ -317,3 +335,17 @@ class TestAdvancedFileHandler:
         shard_checks = [check for check in result.checks if check.name == "Shard Scan"]
         assert len(shard_checks) == 1
         assert shard_checks[0].severity == IssueSeverity.INFO
+
+    def test_sharded_model_preserves_unsuccessful_shard_result(self, tmp_path: Path) -> None:
+        """Non-critical shard failures must not be overwritten after aggregate merge."""
+        shard_path = tmp_path / "model-00001-of-00001.safetensors"
+        shard_path.write_bytes(b"partial")
+
+        handler = AdvancedFileHandler(str(shard_path), IncompleteShardScanner())
+        result = handler.scan()
+
+        assert result.end_time is not None
+        assert result.success is False
+        assert result.has_errors is False
+        assert "scan_outcome" not in result.metadata
+        assert any(check.name == "Shard Parse Coverage" for check in result.checks)
