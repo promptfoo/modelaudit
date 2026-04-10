@@ -9,6 +9,7 @@ import lzma
 import os
 import tempfile
 import zlib
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -159,6 +160,141 @@ class CompressedScanner(BaseScanner):
         return total_out
 
     @staticmethod
+    def _write_decompressed_output_with_limits(
+        output: bytes,
+        destination: Any,
+        total_out: int,
+        max_decompressed_bytes: int,
+        max_ratio: float,
+        compressed_size: int,
+    ) -> int:
+        if not output:
+            return total_out
+
+        total_out += len(output)
+        if total_out > max_decompressed_bytes:
+            raise _DecompressionLimitExceeded(
+                f"Decompressed size exceeded limit ({total_out} > {max_decompressed_bytes})",
+            )
+        if compressed_size > 0 and (total_out / compressed_size) > max_ratio:
+            raise _DecompressionLimitExceeded(
+                f"Decompression ratio exceeded limit ({total_out / compressed_size:.1f}x > {max_ratio:.1f}x)",
+            )
+
+        destination.write(output)
+        return total_out
+
+    @staticmethod
+    def _remaining_decompressed_budget(total_out: int, max_decompressed_bytes: int) -> int:
+        return max(max_decompressed_bytes - total_out, 0)
+
+    @staticmethod
+    def _probe_limit(total_out: int, max_decompressed_bytes: int) -> int:
+        remaining_budget = CompressedScanner._remaining_decompressed_budget(total_out, max_decompressed_bytes)
+        return remaining_budget + 1 if remaining_budget > 0 else 1
+
+    @staticmethod
+    def _read_concatenated_stream_with_limits(
+        source: Any,
+        destination: Any,
+        decompressor_factory: Callable[[], Any],
+        error_types: tuple[type[BaseException], ...],
+        codec: str,
+        max_decompressed_bytes: int,
+        max_ratio: float,
+        compressed_size: int,
+        chunk_size: int,
+    ) -> int:
+        decompressor = decompressor_factory()
+        total_out = 0
+
+        def _consume_pending(pending: bytes) -> None:
+            nonlocal decompressor, total_out
+            while pending or not getattr(decompressor, "needs_input", True):
+                if getattr(decompressor, "eof", False):
+                    if not pending:
+                        break
+                    decompressor = decompressor_factory()
+
+                try:
+                    output = decompressor.decompress(
+                        pending,
+                        max_length=CompressedScanner._probe_limit(total_out, max_decompressed_bytes),
+                    )
+                except error_types as exc:
+                    raise _CorruptStreamError(f"Invalid {codec} stream: {exc}") from exc
+
+                pending = b""
+                total_out = CompressedScanner._write_decompressed_output_with_limits(
+                    output=output,
+                    destination=destination,
+                    total_out=total_out,
+                    max_decompressed_bytes=max_decompressed_bytes,
+                    max_ratio=max_ratio,
+                    compressed_size=compressed_size,
+                )
+
+                unused_data = getattr(decompressor, "unused_data", b"")
+                if unused_data:
+                    pending = unused_data
+                    decompressor = decompressor_factory()
+
+        while True:
+            pending = source.read(chunk_size)
+            if not pending:
+                break
+            _consume_pending(pending)
+
+        _consume_pending(b"")
+
+        if not getattr(decompressor, "eof", False):
+            raise _CorruptStreamError(f"Invalid {codec} stream: missing end-of-stream marker")
+
+        return total_out
+
+    @staticmethod
+    def _read_bzip2_stream_with_limits(
+        source: Any,
+        destination: Any,
+        max_decompressed_bytes: int,
+        max_ratio: float,
+        compressed_size: int,
+        chunk_size: int,
+    ) -> int:
+        return CompressedScanner._read_concatenated_stream_with_limits(
+            source=source,
+            destination=destination,
+            decompressor_factory=bz2.BZ2Decompressor,
+            error_types=(OSError, EOFError),
+            codec="bzip2",
+            max_decompressed_bytes=max_decompressed_bytes,
+            max_ratio=max_ratio,
+            compressed_size=compressed_size,
+            chunk_size=chunk_size,
+        )
+
+    @staticmethod
+    def _read_xz_stream_with_limits(
+        source: Any,
+        destination: Any,
+        max_decompressed_bytes: int,
+        max_ratio: float,
+        compressed_size: int,
+        chunk_size: int,
+    ) -> int:
+        return CompressedScanner._read_concatenated_stream_with_limits(
+            source=source,
+            destination=destination,
+            decompressor_factory=lambda: lzma.LZMADecompressor(format=lzma.FORMAT_AUTO),
+            error_types=(lzma.LZMAError, EOFError),
+            codec="xz",
+            max_decompressed_bytes=max_decompressed_bytes,
+            max_ratio=max_ratio,
+            compressed_size=compressed_size,
+            chunk_size=chunk_size,
+        )
+
+    @staticmethod
     def _read_zlib_stream_with_limits(
         source: Any,
         destination: Any,
@@ -172,19 +308,14 @@ class CompressedScanner(BaseScanner):
 
         def _write_decompressed_output(output: bytes) -> None:
             nonlocal total_out
-            if not output:
-                return
-
-            total_out += len(output)
-            if total_out > max_decompressed_bytes:
-                raise _DecompressionLimitExceeded(
-                    f"Decompressed size exceeded limit ({total_out} > {max_decompressed_bytes})",
-                )
-            if compressed_size > 0 and (total_out / compressed_size) > max_ratio:
-                raise _DecompressionLimitExceeded(
-                    f"Decompression ratio exceeded limit ({total_out / compressed_size:.1f}x > {max_ratio:.1f}x)",
-                )
-            destination.write(output)
+            total_out = CompressedScanner._write_decompressed_output_with_limits(
+                output=output,
+                destination=destination,
+                total_out=total_out,
+                max_decompressed_bytes=max_decompressed_bytes,
+                max_ratio=max_ratio,
+                compressed_size=compressed_size,
+            )
 
         def _remaining_decompressed_budget() -> int:
             return max(max_decompressed_bytes - total_out, 0)
@@ -263,31 +394,23 @@ class CompressedScanner(BaseScanner):
                     except (OSError, EOFError, gzip.BadGzipFile) as exc:
                         raise _CorruptStreamError(f"Invalid gzip stream: {exc}") from exc
                 elif codec == "bzip2":
-                    try:
-                        with bz2.BZ2File(source, "rb") as reader:
-                            total_out = self._copy_stream_with_limits(
-                                source=reader,
-                                destination=temp_file,
-                                max_decompressed_bytes=self.max_decompressed_bytes,
-                                max_ratio=self.max_decompression_ratio,
-                                compressed_size=compressed_size,
-                                chunk_size=self.chunk_size,
-                            )
-                    except (OSError, EOFError) as exc:
-                        raise _CorruptStreamError(f"Invalid bzip2 stream: {exc}") from exc
+                    total_out = self._read_bzip2_stream_with_limits(
+                        source=source,
+                        destination=temp_file,
+                        max_decompressed_bytes=self.max_decompressed_bytes,
+                        max_ratio=self.max_decompression_ratio,
+                        compressed_size=compressed_size,
+                        chunk_size=self.chunk_size,
+                    )
                 elif codec == "xz":
-                    try:
-                        with lzma.LZMAFile(source, "rb") as reader:
-                            total_out = self._copy_stream_with_limits(
-                                source=reader,
-                                destination=temp_file,
-                                max_decompressed_bytes=self.max_decompressed_bytes,
-                                max_ratio=self.max_decompression_ratio,
-                                compressed_size=compressed_size,
-                                chunk_size=self.chunk_size,
-                            )
-                    except (OSError, EOFError, lzma.LZMAError) as exc:
-                        raise _CorruptStreamError(f"Invalid xz stream: {exc}") from exc
+                    total_out = self._read_xz_stream_with_limits(
+                        source=source,
+                        destination=temp_file,
+                        max_decompressed_bytes=self.max_decompressed_bytes,
+                        max_ratio=self.max_decompression_ratio,
+                        compressed_size=compressed_size,
+                        chunk_size=self.chunk_size,
+                    )
                 elif codec == "lz4":
                     lz4_frame = self._get_lz4_frame_module()
                     try:

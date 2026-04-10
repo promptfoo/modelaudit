@@ -336,6 +336,34 @@ def test_compressed_scanner_rejects_raw_trailer_after_zlib_member(tmp_path: Path
     assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
+@pytest.mark.parametrize(
+    ("filename", "compressor"),
+    [
+        ("payload.pkl.bz2", bz2.compress),
+        ("payload.pkl.xz", lzma.compress),
+    ],
+)
+def test_compressed_scanner_rejects_raw_trailer_after_bzip2_or_xz_member(
+    tmp_path: Path,
+    filename: str,
+    compressor: Callable[[bytes], bytes],
+) -> None:
+    """A raw trailer after a valid stream must not hide an unscanned pickle payload."""
+    safe_pickle = pickle.dumps({"safe": [1, 2, 3]})
+    malicious_pickle_trailer = b'cos\nsystem\n(S"echo owned"\ntR.'
+
+    path = tmp_path / filename
+    path.write_bytes(compressor(safe_pickle) + malicious_pickle_trailer)
+
+    result = CompressedScanner().scan(str(path))
+
+    decode_checks = [check for check in result.checks if check.name == "Compressed Wrapper Stream Decode"]
+    assert decode_checks and decode_checks[0].status == CheckStatus.FAILED
+    assert "invalid" in decode_checks[0].message.lower()
+    assert result.success is False
+    assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
 def test_compressed_scanner_allows_concatenated_zlib_members(tmp_path: Path) -> None:
     """Concatenated zlib members should remain a supported benign encoding shape."""
     payload_a = pickle.dumps({"weights": [1, 2, 3]}, protocol=4)
@@ -343,6 +371,35 @@ def test_compressed_scanner_allows_concatenated_zlib_members(tmp_path: Path) -> 
 
     path = tmp_path / "safe_multi_stream.pkl.zlib"
     path.write_bytes(zlib.compress(payload_a) + zlib.compress(payload_b))
+
+    result = CompressedScanner().scan(str(path))
+
+    assert result.success is True
+    assert not any(
+        check.name == "Compressed Wrapper Stream Decode" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+    assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+@pytest.mark.parametrize(
+    ("filename", "compressor"),
+    [
+        ("safe_multi_stream.pkl.bz2", bz2.compress),
+        ("safe_multi_stream.pkl.xz", lzma.compress),
+    ],
+)
+def test_compressed_scanner_allows_concatenated_bzip2_and_xz_members(
+    tmp_path: Path,
+    filename: str,
+    compressor: Callable[[bytes], bytes],
+) -> None:
+    """Concatenated valid members should remain supported for bzip2 and xz."""
+    payload_a = pickle.dumps({"weights": [1, 2, 3]}, protocol=4)
+    payload_b = pickle.dumps({"bias": [4, 5, 6]}, protocol=4)
+
+    path = tmp_path / filename
+    path.write_bytes(compressor(payload_a) + compressor(payload_b))
 
     result = CompressedScanner().scan(str(path))
 
