@@ -527,6 +527,8 @@ def test_compressed_scanner_rejects_raw_trailer_after_bzip2_or_xz_member(
     assert decode_checks and decode_checks[0].status == CheckStatus.FAILED
     assert "invalid" in decode_checks[0].message.lower()
     assert result.success is False
+    assert result.has_warnings is True
+    assert result.has_errors is False
     assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
@@ -597,6 +599,8 @@ def test_compressed_scanner_rejects_raw_trailer_after_lz4_frame(
     assert decode_checks and decode_checks[0].status == CheckStatus.FAILED
     assert "invalid lz4 stream" in decode_checks[0].message.lower()
     assert result.success is False
+    assert result.has_warnings is True
+    assert result.has_errors is False
     assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
@@ -620,6 +624,8 @@ def test_compressed_scanner_rejects_raw_trailer_after_lz4_chunk_api_frame(
     assert decode_checks and decode_checks[0].status == CheckStatus.FAILED
     assert "invalid lz4 stream" in decode_checks[0].message.lower()
     assert result.success is False
+    assert result.has_warnings is True
+    assert result.has_errors is False
     assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 

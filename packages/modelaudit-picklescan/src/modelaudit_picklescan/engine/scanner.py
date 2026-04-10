@@ -594,6 +594,7 @@ class _ScanState:
                     position=position,
                     analysis_incomplete=True,
                 )
+                self._record_raw_nested_payload_truncated(payload_size=len(value), position=position)
             return
 
         if not _looks_like_pickle_payload(value, max_bytes=self.options.max_nested_pickle_bytes):
@@ -675,6 +676,24 @@ class _ScanState:
                     payload_size=payload_size,
                     position=position,
                 )
+
+    def _record_raw_nested_payload_truncated(self, *, payload_size: int, position: int) -> None:
+        if self.status == ScanStatus.COMPLETE:
+            self.status = ScanStatus.INCONCLUSIVE
+        self._add_notice(
+            Notice(
+                message="Nested pickle payload exceeds configured deep-scan byte limit",
+                severity=Severity.INFO,
+                location=f"{self.source} (pos {position})",
+                code="nested_payload_truncated",
+                details={
+                    "encoding": "raw",
+                    "payload_size": payload_size,
+                    "max_nested_pickle_bytes": self.options.max_nested_pickle_bytes,
+                    "analysis_incomplete": True,
+                },
+            )
+        )
 
     def _add_encoded_nested_payload_finding(
         self,

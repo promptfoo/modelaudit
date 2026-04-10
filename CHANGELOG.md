@@ -25,6 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - avoid CoreML nested parse failures on bounded-read truncation
 - harden standalone pickle scanner dangerous global coverage, literal scan
   bounds, nested pickle reporting, and report immutability
+- suppress legacy fallback scanner-limitation noise in standalone-primary pickle
+  mode, avoid benign archive metadata false positives, and mark oversized raw
+  nested pickle payloads as incomplete
 - fail closed when standalone pickle string-literal and encoded nested-payload scans exceed configured bounds
 - add an opt-in standalone-primary pickle migration mode while preserving the
   legacy-primary default
@@ -1165,7 +1168,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **style**: improve code formatting and documentation standards (#12, #23)
 - **fix**: improve core scanner functionality and comprehensive test coverage (#11)
 
-[unreleased]: https://github.com/promptfoo/modelaudit/compare/v0.2.28...HEAD
+[unreleased]: https://github.com/promptfoo/modelaudit/compare/v0.2.33...HEAD
 [0.2.25]: https://github.com/promptfoo/modelaudit/compare/v0.2.24...v0.2.25
 [0.2.24]: https://github.com/promptfoo/modelaudit/compare/v0.2.23...v0.2.24
 [0.2.23]: https://github.com/promptfoo/modelaudit/compare/v0.2.22...v0.2.23

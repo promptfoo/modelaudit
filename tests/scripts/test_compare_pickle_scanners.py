@@ -152,7 +152,7 @@ def test_build_report_can_include_root_standalone_primary_mode() -> None:
 
     assert "root" in report["summary"]
     assert report["summary_by_label"]["root"]["safe"] == {"match": 6}
-    first_comparison = report["comparisons"][0]
+    first_comparison = min(report["comparisons"], key=lambda item: item["path"])
     assert "root_delta" in first_comparison
     assert first_comparison["root"]["engine"] == "root"
     assert first_comparison["root"]["metadata"]["pickle_primary_engine"] == "standalone"

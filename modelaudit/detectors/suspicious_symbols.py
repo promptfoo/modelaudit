@@ -248,8 +248,8 @@ SUSPICIOUS_GLOBALS = {
     "selectors": "*",
     "logging.config": ["dictConfig", "fileConfig", "listen"],
     "syslog": "*",
-    "tarfile": "*",
-    "zipfile": "*",
+    "tarfile": ["open"],
+    "zipfile": ["ZipFile", "PyZipFile"],
     "shelve": "*",
     # Documentation / tooling (can execute code)
     "doctest": "*",

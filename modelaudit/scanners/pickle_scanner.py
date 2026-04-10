@@ -108,20 +108,43 @@ from .rule_mapper import (
 COPYREG_EXTENSION_MODULE = "__copyreg_extension__"
 COPYREG_EXTENSION_PREFIX = "code_"
 _NON_SEEKABLE_PICKLE_COPY_CHUNK_BYTES = 1024 * 1024
-_STANDALONE_PICKLE_SHADOW_METADATA_KEYS = frozenset(
+_STANDALONE_PICKLE_SHADOW_METADATA_KEYS: frozenset[str] = frozenset(
     {
         "analysis_incomplete",
+        "failure_reason",
+        "memory_limited",
         "operational_error",
         "operational_error_reason",
+        "parsing_failed",
+        "recursion_limited",
+        "scanner_limitation",
         "scan_outcome",
         "scan_outcome_reasons",
+        "trusted_incomplete_tail",
     }
 )
-_STANDALONE_PICKLE_NON_FINDING_CHECKS = frozenset(
+_STANDALONE_PICKLE_NON_FINDING_CHECKS: frozenset[str] = frozenset(
     {
         "Standalone Pickle Error",
         "Standalone Pickle Notice",
         "Standalone Pickle Scan",
+    }
+)
+_OPERATIONAL_PICKLE_ISSUE_CATEGORIES: frozenset[str] = frozenset(
+    {
+        "parse_error",
+        "short_read",
+        "io_error",
+        "pickle_file_open_failed",
+        "pickle_scan_runtime_failed",
+    }
+)
+_OPERATIONAL_PICKLE_LIMIT_REASONS: frozenset[str] = frozenset(
+    {
+        "memory_limit",
+        "memory_limit_on_legitimate_model",
+        "recursion_limit_exceeded",
+        "recursion_limit_on_legitimate_model",
     }
 )
 
@@ -129,13 +152,11 @@ _STANDALONE_PICKLE_NON_FINDING_CHECKS = frozenset(
 def _is_operational_pickle_issue(issue: Any) -> bool:
     """Return whether a WARNING/CRITICAL issue represents incomplete analysis, not a malicious finding."""
     details = issue.details if isinstance(issue.details, Mapping) else {}
-    if details.get("category") in {
-        "parse_error",
-        "short_read",
-        "io_error",
-        "pickle_file_open_failed",
-        "pickle_scan_runtime_failed",
-    }:
+    if details.get("category") in _OPERATIONAL_PICKLE_ISSUE_CATEGORIES:
+        return True
+    if details.get("reason") in _OPERATIONAL_PICKLE_LIMIT_REASONS:
+        return True
+    if details.get("scanner_limitation"):
         return True
     return details.get("failure_reason") == "unknown_opcode_or_format_error" and bool(
         details.get("parsing_failed") or details.get("analysis_incomplete")
@@ -624,6 +645,9 @@ ALWAYS_DANGEROUS_FUNCTIONS: set[str] = {
     "shutil.move",
     "shutil.copy",
     "shutil.copytree",
+    "tarfile.open",
+    "zipfile.PyZipFile",
+    "zipfile.ZipFile",
     # Dynamic resolution trampolines (can resolve arbitrary callables)
     "pkgutil.resolve_name",
     # functools.reduce can drive arbitrary callable invocation chains.
@@ -771,16 +795,14 @@ ALWAYS_DANGEROUS_MODULES: set[str] = {
     "select",
     "selectors",
     "syslog",
-    "tarfile",
-    "zipfile",
     "shelve",
     "sqlite3",
     "_sqlite3",
     "doctest",
     "idlelib",
     "lib2to3",
-    # NOTE: broad linecache/logging/uuid/tempfile/functools/glob imports are
-    # intentionally NOT in this set. Exact risky helpers are handled by
+    # NOTE: broad archive/linecache/logging/uuid/tempfile/functools/glob imports
+    # are intentionally NOT in this set. Exact risky helpers are handled by
     # ALWAYS_DANGEROUS_FUNCTIONS or SUSPICIOUS_GLOBALS.
 }
 
@@ -1105,6 +1127,13 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "next",
     ],
     "collections": ["OrderedDict", "defaultdict", "namedtuple", "Counter", "deque"],
+    # Common stdlib metadata/helper objects that do not execute code by themselves.
+    "functools": ["lru_cache"],
+    "logging": ["getLogger", "config"],
+    "tarfile": ["TarInfo"],
+    "tempfile": ["NamedTemporaryFile"],
+    "uuid": ["UUID"],
+    "zipfile": ["ZipInfo"],
     # _codecs is used by NumPy/PyTorch for binary data serialization (e.g., RNG states)
     # encode() only transforms string encodings, it cannot execute code
     "_codecs": ["encode"],
@@ -4222,6 +4251,14 @@ class PickleScanner(BaseScanner):
                     legacy_result = self._scan_pickle_bytes(cast(BinaryIO, spool), file_size)
         except Exception as error:
             if isinstance(error, RecursionError) or self._is_pickle_parse_failure(error):
+                if self.use_standalone_pickle_primary:
+                    package_result.metadata["legacy_compatibility_failed"] = True
+                    package_result.metadata["legacy_compatibility_failure"] = {
+                        "exception_type": type(error).__name__,
+                        "message": str(error),
+                    }
+                    package_result.metadata["pickle_primary_engine"] = "standalone"
+                    return package_result
                 raise
             self._record_pickle_runtime_error(package_result, error, location=source)
             package_result.finish(success=False)

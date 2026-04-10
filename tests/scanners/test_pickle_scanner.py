@@ -4,6 +4,7 @@ import pickle
 import pickletools
 import struct
 import sys
+import tarfile
 import tempfile
 import unittest
 import uuid
@@ -478,6 +479,9 @@ def test_scan_stream_standalone_primary_does_not_inherit_legacy_operational_fail
         legacy_result.metadata["analysis_incomplete"] = True
         legacy_result.metadata["operational_error"] = True
         legacy_result.metadata["operational_error_reason"] = "parse_error"
+        legacy_result.metadata["parsing_failed"] = True
+        legacy_result.metadata["failure_reason"] = "unknown_opcode_or_format_error"
+        legacy_result.metadata["scanner_limitation"] = True
         legacy_result.finish(success=False)
         return legacy_result
 
@@ -490,12 +494,55 @@ def test_scan_stream_standalone_primary_does_not_inherit_legacy_operational_fail
     assert result.metadata["pickle_primary_engine"] == "standalone"
     assert result.metadata["pickle_report_status"] == "complete"
     assert "scan_outcome" not in result.metadata
+    assert "scan_outcome_reasons" not in result.metadata
     assert "analysis_incomplete" not in result.metadata
     assert "operational_error" not in result.metadata
+    assert "operational_error_reason" not in result.metadata
+    assert "parsing_failed" not in result.metadata
+    assert "failure_reason" not in result.metadata
+    assert "scanner_limitation" not in result.metadata
     assert not any(check.name == "Legacy Pickle Parse Failure" for check in result.checks)
     assert not any(
         issue.message == "Legacy pickle parsing failed before full scan completion" for issue in result.issues
     )
+
+
+def test_scan_stream_standalone_primary_suppresses_legacy_parse_exceptions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = pickle.dumps({"safe": True}, protocol=4)
+    scanner = PickleScanner(config={"use_standalone_pickle_primary": True})
+    package_report = PickleReport(
+        source="standalone-clean.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.CLEAN,
+        metadata={"first_pickle_end_pos": len(payload)},
+    )
+
+    def fake_package_scan_stream(
+        file_obj: BinaryIO,
+        *,
+        source: str,
+        size: int | None = None,
+    ) -> PickleReport:
+        del file_obj, source, size
+        return package_report
+
+    def fake_legacy_scan_pickle_bytes(file_obj: BinaryIO, file_size: int) -> ScanResult:
+        del file_obj, file_size
+        raise ValueError("unknown opcode while parsing legacy compatibility stream")
+
+    monkeypatch.setattr(scanner._standalone_pickle_scanner, "scan_stream", fake_package_scan_stream)
+    monkeypatch.setattr(scanner, "_scan_pickle_bytes", fake_legacy_scan_pickle_bytes)
+
+    result = scanner.scan_stream(BytesIO(payload), len(payload), source="standalone-clean.pkl")
+
+    assert result.success is True
+    assert result.has_warnings is False
+    assert result.has_errors is False
+    assert result.metadata["pickle_primary_engine"] == "standalone"
+    assert result.metadata["legacy_compatibility_failed"] is True
+    assert result.metadata["legacy_compatibility_failure"]["exception_type"] == "ValueError"
 
 
 def test_scan_stream_resets_post_budget_global_state_before_reused_scanner_scan() -> None:
@@ -1011,22 +1058,50 @@ def test_merge_missing_pickle_checks_can_ignore_fallback_operational_state() -> 
         },
         rule_code=None,
     )
+    fallback.add_check(
+        name="Legacy Scanner Limitation",
+        passed=False,
+        message="Legacy pickle scanner hit recursion limit before full scan completion",
+        severity=IssueSeverity.CRITICAL,
+        location="standalone-clean.pkl (legacy)",
+        details={
+            "reason": "recursion_limit_exceeded",
+            "scanner_limitation": True,
+            "analysis_incomplete": True,
+        },
+        rule_code=None,
+    )
     fallback.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
     fallback.metadata["scan_outcome_reasons"] = ["pickle_analysis_incomplete"]
     fallback.metadata["analysis_incomplete"] = True
     fallback.metadata["operational_error"] = True
     fallback.metadata["operational_error_reason"] = "parse_error"
+    fallback.metadata["parsing_failed"] = True
+    fallback.metadata["failure_reason"] = "unknown_opcode_or_format_error"
+    fallback.metadata["scanner_limitation"] = True
+    fallback.metadata["recursion_limited"] = True
+    fallback.metadata["trusted_incomplete_tail"] = True
     fallback.finish(success=False)
 
     _merge_missing_pickle_checks(target, fallback, propagate_fallback_state=False)
 
     assert target.success is True
+    assert target.has_warnings is True
+    assert target.has_errors is False
     assert "scan_outcome" not in target.metadata
+    assert "scan_outcome_reasons" not in target.metadata
     assert "analysis_incomplete" not in target.metadata
     assert "operational_error" not in target.metadata
+    assert "operational_error_reason" not in target.metadata
+    assert "parsing_failed" not in target.metadata
+    assert "failure_reason" not in target.metadata
+    assert "scanner_limitation" not in target.metadata
+    assert "recursion_limited" not in target.metadata
+    assert "trusted_incomplete_tail" not in target.metadata
     assert any(check.name == "Legacy Compatibility Check" for check in target.checks)
     assert any(issue.rule_code == "S777" for issue in target.issues)
     assert not any(check.name == "Legacy Pickle Parse Failure" for check in target.checks)
+    assert not any(check.name == "Legacy Scanner Limitation" for check in target.checks)
     assert not any(
         issue.message == "Legacy pickle parsing failed before full scan completion" for issue in target.issues
     )
@@ -5038,6 +5113,8 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
             ("logging", "config"),
             ("tempfile", "NamedTemporaryFile"),
             ("functools", "lru_cache"),
+            ("tarfile", "TarInfo"),
+            ("zipfile", "ZipInfo"),
         )
 
         for module, func in benign_refs:
@@ -5046,11 +5123,8 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
 
             assert result.success, f"Scan failed for {full_ref}"
             assert not any(
-                check.status == CheckStatus.FAILED
-                and check.severity == IssueSeverity.CRITICAL
-                and full_ref in check.message
-                for check in result.checks
-            ), f"Unexpected CRITICAL finding for benign neighbor {full_ref}: {[c.message for c in result.checks]}"
+                check.status == CheckStatus.FAILED and full_ref in check.message for check in result.checks
+            ), f"Unexpected failing finding for benign neighbor {full_ref}: {[c.message for c in result.checks]}"
 
     def test_uuid_object_pickle_does_not_inherit_uuid_module_criticality(self) -> None:
         """Legitimate uuid.UUID objects should not become CRITICAL because uuid has risky private helpers."""
@@ -5060,11 +5134,23 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
 
         assert result.success
         assert not any(
-            check.status == CheckStatus.FAILED
-            and check.severity == IssueSeverity.CRITICAL
-            and "uuid.UUID" in check.message
-            for check in result.checks
-        ), f"Unexpected CRITICAL finding for uuid.UUID pickle: {[c.message for c in result.checks]}"
+            check.status == CheckStatus.FAILED and "uuid.UUID" in check.message for check in result.checks
+        ), f"Unexpected failing finding for uuid.UUID pickle: {[c.message for c in result.checks]}"
+
+    def test_archive_info_object_pickles_do_not_inherit_archive_module_criticality(self) -> None:
+        """Legitimate archive metadata objects should not inherit broad archive-module policy."""
+        benign_payloads = (
+            (pickle.dumps(tarfile.TarInfo("weights.bin"), protocol=4), "tarfile.TarInfo"),
+            (pickle.dumps(zipfile.ZipInfo("weights.bin"), protocol=4), "zipfile.ZipInfo"),
+        )
+
+        for payload, full_ref in benign_payloads:
+            result = self._scan_bytes(payload)
+
+            assert result.success, f"Scan failed for {full_ref}"
+            assert not any(
+                check.status == CheckStatus.FAILED and full_ref in check.message for check in result.checks
+            ), f"Unexpected failing finding for {full_ref}: {[c.message for c in result.checks]}"
 
     def test_narrowed_stdlib_helper_policy_keeps_risky_refs_flagged(self) -> None:
         """Exact risky helpers must stay flagged after broad stdlib module cleanup."""
@@ -5085,6 +5171,10 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
             ("functools", "partialmethod", IssueSeverity.WARNING),
             ("tempfile", "mktemp", IssueSeverity.WARNING),
             ("glob", "glob", IssueSeverity.WARNING),
+            ("base64", "b64decode", IssueSeverity.CRITICAL),
+            ("codecs", "decode", IssueSeverity.CRITICAL),
+            ("tarfile", "open", IssueSeverity.CRITICAL),
+            ("zipfile", "ZipFile", IssueSeverity.CRITICAL),
         )
 
         for module, func, expected_severity in risky_refs:

@@ -21,9 +21,9 @@ class _GlobalRef:
         return f"{self.module}.{self.name}"
 
 
-_BUILTIN_MODULES = frozenset({"builtins", "__builtin__", "__builtins__"})
+_BUILTIN_MODULES: frozenset[str] = frozenset({"builtins", "__builtin__", "__builtins__"})
 
-_BUILTIN_DANGEROUS_NAMES = frozenset(
+_BUILTIN_DANGEROUS_NAMES: frozenset[str] = frozenset(
     {
         "__import__",
         "breakpoint",
@@ -45,7 +45,7 @@ _BUILTIN_DANGEROUS_NAMES = frozenset(
     }
 )
 
-_DANGEROUS_WILDCARD_MODULES = frozenset(
+_DANGEROUS_WILDCARD_MODULES: frozenset[str] = frozenset(
     {
         "_ctypes",
         "_pickle",
@@ -103,7 +103,6 @@ _DANGEROUS_WILDCARD_MODULES = frozenset(
         "subprocess",
         "sys",
         "syslog",
-        "tarfile",
         "telnetlib",
         "threading",
         "timeit",
@@ -112,12 +111,11 @@ _DANGEROUS_WILDCARD_MODULES = frozenset(
         "urllib2",
         "venv",
         "webbrowser",
-        "zipfile",
         "zipimport",
     }
 )
 
-_DANGEROUS_GLOBALS = frozenset(
+_DANGEROUS_GLOBALS: frozenset[tuple[str, str]] = frozenset(
     {
         ("_aix_support", "_read_cmd_output"),
         ("_operator", "attrgetter"),
@@ -125,6 +123,11 @@ _DANGEROUS_GLOBALS = frozenset(
         ("_operator", "methodcaller"),
         ("_osx_support", "_read_output"),
         ("_pyrepl.pager", "pipe_pager"),
+        ("base64", "b64decode"),
+        ("base64", "b64encode"),
+        ("base64", "decode"),
+        ("codecs", "decode"),
+        ("codecs", "encode"),
         ("collections", "eval"),
         ("dill", "load"),
         ("dill", "loads"),
@@ -145,6 +148,7 @@ _DANGEROUS_GLOBALS = frozenset(
         ("pip._vendor.distlib.scripts", "ScriptMaker"),
         ("pkgutil", "resolve_name"),
         ("site", "main"),
+        ("tarfile", "open"),
         ("test.support.script_helper", "assert_python_ok"),
         ("torch", "compile"),
         ("torch", "load"),
@@ -163,6 +167,8 @@ _DANGEROUS_GLOBALS = frozenset(
         ("uuid", "_netstat_getnode"),
         ("uuid", "_popen"),
         ("uuid", "getnode"),
+        ("zipfile", "PyZipFile"),
+        ("zipfile", "ZipFile"),
     }
 )
 

@@ -7,7 +7,9 @@ import io
 import os
 import pickle
 import re
+import tarfile
 import uuid
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -353,10 +355,17 @@ def test_scan_bytes_flags_dill_loads_as_dangerous() -> None:
 @pytest.mark.parametrize(
     ("payload", "expected_reference"),
     [
+        (b"cbase64\nb64decode\n(tR.", "base64.b64decode"),
+        (b"cbase64\nb64encode\n(tR.", "base64.b64encode"),
+        (b"cbase64\ndecode\n(tR.", "base64.decode"),
+        (b"ccodecs\ndecode\n(tR.", "codecs.decode"),
+        (b"ccodecs\nencode\n(tR.", "codecs.encode"),
         (b"cpip\nmain\n(tR.", "pip.main"),
         (b"cnumpy\nload\n(tR.", "numpy.load"),
         (b"cshutil\nrmtree\n(tR.", "shutil.rmtree"),
+        (b"ctarfile\nopen\n(tR.", "tarfile.open"),
         (b"cwebbrowser\nopen\n(tR.", "webbrowser.open"),
+        (b"czipfile\nZipFile\n(tR.", "zipfile.ZipFile"),
         (b"cbuiltins\nglobals\n(tR.", "builtins.globals"),
     ],
 )
@@ -382,6 +391,8 @@ def test_scan_bytes_flags_expanded_high_risk_callables(payload: bytes, expected_
         ),
         (b"clogging\ngetLogger\n.", "logging.getLogger"),
         (b"ctempfile\nNamedTemporaryFile\n.", "tempfile.NamedTemporaryFile"),
+        (pickle.dumps(tarfile.TarInfo("weights.bin"), protocol=4), "tarfile.TarInfo"),
+        (pickle.dumps(zipfile.ZipInfo("weights.bin"), protocol=4), "zipfile.ZipInfo"),
     ],
 )
 def test_scan_bytes_does_not_treat_benign_stdlib_module_references_as_dangerous(
@@ -678,13 +689,21 @@ def test_scan_bytes_flags_oversized_nested_pickle_prefix_without_deep_parse() ->
         options=ScanOptions(max_nested_pickle_bytes=8),
     )
 
-    assert report.status == ScanStatus.COMPLETE
+    assert report.status == ScanStatus.INCONCLUSIVE
     assert report.verdict == SafetyVerdict.MALICIOUS
+    assert report.is_clean is False
+    assert report.coverage.opcode_scan_complete is False
     assert any(
         finding.rule_code == "S213"
         and finding.details.get("analysis_incomplete") is True
         and finding.details.get("payload_size") == len(nested_payload)
         for finding in report.findings
+    )
+    assert any(
+        notice.code == "nested_payload_truncated"
+        and notice.details.get("encoding") == "raw"
+        and notice.details.get("analysis_incomplete") is True
+        for notice in report.notices
     )
 
 
