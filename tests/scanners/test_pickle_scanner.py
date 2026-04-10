@@ -5076,6 +5076,7 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
             ("uuid", "_arp_getnode", IssueSeverity.CRITICAL),
             ("uuid", "_lanscan_getnode", IssueSeverity.CRITICAL),
             ("uuid", "_netstat_getnode", IssueSeverity.CRITICAL),
+            ("uuid", "getnode", IssueSeverity.CRITICAL),
             ("logging.config", "fileConfig", IssueSeverity.CRITICAL),
             ("logging.config", "dictConfig", IssueSeverity.CRITICAL),
             ("logging.config", "listen", IssueSeverity.CRITICAL),

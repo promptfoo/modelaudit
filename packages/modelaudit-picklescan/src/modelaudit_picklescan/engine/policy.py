@@ -162,6 +162,7 @@ _DANGEROUS_GLOBALS = frozenset(
         ("uuid", "_lanscan_getnode"),
         ("uuid", "_netstat_getnode"),
         ("uuid", "_popen"),
+        ("uuid", "getnode"),
     }
 )
 

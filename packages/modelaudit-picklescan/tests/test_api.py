@@ -444,6 +444,12 @@ def test_scan_bytes_does_not_treat_benign_stdlib_module_references_as_dangerous(
             SafetyVerdict.MALICIOUS,
         ),
         (
+            b"cuuid\ngetnode\n(tR.",
+            "uuid.getnode",
+            Severity.CRITICAL,
+            SafetyVerdict.MALICIOUS,
+        ),
+        (
             b"clogging.config\nfileConfig\n(tR.",
             "logging.config.fileConfig",
             Severity.CRITICAL,

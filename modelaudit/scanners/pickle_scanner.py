@@ -632,7 +632,7 @@ ALWAYS_DANGEROUS_FUNCTIONS: set[str] = {
     "logging.config.dictConfig",
     "logging.config.fileConfig",
     "logging.config.listen",
-    # uuid private helpers that call subprocess.Popen directly or through _get_command_stdout.
+    # uuid.getnode can dispatch into platform helpers that call subprocess.Popen.
     "uuid._arp_getnode",
     "uuid._get_command_stdout",
     "uuid._ifconfig_getnode",
@@ -640,6 +640,7 @@ ALWAYS_DANGEROUS_FUNCTIONS: set[str] = {
     "uuid._lanscan_getnode",
     "uuid._netstat_getnode",
     "uuid._popen",
+    "uuid.getnode",
     # Profiling/debugging modules that execute arbitrary Python code
     "cProfile.run",
     "cProfile.runctx",

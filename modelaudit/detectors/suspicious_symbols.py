@@ -184,6 +184,7 @@ SUSPICIOUS_GLOBALS = {
         "_lanscan_getnode",
         "_netstat_getnode",
         "_popen",
+        "getnode",
     ],
     # Network / exfiltration
     "smtplib": "*",
