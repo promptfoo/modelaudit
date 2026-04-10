@@ -19,8 +19,10 @@ from unittest.mock import patch
 
 import pytest
 
+from modelaudit.cache import reset_cache_manager
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners import keras_zip_scanner as keras_zip_scanner_module
-from modelaudit.scanners.base import CheckStatus, IssueSeverity
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.keras_zip_scanner import KerasZipScanner
 
 try:
@@ -31,7 +33,7 @@ except ImportError:  # pragma: no cover - optional dependency in some environmen
 
 def create_configured_keras_zip(
     tmp_path: Path,
-    config: dict[str, Any],
+    config: Any,
     *,
     keras_version: str = "3.13.2",
     file_name: str = "model.keras",
@@ -45,6 +47,24 @@ def create_configured_keras_zip(
         if weights_h5_path is not None:
             zf.write(weights_h5_path, "model.weights.h5")
     return keras_path
+
+
+def _assert_inconclusive_keras_zip_scan(model_path: Path, reason: str, expected_check_name: str) -> None:
+    result = KerasZipScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert result.has_errors is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert reason in result.metadata["scan_outcome_reasons"]
+    assert any(check.name == expected_check_name and check.status == CheckStatus.FAILED for check in result.checks)
+
+    audit_result = scan_model_directory_or_file(str(model_path))
+    metadata = audit_result.file_metadata[str(model_path)]
+
+    assert audit_result.has_errors is False
+    assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert reason in metadata.get("scan_outcome_reasons")
+    assert determine_exit_code(audit_result) == 2
 
 
 def create_external_link_weights_h5(tmp_path: Path) -> Path:
@@ -140,6 +160,159 @@ class TestKerasZipScanner:
         result = scanner.scan(str(keras_path))
 
         assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+
+    @pytest.mark.parametrize(
+        ("config", "reason", "expected_check_name"),
+        [
+            (None, "keras_zip_config_invalid_type", "Model Config Type Validation"),
+            ([], "keras_zip_config_invalid_type", "Model Config Type Validation"),
+            (
+                {"class_name": "Sequential", "config": None},
+                "keras_zip_model_config_structure_invalid",
+                "Model Config Structure Validation",
+            ),
+            (
+                {"class_name": "Sequential", "config": "layers hidden in wrong type"},
+                "keras_zip_model_config_structure_invalid",
+                "Model Config Structure Validation",
+            ),
+            (
+                {"class_name": "Sequential", "config": {"layers": "layers hidden in wrong type"}},
+                "keras_zip_model_layers_invalid_type",
+                "Layers Type Validation",
+            ),
+            (
+                {"class_name": "Sequential", "config": {"layers": ["not a layer dict"]}},
+                "keras_zip_model_layer_invalid_type",
+                "Layer Type Validation",
+            ),
+            (
+                {"class_name": "Sequential", "config": {"layer": "not a layer dict"}},
+                "keras_zip_model_layer_invalid_type",
+                "Single Layer Type Validation",
+            ),
+            (
+                {"class_name": "Sequential", "config": {"layers": []}, "compile_config": ["not", "a", "dict"]},
+                "keras_zip_compile_config_invalid_type",
+                "Compile Config Type Validation",
+            ),
+        ],
+    )
+    def test_invalid_config_json_structure_returns_inconclusive_exit2(
+        self,
+        tmp_path: Path,
+        config: Any,
+        reason: str,
+        expected_check_name: str,
+    ) -> None:
+        """Keras ZIP config.json shapes that cannot be fully traversed should fail closed."""
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            config,
+            file_name=f"{reason}.keras",
+        )
+
+        _assert_inconclusive_keras_zip_scan(keras_path, reason, expected_check_name)
+
+    def test_missing_config_json_returns_inconclusive_exit2(self, tmp_path: Path) -> None:
+        """A direct Keras ZIP scan without config.json cannot be security-complete."""
+        keras_path = tmp_path / "missing_config.keras"
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            zf.writestr("metadata.json", json.dumps({"keras_version": "3.13.2"}))
+
+        result = KerasZipScanner().scan(str(keras_path))
+
+        assert result.success is False
+        assert result.has_errors is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "keras_zip_config_missing" in result.metadata["scan_outcome_reasons"]
+        assert any(
+            check.name == "Keras ZIP Format Check" and check.status == CheckStatus.FAILED for check in result.checks
+        )
+
+    def test_malformed_config_json_returns_inconclusive_exit2(self, tmp_path: Path) -> None:
+        """Malformed config.json without security evidence should exit 2, not 1."""
+        keras_path = tmp_path / "malformed_config.keras"
+        with zipfile.ZipFile(keras_path, "w") as zf:
+            zf.writestr("config.json", "{ invalid json }")
+
+        _assert_inconclusive_keras_zip_scan(
+            keras_path,
+            "keras_zip_config_parse_failed",
+            "Config JSON Parsing",
+        )
+        result = KerasZipScanner().scan(str(keras_path))
+        assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+    def test_inconclusive_compile_config_preserves_security_exit1(self, tmp_path: Path) -> None:
+        """Security findings should still take precedence over incomplete compile_config analysis."""
+        encoded_code = base64.b64encode(b"eval('1')").decode()
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {
+                "class_name": "Sequential",
+                "config": {
+                    "layers": [
+                        {
+                            "class_name": "Lambda",
+                            "name": "lambda_1",
+                            "config": {"function": [encoded_code, None, None]},
+                        }
+                    ]
+                },
+                "compile_config": ["not", "a", "dict"],
+            },
+            keras_version="2.12.0",
+            file_name="lambda_with_invalid_compile_config.keras",
+        )
+
+        result = KerasZipScanner().scan(str(keras_path))
+        audit_result = scan_model_directory_or_file(str(keras_path))
+
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "keras_zip_compile_config_invalid_type" in result.metadata["scan_outcome_reasons"]
+        assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+        assert determine_exit_code(audit_result) == 1
+
+    def test_inconclusive_config_scan_outcome_survives_cache_rerun(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Cached Keras ZIP inconclusive results must still produce exit 2 on subsequent scans."""
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": "not a list"}},
+            file_name="cached_bad_config.keras",
+        )
+        cache_dir = tmp_path / "cache"
+
+        reset_cache_manager()
+        first_result = scan_model_directory_or_file(
+            str(keras_path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        reset_cache_manager()
+
+        def fail_scan(self: KerasZipScanner, path: str) -> Any:
+            raise AssertionError(f"Expected cached scan result for {path}")
+
+        monkeypatch.setattr(KerasZipScanner, "scan", fail_scan)
+
+        second_result = scan_model_directory_or_file(
+            str(keras_path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        metadata = second_result.file_metadata[str(keras_path)]
+
+        assert determine_exit_code(first_result) == 2
+        assert determine_exit_code(second_result) == 2
+        assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+        assert "keras_zip_model_layers_invalid_type" in metadata.get("scan_outcome_reasons")
 
     def test_embedded_weights_size_limit_prevents_unbounded_extraction(
         self,
