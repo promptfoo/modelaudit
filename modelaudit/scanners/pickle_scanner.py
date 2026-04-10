@@ -316,7 +316,12 @@ def _should_fallback_incompleteness_block_success(
     return not _has_trusted_incomplete_tail_context(fallback)
 
 
-def _merge_missing_pickle_checks(target: ScanResult, fallback: ScanResult) -> None:
+def _merge_missing_pickle_checks(
+    target: ScanResult,
+    fallback: ScanResult,
+    *,
+    propagate_fallback_state: bool = True,
+) -> None:
     """Merge only compatibility fallback checks that are absent from the primary result."""
     target_confirms_trusted_incomplete_tail = _target_confirms_trusted_incomplete_tail(target, fallback)
     existing_check_signatures = {_pickle_check_signature(check) for check in target.checks}
@@ -341,6 +346,8 @@ def _merge_missing_pickle_checks(target: ScanResult, fallback: ScanResult) -> No
     for check in fallback.checks:
         if target_confirms_trusted_incomplete_tail and _is_parse_incomplete_pickle_issue(check):
             continue
+        if not propagate_fallback_state and _is_operational_pickle_issue(check):
+            continue
         if check.name in _STANDALONE_PICKLE_NON_FINDING_CHECKS:
             continue
 
@@ -356,6 +363,8 @@ def _merge_missing_pickle_checks(target: ScanResult, fallback: ScanResult) -> No
         target.checks.append(check)
 
     for issue in fallback.issues:
+        if not propagate_fallback_state and _is_operational_pickle_issue(issue):
+            continue
         if _should_skip_fallback_pickle_issue(
             target,
             issue,
@@ -382,6 +391,10 @@ def _merge_missing_pickle_checks(target: ScanResult, fallback: ScanResult) -> No
             target.metadata[key].update(value)
         elif key not in target.metadata:
             target.metadata[key] = value
+
+    if not propagate_fallback_state:
+        target.finish(success=target.success)
+        return
 
     propagate_fallback_scan_outcome = _should_propagate_fallback_scan_outcome(fallback)
     if propagate_fallback_scan_outcome:
@@ -613,9 +626,21 @@ ALWAYS_DANGEROUS_FUNCTIONS: set[str] = {
     "shutil.copytree",
     # Dynamic resolution trampolines (can resolve arbitrary callables)
     "pkgutil.resolve_name",
-    # uuid internal functions that call subprocess.Popen
+    # functools.reduce can drive arbitrary callable invocation chains.
+    "functools.reduce",
+    # logging configuration loaders can resolve and instantiate attacker-controlled callables.
+    "logging.config.dictConfig",
+    "logging.config.fileConfig",
+    "logging.config.listen",
+    # uuid.getnode can dispatch into platform helpers that call subprocess.Popen.
+    "uuid._arp_getnode",
     "uuid._get_command_stdout",
+    "uuid._ifconfig_getnode",
+    "uuid._ip_getnode",
+    "uuid._lanscan_getnode",
+    "uuid._netstat_getnode",
     "uuid._popen",
+    "uuid.getnode",
     # Profiling/debugging modules that execute arbitrary Python code
     "cProfile.run",
     "cProfile.runctx",
@@ -722,9 +747,8 @@ ALWAYS_DANGEROUS_MODULES: set[str] = {
     "types",
     "compileall",
     "py_compile",
-    # Operator / functools bypasses
+    # Operator bypasses
     "_operator",
-    "functools",
     # Pickle recursion
     "pickle",
     "_pickle",
@@ -732,10 +756,8 @@ ALWAYS_DANGEROUS_MODULES: set[str] = {
     "cloudpickle",
     "joblib",
     # Filesystem / shell
-    "tempfile",
     "filecmp",
     "fileinput",
-    "glob",
     "distutils",
     "pydoc",
     "pexpect",
@@ -748,7 +770,6 @@ ALWAYS_DANGEROUS_MODULES: set[str] = {
     "mmap",
     "select",
     "selectors",
-    "logging",
     "syslog",
     "tarfile",
     "zipfile",
@@ -758,10 +779,9 @@ ALWAYS_DANGEROUS_MODULES: set[str] = {
     "doctest",
     "idlelib",
     "lib2to3",
-    # uuid — _get_command_stdout internally calls subprocess.Popen
-    "uuid",
-    # NOTE: linecache and logging.config are intentionally NOT in this set.
-    # - linecache.getline: file read (not code execution), flagged as WARNING
+    # NOTE: broad linecache/logging/uuid/tempfile/functools/glob imports are
+    # intentionally NOT in this set. Exact risky helpers are handled by
+    # ALWAYS_DANGEROUS_FUNCTIONS or SUSPICIOUS_GLOBALS.
 }
 
 # Modules that are suspicious but should only be flagged at WARNING severity.
@@ -775,6 +795,8 @@ WARNING_SEVERITY_MODULES: dict[str, set[str] | None] = {
     # glob.glob / glob.iglob are common in dataset loading pipelines and
     # cannot directly execute code.
     "glob": None,
+    # tempfile.mktemp is race-prone but does not execute code by itself.
+    "tempfile": {"mktemp"},
 }
 
 # Risky ML-specific import surfaces that must be flagged even when they appear
@@ -3997,6 +4019,7 @@ class PickleScanner(BaseScanner):
         self._standalone_pickle_scanner = StandalonePickleScanner(
             options=scan_options_from_config(self.config),
         )
+        self.use_standalone_pickle_primary = self._get_bool_config("use_standalone_pickle_primary", False)
 
     def _prepare_scan_context(self, source: str) -> None:
         """Reset per-scan timeout/context/analyzer state for a new pickle scan."""
@@ -4206,10 +4229,19 @@ class PickleScanner(BaseScanner):
 
         with contextlib.suppress(AttributeError, OSError, ValueError):
             file_obj.seek(stream_start)
+        if self.use_standalone_pickle_primary:
+            _merge_missing_pickle_checks(package_result, legacy_result, propagate_fallback_state=False)
+            first_pickle_end_pos = package_result.metadata.get("first_pickle_end_pos")
+            if isinstance(first_pickle_end_pos, int):
+                package_result.metadata["first_pickle_end_pos"] = first_pickle_end_pos
+            package_result.metadata["pickle_primary_engine"] = "standalone"
+            return package_result
+
         _merge_missing_pickle_checks(legacy_result, package_result)
         first_pickle_end_pos = package_result.metadata.get("first_pickle_end_pos")
         if isinstance(first_pickle_end_pos, int):
             legacy_result.metadata["first_pickle_end_pos"] = first_pickle_end_pos
+        legacy_result.metadata["pickle_primary_engine"] = "legacy"
         return legacy_result
 
     def _copy_pickle_stream_to_spool(self, file_obj: BinaryIO, file_size: int, spool: BinaryIO) -> None:

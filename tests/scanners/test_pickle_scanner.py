@@ -6,6 +6,7 @@ import struct
 import sys
 import tempfile
 import unittest
+import uuid
 import zipfile
 from collections import Counter
 from collections.abc import Callable, Iterator
@@ -362,6 +363,139 @@ def test_scan_stream_uses_single_timeout_budget_for_package_and_legacy_fallback(
     assert not any(check.name == "Scan Timeout Check" and check.status == CheckStatus.FAILED for check in result.checks)
     assert len(legacy_remaining_budget) == 1
     assert legacy_remaining_budget[0] == pytest.approx(1.0)
+
+
+def test_scan_stream_defaults_to_legacy_primary_during_package_migration() -> None:
+    payload = pickle.dumps({"safe": True}, protocol=4)
+
+    result = PickleScanner().scan_stream(BytesIO(payload), len(payload), source="legacy-primary.pkl")
+
+    assert result.success is True
+    assert result.metadata["pickle_primary_engine"] == "legacy"
+    assert result.metadata["pickle_report_status"] == "complete"
+
+
+def test_scan_stream_can_use_standalone_package_as_primary_for_migration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = pickle.dumps({"safe": True}, protocol=4)
+    scanner = PickleScanner(config={"use_standalone_pickle_primary": True})
+    package_report = PickleReport(
+        source="package-primary.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.MALICIOUS,
+        findings=(
+            Finding(
+                message="package-primary synthetic finding",
+                severity=Severity.CRITICAL,
+                location="package-primary.pkl (pos 2)",
+                rule_code="S999",
+                details={"source_engine": "standalone"},
+            ),
+        ),
+        metadata={"first_pickle_end_pos": len(payload), "package_only_metadata": True},
+    )
+
+    def fake_package_scan_stream(
+        file_obj: BinaryIO,
+        *,
+        source: str,
+        size: int | None = None,
+    ) -> PickleReport:
+        del file_obj, source, size
+        return package_report
+
+    def fake_legacy_scan_pickle_bytes(file_obj: BinaryIO, file_size: int) -> ScanResult:
+        del file_obj, file_size
+        legacy_result = scanner._create_result()
+        legacy_result.metadata["legacy_only_metadata"] = True
+        legacy_result.add_check(
+            name="Legacy Compatibility Check",
+            passed=False,
+            message="legacy-only synthetic finding",
+            severity=IssueSeverity.WARNING,
+            location="package-primary.pkl (legacy)",
+            rule_code="S777",
+        )
+        legacy_result.finish(success=True)
+        return legacy_result
+
+    monkeypatch.setattr(scanner._standalone_pickle_scanner, "scan_stream", fake_package_scan_stream)
+    monkeypatch.setattr(scanner, "_scan_pickle_bytes", fake_legacy_scan_pickle_bytes)
+
+    result = scanner.scan_stream(BytesIO(payload), len(payload), source="package-primary.pkl")
+
+    assert result.success is True
+    assert result.metadata["pickle_primary_engine"] == "standalone"
+    assert result.metadata["pickle_report_status"] == "complete"
+    assert result.metadata["pickle_verdict"] == "malicious"
+    assert result.metadata["package_only_metadata"] is True
+    assert result.metadata["legacy_only_metadata"] is True
+    assert any(check.name == "Standalone Pickle Finding" for check in result.checks)
+    assert any(check.name == "Legacy Compatibility Check" for check in result.checks)
+    assert {issue.rule_code for issue in result.issues} >= {"S777", "S999"}
+
+
+def test_scan_stream_standalone_primary_does_not_inherit_legacy_operational_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = pickle.dumps({"safe": True}, protocol=4)
+    scanner = PickleScanner(config={"use_standalone_pickle_primary": True})
+    package_report = PickleReport(
+        source="standalone-clean.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.CLEAN,
+        metadata={"first_pickle_end_pos": len(payload)},
+    )
+
+    def fake_package_scan_stream(
+        file_obj: BinaryIO,
+        *,
+        source: str,
+        size: int | None = None,
+    ) -> PickleReport:
+        del file_obj, source, size
+        return package_report
+
+    def fake_legacy_scan_pickle_bytes(file_obj: BinaryIO, file_size: int) -> ScanResult:
+        del file_obj, file_size
+        legacy_result = scanner._create_result()
+        legacy_result.add_check(
+            name="Legacy Pickle Parse Failure",
+            passed=False,
+            message="Legacy pickle parsing failed before full scan completion",
+            severity=IssueSeverity.CRITICAL,
+            location="standalone-clean.pkl (legacy)",
+            details={
+                "category": "parse_error",
+                "exception_type": "ValueError",
+                "analysis_incomplete": True,
+            },
+            rule_code=None,
+        )
+        legacy_result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+        legacy_result.metadata["scan_outcome_reasons"] = ["pickle_analysis_incomplete"]
+        legacy_result.metadata["analysis_incomplete"] = True
+        legacy_result.metadata["operational_error"] = True
+        legacy_result.metadata["operational_error_reason"] = "parse_error"
+        legacy_result.finish(success=False)
+        return legacy_result
+
+    monkeypatch.setattr(scanner._standalone_pickle_scanner, "scan_stream", fake_package_scan_stream)
+    monkeypatch.setattr(scanner, "_scan_pickle_bytes", fake_legacy_scan_pickle_bytes)
+
+    result = scanner.scan_stream(BytesIO(payload), len(payload), source="standalone-clean.pkl")
+
+    assert result.success is True
+    assert result.metadata["pickle_primary_engine"] == "standalone"
+    assert result.metadata["pickle_report_status"] == "complete"
+    assert "scan_outcome" not in result.metadata
+    assert "analysis_incomplete" not in result.metadata
+    assert "operational_error" not in result.metadata
+    assert not any(check.name == "Legacy Pickle Parse Failure" for check in result.checks)
+    assert not any(
+        issue.message == "Legacy pickle parsing failed before full scan completion" for issue in result.issues
+    )
 
 
 def test_scan_stream_resets_post_budget_global_state_before_reused_scanner_scan() -> None:
@@ -839,6 +973,62 @@ def test_merge_missing_pickle_checks_propagates_fallback_operational_errors_and_
     assert target.metadata["operational_error_reason"] == "short_read"
     assert any(
         check.name == "Pickle Protocol Version Check" and check.status == CheckStatus.PASSED for check in target.checks
+    )
+
+
+def test_merge_missing_pickle_checks_can_ignore_fallback_operational_state() -> None:
+    """Standalone-primary migration should merge legacy evidence without inheriting legacy scan failure state."""
+    scanner = PickleScanner()
+    target = ScanResult(scanner_name="pickle", scanner=scanner)
+    target.add_check(
+        name="Pickle Protocol Version Check",
+        passed=True,
+        message="Valid pickle protocol version 4",
+        location="standalone-clean.pkl",
+    )
+    target.finish(success=True)
+
+    fallback = ScanResult(scanner_name="pickle", scanner=scanner)
+    fallback.add_check(
+        name="Legacy Compatibility Check",
+        passed=False,
+        message="legacy-only synthetic finding",
+        severity=IssueSeverity.WARNING,
+        location="standalone-clean.pkl (legacy)",
+        details={"source_engine": "legacy"},
+        rule_code="S777",
+    )
+    fallback.add_check(
+        name="Legacy Pickle Parse Failure",
+        passed=False,
+        message="Legacy pickle parsing failed before full scan completion",
+        severity=IssueSeverity.CRITICAL,
+        location="standalone-clean.pkl (legacy)",
+        details={
+            "category": "parse_error",
+            "exception_type": "ValueError",
+            "analysis_incomplete": True,
+        },
+        rule_code=None,
+    )
+    fallback.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+    fallback.metadata["scan_outcome_reasons"] = ["pickle_analysis_incomplete"]
+    fallback.metadata["analysis_incomplete"] = True
+    fallback.metadata["operational_error"] = True
+    fallback.metadata["operational_error_reason"] = "parse_error"
+    fallback.finish(success=False)
+
+    _merge_missing_pickle_checks(target, fallback, propagate_fallback_state=False)
+
+    assert target.success is True
+    assert "scan_outcome" not in target.metadata
+    assert "analysis_incomplete" not in target.metadata
+    assert "operational_error" not in target.metadata
+    assert any(check.name == "Legacy Compatibility Check" for check in target.checks)
+    assert any(issue.rule_code == "S777" for issue in target.issues)
+    assert not any(check.name == "Legacy Pickle Parse Failure" for check in target.checks)
+    assert not any(
+        issue.message == "Legacy pickle parsing failed before full scan completion" for issue in target.issues
     )
 
 
@@ -2366,10 +2556,10 @@ def test_post_budget_global_scan_reference_cap_suppresses_warning_only_log_flood
     assert len(findings) == 8
     assert all(finding["module"] == "glob" for finding in findings)
     assert scanner._post_budget_global_reference_limit_exceeded is True
-    glob_warnings = [
+    broad_module_warnings = [
         record for record in caplog.records if "Always-dangerous module detected: glob.helper" in record.getMessage()
     ]
-    assert len(glob_warnings) == 8
+    assert broad_module_warnings == []
 
 
 def test_post_budget_global_scan_reference_cap_preserves_late_critical_tail(
@@ -4839,6 +5029,83 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
         assert result.success
         assert not result.has_errors
         assert not [check for check in result.checks if check.status == CheckStatus.FAILED]
+
+    def test_benign_stdlib_neighbors_do_not_inherit_broad_module_criticality(self) -> None:
+        """Benign neighbors of risky stdlib helpers should not inherit CRITICAL module policy."""
+        benign_refs = (
+            ("uuid", "UUID"),
+            ("logging", "getLogger"),
+            ("logging", "config"),
+            ("tempfile", "NamedTemporaryFile"),
+            ("functools", "lru_cache"),
+        )
+
+        for module, func in benign_refs:
+            result = self._scan_bytes(self._craft_global_only_pickle(module, func))
+            full_ref = f"{module}.{func}"
+
+            assert result.success, f"Scan failed for {full_ref}"
+            assert not any(
+                check.status == CheckStatus.FAILED
+                and check.severity == IssueSeverity.CRITICAL
+                and full_ref in check.message
+                for check in result.checks
+            ), f"Unexpected CRITICAL finding for benign neighbor {full_ref}: {[c.message for c in result.checks]}"
+
+    def test_uuid_object_pickle_does_not_inherit_uuid_module_criticality(self) -> None:
+        """Legitimate uuid.UUID objects should not become CRITICAL because uuid has risky private helpers."""
+        payload = pickle.dumps(uuid.UUID("12345678-1234-5678-1234-567812345678"), protocol=4)
+
+        result = self._scan_bytes(payload)
+
+        assert result.success
+        assert not any(
+            check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+            and "uuid.UUID" in check.message
+            for check in result.checks
+        ), f"Unexpected CRITICAL finding for uuid.UUID pickle: {[c.message for c in result.checks]}"
+
+    def test_narrowed_stdlib_helper_policy_keeps_risky_refs_flagged(self) -> None:
+        """Exact risky helpers must stay flagged after broad stdlib module cleanup."""
+        risky_refs = (
+            ("uuid", "_get_command_stdout", IssueSeverity.CRITICAL),
+            ("uuid", "_popen", IssueSeverity.CRITICAL),
+            ("uuid", "_ifconfig_getnode", IssueSeverity.CRITICAL),
+            ("uuid", "_ip_getnode", IssueSeverity.CRITICAL),
+            ("uuid", "_arp_getnode", IssueSeverity.CRITICAL),
+            ("uuid", "_lanscan_getnode", IssueSeverity.CRITICAL),
+            ("uuid", "_netstat_getnode", IssueSeverity.CRITICAL),
+            ("uuid", "getnode", IssueSeverity.CRITICAL),
+            ("logging.config", "fileConfig", IssueSeverity.CRITICAL),
+            ("logging.config", "dictConfig", IssueSeverity.CRITICAL),
+            ("logging.config", "listen", IssueSeverity.CRITICAL),
+            ("functools", "reduce", IssueSeverity.CRITICAL),
+            ("functools", "partial", IssueSeverity.WARNING),
+            ("functools", "partialmethod", IssueSeverity.WARNING),
+            ("tempfile", "mktemp", IssueSeverity.WARNING),
+            ("glob", "glob", IssueSeverity.WARNING),
+        )
+
+        for module, func, expected_severity in risky_refs:
+            result = self._scan_bytes(self._craft_global_reduce_pickle(module, func))
+            full_ref = f"{module}.{func}"
+
+            assert result.success, f"Scan failed for {full_ref}"
+            assert any(
+                check.status == CheckStatus.FAILED and check.severity == expected_severity and full_ref in check.message
+                for check in result.checks
+            ), (
+                f"Expected {expected_severity.value} finding for {full_ref}, got: "
+                f"{[(c.severity, c.message) for c in result.checks if c.status == CheckStatus.FAILED]}"
+            )
+            if expected_severity == IssueSeverity.WARNING:
+                assert not any(
+                    check.status == CheckStatus.FAILED
+                    and check.severity == IssueSeverity.CRITICAL
+                    and full_ref in check.message
+                    for check in result.checks
+                ), f"Unexpected CRITICAL finding for warning-level ref {full_ref}: {[c.message for c in result.checks]}"
 
     def test_sqlite3_blocked(self) -> None:
         """sqlite3 module should be flagged as dangerous."""

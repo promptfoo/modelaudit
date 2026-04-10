@@ -39,6 +39,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - harden standalone pickle scanner dangerous global coverage, literal scan
   bounds, nested pickle reporting, and report immutability
 - fail closed when standalone pickle string-literal and encoded nested-payload scans exceed configured bounds
+- add an opt-in standalone-primary pickle migration mode while preserving the
+  legacy-primary default
 - flag TensorFlow `LoadLibrary` and `LoadLibraryV2` graph ops as dangerous native-library loading
 - detect split CNTK native-user-function and native-library references
 - detect Linux/macOS native-library members in Keras archives and uppercase native-library members in PyTorch ZIPs
@@ -49,6 +51,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - fail closed on unterminated OpenVINO DOCTYPE declarations
 - avoid PMML `<Extension>` false positives for benign `subprocess` prose while preserving `subprocess.getoutput()`, `subprocess.getstatusoutput()`, and `importlib.import_module("subprocess")` detections
 - route helper-level ZIP-backed `.ckpt`/`.pkl` checkpoints through archive scanners
+- route gzip/bzip2/xz/lz4/zlib wrappers by magic bytes even when they use misleading extensions
+- reject raw trailers after bzip2 and xz compressed-wrapper payloads
+- reject raw trailers after lz4 compressed-wrapper frames and bound lz4 decompression output probes
 
 ## [0.2.31](https://github.com/promptfoo/modelaudit/compare/v0.2.30...v0.2.31) (2026-04-04)
 
