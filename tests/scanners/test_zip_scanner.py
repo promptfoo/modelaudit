@@ -342,6 +342,8 @@ class TestZipScanner:
 
         result = self.scanner.scan(str(mar_path))
         assert result.success is False
+        assert result.has_warnings is True
+        assert result.has_errors is False
 
         handler_failures = [
             check
@@ -352,6 +354,8 @@ class TestZipScanner:
         assert handler_failures[0].severity == IssueSeverity.WARNING
         assert "unable to parse python entry for static analysis" in handler_failures[0].message.lower()
         assert handler_failures[0].details.get("entry") == "handler.py"
+        assert handler_failures[0].details.get("analysis_kind") == "syntax"
+        assert "expected ':'" in str(handler_failures[0].details.get("parse_error")).lower()
         assert handler_failures[0].location == f"{mar_path}:handler.py"
 
     def test_scan_extensionless_nested_zip_recurses(self, tmp_path: Path) -> None:

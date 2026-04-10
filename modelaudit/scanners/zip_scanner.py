@@ -527,7 +527,7 @@ class ZipScanner(BaseScanner):
                 message=f"Unable to parse Python entry for static analysis: {parse_error}",
                 severity=IssueSeverity.WARNING,
                 location=f"{archive_path}:{entry_name}",
-                details={"entry": entry_name},
+                details={"entry": entry_name, "analysis_kind": "syntax", "parse_error": parse_error},
             )
         else:
             result.add_check(
