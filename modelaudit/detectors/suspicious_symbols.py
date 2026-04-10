@@ -211,7 +211,7 @@ SUSPICIOUS_GLOBALS = {
     "timeit": ["timeit", "repeat"],
     "trace": "*",
     # Operator / functools bypasses
-    "functools": ["reduce", "partial"],
+    "functools": ["reduce", "partial", "partialmethod"],
     "_operator": "*",
     # Pickle recursion
     "cloudpickle": "*",

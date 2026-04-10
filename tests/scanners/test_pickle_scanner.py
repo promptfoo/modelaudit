@@ -6,6 +6,7 @@ import struct
 import sys
 import tempfile
 import unittest
+import uuid
 import zipfile
 from collections import Counter
 from collections.abc import Callable, Iterator
@@ -2555,10 +2556,10 @@ def test_post_budget_global_scan_reference_cap_suppresses_warning_only_log_flood
     assert len(findings) == 8
     assert all(finding["module"] == "glob" for finding in findings)
     assert scanner._post_budget_global_reference_limit_exceeded is True
-    glob_warnings = [
+    broad_module_warnings = [
         record for record in caplog.records if "Always-dangerous module detected: glob.helper" in record.getMessage()
     ]
-    assert len(glob_warnings) == 8
+    assert broad_module_warnings == []
 
 
 def test_post_budget_global_scan_reference_cap_preserves_late_critical_tail(
@@ -5028,6 +5029,74 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
         assert result.success
         assert not result.has_errors
         assert not [check for check in result.checks if check.status == CheckStatus.FAILED]
+
+    def test_benign_stdlib_neighbors_do_not_inherit_broad_module_criticality(self) -> None:
+        """Benign neighbors of risky stdlib helpers should not inherit CRITICAL module policy."""
+        benign_refs = (
+            ("uuid", "UUID"),
+            ("logging", "getLogger"),
+            ("tempfile", "NamedTemporaryFile"),
+            ("functools", "lru_cache"),
+        )
+
+        for module, func in benign_refs:
+            result = self._scan_bytes(self._craft_global_only_pickle(module, func))
+            full_ref = f"{module}.{func}"
+
+            assert result.success, f"Scan failed for {full_ref}"
+            assert not any(
+                check.status == CheckStatus.FAILED
+                and check.severity == IssueSeverity.CRITICAL
+                and full_ref in check.message
+                for check in result.checks
+            ), f"Unexpected CRITICAL finding for benign neighbor {full_ref}: {[c.message for c in result.checks]}"
+
+    def test_uuid_object_pickle_does_not_inherit_uuid_module_criticality(self) -> None:
+        """Legitimate uuid.UUID objects should not become CRITICAL because uuid has risky private helpers."""
+        payload = pickle.dumps(uuid.UUID("12345678-1234-5678-1234-567812345678"), protocol=4)
+
+        result = self._scan_bytes(payload)
+
+        assert result.success
+        assert not any(
+            check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+            and "uuid.UUID" in check.message
+            for check in result.checks
+        ), f"Unexpected CRITICAL finding for uuid.UUID pickle: {[c.message for c in result.checks]}"
+
+    def test_narrowed_stdlib_helper_policy_keeps_risky_refs_flagged(self) -> None:
+        """Exact risky helpers must stay flagged after broad stdlib module cleanup."""
+        risky_refs = (
+            ("uuid", "_get_command_stdout", IssueSeverity.CRITICAL),
+            ("uuid", "_popen", IssueSeverity.CRITICAL),
+            ("logging.config", "listen", IssueSeverity.CRITICAL),
+            ("functools", "reduce", IssueSeverity.CRITICAL),
+            ("functools", "partial", IssueSeverity.WARNING),
+            ("functools", "partialmethod", IssueSeverity.WARNING),
+            ("tempfile", "mktemp", IssueSeverity.WARNING),
+            ("glob", "glob", IssueSeverity.WARNING),
+        )
+
+        for module, func, expected_severity in risky_refs:
+            result = self._scan_bytes(self._craft_global_reduce_pickle(module, func))
+            full_ref = f"{module}.{func}"
+
+            assert result.success, f"Scan failed for {full_ref}"
+            assert any(
+                check.status == CheckStatus.FAILED and check.severity == expected_severity and full_ref in check.message
+                for check in result.checks
+            ), (
+                f"Expected {expected_severity.value} finding for {full_ref}, got: "
+                f"{[(c.severity, c.message) for c in result.checks if c.status == CheckStatus.FAILED]}"
+            )
+            if expected_severity == IssueSeverity.WARNING:
+                assert not any(
+                    check.status == CheckStatus.FAILED
+                    and check.severity == IssueSeverity.CRITICAL
+                    and full_ref in check.message
+                    for check in result.checks
+                ), f"Unexpected CRITICAL finding for warning-level ref {full_ref}: {[c.message for c in result.checks]}"
 
     def test_sqlite3_blocked(self) -> None:
         """sqlite3 module should be flagged as dangerous."""
