@@ -885,8 +885,8 @@ __import__('pickle').loads(data)
             "dropper.PS1",
         }.issubset(suspicious_filenames)
 
-    def test_native_library_near_match_extension_stays_clean(self, tmp_path: Path) -> None:
-        """Native-library extension near matches should not be treated as executable archive members."""
+    def test_executable_extension_near_matches_stay_clean(self, tmp_path: Path) -> None:
+        """Executable extension near matches should not be treated as executable archive members."""
         archive_path = tmp_path / "safe.keras"
         config = {"class_name": "Sequential", "config": {"layers": []}}
         with zipfile.ZipFile(archive_path, "w") as zf:
@@ -895,6 +895,13 @@ __import__('pickle').loads(data)
             zf.writestr("plugin.so.version", "not a versioned shared object")
             zf.writestr("plugin.so.6cache", "not a versioned shared object")
             zf.writestr("plugin.dllcache", "not a dll")
+            zf.writestr("launcher.bashrc", "not a standalone bash script")
+            zf.writestr("runner.cmdline", "not a cmd script")
+            zf.writestr("screensaver.scrub", "not a screensaver")
+            zf.writestr("payload.composer", "not a DOS executable")
+            zf.writestr("dropper.ps10", "not a PowerShell script")
+            zf.writestr("installer.executable", "not a PE executable")
+            zf.writestr("batch.baton", "not a batch script")
 
         result = KerasZipScanner().scan(str(archive_path))
 
