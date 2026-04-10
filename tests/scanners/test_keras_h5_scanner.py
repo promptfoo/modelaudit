@@ -9,7 +9,9 @@ pytest.importorskip("h5py")
 
 import h5py
 
-from modelaudit.scanners.base import CheckStatus, IssueSeverity
+from modelaudit.cache import reset_cache_manager
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.keras_h5_scanner import KerasH5Scanner
 
 ASSETS_DIR = Path(__file__).parent.parent / "assets" / "samples" / "keras"
@@ -76,9 +78,9 @@ def create_mock_h5_file(tmp_path, *, malicious=False):
 
 def create_custom_h5_file(
     tmp_path: Path,
-    model_config: dict[str, Any],
+    model_config: Any,
     *,
-    training_config: dict[str, Any] | None = None,
+    training_config: Any | None = None,
     keras_version: str = "3.13.2",
     file_name: str = "model.h5",
 ) -> Path:
@@ -90,6 +92,26 @@ def create_custom_h5_file(
         f.attrs["keras_version"] = keras_version
         if training_config is not None:
             f.attrs["training_config"] = json.dumps(training_config)
+
+    return h5_path
+
+
+def create_raw_config_h5_file(
+    tmp_path: Path,
+    *,
+    model_config_attr: Any,
+    training_config_attr: Any | None = None,
+    keras_version: str = "3.13.2",
+    file_name: str = "model.h5",
+) -> Path:
+    """Create a Keras H5 file with raw JSON config attributes."""
+    h5_path = tmp_path / file_name
+
+    with h5py.File(h5_path, "w") as f:
+        f.attrs["model_config"] = model_config_attr
+        f.attrs["keras_version"] = keras_version
+        if training_config_attr is not None:
+            f.attrs["training_config"] = training_config_attr
 
     return h5_path
 
@@ -267,6 +289,192 @@ def test_keras_h5_scanner_benign_model_has_no_warning_noise(tmp_path: Path) -> N
     result = scanner.scan(str(model_path))
 
     assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+
+
+def _assert_inconclusive_keras_h5_scan(model_path: Path, reason: str, expected_check_name: str) -> None:
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert result.success is False
+    assert result.has_errors is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert reason in result.metadata["scan_outcome_reasons"]
+    assert any(check.name == expected_check_name and check.status == CheckStatus.FAILED for check in result.checks)
+
+    audit_result = scan_model_directory_or_file(str(model_path))
+    metadata = audit_result.file_metadata[str(model_path)]
+
+    assert audit_result.has_errors is False
+    assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert reason in metadata.get("scan_outcome_reasons")
+    assert determine_exit_code(audit_result) == 2
+
+
+@pytest.mark.parametrize(
+    ("model_config", "reason", "expected_check_name"),
+    [
+        (None, "keras_h5_model_config_invalid_type", "Model Config Type Validation"),
+        ([], "keras_h5_model_config_invalid_type", "Model Config Type Validation"),
+        (
+            {"class_name": "Sequential", "config": "layers hidden in wrong type"},
+            "keras_h5_model_config_structure_invalid",
+            "Model Config Structure Validation",
+        ),
+        (
+            {"class_name": "Sequential", "config": {"layers": "layers hidden in wrong type"}},
+            "keras_h5_model_layers_invalid_type",
+            "Layers Type Validation",
+        ),
+        (
+            {"class_name": "Sequential", "config": {"layers": ["not a layer dict"]}},
+            "keras_h5_model_layer_invalid_type",
+            "Layer Type Validation",
+        ),
+    ],
+)
+def test_keras_h5_invalid_model_config_structure_returns_inconclusive_exit2(
+    tmp_path: Path,
+    model_config: Any,
+    reason: str,
+    expected_check_name: str,
+) -> None:
+    """Keras H5 model_config that cannot be fully traversed should fail closed."""
+    model_path = create_custom_h5_file(
+        tmp_path,
+        model_config,
+        file_name=f"{reason}.h5",
+    )
+
+    _assert_inconclusive_keras_h5_scan(model_path, reason, expected_check_name)
+
+
+def test_keras_h5_malformed_model_config_json_returns_inconclusive_exit2(tmp_path: Path) -> None:
+    """Malformed Keras model_config JSON should not be reported as a clean scan or security finding."""
+    model_path = create_raw_config_h5_file(
+        tmp_path,
+        model_config_attr="{",
+        file_name="malformed_model_config.h5",
+    )
+
+    _assert_inconclusive_keras_h5_scan(
+        model_path,
+        "keras_h5_model_config_parse_failed",
+        "Keras H5 Config Parse",
+    )
+    result = KerasH5Scanner().scan(str(model_path))
+    assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+@pytest.mark.parametrize(
+    ("training_config", "reason", "expected_check_name"),
+    [
+        ("{", "keras_h5_training_config_parse_failed", "Keras H5 Config Parse"),
+        ("null", "keras_h5_training_config_invalid_type", "Training Config Type Validation"),
+        (["not", "a", "dict"], "keras_h5_training_config_invalid_type", "Training Config Type Validation"),
+    ],
+)
+def test_keras_h5_invalid_training_config_returns_inconclusive_exit2(
+    tmp_path: Path,
+    training_config: Any,
+    reason: str,
+    expected_check_name: str,
+) -> None:
+    """Unreadable training_config can hide custom metrics/losses, so it must fail closed."""
+    model_path = (
+        create_raw_config_h5_file(
+            tmp_path,
+            model_config_attr=json.dumps(
+                {
+                    "class_name": "Sequential",
+                    "config": {"layers": [{"class_name": "Dense", "config": {"units": 1}}]},
+                }
+            ),
+            training_config_attr=training_config,
+            file_name="invalid_training_config_json.h5",
+        )
+        if isinstance(training_config, str)
+        else create_custom_h5_file(
+            tmp_path,
+            {
+                "class_name": "Sequential",
+                "config": {"layers": [{"class_name": "Dense", "config": {"units": 1}}]},
+            },
+            training_config=training_config,
+            file_name="invalid_training_config_type.h5",
+        )
+    )
+
+    _assert_inconclusive_keras_h5_scan(model_path, reason, expected_check_name)
+
+
+def test_keras_h5_inconclusive_training_config_preserves_security_exit1(tmp_path: Path) -> None:
+    """Security findings should still take precedence over an incomplete training_config scan."""
+    model_path = create_raw_config_h5_file(
+        tmp_path,
+        model_config_attr=json.dumps(
+            {
+                "class_name": "Sequential",
+                "config": {
+                    "layers": [
+                        {
+                            "class_name": "Lambda",
+                            "config": {"function": "lambda x: eval('1')"},
+                        }
+                    ]
+                },
+            }
+        ),
+        training_config_attr="{",
+        keras_version="3.11.2",
+        file_name="lambda_with_malformed_training_config.h5",
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+    audit_result = scan_model_directory_or_file(str(model_path))
+
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "keras_h5_training_config_parse_failed" in result.metadata["scan_outcome_reasons"]
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+    assert determine_exit_code(audit_result) == 1
+
+
+def test_keras_h5_inconclusive_scan_outcome_survives_cache_rerun(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cached Keras H5 inconclusive results must still produce exit 2 on subsequent scans."""
+    model_path = create_custom_h5_file(
+        tmp_path,
+        [],
+        file_name="cached_bad_model_config.h5",
+    )
+    cache_dir = tmp_path / "cache"
+
+    reset_cache_manager()
+    first_result = scan_model_directory_or_file(
+        str(model_path),
+        cache_enabled=True,
+        cache_dir=str(cache_dir),
+        min_cache_file_size=0,
+    )
+    reset_cache_manager()
+
+    def fail_scan(self: KerasH5Scanner, path: str) -> Any:
+        raise AssertionError(f"Expected cached scan result for {path}")
+
+    monkeypatch.setattr(KerasH5Scanner, "scan", fail_scan)
+
+    second_result = scan_model_directory_or_file(
+        str(model_path),
+        cache_enabled=True,
+        cache_dir=str(cache_dir),
+        min_cache_file_size=0,
+    )
+    metadata = second_result.file_metadata[str(model_path)]
+
+    assert determine_exit_code(first_result) == 2
+    assert determine_exit_code(second_result) == 2
+    assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert "keras_h5_model_config_invalid_type" in metadata.get("scan_outcome_reasons")
 
 
 def test_keras_h5_scanner_skips_generic_hdf5_external_links_without_keras_metadata(tmp_path: Path) -> None:
