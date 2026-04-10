@@ -175,8 +175,16 @@ SUSPICIOUS_GLOBALS = {
     # Dynamic resolution / import trampolines
     "pkgutil": ["resolve_name", "get_importer", "walk_packages"],
     "zipimport": "*",
-    # uuid — _get_command_stdout/_popen internally call subprocess.Popen
-    "uuid": ["_get_command_stdout", "_popen"],
+    # uuid private helpers that invoke platform commands through subprocess wrappers
+    "uuid": [
+        "_arp_getnode",
+        "_get_command_stdout",
+        "_ifconfig_getnode",
+        "_ip_getnode",
+        "_lanscan_getnode",
+        "_netstat_getnode",
+        "_popen",
+    ],
     # Network / exfiltration
     "smtplib": "*",
     "xmlrpc": "*",
@@ -237,7 +245,7 @@ SUSPICIOUS_GLOBALS = {
     "_sqlite3": "*",
     "select": "*",
     "selectors": "*",
-    "logging": ["config"],
+    "logging.config": ["dictConfig", "fileConfig", "listen"],
     "syslog": "*",
     "tarfile": "*",
     "zipfile": "*",

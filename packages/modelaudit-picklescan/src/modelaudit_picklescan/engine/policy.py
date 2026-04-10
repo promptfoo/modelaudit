@@ -131,6 +131,8 @@ _DANGEROUS_GLOBALS = frozenset(
         ("functools", "reduce"),
         ("joblib", "_pickle_load"),
         ("joblib", "load"),
+        ("logging.config", "dictConfig"),
+        ("logging.config", "fileConfig"),
         ("logging.config", "listen"),
         ("numpy", "load"),
         ("numpy.testing._private.utils", "runstring"),
@@ -153,7 +155,12 @@ _DANGEROUS_GLOBALS = frozenset(
         ("torch.storage", "_load_from_bytes"),
         ("types", "CodeType"),
         ("types", "FunctionType"),
+        ("uuid", "_arp_getnode"),
         ("uuid", "_get_command_stdout"),
+        ("uuid", "_ifconfig_getnode"),
+        ("uuid", "_ip_getnode"),
+        ("uuid", "_lanscan_getnode"),
+        ("uuid", "_netstat_getnode"),
         ("uuid", "_popen"),
     }
 )

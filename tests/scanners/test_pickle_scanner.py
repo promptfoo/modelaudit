@@ -5035,6 +5035,7 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
         benign_refs = (
             ("uuid", "UUID"),
             ("logging", "getLogger"),
+            ("logging", "config"),
             ("tempfile", "NamedTemporaryFile"),
             ("functools", "lru_cache"),
         )
@@ -5070,6 +5071,13 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
         risky_refs = (
             ("uuid", "_get_command_stdout", IssueSeverity.CRITICAL),
             ("uuid", "_popen", IssueSeverity.CRITICAL),
+            ("uuid", "_ifconfig_getnode", IssueSeverity.CRITICAL),
+            ("uuid", "_ip_getnode", IssueSeverity.CRITICAL),
+            ("uuid", "_arp_getnode", IssueSeverity.CRITICAL),
+            ("uuid", "_lanscan_getnode", IssueSeverity.CRITICAL),
+            ("uuid", "_netstat_getnode", IssueSeverity.CRITICAL),
+            ("logging.config", "fileConfig", IssueSeverity.CRITICAL),
+            ("logging.config", "dictConfig", IssueSeverity.CRITICAL),
             ("logging.config", "listen", IssueSeverity.CRITICAL),
             ("functools", "reduce", IssueSeverity.CRITICAL),
             ("functools", "partial", IssueSeverity.WARNING),

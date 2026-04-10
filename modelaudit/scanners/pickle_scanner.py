@@ -628,10 +628,17 @@ ALWAYS_DANGEROUS_FUNCTIONS: set[str] = {
     "pkgutil.resolve_name",
     # functools.reduce can drive arbitrary callable invocation chains.
     "functools.reduce",
-    # logging.config.listen starts a configuration socket server.
+    # logging configuration loaders can resolve and instantiate attacker-controlled callables.
+    "logging.config.dictConfig",
+    "logging.config.fileConfig",
     "logging.config.listen",
-    # uuid internal functions that call subprocess.Popen
+    # uuid private helpers that call subprocess.Popen directly or through _get_command_stdout.
+    "uuid._arp_getnode",
     "uuid._get_command_stdout",
+    "uuid._ifconfig_getnode",
+    "uuid._ip_getnode",
+    "uuid._lanscan_getnode",
+    "uuid._netstat_getnode",
     "uuid._popen",
     # Profiling/debugging modules that execute arbitrary Python code
     "cProfile.run",
