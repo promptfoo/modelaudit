@@ -7,6 +7,7 @@ import io
 import os
 import pickle
 import re
+import uuid
 from pathlib import Path
 
 import pytest
@@ -366,6 +367,72 @@ def test_scan_bytes_flags_expanded_high_risk_callables(payload: bytes, expected_
     assert any(
         finding.rule_code == "DANGEROUS_CALL"
         and finding.severity == Severity.CRITICAL
+        and finding.details.get("import_reference") == expected_reference
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_reference"),
+    [
+        (
+            pickle.dumps(uuid.UUID("12345678-1234-5678-1234-567812345678"), protocol=4),
+            "uuid.UUID",
+        ),
+        (b"clogging\ngetLogger\n.", "logging.getLogger"),
+        (b"ctempfile\nNamedTemporaryFile\n.", "tempfile.NamedTemporaryFile"),
+    ],
+)
+def test_scan_bytes_does_not_treat_benign_stdlib_module_references_as_dangerous(
+    payload: bytes, expected_reference: str
+) -> None:
+    report = scan_bytes(payload, source=f"{expected_reference}.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+    assert any(
+        ref["import_reference"] == expected_reference and ref["is_dangerous"] is False
+        for ref in report.metadata["import_references"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_reference", "expected_severity", "expected_verdict"),
+    [
+        (
+            b"cuuid\n_get_command_stdout\n(tR.",
+            "uuid._get_command_stdout",
+            Severity.CRITICAL,
+            SafetyVerdict.MALICIOUS,
+        ),
+        (
+            b"clogging.config\nlisten\n(tR.",
+            "logging.config.listen",
+            Severity.CRITICAL,
+            SafetyVerdict.MALICIOUS,
+        ),
+        (
+            b"ctempfile\nmktemp\n(tR.",
+            "tempfile.mktemp",
+            Severity.WARNING,
+            SafetyVerdict.SUSPICIOUS,
+        ),
+    ],
+)
+def test_scan_bytes_keeps_exact_risky_stdlib_functions_flagged(
+    payload: bytes,
+    expected_reference: str,
+    expected_severity: Severity,
+    expected_verdict: SafetyVerdict,
+) -> None:
+    report = scan_bytes(payload, source=f"{expected_reference}.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == expected_verdict
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.severity == expected_severity
         and finding.details.get("import_reference") == expected_reference
         for finding in report.findings
     )

@@ -74,7 +74,6 @@ _DANGEROUS_WILDCARD_MODULES = frozenset(
         "idlelib",
         "importlib",
         "lib2to3",
-        "logging",
         "marshal",
         "mmap",
         "multiprocessing",
@@ -106,13 +105,11 @@ _DANGEROUS_WILDCARD_MODULES = frozenset(
         "syslog",
         "tarfile",
         "telnetlib",
-        "tempfile",
         "threading",
         "timeit",
         "trace",
         "urllib",
         "urllib2",
-        "uuid",
         "venv",
         "webbrowser",
         "zipfile",
@@ -134,6 +131,7 @@ _DANGEROUS_GLOBALS = frozenset(
         ("functools", "reduce"),
         ("joblib", "_pickle_load"),
         ("joblib", "load"),
+        ("logging.config", "listen"),
         ("numpy", "load"),
         ("numpy.testing._private.utils", "runstring"),
         ("operator", "attrgetter"),
@@ -155,6 +153,8 @@ _DANGEROUS_GLOBALS = frozenset(
         ("torch.storage", "_load_from_bytes"),
         ("types", "CodeType"),
         ("types", "FunctionType"),
+        ("uuid", "_get_command_stdout"),
+        ("uuid", "_popen"),
     }
 )
 
@@ -162,6 +162,7 @@ _WARNING_GLOBALS: dict[str, frozenset[str] | None] = {
     "functools": frozenset({"partial", "partialmethod"}),
     "glob": None,
     "linecache": frozenset({"getline"}),
+    "tempfile": frozenset({"mktemp"}),
 }
 
 _SUSPICIOUS_STRING_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
