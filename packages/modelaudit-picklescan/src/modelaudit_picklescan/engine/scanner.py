@@ -313,7 +313,6 @@ class _ScanState:
         self.deadline = time.monotonic() + options.timeout_s
         self.stack: list[Any] = []
         self.memo: dict[int | str, Any] = {}
-        self.next_memo_index = 0
         self.findings: list[Finding] = []
         self.notices: list[Notice] = []
         self.errors: list[ScanError] = []
@@ -361,7 +360,6 @@ class _ScanState:
                             self.first_pickle_end_pos = self.position_offset + self.stream.tell()
                         self.stack.clear()
                         self.memo.clear()
-                        self.next_memo_index = 0
                         break
 
                 if not parsed_opcode:
@@ -612,16 +610,13 @@ class _ScanState:
             return
 
         if op_name in _MEMO_WRITE_OPCODES:
-            if self.stack:
+            if self.stack and isinstance(arg, int):
                 self.memo[arg] = self.stack[-1]
-            if isinstance(arg, int):
-                self.next_memo_index = max(self.next_memo_index, arg + 1)
             return
 
         if op_name == "MEMOIZE":
             if self.stack:
-                self.memo[self.next_memo_index] = self.stack[-1]
-                self.next_memo_index += 1
+                self.memo[len(self.memo)] = self.stack[-1]
             return
 
         if op_name in _MEMO_READ_OPCODES:

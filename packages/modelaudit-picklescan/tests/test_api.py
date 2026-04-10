@@ -118,10 +118,18 @@ def test_scan_bytes_dict_mutation_operands_do_not_become_reduce_call_targets(pay
     )
 
 
-def test_scan_bytes_memoize_index_advances_after_explicit_memo_write() -> None:
-    payload = b"\x80\x04cbuiltins\nlen\nq\x00cos\nsystem\n\x94h\x01\x8c\x04echo\x85R."
-
-    report = scan_bytes(payload, source="memoize-after-put.pkl")
+@pytest.mark.parametrize(
+    ("payload", "source"),
+    [
+        (b"\x80\x04cbuiltins\nlen\nq\x00cos\nsystem\n\x94h\x01\x8c\x04echo\x85R.", "memoize-after-put.pkl"),
+        (b"\x80\x04cbuiltins\nlen\nqdcos\nsystem\n\x94h\x01\x8c\x04echo\x85R.", "memoize-after-sparse-put.pkl"),
+    ],
+)
+def test_scan_bytes_memoize_index_uses_runtime_memo_size_after_explicit_memo_write(
+    payload: bytes,
+    source: str,
+) -> None:
+    report = scan_bytes(payload, source=source)
 
     assert report.status == ScanStatus.COMPLETE
     assert report.verdict == SafetyVerdict.MALICIOUS
