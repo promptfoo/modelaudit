@@ -214,6 +214,84 @@ class TestKerasZipScanner:
 
         _assert_inconclusive_keras_zip_scan(keras_path, reason, expected_check_name)
 
+    def test_invalid_config_json_list_still_detects_get_file_gadget(self, tmp_path: Path) -> None:
+        """List-root configs are incomplete but can still contain structured CVE evidence."""
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            [
+                {
+                    "class_name": "Lambda",
+                    "config": {
+                        "fn": "get_file",
+                        "kwargs": {"origin": "https://example.invalid/payload.py"},
+                    },
+                }
+            ],
+            file_name="list_get_file.keras",
+        )
+
+        result = KerasZipScanner().scan(str(keras_path))
+        aggregate_result = scan_model_directory_or_file(
+            str(keras_path),
+            config={"cache_scan_results": False},
+        )
+
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-8747"]
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "keras_zip_config_invalid_type" in result.metadata["scan_outcome_reasons"]
+        assert len(cve_issues) == 1
+        assert cve_issues[0].severity == IssueSeverity.CRITICAL
+        assert determine_exit_code(aggregate_result) == 1
+
+    def test_invalid_config_json_list_still_checks_embedded_hdf5_weights(self, tmp_path: Path) -> None:
+        """Invalid config structure must not skip independent embedded weights checks."""
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            [],
+            keras_version="3.12.0",
+            file_name="list_with_external_weights.keras",
+            weights_h5_path=create_external_link_weights_h5(tmp_path),
+        )
+
+        result = KerasZipScanner().scan(str(keras_path))
+        aggregate_result = scan_model_directory_or_file(
+            str(keras_path),
+            config={"cache_scan_results": False},
+        )
+
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "keras_zip_config_invalid_type" in result.metadata["scan_outcome_reasons"]
+        assert len(cve_issues) == 1
+        assert cve_issues[0].severity == IssueSeverity.WARNING
+        assert determine_exit_code(aggregate_result) == 1
+
+    def test_invalid_config_json_list_fixed_keras_weights_stays_inconclusive_only(self, tmp_path: Path) -> None:
+        """Fixed-version metadata should prevent warning noise even when config shape is invalid."""
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            [],
+            keras_version="3.12.1",
+            file_name="fixed_list_with_external_weights.keras",
+            weights_h5_path=create_external_link_weights_h5(tmp_path),
+        )
+
+        aggregate_result = scan_model_directory_or_file(
+            str(keras_path),
+            config={"cache_scan_results": False},
+        )
+
+        metadata = aggregate_result.file_metadata[str(keras_path)]
+        security_issues = [
+            issue
+            for issue in aggregate_result.issues
+            if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        ]
+        assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+        assert "keras_zip_config_invalid_type" in metadata.get("scan_outcome_reasons")
+        assert security_issues == []
+        assert determine_exit_code(aggregate_result) == 2
+
     def test_missing_config_json_returns_inconclusive_exit2(self, tmp_path: Path) -> None:
         """A direct Keras ZIP scan without config.json cannot be security-complete."""
         keras_path = tmp_path / "missing_config.keras"

@@ -363,6 +363,8 @@ class KerasZipScanner(BaseScanner):
                         location=path,
                         details={"files": zf.namelist()},
                     )
+                    self._load_keras_metadata(zf, result)
+                    self._check_archive_security_members(zf, path, result)
                     self._merge_recursive_archive_scan(path, result)
                     self._finish_scan_result(result)
                     return result
@@ -394,6 +396,8 @@ class KerasZipScanner(BaseScanner):
                             "max_config_bytes": _KERAS_CONFIG_MAX_BYTES,
                         },
                     )
+                    self._load_keras_metadata(zf, result)
+                    self._check_archive_security_members(zf, path, result)
                     self._merge_recursive_archive_scan(path, result)
                     self._finish_scan_result(result)
                     return result
@@ -401,6 +405,9 @@ class KerasZipScanner(BaseScanner):
                 # CVE-2025-9906 can be detected in any parsed JSON shape; the
                 # rest of the structured model scan requires a top-level object.
                 self._check_unsafe_deserialization_bypass(model_config, result)
+                self._check_get_file_gadget(model_config, result)
+                self._load_keras_metadata(zf, result)
+
                 if not isinstance(model_config, dict):
                     self._mark_inconclusive_scan_result(result, "keras_zip_config_invalid_type")
                     result.add_check(
@@ -411,56 +418,15 @@ class KerasZipScanner(BaseScanner):
                         location=f"{path}/{config_info.filename}",
                         details={"actual_type": type(model_config).__name__, "expected_type": "dict"},
                     )
+                    self._check_archive_security_members(zf, path, result)
                     self._merge_recursive_archive_scan(path, result)
                     self._finish_scan_result(result)
                     return result
 
-                # CVE-2025-8747: Check for structured get_file gadget usage
-                self._check_get_file_gadget(model_config, result)
-
-                # Check for metadata.json
-                metadata_info = self._get_archive_member_info(zf, _KERAS_METADATA_ENTRY)
-                if metadata_info is not None:
-                    try:
-                        metadata_data = _read_zip_member_bounded(
-                            zf,
-                            metadata_info,
-                            _KERAS_METADATA_MAX_BYTES,
-                        )
-                        metadata = json.loads(metadata_data)
-                        result.metadata["keras_metadata"] = metadata
-                        keras_version = metadata.get("keras_version")
-                        if isinstance(keras_version, str) and keras_version.strip():
-                            result.metadata["keras_version"] = keras_version.strip()
-                    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
-                        pass  # Metadata parsing is optional
-
-                self._check_embedded_hdf5_weights_external_references(zf, result)
-
                 # Scan model configuration
                 self._scan_model_config(model_config, result)
 
-                # Check for suspicious files in the ZIP
-                for filename in zf.namelist():
-                    normalized_name = filename.lower()
-                    if normalized_name.endswith((".py", ".pyc", ".pyo")):
-                        result.add_check(
-                            name="Python File Detection",
-                            passed=False,
-                            message=f"Python file found in Keras ZIP: {filename}",
-                            severity=IssueSeverity.WARNING,
-                            location=f"{path}/{filename}",
-                            details={"filename": filename},
-                        )
-                    elif is_executable_archive_member_name(normalized_name):
-                        result.add_check(
-                            name="Executable File Detection",
-                            passed=False,
-                            message=f"Executable file found in Keras ZIP: {filename}",
-                            severity=IssueSeverity.CRITICAL,
-                            location=f"{path}/{filename}",
-                            details={"filename": filename},
-                        )
+                self._check_archive_security_members(zf, path, result)
 
                 self._merge_recursive_archive_scan(path, result)
 
@@ -493,6 +459,58 @@ class KerasZipScanner(BaseScanner):
 
         self._finish_scan_result(result)
         return result
+
+    def _load_keras_metadata(self, archive: zipfile.ZipFile, result: ScanResult) -> None:
+        metadata_info = self._get_archive_member_info(archive, _KERAS_METADATA_ENTRY)
+        if metadata_info is None:
+            return
+
+        try:
+            metadata_data = _read_zip_member_bounded(
+                archive,
+                metadata_info,
+                _KERAS_METADATA_MAX_BYTES,
+            )
+            metadata = json.loads(metadata_data)
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+            return
+
+        if not isinstance(metadata, dict):
+            return
+
+        result.metadata["keras_metadata"] = metadata
+        keras_version = metadata.get("keras_version")
+        if isinstance(keras_version, str) and keras_version.strip():
+            result.metadata["keras_version"] = keras_version.strip()
+
+    def _check_archive_security_members(
+        self,
+        archive: zipfile.ZipFile,
+        archive_path: str,
+        result: ScanResult,
+    ) -> None:
+        self._check_embedded_hdf5_weights_external_references(archive, result)
+
+        for filename in archive.namelist():
+            normalized_name = filename.lower()
+            if normalized_name.endswith((".py", ".pyc", ".pyo")):
+                result.add_check(
+                    name="Python File Detection",
+                    passed=False,
+                    message=f"Python file found in Keras ZIP: {filename}",
+                    severity=IssueSeverity.WARNING,
+                    location=f"{archive_path}/{filename}",
+                    details={"filename": filename},
+                )
+            elif is_executable_archive_member_name(normalized_name):
+                result.add_check(
+                    name="Executable File Detection",
+                    passed=False,
+                    message=f"Executable file found in Keras ZIP: {filename}",
+                    severity=IssueSeverity.CRITICAL,
+                    location=f"{archive_path}/{filename}",
+                    details={"filename": filename},
+                )
 
     @staticmethod
     def _mark_inconclusive_scan_result(result: ScanResult, reason: str) -> None:
@@ -996,7 +1014,7 @@ class KerasZipScanner(BaseScanner):
                     why=get_cve_2025_1550_explanation("untrusted_module"),
                 )
 
-    def _check_get_file_gadget(self, model_config: dict[str, Any], result: ScanResult) -> None:
+    def _check_get_file_gadget(self, model_config: Any, result: ScanResult) -> None:
         """Check for CVE-2025-8747: keras.utils.get_file gadget bypass.
 
         CVE-2025-8747: Bypass of CVE-2025-1550 fix. Uses keras.utils.get_file
