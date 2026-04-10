@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.jinja2_template_scanner import Jinja2TemplateScanner
 
@@ -330,8 +331,73 @@ class TestJinja2TemplateScannerEdgeCases:
         scanner = Jinja2TemplateScanner()
         result = scanner.scan(str(tokenizer_file))
 
-        # Should complete (may or may not succeed depending on implementation)
-        assert result is not None
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == "inconclusive"
+        assert "jinja2_json_parse_failed" in result.metadata["scan_outcome_reasons"]
+        parsing_checks = [c for c in result.checks if c.name == "Template Config Parsing"]
+        assert len(parsing_checks) == 1
+        assert parsing_checks[0].status == CheckStatus.FAILED
+        assert parsing_checks[0].severity == IssueSeverity.INFO
+
+    def test_malformed_json_raw_template_fallback_detects_ssti(self, tmp_path: Path) -> None:
+        """Malformed tokenizer configs should still scan visible raw template payloads."""
+        tokenizer_file = tmp_path / "tokenizer_config.json"
+        tokenizer_file.write_text(
+            '{"chat_template":"{{ lipsum.__globals__.os.popen(\'id\').read() }}",',
+            encoding="utf-8",
+        )
+
+        scanner = Jinja2TemplateScanner()
+        result = scanner.scan(str(tokenizer_file))
+
+        assert result.metadata["scan_outcome"] == "inconclusive"
+        assert "jinja2_json_parse_failed" in result.metadata["scan_outcome_reasons"]
+        failed_checks = [c for c in result.checks if c.name == "Jinja2 Template Injection Detection"]
+        assert failed_checks
+        assert any(c.details.get("template_location") == "raw_json_parse_fallback" for c in failed_checks)
+        assert any(c.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for c in failed_checks)
+
+        aggregate_result = scan_model_directory_or_file(
+            str(tokenizer_file),
+            config={"cache_scan_results": False},
+        )
+        assert determine_exit_code(aggregate_result) == 1
+
+    def test_malformed_yaml_raw_template_fallback_detects_ssti(self, tmp_path: Path) -> None:
+        """Malformed YAML configs should use the same bounded raw template fallback."""
+        pytest.importorskip("yaml")
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        yaml_file = model_dir / "config.yaml"
+        yaml_file.write_text(
+            "template: \"{{ lipsum.__globals__.os.popen('id').read() }}\"\nbroken: [\n",
+            encoding="utf-8",
+        )
+
+        result = Jinja2TemplateScanner().scan(str(yaml_file))
+
+        assert result.metadata["scan_outcome"] == "inconclusive"
+        assert "jinja2_yaml_parse_failed" in result.metadata["scan_outcome_reasons"]
+        failed_checks = [c for c in result.checks if c.name == "Jinja2 Template Injection Detection"]
+        assert failed_checks
+        assert any(c.details.get("template_location") == "raw_yaml_parse_fallback" for c in failed_checks)
+
+    def test_malformed_json_without_raw_template_returns_inconclusive_exit2(self, tmp_path: Path) -> None:
+        """Malformed structured configs without recoverable templates should fail closed."""
+        tokenizer_file = tmp_path / "tokenizer_config.json"
+        tokenizer_file.write_text("{invalid json content", encoding="utf-8")
+
+        result = scan_model_directory_or_file(
+            str(tokenizer_file),
+            config={"cache_scan_results": False},
+        )
+
+        metadata = result.file_metadata[str(tokenizer_file)]
+        assert metadata.get("scan_outcome") == "inconclusive"
+        assert "jinja2_json_parse_failed" in metadata.get("scan_outcome_reasons")
+        assert result.success is False
+        assert result.has_errors is False
+        assert determine_exit_code(result) == 2
 
     def test_handles_json_without_templates(self, tmp_path: Path) -> None:
         """Test handling of JSON file without template fields."""

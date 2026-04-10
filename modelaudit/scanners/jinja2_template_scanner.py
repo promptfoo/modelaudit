@@ -26,7 +26,7 @@ from typing import Any, ClassVar
 
 from modelaudit.detectors.suspicious_symbols import JINJA2_SSTI_PATTERNS
 
-from .base import BaseScanner, IssueSeverity, ScanResult, logger
+from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult, logger
 
 # Optional GGUF support with graceful fallback
 try:
@@ -54,6 +54,11 @@ try:
     HAS_YAML = True
 except ImportError:
     HAS_YAML = False
+
+
+_INCONCLUSIVE_METADATA_KEY = "scan_outcome"
+_INCONCLUSIVE_REASONS_METADATA_KEY = "scan_outcome_reasons"
+_RAW_PARSE_FALLBACK_READ_BYTES = 256 * 1024
 
 
 class MLContext:
@@ -86,6 +91,10 @@ class DetectionResult:
         self.risk_level = risk_level
         self.location = location
         self.explanation = explanation
+
+
+def _scan_result_has_security_findings(result: ScanResult) -> bool:
+    return any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
 
 
 class Jinja2TemplateScanner(BaseScanner):
@@ -188,9 +197,27 @@ class Jinja2TemplateScanner(BaseScanner):
             }
 
             # Extract templates based on file type
-            templates = self._extract_templates(path, context)
+            templates, extraction_failures = self._extract_templates(path, context)
+            for failure in extraction_failures:
+                self._mark_inconclusive_scan_result(result, path, failure)
 
             if not templates:
+                if extraction_failures:
+                    result.add_check(
+                        name="Template Extraction",
+                        passed=False,
+                        message="Template extraction incomplete due to malformed structured config",
+                        severity=IssueSeverity.INFO,
+                        location=path,
+                        details={
+                            "file_type": context.file_type,
+                            "failure_reasons": [failure["reason"] for failure in extraction_failures],
+                        },
+                    )
+                    result.bytes_scanned = file_size
+                    self._finish_scan_result(result)
+                    return result
+
                 result.add_check(
                     name="Template Extraction",
                     passed=True,
@@ -253,7 +280,7 @@ class Jinja2TemplateScanner(BaseScanner):
                 )
 
             result.bytes_scanned = file_size
-            result.finish(success=True)
+            self._finish_scan_result(result)
             return result
 
         except Exception as e:
@@ -277,6 +304,40 @@ class Jinja2TemplateScanner(BaseScanner):
             )
             result.finish(success=False)
             return result
+
+    def _mark_inconclusive_scan_result(
+        self,
+        result: ScanResult,
+        location: str,
+        failure: dict[str, Any],
+    ) -> None:
+        reason = str(failure["reason"])
+        reasons = result.metadata.get(_INCONCLUSIVE_REASONS_METADATA_KEY)
+        if not isinstance(reasons, list):
+            reasons = []
+        if reason not in reasons:
+            reasons.append(reason)
+
+        result.metadata[_INCONCLUSIVE_METADATA_KEY] = INCONCLUSIVE_SCAN_OUTCOME
+        result.metadata[_INCONCLUSIVE_REASONS_METADATA_KEY] = reasons
+        result.add_check(
+            name="Template Config Parsing",
+            passed=False,
+            message=f"Failed to parse {failure['format']} config for template extraction",
+            severity=IssueSeverity.INFO,
+            location=location,
+            details=failure,
+        )
+
+    @staticmethod
+    def _finish_scan_result(result: ScanResult) -> None:
+        if result.metadata.get(
+            _INCONCLUSIVE_METADATA_KEY
+        ) == INCONCLUSIVE_SCAN_OUTCOME and not _scan_result_has_security_findings(result):
+            result.finish(success=False)
+            return
+
+        result.finish(success=True)
 
     def _determine_context(self, path: str) -> MLContext:
         """Determine ML context and file type"""
@@ -317,23 +378,28 @@ class Jinja2TemplateScanner(BaseScanner):
 
         return context
 
-    def _extract_templates(self, path: str, context: MLContext) -> dict[str, str]:
+    def _extract_templates(self, path: str, context: MLContext) -> tuple[dict[str, str], list[dict[str, Any]]]:
         """Extract Jinja2 templates from various file formats"""
-        templates = {}
+        templates: dict[str, str] = {}
+        extraction_failures: list[dict[str, Any]] = []
 
         try:
             if context.file_type == "gguf" and HAS_GGUF:
                 templates.update(self._extract_gguf_templates(path))
             elif context.file_type in ["json", "tokenizer_config"]:
-                templates.update(self._extract_json_templates(path))
+                extracted, failures = self._extract_json_templates(path)
+                templates.update(extracted)
+                extraction_failures.extend(failures)
             elif context.file_type == "yaml":
-                templates.update(self._extract_yaml_templates(path))
+                extracted, failures = self._extract_yaml_templates(path)
+                templates.update(extracted)
+                extraction_failures.extend(failures)
             elif context.file_type == "template":
                 templates.update(self._extract_template_file(path))
         except Exception as e:
             logger.warning(f"Failed to extract templates from {path}: {e}")
 
-        return templates
+        return templates, extraction_failures
 
     def _extract_gguf_templates(self, path: str) -> dict[str, str]:
         """Extract chat templates from GGUF metadata"""
@@ -360,9 +426,10 @@ class Jinja2TemplateScanner(BaseScanner):
 
         return templates
 
-    def _extract_json_templates(self, path: str) -> dict[str, str]:
+    def _extract_json_templates(self, path: str) -> tuple[dict[str, str], list[dict[str, Any]]]:
         """Extract templates from JSON configuration files"""
         templates: dict[str, str] = {}
+        extraction_failures: list[dict[str, Any]] = []
 
         try:
             with open(path, encoding="utf-8") as f:
@@ -373,8 +440,10 @@ class Jinja2TemplateScanner(BaseScanner):
 
         except Exception as e:
             logger.debug(f"Error extracting JSON templates: {e}")
+            extraction_failures.append(self._template_extraction_failure("json", "jinja2_json_parse_failed", e))
+            self._extract_raw_template_fallback(path, templates, "raw_json_parse_fallback")
 
-        return templates
+        return templates, extraction_failures
 
     def _find_json_templates(self, data: Any, templates: dict[str, str], path: str) -> None:
         """Recursively find template strings in JSON data"""
@@ -406,12 +475,13 @@ class Jinja2TemplateScanner(BaseScanner):
                 current_path = f"{path}[{i}]" if path else f"[{i}]"
                 self._find_json_templates(item, templates, current_path)
 
-    def _extract_yaml_templates(self, path: str) -> dict[str, str]:
+    def _extract_yaml_templates(self, path: str) -> tuple[dict[str, str], list[dict[str, Any]]]:
         """Extract templates from YAML configuration files"""
         templates: dict[str, str] = {}
+        extraction_failures: list[dict[str, Any]] = []
 
         if not HAS_YAML:
-            return templates
+            return templates, extraction_failures
 
         try:
             with open(path, encoding="utf-8") as f:
@@ -422,8 +492,33 @@ class Jinja2TemplateScanner(BaseScanner):
 
         except Exception as e:
             logger.debug(f"Error extracting YAML templates: {e}")
+            extraction_failures.append(self._template_extraction_failure("yaml", "jinja2_yaml_parse_failed", e))
+            self._extract_raw_template_fallback(path, templates, "raw_yaml_parse_fallback")
 
-        return templates
+        return templates, extraction_failures
+
+    def _template_extraction_failure(self, config_format: str, reason: str, error: Exception) -> dict[str, Any]:
+        return {
+            "format": config_format,
+            "reason": reason,
+            "exception": str(error),
+            "exception_type": type(error).__name__,
+        }
+
+    def _extract_raw_template_fallback(self, path: str, templates: dict[str, str], template_key: str) -> None:
+        try:
+            with open(path, "rb") as f:
+                raw = f.read(_RAW_PARSE_FALLBACK_READ_BYTES + 1)
+        except OSError as exc:
+            logger.debug("Error reading raw template fallback from %s: %s", path, exc)
+            return
+
+        if len(raw) > _RAW_PARSE_FALLBACK_READ_BYTES:
+            return
+
+        text = raw.decode("utf-8", errors="replace")
+        if self._looks_like_template(text) and len(text) <= self.max_template_size:
+            templates[template_key] = text
 
     def _extract_template_file(self, path: str) -> dict[str, str]:
         """Extract content from standalone template files"""
