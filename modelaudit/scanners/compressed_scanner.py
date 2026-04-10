@@ -318,12 +318,8 @@ class CompressedScanner(BaseScanner):
                 compressed_size=compressed_size,
             )
 
-        def _remaining_decompressed_budget() -> int:
-            return max(max_decompressed_bytes - total_out, 0)
-
         def _probe_limit() -> int:
-            remaining_budget = _remaining_decompressed_budget()
-            return remaining_budget + 1 if remaining_budget > 0 else 1
+            return CompressedScanner._probe_limit(total_out, max_decompressed_bytes, chunk_size)
 
         while True:
             pending = source.read(chunk_size)

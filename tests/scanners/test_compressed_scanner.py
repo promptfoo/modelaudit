@@ -297,8 +297,8 @@ def test_read_zlib_stream_uses_bounded_decompression(monkeypatch: pytest.MonkeyP
     )
 
     assert fake_decompressor.max_lengths
-    assert fake_decompressor.max_lengths == [1025, 769, 513]
-    assert fake_decompressor.flush_lengths == [257]
+    assert fake_decompressor.max_lengths == [4, 4, 4]
+    assert fake_decompressor.flush_lengths == [4]
 
 
 def test_read_concatenated_stream_uses_chunk_bounded_decompression() -> None:
