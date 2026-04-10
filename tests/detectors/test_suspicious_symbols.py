@@ -229,7 +229,7 @@ class TestSuspiciousOps:
 
     def test_critical_operations_present(self) -> None:
         """Test that critical dangerous operations are included."""
-        critical_ops = ["PyFunc", "ReadFile", "WriteFile", "ShellExecute"]
+        critical_ops = ["PyFunc", "ReadFile", "WriteFile", "ShellExecute", "LoadLibrary"]
 
         for op in critical_ops:
             assert op in SUSPICIOUS_OPS, f"Critical operation {op} not flagged"

@@ -29,6 +29,7 @@ from ..config.explanations import (
     get_pattern_explanation,
 )
 from ..utils.file.detection import _normalize_archive_member_name, _read_zip_member_bounded
+from .archive_member_security import is_executable_archive_member_name
 from .base import BaseScanner, IssueSeverity, ScanResult
 from .keras_utils import (
     check_custom_loss_config,
@@ -434,7 +435,7 @@ class KerasZipScanner(BaseScanner):
                             location=f"{path}/{filename}",
                             details={"filename": filename},
                         )
-                    elif normalized_name.endswith((".sh", ".bat", ".exe", ".dll")):
+                    elif is_executable_archive_member_name(normalized_name):
                         result.add_check(
                             name="Executable File Detection",
                             passed=False,

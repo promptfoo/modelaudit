@@ -605,6 +605,8 @@ SUSPICIOUS_OPS = {
     # System operations - CRITICAL RISK
     "ShellExecute",  # Execute shell commands
     "ExecuteOp",  # Execute arbitrary operations
+    "LoadLibrary",  # Load native TensorFlow op libraries
+    "LoadLibraryV2",  # Load native TensorFlow op libraries (V2 variant)
     "SystemConfig",  # System configuration access
     # Queue operations - data exfiltration risk
     "QueueEnqueue",  # Enqueue data (potential exfiltration)
@@ -648,6 +650,8 @@ TENSORFLOW_DANGEROUS_OPS: dict[str, str] = {
     # System operations - CRITICAL RISK
     "ShellExecute": "Can execute shell commands",
     "ExecuteOp": "Can execute arbitrary operations",
+    "LoadLibrary": "Can load native TensorFlow op libraries",
+    "LoadLibraryV2": "Can load native TensorFlow op libraries (V2 variant)",
     "SystemConfig": "Can access system configuration",
     # Queue operations - data exfiltration risk
     "QueueEnqueue": "Can enqueue data to queues, potential data exfiltration vector",

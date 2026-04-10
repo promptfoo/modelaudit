@@ -240,6 +240,25 @@ def test_detect_pyfunc_operation(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+@pytest.mark.parametrize("op_name", ["LoadLibrary", "LoadLibraryV2"])
+def test_detect_loadlibrary_operation(tmp_path: Path, op_name: str) -> None:
+    model_path = _create_test_savedmodel_with_op(tmp_path, op_name, f"{op_name.lower()}_test")
+
+    result = TensorFlowSavedModelScanner().scan(model_path)
+
+    load_library_issues = [
+        issue
+        for issue in result.issues
+        if issue.message and f"Dangerous TensorFlow operation: {op_name}" in issue.message
+    ]
+    assert result.success is False
+    assert load_library_issues
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in load_library_issues)
+    assert all(issue.details.get("op_type") == op_name for issue in load_library_issues)
+    assert all(issue.why for issue in load_library_issues)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 def test_detect_writefile_operation(tmp_path: Path) -> None:
     # Synthesize a SavedModel containing a WriteFile node
     model_path = _create_test_savedmodel_with_op(tmp_path, "WriteFile", "writefile_test")
@@ -1083,7 +1102,7 @@ def test_tf_scanner_explanations_for_all_suspicious_ops(tmp_path: Path) -> None:
 def test_tf_scanner_explanation_categories(tmp_path: Path) -> None:
     """Test that TensorFlow scanner provides appropriate explanations by operation category."""
     # Test critical risk operations (code execution)
-    critical_ops = ["PyFunc", "PyCall", "ExecuteOp", "ShellExecute"]
+    critical_ops = ["PyFunc", "PyCall", "ExecuteOp", "ShellExecute", "LoadLibrary"]
     for op_name in critical_ops:
         model_path = _create_test_savedmodel_with_op(tmp_path, op_name, f"critical_test_{op_name.lower()}")
 

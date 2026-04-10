@@ -65,6 +65,34 @@ def test_cntk_scanner_detects_multi_signal_payload_as_critical(tmp_path: Path) -
     assert any("multiple independent suspicious signals" in issue.message.lower() for issue in result.issues)
 
 
+def test_cntk_scanner_detects_split_native_library_load_reference(tmp_path: Path) -> None:
+    path = tmp_path / "split_native_load.dnn"
+    payload = b" native_user_function\x00C:\\temp\\evil.dll "
+    _write_cntkv2(path, payload=payload)
+
+    result = CntkScanner().scan(str(path))
+
+    matching_issues = [
+        issue
+        for issue in result.issues
+        if issue.details.get("category") == "external_load_reference"
+        and "library_reference=C:\\temp\\evil.dll" in " ".join(issue.details.get("examples", []))
+    ]
+    assert matching_issues
+    assert all(issue.severity == IssueSeverity.WARNING for issue in matching_issues)
+
+
+def test_cntk_scanner_split_load_correlation_ignores_generic_metadata(tmp_path: Path) -> None:
+    path = tmp_path / "benign_split_words.cmf"
+    payload = b" module\x00/model/base\x00library_version\x00native_user_functional_features\x00evil.dllcache "
+    _write_cntkv2(path, payload=payload)
+
+    result = CntkScanner().scan(str(path))
+
+    assert result.success is True
+    assert result.issues == []
+
+
 def test_cntk_scanner_false_positive_control_no_critical(tmp_path: Path) -> None:
     path = tmp_path / "benign_risky_words.cmf"
     payload = b" exec_summary network_score library_version model_path=/models/base "
