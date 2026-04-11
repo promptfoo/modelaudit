@@ -48,6 +48,7 @@ from modelaudit.scanners.pickle_scanner import (
     _simulate_symbolic_reference_maps,
     check_opcode_sequence,
 )
+from modelaudit.scanners.pickle_support import _NESTED_PICKLE_VALIDATION_WINDOW_BYTES
 from modelaudit.scanners.rule_mapper import get_pickle_opcode_rule_code
 from tests.assets.generators.generate_advanced_pickle_tests import (
     generate_memo_based_attack,
@@ -130,6 +131,19 @@ def _make_dup_heavy_pickle(iterations: int) -> bytes:
         payload += b"h\x002a0"
     payload += b"."
     return bytes(payload)
+
+
+def _make_os_system_pickle() -> bytes:
+    class Evil:
+        def __reduce__(self) -> tuple[object, tuple[str]]:
+            return (os.system, ("echo nested-pickle",))
+
+    return pickle.dumps(Evil(), protocol=4)
+
+
+def _make_delayed_os_system_pickle() -> bytes:
+    padding = b"K\x010" * ((_NESTED_PICKLE_VALIDATION_WINDOW_BYTES // 3) + 16)
+    return b"\x80\x04" + padding + b"cos\nsystem\n\x8c\x12echo nested-pickle\x85R."
 
 
 class _SliceCountingSearchWindow:
@@ -1939,7 +1953,7 @@ def test_post_budget_global_scan_uses_consumed_opcode_boundary(tmp_path: Path) -
 def test_post_budget_opcode_scan_uses_consumed_opcode_boundary(tmp_path: Path) -> None:
     """Opcode tail scans should start at the consumed boundary, not inside the prior payload."""
     pickle_path = tmp_path / "post-budget-opcode-consumed-boundary.pkl"
-    inner_pickle = pickle.dumps({"ab": 1}, protocol=4)
+    inner_pickle = _make_os_system_pickle()
     poison_payload = b"\x8c\xff" + (b"A" * 4998)
     payload = (
         b"\x80\x04"
@@ -2176,7 +2190,7 @@ def test_scan_pickle_detects_post_budget_stack_global_with_binget(tmp_path: Path
 
 def test_post_budget_opcode_scan_detects_nested_pickle_payload(tmp_path: Path) -> None:
     """Nested inner pickle payloads beyond the opcode budget should still be surfaced."""
-    inner_pickle = pickle.dumps({"ab": 1}, protocol=4)
+    inner_pickle = _make_os_system_pickle()
     pickle_path = tmp_path / "post-budget-nested-pickle.pkl"
     benign_padding = _make_opcode_padding_stream(opcode_pairs=512)
     malicious_stream = b"\x80\x04B" + struct.pack("<I", len(inner_pickle)) + inner_pickle + b"."
@@ -2193,10 +2207,6 @@ def test_post_budget_opcode_scan_detects_nested_pickle_payload(tmp_path: Path) -
         finding["check_name"] == "Nested Pickle Detection" and finding["details"].get("opcode") == "BINBYTES"
         for finding in checks[0].details["findings"]
     ), checks[0].details
-    assert not any(
-        check.name == "Post-Budget Global Reference Scan" and check.status == CheckStatus.FAILED
-        for check in result.checks
-    ), f"Expected opcode-based detection, got: {result.checks}"
     assert result.success is False
 
 
@@ -2204,7 +2214,7 @@ def test_post_budget_opcode_scan_detects_encoded_pickle_payload(tmp_path: Path) 
     """Encoded inner pickle payloads beyond the opcode budget should still be surfaced."""
     import base64
 
-    inner_pickle = pickle.dumps({"ab": 1}, protocol=4)
+    inner_pickle = _make_os_system_pickle()
     encoded_pickle = base64.b64encode(inner_pickle)
     pickle_path = tmp_path / "post-budget-encoded-pickle.pkl"
     benign_padding = _make_opcode_padding_stream(opcode_pairs=512)
@@ -3436,40 +3446,85 @@ class TestDillLoadersRegression:
         ]
         assert len(ignored_pe_issues) == 0, "Validated PE signatures should not be suppressed"
 
-    def test_nested_pickle_detection(self):
-        """Scanner should detect nested pickle bytes and encoded payloads"""
+    def test_benign_nested_pickle_detection_is_info_only(self, tmp_path: Path) -> None:
+        """Benign nested pickle bytes and encoded payloads should not be critical."""
         scanner = PickleScanner()
 
         import base64
-        import os
-        import tempfile
 
-        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
-            try:
-                inner = {"a": 1}
-                inner_bytes = pickle.dumps(inner)
-                outer = {
-                    "raw": inner_bytes,
-                    "enc": base64.b64encode(inner_bytes).decode("ascii"),
-                }
-                pickle.dump(outer, f)
-                f.flush()
-                f.close()  # Close file before scanning (required on Windows to allow deletion)
+        inner = {"a": 1}
+        inner_bytes = pickle.dumps(inner)
+        outer = {
+            "raw": inner_bytes,
+            "enc": base64.b64encode(inner_bytes).decode("ascii"),
+        }
+        pickle_path = tmp_path / "benign-nested.pkl"
+        pickle_path.write_bytes(pickle.dumps(outer))
 
-                result = scanner.scan(f.name)
+        result = scanner.scan(str(pickle_path))
 
-                assert result.success
+        assert result.success
 
-                nested_issues = [
-                    i
-                    for i in result.issues
-                    if "nested pickle payload" in i.message.lower() or "encoded pickle payload" in i.message.lower()
-                ]
-                assert nested_issues
-                assert any(i.severity == IssueSeverity.CRITICAL for i in nested_issues)
+        nested_issues = [
+            i
+            for i in result.issues
+            if "nested pickle payload" in i.message.lower() or "encoded pickle payload" in i.message.lower()
+        ]
+        assert nested_issues
+        assert all(i.severity == IssueSeverity.INFO for i in nested_issues)
+        assert not any(i.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for i in nested_issues)
 
-            finally:
-                os.unlink(f.name)
+    def test_malicious_nested_pickle_detection_stays_critical(self, tmp_path: Path) -> None:
+        """Nested pickle payloads with dangerous reducers should remain critical."""
+        scanner = PickleScanner()
+
+        import base64
+
+        inner_bytes = _make_os_system_pickle()
+        outer = {
+            "raw": inner_bytes,
+            "enc": base64.b64encode(inner_bytes).decode("ascii"),
+        }
+        pickle_path = tmp_path / "malicious-nested.pkl"
+        pickle_path.write_bytes(pickle.dumps(outer))
+
+        result = scanner.scan(str(pickle_path))
+
+        nested_issues = [
+            i
+            for i in result.issues
+            if "nested pickle payload" in i.message.lower() or "encoded pickle payload" in i.message.lower()
+        ]
+        assert nested_issues
+        assert any(i.severity == IssueSeverity.CRITICAL for i in nested_issues)
+
+    def test_nested_pickle_detection_scans_beyond_validation_sample(self, tmp_path: Path) -> None:
+        """Dangerous nested evidence beyond the header-validation window should stay critical."""
+        scanner = PickleScanner()
+        pickle_path = tmp_path / "delayed-malicious-nested.pkl"
+        pickle_path.write_bytes(pickle.dumps({"raw": _make_delayed_os_system_pickle()}))
+
+        result = scanner.scan(str(pickle_path))
+
+        nested_issues = [i for i in result.issues if "nested pickle payload" in i.message.lower()]
+        assert nested_issues
+        assert any(
+            i.severity == IssueSeverity.CRITICAL and i.details.get("evidence") == "dangerous_execution"
+            for i in nested_issues
+        )
+
+    def test_safe_nested_reduce_detection_is_info_only(self, tmp_path: Path) -> None:
+        """Benign nested reconstruction opcodes should not warn without dangerous evidence."""
+        scanner = PickleScanner()
+        pickle_path = tmp_path / "safe-nested-reduce.pkl"
+        pickle_path.write_bytes(pickle.dumps({"raw": pickle.dumps(slice(1, 5, 2), protocol=4)}))
+
+        result = scanner.scan(str(pickle_path))
+
+        assert result.success
+        nested_issues = [i for i in result.issues if "nested pickle payload" in i.message.lower()]
+        assert nested_issues
+        assert all(i.severity == IssueSeverity.INFO for i in nested_issues)
 
 
 class TestPickleScannerBlocklistHardening(unittest.TestCase):
