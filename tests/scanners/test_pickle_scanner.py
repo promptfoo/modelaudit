@@ -3506,6 +3506,21 @@ class TestDillLoadersRegression:
         assert nested_issues
         assert any(i.severity == IssueSeverity.CRITICAL for i in nested_issues)
 
+    def test_nested_pickle_detection_scans_later_streams_after_benign_prefix(self) -> None:
+        """A benign first pickle stream should not mask a malicious follow-on stream."""
+        benign_stream = pickle.dumps({"safe": True})
+        malicious_stream = _make_os_system_pickle()
+
+        severity, evidence, details = _classify_nested_pickle_payload(
+            benign_stream + malicious_stream,
+            SimpleNamespace(offset=0),
+            {},
+        )
+
+        assert severity == IssueSeverity.CRITICAL
+        assert evidence == "dangerous_execution"
+        assert details["evidence"] == "dangerous_execution"
+
     def test_nested_pickle_parse_error_preserves_collected_dangerous_opcodes(self) -> None:
         """Trailing parse errors should not hide dangerous nested opcodes already seen."""
         severity, evidence, details = _classify_nested_pickle_payload(

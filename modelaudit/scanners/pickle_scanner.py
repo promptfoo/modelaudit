@@ -3411,6 +3411,7 @@ def _classify_nested_pickle_payload(
     try:
         for opcode_info in _genops_with_fallback(
             io.BytesIO(nested_bytes),
+            multi_stream=True,
             max_items=_POST_BUDGET_OPCODE_SCAN_LIMIT_OPCODES,
         ):
             opcodes.append(opcode_info)
