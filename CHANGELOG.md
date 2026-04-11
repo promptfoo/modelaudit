@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- mark malformed SafeTensors scans inconclusive instead of clean
 - preserve picklescan stack state across reused scanner runs
 - mark partial streaming scans inconclusive when large-file streaming coverage is incomplete
 - harden native code detection in model scanners ([#897](https://github.com/promptfoo/modelaudit/issues/897)) ([f4f661a](https://github.com/promptfoo/modelaudit/commit/f4f661a09be0032e15aa8895864413e3878233f8))
