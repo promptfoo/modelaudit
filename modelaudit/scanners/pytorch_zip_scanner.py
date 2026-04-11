@@ -215,7 +215,14 @@ class PyTorchZipScanner(BaseScanner):
                 self._check_pytorch_vulnerabilities(zip_file, safe_entries, result, path)
 
                 # Scan all discovered pickle files
-                bytes_scanned = self._scan_pickle_files(zip_file, pickle_files, result, path)
+                trusted_pytorch_storage_context = self._has_trusted_pytorch_storage_context(safe_entries)
+                bytes_scanned = self._scan_pickle_files(
+                    zip_file,
+                    pickle_files,
+                    result,
+                    path,
+                    trusted_pytorch_storage_context=trusted_pytorch_storage_context,
+                )
                 self._check_timeout()  # Check timeout after pickle scanning
 
                 # Validate tensor metadata consistency (CVE-2026-24747)
@@ -653,6 +660,8 @@ class PyTorchZipScanner(BaseScanner):
         pickle_files: list[zipfile.ZipInfo],
         result: ScanResult,
         path: str,
+        *,
+        trusted_pytorch_storage_context: bool,
     ) -> int:
         """Scan all discovered pickle files for malicious content"""
         bytes_scanned = 0
@@ -708,7 +717,8 @@ class PyTorchZipScanner(BaseScanner):
                     )
             sub_result.metadata.setdefault("archive_file_size", original_file_size)
             apply_pickle_member_context(sub_result, archive_path=path, member_name=name)
-            if os.path.basename(name) == "data.pkl":
+            normalized_name = name.replace("\\", "/")
+            if trusted_pytorch_storage_context and normalized_name.rsplit("/", 1)[-1] == "data.pkl":
                 self._downgrade_trusted_storage_persistent_ids(sub_result)
 
             # Add CVE-2025-32434 specific warnings
@@ -716,6 +726,20 @@ class PyTorchZipScanner(BaseScanner):
             result.merge(sub_result)
 
         return bytes_scanned
+
+    @classmethod
+    def _has_trusted_pytorch_storage_context(cls, safe_entries: list[zipfile.ZipInfo]) -> bool:
+        """Return whether the archive has PyTorch ZIP storage markers around data.pkl."""
+        names = {cls._get_zip_member_name(entry).replace("\\", "/").lstrip("/") for entry in safe_entries}
+        for name in names:
+            if name.rsplit("/", 1)[-1] != "data.pkl":
+                continue
+            prefix = name[: -len("data.pkl")]
+            if f"{prefix}version" not in names:
+                continue
+            if any(candidate.startswith(f"{prefix}data/") for candidate in names):
+                return True
+        return False
 
     @staticmethod
     def _is_pytorch_storage_persistent_id_record(details: dict[str, Any]) -> bool:

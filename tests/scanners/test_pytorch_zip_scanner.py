@@ -641,10 +641,8 @@ def test_pytorch_zip_scanner_trusts_storage_persistent_ids_in_data_pkl(tmp_path:
     payload = (
         b"\x80\x04(\x8c\x07storage\x94\x8c\x05torch\x94\x8c\x0cFloatStorage\x94\x93\x8c\x01k\x94\x8c\x03cpu\x94K\x01tQ."
     )
-    model_path = tmp_path / "storage_persistent_id.pt"
-    with zipfile.ZipFile(model_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/byteorder", "little")
+    model_path = create_mock_pytorch_zip(tmp_path / "storage_persistent_id.pt", with_pickle=False, prefix="archive")
+    with zipfile.ZipFile(model_path, "a") as zipf:
         zipf.writestr("archive/data.pkl", payload)
         zipf.writestr("archive/data/0", b"\x00" * 8)
 
@@ -656,6 +654,22 @@ def test_pytorch_zip_scanner_trusts_storage_persistent_ids_in_data_pkl(tmp_path:
     assert trusted_checks
     assert all(check.status == CheckStatus.PASSED for check in trusted_checks)
     assert all(check.severity == IssueSeverity.INFO for check in trusted_checks)
+
+
+def test_pytorch_zip_scanner_does_not_trust_storage_persistent_ids_without_storage_layout(
+    tmp_path: Path,
+) -> None:
+    payload = (
+        b"\x80\x04(\x8c\x07storage\x94\x8c\x05torch\x94\x8c\x0cFloatStorage\x94\x93\x8c\x01k\x94\x8c\x03cpu\x94K\x01tQ."
+    )
+    model_path = create_mock_pytorch_zip(tmp_path / "storage_persistent_id_untrusted.pt", with_pickle=False)
+    with zipfile.ZipFile(model_path, "a") as zipf:
+        zipf.writestr("data.pkl", payload)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert any(issue.details.get("pickle_rule_code") == "PERSISTENT_ID" for issue in result.issues)
+    assert not any(check.details.get("trusted_pytorch_archive_context") is True for check in result.checks)
 
 
 def test_pytorch_zip_scanner_entry_limit(tmp_path):
