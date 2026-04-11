@@ -328,17 +328,21 @@ def check_lambda_dict_function(
         result.add_check(
             name="Lambda Layer Code Analysis",
             passed=False,
-            message=f"Lambda layer '{layer_name}' contains embedded bytecode (dict-format)",
-            severity=IssueSeverity.WARNING,
+            message=(
+                f"Lambda layer '{layer_name}' contains embedded bytecode (dict-format) with no dangerous "
+                "text patterns detected"
+            ),
+            severity=IssueSeverity.INFO,
             location=location,
             details={
                 "layer_name": layer_name,
                 "layer_class": "Lambda",
                 "function_format": "dict_bytecode",
+                "analysis_status": "opaque_bytecode",
             },
             why=(
                 "Keras 3.x Lambda layers embed compiled bytecode that will execute "
-                "arbitrary code during model loading or inference."
+                "during model loading or inference; no high-risk text patterns were detected."
             ),
         )
     return True

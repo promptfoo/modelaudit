@@ -9,6 +9,7 @@ The new .keras format is a ZIP archive containing:
 
 import base64
 import json
+import marshal
 import os
 import tempfile
 import warnings
@@ -866,6 +867,38 @@ __import__('pickle').loads(data)
 
         finally:
             os.unlink(temp_path)
+
+    def test_opaque_lambda_bytecode_is_info_only(self, tmp_path: Path) -> None:
+        """Benign compiled Lambda bytecode should not produce warning-level noise."""
+        scanner = KerasZipScanner()
+        encoded_code = base64.b64encode(marshal.dumps((lambda x: x + 1).__code__)).decode()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "opaque_lambda",
+                        "config": {"function": [encoded_code, None, None]},
+                    }
+                ]
+            },
+        }
+
+        result = scanner.scan(str(create_configured_keras_zip(tmp_path, config)))
+
+        opaque_issues = [
+            issue
+            for issue in result.issues
+            if "opaque encoded bytecode" in issue.message and "opaque_lambda" in issue.message
+        ]
+        assert len(opaque_issues) == 1
+        assert opaque_issues[0].severity == IssueSeverity.INFO
+        assert not [
+            issue
+            for issue in result.issues
+            if "opaque_lambda" in issue.message and issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        ]
 
     def test_stringlookup_external_vocabulary_path_triggers_cve_2025_12058(self, tmp_path: Path) -> None:
         """Absolute StringLookup vocabulary paths should be attributed to CVE-2025-12058 on vulnerable Keras."""
