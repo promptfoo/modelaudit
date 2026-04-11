@@ -1,11 +1,14 @@
 import sys
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from modelaudit import core
+from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.scanners import _registry
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity
 from modelaudit.scanners.tflite_scanner import _MAX_COUNT, TFLiteScanner
 
 # Try to import tflite to check availability
@@ -15,6 +18,19 @@ try:
     HAS_TFLITE = True
 except ImportError:
     HAS_TFLITE = False
+
+
+def _single_file_metadata(aggregate: Any) -> Any:
+    return next(iter(aggregate.file_metadata.values()))
+
+
+def _assert_tflite_inconclusive_exit2(aggregate: Any, reason: str) -> None:
+    metadata = _single_file_metadata(aggregate)
+    assert aggregate.success is False
+    assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert reason in metadata.get("scan_outcome_reasons", [])
+    assert core.determine_exit_code(aggregate) == 2
+    assert not any(issue.severity == IssueSeverity.CRITICAL for issue in aggregate.issues)
 
 
 def test_tflite_scanner_can_handle(tmp_path: Path) -> None:
@@ -114,10 +130,58 @@ def test_tflite_scanner_parsing_error(tmp_path: Path) -> None:
     scanner = TFLiteScanner()
     result = scanner.scan(str(path))
     assert not result.success
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "tflite_magic_validation_failed" in result.metadata["scan_outcome_reasons"]
     # Scanner checks magic bytes first, so invalid data will fail the magic check
     assert any(
         "TFLite magic bytes" in issue.message or "Invalid TFLite file" in issue.message for issue in result.issues
     )
+
+
+def test_tflite_invalid_magic_returns_inconclusive_exit2(tmp_path: Path) -> None:
+    path = tmp_path / "model.tflite"
+    path.write_bytes(b"invalid tflite data")
+
+    with patch("modelaudit.scanners.tflite_scanner.HAS_TFLITE", True):
+        direct = TFLiteScanner().scan(str(path))
+        aggregate = core.scan_model_directory_or_file(str(path), recursive=False)
+
+    assert direct.success is False
+    assert direct.has_errors is False
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "tflite_magic_validation_failed" in direct.metadata["scan_outcome_reasons"]
+    assert any("TFLite magic bytes" in issue.message for issue in direct.issues)
+    _assert_tflite_inconclusive_exit2(aggregate, "tflite_magic_validation_failed")
+
+
+def test_tflite_invalid_magic_uncached_rerun_preserves_exit2(tmp_path: Path) -> None:
+    path = tmp_path / "model.tflite"
+    path.write_bytes(b"invalid tflite data")
+    cache_dir = tmp_path / "cache"
+
+    reset_cache_manager()
+    try:
+        with patch("modelaudit.scanners.tflite_scanner.HAS_TFLITE", True):
+            first = core.scan_model_directory_or_file(
+                str(path),
+                recursive=False,
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            second = core.scan_model_directory_or_file(
+                str(path),
+                recursive=False,
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+
+        _assert_tflite_inconclusive_exit2(first, "tflite_magic_validation_failed")
+        _assert_tflite_inconclusive_exit2(second, "tflite_magic_validation_failed")
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
 
 
 @pytest.mark.skipif(not HAS_TFLITE, reason="tflite not installed")
@@ -275,10 +339,14 @@ def test_tflite_scanner_model_structure_parse_errors_do_not_escape(tmp_path: Pat
         result = TFLiteScanner().scan(str(path))
 
         assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "tflite_structure_validation_failed" in result.metadata["scan_outcome_reasons"]
         assert any(
             issue.message and "Invalid TFLite model structure or traversal error" in issue.message
             for issue in result.issues
         )
+        aggregate = core.scan_model_directory_or_file(str(path), recursive=False)
+        _assert_tflite_inconclusive_exit2(aggregate, "tflite_structure_validation_failed")
 
 
 def test_tflite_metadata_extraction_excessive_subgraph_count_stops_early(tmp_path: Path) -> None:
