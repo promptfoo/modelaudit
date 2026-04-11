@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- recover malformed Jinja template configs as inconclusive scan outcomes
 - traverse NeMo YAML list configs when checking suspicious targets
 - mark malformed Keras ZIP configs inconclusive instead of clean
 - mark malformed Keras H5 scans inconclusive instead of clean
