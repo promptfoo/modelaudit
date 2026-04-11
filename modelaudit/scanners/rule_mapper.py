@@ -112,6 +112,8 @@ def get_pickle_opcode_rule_code(opcode_name: str) -> str | None:
         return _rule("S210")
     elif opcode_upper in ["EXT1", "EXT2", "EXT4"]:
         return _rule("S211")
+    elif opcode_upper in ["PERSID", "BINPERSID"]:
+        return _rule("S212")
 
     return None
 

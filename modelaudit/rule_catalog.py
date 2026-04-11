@@ -163,6 +163,13 @@ RULE_CATALOG: tuple[RuleCatalogEntry, ...] = (
         patterns=(r"pickle.*SETITEMS", r"SETITEMS.*opcode"),
     ),
     RuleCatalogEntry(
+        code="S212",
+        name="Pickle persistent ID opcode",
+        severity="MEDIUM",
+        description="Persistent object resolution via pickle persistent_load callback",
+        patterns=(r"pickle.*PERSID", r"PERSID.*opcode", r"persistent_load"),
+    ),
+    RuleCatalogEntry(
         code="S213",
         name="Nested/encoded pickle payload",
         severity="CRITICAL",

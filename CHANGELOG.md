@@ -106,6 +106,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - mark incomplete ZIP, TAR, and 7z archive traversals as inconclusive in scan metadata
 - route helper-level ZIP-backed `.ckpt`/`.pkl` checkpoints through archive scanners
 - harden standalone pickle scanner dangerous global coverage, nested payload bounds, incomplete-scan reporting, and standalone-primary migration behavior
+- flag untrusted pickle persistent ID opcodes while keeping PyTorch storage persistent IDs non-failing
 
 ## [0.2.31](https://github.com/promptfoo/modelaudit/compare/v0.2.30...v0.2.31) (2026-04-04)
 

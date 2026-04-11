@@ -84,6 +84,36 @@ def test_scan_bytes_detects_reduce_invoking_os_system() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("payload", "opcode"),
+    [
+        (b"Pexternal-storage-key\n.", "PERSID"),
+        (b"\x80\x04\x8c\x14external-storage-key\x94Q.", "BINPERSID"),
+    ],
+)
+def test_scan_bytes_flags_untrusted_persistent_ids(payload: bytes, opcode: str) -> None:
+    report = scan_bytes(payload, source="persistent-id.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "PERSISTENT_ID" and finding.details.get("opcode") == opcode for finding in report.findings
+    )
+
+
+def test_scan_bytes_treats_pytorch_storage_persistent_ids_as_covered_benign() -> None:
+    payload = (
+        b"\x80\x04(\x8c\x07storage\x94\x8c\x05torch\x94\x8c\x0cFloatStorage\x94\x93\x8c\x01k\x94\x8c\x03cpu\x94K\x01tQ."
+    )
+
+    report = scan_bytes(payload, source="pytorch-storage.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+    assert any(notice.code == "pytorch_storage_persistent_id" for notice in report.notices)
+
+
 def test_scan_bytes_attributes_reduce_calls_to_the_callable_operand_not_nested_args() -> None:
     payload = b"cbuiltins\nlen\n(cos\nsystem\ntR."
 

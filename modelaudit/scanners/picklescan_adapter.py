@@ -419,6 +419,11 @@ def _legacy_rule_code_for_finding(finding: Finding) -> str | None:
         if isinstance(opcode, str):
             return get_pickle_opcode_rule_code(opcode)
         return "S211"
+    if finding.rule_code == "PERSISTENT_ID":
+        opcode = finding.details.get("opcode")
+        if isinstance(opcode, str):
+            return get_pickle_opcode_rule_code(opcode)
+        return "S212"
     if finding.rule_code in {"DANGEROUS_CALL", "DANGEROUS_GLOBAL"}:
         opcode = finding.details.get("opcode")
         if isinstance(opcode, str):
