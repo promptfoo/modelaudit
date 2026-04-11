@@ -20,6 +20,7 @@ from modelaudit.scanner_registry_metadata import (
     get_registered_scanner_extensions,
 )
 from modelaudit.scanners import SCANNER_REGISTRY, ScannerRegistry, _registry
+from modelaudit.scanners.archive_dispatch import _HEADER_FORMAT_TO_SCANNER_ID
 from modelaudit.scanners.base import BaseScanner, IssueSeverity
 from tests.helpers import create_mock_pytorch_zip
 
@@ -304,6 +305,18 @@ def test_extension_format_map_excludes_ambiguous_routable_extensions() -> None:
 def test_scannable_model_extensions_are_registry_backed() -> None:
     """Source-download filters should not carry an independent scanner list."""
     assert frozenset(get_registered_scanner_extensions()) == SCANNABLE_MODEL_EXTENSIONS
+
+
+def test_archive_dispatch_header_map_is_backed_by_scanner_descriptors() -> None:
+    """Nested archive dispatch should consume scanner-owned header aliases."""
+    for scanner_id, scanner_info in SCANNER_REGISTRY_METADATA.items():
+        expected_keys = {scanner_id, *(str(header_format) for header_format in scanner_info.get("header_formats", ()))}
+        actual_keys = {
+            header_format
+            for header_format, mapped_scanner_id in _HEADER_FORMAT_TO_SCANNER_ID.items()
+            if mapped_scanner_id == scanner_id
+        }
+        assert actual_keys == expected_keys
 
 
 @pytest.mark.parametrize(

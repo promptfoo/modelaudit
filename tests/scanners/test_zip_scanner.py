@@ -1,3 +1,4 @@
+import gzip
 import io
 import os
 import tarfile
@@ -390,6 +391,56 @@ class TestZipScanner:
             "Expected critical nested pickle finding, got: "
             f"{[(i.location, i.message, i.details) for i in result.issues]}"
         )
+
+    def test_scan_extensionless_nested_gzip_recurses_by_header(self, tmp_path: Path) -> None:
+        """Extensionless gzip members should route through CompressedScanner by header."""
+        archive_path = tmp_path / "outer.zip"
+        payload = b'cos\nsystem\n(S"echo zipped gzip payload"\ntR.'
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("compressed_payload", gzip.compress(payload))
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert result.success is False
+        assert result.has_errors is True
+        routing_checks = [check for check in result.checks if check.name == "Compressed Wrapper Inner Scanner Routing"]
+        assert any(
+            check.details.get("inner_scanner") == "pickle" and check.details.get("zip_entry") == "compressed_payload"
+            for check in routing_checks
+        ), f"Expected compressed nested routing check, got: {[(c.location, c.details) for c in routing_checks]}"
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL
+            and issue.details.get("zip_entry") == "compressed_payload"
+            and ("os.system" in issue.message.lower() or "posix.system" in issue.message.lower())
+            for issue in result.issues
+        ), (
+            "Expected critical nested compressed pickle finding, got: "
+            f"{[(i.location, i.message, i.details) for i in result.issues]}"
+        )
+
+    def test_scan_extensionless_nested_gzip_benign_text_does_not_route_to_pickle(self, tmp_path: Path) -> None:
+        """Extensionless gzip text should not be treated as a nested pickle just because it is compressed."""
+        archive_path = tmp_path / "outer-benign.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("compressed_payload", gzip.compress(b"just some harmless text\n"))
+
+        result = self.scanner.scan(str(archive_path))
+
+        routing_checks = [
+            check
+            for check in result.checks
+            if check.name == "Compressed Wrapper Inner Scanner Routing"
+            and check.details.get("zip_entry") == "compressed_payload"
+        ]
+        assert not any(check.details.get("inner_scanner") == "pickle" for check in routing_checks), (
+            "Expected benign gzip text to avoid pickle routing, got: "
+            f"{[(check.location, check.details) for check in routing_checks]}"
+        )
+        assert not [
+            issue
+            for issue in result.issues
+            if issue.severity == IssueSeverity.CRITICAL and issue.details.get("zip_entry") == "compressed_payload"
+        ]
 
     def test_nested_keras_member_routes_through_nested_scan_callback(self, tmp_path: Path) -> None:
         """Nested ZIP-based members should preserve ZIP depth and use the injected callback."""
