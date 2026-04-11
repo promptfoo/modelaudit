@@ -19,7 +19,7 @@ from unittest.mock import patch
 
 import pytest
 
-from modelaudit.cache import reset_cache_manager
+from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners import keras_zip_scanner as keras_zip_scanner_module
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
@@ -352,12 +352,11 @@ class TestKerasZipScanner:
         assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
         assert determine_exit_code(audit_result) == 1
 
-    def test_inconclusive_config_scan_outcome_survives_cache_rerun(
+    def test_inconclusive_config_scan_outcome_uncached_rerun_preserves_exit2(
         self,
         tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Cached Keras ZIP inconclusive results must still produce exit 2 on subsequent scans."""
+        """Uncached Keras ZIP inconclusive results must still produce exit 2 on subsequent scans."""
         keras_path = create_configured_keras_zip(
             tmp_path,
             {"class_name": "Sequential", "config": {"layers": "not a list"}},
@@ -372,13 +371,6 @@ class TestKerasZipScanner:
             cache_dir=str(cache_dir),
             min_cache_file_size=0,
         )
-        reset_cache_manager()
-
-        def fail_scan(self: KerasZipScanner, path: str) -> Any:
-            raise AssertionError(f"Expected cached scan result for {path}")
-
-        monkeypatch.setattr(KerasZipScanner, "scan", fail_scan)
-
         second_result = scan_model_directory_or_file(
             str(keras_path),
             cache_enabled=True,
@@ -391,6 +383,7 @@ class TestKerasZipScanner:
         assert determine_exit_code(second_result) == 2
         assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
         assert "keras_zip_model_layers_invalid_type" in metadata.get("scan_outcome_reasons")
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
 
     def test_embedded_weights_size_limit_prevents_unbounded_extraction(
         self,
