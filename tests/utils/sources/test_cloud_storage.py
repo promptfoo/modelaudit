@@ -81,8 +81,7 @@ class TestCloudURLRedaction:
 
     def test_redact_cloud_error_for_display_redacts_query_credentials_without_exact_url(self) -> None:
         message = (
-            "provider failed: https://storage.googleapis.com/bucket/model.bin"
-            "?X-Goog-Signature=secret&token=abc123"
+            "provider failed: https://storage.googleapis.com/bucket/model.bin?X-Goog-Signature=secret&token=abc123"
         )
 
         redacted = redact_cloud_error_for_display(message)

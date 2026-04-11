@@ -559,9 +559,7 @@ def download_from_cloud(
 
     # Ensure target was analyzed successfully
     if "error" in metadata or metadata.get("type") == "unknown":
-        error_msg = redact_cloud_error_for_display(
-            metadata.get("error", "Unknown cloud target type"), url
-        )
+        error_msg = redact_cloud_error_for_display(metadata.get("error", "Unknown cloud target type"), url)
         raise ValueError(f"Failed to analyze cloud target {redact_url_for_display(url)}: {error_msg}")
 
     # Check if we can use streaming analysis
