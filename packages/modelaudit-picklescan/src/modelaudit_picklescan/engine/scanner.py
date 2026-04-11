@@ -38,6 +38,7 @@ _BASE64_LITERAL_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrs
 _HEX_LITERAL_CHARS = frozenset("0123456789abcdefABCDEF")
 _ENCODED_LITERAL_PROBE_CHARS = 64
 _PYTORCH_STORAGE_TAG = "storage"
+_PERSISTENT_ID_PREVIEW_MAX_DEPTH = 8
 
 
 class _OpcodeBudgetExceeded(Exception):
@@ -1110,11 +1111,6 @@ def _is_likely_pytorch_storage_persistent_id(value: Any) -> bool:
 def _is_pytorch_storage_marker(value: Any) -> bool:
     if isinstance(value, _GlobalRef):
         return (value.module == "torch" or value.module.startswith("torch.")) and _looks_like_storage_name(value.name)
-    if isinstance(value, str):
-        module, _, name = value.rpartition(".")
-        if not module:
-            return False
-        return (module == "torch" or module.startswith("torch.")) and _looks_like_storage_name(name)
     return False
 
 
@@ -1122,11 +1118,13 @@ def _looks_like_storage_name(value: str) -> bool:
     return value in {"Storage", "TypedStorage", "UntypedStorage"} or value.endswith("Storage")
 
 
-def _persistent_id_preview(value: Any) -> str:
+def _persistent_id_preview(value: Any, *, depth: int = 0) -> str:
     if isinstance(value, _GlobalRef):
         return value.symbol
     if isinstance(value, tuple):
-        items = ", ".join(_persistent_id_preview(item) for item in value[:5])
+        if depth >= _PERSISTENT_ID_PREVIEW_MAX_DEPTH:
+            return "(...)"
+        items = ", ".join(_persistent_id_preview(item, depth=depth + 1) for item in value[:5])
         suffix = ", ..." if len(value) > 5 else ""
         return f"({items}{suffix})"
     if isinstance(value, bytes):

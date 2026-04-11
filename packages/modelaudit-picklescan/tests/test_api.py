@@ -115,7 +115,7 @@ def test_scan_bytes_treats_pytorch_storage_persistent_ids_as_covered_benign() ->
 
 
 def test_scan_bytes_flags_noncanonical_pytorch_storage_persistent_ids() -> None:
-    payload = b"\x80\x04(\x8c\x07storage\x94\x8c\x12torch.FloatStorage\x94\x8c\x04eviltQ."
+    payload = b"\x80\x04(\x8c\x07storage\x94\x8c\x12torch.FloatStorage\x94\x8c\x04evil\x94\x8c\x03cpu\x94K\x01tQ."
 
     report = scan_bytes(payload, source="noncanonical-pytorch-storage.pkl")
 
@@ -126,6 +126,20 @@ def test_scan_bytes_flags_noncanonical_pytorch_storage_persistent_ids() -> None:
         for finding in report.findings
     )
     assert not any(notice.code == "pytorch_storage_persistent_id" for notice in report.notices)
+
+
+def test_scan_bytes_flags_deeply_nested_persistent_id_preview() -> None:
+    payload = b"\x80\x04)" + (b"\x85" * 1500) + b"Q."
+
+    report = scan_bytes(payload, source="deep-persistent-id.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert report.errors == ()
+    assert any(
+        finding.rule_code == "PERSISTENT_ID" and finding.details.get("opcode") == "BINPERSID"
+        for finding in report.findings
+    )
 
 
 def test_scan_bytes_attributes_reduce_calls_to_the_callable_operand_not_nested_args() -> None:
