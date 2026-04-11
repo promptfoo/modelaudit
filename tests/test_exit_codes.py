@@ -5,6 +5,7 @@ from typing import Any
 from unittest.mock import patch
 
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.core_results import add_issue_to_model
 
 # Ensure models are rebuilt for forward references
 from modelaudit.models import ModelAuditResultModel, rebuild_models
@@ -191,6 +192,26 @@ def test_exit_code_info_level_issues():
         ]
     )
     assert determine_exit_code(results) == 0  # INFO level should not trigger exit code 1
+
+
+def test_add_issue_to_model_unknown_severity_defaults_to_info():
+    """Unknown aggregate issue severity should not become a warning."""
+    results = _create_result_model()
+
+    add_issue_to_model(results, "unknown severity diagnostic", severity="unknown")
+
+    assert results.issues[0].severity == IssueSeverity.INFO
+    assert determine_exit_code(results) == 0
+
+
+def test_add_issue_to_model_missing_severity_defaults_to_info():
+    """Omitted aggregate issue severity should not become a warning."""
+    results = _create_result_model()
+
+    add_issue_to_model(results, "missing severity diagnostic")
+
+    assert results.issues[0].severity == IssueSeverity.INFO
+    assert determine_exit_code(results) == 0
 
 
 def test_exit_code_inconclusive_pickle_without_security_findings() -> None:
