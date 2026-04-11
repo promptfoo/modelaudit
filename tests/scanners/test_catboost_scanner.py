@@ -5,8 +5,9 @@ from __future__ import annotations
 import struct
 from pathlib import Path
 
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners import get_scanner_for_file
-from modelaudit.scanners.base import CheckStatus, IssueSeverity
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.catboost_scanner import CatBoostScanner
 from modelaudit.utils.file.detection import detect_file_format, detect_file_format_from_magic
 
@@ -40,6 +41,13 @@ def test_can_handle_rejects_non_cbm_content_with_cbm_extension(tmp_path: Path) -
     assert CatBoostScanner.can_handle(str(fake_path)) is False
 
 
+def test_can_handle_accepts_corrupt_cbm_magic_for_fail_closed_scan(tmp_path: Path) -> None:
+    corrupt_path = tmp_path / "corrupt.cbm"
+    corrupt_path.write_bytes(b"CBM1" + struct.pack("<I", 128) + b"tiny")
+
+    assert CatBoostScanner.can_handle(str(corrupt_path)) is True
+
+
 def test_scan_benign_cbm_has_no_critical_findings(tmp_path: Path) -> None:
     model_path = tmp_path / "benign.cbm"
     model_path.write_bytes(
@@ -71,6 +79,8 @@ def test_scan_corrupt_cbm_reports_structured_parse_failure(tmp_path: Path) -> No
     result = CatBoostScanner().scan(str(model_path))
 
     assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == ["catboost_structure_parse_failed"]
     assert any(
         check.name == "CatBoost Core Section Bounds Check" and check.status == CheckStatus.FAILED
         for check in result.checks
@@ -78,6 +88,19 @@ def test_scan_corrupt_cbm_reports_structured_parse_failure(tmp_path: Path) -> No
     assert any(
         check.name == "CatBoost Structure Parsing" and check.status == CheckStatus.FAILED for check in result.checks
     )
+
+
+def test_scan_corrupt_cbm_aggregate_exit_code_is_inconclusive(tmp_path: Path) -> None:
+    model_path = tmp_path / "corrupt.cbm"
+    model_path.write_bytes(b"CBM1" + struct.pack("<I", 128) + b"tiny")
+
+    result = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
+
+    metadata = result.file_metadata[str(model_path)]
+    assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "catboost_structure_parse_failed" in metadata["scan_outcome_reasons"]
+    assert result.success is False
+    assert determine_exit_code(result) == 2
 
 
 def test_scan_detects_correlated_command_and_network_indicators(tmp_path: Path) -> None:

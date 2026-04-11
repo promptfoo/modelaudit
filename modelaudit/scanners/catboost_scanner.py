@@ -10,7 +10,7 @@ import struct
 from typing import Any, ClassVar
 from urllib.parse import urlparse
 
-from .base import BaseScanner, IssueSeverity, ScanResult
+from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 
 CATBOOST_MAGIC = b"CBM1"
 _SIZE_SENTINEL = 0xFFFFFFFF
@@ -99,21 +99,15 @@ class CatBoostScanner(BaseScanner):
 
         try:
             file_size = os.path.getsize(path)
-            if file_size < 8:
+            if file_size < 4:
                 return False
 
             with open(path, "rb") as f:
                 if f.read(4) != CATBOOST_MAGIC:
                     return False
-                core_size, header_size = cls._read_core_size(f)
 
-            if core_size <= 0:
-                return False
-
-            return header_size + core_size <= file_size
+            return True
         except OSError:
-            return False
-        except (_CatBoostParseError, struct.error):
             return False
 
     @staticmethod
@@ -160,6 +154,7 @@ class CatBoostScanner(BaseScanner):
                 details={"error_type": type(error).__name__},
                 why="Corrupted or truncated model files should be treated as suspicious input.",
             )
+            self._mark_inconclusive_scan_result(result, "catboost_structure_parse_failed")
             result.finish(success=False)
             return result
         except OSError as error:
@@ -171,6 +166,7 @@ class CatBoostScanner(BaseScanner):
                 location=path,
                 details={"error": str(error), "error_type": type(error).__name__},
             )
+            self._mark_inconclusive_scan_result(result, "catboost_read_failed")
             result.finish(success=False)
             return result
 
@@ -194,6 +190,17 @@ class CatBoostScanner(BaseScanner):
 
         result.finish(success=not result.has_errors)
         return result
+
+    def _mark_inconclusive_scan_result(self, result: ScanResult, reason: str) -> None:
+        """Mark CatBoost analysis as incomplete for aggregate exit-code handling."""
+        existing_reasons = result.metadata.get("scan_outcome_reasons")
+        reasons = existing_reasons if isinstance(existing_reasons, list) else []
+        if reason not in reasons:
+            reasons.append(reason)
+
+        result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+        result.metadata["scan_outcome_reasons"] = reasons
+        result.metadata["analysis_incomplete"] = True
 
     def _parse_sections(
         self,
