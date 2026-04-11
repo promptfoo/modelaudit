@@ -12,6 +12,7 @@ from typing import Any
 
 import pytest
 
+from modelaudit import core as core_module
 from modelaudit.core import scan_file
 from modelaudit.scanners.base import IssueSeverity, ScanResult
 from tests.helpers import create_mock_gguf, create_mock_pytorch_zip
@@ -568,6 +569,13 @@ def test_scan_file_routes_raw_bin_without_zip_structure_to_pytorch_binary(tmp_pa
 
     assert result.scanner_name == "pytorch_binary"
     assert result.success is True
+
+
+def test_preferred_scanner_does_not_route_generic_zip_bin_to_pickle(tmp_path: Path) -> None:
+    model_path = tmp_path / "weights.bin"
+    _create_misnamed_zip(model_path, {"metadata.txt": b"not a pickle"})
+
+    assert core_module._select_preferred_scanner_id(str(model_path), "zip", ".bin") == "zip"
 
 
 def test_scan_file_routes_misnamed_executorch_archive_by_content(tmp_path: Path) -> None:

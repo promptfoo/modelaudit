@@ -12,7 +12,7 @@ import pytest
 
 from modelaudit import core
 from modelaudit.scanners._archive_locations import rewrite_extracted_member_location
-from modelaudit.scanners.archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY
+from modelaudit.scanners.archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY, _select_nested_scanner_id
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.zip_scanner import ZipScanner
 
@@ -633,6 +633,14 @@ class TestZipScanner:
         compression_issues = [i for i in result.issues if i.rule_code == "S410"]
         assert len(compression_issues) == 1
         assert compression_issues[0].details["entry"] == "suspicious.txt"
+
+    def test_nested_zip_dispatch_does_not_route_generic_bin_zip_to_pickle(self, tmp_path: Path) -> None:
+        """A generic ZIP archive named .bin should not be forced through pickle routing."""
+        archive_path = tmp_path / "weights.bin"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("metadata.txt", "not a pickle")
+
+        assert _select_nested_scanner_id(str(archive_path)) == "zip"
 
     def test_max_depth_limit(self):
         """Test that maximum nesting depth is enforced"""

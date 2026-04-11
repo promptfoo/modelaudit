@@ -89,11 +89,6 @@ def _select_preferred_scanner_id(path: str, header_format: str, ext: str) -> str
             return "skops"
         if ext == ".joblib":
             return "joblib"
-
-        if ext == ".bin":
-            # ZIP-backed torch.save() .bin files are routed through the pickle scanner,
-            # which already understands the ZIP serialization used by PyTorch.
-            return "pickle"
         return "zip"
 
     if ext == ".joblib" and header_format in _COMPRESSED_HEADER_FORMATS | {"pickle"}:
