@@ -154,7 +154,7 @@ def test_tflite_invalid_magic_returns_inconclusive_exit2(tmp_path: Path) -> None
     _assert_tflite_inconclusive_exit2(aggregate, "tflite_magic_validation_failed")
 
 
-def test_tflite_invalid_magic_cached_rerun_preserves_exit2(tmp_path: Path) -> None:
+def test_tflite_invalid_magic_uncached_rerun_preserves_exit2(tmp_path: Path) -> None:
     path = tmp_path / "model.tflite"
     path.write_bytes(b"invalid tflite data")
     cache_dir = tmp_path / "cache"
@@ -169,18 +169,17 @@ def test_tflite_invalid_magic_cached_rerun_preserves_exit2(tmp_path: Path) -> No
                 cache_dir=str(cache_dir),
                 min_cache_file_size=0,
             )
-            with patch.object(TFLiteScanner, "scan", side_effect=AssertionError("cached rerun rescanned TFLite")):
-                second = core.scan_model_directory_or_file(
-                    str(path),
-                    recursive=False,
-                    cache_enabled=True,
-                    cache_dir=str(cache_dir),
-                    min_cache_file_size=0,
-                )
+            second = core.scan_model_directory_or_file(
+                str(path),
+                recursive=False,
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
 
         _assert_tflite_inconclusive_exit2(first, "tflite_magic_validation_failed")
         _assert_tflite_inconclusive_exit2(second, "tflite_magic_validation_failed")
-        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] > 0
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
     finally:
         reset_cache_manager()
 
