@@ -14,8 +14,8 @@ try:
 except ImportError:
     HAS_YAML = False
 
-from modelaudit.core import scan_file
-from modelaudit.scanners.base import CheckStatus, IssueSeverity
+from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.nemo_scanner import NemoScanner
 
 
@@ -158,6 +158,101 @@ class TestCVE202523304HydraTarget:
         cve_checks = [c for c in result.checks if "CVE-2025-23304" in c.name]
         assert len(cve_checks) > 0, "Should detect subprocess.Popen"
         assert cve_checks[0].details.get("target") == "subprocess.Popen"
+
+    def test_top_level_list_target_detected(self, tmp_path: Path) -> None:
+        """Top-level YAML lists must be traversed, not mistaken for absent config."""
+        path = _create_nemo_file_from_bytes(
+            tmp_path,
+            b"- _target_: os.system\n  command: id\n",
+        )
+
+        result = scan_file(str(path), config={"cache_scan_results": False})
+
+        assert result.scanner_name == "nemo"
+        cve_checks = [c for c in result.checks if c.name == "CVE-2025-23304: Dangerous Hydra _target_"]
+        assert len(cve_checks) == 1
+        assert cve_checks[0].status == CheckStatus.FAILED
+        assert cve_checks[0].severity == IssueSeverity.CRITICAL
+        assert cve_checks[0].details["target"] == "os.system"
+        assert cve_checks[0].details["config_path"] == "[0]._target_"
+
+    def test_nested_list_target_detected(self, tmp_path: Path) -> None:
+        """Nested list-of-list structures should remain part of Hydra target traversal."""
+        path = _create_nemo_file_from_bytes(
+            tmp_path,
+            b"trainer:\n  callbacks:\n    - - _target_: subprocess.Popen\n        args:\n          - whoami\n",
+        )
+
+        result = NemoScanner().scan(str(path))
+
+        cve_checks = [c for c in result.checks if c.name == "CVE-2025-23304: Dangerous Hydra _target_"]
+        assert len(cve_checks) == 1
+        assert cve_checks[0].details["target"] == "subprocess.Popen"
+        assert cve_checks[0].details["config_path"] == "trainer.callbacks[0][0]._target_"
+
+    @pytest.mark.parametrize(
+        ("payload", "expected_reason", "expected_check"),
+        [
+            (b"model: [unterminated\n", "nemo_config_yaml_parse_failed", "NeMo Config YAML Parsing"),
+            (b"null\n", "nemo_config_invalid_structure", "NeMo Config Structure"),
+            (b"just text\n", "nemo_config_invalid_structure", "NeMo Config Structure"),
+        ],
+    )
+    def test_unanalyzable_yaml_config_returns_inconclusive_exit2(
+        self,
+        tmp_path: Path,
+        payload: bytes,
+        expected_reason: str,
+        expected_check: str,
+    ) -> None:
+        """Present but unanalyzable configs should fail closed as inconclusive coverage."""
+        path = _create_nemo_file_from_bytes(tmp_path, payload)
+
+        direct_result = NemoScanner().scan(str(path))
+        aggregate_result = scan_model_directory_or_file(
+            str(path),
+            config={"cache_scan_results": False},
+        )
+
+        assert direct_result.success is False
+        assert direct_result.has_errors is False
+        assert direct_result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert expected_reason in direct_result.metadata["scan_outcome_reasons"]
+        checks = [c for c in direct_result.checks if c.name == expected_check]
+        assert len(checks) == 1
+        assert checks[0].status == CheckStatus.FAILED
+        assert checks[0].severity == IssueSeverity.INFO
+
+        metadata = aggregate_result.file_metadata[str(path)]
+        assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+        assert expected_reason in metadata.get("scan_outcome_reasons")
+        assert aggregate_result.success is False
+        assert aggregate_result.has_errors is False
+        assert determine_exit_code(aggregate_result) == 2
+
+    def test_inconclusive_config_preserves_security_exit1(self, tmp_path: Path) -> None:
+        """Security findings should keep priority over inconclusive config coverage."""
+        nemo_path = tmp_path / "model.nemo"
+        malformed_config = b"model: [unterminated\n"
+        script = b"#!/bin/sh\nid\n"
+        with tarfile.open(nemo_path, "w") as tar:
+            info = tarfile.TarInfo(name="model_config.yaml")
+            info.size = len(malformed_config)
+            tar.addfile(info, io.BytesIO(malformed_config))
+            info = tarfile.TarInfo(name="payload.sh")
+            info.size = len(script)
+            tar.addfile(info, io.BytesIO(script))
+
+        result = scan_model_directory_or_file(
+            str(nemo_path),
+            config={"cache_scan_results": False},
+        )
+
+        metadata = result.file_metadata[str(nemo_path)]
+        assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+        assert "nemo_config_yaml_parse_failed" in metadata.get("scan_outcome_reasons")
+        assert any(issue.severity == IssueSeverity.WARNING for issue in result.issues)
+        assert determine_exit_code(result) == 1
 
     def test_dangerous_eval_detected(self, tmp_path):
         """builtins.eval _target_ should trigger CVE-2025-23304."""
