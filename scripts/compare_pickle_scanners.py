@@ -170,6 +170,10 @@ def _scan_fixture(
     return legacy_result, package_result, adapter_result
 
 
+def _scan_root_fixture(path: Path, *, config: dict[str, Any] | None = None) -> NormalizedResult:
+    return _normalize_scan_result(PickleScanner(config=config).scan(str(path)), engine="root")
+
+
 def _classify_delta(label: str, legacy: NormalizedResult, package: NormalizedResult) -> str:
     legacy_rank = VERDICT_RANK[legacy.verdict]
     package_rank = VERDICT_RANK[package.verdict]
@@ -187,7 +191,11 @@ def _classify_delta(label: str, legacy: NormalizedResult, package: NormalizedRes
     return "match"
 
 
-def _build_report() -> dict[str, Any]:
+def _build_report(
+    *,
+    include_root: bool = False,
+    root_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     fixtures: list[Path] = []
     comparisons: list[dict[str, Any]] = []
     previous_logging_disable_level = logging.root.manager.disable
@@ -201,17 +209,20 @@ def _build_report() -> dict[str, Any]:
             legacy_result, package_result, adapter_result = _scan_fixture(path, legacy_scanner)
             package_delta = _classify_delta(label, legacy_result, package_result)
             adapter_delta = _classify_delta(label, legacy_result, adapter_result)
-            comparisons.append(
-                {
-                    "path": path.relative_to(REPO_ROOT).as_posix(),
-                    "label": label,
-                    "package_delta": package_delta,
-                    "adapter_delta": adapter_delta,
-                    "legacy": legacy_result.__dict__,
-                    "package": package_result.__dict__,
-                    "adapter": adapter_result.__dict__,
-                }
-            )
+            comparison = {
+                "path": path.relative_to(REPO_ROOT).as_posix(),
+                "label": label,
+                "package_delta": package_delta,
+                "adapter_delta": adapter_delta,
+                "legacy": legacy_result.__dict__,
+                "package": package_result.__dict__,
+                "adapter": adapter_result.__dict__,
+            }
+            if include_root:
+                root_result = _scan_root_fixture(path, config=root_config)
+                comparison["root_delta"] = _classify_delta(label, legacy_result, root_result)
+                comparison["root"] = root_result.__dict__
+            comparisons.append(comparison)
     finally:
         logging.disable(previous_logging_disable_level)
 
@@ -219,29 +230,27 @@ def _build_report() -> dict[str, Any]:
         "package": {},
         "adapter": {},
     }
+    if include_root:
+        summary["root"] = {}
     by_label: dict[str, dict[str, dict[str, int]]] = {
         "package": {label: {} for label in FIXTURE_LABELS},
         "adapter": {label: {} for label in FIXTURE_LABELS},
     }
+    if include_root:
+        by_label["root"] = {label: {} for label in FIXTURE_LABELS}
     for comparison in comparisons:
-        package_summary = summary["package"]
-        adapter_summary = summary["adapter"]
-        package_delta = comparison["package_delta"]
-        adapter_delta = comparison["adapter_delta"]
-        package_summary[package_delta] = package_summary.get(package_delta, 0) + 1
-        adapter_summary[adapter_delta] = adapter_summary.get(adapter_delta, 0) + 1
-
         label = comparison["label"]
-        package_label_summary = by_label["package"][label]
-        adapter_label_summary = by_label["adapter"][label]
-        package_label_summary[package_delta] = package_label_summary.get(package_delta, 0) + 1
-        adapter_label_summary[adapter_delta] = adapter_label_summary.get(adapter_delta, 0) + 1
+        for engine_name, engine_summary in summary.items():
+            delta = comparison[f"{engine_name}_delta"]
+            engine_summary[delta] = engine_summary.get(delta, 0) + 1
+
+            label_summary = by_label[engine_name][label]
+            label_summary[delta] = label_summary.get(delta, 0) + 1
 
     return {
         "fixture_count": len(fixtures),
         "summary": {
-            "package": dict(sorted(summary["package"].items())),
-            "adapter": dict(sorted(summary["adapter"].items())),
+            engine_name: dict(sorted(engine_summary.items())) for engine_name, engine_summary in summary.items()
         },
         "summary_by_label": {
             engine_name: {label: dict(sorted(label_summary.items())) for label, label_summary in engine_summary.items()}
@@ -271,7 +280,9 @@ def _print_text_report(report: dict[str, Any]) -> None:
             print(f"    {label}: {deltas}")
 
     interesting = [
-        item for item in report["comparisons"] if item["package_delta"] != "match" or item["adapter_delta"] != "match"
+        item
+        for item in report["comparisons"]
+        if any(key.endswith("_delta") and value != "match" for key, value in item.items())
     ]
     if not interesting:
         print("\nNo verdict/status/rule drift found.")
@@ -279,44 +290,48 @@ def _print_text_report(report: dict[str, Any]) -> None:
 
     print("\nDeltas:")
     for item in interesting:
-        print(f"\n[package={item['package_delta']} adapter={item['adapter_delta']}] {item['path']} ({item['label']})")
+        delta_summary = " ".join(
+            f"{key.removesuffix('_delta')}={value}" for key, value in item.items() if key.endswith("_delta")
+        )
+        print(f"\n[{delta_summary}] {item['path']} ({item['label']})")
+        for engine_name in ("legacy", "package", "adapter", "root"):
+            engine_result = item.get(engine_name)
+            if not isinstance(engine_result, dict):
+                continue
+            print(
+                f"  {engine_name:7}: "
+                f"status={engine_result['status']} verdict={engine_result['verdict']} "
+                f"warnings={engine_result['warning_count']} criticals={engine_result['critical_count']} "
+                f"success={engine_result['success']}"
+            )
         legacy = item["legacy"]
         package = item["package"]
         adapter = item["adapter"]
-        print(
-            "  legacy : "
-            f"status={legacy['status']} verdict={legacy['verdict']} "
-            f"warnings={legacy['warning_count']} criticals={legacy['critical_count']} "
-            f"success={legacy['success']}"
-        )
-        print(
-            "  package: "
-            f"status={package['status']} verdict={package['verdict']} "
-            f"warnings={package['warning_count']} criticals={package['critical_count']} "
-            f"success={package['success']}"
-        )
-        print(
-            "  adapter: "
-            f"status={adapter['status']} verdict={adapter['verdict']} "
-            f"warnings={adapter['warning_count']} criticals={adapter['critical_count']} "
-            f"success={adapter['success']}"
-        )
         legacy_rules = Counter(legacy["rule_codes"])
         package_rules = Counter(package["rule_codes"])
         adapter_rules = Counter(adapter["rule_codes"])
         print(f"  legacy-only rules : {sorted((legacy_rules - package_rules).elements())}")
         print(f"  package-only rules: {sorted((package_rules - legacy_rules).elements())}")
         print(f"  adapter-only rules: {sorted((adapter_rules - legacy_rules).elements())}")
+        root = item.get("root")
+        if isinstance(root, dict):
+            root_rules = Counter(root["rule_codes"])
+            print(f"  root-only rules   : {sorted((root_rules - legacy_rules).elements())}")
         for message in package["messages"][:5]:
             print(f"  package finding: {message}")
         for message in adapter["messages"][:5]:
             print(f"  adapter finding: {message}")
+        if isinstance(root, dict):
+            for message in root["messages"][:5]:
+                print(f"  root finding: {message}")
 
 
 def _has_exit_failure_drift(report: dict[str, Any]) -> bool:
     return any(
-        item["package_delta"] in EXIT_FAILURE_DELTAS or item["adapter_delta"] in EXIT_FAILURE_DELTAS
+        value in EXIT_FAILURE_DELTAS
         for item in report["comparisons"]
+        for key, value in item.items()
+        if key.endswith("_delta")
     )
 
 
@@ -325,9 +340,16 @@ def main() -> int:
         description="Compare legacy PickleScanner and modelaudit_picklescan on repo fixtures."
     )
     parser.add_argument("--json", action="store_true", help="Print the full diff report as JSON")
+    parser.add_argument("--include-root", action="store_true", help="Also compare the actual root PickleScanner")
+    parser.add_argument(
+        "--root-standalone-primary",
+        action="store_true",
+        help="Compare the root scanner with use_standalone_pickle_primary=True",
+    )
     args = parser.parse_args()
 
-    report = _build_report()
+    root_config = {"use_standalone_pickle_primary": True} if args.root_standalone_primary else None
+    report = _build_report(include_root=args.include_root or args.root_standalone_primary, root_config=root_config)
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
     else:

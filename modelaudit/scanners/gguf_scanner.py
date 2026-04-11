@@ -6,7 +6,7 @@ import os
 import struct
 from typing import Any, BinaryIO, ClassVar
 
-from .base import BaseScanner, IssueSeverity, ScanResult
+from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 
 # Map ggml_type enum to (block_size, type_size) for comprehensive validation
 # Values derived from ggml source
@@ -35,6 +35,8 @@ GGML_VARIANT_MAGICS = {
     b"GGLA",
     b"GGSA",
 }
+GGUF_PARSE_INCONCLUSIVE_REASON = "gguf_parse_incomplete"
+GGUF_STRUCTURE_INCONCLUSIVE_REASON = "gguf_structure_validation_failed"
 
 
 class GgufScanner(BaseScanner):
@@ -58,6 +60,32 @@ class GgufScanner(BaseScanner):
             "max_uncompressed",
             100 * 1024 * 1024 * 1024,
         )  # 100GB for large GGUF models
+
+    @staticmethod
+    def _mark_inconclusive(result: ScanResult, reason: str) -> None:
+        """Mark malformed GGUF/GGML framing as an explicit inconclusive scan."""
+        result.metadata["analysis_incomplete"] = True
+        result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+
+        reasons = result.metadata.get("scan_outcome_reasons")
+        if not isinstance(reasons, list):
+            reasons = []
+            result.metadata["scan_outcome_reasons"] = reasons
+        if reason not in reasons:
+            reasons.append(reason)
+
+    @staticmethod
+    def _has_security_findings(result: ScanResult) -> bool:
+        """Return True when GGUF scanning found WARNING/CRITICAL security findings."""
+        return any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+    def _finish_result(self, result: ScanResult) -> None:
+        """Finalize success so inconclusive/no-finding scans fail closed."""
+        if result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME and not self._has_security_findings(result):
+            result.finish(success=False)
+            return
+
+        result.finish(success=not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues))
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -109,6 +137,7 @@ class GgufScanner(BaseScanner):
                         details={"magic_bytes": magic.hex()},
                         rule_code="S903",
                     )
+                    self._mark_inconclusive(result, GGUF_PARSE_INCONCLUSIVE_REASON)
                     result.finish(success=False)
                     return result
         except Exception as e:
@@ -121,12 +150,11 @@ class GgufScanner(BaseScanner):
                 details={"exception": str(e), "exception_type": type(e).__name__},
                 rule_code="S1005",  # Invalid signature/corrupted file
             )
+            self._mark_inconclusive(result, GGUF_PARSE_INCONCLUSIVE_REASON)
             result.finish(success=False)
             return result
 
-        result.finish(
-            success=not any(i.severity == IssueSeverity.CRITICAL for i in result.issues),
-        )
+        self._finish_result(result)
         return result
 
     def _read_string(self, f: BinaryIO, max_length: int = 1024 * 1024) -> str:
@@ -152,6 +180,19 @@ class GgufScanner(BaseScanner):
 
     def _scan_gguf(self, f: BinaryIO, file_size: int, result: ScanResult) -> None:
         """Comprehensive GGUF file scanning with security checks."""
+        if file_size < 24:
+            result.add_check(
+                name="GGUF File Size Validation",
+                passed=False,
+                message="File too small to contain GGUF metadata",
+                severity=IssueSeverity.INFO,
+                location=self.current_file_path,
+                details={"file_size": file_size, "min_required": 24},
+                rule_code="S902",
+            )
+            self._mark_inconclusive(result, GGUF_PARSE_INCONCLUSIVE_REASON)
+            return
+
         # Read header
         version = struct.unpack("<I", f.read(4))[0]
         n_tensors = struct.unpack("<Q", f.read(8))[0]
@@ -165,18 +206,6 @@ class GgufScanner(BaseScanner):
                 "n_kv": n_kv,
             },
         )
-
-        if file_size < 24:
-            result.add_check(
-                name="GGUF File Size Validation",
-                passed=False,
-                message="File too small to contain GGUF metadata",
-                severity=IssueSeverity.INFO,
-                location=self.current_file_path,
-                details={"file_size": file_size, "min_required": 24},
-                rule_code="S902",
-            )
-            return
 
         # Parse metadata with security checks
         metadata: dict[str, Any] = {}
@@ -224,6 +253,7 @@ class GgufScanner(BaseScanner):
                 details={"error": str(e), "error_type": type(e).__name__},
                 rule_code="S902",
             )
+            self._mark_inconclusive(result, GGUF_PARSE_INCONCLUSIVE_REASON)
             return
 
         # Align to tensor data
@@ -315,6 +345,7 @@ class GgufScanner(BaseScanner):
                 details={"error": str(e), "error_type": type(e).__name__},
                 rule_code="S902",
             )
+            self._mark_inconclusive(result, GGUF_PARSE_INCONCLUSIVE_REASON)
             return
 
         # Calculate tensor data section start (offsets in tensor info are relative to this)
@@ -333,6 +364,7 @@ class GgufScanner(BaseScanner):
                 location=self.current_file_path,
                 details={"tensor_data_start": tensor_data_start, "file_size": file_size},
             )
+            self._mark_inconclusive(result, GGUF_STRUCTURE_INCONCLUSIVE_REASON)
             return
 
         # Validate tensor sizes and offsets
@@ -351,6 +383,7 @@ class GgufScanner(BaseScanner):
                             details={"tensor_name": tensor["name"], "invalid_dimension": d},
                             rule_code="S902",
                         )
+                        self._mark_inconclusive(result, GGUF_STRUCTURE_INCONCLUSIVE_REASON)
                         has_invalid_dimension = True
                         break
                     nelements *= d
@@ -362,13 +395,22 @@ class GgufScanner(BaseScanner):
                 # Check for extremely large tensors using correct size calculation
                 # For quantized types, use the actual type information
                 info = _GGML_TYPE_INFO.get(tensor["type"])
-                if info:
-                    # For quantized types, calculate based on block and type size
-                    blck, ts = info
-                    estimated_size = ((nelements + blck - 1) // blck) * ts
-                else:
-                    # Fallback for unknown types - assume 4 bytes per element
-                    estimated_size = nelements * 4
+                if info is None:
+                    result.add_check(
+                        name="Tensor Type Validation",
+                        passed=False,
+                        message=f"Tensor {tensor['name']} uses unknown GGML type {tensor['type']}",
+                        severity=IssueSeverity.INFO,
+                        location=self.current_file_path,
+                        details={"tensor_name": tensor["name"], "tensor_type": tensor["type"]},
+                        rule_code="S902",
+                    )
+                    self._mark_inconclusive(result, GGUF_STRUCTURE_INCONCLUSIVE_REASON)
+                    continue
+
+                # For quantized types, calculate based on block and type size
+                blck, ts = info
+                estimated_size = ((nelements + blck - 1) // blck) * ts
 
                 if estimated_size > self.max_uncompressed:
                     result.add_check(
@@ -385,60 +427,57 @@ class GgufScanner(BaseScanner):
                         },
                     )
 
-                # Validate tensor type and size
-                # Note: tensor offsets are relative to tensor_data_start, not file start
-                info = _GGML_TYPE_INFO.get(tensor["type"])
-                if info:
-                    blck, ts = info
-                    if nelements % blck != 0:
+                # Validate tensor type and size.
+                # Note: tensor offsets are relative to tensor_data_start, not file start.
+                if nelements % blck != 0:
+                    result.add_check(
+                        name="Tensor Block Alignment Check",
+                        passed=False,
+                        message=f"Tensor {tensor['name']} not aligned to block size {blck}",
+                        severity=IssueSeverity.WARNING,
+                        location=self.current_file_path,
+                        details={"tensor_name": tensor["name"], "block_size": blck, "elements": nelements},
+                        rule_code="S804",
+                    )
+
+                expected = ((nelements + blck - 1) // blck) * ts
+
+                # Calculate actual size: use next tensor's offset, or file size for last tensor
+                if idx + 1 < len(tensors):
+                    next_offset = tensors[idx + 1]["offset"]
+                    if next_offset < tensor["offset"]:
                         result.add_check(
-                            name="Tensor Block Alignment Check",
+                            name="Tensor Offset Order Validation",
                             passed=False,
-                            message=f"Tensor {tensor['name']} not aligned to block size {blck}",
+                            message=f"Non-monotonic offsets for tensor {tensor['name']}",
                             severity=IssueSeverity.WARNING,
                             location=self.current_file_path,
-                            details={"tensor_name": tensor["name"], "block_size": blck, "elements": nelements},
-                            rule_code="S804",
+                            details={"current_offset": tensor["offset"], "next_offset": next_offset},
                         )
+                        continue
+                    actual = next_offset - tensor["offset"]
+                else:
+                    # Last tensor: calculate from absolute position to end of file
+                    tensor_abs_start = tensor_data_start + tensor["offset"]
+                    actual = file_size - tensor_abs_start
 
-                    expected = ((nelements + blck - 1) // blck) * ts
-
-                    # Calculate actual size: use next tensor's offset, or file size for last tensor
-                    if idx + 1 < len(tensors):
-                        next_offset = tensors[idx + 1]["offset"]
-                        if next_offset < tensor["offset"]:
-                            result.add_check(
-                                name="Tensor Offset Order Validation",
-                                passed=False,
-                                message=f"Non-monotonic offsets for tensor {tensor['name']}",
-                                severity=IssueSeverity.WARNING,
-                                location=self.current_file_path,
-                                details={"current_offset": tensor["offset"], "next_offset": next_offset},
-                            )
-                            continue
-                        actual = next_offset - tensor["offset"]
-                    else:
-                        # Last tensor: calculate from absolute position to end of file
-                        tensor_abs_start = tensor_data_start + tensor["offset"]
-                        actual = file_size - tensor_abs_start
-
-                    # Allow for alignment padding (tensors may be aligned to 32 bytes)
-                    # Only flag if difference is more than alignment padding
-                    if abs(expected - actual) > tensor_data_alignment:
-                        result.add_check(
-                            name="Tensor Size Consistency Check",
-                            passed=False,
-                            message=f"Size mismatch for tensor {tensor['name']}",
-                            severity=IssueSeverity.WARNING,
-                            location=self.current_file_path,
-                            details={
-                                "tensor_name": tensor["name"],
-                                "expected": expected,
-                                "actual": actual,
-                                "alignment_tolerance": tensor_data_alignment,
-                            },
-                            rule_code="S902",
-                        )
+                # Allow for alignment padding (tensors may be aligned to 32 bytes)
+                # Only flag if difference is more than alignment padding
+                if abs(expected - actual) > tensor_data_alignment:
+                    result.add_check(
+                        name="Tensor Size Consistency Check",
+                        passed=False,
+                        message=f"Size mismatch for tensor {tensor['name']}",
+                        severity=IssueSeverity.WARNING,
+                        location=self.current_file_path,
+                        details={
+                            "tensor_name": tensor["name"],
+                            "expected": expected,
+                            "actual": actual,
+                            "alignment_tolerance": tensor_data_alignment,
+                        },
+                        rule_code="S902",
+                    )
             except (OverflowError, ValueError) as e:
                 result.add_check(
                     name="Tensor Validation Error",
@@ -449,6 +488,7 @@ class GgufScanner(BaseScanner):
                     details={"tensor_name": tensor["name"], "error": str(e)},
                     rule_code="S804",
                 )
+                self._mark_inconclusive(result, GGUF_STRUCTURE_INCONCLUSIVE_REASON)
 
         result.bytes_scanned = f.tell()
 
@@ -473,6 +513,7 @@ class GgufScanner(BaseScanner):
                 details={"file_size": file_size, "min_required": 32},
                 rule_code="S1005",  # Invalid signature/corrupted file
             )
+            self._mark_inconclusive(result, GGUF_PARSE_INCONCLUSIVE_REASON)
             return
 
         # Basic heuristic validation
@@ -488,6 +529,7 @@ class GgufScanner(BaseScanner):
                     details={"header_bytes_read": len(version_bytes), "expected": 4},
                     rule_code="S902",
                 )
+                self._mark_inconclusive(result, GGUF_PARSE_INCONCLUSIVE_REASON)
                 return
 
             version = struct.unpack("<I", version_bytes)[0]

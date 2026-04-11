@@ -8,7 +8,7 @@ import re
 from pathlib import Path
 from typing import Any, ClassVar
 
-from .base import BaseScanner, IssueSeverity, ScanResult
+from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 
 logger = logging.getLogger("modelaudit.scanners")
 
@@ -57,6 +57,7 @@ STANDARD_ONNX_DOMAINS: frozenset[str] = frozenset(
         "ai.onnx.preview.training",
     }
 )
+ONNX_STRUCTURE_INCONCLUSIVE_REASON = "onnx_structure_validation_failed"
 _PYTHON_OPERATOR_TYPES: frozenset[str] = frozenset(
     {
         "pyfunc",
@@ -151,6 +152,25 @@ def _parse_external_data_extent(info: dict[str, str], key: str) -> int | None:
     if parsed < 0:
         raise ValueError(f"{key} must be non-negative, got {parsed}")
     return parsed
+
+
+def _mark_inconclusive_scan_result(result: ScanResult, reason: str) -> None:
+    """Mark the ONNX scan inconclusive when structure validation cannot complete."""
+    result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+    reasons = result.metadata.get("scan_outcome_reasons")
+    if not isinstance(reasons, list):
+        reasons = []
+    if reason not in reasons:
+        reasons.append(reason)
+    result.metadata["scan_outcome_reasons"] = reasons
+
+
+def _finish_scan_result(result: ScanResult) -> None:
+    """Finalize success so incomplete ONNX validation fails closed."""
+    success = not result.has_errors
+    if result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME:
+        success = False
+    result.finish(success=success)
 
 
 class OnnxScanner(BaseScanner):
@@ -287,7 +307,7 @@ class OnnxScanner(BaseScanner):
         self._check_tensor_sizes(model, path, result)
         self._check_weight_distribution(model, path, result)
 
-        result.finish(success=not result.has_errors)
+        _finish_scan_result(result)
         return result
 
     def _check_custom_ops(self, model: Any, path: str, result: ScanResult) -> None:
@@ -601,13 +621,20 @@ class OnnxScanner(BaseScanner):
                     },
                 )
         except Exception as e:
+            _mark_inconclusive_scan_result(result, ONNX_STRUCTURE_INCONCLUSIVE_REASON)
             result.add_check(
                 name="External Data Size Validation",
                 passed=False,
                 message=f"Failed to validate external data size: {e}",
-                severity=IssueSeverity.DEBUG,
+                severity=IssueSeverity.INFO,
                 location=str(external_path),
                 rule_code="S902",
+                details={
+                    "tensor": tensor.name,
+                    "data_type": int(tensor.data_type),
+                    "exception": str(e),
+                    "exception_type": type(e).__name__,
+                },
             )
 
     def _check_tensor_sizes(self, model: Any, path: str, result: ScanResult) -> None:
@@ -651,13 +678,20 @@ class OnnxScanner(BaseScanner):
                             rule_code=None,  # Passing check
                         )
                 except Exception as e:
+                    _mark_inconclusive_scan_result(result, ONNX_STRUCTURE_INCONCLUSIVE_REASON)
                     result.add_check(
                         name="Tensor Validation",
                         passed=False,
                         message=f"Failed to validate tensor '{tensor.name}': {e}",
-                        severity=IssueSeverity.DEBUG,
+                        severity=IssueSeverity.INFO,
                         location=path,
                         rule_code="S703",
+                        details={
+                            "tensor": tensor.name,
+                            "data_type": int(tensor.data_type),
+                            "exception": str(e),
+                            "exception_type": type(e).__name__,
+                        },
                     )
 
     def _check_weight_distribution(self, model: Any, path: str, result: ScanResult) -> None:
