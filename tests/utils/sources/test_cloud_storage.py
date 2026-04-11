@@ -14,6 +14,7 @@ from modelaudit.utils.sources.cloud_storage import (
     filter_scannable_files,
     get_cloud_object_size,
     is_cloud_url,
+    redact_cloud_error_for_display,
     redact_url_for_display,
 )
 
@@ -67,6 +68,30 @@ class TestCloudURLRedaction:
         url = "s3://bucket/model.bin?X-Amz-Credential=secret&X-Amz-Signature=secret"
         assert redact_url_for_display(url) == "s3://bucket/model.bin"
 
+    def test_redact_cloud_error_for_display_redacts_embedded_signed_urls(self) -> None:
+        url = "s3://bucket/model.bin?X-Amz-Credential=cred&X-Amz-Signature=secret"
+        message = f"Forbidden while opening {url}"
+
+        redacted = redact_cloud_error_for_display(message, url)
+
+        assert "s3://bucket/model.bin" in redacted
+        assert "X-Amz-Credential" not in redacted
+        assert "X-Amz-Signature" not in redacted
+        assert "secret" not in redacted
+
+    def test_redact_cloud_error_for_display_redacts_query_credentials_without_exact_url(self) -> None:
+        message = (
+            "provider failed: https://storage.googleapis.com/bucket/model.bin"
+            "?X-Goog-Signature=secret&token=abc123"
+        )
+
+        redacted = redact_cloud_error_for_display(message)
+
+        assert "X-Goog-Signature=<redacted>" in redacted
+        assert "token=<redacted>" in redacted
+        assert "secret" not in redacted
+        assert "abc123" not in redacted
+
 
 @patch("fsspec.filesystem")
 def test_download_from_cloud(mock_fs, tmp_path):
@@ -118,6 +143,23 @@ def test_download_from_cloud_redacts_sensitive_url_in_errors(mock_fs, mock_disk_
 
     assert "s3://bucket/model.bin" in str(excinfo.value)
     assert "X-Amz-Signature" not in str(excinfo.value)
+
+
+@patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+def test_download_from_cloud_redacts_raw_analyzer_error_url(mock_analyze):
+    url = "s3://bucket/model.bin?X-Amz-Signature=secret"
+    mock_analyze.return_value = {
+        "type": "unknown",
+        "error": f"Forbidden while opening {url}",
+    }
+
+    with pytest.raises(ValueError) as excinfo:
+        download_from_cloud(url, use_cache=False, show_progress=False)
+
+    message = str(excinfo.value)
+    assert "s3://bucket/model.bin" in message
+    assert "X-Amz-Signature" not in message
+    assert "secret" not in message
 
 
 @pytest.mark.asyncio

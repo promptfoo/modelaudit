@@ -24,6 +24,15 @@ from ..helpers.disk_space import check_disk_space
 logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
 
+_SENSITIVE_QUERY_PARAM_RE = re.compile(
+    (
+        r"([?&][^=\s&]*(?:signature|credential|security-token|access-key|access_key|token|"
+        r"secret|api-key|api_key|apikey|sig|sas)[^=\s&]*=)[^\s&#]+"
+    ),
+    re.IGNORECASE,
+)
+_URL_USERINFO_RE = re.compile(r"([a-z][a-z0-9+.-]*://)([^/@\s]+)@", re.IGNORECASE)
+
 
 def _run_coroutine_sync(coro_factory: Callable[[], Coroutine[Any, Any, _T]]) -> _T:
     """Run a coroutine from sync code without deadlocking an active event loop."""
@@ -67,6 +76,15 @@ def redact_url_for_display(url: str) -> str:
         netloc = f"{netloc}:{parts.port}"
 
     return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+
+
+def redact_cloud_error_for_display(message: object, source_url: str | None = None) -> str:
+    """Remove signed URL credentials from provider exception text."""
+    redacted = str(message)
+    if source_url:
+        redacted = redacted.replace(source_url, redact_url_for_display(source_url))
+    redacted = _URL_USERINFO_RE.sub(r"\1<credentials-redacted>@", redacted)
+    return _SENSITIVE_QUERY_PARAM_RE.sub(r"\1<redacted>", redacted)
 
 
 def get_fs_protocol(url: str) -> str:
@@ -164,7 +182,10 @@ def get_cloud_object_size(fs: Any, url: str, strict: bool = False) -> int | None
         info = fs.info(url)
     except Exception as exc:
         if strict:
-            raise ValueError(f"Unable to read cloud object info for {redact_url_for_display(url)}: {exc}") from exc
+            redacted_error = redact_cloud_error_for_display(exc, url)
+            raise ValueError(
+                f"Unable to read cloud object info for {redact_url_for_display(url)}: {redacted_error}"
+            ) from exc
         return None
 
     top_level_size_error: Exception | None = None
@@ -224,9 +245,9 @@ def get_cloud_object_size(fs: Any, url: str, strict: bool = False) -> int | None
         if top_level_size_error is not None:
             error_parts.append(f"invalid size from info(): {top_level_size_error}")
         if walk_error:
-            error_parts.append(f"walk() failed: {walk_error}")
+            error_parts.append(f"walk() failed: {redact_cloud_error_for_display(walk_error, url)}")
         if ls_error:
-            error_parts.append(f"ls() failed: {ls_error}")
+            error_parts.append(f"ls() failed: {redact_cloud_error_for_display(ls_error, url)}")
         if not error_parts:
             error_parts.append("cloud provider did not return file sizes")
         raise ValueError(
@@ -297,7 +318,7 @@ async def analyze_cloud_target(url: str) -> dict[str, Any]:
         }
     except Exception as e:
         # If we can't get info, assume it's a file
-        return {"type": "unknown", "error": str(e)}
+        return {"type": "unknown", "error": redact_cloud_error_for_display(e, url)}
 
 
 def prompt_for_large_download(metadata: dict[str, Any]) -> bool:
@@ -538,7 +559,9 @@ def download_from_cloud(
 
     # Ensure target was analyzed successfully
     if "error" in metadata or metadata.get("type") == "unknown":
-        error_msg = metadata.get("error", "Unknown cloud target type")
+        error_msg = redact_cloud_error_for_display(
+            metadata.get("error", "Unknown cloud target type"), url
+        )
         raise ValueError(f"Failed to analyze cloud target {redact_url_for_display(url)}: {error_msg}")
 
     # Check if we can use streaming analysis
