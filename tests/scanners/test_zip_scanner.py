@@ -174,7 +174,12 @@ def test_scan_nested_file_header_routed_generic_suffix_can_report_findings(
 
     assert result.scanner_name == "header_routed_finding"
     assert result.success is False
-    assert any(check.status == CheckStatus.FAILED for check in result.checks)
+    failed_checks = [check for check in result.checks if check.status == CheckStatus.FAILED]
+    assert len(failed_checks) == 1
+    assert failed_checks[0].severity == IssueSeverity.WARNING
+    assert "detected header-routed payload" in failed_checks[0].message.lower()
+    assert result.has_warnings is True
+    assert result.has_errors is False
 
 
 class TestZipScanner:
