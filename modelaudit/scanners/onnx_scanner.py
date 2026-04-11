@@ -448,9 +448,7 @@ class OnnxScanner(BaseScanner):
                     lexical_external_path,
                     model_dir,
                 )
-                symlink_escapes_model_dir = (
-                    has_symlink_component and external_path.exists() and not _is_contained_in(external_path, model_dir)
-                )
+                symlink_escapes_model_dir = has_symlink_component and not _is_contained_in(external_path, model_dir)
                 escapes_model_dir = has_windows_absolute_path or not _is_contained_in(external_path, model_dir)
                 if symlink_escapes_model_dir:
                     result.add_check(

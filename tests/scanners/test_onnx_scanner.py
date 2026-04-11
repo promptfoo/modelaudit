@@ -486,7 +486,7 @@ class TestCVE202634447SymlinkTraversal:
         ]
         assert traversal_checks == []
 
-    def test_broken_symlink_is_missing_external_data_not_cve(
+    def test_broken_symlink_inside_model_dir_is_missing_external_data_not_cve(
         self,
         tmp_path: Path,
         requires_symlinks: None,
@@ -497,7 +497,7 @@ class TestCVE202634447SymlinkTraversal:
             external_path="weights.bin",
             missing_external=True,
         )
-        (tmp_path / "weights.bin").symlink_to(tmp_path.parent / f"{tmp_path.name}_missing_weights.bin")
+        (tmp_path / "weights.bin").symlink_to(tmp_path / "missing_weights.bin")
 
         result = OnnxScanner().scan(str(model_path))
 
@@ -509,6 +509,30 @@ class TestCVE202634447SymlinkTraversal:
         ]
         assert len(missing_checks) == 1
         assert missing_checks[0].severity == IssueSeverity.WARNING
+
+    def test_broken_symlink_escape_detected_without_target_file(
+        self,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        model_path = create_onnx_model(
+            tmp_path,
+            external=True,
+            external_path="weights.bin",
+            missing_external=True,
+        )
+        missing_outside_weights = tmp_path.parent / f"{tmp_path.name}_missing_weights.bin"
+        (tmp_path / "weights.bin").symlink_to(missing_outside_weights)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        assert result.success is False
+        cve_checks = [c for c in result.checks if c.details.get("cve_id") == "CVE-2026-34447"]
+        assert len(cve_checks) == 1
+        details = cve_checks[0].details
+        assert cve_checks[0].severity == IssueSeverity.CRITICAL
+        assert details["resolved_path"] == str(missing_outside_weights.resolve())
+        assert not [c for c in result.checks if c.details.get("cve_id") == "CVE-2025-51480"]
 
 
 class TestCVE202427318NestedPathTraversal:
