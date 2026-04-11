@@ -197,6 +197,25 @@ def test_stream_analyze_file_protocol_with_payload_still_emits_warning(
     assert result.has_warnings is True
 
 
+def test_stream_analyze_file_partial_protocol_marker_still_emits_warning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = tmp_path / "partial_protocol.pkl"
+    file_path.write_bytes(b"\x80\x03N.")
+    url = f"file://{file_path}"
+
+    monkeypatch.setattr(streaming, "get_fs_protocol", lambda u: "file")
+    monkeypatch.setattr(fsspec, "filesystem", lambda protocol, token=None: LocalFileSystem())
+
+    result, was_complete = streaming.stream_analyze_file(url, HeaderOnlyScanner(), max_bytes=2)
+
+    assert was_complete is False
+    assert result is not None
+    assert any(issue.type == "streaming_pickle_protocol_check" for issue in result.issues)
+    assert result.has_warnings is True
+
+
 def test_stream_analyze_file_does_not_retry_sourceful_scan_stream_typeerror(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
