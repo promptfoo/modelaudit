@@ -9,9 +9,10 @@ from typing import Any
 
 import pytest
 
+from modelaudit import core
 from modelaudit.scanners._archive_locations import rewrite_extracted_member_location
 from modelaudit.scanners.archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY
-from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.zip_scanner import ZipScanner
 
 
@@ -336,6 +337,30 @@ class TestZipScanner:
         assert handler_failures[0].details.get("size_limit") == 16
         assert handler_failures[0].location == f"{mar_path}:handler.py"
 
+    def test_scan_manifestless_mar_reports_malformed_python_handler(self, tmp_path: Path) -> None:
+        """Manifest-less .mar handlers with invalid syntax should emit parse-error analysis checks."""
+        mar_path = tmp_path / "malformed_handler.mar"
+        with zipfile.ZipFile(mar_path, "w") as archive:
+            archive.writestr("handler.py", "def handle(data, context)\n    return data\n")
+
+        result = self.scanner.scan(str(mar_path))
+        assert result.success is False
+        assert result.has_warnings is True
+        assert result.has_errors is False
+
+        handler_failures = [
+            check
+            for check in result.checks
+            if check.name == "TorchServe Handler Static Analysis" and check.status == CheckStatus.FAILED
+        ]
+        assert len(handler_failures) == 1
+        assert handler_failures[0].severity == IssueSeverity.WARNING
+        assert "unable to parse python entry for static analysis" in handler_failures[0].message.lower()
+        assert handler_failures[0].details.get("entry") == "handler.py"
+        assert handler_failures[0].details.get("analysis_kind") == "syntax"
+        assert "expected ':'" in str(handler_failures[0].details.get("parse_error")).lower()
+        assert handler_failures[0].location == f"{mar_path}:handler.py"
+
     def test_scan_extensionless_nested_zip_recurses(self, tmp_path: Path) -> None:
         """Extensionless ZIP members should be recursively scanned by content."""
         inner_zip = io.BytesIO()
@@ -579,6 +604,80 @@ class TestZipScanner:
             and "too many entries" in check.message.lower()
             for check in result.checks
         )
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert result.metadata["analysis_incomplete"] is True
+        assert "zip_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+
+    def test_core_zip_partial_nested_scan_without_findings_returns_exit_code_2(self, tmp_path: Path) -> None:
+        """A failed nested ZIP member scan with no finding should stay inconclusive in aggregate output."""
+        archive_path = tmp_path / "nested_failure.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("member.bin", b"payload")
+
+        def nested_scan(_path: str, _config: dict[str, Any]) -> ScanResult:
+            nested_result = ScanResult(scanner_name="test_nested")
+            nested_result.finish(success=False)
+            return nested_result
+
+        scan_kwargs: dict[str, Any] = {NESTED_SCAN_CALLBACK_CONFIG_KEY: nested_scan}
+        audit_result = core.scan_model_directory_or_file(
+            str(archive_path),
+            cache_enabled=False,
+            **scan_kwargs,
+        )
+
+        metadata = audit_result.file_metadata[str(archive_path)]
+        assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert metadata["analysis_incomplete"] is True
+        assert audit_result.success is False
+        assert core.determine_exit_code(audit_result) == 2
+
+    def test_zip_nested_critical_finding_does_not_mark_archive_incomplete(self, tmp_path: Path) -> None:
+        """Real nested findings should fail the archive without claiming partial traversal."""
+        archive_path = tmp_path / "nested_critical.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("model.pkl", b"payload")
+
+        def nested_scan(path: str, _config: dict[str, Any]) -> ScanResult:
+            nested_result = ScanResult(scanner_name="test_nested")
+            nested_result.add_check(
+                name="Nested Critical Finding",
+                passed=False,
+                message="Nested member is malicious",
+                severity=IssueSeverity.CRITICAL,
+                location=path,
+            )
+            nested_result.finish(success=False)
+            return nested_result
+
+        result = ZipScanner(config={NESTED_SCAN_CALLBACK_CONFIG_KEY: nested_scan}).scan(str(archive_path))
+
+        assert result.success is False
+        assert result.has_errors is True
+        assert "scan_outcome" not in result.metadata
+        assert result.metadata.get("analysis_incomplete") is not True
+        assert any(check.name == "Nested Critical Finding" for check in result.checks)
+
+    def test_zip_incomplete_metadata_survives_cache_roundtrip(self, tmp_path: Path) -> None:
+        """Cache conversion should preserve explicit partial-archive outcome metadata."""
+        archive_path = tmp_path / "cached_many_entries.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("one.txt", "one")
+            archive.writestr("two.txt", "two")
+
+        config = {
+            "cache_enabled": True,
+            "cache_dir": str(tmp_path / "scan-cache"),
+            "max_zip_entries": 1,
+        }
+
+        first_result = core.scan_file(str(archive_path), config=config)
+        second_result = core.scan_file(str(archive_path), config=config)
+
+        assert first_result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "zip_analysis_incomplete" in first_result.metadata["scan_outcome_reasons"]
+        assert second_result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "zip_analysis_incomplete" in second_result.metadata["scan_outcome_reasons"]
 
     def test_oversized_symlink_target_fails_closed(self, tmp_path: Path) -> None:
         """Symlink targets should be read with a bounded cap instead of being silently trusted."""
