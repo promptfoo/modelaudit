@@ -351,6 +351,63 @@ def test_pmml_scanner_namespaced_resource_url_attributes_warn(tmp_path: Path) ->
     assert any(str(issue.details.get("attribute", "")).endswith("}href") for issue in external_issues)
 
 
+def test_pmml_scanner_schema_location_urls_warn(tmp_path: Path) -> None:
+    """XML schemaLocation attributes are external references."""
+    pmml = """<?xml version='1.0'?>
+<PMML xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      version='4.4'
+      xsi:schemaLocation="https://evil.example/schema.xsd">
+  <Header/>
+  <DataDictionary numberOfFields='0'/>
+</PMML>"""
+    path = tmp_path / "schema_location.pmml"
+    path.write_text(pmml, encoding="utf-8")
+
+    result = PmmlScanner().scan(str(path))
+
+    external_issues = [issue for issue in result.issues if "external resource" in issue.message.lower()]
+    assert external_issues
+    assert all(issue.severity == IssueSeverity.WARNING for issue in external_issues)
+    assert any(str(issue.details.get("attribute", "")).endswith("}schemaLocation") for issue in external_issues)
+
+
+def test_pmml_scanner_namespaced_documentation_element_urls_warn(tmp_path: Path) -> None:
+    """Custom namespaced documentation-looking elements should not receive PMML doc URL exemptions."""
+    pmml = """<?xml version='1.0'?>
+<PMML xmlns:x="https://example.com/custom" version='4.4'>
+  <Header/>
+  <x:annotation>https://evil.example/payload</x:annotation>
+  <DataDictionary numberOfFields='0'/>
+</PMML>"""
+    path = tmp_path / "namespaced_doc_element.pmml"
+    path.write_text(pmml, encoding="utf-8")
+
+    result = PmmlScanner().scan(str(path))
+
+    external_issues = [issue for issue in result.issues if "external resource" in issue.message.lower()]
+    assert external_issues
+    assert all(issue.severity == IssueSeverity.WARNING for issue in external_issues)
+    assert any(str(issue.details.get("tag", "")).endswith("}annotation") for issue in external_issues)
+
+
+def test_pmml_scanner_namespaced_documentation_attribute_urls_warn(tmp_path: Path) -> None:
+    """Custom namespaced documentation-looking attributes should not receive PMML doc URL exemptions."""
+    pmml = """<?xml version='1.0'?>
+<PMML xmlns:x="https://example.com/custom" version='4.4'>
+  <Header x:label="https://evil.example/payload"/>
+  <DataDictionary numberOfFields='0'/>
+</PMML>"""
+    path = tmp_path / "namespaced_doc_attribute.pmml"
+    path.write_text(pmml, encoding="utf-8")
+
+    result = PmmlScanner().scan(str(path))
+
+    external_issues = [issue for issue in result.issues if "external resource" in issue.message.lower()]
+    assert external_issues
+    assert all(issue.severity == IssueSeverity.WARNING for issue in external_issues)
+    assert any(str(issue.details.get("attribute", "")).endswith("}label") for issue in external_issues)
+
+
 def test_pmml_scanner_malformed_xml(tmp_path: Path) -> None:
     """Test handling of malformed XML."""
     malformed_xml = """<?xml version='1.0'?>
