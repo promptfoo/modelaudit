@@ -2832,7 +2832,7 @@ wheels = [
 
 [[package]]
 name = "modelaudit"
-version = "0.2.34"
+version = "0.2.35"
 source = { editable = "." }
 dependencies = [
     { name = "click" },
