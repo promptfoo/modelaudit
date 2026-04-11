@@ -505,6 +505,54 @@ def test_pytorch_zip_scans_non_numeric_files_in_archive_data(tmp_path):
     # At minimum, the file should have been scanned (not skipped)
 
 
+def test_pytorch_zip_allows_torchscript_generated_python_files(tmp_path: Path) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "scripted.pt", prefix="archive")
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr("archive/code/__torch__.py", "class Module:\n    pass\n")
+        zip_file.writestr("archive/code/__torch__/torch/nn/modules/container.py", "class Sequential:\n    pass\n")
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    python_failures = [
+        check
+        for check in result.checks
+        if check.name == "Python Code File Detection" and check.status == CheckStatus.FAILED
+    ]
+    python_successes = [
+        check
+        for check in result.checks
+        if check.name == "Python Code File Detection" and check.status == CheckStatus.PASSED
+    ]
+    assert python_failures == []
+    assert len(python_successes) == 1
+    assert python_successes[0].message == "No unexpected Python code files found in model"
+    assert not [
+        issue
+        for issue in result.issues
+        if issue.location
+        and "archive/code/__torch__" in issue.location
+        and issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+    ]
+
+
+def test_pytorch_zip_still_warns_on_unexpected_python_files(tmp_path: Path) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "model.pt", prefix="archive")
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr("archive/code/helper.py", "print('not generated TorchScript source')\n")
+        zip_file.writestr("archive/data/malicious.py", "import os\nos.system('id')\n")
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    python_failures = [
+        check
+        for check in result.checks
+        if check.name == "Python Code File Detection" and check.status == CheckStatus.FAILED
+    ]
+    failed_files = {check.details["file"] for check in python_failures}
+    assert {"archive/code/helper.py", "archive/data/malicious.py"}.issubset(failed_files)
+    assert all(check.severity == IssueSeverity.WARNING for check in python_failures)
+
+
 def test_pytorch_zip_numeric_detection_edge_cases(tmp_path):
     """Test edge cases for numeric file detection in archive/data/."""
     zip_path = tmp_path / "model.pt"

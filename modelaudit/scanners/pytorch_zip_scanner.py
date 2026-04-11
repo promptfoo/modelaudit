@@ -266,6 +266,25 @@ class PyTorchZipScanner(BaseScanner):
         return get_zip_member_names(entries)
 
     @staticmethod
+    def _is_torchscript_generated_python(name: str) -> bool:
+        """Return true for TorchScript's generated Python source archive layout."""
+        normalized = name.replace("\\", "/").lstrip("/").lower()
+        parts = tuple(part for part in normalized.split("/") if part)
+        if not parts or not parts[-1].endswith(".py"):
+            return False
+
+        for index, part in enumerate(parts):
+            if part != "code":
+                continue
+            torchscript_parts = parts[index + 1 :]
+            if torchscript_parts == ("__torch__.py",) or (
+                len(torchscript_parts) > 1 and torchscript_parts[0] == "__torch__"
+            ):
+                return True
+
+        return False
+
+    @staticmethod
     def _find_zip_entry(entries: list[zipfile.ZipInfo], member_name: str) -> zipfile.ZipInfo | None:
         """Return the first matching ZipInfo entry for a member name, or None."""
         return find_zip_entry(entries, member_name)
@@ -802,6 +821,8 @@ class PyTorchZipScanner(BaseScanner):
             normalized_name = name.lower()
             # Check for Python code files
             if normalized_name.endswith(".py"):
+                if self._is_torchscript_generated_python(name):
+                    continue
                 result.add_check(
                     name="Python Code File Detection",
                     passed=False,
@@ -828,7 +849,7 @@ class PyTorchZipScanner(BaseScanner):
             result.add_check(
                 name="Python Code File Detection",
                 passed=True,
-                message="No Python code files found in model",
+                message="No unexpected Python code files found in model",
                 location=path,
             )
 
