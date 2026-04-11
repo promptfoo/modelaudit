@@ -5,8 +5,13 @@ import json
 import struct
 from pathlib import Path
 
+import pytest
+
+import modelaudit.scanners.mxnet_scanner as mxnet_scanner
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.models import ModelAuditResultModel
 from modelaudit.scanners import get_scanner_for_file
-from modelaudit.scanners.base import IssueSeverity
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity, ScanResult
 from modelaudit.scanners.mxnet_scanner import MXNetScanner
 
 
@@ -40,6 +45,22 @@ def _write_params_file(path: Path, values: tuple[float, ...] | None = None) -> N
     path.write_bytes(struct.pack(f"<{len(tensor_values)}f", *tensor_values))
 
 
+def _assert_inconclusive_result(result: ScanResult, reason: str) -> None:
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert reason in result.metadata["scan_outcome_reasons"]
+    assert result.metadata["analysis_incomplete"] is True
+
+
+def _assert_aggregate_inconclusive(result: ModelAuditResultModel, path: Path, reason: str) -> None:
+    metadata = result.file_metadata[str(path)]
+    assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert reason in metadata["scan_outcome_reasons"]
+    assert metadata["analysis_incomplete"] is True
+    assert result.success is False
+    assert determine_exit_code(result) == 2
+
+
 def test_mxnet_scanner_can_handle_symbol_and_params(tmp_path: Path) -> None:
     symbol_path = tmp_path / "model-symbol.json"
     params_path = tmp_path / "model-0000.params"
@@ -51,13 +72,20 @@ def test_mxnet_scanner_can_handle_symbol_and_params(tmp_path: Path) -> None:
 
 
 def test_mxnet_scanner_rejects_non_mxnet_files(tmp_path: Path) -> None:
-    fake_symbol = tmp_path / "fake-symbol.json"
+    fake_symbol = tmp_path / "fake.json"
     fake_symbol.write_text('{"not": "mxnet"}', encoding="utf-8")
     bad_params_name = tmp_path / "weights.params"
     bad_params_name.write_bytes(b"raw bytes")
 
     assert not MXNetScanner.can_handle(str(fake_symbol))
     assert not MXNetScanner.can_handle(str(bad_params_name))
+
+
+def test_mxnet_scanner_routes_malformed_symbol_for_fail_closed_scan(tmp_path: Path) -> None:
+    symbol_path = tmp_path / "malformed-symbol.json"
+    symbol_path.write_text('{"nodes": [', encoding="utf-8")
+
+    assert MXNetScanner.can_handle(str(symbol_path))
 
 
 def test_mxnet_symbol_scan_with_valid_pair_has_no_security_findings(tmp_path: Path) -> None:
@@ -149,8 +177,116 @@ def test_mxnet_scanner_handles_corrupt_params_file(tmp_path: Path) -> None:
 
     result = MXNetScanner().scan(str(params_path))
 
-    assert not result.success
+    _assert_inconclusive_result(result, "mxnet_params_empty")
     assert any("MXNet params blob is empty" in issue.message for issue in result.issues)
+
+
+def test_mxnet_corrupt_params_aggregate_exit_code_is_inconclusive(tmp_path: Path) -> None:
+    params_path = tmp_path / "corrupt-0000.params"
+    params_path.write_bytes(b"")
+
+    result = scan_model_directory_or_file(str(params_path), cache_scan_results=False)
+
+    _assert_aggregate_inconclusive(result, params_path, "mxnet_params_empty")
+
+
+def test_mxnet_truncated_params_aggregate_exit_code_is_inconclusive(tmp_path: Path) -> None:
+    params_path = tmp_path / "truncated-0000.params"
+    params_path.write_bytes(b"short")
+
+    direct_result = MXNetScanner().scan(str(params_path))
+    aggregate_result = scan_model_directory_or_file(str(params_path), cache_scan_results=False)
+
+    _assert_inconclusive_result(direct_result, "mxnet_params_truncated")
+    _assert_aggregate_inconclusive(aggregate_result, params_path, "mxnet_params_truncated")
+
+
+def test_mxnet_malformed_symbol_scan_is_inconclusive(tmp_path: Path) -> None:
+    symbol_path = tmp_path / "broken-symbol.json"
+    symbol_path.write_text('{"nodes": [', encoding="utf-8")
+
+    result = MXNetScanner().scan(str(symbol_path))
+    aggregate_result = scan_model_directory_or_file(str(symbol_path), cache_scan_results=False)
+
+    _assert_inconclusive_result(result, "mxnet_symbol_parse_failed")
+    _assert_aggregate_inconclusive(aggregate_result, symbol_path, "mxnet_symbol_parse_failed")
+    assert any(check.name == "MXNet Symbol Parse" for check in result.checks)
+
+
+def test_mxnet_unsupported_extension_scan_is_inconclusive(tmp_path: Path) -> None:
+    artifact_path = tmp_path / "model.mxnet"
+    artifact_path.write_bytes(b"mxnet-ish content")
+
+    result = MXNetScanner().scan(str(artifact_path))
+
+    _assert_inconclusive_result(result, "mxnet_unsupported_extension")
+
+
+def test_mxnet_symbol_read_failure_scan_is_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    symbol_path = tmp_path / "unreadable-symbol.json"
+    symbol_path.write_text("{}", encoding="utf-8")
+
+    def raise_os_error(path: Path, max_bytes: int) -> tuple[bytes, bool]:
+        raise OSError("symbol read failed")
+
+    monkeypatch.setattr(MXNetScanner, "_read_bounded_bytes", staticmethod(raise_os_error))
+
+    result = MXNetScanner().scan(str(symbol_path))
+
+    _assert_inconclusive_result(result, "mxnet_symbol_read_failed")
+
+
+def test_mxnet_params_read_failure_scan_is_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    params_path = tmp_path / "unreadable-0000.params"
+    params_path.write_bytes(b"placeholder params")
+
+    def raise_os_error(path: Path, max_bytes: int) -> tuple[bytes, bool]:
+        raise OSError("params read failed")
+
+    monkeypatch.setattr(MXNetScanner, "_read_bounded_bytes", staticmethod(raise_os_error))
+
+    result = MXNetScanner().scan(str(params_path))
+
+    _assert_inconclusive_result(result, "mxnet_params_read_failed")
+
+
+def test_mxnet_truncated_symbol_scan_is_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    symbol_path = tmp_path / "truncated-symbol.json"
+    _write_symbol_file(symbol_path)
+    monkeypatch.setattr(mxnet_scanner, "MAX_SYMBOL_READ_BYTES", 8)
+
+    result = MXNetScanner().scan(str(symbol_path))
+
+    _assert_inconclusive_result(result, "mxnet_symbol_truncated")
+
+
+def test_mxnet_empty_symbol_scan_is_inconclusive(tmp_path: Path) -> None:
+    symbol_path = tmp_path / "empty-symbol.json"
+    symbol_path.write_text("", encoding="utf-8")
+
+    result = MXNetScanner().scan(str(symbol_path))
+
+    _assert_inconclusive_result(result, "mxnet_symbol_empty")
+
+
+def test_mxnet_invalid_symbol_structure_scan_is_inconclusive(tmp_path: Path) -> None:
+    symbol_path = tmp_path / "invalid-symbol.json"
+    symbol_path.write_text(json.dumps({"nodes": [], "arg_nodes": [], "heads": []}), encoding="utf-8")
+
+    result = MXNetScanner().scan(str(symbol_path))
+    aggregate_result = scan_model_directory_or_file(str(symbol_path), cache_scan_results=False)
+
+    _assert_inconclusive_result(result, "mxnet_symbol_invalid_structure")
+    _assert_aggregate_inconclusive(aggregate_result, symbol_path, "mxnet_symbol_invalid_structure")
 
 
 def test_mxnet_params_numeric_blob_does_not_trigger_false_positives(tmp_path: Path) -> None:

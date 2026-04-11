@@ -58,12 +58,30 @@ _OPERATIONAL_ERROR_REASON_METADATA_KEY = "operational_error_reason"
 _SCAN_OUTCOME_METADATA_KEY = "scan_outcome"
 
 HEADER_FORMAT_TO_SCANNER_ID = _registry.get_header_format_to_scanner_ids()
+_COMPRESSED_HEADER_FORMATS = frozenset({"compressed", "gzip", "bzip2", "xz", "lz4", "zlib"})
+_R_SERIALIZED_EXTENSIONS = frozenset({".rds", ".rda", ".rdata"})
 
 
 def _mark_operational_scan_error(scan_result: ScanResult, reason: str) -> None:
     """Mark a scan result as an operational failure for exit-code aggregation."""
     scan_result.metadata[_OPERATIONAL_ERROR_METADATA_KEY] = True
     scan_result.metadata[_OPERATIONAL_ERROR_REASON_METADATA_KEY] = reason
+
+
+def _mark_inconclusive_scan_outcome(scan_result: ScanResult, reason: str) -> None:
+    """Mark a scan result as explicitly inconclusive for exit-code aggregation."""
+    scan_result.metadata["analysis_incomplete"] = True
+    scan_result.metadata[_SCAN_OUTCOME_METADATA_KEY] = INCONCLUSIVE_SCAN_OUTCOME
+    scan_result.metadata.setdefault(
+        "scan_outcome_message",
+        "Scan analysis incomplete; failed closed because full coverage was not available.",
+    )
+
+    existing_reasons = scan_result.metadata.get("scan_outcome_reasons")
+    reasons = existing_reasons if isinstance(existing_reasons, list) else []
+    if reason not in reasons:
+        reasons.append(reason)
+    scan_result.metadata["scan_outcome_reasons"] = reasons
 
 
 def _scan_result_has_operational_error(scan_result: ScanResult) -> bool:
@@ -238,8 +256,11 @@ def _select_preferred_scanner_id(path: str, header_format: str, ext: str) -> str
             return "pickle"
         return "zip"
 
-    if ext == ".joblib" and header_format in {"compressed", "pickle"}:
+    if ext == ".joblib" and header_format in _COMPRESSED_HEADER_FORMATS | {"pickle"}:
         return "joblib"
+
+    if ext in _R_SERIALIZED_EXTENSIONS and header_format in _COMPRESSED_HEADER_FORMATS | {"r_serialized"}:
+        return "r_serialized"
 
     if header_format == "tar" and ext == ".nemo":
         return "nemo"
@@ -787,6 +808,8 @@ def scan_model_directory_or_file(
             if scanner:
                 scan_result, was_complete = stream_analyze_file(stream_url, scanner)
                 if scan_result:
+                    if not was_complete:
+                        _mark_inconclusive_scan_outcome(scan_result, "streaming_analysis_incomplete")
                     results.files_scanned += 1
 
                     # Use helper function to add scan result to Pydantic model

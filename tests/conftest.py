@@ -143,6 +143,7 @@ def pytest_runtest_setup(item):
             "test_tflite_scanner.py",  # TFLite scanner guardrail tests
             "test_tensorrt_scanner.py",  # TensorRT scanner tests
             "test_torchserve_mar_scanner.py",  # TorchServe .mar scanner tests
+            "test_jinja2_template_scanner.py",  # Jinja2 template parse fallback regression tests
             "test_executorch_scanner.py",  # ExecuTorch scanner tests
             "test_telemetry.py",  # telemetry payload and availability tests
             "test_telemetry_decoupling.py",  # telemetry failure-isolation tests

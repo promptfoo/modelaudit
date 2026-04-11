@@ -114,6 +114,26 @@ def test_tensorrt_scanner_detects_embedded_pe_header(tmp_path: Path) -> None:
     )
 
 
+def test_tensorrt_scanner_detects_embedded_pe_header_after_invalid_decoy(tmp_path: Path) -> None:
+    path = tmp_path / "embedded_pe_after_decoy.engine"
+    prefix = b"tensorrt engine prefix\x00"
+    invalid_pe_near_match = bytearray(b"\x00" * 0x100)
+    invalid_pe_near_match[0:2] = b"MZ"
+    invalid_pe_near_match[0x3C:0x40] = (0x80).to_bytes(4, "little")
+    invalid_pe_near_match[0x80:0x84] = b"PX\x00\x00"
+    separator = b"\x00decoy boundary\x00"
+    path.write_bytes(prefix + bytes(invalid_pe_near_match) + separator + _minimal_pe_header())
+
+    result = TensorRTScanner().scan(str(path))
+
+    assert result.success is False
+    assert any(
+        issue.details.get("pattern") == "embedded PE"
+        and issue.details.get("offset") == len(prefix) + len(invalid_pe_near_match) + len(separator)
+        for issue in result.issues
+    )
+
+
 def test_tensorrt_scanner_detects_embedded_elf_shared_object(tmp_path: Path) -> None:
     path = tmp_path / "embedded_elf.engine"
     prefix = b"tensorrt engine prefix\x00"
