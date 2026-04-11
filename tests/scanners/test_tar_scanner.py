@@ -2,12 +2,13 @@ import os
 import tarfile
 import tempfile
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import pytest
 
 from modelaudit import core
-from modelaudit.scanners.base import CheckStatus, IssueSeverity
+from modelaudit.scanners.archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.tar_scanner import (
     DEFAULT_MAX_DECOMPRESSED_BYTES,
     DEFAULT_MAX_DECOMPRESSION_RATIO,
@@ -703,6 +704,82 @@ class TestTarScanner:
         entry_checks = [check for check in result.checks if check.name == "Entry Count Limit Check"]
         assert len(entry_checks) == 1
         assert entry_checks[0].status == CheckStatus.PASSED
+
+    def test_max_entries_limit_marks_inconclusive_metadata(self, tmp_path: Path) -> None:
+        """Entry-count truncation should make TAR coverage explicit in metadata."""
+        archive_path = tmp_path / "too_many_entries.tar"
+        with tarfile.open(archive_path, "w") as archive:
+            for index in range(2):
+                payload = f"payload-{index}".encode()
+                info = tarfile.TarInfo(f"payload-{index}.bin")
+                info.size = len(payload)
+                archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = TarScanner(config={"max_tar_entries": 1}).scan(str(archive_path))
+
+        assert result.success is False
+        entry_checks = [check for check in result.checks if check.name == "Entry Count Limit Check"]
+        assert len(entry_checks) == 1
+        assert entry_checks[0].status == CheckStatus.FAILED
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert result.metadata["analysis_incomplete"] is True
+        assert "tar_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+
+    def test_core_tar_partial_nested_scan_without_findings_returns_exit_code_2(self, tmp_path: Path) -> None:
+        """A failed nested TAR member scan with no finding should stay inconclusive in aggregate output."""
+        archive_path = tmp_path / "nested_failure.tar"
+        with tarfile.open(archive_path, "w") as archive:
+            payload = b"payload"
+            info = tarfile.TarInfo("member.bin")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        def nested_scan(_path: str, _config: dict[str, Any]) -> ScanResult:
+            nested_result = ScanResult(scanner_name="test_nested")
+            nested_result.finish(success=False)
+            return nested_result
+
+        scan_kwargs: dict[str, Any] = {NESTED_SCAN_CALLBACK_CONFIG_KEY: nested_scan}
+        audit_result = core.scan_model_directory_or_file(
+            str(archive_path),
+            cache_enabled=False,
+            **scan_kwargs,
+        )
+
+        metadata = audit_result.file_metadata[str(archive_path)]
+        assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert metadata["analysis_incomplete"] is True
+        assert audit_result.success is False
+        assert core.determine_exit_code(audit_result) == 2
+
+    def test_tar_nested_critical_finding_does_not_mark_archive_incomplete(self, tmp_path: Path) -> None:
+        """Real nested findings should fail the archive without claiming partial traversal."""
+        archive_path = tmp_path / "nested_critical.tar"
+        with tarfile.open(archive_path, "w") as archive:
+            payload = b"payload"
+            info = tarfile.TarInfo("model.pkl")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        def nested_scan(path: str, _config: dict[str, Any]) -> ScanResult:
+            nested_result = ScanResult(scanner_name="test_nested")
+            nested_result.add_check(
+                name="Nested Critical Finding",
+                passed=False,
+                message="Nested member is malicious",
+                severity=IssueSeverity.CRITICAL,
+                location=path,
+            )
+            nested_result.finish(success=False)
+            return nested_result
+
+        result = TarScanner(config={NESTED_SCAN_CALLBACK_CONFIG_KEY: nested_scan}).scan(str(archive_path))
+
+        assert result.success is False
+        assert result.has_errors is True
+        assert "scan_outcome" not in result.metadata
+        assert result.metadata.get("analysis_incomplete") is not True
+        assert any(check.name == "Nested Critical Finding" for check in result.checks)
 
     def test_scan_compressed_tar_detects_wrapper_by_content_not_suffix(self, tmp_path: Path) -> None:
         """Compressed TARs with plain .tar suffix should still enforce wrapper limits by magic bytes."""
