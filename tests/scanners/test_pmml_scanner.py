@@ -248,6 +248,26 @@ def test_pmml_scanner_resource_url_attributes_still_warn(tmp_path: Path) -> None
     assert any(issue.details.get("attribute") == "source" for issue in external_issues)
 
 
+def test_pmml_scanner_namespaced_resource_url_attributes_warn(tmp_path: Path) -> None:
+    """Namespaced resource attributes should still be treated as external references."""
+    pmml = """<?xml version='1.0'?>
+<PMML xmlns:xlink="http://www.w3.org/1999/xlink" version='4.4'>
+  <Header/>
+  <DataDictionary>
+    <DataField name="payload" optype="categorical" dataType="string" xlink:href="https://evil.example/payload"/>
+  </DataDictionary>
+</PMML>"""
+    path = tmp_path / "namespaced_resource_attr.pmml"
+    path.write_text(pmml, encoding="utf-8")
+
+    result = PmmlScanner().scan(str(path))
+
+    external_issues = [issue for issue in result.issues if "external resource" in issue.message.lower()]
+    assert external_issues
+    assert all(issue.severity == IssueSeverity.WARNING for issue in external_issues)
+    assert any(str(issue.details.get("attribute", "")).endswith("}href") for issue in external_issues)
+
+
 def test_pmml_scanner_malformed_xml(tmp_path: Path) -> None:
     """Test handling of malformed XML."""
     malformed_xml = """<?xml version='1.0'?>

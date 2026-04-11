@@ -229,7 +229,7 @@ class PmmlScanner(BaseScanner):
         """Validate basic PMML structure and extract metadata."""
         # Extract local tag name (without namespace)
         # Tags can be "{http://namespace}PMML" or just "PMML"
-        tag_name = self._local_tag_name(root.tag)
+        tag_name = self._local_xml_name(root.tag)
 
         if tag_name != "pmml":
             result.add_check(
@@ -258,7 +258,7 @@ class PmmlScanner(BaseScanner):
     def _check_suspicious_content(self, root: Any, result: ScanResult, path: str) -> None:
         """Check for suspicious patterns and external references in PMML content."""
         for elem in root.iter():
-            tag_name = self._local_tag_name(elem.tag)
+            tag_name = self._local_xml_name(elem.tag)
 
             # Combine element text content with attributes for comprehensive scanning
             elem_text = elem.text or ""
@@ -297,7 +297,7 @@ class PmmlScanner(BaseScanner):
                     self._add_external_resource_check_if_url(result, path, elem.tag, elem_text, context="text")
 
                 for attr_name, attr_value in elem.attrib.items():
-                    normalized_attr_name = attr_name.strip().lower()
+                    normalized_attr_name = self._local_xml_name(attr_name)
                     if self._is_external_resource_attribute(tag_name, normalized_attr_name, elem.attrib):
                         self._add_external_resource_check_if_url(
                             result,
@@ -390,11 +390,12 @@ class PmmlScanner(BaseScanner):
         )
 
     @staticmethod
-    def _local_tag_name(tag: Any) -> str:
-        """Extract a lowercase local tag name from namespaced ElementTree tags."""
-        if not isinstance(tag, str):
+    def _local_xml_name(name: Any) -> str:
+        """Extract a lowercase local name from namespaced ElementTree names."""
+        if not isinstance(name, str):
             return ""
-        return tag.split("}")[-1].lower() if "}" in tag else tag.lower()
+        local_name = name.split("}")[-1] if "}" in name else name
+        return local_name.rsplit(":", 1)[-1].strip().lower()
 
     def _get_all_text_content(self, element: Any) -> tuple[str, bool]:
         """Collect Extension text and report whether traversal hit the node budget."""
@@ -411,7 +412,7 @@ class PmmlScanner(BaseScanner):
             current = stack.pop()
             nodes_seen += 1
 
-            tag_name = self._local_tag_name(current.tag)
+            tag_name = self._local_xml_name(current.tag)
             if tag_name:
                 text_parts.append(tag_name)
 
