@@ -26,7 +26,9 @@ Differential harness for comparing the legacy in-repo `PickleScanner` against th
 standalone `modelaudit-picklescan` package on committed pickle fixtures. The
 harness uses a pure legacy baseline (without package-result merging) and prints
 label-aware drift summaries so safe-fixture false-positive regressions are easy
-to spot. Use `--json` for a machine-readable report.
+to spot. Use `--json` for a machine-readable report. Add `--include-root` to
+compare the actual root scanner result, or `--root-standalone-primary` to audit
+the opt-in standalone-primary migration mode.
 
 ## Development Use Only
 

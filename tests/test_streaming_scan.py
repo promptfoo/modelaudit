@@ -93,6 +93,63 @@ def test_scan_model_directory_or_file_streaming_path() -> None:
         assert determine_exit_code(result) == 0
 
 
+def test_scan_model_directory_or_file_partial_streaming_path_returns_exit_code_2() -> None:
+    """Partial stream:// analysis without findings should be explicit and fail closed."""
+    stream_url = "s3://bucket/model.pkl"
+    scan_result = ScanResult(scanner_name="streaming")
+    scan_result.bytes_scanned = 128
+    scan_result.finish(success=True)
+
+    with (
+        patch("modelaudit.core.stream_analyze_file") as mock_stream,
+        patch("modelaudit.scanners.get_scanner_for_file") as mock_scanner,
+    ):
+        dummy_scanner = object()
+        mock_scanner.return_value = dummy_scanner
+        mock_stream.return_value = (scan_result, False)
+
+        result = scan_model_directory_or_file(f"stream://{stream_url}")
+
+    metadata = result.file_metadata[stream_url].model_dump()
+    assert metadata["scan_outcome"] == "inconclusive"
+    assert metadata["analysis_incomplete"] is True
+    assert "streaming_analysis_incomplete" in metadata["scan_outcome_reasons"]
+    assert "failed closed" in metadata["scan_outcome_message"]
+    assert any(issue.message == "Streaming analysis was partial - only analyzed file header" for issue in result.issues)
+    assert result.has_errors is False
+    assert result.files_scanned == 1
+    assert result.success is False
+    assert determine_exit_code(result) == 2
+
+
+def test_scan_model_directory_or_file_partial_streaming_security_finding_returns_exit_code_1() -> None:
+    """Security findings should outrank partial stream:// analysis metadata."""
+    stream_url = "s3://bucket/model.pkl"
+    scan_result = ScanResult(scanner_name="streaming")
+    scan_result.bytes_scanned = 128
+    scan_result.add_issue(
+        "Dangerous payload found in streamed prefix",
+        severity=IssueSeverity.CRITICAL,
+        location=stream_url,
+    )
+    scan_result.finish(success=True)
+
+    with (
+        patch("modelaudit.core.stream_analyze_file") as mock_stream,
+        patch("modelaudit.scanners.get_scanner_for_file") as mock_scanner,
+    ):
+        dummy_scanner = object()
+        mock_scanner.return_value = dummy_scanner
+        mock_stream.return_value = (scan_result, False)
+
+        result = scan_model_directory_or_file(f"stream://{stream_url}")
+
+    metadata = result.file_metadata[stream_url].model_dump()
+    assert metadata["scan_outcome"] == "inconclusive"
+    assert result.success is True
+    assert determine_exit_code(result) == 1
+
+
 def test_scan_model_streaming_basic(temp_test_files: list[Path]) -> None:
     """Test basic streaming scan functionality."""
 
