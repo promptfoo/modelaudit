@@ -456,7 +456,7 @@ class SafeTensorsScanner(BaseScanner):
                             lower_val = value.lower()
 
                             # Check for simple code-like patterns
-                            if any(s in lower_val for s in ["import ", "#!/", "\\"]):
+                            if any(s in lower_val for s in ["import ", "#!/"]):
                                 result.add_check(
                                     name="Metadata Code Pattern Check",
                                     passed=False,
@@ -651,13 +651,7 @@ class SafeTensorsScanner(BaseScanner):
         path_traversal_patterns = [
             r"\.\./+",
             r"\.\.\\+",
-            r"/etc/",
-            r"/proc/",
-            r"/root/",
-            r"/home/",
-            r"C:\\",
-            r"%[0-9a-fA-F]{2}",  # URL encoded characters
-            r"\\[a-zA-Z]:",  # Windows drive letters
+            r"%2e%2e(?:%2f|/|%5c|\\)",
         ]
 
         for pattern in path_traversal_patterns:
