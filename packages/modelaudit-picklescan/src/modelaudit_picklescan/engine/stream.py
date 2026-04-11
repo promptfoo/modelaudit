@@ -16,9 +16,16 @@ class _StreamReadError(Exception):
 class _BoundedPickleStream:
     """Incrementally read pickle bytes while enforcing an optional byte limit."""
 
-    def __init__(self, stream: BinaryIO, byte_limit: int | None) -> None:
+    def __init__(
+        self,
+        stream: BinaryIO,
+        byte_limit: int | None,
+        *,
+        unbounded_read_limit: int,
+    ) -> None:
         self._stream = stream
         self._byte_limit = byte_limit
+        self._unbounded_read_limit = max(unbounded_read_limit, 1)
         self._prefetched = bytearray()
         self._position = 0
         self.short_read = False
@@ -91,7 +98,9 @@ class _BoundedPickleStream:
         if requested_size is not None and requested_size < 0:
             requested_size = None
         if self._byte_limit is None:
-            return requested_size
+            if requested_size is None:
+                return self._unbounded_read_limit
+            return min(requested_size, self._unbounded_read_limit)
 
         remaining = max(self._byte_limit - self._position, 0)
         if requested_size is None:

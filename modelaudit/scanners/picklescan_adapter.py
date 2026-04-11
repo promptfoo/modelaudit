@@ -105,6 +105,14 @@ def scan_options_from_config(config: Mapping[str, Any]) -> ScanOptions:
             _DEFAULT_SCAN_OPTIONS.post_budget_scan_bytes,
             minimum=0,
         ),
+        max_unbounded_stream_read_bytes=_parse_min_int(
+            config.get(
+                "max_unbounded_stream_read_bytes",
+                _DEFAULT_SCAN_OPTIONS.max_unbounded_stream_read_bytes,
+            ),
+            _DEFAULT_SCAN_OPTIONS.max_unbounded_stream_read_bytes,
+            minimum=1,
+        ),
         max_string_literal_scan_chars=_parse_min_int(
             config.get(
                 "max_string_literal_scan_chars",
