@@ -3535,6 +3535,67 @@ class TestDillLoadersRegression:
         assert details["analysis_incomplete"] is True
         assert "analysis_error_type" in details
 
+    def test_nested_pickle_parse_error_without_dangerous_prefix_fails_closed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Parse aborts after benign prefix evidence should still be critical."""
+        from modelaudit.scanners import pickle_scanner as pickle_scanner_module
+
+        benign_opcodes = list(pickletools.genops(pickle.dumps({"padding": "benign"})))
+
+        def _benign_prefix_then_parse_error(
+            file_obj: BinaryIO,
+            *,
+            multi_stream: bool = False,
+            max_items: int | None = None,
+            deadline: float | None = None,
+        ) -> Iterator[tuple[Any, Any, int | None]]:
+            del file_obj, multi_stream, max_items, deadline
+            yield from benign_opcodes
+            raise ValueError("trailing nested parse error")
+
+        monkeypatch.setattr(pickle_scanner_module, "_genops_with_fallback", _benign_prefix_then_parse_error)
+
+        severity, evidence, details = _classify_nested_pickle_payload(
+            b"\x80\x04.",
+            SimpleNamespace(offset=0),
+            {},
+        )
+
+        assert severity == IssueSeverity.CRITICAL
+        assert evidence == "analysis_incomplete"
+        assert details["analysis_incomplete"] is True
+        assert details["analysis_error_type"] == "ValueError"
+        assert details["partial_evidence"] == "structure_only"
+
+    def test_nested_pickle_classification_passes_deadline_to_parser(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Nested re-parsing should preserve the active scan deadline."""
+        from modelaudit.scanners import pickle_scanner as pickle_scanner_module
+
+        observed_deadlines: list[float | None] = []
+
+        def _capture_deadline(
+            file_obj: BinaryIO,
+            *,
+            multi_stream: bool = False,
+            max_items: int | None = None,
+            deadline: float | None = None,
+        ) -> Iterator[tuple[Any, Any, int | None]]:
+            del file_obj, multi_stream, max_items
+            observed_deadlines.append(deadline)
+            yield from pickletools.genops(pickle.dumps({"safe": True}))
+
+        monkeypatch.setattr(pickle_scanner_module, "_genops_with_fallback", _capture_deadline)
+
+        _classify_nested_pickle_payload(
+            b"\x80\x04.",
+            SimpleNamespace(offset=0),
+            {},
+            deadline=123.0,
+        )
+
+        assert observed_deadlines == [123.0]
+
     def test_nested_pickle_budget_error_preserves_collected_dangerous_opcodes(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

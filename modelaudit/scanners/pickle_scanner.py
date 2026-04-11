@@ -3404,6 +3404,8 @@ def _classify_nested_pickle_payload(
     payload: bytes | bytearray,
     nested_match: Any,
     ml_context: dict[str, Any],
+    *,
+    deadline: float | None = None,
 ) -> tuple[IssueSeverity, str, dict[str, Any]]:
     """Classify nested pickle evidence without treating structure alone as critical."""
     nested_bytes = bytes(payload)[nested_match.offset :]
@@ -3413,6 +3415,7 @@ def _classify_nested_pickle_payload(
             io.BytesIO(nested_bytes),
             multi_stream=True,
             max_items=_POST_BUDGET_OPCODE_SCAN_LIMIT_OPCODES,
+            deadline=deadline,
         ):
             opcodes.append(opcode_info)
     except _GenopsBudgetExceeded as exc:
@@ -3448,16 +3451,29 @@ def _classify_nested_pickle_payload(
     except Exception as exc:
         if opcodes:
             severity, evidence, evidence_details = _classify_nested_pickle_opcodes(opcodes, ml_context)
-            if severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}:
+            if severity == IssueSeverity.CRITICAL:
                 evidence_details["analysis_incomplete"] = True
                 evidence_details["analysis_error"] = str(exc)
                 evidence_details["analysis_error_type"] = type(exc).__name__
                 return severity, evidence, evidence_details
+            return (
+                _get_context_aware_severity(IssueSeverity.CRITICAL, ml_context),
+                "analysis_incomplete",
+                {
+                    "evidence": "analysis_incomplete",
+                    "partial_evidence": evidence,
+                    "partial_evidence_details": evidence_details,
+                    "analysis_incomplete": True,
+                    "analysis_error": str(exc),
+                    "analysis_error_type": type(exc).__name__,
+                },
+            )
         return (
-            _get_context_aware_severity(IssueSeverity.WARNING, ml_context),
+            _get_context_aware_severity(IssueSeverity.CRITICAL, ml_context),
             "analysis_incomplete",
             {
                 "evidence": "analysis_incomplete",
+                "analysis_incomplete": True,
                 "analysis_error": str(exc),
                 "analysis_error_type": type(exc).__name__,
             },
@@ -3588,6 +3604,8 @@ def _collect_nested_pickle_opcode_findings(
     arg: Any,
     pos: int | None,
     ml_context: dict[str, Any],
+    *,
+    deadline: float | None = None,
 ) -> list[dict[str, Any]]:
     """Return nested/encoded pickle findings for a single opcode payload."""
     findings: list[dict[str, Any]] = []
@@ -3595,7 +3613,12 @@ def _collect_nested_pickle_opcode_findings(
     if opcode_name in {"BINBYTES", "SHORT_BINBYTES", "BINBYTES8", "BYTEARRAY8"} and isinstance(arg, bytes | bytearray):
         nested_match = _find_nested_pickle_match(arg)
         if nested_match is not None:
-            severity, evidence, evidence_details = _classify_nested_pickle_payload(arg, nested_match, ml_context)
+            severity, evidence, evidence_details = _classify_nested_pickle_payload(
+                arg,
+                nested_match,
+                ml_context,
+                deadline=deadline,
+            )
             findings.append(
                 _build_opcode_check_finding(
                     check_name="Nested Pickle Detection",
@@ -3621,7 +3644,10 @@ def _collect_nested_pickle_opcode_findings(
             nested_match = _find_nested_pickle_match(payload)
             if nested_match is not None:
                 severity, evidence, evidence_details = _classify_nested_pickle_payload(
-                    payload, nested_match, ml_context
+                    payload,
+                    nested_match,
+                    ml_context,
+                    deadline=deadline,
                 )
                 findings.append(
                     _build_opcode_check_finding(
@@ -3652,7 +3678,10 @@ def _collect_nested_pickle_opcode_findings(
             nested_match = _find_nested_pickle_match(decoded)
             if nested_match is not None:
                 severity, evidence, evidence_details = _classify_nested_pickle_payload(
-                    decoded, nested_match, ml_context
+                    decoded,
+                    nested_match,
+                    ml_context,
+                    deadline=deadline,
                 )
                 findings.append(
                     _build_opcode_check_finding(
@@ -6153,7 +6182,15 @@ class PickleScanner(BaseScanner):
             if absolute_pos is None or absolute_pos < minimum_offset:
                 continue
 
-            findings.extend(_collect_nested_pickle_opcode_findings(opcode.name, arg, absolute_pos, ml_context))
+            findings.extend(
+                _collect_nested_pickle_opcode_findings(
+                    opcode.name,
+                    arg,
+                    absolute_pos,
+                    ml_context,
+                    deadline=deadline,
+                )
+            )
             findings.extend(_collect_encoded_python_opcode_findings(opcode.name, arg, absolute_pos, ml_context))
 
             if opcode.name == "STACK_GLOBAL":
@@ -7591,7 +7628,13 @@ class PickleScanner(BaseScanner):
                             ),
                         )
 
-                for nested_finding in _collect_nested_pickle_opcode_findings(opcode.name, arg, pos, ml_context):
+                for nested_finding in _collect_nested_pickle_opcode_findings(
+                    opcode.name,
+                    arg,
+                    pos,
+                    ml_context,
+                    deadline=deadline,
+                ):
                     result.add_check(
                         name=nested_finding["check_name"],
                         passed=False,
