@@ -581,7 +581,7 @@ class SafeTensorsScanner(BaseScanner):
         # Convert metadata to string for pattern analysis
         import json
 
-        metadata_str = json.dumps(metadata, indent=2)
+        metadata_str = json.dumps(metadata, indent=2, ensure_ascii=False)
 
         # XSS/HTML injection patterns
         html_patterns = [

@@ -411,6 +411,48 @@ def test_suspicious_metadata(tmp_path: Path) -> None:
     assert any("suspicious metadata" in issue.message.lower() for issue in result.issues)
 
 
+def test_unicode_metadata_is_not_code_injection(tmp_path: Path) -> None:
+    file_path = tmp_path / "unicode_metadata.safetensors"
+    data = {"t": np.arange(5, dtype=np.float32)}
+    metadata = {"description": "café model trained on multilingual text 日本語"}
+    save_file(data, str(file_path), metadata=metadata)
+
+    scanner = SafeTensorsScanner()
+    result = scanner.scan(str(file_path))
+
+    code_injection_checks = [check for check in result.checks if check.name == "SafeTensors Code Injection Detection"]
+    assert code_injection_checks == []
+    assert [issue for issue in result.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}] == []
+
+
+def test_literal_unicode_escape_metadata_still_flags_code_injection(tmp_path: Path) -> None:
+    file_path = tmp_path / "escaped_payload_metadata.safetensors"
+    data = {"t": np.arange(5, dtype=np.float32)}
+    metadata = {"payload": r"\u0065\u0076\u0061\u006c\u0028"}
+    save_file(data, str(file_path), metadata=metadata)
+
+    scanner = SafeTensorsScanner()
+    result = scanner.scan(str(file_path))
+
+    code_injection_checks = [check for check in result.checks if check.name == "SafeTensors Code Injection Detection"]
+    assert code_injection_checks
+    assert all(check.severity == IssueSeverity.CRITICAL for check in code_injection_checks)
+
+
+def test_single_comment_token_does_not_bypass_unicode_escape_detection(tmp_path: Path) -> None:
+    file_path = tmp_path / "commented_escape_payload_metadata.safetensors"
+    data = {"t": np.arange(5, dtype=np.float32)}
+    metadata = {"payload": r"\u0065#\u0076\u0061\u006c\u0028"}
+    save_file(data, str(file_path), metadata=metadata)
+
+    scanner = SafeTensorsScanner()
+    result = scanner.scan(str(file_path))
+
+    code_injection_checks = [check for check in result.checks if check.name == "SafeTensors Code Injection Detection"]
+    assert code_injection_checks
+    assert all(check.severity == IssueSeverity.CRITICAL for check in code_injection_checks)
+
+
 def test_mixed_suspicious_patterns(tmp_path: Path) -> None:
     """Test that both simple patterns and regex patterns are detected from the same metadata value."""
     file_path = tmp_path / "model.safetensors"
