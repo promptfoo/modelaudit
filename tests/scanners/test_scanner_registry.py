@@ -12,7 +12,13 @@ from typing import Literal
 
 import pytest
 
+from modelaudit.config.constants import SCANNABLE_MODEL_EXTENSIONS
 from modelaudit.core import scan_file
+from modelaudit.scanner_registry_metadata import (
+    SCANNER_REGISTRY_METADATA,
+    get_extension_format_map,
+    get_registered_scanner_extensions,
+)
 from modelaudit.scanners import SCANNER_REGISTRY, ScannerRegistry, _registry
 from modelaudit.scanners.base import BaseScanner, IssueSeverity
 from tests.helpers import create_mock_pytorch_zip
@@ -245,6 +251,59 @@ def test_representative_scanner_descriptors_match_scanner_class_metadata(scanner
     assert not (scanner_only_extensions & explicitly_routed_extensions)
     assert not (scanner_only_extensions & content_routed_extensions)
     assert content_routed_extensions <= descriptor_extensions
+
+
+@pytest.mark.parametrize("scanner_id", sorted(SCANNER_REGISTRY_METADATA))
+def test_scanner_descriptors_match_class_extension_metadata(scanner_id: str) -> None:
+    """All direct descriptor extensions must match the scanner class contract."""
+    registry = ScannerRegistry()
+    scanner_info = registry.get_scanner_info(scanner_id)
+    scanner_class = registry.load_scanner_by_id(scanner_id)
+
+    assert scanner_info is not None
+    if scanner_class is None:
+        assert scanner_id in registry.get_failed_scanners()
+        return
+
+    explicitly_routed_extensions = set(scanner_info["extensions"])
+    scanner_only_extensions = set(scanner_info.get("scanner_only_extensions", []))
+    content_routed_extensions = set(scanner_info.get("content_routed_extensions", []))
+    scanner_extensions = set(scanner_class.supported_extensions)
+
+    assert scanner_extensions == explicitly_routed_extensions | scanner_only_extensions
+    assert not (scanner_only_extensions & explicitly_routed_extensions)
+    assert not (scanner_only_extensions & content_routed_extensions)
+    assert not (content_routed_extensions & explicitly_routed_extensions)
+
+
+def test_extension_format_map_is_backed_by_scanner_descriptors() -> None:
+    """Extension-only validation policy must stay inside scanner metadata."""
+    extension_format_map = get_extension_format_map()
+    registered_extensions = get_registered_scanner_extensions()
+    registry = ScannerRegistry()
+
+    assert set(extension_format_map) <= registered_extensions
+    for extension, extension_format in extension_format_map.items():
+        assert registry.get_scanner_id_for_header_format(extension_format) is not None, (
+            f"{extension} maps to unresolved format {extension_format}"
+        )
+
+
+def test_extension_format_map_excludes_ambiguous_routable_extensions() -> None:
+    """Generic routed extensions should not become authoritative type claims."""
+    extension_format_map = get_extension_format_map()
+
+    assert ".json" not in extension_format_map
+    assert ".yaml" not in extension_format_map
+    assert ".txt" not in extension_format_map
+    assert ".model" not in extension_format_map
+    assert ".exe" not in extension_format_map
+    assert ".joblib" not in extension_format_map
+
+
+def test_scannable_model_extensions_are_registry_backed() -> None:
+    """Source-download filters should not carry an independent scanner list."""
+    assert frozenset(get_registered_scanner_extensions()) == SCANNABLE_MODEL_EXTENSIONS
 
 
 @pytest.mark.parametrize(

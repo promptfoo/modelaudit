@@ -55,8 +55,8 @@ Out of scope:
 1. Routing and integration
 
 - Register scanner with proper priority relative to manifest/text scanners.
-- Add extension mapping entries for selected MXNet artifacts.
-- Ensure lazy loader class mapping is added.
+- Add descriptor-owned extension mapping entries for selected MXNet artifacts.
+- Ensure lazy exports resolve from scanner metadata.
 
 1. Robustness
 

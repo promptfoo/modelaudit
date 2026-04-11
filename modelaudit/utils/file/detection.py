@@ -6,6 +6,7 @@ import tarfile
 import zipfile
 from pathlib import Path, PurePosixPath
 
+from ...scanner_registry_metadata import get_extension_format_map
 from ..helpers.types import FileExtension, FileFormat, FilePath, MagicBytes
 from ._compression import is_zlib_header
 
@@ -1161,154 +1162,12 @@ def find_sharded_files(directory: str) -> list[str]:
     )
 
 
-EXTENSION_FORMAT_MAP = {
-    ".pt": "pickle",
-    ".pth": "pickle",
-    ".ckpt": "pickle",
-    ".dnn": "cntk",
-    ".cmf": "cntk",
-    ".t7": "torch7",
-    ".th": "torch7",
-    ".net": "torch7",
-    ".rknn": "rknn",
-    ".pkl": "pickle",
-    ".pickle": "pickle",
-    ".dill": "pickle",
-    ".h5": "hdf5",
-    ".hdf5": "hdf5",
-    ".keras": "keras",  # Keras 3.x uses ZIP, legacy Keras uses HDF5
-    ".pb": "protobuf",
-    ".meta": "tf_metagraph",
-    ".mlmodel": "coreml",
-    ".safetensors": "safetensors",
-    ".onnx": "onnx",
-    ".bin": "pytorch_binary",
-    ".gz": "compressed",
-    ".bz2": "compressed",
-    ".xz": "compressed",
-    ".lz4": "compressed",
-    ".zlib": "compressed",
-    ".zip": "zip",
-    ".mar": "torchserve_mar",
-    ".gguf": "gguf",
-    ".ggml": "ggml",
-    ".ggmf": "ggml",
-    ".ggjt": "ggml",
-    ".ggla": "ggml",
-    ".ggsa": "ggml",
-    ".ptl": "executorch",
-    ".pte": "executorch",
-    ".tar": "tar",
-    ".tar.gz": "tar",
-    ".tgz": "tar",
-    ".tar.bz2": "tar",
-    ".tbz2": "tar",
-    ".tar.xz": "tar",
-    ".txz": "tar",
-    ".npy": "numpy",
-    ".npz": "zip",
-    ".joblib": "pickle",  # joblib can be either zip or pickle format
-    ".skops": "skops",
-    ".pdmodel": "paddle",
-    ".pdiparams": "paddle",
-    ".params": "mxnet",
-    ".engine": "tensorrt",
-    ".plan": "tensorrt",
-    ".trt": "tensorrt",
-    ".msgpack": "flax_msgpack",
-    ".nemo": "nemo",
-    ".cbm": "catboost",
-    ".llamafile": "llamafile",
-    ".lgb": "lightgbm",
-    ".lightgbm": "lightgbm",
-    ".rds": "r_serialized",
-    ".rda": "r_serialized",
-    ".rdata": "r_serialized",
-}
+_EXTENSION_FORMAT_MAP = get_extension_format_map()
 
 
 def detect_format_from_extension_pattern_matching(extension: FileExtension) -> FileFormat:
-    """Detect format using Python 3.10+ pattern matching for file extensions."""
-    # Use pattern matching for more readable extension handling
-    match extension.lower():
-        # PyTorch/Pickle formats
-        case ".pt" | ".pth" | ".ckpt" | ".pkl" | ".pickle" | ".dill":
-            return "pickle"
-        case ".dnn" | ".cmf":
-            return "cntk"
-        case ".t7" | ".th" | ".net":
-            return "torch7"
-        case ".rknn":
-            return "rknn"
-        # HDF5 formats
-        case ".h5" | ".hdf5":
-            return "hdf5"
-        # Keras format: Keras 3.x uses ZIP, legacy Keras uses HDF5
-        case ".keras":
-            return "keras"
-        # Archive formats
-        case ".zip":
-            return "zip"
-        case ".gz" | ".bz2" | ".xz" | ".lz4" | ".zlib":
-            return "compressed"
-        case ".mar":
-            return "torchserve_mar"
-        case ".tar" | ".tar.gz" | ".tgz":
-            return "tar"
-        # ML model formats
-        case ".onnx":
-            return "onnx"
-        case ".safetensors":
-            return "safetensors"
-        case ".bin":
-            return "pytorch_binary"
-        # GGML/GGUF formats
-        case ".gguf":
-            return "gguf"
-        case ".ggml" | ".ggmf" | ".ggjt" | ".ggla" | ".ggsa":
-            return "ggml"
-        # ExecutorTorch formats
-        case ".ptl" | ".pte":
-            return "executorch"
-        # Other formats
-        case ".pb":
-            return "protobuf"
-        case ".meta":
-            return "tf_metagraph"
-        case ".tflite":
-            return "tflite"
-        case ".mlmodel":
-            return "coreml"
-        case ".engine" | ".plan" | ".trt":
-            return "tensorrt"
-        case ".pdmodel" | ".pdiparams":
-            return "paddle"
-        case ".params":
-            return "mxnet"
-        case ".xml":
-            return "openvino"
-        case ".pmml":
-            return "pmml"
-        case ".npy" | ".npz":
-            return "numpy"
-        case ".skops":
-            return "skops"
-        case ".msgpack":
-            return "flax_msgpack"
-        case ".nemo":
-            return "nemo"
-        case ".cbm":
-            return "catboost"
-        case ".llamafile":
-            return "llamafile"
-        case ".lgb" | ".lightgbm":
-            return "lightgbm"
-        case ".rds" | ".rda" | ".rdata":
-            return "r_serialized"
-        case ".7z":
-            return "sevenzip"
-
-    return "unknown"
+    """Detect format from the descriptor-owned extension-format policy."""
+    return _EXTENSION_FORMAT_MAP.get(extension.lower(), "unknown")
 
 
 def detect_format_from_extension(path: FilePath) -> FileFormat:
@@ -1325,7 +1184,7 @@ def detect_format_from_extension(path: FilePath) -> FileFormat:
     if file_path.suffix.lower() == ".json" and filename_lower.endswith("-symbol.json"):
         return "mxnet"
 
-    # Use pattern matching for modern Python 3.10+ approach
+    # Remaining extension-only policy is centralized with scanner metadata.
     return detect_format_from_extension_pattern_matching(file_path.suffix)
 
 

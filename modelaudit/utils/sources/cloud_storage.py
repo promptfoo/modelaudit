@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 import click
 from yaspin import yaspin
 
+from modelaudit.config.constants import SCANNABLE_MODEL_EXTENSIONS
 from modelaudit.utils.helpers.retry import retry_with_backoff
 
 from ..helpers.disk_space import check_disk_space
@@ -440,46 +441,12 @@ class GCSCache:
 
 def filter_scannable_files(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Filter files to only include scannable model types."""
-    SCANNABLE_EXTENSIONS = {
-        ".pkl",
-        ".pickle",
-        ".joblib",
-        ".pt",
-        ".pth",
-        ".h5",
-        ".hdf5",
-        ".keras",
-        ".onnx",
-        ".pb",
-        ".pbtxt",
-        ".tflite",
-        ".lite",
-        ".safetensors",
-        ".msgpack",
-        ".bin",
-        ".ckpt",
-        ".pdmodel",
-        ".pdiparams",
-        ".pdopt",
-        ".ot",
-        ".ort",
-        ".gguf",
-        ".ggml",
-        ".pmml",
-        ".mar",
-        ".model",
-        ".mlmodel",
-        ".ov",
-        ".tar",
-        ".tar.gz",
-        ".tgz",
-    }
     scannable = []
     for file in files:
         path = Path(file["path"])
         suffixes = [s.lower() for s in path.suffixes]
         for i in range(1, len(suffixes) + 1):
-            if "".join(suffixes[-i:]) in SCANNABLE_EXTENSIONS:
+            if "".join(suffixes[-i:]) in SCANNABLE_MODEL_EXTENSIONS:
                 scannable.append(file)
                 break
 

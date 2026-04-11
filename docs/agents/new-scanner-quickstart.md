@@ -55,12 +55,13 @@ class ExampleScanner(BaseScanner):
 
 ## 3. Register the scanner
 
-Update `modelaudit/scanners/__init__.py` in `ScannerRegistry._init_registry`:
+Update `modelaudit/scanner_registry_metadata.py`:
 
 - Add one scanner descriptor entry with module/class metadata
 - Set priority, direct extensions, and any descriptor-owned `header_formats` / `content_routed_extensions` carefully
 - Declare dependency names for load-time diagnostics
 - Document intentional descriptor/class extension differences with `scanner_only_extensions` instead of leaving silent drift
+- If the extension is authoritative enough for extension-only format validation, add it to the descriptor-owned `EXTENSION_FORMAT_MAP`; leave generic text/config extensions out
 - Do not add a second class map in `__getattr__`; lazy exports are resolved from descriptor metadata
 
 ## 4. Dependency handling rules
