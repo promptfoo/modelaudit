@@ -120,6 +120,28 @@ def _resolve_external_location(model_dir: Path, location: str) -> Path:
     return (model_dir / location).resolve()
 
 
+def _resolve_external_location_lexically(model_dir: Path, location: str) -> Path:
+    """Resolve an external_data location without following symlinks."""
+    if _is_windows_absolute_path(location):
+        return Path(location)
+    return Path(os.path.normpath(str(model_dir / location)))
+
+
+def _has_symlink_component(path: Path, root: Path) -> bool:
+    """Return True when any component from root to path is a symlink."""
+    try:
+        relative_parts = path.relative_to(root).parts
+    except ValueError:
+        return False
+
+    current = root
+    for part in relative_parts:
+        current = current / part
+        if current.is_symlink():
+            return True
+    return False
+
+
 def _tensor_data_type_to_np_dtype(data_type: int) -> Any:
     """Resolve an ONNX tensor dtype across current and legacy ONNX APIs."""
     import numpy as np
@@ -411,6 +433,7 @@ class OnnxScanner(BaseScanner):
                     )
                     continue
                 has_windows_absolute_path = _is_windows_absolute_path(location)
+                lexical_external_path = _resolve_external_location_lexically(model_dir, location)
                 external_path = _resolve_external_location(model_dir, location)
                 # CVE-2024-27318: Detect nested path traversal (e.g.
                 # "subdir/../../etc/passwd") which bypasses naive lstrip
@@ -418,8 +441,54 @@ class OnnxScanner(BaseScanner):
                 # the existence check so traversal attempts against
                 # non-existent targets are still flagged.
                 has_traversal_raw = ".." in location.replace("\\", "/").split("/")
+                lexical_in_model_dir = not has_windows_absolute_path and _is_contained_in(
+                    lexical_external_path, model_dir
+                )
+                has_symlink_component = lexical_in_model_dir and _has_symlink_component(
+                    lexical_external_path,
+                    model_dir,
+                )
+                symlink_escapes_model_dir = (
+                    has_symlink_component and external_path.exists() and not _is_contained_in(external_path, model_dir)
+                )
                 escapes_model_dir = has_windows_absolute_path or not _is_contained_in(external_path, model_dir)
-                if escapes_model_dir:
+                if symlink_escapes_model_dir:
+                    result.add_check(
+                        name="CVE-2026-34447: External Data Symlink Traversal",
+                        passed=False,
+                        message=(
+                            "CVE-2026-34447: External data path "
+                            f"'{location}' for tensor '{tensor.name}' resolves through a symlink outside "
+                            "the model directory"
+                        ),
+                        severity=IssueSeverity.CRITICAL,
+                        location=str(lexical_external_path),
+                        details={
+                            "tensor": tensor.name,
+                            "file": location,
+                            "symlink_path": str(lexical_external_path),
+                            "resolved_path": str(external_path),
+                            "cve_id": "CVE-2026-34447",
+                            "cvss": 5.5,
+                            "cwe": "CWE-22",
+                            "description": (
+                                "ONNX external_data loading can follow symlinks that escape the model "
+                                "directory and disclose local files."
+                            ),
+                            "remediation": (
+                                "Reject external_data entries that traverse symlinks outside the model "
+                                "directory and update ONNX to a version containing the symlink traversal fix."
+                            ),
+                        },
+                        why=(
+                            "The external_data location is lexically inside the model directory, but a symlink "
+                            "component resolves outside that directory. Loading external data may read a file "
+                            "the model archive should not be able to reference."
+                        ),
+                    )
+                elif has_symlink_component and not external_path.exists():
+                    missing_files.setdefault(location, []).append(tensor.name)
+                elif escapes_model_dir:
                     # Track for per-file CVE-2025-51480 (write direction) reporting
                     traversal_files.setdefault(location, []).append(tensor.name)
                     # Determine specific CVE attribution

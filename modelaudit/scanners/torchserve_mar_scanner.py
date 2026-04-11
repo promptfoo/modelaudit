@@ -1396,7 +1396,24 @@ class TorchServeMarScanner(BaseScanner):
                     message=f"Archive entry attempted path traversal outside extraction root: {member_name}",
                     severity=IssueSeverity.CRITICAL,
                     location=f"{archive_path}:{member_name}",
-                    details={"entry": member_name},
+                    details={
+                        "entry": member_name,
+                        "cve_id": "CVE-2023-48299",
+                        "cvss": 7.5,
+                        "cwe": "CWE-22",
+                        "description": (
+                            "TorchServe MAR archives with traversal entries can write files outside the "
+                            "intended extraction directory."
+                        ),
+                        "remediation": (
+                            "Upgrade TorchServe to a patched version and reject .mar archives containing "
+                            "absolute paths or parent-directory traversal."
+                        ),
+                    },
+                    why=(
+                        "CVE-2023-48299 is a ZipSlip-style TorchServe MAR extraction vulnerability. "
+                        "This archive member would escape the extraction root if extracted naively."
+                    ),
                 )
                 continue
 

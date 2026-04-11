@@ -89,6 +89,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- add CVE-specific coverage for ONNX symlink traversal, Keras `get_file(extract=True)` archives, MXNet ReDoS operator names, NeMo archive/checkpoint exploits, and TorchServe MAR ZipSlip attribution
 - mark trailing bytes after NumPy object-array pickle payloads inconclusive without escalating to security findings
 - avoid CoreML nested parse failures on bounded-read truncation
 - mark incomplete sharded-model scans as inconclusive, ignore shard-name prefix matches, and skip caching explicit incomplete outcomes

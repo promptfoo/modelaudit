@@ -809,6 +809,30 @@ def test_scan_detects_path_traversal_member_names(tmp_path: Path) -> None:
     traversal_failures = _failed_checks(result, "TorchServe MAR Path Traversal Protection")
     assert len(traversal_failures) >= 1
     assert traversal_failures[0].severity == IssueSeverity.CRITICAL
+    details = traversal_failures[0].details
+    assert details["cve_id"] == "CVE-2023-48299"
+    assert details["cvss"] == 7.5
+    assert details["cwe"] == "CWE-22"
+    assert "remediation" in details
+
+
+def test_scan_allows_normalized_safe_member_names(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"def handle(data, context):\n    return data\n",
+            "subdir/../weights.bin": b"weights",
+        },
+        filename="normalized_safe.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+
+    traversal_failures = _failed_checks(result, "TorchServe MAR Path Traversal Protection")
+    assert traversal_failures == []
+    assert not [check for check in result.checks if check.details.get("cve_id") == "CVE-2023-48299"]
 
 
 def test_scan_detects_conflicting_duplicate_manifest_handler_entries(tmp_path: Path) -> None:
