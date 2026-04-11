@@ -100,7 +100,7 @@ class _BoundedPickleStream:
         if self._byte_limit is None:
             if requested_size is None:
                 return self._unbounded_read_limit
-            return min(requested_size, self._unbounded_read_limit)
+            return requested_size
 
         remaining = max(self._byte_limit - self._position, 0)
         if requested_size is None:

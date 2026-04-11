@@ -267,6 +267,20 @@ def test_scan_stream_incrementally_reads_bounded_streams_without_preloading_enti
     assert stream.max_seen_read_size <= 32
 
 
+def test_scan_stream_honors_explicit_reads_without_declared_size() -> None:
+    payload = pickle.dumps(b"a" * 64, protocol=4)
+
+    report = PickleScanner(ScanOptions(max_unbounded_stream_read_bytes=8)).scan_stream(
+        io.BytesIO(payload),
+        source="unknown-size-binbytes.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.errors == ()
+    assert report.coverage.bytes_scanned == len(payload)
+
+
 def test_scan_stream_bounds_protocol_zero_readline_without_declared_size() -> None:
     stream = NoUnboundedReadlineStream(b"S'" + (b"a" * 64))
 
@@ -281,12 +295,12 @@ def test_scan_stream_bounds_protocol_zero_readline_without_declared_size() -> No
     assert stream.max_seen_readline_size <= 8
 
 
-def test_bounded_pickle_stream_caps_negative_reads_without_a_byte_limit() -> None:
+def test_bounded_pickle_stream_caps_unbounded_reads_without_a_byte_limit() -> None:
     stream = engine_scanner._BoundedPickleStream(io.BytesIO(b"abc"), None, unbounded_read_limit=16)
 
     assert stream._bounded_size(-1) == 16
     assert stream._bounded_size(None) == 16
-    assert stream._bounded_size(128) == 16
+    assert stream._bounded_size(128) == 128
     assert stream._bounded_size(8) == 8
 
 
