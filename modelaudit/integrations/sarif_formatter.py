@@ -11,6 +11,11 @@ from typing import Any
 from urllib.parse import quote
 
 from modelaudit import __version__
+from modelaudit.core_results import (
+    determine_exit_code,
+    results_have_inconclusive_outcome,
+    results_have_operational_error,
+)
 from modelaudit.models import ModelAuditResultModel
 from modelaudit.scanner_results import IssueSeverity
 
@@ -53,12 +58,14 @@ def _create_run(
 
     # Create rules from unique issue types
     rules = _create_rules(issues)
+    rule_indices = {rule["id"]: idx for idx, rule in enumerate(rules)}
 
     # Create results from issues
-    results = _create_results(issues)
+    results = _create_results(issues, rule_indices)
 
     # Create artifacts from scanned files
     artifacts = _create_artifacts(audit_result)
+    exit_code = determine_exit_code(audit_result)
 
     run = {
         "tool": {
@@ -77,12 +84,12 @@ def _create_run(
         },
         "invocations": [
             {
-                "executionSuccessful": audit_result.success,
+                "executionSuccessful": exit_code != 2,
                 "commandLine": f"modelaudit {' '.join(scan_paths)}",
                 "arguments": scan_paths,
                 "workingDirectory": {"uri": Path.cwd().as_uri()},
-                "exitCode": 0 if not audit_result.issues else 1,
-                "exitCodeDescription": "No issues found" if not audit_result.issues else "Security issues detected",
+                "exitCode": exit_code,
+                "exitCodeDescription": _exit_code_description(audit_result, exit_code),
                 "exitSignalName": None,
                 "exitSignalNumber": None,
                 "processStartFailureMessage": None,
@@ -125,6 +132,21 @@ def _create_run(
     return run
 
 
+def _exit_code_description(audit_result: ModelAuditResultModel, exit_code: int) -> str:
+    """Return a user-facing description for ModelAudit CLI exit semantics."""
+    if exit_code == 0:
+        return "No security issues found"
+    if exit_code == 1:
+        return "Security issues detected"
+    if results_have_operational_error(audit_result):
+        return "Errors occurred during scanning"
+    if results_have_inconclusive_outcome(audit_result):
+        return "Scan outcome was inconclusive"
+    if audit_result.files_scanned == 0:
+        return "No files were scanned"
+    return "Errors occurred during scanning"
+
+
 def _create_rules(issues: list) -> list[dict[str, Any]]:
     """Create SARIF rules from unique issue types."""
     rules = []
@@ -137,7 +159,7 @@ def _create_rules(issues: list) -> list[dict[str, Any]]:
         if rule_id not in seen_rules:
             seen_rules.add(rule_id)
 
-            rule = {
+            rule: dict[str, Any] = {
                 "id": rule_id,
                 "name": _get_rule_name(issue),
                 "shortDescription": {"text": _get_rule_short_description(issue)},
@@ -154,6 +176,10 @@ def _create_rules(issues: list) -> list[dict[str, Any]]:
                 },
             }
 
+            rule_code = _get_issue_rule_code(issue)
+            if rule_code:
+                rule["properties"]["rule_code"] = rule_code
+
             # Add help information if available
             if hasattr(issue, "why") and issue.why:
                 rule["help"] = {"text": issue.why, "markdown": issue.why}
@@ -163,14 +189,17 @@ def _create_rules(issues: list) -> list[dict[str, Any]]:
     return rules
 
 
-def _create_results(issues: list) -> list[dict[str, Any]]:
+def _create_results(issues: list, rule_indices: dict[str, int] | None = None) -> list[dict[str, Any]]:
     """Create SARIF results from issues."""
     results = []
+    if rule_indices is None:
+        rule_indices = {rule["id"]: idx for idx, rule in enumerate(_create_rules(issues))}
 
-    for idx, issue in enumerate(issues):
+    for issue in issues:
+        rule_id = _get_rule_id(issue)
         result = {
-            "ruleId": _get_rule_id(issue),
-            "ruleIndex": idx,
+            "ruleId": rule_id,
+            "ruleIndex": rule_indices[rule_id],
             "level": _severity_to_sarif_level(issue.severity),
             "message": {"text": issue.message},
             "locations": [],
@@ -206,8 +235,16 @@ def _create_results(issues: list) -> list[dict[str, Any]]:
         result["partialFingerprints"]["primaryLocationLineHash"] = fingerprint  # type: ignore[index]
 
         # Add properties with additional details
-        if issue.details:
-            result["properties"] = issue.details
+        properties = dict(issue.details or {})
+        properties.pop("rule_code", None)
+        properties.pop("issue_type", None)
+        rule_code = _get_issue_rule_code(issue)
+        if rule_code:
+            properties["rule_code"] = rule_code
+        if hasattr(issue, "type") and issue.type:
+            properties["issue_type"] = issue.type
+        if properties:
+            result["properties"] = properties
 
         # Add fix suggestions if available
         if hasattr(issue, "recommendation") and issue.recommendation:
@@ -255,6 +292,10 @@ def _create_artifacts(audit_result: ModelAuditResultModel) -> list[dict[str, Any
 
 def _get_rule_id(issue: Any) -> str:
     """Generate a rule ID from an issue."""
+    rule_code = _get_issue_rule_code(issue)
+    if rule_code:
+        return rule_code
+
     if hasattr(issue, "type") and issue.type:
         return f"MA{str(issue.type).replace(' ', '-').upper()}"
 
@@ -263,6 +304,14 @@ def _get_rule_id(issue: Any) -> str:
     # Remove special characters
     base = "".join(c if c.isalnum() or c == "-" else "" for c in base)
     return f"MA-{base}"
+
+
+def _get_issue_rule_code(issue: Any) -> str | None:
+    """Return the stable ModelAudit rule code for an issue when available."""
+    rule_code = getattr(issue, "rule_code", None)
+    if isinstance(rule_code, str) and rule_code:
+        return rule_code
+    return None
 
 
 def _get_rule_name(issue: Any) -> str:

@@ -222,6 +222,37 @@ class TestCreateResults:
         assert region["startLine"] == 42
         assert region["startColumn"] == 10
 
+    def test_result_properties_prefer_issue_identity_fields(self) -> None:
+        """Canonical issue identity fields should override stale details."""
+        issue = Issue(
+            message="Test",
+            severity=IssueSeverity.WARNING,
+            details={"rule_code": "STALE", "issue_type": "stale"},
+            timestamp=time.time(),
+            type="pickle_check",
+            rule_code="S201",
+        )
+
+        results = _create_results([issue])
+
+        assert results[0]["properties"]["rule_code"] == "S201"
+        assert results[0]["properties"]["issue_type"] == "pickle_check"
+
+    def test_result_properties_strip_legacy_identity_details(self) -> None:
+        """Legacy identity details should not imply canonical SARIF rule codes."""
+        issue = Issue(
+            message="Test",
+            severity=IssueSeverity.WARNING,
+            details={"rule_code": "S201", "issue_type": "pickle_check", "context": "kept"},
+            timestamp=time.time(),
+        )
+
+        results = _create_results([issue])
+
+        assert "rule_code" not in results[0]["properties"]
+        assert "issue_type" not in results[0]["properties"]
+        assert results[0]["properties"]["context"] == "kept"
+
     def test_result_fingerprints(self):
         """Test result has fingerprints for deduplication."""
         issue = Issue(
