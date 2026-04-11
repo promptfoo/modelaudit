@@ -49,6 +49,7 @@ _PROSE_MARKERS: tuple[str, ...] = (
     " mentions",
     " includes",
 )
+_MAX_PROSE_LINE_CONTEXT_BYTES = 512
 _WORD_PATTERN = re.compile(rb"[A-Za-z]{2,}")
 _CODE_LINE_PREFIXES: tuple[bytes, ...] = (
     b"import ",
@@ -62,6 +63,10 @@ _CODE_LINE_MARKERS: tuple[bytes, ...] = (
     b";",
     b"lambda ",
 )
+_INLINE_COMPOUND_STATEMENT_PATTERN = re.compile(
+    rb"^\s*(?:if|elif|else|for|while|with|try|except|finally|match|case)\b[^#\n]*:\s*\S"
+)
+_STRUCTURED_METADATA_PREFIXES: tuple[bytes, ...] = (b"{", b"[", b'"', b"'")
 
 
 def _is_metadata_context(context: str) -> bool:
@@ -80,10 +85,11 @@ def _is_metadata_context(context: str) -> bool:
 
 def _extract_line(data: bytes, match_index: int) -> bytes:
     """Extract the line containing a matched network token."""
-    line_start = data.rfind(b"\n", 0, match_index) + 1
+    line_start = max(data.rfind(b"\n", 0, match_index) + 1, match_index - _MAX_PROSE_LINE_CONTEXT_BYTES)
     line_end = data.find(b"\n", match_index)
     if line_end == -1:
         line_end = len(data)
+    line_end = min(line_end, match_index + _MAX_PROSE_LINE_CONTEXT_BYTES)
     return data[line_start:line_end]
 
 
@@ -126,7 +132,11 @@ def _is_doc_only_network_reference(
 
     if any(stripped.startswith(prefix) for prefix in _CODE_LINE_PREFIXES):
         return False
+    if _INLINE_COMPOUND_STATEMENT_PATTERN.match(line_lower):
+        return False
     if any(marker in line_lower for marker in _CODE_LINE_MARKERS):
+        return False
+    if metadata_context and stripped.startswith(_STRUCTURED_METADATA_PREFIXES):
         return False
 
     text = line.decode("utf-8", errors="ignore").lower()

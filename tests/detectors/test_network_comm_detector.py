@@ -190,10 +190,37 @@ class TestNetworkCommDetector:
 
         assert any(finding["type"] == "network_library" and finding["library"] == "socket" for finding in findings)
 
+    def test_metadata_context_with_marker_in_structured_hook_still_flags_network_import(self) -> None:
+        """Marker words in structured metadata should not hide executable import text."""
+        detector = NetworkCommDetector()
+        data = b'{"hook": "import socket includes callback"}'
+
+        findings = detector.scan(data, "metadata.json")
+
+        assert any(finding["type"] == "network_library" and finding["library"] == "socket" for finding in findings)
+
     def test_inline_comment_prose_marker_after_code_still_flags_network_import(self) -> None:
         """Inline prose markers should not hide executable import statements."""
         detector = NetworkCommDetector()
         data = b"if True: import socket  # for outbound callback"
+
+        findings = detector.scan(data, "model.pkl")
+
+        assert any(finding["type"] == "network_library" and finding["library"] == "socket" for finding in findings)
+
+    def test_inline_compound_statement_with_prose_marker_still_flags_network_import(self) -> None:
+        """Compound statements should stay executable even when comments look prose-like."""
+        detector = NetworkCommDetector()
+        data = b"for _ in [0]: import socket  # examples"
+
+        findings = detector.scan(data, "metadata.json")
+
+        assert any(finding["type"] == "network_library" and finding["library"] == "socket" for finding in findings)
+
+    def test_newline_free_binary_prose_marker_does_not_hide_later_import(self) -> None:
+        """A prose marker far away in a binary blob should not suppress a later import token."""
+        detector = NetworkCommDetector()
+        data = b"Model documentation includes examples " + (b"x" * 600) + b"import socket"
 
         findings = detector.scan(data, "model.pkl")
 

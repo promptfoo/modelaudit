@@ -74,11 +74,10 @@ def exfiltrate(data):
 
         result = PickleScanner().scan(str(test_file))
 
-        assert not [
-            check
-            for check in result.checks
-            if check.name == "Network Communication Detection" and check.status == CheckStatus.FAILED
-        ]
+        network_checks = [check for check in result.checks if check.name == "Network Communication Detection"]
+        assert network_checks, "Expected Network Communication Detection check to be emitted"
+        assert all(check.status != CheckStatus.FAILED for check in network_checks)
+        assert any(check.status == CheckStatus.PASSED for check in network_checks)
 
     def test_pytorch_zip_scanner_integration(self, tmp_path):
         """Test network communication detection in PyTorch ZIP scanner."""
@@ -145,11 +144,10 @@ class NetworkExfiltrator:
 
         result = PyTorchZipScanner().scan(str(test_file))
 
-        assert not [
-            check
-            for check in result.checks
-            if check.name == "Network Communication Detection" and check.status == CheckStatus.FAILED
-        ]
+        network_checks = [check for check in result.checks if check.name == "Network Communication Detection"]
+        assert network_checks, "Expected Network Communication Detection check to be emitted"
+        assert all(check.status != CheckStatus.FAILED for check in network_checks)
+        assert any(check.status == CheckStatus.PASSED for check in network_checks)
 
     def test_network_detection_can_be_disabled(self, tmp_path):
         """Test that network detection can be disabled via config."""
