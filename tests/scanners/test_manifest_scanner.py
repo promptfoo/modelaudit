@@ -5,7 +5,8 @@ from pathlib import Path
 import pytest
 
 import modelaudit.scanners.manifest_scanner as manifest_scanner_module
-from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.manifest_scanner import ManifestScanner, _is_trusted_url_domain
 
 
@@ -175,7 +176,7 @@ def test_parse_file_logs_warning(caplog, capsys):
         result = ScanResult(scanner.name)
         content = scanner._parse_file("nonexistent.json", ".json", result)
 
-    assert content is None
+    assert content is manifest_scanner_module._PARSE_FAILED
     assert any("Error parsing file nonexistent.json" in record.getMessage() for record in caplog.records)
     assert capsys.readouterr().out == ""
     assert any(issue.severity == IssueSeverity.DEBUG for issue in result.issues)
@@ -519,6 +520,186 @@ def test_manifest_scanner_duplicate_urls_not_repeated(tmp_path):
     url_checks = [check for check in result.checks if "Untrusted URL" in check.name]
     failed_url_checks = [c for c in url_checks if c.status == CheckStatus.FAILED]
     assert len(failed_url_checks) == 1
+
+
+def test_manifest_scanner_top_level_list_weak_hash_detected(tmp_path: Path) -> None:
+    """Top-level manifest arrays should receive the same hash checks as objects."""
+    test_file = tmp_path / "config.json"
+    sha1_hash = "0" * 40
+    test_file.write_text(json.dumps([{"model_type": "bert", "checksum": sha1_hash}]))
+
+    scanner = ManifestScanner()
+    result = scanner.scan(str(test_file))
+
+    failed_hash_checks = [
+        check for check in result.checks if check.name == "Weak Hash Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert result.success is True
+    assert result.metadata["root_type"] == "list"
+    assert result.metadata["entry_count"] == 1
+    assert len(failed_hash_checks) == 1
+    assert failed_hash_checks[0].details["key"] == "[0].checksum"
+    assert failed_hash_checks[0].details["algorithm"] == "SHA1"
+
+    aggregate = scan_model_directory_or_file(str(test_file), cache_scan_results=False)
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_manifest_scanner_top_level_list_untrusted_url_detected(tmp_path: Path) -> None:
+    """Top-level manifest arrays should not bypass URL allowlist checks."""
+    test_file = tmp_path / "config.json"
+    test_file.write_text(json.dumps([{"download_url": "https://evil.invalid/model.bin"}]))
+
+    scanner = ManifestScanner()
+    result = scanner.scan(str(test_file))
+
+    failed_url_checks = [
+        check for check in result.checks if check.name == "Untrusted URL Check" and check.status == CheckStatus.FAILED
+    ]
+    assert result.success is True
+    assert result.metadata["root_type"] == "list"
+    assert len(failed_url_checks) == 1
+    assert failed_url_checks[0].details["key_path"] == "[0].download_url"
+
+    aggregate = scan_model_directory_or_file(str(test_file), cache_scan_results=False)
+    assert determine_exit_code(aggregate) == 0
+
+
+def test_manifest_scanner_malformed_manifest_is_inconclusive(tmp_path: Path) -> None:
+    """Malformed manifests should fail closed when no security finding was recovered."""
+    test_file = tmp_path / "config.json"
+    test_file.write_text('{"model_type": "bert", "checksum": "0000",')
+
+    scanner = ManifestScanner()
+    result = scanner.scan(str(test_file))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == ["manifest_parse_failed"]
+    assert any(check.name == "Manifest Parse Coverage" for check in result.checks)
+
+    aggregate = scan_model_directory_or_file(str(test_file), cache_scan_results=False)
+    metadata = aggregate.file_metadata[str(test_file)]
+    assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "manifest_parse_failed" in metadata["scan_outcome_reasons"]
+    assert aggregate.success is False
+    assert determine_exit_code(aggregate) == 2
+
+
+def test_manifest_scanner_scalar_root_is_inconclusive(tmp_path: Path) -> None:
+    """Scalar manifest roots cannot receive structured checks and should fail closed."""
+    test_file = tmp_path / "config.json"
+    test_file.write_text("null")
+
+    scanner = ManifestScanner()
+    result = scanner.scan(str(test_file))
+
+    structure_checks = [
+        check for check in result.checks if check.name == "Manifest Structure" and check.status == CheckStatus.FAILED
+    ]
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == ["manifest_unsupported_root_type"]
+    assert len(structure_checks) == 1
+    assert structure_checks[0].details["root_type"] == "NoneType"
+
+    aggregate = scan_model_directory_or_file(str(test_file), cache_scan_results=False)
+    assert aggregate.success is False
+    assert determine_exit_code(aggregate) == 2
+
+
+def test_manifest_scanner_inconclusive_parse_preserves_security_exit(tmp_path: Path) -> None:
+    """Recovered blacklist findings should still produce security exit code 1."""
+    test_file = tmp_path / "config.json"
+    test_file.write_text('{"model_name": "unsafe-model",')
+
+    scanner = ManifestScanner(config={"blacklist_patterns": ["unsafe"]})
+    result = scanner.scan(str(test_file))
+
+    assert result.success is True
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+    aggregate = scan_model_directory_or_file(
+        str(test_file),
+        blacklist_patterns=["unsafe"],
+        cache_scan_results=False,
+    )
+    assert aggregate.success is True
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_manifest_scanner_parses_toml_manifest_for_weak_hash(tmp_path: Path) -> None:
+    """Supported TOML manifests should receive structured weak-hash checks."""
+    test_file = tmp_path / "model_config.toml"
+    test_file.write_text('model_type = "bert"\nchecksum = "0000000000000000000000000000000000000000"\n')
+
+    scanner = ManifestScanner()
+    result = scanner.scan(str(test_file))
+
+    failed_hash_checks = [
+        check for check in result.checks if check.name == "Weak Hash Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert result.success is True
+    assert result.metadata["root_type"] == "dict"
+    assert len(failed_hash_checks) == 1
+    assert failed_hash_checks[0].details["key"] == "checksum"
+    assert failed_hash_checks[0].details["algorithm"] == "SHA1"
+
+
+def test_manifest_scanner_parses_ini_manifest_for_weak_hash(tmp_path: Path) -> None:
+    """Supported INI manifests should receive structured weak-hash checks."""
+    test_file = tmp_path / "model_config.ini"
+    test_file.write_text("[model]\nmodel_type = bert\nchecksum = 0000000000000000000000000000000000000000\n")
+
+    scanner = ManifestScanner()
+    result = scanner.scan(str(test_file))
+
+    failed_hash_checks = [
+        check for check in result.checks if check.name == "Weak Hash Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert result.success is True
+    assert result.metadata["root_type"] == "dict"
+    assert len(failed_hash_checks) == 1
+    assert failed_hash_checks[0].details["key"] == "model.checksum"
+    assert failed_hash_checks[0].details["algorithm"] == "SHA1"
+
+
+def test_manifest_scanner_parses_config_ini_manifest_for_weak_hash(tmp_path: Path) -> None:
+    """INI-style .config manifests should not be mistaken for JSON arrays."""
+    test_file = tmp_path / "model.config"
+    test_file.write_text("[model]\nmodel_type = bert\nchecksum = 0000000000000000000000000000000000000000\n")
+
+    scanner = ManifestScanner()
+    result = scanner.scan(str(test_file))
+
+    failed_hash_checks = [
+        check for check in result.checks if check.name == "Weak Hash Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert result.success is True
+    assert result.metadata["root_type"] == "dict"
+    assert len(failed_hash_checks) == 1
+    assert failed_hash_checks[0].details["key"] == "model.checksum"
+    assert failed_hash_checks[0].details["algorithm"] == "SHA1"
+
+
+def test_manifest_scanner_parses_config_json_array_for_weak_hash(tmp_path: Path) -> None:
+    """JSON array .config manifests should continue using JSON parsing."""
+    test_file = tmp_path / "model.config"
+    sha1_hash = "0" * 40
+    test_file.write_text(json.dumps([{"model_type": "bert", "checksum": sha1_hash}]))
+
+    scanner = ManifestScanner()
+    result = scanner.scan(str(test_file))
+
+    failed_hash_checks = [
+        check for check in result.checks if check.name == "Weak Hash Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert result.success is True
+    assert result.metadata["root_type"] == "list"
+    assert len(failed_hash_checks) == 1
+    assert failed_hash_checks[0].details["key"] == "[0].checksum"
+    assert failed_hash_checks[0].details["algorithm"] == "SHA1"
 
 
 def test_manifest_scanner_enforces_size_limit(tmp_path):
