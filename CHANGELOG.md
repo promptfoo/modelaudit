@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- mark malformed GGUF scans inconclusive instead of clean
 - mark malformed SafeTensors scans inconclusive instead of clean
 - preserve picklescan stack state across reused scanner runs
 - mark partial streaming scans inconclusive when large-file streaming coverage is incomplete
