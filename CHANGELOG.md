@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - honor trusted header/content routing for misnamed ONNX, GGUF, and NumPy artifacts.
+- route extensionless compressed archive members through registry-backed nested dispatch.
 
 ## [0.2.36](https://github.com/promptfoo/modelaudit/compare/v0.2.35...v0.2.36) (2026-04-11)
 
