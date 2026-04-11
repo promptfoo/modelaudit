@@ -2411,7 +2411,7 @@ def test_post_budget_global_scan_runs_after_deadline_truncation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Deadline-triggered truncation should not continue scanning past the timeout boundary."""
-    import modelaudit.scanners.pickle_scanner as pickle_scanner_module
+    from modelaudit.scanners import pickle_scanner as pickle_scanner_module
 
     pickle_path = tmp_path / "post-budget-deadline.pkl"
     pickle_path.write_bytes(b"\x80\x04cmysterypkg\nloader\n.")
@@ -3524,7 +3524,7 @@ class TestDillLoadersRegression:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Budget exhaustion should not discard dangerous nested opcodes already yielded."""
-        import modelaudit.scanners.pickle_scanner as pickle_scanner_module
+        from modelaudit.scanners import pickle_scanner as pickle_scanner_module
 
         dangerous_opcodes = list(pickletools.genops(_make_os_system_pickle()))
 
@@ -3554,6 +3554,36 @@ class TestDillLoadersRegression:
         assert evidence == "dangerous_execution"
         assert details["evidence"] == "dangerous_execution"
         assert details["analysis_incomplete"] is True
+
+    def test_nested_pickle_budget_error_without_dangerous_prefix_fails_closed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Budget exhaustion before a dangerous opcode should still fail closed."""
+        from modelaudit.scanners import pickle_scanner as pickle_scanner_module
+
+        def _benign_prefix_then_budget(
+            file_obj: BinaryIO,
+            *,
+            multi_stream: bool = False,
+            max_items: int | None = None,
+            deadline: float | None = None,
+        ) -> Iterator[tuple[Any, Any, int | None]]:
+            del file_obj, multi_stream, max_items, deadline
+            yield from pickletools.genops(pickle.dumps({"padding": "benign"}))
+            raise _GenopsBudgetExceeded("max_items")
+
+        monkeypatch.setattr(pickle_scanner_module, "_genops_with_fallback", _benign_prefix_then_budget)
+
+        severity, evidence, details = _classify_nested_pickle_payload(
+            b"\x80\x04.",
+            SimpleNamespace(offset=0),
+            {},
+        )
+
+        assert severity == IssueSeverity.CRITICAL
+        assert evidence == "analysis_incomplete"
+        assert details["analysis_incomplete"] is True
+        assert details["opcode_budget_exceeded"] is True
         assert details["analysis_error"] == "max_items"
 
     def test_nested_pickle_detection_scans_beyond_validation_sample(self, tmp_path: Path) -> None:

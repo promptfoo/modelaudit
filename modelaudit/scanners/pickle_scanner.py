@@ -3422,9 +3422,14 @@ def _classify_nested_pickle_payload(
                 evidence_details["analysis_error"] = exc.reason
                 return severity, evidence, evidence_details
         return (
-            _get_context_aware_severity(IssueSeverity.WARNING, ml_context),
+            _get_context_aware_severity(IssueSeverity.CRITICAL, ml_context),
             "analysis_incomplete",
-            {"evidence": "analysis_incomplete", "analysis_error": exc.reason},
+            {
+                "evidence": "analysis_incomplete",
+                "analysis_incomplete": True,
+                "analysis_error": exc.reason,
+                "opcode_budget_exceeded": True,
+            },
         )
     except Exception as exc:
         if opcodes:
