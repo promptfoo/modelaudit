@@ -178,6 +178,84 @@ def test_scan_model_streaming_basic(temp_test_files: list[Path]) -> None:
         assert len(result.content_hash) == 64  # SHA256 hex string
 
 
+def test_scan_model_streaming_skips_non_model_files(tmp_path: Path) -> None:
+    """Streaming directory scans should honor the normal skip_file_types policy."""
+    ignored_file = tmp_path / "notes.log"
+    ignored_file.write_text("debug output")
+    model_file = tmp_path / "model.pkl"
+    with model_file.open("wb") as f:
+        pickle.dump({"data": "safe"}, f)
+
+    with patch("modelaudit.core.scan_file") as mock_scan:
+        mock_scan.return_value = create_mock_scan_result(bytes_scanned=100)
+
+        result = scan_model_streaming(
+            file_generator=iter([(ignored_file, False), (model_file, True)]),
+            timeout=30,
+            delete_after_scan=False,
+            skip_file_types=True,
+        )
+
+    mock_scan.assert_called_once()
+    assert mock_scan.call_args.args[0] == str(model_file)
+    assert mock_scan.call_args.kwargs["config"]["skip_file_types"] is True
+    assert result.files_scanned == 1
+
+
+def test_scan_model_streaming_keeps_non_model_files_when_skip_disabled(tmp_path: Path) -> None:
+    """The skip_file_types flag should remain opt-out for streaming scans."""
+    ignored_file = tmp_path / "notes.log"
+    ignored_file.write_text("debug output")
+    model_file = tmp_path / "model.pkl"
+    with model_file.open("wb") as f:
+        pickle.dump({"data": "safe"}, f)
+
+    with patch("modelaudit.core.scan_file") as mock_scan:
+        mock_scan.return_value = create_mock_scan_result(bytes_scanned=100)
+
+        result = scan_model_streaming(
+            file_generator=iter([(ignored_file, False), (model_file, True)]),
+            timeout=30,
+            delete_after_scan=False,
+            skip_file_types=False,
+        )
+
+    assert [call.args[0] for call in mock_scan.call_args_list] == [str(ignored_file), str(model_file)]
+    assert result.files_scanned == 2
+
+
+def test_scan_model_streaming_skips_huggingface_cache_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Streaming scans should skip HF bookkeeping metadata like regular scans."""
+    hf_home = tmp_path / ".cache" / "huggingface"
+    monkeypatch.setenv("HF_HOME", str(hf_home))
+    snapshots_dir = hf_home / "hub" / "models--test-model" / "snapshots" / "abc123"
+    snapshots_dir.mkdir(parents=True)
+
+    metadata_file = snapshots_dir / "config.json.metadata"
+    metadata_file.write_text("{}")
+    model_file = snapshots_dir / "model.pkl"
+    with model_file.open("wb") as f:
+        pickle.dump({"data": "safe"}, f)
+
+    with patch("modelaudit.core.scan_file") as mock_scan:
+        mock_scan.return_value = create_mock_scan_result(bytes_scanned=100)
+
+        result = scan_model_streaming(
+            file_generator=iter([(metadata_file, False), (model_file, True)]),
+            timeout=30,
+            delete_after_scan=False,
+            scan_root=str(snapshots_dir),
+            cache_enabled=False,
+        )
+
+    mock_scan.assert_called_once()
+    assert mock_scan.call_args.args[0] == str(model_file)
+    assert result.files_scanned == 1
+
+
 def test_scan_model_streaming_symlink_outside_directory_matches_normal_scan(
     tmp_path: Path,
     requires_symlinks: None,
