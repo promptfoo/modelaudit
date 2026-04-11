@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
+from types import MappingProxyType
 from typing import Any
 
 
@@ -32,6 +34,36 @@ class Severity(str, Enum):
     INFO = "info"
     WARNING = "warning"
     CRITICAL = "critical"
+
+
+def _immutable_mapping(value: Mapping[str, Any]) -> Mapping[str, Any]:
+    frozen = _deep_freeze(deepcopy(dict(value)))
+    assert isinstance(frozen, Mapping)
+    return frozen
+
+
+def _mapping_to_dict(value: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: _deep_mutable_copy(item) for key, item in value.items()}
+
+
+def _deep_freeze(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _deep_freeze(item) for key, item in value.items()})
+    if isinstance(value, list | tuple):
+        return tuple(_deep_freeze(item) for item in value)
+    if isinstance(value, set | frozenset):
+        return frozenset(_deep_freeze(item) for item in value)
+    return value
+
+
+def _deep_mutable_copy(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _deep_mutable_copy(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_deep_mutable_copy(item) for item in value]
+    if isinstance(value, frozenset):
+        return [_deep_mutable_copy(item) for item in value]
+    return deepcopy(value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,12 +94,13 @@ class Finding:
     severity: Severity
     location: str | None = None
     rule_code: str | None = None
-    details: dict[str, Any] = field(default_factory=dict)
+    details: Mapping[str, Any] = field(default_factory=dict)
     why: str | None = None
 
     def __post_init__(self) -> None:
         if self.severity not in {Severity.WARNING, Severity.CRITICAL}:
             raise ValueError(f"finding severity must be warning/critical, got {self.severity.value}")
+        object.__setattr__(self, "details", _immutable_mapping(self.details))
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -75,7 +108,7 @@ class Finding:
             "severity": self.severity.value,
             "location": self.location,
             "rule_code": self.rule_code,
-            "details": deepcopy(self.details),
+            "details": _mapping_to_dict(self.details),
             "why": self.why,
         }
 
@@ -88,11 +121,12 @@ class Notice:
     severity: Severity = Severity.INFO
     location: str | None = None
     code: str | None = None
-    details: dict[str, Any] = field(default_factory=dict)
+    details: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.severity not in {Severity.DEBUG, Severity.INFO}:
             raise ValueError(f"notice severity must be debug/info, got {self.severity.value}")
+        object.__setattr__(self, "details", _immutable_mapping(self.details))
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -100,7 +134,7 @@ class Notice:
             "severity": self.severity.value,
             "location": self.location,
             "code": self.code,
-            "details": deepcopy(self.details),
+            "details": _mapping_to_dict(self.details),
         }
 
 
@@ -112,7 +146,10 @@ class ScanError:
     category: str
     location: str | None = None
     exception_type: str | None = None
-    details: dict[str, Any] = field(default_factory=dict)
+    details: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "details", _immutable_mapping(self.details))
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -120,7 +157,7 @@ class ScanError:
             "category": self.category,
             "location": self.location,
             "exception_type": self.exception_type,
-            "details": deepcopy(self.details),
+            "details": _mapping_to_dict(self.details),
         }
 
 
@@ -135,8 +172,11 @@ class PickleReport:
     notices: tuple[Notice, ...] = ()
     errors: tuple[ScanError, ...] = ()
     coverage: CoverageSummary = field(default_factory=CoverageSummary)
-    metadata: dict[str, Any] = field(default_factory=dict)
+    metadata: Mapping[str, Any] = field(default_factory=dict)
     duration_s: float = 0.0
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "metadata", _immutable_mapping(self.metadata))
 
     @property
     def has_security_findings(self) -> bool:
@@ -155,7 +195,7 @@ class PickleReport:
             "notices": [notice.to_dict() for notice in self.notices],
             "errors": [error.to_dict() for error in self.errors],
             "coverage": self.coverage.to_dict(),
-            "metadata": deepcopy(self.metadata),
+            "metadata": _mapping_to_dict(self.metadata),
             "duration_s": self.duration_s,
             "has_security_findings": self.has_security_findings,
             "is_clean": self.is_clean,
