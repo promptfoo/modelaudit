@@ -14,6 +14,7 @@ from modelaudit.utils.sources.cloud_storage import (
     filter_scannable_files,
     get_cloud_object_size,
     is_cloud_url,
+    redact_url_for_display,
 )
 
 
@@ -57,6 +58,16 @@ class TestCloudURLDetection:
             assert not is_cloud_url(url), f"Incorrectly detected {url}"
 
 
+class TestCloudURLRedaction:
+    def test_redact_url_for_display_strips_credentials_and_query(self) -> None:
+        url = "https://user:pass@example.com:8443/path/to/model.bin?X-Amz-Signature=secret#fragment"
+        assert redact_url_for_display(url) == "https://example.com:8443/path/to/model.bin"
+
+    def test_redact_url_for_display_strips_cloud_query_params(self) -> None:
+        url = "s3://bucket/model.bin?X-Amz-Credential=secret&X-Amz-Signature=secret"
+        assert redact_url_for_display(url) == "s3://bucket/model.bin"
+
+
 @patch("fsspec.filesystem")
 def test_download_from_cloud(mock_fs, tmp_path):
     fs_meta = make_fs_mock()
@@ -82,6 +93,31 @@ def test_download_from_cloud(mock_fs, tmp_path):
     assert result.exists() or True  # Mock doesn't create actual files
 
     # Note: fsspec filesystems don't need explicit cleanup according to implementation
+
+
+@patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+@patch("modelaudit.utils.sources.cloud_storage.check_disk_space")
+@patch("fsspec.filesystem")
+def test_download_from_cloud_redacts_sensitive_url_in_errors(mock_fs, mock_disk_space, mock_analyze, tmp_path):
+    fs = make_fs_mock()
+    fs.info.return_value = {"type": "file", "size": 1024}
+    mock_fs.return_value = fs
+    mock_analyze.return_value = {
+        "type": "file",
+        "size": 1024,
+        "name": "model.bin",
+        "human_size": "1.0 KB",
+        "estimated_time": "1 second",
+    }
+    mock_disk_space.return_value = (False, "not enough space")
+
+    url = "s3://bucket/model.bin?X-Amz-Signature=secret"
+
+    with pytest.raises(Exception) as excinfo:
+        download_from_cloud(url, cache_dir=tmp_path, use_cache=False, show_progress=False)
+
+    assert "s3://bucket/model.bin" in str(excinfo.value)
+    assert "X-Amz-Signature" not in str(excinfo.value)
 
 
 @pytest.mark.asyncio

@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, TypeVar
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 import click
 from yaspin import yaspin
@@ -52,6 +52,23 @@ def is_cloud_url(url: str) -> bool:
     return any(re.match(p, url) for p in patterns)
 
 
+def redact_url_for_display(url: str) -> str:
+    """Remove credentials, query strings, and fragments from a URL for display."""
+    try:
+        parts = urlsplit(url)
+    except Exception:
+        return "<cloud URL redacted>"
+
+    if not parts.scheme:
+        return url
+
+    netloc = parts.hostname or ""
+    if parts.port is not None:
+        netloc = f"{netloc}:{parts.port}"
+
+    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+
+
 def get_fs_protocol(url: str) -> str:
     """Get the fsspec protocol for a given URL."""
     parsed = urlparse(url)
@@ -65,13 +82,13 @@ def get_fs_protocol(url: str) -> str:
         elif parsed.netloc.endswith(".r2.cloudflarestorage.com"):
             return "s3"
         else:
-            raise ValueError(f"Unsupported cloud storage URL: {url}")
+            raise ValueError(f"Unsupported cloud storage URL: {redact_url_for_display(url)}")
     elif scheme == "gcs" or scheme == "gs":
         return "gcs"
     elif scheme in {"s3", "r2"}:
         return "s3"
     else:
-        raise ValueError(f"Unsupported cloud storage URL: {url}")
+        raise ValueError(f"Unsupported cloud storage URL: {redact_url_for_display(url)}")
 
 
 def estimate_download_time(size_bytes: int, bandwidth_mbps: float = 10.0) -> str:
@@ -147,7 +164,7 @@ def get_cloud_object_size(fs: Any, url: str, strict: bool = False) -> int | None
         info = fs.info(url)
     except Exception as exc:
         if strict:
-            raise ValueError(f"Unable to read cloud object info for {url}: {exc}") from exc
+            raise ValueError(f"Unable to read cloud object info for {redact_url_for_display(url)}: {exc}") from exc
         return None
 
     top_level_size_error: Exception | None = None
@@ -212,7 +229,9 @@ def get_cloud_object_size(fs: Any, url: str, strict: bool = False) -> int | None
             error_parts.append(f"ls() failed: {ls_error}")
         if not error_parts:
             error_parts.append("cloud provider did not return file sizes")
-        raise ValueError(f"Unable to determine cloud object size for {url}: {'; '.join(error_parts)}")
+        raise ValueError(
+            f"Unable to determine cloud object size for {redact_url_for_display(url)}: {'; '.join(error_parts)}"
+        )
 
     return None
 
@@ -520,7 +539,7 @@ def download_from_cloud(
     # Ensure target was analyzed successfully
     if "error" in metadata or metadata.get("type") == "unknown":
         error_msg = metadata.get("error", "Unknown cloud target type")
-        raise ValueError(f"Failed to analyze cloud target {url}: {error_msg}")
+        raise ValueError(f"Failed to analyze cloud target {redact_url_for_display(url)}: {error_msg}")
 
     # Check if we can use streaming analysis
     if stream_analyze and metadata.get("type") == "file":
@@ -581,12 +600,15 @@ def download_from_cloud(
             else:
                 object_size = None
                 if show_progress:
-                    click.echo(f"⚠️  Unable to determine download size for {url}; continuing without disk check: {exc}")
+                    click.echo(
+                        "⚠️  Unable to determine download size for "
+                        f"{redact_url_for_display(url)}; continuing without disk check: {exc}"
+                    )
 
         if object_size is not None:
             has_space, message = check_disk_space(download_path, object_size)
             if not has_space:
-                raise Exception(f"Cannot download from {url}: {message}")
+                raise Exception(f"Cannot download from {redact_url_for_display(url)}: {message}")
 
         # Download based on type
         if metadata["type"] == "directory":
@@ -694,7 +716,7 @@ def download_from_cloud_streaming(
 
     if "error" in metadata or metadata.get("type") == "unknown":
         error_msg = metadata.get("error", "Unknown cloud target type")
-        raise ValueError(f"Failed to analyze cloud target {url}: {error_msg}")
+        raise ValueError(f"Failed to analyze cloud target {redact_url_for_display(url)}: {error_msg}")
 
     # Check size limits
     size = metadata.get("total_size", metadata.get("size", 0))

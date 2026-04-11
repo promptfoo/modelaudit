@@ -53,7 +53,7 @@ from .utils.helpers.auto_defaults import (
     parse_size_string,
 )
 from .utils.helpers.interrupt_handler import interruptible_scan
-from .utils.sources.cloud_storage import download_from_cloud, is_cloud_url
+from .utils.sources.cloud_storage import download_from_cloud, is_cloud_url, redact_url_for_display
 from .utils.sources.huggingface import (
     download_file_from_hf,
     download_model,
@@ -1284,7 +1284,7 @@ def _resolve_scan_source_for_path(
 
             try:
                 metadata = asyncio.run(analyze_cloud_target(path))
-                click.echo(f"\n📊 Preview for {style_text(path, fg='cyan')}:")
+                click.echo(f"\n📊 Preview for {style_text(redact_url_for_display(path), fg='cyan')}:")
                 click.echo(f"   Type: {metadata['type']}")
 
                 if metadata["type"] == "file":
@@ -1303,7 +1303,7 @@ def _resolve_scan_source_for_path(
 
                 return _SourceDispatchResult(actual_path=path, local_scan_required=False)
             except Exception as exc:
-                click.echo(f"Error analyzing {path}: {exc!s}", err=True)
+                click.echo(f"Error analyzing {redact_url_for_display(path)}: {exc!s}", err=True)
                 audit_result.has_errors = True
                 return None
 
@@ -1350,11 +1350,11 @@ def _resolve_scan_source_for_path(
                 return _SourceDispatchResult(actual_path=path, local_scan_required=False)
 
             if runtime.show_styled_output and should_show_spinner():
-                spinner_text = f"Downloading from {style_text(path, fg='cyan')}"
+                spinner_text = f"Downloading from {style_text(redact_url_for_display(path), fg='cyan')}"
                 download_spinner = yaspin(Spinners.dots, text=spinner_text)
                 download_spinner.start()
             elif runtime.show_styled_output:
-                click.echo(f"Downloading from {path}...")
+                click.echo(f"Downloading from {redact_url_for_display(path)}...")
 
             download_path = download_from_cloud(  # type: ignore[assignment]
                 path,
@@ -1391,7 +1391,7 @@ def _resolve_scan_source_for_path(
 
             error_msg = str(exc)
             if "insufficient disk space" in error_msg.lower():
-                logger.error(f"Disk space error for {path}: {error_msg}")
+                logger.error(f"Disk space error for {redact_url_for_display(path)}: {error_msg}")
                 click.echo(style_text(f"\n⚠️  {error_msg}", fg="yellow"), err=True)
                 click.echo(
                     style_text(
@@ -1401,8 +1401,8 @@ def _resolve_scan_source_for_path(
                     err=True,
                 )
             else:
-                logger.error(f"Failed to download from {path}: {error_msg}", exc_info=verbose)
-                click.echo(f"Error downloading from {path}: {error_msg}", err=True)
+                logger.error(f"Failed to download from {redact_url_for_display(path)}: {error_msg}", exc_info=verbose)
+                click.echo(f"Error downloading from {redact_url_for_display(path)}: {error_msg}", err=True)
 
             audit_result.has_errors = True
             return None
