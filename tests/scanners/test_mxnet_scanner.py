@@ -145,6 +145,72 @@ def test_mxnet_scanner_detects_suspicious_custom_operator_reference(tmp_path: Pa
     assert "node: custom_loader" in (custom_issues[0].location or "")
 
 
+def test_mxnet_scanner_detects_cve_2022_24294_pathological_operator_name(tmp_path: Path) -> None:
+    symbol_path = tmp_path / "redos-symbol.json"
+    params_path = tmp_path / "redos-0000.params"
+    pathological_operator = "<A" * 600
+    _write_symbol_file(
+        symbol_path,
+        custom_node={
+            "op": pathological_operator,
+            "name": "redos_operator",
+            "attrs": {"kernel": "(1,1)"},
+            "inputs": [[1, 0, 0]],
+        },
+    )
+    _write_params_file(params_path)
+
+    result = MXNetScanner().scan(str(symbol_path))
+
+    cve_checks = [check for check in result.checks if check.details.get("cve_id") == "CVE-2022-24294"]
+    assert len(cve_checks) == 1
+    assert cve_checks[0].severity == IssueSeverity.WARNING
+    details = cve_checks[0].details
+    assert details["cvss"] == 7.5
+    assert details["cwe"] == "CWE-400"
+    assert "remediation" in details
+    assert details["finding_count"] == 1
+    assert details["findings"][0]["op_name_length"] == len(pathological_operator)
+
+
+def test_mxnet_scanner_long_simple_operator_name_no_cve(tmp_path: Path) -> None:
+    symbol_path = tmp_path / "long-safe-symbol.json"
+    params_path = tmp_path / "long-safe-0000.params"
+    _write_symbol_file(
+        symbol_path,
+        custom_node={
+            "op": f"Custom{'A' * 2000}",
+            "name": "long_custom_operator",
+            "attrs": {"kernel": "(1,1)"},
+            "inputs": [[1, 0, 0]],
+        },
+    )
+    _write_params_file(params_path)
+
+    result = MXNetScanner().scan(str(symbol_path))
+
+    assert not [check for check in result.checks if check.details.get("cve_id") == "CVE-2022-24294"]
+
+
+def test_mxnet_scanner_long_node_name_no_cve(tmp_path: Path) -> None:
+    symbol_path = tmp_path / "long-node-symbol.json"
+    params_path = tmp_path / "long-node-0000.params"
+    _write_symbol_file(
+        symbol_path,
+        custom_node={
+            "op": "Convolution",
+            "name": f"node_{'<' * 1500}",
+            "attrs": {"kernel": "(1,1)", "num_filter": "8"},
+            "inputs": [[1, 0, 0]],
+        },
+    )
+    _write_params_file(params_path)
+
+    result = MXNetScanner().scan(str(symbol_path))
+
+    assert not [check for check in result.checks if check.details.get("cve_id") == "CVE-2022-24294"]
+
+
 def test_mxnet_scanner_detects_encoded_metadata_payload(tmp_path: Path) -> None:
     symbol_path = tmp_path / "payload-symbol.json"
     params_path = tmp_path / "payload-0000.params"

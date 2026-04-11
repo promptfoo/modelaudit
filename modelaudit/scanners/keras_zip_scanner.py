@@ -24,6 +24,7 @@ from ..config.explanations import (
     get_cve_2025_8747_explanation,
     get_cve_2025_9906_explanation,
     get_cve_2025_12058_explanation,
+    get_cve_2025_12060_explanation,
     get_cve_2025_49655_explanation,
     get_cve_2026_1669_explanation,
     get_pattern_explanation,
@@ -84,6 +85,10 @@ _DANGEROUS_CONFIG_MODULES = frozenset(
 # CVE-2025-8747: keras.utils.get_file used as gadget to download + execute files
 _GET_FILE_PATTERN = re.compile(r"get_file", re.IGNORECASE)
 _URL_PATTERN = re.compile(r"https?://", re.IGNORECASE)
+_ARCHIVE_EXTRACT_URL_PATTERN = re.compile(
+    r"\.(?:tar|tgz|tbz2|txz|tar\.gz|tar\.bz2|tar\.xz|tar\.zst|tar\.lz|tar\.lz4|tar\.lzma)(?:[?#]|$)",
+    re.IGNORECASE,
+)
 _URL_SCHEME_PATTERN = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
 _WINDOWS_ABSOLUTE_PATH_PATTERN = re.compile(r"^(?:[a-zA-Z]:[\\/]|\\\\)")
 _KERAS_CONFIG_ENTRY = "config.json"
@@ -405,6 +410,7 @@ class KerasZipScanner(BaseScanner):
                 # CVE-2025-9906 can be detected in any parsed JSON shape; the
                 # rest of the structured model scan requires a top-level object.
                 self._check_unsafe_deserialization_bypass(model_config, result)
+                self._check_get_file_archive_extraction(model_config, result)
                 self._check_get_file_gadget(model_config, result)
                 self._load_keras_metadata(zf, result)
 
@@ -1064,6 +1070,82 @@ class KerasZipScanner(BaseScanner):
                 why=get_cve_2025_8747_explanation("get_file_gadget"),
             )
             return
+
+    def _check_get_file_archive_extraction(self, model_config: Any, result: ScanResult) -> None:
+        """Check for CVE-2025-12060: get_file(extract=True) tar traversal risk."""
+        for context, node in self._iter_dict_nodes(model_config):
+            if self._is_primarily_documentation(context, node):
+                continue
+
+            direct_string_values: list[str] = []
+            url_candidate_values: list[str] = []
+            for key, value in node.items():
+                direct_string_values.extend(self._extract_string_literals(value))
+                key_lower = str(key).lower()
+                if key_lower in {"url", "origin", "args", "kwargs"}:
+                    url_candidate_values.extend(self._extract_string_literals(value, include_dict_values=True))
+
+            has_get_file = any(
+                _GET_FILE_PATTERN.fullmatch(value.strip()) is not None
+                or value.strip().lower().endswith(".get_file")
+                or "keras.utils.get_file" in value.strip().lower()
+                for value in direct_string_values
+            )
+            if not has_get_file or not self._node_has_get_file_extract_true(node):
+                continue
+
+            archive_urls = [
+                value
+                for value in url_candidate_values
+                if _URL_PATTERN.search(value) is not None and _ARCHIVE_EXTRACT_URL_PATTERN.search(value) is not None
+            ]
+            if not archive_urls:
+                continue
+
+            result.add_check(
+                name="CVE-2025-12060: get_file Archive Extraction Traversal",
+                passed=False,
+                message=(
+                    "CVE-2025-12060: config.json contains keras.utils.get_file with extract=True "
+                    "and a remote tar archive URL"
+                ),
+                severity=IssueSeverity.CRITICAL,
+                location=f"{self.current_file_path}/config.json",
+                details={
+                    "cve_id": "CVE-2025-12060",
+                    "context": context,
+                    "urls": archive_urls[:5],
+                    "cvss": 8.8,
+                    "cwe": "CWE-22",
+                    "description": (
+                        "keras.utils.get_file(extract=True) can extract attacker-controlled tar archives "
+                        "with traversal or symlink entries outside the intended destination."
+                    ),
+                    "affected_versions": "Keras < 3.12.0",
+                    "remediation": (
+                        "Upgrade Keras to >= 3.12.0 and reject configs that download and extract tar archives."
+                    ),
+                },
+                why=get_cve_2025_12060_explanation("get_file_extract_tar"),
+            )
+            return
+
+    @staticmethod
+    def _node_has_get_file_extract_true(node: dict[str, Any]) -> bool:
+        """Return True only for direct get_file extract=True argument positions."""
+        if node.get("extract") is True:
+            return True
+
+        kwargs = node.get("kwargs")
+        if isinstance(kwargs, dict) and kwargs.get("extract") is True:
+            return True
+
+        args = node.get("args")
+        if isinstance(args, list | tuple):
+            # keras.utils.get_file positional args: fname, origin, untar, ..., extract.
+            return (len(args) > 2 and args[2] is True) or (len(args) > 7 and args[7] is True)
+
+        return False
 
     def _check_unsafe_deserialization_bypass(self, model_config: Any, result: ScanResult) -> None:
         """Check for CVE-2025-9906: enable_unsafe_deserialization bypass in config.json.
