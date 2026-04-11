@@ -160,7 +160,7 @@ class TestNetworkCommDetector:
         assert "backdoor" in patterns
         assert "botnet" in patterns
 
-    def test_benign_metadata_reference_keys_are_not_cc_patterns(self):
+    def test_benign_metadata_reference_keys_are_not_cc_patterns(self) -> None:
         """Common model metadata URL keys are not C&C indicators by themselves."""
         detector = NetworkCommDetector()
 
