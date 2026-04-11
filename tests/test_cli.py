@@ -256,6 +256,62 @@ def test_scan_json_subprocess_mixed_directory_keeps_stdout_parseable(tmp_path: P
     assert any(asset.get("path") == str(model_file) for asset in output_payload.get("assets", []))
 
 
+def test_scan_sarif_subprocess_single_skipped_file_reports_cli_exit_code(tmp_path: Path) -> None:
+    """SARIF invocation metadata should reflect the CLI exit code for skipped scans."""
+    skipped_file = tmp_path / "skip.py"
+    skipped_file.write_text("print('hello')\n")
+
+    completed = subprocess.run(
+        [sys.executable, "-m", "modelaudit", "scan", str(skipped_file), "--format", "sarif", "--no-cache"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 2
+    sarif_payload = json.loads(completed.stdout)
+    invocation = sarif_payload["runs"][0]["invocations"][0]
+    assert invocation["exitCode"] == 2
+    assert invocation["executionSuccessful"] is False
+    assert invocation["exitCodeDescription"] == "Errors occurred during scanning"
+    assert invocation["properties"]["filesScanned"] == 0
+
+
+def test_scan_sarif_subprocess_preserves_modelaudit_rule_codes() -> None:
+    """SARIF rule identifiers should match ModelAudit rule codes from JSON output."""
+    model_file = Path("tests/assets/samples/pickles/malicious_system_call.pkl").resolve()
+
+    json_completed = subprocess.run(
+        [sys.executable, "-m", "modelaudit", "scan", str(model_file), "--format", "json", "--no-cache"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    sarif_completed = subprocess.run(
+        [sys.executable, "-m", "modelaudit", "scan", str(model_file), "--format", "sarif", "--no-cache"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert json_completed.returncode == 1
+    assert sarif_completed.returncode == 1
+
+    json_payload = json.loads(json_completed.stdout)
+    expected_rule_codes = {issue["rule_code"] for issue in json_payload["issues"] if issue.get("rule_code")}
+    assert "S201" in expected_rule_codes
+
+    sarif_payload = json.loads(sarif_completed.stdout)
+    run = sarif_payload["runs"][0]
+    result_rule_ids = {result["ruleId"] for result in run["results"]}
+    driver_rule_ids = {rule["id"] for rule in run["tool"]["driver"]["rules"]}
+
+    assert expected_rule_codes <= result_rule_ids
+    assert expected_rule_codes <= driver_rule_ids
+    assert run["invocations"][0]["exitCode"] == 1
+    assert run["invocations"][0]["executionSuccessful"] is True
+
+
 def test_scan_can_apply_local_config_once_when_confirmed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Interactive scans can apply a local config for the current run only."""
     import tarfile
