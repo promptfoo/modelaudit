@@ -26,7 +26,10 @@ def test_model_extensions_includes_gguf_formats():
     """Test that GGUF and GGML formats are included (critical for llama.cpp models)."""
     assert ".gguf" in MODEL_EXTENSIONS
     assert ".ggml" in MODEL_EXTENSIONS
-    # Note: variants like .ggjt, .ggla, .ggmf, .ggsa are not in actual scanners
+    assert ".ggjt" in MODEL_EXTENSIONS
+    assert ".ggla" in MODEL_EXTENSIONS
+    assert ".ggmf" in MODEL_EXTENSIONS
+    assert ".ggsa" in MODEL_EXTENSIONS
 
 
 def test_model_extensions_includes_jax_flax():

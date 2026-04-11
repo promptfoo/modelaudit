@@ -583,6 +583,11 @@ def test_filter_scannable_files_recognizes_pdiparams():
     assert filter_scannable_files(files) == files
 
 
+def test_filter_scannable_files_uses_registry_extensions():
+    files = [{"path": "model.nemo"}, {"path": "model.rds"}, {"path": "README.md"}, {"path": "notes.csv"}]
+    assert filter_scannable_files(files) == files[:3]
+
+
 def test_filter_scannable_files_handles_tar_gz_and_tgz():
     files = [{"path": "archive.tar.gz"}, {"path": "weights.tgz"}]
     assert filter_scannable_files(files) == files

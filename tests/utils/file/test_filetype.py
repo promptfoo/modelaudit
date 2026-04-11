@@ -13,6 +13,7 @@ from typing import cast
 
 import pytest
 
+from modelaudit.scanner_registry_metadata import get_extension_format_map
 from modelaudit.utils.file.detection import (
     PROTO0_1_MAX_PROBE_BYTES,
     detect_file_format,
@@ -653,6 +654,14 @@ def test_detect_format_from_extension(tmp_path):
     skops_path = tmp_path / "pipeline.skops"
     skops_path.write_bytes(b"PK\x03\x04")
     assert detect_format_from_extension(str(skops_path)) == "skops"
+
+
+@pytest.mark.parametrize("extension", [".tar.xz", ".ggmf", ".params", ".skops", ".npz"])
+def test_detect_format_from_extension_uses_descriptor_owned_policy(tmp_path: Path, extension: str) -> None:
+    path = tmp_path / f"model{extension}"
+    path.write_bytes(b"abc")
+
+    assert detect_format_from_extension(str(path)) == get_extension_format_map()[extension]
 
 
 def test_detect_gguf_ggml_formats(tmp_path):

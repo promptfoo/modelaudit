@@ -15,7 +15,8 @@
 ## Routing & Coverage Invariants
 
 - Prefer trusted file structure and bounded content sniffing over extension-only routing, especially for ZIP-like containers and nested archives.
-- Keep scanner routing metadata descriptor-owned in `ScannerRegistry`; header-format aliases, content-routed extensions, and lazy class exports should come from one descriptor entry, with `can_handle()` as the final content gate.
+- Keep scanner routing metadata descriptor-owned in `scanner_registry_metadata.py`; header-format aliases, content-routed extensions, extension-only format policy, and lazy class exports should come from that descriptor module, with `can_handle()` as the final content gate.
+- Source discovery filters should consume the registry-backed scannable extension set instead of carrying local allowlists.
 - For routing, prefiltering, or archive-recursion changes, add one malicious positive regression and one benign near-match negative regression.
 - If a scanner aborts to avoid partial coverage, make the result operationally explicit (`success=False` with a clear error message) and preserve consistent exit-code and cache behavior.
 

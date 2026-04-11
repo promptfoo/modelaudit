@@ -31,8 +31,8 @@ Out of scope:
 ## Deliverables
 
 - `modelaudit/scanners/torchserve_mar_scanner.py`
-- Registry wiring in `modelaudit/scanners/__init__.py`
-- Extension detection updates in `modelaudit/utils/file/detection.py`
+- Registry metadata in `modelaudit/scanner_registry_metadata.py`
+- Descriptor-owned extension detection updates
 - Unit tests under `tests/scanners/test_torchserve_mar_scanner.py`
 - Fixture allowlist update in `tests/conftest.py`
 - User docs and changelog updates
@@ -84,8 +84,8 @@ Out of scope:
 1. Registry and routing
 
 - Add scanner registration entry with priority before generic ZIP scanner.
-- Add class mapping in `__getattr__`.
-- Add extension mapping for `.mar` in `EXTENSION_FORMAT_MAP`.
+- Ensure lazy exports resolve from scanner metadata.
+- Add extension mapping for `.mar` in `modelaudit/scanner_registry_metadata.py` `EXTENSION_FORMAT_MAP`.
 - Ensure fallback behavior keeps `.mar` from being treated as unknown.
 
 1. Performance and resilience

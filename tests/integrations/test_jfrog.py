@@ -224,7 +224,7 @@ class TestJFrogStorageAPI:
             assert result == expected
 
     def test_filter_scannable_files(self):
-        """Test filtering of files to scannable model types."""
+        """Test filtering of files to registry-backed scanner extensions."""
         files = [
             {"name": "model.pkl", "path": "/repo/model.pkl", "size": 1024},
             {"name": "data.txt", "path": "/repo/data.txt", "size": 512},
@@ -235,9 +235,9 @@ class TestJFrogStorageAPI:
 
         scannable = filter_scannable_files(files)
 
-        assert len(scannable) == 3
+        assert len(scannable) == 5
         scannable_names = {f["name"] for f in scannable}
-        assert scannable_names == {"model.pkl", "model.pt", "weights.safetensors"}
+        assert scannable_names == {"model.pkl", "data.txt", "model.pt", "config.json", "weights.safetensors"}
 
 
 class TestJFrogFolderDetection:
@@ -341,10 +341,10 @@ class TestJFrogFolderListing:
             selective=True,  # Filter to only scannable files
         )
 
-        # Should filter out readme.txt, keep only model files
-        assert len(files) == 2
+        # Text files have a registry-backed scanner and remain in selective downloads.
+        assert len(files) == 3
         file_names = {f["name"] for f in files}
-        assert file_names == {"model1.pkl", "model2.pt"}
+        assert file_names == {"model1.pkl", "model2.pt", "readme.txt"}
 
         # Check file details
         pkl_file = next(f for f in files if f["name"] == "model1.pkl")

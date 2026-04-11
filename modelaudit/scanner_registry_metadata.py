@@ -4,6 +4,77 @@ from __future__ import annotations
 
 from typing import Any
 
+# Extension-only format detection is intentionally narrower than scanner routing:
+# generic config/text extensions are routed by scanner descriptors and content
+# gates, but they are not authoritative enough for magic-vs-extension validation.
+EXTENSION_FORMAT_MAP: dict[str, str] = {
+    ".7z": "sevenzip",
+    ".bin": "pytorch_binary",
+    ".bz2": "compressed",
+    ".cbm": "catboost",
+    ".ckpt": "pickle",
+    ".cmf": "cntk",
+    ".dill": "pickle",
+    ".dnn": "cntk",
+    ".engine": "tensorrt",
+    ".ggjt": "ggml",
+    ".ggla": "ggml",
+    ".ggmf": "ggml",
+    ".ggml": "ggml",
+    ".ggsa": "ggml",
+    ".gguf": "gguf",
+    ".gz": "compressed",
+    ".h5": "hdf5",
+    ".hdf5": "hdf5",
+    ".keras": "keras",
+    ".lgb": "lightgbm",
+    ".lightgbm": "lightgbm",
+    ".llamafile": "llamafile",
+    ".lz4": "compressed",
+    ".mar": "torchserve_mar",
+    ".meta": "tf_metagraph",
+    ".mlmodel": "coreml",
+    ".msgpack": "flax_msgpack",
+    ".nemo": "nemo",
+    ".net": "torch7",
+    ".npy": "numpy",
+    ".npz": "numpy",
+    ".onnx": "onnx",
+    ".params": "mxnet",
+    ".pb": "protobuf",
+    ".pdiparams": "paddle",
+    ".pdmodel": "paddle",
+    ".pickle": "pickle",
+    ".pkl": "pickle",
+    ".plan": "tensorrt",
+    ".pmml": "pmml",
+    ".pt": "pickle",
+    ".pte": "executorch",
+    ".pth": "pickle",
+    ".ptl": "executorch",
+    ".rda": "r_serialized",
+    ".rdata": "r_serialized",
+    ".rds": "r_serialized",
+    ".rknn": "rknn",
+    ".safetensors": "safetensors",
+    ".skops": "skops",
+    ".tar": "tar",
+    ".tar.bz2": "tar",
+    ".tar.gz": "tar",
+    ".tar.xz": "tar",
+    ".tbz2": "tar",
+    ".tflite": "tflite",
+    ".tgz": "tar",
+    ".th": "torch7",
+    ".trt": "tensorrt",
+    ".t7": "torch7",
+    ".txz": "tar",
+    ".xml": "openvino",
+    ".xz": "compressed",
+    ".zlib": "compressed",
+    ".zip": "zip",
+}
+
 SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = {
     "pickle": {
         "module": "modelaudit.scanners.pickle_scanner",
@@ -459,3 +530,27 @@ def get_scanner_registry_metadata() -> dict[str, dict[str, Any]]:
         metadata[scanner_id] = copied_info
 
     return metadata
+
+
+def get_registered_scanner_extensions() -> set[str]:
+    """Return every scanner-declared extension from descriptor metadata."""
+    extensions: set[str] = set()
+    for scanner_info in SCANNER_REGISTRY_METADATA.values():
+        for list_key in ("extensions", "content_routed_extensions", "scanner_only_extensions"):
+            for extension in scanner_info.get(list_key, []):
+                extension_text = str(extension).lower()
+                if extension_text:
+                    extensions.add(extension_text)
+
+    return extensions
+
+
+def get_extension_format_map() -> dict[str, str]:
+    """Return extension-only format policy after checking descriptor coverage."""
+    registered_extensions = get_registered_scanner_extensions()
+    missing_extensions = set(EXTENSION_FORMAT_MAP) - registered_extensions
+    if missing_extensions:
+        formatted = ", ".join(sorted(missing_extensions))
+        raise RuntimeError(f"Extension format map contains unregistered extensions: {formatted}")
+
+    return dict(EXTENSION_FORMAT_MAP)

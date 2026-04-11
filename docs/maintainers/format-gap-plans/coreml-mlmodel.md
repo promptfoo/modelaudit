@@ -58,8 +58,8 @@ Out of scope:
 
 1. Routing and registration
 
-- Add scanner entry and class mapping.
-- Add `.mlmodel` mapping to extension detection.
+- Add scanner metadata entry.
+- Add `.mlmodel` mapping to descriptor-owned extension detection.
 - Ensure scanner priority is above generic manifest/text handling.
 
 1. Optional deep-validation path
