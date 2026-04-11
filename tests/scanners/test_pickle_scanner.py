@@ -3601,6 +3601,38 @@ class TestDillLoadersRegression:
         assert details["opcode_budget_exceeded"] is True
         assert details["analysis_error"] == "max_items"
 
+    def test_nested_pickle_budget_error_with_warning_prefix_fails_closed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Budget exhaustion after warning evidence should not leave the scan non-critical."""
+        from modelaudit.scanners import pickle_scanner as pickle_scanner_module
+
+        warning_opcodes = list(pickletools.genops(b"cthirdparty\nLoader\n."))
+
+        def _warning_prefix_then_budget(
+            file_obj: BinaryIO,
+            *,
+            multi_stream: bool = False,
+            max_items: int | None = None,
+            deadline: float | None = None,
+        ) -> Iterator[tuple[Any, Any, int | None]]:
+            del file_obj, multi_stream, max_items, deadline
+            yield from warning_opcodes
+            raise _GenopsBudgetExceeded("max_items")
+
+        monkeypatch.setattr(pickle_scanner_module, "_genops_with_fallback", _warning_prefix_then_budget)
+
+        severity, evidence, details = _classify_nested_pickle_payload(
+            b"\x80\x04.",
+            SimpleNamespace(offset=0),
+            {},
+        )
+
+        assert severity == IssueSeverity.CRITICAL
+        assert evidence == "analysis_incomplete"
+        assert details["analysis_incomplete"] is True
+        assert details["opcode_budget_exceeded"] is True
+        assert details["partial_evidence"] == "unknown_import"
+        assert details["partial_evidence_details"]["import_reference"] == "thirdparty.Loader"
+
     def test_nested_pickle_classification_scans_follow_on_streams(self) -> None:
         """A benign first nested stream should not hide a malicious follow-on stream."""
         payload = pickle.dumps({"safe": True}, protocol=4) + _make_os_system_pickle()

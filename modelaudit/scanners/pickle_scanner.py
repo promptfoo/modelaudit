@@ -3418,10 +3418,23 @@ def _classify_nested_pickle_payload(
     except _GenopsBudgetExceeded as exc:
         if opcodes:
             severity, evidence, evidence_details = _classify_nested_pickle_opcodes(opcodes, ml_context)
-            if severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}:
+            if severity == IssueSeverity.CRITICAL:
                 evidence_details["analysis_incomplete"] = True
                 evidence_details["analysis_error"] = exc.reason
+                evidence_details["opcode_budget_exceeded"] = True
                 return severity, evidence, evidence_details
+            return (
+                _get_context_aware_severity(IssueSeverity.CRITICAL, ml_context),
+                "analysis_incomplete",
+                {
+                    "evidence": "analysis_incomplete",
+                    "partial_evidence": evidence,
+                    "partial_evidence_details": evidence_details,
+                    "analysis_incomplete": True,
+                    "analysis_error": exc.reason,
+                    "opcode_budget_exceeded": True,
+                },
+            )
         return (
             _get_context_aware_severity(IssueSeverity.CRITICAL, ml_context),
             "analysis_incomplete",
