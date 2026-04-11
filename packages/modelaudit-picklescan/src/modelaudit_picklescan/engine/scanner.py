@@ -1105,7 +1105,7 @@ def _is_likely_pytorch_storage_persistent_id(value: Any) -> bool:
         return False
     if not isinstance(location, str):
         return False
-    return isinstance(size, int) and size >= 0
+    return isinstance(size, int) and not isinstance(size, bool) and size >= 0
 
 
 def _is_pytorch_storage_marker(value: Any) -> bool:
