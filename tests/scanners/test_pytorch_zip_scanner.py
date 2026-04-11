@@ -128,6 +128,56 @@ def test_pytorch_zip_scanner_malicious_model(tmp_path):
     assert any("eval" in issue.message.lower() for issue in result.issues)
 
 
+def test_pytorch_zip_discovery_rejects_ascii_opcode_plain_text_members(tmp_path: Path) -> None:
+    """Plain text members that start with protocol-0 opcode bytes should not be routed as pickles."""
+    model_path = tmp_path / "ascii_text_members.pt"
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data", b"cat is a category label, not a GLOBAL opcode stream")
+        zip_file.writestr("archive/constants", b"I keep integer-looking notes in this checkpoint manifest")
+        zip_file.writestr("archive/notes", b"(plain prose inside parentheses)")
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert result.metadata["pickle_files"] == []
+    assert not any(
+        check.name == "Pickle Format Check" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+def test_pytorch_zip_discovery_accepts_extensionless_proto0_pickle(tmp_path: Path) -> None:
+    """Extensionless PyTorch pickle members should still be discovered through structural probing."""
+    model_path = tmp_path / "extensionless_proto0.pt"
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data", pickle.dumps({"weights": [1, 2, 3]}, protocol=0))
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert result.metadata["pickle_files"] == ["archive/data"]
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+def test_pytorch_zip_discovery_scans_only_real_extensionless_pickle_near_text(tmp_path: Path) -> None:
+    """A real extensionless pickle should still be scanned when sibling text starts with pickle-ish bytes."""
+    model_path = tmp_path / "mixed_extensionless_members.pt"
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data", b"cbuiltins\neval\n(S'print(1)'\ntR.")
+        zip_file.writestr("archive/constants", b"compiled constants are documented here")
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.metadata["pickle_files"] == ["archive/data"]
+    assert any(issue.severity == IssueSeverity.CRITICAL and "eval" in issue.message.lower() for issue in result.issues)
+
+
 def test_pytorch_zip_scanner_detects_case_insensitive_native_library_members(tmp_path: Path) -> None:
     model_path = create_mock_pytorch_zip(tmp_path / "native_libs.pt")
     with zipfile.ZipFile(model_path, "a") as zip_file:

@@ -13,6 +13,7 @@ from typing import Any, ClassVar
 
 from ..detectors.suspicious_symbols import CVE_COMBINED_PATTERNS
 from ..utils import sanitize_archive_path
+from ..utils.file.detection import PROTO0_1_MAX_PROBE_BYTES, PROTO0_1_START_BYTES, _looks_like_proto0_or_1_pickle
 from .archive_member_security import is_executable_archive_member_name
 from .base import BaseScanner, IssueSeverity, ScanResult
 from .pickle_scanner import PickleScanner
@@ -30,6 +31,14 @@ from .pytorch_zip_support import (
 
 logger = logging.getLogger(__name__)
 _INSTALLED_PYTORCH_VERSION_UNSET = object()
+_PICKLE_BINARY_PROTOCOL_PREFIXES: tuple[bytes, ...] = (
+    b"\x80\x01",
+    b"\x80\x02",
+    b"\x80\x03",
+    b"\x80\x04",
+    b"\x80\x05",
+)
+_PICKLE_DISCOVERY_SHORT_PROBE_BYTES = 16
 
 
 @dataclass(frozen=True)
@@ -612,17 +621,28 @@ class PyTorchZipScanner(BaseScanner):
                     data_start = self._read_member_prefix(
                         zip_file,
                         entry,
-                        8,
+                        _PICKLE_DISCOVERY_SHORT_PROBE_BYTES,
                         phase="pickle_discovery",
                         result=result,
                     )
-                    # Include protocol 1 and check for protocol 0 ASCII pickles
-                    pickle_magics = [b"\x80\x01", b"\x80\x02", b"\x80\x03", b"\x80\x04", b"\x80\x05"]
-                    # Common Protocol 0 ASCII opcodes: MARK '(', PUT 'p', GLOBAL 'c',
-                    # LIST 'l', DICT 'd', INT 'I'/'i', STRING 'S', UNICODE 'V', etc.
-                    ascii_pickle_opcodes = [b"(", b"p", b"c", b"l", b"d", b"I", b"i", b"S", b"V", b"q", b"t", b"u"]
-                    if any(data_start.startswith(m) for m in pickle_magics) or any(
-                        data_start.startswith(op) for op in ascii_pickle_opcodes
+                    if any(data_start.startswith(magic) for magic in _PICKLE_BINARY_PROTOCOL_PREFIXES):
+                        pickle_files.append(entry)
+                        continue
+
+                    if not data_start or data_start[0] not in PROTO0_1_START_BYTES:
+                        continue
+
+                    if entry.file_size > len(data_start):
+                        data_start = self._read_member_prefix(
+                            zip_file,
+                            entry,
+                            PROTO0_1_MAX_PROBE_BYTES,
+                            phase="pickle_discovery",
+                            result=result,
+                        )
+                    if _looks_like_proto0_or_1_pickle(
+                        data_start,
+                        sample_is_prefix=entry.file_size > len(data_start),
                     ):
                         pickle_files.append(entry)
                 except Exception:
