@@ -3470,9 +3470,15 @@ class TestDillLoadersRegression:
             for i in result.issues
             if "nested pickle payload" in i.message.lower() or "encoded pickle payload" in i.message.lower()
         ]
-        assert nested_issues
-        assert all(i.severity == IssueSeverity.INFO for i in nested_issues)
-        assert not any(i.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for i in nested_issues)
+        raw_issue = next((i for i in nested_issues if "nested pickle payload" in i.message.lower()), None)
+        encoded_issue = next((i for i in nested_issues if "encoded pickle payload" in i.message.lower()), None)
+        assert raw_issue is not None
+        assert encoded_issue is not None
+        assert raw_issue.severity == IssueSeverity.INFO
+        assert encoded_issue.severity == IssueSeverity.INFO
+        assert not any(
+            i.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for i in (raw_issue, encoded_issue)
+        )
 
     def test_malicious_nested_pickle_detection_stays_critical(self, tmp_path: Path) -> None:
         """Nested pickle payloads with dangerous reducers should remain critical."""

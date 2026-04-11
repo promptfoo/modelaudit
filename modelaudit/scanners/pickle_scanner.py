@@ -3396,8 +3396,8 @@ def _build_opcode_check_finding(
 
 
 def _parse_global_reference_arg(arg: str) -> tuple[str, str]:
-    parts = arg.split(" ", 1) if " " in arg else arg.rsplit(".", 1) if "." in arg else [arg, ""]
-    return parts[0], parts[1] if len(parts) > 1 else ""
+    parsed = _parse_module_function(arg)
+    return parsed if parsed is not None else (arg, "")
 
 
 def _classify_nested_pickle_payload(
@@ -3422,9 +3422,13 @@ def _classify_nested_pickle_payload(
         )
     except Exception as exc:
         return (
-            IssueSeverity.INFO,
-            "structure_only",
-            {"evidence": "structure_only", "analysis_error": str(exc), "analysis_error_type": type(exc).__name__},
+            _get_context_aware_severity(IssueSeverity.WARNING, ml_context),
+            "analysis_incomplete",
+            {
+                "evidence": "analysis_incomplete",
+                "analysis_error": str(exc),
+                "analysis_error_type": type(exc).__name__,
+            },
         )
 
     (
