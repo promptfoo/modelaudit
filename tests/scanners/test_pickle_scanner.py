@@ -3601,6 +3601,20 @@ class TestDillLoadersRegression:
         assert details["opcode_budget_exceeded"] is True
         assert details["analysis_error"] == "max_items"
 
+    def test_nested_pickle_classification_scans_follow_on_streams(self) -> None:
+        """A benign first nested stream should not hide a malicious follow-on stream."""
+        payload = pickle.dumps({"safe": True}, protocol=4) + _make_os_system_pickle()
+
+        severity, evidence, details = _classify_nested_pickle_payload(
+            payload,
+            SimpleNamespace(offset=0),
+            {},
+        )
+
+        assert severity == IssueSeverity.CRITICAL
+        assert evidence == "dangerous_execution"
+        assert details["evidence"] == "dangerous_execution"
+
     def test_nested_pickle_detection_scans_beyond_validation_sample(self, tmp_path: Path) -> None:
         """Dangerous nested evidence beyond the header-validation window should stay critical."""
         scanner = PickleScanner()
