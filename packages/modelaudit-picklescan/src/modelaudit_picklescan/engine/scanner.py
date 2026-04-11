@@ -2,65 +2,24 @@
 
 from __future__ import annotations
 
-import base64
-import binascii
 import pickletools
 import re
 import time
-from dataclasses import dataclass
-from io import BytesIO, StringIO
+from io import BytesIO
 from typing import Any, BinaryIO, cast
 
 from ..options import ScanOptions
 from ..report import CoverageSummary, Finding, Notice, PickleReport, SafetyVerdict, ScanError, ScanStatus, Severity
+from .nested import (
+    _decode_possible_encoded_pickle,
+    _detect_oversized_encoded_pickle_prefixes,
+    _has_pickle_prefix,
+    _looks_like_pickle_payload,
+)
+from .policy import _GlobalRef, global_severity, suspicious_string_matches
+from .stream import _BoundedPickleStream, _StreamReadError
 
 _MARK = object()
-_DANGEROUS_WILDCARD_MODULES = frozenset(
-    {
-        "__builtin__",
-        "__builtins__",
-        "builtins",
-        "cloudpickle",
-        "ctypes",
-        "dill._dill",
-        "importlib",
-        "marshal",
-        "nt",
-        "os",
-        "pickle",
-        "posix",
-        "runpy",
-        "socket",
-        "ssl",
-        "subprocess",
-        "sys",
-        "urllib",
-    }
-)
-_DANGEROUS_GLOBALS = {
-    "collections": frozenset({"eval"}),
-    "operator": frozenset({"attrgetter", "itemgetter", "methodcaller"}),
-    "_operator": frozenset({"attrgetter", "itemgetter", "methodcaller"}),
-    "dill": frozenset({"load", "loads"}),
-    "pkgutil": frozenset({"resolve_name"}),
-    "types": frozenset({"CodeType", "FunctionType"}),
-    "torch.serialization": frozenset({"load"}),
-}
-_WARNING_GLOBALS = {
-    "functools": frozenset({"partial", "partialmethod"}),
-}
-_BUILTIN_DANGEROUS_NAMES = frozenset(
-    {
-        "__import__",
-        "breakpoint",
-        "compile",
-        "eval",
-        "exec",
-        "getattr",
-        "open",
-        "setattr",
-    }
-)
 _REDUCE_OPCODES = frozenset({"REDUCE", "NEWOBJ", "NEWOBJ_EX", "OBJ", "INST", "BUILD"})
 _STACK_GLOBAL_STRING_OPCODES = frozenset(
     {
@@ -75,33 +34,9 @@ _STACK_GLOBAL_STRING_OPCODES = frozenset(
 )
 _MEMO_WRITE_OPCODES = frozenset({"PUT", "BINPUT", "LONG_BINPUT"})
 _MEMO_READ_OPCODES = frozenset({"GET", "BINGET", "LONG_BINGET"})
-_SUSPICIOUS_STRING_PATTERNS = frozenset(
-    {
-        "__import__(",
-        "eval(",
-        "exec(",
-        "os.system",
-        "subprocess.",
-    }
-)
-_SUSPICIOUS_STRING_PATTERNS_SORTED = tuple(sorted(_SUSPICIOUS_STRING_PATTERNS))
-_NESTED_PICKLE_SCAN_LIMIT_BYTES = 2 * 1024 * 1024
-_MAX_BASE64_NESTED_PICKLE_CHARS = ((_NESTED_PICKLE_SCAN_LIMIT_BYTES + 2) // 3) * 4
-_MAX_HEX_NESTED_PICKLE_CHARS = _NESTED_PICKLE_SCAN_LIMIT_BYTES * 2
-_BASE64_CANDIDATE_RE = re.compile(r"[A-Za-z0-9+/]+={0,2}")
-_HEX_CANDIDATE_RE = re.compile(r"(?:\\x)?[0-9a-fA-F]+")
-
-
-@dataclass(frozen=True, slots=True)
-class _GlobalRef:
-    module: str
-    name: str
-    position: int
-    malformed: bool = False
-
-    @property
-    def symbol(self) -> str:
-        return f"{self.module}.{self.name}"
+_BASE64_LITERAL_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=")
+_HEX_LITERAL_CHARS = frozenset("0123456789abcdefABCDEF")
+_ENCODED_LITERAL_PROBE_CHARS = 64
 
 
 class _OpcodeBudgetExceeded(Exception):
@@ -117,142 +52,6 @@ class _ScanTimeout(Exception):
     """Raised when opcode analysis exceeds the configured timeout."""
 
 
-class _StreamReadError(Exception):
-    """Raised when the source stream fails during incremental parsing."""
-
-    def __init__(self, source_error: Exception) -> None:
-        super().__init__(str(source_error))
-        self.source_error = source_error
-
-
-class _BoundedPickleStream:
-    """Incrementally read pickle bytes while enforcing an optional byte limit."""
-
-    def __init__(self, stream: BinaryIO, byte_limit: int | None) -> None:
-        self._stream = stream
-        self._byte_limit = byte_limit
-        self._prefetched = bytearray()
-        self._position = 0
-        self.short_read = False
-
-    def tell(self) -> int:
-        return self._position
-
-    def has_remaining_bytes(self) -> bool:
-        if self._byte_limit is not None and self._position >= self._byte_limit:
-            return False
-        if self._prefetched:
-            return True
-
-        chunk = self._read_once(1)
-        if not chunk:
-            if self._byte_limit is not None and self._position < self._byte_limit:
-                self.short_read = True
-            return False
-        self._prefetched.extend(chunk)
-        return True
-
-    def read(self, size: int | None = -1) -> bytes:
-        read_size = self._bounded_size(size)
-        if read_size == 0:
-            return b""
-
-        if read_size is None:
-            prefetched = self._consume_prefetched()
-            chunk = self._read_once(None)
-            payload = prefetched + chunk
-            self._position += len(payload)
-            return payload
-
-        chunks: list[bytes] = []
-        prefetched = self._consume_prefetched(read_size)
-        if prefetched:
-            chunks.append(prefetched)
-        bytes_read = len(prefetched)
-        while bytes_read < read_size:
-            chunk = self._read_once(read_size - bytes_read)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            bytes_read += len(chunk)
-
-        self._position += bytes_read
-        self._mark_short_read_if_needed(bytes_read, expected_bytes=read_size)
-        return b"".join(chunks)
-
-    def readline(self, size: int | None = -1) -> bytes:
-        read_size = self._bounded_size(size)
-        if read_size == 0:
-            return b""
-
-        prefix = self._consume_prefetched_line(read_size)
-        if prefix.endswith(b"\n") or (read_size is not None and len(prefix) >= read_size):
-            self._position += len(prefix)
-            return prefix
-
-        suffix_size = None if read_size is None else read_size - len(prefix)
-        suffix = self._readline_once(suffix_size)
-        chunk = prefix + suffix
-        chunk_len = len(chunk)
-        if self._byte_limit is not None and self._position + chunk_len < self._byte_limit and not chunk.endswith(b"\n"):
-            self.short_read = True
-        self._position += chunk_len
-        return chunk
-
-    def _bounded_size(self, requested_size: int | None) -> int | None:
-        if requested_size is not None and requested_size < 0:
-            requested_size = None
-        if self._byte_limit is None:
-            return requested_size
-
-        remaining = max(self._byte_limit - self._position, 0)
-        if requested_size is None:
-            return remaining
-        return min(requested_size, remaining)
-
-    def _read_once(self, size: int | None) -> bytes:
-        try:
-            return self._stream.read() if size is None else self._stream.read(size)
-        except (OSError, ValueError) as error:
-            raise _StreamReadError(error) from error
-
-    def _readline_once(self, size: int | None) -> bytes:
-        try:
-            return self._stream.readline() if size is None else self._stream.readline(size)
-        except (OSError, ValueError) as error:
-            raise _StreamReadError(error) from error
-
-    def _mark_short_read_if_needed(self, bytes_read: int, *, expected_bytes: int) -> None:
-        if self._byte_limit is None:
-            return
-        if bytes_read < expected_bytes and self._position < self._byte_limit:
-            self.short_read = True
-
-    def _consume_prefetched(self, size: int | None = None) -> bytes:
-        if not self._prefetched:
-            return b""
-
-        if size is None or size >= len(self._prefetched):
-            chunk = bytes(self._prefetched)
-            self._prefetched.clear()
-            return chunk
-
-        chunk = bytes(self._prefetched[:size])
-        del self._prefetched[:size]
-        return chunk
-
-    def _consume_prefetched_line(self, size: int | None = None) -> bytes:
-        if not self._prefetched:
-            return b""
-
-        limit = len(self._prefetched) if size is None else min(size, len(self._prefetched))
-        newline_index = self._prefetched.find(b"\n", 0, limit)
-        end = newline_index + 1 if newline_index >= 0 else limit
-        chunk = bytes(self._prefetched[:end])
-        del self._prefetched[:end]
-        return chunk
-
-
 def scan_pickle_payload(
     payload: bytes,
     *,
@@ -260,6 +59,8 @@ def scan_pickle_payload(
     options: ScanOptions,
     bytes_total: int | None = None,
     position_offset: int = 0,
+    nested_depth: int = 0,
+    deadline: float | None = None,
 ) -> PickleReport:
     """Scan pickle bytes and return a standalone report."""
 
@@ -270,6 +71,8 @@ def scan_pickle_payload(
         options=options,
         bytes_total=bytes_total,
         position_offset=position_offset,
+        nested_depth=nested_depth,
+        deadline=deadline,
     )
 
 
@@ -280,6 +83,8 @@ def scan_pickle_stream(
     options: ScanOptions,
     bytes_total: int | None = None,
     position_offset: int = 0,
+    nested_depth: int = 0,
+    deadline: float | None = None,
 ) -> PickleReport:
     """Scan pickle bytes directly from a binary stream and return a standalone report."""
 
@@ -290,6 +95,8 @@ def scan_pickle_stream(
         options=options,
         bytes_total=bytes_total,
         position_offset=position_offset,
+        nested_depth=nested_depth,
+        deadline=deadline,
     )
     scan.run()
     return scan.to_report(duration_s=time.monotonic() - started_at)
@@ -304,13 +111,16 @@ class _ScanState:
         options: ScanOptions,
         bytes_total: int | None,
         position_offset: int,
+        nested_depth: int,
+        deadline: float | None,
     ) -> None:
         self.source = source
         self.stream = stream
         self.options = options
         self.bytes_total = bytes_total
         self.position_offset = position_offset
-        self.deadline = time.monotonic() + options.timeout_s
+        self.nested_depth = nested_depth
+        self.deadline = deadline if deadline is not None else time.monotonic() + options.timeout_s
         self.stack: list[Any] = []
         self.memo: dict[int | str, Any] = {}
         self.next_memo_index = 0
@@ -326,6 +136,7 @@ class _ScanState:
         self.status = ScanStatus.COMPLETE
         self.verdict = SafetyVerdict.CLEAN
         self._seen_finding_keys: set[tuple[str, str | None, str | None]] = set()
+        self._seen_notice_keys: set[tuple[str | None, str | None, str]] = set()
         self._seen_global_reference_keys: set[tuple[str, str, int, str]] = set()
 
     def run(self) -> None:
@@ -375,7 +186,7 @@ class _ScanState:
                     break
         except _OpcodeBudgetExceeded as error:
             self.status = ScanStatus.INCONCLUSIVE
-            self.notices.append(
+            self._add_notice(
                 Notice(
                     message=f"Opcode analysis stopped after reaching max_opcodes={self.options.max_opcodes}",
                     severity=Severity.INFO,
@@ -391,7 +202,7 @@ class _ScanState:
             self._scan_post_budget_tail(error.stream_offset, tail_prefix=error.tail_prefix)
         except _ScanTimeout:
             self.status = ScanStatus.INCONCLUSIVE
-            self.notices.append(
+            self._add_notice(
                 Notice(
                     message=f"Opcode analysis timed out after {self.options.timeout_s:.3f} seconds",
                     severity=Severity.INFO,
@@ -434,7 +245,7 @@ class _ScanState:
                 )
             else:
                 self.status = ScanStatus.INCONCLUSIVE
-                self.notices.append(
+                self._add_notice(
                     Notice(
                         message=f"Pickle parsing stopped before the stream was fully consumed: {type(error).__name__}",
                         severity=Severity.INFO,
@@ -648,7 +459,7 @@ class _ScanState:
             if callable_ref is None:
                 return
 
-            global_severity = _global_severity(callable_ref.module, callable_ref.name)
+            global_severity = global_severity_for_ref(callable_ref)
             if global_severity is not None:
                 self._add_finding(
                     Finding(
@@ -755,41 +566,66 @@ class _ScanState:
         return None
 
     def _scan_string_literal(self, value: str, *, op_name: str, position: int) -> None:
-        normalized = value.lower()
-        for matched_pattern in _SUSPICIOUS_STRING_PATTERNS_SORTED:
-            if matched_pattern not in normalized:
-                continue
-
-            self._add_finding(
-                Finding(
-                    message=f"Suspicious string literal contains code execution pattern: {matched_pattern}",
-                    severity=Severity.WARNING,
-                    location=f"{self.source} (pos {position})",
-                    rule_code="SUSPICIOUS_STRING",
-                    details={
-                        "opcode": op_name,
-                        "pattern": matched_pattern,
-                    },
-                    why=(
-                        "Suspicious code-like strings embedded in pickle payloads can be used by "
-                        "downstream loaders or helper code during deserialization workflows."
-                    ),
+        for window in self._bounded_string_windows(value, op_name=op_name, position=position):
+            for matched_pattern in suspicious_string_matches(window):
+                self._add_finding(
+                    Finding(
+                        message=f"Suspicious string literal contains code execution pattern: {matched_pattern}",
+                        severity=Severity.WARNING,
+                        location=f"{self.source} (pos {position})",
+                        rule_code="SUSPICIOUS_STRING",
+                        details={
+                            "opcode": op_name,
+                            "pattern": matched_pattern,
+                        },
+                        why=(
+                            "Suspicious code-like strings embedded in pickle payloads can be used by "
+                            "downstream loaders or helper code during deserialization workflows."
+                        ),
+                    )
                 )
-            )
 
     def _scan_raw_nested_pickle_bytes(self, value: bytes, *, position: int) -> None:
-        if not _looks_like_pickle_payload(value):
+        if len(value) > self.options.max_nested_pickle_bytes:
+            if _has_pickle_prefix(value):
+                self._add_nested_payload_finding(
+                    encoding="raw",
+                    payload_size=len(value),
+                    position=position,
+                    analysis_incomplete=True,
+                )
+                self._record_raw_nested_payload_truncated(payload_size=len(value), position=position)
             return
 
+        if not _looks_like_pickle_payload(value, max_bytes=self.options.max_nested_pickle_bytes):
+            return
+
+        self._add_nested_payload_finding(encoding="raw", payload_size=len(value), position=position)
+        self._surface_nested_pickle_findings(value, encoding="raw", position=position)
+
+    def _add_nested_payload_finding(
+        self,
+        *,
+        encoding: str,
+        payload_size: int,
+        position: int,
+        analysis_incomplete: bool = False,
+    ) -> None:
         self._add_finding(
             Finding(
-                message="Nested pickle payload detected",
+                message=(
+                    "Nested pickle payload detected"
+                    if not analysis_incomplete
+                    else "Nested pickle payload exceeds deep-scan byte limit"
+                ),
                 severity=Severity.CRITICAL,
                 location=f"{self.source} (pos {position})",
                 rule_code="S213",
                 details={
-                    "encoding": "raw",
-                    "payload_size": len(value),
+                    "encoding": encoding,
+                    "payload_size": payload_size,
+                    "max_nested_pickle_bytes": self.options.max_nested_pickle_bytes,
+                    "analysis_incomplete": analysis_incomplete,
                 },
                 why=(
                     "This pickle contains another serialized pickle payload inside a byte field. "
@@ -799,30 +635,131 @@ class _ScanState:
         )
 
     def _scan_encoded_nested_pickle_literal(self, value: str, *, position: int) -> None:
-        for encoding, decoded in _decode_possible_encoded_pickle(value):
-            self._add_finding(
-                Finding(
-                    message="Encoded pickle payload detected",
-                    severity=Severity.CRITICAL,
-                    location=f"{self.source} (pos {position})",
-                    rule_code="S601" if encoding == "base64" else "S602",
-                    details={
-                        "encoding": encoding,
-                        "payload_size": len(decoded),
-                    },
-                    why=(
-                        "Encoded nested pickle payloads can hide deserialization gadgets "
-                        "inside apparently inert metadata strings."
-                    ),
-                )
+        values: tuple[str, ...] = (value,)
+        if len(value) > self.options.max_string_literal_scan_chars:
+            self._record_literal_scan_truncated(
+                literal_type="string",
+                literal_length=len(value),
+                op_name="encoded_nested_pickle",
+                position=position,
             )
+            values = self._bounded_encoded_nested_windows(value)
+
+        for candidate in values:
+            decoded_payload_found = False
+            for encoding, decoded in _decode_possible_encoded_pickle(
+                candidate,
+                max_nested_pickle_bytes=self.options.max_nested_pickle_bytes,
+            ):
+                decoded_payload_found = True
+                self._add_encoded_nested_payload_finding(
+                    encoding=encoding,
+                    payload_size=len(decoded),
+                    position=position,
+                )
+                self._surface_nested_pickle_findings(decoded, encoding=encoding, position=position)
+            if decoded_payload_found:
+                continue
+
+            for encoding, payload_size in _detect_oversized_encoded_pickle_prefixes(
+                candidate,
+                max_nested_pickle_bytes=self.options.max_nested_pickle_bytes,
+            ):
+                self._add_encoded_nested_payload_finding(
+                    encoding=encoding,
+                    payload_size=payload_size,
+                    position=position,
+                    analysis_incomplete=True,
+                )
+                self._record_encoded_nested_payload_truncated(
+                    encoding=encoding,
+                    payload_size=payload_size,
+                    position=position,
+                )
+
+    def _record_raw_nested_payload_truncated(self, *, payload_size: int, position: int) -> None:
+        if self.status == ScanStatus.COMPLETE:
+            self.status = ScanStatus.INCONCLUSIVE
+        self._add_notice(
+            Notice(
+                message="Nested pickle payload exceeds configured deep-scan byte limit",
+                severity=Severity.INFO,
+                location=f"{self.source} (pos {position})",
+                code="nested_payload_truncated",
+                details={
+                    "encoding": "raw",
+                    "payload_size": payload_size,
+                    "max_nested_pickle_bytes": self.options.max_nested_pickle_bytes,
+                    "analysis_incomplete": True,
+                },
+            )
+        )
+
+    def _add_encoded_nested_payload_finding(
+        self,
+        *,
+        encoding: str,
+        payload_size: int,
+        position: int,
+        analysis_incomplete: bool = False,
+    ) -> None:
+        rule_code = "S601" if encoding == "base64" else "S602"
+        details: dict[str, Any] = {
+            "encoding": encoding,
+            "payload_size": payload_size,
+        }
+        if analysis_incomplete:
+            details["max_nested_pickle_bytes"] = self.options.max_nested_pickle_bytes
+            details["analysis_incomplete"] = True
+
+        self._add_finding(
+            Finding(
+                message=(
+                    "Encoded pickle payload detected"
+                    if not analysis_incomplete
+                    else "Encoded pickle payload exceeds deep-scan byte limit"
+                ),
+                severity=Severity.CRITICAL,
+                location=f"{self.source} (pos {position})",
+                rule_code=rule_code,
+                details=details,
+                why=(
+                    "Encoded nested pickle payloads can hide deserialization gadgets "
+                    "inside apparently inert metadata strings."
+                ),
+            )
+        )
+
+    def _record_encoded_nested_payload_truncated(
+        self,
+        *,
+        encoding: str,
+        payload_size: int,
+        position: int,
+    ) -> None:
+        if self.status == ScanStatus.COMPLETE:
+            self.status = ScanStatus.INCONCLUSIVE
+        self._add_notice(
+            Notice(
+                message="Encoded pickle payload exceeds configured deep-scan byte limit",
+                severity=Severity.INFO,
+                location=f"{self.source} (pos {position})",
+                code="encoded_nested_payload_truncated",
+                details={
+                    "encoding": encoding,
+                    "payload_size": payload_size,
+                    "max_nested_pickle_bytes": self.options.max_nested_pickle_bytes,
+                    "analysis_incomplete": True,
+                },
+            )
+        )
 
     def _record_global_ref(self, ref: _GlobalRef, *, op_name: str) -> None:
         if ref.malformed:
             return
 
         self.global_count += 1
-        global_severity = _global_severity(ref.module, ref.name)
+        global_severity = global_severity_for_ref(ref)
         is_dangerous = global_severity is not None
         reference_key = (ref.symbol, op_name, ref.position, "dangerous" if is_dangerous else "observed")
         if reference_key not in self._seen_global_reference_keys:
@@ -882,6 +819,123 @@ class _ScanState:
             return
         self._seen_finding_keys.add(key)
         self.findings.append(finding)
+
+    def _add_notice(self, notice: Notice) -> None:
+        key = (notice.code, notice.location, notice.message)
+        if key in self._seen_notice_keys:
+            return
+        self._seen_notice_keys.add(key)
+        self.notices.append(notice)
+
+    def _bounded_string_windows(self, value: str, *, op_name: str, position: int) -> tuple[str, ...]:
+        max_chars = self.options.max_string_literal_scan_chars
+        if max_chars <= 0:
+            if value:
+                self._record_literal_scan_truncated(
+                    literal_type="string",
+                    literal_length=len(value),
+                    op_name=op_name,
+                    position=position,
+                )
+            return ()
+        if len(value) <= max_chars:
+            return (value,)
+
+        self._record_literal_scan_truncated(
+            literal_type="string",
+            literal_length=len(value),
+            op_name=op_name,
+            position=position,
+        )
+        prefix_chars = max_chars // 2
+        suffix_chars = max_chars - prefix_chars
+        return (value[:prefix_chars], value[-suffix_chars:] if suffix_chars else "")
+
+    def _record_literal_scan_truncated(
+        self,
+        *,
+        literal_type: str,
+        literal_length: int,
+        op_name: str,
+        position: int,
+    ) -> None:
+        if self.status == ScanStatus.COMPLETE:
+            self.status = ScanStatus.INCONCLUSIVE
+        self._add_notice(
+            Notice(
+                message=f"{literal_type.capitalize()} literal scan truncated at configured limit",
+                severity=Severity.INFO,
+                location=f"{self.source} (pos {position})",
+                code="literal_scan_truncated",
+                details={
+                    "opcode": op_name,
+                    "literal_type": literal_type,
+                    "literal_length": literal_length,
+                    "max_string_literal_scan_chars": self.options.max_string_literal_scan_chars,
+                    "analysis_incomplete": True,
+                },
+            )
+        )
+
+    def _bounded_encoded_nested_windows(self, value: str) -> tuple[str, ...]:
+        max_chars = _encoded_nested_window_char_limit(value, self.options.max_nested_pickle_bytes)
+        if len(value) <= max_chars:
+            return (value,)
+
+        prefix = value[:max_chars]
+        suffix = value[-max_chars:]
+        if prefix == suffix:
+            return (prefix,)
+        return (prefix, suffix)
+
+    def _surface_nested_pickle_findings(self, payload: bytes, *, encoding: str, position: int) -> None:
+        if self.nested_depth >= self.options.max_nested_depth:
+            return
+
+        nested_source = f"{self.source} (nested {encoding} pickle at pos {position})"
+        nested_report = scan_pickle_payload(
+            payload,
+            source=nested_source,
+            options=self.options,
+            nested_depth=self.nested_depth + 1,
+            deadline=self.deadline,
+        )
+        for nested_finding in nested_report.findings:
+            nested_finding_details = nested_finding.to_dict()["details"]
+            self._add_finding(
+                Finding(
+                    message=f"Nested pickle finding: {nested_finding.message}",
+                    severity=nested_finding.severity,
+                    location=nested_finding.location,
+                    rule_code=nested_finding.rule_code,
+                    details={
+                        "nested_encoding": encoding,
+                        "nested_source": nested_source,
+                        "nested_rule_code": nested_finding.rule_code,
+                        "nested_details": nested_finding_details,
+                    },
+                    why=nested_finding.why,
+                )
+            )
+
+        if nested_report.status != ScanStatus.COMPLETE:
+            if self.status == ScanStatus.COMPLETE:
+                self.status = ScanStatus.INCONCLUSIVE
+            self._add_notice(
+                Notice(
+                    message="Nested pickle analysis did not complete",
+                    severity=Severity.INFO,
+                    location=nested_source,
+                    code="nested_pickle_incomplete",
+                    details={
+                        "nested_encoding": encoding,
+                        "nested_status": nested_report.status.value,
+                        "nested_errors": [error.to_dict() for error in nested_report.errors],
+                        "nested_notices": [notice.to_dict() for notice in nested_report.notices],
+                        "analysis_incomplete": True,
+                    },
+                )
+            )
 
     def _coalesce_redundant_global_findings(self) -> None:
         called_global_keys = {
@@ -972,28 +1026,34 @@ class _ScanState:
         self.verdict = SafetyVerdict.UNKNOWN
 
 
-def _global_severity(module: str, name: str) -> Severity | None:
-    warning_names = _WARNING_GLOBALS.get(module)
-    if warning_names is not None and name in warning_names:
-        return Severity.WARNING
+def global_severity_for_ref(ref: _GlobalRef) -> Severity | None:
+    return global_severity(ref.module, ref.name)
 
-    if module in _DANGEROUS_WILDCARD_MODULES:
-        if module in {"builtins", "__builtin__", "__builtins__"}:
-            return Severity.CRITICAL if name in _BUILTIN_DANGEROUS_NAMES else None
-        return Severity.CRITICAL
 
-    top_level_module = module.split(".", 1)[0]
-    if top_level_module in _DANGEROUS_WILDCARD_MODULES and top_level_module not in {
-        "builtins",
-        "__builtin__",
-        "__builtins__",
-    }:
-        return Severity.CRITICAL
+def _encoded_nested_window_char_limit(value: str, max_nested_pickle_bytes: int) -> int:
+    max_base64_chars = ((max_nested_pickle_bytes + 2) // 3) * 4
+    max_plain_hex_chars = max_nested_pickle_bytes * 2
+    max_escaped_hex_chars = max_nested_pickle_bytes * 4
+    probe = _encoded_literal_probe(value)
+    if "\\x" in probe:
+        return max(16, max_escaped_hex_chars)
+    if _chars_are_in_alphabet(probe, _HEX_LITERAL_CHARS):
+        return max(16, max_plain_hex_chars)
+    if _chars_are_in_alphabet(probe, _BASE64_LITERAL_CHARS):
+        return max(16, max_base64_chars)
+    return 16
 
-    blocked_names = _DANGEROUS_GLOBALS.get(module)
-    if blocked_names is not None and name in blocked_names:
-        return Severity.CRITICAL
-    return None
+
+def _encoded_literal_probe(value: str) -> str:
+    stripped = value.strip()
+    max_probe_chars = _ENCODED_LITERAL_PROBE_CHARS * 2
+    if len(stripped) <= max_probe_chars:
+        return stripped
+    return stripped[:_ENCODED_LITERAL_PROBE_CHARS] + stripped[-_ENCODED_LITERAL_PROBE_CHARS:]
+
+
+def _chars_are_in_alphabet(value: str, alphabet: frozenset[str]) -> bool:
+    return bool(value) and all(char in alphabet for char in value)
 
 
 def _post_budget_opcode_prefix(op_name: str, arg: Any, stack: list[Any]) -> bytes:
@@ -1019,61 +1079,6 @@ def _coerce_text_value(value: Any) -> str:
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="ignore")
     return str(value)
-
-
-def _decode_possible_encoded_pickle(value: str) -> list[tuple[str, bytes]]:
-    stripped = value.strip()
-    if len(stripped) < 16:
-        return []
-
-    decoded_values: list[tuple[str, bytes]] = []
-
-    if _BASE64_CANDIDATE_RE.fullmatch(stripped):
-        bounded = stripped[:_MAX_BASE64_NESTED_PICKLE_CHARS]
-        padded = bounded + ("=" * (-len(bounded) % 4))
-        try:
-            decoded = base64.b64decode(padded, validate=True)
-        except (binascii.Error, ValueError):
-            decoded = b""
-        if _looks_like_pickle_payload(decoded):
-            decoded_values.append(("base64", decoded))
-
-    hex_candidate = stripped[:_MAX_HEX_NESTED_PICKLE_CHARS].replace("\\x", "")
-    if (
-        len(hex_candidate) >= 16
-        and len(hex_candidate) % 2 == 0
-        and _HEX_CANDIDATE_RE.fullmatch(hex_candidate)
-        and not re.fullmatch(r"(.)\1*", hex_candidate)
-    ):
-        bounded_hex_candidate = hex_candidate[:_MAX_HEX_NESTED_PICKLE_CHARS]
-        try:
-            decoded = binascii.unhexlify(bounded_hex_candidate)
-        except (binascii.Error, ValueError):
-            decoded = b""
-        if _looks_like_pickle_payload(decoded):
-            decoded_values.append(("hex", decoded))
-
-    return decoded_values
-
-
-def _looks_like_pickle_payload(value: bytes) -> bool:
-    if len(value) < 2 or len(value) > _NESTED_PICKLE_SCAN_LIMIT_BYTES:
-        return False
-    if not (value[:1] == b"\x80" or value[:1] in {b"(", b"c", b"d", b"l", b"i", b"I", b"S", b"V"}):
-        return False
-
-    try:
-        saw_stop = False
-        for opcode, _arg, _pos in pickletools.genops(BytesIO(value)):
-            if opcode.name == "STOP":
-                saw_stop = True
-                break
-        if not saw_stop:
-            return False
-        pickletools.dis(value, out=StringIO())
-    except Exception:
-        return False
-    return True
 
 
 def _location_position(location: str | None) -> int | None:
