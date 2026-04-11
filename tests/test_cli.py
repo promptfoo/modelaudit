@@ -273,7 +273,7 @@ def test_scan_sarif_subprocess_single_skipped_file_reports_cli_exit_code(tmp_pat
     invocation = sarif_payload["runs"][0]["invocations"][0]
     assert invocation["exitCode"] == 2
     assert invocation["executionSuccessful"] is False
-    assert invocation["exitCodeDescription"] == "Errors occurred during scanning"
+    assert invocation["exitCodeDescription"] == "No files were scanned"
     assert invocation["properties"]["filesScanned"] == 0
 
 
@@ -304,10 +304,18 @@ def test_scan_sarif_subprocess_preserves_modelaudit_rule_codes() -> None:
     sarif_payload = json.loads(sarif_completed.stdout)
     run = sarif_payload["runs"][0]
     result_rule_ids = {result["ruleId"] for result in run["results"]}
+    result_property_rule_codes = {
+        result["properties"]["rule_code"] for result in run["results"] if result.get("properties")
+    }
     driver_rule_ids = {rule["id"] for rule in run["tool"]["driver"]["rules"]}
+    driver_property_rule_codes = {
+        rule["properties"]["rule_code"] for rule in run["tool"]["driver"]["rules"] if rule.get("properties")
+    }
 
     assert expected_rule_codes <= result_rule_ids
+    assert expected_rule_codes <= result_property_rule_codes
     assert expected_rule_codes <= driver_rule_ids
+    assert expected_rule_codes <= driver_property_rule_codes
     assert run["invocations"][0]["exitCode"] == 1
     assert run["invocations"][0]["executionSuccessful"] is True
 

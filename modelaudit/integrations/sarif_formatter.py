@@ -11,7 +11,11 @@ from typing import Any
 from urllib.parse import quote
 
 from modelaudit import __version__
-from modelaudit.core_results import determine_exit_code
+from modelaudit.core_results import (
+    determine_exit_code,
+    results_have_inconclusive_outcome,
+    results_have_operational_error,
+)
 from modelaudit.models import ModelAuditResultModel
 from modelaudit.scanner_results import IssueSeverity
 
@@ -85,7 +89,7 @@ def _create_run(
                 "arguments": scan_paths,
                 "workingDirectory": {"uri": Path.cwd().as_uri()},
                 "exitCode": exit_code,
-                "exitCodeDescription": _exit_code_description(exit_code),
+                "exitCodeDescription": _exit_code_description(audit_result, exit_code),
                 "exitSignalName": None,
                 "exitSignalNumber": None,
                 "processStartFailureMessage": None,
@@ -128,12 +132,18 @@ def _create_run(
     return run
 
 
-def _exit_code_description(exit_code: int) -> str:
+def _exit_code_description(audit_result: ModelAuditResultModel, exit_code: int) -> str:
     """Return a user-facing description for ModelAudit CLI exit semantics."""
     if exit_code == 0:
         return "No security issues found"
     if exit_code == 1:
         return "Security issues detected"
+    if results_have_operational_error(audit_result):
+        return "Errors occurred during scanning"
+    if results_have_inconclusive_outcome(audit_result):
+        return "Scan outcome was inconclusive"
+    if audit_result.files_scanned == 0:
+        return "No files were scanned"
     return "Errors occurred during scanning"
 
 
@@ -228,9 +238,9 @@ def _create_results(issues: list, rule_indices: dict[str, int] | None = None) ->
         properties = dict(issue.details or {})
         rule_code = _get_issue_rule_code(issue)
         if rule_code:
-            properties.setdefault("rule_code", rule_code)
+            properties["rule_code"] = rule_code
         if hasattr(issue, "type") and issue.type:
-            properties.setdefault("issue_type", issue.type)
+            properties["issue_type"] = issue.type
         if properties:
             result["properties"] = properties
 

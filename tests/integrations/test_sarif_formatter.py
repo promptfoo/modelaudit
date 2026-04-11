@@ -222,6 +222,22 @@ class TestCreateResults:
         assert region["startLine"] == 42
         assert region["startColumn"] == 10
 
+    def test_result_properties_prefer_issue_identity_fields(self) -> None:
+        """Canonical issue identity fields should override stale details."""
+        issue = Issue(
+            message="Test",
+            severity=IssueSeverity.WARNING,
+            details={"rule_code": "STALE", "issue_type": "stale"},
+            timestamp=time.time(),
+            type="pickle_check",
+            rule_code="S201",
+        )
+
+        results = _create_results([issue])
+
+        assert results[0]["properties"]["rule_code"] == "S201"
+        assert results[0]["properties"]["issue_type"] == "pickle_check"
+
     def test_result_fingerprints(self):
         """Test result has fingerprints for deduplication."""
         issue = Issue(
