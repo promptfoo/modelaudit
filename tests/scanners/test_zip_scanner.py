@@ -6,7 +6,7 @@ import tempfile
 import zipfile
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -62,7 +62,7 @@ def test_rewrite_extracted_member_location_preserves_scanner_specific_suffix_pol
 
 
 class _HeaderRoutedTempScanner(BaseScanner):
-    name = "header_routed_temp"
+    name: ClassVar[str] = "header_routed_temp"
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -77,6 +77,22 @@ class _HeaderRoutedTempScanner(BaseScanner):
             location=path,
         )
         result.finish(success=True)
+        return result
+
+
+class _HeaderRoutedFindingScanner(_HeaderRoutedTempScanner):
+    name: ClassVar[str] = "header_routed_finding"
+
+    def scan(self, path: str) -> ScanResult:
+        result = ScanResult(scanner_name=self.name, scanner=self)
+        result.add_check(
+            name="Header-routed temp scan",
+            passed=False,
+            message=f"Detected header-routed payload in {path}",
+            severity=IssueSeverity.WARNING,
+            location=path,
+        )
+        result.finish(success=False)
         return result
 
 
@@ -109,6 +125,56 @@ def test_scan_nested_file_honors_header_route_when_temp_suffix_is_rejected(
 
     assert result.scanner_name == "header_routed_temp"
     assert result.success is True
+
+
+def test_scan_nested_file_drops_header_route_when_rechecked_header_mismatches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extracted_member = tmp_path / "member.dat"
+    extracted_member.write_bytes(b"not actually a header-routed payload")
+    detected_formats = iter(["header_only_model", "unknown"])
+
+    monkeypatch.setattr(archive_dispatch, "detect_file_format", lambda _path: next(detected_formats))
+    monkeypatch.setitem(
+        archive_dispatch._HEADER_FORMAT_TO_SCANNER_ID,
+        "header_only_model",
+        "header_only_scanner",
+    )
+    monkeypatch.setattr(_registry, "load_scanner_by_id", lambda _scanner_id: _HeaderRoutedTempScanner)
+    monkeypatch.setattr(_registry, "get_scanner_for_path", lambda _path: None)
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.success is True
+
+
+def test_scan_nested_file_header_routed_generic_suffix_can_report_findings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extracted_member = tmp_path / "member.dat"
+    extracted_member.write_bytes(b"header-routed malicious payload")
+
+    monkeypatch.setattr(archive_dispatch, "detect_file_format", lambda _path: "header_only_model")
+    monkeypatch.setitem(
+        archive_dispatch._HEADER_FORMAT_TO_SCANNER_ID,
+        "header_only_model",
+        "header_only_scanner",
+    )
+    monkeypatch.setattr(_registry, "load_scanner_by_id", lambda _scanner_id: _HeaderRoutedFindingScanner)
+
+    def get_scanner_for_path(path: str) -> type[BaseScanner] | None:
+        raise AssertionError(f"header-routed nested member fell back to path routing: {path}")
+
+    monkeypatch.setattr(_registry, "get_scanner_for_path", get_scanner_for_path)
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "header_routed_finding"
+    assert result.success is False
+    assert any(check.status == CheckStatus.FAILED for check in result.checks)
 
 
 class TestZipScanner:
