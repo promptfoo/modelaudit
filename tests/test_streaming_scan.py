@@ -202,6 +202,52 @@ def test_scan_model_streaming_skips_non_model_files(tmp_path: Path) -> None:
     assert result.files_scanned == 1
 
 
+def test_scan_model_streaming_preserves_license_metadata_when_skipped(tmp_path: Path) -> None:
+    """Skipped license files should still populate file metadata in streaming mode."""
+    license_file = tmp_path / "license.txt"
+    license_file.write_text("MIT License\nCopyright 2026 Example")
+
+    with patch("modelaudit.core.scan_file") as mock_scan:
+        result = scan_model_streaming(
+            file_generator=iter([(license_file, True)]),
+            timeout=30,
+            delete_after_scan=False,
+            skip_file_types=True,
+        )
+
+    mock_scan.assert_not_called()
+    assert result.files_scanned == 0
+    assert str(license_file) in result.file_metadata
+    metadata = result.file_metadata[str(license_file)].model_dump()
+    assert "license_info" in metadata
+    assert "copyright_notices" in metadata
+
+
+def test_scan_model_streaming_skip_file_types_preserves_malicious_findings(tmp_path: Path) -> None:
+    """Prefiltering should skip non-model files without dropping model security findings."""
+    ignored_file = tmp_path / "notes.log"
+    ignored_file.write_text("debug output")
+    model_file = tmp_path / "model.pkl"
+    with model_file.open("wb") as f:
+        pickle.dump({"data": "safe"}, f)
+
+    with patch("modelaudit.core.scan_file") as mock_scan:
+        mock_scan.return_value = create_mock_scan_result(bytes_scanned=100, with_critical_issue=True)
+
+        result = scan_model_streaming(
+            file_generator=iter([(ignored_file, False), (model_file, True)]),
+            timeout=30,
+            delete_after_scan=False,
+            skip_file_types=True,
+        )
+
+    mock_scan.assert_called_once()
+    assert mock_scan.call_args.args[0] == str(model_file)
+    assert result.files_scanned == 1
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+    assert determine_exit_code(result) == 1
+
+
 def test_scan_model_streaming_keeps_non_model_files_when_skip_disabled(tmp_path: Path) -> None:
     """The skip_file_types flag should remain opt-out for streaming scans."""
     ignored_file = tmp_path / "notes.log"

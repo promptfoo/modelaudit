@@ -1127,8 +1127,8 @@ def scan_model_streaming(
     results = create_initial_audit_result()
     file_hashes: list[str] = []
     files_processed = 0
-    skip_file_types = bool(kwargs.get("skip_file_types", False))
-    metadata_scanner_available = _registry.has_scanner_class("MetadataScanner")
+    skip_file_types: bool = bool(kwargs.get("skip_file_types", False))
+    metadata_scanner_available: bool = _registry.has_scanner_class("MetadataScanner")
 
     base_dir = Path(scan_root).resolve() if scan_root is not None else None
     hf_cache_root = _find_hf_cache_root(base_dir) if base_dir is not None else None
@@ -1150,7 +1150,7 @@ def scan_model_streaming(
                 break
 
             try:
-                if _is_huggingface_cache_file(str(source_path)):
+                if is_hf_cache and _is_huggingface_cache_file(str(source_path)):
                     logger.debug(f"Skipping HuggingFace cache file: {source_path}")
                     continue
 
