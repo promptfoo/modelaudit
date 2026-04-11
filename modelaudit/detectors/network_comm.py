@@ -48,7 +48,6 @@ _PROSE_MARKERS: tuple[str, ...] = (
     " says",
     " mentions",
     " includes",
-    " for ",
 )
 _WORD_PATTERN = re.compile(rb"[A-Za-z]{2,}")
 _CODE_LINE_PREFIXES: tuple[bytes, ...] = (
@@ -56,6 +55,7 @@ _CODE_LINE_PREFIXES: tuple[bytes, ...] = (
     b"from ",
     b"def ",
     b"class ",
+    b"if ",
 )
 _CODE_LINE_MARKERS: tuple[bytes, ...] = (
     b"=",
@@ -131,7 +131,9 @@ def _is_doc_only_network_reference(
 
     text = line.decode("utf-8", errors="ignore").lower()
     has_prose_marker = any(marker in text for marker in _PROSE_MARKERS)
-    return (metadata_context and word_count >= 4) or (word_count >= 6 and has_prose_marker)
+    if not has_prose_marker:
+        return False
+    return (metadata_context and word_count >= 4) or word_count >= 6
 
 
 class NetworkCommDetector:

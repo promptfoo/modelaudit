@@ -181,6 +181,24 @@ class TestNetworkCommDetector:
 
         assert any(finding["type"] == "network_library" for finding in findings)
 
+    def test_metadata_context_without_prose_marker_still_flags_network_import(self) -> None:
+        """Metadata filenames alone should not suppress executable-looking imports."""
+        detector = NetworkCommDetector()
+        data = b'{"hook": "import socket then send payload"}'
+
+        findings = detector.scan(data, "metadata.json")
+
+        assert any(finding["type"] == "network_library" and finding["library"] == "socket" for finding in findings)
+
+    def test_inline_comment_prose_marker_after_code_still_flags_network_import(self) -> None:
+        """Inline prose markers should not hide executable import statements."""
+        detector = NetworkCommDetector()
+        data = b"if True: import socket  # for outbound callback"
+
+        findings = detector.scan(data, "model.pkl")
+
+        assert any(finding["type"] == "network_library" and finding["library"] == "socket" for finding in findings)
+
     def test_network_library_after_doc_import_still_flagged(self) -> None:
         """A prose import mention should not hide a later executable import."""
         detector = NetworkCommDetector()
