@@ -144,6 +144,20 @@ def test_build_report_summarizes_drift_by_fixture_label_and_preserves_safe_fp_au
     assert "S310" in exploit4["legacy"]["rule_codes"]
 
 
+def test_build_report_can_include_root_standalone_primary_mode() -> None:
+    report = compare_pickle_scanners._build_report(
+        include_root=True,
+        root_config={"use_standalone_pickle_primary": True},
+    )
+
+    assert "root" in report["summary"]
+    assert report["summary_by_label"]["root"]["safe"] == {"match": 6}
+    first_comparison = min(report["comparisons"], key=lambda item: item["path"])
+    assert "root_delta" in first_comparison
+    assert first_comparison["root"]["engine"] == "root"
+    assert first_comparison["root"]["metadata"]["pickle_primary_engine"] == "standalone"
+
+
 def test_fixture_label_marks_clear_malicious_paths_without_overlabeling_license_fixtures() -> None:
     assert (
         compare_pickle_scanners._fixture_label(
