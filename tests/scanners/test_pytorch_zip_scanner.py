@@ -509,7 +509,9 @@ def test_pytorch_zip_allows_torchscript_generated_python_files(tmp_path: Path) -
     model_path = create_mock_pytorch_zip(tmp_path / "scripted.pt", prefix="archive")
     with zipfile.ZipFile(model_path, "a") as zip_file:
         zip_file.writestr("archive/code/__torch__.py", "class Module:\n    pass\n")
+        zip_file.writestr("archive/code/__torch__.py.debug_pkl", b"\x80\x04N.")
         zip_file.writestr("archive/code/__torch__/torch/nn/modules/container.py", "class Sequential:\n    pass\n")
+        zip_file.writestr("archive/code/__torch__/torch/nn/modules/container.py.debug_pkl", b"\x80\x04N.")
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -572,6 +574,22 @@ def test_pytorch_zip_still_warns_on_unexpected_python_files(tmp_path: Path) -> N
     ]
     failed_files = {check.details["file"] for check in python_failures}
     assert {"archive/code/helper.py", "archive/data/malicious.py"}.issubset(failed_files)
+    assert all(check.severity == IssueSeverity.WARNING for check in python_failures)
+
+
+def test_pytorch_zip_warns_on_unpaired_python_under_torchscript_tree(tmp_path: Path) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "model.pt", prefix="archive")
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr("archive/code/__torch__/payload.py", "import os\nos.system('id')\n")
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    python_failures = [
+        check
+        for check in result.checks
+        if check.name == "Python Code File Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert any(check.details.get("file") == "archive/code/__torch__/payload.py" for check in python_failures)
     assert all(check.severity == IssueSeverity.WARNING for check in python_failures)
 
 

@@ -266,7 +266,7 @@ class PyTorchZipScanner(BaseScanner):
         return get_zip_member_names(entries)
 
     @staticmethod
-    def _is_torchscript_generated_python(name: str) -> bool:
+    def _is_torchscript_generated_python(name: str, member_names: set[str]) -> bool:
         """Return true for TorchScript's generated Python source archive layout."""
         normalized = name.replace("\\", "/").lstrip("/").lower()
         parts = tuple(part for part in normalized.split("/") if part)
@@ -284,9 +284,10 @@ class PyTorchZipScanner(BaseScanner):
             return False
 
         torchscript_parts = parts[code_index + 1 :]
-        return torchscript_parts == ("__torch__.py",) or (
+        is_generated_path = torchscript_parts == ("__torch__.py",) or (
             len(torchscript_parts) > 1 and torchscript_parts[0] == "__torch__"
         )
+        return is_generated_path and f"{normalized}.debug_pkl" in member_names
 
     @staticmethod
     def _find_zip_entry(entries: list[zipfile.ZipInfo], member_name: str) -> zipfile.ZipInfo | None:
@@ -819,13 +820,16 @@ class PyTorchZipScanner(BaseScanner):
         """Detect suspicious non-pickle files in the archive"""
         python_files_found = False
         executable_files_found = False
+        member_names = {
+            self._get_zip_member_name(entry).replace("\\", "/").lstrip("/").lower() for entry in safe_entries
+        }
 
         for entry in safe_entries:
             name = self._get_zip_member_name(entry)
             normalized_name = name.lower()
             # Check for Python code files
             if normalized_name.endswith(".py"):
-                if self._is_torchscript_generated_python(name):
+                if self._is_torchscript_generated_python(name, member_names):
                     continue
                 result.add_check(
                     name="Python Code File Detection",
