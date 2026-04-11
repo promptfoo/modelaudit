@@ -39,7 +39,8 @@ XML_COMMENT_PATTERN = re.compile(r"<!--.*?-->", re.DOTALL)
 XML_CDATA_PATTERN = re.compile(r"<!\[CDATA\[.*?\]\]>", re.DOTALL)
 SUSPICIOUS_ELEMENT_NAMES = frozenset({"script", "javascript", "python", "exec", "eval"})
 DOCUMENTATION_ELEMENT_NAMES = frozenset({"annotation", "copyright", "description", "documentation"})
-DOCUMENTATION_ATTRIBUTE_NAMES = frozenset({"description", "documentation", "label", "reference"})
+DOCUMENTATION_ATTRIBUTE_NAMES = frozenset({"description", "documentation", "label"})
+DOCUMENTATION_REFERENCE_TAG_NAMES = frozenset({"application", "header"})
 EXTERNAL_RESOURCE_ATTRIBUTE_NAMES = frozenset(
     {
         "file",
@@ -354,6 +355,8 @@ class PmmlScanner(BaseScanner):
         """Return True when a URL-bearing attribute is an external resource reference."""
         if attr_name in DOCUMENTATION_ATTRIBUTE_NAMES:
             return False
+        if attr_name == "reference":
+            return tag_name not in DOCUMENTATION_REFERENCE_TAG_NAMES
         if attr_name in EXTERNAL_RESOURCE_ATTRIBUTE_NAMES:
             return True
 

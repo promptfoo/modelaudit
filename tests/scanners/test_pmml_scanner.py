@@ -248,6 +248,26 @@ def test_pmml_scanner_resource_url_attributes_still_warn(tmp_path: Path) -> None
     assert any(issue.details.get("attribute") == "source" for issue in external_issues)
 
 
+def test_pmml_scanner_non_documentation_reference_attribute_still_warns(tmp_path: Path) -> None:
+    """Non-documentation reference attributes should remain external resource references."""
+    pmml = """<?xml version='1.0'?>
+<PMML version='4.4'>
+  <Header/>
+  <DataDictionary>
+    <DataField name="payload" optype="categorical" dataType="string" reference="https://evil.example/payload"/>
+  </DataDictionary>
+</PMML>"""
+    path = tmp_path / "reference_attr.pmml"
+    path.write_text(pmml, encoding="utf-8")
+
+    result = PmmlScanner().scan(str(path))
+
+    external_issues = [issue for issue in result.issues if "external resource" in issue.message.lower()]
+    assert external_issues
+    assert all(issue.severity == IssueSeverity.WARNING for issue in external_issues)
+    assert any(issue.details.get("attribute") == "reference" for issue in external_issues)
+
+
 def test_pmml_scanner_namespaced_resource_url_attributes_warn(tmp_path: Path) -> None:
     """Namespaced resource attributes should still be treated as external references."""
     pmml = """<?xml version='1.0'?>
