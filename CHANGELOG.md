@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- flag Paddle code patterns as warnings instead of failing benign scans
 - route corrupt CatBoost scans to fail closed outcomes
 - mark incomplete MXNet scans inconclusive instead of clean
 - harden manifest parse boundaries around malformed metadata
