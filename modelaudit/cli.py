@@ -53,7 +53,12 @@ from .utils.helpers.auto_defaults import (
     parse_size_string,
 )
 from .utils.helpers.interrupt_handler import interruptible_scan
-from .utils.sources.cloud_storage import download_from_cloud, is_cloud_url, redact_url_for_display
+from .utils.sources.cloud_storage import (
+    download_from_cloud,
+    is_cloud_url,
+    redact_cloud_error_for_display,
+    redact_url_for_display,
+)
 from .utils.sources.huggingface import (
     download_file_from_hf,
     download_model,
@@ -65,6 +70,16 @@ from .utils.sources.jfrog import is_jfrog_url
 from .utils.sources.pytorch_hub import download_pytorch_hub_model, is_pytorch_hub_url
 
 logger = logging.getLogger("modelaudit")
+
+
+def _display_path(path: str) -> str:
+    """Return a path safe for user-facing CLI output."""
+    return redact_url_for_display(path) if is_cloud_url(path) else path
+
+
+def _display_error(error: object, path: str) -> str:
+    """Return an error safe for user-facing CLI output."""
+    return redact_cloud_error_for_display(error, path) if is_cloud_url(path) else str(error)
 
 
 @dataclass
@@ -237,6 +252,10 @@ def expand_paths(paths: tuple[str, ...]) -> tuple[list[str], list[str]]:
     expanded: list[str] = []
     missing_globs: list[str] = []
     for path_str in paths:
+        if is_cloud_url(path_str):
+            expanded.append(path_str)
+            continue
+
         # Handle glob patterns and resolve paths
         path = Path(path_str)
         if "*" in path_str or "?" in path_str:
@@ -532,7 +551,8 @@ def _show_scan_runtime_defaults(
             "─" * 80,
         ]
         click.echo("\n".join(header))
-        click.echo(f"Paths to scan: {style_text(', '.join(expanded_paths), fg='green')}")
+        display_paths = [_display_path(path) for path in expanded_paths]
+        click.echo(f"Paths to scan: {style_text(', '.join(display_paths), fg='green')}")
         if blacklist:
             click.echo(
                 f"Additional blacklist patterns: {style_text(', '.join(blacklist), fg='yellow')}",
@@ -832,16 +852,17 @@ def _scan_local_or_downloaded_path(
 ) -> None:
     """Scan a local artifact or a downloaded path resolved by source dispatch."""
     actual_path = source_result.actual_path
+    display_path = _display_path(path)
     if _should_skip_non_model_file(actual_path, runtime, verbose=verbose):
         return
 
     spinner = None
     if runtime.show_styled_output and should_show_spinner():
-        spinner_text = f"Scanning {style_text(path, fg='cyan')}"
+        spinner_text = f"Scanning {style_text(display_path, fg='cyan')}"
         spinner = yaspin(Spinners.dots, text=spinner_text)
         spinner.start()
     elif runtime.show_styled_output:
-        click.echo(f"Scanning {path}...")
+        click.echo(f"Scanning {display_path}...")
 
     try:
         progress_callback = _create_path_progress_callback(
@@ -925,7 +946,7 @@ def _scan_local_or_downloaded_path(
         has_critical = any(issue.severity == IssueSeverity.CRITICAL for issue in visible_issues)
 
         if spinner:
-            spinner.text = f"Scanned {style_text(path, fg='cyan')}"
+            spinner.text = f"Scanned {style_text(display_path, fg='cyan')}"
             if issue_count == 0:
                 spinner.ok(style_text("✅ Clean", fg="green", bold=True))
             elif has_critical:
@@ -946,22 +967,23 @@ def _scan_local_or_downloaded_path(
                 )
         elif runtime.show_styled_output:
             if issue_count == 0:
-                click.echo(f"Scanned {path}: Clean")
+                click.echo(f"Scanned {display_path}: Clean")
             else:
                 issues_str = "issue" if issue_count == 1 else "issues"
                 if has_critical:
-                    click.echo(f"Scanned {path}: Found {issue_count} {issues_str} (CRITICAL)")
+                    click.echo(f"Scanned {display_path}: Found {issue_count} {issues_str} (CRITICAL)")
                 else:
-                    click.echo(f"Scanned {path}: Found {issue_count} {issues_str}")
+                    click.echo(f"Scanned {display_path}: Found {issue_count} {issues_str}")
     except Exception as exc:
+        display_error = _display_error(exc, path)
         if spinner:
-            spinner.text = f"Error scanning {style_text(path, fg='cyan')}"
+            spinner.text = f"Error scanning {style_text(display_path, fg='cyan')}"
             spinner.fail(style_text("❌ Error", fg="red", bold=True))
         elif runtime.show_styled_output:
-            click.echo(f"Error scanning {path}")
+            click.echo(f"Error scanning {display_path}")
 
-        logger.error(f"Error during scan of {path}: {exc!s}", exc_info=verbose)
-        click.echo(f"Error scanning {path}: {exc!s}", err=True)
+        logger.error(f"Error during scan of {display_path}: {display_error}", exc_info=verbose)
+        click.echo(f"Error scanning {display_path}: {display_error}", err=True)
         audit_result.has_errors = True
         path_state.scanned_paths.append(actual_path)
 
@@ -1389,7 +1411,7 @@ def _resolve_scan_source_for_path(
             elif runtime.show_styled_output:
                 click.echo("Download failed")
 
-            error_msg = str(exc)
+            error_msg = _display_error(exc, path)
             if "insufficient disk space" in error_msg.lower():
                 logger.error(f"Disk space error for {redact_url_for_display(path)}: {error_msg}")
                 click.echo(style_text(f"\n⚠️  {error_msg}", fg="yellow"), err=True)

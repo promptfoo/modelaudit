@@ -87,6 +87,15 @@ def redact_cloud_error_for_display(message: object, source_url: str | None = Non
     return _SENSITIVE_QUERY_PARAM_RE.sub(r"\1<redacted>", redacted)
 
 
+def _cloud_url_basename(url: str) -> str:
+    """Return a local filename derived from a cloud URL without query secrets."""
+    try:
+        path = urlsplit(url).path
+    except Exception:
+        path = url
+    return Path(path).name
+
+
 def get_fs_protocol(url: str) -> str:
     """Get the fsspec protocol for a given URL."""
     parsed = urlparse(url)
@@ -275,7 +284,11 @@ async def analyze_cloud_target(url: str) -> dict[str, Any]:
         fs = fsspec.filesystem(fs_protocol, **fs_args)
 
         # Get info about the target with retry
-        @retry_with_backoff(max_retries=3, verbose=True)
+        @retry_with_backoff(
+            max_retries=3,
+            verbose=True,
+            sanitize_error=lambda exc: redact_cloud_error_for_display(exc, url),
+        )
         def get_info():
             return fs.info(url)
 
@@ -286,7 +299,7 @@ async def analyze_cloud_target(url: str) -> dict[str, Any]:
             return {
                 "type": "file",
                 "size": info.get("size", 0),
-                "name": Path(url).name,
+                "name": _cloud_url_basename(url),
                 "estimated_time": estimate_download_time(info.get("size", 0)),
                 "human_size": format_size(info.get("size", 0)),
             }
@@ -303,7 +316,9 @@ async def analyze_cloud_target(url: str) -> dict[str, Any]:
                 item_info = fs.info(item)
                 if item_info.get("type") == "file" or "size" in item_info:
                     size = item_info.get("size", 0)
-                    files.append({"path": item, "name": Path(item).name, "size": size, "human_size": format_size(size)})
+                    files.append(
+                        {"path": item, "name": _cloud_url_basename(item), "size": size, "human_size": format_size(size)}
+                    )
                     total_size += size
             except Exception:
                 continue
@@ -483,7 +498,8 @@ def filter_scannable_files(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Filter files to only include scannable model types."""
     scannable = []
     for file in files:
-        path = Path(file["path"])
+        file_path = str(file["path"])
+        path = Path(_cloud_url_basename(file_path) if is_cloud_url(file_path) else file_path)
         suffixes = [s.lower() for s in path.suffixes]
         for i in range(1, len(suffixes) + 1):
             if "".join(suffixes[-i:]) in SCANNABLE_MODEL_EXTENSIONS:
@@ -500,11 +516,12 @@ def _build_safe_local_path(base_url: str, file_url: str, download_path: Path) ->
     if file_url.startswith(f"{normalized_base}/"):
         relative_path = file_url[len(normalized_base) + 1 :]
     elif file_url == normalized_base:
-        relative_path = Path(file_url).name
+        relative_path = _cloud_url_basename(file_url)
     else:
         # Fallback to basename for unexpected path shapes.
-        relative_path = Path(file_url).name
+        relative_path = _cloud_url_basename(file_url)
 
+    relative_path = urlsplit(relative_path).path
     if not relative_path:
         raise ValueError(f"Invalid cloud object path: {file_url}")
 
@@ -664,17 +681,25 @@ def download_from_cloud(
                 if show_progress:
                     click.echo(f"Downloading {file_info['name']} ({file_info['human_size']})")
 
-                @retry_with_backoff(max_retries=3, verbose=show_progress)
+                @retry_with_backoff(
+                    max_retries=3,
+                    verbose=show_progress,
+                    sanitize_error=lambda exc, source_url=file_url: redact_cloud_error_for_display(exc, source_url),
+                )
                 def download_file(url=file_url, path=local_path):
                     fs.get(url, str(path))
 
                 download_file()
         else:
             # Single file download
-            file_name = Path(url).name
+            file_name = _cloud_url_basename(url)
             local_file = download_path / file_name
 
-            @retry_with_backoff(max_retries=3, verbose=show_progress)
+            @retry_with_backoff(
+                max_retries=3,
+                verbose=show_progress,
+                sanitize_error=lambda exc: redact_cloud_error_for_display(exc, url),
+            )
             def download_single_file():
                 fs.get(url, str(local_file))
 
@@ -768,7 +793,7 @@ def download_from_cloud_streaming(
             raise ValueError("No scannable model files found")
     else:
         # Single file
-        files = [{"path": url, "name": Path(url).name, "size": metadata.get("size", 0)}]
+        files = [{"path": url, "name": _cloud_url_basename(url), "size": metadata.get("size", 0)}]
 
     # Create temp directory for downloads
     temp_dir = Path(tempfile.mkdtemp(prefix="modelaudit_stream_"))
@@ -778,7 +803,7 @@ def download_from_cloud_streaming(
         total_files = len(files)
         for i, file_info in enumerate(files):
             file_url = file_info["path"]
-            file_name = file_info.get("name") or Path(file_url).name
+            file_name = file_info.get("name") or _cloud_url_basename(file_url)
             is_last = i == total_files - 1
 
             # Build a safe local path relative to the requested cloud base path.
@@ -788,7 +813,11 @@ def download_from_cloud_streaming(
             if show_progress:
                 click.echo(f"⬇️  Downloading {file_name} ({file_info.get('human_size', 'unknown size')})")
 
-            @retry_with_backoff(max_retries=3, verbose=show_progress)
+            @retry_with_backoff(
+                max_retries=3,
+                verbose=show_progress,
+                sanitize_error=lambda exc, source_url=file_url: redact_cloud_error_for_display(exc, source_url),
+            )
             def download_file(url=file_url, path=local_path):
                 fs.get(url, str(path))
 

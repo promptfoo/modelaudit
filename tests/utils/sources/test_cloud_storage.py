@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from modelaudit.utils.helpers.retry import RetryError
 from modelaudit.utils.sources.cloud_storage import (
     GCSCache,
     _run_coroutine_sync,
@@ -92,6 +93,31 @@ class TestCloudURLRedaction:
         assert "abc123" not in redacted
 
 
+@patch("modelaudit.utils.helpers.retry.time.sleep")
+@patch("fsspec.filesystem")
+def test_analyze_cloud_target_redacts_signed_url_retry_logs(mock_fs, mock_sleep, caplog):
+    url = "s3://bucket/model.bin?X-Amz-Signature=secret"
+    fs = make_fs_mock()
+    fs.info.side_effect = OSError(f"Forbidden while opening {url}")
+    mock_fs.return_value = fs
+    caplog.set_level(logging.DEBUG, logger="modelaudit.utils.helpers.retry")
+
+    result = asyncio.run(analyze_cloud_target(url))
+
+    assert "X-Amz-Signature" not in result["error"]
+    assert "secret" not in result["error"]
+    assert "s3://bucket/model.bin" in caplog.text
+    assert "X-Amz-Signature" not in caplog.text
+    assert "secret" not in caplog.text
+    mock_sleep.assert_called()
+
+
+def test_filter_scannable_files_handles_signed_cloud_urls() -> None:
+    files = [{"path": "s3://bucket/model.pkl?X-Amz-Signature=secret"}]
+
+    assert filter_scannable_files(files) == files
+
+
 @patch("fsspec.filesystem")
 def test_download_from_cloud(mock_fs, tmp_path):
     fs_meta = make_fs_mock()
@@ -122,6 +148,34 @@ def test_download_from_cloud(mock_fs, tmp_path):
 @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
 @patch("modelaudit.utils.sources.cloud_storage.check_disk_space")
 @patch("fsspec.filesystem")
+def test_download_from_cloud_strips_signed_url_from_local_filename(mock_fs, mock_disk_space, mock_analyze, tmp_path):
+    url = "s3://bucket/model.bin?X-Amz-Signature=secret"
+    fs = make_fs_mock()
+    fs.info.return_value = {"type": "file", "size": 1024}
+    fs.get.side_effect = lambda _src, dst: Path(dst).write_bytes(b"data")
+    mock_fs.return_value = fs
+    mock_analyze.return_value = {
+        "type": "file",
+        "size": 1024,
+        "name": "model.bin",
+        "human_size": "1.0 KB",
+        "estimated_time": "1 second",
+    }
+    mock_disk_space.return_value = (True, "")
+
+    result = download_from_cloud(url, cache_dir=tmp_path, use_cache=False, show_progress=False)
+
+    assert isinstance(result, Path)
+    assert result.name == "model.bin"
+    assert "X-Amz-Signature" not in str(result)
+    assert "secret" not in str(result)
+    assert "X-Amz-Signature" not in fs.get.call_args.args[1]
+    assert "secret" not in fs.get.call_args.args[1]
+
+
+@patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+@patch("modelaudit.utils.sources.cloud_storage.check_disk_space")
+@patch("fsspec.filesystem")
 def test_download_from_cloud_redacts_sensitive_url_in_errors(mock_fs, mock_disk_space, mock_analyze, tmp_path):
     fs = make_fs_mock()
     fs.info.return_value = {"type": "file", "size": 1024}
@@ -142,6 +196,37 @@ def test_download_from_cloud_redacts_sensitive_url_in_errors(mock_fs, mock_disk_
 
     assert "s3://bucket/model.bin" in str(excinfo.value)
     assert "X-Amz-Signature" not in str(excinfo.value)
+
+
+@patch("modelaudit.utils.helpers.retry.time.sleep")
+@patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+@patch("modelaudit.utils.sources.cloud_storage.check_disk_space")
+@patch("fsspec.filesystem")
+def test_download_from_cloud_redacts_signed_url_retry_logs(
+    mock_fs, mock_disk_space, mock_analyze, mock_sleep, tmp_path, caplog
+):
+    url = "s3://bucket/model.bin?X-Amz-Signature=secret"
+    fs = make_fs_mock()
+    fs.info.return_value = {"type": "file", "size": 1024}
+    fs.get.side_effect = OSError(f"Forbidden while opening {url}")
+    mock_fs.return_value = fs
+    mock_analyze.return_value = {
+        "type": "file",
+        "size": 1024,
+        "name": "model.bin",
+        "human_size": "1.0 KB",
+        "estimated_time": "1 second",
+    }
+    mock_disk_space.return_value = (True, "")
+    caplog.set_level(logging.DEBUG, logger="modelaudit.utils.helpers.retry")
+
+    with pytest.raises(RetryError):
+        download_from_cloud(url, cache_dir=tmp_path, use_cache=False, show_progress=False)
+
+    assert "s3://bucket/model.bin" in caplog.text
+    assert "X-Amz-Signature" not in caplog.text
+    assert "secret" not in caplog.text
+    mock_sleep.assert_called()
 
 
 @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
