@@ -51,7 +51,9 @@ def scan_result_from_dict(result_dict: dict[str, Any]) -> "ScanResult":
     def _normalize_issue_severity(val: Any) -> IssueSeverity:
         if isinstance(val, IssueSeverity):
             return val
-        s = str(val).lower() if val is not None else "info"
+        if val is None:
+            return IssueSeverity.INFO
+        s = str(val).lower()
         # Back-compat synonyms
         if s in ("warn",):
             s = "warning"
@@ -60,7 +62,7 @@ def scan_result_from_dict(result_dict: dict[str, Any]) -> "ScanResult":
         try:
             return IssueSeverity(s)
         except Exception:
-            return IssueSeverity.INFO
+            return IssueSeverity.WARNING
 
     def _coerce_details(val: Any) -> dict[str, Any]:
         if isinstance(val, dict):

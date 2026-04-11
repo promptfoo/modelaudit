@@ -156,7 +156,7 @@ class TestScanResultFromDict:
         assert result.issues[0].severity == IssueSeverity.CRITICAL
 
     def test_severity_normalization_invalid(self) -> None:
-        """Test invalid severity defaults to INFO."""
+        """Test invalid cached severity defaults to WARNING."""
         result_dict = {
             "scanner": "test",
             "issues": [{"message": "Test", "severity": "invalid_value", "timestamp": FIXED_TIMESTAMP}],
@@ -165,7 +165,7 @@ class TestScanResultFromDict:
 
         result = scan_result_from_dict(result_dict)
 
-        assert result.issues[0].severity == IssueSeverity.INFO
+        assert result.issues[0].severity == IssueSeverity.WARNING
 
     def test_missing_issue_severity_defaults_to_info(self) -> None:
         """Missing cached issue severity should not become a warning."""
