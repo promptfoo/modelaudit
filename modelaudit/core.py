@@ -779,11 +779,22 @@ def _is_huggingface_cache_file(path: str) -> bool:
     # We no longer skip all HuggingFace cache files since we handle symlinks properly now
 
     # Check for Git-related files that are commonly cached
-    if filename in [".gitignore", ".gitattributes", "main", "HEAD"]:
+    if filename in [".gitignore", ".gitattributes"]:
         return True
 
-    # Check if file is in refs directory (Git references, not actual model files)
-    return bool("/refs/" in path and filename in ["main", "HEAD"])
+    if filename in ["main", "HEAD"]:
+        hf_cache_root = _find_hf_cache_root(path_obj)
+        if hf_cache_root is None:
+            return False
+
+        try:
+            relative_parts = _resolve_hf_cache_path(path_obj).relative_to(hf_cache_root).parts
+        except ValueError:
+            return False
+
+        return bool(relative_parts and relative_parts[0] == "refs")
+
+    return False
 
 
 @cached_scan()

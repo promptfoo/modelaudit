@@ -256,6 +256,23 @@ def test_scan_model_streaming_skips_huggingface_cache_metadata(
     assert result.files_scanned == 1
 
 
+def test_scan_model_streaming_scans_local_file_named_main(tmp_path: Path) -> None:
+    """A local payload named like an HF ref must still be scanned in streaming mode."""
+    payload = tmp_path / "main"
+    payload.write_bytes(b"\x80\x02cos\nsystem\n.")
+
+    result = scan_model_streaming(
+        file_generator=iter([(payload, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        cache_enabled=False,
+    )
+
+    assert result.files_scanned == 1
+    assert any(issue.severity == IssueSeverity.CRITICAL and "system" in issue.message for issue in result.issues)
+    assert determine_exit_code(result) == 1
+
+
 def test_scan_model_streaming_symlink_outside_directory_matches_normal_scan(
     tmp_path: Path,
     requires_symlinks: None,
