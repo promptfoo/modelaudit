@@ -20,7 +20,7 @@ from modelaudit.scanner_registry_metadata import (
     get_registered_scanner_extensions,
 )
 from modelaudit.scanners import SCANNER_REGISTRY, ScannerRegistry, _registry
-from modelaudit.scanners.archive_dispatch import _HEADER_FORMAT_TO_SCANNER_ID
+from modelaudit.scanners.archive_dispatch import _HEADER_FORMAT_TO_SCANNER_ID, _select_nested_scanner_id
 from modelaudit.scanners.base import BaseScanner, IssueSeverity
 from tests.helpers import create_mock_pytorch_zip
 
@@ -58,6 +58,17 @@ def _write_tar_archive(path: Path, mode: TarWriteMode) -> Path:
 
 def _write_safe_pickle(path: Path) -> Path:
     path.write_bytes(pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+    return path
+
+
+def _write_gzip_joblib_pickle(path: Path) -> Path:
+    path.write_bytes(gzip.compress(pickle.dumps({"weights": [1, 2, 3]}, protocol=4)))
+    return path
+
+
+def _write_gzip_r_serialized(path: Path, body: str) -> Path:
+    with gzip.open(path, "wb") as stream:
+        stream.write(f"RDX2\nX\n{body}".encode())
     return path
 
 
@@ -317,6 +328,27 @@ def test_archive_dispatch_header_map_is_backed_by_scanner_descriptors() -> None:
             if mapped_scanner_id == scanner_id
         }
         assert actual_keys == expected_keys
+
+
+def test_select_nested_scanner_id_routes_compressed_joblib_members(tmp_path: Path) -> None:
+    member_path = _write_gzip_joblib_pickle(tmp_path / "nested.joblib")
+
+    assert _select_nested_scanner_id(str(member_path)) == "joblib"
+
+
+@pytest.mark.parametrize("suffix", [".rds", ".rda", ".rdata"])
+def test_select_nested_scanner_id_routes_compressed_r_serialized_members(tmp_path: Path, suffix: str) -> None:
+    member_path = _write_gzip_r_serialized(tmp_path / f"workspace{suffix}", "workspace\nmodel")
+
+    assert _select_nested_scanner_id(str(member_path)) == "r_serialized"
+
+
+def test_select_nested_scanner_id_does_not_route_compressed_non_target_suffix_to_r_serialized(
+    tmp_path: Path,
+) -> None:
+    member_path = _write_gzip_r_serialized(tmp_path / "workspace.txt", "workspace\nmodel")
+
+    assert _select_nested_scanner_id(str(member_path)) != "r_serialized"
 
 
 @pytest.mark.parametrize(
