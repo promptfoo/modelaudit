@@ -6,8 +6,9 @@ import sys
 import warnings
 from typing import TYPE_CHECKING, Any, BinaryIO, ClassVar
 
-from .base import BaseScanner, IssueSeverity, ScanResult
+from .base import BaseScanner, Check, Issue, IssueSeverity, ScanResult
 from .pickle_scanner import PickleScanner
+from .pickle_support import _finish_with_inconclusive_contract, _mark_inconclusive_scan_result
 
 # Import NumPy with compatibility handling
 try:
@@ -101,6 +102,21 @@ class NumPyScanner(BaseScanner):
             file_obj,
             payload_size,
             source=context_path,
+        )
+
+    @staticmethod
+    def _is_trailing_pickle_parse_noise(item: Check | Issue) -> bool:
+        """Return True for parse diagnostics superseded by NumPy trailing-byte validation."""
+        details = item.details or {}
+        if details.get("analysis_incomplete") is not True:
+            return False
+
+        message = item.message.lower()
+        return (
+            "pickle parsing failed before full scan completion" in message
+            or "pickle parsing stopped before the stream was fully consumed" in message
+            or details.get("pickle_notice_code") == "parse_incomplete"
+            or details.get("failure_reason") == "unknown_opcode_or_format_error"
         )
 
     def _validate_dtype(self, dtype: Any) -> None:
@@ -321,12 +337,20 @@ class NumPyScanner(BaseScanner):
                                 file_size - data_offset,
                                 path,
                             )
-                            result.issues.extend(embedded_result.issues)
-                            result.checks.extend(embedded_result.checks)
 
                             pickle_end_offset = embedded_result.metadata.get("first_pickle_end_pos")
                             if isinstance(pickle_end_offset, int) and pickle_end_offset < file_size:
                                 trailing_bytes = file_size - pickle_end_offset
+                                result.issues.extend(
+                                    issue
+                                    for issue in embedded_result.issues
+                                    if not self._is_trailing_pickle_parse_noise(issue)
+                                )
+                                result.checks.extend(
+                                    check
+                                    for check in embedded_result.checks
+                                    if not self._is_trailing_pickle_parse_noise(check)
+                                )
                                 result.add_check(
                                     name="File Integrity Check",
                                     passed=False,
@@ -343,8 +367,12 @@ class NumPyScanner(BaseScanner):
                                         "dtype": str(dtype),
                                     },
                                 )
-                                result.finish(success=False)
+                                _mark_inconclusive_scan_result(result, "numpy_object_pickle_trailing_bytes")
+                                _finish_with_inconclusive_contract(result, default_success=True)
                                 return result
+
+                            result.issues.extend(embedded_result.issues)
+                            result.checks.extend(embedded_result.checks)
 
                             # Object-dtype .npy payloads are stored as a pickle stream rather than
                             # fixed-width element data, so the numeric dtype/size validation path
