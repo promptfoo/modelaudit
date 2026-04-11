@@ -33,6 +33,7 @@ _OPENVINO_SUSPICIOUS_PATTERN = (
     if _OPENVINO_SUSPICIOUS_STRING_PATTERNS
     else None
 )
+_OPENVINO_NATIVE_LIBRARY_SUFFIX = re.compile(r"(?:\.so(?:\.\d+)*|\.dll|\.dylib|\.lib)$", re.IGNORECASE)
 
 
 def _local_tag_name(tag: str) -> str:
@@ -138,6 +139,18 @@ def _iter_element_attributes(layer: Any) -> Iterator[tuple[str, str, str]]:
                 yield element_tag, attr_name.strip().lower(), normalized_value
 
 
+def _is_likely_external_library_reference(value: str) -> bool:
+    """Return True for native-library filenames or path-like OpenVINO plugin references."""
+    normalized_value = value.strip().strip("\"'")
+    if not normalized_value:
+        return False
+
+    if _OPENVINO_NATIVE_LIBRARY_SUFFIX.search(normalized_value):
+        return True
+
+    return "/" in normalized_value or "\\" in normalized_value
+
+
 class OpenVinoScanner(BaseScanner):
     """Scanner for OpenVINO IR (.xml/.bin) model files."""
 
@@ -227,7 +240,7 @@ class OpenVinoScanner(BaseScanner):
                 )
 
             for element_tag, attr_name, attr_val in _iter_element_attributes(layer):
-                if attr_name in {"library", "implementation"}:
+                if attr_name in {"library", "implementation"} and _is_likely_external_library_reference(attr_val):
                     result.add_check(
                         name="External Library Reference Check",
                         passed=False,

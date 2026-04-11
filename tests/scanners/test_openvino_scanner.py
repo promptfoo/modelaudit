@@ -219,6 +219,75 @@ def test_openvino_scanner_detects_nested_external_library_references(tmp_path: P
     assert any("external library 'evil.so'" in issue.message for issue in result.issues)
 
 
+def test_openvino_scanner_symbolic_implementation_metadata_is_not_external_library(tmp_path: Path) -> None:
+    """OpenVINO backend labels should not be treated as native library references."""
+    xml_path = tmp_path / "model.xml"
+    xml_path.write_text(
+        """
+        <net version='10'>
+          <layers>
+            <layer id='1' name='conv' type='Convolution'>
+              <data implementation='fp16' library='CPU'/>
+            </layer>
+          </layers>
+        </net>
+        """,
+        encoding="utf-8",
+    )
+    (tmp_path / "model.bin").write_bytes(b"\x00")
+
+    result = OpenVinoScanner().scan(str(xml_path))
+
+    assert result.success is True
+    assert not any(check.name == "External Library Reference Check" for check in result.checks)
+
+
+def test_openvino_scanner_detects_versioned_native_library_reference(tmp_path: Path) -> None:
+    """Native library filenames should still be treated as external references."""
+    xml_path = tmp_path / "model.xml"
+    xml_path.write_text(
+        """
+        <net version='10'>
+          <layers>
+            <layer id='1' name='conv' type='Convolution'>
+              <data implementation='libcustom_op.so.1'/>
+            </layer>
+          </layers>
+        </net>
+        """,
+        encoding="utf-8",
+    )
+    (tmp_path / "model.bin").write_bytes(b"\x00")
+
+    result = OpenVinoScanner().scan(str(xml_path))
+
+    assert result.success is False
+    assert any("external library 'libcustom_op.so.1'" in issue.message for issue in result.issues)
+
+
+def test_openvino_scanner_detects_path_external_library_reference(tmp_path: Path) -> None:
+    """Path-like plugin references should still be treated as external libraries."""
+    xml_path = tmp_path / "model.xml"
+    xml_path.write_text(
+        """
+        <net version='10'>
+          <layers>
+            <layer id='1' name='conv' type='Convolution'>
+              <data library='../plugins/custom_op'/>
+            </layer>
+          </layers>
+        </net>
+        """,
+        encoding="utf-8",
+    )
+    (tmp_path / "model.bin").write_bytes(b"\x00")
+
+    result = OpenVinoScanner().scan(str(xml_path))
+
+    assert result.success is False
+    assert any("external library '../plugins/custom_op'" in issue.message for issue in result.issues)
+
+
 def test_openvino_scanner_layer_attribute_importlib_false_positive_control(tmp_path: Path) -> None:
     """Benign names containing importlib as a substring should not be flagged."""
     xml_path = tmp_path / "model.xml"
