@@ -63,22 +63,21 @@ class TestCoreIntegration:
             loaded_count = len(_registry._loaded_scanners)
             assert loaded_count <= 10  # Should be reasonable
 
-    def test_preferred_scanner_lazy_loading(self):
+    def test_preferred_scanner_lazy_loading(self, tmp_path: Path) -> None:
         """Test that preferred scanner detection uses lazy loading."""
         _registry._loaded_scanners.clear()
 
         # Create a pickle file (should prefer pickle scanner)
-        with tempfile.NamedTemporaryFile(suffix=".pkl") as f:
-            f.write(b"\x80\x02]q\x00.")  # Simple pickle data
-            f.flush()
+        file_path = tmp_path / "model.pkl"
+        file_path.write_bytes(b"\x80\x02]q\x00.")  # Simple pickle data
 
-            result = core.scan_file(f.name)
+        result = core.scan_file(str(file_path))
 
-            # Should use pickle scanner
-            assert result.scanner_name == "pickle"
+        # Should use pickle scanner
+        assert result.scanner_name == "pickle"
 
-            # Should have loaded pickle scanner
-            assert "pickle" in _registry._loaded_scanners
+        # Should have loaded pickle scanner
+        assert "pickle" in _registry._loaded_scanners
 
     def test_multiple_file_types_incremental_loading(self):
         """Test that scanning multiple file types loads scanners incrementally."""
