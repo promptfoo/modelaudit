@@ -75,6 +75,16 @@ class _NonSeekableBytesIO(BytesIO):
         raise OSError("seek disabled")
 
 
+def _assert_user_visible_parse_failure_issue(result: ScanResult) -> None:
+    parse_issue = next(
+        issue for issue in result.issues if issue.message == "Pickle parsing failed before full scan completion"
+    )
+    assert parse_issue.severity == IssueSeverity.INFO
+    assert parse_issue.details["category"] == "parse_error"
+    assert parse_issue.details["analysis_incomplete"] is True
+    assert "opcode" in parse_issue.details["parse_error"]
+
+
 def test_pickle_scanner_star_import_exports_scanner_class() -> None:
     """Wildcard imports should still expose the scanner class after helper extraction."""
     namespace: dict[str, object] = {}
@@ -645,6 +655,7 @@ def test_scan_stream_parse_failure_is_inconclusive_for_pickle_stream(
     assert parse_check.status == CheckStatus.FAILED
     assert parse_check.severity == IssueSeverity.INFO
     assert parse_check.details["category"] == "parse_error"
+    _assert_user_visible_parse_failure_issue(result)
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
@@ -674,6 +685,7 @@ def test_scan_stream_non_seekable_parse_failure_is_inconclusive(
     assert parse_check.status == CheckStatus.FAILED
     assert parse_check.severity == IssueSeverity.INFO
     assert parse_check.details["category"] == "parse_error"
+    _assert_user_visible_parse_failure_issue(result)
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
@@ -937,6 +949,7 @@ def test_unknown_opcode_pickle_parse_failure_is_inconclusive(
     assert parse_check.status == CheckStatus.FAILED
     assert parse_check.severity == IssueSeverity.INFO
     assert parse_check.details["category"] == "parse_error"
+    _assert_user_visible_parse_failure_issue(result)
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
@@ -960,6 +973,7 @@ def test_merge_missing_pickle_checks_preserves_ruleless_parse_failures_as_inconc
         severity=IssueSeverity.INFO,
         location="truncated.pkl (pos 4)",
         details={
+            "category": "parse_error",
             "parse_error": "pickle exhausted before seeing STOP",
             "failure_reason": "unknown_opcode_or_format_error",
             "analysis_incomplete": True,
@@ -1175,6 +1189,7 @@ def test_merge_missing_pickle_checks_preserves_bin_parse_failures_as_inconclusiv
         location="truncated.bin (pos 0)",
         details={
             "pickle_source": "truncated.bin",
+            "category": "parse_error",
             "parse_error": "pickle exhausted before seeing STOP",
             "failure_reason": "unknown_opcode_or_format_error",
             "analysis_incomplete": True,
@@ -1281,6 +1296,7 @@ def test_merge_missing_pickle_checks_trusts_legacy_boundary_for_benign_joblib_ta
         location="numpy_arrays.joblib (decompressed) (pos 227)",
         details={
             "pickle_source": "numpy_arrays.joblib (decompressed)",
+            "category": "parse_error",
             "parse_error": "at position 226, opcode b'\\r' unknown",
             "failure_reason": "unknown_opcode_or_format_error",
             "analysis_incomplete": True,
@@ -1344,6 +1360,7 @@ def test_merge_missing_pickle_checks_does_not_trust_boundary_for_dangerous_jobli
         location="dangerous.joblib (decompressed) (pos 227)",
         details={
             "pickle_source": "dangerous.joblib (decompressed)",
+            "category": "parse_error",
             "parse_error": "at position 226, opcode b'\\r' unknown",
             "failure_reason": "unknown_opcode_or_format_error",
             "analysis_incomplete": True,

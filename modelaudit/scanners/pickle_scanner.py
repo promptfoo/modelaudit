@@ -4691,7 +4691,11 @@ class PickleScanner(BaseScanner):
                         error=e,
                         early_detection_successful=early_pattern_scan_completed,
                     )
-                    _finish_with_inconclusive_contract(result, default_success=False)
+                    _finish_with_inconclusive_contract(
+                        result,
+                        default_success=False,
+                        allow_security_findings_override=True,
+                    )
                     return result
 
             if pickle_file_opened:
@@ -4854,7 +4858,11 @@ class PickleScanner(BaseScanner):
                         location=source,
                         error=error,
                     )
-                    _finish_with_inconclusive_contract(result, default_success=False)
+                    _finish_with_inconclusive_contract(
+                        result,
+                        default_success=False,
+                        allow_security_findings_override=True,
+                    )
                     return result
 
             self._record_pickle_runtime_error(result, error, location=source)
@@ -8007,7 +8015,11 @@ class PickleScanner(BaseScanner):
                         location=self.current_file_path,
                         error=e,
                     )
-                    _finish_with_inconclusive_contract(result, default_success=False)
+                    _finish_with_inconclusive_contract(
+                        result,
+                        default_success=False,
+                        allow_security_findings_override=True,
+                    )
                     return result
 
                 # Determine user-friendly error message and severity
