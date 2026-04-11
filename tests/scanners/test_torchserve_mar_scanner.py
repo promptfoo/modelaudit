@@ -813,6 +813,7 @@ def test_scan_detects_path_traversal_member_names(tmp_path: Path) -> None:
     assert details["cve_id"] == "CVE-2023-48299"
     assert details["cvss"] == 7.5
     assert details["cwe"] == "CWE-22"
+    assert "TorchServe MAR archives with traversal entries" in details["description"]
     assert "remediation" in details
 
 

@@ -86,7 +86,7 @@ _DANGEROUS_CONFIG_MODULES = frozenset(
 _GET_FILE_PATTERN = re.compile(r"get_file", re.IGNORECASE)
 _URL_PATTERN = re.compile(r"https?://", re.IGNORECASE)
 _ARCHIVE_EXTRACT_URL_PATTERN = re.compile(
-    r"\.(?:tar|tgz|tbz2|txz|tar\.gz|tar\.bz2|tar\.xz)(?:[?#]|$)",
+    r"\.(?:tar|tgz|tbz2|txz|tar\.gz|tar\.bz2|tar\.xz|tar\.zst|tar\.lz|tar\.lz4|tar\.lzma)(?:[?#]|$)",
     re.IGNORECASE,
 )
 _URL_SCHEME_PATTERN = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
@@ -1137,7 +1137,15 @@ class KerasZipScanner(BaseScanner):
             return True
 
         kwargs = node.get("kwargs")
-        return isinstance(kwargs, dict) and kwargs.get("extract") is True
+        if isinstance(kwargs, dict) and kwargs.get("extract") is True:
+            return True
+
+        args = node.get("args")
+        if isinstance(args, list | tuple):
+            # keras.utils.get_file positional args: fname, origin, untar, ..., extract.
+            return (len(args) > 2 and args[2] is True) or (len(args) > 7 and args[7] is True)
+
+        return False
 
     def _check_unsafe_deserialization_bypass(self, model_config: Any, result: ScanResult) -> None:
         """Check for CVE-2025-9906: enable_unsafe_deserialization bypass in config.json.

@@ -247,6 +247,7 @@ class NemoScanner(BaseScanner):
                     )
                     continue
 
+                name_lower = member.name.lower()
                 if member.issym() or member.islnk():
                     target_base = os.path.dirname(resolved_member)
                     _target_resolved, target_safe = sanitize_archive_path(member.linkname, target_base)
@@ -257,12 +258,51 @@ class NemoScanner(BaseScanner):
                             entry=member.name,
                             target=member.linkname,
                         )
+                    elif name_lower.endswith(tuple(NEMO_CHECKPOINT_MEMBER_EXTENSIONS)):
+                        link_target_name = self._resolve_archive_link_member_name(member)
+                        if link_target_name is None:
+                            self._mark_inconclusive_scan_result(
+                                result,
+                                reason="nemo_checkpoint_link_target_unresolved",
+                                check_name="NeMo Checkpoint Nested Scan",
+                                message=f"Could not resolve checkpoint link target: {member.name}",
+                                location=f"{path}:{member.name}",
+                                details={"entry": member.name, "target": member.linkname},
+                            )
+                        else:
+                            try:
+                                target_member = tar.getmember(link_target_name)
+                            except KeyError:
+                                self._mark_inconclusive_scan_result(
+                                    result,
+                                    reason="nemo_checkpoint_link_target_missing",
+                                    check_name="NeMo Checkpoint Nested Scan",
+                                    message=f"Checkpoint link target not found: {member.name} -> {member.linkname}",
+                                    location=f"{path}:{member.name}",
+                                    details={"entry": member.name, "target": member.linkname},
+                                )
+                            else:
+                                if target_member.isfile():
+                                    self._scan_checkpoint_member(
+                                        tar,
+                                        target_member,
+                                        path,
+                                        result,
+                                        entry_name=member.name,
+                                    )
+                                else:
+                                    self._mark_inconclusive_scan_result(
+                                        result,
+                                        reason="nemo_checkpoint_link_target_not_file",
+                                        check_name="NeMo Checkpoint Nested Scan",
+                                        message=f"Checkpoint link target is not a regular file: {member.name}",
+                                        location=f"{path}:{member.name}",
+                                        details={"entry": member.name, "target": member.linkname},
+                                    )
                     continue
 
                 if not member.isfile():
                     continue
-
-                name_lower = member.name.lower()
 
                 # Check for suspicious files in the archive
                 if name_lower.endswith((".py", ".sh", ".bat", ".cmd", ".ps1")):
@@ -358,6 +398,19 @@ class NemoScanner(BaseScanner):
                 location=path,
             )
 
+    @staticmethod
+    def _resolve_archive_link_member_name(member: tarfile.TarInfo) -> str | None:
+        """Resolve a tar link target to a normalized archive member name."""
+        linkname = member.linkname.replace("\\", "/")
+        if is_absolute_archive_path(linkname):
+            return None
+
+        member_dir = os.path.dirname(member.name.replace("\\", "/"))
+        candidate = os.path.normpath(os.path.join(member_dir, linkname)).replace("\\", "/")
+        if candidate in {"", "."} or candidate == ".." or candidate.startswith("../"):
+            return None
+        return candidate.lstrip("./")
+
     def _add_archive_path_traversal_check(
         self,
         result: ScanResult,
@@ -417,28 +470,41 @@ class NemoScanner(BaseScanner):
         member: tarfile.TarInfo,
         archive_path: str,
         result: ScanResult,
+        *,
+        entry_name: str | None = None,
     ) -> None:
         """Run existing nested scanners over small NeMo checkpoint members."""
+        report_entry = entry_name or member.name
         max_scan_bytes = self._normalize_positive_int_config(
             self.config.get("max_nemo_checkpoint_scan_bytes"),
             NEMO_MAX_CHECKPOINT_SCAN_BYTES,
         )
         if member.size > max_scan_bytes:
-            result.add_check(
-                name="NeMo Checkpoint Nested Scan",
-                passed=True,
-                message=f"Skipped large checkpoint member: {member.name}",
-                location=f"{archive_path}:{member.name}",
+            self._mark_inconclusive_scan_result(
+                result,
+                reason="nemo_checkpoint_scan_skipped_size_limit",
+                check_name="NeMo Checkpoint Nested Scan",
+                message=f"Checkpoint member exceeds nested scan limit: {report_entry}",
+                location=f"{archive_path}:{report_entry}",
                 details={
-                    "entry": member.name,
+                    "entry": report_entry,
+                    "source_entry": member.name,
                     "size_bytes": member.size,
                     "max_scan_bytes": max_scan_bytes,
                 },
             )
             return
 
-        extracted_path = self._extract_member_to_tempfile(tar, member)
+        extracted_path = self._extract_member_to_tempfile(tar, member, suffix_source=report_entry)
         if extracted_path is None:
+            self._mark_inconclusive_scan_result(
+                result,
+                reason="nemo_checkpoint_extract_failed",
+                check_name="NeMo Checkpoint Nested Scan",
+                message=f"Could not extract checkpoint member for nested scan: {report_entry}",
+                location=f"{archive_path}:{report_entry}",
+                details={"entry": report_entry, "source_entry": member.name},
+            )
             return
 
         try:
@@ -446,9 +512,34 @@ class NemoScanner(BaseScanner):
 
             scanner = get_scanner_for_file(extracted_path, config=dict(self.config))
             if scanner is None:
+                self._mark_inconclusive_scan_result(
+                    result,
+                    reason="nemo_checkpoint_no_nested_scanner",
+                    check_name="NeMo Checkpoint Nested Scan",
+                    message=f"No nested scanner available for checkpoint member: {report_entry}",
+                    location=f"{archive_path}:{report_entry}",
+                    details={"entry": report_entry, "source_entry": member.name},
+                )
                 return
 
-            nested_result = scanner.scan(extracted_path)
+            try:
+                nested_result = scanner.scan(extracted_path)
+            except Exception as exc:
+                self._mark_inconclusive_scan_result(
+                    result,
+                    reason="nemo_checkpoint_nested_scan_failed",
+                    check_name="NeMo Checkpoint Nested Scan",
+                    message=f"Nested scan failed for checkpoint member {report_entry}: {exc!s}",
+                    location=f"{archive_path}:{report_entry}",
+                    details={
+                        "entry": report_entry,
+                        "source_entry": member.name,
+                        "nested_scanner": scanner.name,
+                        "exception_type": type(exc).__name__,
+                    },
+                )
+                return
+
             critical_issues = [
                 issue
                 for issue in nested_result.issues
@@ -458,7 +549,7 @@ class NemoScanner(BaseScanner):
                 self._add_checkpoint_deserialization_check(
                     result,
                     archive_path=archive_path,
-                    entry=member.name,
+                    entry=report_entry,
                     nested_scanner=nested_result.scanner_name,
                     critical_issues=critical_issues,
                 )
@@ -501,12 +592,17 @@ class NemoScanner(BaseScanner):
         )
 
     @staticmethod
-    def _extract_member_to_tempfile(tar: tarfile.TarFile, member: tarfile.TarInfo) -> str | None:
+    def _extract_member_to_tempfile(
+        tar: tarfile.TarFile,
+        member: tarfile.TarInfo,
+        *,
+        suffix_source: str | None = None,
+    ) -> str | None:
         member_file = tar.extractfile(member)
         if member_file is None:
             return None
 
-        _root, suffix = os.path.splitext(member.name)
+        _root, suffix = os.path.splitext(suffix_source or member.name)
         with member_file, tempfile.NamedTemporaryFile(suffix=suffix or ".bin", delete=False) as temp_file:
             while True:
                 chunk = member_file.read(64 * 1024)
