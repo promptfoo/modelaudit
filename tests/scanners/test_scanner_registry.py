@@ -14,7 +14,11 @@ import pytest
 
 from modelaudit.config.constants import SCANNABLE_MODEL_EXTENSIONS
 from modelaudit.core import scan_file
-from modelaudit.scanner_registry_metadata import get_extension_format_map, get_registered_scanner_extensions
+from modelaudit.scanner_registry_metadata import (
+    SCANNER_REGISTRY_METADATA,
+    get_extension_format_map,
+    get_registered_scanner_extensions,
+)
 from modelaudit.scanners import SCANNER_REGISTRY, ScannerRegistry, _registry
 from modelaudit.scanners.base import BaseScanner, IssueSeverity
 from tests.helpers import create_mock_pytorch_zip
@@ -247,6 +251,29 @@ def test_representative_scanner_descriptors_match_scanner_class_metadata(scanner
     assert not (scanner_only_extensions & explicitly_routed_extensions)
     assert not (scanner_only_extensions & content_routed_extensions)
     assert content_routed_extensions <= descriptor_extensions
+
+
+@pytest.mark.parametrize("scanner_id", sorted(SCANNER_REGISTRY_METADATA))
+def test_scanner_descriptors_match_class_extension_metadata(scanner_id: str) -> None:
+    """All direct descriptor extensions must match the scanner class contract."""
+    registry = ScannerRegistry()
+    scanner_info = registry.get_scanner_info(scanner_id)
+    scanner_class = registry.load_scanner_by_id(scanner_id)
+
+    assert scanner_info is not None
+    if scanner_class is None:
+        assert scanner_id in registry.get_failed_scanners()
+        return
+
+    explicitly_routed_extensions = set(scanner_info["extensions"])
+    scanner_only_extensions = set(scanner_info.get("scanner_only_extensions", []))
+    content_routed_extensions = set(scanner_info.get("content_routed_extensions", []))
+    scanner_extensions = set(scanner_class.supported_extensions)
+
+    assert scanner_extensions == explicitly_routed_extensions | scanner_only_extensions
+    assert not (scanner_only_extensions & explicitly_routed_extensions)
+    assert not (scanner_only_extensions & content_routed_extensions)
+    assert not (content_routed_extensions & explicitly_routed_extensions)
 
 
 def test_extension_format_map_is_backed_by_scanner_descriptors() -> None:
