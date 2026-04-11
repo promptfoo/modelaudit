@@ -199,7 +199,8 @@ def stream_analyze_file(
 
             if content.startswith(b"\x80"):  # Pickle protocol marker
                 protocol_version = content[1] if len(content) > 1 else 0
-                if protocol_version >= 3:
+                protocol_marker_only = len(content) == 2 and protocol_version in {2, 3, 4, 5}
+                if protocol_version >= 3 and not protocol_marker_only:
                     issues.append(
                         Issue(
                             message=f"Pickle protocol {protocol_version} detected",
