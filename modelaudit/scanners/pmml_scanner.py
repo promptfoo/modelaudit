@@ -38,6 +38,21 @@ DANGEROUS_ENTITIES = ["<!DOCTYPE", "<!ENTITY", "<!ELEMENT", "<!ATTLIST"]
 XML_COMMENT_PATTERN = re.compile(r"<!--.*?-->", re.DOTALL)
 XML_CDATA_PATTERN = re.compile(r"<!\[CDATA\[.*?\]\]>", re.DOTALL)
 SUSPICIOUS_ELEMENT_NAMES = frozenset({"script", "javascript", "python", "exec", "eval"})
+DOCUMENTATION_ELEMENT_NAMES = frozenset({"annotation", "copyright", "description", "documentation"})
+DOCUMENTATION_ATTRIBUTE_NAMES = frozenset({"description", "documentation", "label", "reference"})
+EXTERNAL_RESOURCE_ATTRIBUTE_NAMES = frozenset(
+    {
+        "file",
+        "filename",
+        "href",
+        "location",
+        "path",
+        "source",
+        "src",
+        "uri",
+        "url",
+    },
+)
 
 
 class PmmlScanner(BaseScanner):
@@ -275,22 +290,23 @@ class PmmlScanner(BaseScanner):
                 combined = f"{elem_text} {attr_text}".lower()
 
             # Check for external resource references
-            for url_pattern in URL_PATTERNS:
-                if url_pattern in combined:
-                    result.add_check(
-                        name="External Resource Reference Check",
-                        passed=False,
-                        message=f"PMML references external resource: {url_pattern}",
-                        severity=IssueSeverity.WARNING,
-                        location=path,
-                        details={"tag": elem.tag, "url_pattern": url_pattern},
-                        why=(
-                            "External references in PMML files may be used to exfiltrate data or perform "
-                            "network requests."
-                        ),
-                        rule_code="S902",
-                    )
-                    break
+            if tag_name == "extension":
+                self._add_external_resource_check_if_url(result, path, elem.tag, combined, context="extension")
+            else:
+                if tag_name not in DOCUMENTATION_ELEMENT_NAMES:
+                    self._add_external_resource_check_if_url(result, path, elem.tag, elem_text, context="text")
+
+                for attr_name, attr_value in elem.attrib.items():
+                    normalized_attr_name = attr_name.strip().lower()
+                    if self._is_external_resource_attribute(tag_name, normalized_attr_name, elem.attrib):
+                        self._add_external_resource_check_if_url(
+                            result,
+                            path,
+                            elem.tag,
+                            str(attr_value),
+                            context="attribute",
+                            attribute=attr_name,
+                        )
 
             # Check for suspicious element names (like <script>)
             if tag_name in SUSPICIOUS_ELEMENT_NAMES:
@@ -323,6 +339,55 @@ class PmmlScanner(BaseScanner):
                             rule_code="S902",
                         )
                         break
+
+    @staticmethod
+    def _find_url_pattern(text: str) -> str | None:
+        """Return the first URL scheme pattern found in text."""
+        normalized_text = text.lower()
+        for url_pattern in URL_PATTERNS:
+            if url_pattern in normalized_text:
+                return url_pattern
+        return None
+
+    @staticmethod
+    def _is_external_resource_attribute(tag_name: str, attr_name: str, attributes: dict[str, Any]) -> bool:
+        """Return True when a URL-bearing attribute is an external resource reference."""
+        if attr_name in DOCUMENTATION_ATTRIBUTE_NAMES:
+            return False
+        if attr_name in EXTERNAL_RESOURCE_ATTRIBUTE_NAMES:
+            return True
+
+        return tag_name == "value" and attr_name == "value" and attributes.get("property", "").lower() == "external"
+
+    def _add_external_resource_check_if_url(
+        self,
+        result: ScanResult,
+        path: str,
+        tag: Any,
+        text: str,
+        *,
+        context: str,
+        attribute: str | None = None,
+    ) -> None:
+        """Add an external resource warning when text contains a resource URL."""
+        url_pattern = self._find_url_pattern(text)
+        if url_pattern is None:
+            return
+
+        details = {"tag": tag, "url_pattern": url_pattern, "context": context}
+        if attribute is not None:
+            details["attribute"] = attribute
+
+        result.add_check(
+            name="External Resource Reference Check",
+            passed=False,
+            message=f"PMML references external resource: {url_pattern}",
+            severity=IssueSeverity.WARNING,
+            location=path,
+            details=details,
+            why=("External references in PMML files may be used to exfiltrate data or perform network requests."),
+            rule_code="S902",
+        )
 
     @staticmethod
     def _local_tag_name(tag: Any) -> str:
