@@ -14,7 +14,7 @@ from typing import Any, ClassVar
 from ..detectors.suspicious_symbols import CVE_COMBINED_PATTERNS
 from ..utils import sanitize_archive_path
 from .archive_member_security import is_executable_archive_member_name
-from .base import BaseScanner, IssueSeverity, ScanResult
+from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 from .pickle_scanner import PickleScanner
 from .picklescan_adapter import apply_pickle_member_context
 from .pytorch_zip_support import (
@@ -708,12 +708,37 @@ class PyTorchZipScanner(BaseScanner):
                     )
             sub_result.metadata.setdefault("archive_file_size", original_file_size)
             apply_pickle_member_context(sub_result, archive_path=path, member_name=name)
+            if os.path.basename(name) == "data.pkl":
+                self._downgrade_trusted_storage_persistent_ids(sub_result)
 
             # Add CVE-2025-32434 specific warnings
             self._add_weights_only_safety_warnings(sub_result, result, path, name)
             result.merge(sub_result)
 
         return bytes_scanned
+
+    @staticmethod
+    def _is_pytorch_storage_persistent_id_record(details: dict[str, Any]) -> bool:
+        return (
+            details.get("pickle_rule_code") == "PERSISTENT_ID"
+            and details.get("opcode") == "BINPERSID"
+            and details.get("pytorch_storage_persistent_id") is True
+        )
+
+    @classmethod
+    def _downgrade_trusted_storage_persistent_ids(cls, result: ScanResult) -> None:
+        """Treat PyTorch storage persistent IDs as informational inside validated PyTorch ZIP data.pkl."""
+        for check in result.checks:
+            if not cls._is_pytorch_storage_persistent_id_record(check.details):
+                continue
+            check.status = CheckStatus.PASSED
+            check.severity = IssueSeverity.INFO
+            check.message = "PyTorch storage persistent ID found in validated PyTorch archive"
+            check.details["trusted_pytorch_archive_context"] = True
+
+        result.issues = [
+            issue for issue in result.issues if not cls._is_pytorch_storage_persistent_id_record(issue.details)
+        ]
 
     def _scan_for_jit_patterns(
         self,

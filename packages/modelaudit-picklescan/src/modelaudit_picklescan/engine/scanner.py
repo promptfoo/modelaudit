@@ -37,7 +37,6 @@ _MEMO_READ_OPCODES = frozenset({"GET", "BINGET", "LONG_BINGET"})
 _BASE64_LITERAL_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=")
 _HEX_LITERAL_CHARS = frozenset("0123456789abcdefABCDEF")
 _ENCODED_LITERAL_PROBE_CHARS = 64
-_PYTORCH_STORAGE_TAG = "storage"
 _PERSISTENT_ID_PREVIEW_MAX_DEPTH = 8
 
 
@@ -600,18 +599,8 @@ class _ScanState:
         preview = _persistent_id_preview(persistent_id)
         if preview:
             details["persistent_id_preview"] = preview
-
         if op_name == "BINPERSID" and _is_likely_pytorch_storage_persistent_id(persistent_id):
-            self._add_notice(
-                Notice(
-                    message="Observed PyTorch storage persistent ID used for tensor storage reconstruction",
-                    severity=Severity.INFO,
-                    location=f"{self.source} (pos {position})",
-                    code="pytorch_storage_persistent_id",
-                    details=details,
-                )
-            )
-            return
+            details["pytorch_storage_persistent_id"] = True
 
         self._add_finding(
             Finding(
@@ -1097,7 +1086,7 @@ def _is_likely_pytorch_storage_persistent_id(value: Any) -> bool:
     if not isinstance(value, tuple) or len(value) != 5:
         return False
     tag, storage_type, key, location, size = value
-    if tag != _PYTORCH_STORAGE_TAG:
+    if tag != "storage":
         return False
     if not _is_pytorch_storage_marker(storage_type):
         return False

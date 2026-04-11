@@ -101,7 +101,7 @@ def test_scan_bytes_flags_untrusted_persistent_ids(payload: bytes, opcode: str) 
     )
 
 
-def test_scan_bytes_treats_pytorch_storage_persistent_ids_as_covered_benign() -> None:
+def test_scan_bytes_flags_canonical_pytorch_storage_persistent_ids() -> None:
     payload = (
         b"\x80\x04(\x8c\x07storage\x94\x8c\x05torch\x94\x8c\x0cFloatStorage\x94\x93\x8c\x01k\x94\x8c\x03cpu\x94K\x01tQ."
     )
@@ -109,9 +109,12 @@ def test_scan_bytes_treats_pytorch_storage_persistent_ids_as_covered_benign() ->
     report = scan_bytes(payload, source="pytorch-storage.pkl")
 
     assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
-    assert report.findings == ()
-    assert any(notice.code == "pytorch_storage_persistent_id" for notice in report.notices)
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "PERSISTENT_ID" and finding.details.get("opcode") == "BINPERSID"
+        for finding in report.findings
+    )
+    assert report.notices == ()
 
 
 def test_scan_bytes_flags_noncanonical_pytorch_storage_persistent_ids() -> None:
@@ -125,7 +128,7 @@ def test_scan_bytes_flags_noncanonical_pytorch_storage_persistent_ids() -> None:
         finding.rule_code == "PERSISTENT_ID" and finding.details.get("opcode") == "BINPERSID"
         for finding in report.findings
     )
-    assert not any(notice.code == "pytorch_storage_persistent_id" for notice in report.notices)
+    assert report.notices == ()
 
 
 def test_scan_bytes_flags_deeply_nested_persistent_id_preview() -> None:
@@ -155,7 +158,7 @@ def test_scan_bytes_flags_pytorch_storage_persistent_ids_with_bool_size() -> Non
         finding.rule_code == "PERSISTENT_ID" and finding.details.get("opcode") == "BINPERSID"
         for finding in report.findings
     )
-    assert not any(notice.code == "pytorch_storage_persistent_id" for notice in report.notices)
+    assert report.notices == ()
 
 
 def test_scan_bytes_flags_pytorch_storage_persistent_ids_with_extra_fields() -> None:
@@ -172,7 +175,7 @@ def test_scan_bytes_flags_pytorch_storage_persistent_ids_with_extra_fields() -> 
         finding.rule_code == "PERSISTENT_ID" and finding.details.get("opcode") == "BINPERSID"
         for finding in report.findings
     )
-    assert not any(notice.code == "pytorch_storage_persistent_id" for notice in report.notices)
+    assert report.notices == ()
 
 
 def test_scan_bytes_attributes_reduce_calls_to_the_callable_operand_not_nested_args() -> None:

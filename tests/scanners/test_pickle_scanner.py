@@ -231,7 +231,7 @@ def test_pickle_scanner_flags_untrusted_persistent_ids(
     ), f"Expected persistent ID warning, got: {[(issue.rule_code, issue.message) for issue in result.issues]}"
 
 
-def test_pickle_scanner_does_not_warn_on_pytorch_storage_persistent_id(tmp_path: Path) -> None:
+def test_pickle_scanner_warns_on_pytorch_storage_persistent_id(tmp_path: Path) -> None:
     payload = (
         b"\x80\x04(\x8c\x07storage\x94\x8c\x05torch\x94\x8c\x0cFloatStorage\x94\x93\x8c\x01k\x94\x8c\x03cpu\x94K\x01tQ."
     )
@@ -242,9 +242,13 @@ def test_pickle_scanner_does_not_warn_on_pytorch_storage_persistent_id(tmp_path:
 
     assert result.success is True
     assert result.has_errors is False
-    assert not any(
-        issue.rule_code == "S212" or issue.details.get("pickle_rule_code") == "PERSISTENT_ID" for issue in result.issues
-    ), f"Expected PyTorch storage persistent ID to remain non-failing, got: {result.issues}"
+    assert result.has_warnings is True
+    assert any(
+        issue.rule_code == "S212"
+        and issue.details.get("pickle_rule_code") == "PERSISTENT_ID"
+        and issue.details.get("opcode") == "BINPERSID"
+        for issue in result.issues
+    ), f"Expected PyTorch storage persistent ID warning, got: {result.issues}"
 
 
 def test_scan_stream_enforces_declared_file_size_limit() -> None:
