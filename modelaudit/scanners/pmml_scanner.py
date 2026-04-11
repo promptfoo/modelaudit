@@ -319,6 +319,7 @@ class PmmlScanner(BaseScanner):
                     normalized_attr_name = self._local_xml_name(attr_name)
                     url_pattern = self._external_resource_attribute_url_pattern(
                         tag_name,
+                        attr_name,
                         normalized_attr_name,
                         str(attr_value),
                         elem.attrib,
@@ -382,24 +383,31 @@ class PmmlScanner(BaseScanner):
     def _external_resource_attribute_url_pattern(
         tag_name: str,
         attr_name: str,
+        normalized_attr_name: str,
         attr_value: str,
         attributes: dict[str, Any],
         *,
         in_header_metadata: bool,
     ) -> str | None:
         """Return the URL pattern when an attribute is an external resource reference."""
-        if attr_name in DOCUMENTATION_ATTRIBUTE_NAMES:
+        if normalized_attr_name in DOCUMENTATION_ATTRIBUTE_NAMES:
             return PmmlScanner._find_url_pattern(
                 attr_value,
                 ignored_patterns=BENIGN_DOCUMENTATION_URL_PATTERNS,
             )
-        if attr_name == "reference":
-            ignored_patterns = BENIGN_DOCUMENTATION_URL_PATTERNS if in_header_metadata else None
+        if normalized_attr_name == "reference":
+            ignored_patterns = (
+                BENIGN_DOCUMENTATION_URL_PATTERNS if attr_name == "reference" and in_header_metadata else None
+            )
             return PmmlScanner._find_url_pattern(attr_value, ignored_patterns=ignored_patterns)
-        if attr_name in EXTERNAL_RESOURCE_ATTRIBUTE_NAMES:
+        if normalized_attr_name in EXTERNAL_RESOURCE_ATTRIBUTE_NAMES:
             return PmmlScanner._find_url_pattern(attr_value)
 
-        if tag_name == "value" and attr_name == "value" and attributes.get("property", "").lower() == "external":
+        if (
+            tag_name == "value"
+            and normalized_attr_name == "value"
+            and attributes.get("property", "").lower() == "external"
+        ):
             return PmmlScanner._find_url_pattern(attr_value)
         return None
 
