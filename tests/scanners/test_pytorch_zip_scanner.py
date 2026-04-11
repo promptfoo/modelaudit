@@ -752,6 +752,36 @@ def test_pytorch_zip_scanner_compression_ratio_check(tmp_path):
     assert ratio_issues[0].severity == IssueSeverity.WARNING
 
 
+def test_pytorch_zip_scanner_small_high_ratio_metadata_stays_clean(tmp_path: Path) -> None:
+    """Small repetitive metadata should not fail the compression ratio check."""
+    zip_path = create_mock_pytorch_zip(tmp_path / "model.pt")
+    with zipfile.ZipFile(zip_path, "a", compression=zipfile.ZIP_DEFLATED) as zipf:
+        zipf.writestr("metadata/repetitive.txt", "A" * 16384)
+
+    scanner = PyTorchZipScanner()
+    result = scanner.scan(str(zip_path))
+
+    ratio_failures = [
+        check
+        for check in result.checks
+        if check.name == "Compression Ratio Check" and check.status == CheckStatus.FAILED
+    ]
+    assert ratio_failures == []
+    assert not [
+        issue
+        for issue in result.issues
+        if "compression ratio" in issue.message.lower()
+        and issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+    ]
+    ratio_successes = [
+        check
+        for check in result.checks
+        if check.name == "Compression Ratio Check" and check.status == CheckStatus.PASSED
+    ]
+    assert len(ratio_successes) == 1
+    assert ratio_successes[0].details["min_uncompressed_size"] == 1024 * 1024
+
+
 def test_pytorch_zip_scanner_compression_ratio_passes(tmp_path):
     """Test that scanner passes when compression ratio is within limits."""
     zip_path = tmp_path / "model.pt"
