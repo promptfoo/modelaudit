@@ -5,10 +5,52 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.35](https://github.com/promptfoo/modelaudit/compare/v0.2.34...v0.2.35) (2026-04-11)
+
+### Bug Fixes
+
+- clean up oversized zip entry temps ([#911](https://github.com/promptfoo/modelaudit/issues/911)) ([66b4871](https://github.com/promptfoo/modelaudit/commit/66b4871f49e367dea545f36af85c9cc75303d615))
+- flag Paddle code patterns as warnings ([#925](https://github.com/promptfoo/modelaudit/issues/925)) ([32fa0b7](https://github.com/promptfoo/modelaudit/commit/32fa0b7551c13059515c464b0118851fa1fbe671))
+- harden manifest parse boundaries ([#922](https://github.com/promptfoo/modelaudit/issues/922)) ([6f5b516](https://github.com/promptfoo/modelaudit/commit/6f5b516bec8492b2f062ba5ea10498c705d972ca))
+- harden standalone pickle scanner ([#901](https://github.com/promptfoo/modelaudit/issues/901)) ([31f7dd3](https://github.com/promptfoo/modelaudit/commit/31f7dd38c6bd77631ccdca90438312c4db2ac857))
+- mark corrupt NumPy object payloads inconclusive ([#912](https://github.com/promptfoo/modelaudit/issues/912)) ([ecba19d](https://github.com/promptfoo/modelaudit/commit/ecba19dc585d5bfbfbfbd687e81cd734a7b0103b))
+- mark incomplete MXNet scans inconclusive ([#923](https://github.com/promptfoo/modelaudit/issues/923)) ([a928ed7](https://github.com/promptfoo/modelaudit/commit/a928ed723a220185c3c0ea4b046b8885c74e8f62))
+- mark incomplete sharded scans inconclusive ([#909](https://github.com/promptfoo/modelaudit/issues/909)) ([510d0fb](https://github.com/promptfoo/modelaudit/commit/510d0fbe45ae9f1b7e213227ebb1210b15a35991))
+- mark malformed GGUF scans inconclusive ([#914](https://github.com/promptfoo/modelaudit/issues/914)) ([9b3e216](https://github.com/promptfoo/modelaudit/commit/9b3e21607309b846b15f809af6fd1bef31268b6a))
+- mark malformed Keras H5 configs inconclusive ([#917](https://github.com/promptfoo/modelaudit/issues/917)) ([23671c3](https://github.com/promptfoo/modelaudit/commit/23671c38796293978b0538eb4c7ce30c8cfa5160))
+- mark malformed Keras ZIP configs inconclusive ([#918](https://github.com/promptfoo/modelaudit/issues/918)) ([d4ad8d8](https://github.com/promptfoo/modelaudit/commit/d4ad8d8717c4f1ca647b292035f68bbf570d9904))
+- mark malformed SafeTensors scans inconclusive ([#913](https://github.com/promptfoo/modelaudit/issues/913)) ([43913d6](https://github.com/promptfoo/modelaudit/commit/43913d65c5eb89014d1bb137768f89e93b8d0d41))
+- mark malformed tflite scans inconclusive ([#916](https://github.com/promptfoo/modelaudit/issues/916)) ([07c871a](https://github.com/promptfoo/modelaudit/commit/07c871a8d19e9181bdcd568fffa9a165883585de))
+- mark partial archive scans inconclusive ([#907](https://github.com/promptfoo/modelaudit/issues/907)) ([c8eb918](https://github.com/promptfoo/modelaudit/commit/c8eb918b8d0a717460be93097cfc1cf0a47e6689))
+- mark partial streaming scans inconclusive ([#908](https://github.com/promptfoo/modelaudit/issues/908)) ([3d47a10](https://github.com/promptfoo/modelaudit/commit/3d47a1055d09c20995c21ebe75a50a2c3d1105f0))
+- mark unknown ONNX tensor dtypes inconclusive ([#915](https://github.com/promptfoo/modelaudit/issues/915)) ([35661b6](https://github.com/promptfoo/modelaudit/commit/35661b6ac166f38f7642ac9a3ea89b6cea538928))
+- preserve picklescan stack state ([#910](https://github.com/promptfoo/modelaudit/issues/910)) ([fabac5c](https://github.com/promptfoo/modelaudit/commit/fabac5c9ead49c2ed5f8357dfa53ccdcce946527))
+- recover malformed Jinja template configs ([#920](https://github.com/promptfoo/modelaudit/issues/920)) ([d619c8f](https://github.com/promptfoo/modelaudit/commit/d619c8f185040c7b3c772a4b94631edddde9d8a8))
+- route corrupt catboost scans fail closed ([#924](https://github.com/promptfoo/modelaudit/issues/924)) ([052bb5f](https://github.com/promptfoo/modelaudit/commit/052bb5f4e6dbc5e48a3fe5d134e0ec8d9605e292))
+- traverse nemo yaml list configs ([#919](https://github.com/promptfoo/modelaudit/issues/919)) ([0d8d4fd](https://github.com/promptfoo/modelaudit/commit/0d8d4fd4dc2ef774db093fb9e7daf27c32b5a0a8))
+- **zip:** fail closed on MAR handler parse errors ([#896](https://github.com/promptfoo/modelaudit/issues/896)) ([a06a620](https://github.com/promptfoo/modelaudit/commit/a06a620f011d120072b1e8619e543a7306d5a4fc))
+
+### Documentation
+
+- add repo correctness audit ledger ([#921](https://github.com/promptfoo/modelaudit/issues/921)) ([06be0b6](https://github.com/promptfoo/modelaudit/commit/06be0b6eaeb53f5f238612a386665c45f3c27dc2))
+
 ## [0.2.34](https://github.com/promptfoo/modelaudit/compare/v0.2.33...v0.2.34) (2026-04-10)
 
 ### Bug Fixes
 
+- flag Paddle code patterns as warnings instead of failing benign scans
+- route corrupt CatBoost scans to fail closed outcomes
+- mark incomplete MXNet scans inconclusive instead of clean
+- harden manifest parse boundaries around malformed metadata
+- recover malformed Jinja template configs as inconclusive scan outcomes
+- traverse NeMo YAML list configs when checking suspicious targets
+- mark malformed Keras ZIP configs inconclusive instead of clean
+- mark malformed Keras H5 scans inconclusive instead of clean
+- mark malformed TFLite scans inconclusive instead of clean
+- mark malformed GGUF scans inconclusive instead of clean
+- mark malformed SafeTensors scans inconclusive instead of clean
+- preserve picklescan stack state across reused scanner runs
+- mark partial streaming scans inconclusive when large-file streaming coverage is incomplete
 - harden native code detection in model scanners ([#897](https://github.com/promptfoo/modelaudit/issues/897)) ([f4f661a](https://github.com/promptfoo/modelaudit/commit/f4f661a09be0032e15aa8895864413e3878233f8))
 
 ## [0.2.33](https://github.com/promptfoo/modelaudit/compare/v0.2.32...v0.2.33) (2026-04-09)
@@ -49,6 +91,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - detect Linux/macOS native-library members in Keras archives and uppercase native-library members in PyTorch ZIPs
 - detect embedded Windows DLL/PE, Linux ELF shared-object, and TensorRT plugin entry-point markers in TensorRT engines
 - detect punctuation-delimited TensorRT `/tmp` plugin paths
+- clean up temporary ZIP entry files when extraction fails on entry size limits
 - preserve HuggingFace cache provenance for symlinked custom cache roots
 - mark ONNX tensor dtype validation failures inconclusive instead of allowing clean scans
 - ignore remote OCI `layers[].urls` entries during local layer discovery
@@ -56,6 +99,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - avoid PMML `<Extension>` false positives for benign `subprocess` prose while preserving `subprocess.getoutput()`, `subprocess.getstatusoutput()`, and `importlib.import_module("subprocess")` detections
 - mark incomplete ZIP, TAR, and 7z archive traversals as inconclusive in scan metadata
 - route helper-level ZIP-backed `.ckpt`/`.pkl` checkpoints through archive scanners
+- harden standalone pickle scanner dangerous global coverage, nested payload bounds, incomplete-scan reporting, and standalone-primary migration behavior
 
 ## [0.2.31](https://github.com/promptfoo/modelaudit/compare/v0.2.30...v0.2.31) (2026-04-04)
 

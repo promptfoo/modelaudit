@@ -10,7 +10,7 @@ from typing import Any, ClassVar
 
 from modelaudit.detectors.suspicious_symbols import EXECUTABLE_SIGNATURES
 
-from .base import BaseScanner, IssueSeverity, ScanResult
+from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 
 MAX_SYMBOL_READ_BYTES = 10 * 1024 * 1024
 MAX_PARAMS_READ_BYTES = 10 * 1024 * 1024
@@ -123,6 +123,11 @@ SUSPICIOUS_TEXT_TOKENS = (
 )
 
 
+def _scan_result_has_security_findings(result: ScanResult) -> bool:
+    """Return True when the result includes WARNING/CRITICAL findings."""
+    return any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
 class MXNetScanner(BaseScanner):
     """Scanner for MXNet symbol graph and params artifacts."""
 
@@ -140,27 +145,13 @@ class MXNetScanner(BaseScanner):
         if suffix == ".params":
             return cls._is_mxnet_params_filename(path_obj.name)
 
-        if suffix == ".json" and path_obj.name.lower().endswith("-symbol.json"):
-            return cls._is_mxnet_symbol_graph(path_obj)
-
-        return False
+        # Route MXNet symbol artifacts by their framework filename convention so
+        # malformed graphs reach scan() and fail closed as inconclusive.
+        return suffix == ".json" and path_obj.name.lower().endswith("-symbol.json")
 
     @classmethod
     def _is_mxnet_params_filename(cls, filename: str) -> bool:
         return bool(PARAMS_NAME_RE.match(filename))
-
-    @classmethod
-    def _is_mxnet_symbol_graph(cls, path: Path) -> bool:
-        try:
-            raw_bytes, truncated = cls._read_bounded_bytes(path, MAX_SYMBOL_READ_BYTES)
-            if truncated:
-                return False
-
-            payload = json.loads(raw_bytes.decode("utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError):
-            return False
-
-        return cls._has_valid_symbol_structure(payload)
 
     @classmethod
     def _has_valid_symbol_structure(cls, payload: Any) -> bool:
@@ -210,10 +201,31 @@ class MXNetScanner(BaseScanner):
                 location=path,
                 details={"extension": suffix},
             )
+            self._mark_inconclusive_scan_result(result, "mxnet_unsupported_extension")
             analysis_complete = False
 
-        result.finish(success=(not result.has_errors) and analysis_complete)
+        self._finish_mxnet_result(result, analysis_complete=analysis_complete)
         return result
+
+    def _mark_inconclusive_scan_result(self, result: ScanResult, reason: str) -> None:
+        """Mark MXNet analysis as incomplete for aggregate exit-code handling."""
+        existing_reasons = result.metadata.get("scan_outcome_reasons")
+        reasons = existing_reasons if isinstance(existing_reasons, list) else []
+        if reason not in reasons:
+            reasons.append(reason)
+
+        result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+        result.metadata["scan_outcome_reasons"] = reasons
+        result.metadata["analysis_incomplete"] = True
+
+    def _finish_mxnet_result(self, result: ScanResult, *, analysis_complete: bool) -> None:
+        """Fail closed for incomplete MXNet scans unless security findings were recovered."""
+        has_security_findings = _scan_result_has_security_findings(result)
+        if result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME and not has_security_findings:
+            result.finish(success=False)
+            return
+
+        result.finish(success=(not result.has_errors) and (analysis_complete or has_security_findings))
 
     def _scan_symbol_graph(self, path: str, result: ScanResult) -> bool:
         path_obj = Path(path)
@@ -228,6 +240,7 @@ class MXNetScanner(BaseScanner):
                 location=path,
                 details={"exception": str(exc), "exception_type": type(exc).__name__},
             )
+            self._mark_inconclusive_scan_result(result, "mxnet_symbol_read_failed")
             return False
 
         result.bytes_scanned += len(raw_bytes)
@@ -240,6 +253,7 @@ class MXNetScanner(BaseScanner):
                 location=path,
                 details={"max_bytes": MAX_SYMBOL_READ_BYTES},
             )
+            self._mark_inconclusive_scan_result(result, "mxnet_symbol_truncated")
 
         if not raw_bytes:
             result.add_check(
@@ -249,6 +263,7 @@ class MXNetScanner(BaseScanner):
                 severity=IssueSeverity.INFO,
                 location=path,
             )
+            self._mark_inconclusive_scan_result(result, "mxnet_symbol_empty")
             return False
 
         try:
@@ -262,6 +277,7 @@ class MXNetScanner(BaseScanner):
                 location=path,
                 details={"exception": str(exc), "exception_type": type(exc).__name__},
             )
+            self._mark_inconclusive_scan_result(result, "mxnet_symbol_parse_failed")
             return False
 
         if not self._has_valid_symbol_structure(payload):
@@ -272,6 +288,7 @@ class MXNetScanner(BaseScanner):
                 severity=IssueSeverity.INFO,
                 location=path,
             )
+            self._mark_inconclusive_scan_result(result, "mxnet_symbol_invalid_structure")
             return False
 
         nodes = payload.get("nodes", [])
@@ -338,6 +355,7 @@ class MXNetScanner(BaseScanner):
                 location=path,
                 details={"exception": str(exc), "exception_type": type(exc).__name__},
             )
+            self._mark_inconclusive_scan_result(result, "mxnet_params_read_failed")
             return False
 
         result.bytes_scanned += len(raw_bytes)
@@ -351,6 +369,7 @@ class MXNetScanner(BaseScanner):
                 location=path,
                 details={"max_bytes": MAX_PARAMS_READ_BYTES},
             )
+            self._mark_inconclusive_scan_result(result, "mxnet_params_truncated")
 
         if not raw_bytes:
             result.add_check(
@@ -360,6 +379,7 @@ class MXNetScanner(BaseScanner):
                 severity=IssueSeverity.INFO,
                 location=path,
             )
+            self._mark_inconclusive_scan_result(result, "mxnet_params_empty")
             return False
 
         if len(raw_bytes) < MIN_PARAMS_SIZE_BYTES:
@@ -371,6 +391,7 @@ class MXNetScanner(BaseScanner):
                 location=path,
                 details={"size_bytes": len(raw_bytes), "minimum_expected_bytes": MIN_PARAMS_SIZE_BYTES},
             )
+            self._mark_inconclusive_scan_result(result, "mxnet_params_truncated")
 
         self._scan_params_signatures(path, raw_bytes, result)
         self._scan_params_text_payloads(path, raw_bytes, result)

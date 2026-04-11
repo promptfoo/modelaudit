@@ -30,7 +30,7 @@ from ..config.explanations import (
 )
 from ..utils.file.detection import _normalize_archive_member_name, _read_zip_member_bounded
 from .archive_member_security import is_executable_archive_member_name
-from .base import BaseScanner, IssueSeverity, ScanResult
+from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 from .keras_utils import (
     check_custom_loss_config,
     check_custom_metric_config,
@@ -354,6 +354,7 @@ class KerasZipScanner(BaseScanner):
                 config_info = self._get_archive_member_info(zf, _KERAS_CONFIG_ENTRY)
                 # Check for config.json
                 if config_info is None:
+                    self._mark_inconclusive_scan_result(result, "keras_zip_config_missing")
                     result.add_check(
                         name="Keras ZIP Format Check",
                         passed=False,
@@ -362,8 +363,10 @@ class KerasZipScanner(BaseScanner):
                         location=path,
                         details={"files": zf.namelist()},
                     )
+                    self._load_keras_metadata(zf, result)
+                    self._check_archive_security_members(zf, path, result)
                     self._merge_recursive_archive_scan(path, result)
-                    result.finish(success=result.success)
+                    self._finish_scan_result(result)
                     return result
 
                 # Read and parse config.json
@@ -377,6 +380,7 @@ class KerasZipScanner(BaseScanner):
                     raw_config_text = config_data.decode("utf-8", errors="ignore")
                     model_config = json.loads(config_data)
                 except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as e:
+                    self._mark_inconclusive_scan_result(result, "keras_zip_config_parse_failed")
                     # Fall back to a structure-aware raw scan only when the archive
                     # config is malformed and cannot be parsed as JSON.
                     if raw_config_text:
@@ -385,65 +389,44 @@ class KerasZipScanner(BaseScanner):
                         name="Config JSON Parsing",
                         passed=False,
                         message=f"Failed to parse config.json: {e}",
-                        severity=IssueSeverity.CRITICAL,
+                        severity=IssueSeverity.INFO,
                         location=f"{path}/{config_info.filename}",
                         details={
                             "error": str(e),
                             "max_config_bytes": _KERAS_CONFIG_MAX_BYTES,
                         },
                     )
+                    self._load_keras_metadata(zf, result)
+                    self._check_archive_security_members(zf, path, result)
                     self._merge_recursive_archive_scan(path, result)
-                    result.finish(success=False)
+                    self._finish_scan_result(result)
                     return result
 
-                # CVE-2025-8747: Check for structured get_file gadget usage
-                self._check_get_file_gadget(model_config, result)
-                # CVE-2025-9906: structured fallback check on parsed config
+                # CVE-2025-9906 can be detected in any parsed JSON shape; the
+                # rest of the structured model scan requires a top-level object.
                 self._check_unsafe_deserialization_bypass(model_config, result)
+                self._check_get_file_gadget(model_config, result)
+                self._load_keras_metadata(zf, result)
 
-                # Check for metadata.json
-                metadata_info = self._get_archive_member_info(zf, _KERAS_METADATA_ENTRY)
-                if metadata_info is not None:
-                    try:
-                        metadata_data = _read_zip_member_bounded(
-                            zf,
-                            metadata_info,
-                            _KERAS_METADATA_MAX_BYTES,
-                        )
-                        metadata = json.loads(metadata_data)
-                        result.metadata["keras_metadata"] = metadata
-                        keras_version = metadata.get("keras_version")
-                        if isinstance(keras_version, str) and keras_version.strip():
-                            result.metadata["keras_version"] = keras_version.strip()
-                    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
-                        pass  # Metadata parsing is optional
-
-                self._check_embedded_hdf5_weights_external_references(zf, result)
+                if not isinstance(model_config, dict):
+                    self._mark_inconclusive_scan_result(result, "keras_zip_config_invalid_type")
+                    result.add_check(
+                        name="Model Config Type Validation",
+                        passed=False,
+                        message=f"Invalid config.json type: expected dict, got {type(model_config).__name__}",
+                        severity=IssueSeverity.INFO,
+                        location=f"{path}/{config_info.filename}",
+                        details={"actual_type": type(model_config).__name__, "expected_type": "dict"},
+                    )
+                    self._check_archive_security_members(zf, path, result)
+                    self._merge_recursive_archive_scan(path, result)
+                    self._finish_scan_result(result)
+                    return result
 
                 # Scan model configuration
                 self._scan_model_config(model_config, result)
 
-                # Check for suspicious files in the ZIP
-                for filename in zf.namelist():
-                    normalized_name = filename.lower()
-                    if normalized_name.endswith((".py", ".pyc", ".pyo")):
-                        result.add_check(
-                            name="Python File Detection",
-                            passed=False,
-                            message=f"Python file found in Keras ZIP: {filename}",
-                            severity=IssueSeverity.WARNING,
-                            location=f"{path}/{filename}",
-                            details={"filename": filename},
-                        )
-                    elif is_executable_archive_member_name(normalized_name):
-                        result.add_check(
-                            name="Executable File Detection",
-                            passed=False,
-                            message=f"Executable file found in Keras ZIP: {filename}",
-                            severity=IssueSeverity.CRITICAL,
-                            location=f"{path}/{filename}",
-                            details={"filename": filename},
-                        )
+                self._check_archive_security_members(zf, path, result)
 
                 self._merge_recursive_archive_scan(path, result)
 
@@ -474,8 +457,88 @@ class KerasZipScanner(BaseScanner):
             result.finish(success=False)
             return result
 
-        result.finish(success=result.success)
+        self._finish_scan_result(result)
         return result
+
+    def _load_keras_metadata(self, archive: zipfile.ZipFile, result: ScanResult) -> None:
+        metadata_info = self._get_archive_member_info(archive, _KERAS_METADATA_ENTRY)
+        if metadata_info is None:
+            return
+
+        try:
+            metadata_data = _read_zip_member_bounded(
+                archive,
+                metadata_info,
+                _KERAS_METADATA_MAX_BYTES,
+            )
+            metadata = json.loads(metadata_data)
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+            return
+
+        if not isinstance(metadata, dict):
+            return
+
+        result.metadata["keras_metadata"] = metadata
+        keras_version = metadata.get("keras_version")
+        if isinstance(keras_version, str) and keras_version.strip():
+            result.metadata["keras_version"] = keras_version.strip()
+
+    def _check_archive_security_members(
+        self,
+        archive: zipfile.ZipFile,
+        archive_path: str,
+        result: ScanResult,
+    ) -> None:
+        self._check_embedded_hdf5_weights_external_references(archive, result)
+
+        for filename in archive.namelist():
+            normalized_name = filename.lower()
+            if normalized_name.endswith((".py", ".pyc", ".pyo")):
+                result.add_check(
+                    name="Python File Detection",
+                    passed=False,
+                    message=f"Python file found in Keras ZIP: {filename}",
+                    severity=IssueSeverity.WARNING,
+                    location=f"{archive_path}/{filename}",
+                    details={"filename": filename},
+                )
+            elif is_executable_archive_member_name(normalized_name):
+                result.add_check(
+                    name="Executable File Detection",
+                    passed=False,
+                    message=f"Executable file found in Keras ZIP: {filename}",
+                    severity=IssueSeverity.CRITICAL,
+                    location=f"{archive_path}/{filename}",
+                    details={"filename": filename},
+                )
+
+    @staticmethod
+    def _mark_inconclusive_scan_result(result: ScanResult, reason: str) -> None:
+        """Mark the scan as incomplete without converting it into a security finding."""
+        existing_reasons = result.metadata.get("scan_outcome_reasons")
+        reasons = existing_reasons if isinstance(existing_reasons, list) else []
+        if reason not in reasons:
+            reasons.append(reason)
+
+        result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+        result.metadata["scan_outcome_reasons"] = reasons
+        result.metadata["analysis_incomplete"] = True
+
+    @staticmethod
+    def _scan_result_has_security_findings(result: ScanResult) -> bool:
+        """Return True when the scan found warning or critical security risk."""
+        return any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+
+    @classmethod
+    def _finish_scan_result(cls, result: ScanResult) -> None:
+        """Fail closed on incomplete/no-finding scans while preserving security precedence."""
+        is_inconclusive = result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+        has_security_findings = cls._scan_result_has_security_findings(result)
+        if is_inconclusive and not has_security_findings:
+            result.finish(success=False)
+            return
+
+        result.finish(success=result.success and not result.has_errors)
 
     def _scan_model_config(self, model_config: dict[str, Any], result: ScanResult) -> None:
         """Scan the model configuration for suspicious elements"""
@@ -500,16 +563,55 @@ class KerasZipScanner(BaseScanner):
                 },
             )
 
-        self._scan_compile_config(model_config.get("compile_config"), result)
+        if "compile_config" in model_config:
+            self._scan_compile_config(model_config.get("compile_config"), result)
 
         # Get layers from config
         layers = []
-        if "config" in model_config and isinstance(model_config["config"], dict):
-            if "layers" in model_config["config"]:
-                layers = model_config["config"]["layers"]
-            elif "layer" in model_config["config"]:
+        config_value = model_config.get("config")
+        if "config" in model_config and not isinstance(config_value, dict):
+            self._mark_inconclusive_scan_result(result, "keras_zip_model_config_structure_invalid")
+            result.add_check(
+                name="Model Config Structure Validation",
+                passed=False,
+                message=f"Invalid model config type: expected dict, got {type(config_value).__name__}",
+                rule_code="S902",
+                severity=IssueSeverity.INFO,
+                location=f"{self.current_file_path}/config.json",
+                details={"actual_type": type(config_value).__name__, "expected_type": "dict"},
+            )
+        elif isinstance(config_value, dict):
+            if "layers" in config_value:
+                layers_value = config_value["layers"]
+                if isinstance(layers_value, list):
+                    layers = layers_value
+                else:
+                    self._mark_inconclusive_scan_result(result, "keras_zip_model_layers_invalid_type")
+                    result.add_check(
+                        name="Layers Type Validation",
+                        passed=False,
+                        message=f"Invalid layers type: expected list, got {type(layers_value).__name__}",
+                        rule_code="S902",
+                        severity=IssueSeverity.INFO,
+                        location=f"{self.current_file_path}/config.json",
+                        details={"actual_type": type(layers_value).__name__, "expected_type": "list"},
+                    )
+            elif "layer" in config_value:
                 # Single layer model
-                layers = [model_config["config"]["layer"]]
+                layer_value = config_value["layer"]
+                if isinstance(layer_value, dict):
+                    layers = [layer_value]
+                else:
+                    self._mark_inconclusive_scan_result(result, "keras_zip_model_layer_invalid_type")
+                    result.add_check(
+                        name="Single Layer Type Validation",
+                        passed=False,
+                        message=f"Invalid layer type: expected dict, got {type(layer_value).__name__}",
+                        rule_code="S902",
+                        severity=IssueSeverity.INFO,
+                        location=f"{self.current_file_path}/config.json",
+                        details={"actual_type": type(layer_value).__name__, "expected_type": "dict"},
+                    )
 
         # Count of each layer type
         layer_counts: dict[str, int] = {}
@@ -517,10 +619,37 @@ class KerasZipScanner(BaseScanner):
         # Check each layer
         for i, layer in enumerate(layers):
             if not isinstance(layer, dict):
+                self._mark_inconclusive_scan_result(result, "keras_zip_model_layer_invalid_type")
+                result.add_check(
+                    name="Layer Type Validation",
+                    passed=False,
+                    message=f"Invalid layer type: expected dict, got {type(layer).__name__}",
+                    rule_code="S902",
+                    severity=IssueSeverity.INFO,
+                    location=f"{self.current_file_path}/config.json",
+                    details={"actual_type": type(layer).__name__, "expected_type": "dict", "index": i},
+                )
                 continue
 
             layer_class = layer.get("class_name", "")
             layer_name = layer.get("name", f"layer_{i}")
+
+            layer_config = layer.get("config")
+            if "config" in layer and not isinstance(layer_config, dict):
+                self._mark_inconclusive_scan_result(result, "keras_zip_layer_config_invalid_type")
+                result.add_check(
+                    name="Layer Config Type Validation",
+                    passed=False,
+                    message=f"Invalid layer config type: expected dict, got {type(layer_config).__name__}",
+                    rule_code="S902",
+                    severity=IssueSeverity.INFO,
+                    location=f"{self.current_file_path} (layer: {layer_name})",
+                    details={
+                        "layer_name": layer_name,
+                        "actual_type": type(layer_config).__name__,
+                        "expected_type": "dict",
+                    },
+                )
 
             # Update layer count
             layer_counts[layer_class] = layer_counts.get(layer_class, 0) + 1
@@ -633,19 +762,40 @@ class KerasZipScanner(BaseScanner):
                 )
 
             # Recursively check nested models
-            if (
-                layer_class in ["Model", "Functional", "Sequential"]
-                and "config" in layer
-                and isinstance(layer["config"], dict)
-            ):
-                self._scan_model_config(layer, result)
+            if layer_class in ["Model", "Functional", "Sequential"] and "config" in layer:
+                nested_config = layer["config"]
+                if isinstance(nested_config, dict):
+                    self._scan_model_config(layer, result)
+                else:
+                    self._mark_inconclusive_scan_result(result, "keras_zip_nested_model_config_invalid_type")
+                    result.add_check(
+                        name="Nested Model Config Type Validation",
+                        passed=False,
+                        message=f"Invalid nested model config type: expected dict, got {type(nested_config).__name__}",
+                        rule_code="S902",
+                        severity=IssueSeverity.INFO,
+                        location=f"{self.current_file_path} (layer: {layer_name})",
+                        details={"actual_type": type(nested_config).__name__, "expected_type": "dict"},
+                    )
 
         # Add layer counts to metadata
         result.metadata["layer_counts"] = layer_counts
 
     def _scan_compile_config(self, compile_config: Any, result: ScanResult) -> None:
         """Inspect compile_config for custom metrics and losses."""
+        if compile_config is None:
+            return
         if not isinstance(compile_config, dict):
+            self._mark_inconclusive_scan_result(result, "keras_zip_compile_config_invalid_type")
+            result.add_check(
+                name="Compile Config Type Validation",
+                passed=False,
+                message=f"Invalid compile_config type: expected dict, got {type(compile_config).__name__}",
+                rule_code="S902",
+                severity=IssueSeverity.INFO,
+                location=f"{self.current_file_path}/config.json",
+                details={"actual_type": type(compile_config).__name__, "expected_type": "dict"},
+            )
             return
 
         self._check_custom_metric_config(compile_config.get("metrics"), result, "compile_config.metrics")
@@ -864,7 +1014,7 @@ class KerasZipScanner(BaseScanner):
                     why=get_cve_2025_1550_explanation("untrusted_module"),
                 )
 
-    def _check_get_file_gadget(self, model_config: dict[str, Any], result: ScanResult) -> None:
+    def _check_get_file_gadget(self, model_config: Any, result: ScanResult) -> None:
         """Check for CVE-2025-8747: keras.utils.get_file gadget bypass.
 
         CVE-2025-8747: Bypass of CVE-2025-1550 fix. Uses keras.utils.get_file
@@ -915,7 +1065,7 @@ class KerasZipScanner(BaseScanner):
             )
             return
 
-    def _check_unsafe_deserialization_bypass(self, model_config: dict[str, Any], result: ScanResult) -> None:
+    def _check_unsafe_deserialization_bypass(self, model_config: Any, result: ScanResult) -> None:
         """Check for CVE-2025-9906: enable_unsafe_deserialization bypass in config.json.
 
         CVE-2025-9906: config.json in .keras archives can reference
@@ -1410,6 +1560,8 @@ class KerasZipScanner(BaseScanner):
     def _check_lambda_layer(self, layer: dict[str, Any], result: ScanResult, layer_name: str) -> None:
         """Check Lambda layer for executable Python code"""
         layer_config = layer.get("config", {})
+        if not isinstance(layer_config, dict):
+            return
 
         # Lambda layers in Keras ZIP format store the function as a list
         # where the first element is base64-encoded Python code

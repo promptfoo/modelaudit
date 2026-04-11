@@ -2,8 +2,11 @@
 
 import struct
 from pathlib import Path
+from typing import Any
 
-from modelaudit.scanners.base import IssueSeverity
+from modelaudit.cache import get_cache_manager, reset_cache_manager
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity
 from modelaudit.scanners.gguf_scanner import GgufScanner
 
 
@@ -78,6 +81,67 @@ def _write_ggml_variant_file(path, magic):
         f.write(magic)
         f.write(struct.pack("<I", 1))
         f.write(b"\0" * 24)
+
+
+def _write_gguf_with_tensor_type(path: Path, tensor_type: int) -> None:
+    with path.open("wb") as f:
+        f.write(b"GGUF")
+        f.write(struct.pack("<I", 3))
+        f.write(struct.pack("<Q", 1))
+        f.write(struct.pack("<Q", 0))
+
+        name = b"unknown"
+        f.write(struct.pack("<Q", len(name)))
+        f.write(name)
+        f.write(struct.pack("<I", 1))
+        f.write(struct.pack("<Q", 8))
+        f.write(struct.pack("<I", tensor_type))
+        f.write(struct.pack("<Q", 0))
+
+        pad_to_tensor_data = (32 - (f.tell() % 32)) % 32
+        if pad_to_tensor_data:
+            f.write(b"\0" * pad_to_tensor_data)
+        f.write(b"\0" * 32)
+
+
+def _single_file_metadata(aggregate: Any) -> Any:
+    return next(iter(aggregate.file_metadata.values()))
+
+
+def _assert_inconclusive_exit2(aggregate: Any, reason: str) -> None:
+    metadata = _single_file_metadata(aggregate)
+    assert aggregate.success is False
+    assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert reason in metadata.get("scan_outcome_reasons", [])
+    assert determine_exit_code(aggregate) == 2
+    assert not any(issue.severity == IssueSeverity.CRITICAL for issue in aggregate.issues)
+
+
+def _assert_uncached_rerun_preserves_inconclusive_exit2(
+    path: Path,
+    cache_dir: Path,
+    reason: str,
+) -> None:
+    reset_cache_manager()
+    try:
+        first = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        second = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+
+        _assert_inconclusive_exit2(first, reason)
+        _assert_inconclusive_exit2(second, reason)
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
 
 
 def test_gguf_scanner_can_handle_gguf(tmp_path):
@@ -169,17 +233,19 @@ def test_gguf_scanner_invalid_alignment_falls_back_to_default(tmp_path: Path) ->
     assert not any("size mismatch" in issue.message.lower() for issue in result.issues)
 
 
-def test_gguf_scanner_large_kv_count(tmp_path):
+def test_gguf_scanner_large_kv_count(tmp_path: Path) -> None:
     """Test detection of suspiciously large KV counts."""
     path = tmp_path / "bad.gguf"
     _write_minimal_gguf(path, n_kv=2**31)
     result = GgufScanner().scan(str(path))
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert any(i.severity == IssueSeverity.INFO for i in result.issues)
     # Should detect parsing error due to impossibly large KV count
     assert "parse error" in str(result.issues[0].message).lower() or "invalid" in str(result.issues[0].message).lower()
 
 
-def test_gguf_scanner_large_tensor_count(tmp_path):
+def test_gguf_scanner_large_tensor_count(tmp_path: Path) -> None:
     """Test detection of suspiciously large tensor counts."""
     path = tmp_path / "bad.gguf"
     with open(path, "wb") as f:
@@ -189,10 +255,12 @@ def test_gguf_scanner_large_tensor_count(tmp_path):
         f.write(struct.pack("<Q", 0))  # kv count
 
     result = GgufScanner().scan(str(path))
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert any(i.severity == IssueSeverity.INFO for i in result.issues)
 
 
-def test_gguf_scanner_truncated_file(tmp_path):
+def test_gguf_scanner_truncated_file(tmp_path: Path) -> None:
     """Test handling of truncated GGUF files."""
     path = tmp_path / "trunc.gguf"
     with open(path, "wb") as f:
@@ -202,7 +270,76 @@ def test_gguf_scanner_truncated_file(tmp_path):
         f.write(struct.pack("<Q", 5))  # Claims 5 KV pairs but file ends
 
     result = GgufScanner().scan(str(path))
-    assert not result.success or any(i.severity == IssueSeverity.INFO for i in result.issues)
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert any(i.severity == IssueSeverity.INFO for i in result.issues)
+
+
+def test_gguf_truncated_metadata_returns_exit2(tmp_path: Path) -> None:
+    path = tmp_path / "truncated_metadata.gguf"
+    with path.open("wb") as f:
+        f.write(b"GGUF")
+        f.write(struct.pack("<I", 3))
+        f.write(struct.pack("<Q", 0))
+        f.write(struct.pack("<Q", 5))
+
+    direct = GgufScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path))
+    metadata = next(iter(aggregate.file_metadata.values()))
+
+    assert direct.success is False
+    assert direct.has_errors is False
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "gguf_parse_incomplete" in direct.metadata["scan_outcome_reasons"]
+    assert aggregate.success is False
+    assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert determine_exit_code(aggregate) == 2
+    assert not any(issue.severity == IssueSeverity.CRITICAL for issue in aggregate.issues)
+
+
+def test_gguf_truncated_metadata_uncached_rerun_preserves_exit2(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "truncated_metadata.gguf"
+    with path.open("wb") as f:
+        f.write(b"GGUF")
+        f.write(struct.pack("<I", 3))
+        f.write(struct.pack("<Q", 0))
+        f.write(struct.pack("<Q", 5))
+
+    _assert_uncached_rerun_preserves_inconclusive_exit2(
+        path,
+        tmp_path / "cache",
+        "gguf_parse_incomplete",
+    )
+
+
+def test_gguf_unknown_tensor_type_is_inconclusive(tmp_path: Path) -> None:
+    path = tmp_path / "unknown_tensor_type.gguf"
+    _write_gguf_with_tensor_type(path, tensor_type=999)
+
+    direct = GgufScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path))
+
+    assert direct.success is False
+    assert direct.has_errors is False
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "gguf_structure_validation_failed" in direct.metadata["scan_outcome_reasons"]
+    assert any("unknown ggml type" in issue.message.lower() for issue in direct.issues)
+    assert determine_exit_code(aggregate) == 2
+
+
+def test_gguf_unknown_tensor_type_uncached_rerun_preserves_exit2(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "unknown_tensor_type.gguf"
+    _write_gguf_with_tensor_type(path, tensor_type=999)
+
+    _assert_uncached_rerun_preserves_inconclusive_exit2(
+        path,
+        tmp_path / "cache",
+        "gguf_structure_validation_failed",
+    )
 
 
 def test_gguf_scanner_suspicious_key_paths(tmp_path):
@@ -223,7 +360,7 @@ def test_gguf_scanner_suspicious_values(tmp_path):
     assert any("suspicious" in i.message.lower() for i in result.issues)
 
 
-def test_gguf_scanner_string_length_security(tmp_path):
+def test_gguf_scanner_string_length_security(tmp_path: Path) -> None:
     """Test security checks for string lengths."""
     path = tmp_path / "long_string.gguf"
     with open(path, "wb") as f:
@@ -236,6 +373,8 @@ def test_gguf_scanner_string_length_security(tmp_path):
 
     result = GgufScanner().scan(str(path))
     assert any(i.severity == IssueSeverity.INFO for i in result.issues)
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
 
 
 def test_ggml_scanner_basic(tmp_path):
@@ -273,7 +412,7 @@ def test_ggml_scanner_suspicious_version(tmp_path):
     assert result.metadata["version"] == 99999
 
 
-def test_ggml_scanner_truncated(tmp_path):
+def test_ggml_scanner_truncated(tmp_path: Path) -> None:
     """Test handling of truncated GGML files."""
     path = tmp_path / "trunc.ggml"
     with open(path, "wb") as f:
@@ -282,6 +421,8 @@ def test_ggml_scanner_truncated(tmp_path):
 
     result = GgufScanner().scan(str(path))
     assert any(i.severity == IssueSeverity.INFO for i in result.issues)
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
 
 
 def test_gguf_scanner_file_extensions(tmp_path):
@@ -357,7 +498,7 @@ def test_gguf_scanner_error_handling(tmp_path):
     assert not result.success
 
 
-def test_gguf_scanner_invalid_tensor_dimensions(tmp_path):
+def test_gguf_scanner_invalid_tensor_dimensions(tmp_path: Path) -> None:
     """Test handling of tensors with invalid dimensions (regression test for dimension bug)."""
     path = tmp_path / "invalid_dims.gguf"
     with open(path, "wb") as f:
@@ -413,8 +554,8 @@ def test_gguf_scanner_invalid_tensor_dimensions(tmp_path):
 
     result = GgufScanner().scan(str(path))
 
-    # The scan should succeed but report the invalid dimensions
-    assert result.success
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
 
     # Should have warnings about both invalid dimensions
     warning_messages = [issue.message for issue in result.issues]

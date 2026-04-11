@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -13,18 +13,36 @@ from modelaudit_picklescan import Finding, PickleReport, ScanOptions, ScanStatus
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, Check, Issue, IssueSeverity, ScanResult
 from .rule_mapper import get_generic_rule_code, get_import_rule_code, get_pickle_opcode_rule_code
 
-_INCONCLUSIVE_NOTICE_CODES = frozenset({"opcode_budget", "parse_incomplete", "timeout"})
+_INCONCLUSIVE_NOTICE_CODES = frozenset(
+    {
+        "encoded_nested_payload_truncated",
+        "literal_scan_truncated",
+        "nested_payload_truncated",
+        "nested_pickle_incomplete",
+        "opcode_budget",
+        "parse_incomplete",
+        "timeout",
+    }
+)
 _DEFAULT_SCAN_OPTIONS = ScanOptions()
 _IMPORT_MODULE_ALIASES = {
     "nt": "os",
     "posix": "os",
 }
 _LEGACY_NOTICE_RULE_CODES = {
+    "encoded_nested_payload_truncated": "S902",
+    "literal_scan_truncated": "S902",
+    "nested_payload_truncated": "S902",
+    "nested_pickle_incomplete": "S902",
     "opcode_budget": "S902",
     "parse_incomplete": "S902",
     "timeout": "S902",
 }
 _LEGACY_SCAN_OUTCOME_REASONS = {
+    "encoded_nested_payload_truncated": "encoded_nested_payload_truncated",
+    "literal_scan_truncated": "literal_scan_truncated",
+    "nested_payload_truncated": "nested_payload_truncated",
+    "nested_pickle_incomplete": "nested_pickle_incomplete",
     "opcode_budget": "opcode_budget_exceeded",
     "parse_incomplete": "pickle_analysis_incomplete",
     "timeout": "scan_timeout",
@@ -87,6 +105,30 @@ def scan_options_from_config(config: Mapping[str, Any]) -> ScanOptions:
             _DEFAULT_SCAN_OPTIONS.post_budget_scan_bytes,
             minimum=0,
         ),
+        max_string_literal_scan_chars=_parse_min_int(
+            config.get(
+                "max_string_literal_scan_chars",
+                _DEFAULT_SCAN_OPTIONS.max_string_literal_scan_chars,
+            ),
+            _DEFAULT_SCAN_OPTIONS.max_string_literal_scan_chars,
+            minimum=0,
+        ),
+        max_nested_pickle_bytes=_parse_min_int(
+            config.get(
+                "max_nested_pickle_bytes",
+                _DEFAULT_SCAN_OPTIONS.max_nested_pickle_bytes,
+            ),
+            _DEFAULT_SCAN_OPTIONS.max_nested_pickle_bytes,
+            minimum=0,
+        ),
+        max_nested_depth=_parse_min_int(
+            config.get(
+                "max_nested_depth",
+                _DEFAULT_SCAN_OPTIONS.max_nested_depth,
+            ),
+            _DEFAULT_SCAN_OPTIONS.max_nested_depth,
+            minimum=0,
+        ),
     )
 
 
@@ -97,9 +139,11 @@ def pickle_report_to_scan_result(
     scanner: BaseScanner | None = None,
 ) -> ScanResult:
     """Convert a standalone PickleReport into the repository's ScanResult model."""
+    report_dict = report.to_dict()
+    report_metadata = report_dict["metadata"]
     result = ScanResult(scanner_name=scanner_name, scanner=scanner)
     result.bytes_scanned = report.coverage.bytes_scanned
-    result.metadata.update(report.metadata)
+    result.metadata.update(report_metadata)
     result.metadata["pickle_report_status"] = report.status.value
     result.metadata["pickle_verdict"] = report.verdict.value
     result.metadata["pickle_source"] = report.source
@@ -121,7 +165,7 @@ def pickle_report_to_scan_result(
         details = _add_legacy_detail_aliases(
             {
                 "pickle_source": report.source,
-                **finding.details,
+                **finding.to_dict()["details"],
             }
         )
         if finding.rule_code:
@@ -141,7 +185,7 @@ def pickle_report_to_scan_result(
         details = {
             "pickle_source": report.source,
             "notice_code": notice.code,
-            **notice.details,
+            **notice.to_dict()["details"],
         }
         details.setdefault("pickle_notice_code", notice.code)
         result.add_check(
@@ -175,9 +219,9 @@ def pickle_report_to_scan_result(
                 ),
             )
 
-    import_references = report.metadata.get("import_references", [])
+    import_references = report_metadata.get("import_references", [])
     finding_ref_keys = _finding_reference_keys(report.findings)
-    if isinstance(import_references, list):
+    if _is_reference_sequence(import_references):
         for reference in import_references:
             if not isinstance(reference, Mapping):
                 continue
@@ -218,7 +262,7 @@ def pickle_report_to_scan_result(
                 "pickle_source": report.source,
                 "category": error.category,
                 "exception_type": error.exception_type,
-                **error.details,
+                **error.to_dict()["details"],
             },
         )
 
@@ -304,7 +348,7 @@ def _pickle_source_extension(source: str) -> str:
 
 def _has_only_benign_serialization_tail_imports(report: PickleReport) -> bool:
     import_references = report.metadata.get("import_references")
-    if not isinstance(import_references, list) or not import_references:
+    if not _is_reference_sequence(import_references) or not import_references:
         return False
 
     for reference in import_references:
@@ -323,11 +367,15 @@ def _has_only_benign_serialization_tail_imports(report: PickleReport) -> bool:
 
 def _has_only_non_dangerous_import_references(report: PickleReport) -> bool:
     import_references = report.metadata.get("import_references")
-    if not isinstance(import_references, list) or not import_references:
+    if not _is_reference_sequence(import_references) or not import_references:
         return False
     return all(
         isinstance(reference, Mapping) and not bool(reference.get("is_dangerous")) for reference in import_references
     )
+
+
+def _is_reference_sequence(value: object) -> bool:
+    return isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray)
 
 
 def _apply_member_context_to_record(
