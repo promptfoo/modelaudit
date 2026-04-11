@@ -332,7 +332,7 @@ def check_lambda_dict_function(
                 f"Lambda layer '{layer_name}' contains embedded bytecode (dict-format) with no dangerous "
                 "text patterns detected"
             ),
-            severity=IssueSeverity.INFO,
+            severity=IssueSeverity.WARNING,
             location=location,
             details={
                 "layer_name": layer_name,

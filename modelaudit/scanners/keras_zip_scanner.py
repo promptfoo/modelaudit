@@ -1744,7 +1744,7 @@ class KerasZipScanner(BaseScanner):
                                     f"Lambda layer '{layer_name}' contains opaque encoded bytecode with no dangerous "
                                     "text patterns detected"
                                 ),
-                                severity=IssueSeverity.INFO,
+                                severity=IssueSeverity.WARNING,
                                 location=f"{self.current_file_path} (layer: {layer_name})",
                                 details={
                                     "layer_name": layer_name,

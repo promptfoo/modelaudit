@@ -868,8 +868,8 @@ __import__('pickle').loads(data)
         finally:
             os.unlink(temp_path)
 
-    def test_opaque_lambda_bytecode_is_info_only(self, tmp_path: Path) -> None:
-        """Benign compiled Lambda bytecode should not produce warning-level noise."""
+    def test_opaque_lambda_bytecode_stays_warning(self, tmp_path: Path) -> None:
+        """Opaque compiled Lambda bytecode should remain a warning-level finding."""
         scanner = KerasZipScanner()
         encoded_code = base64.b64encode(marshal.dumps((lambda x: x + 1).__code__)).decode()
         config = {
@@ -893,11 +893,11 @@ __import__('pickle').loads(data)
             if "opaque encoded bytecode" in issue.message and "opaque_lambda" in issue.message
         ]
         assert len(opaque_issues) == 1
-        assert opaque_issues[0].severity == IssueSeverity.INFO
+        assert opaque_issues[0].severity == IssueSeverity.WARNING
         assert not [
             issue
             for issue in result.issues
-            if "opaque_lambda" in issue.message and issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+            if "opaque_lambda" in issue.message and issue.severity == IssueSeverity.CRITICAL
         ]
 
     def test_stringlookup_external_vocabulary_path_triggers_cve_2025_12058(self, tmp_path: Path) -> None:

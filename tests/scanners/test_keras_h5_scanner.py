@@ -804,7 +804,7 @@ def test_lambda_safe_prefix_with_comment_token_in_malicious_payload_is_flagged(t
     )
 
 
-def test_lambda_dict_bytecode_without_dangerous_patterns_is_info_only(tmp_path: Path) -> None:
+def test_lambda_dict_bytecode_without_dangerous_patterns_stays_warning(tmp_path: Path) -> None:
     encoded_code = base64.b64encode(marshal.dumps((lambda x: x + 1).__code__)).decode()
     model_path = create_custom_h5_file(
         tmp_path,
@@ -831,11 +831,11 @@ def test_lambda_dict_bytecode_without_dangerous_patterns_is_info_only(tmp_path: 
         issue for issue in result.issues if "embedded bytecode" in issue.message and "safe_dict_lambda" in issue.message
     ]
     assert len(bytecode_issues) == 1
-    assert bytecode_issues[0].severity == IssueSeverity.INFO
+    assert bytecode_issues[0].severity == IssueSeverity.WARNING
     assert not [
         issue
         for issue in result.issues
-        if "safe_dict_lambda" in issue.message and issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        if "safe_dict_lambda" in issue.message and issue.severity == IssueSeverity.CRITICAL
     ]
 
 
