@@ -124,6 +124,41 @@ def test_flax_msgpack_restore_fn_dangerous_value_still_critical(tmp_path: Path) 
     )
 
 
+@pytest.mark.parametrize(
+    ("metadata_key", "dangerous_callable"),
+    [
+        ("restore_fn", "eval"),
+        ("jax_fn", "exec"),
+        ("compiled_fn", "compile"),
+        ("exec_fn", "os.system"),
+        ("transform_fn", "subprocess.run"),
+        ("__tree_flatten__", "__import__"),
+        ("__tree_unflatten__", "subprocess.Popen"),
+    ],
+)
+def test_flax_msgpack_function_metadata_key_value_combinations(
+    tmp_path: Path,
+    metadata_key: str,
+    dangerous_callable: str,
+) -> None:
+    """Function metadata keys should be value-aware across common callable names."""
+    for value, should_be_critical in ((dangerous_callable, True), ("custom_deserialize", False)):
+        path = tmp_path / f"{metadata_key.strip('_') or 'dunder'}_{value.replace('.', '_')}.msgpack"
+        create_msgpack_file(path, {"params": {"w": [1, 2, 3]}, metadata_key: value})
+
+        result = FlaxMsgpackScanner().scan(str(path))
+        key_critical_issues = [
+            issue
+            for issue in result.issues
+            if issue.severity == IssueSeverity.CRITICAL and metadata_key in issue.message
+        ]
+
+        if should_be_critical:
+            assert key_critical_issues, f"Expected CRITICAL for {metadata_key}={value!r}: {result.issues}"
+        else:
+            assert not key_critical_issues, f"Expected no CRITICAL for {metadata_key}={value!r}: {result.issues}"
+
+
 def test_flax_msgpack_jax_internal_key_metadata_is_not_critical(tmp_path: Path) -> None:
     """JAX internal metadata key names should not become critical without dangerous values."""
     path = tmp_path / "benign_jax_internal_keys.msgpack"
