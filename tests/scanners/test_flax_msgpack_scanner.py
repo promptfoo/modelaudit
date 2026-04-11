@@ -96,6 +96,69 @@ def test_flax_msgpack_malicious_content_marks_scan_unsuccessful(tmp_path: Path) 
     )
 
 
+def test_flax_msgpack_restore_fn_custom_value_no_critical(tmp_path: Path) -> None:
+    """Benign Orbax restore function names should not be key-name criticals."""
+    path = tmp_path / "benign_restore_fn.msgpack"
+    create_msgpack_file(path, {"params": {"w": [1, 2, 3]}, "restore_fn": "custom_deserialize"})
+
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    assert result.success is True
+    assert not [
+        issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL and "restore_fn" in issue.message
+    ]
+
+
+def test_flax_msgpack_restore_fn_dangerous_value_still_critical(tmp_path: Path) -> None:
+    """Function metadata that directly names dangerous callables should stay critical."""
+    path = tmp_path / "dangerous_restore_fn.msgpack"
+    create_msgpack_file(path, {"params": {"w": [1, 2, 3]}, "restore_fn": "eval"})
+
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    assert result.success is False
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and issue.message == "Suspicious object attribute value detected: restore_fn"
+        for issue in result.issues
+    )
+
+
+def test_flax_msgpack_jax_internal_key_metadata_is_not_critical(tmp_path: Path) -> None:
+    """JAX internal metadata key names should not become critical without dangerous values."""
+    path = tmp_path / "benign_jax_internal_keys.msgpack"
+    create_msgpack_file(
+        path,
+        {
+            "params": {"w": [1, 2, 3]},
+            "__jax_array__": {"dtype": "float32", "shape": [3]},
+            "__tree_flatten__": "tree_def",
+            "__tree_unflatten__": "tree_def",
+        },
+    )
+
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    critical_messages = [issue.message for issue in result.issues if issue.severity == IssueSeverity.CRITICAL]
+    assert not any("__jax_array__" in message for message in critical_messages)
+    assert not any("__tree_flatten__" in message for message in critical_messages)
+    assert not any("__tree_unflatten__" in message for message in critical_messages)
+
+
+def test_flax_msgpack_metadata_system_os_keys_not_critical(tmp_path: Path) -> None:
+    """Environment-like top-level metadata keys should not be unconditional criticals."""
+    path = tmp_path / "benign_system_metadata.msgpack"
+    create_msgpack_file(path, {"params": {"w": [1, 2, 3]}, "system": "linux", "os": "linux-x86_64"})
+
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    assert not [
+        issue
+        for issue in result.issues
+        if issue.severity == IssueSeverity.CRITICAL and "top-level keys" in issue.message.lower()
+    ]
+
+
 def test_flax_msgpack_respects_file_size_limit(tmp_path: Path) -> None:
     """Scanner should fail closed before reading files larger than max_file_read_size."""
     path = tmp_path / "too_large.msgpack"
@@ -376,9 +439,11 @@ def test_flax_msgpack_jax_specific_threats(tmp_path):
     scanner = FlaxMsgpackScanner()
     result = scanner.scan(str(path))
 
-    # Should detect multiple threats (CRITICAL or INFO severity)
+    # Should detect multiple threats (CRITICAL, WARNING, or INFO severity)
     security_issues = [
-        issue for issue in result.issues if issue.severity in (IssueSeverity.CRITICAL, IssueSeverity.INFO)
+        issue
+        for issue in result.issues
+        if issue.severity in (IssueSeverity.CRITICAL, IssueSeverity.WARNING, IssueSeverity.INFO)
     ]
 
     # Check for JAX-specific threats
