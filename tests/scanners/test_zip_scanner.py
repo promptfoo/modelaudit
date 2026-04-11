@@ -511,8 +511,7 @@ class TestZipScanner:
         """High compression-ratio entries should be reported without extracting them."""
         archive_path = tmp_path / "suspicious.zip"
         with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
-            # Keep highly compressible but smaller to speed CI.
-            z.writestr("suspicious.txt", "A" * 300000)
+            z.writestr("suspicious.txt", "A" * (2 * 1024 * 1024))
 
         nested_scan_paths: list[str] = []
 
@@ -532,11 +531,39 @@ class TestZipScanner:
         assert compression_issues[0].details["entry"] == "suspicious.txt"
         assert "skipping extraction" in compression_issues[0].message
 
+    def test_small_high_compression_ratio_entry_stays_clean(self, tmp_path: Path) -> None:
+        """Small repetitive metadata should not be treated as a ZIP bomb."""
+        archive_path = tmp_path / "metadata.zip"
+        with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+            z.writestr("metadata.txt", "A" * 16384)
+
+        nested_scan_paths: list[str] = []
+
+        def nested_scan(path: str, _config: dict[str, Any]) -> ScanResult:
+            nested_scan_paths.append(path)
+            return ScanResult(scanner_name="test")
+
+        scanner = ZipScanner(config={NESTED_SCAN_CALLBACK_CONFIG_KEY: nested_scan})
+        result = scanner.scan(str(archive_path))
+
+        assert result.success is True
+        assert any(path.endswith("_metadata.txt") for path in nested_scan_paths)
+        assert not [issue for issue in result.issues if issue.rule_code == "S410"]
+        compression_checks = [
+            check
+            for check in result.checks
+            if check.name == "Compression Ratio Check" and check.details.get("entry") == "metadata.txt"
+        ]
+        assert len(compression_checks) == 1
+        assert compression_checks[0].status == CheckStatus.PASSED
+        assert "size floor" in compression_checks[0].message
+        assert compression_checks[0].details["min_uncompressed_size"] == 1024 * 1024
+
     def test_zip_bomb_detection_skips_only_suspicious_entry(self, tmp_path: Path) -> None:
         """Suspicious entries should be skipped while safe entries still route to nested scanning."""
         archive_path = tmp_path / "mixed.zip"
         with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
-            z.writestr("suspicious.txt", "A" * 300000)
+            z.writestr("suspicious.txt", "A" * (2 * 1024 * 1024))
             z.writestr("safe.bin", os.urandom(4096))
 
         nested_scan_paths: list[str] = []

@@ -38,6 +38,8 @@ class ZipScanner(BaseScanner):
     supported_extensions: ClassVar[list[str]] = [".zip", ".npz", ".mar"]
     MAX_MAR_PYTHON_ANALYSIS_BYTES: ClassVar[int] = 10 * 1024 * 1024
     MAX_SYMLINK_TARGET_BYTES: ClassVar[int] = 64 * 1024
+    MAX_COMPRESSION_RATIO: ClassVar[int] = 100
+    MIN_COMPRESSION_BOMB_UNCOMPRESSED_SIZE: ClassVar[int] = 1024 * 1024
 
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
@@ -46,6 +48,11 @@ class ZipScanner(BaseScanner):
             "max_zip_entries",
             10000,
         )  # Limit number of entries
+        self.max_compression_ratio = self.MAX_COMPRESSION_RATIO
+        self.min_compression_bomb_uncompressed_size = self._normalize_positive_int_config(
+            self.config.get("zip_min_compression_bomb_uncompressed_size"),
+            self.MIN_COMPRESSION_BOMB_UNCOMPRESSED_SIZE,
+        )
 
     def _get_zip_depth(self) -> int:
         """Return the current nested ZIP depth from config."""
@@ -353,13 +360,16 @@ class ZipScanner(BaseScanner):
                 # Check compression ratio for zip bomb detection
                 if info.compress_size > 0:
                     compression_ratio = info.file_size / info.compress_size
-                    if compression_ratio > 100:
+                    if (
+                        compression_ratio > self.max_compression_ratio
+                        and info.file_size >= self.min_compression_bomb_uncompressed_size
+                    ):
                         result.add_check(
                             name="Compression Ratio Check",
                             passed=False,
                             message=(
-                                f"Suspicious compression ratio ({compression_ratio:.1f}x) in entry: {name}; "
-                                "skipping extraction"
+                                f"Suspicious compression ratio ({compression_ratio:.1f}x) and "
+                                f"uncompressed size ({info.file_size} bytes) in entry: {name}; skipping extraction"
                             ),
                             severity=IssueSeverity.WARNING,
                             rule_code="S410",  # Archive bomb
@@ -369,24 +379,32 @@ class ZipScanner(BaseScanner):
                                 "compressed_size": info.compress_size,
                                 "uncompressed_size": info.file_size,
                                 "ratio": compression_ratio,
-                                "threshold": 100,
+                                "threshold": self.max_compression_ratio,
+                                "min_uncompressed_size": self.min_compression_bomb_uncompressed_size,
                             },
                         )
                         scan_complete = False
                         continue
                     else:
                         # Record safe compression ratio
+                        if compression_ratio > self.max_compression_ratio:
+                            message = (
+                                f"Compression ratio ({compression_ratio:.1f}x) is below actionable size floor: {name}"
+                            )
+                        else:
+                            message = f"Compression ratio ({compression_ratio:.1f}x) is within safe limits: {name}"
                         result.add_check(
                             name="Compression Ratio Check",
                             passed=True,
-                            message=f"Compression ratio ({compression_ratio:.1f}x) is within safe limits: {name}",
+                            message=message,
                             location=f"{path}:{name}",
                             details={
                                 "entry": name,
                                 "compressed_size": info.compress_size,
                                 "uncompressed_size": info.file_size,
                                 "ratio": compression_ratio,
-                                "threshold": 100,
+                                "threshold": self.max_compression_ratio,
+                                "min_uncompressed_size": self.min_compression_bomb_uncompressed_size,
                             },
                             rule_code=None,  # Passing check
                         )

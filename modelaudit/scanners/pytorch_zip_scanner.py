@@ -149,6 +149,7 @@ class PyTorchZipScanner(BaseScanner):
 
     # Security limits for archive manipulation protection
     MAX_COMPRESSION_RATIO: ClassVar[int] = 100  # 100:1 compression ratio threshold
+    MIN_COMPRESSION_BOMB_UNCOMPRESSED_SIZE: ClassVar[int] = 1024 * 1024
     MAX_ARCHIVE_ENTRIES: ClassVar[int] = 10000  # Maximum number of entries in archive
 
     def __init__(self, config: dict[str, Any] | None = None):
@@ -159,6 +160,10 @@ class PyTorchZipScanner(BaseScanner):
         self._relaxed_crc_tracker = RelaxedZipCrcTracker()
         # Configurable limits (can override class defaults via config)
         self.max_compression_ratio = self.config.get("max_compression_ratio", self.MAX_COMPRESSION_RATIO)
+        self.min_compression_bomb_uncompressed_size = self._normalize_positive_int_config(
+            self.config.get("min_compression_bomb_uncompressed_size"),
+            self.MIN_COMPRESSION_BOMB_UNCOMPRESSED_SIZE,
+        )
         self.max_archive_entries = self.config.get("max_archive_entries", self.MAX_ARCHIVE_ENTRIES)
 
     @classmethod
@@ -530,11 +535,17 @@ class PyTorchZipScanner(BaseScanner):
             # where the size field is zero) are skipped since ratio is undefined.
             if info.compress_size > 0:
                 compression_ratio = info.file_size / info.compress_size
-                if compression_ratio > self.max_compression_ratio:
+                if (
+                    compression_ratio > self.max_compression_ratio
+                    and info.file_size >= self.min_compression_bomb_uncompressed_size
+                ):
                     result.add_check(
                         name="Compression Ratio Check",
                         passed=False,
-                        message=f"Suspicious compression ratio ({compression_ratio:.1f}x) in entry: {name}",
+                        message=(
+                            f"Suspicious compression ratio ({compression_ratio:.1f}x) and "
+                            f"uncompressed size ({info.file_size} bytes) in entry: {name}"
+                        ),
                         severity=IssueSeverity.WARNING,
                         location=f"{path}:{name}",
                         details={
@@ -543,6 +554,7 @@ class PyTorchZipScanner(BaseScanner):
                             "uncompressed_size": info.file_size,
                             "ratio": compression_ratio,
                             "threshold": self.max_compression_ratio,
+                            "min_uncompressed_size": self.min_compression_bomb_uncompressed_size,
                             "risk": "High compression ratio may indicate a decompression bomb",
                         },
                         why="Decompression bombs use high compression ratios to exhaust system resources",
@@ -576,7 +588,10 @@ class PyTorchZipScanner(BaseScanner):
                 passed=True,
                 message="All entries have safe compression ratios",
                 location=path,
-                details={"threshold": self.max_compression_ratio},
+                details={
+                    "threshold": self.max_compression_ratio,
+                    "min_uncompressed_size": self.min_compression_bomb_uncompressed_size,
+                },
             )
 
         if not duplicate_entry_collisions_found and archive_entries:
