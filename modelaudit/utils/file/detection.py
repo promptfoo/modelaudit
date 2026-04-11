@@ -986,6 +986,8 @@ def detect_file_format(path: str) -> str:
         return "sevenzip"
     if _is_tar_archive(path):
         return "tar"
+    if compression_format:
+        return compression_format
     # Check ZIP magic first (for .pt/.pth files that are actually zips)
     if magic4.startswith(b"PK"):
         if ext == ".mar" and is_torchserve_mar_archive(path):
