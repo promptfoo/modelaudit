@@ -30,6 +30,14 @@ from .pytorch_zip_support import (
 
 logger = logging.getLogger(__name__)
 _INSTALLED_PYTORCH_VERSION_UNSET = object()
+_TORCHSCRIPT_DEBUG_PAYLOAD_MARKER = b"FORMAT_WITH_STRING_TABLE"
+_TORCHSCRIPT_DEBUG_PREFIX_BYTES = 256
+_TORCHSCRIPT_SOURCE_MAX_BYTES = 1024 * 1024
+_TORCHSCRIPT_GENERATED_CLASS_PATTERN = re.compile(r"(?m)^class\s+[A-Za-z_][A-Za-z0-9_]*\(Module\):\s*$")
+_TORCHSCRIPT_GENERATED_METHOD_PATTERN = re.compile(r"(?m)^\s+def\s+\w+\(self:\s+__torch__\.")
+_TORCHSCRIPT_FORBIDDEN_SOURCE_PATTERN = re.compile(
+    r"(?im)(?:^\s*(?:import|from)\s+|\b(?:__import__|eval|exec|compile|open)\s*\(|\b(?:os|subprocess|socket|requests)\s*\.)"
+)
 
 
 @dataclass(frozen=True)
@@ -225,7 +233,7 @@ class PyTorchZipScanner(BaseScanner):
                 bytes_scanned += self._scan_for_jit_patterns(zip_file, safe_entries, result, path)
 
                 # Detect suspicious non-pickle files
-                self._detect_suspicious_files(safe_entries, result, path)
+                self._detect_suspicious_files(zip_file, safe_entries, result, path)
 
                 # Validate PyTorch model structure
                 self._validate_pytorch_structure(pickle_files, result)
@@ -266,28 +274,80 @@ class PyTorchZipScanner(BaseScanner):
         return get_zip_member_names(entries)
 
     @staticmethod
-    def _is_torchscript_generated_python(name: str, member_names: set[str]) -> bool:
-        """Return true for TorchScript's generated Python source archive layout."""
+    def _torchscript_debug_member_name(name: str, member_names: set[str]) -> str | None:
+        """Return the sibling TorchScript debug member name for a generated-source path."""
         normalized = name.replace("\\", "/").lstrip("/").lower()
         parts = tuple(part for part in normalized.split("/") if part)
         if not parts or not parts[-1].endswith(".py"):
-            return False
+            return None
 
         try:
             code_index = parts.index("code")
         except ValueError:
-            return False
+            return None
 
         # TorchScript writes generated Python directly under the archive root
         # (optionally behind a single top-level archive prefix like "archive/").
         if code_index > 1:
-            return False
+            return None
 
         torchscript_parts = parts[code_index + 1 :]
         is_generated_path = torchscript_parts == ("__torch__.py",) or (
             len(torchscript_parts) > 1 and torchscript_parts[0] == "__torch__"
         )
-        return is_generated_path and f"{normalized}.debug_pkl" in member_names
+        debug_name = f"{normalized}.debug_pkl"
+        if not is_generated_path or debug_name not in member_names:
+            return None
+        return debug_name
+
+    @staticmethod
+    def _looks_like_torchscript_generated_source(source: bytes) -> bool:
+        """Return true when source text has TorchScript-generated structure and no Python escape hatches."""
+        try:
+            text = source.decode("utf-8")
+        except UnicodeDecodeError:
+            return False
+
+        if _TORCHSCRIPT_FORBIDDEN_SOURCE_PATTERN.search(text):
+            return False
+        return (
+            "__parameters__ = [" in text
+            and "__buffers__ = [" in text
+            and _TORCHSCRIPT_GENERATED_CLASS_PATTERN.search(text) is not None
+            and _TORCHSCRIPT_GENERATED_METHOD_PATTERN.search(text) is not None
+        )
+
+    def _is_torchscript_generated_python(
+        self,
+        zip_file: zipfile.ZipFile,
+        entry: zipfile.ZipInfo,
+        debug_entry: zipfile.ZipInfo,
+        result: ScanResult,
+    ) -> bool:
+        """Return true for validated TorchScript-generated Python source members."""
+        try:
+            debug_prefix = self._read_member_prefix(
+                zip_file,
+                debug_entry,
+                _TORCHSCRIPT_DEBUG_PREFIX_BYTES,
+                phase="torchscript generated source validation",
+                result=result,
+            )
+            if _TORCHSCRIPT_DEBUG_PAYLOAD_MARKER not in debug_prefix:
+                return False
+
+            source = self._read_member_bytes(
+                zip_file,
+                entry,
+                phase="torchscript generated source validation",
+                result=result,
+                max_bytes=_TORCHSCRIPT_SOURCE_MAX_BYTES,
+            )
+        except Exception as exc:
+            logger.debug("Unable to validate TorchScript generated source member %s: %s", entry.filename, exc)
+            return False
+
+        return self._looks_like_torchscript_generated_source(source)
 
     @staticmethod
     def _find_zip_entry(entries: list[zipfile.ZipInfo], member_name: str) -> zipfile.ZipInfo | None:
@@ -813,6 +873,7 @@ class PyTorchZipScanner(BaseScanner):
 
     def _detect_suspicious_files(
         self,
+        zip_file: zipfile.ZipFile,
         safe_entries: list[zipfile.ZipInfo],
         result: ScanResult,
         path: str,
@@ -823,13 +884,23 @@ class PyTorchZipScanner(BaseScanner):
         member_names = {
             self._get_zip_member_name(entry).replace("\\", "/").lstrip("/").lower() for entry in safe_entries
         }
+        entries_by_normalized_name = {
+            self._get_zip_member_name(entry).replace("\\", "/").lstrip("/").lower(): entry for entry in safe_entries
+        }
 
         for entry in safe_entries:
             name = self._get_zip_member_name(entry)
             normalized_name = name.lower()
             # Check for Python code files
             if normalized_name.endswith(".py"):
-                if self._is_torchscript_generated_python(name, member_names):
+                debug_member_name = self._torchscript_debug_member_name(name, member_names)
+                debug_entry = entries_by_normalized_name.get(debug_member_name or "")
+                if debug_entry is not None and self._is_torchscript_generated_python(
+                    zip_file,
+                    entry,
+                    debug_entry,
+                    result,
+                ):
                     continue
                 result.add_check(
                     name="Python Code File Detection",

@@ -507,11 +507,40 @@ def test_pytorch_zip_scans_non_numeric_files_in_archive_data(tmp_path):
 
 def test_pytorch_zip_allows_torchscript_generated_python_files(tmp_path: Path) -> None:
     model_path = create_mock_pytorch_zip(tmp_path / "scripted.pt", prefix="archive")
+    debug_pkl = b"\x80\x02X\x18\x00\x00\x00FORMAT_WITH_STRING_TABLEq\x00."
     with zipfile.ZipFile(model_path, "a") as zip_file:
-        zip_file.writestr("archive/code/__torch__.py", "class Module:\n    pass\n")
-        zip_file.writestr("archive/code/__torch__.py.debug_pkl", b"\x80\x04N.")
-        zip_file.writestr("archive/code/__torch__/torch/nn/modules/container.py", "class Sequential:\n    pass\n")
-        zip_file.writestr("archive/code/__torch__/torch/nn/modules/container.py.debug_pkl", b"\x80\x04N.")
+        zip_file.writestr(
+            "archive/code/__torch__.py",
+            "\n".join(
+                [
+                    "class Module(Module):",
+                    "  __parameters__ = []",
+                    "  __buffers__ = []",
+                    "  training : bool",
+                    "  def forward(self: __torch__.Module,",
+                    "    x: Tensor) -> Tensor:",
+                    "    return torch.relu(x)",
+                    "",
+                ]
+            ),
+        )
+        zip_file.writestr("archive/code/__torch__.py.debug_pkl", debug_pkl)
+        zip_file.writestr(
+            "archive/code/__torch__/torch/nn/modules/container.py",
+            "\n".join(
+                [
+                    "class Sequential(Module):",
+                    "  __parameters__ = []",
+                    "  __buffers__ = []",
+                    "  training : bool",
+                    "  def forward(self: __torch__.torch.nn.modules.container.Sequential,",
+                    "    x: Tensor) -> Tensor:",
+                    "    return x",
+                    "",
+                ]
+            ),
+        )
+        zip_file.writestr("archive/code/__torch__/torch/nn/modules/container.py.debug_pkl", debug_pkl)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -581,6 +610,39 @@ def test_pytorch_zip_warns_on_unpaired_python_under_torchscript_tree(tmp_path: P
     model_path = create_mock_pytorch_zip(tmp_path / "model.pt", prefix="archive")
     with zipfile.ZipFile(model_path, "a") as zip_file:
         zip_file.writestr("archive/code/__torch__/payload.py", "import os\nos.system('id')\n")
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    python_failures = [
+        check
+        for check in result.checks
+        if check.name == "Python Code File Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert any(check.details.get("file") == "archive/code/__torch__/payload.py" for check in python_failures)
+    assert all(check.severity == IssueSeverity.WARNING for check in python_failures)
+
+
+def test_pytorch_zip_warns_on_forged_torchscript_debug_pair(tmp_path: Path) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "model.pt", prefix="archive")
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr(
+            "archive/code/__torch__/payload.py",
+            "\n".join(
+                [
+                    "class Payload(Module):",
+                    "  __parameters__ = []",
+                    "  __buffers__ = []",
+                    "  def forward(self: __torch__.Payload,",
+                    "    x: Tensor) -> Tensor:",
+                    "    return __import__('os').system('id')",
+                    "",
+                ]
+            ),
+        )
+        zip_file.writestr(
+            "archive/code/__torch__/payload.py.debug_pkl",
+            b"\x80\x02X\x18\x00\x00\x00FORMAT_WITH_STRING_TABLEq\x00.",
+        )
 
     result = PyTorchZipScanner().scan(str(model_path))
 
