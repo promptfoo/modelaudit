@@ -236,6 +236,8 @@ def _create_results(issues: list, rule_indices: dict[str, int] | None = None) ->
 
         # Add properties with additional details
         properties = dict(issue.details or {})
+        properties.pop("rule_code", None)
+        properties.pop("issue_type", None)
         rule_code = _get_issue_rule_code(issue)
         if rule_code:
             properties["rule_code"] = rule_code

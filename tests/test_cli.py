@@ -260,12 +260,14 @@ def test_scan_sarif_subprocess_single_skipped_file_reports_cli_exit_code(tmp_pat
     """SARIF invocation metadata should reflect the CLI exit code for skipped scans."""
     skipped_file = tmp_path / "skip.py"
     skipped_file.write_text("print('hello')\n")
+    env = {**os.environ, "PROMPTFOO_DISABLE_TELEMETRY": "1"}
 
     completed = subprocess.run(
         [sys.executable, "-m", "modelaudit", "scan", str(skipped_file), "--format", "sarif", "--no-cache"],
         check=False,
         capture_output=True,
         text=True,
+        env=env,
     )
 
     assert completed.returncode == 2
@@ -280,18 +282,21 @@ def test_scan_sarif_subprocess_single_skipped_file_reports_cli_exit_code(tmp_pat
 def test_scan_sarif_subprocess_preserves_modelaudit_rule_codes() -> None:
     """SARIF rule identifiers should match ModelAudit rule codes from JSON output."""
     model_file = Path("tests/assets/samples/pickles/malicious_system_call.pkl").resolve()
+    env = {**os.environ, "PROMPTFOO_DISABLE_TELEMETRY": "1"}
 
     json_completed = subprocess.run(
         [sys.executable, "-m", "modelaudit", "scan", str(model_file), "--format", "json", "--no-cache"],
         check=False,
         capture_output=True,
         text=True,
+        env=env,
     )
     sarif_completed = subprocess.run(
         [sys.executable, "-m", "modelaudit", "scan", str(model_file), "--format", "sarif", "--no-cache"],
         check=False,
         capture_output=True,
         text=True,
+        env=env,
     )
 
     assert json_completed.returncode == 1
