@@ -108,6 +108,33 @@ def _select_preferred_scanner_id(path: str, header_format: str, ext: str) -> str
     return _registry.get_scanner_id_for_header_format(header_format)
 
 
+def _is_direct_header_route(scanner_id: str, header_format: str) -> bool:
+    """Return whether the detected header directly maps to this scanner."""
+    return header_format != "unknown" and HEADER_FORMAT_TO_SCANNER_ID.get(header_format) == scanner_id
+
+
+def _preferred_scanner_can_handle(
+    scanner_class: type[BaseScanner],
+    scanner_id: str,
+    header_format: str,
+    path: str,
+) -> bool:
+    """Honor trusted header routing even when scanner can_handle is suffix-gated."""
+    if scanner_class.can_handle(path):
+        return True
+
+    if os.path.exists(path) and _is_direct_header_route(scanner_id, header_format):
+        logger.debug(
+            "Using %s scanner for %s based on detected %s header despite can_handle rejection",
+            scanner_class.name,
+            path,
+            header_format,
+        )
+        return True
+
+    return False
+
+
 def _calculate_file_hash(file_path: str) -> str:
     """Calculate SHA256 hash of a file for deduplication purposes.
 
@@ -935,7 +962,11 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     progress_callback = config.get("progress_callback")
     timeout = config.get("timeout", 3600)
 
-    if preferred_scanner and preferred_scanner.can_handle(path):
+    if (
+        preferred_scanner
+        and scanner_id
+        and _preferred_scanner_can_handle(preferred_scanner, scanner_id, header_format, path)
+    ):
         logger.debug(
             f"Using {preferred_scanner.name} scanner for {path} based on header",
         )
