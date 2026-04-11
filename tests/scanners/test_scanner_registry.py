@@ -343,6 +343,14 @@ def test_select_nested_scanner_id_routes_compressed_r_serialized_members(tmp_pat
     assert _select_nested_scanner_id(str(member_path)) == "r_serialized"
 
 
+def test_select_nested_scanner_id_does_not_route_compressed_non_target_suffix_to_r_serialized(
+    tmp_path: Path,
+) -> None:
+    member_path = _write_gzip_r_serialized(tmp_path / "workspace.txt", "workspace\nmodel")
+
+    assert _select_nested_scanner_id(str(member_path)) != "r_serialized"
+
+
 @pytest.mark.parametrize(
     ("header_format", "scanner_id"),
     [
