@@ -17,6 +17,7 @@ from modelaudit.utils.sources.jfrog import (
     get_storage_api_url,
     is_jfrog_url,
     list_jfrog_folder_contents,
+    redact_jfrog_url_for_display,
 )
 
 
@@ -49,6 +50,16 @@ class TestJFrogURLDetection:
 
 
 class TestJFrogDownload:
+    def test_redact_jfrog_url_for_display(self) -> None:
+        raw_url = "https://user:leaky-pass@company.jfrog.io/artifactory/repo/model.bin?token=leaky-token#fragment"
+
+        redacted = redact_jfrog_url_for_display(raw_url)
+
+        assert redacted == "https://<credentials-redacted>@company.jfrog.io/artifactory/repo/model.bin"
+        assert "leaky-pass" not in redacted
+        assert "leaky-token" not in redacted
+        assert "fragment" not in redacted
+
     @patch("modelaudit.utils.sources.jfrog.requests.get")
     def test_download_success(self, mock_get, tmp_path):
         # Mock successful response
@@ -138,6 +149,25 @@ class TestJFrogDownload:
         # Verify request was made without auth headers
         call_args = mock_get.call_args
         assert not call_args[1]["headers"]  # Empty headers dict
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    def test_download_error_redacts_sensitive_url(self, mock_get, tmp_path):
+        """Download errors should not expose URL credentials or query tokens."""
+        mock_response = mock_get.return_value
+        mock_error_response = MagicMock(spec=requests.Response)
+        mock_error_response.status_code = 401
+        mock_response.raise_for_status.side_effect = requests.exceptions.HTTPError(response=mock_error_response)
+        raw_url = "https://user:leaky-pass@company.jfrog.io/artifactory/repo/model.bin?token=leaky-token"
+
+        with pytest.raises(Exception) as excinfo:
+            download_artifact(raw_url, cache_dir=tmp_path)
+
+        message = str(excinfo.value)
+        assert "https://<credentials-redacted>@company.jfrog.io/artifactory/repo/model.bin" in message
+        assert "user:leaky-pass" not in message
+        assert "leaky-token" not in message
+        assert "?token=" not in message
+        assert mock_get.call_args[0][0] == raw_url
 
     @patch("modelaudit.utils.sources.jfrog.requests.get")
     def test_import_does_not_load_dotenv_from_cwd(self, mock_get, tmp_path):

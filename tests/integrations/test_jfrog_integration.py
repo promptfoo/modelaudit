@@ -1,4 +1,5 @@
 import hashlib
+import logging
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -76,7 +77,54 @@ def test_scan_jfrog_artifact_success(mock_scan, mock_download, mock_detect, mock
     metadata = results.metadata
     assert "jfrog_source" in metadata
     assert metadata["jfrog_source"]["type"] == "file"
+    assert metadata["jfrog_source"]["url"] == "https://company.jfrog.io/artifactory/repo/model.pt"
     assert metadata["jfrog_source"]["repo"] == "test-repo"
+
+
+@patch("modelaudit.integrations.jfrog.shutil.rmtree")
+@patch("modelaudit.integrations.jfrog.tempfile.mkdtemp")
+@patch("modelaudit.integrations.jfrog.detect_jfrog_target_type")
+@patch("modelaudit.integrations.jfrog.download_artifact")
+@patch("modelaudit.core.scan_model_directory_or_file")
+def test_scan_jfrog_artifact_redacts_source_url(
+    mock_scan: MagicMock,
+    mock_download: MagicMock,
+    mock_detect: MagicMock,
+    mock_mkdtemp: MagicMock,
+    mock_rmtree: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """JFrog scan logs and metadata should not store URL credentials."""
+    temp_dir = "/tmp/modelaudit_jfrog_test"
+    mock_mkdtemp.return_value = temp_dir
+    mock_detect.return_value = {"type": "file", "repo": "test-repo"}
+    mock_download.return_value = Path(f"{temp_dir}/model.pt")
+
+    from modelaudit.models import create_initial_audit_result
+
+    mock_result = create_initial_audit_result()
+    mock_scan.return_value = mock_result
+    raw_url = "https://user:leaky-pass@company.jfrog.io/artifactory/repo/model.pt?token=leaky-token"
+
+    with caplog.at_level(logging.DEBUG, logger="modelaudit.integrations.jfrog"):
+        results = scan_jfrog_artifact(raw_url, api_token="token")
+
+    assert results.metadata["jfrog_source"]["url"] == (
+        "https://<credentials-redacted>@company.jfrog.io/artifactory/repo/model.pt"
+    )
+    assert "user:leaky-pass" not in caplog.text
+    assert "leaky-token" not in caplog.text
+    assert "user:leaky-pass" not in results.metadata["jfrog_source"]["url"]
+    assert "leaky-token" not in results.metadata["jfrog_source"]["url"]
+    mock_detect.assert_called_once_with(raw_url, api_token="token", access_token=None, timeout=30)
+    mock_download.assert_called_once_with(
+        raw_url,
+        cache_dir=Path(temp_dir),
+        api_token="token",
+        access_token=None,
+        timeout=3600,
+    )
+    mock_rmtree.assert_called_once_with(Path(temp_dir), ignore_errors=True)
 
 
 @patch("modelaudit.integrations.jfrog.shutil.rmtree")
