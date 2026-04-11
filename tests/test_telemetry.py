@@ -662,7 +662,7 @@ class TestTelemetryIntegration:
             # Should still work without PostHog
             assert client._posthog_client is None
 
-    @patch("modelaudit.core.record_issue_found")
+    @patch("modelaudit.core_results.record_issue_found")
     def test_core_scan_emits_issue_found_telemetry(self, mock_record_issue_found):
         """Core scans should emit issue telemetry for detected findings."""
         from modelaudit.core import scan_model_directory_or_file
