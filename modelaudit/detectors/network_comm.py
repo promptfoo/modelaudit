@@ -6,6 +6,7 @@ that could be used for data exfiltration or command & control operations.
 
 import ipaddress
 import re
+from collections.abc import Iterator
 from typing import Any, ClassVar
 
 _DOC_CONTEXT_EXTENSIONS: tuple[str, ...] = (
@@ -84,6 +85,17 @@ def _extract_line(data: bytes, match_index: int) -> bytes:
     if line_end == -1:
         line_end = len(data)
     return data[line_start:line_end]
+
+
+def _iter_pattern_matches(data: bytes, pattern: bytes) -> Iterator[int]:
+    """Yield non-overlapping match positions for a byte pattern."""
+    start = 0
+    while True:
+        match_index = data.find(pattern, start)
+        if match_index < 0:
+            break
+        yield match_index
+        start = match_index + max(1, len(pattern))
 
 
 def _has_call_syntax(data: bytes, match_index: int, token_len: int) -> bool:
@@ -681,8 +693,7 @@ class NetworkCommDetector:
             patterns = [b"import " + lib, b"from " + lib, lib + b".connect", lib + b".request", lib + b".__init__"]
 
             for pattern in patterns:
-                match_index = data.find(pattern)
-                if match_index >= 0:
+                for match_index in _iter_pattern_matches(data, pattern):
                     if _is_doc_only_network_reference(
                         data,
                         match_index=match_index,
@@ -712,12 +723,14 @@ class NetworkCommDetector:
                         }
                     )
                     break  # One finding per library
+                else:
+                    continue
+                break
 
     def _scan_network_functions(self, data: bytes, context: str) -> None:
         """Scan for network function calls."""
         for func in self.NETWORK_FUNCTIONS:
-            idx = data.find(func)
-            if idx >= 0:
+            for idx in _iter_pattern_matches(data, func):
                 if _is_doc_only_network_reference(
                     data,
                     match_index=idx,
@@ -751,6 +764,7 @@ class NetworkCommDetector:
                         "context": context,
                     }
                 )
+                break
 
     def _scan_cc_patterns(self, data: bytes, context: str) -> None:
         """Scan for command & control patterns."""

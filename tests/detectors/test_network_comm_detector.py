@@ -153,6 +153,16 @@ class TestNetworkCommDetector:
         func_findings = [finding for finding in findings if finding["type"] == "network_function"]
         assert any(finding["function"] == "socket.connect" for finding in func_findings)
 
+    def test_network_function_after_doc_token_still_flagged(self) -> None:
+        """A prose token mention should not hide a later executable-looking function call."""
+        detector = NetworkCommDetector()
+        data = b'This README says requests.get is shown for examples.\nrequests.get("https://evil.example")'
+
+        findings = detector.scan(data, "metadata.json")
+
+        func_findings = [finding for finding in findings if finding["type"] == "network_function"]
+        assert any(finding["function"] == "requests.get" for finding in func_findings)
+
     def test_network_library_with_realistic_prose_context_not_flagged(self) -> None:
         """Import-like words in prose should not be treated as network imports."""
         detector = NetworkCommDetector()
@@ -170,6 +180,16 @@ class TestNetworkCommDetector:
         findings = detector.scan(data, "src/metadata_utils.py")
 
         assert any(finding["type"] == "network_library" for finding in findings)
+
+    def test_network_library_after_doc_import_still_flagged(self) -> None:
+        """A prose import mention should not hide a later executable import."""
+        detector = NetworkCommDetector()
+        data = b"Model documentation includes import socket for demos and troubleshooting examples.\nimport socket"
+
+        findings = detector.scan(data, "README.txt")
+
+        lib_findings = [finding for finding in findings if finding["type"] == "network_library"]
+        assert any(finding["library"] == "socket" for finding in lib_findings)
 
     def test_detect_cc_patterns(self):
         """Test detection of command & control patterns."""
