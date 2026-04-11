@@ -29,6 +29,12 @@ def test_scan_options_defaults_are_safe_and_finite() -> None:
         ({"post_budget_scan_bytes": True}, "post_budget_scan_bytes must be greater than or equal to 0"),
         ({"post_budget_scan_bytes": 1.5}, "post_budget_scan_bytes must be greater than or equal to 0"),
         ({"post_budget_scan_bytes": "1024"}, "post_budget_scan_bytes must be greater than or equal to 0"),
+        ({"max_string_literal_scan_chars": -1}, "max_string_literal_scan_chars must be greater than or equal to 0"),
+        ({"max_string_literal_scan_chars": True}, "max_string_literal_scan_chars must be greater than or equal to 0"),
+        ({"max_nested_pickle_bytes": -1}, "max_nested_pickle_bytes must be greater than or equal to 0"),
+        ({"max_nested_pickle_bytes": False}, "max_nested_pickle_bytes must be greater than or equal to 0"),
+        ({"max_nested_depth": -1}, "max_nested_depth must be greater than or equal to 0"),
+        ({"max_nested_depth": 1.5}, "max_nested_depth must be greater than or equal to 0"),
     ],
 )
 def test_scan_options_reject_invalid_resource_limits(

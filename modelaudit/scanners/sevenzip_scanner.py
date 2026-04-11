@@ -16,6 +16,8 @@ else:
 from ..utils import sanitize_archive_path
 from ._archive_config import get_archive_depth
 from ._archive_locations import rewrite_extracted_member_location
+from ._archive_outcomes import mark_archive_scan_incomplete, member_scan_incomplete
+from .archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 # Try to import py7zr with graceful fallback
@@ -278,6 +280,7 @@ class SevenZipScanner(BaseScanner):
                     "install_command": "pip install py7zr",
                 },
             )
+            mark_archive_scan_incomplete(result, "sevenzip_analysis_incomplete")
             result.finish(success=False)
             return result
 
@@ -311,6 +314,7 @@ class SevenZipScanner(BaseScanner):
                 location=path,
                 details={"error": str(e), "error_type": "invalid_format"},
             )
+            mark_archive_scan_incomplete(result, "sevenzip_analysis_incomplete")
             result.finish(success=False)
             return result
 
@@ -323,6 +327,7 @@ class SevenZipScanner(BaseScanner):
                 location=path,
                 details={"error": str(e), "error_type": "scan_failure"},
             )
+            mark_archive_scan_incomplete(result, "sevenzip_analysis_incomplete")
             result.finish(success=False)
             return result
 
@@ -345,6 +350,7 @@ class SevenZipScanner(BaseScanner):
         scan_complete = True
 
         if budget.should_stop():
+            mark_archive_scan_incomplete(result, "sevenzip_analysis_incomplete")
             result.finish(success=False)
             return result
 
@@ -357,6 +363,7 @@ class SevenZipScanner(BaseScanner):
                 location=path,
                 details={"depth": depth, "max_depth": self.max_depth},
             )
+            mark_archive_scan_incomplete(result, "sevenzip_analysis_incomplete")
             result.finish(success=False)
             return result
 
@@ -391,6 +398,7 @@ class SevenZipScanner(BaseScanner):
                 result.metadata["scannable_files"] = 0
                 result.metadata["unsafe_entries"] = 0
                 result.metadata["file_size"] = os.path.getsize(path)
+                mark_archive_scan_incomplete(result, "sevenzip_analysis_incomplete")
                 result.finish(success=False)
                 return result
 
@@ -417,6 +425,7 @@ class SevenZipScanner(BaseScanner):
                 result.metadata["scannable_files"] = 0
                 result.metadata["unsafe_entries"] = 0
                 result.metadata["file_size"] = os.path.getsize(path)
+                mark_archive_scan_incomplete(result, "sevenzip_analysis_incomplete")
                 result.finish(success=False)
                 return result
 
@@ -463,6 +472,8 @@ class SevenZipScanner(BaseScanner):
             result.metadata["unsafe_entries"] = len(file_names) - len(safe_file_names)
             result.metadata["file_size"] = os.path.getsize(path)
 
+        if not scan_complete or budget.should_stop():
+            mark_archive_scan_incomplete(result, "sevenzip_analysis_incomplete")
         result.finish(success=scan_complete and not budget.should_stop() and not result.has_errors)
         return result
 
@@ -851,6 +862,15 @@ class SevenZipScanner(BaseScanner):
                 preserve_non_delimited_suffix=True,
             )
 
+    def _scan_nested_archive_entry(self, path: str, nested_config: dict[str, Any]) -> ScanResult:
+        """Dispatch a nested archive member through an injected callback or registry fallback."""
+        nested_scan_callback = self.config.get(NESTED_SCAN_CALLBACK_CONFIG_KEY)
+        if callable(nested_scan_callback):
+            return nested_scan_callback(path, nested_config)
+        from .. import core
+
+        return core.scan_file(path, nested_config)
+
     def _scan_extracted_file(
         self,
         extracted_path: str,
@@ -869,15 +889,13 @@ class SevenZipScanner(BaseScanner):
                     budget=budget,
                 )
             else:
-                from .. import core
-
                 nested_config = dict(self.config)
                 nested_config["_archive_depth"] = depth + 1
-                file_result = core.scan_file(extracted_path, nested_config)
+                file_result = self._scan_nested_archive_entry(extracted_path, nested_config)
 
             self._rewrite_nested_result_context(file_result, extracted_path, archive_path, original_name)
             result.merge(file_result)
-            return file_result.success and not file_result.has_errors
+            return not member_scan_incomplete(file_result)
 
         except Exception as e:
             result.add_check(

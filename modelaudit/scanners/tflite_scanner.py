@@ -3,7 +3,7 @@
 import os
 from typing import Any, ClassVar
 
-from .base import BaseScanner, IssueSeverity, ScanResult
+from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 
 try:
     import tflite
@@ -18,6 +18,9 @@ _TFLITE_MAGIC_OFFSET = 4
 _TFLITE_MAGIC_SIZE = 4
 _TFLITE_MIN_HEADER_SIZE = _TFLITE_MAGIC_OFFSET + _TFLITE_MAGIC_SIZE
 _TFLITE_MAGIC_BYTES = b"TFL3"
+TFLITE_MAGIC_INCONCLUSIVE_REASON = "tflite_magic_validation_failed"
+TFLITE_PARSE_INCONCLUSIVE_REASON = "tflite_parse_incomplete"
+TFLITE_STRUCTURE_INCONCLUSIVE_REASON = "tflite_structure_validation_failed"
 
 
 def _has_tflite_magic_bytes(data: bytes) -> bool:
@@ -25,6 +28,16 @@ def _has_tflite_magic_bytes(data: bytes) -> bool:
         len(data) >= _TFLITE_MIN_HEADER_SIZE
         and data[_TFLITE_MAGIC_OFFSET : _TFLITE_MAGIC_OFFSET + _TFLITE_MAGIC_SIZE] == _TFLITE_MAGIC_BYTES
     )
+
+
+def _mark_inconclusive_scan_result(result: ScanResult, reason: str) -> None:
+    result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+    reasons = result.metadata.get("scan_outcome_reasons")
+    if not isinstance(reasons, list):
+        reasons = []
+    if reason not in reasons:
+        reasons.append(reason)
+    result.metadata["scan_outcome_reasons"] = reasons
 
 
 class TFLiteScanner(BaseScanner):
@@ -77,6 +90,7 @@ class TFLiteScanner(BaseScanner):
             # Check for TFLite magic bytes "TFL3" at offset 4
             # TFLite uses FlatBuffer format: bytes 0-3 are root table offset, bytes 4-7 are file identifier
             if not _has_tflite_magic_bytes(data):
+                _mark_inconclusive_scan_result(result, TFLITE_MAGIC_INCONCLUSIVE_REASON)
                 result.add_check(
                     name="TFLite Magic Bytes Check",
                     passed=False,
@@ -98,6 +112,7 @@ class TFLiteScanner(BaseScanner):
 
             model = tflite.Model.GetRootAsModel(data, 0)
         except Exception as e:  # pragma: no cover - parse errors
+            _mark_inconclusive_scan_result(result, TFLITE_PARSE_INCONCLUSIVE_REASON)
             result.add_check(
                 name="TFLite File Parse",
                 passed=False,
@@ -174,6 +189,7 @@ class TFLiteScanner(BaseScanner):
                             details={"operator_name": name, "operator_index": o_index},
                         )
         except Exception as e:  # pragma: no cover - malformed structure traversal
+            _mark_inconclusive_scan_result(result, TFLITE_STRUCTURE_INCONCLUSIVE_REASON)
             result.add_check(
                 name="TFLite Model Structure Parse",
                 passed=False,
