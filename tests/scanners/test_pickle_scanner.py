@@ -13,6 +13,7 @@ from collections import Counter
 from collections.abc import Callable, Iterator
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, BinaryIO, ClassVar, cast
 
 import pytest
@@ -34,6 +35,7 @@ from modelaudit.scanners.pickle_scanner import (
     _RAW_PATTERN_SCAN_LIMIT_BYTES,
     _RESYNC_FAST_FORWARD_PROBE_BYTES,
     PickleScanner,
+    _classify_nested_pickle_payload,
     _find_nested_pickle_match,
     _find_next_resync_stream_candidate_offset,
     _genops_with_fallback,
@@ -3503,6 +3505,56 @@ class TestDillLoadersRegression:
         ]
         assert nested_issues
         assert any(i.severity == IssueSeverity.CRITICAL for i in nested_issues)
+
+    def test_nested_pickle_parse_error_preserves_collected_dangerous_opcodes(self) -> None:
+        """Trailing parse errors should not hide dangerous nested opcodes already seen."""
+        severity, evidence, details = _classify_nested_pickle_payload(
+            _make_os_system_pickle()[:-1],
+            SimpleNamespace(offset=0),
+            {},
+        )
+
+        assert severity == IssueSeverity.CRITICAL
+        assert evidence == "dangerous_execution"
+        assert details["evidence"] == "dangerous_execution"
+        assert details["analysis_incomplete"] is True
+        assert "analysis_error_type" in details
+
+    def test_nested_pickle_budget_error_preserves_collected_dangerous_opcodes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Budget exhaustion should not discard dangerous nested opcodes already yielded."""
+        import modelaudit.scanners.pickle_scanner as pickle_scanner_module
+
+        dangerous_opcodes = list(pickletools.genops(_make_os_system_pickle()))
+
+        def _dangerous_then_budget(
+            file_obj: BinaryIO,
+            *,
+            multi_stream: bool = False,
+            max_items: int | None = None,
+            deadline: float | None = None,
+        ) -> Iterator[tuple[Any, Any, int | None]]:
+            del file_obj, multi_stream, max_items, deadline
+            for opcode_info in dangerous_opcodes:
+                if opcode_info[0].name == "STOP":
+                    break
+                yield opcode_info
+            raise _GenopsBudgetExceeded("max_items")
+
+        monkeypatch.setattr(pickle_scanner_module, "_genops_with_fallback", _dangerous_then_budget)
+
+        severity, evidence, details = _classify_nested_pickle_payload(
+            b"\x80\x04.",
+            SimpleNamespace(offset=0),
+            {},
+        )
+
+        assert severity == IssueSeverity.CRITICAL
+        assert evidence == "dangerous_execution"
+        assert details["evidence"] == "dangerous_execution"
+        assert details["analysis_incomplete"] is True
+        assert details["analysis_error"] == "max_items"
 
     def test_nested_pickle_detection_scans_beyond_validation_sample(self, tmp_path: Path) -> None:
         """Dangerous nested evidence beyond the header-validation window should stay critical."""

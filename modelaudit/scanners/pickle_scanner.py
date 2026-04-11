@@ -3407,20 +3407,33 @@ def _classify_nested_pickle_payload(
 ) -> tuple[IssueSeverity, str, dict[str, Any]]:
     """Classify nested pickle evidence without treating structure alone as critical."""
     nested_bytes = bytes(payload)[nested_match.offset :]
+    opcodes: list[tuple[Any, Any, int | None]] = []
     try:
-        opcodes = list(
-            _genops_with_fallback(
-                io.BytesIO(nested_bytes),
-                max_items=_POST_BUDGET_OPCODE_SCAN_LIMIT_OPCODES,
-            )
-        )
+        for opcode_info in _genops_with_fallback(
+            io.BytesIO(nested_bytes),
+            max_items=_POST_BUDGET_OPCODE_SCAN_LIMIT_OPCODES,
+        ):
+            opcodes.append(opcode_info)
     except _GenopsBudgetExceeded as exc:
+        if opcodes:
+            severity, evidence, evidence_details = _classify_nested_pickle_opcodes(opcodes, ml_context)
+            if severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}:
+                evidence_details["analysis_incomplete"] = True
+                evidence_details["analysis_error"] = exc.reason
+                return severity, evidence, evidence_details
         return (
             _get_context_aware_severity(IssueSeverity.WARNING, ml_context),
             "analysis_incomplete",
             {"evidence": "analysis_incomplete", "analysis_error": exc.reason},
         )
     except Exception as exc:
+        if opcodes:
+            severity, evidence, evidence_details = _classify_nested_pickle_opcodes(opcodes, ml_context)
+            if severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}:
+                evidence_details["analysis_incomplete"] = True
+                evidence_details["analysis_error"] = str(exc)
+                evidence_details["analysis_error_type"] = type(exc).__name__
+                return severity, evidence, evidence_details
         return (
             _get_context_aware_severity(IssueSeverity.WARNING, ml_context),
             "analysis_incomplete",
@@ -3431,6 +3444,14 @@ def _classify_nested_pickle_payload(
             },
         )
 
+    return _classify_nested_pickle_opcodes(opcodes, ml_context)
+
+
+def _classify_nested_pickle_opcodes(
+    opcodes: list[tuple[Any, Any, int | None]],
+    ml_context: dict[str, Any],
+) -> tuple[IssueSeverity, str, dict[str, Any]]:
+    """Classify already-collected nested pickle opcodes."""
     (
         stack_global_refs,
         callable_refs,
