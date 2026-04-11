@@ -114,6 +114,20 @@ def test_scan_bytes_treats_pytorch_storage_persistent_ids_as_covered_benign() ->
     assert any(notice.code == "pytorch_storage_persistent_id" for notice in report.notices)
 
 
+def test_scan_bytes_flags_noncanonical_pytorch_storage_persistent_ids() -> None:
+    payload = b"\x80\x04(\x8c\x07storage\x94\x8c\x12torch.FloatStorage\x94\x8c\x04eviltQ."
+
+    report = scan_bytes(payload, source="noncanonical-pytorch-storage.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "PERSISTENT_ID" and finding.details.get("opcode") == "BINPERSID"
+        for finding in report.findings
+    )
+    assert not any(notice.code == "pytorch_storage_persistent_id" for notice in report.notices)
+
+
 def test_scan_bytes_attributes_reduce_calls_to_the_callable_operand_not_nested_args() -> None:
     payload = b"cbuiltins\nlen\n(cos\nsystem\ntR."
 

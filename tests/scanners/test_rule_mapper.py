@@ -31,3 +31,8 @@ def test_generic_rule_prefers_network_codes_for_urls() -> None:
 def test_network_rule_mapping_prioritizes_exfiltration_patterns() -> None:
     """Explicit exfil/C2 indicators should map to S310."""
     assert get_network_rule_code("blacklisted_domain c2.example beacon") == "S310"
+
+
+def test_generic_rule_does_not_map_protocol_version_to_persistent_id() -> None:
+    """Generic protocol-version text should not be classified as persistent ID use."""
+    assert get_generic_rule_code("Valid pickle protocol version 4") is None

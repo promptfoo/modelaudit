@@ -325,7 +325,7 @@ def get_generic_rule_code(message: str) -> str | None:
 
     # Check for specific patterns
     if "protocol" in msg_lower and "version" in msg_lower:
-        return _rule("S212")
+        return None
     elif (
         ("stack" in msg_lower and "depth" in msg_lower)
         or "timeout" in msg_lower

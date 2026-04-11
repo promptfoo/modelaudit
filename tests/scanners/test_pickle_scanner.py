@@ -240,6 +240,8 @@ def test_pickle_scanner_does_not_warn_on_pytorch_storage_persistent_id(tmp_path:
 
     result = PickleScanner().scan(str(pickle_path))
 
+    assert result.success is True
+    assert result.has_errors is False
     assert not any(
         issue.rule_code == "S212" or issue.details.get("pickle_rule_code") == "PERSISTENT_ID" for issue in result.issues
     ), f"Expected PyTorch storage persistent ID to remain non-failing, got: {result.issues}"

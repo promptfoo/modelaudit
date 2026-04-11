@@ -1093,11 +1093,18 @@ def global_severity_for_ref(ref: _GlobalRef) -> Severity | None:
 
 
 def _is_likely_pytorch_storage_persistent_id(value: Any) -> bool:
-    if not isinstance(value, tuple) or not value:
+    if not isinstance(value, tuple) or len(value) < 5:
         return False
-    if value[0] != _PYTORCH_STORAGE_TAG:
+    tag, storage_type, key, location, size, *_ = value
+    if tag != _PYTORCH_STORAGE_TAG:
         return False
-    return any(_is_pytorch_storage_marker(item) for item in value[1:])
+    if not _is_pytorch_storage_marker(storage_type):
+        return False
+    if not isinstance(key, (str, bytes)):
+        return False
+    if not isinstance(location, str):
+        return False
+    return isinstance(size, int) and size >= 0
 
 
 def _is_pytorch_storage_marker(value: Any) -> bool:
