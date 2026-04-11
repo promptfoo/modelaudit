@@ -326,6 +326,24 @@ def test_scan_bytes_flags_suspicious_exec_string_literals() -> None:
     assert any(finding.rule_code == "SUSPICIOUS_STRING" and "exec(" in finding.message for finding in report.findings)
 
 
+def test_scan_bytes_allows_common_dunder_metadata_literals() -> None:
+    report = scan_bytes(
+        pickle.dumps(
+            {
+                "__version__": "1.0.0",
+                "__metadata__": {"format": "safe"},
+                "__schema__": "model-card-v1",
+                "__name__": "example-model",
+            }
+        ),
+        source="dunder-metadata.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert not any(finding.rule_code == "SUSPICIOUS_STRING" for finding in report.findings)
+
+
 @pytest.mark.parametrize(
     ("literal", "expected_pattern"),
     [

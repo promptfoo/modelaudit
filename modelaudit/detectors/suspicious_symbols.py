@@ -293,11 +293,16 @@ DANGEROUS_BUILTINS = [
 
 # Suspicious string patterns used by PickleScanner
 # Regex patterns that match potentially malicious code in string literals
+DANGEROUS_DUNDER_METHOD_PATTERN = (
+    r"(?<!\w)__(?:reduce(?:_ex)?|setstate|getstate|getnewargs(?:_ex)?|getinitargs|new|class|subclasses|globals|"
+    r"builtins|mro)__(?!\w)"
+)
+
 SUSPICIOUS_STRING_PATTERNS = [
-    # Python magic methods - can hide malicious code
-    # Require at least one letter between the double underscores to avoid matching
-    # feature column names like "Occupation________" from one-hot encoding
-    r"(?<!\w)__(?=[a-zA-Z])[a-zA-Z0-9_]*[a-zA-Z]__(?!\w)",  # Magic methods like __reduce__, __setstate__
+    # Dangerous Python magic methods/attributes that can participate in pickle
+    # execution or introspection chains. Common metadata keys like __version__
+    # and __metadata__ are intentionally excluded.
+    DANGEROUS_DUNDER_METHOD_PATTERN,
     # Encoding/decoding operations - often used for obfuscation
     r"base64\.b64decode",  # Base64 decoding
     # Dynamic code execution - CRITICAL

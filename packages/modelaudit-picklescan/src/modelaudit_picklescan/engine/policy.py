@@ -179,8 +179,13 @@ _WARNING_GLOBALS: dict[str, frozenset[str] | None] = {
     "tempfile": frozenset({"mktemp"}),
 }
 
+_DANGEROUS_DUNDER_METHOD_RE = re.compile(
+    r"(?<!\w)__(?:reduce(?:_ex)?|setstate|getstate|getnewargs(?:_ex)?|getinitargs|new|class|subclasses|globals|"
+    r"builtins|mro)__(?!\w)"
+)
+
 _SUSPICIOUS_STRING_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("magic method", re.compile(r"(?<!\w)__(?=[a-zA-Z])[a-zA-Z0-9_]*[a-zA-Z]__(?!\w)")),
+    ("magic method", _DANGEROUS_DUNDER_METHOD_RE),
     ("base64.b64decode", re.compile(r"base64\.b64decode", re.IGNORECASE)),
     ("eval(", re.compile(r"eval\s*\(", re.IGNORECASE)),
     ("exec(", re.compile(r"exec\s*\(", re.IGNORECASE)),
