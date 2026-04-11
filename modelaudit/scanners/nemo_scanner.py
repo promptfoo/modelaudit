@@ -11,7 +11,7 @@ import re
 import tarfile
 from typing import Any, ClassVar
 
-from .base import BaseScanner, IssueSeverity, ScanResult
+from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 
 try:
     import yaml
@@ -105,6 +105,9 @@ CVE_2025_23304_REMEDIATION = (
     "Update to NeMo >= 2.3.2 which validates _target_ values. Do not load untrusted .nemo files."
 )
 
+_INCONCLUSIVE_METADATA_KEY = "scan_outcome"
+_INCONCLUSIVE_REASONS_METADATA_KEY = "scan_outcome_reasons"
+
 
 def _find_suspicious_target_pattern(target: str) -> str | None:
     """Return a suspicious identifier token if a target contains one."""
@@ -117,6 +120,10 @@ def _find_suspicious_target_pattern(target: str) -> str | None:
                 if token_lower.startswith(pattern) and token_lower[len(pattern) :].isdigit():
                     return pattern
     return None
+
+
+def _scan_result_has_security_findings(result: ScanResult) -> bool:
+    return any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
 
 
 class NemoScanner(BaseScanner):
@@ -176,11 +183,50 @@ class NemoScanner(BaseScanner):
             result.success = False
 
         result.bytes_scanned = file_size
+        self._finish_scan_result(result)
         return result
+
+    def _mark_inconclusive_scan_result(
+        self,
+        result: ScanResult,
+        *,
+        reason: str,
+        check_name: str,
+        message: str,
+        location: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        reasons = result.metadata.get(_INCONCLUSIVE_REASONS_METADATA_KEY)
+        if not isinstance(reasons, list):
+            reasons = []
+        if reason not in reasons:
+            reasons.append(reason)
+
+        result.metadata[_INCONCLUSIVE_METADATA_KEY] = INCONCLUSIVE_SCAN_OUTCOME
+        result.metadata[_INCONCLUSIVE_REASONS_METADATA_KEY] = reasons
+        result.add_check(
+            name=check_name,
+            passed=False,
+            message=message,
+            severity=IssueSeverity.INFO,
+            location=location,
+            details={"scan_outcome_reason": reason, **(details or {})},
+        )
+
+    @staticmethod
+    def _finish_scan_result(result: ScanResult) -> None:
+        if result.metadata.get(
+            _INCONCLUSIVE_METADATA_KEY
+        ) == INCONCLUSIVE_SCAN_OUTCOME and not _scan_result_has_security_findings(result):
+            result.finish(success=False)
+            return
+
+        result.finish(success=result.success and not result.has_errors)
 
     def _scan_nemo_archive(self, path: str, result: ScanResult) -> None:
         """Extract and scan YAML configs from a NeMo tar archive."""
         yaml_configs_found = 0
+        yaml_config_files_found = 0
 
         with tarfile.open(path, "r:*") as tar:
             for member in tar:
@@ -204,6 +250,7 @@ class NemoScanner(BaseScanner):
 
                 # Parse YAML config files
                 if name_lower.endswith((".yaml", ".yml")):
+                    yaml_config_files_found += 1
                     if member.size > self.MAX_CONFIG_SIZE:
                         result.add_check(
                             name="NeMo Config Size Check",
@@ -230,17 +277,46 @@ class NemoScanner(BaseScanner):
                                 )
                                 continue
                             config = yaml.safe_load(raw)
-                            if isinstance(config, dict):
+                            if isinstance(config, dict | list):
                                 yaml_configs_found += 1
                                 self._check_hydra_targets(config, member.name, path, result)
+                            else:
+                                self._mark_inconclusive_scan_result(
+                                    result,
+                                    reason="nemo_config_invalid_structure",
+                                    check_name="NeMo Config Structure",
+                                    message=(
+                                        f"YAML config {member.name} has unsupported "
+                                        f"top-level type: {type(config).__name__}"
+                                    ),
+                                    location=f"{path}:{member.name}",
+                                    details={
+                                        "config_file": member.name,
+                                        "expected_type": "dict_or_list",
+                                        "actual_type": type(config).__name__,
+                                    },
+                                )
                         except yaml.YAMLError:
                             logger.debug("Failed to parse YAML config %s in %s", member.name, path)
+                            self._mark_inconclusive_scan_result(
+                                result,
+                                reason="nemo_config_yaml_parse_failed",
+                                check_name="NeMo Config YAML Parsing",
+                                message=f"Failed to parse YAML config {member.name}",
+                                location=f"{path}:{member.name}",
+                                details={"config_file": member.name},
+                            )
 
         if yaml_configs_found == 0:
+            message = (
+                "No YAML configuration found in NeMo archive"
+                if yaml_config_files_found == 0
+                else "No analyzable YAML configuration found in NeMo archive"
+            )
             result.add_check(
                 name="NeMo Config Presence",
                 passed=False,
-                message="No YAML configuration found in NeMo archive",
+                message=message,
                 severity=IssueSeverity.INFO,
                 location=path,
             )
@@ -261,6 +337,18 @@ class NemoScanner(BaseScanner):
         path_prefix: str = "",
     ) -> None:
         """Recursively check _target_ values in Hydra config."""
+        if isinstance(config, list):
+            for index, item in enumerate(config):
+                if isinstance(item, dict | list):
+                    self._check_hydra_targets(
+                        item,
+                        config_name,
+                        archive_path,
+                        result,
+                        f"{path_prefix}[{index}]" if path_prefix else f"[{index}]",
+                    )
+            return
+
         if not isinstance(config, dict):
             return
 
@@ -269,18 +357,8 @@ class NemoScanner(BaseScanner):
 
             if key == "_target_" and isinstance(value, str):
                 self._evaluate_target(value, current_path, config_name, archive_path, result)
-            elif isinstance(value, dict):
+            elif isinstance(value, dict | list):
                 self._check_hydra_targets(value, config_name, archive_path, result, current_path)
-            elif isinstance(value, list):
-                for i, item in enumerate(value):
-                    if isinstance(item, dict):
-                        self._check_hydra_targets(
-                            item,
-                            config_name,
-                            archive_path,
-                            result,
-                            f"{current_path}[{i}]",
-                        )
 
     def _evaluate_target(
         self,
