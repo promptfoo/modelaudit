@@ -1,8 +1,12 @@
+import bz2
+import gzip
 import io
+import lzma
 import os
 import tarfile
 import tempfile
 import zipfile
+import zlib
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -11,7 +15,10 @@ import pytest
 
 from modelaudit import core
 from modelaudit.scanners._archive_locations import rewrite_extracted_member_location
-from modelaudit.scanners.archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY
+from modelaudit.scanners.archive_dispatch import (
+    NESTED_SCAN_CALLBACK_CONFIG_KEY,
+    _select_nested_scanner_id,
+)
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.zip_scanner import ZipScanner
 
@@ -53,6 +60,28 @@ def test_rewrite_extracted_member_location_preserves_scanner_specific_suffix_pol
         )
         == "/archive.zip:model.pkl /tmp/extracted.pkl2"
     )
+
+
+@pytest.mark.parametrize(
+    ("payload", "filename"),
+    [
+        (gzip.compress(b"payload"), "gzip_member"),
+        (bz2.compress(b"payload"), "bzip2_member"),
+        (lzma.compress(b"payload"), "xz_member"),
+        (b"\x04\x22\x4d\x18" + b"\x00" * 8, "lz4_member"),
+        (zlib.compress(b"payload"), "zlib_member"),
+    ],
+)
+def test_nested_dispatch_routes_compressed_header_aliases_to_compressed_scanner(
+    tmp_path: Path,
+    payload: bytes,
+    filename: str,
+) -> None:
+    """Extensionless archive members with compression magic should route to CompressedScanner."""
+    member_path = tmp_path / filename
+    member_path.write_bytes(payload)
+
+    assert _select_nested_scanner_id(str(member_path)) == "compressed"
 
 
 class TestZipScanner:
@@ -388,6 +417,37 @@ class TestZipScanner:
             for issue in result.issues
         ), (
             "Expected critical nested pickle finding, got: "
+            f"{[(i.location, i.message, i.details) for i in result.issues]}"
+        )
+
+    def test_scan_extensionless_nested_gzip_pickle_recurses_by_header(self, tmp_path: Path) -> None:
+        """Extensionless compressed members should decompress and scan their payload."""
+        archive_path = tmp_path / "outer.zip"
+        with zipfile.ZipFile(archive_path, "w") as outer_archive:
+            outer_archive.writestr(
+                "payload",
+                gzip.compress(b'cos\nsystem\n(S"echo pwned"\ntR.'),
+            )
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert result.success is False
+        assert result.has_errors is True
+        assert any(
+            check.name == "Compressed Wrapper Inner Scanner Routing"
+            and check.details.get("zip_entry") == "payload"
+            and check.details.get("inner_scanner") == "pickle"
+            for check in result.checks
+        ), f"Expected compressed routing check, got: {[(c.name, c.details) for c in result.checks]}"
+        assert any(
+            issue.rule_code == "S201"
+            and issue.severity == IssueSeverity.CRITICAL
+            and issue.details.get("zip_entry") == "payload"
+            and issue.location == f"{archive_path}:payload"
+            and ("os.system" in issue.message.lower() or "posix.system" in issue.message.lower())
+            for issue in result.issues
+        ), (
+            "Expected critical compressed nested pickle finding, got: "
             f"{[(i.location, i.message, i.details) for i in result.issues]}"
         )
 
