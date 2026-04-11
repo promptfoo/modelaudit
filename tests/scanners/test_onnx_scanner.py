@@ -11,7 +11,8 @@ import onnx
 from onnx import TensorProto, helper
 from onnx.onnx_ml_pb2 import StringStringEntryProto
 
-from modelaudit.scanners.base import CheckStatus, IssueSeverity
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.onnx_scanner import OnnxScanner
 
 
@@ -556,6 +557,12 @@ class TestCVE202427318NestedPathTraversal:
 class TestExternalDataSizeValidation:
     """Tests for external_data offset/length and dtype validation."""
 
+    @staticmethod
+    def _set_initializer_data_type(model_path: Path, data_type: int) -> None:
+        model = onnx.load(str(model_path), load_external_data=False)
+        model.graph.initializer[0].data_type = data_type
+        onnx.save(model, str(model_path))
+
     def test_offset_past_remaining_data_fails_size_validation(self, tmp_path: Path) -> None:
         model_path = create_onnx_model(
             tmp_path,
@@ -605,6 +612,49 @@ class TestExternalDataSizeValidation:
         size_checks = [c for c in result.checks if c.name == "External Data Size Validation"]
         assert len(size_checks) > 0
         assert size_checks[0].status == CheckStatus.PASSED
+
+    def test_unknown_external_data_dtype_is_inconclusive(self, tmp_path: Path) -> None:
+        model_path = create_onnx_model(tmp_path, external=True, external_path="weights.bin")
+        self._set_initializer_data_type(model_path, 9999)
+
+        direct = OnnxScanner().scan(str(model_path))
+        aggregate = scan_model_directory_or_file(str(model_path), recursive=False)
+        metadata = next(iter(aggregate.file_metadata.values()))
+
+        assert direct.success is False
+        assert direct.has_errors is False
+        assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "onnx_structure_validation_failed" in direct.metadata["scan_outcome_reasons"]
+        size_checks = [
+            c for c in direct.checks if c.name == "External Data Size Validation" and c.status == CheckStatus.FAILED
+        ]
+        assert len(size_checks) > 0
+        assert size_checks[0].severity == IssueSeverity.INFO
+        assert size_checks[0].details["data_type"] == 9999
+        assert aggregate.success is False
+        assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+        assert determine_exit_code(aggregate) == 2
+        assert not any(issue.severity == IssueSeverity.CRITICAL for issue in aggregate.issues)
+
+    def test_unknown_external_data_dtype_preserves_security_exit1(self, tmp_path: Path) -> None:
+        model_path = create_onnx_model(
+            tmp_path,
+            custom=True,
+            custom_domain="",
+            custom_op_type="PyFunc",
+            external=True,
+            external_path="weights.bin",
+        )
+        self._set_initializer_data_type(model_path, 9999)
+
+        direct = OnnxScanner().scan(str(model_path))
+        aggregate = scan_model_directory_or_file(str(model_path), recursive=False)
+
+        assert direct.success is False
+        assert direct.has_errors is True
+        assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert any(issue.severity == IssueSeverity.CRITICAL for issue in aggregate.issues)
+        assert determine_exit_code(aggregate) == 1
 
     def test_invalid_offset_metadata_fails_size_validation(self, tmp_path: Path) -> None:
         model_path = create_onnx_model(
