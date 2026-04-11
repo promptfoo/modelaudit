@@ -8,18 +8,34 @@ import ipaddress
 import re
 from typing import Any, ClassVar
 
-_DOC_CONTEXT_MARKERS: tuple[str, ...] = (
+_DOC_CONTEXT_EXTENSIONS: tuple[str, ...] = (
     ".md",
     ".rst",
     ".txt",
     ".json",
     ".yaml",
     ".yml",
+)
+_DOC_CONTEXT_NAMES: frozenset[str] = frozenset(
+    {
+        "readme",
+        "metadata",
+        "description",
+        "model_card",
+        "manifest",
+    }
+)
+_DOC_CONTEXT_SEGMENTS: frozenset[str] = frozenset(
+    {
+        "metadata",
+        "description",
+        "model_card",
+        "manifest",
+    }
+)
+_DOC_CONTEXT_NAME_PREFIXES: tuple[str, ...] = (
     "readme",
-    "metadata",
-    "description",
     "model_card",
-    "manifest",
 )
 _PROSE_MARKERS: tuple[str, ...] = (
     " example",
@@ -50,7 +66,15 @@ _CODE_LINE_MARKERS: tuple[bytes, ...] = (
 def _is_metadata_context(context: str) -> bool:
     """Return whether the scan context appears to be documentation or metadata."""
     context_lower = context.lower()
-    return any(marker in context_lower for marker in _DOC_CONTEXT_MARKERS)
+    context_segments = [segment for segment in context_lower.replace("\\", "/").split("/") if segment]
+    filename = context_segments[-1] if context_segments else context_lower
+    stem = filename.rsplit(".", 1)[0]
+
+    if filename.endswith(_DOC_CONTEXT_EXTENSIONS):
+        return True
+    if stem in _DOC_CONTEXT_NAMES or stem.startswith(_DOC_CONTEXT_NAME_PREFIXES):
+        return True
+    return any(segment in _DOC_CONTEXT_SEGMENTS for segment in context_segments[:-1])
 
 
 def _extract_line(data: bytes, match_index: int) -> bytes:
@@ -88,7 +112,7 @@ def _is_doc_only_network_reference(
     word_count = len(_WORD_PATTERN.findall(line))
     metadata_context = _is_metadata_context(context)
 
-    if any(stripped.startswith(prefix) for prefix in _CODE_LINE_PREFIXES) and word_count <= 4:
+    if any(stripped.startswith(prefix) for prefix in _CODE_LINE_PREFIXES):
         return False
     if any(marker in line_lower for marker in _CODE_LINE_MARKERS):
         return False

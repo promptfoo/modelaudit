@@ -162,6 +162,15 @@ class TestNetworkCommDetector:
 
         assert not [finding for finding in findings if finding["type"] == "network_library"]
 
+    def test_executable_metadata_named_path_still_flags_network_import(self) -> None:
+        """Executable paths containing metadata-like words should not be treated as prose."""
+        detector = NetworkCommDetector()
+        data = b"import socket  # used by this metadata helper to open outbound connections"
+
+        findings = detector.scan(data, "src/metadata_utils.py")
+
+        assert any(finding["type"] == "network_library" for finding in findings)
+
     def test_detect_cc_patterns(self):
         """Test detection of command & control patterns."""
         detector = NetworkCommDetector()
