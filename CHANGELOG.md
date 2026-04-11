@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.34](https://github.com/promptfoo/modelaudit/compare/v0.2.33...v0.2.34) (2026-04-10)
+
+### Bug Fixes
+
+- mark incomplete MXNet scans inconclusive instead of clean
+- harden manifest parse boundaries around malformed metadata
+- recover malformed Jinja template configs as inconclusive scan outcomes
+- traverse NeMo YAML list configs when checking suspicious targets
+- mark malformed Keras ZIP configs inconclusive instead of clean
+- mark malformed Keras H5 scans inconclusive instead of clean
+- mark malformed TFLite scans inconclusive instead of clean
+- mark malformed GGUF scans inconclusive instead of clean
+- mark malformed SafeTensors scans inconclusive instead of clean
+- preserve picklescan stack state across reused scanner runs
+- mark partial streaming scans inconclusive when large-file streaming coverage is incomplete
+- harden native code detection in model scanners ([#897](https://github.com/promptfoo/modelaudit/issues/897)) ([f4f661a](https://github.com/promptfoo/modelaudit/commit/f4f661a09be0032e15aa8895864413e3878233f8))
+
 ## [0.2.33](https://github.com/promptfoo/modelaudit/compare/v0.2.32...v0.2.33) (2026-04-09)
 
 ### Features
@@ -35,18 +52,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-- mark incomplete MXNet artifact scans inconclusive
+- mark trailing bytes after NumPy object-array pickle payloads inconclusive without escalating to security findings
 - avoid CoreML nested parse failures on bounded-read truncation
+- mark incomplete sharded-model scans as inconclusive, ignore shard-name prefix matches, and skip caching explicit incomplete outcomes
 - flag TensorFlow `LoadLibrary` and `LoadLibraryV2` graph ops as dangerous native-library loading
 - detect split CNTK native-user-function and native-library references
 - detect Linux/macOS native-library members in Keras archives and uppercase native-library members in PyTorch ZIPs
 - detect embedded Windows DLL/PE, Linux ELF shared-object, and TensorRT plugin entry-point markers in TensorRT engines
 - detect punctuation-delimited TensorRT `/tmp` plugin paths
+- clean up temporary ZIP entry files when extraction fails on entry size limits
 - preserve HuggingFace cache provenance for symlinked custom cache roots
+- mark ONNX tensor dtype validation failures inconclusive instead of allowing clean scans
 - ignore remote OCI `layers[].urls` entries during local layer discovery
 - fail closed on unterminated OpenVINO DOCTYPE declarations
 - avoid PMML `<Extension>` false positives for benign `subprocess` prose while preserving `subprocess.getoutput()`, `subprocess.getstatusoutput()`, and `importlib.import_module("subprocess")` detections
+- mark incomplete ZIP, TAR, and 7z archive traversals as inconclusive in scan metadata
 - route helper-level ZIP-backed `.ckpt`/`.pkl` checkpoints through archive scanners
+- harden standalone pickle scanner dangerous global coverage, nested payload bounds, incomplete-scan reporting, and standalone-primary migration behavior
 
 ## [0.2.31](https://github.com/promptfoo/modelaudit/compare/v0.2.30...v0.2.31) (2026-04-04)
 

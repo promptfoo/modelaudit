@@ -6,12 +6,54 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity, ScanResult
 from modelaudit.utils.file.handlers import (
+    MAX_RECORDED_MISSING_SHARD_INDICES,
     AdvancedFileHandler,
     MemoryMappedHandler,
+    ParallelShardHandler,
     ShardedModelDetector,
     should_use_advanced_handler,
 )
+
+
+class CompletingShardScanner:
+    """Minimal scanner for shard-handler coverage tests."""
+
+    name = "completing_shard_scanner"
+
+    def scan(self, shard_path: str) -> ScanResult:
+        result = ScanResult(scanner_name=self.name)
+        result.bytes_scanned = Path(shard_path).stat().st_size
+        result.finish(success=True)
+        return result
+
+
+class FailingShardScanner:
+    """Scanner that simulates an operational shard scan failure."""
+
+    name = "failing_shard_scanner"
+
+    def scan(self, shard_path: str) -> ScanResult:
+        raise RuntimeError(f"cannot scan {Path(shard_path).name}")
+
+
+class IncompleteShardScanner:
+    """Scanner that returns an unsuccessful non-critical shard result."""
+
+    name = "incomplete_shard_scanner"
+
+    def scan(self, shard_path: str) -> ScanResult:
+        result = ScanResult(scanner_name=self.name)
+        result.add_check(
+            name="Shard Parse Coverage",
+            passed=False,
+            message=f"Shard could not be fully parsed: {Path(shard_path).name}",
+            severity=IssueSeverity.INFO,
+            location=shard_path,
+        )
+        result.finish(success=False)
+        return result
 
 
 class TestShardedModelDetector:
@@ -56,6 +98,47 @@ class TestShardedModelDetector:
 
             assert shard_info is not None
             assert shard_info["total_shards"] == 2
+
+    def test_detect_shards_records_missing_expected_indices(self, tmp_path: Path) -> None:
+        """Missing numbered shards should be explicit in detector metadata."""
+        shard_one = tmp_path / "model-00001-of-00003.safetensors"
+        shard_three = tmp_path / "model-00003-of-00003.safetensors"
+        shard_one.write_bytes(b"test")
+        shard_three.write_bytes(b"test")
+
+        shard_info = ShardedModelDetector.detect_shards(str(shard_one))
+
+        assert shard_info is not None
+        assert shard_info["total_shards"] == 2
+        assert shard_info["expected_total_shards"] == 3
+        assert shard_info["missing_shard_count"] == 1
+        assert shard_info["missing_shard_indices"] == [2]
+
+    def test_detect_shards_bounds_missing_expected_indices(self, tmp_path: Path) -> None:
+        """Huge declared shard totals should not expand into huge missing-index lists."""
+        shard_one = tmp_path / "model-00001-of-999999999999.safetensors"
+        shard_one.write_bytes(b"test")
+
+        shard_info = ShardedModelDetector.detect_shards(str(shard_one))
+
+        assert shard_info is not None
+        assert shard_info["expected_total_shards"] == 999999999999
+        assert shard_info["missing_shard_count"] == 999999999998
+        assert len(shard_info["missing_shard_indices"]) == MAX_RECORDED_MISSING_SHARD_INDICES
+        assert shard_info["missing_shard_indices_truncated"] is True
+
+    def test_detect_shards_ignores_suffix_near_matches(self, tmp_path: Path) -> None:
+        """Shard routing should not count files that only prefix-match a shard name."""
+        shard_one = tmp_path / "model-00001-of-00001.safetensors"
+        near_match = tmp_path / "model-00001-of-00001.safetensors.bak"
+        shard_one.write_bytes(b"test")
+        near_match.write_bytes(b"backup")
+
+        shard_info = ShardedModelDetector.detect_shards(str(shard_one))
+
+        assert shard_info is not None
+        assert shard_info["shards"] == [str(shard_one)]
+        assert shard_info["total_shards"] == 1
 
     def test_no_shards_detected(self) -> None:
         """Test when file is not sharded."""
@@ -206,3 +289,63 @@ class TestAdvancedFileHandler:
             check.name == "Large File Coverage Check" and "Error scanning file:" in check.message
             for check in result.checks
         )
+
+    def test_sharded_model_missing_shards_marks_scan_inconclusive(self, tmp_path: Path) -> None:
+        """A partial shard set must not report complete coverage."""
+        shard_one = tmp_path / "model-00001-of-00003.safetensors"
+        shard_three = tmp_path / "model-00003-of-00003.safetensors"
+        shard_one.write_bytes(b"safe")
+        shard_three.write_bytes(b"safe")
+
+        handler = AdvancedFileHandler(str(shard_one), CompletingShardScanner())
+        result = handler.scan()
+
+        assert result.end_time is not None
+        assert result.success is False
+        assert result.metadata["analysis_incomplete"] is True
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "missing_model_shards" in result.metadata["scan_outcome_reasons"]
+        coverage_checks = [check for check in result.checks if check.name == "Sharded Model Coverage Check"]
+        assert len(coverage_checks) == 1
+        assert coverage_checks[0].severity == IssueSeverity.INFO
+        assert coverage_checks[0].details["missing_shard_count"] == 1
+        assert coverage_checks[0].details["missing_shard_indices"] == [2]
+        assert coverage_checks[0].details["missing_shard_indices_truncated"] is False
+
+    def test_parallel_shard_errors_mark_scan_inconclusive(self, tmp_path: Path) -> None:
+        """Shard scan exceptions are incomplete coverage, not security findings."""
+        shard_path = tmp_path / "model-00001-of-00001.safetensors"
+        shard_path.write_bytes(b"safe")
+        handler = ParallelShardHandler(
+            {
+                "shards": [str(shard_path)],
+                "total_shards": 1,
+                "total_size": shard_path.stat().st_size,
+            },
+            FailingShardScanner,
+        )
+
+        result = handler.scan_shards()
+
+        assert result.end_time is not None
+        assert result.success is False
+        assert result.metadata["analysis_incomplete"] is True
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "shard_scan_error" in result.metadata["scan_outcome_reasons"]
+        shard_checks = [check for check in result.checks if check.name == "Shard Scan"]
+        assert len(shard_checks) == 1
+        assert shard_checks[0].severity == IssueSeverity.INFO
+
+    def test_sharded_model_preserves_unsuccessful_shard_result(self, tmp_path: Path) -> None:
+        """Non-critical shard failures must not be overwritten after aggregate merge."""
+        shard_path = tmp_path / "model-00001-of-00001.safetensors"
+        shard_path.write_bytes(b"partial")
+
+        handler = AdvancedFileHandler(str(shard_path), IncompleteShardScanner())
+        result = handler.scan()
+
+        assert result.end_time is not None
+        assert result.success is False
+        assert result.has_errors is False
+        assert "scan_outcome" not in result.metadata
+        assert any(check.name == "Shard Parse Coverage" for check in result.checks)

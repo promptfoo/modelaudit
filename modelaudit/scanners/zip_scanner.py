@@ -1,3 +1,4 @@
+import contextlib
 import os
 import re
 import stat
@@ -9,6 +10,7 @@ from ..utils import is_absolute_archive_path, is_critical_system_path, sanitize_
 from ..utils.helpers.assets import asset_from_scan_result
 from ._archive_config import get_archive_depth
 from ._archive_locations import rewrite_extracted_member_location
+from ._archive_outcomes import mark_archive_scan_incomplete, member_scan_incomplete
 from .archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY, scan_nested_file
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -124,6 +126,7 @@ class ZipScanner(BaseScanner):
                 location=path,
                 details={"path": path},
             )
+            mark_archive_scan_incomplete(result, "zip_analysis_incomplete")
             result.finish(success=False)
             return result
         except Exception as e:
@@ -136,6 +139,7 @@ class ZipScanner(BaseScanner):
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )
+            mark_archive_scan_incomplete(result, "zip_analysis_incomplete")
             result.finish(success=False)
             return result
 
@@ -215,6 +219,7 @@ class ZipScanner(BaseScanner):
                 location=path,
                 details={"depth": depth, "max_depth": self.max_depth},
             )
+            mark_archive_scan_incomplete(result, "zip_analysis_incomplete")
             result.finish(success=False)
             return result
         else:
@@ -243,6 +248,7 @@ class ZipScanner(BaseScanner):
                         "max_entries": self.max_entries,
                     },
                 )
+                mark_archive_scan_incomplete(result, "zip_analysis_incomplete")
                 result.finish(success=False)
                 return result
             else:
@@ -386,6 +392,7 @@ class ZipScanner(BaseScanner):
                         )
 
                 # Extract and scan the file
+                tmp_path: str | None = None
                 try:
                     max_entry_size = self._get_max_entry_size()
 
@@ -399,26 +406,28 @@ class ZipScanner(BaseScanner):
                         )
                         suffix = f"_{safe_name}"
 
-                    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-                        tmp_path = tmp.name
-                        total_size = 0
-                        with z.open(info) as entry:
-                            while True:
-                                chunk = entry.read(4096)
-                                if not chunk:
-                                    break
-                                total_size += len(chunk)
-                                if total_size > max_entry_size:
-                                    raise ValueError(
-                                        f"ZIP entry {name} exceeds maximum size of {max_entry_size} bytes",
-                                    )
-                                tmp.write(chunk)
-
                     try:
+                        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                            tmp_path = tmp.name
+                            total_size = 0
+                            with z.open(info) as entry:
+                                while True:
+                                    chunk = entry.read(4096)
+                                    if not chunk:
+                                        break
+                                    total_size += len(chunk)
+                                    if total_size > max_entry_size:
+                                        raise ValueError(
+                                            f"ZIP entry {name} exceeds maximum size of {max_entry_size} bytes",
+                                        )
+                                    tmp.write(chunk)
+
                         if archive_ext == ".mar" and name.lower().endswith(".py"):
                             mar_python_result = self._scan_mar_python_entry(path, name, tmp_path, total_size)
                             if mar_python_result is not None:
                                 result.merge(mar_python_result)
+                                if not mar_python_result.success:
+                                    scan_complete = False
 
                         nested_config = dict(self.config)
                         nested_config["_archive_depth"] = depth + 1
@@ -429,7 +438,7 @@ class ZipScanner(BaseScanner):
                         # so production scans preserve core routing while direct
                         # ZipScanner usage still falls back to registry routing.
                         file_result = self._scan_nested_archive_entry(tmp_path, nested_config)
-                        if not file_result.success:
+                        if member_scan_incomplete(file_result):
                             scan_complete = False
 
                         self._rewrite_nested_result_context(file_result, tmp_path, path, name)
@@ -447,7 +456,9 @@ class ZipScanner(BaseScanner):
                         if file_result.scanner_name == "unknown":
                             result.bytes_scanned += total_size
                     finally:
-                        os.unlink(tmp_path)
+                        if tmp_path is not None:
+                            with contextlib.suppress(FileNotFoundError):
+                                os.unlink(tmp_path)
 
                 except Exception as e:
                     scan_complete = False
@@ -463,6 +474,8 @@ class ZipScanner(BaseScanner):
 
         result.metadata["contents"] = contents
         result.metadata["file_size"] = os.path.getsize(path)
+        if not scan_complete:
+            mark_archive_scan_incomplete(result, "zip_analysis_incomplete")
         result.finish(success=scan_complete and not result.has_errors)
         return result
 
@@ -525,7 +538,7 @@ class ZipScanner(BaseScanner):
                 message=f"Unable to parse Python entry for static analysis: {parse_error}",
                 severity=IssueSeverity.WARNING,
                 location=f"{archive_path}:{entry_name}",
-                details={"entry": entry_name},
+                details={"entry": entry_name, "analysis_kind": "syntax", "parse_error": parse_error},
             )
         else:
             result.add_check(
