@@ -228,6 +228,27 @@ def test_pmml_scanner_documentation_urls_are_not_external_resources(tmp_path: Pa
     assert not any("external resource" in issue.message.lower() for issue in result.issues)
 
 
+def test_pmml_scanner_documentation_file_urls_still_warn(tmp_path: Path) -> None:
+    """Documentation contexts should still warn on local or transfer URL schemes."""
+    pmml = """<?xml version='1.0'?>
+<PMML version='4.4'>
+  <Header description="file:///var/tmp/model-card">
+    <Annotation>Read ftp://example.com/archive before loading.</Annotation>
+    <Application name="Trainer" reference="file:///tmp/reference"/>
+  </Header>
+  <DataDictionary numberOfFields='0'/>
+</PMML>"""
+    path = tmp_path / "documented_file_refs.pmml"
+    path.write_text(pmml, encoding="utf-8")
+
+    result = PmmlScanner().scan(str(path))
+
+    external_issues = [issue for issue in result.issues if "external resource" in issue.message.lower()]
+    assert external_issues
+    assert {issue.details.get("url_pattern") for issue in external_issues} >= {"file://", "ftp://"}
+    assert all(issue.severity == IssueSeverity.WARNING for issue in external_issues)
+
+
 def test_pmml_scanner_resource_url_attributes_still_warn(tmp_path: Path) -> None:
     """Explicit resource attributes should remain warning-level external references."""
     pmml = """<?xml version='1.0'?>

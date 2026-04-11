@@ -34,6 +34,7 @@ SUSPICIOUS_PATTERNS = [
     r"system\s*\(",
 ]
 URL_PATTERNS = ["http://", "https://", "file://", "ftp://"]
+BENIGN_DOCUMENTATION_URL_PATTERNS = frozenset({"http://", "https://"})
 DANGEROUS_ENTITIES = ["<!DOCTYPE", "<!ENTITY", "<!ELEMENT", "<!ATTLIST"]
 XML_COMMENT_PATTERN = re.compile(r"<!--.*?-->", re.DOTALL)
 XML_CDATA_PATTERN = re.compile(r"<!\[CDATA\[.*?\]\]>", re.DOTALL)
@@ -296,10 +297,30 @@ class PmmlScanner(BaseScanner):
             else:
                 if tag_name not in DOCUMENTATION_ELEMENT_NAMES:
                     self._add_external_resource_check_if_url(result, path, elem.tag, elem_text, context="text")
+                else:
+                    url_pattern = self._find_url_pattern(
+                        elem_text,
+                        ignored_patterns=BENIGN_DOCUMENTATION_URL_PATTERNS,
+                    )
+                    if url_pattern is not None:
+                        self._add_external_resource_check_if_url(
+                            result,
+                            path,
+                            elem.tag,
+                            elem_text,
+                            context="text",
+                            url_pattern=url_pattern,
+                        )
 
                 for attr_name, attr_value in elem.attrib.items():
                     normalized_attr_name = self._local_xml_name(attr_name)
-                    if self._is_external_resource_attribute(tag_name, normalized_attr_name, elem.attrib):
+                    url_pattern = self._external_resource_attribute_url_pattern(
+                        tag_name,
+                        normalized_attr_name,
+                        str(attr_value),
+                        elem.attrib,
+                    )
+                    if url_pattern is not None:
                         self._add_external_resource_check_if_url(
                             result,
                             path,
@@ -307,6 +328,7 @@ class PmmlScanner(BaseScanner):
                             str(attr_value),
                             context="attribute",
                             attribute=attr_name,
+                            url_pattern=url_pattern,
                         )
 
             # Check for suspicious element names (like <script>)
@@ -342,25 +364,40 @@ class PmmlScanner(BaseScanner):
                         break
 
     @staticmethod
-    def _find_url_pattern(text: str) -> str | None:
+    def _find_url_pattern(text: str, *, ignored_patterns: frozenset[str] | None = None) -> str | None:
         """Return the first URL scheme pattern found in text."""
         normalized_text = text.lower()
         for url_pattern in URL_PATTERNS:
+            if ignored_patterns is not None and url_pattern in ignored_patterns:
+                continue
             if url_pattern in normalized_text:
                 return url_pattern
         return None
 
     @staticmethod
-    def _is_external_resource_attribute(tag_name: str, attr_name: str, attributes: dict[str, Any]) -> bool:
-        """Return True when a URL-bearing attribute is an external resource reference."""
+    def _external_resource_attribute_url_pattern(
+        tag_name: str,
+        attr_name: str,
+        attr_value: str,
+        attributes: dict[str, Any],
+    ) -> str | None:
+        """Return the URL pattern when an attribute is an external resource reference."""
         if attr_name in DOCUMENTATION_ATTRIBUTE_NAMES:
-            return False
+            return PmmlScanner._find_url_pattern(
+                attr_value,
+                ignored_patterns=BENIGN_DOCUMENTATION_URL_PATTERNS,
+            )
         if attr_name == "reference":
-            return tag_name not in DOCUMENTATION_REFERENCE_TAG_NAMES
+            ignored_patterns = (
+                BENIGN_DOCUMENTATION_URL_PATTERNS if tag_name in DOCUMENTATION_REFERENCE_TAG_NAMES else None
+            )
+            return PmmlScanner._find_url_pattern(attr_value, ignored_patterns=ignored_patterns)
         if attr_name in EXTERNAL_RESOURCE_ATTRIBUTE_NAMES:
-            return True
+            return PmmlScanner._find_url_pattern(attr_value)
 
-        return tag_name == "value" and attr_name == "value" and attributes.get("property", "").lower() == "external"
+        if tag_name == "value" and attr_name == "value" and attributes.get("property", "").lower() == "external":
+            return PmmlScanner._find_url_pattern(attr_value)
+        return None
 
     def _add_external_resource_check_if_url(
         self,
@@ -371,9 +408,10 @@ class PmmlScanner(BaseScanner):
         *,
         context: str,
         attribute: str | None = None,
+        url_pattern: str | None = None,
     ) -> None:
         """Add an external resource warning when text contains a resource URL."""
-        url_pattern = self._find_url_pattern(text)
+        url_pattern = url_pattern or self._find_url_pattern(text)
         if url_pattern is None:
             return
 
