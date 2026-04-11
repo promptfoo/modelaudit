@@ -273,16 +273,20 @@ class PyTorchZipScanner(BaseScanner):
         if not parts or not parts[-1].endswith(".py"):
             return False
 
-        for index, part in enumerate(parts):
-            if part != "code":
-                continue
-            torchscript_parts = parts[index + 1 :]
-            if torchscript_parts == ("__torch__.py",) or (
-                len(torchscript_parts) > 1 and torchscript_parts[0] == "__torch__"
-            ):
-                return True
+        try:
+            code_index = parts.index("code")
+        except ValueError:
+            return False
 
-        return False
+        # TorchScript writes generated Python directly under the archive root
+        # (optionally behind a single top-level archive prefix like "archive/").
+        if code_index > 1:
+            return False
+
+        torchscript_parts = parts[code_index + 1 :]
+        return torchscript_parts == ("__torch__.py",) or (
+            len(torchscript_parts) > 1 and torchscript_parts[0] == "__torch__"
+        )
 
     @staticmethod
     def _find_zip_entry(entries: list[zipfile.ZipInfo], member_name: str) -> zipfile.ZipInfo | None:

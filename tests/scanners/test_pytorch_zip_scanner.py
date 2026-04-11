@@ -535,6 +535,28 @@ def test_pytorch_zip_allows_torchscript_generated_python_files(tmp_path: Path) -
     ]
 
 
+def test_pytorch_zip_does_not_allow_nested_torchscript_generated_python_files(tmp_path: Path) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "nested_scripted.pt", prefix="archive")
+    nested_path = "archive/data/code/__torch__/payload.py"
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr(nested_path, "class Payload:\n    pass\n")
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    python_failures = [
+        check
+        for check in result.checks
+        if check.name == "Python Code File Detection" and check.status == CheckStatus.FAILED
+    ]
+    failed_files = {check.details["file"] for check in python_failures}
+
+    assert nested_path in failed_files
+    assert any(
+        issue.location == f"{model_path}:{nested_path}" and issue.severity == IssueSeverity.WARNING
+        for issue in result.issues
+    )
+
+
 def test_pytorch_zip_still_warns_on_unexpected_python_files(tmp_path: Path) -> None:
     model_path = create_mock_pytorch_zip(tmp_path / "model.pt", prefix="archive")
     with zipfile.ZipFile(model_path, "a") as zip_file:
