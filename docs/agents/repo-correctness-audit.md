@@ -35,8 +35,7 @@ obligations below.
 3. Security precedence
    - Warning/critical security findings keep exit code 1 even when the scan is
      also inconclusive.
-   - Operational or coverage failures without security findings return exit code
-     2.
+   - Operational or coverage failures without security findings return exit code 2.
    - INFO-only review notes do not create security failures.
 
 4. Bounded resource use
@@ -77,80 +76,80 @@ E4 is the target. Most components start below E4.
 
 ### Core and Cross-Cutting Layers
 
-| Area | Files | Initial risks | Evidence |
-| --- | --- | --- | --- |
-| Core orchestration | `modelaudit/core.py`, `modelaudit/models.py`, `modelaudit/scanner_results.py` | exit-code precedence, scan metadata preservation, directory dedupe, cache and stream behavior | E1 |
-| Scanner registry/routing | `modelaudit/scanners/__init__.py`, `modelaudit/scanner_registry_metadata.py`, `modelaudit/utils/file/detection.py` | suffix routing, header aliases, optional dependency fallback, lazy loading | E1 |
-| CLI/output | `modelaudit/cli.py`, output helpers, SARIF/JFrog integrations | JSON/SARIF consistency, exit codes, partial scans | E0 |
-| Cache | `modelaudit/cache/`, `modelaudit/utils/helpers/cache_decorator.py` | stale safety metadata, inconclusive persistence, config-sensitive keys | E1 |
-| Archive recursion | `zip`, `tar`, `sevenzip`, `compressed`, `oci_layer`, `torchserve_mar` scanners | traversal, temp cleanup, nested routing, partial coverage | E3 through recent PRs |
-| Standalone pickle package | `packages/modelaudit-picklescan/` | parity with adapter, opcode budgets, immutable results | E3 through recent PRs |
-| Test infrastructure | `tests/conftest.py`, CI allowlists | regression tests skipped in reduced Python lanes | E3 for current allowlist updates |
+| Area                      | Files                                                                                                              | Initial risks                                                                                 | Evidence                         |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------- | -------------------------------- |
+| Core orchestration        | `modelaudit/core.py`, `modelaudit/models.py`, `modelaudit/scanner_results.py`                                      | exit-code precedence, scan metadata preservation, directory dedupe, cache and stream behavior | E1                               |
+| Scanner registry/routing  | `modelaudit/scanners/__init__.py`, `modelaudit/scanner_registry_metadata.py`, `modelaudit/utils/file/detection.py` | suffix routing, header aliases, optional dependency fallback, lazy loading                    | E1                               |
+| CLI/output                | `modelaudit/cli.py`, output helpers, SARIF/JFrog integrations                                                      | JSON/SARIF consistency, exit codes, partial scans                                             | E0                               |
+| Cache                     | `modelaudit/cache/`, `modelaudit/utils/helpers/cache_decorator.py`                                                 | stale safety metadata, inconclusive persistence, config-sensitive keys                        | E1                               |
+| Archive recursion         | `zip`, `tar`, `sevenzip`, `compressed`, `oci_layer`, `torchserve_mar` scanners                                     | traversal, temp cleanup, nested routing, partial coverage                                     | E3 through recent PRs            |
+| Standalone pickle package | `packages/modelaudit-picklescan/`                                                                                  | parity with adapter, opcode budgets, immutable results                                        | E3 through recent PRs            |
+| Test infrastructure       | `tests/conftest.py`, CI allowlists                                                                                 | regression tests skipped in reduced Python lanes                                              | E3 for current allowlist updates |
 
 ### Scanner Inventory
 
-| Scanner | Primary files/formats | Current evidence | Next proof target |
-| --- | --- | --- | --- |
-| `pickle` | `.pkl`, `.pickle`, `.dill`, `.bin`, `.pt`, `.pth`, `.ckpt` | E3 | post-budget and malformed opcode corpus parity |
-| `picklescan_adapter` | standalone picklescan bridge | E3 | adapter/cache equivalence for inconclusive reports |
-| `pytorch_zip` | ZIP-backed PyTorch checkpoints | E3 | ZIP metadata parse boundaries and nested pickle cache semantics |
-| `pytorch_binary` | raw `.bin` PyTorch-like blobs | E1 | bounded binary fallback and benign weight near-matches |
-| `joblib` | `.joblib`, compressed/raw pickle wrappers | E3 | codec failure semantics and cache preservation |
-| `jax_checkpoint` | JAX/Orbax/checkpoint pickles | E1 | index/metadata structure failures and nested pickle routing |
-| `flax_msgpack` | `.msgpack`, `.flax`, `.orbax`, `.jax` | E1 | msgpack extension types, depth, and partial unpack coverage |
-| `numpy` | `.npy`, `.npz` | E3 | object-array pickle failures and `.npz` member routing |
-| `safetensors` | `.safetensors` | E3 | malformed header/schema and dtype consistency |
-| `keras_h5` | HDF5 Keras models | E3, PR #917 | cache and aggregate semantics after malformed config fixes |
-| `keras_zip` | `.keras` ZIP models | E3, PR #918 | metadata/weights alias ambiguity after malformed config fixes |
-| `tf_savedmodel` | SavedModel dirs, `.pb` | E1 | protobuf parse budgets and function library edges |
-| `tf_metagraph` | `.meta` | E1 | protobuf parse budgets and attr truncation semantics |
-| `tflite` | `.tflite`, routed `.bin` | E3, PR #916 | flatbuffer table bounds and custom-op recovery |
-| `onnx` | `.onnx` | E3, PR #915 | external data path policy and dtype coverage |
-| `coreml` | `.mlmodel` | E3 | protobuf truncation, linked model paths, custom layer strings |
-| `openvino` | `.xml` IR | E3 | XML parse failures, entity/DOCTYPE boundaries, companion `.bin` |
-| `gguf` | `.gguf`, `.ggml`, related | E3, PR #914 | metadata value type matrix and tensor offset checks |
-| `xgboost` | `.bst`, `.model`, `.json`, `.ubj` | E1 | JSON/UBJSON malformed root, subprocess isolation |
-| `lightgbm` | `.model`, `.txt`, `.lgb`, `.lightgbm` | E1 | text parser bounds and native-library indicators |
-| `catboost` | `.cbm` | E3, PR #924 | binary marker bounds and metadata strings |
-| `mxnet` | `*-symbol.json`, `*-NNNN.params` | E3, PR #923 | graph reference traversal and metadata payload recovery |
-| `nemo` | `.nemo` tar archives | E3, PR #919 | multi-config precedence and malformed member combinations |
-| `jinja2_template` | tokenizer configs, YAML, templates, GGUF metadata | E3, PR #920 | cache preservation and GGUF metadata extraction failures |
-| `skops` | `.skops` ZIP archives | E3 | JSON schema variations and duplicate member precedence |
-| `torchserve_mar` | `.mar` archives | E3 | manifest schema roots and handler AST edge cases |
-| `oci_layer` | OCI `.manifest` | E3 | manifest schema roots, local-vs-remote layer resolution |
-| `zip` | generic ZIP/NPZ/MAR fallback | E3 | unsupported member failure semantics and cleanup |
-| `tar` | tar families | E3 | unsupported member failure semantics and cleanup |
-| `sevenzip` | `.7z` | E3 | nested routing parity with ZIP/TAR |
-| `compressed` | `.gz`, `.bz2`, `.xz`, `.lz4`, `.zlib` | E3 | wrapper extension inference and temporary cleanup |
-| `manifest` | model/config manifests | E3, PR #922 | JSON/YAML/TOML malformed roots and nested scanning |
-| `metadata` | model cards/docs/text | E1 | secret/security pattern false positives and truncation |
-| `text` | general text docs | E0 | duplicate responsibility with metadata/manifest |
-| `pmml` | `.pmml` | E3 | XML parse boundaries and extension payload recovery |
-| `paddle` | `.pdmodel`, `.pdiparams` | E3, PR #925 | protobuf/op descriptor parse failures |
-| `cntk` | `.dnn`, `.cmf` | E3 | split reference tracking and malformed binary handling |
-| `rknn` | `.rknn` | E1 | marker and string extraction bounds |
-| `torch7` | `.t7`, `.th`, `.net` | E1 | legacy serialization parse failures |
-| `r_serialized` | `.rds`, `.rda`, `.rdata` | E1 | format header variants and string extraction bounds |
-| `executorch` | `.ptl`, `.pte` | E1 | archive/table parse failures and nested payloads |
-| `tensorrt` | `.engine`, `.plan`, `.trt` | E3 | plugin marker matrix and binary truncation |
-| `llamafile` | `.llamafile`, `.exe`, extensionless | E1 | executable header routing and model payload boundaries |
-| `weight_distribution` | optional secondary analysis | E0 | optional dependency isolation and non-security failure behavior |
+| Scanner               | Primary files/formats                                      | Current evidence | Next proof target                                               |
+| --------------------- | ---------------------------------------------------------- | ---------------- | --------------------------------------------------------------- |
+| `pickle`              | `.pkl`, `.pickle`, `.dill`, `.bin`, `.pt`, `.pth`, `.ckpt` | E3               | post-budget and malformed opcode corpus parity                  |
+| `picklescan_adapter`  | standalone picklescan bridge                               | E3               | adapter/cache equivalence for inconclusive reports              |
+| `pytorch_zip`         | ZIP-backed PyTorch checkpoints                             | E3               | ZIP metadata parse boundaries and nested pickle cache semantics |
+| `pytorch_binary`      | raw `.bin` PyTorch-like blobs                              | E1               | bounded binary fallback and benign weight near-matches          |
+| `joblib`              | `.joblib`, compressed/raw pickle wrappers                  | E3               | codec failure semantics and cache preservation                  |
+| `jax_checkpoint`      | JAX/Orbax/checkpoint pickles                               | E1               | index/metadata structure failures and nested pickle routing     |
+| `flax_msgpack`        | `.msgpack`, `.flax`, `.orbax`, `.jax`                      | E1               | msgpack extension types, depth, and partial unpack coverage     |
+| `numpy`               | `.npy`, `.npz`                                             | E3               | object-array pickle failures and `.npz` member routing          |
+| `safetensors`         | `.safetensors`                                             | E3               | malformed header/schema and dtype consistency                   |
+| `keras_h5`            | HDF5 Keras models                                          | E3, PR #917      | cache and aggregate semantics after malformed config fixes      |
+| `keras_zip`           | `.keras` ZIP models                                        | E3, PR #918      | metadata/weights alias ambiguity after malformed config fixes   |
+| `tf_savedmodel`       | SavedModel dirs, `.pb`                                     | E1               | protobuf parse budgets and function library edges               |
+| `tf_metagraph`        | `.meta`                                                    | E1               | protobuf parse budgets and attr truncation semantics            |
+| `tflite`              | `.tflite`, routed `.bin`                                   | E3, PR #916      | flatbuffer table bounds and custom-op recovery                  |
+| `onnx`                | `.onnx`                                                    | E3, PR #915      | external data path policy and dtype coverage                    |
+| `coreml`              | `.mlmodel`                                                 | E3               | protobuf truncation, linked model paths, custom layer strings   |
+| `openvino`            | `.xml` IR                                                  | E3               | XML parse failures, entity/DOCTYPE boundaries, companion `.bin` |
+| `gguf`                | `.gguf`, `.ggml`, related                                  | E3, PR #914      | metadata value type matrix and tensor offset checks             |
+| `xgboost`             | `.bst`, `.model`, `.json`, `.ubj`                          | E1               | JSON/UBJSON malformed root, subprocess isolation                |
+| `lightgbm`            | `.model`, `.txt`, `.lgb`, `.lightgbm`                      | E1               | text parser bounds and native-library indicators                |
+| `catboost`            | `.cbm`                                                     | E3, PR #924      | binary marker bounds and metadata strings                       |
+| `mxnet`               | `*-symbol.json`, `*-NNNN.params`                           | E3, PR #923      | graph reference traversal and metadata payload recovery         |
+| `nemo`                | `.nemo` tar archives                                       | E3, PR #919      | multi-config precedence and malformed member combinations       |
+| `jinja2_template`     | tokenizer configs, YAML, templates, GGUF metadata          | E3, PR #920      | cache preservation and GGUF metadata extraction failures        |
+| `skops`               | `.skops` ZIP archives                                      | E3               | JSON schema variations and duplicate member precedence          |
+| `torchserve_mar`      | `.mar` archives                                            | E3               | manifest schema roots and handler AST edge cases                |
+| `oci_layer`           | OCI `.manifest`                                            | E3               | manifest schema roots, local-vs-remote layer resolution         |
+| `zip`                 | generic ZIP/NPZ/MAR fallback                               | E3               | unsupported member failure semantics and cleanup                |
+| `tar`                 | tar families                                               | E3               | unsupported member failure semantics and cleanup                |
+| `sevenzip`            | `.7z`                                                      | E3               | nested routing parity with ZIP/TAR                              |
+| `compressed`          | `.gz`, `.bz2`, `.xz`, `.lz4`, `.zlib`                      | E3               | wrapper extension inference and temporary cleanup               |
+| `manifest`            | model/config manifests                                     | E3, PR #922      | JSON/YAML/TOML malformed roots and nested scanning              |
+| `metadata`            | model cards/docs/text                                      | E1               | secret/security pattern false positives and truncation          |
+| `text`                | general text docs                                          | E0               | duplicate responsibility with metadata/manifest                 |
+| `pmml`                | `.pmml`                                                    | E3               | XML parse boundaries and extension payload recovery             |
+| `paddle`              | `.pdmodel`, `.pdiparams`                                   | E3, PR #925      | protobuf/op descriptor parse failures                           |
+| `cntk`                | `.dnn`, `.cmf`                                             | E3               | split reference tracking and malformed binary handling          |
+| `rknn`                | `.rknn`                                                    | E1               | marker and string extraction bounds                             |
+| `torch7`              | `.t7`, `.th`, `.net`                                       | E1               | legacy serialization parse failures                             |
+| `r_serialized`        | `.rds`, `.rda`, `.rdata`                                   | E1               | format header variants and string extraction bounds             |
+| `executorch`          | `.ptl`, `.pte`                                             | E1               | archive/table parse failures and nested payloads                |
+| `tensorrt`            | `.engine`, `.plan`, `.trt`                                 | E3               | plugin marker matrix and binary truncation                      |
+| `llamafile`           | `.llamafile`, `.exe`, extensionless                        | E1               | executable header routing and model payload boundaries          |
+| `weight_distribution` | optional secondary analysis                                | E0               | optional dependency isolation and non-security failure behavior |
 
 ## Current Findings and PR Ledger
 
 Recent concrete fixes from this audit stream:
 
-| PR | Component | Finding | Status |
-| --- | --- | --- | --- |
-| #917 | Keras H5 | Malformed config/training config could be treated as clean or wrong security failure instead of inconclusive coverage | Open, review pending |
-| #918 | Keras ZIP | Malformed `config.json` structures could scan clean or crash as the wrong failure type | Open, review pending |
-| #919 | NeMo | Top-level YAML lists were not traversed for Hydra `_target_`; malformed/scalar configs looked like missing config | Open, review pending |
-| #920 | Jinja2 template | Malformed tokenizer/YAML configs swallowed parse failures and returned "No templates found"; raw visible SSTI payloads were missed | Open, review pending |
-| #922 | Manifest | `.config` INI manifests with section headers could skip structured parsing and lose URL/hash checks | Open, review pending |
-| #923 | MXNet | Malformed symbol artifacts needed routing into fail-closed scanner outcomes instead of aggregate clean/unknown results | Open, review pending |
-| #924 | CatBoost | Corrupt declared-section scans fail closed as inconclusive instead of returning incomplete coverage as clean | Open, review pending |
-| #925 | Paddle | Suspicious Paddle code indicators are warnings, preserving signal without escalating review-only findings to errors | Open, review pending |
-| #926 | Native code tests | Expanded native-code detection regression coverage and benign executable-suffix near-match negatives | Open, review pending |
+| PR   | Component         | Finding                                                                                                                            | Status               |
+| ---- | ----------------- | ---------------------------------------------------------------------------------------------------------------------------------- | -------------------- |
+| #917 | Keras H5          | Malformed config/training config could be treated as clean or wrong security failure instead of inconclusive coverage              | Open, review pending |
+| #918 | Keras ZIP         | Malformed `config.json` structures could scan clean or crash as the wrong failure type                                             | Open, review pending |
+| #919 | NeMo              | Top-level YAML lists were not traversed for Hydra `_target_`; malformed/scalar configs looked like missing config                  | Open, review pending |
+| #920 | Jinja2 template   | Malformed tokenizer/YAML configs swallowed parse failures and returned "No templates found"; raw visible SSTI payloads were missed | Open, review pending |
+| #922 | Manifest          | `.config` INI manifests with section headers could skip structured parsing and lose URL/hash checks                                | Open, review pending |
+| #923 | MXNet             | Malformed symbol artifacts needed routing into fail-closed scanner outcomes instead of aggregate clean/unknown results             | Open, review pending |
+| #924 | CatBoost          | Corrupt declared-section scans fail closed as inconclusive instead of returning incomplete coverage as clean                       | Open, review pending |
+| #925 | Paddle            | Suspicious Paddle code indicators are warnings, preserving signal without escalating review-only findings to errors                | Open, review pending |
+| #926 | Native code tests | Expanded native-code detection regression coverage and benign executable-suffix near-match negatives                               | Open, review pending |
 
 Earlier open PRs from the same boundary-hardening campaign include #901 and
 #907 through #916. All open PR entries remain provisional until CI and review
