@@ -9,13 +9,14 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+import modelaudit.core_results as core_results
 from modelaudit.integrations.license_checker import (
     LICENSE_FILES,
     check_commercial_use_warnings,
     collect_license_metadata,
 )
 from modelaudit.models import ModelAuditResultModel, ScanConfigModel, create_initial_audit_result
-from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, Check, Issue, IssueSeverity, ScanResult
+from modelaudit.scanner_results import Issue, IssueSeverity, ScanResult
 from modelaudit.scanners import _registry
 from modelaudit.scanners.archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY
 from modelaudit.scanners.base import BaseScanner
@@ -41,7 +42,6 @@ from modelaudit.utils.file.large_file_handler import (
     should_use_large_file_handler,
 )
 from modelaudit.utils.file.streaming import stream_analyze_file
-from modelaudit.utils.helpers.assets import asset_from_scan_result
 from modelaudit.utils.helpers.cache_decorator import cached_scan
 from modelaudit.utils.helpers.interrupt_handler import check_interrupted
 from modelaudit.utils.helpers.types import (
@@ -53,183 +53,23 @@ from modelaudit.utils.sources._huggingface_cache import _find_hf_cache_root, _pa
 
 logger = logging.getLogger("modelaudit.core")
 
-_OPERATIONAL_ERROR_METADATA_KEY = "operational_error"
-_OPERATIONAL_ERROR_REASON_METADATA_KEY = "operational_error_reason"
-_SCAN_OUTCOME_METADATA_KEY = "scan_outcome"
+_add_asset_to_results = core_results.add_asset_to_results
+_add_error_asset_to_results = core_results.add_error_asset_to_results
+_add_issue_to_model = core_results.add_issue_to_model
+_add_scan_result_to_model = core_results.add_scan_result_to_model
+_consolidate_checks = core_results.consolidate_checks
+_mark_inconclusive_scan_outcome = core_results.mark_inconclusive_scan_outcome
+_mark_operational_scan_error = core_results.mark_operational_scan_error
+_results_should_be_unsuccessful = core_results.results_should_be_unsuccessful
+_scan_result_has_operational_error = core_results.scan_result_has_operational_error
+_serialize_streamed_records = core_results.serialize_streamed_records
+_to_telemetry_severity = core_results.to_telemetry_severity
+determine_exit_code = core_results.determine_exit_code
+merge_scan_result = core_results.merge_scan_result
 
 HEADER_FORMAT_TO_SCANNER_ID = _registry.get_header_format_to_scanner_ids()
 _COMPRESSED_HEADER_FORMATS = frozenset({"compressed", "gzip", "bzip2", "xz", "lz4", "zlib"})
 _R_SERIALIZED_EXTENSIONS = frozenset({".rds", ".rda", ".rdata"})
-
-
-def _mark_operational_scan_error(scan_result: ScanResult, reason: str) -> None:
-    """Mark a scan result as an operational failure for exit-code aggregation."""
-    scan_result.metadata[_OPERATIONAL_ERROR_METADATA_KEY] = True
-    scan_result.metadata[_OPERATIONAL_ERROR_REASON_METADATA_KEY] = reason
-
-
-def _mark_inconclusive_scan_outcome(scan_result: ScanResult, reason: str) -> None:
-    """Mark a scan result as explicitly inconclusive for exit-code aggregation."""
-    scan_result.metadata["analysis_incomplete"] = True
-    scan_result.metadata[_SCAN_OUTCOME_METADATA_KEY] = INCONCLUSIVE_SCAN_OUTCOME
-    scan_result.metadata.setdefault(
-        "scan_outcome_message",
-        "Scan analysis incomplete; failed closed because full coverage was not available.",
-    )
-
-    existing_reasons = scan_result.metadata.get("scan_outcome_reasons")
-    reasons = existing_reasons if isinstance(existing_reasons, list) else []
-    if reason not in reasons:
-        reasons.append(reason)
-    scan_result.metadata["scan_outcome_reasons"] = reasons
-
-
-def _scan_result_has_operational_error(scan_result: ScanResult) -> bool:
-    """Return True when a scan result represents an operational failure."""
-    metadata = scan_result.metadata or {}
-    explicit_flag = metadata.get(_OPERATIONAL_ERROR_METADATA_KEY)
-    if explicit_flag is not None:
-        return bool(explicit_flag)
-
-    return False
-
-
-def _results_have_operational_error(results: ModelAuditResultModel) -> bool:
-    """Return True when aggregated results include an operational failure."""
-    if getattr(results, "has_errors", False):
-        return True
-
-    return any(
-        bool(metadata.get(_OPERATIONAL_ERROR_METADATA_KEY)) for metadata in (results.file_metadata or {}).values()
-    )
-
-
-def _metadata_has_scan_outcome(metadata: Any, outcome: str) -> bool:
-    """Return True when metadata reports the requested scan outcome."""
-    if metadata is None:
-        return False
-    if isinstance(metadata, dict):
-        return metadata.get(_SCAN_OUTCOME_METADATA_KEY) == outcome
-
-    getter = getattr(metadata, "get", None)
-    if callable(getter):
-        try:
-            value = getter(_SCAN_OUTCOME_METADATA_KEY)
-            return bool(value == outcome)
-        except Exception:
-            return False
-
-    return getattr(metadata, _SCAN_OUTCOME_METADATA_KEY, None) == outcome
-
-
-def _results_have_inconclusive_outcome(results: ModelAuditResultModel) -> bool:
-    """Return True when any scanned file completed with an explicit inconclusive outcome."""
-    return any(
-        _metadata_has_scan_outcome(metadata, INCONCLUSIVE_SCAN_OUTCOME)
-        for metadata in (results.file_metadata or {}).values()
-    )
-
-
-def _results_have_security_findings(results: ModelAuditResultModel) -> bool:
-    """Return True when WARNING/CRITICAL issues were reported."""
-    return any(
-        hasattr(issue, "severity") and issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL)
-        for issue in (results.issues or [])
-    )
-
-
-def _results_should_be_unsuccessful(results: ModelAuditResultModel) -> bool:
-    """Return True when the aggregate result should not be considered successful."""
-    if _results_have_operational_error(results):
-        return True
-
-    return _results_have_inconclusive_outcome(results) and not _results_have_security_findings(results)
-
-
-def _to_telemetry_severity(severity: Any) -> str:
-    """Normalize severity values to stable telemetry strings."""
-    if hasattr(severity, "value"):
-        return str(severity.value).lower()
-    if hasattr(severity, "name"):
-        return str(severity.name).lower()
-
-    severity_str = str(severity).lower()
-    if severity_str.startswith("issueseverity."):
-        severity_str = severity_str.split(".", 1)[1]
-    return severity_str
-
-
-def _add_asset_to_results(
-    results: ModelAuditResultModel,
-    file_path: str,
-    file_result: ScanResult,
-) -> None:
-    """Helper function to add an asset entry to the results."""
-    from .models import AssetModel
-
-    asset_dict = asset_from_scan_result(file_path, file_result)
-    asset = AssetModel(**asset_dict)
-    results.assets.append(asset)
-
-
-def _add_error_asset_to_results(results: ModelAuditResultModel, file_path: str) -> None:
-    """Helper function to add an error asset entry to the results."""
-    from .models import AssetModel
-
-    asset = AssetModel(path=file_path, type="error", size=None, tensors=None, keys=None, contents=None)
-    results.assets.append(asset)
-
-
-def _add_scan_result_to_model(
-    results: ModelAuditResultModel, scan_metadata: dict[str, Any], file_result: ScanResult, file_path: str
-) -> None:
-    """Helper function to add scan result data to Pydantic model."""
-
-    from .models import FileMetadataModel
-
-    # Update byte counts
-    results.bytes_scanned += file_result.bytes_scanned
-    # files_scanned is incremented elsewhere to avoid double counting
-
-    # Add scanner to tracking lists
-    if file_result.scanner_name and file_result.scanner_name not in scan_metadata.get("scanners", []):
-        scan_metadata.setdefault("scanners", []).append(file_result.scanner_name)
-    if (
-        file_result.scanner_name
-        and file_result.scanner_name not in results.scanner_names
-        and file_result.scanner_name != "unknown"
-    ):
-        results.scanner_names.append(file_result.scanner_name)
-    if _scan_result_has_operational_error(file_result):
-        scan_metadata["has_operational_errors"] = True
-
-    # Convert and add issues
-    for issue in file_result.issues:
-        issue_dict = issue.to_dict() if hasattr(issue, "to_dict") else issue
-        if isinstance(issue_dict, dict):
-            record_issue_found(
-                issue_type=str(issue_dict.get("message", "unknown_issue")),
-                severity=_to_telemetry_severity(issue_dict.get("severity", "unknown")),
-                scanner=file_result.scanner_name,
-                file_path=file_path,
-            )
-            results.issues.append(Issue(**issue_dict))
-
-    # Convert and add checks
-    for check in file_result.checks:
-        check_dict = check.to_dict() if hasattr(check, "to_dict") else check
-        if isinstance(check_dict, dict):
-            results.checks.append(Check(**check_dict))
-
-    # Add file metadata if available
-    if hasattr(file_result, "metadata") and file_result.metadata:
-        # Convert ml_context if present
-        metadata_dict = file_result.metadata.copy()
-        if "ml_context" in metadata_dict and isinstance(metadata_dict["ml_context"], dict):
-            from .models import MLContextModel
-
-            metadata_dict["ml_context"] = MLContextModel(**metadata_dict["ml_context"])
-        results.file_metadata[file_path] = FileMetadataModel(**metadata_dict)
 
 
 def _select_preferred_scanner_id(path: str, header_format: str, ext: str) -> str | None:
@@ -266,73 +106,6 @@ def _select_preferred_scanner_id(path: str, header_format: str, ext: str) -> str
         return "nemo"
 
     return _registry.get_scanner_id_for_header_format(header_format)
-
-
-def _add_issue_to_model(
-    results: ModelAuditResultModel,
-    message: str,
-    severity: str = "warning",
-    location: str | None = None,
-    details: dict | None = None,
-    issue_type: str | None = None,
-) -> None:
-    """Helper function to add an issue directly to the Pydantic model."""
-    import time
-
-    # Convert string severity to enum
-    severity_enum = {
-        "debug": IssueSeverity.DEBUG,
-        "info": IssueSeverity.INFO,
-        "warning": IssueSeverity.WARNING,
-        "critical": IssueSeverity.CRITICAL,
-    }.get(severity.lower(), IssueSeverity.WARNING)
-
-    issue = Issue(
-        message=message,
-        severity=severity_enum,
-        location=location,
-        details=details or {},
-        timestamp=time.time(),
-        why=None,
-        type=issue_type,
-    )
-    results.issues.append(issue)
-
-
-def _normalize_streamed_location(location: str | None, report_path: str, resolved_path: str) -> str | None:
-    """Rewrite streamed result locations to the original source path when needed."""
-    if not location or report_path == resolved_path:
-        return location
-
-    if location == resolved_path:
-        return report_path
-
-    if not location.startswith(resolved_path):
-        return location
-
-    suffix = location[len(resolved_path) :]
-    if suffix and suffix[0] not in {":", " ", "(", "[", "/", "\\"}:
-        return location
-
-    return f"{report_path}{suffix}"
-
-
-def _serialize_streamed_records(records: list[Any], report_path: str, resolved_path: str) -> list[dict[str, Any]]:
-    """Convert streamed issues/checks into dicts with source-path locations."""
-    serialized: list[dict[str, Any]] = []
-    for record in records:
-        record_dict = record.to_dict() if hasattr(record, "to_dict") else record
-        if not isinstance(record_dict, dict):
-            continue
-
-        normalized_record = dict(record_dict)
-        location = normalized_record.get("location")
-        if isinstance(location, str):
-            normalized_record["location"] = _normalize_streamed_location(location, report_path, resolved_path)
-
-        serialized.append(normalized_record)
-
-    return serialized
 
 
 def _calculate_file_hash(file_path: str) -> str:
@@ -427,297 +200,6 @@ def _resolve_directory_scan_target(
         return None, False
 
     return resolved_file, is_hf_cache_symlink
-
-
-def _extract_primary_asset_from_location(location: str) -> str:
-    """Extract primary asset path from location string.
-
-    Args:
-        location: Location string in various formats
-
-    Returns:
-        Primary asset path, or "unknown" if cannot be determined
-    """
-    if not location or not isinstance(location, str):
-        return "unknown"
-
-    # Locations are single paths. Duplicate copies are tracked separately in
-    # details["duplicate_files"] to avoid ambiguous delimiter encoding.
-    primary_location = location.strip()
-
-    if not primary_location:
-        return "unknown"
-
-    # Extract main file path (before any ':' separator for archive contents)
-    drive, tail = os.path.splitdrive(primary_location)
-    if ":" in tail:
-        tail = tail.split(":", 1)[0]
-    primary_asset = f"{drive}{tail}"
-
-    # Normalize empty paths
-    return primary_asset.strip() if primary_asset.strip() else "unknown"
-
-
-def _group_checks_by_asset(checks_list: list[Any]) -> dict[tuple[str, str], list[dict[str, Any]]]:
-    """Group checks by (check_name, primary_asset_path).
-
-    Args:
-        checks_list: List of check dictionaries
-
-    Returns:
-        Dictionary mapping (check_name, asset_path) to list of checks
-    """
-    check_groups: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
-
-    for i, check in enumerate(checks_list):
-        # Type guard: ensure check is a dictionary
-        if not isinstance(check, dict):
-            logger.warning(f"Invalid check format at index {i}, skipping: {type(check)}")
-            continue
-
-        check_name = check.get("name", "Unknown Check")
-        location = check.get("location", "")
-        primary_asset = _extract_primary_asset_from_location(location)
-        details = check.get("details")
-        zip_entry_id = details.get("zip_entry_id") if isinstance(details, dict) else None
-        zip_entry = details.get("zip_entry") if isinstance(details, dict) else None
-
-        if isinstance(zip_entry_id, str) and zip_entry_id:
-            asset_group = f"{primary_asset}:{zip_entry_id}"
-        elif isinstance(zip_entry, str) and zip_entry:
-            asset_group = f"{primary_asset}:{zip_entry}"
-        else:
-            asset_group = primary_asset
-
-        group_key = (check_name, asset_group)
-        check_groups[group_key].append(check)
-
-    return check_groups
-
-
-def _create_consolidated_message(
-    check_name: str, group_checks: list[dict[str, Any]], consolidated_status: str, failed_count: int
-) -> str:
-    """Create appropriate consolidated message based on check results.
-
-    Args:
-        check_name: Name of the check
-        group_checks: List of checks in this group
-        consolidated_status: Overall status (passed/failed)
-        failed_count: Number of failed checks
-
-    Returns:
-        Consolidated message string
-    """
-    if consolidated_status == "passed":
-        # For passed checks, use the message from first check or create generic
-        messages = {c.get("message", "") for c in group_checks if c.get("status") == "passed"}
-
-        # If all passed checks have the same message, use it
-        if len(messages) == 1:
-            return str(next(iter(messages)))
-        else:
-            return f"{check_name} completed successfully"
-
-    else:  # failed status
-        # For failed checks, summarize or use common message
-        failed_messages = {c.get("message", "") for c in group_checks if c.get("status") == "failed"}
-
-        if len(failed_messages) == 1:
-            return str(next(iter(failed_messages)))
-        elif failed_count == 1:
-            return f"{check_name} found 1 issue"
-        else:
-            return f"{check_name} found {failed_count} issues"
-
-
-def _collect_consolidated_details(group_checks: list[dict[str, Any]]) -> dict[str, Any]:
-    """Collect and consolidate details from failed checks.
-
-    Args:
-        group_checks: List of checks in this group
-
-    Returns:
-        Consolidated details dictionary
-    """
-    consolidated_details: dict[str, Any] = {"component_count": len(group_checks)}
-    failed_details: list[Any] = []
-
-    for check in group_checks:
-        if check.get("status") == "failed" and check.get("details"):
-            failed_details.append(check["details"])
-
-    if failed_details:
-        consolidated_details["findings"] = failed_details
-
-    return consolidated_details
-
-
-def _extract_failure_context(group_checks: list[dict[str, Any]]) -> tuple[str | None, str | None]:
-    """Extract severity and explanation from failed checks.
-
-    Args:
-        group_checks: List of checks in this group
-
-    Returns:
-        Tuple of (severity, explanation) from failed checks
-    """
-    consolidated_severity = None
-    consolidated_why = None
-
-    for check in group_checks:
-        if check.get("status") == "failed":
-            if not consolidated_severity and check.get("severity"):
-                consolidated_severity = check["severity"]
-            if not consolidated_why and check.get("why"):
-                consolidated_why = check["why"]
-
-            # Stop once we have both
-            if consolidated_severity and consolidated_why:
-                break
-
-    return consolidated_severity, consolidated_why
-
-
-def _get_consolidated_timestamp(group_checks: list[dict[str, Any]]) -> float:
-    """Get the most recent timestamp from a group of checks.
-
-    Args:
-        group_checks: List of checks in this group
-
-    Returns:
-        Most recent timestamp, or current time if none found
-    """
-    timestamps = [c.get("timestamp", 0) for c in group_checks if isinstance(c.get("timestamp"), int | float)]
-    return max(timestamps) if timestamps else time.time()
-
-
-def _update_result_counts(
-    results: ModelAuditResultModel, consolidated_checks: list[dict[str, Any]], original_count: int
-) -> None:
-    """Update result model with consolidated check counts.
-
-    Args:
-        results: Results model to update
-        consolidated_checks: List of consolidated checks
-        original_count: Original number of checks before consolidation
-    """
-
-    # Filter for success rate: include all passed checks + failed WARNING/CRITICAL checks
-    # Exclude failed INFO/DEBUG checks from success rate (they're informational)
-    def is_failed_info_or_debug(check):
-        if check.get("status") != "failed":
-            return False
-        severity = check.get("severity", "")
-        # Check both string and enum values for compatibility
-        return severity in ("info", "debug", IssueSeverity.INFO.value, IssueSeverity.DEBUG.value)
-
-    # Exclude only failed INFO/DEBUG checks from success rate
-    security_checks = [c for c in consolidated_checks if not is_failed_info_or_debug(c)]
-
-    total_checks = len(security_checks)
-    passed_checks = sum(1 for c in security_checks if c.get("status") == "passed")
-    failed_checks = sum(1 for c in security_checks if c.get("status") == "failed")
-    skipped_checks = total_checks - passed_checks - failed_checks
-
-    # Debug logging
-    info_debug_excluded = len(consolidated_checks) - len(security_checks)
-    logger.debug(
-        f"Check statistics: {total_checks} total ({info_debug_excluded} INFO/DEBUG excluded), "
-        f"{passed_checks} passed, {failed_checks} failed"
-    )
-
-    # Validate counts make sense
-    if passed_checks + failed_checks + skipped_checks != total_checks:
-        logger.warning(
-            f"Check count mismatch: {passed_checks}P + {failed_checks}F + {skipped_checks}S != {total_checks}T"
-        )
-
-    results.total_checks = total_checks
-    results.passed_checks = passed_checks
-    results.failed_checks = failed_checks
-
-    # Log consolidation summary
-    reduction_count = original_count - total_checks
-    logger.debug(f"Check consolidation: {original_count} -> {total_checks} ({reduction_count} duplicates removed)")
-
-    if skipped_checks > 0:
-        logger.debug(f"Check status distribution: {passed_checks}P, {failed_checks}F, {skipped_checks}S")
-
-
-def _consolidate_checks(results: ModelAuditResultModel) -> None:
-    """Consolidate duplicate checks by name and asset for cleaner reporting.
-
-    Groups checks by (check_name, primary_asset_path) and consolidates them into
-    single checks per asset. This provides a cleaner reporting view while preserving
-    all findings from thorough scanning.
-
-    Args:
-        results: Scan results dictionary containing 'checks' list
-
-    Raises:
-        Exception: Logs errors but doesn't fail the scan if consolidation fails
-    """
-    checks_list = [check.model_dump() if hasattr(check, "model_dump") else check for check in results.checks]
-    if not checks_list:
-        logger.debug("No checks to consolidate")
-        return
-
-    logger.debug(f"Starting consolidation of {len(checks_list)} checks")
-
-    # Group checks by (check_name, primary_asset_path)
-    check_groups = _group_checks_by_asset(checks_list)
-
-    # Consolidate checks within each group
-    consolidated_checks: list[dict[str, Any]] = []
-
-    for (check_name, primary_asset), group_checks in check_groups.items():
-        if len(group_checks) == 1:
-            # Single check - use as-is
-            consolidated_checks.append(group_checks[0])
-            continue
-
-        # Multiple checks - consolidate them
-        statuses = [c.get("status") for c in group_checks]
-        failed_count = sum(s == "failed" for s in statuses)
-        passed_count = sum(s == "passed" for s in statuses)
-        if failed_count:
-            consolidated_status = "failed"
-        elif passed_count:
-            consolidated_status = "passed"
-        else:
-            consolidated_status = "skipped"
-
-        # Build consolidated check
-        consolidated_check = {
-            "name": check_name,
-            "status": consolidated_status,
-            "message": _create_consolidated_message(check_name, group_checks, consolidated_status, failed_count),
-            "location": group_checks[0].get("location", primary_asset),
-            "details": _collect_consolidated_details(group_checks),
-            "timestamp": _get_consolidated_timestamp(group_checks),
-        }
-
-        # Add optional fields for failed checks
-        consolidated_severity, consolidated_why = _extract_failure_context(group_checks)
-        if consolidated_severity:
-            consolidated_check["severity"] = consolidated_severity
-        if consolidated_why:
-            consolidated_check["why"] = consolidated_why
-
-        consolidated_checks.append(consolidated_check)
-
-        # Log consolidation info
-        logger.debug(
-            f"Consolidated {len(group_checks)} '{check_name}' checks for {primary_asset} "
-            f"({passed_count} passed, {failed_count} failed)"
-        )
-
-    # Update results with consolidated checks and counts - convert to Pydantic models
-    from .models import Check
-
-    results.checks = [Check(**check) if isinstance(check, dict) else check for check in consolidated_checks]
-    _update_result_counts(results, consolidated_checks, len(checks_list))
 
 
 def validate_scan_config(config: dict[str, Any]) -> ScanConfigModel:
@@ -1233,44 +715,6 @@ def scan_model_directory_or_file(
     return results
 
 
-def determine_exit_code(results: ModelAuditResultModel) -> int:
-    """
-    Determine the appropriate exit code based on scan results.
-
-    Exit codes:
-    - 0: Success, no security issues found
-    - 1: Security issues found (scan completed successfully)
-    - 2: Operational errors occurred during scanning, the scan outcome was
-         inconclusive without any WARNING/CRITICAL findings, or no files were
-         scanned and no security issues were found
-
-    Args:
-        results: ModelAuditResultModel with scan results
-
-    Returns:
-        Exit code (0, 1, or 2)
-    """
-    # Check for operational errors first (highest priority)
-    if _results_have_operational_error(results):
-        return 2
-
-    # Security findings take precedence over inconclusive outcomes so the
-    # caller still gets exit code 1 when genuine risks were identified.
-    if _results_have_security_findings(results):
-        return 1
-
-    if _results_have_inconclusive_outcome(results):
-        return 2
-
-    # Check if no files were scanned
-    files_scanned = results.files_scanned
-    if files_scanned == 0:
-        return 2
-
-    # No issues found
-    return 0
-
-
 # _should_skip_file has been moved to utils.file_filter module
 
 
@@ -1610,42 +1054,6 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         result.bytes_scanned = file_size
 
     return result
-
-
-def merge_scan_result(
-    results: ModelAuditResultModel,
-    scan_result: ScanResult | dict[str, Any],
-) -> None:
-    """
-    Merge a ScanResult object into the ModelAuditResultModel.
-
-    Args:
-        results: The existing ModelAuditResultModel
-        scan_result: The ScanResult object or dict to merge
-    """
-    # Record telemetry for issues before aggregation
-    if isinstance(scan_result, ScanResult):
-        file_path = scan_result.file_path if hasattr(scan_result, "file_path") else None
-        for issue in scan_result.issues:
-            record_issue_found(
-                issue.message,
-                issue.severity.name if hasattr(issue.severity, "name") else str(issue.severity),
-                scan_result.scanner_name,
-                file_path=file_path,
-            )
-        # Use the new direct aggregation method for better performance and type safety
-        results.aggregate_scan_result_direct(scan_result)
-    else:
-        # Fallback to dict-based aggregation for backward compatibility with telemetry
-        file_path = scan_result.get("file_path")
-        for issue in scan_result.get("issues", []):
-            record_issue_found(
-                issue.get("message", "unknown_issue"),
-                issue.get("severity", "unknown"),
-                scan_result.get("scanner_name", "unknown"),
-                file_path=file_path,
-            )
-        results.aggregate_scan_result(scan_result)
 
 
 def scan_model_streaming(

@@ -3,7 +3,8 @@
 ## Core Components
 
 - `cli.py`: Click-based CLI interface
-- `core.py`: Main scanning logic and file traversal
+- `core.py`: Main scanning logic, file traversal, routing, and scanner invocation
+- `core_results.py`: Aggregate result helpers, exit-code semantics, check consolidation, and asset/metadata attachment
 - `metadata_extractor.py`: Metadata extraction command backend (`modelaudit metadata`)
 - `scanner_results.py`: Leaf result/check/issue contracts re-exported by `scanners/base.py`
 - `scanner_registry_metadata.py`: Static scanner metadata consumed by registry loading and extension utilities
@@ -103,6 +104,7 @@ result.add_check(
 - `modelaudit/scanners/base.py`: Scanner interface and base classes
 - `modelaudit/scanners/<scanner>_support/`: Extracted helper modules for large scanners while preserving public `<scanner>_scanner.py` entrypoints
 - `modelaudit/core.py`: Main scanning orchestration logic
+- `modelaudit/core_results.py`: Shared result aggregation/finalization logic used by core scan flows
 - `modelaudit/cli.py`: Command-line interface
 - `pyproject.toml`: Dependencies and project configuration
 - `tests/conftest.py`: Test configuration and fixtures

@@ -14,23 +14,23 @@ import pytest
 
 from modelaudit.core import (
     HEADER_FORMAT_TO_SCANNER_ID,
-    _extract_primary_asset_from_location,
     scan_file,
     scan_model_directory_or_file,
 )
+from modelaudit.core_results import _extract_primary_asset_from_location
 from modelaudit.scanners import _registry
 from modelaudit.utils.file import detection
 
 
 def test_extract_primary_asset_windows_path_with_archive() -> None:
     location = r"C:\\Users\\test\\archive.zip:inner\\file"
-    with patch("modelaudit.core.os.path.splitdrive", ntpath.splitdrive):
+    with patch("modelaudit.core_results.os.path.splitdrive", ntpath.splitdrive):
         assert _extract_primary_asset_from_location(location) == r"C:\\Users\\test\\archive.zip"
 
 
 def test_extract_primary_asset_windows_path_without_archive() -> None:
     location = r"C:\\Users\\test\\file.txt"
-    with patch("modelaudit.core.os.path.splitdrive", ntpath.splitdrive):
+    with patch("modelaudit.core_results.os.path.splitdrive", ntpath.splitdrive):
         assert _extract_primary_asset_from_location(location) == r"C:\\Users\\test\\file.txt"
 
 
