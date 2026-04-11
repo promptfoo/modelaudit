@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- mark malformed Keras ZIP configs inconclusive instead of clean
 - mark malformed Keras H5 scans inconclusive instead of clean
 - mark malformed TFLite scans inconclusive instead of clean
 - mark malformed GGUF scans inconclusive instead of clean
