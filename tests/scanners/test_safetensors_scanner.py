@@ -439,6 +439,20 @@ def test_literal_unicode_escape_metadata_still_flags_code_injection(tmp_path: Pa
     assert all(check.severity == IssueSeverity.CRITICAL for check in code_injection_checks)
 
 
+def test_single_comment_token_does_not_bypass_unicode_escape_detection(tmp_path: Path) -> None:
+    file_path = tmp_path / "commented_escape_payload_metadata.safetensors"
+    data = {"t": np.arange(5, dtype=np.float32)}
+    metadata = {"payload": r"\u0065#\u0076\u0061\u006c\u0028"}
+    save_file(data, str(file_path), metadata=metadata)
+
+    scanner = SafeTensorsScanner()
+    result = scanner.scan(str(file_path))
+
+    code_injection_checks = [check for check in result.checks if check.name == "SafeTensors Code Injection Detection"]
+    assert code_injection_checks
+    assert all(check.severity == IssueSeverity.CRITICAL for check in code_injection_checks)
+
+
 def test_mixed_suspicious_patterns(tmp_path: Path) -> None:
     """Test that both simple patterns and regex patterns are detected from the same metadata value."""
     file_path = tmp_path / "model.safetensors"
