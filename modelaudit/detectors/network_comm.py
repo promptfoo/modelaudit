@@ -8,6 +8,95 @@ import ipaddress
 import re
 from typing import Any, ClassVar
 
+_DOC_CONTEXT_MARKERS: tuple[str, ...] = (
+    ".md",
+    ".rst",
+    ".txt",
+    ".json",
+    ".yaml",
+    ".yml",
+    "readme",
+    "metadata",
+    "description",
+    "model_card",
+    "manifest",
+)
+_PROSE_MARKERS: tuple[str, ...] = (
+    " example",
+    " examples",
+    " documentation",
+    " readme",
+    " description",
+    " metadata",
+    " says",
+    " mentions",
+    " includes",
+    " for ",
+)
+_WORD_PATTERN = re.compile(rb"[A-Za-z]{2,}")
+_CODE_LINE_PREFIXES: tuple[bytes, ...] = (
+    b"import ",
+    b"from ",
+    b"def ",
+    b"class ",
+)
+_CODE_LINE_MARKERS: tuple[bytes, ...] = (
+    b"=",
+    b";",
+    b"lambda ",
+)
+
+
+def _is_metadata_context(context: str) -> bool:
+    """Return whether the scan context appears to be documentation or metadata."""
+    context_lower = context.lower()
+    return any(marker in context_lower for marker in _DOC_CONTEXT_MARKERS)
+
+
+def _extract_line(data: bytes, match_index: int) -> bytes:
+    """Extract the line containing a matched network token."""
+    line_start = data.rfind(b"\n", 0, match_index) + 1
+    line_end = data.find(b"\n", match_index)
+    if line_end == -1:
+        line_end = len(data)
+    return data[line_start:line_end]
+
+
+def _has_call_syntax(data: bytes, match_index: int, token_len: int) -> bool:
+    """Return whether a token is followed by call syntax after optional whitespace."""
+    cursor = match_index + token_len
+    while cursor < len(data) and data[cursor : cursor + 1] in {b" ", b"\t", b"\r", b"\n"}:
+        cursor += 1
+    return cursor < len(data) and data[cursor : cursor + 1] == b"("
+
+
+def _is_doc_only_network_reference(
+    data: bytes,
+    *,
+    match_index: int,
+    token_len: int,
+    context: str,
+    requires_call: bool,
+) -> bool:
+    """Return whether a raw network token appears in prose instead of executable code."""
+    if requires_call and _has_call_syntax(data, match_index, token_len):
+        return False
+
+    line = _extract_line(data, match_index)
+    line_lower = line.lower()
+    stripped = line_lower.lstrip()
+    word_count = len(_WORD_PATTERN.findall(line))
+    metadata_context = _is_metadata_context(context)
+
+    if any(stripped.startswith(prefix) for prefix in _CODE_LINE_PREFIXES) and word_count <= 4:
+        return False
+    if any(marker in line_lower for marker in _CODE_LINE_MARKERS):
+        return False
+
+    text = line.decode("utf-8", errors="ignore").lower()
+    has_prose_marker = any(marker in text for marker in _PROSE_MARKERS)
+    return (metadata_context and word_count >= 4) or (word_count >= 6 and has_prose_marker)
+
 
 class NetworkCommDetector:
     """Detector for network communication patterns in model files."""
@@ -568,7 +657,17 @@ class NetworkCommDetector:
             patterns = [b"import " + lib, b"from " + lib, lib + b".connect", lib + b".request", lib + b".__init__"]
 
             for pattern in patterns:
-                if pattern in data:
+                match_index = data.find(pattern)
+                if match_index >= 0:
+                    if _is_doc_only_network_reference(
+                        data,
+                        match_index=match_index,
+                        token_len=len(pattern),
+                        context=context,
+                        requires_call=False,
+                    ):
+                        continue
+
                     confidence = 0.7
                     severity = "HIGH"
 
@@ -593,9 +692,18 @@ class NetworkCommDetector:
     def _scan_network_functions(self, data: bytes, context: str) -> None:
         """Scan for network function calls."""
         for func in self.NETWORK_FUNCTIONS:
-            if func in data:
+            idx = data.find(func)
+            if idx >= 0:
+                if _is_doc_only_network_reference(
+                    data,
+                    match_index=idx,
+                    token_len=len(func),
+                    context=context,
+                    requires_call=True,
+                ):
+                    continue
+
                 # Try to get some context around the function call
-                idx = data.find(func)
                 start = max(0, idx - 50)
                 end = min(len(data), idx + 100)
                 snippet = data[start:end].decode("utf-8", errors="ignore")
@@ -716,6 +824,15 @@ class NetworkCommDetector:
             matches = regex.finditer(data)
 
             for match in matches:
+                if pattern_type == "network_import" and _is_doc_only_network_reference(
+                    data,
+                    match_index=match.start(),
+                    token_len=len(match.group()),
+                    context=context,
+                    requires_call=False,
+                ):
+                    continue
+
                 # Get context around the match to validate it's not in binary weights
                 start_pos = max(0, match.start() - 100)
                 end_pos = min(len(data), match.end() + 100)

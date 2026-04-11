@@ -134,6 +134,34 @@ class TestNetworkCommDetector:
         assert "requests.post" in funcs
         assert "urlopen" in funcs
 
+    def test_network_functions_not_flagged_in_documentation_metadata_context(self) -> None:
+        """Documentation prose should not report raw network library/function token mentions."""
+        detector = NetworkCommDetector()
+        data = b"This README says: import socket, requests.get, and urlopen are shown for examples."
+
+        findings = detector.scan(data, "model_card.md")
+
+        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+
+    def test_network_function_with_parentheses_still_flagged_in_metadata_context(self) -> None:
+        """Executable-looking calls should stay detectable even when embedded in metadata files."""
+        detector = NetworkCommDetector()
+        data = b'socket.connect(("api.example", 4444))'
+
+        findings = detector.scan(data, "metadata.json")
+
+        func_findings = [finding for finding in findings if finding["type"] == "network_function"]
+        assert any(finding["function"] == "socket.connect" for finding in func_findings)
+
+    def test_network_library_with_realistic_prose_context_not_flagged(self) -> None:
+        """Import-like words in prose should not be treated as network imports."""
+        detector = NetworkCommDetector()
+        data = b"Model documentation includes import socket for demos and troubleshooting examples."
+
+        findings = detector.scan(data, "README.txt")
+
+        assert not [finding for finding in findings if finding["type"] == "network_library"]
+
     def test_detect_cc_patterns(self):
         """Test detection of command & control patterns."""
         detector = NetworkCommDetector()

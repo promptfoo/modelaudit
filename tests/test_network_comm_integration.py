@@ -2,6 +2,7 @@
 
 import pickle
 import zipfile
+from pathlib import Path
 
 from modelaudit.scanners.base import CheckStatus
 from modelaudit.scanners.pickle_scanner import PickleScanner
@@ -60,6 +61,25 @@ def exfiltrate(data):
         assert any("socket" in msg for msg in messages)
         assert any("requests" in msg or "http" in msg for msg in messages)
 
+    def test_pickle_scanner_metadata_field_description_text_no_fp(self, tmp_path: Path) -> None:
+        """Description prose mentioning network APIs should not fail network checks."""
+        test_file = tmp_path / "model_with_network_docs.pkl"
+        data = {
+            "model_weights": [1.0, 2.0, 3.0],
+            "description": "Model documentation includes import socket and requests.get examples.",
+        }
+
+        with open(test_file, "wb") as f:
+            pickle.dump(data, f)
+
+        result = PickleScanner().scan(str(test_file))
+
+        assert not [
+            check
+            for check in result.checks
+            if check.name == "Network Communication Detection" and check.status == CheckStatus.FAILED
+        ]
+
     def test_pytorch_zip_scanner_integration(self, tmp_path):
         """Test network communication detection in PyTorch ZIP scanner."""
         # Create a PyTorch ZIP file with network patterns
@@ -109,6 +129,27 @@ class NetworkExfiltrator:
         all_messages = " ".join(c.message for c in network_checks)
         # Check for backdoor detection (the scanner detects port 1337 as a common backdoor)
         assert "backdoor" in all_messages.lower() or "1337" in all_messages
+
+    def test_pytorch_zip_scanner_metadata_readme_member_no_network_fp(self, tmp_path: Path) -> None:
+        """README-style archive members should not fail network checks for prose mentions."""
+        test_file = tmp_path / "model_with_network_readme.pt"
+
+        with zipfile.ZipFile(test_file, "w") as zf:
+            zf.writestr("version", "3\n")
+            zf.writestr("byteorder", "little")
+            zf.writestr("data.pkl", pickle.dumps({"state_dict": {"layer1.weight": [1.0, 2.0]}}))
+            zf.writestr(
+                "metadata/README.md",
+                b"This README says import socket and requests.get can be used in client examples.",
+            )
+
+        result = PyTorchZipScanner().scan(str(test_file))
+
+        assert not [
+            check
+            for check in result.checks
+            if check.name == "Network Communication Detection" and check.status == CheckStatus.FAILED
+        ]
 
     def test_network_detection_can_be_disabled(self, tmp_path):
         """Test that network detection can be disabled via config."""
