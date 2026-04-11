@@ -7,6 +7,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from modelaudit import core
 from modelaudit.scanners._archive_locations import rewrite_extracted_member_location
 from modelaudit.scanners.archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY
@@ -698,6 +700,32 @@ class TestZipScanner:
             and check.details.get("entry") == "link.txt"
             for check in result.checks
         )
+
+    def test_oversized_entry_cleanup_removes_partial_temp_file(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Entry extraction failures should not leave partial temp files behind."""
+        scratch_dir = tmp_path / "scratch"
+        scratch_dir.mkdir()
+        monkeypatch.setattr(tempfile, "tempdir", str(scratch_dir))
+
+        archive_path = tmp_path / "oversized_entry.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("big.bin", b"A" * 32)
+
+        result = ZipScanner(config={"max_file_size": 8}).scan(str(archive_path))
+
+        assert result.success is False
+        assert any(
+            check.name == "ZIP Entry Scan"
+            and check.status == CheckStatus.FAILED
+            and "exceeds maximum size" in check.message
+            and check.details.get("entry") == "big.bin"
+            for check in result.checks
+        )
+        assert list(scratch_dir.iterdir()) == []
 
     def test_scan_zip_with_dangerous_pickle(self):
         """Test scanning a ZIP file containing a dangerous pickle"""
