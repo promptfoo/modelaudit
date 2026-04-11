@@ -55,8 +55,6 @@ def _select_nested_scanner_id(path: str) -> str | None:
             return "skops"
         if ext == ".joblib":
             return "joblib"
-        if ext == ".bin":
-            return "pickle"
         return "zip"
 
     if ext == ".joblib" and header_format in _COMPRESSED_HEADER_FORMATS | {"pickle"}:
