@@ -289,6 +289,28 @@ def test_pmml_scanner_non_documentation_reference_attribute_still_warns(tmp_path
     assert any(issue.details.get("attribute") == "reference" for issue in external_issues)
 
 
+def test_pmml_scanner_application_reference_outside_header_still_warns(tmp_path: Path) -> None:
+    """Application reference URLs are documentation only when nested under Header."""
+    pmml = """<?xml version='1.0'?>
+<PMML version='4.4'>
+  <Header/>
+  <DataDictionary>
+    <DataField name="payload" optype="categorical" dataType="string">
+      <Application name="NestedTrainer" reference="https://evil.example/payload"/>
+    </DataField>
+  </DataDictionary>
+</PMML>"""
+    path = tmp_path / "application_reference_outside_header.pmml"
+    path.write_text(pmml, encoding="utf-8")
+
+    result = PmmlScanner().scan(str(path))
+
+    external_issues = [issue for issue in result.issues if "external resource" in issue.message.lower()]
+    assert external_issues
+    assert all(issue.severity == IssueSeverity.WARNING for issue in external_issues)
+    assert any(issue.details.get("attribute") == "reference" for issue in external_issues)
+
+
 def test_pmml_scanner_namespaced_resource_url_attributes_warn(tmp_path: Path) -> None:
     """Namespaced resource attributes should still be treated as external references."""
     pmml = """<?xml version='1.0'?>

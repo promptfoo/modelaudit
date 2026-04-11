@@ -41,7 +41,6 @@ XML_CDATA_PATTERN = re.compile(r"<!\[CDATA\[.*?\]\]>", re.DOTALL)
 SUSPICIOUS_ELEMENT_NAMES = frozenset({"script", "javascript", "python", "exec", "eval"})
 DOCUMENTATION_ELEMENT_NAMES = frozenset({"annotation", "copyright", "description", "documentation"})
 DOCUMENTATION_ATTRIBUTE_NAMES = frozenset({"description", "documentation", "label"})
-DOCUMENTATION_REFERENCE_TAG_NAMES = frozenset({"application", "header"})
 EXTERNAL_RESOURCE_ATTRIBUTE_NAMES = frozenset(
     {
         "file",
@@ -259,8 +258,12 @@ class PmmlScanner(BaseScanner):
 
     def _check_suspicious_content(self, root: Any, result: ScanResult, path: str) -> None:
         """Check for suspicious patterns and external references in PMML content."""
+        parent_by_child = {child: parent for parent in root.iter() for child in parent}
         for elem in root.iter():
             tag_name = self._local_xml_name(elem.tag)
+            parent = parent_by_child.get(elem)
+            parent_tag_name = self._local_xml_name(parent.tag) if parent is not None else ""
+            in_header_metadata = tag_name == "header" or (tag_name == "application" and parent_tag_name == "header")
 
             # Combine element text content with attributes for comprehensive scanning
             elem_text = elem.text or ""
@@ -319,6 +322,7 @@ class PmmlScanner(BaseScanner):
                         normalized_attr_name,
                         str(attr_value),
                         elem.attrib,
+                        in_header_metadata=in_header_metadata,
                     )
                     if url_pattern is not None:
                         self._add_external_resource_check_if_url(
@@ -380,6 +384,8 @@ class PmmlScanner(BaseScanner):
         attr_name: str,
         attr_value: str,
         attributes: dict[str, Any],
+        *,
+        in_header_metadata: bool,
     ) -> str | None:
         """Return the URL pattern when an attribute is an external resource reference."""
         if attr_name in DOCUMENTATION_ATTRIBUTE_NAMES:
@@ -388,9 +394,7 @@ class PmmlScanner(BaseScanner):
                 ignored_patterns=BENIGN_DOCUMENTATION_URL_PATTERNS,
             )
         if attr_name == "reference":
-            ignored_patterns = (
-                BENIGN_DOCUMENTATION_URL_PATTERNS if tag_name in DOCUMENTATION_REFERENCE_TAG_NAMES else None
-            )
+            ignored_patterns = BENIGN_DOCUMENTATION_URL_PATTERNS if in_header_metadata else None
             return PmmlScanner._find_url_pattern(attr_value, ignored_patterns=ignored_patterns)
         if attr_name in EXTERNAL_RESOURCE_ATTRIBUTE_NAMES:
             return PmmlScanner._find_url_pattern(attr_value)
