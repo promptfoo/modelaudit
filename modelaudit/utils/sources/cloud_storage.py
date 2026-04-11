@@ -87,6 +87,13 @@ def redact_cloud_error_for_display(message: object, source_url: str | None = Non
     return _SENSITIVE_QUERY_PARAM_RE.sub(r"\1<redacted>", redacted)
 
 
+def _cloud_error_sanitizer(source_url: str) -> Callable[[Exception], str]:
+    def sanitize(exc: Exception) -> str:
+        return redact_cloud_error_for_display(exc, source_url)
+
+    return sanitize
+
+
 def _cloud_url_basename(url: str) -> str:
     """Return a local filename derived from a cloud URL without query secrets."""
     try:
@@ -287,7 +294,7 @@ async def analyze_cloud_target(url: str) -> dict[str, Any]:
         @retry_with_backoff(
             max_retries=3,
             verbose=True,
-            sanitize_error=lambda exc: redact_cloud_error_for_display(exc, url),
+            sanitize_error=_cloud_error_sanitizer(url),
         )
         def get_info():
             return fs.info(url)
@@ -684,7 +691,7 @@ def download_from_cloud(
                 @retry_with_backoff(
                     max_retries=3,
                     verbose=show_progress,
-                    sanitize_error=lambda exc, source_url=file_url: redact_cloud_error_for_display(exc, source_url),
+                    sanitize_error=_cloud_error_sanitizer(file_url),
                 )
                 def download_file(url=file_url, path=local_path):
                     fs.get(url, str(path))
@@ -698,7 +705,7 @@ def download_from_cloud(
             @retry_with_backoff(
                 max_retries=3,
                 verbose=show_progress,
-                sanitize_error=lambda exc: redact_cloud_error_for_display(exc, url),
+                sanitize_error=_cloud_error_sanitizer(url),
             )
             def download_single_file():
                 fs.get(url, str(local_file))
@@ -816,7 +823,7 @@ def download_from_cloud_streaming(
             @retry_with_backoff(
                 max_retries=3,
                 verbose=show_progress,
-                sanitize_error=lambda exc, source_url=file_url: redact_cloud_error_for_display(exc, source_url),
+                sanitize_error=_cloud_error_sanitizer(file_url),
             )
             def download_file(url=file_url, path=local_path):
                 fs.get(url, str(path))
