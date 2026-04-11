@@ -233,6 +233,49 @@ def _finish_with_inconclusive_contract(
     result.finish(success=default_success or (allow_security_findings_override and has_security_findings))
 
 
+def _add_pickle_parse_failure_check(
+    result: ScanResult,
+    *,
+    location: str,
+    error: Exception,
+    early_detection_successful: bool | None = None,
+) -> None:
+    """Record incomplete pickle parsing as an operationally inconclusive scan."""
+    details: dict[str, Any] = {
+        "file_type": "pickle",
+        "category": "parse_error",
+        "parse_error": str(error),
+        "exception_type": type(error).__name__,
+        "parsing_failed": True,
+        "failure_reason": "unknown_opcode_or_format_error",
+        "analysis_incomplete": True,
+    }
+    if early_detection_successful is not None:
+        details["early_detection_successful"] = early_detection_successful
+
+    result.add_check(
+        name="Pickle Format Check",
+        passed=False,
+        message="Pickle parsing failed before full scan completion",
+        severity=IssueSeverity.INFO,
+        location=location,
+        details=details,
+        why=(
+            "The scanner could not fully parse this pickle file due to an opcode/format error. "
+            "The scan is marked inconclusive rather than a security finding unless separate dangerous evidence exists."
+        ),
+    )
+    result.metadata.update(
+        {
+            "file_type": "pickle",
+            "parsing_failed": True,
+            "failure_reason": "unknown_opcode_or_format_error",
+            "analysis_incomplete": True,
+        }
+    )
+    _mark_inconclusive_scan_result(result, "pickle_analysis_incomplete")
+
+
 def _freeze_pickle_scan_value(value: Any) -> Hashable:
     """Convert nested check details into a hashable representation for dedupe."""
     if isinstance(value, Mapping):
@@ -4640,37 +4683,15 @@ class PickleScanner(BaseScanner):
                     return result
 
                 elif file_ext in [".pkl", ".pickle", ".joblib", ".dill", ".pt", ".pth", ".ckpt"]:
-                    # Pickle-like files must fail closed when parsing aborts on unknown opcodes.
+                    # Pickle-like files fail closed operationally when parsing aborts on unknown opcodes.
                     logger.warning(f"Pickle parse failed for {path}: {e}")
-                    result.add_check(
-                        name="Pickle Format Check",
-                        passed=False,
-                        message="Pickle parsing failed before full scan completion",
-                        severity=IssueSeverity.CRITICAL,
+                    _add_pickle_parse_failure_check(
+                        result,
                         location=path,
-                        details={
-                            "file_type": "pickle",
-                            "parse_error": str(e),
-                            "early_detection_successful": early_pattern_scan_completed,
-                            "parsing_failed": True,
-                            "failure_reason": "unknown_opcode_or_format_error",
-                        },
-                        why=(
-                            "The scanner could not fully parse this pickle file due to an opcode/format error. "
-                            "Because full opcode analysis did not complete, the file is treated as unsafe."
-                        ),
+                        error=e,
+                        early_detection_successful=early_pattern_scan_completed,
                     )
-
-                    # Fail closed metadata for parse failures on pickle-like files.
-                    result.metadata.update(
-                        {
-                            "file_type": "pickle",
-                            "parsing_failed": True,
-                            "failure_reason": "unknown_opcode_or_format_error",
-                        }
-                    )
-
-                    result.finish(success=False)
+                    _finish_with_inconclusive_contract(result, default_success=False)
                     return result
 
             if pickle_file_opened:
@@ -4828,27 +4849,12 @@ class PickleScanner(BaseScanner):
                     result.finish(success=True)
                     return result
                 if file_ext in {".pkl", ".pickle", ".joblib", ".dill", ".pt", ".pth", ".ckpt"}:
-                    result.add_check(
-                        name="Pickle Format Check",
-                        passed=False,
-                        message="Pickle parsing failed before full scan completion",
-                        severity=IssueSeverity.CRITICAL,
+                    _add_pickle_parse_failure_check(
+                        result,
                         location=source,
-                        details={
-                            "file_type": "pickle",
-                            "parse_error": str(error),
-                            "parsing_failed": True,
-                            "failure_reason": "unknown_opcode_or_format_error",
-                        },
+                        error=error,
                     )
-                    result.metadata.update(
-                        {
-                            "file_type": "pickle",
-                            "parsing_failed": True,
-                            "failure_reason": "unknown_opcode_or_format_error",
-                        }
-                    )
-                    result.finish(success=False)
+                    _finish_with_inconclusive_contract(result, default_success=False)
                     return result
 
             self._record_pickle_runtime_error(result, error, location=source)
@@ -7996,31 +8002,12 @@ class PickleScanner(BaseScanner):
                     ".ckpt",
                 ]:
                     logger.warning(f"Pickle parse failed for {self.current_file_path}: {e}")
-                    result.add_check(
-                        name="Pickle Format Check",
-                        passed=False,
-                        message="Pickle parsing failed before full scan completion",
-                        severity=IssueSeverity.CRITICAL,
+                    _add_pickle_parse_failure_check(
+                        result,
                         location=self.current_file_path,
-                        details={
-                            "file_type": "pickle",
-                            "parse_error": str(e),
-                            "parsing_failed": True,
-                            "failure_reason": "unknown_opcode_or_format_error",
-                        },
-                        why=(
-                            "The scanner could not fully parse this pickle file due to an opcode/format error. "
-                            "Because full opcode analysis did not complete, the file is treated as unsafe."
-                        ),
+                        error=e,
                     )
-                    result.metadata.update(
-                        {
-                            "file_type": "pickle",
-                            "parsing_failed": True,
-                            "failure_reason": "unknown_opcode_or_format_error",
-                        }
-                    )
-                    result.finish(success=False)
+                    _finish_with_inconclusive_contract(result, default_success=False)
                     return result
 
                 # Determine user-friendly error message and severity
