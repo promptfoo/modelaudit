@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- mark incomplete MXNet scans inconclusive instead of clean
 - harden manifest parse boundaries around malformed metadata
 - recover malformed Jinja template configs as inconclusive scan outcomes
 - traverse NeMo YAML list configs when checking suspicious targets
