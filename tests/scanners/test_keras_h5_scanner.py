@@ -9,7 +9,7 @@ pytest.importorskip("h5py")
 
 import h5py
 
-from modelaudit.cache import reset_cache_manager
+from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.keras_h5_scanner import KerasH5Scanner
@@ -487,11 +487,8 @@ def test_keras_h5_inconclusive_training_config_preserves_security_exit1(tmp_path
     assert determine_exit_code(audit_result) == 1
 
 
-def test_keras_h5_inconclusive_scan_outcome_survives_cache_rerun(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Cached Keras H5 inconclusive results must still produce exit 2 on subsequent scans."""
+def test_keras_h5_inconclusive_scan_outcome_uncached_rerun_preserves_exit2(tmp_path: Path) -> None:
+    """Uncached Keras H5 inconclusive results must still produce exit 2 on subsequent scans."""
     model_path = create_custom_h5_file(
         tmp_path,
         [],
@@ -506,13 +503,6 @@ def test_keras_h5_inconclusive_scan_outcome_survives_cache_rerun(
         cache_dir=str(cache_dir),
         min_cache_file_size=0,
     )
-    reset_cache_manager()
-
-    def fail_scan(self: KerasH5Scanner, path: str) -> Any:
-        raise AssertionError(f"Expected cached scan result for {path}")
-
-    monkeypatch.setattr(KerasH5Scanner, "scan", fail_scan)
-
     second_result = scan_model_directory_or_file(
         str(model_path),
         cache_enabled=True,
@@ -525,6 +515,7 @@ def test_keras_h5_inconclusive_scan_outcome_survives_cache_rerun(
     assert determine_exit_code(second_result) == 2
     assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
     assert "keras_h5_model_config_invalid_type" in metadata.get("scan_outcome_reasons")
+    assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
 
 
 def test_keras_h5_scanner_skips_generic_hdf5_external_links_without_keras_metadata(tmp_path: Path) -> None:
