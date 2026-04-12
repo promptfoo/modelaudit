@@ -46,7 +46,7 @@ def test_joblib_scanner_closes_bytesio(tmp_path: Path, monkeypatch: pytest.Monke
     assert closed.get("closed") is True
 
 
-def test_joblib_scanner_fails_closed_on_incomplete_pickle_without_dangerous_findings(tmp_path: Path) -> None:
+def test_joblib_scanner_marks_incomplete_pickle_inconclusive_without_dangerous_findings(tmp_path: Path) -> None:
     path = tmp_path / "truncated.joblib"
     path.write_bytes(b"\x80\x04}q\x00")
 
@@ -55,12 +55,13 @@ def test_joblib_scanner_fails_closed_on_incomplete_pickle_without_dangerous_find
     assert result.success is False
     assert result.metadata["scan_outcome"] == "inconclusive"
     assert result.metadata["analysis_incomplete"] is True
-    assert any(
-        issue.severity.value == "critical"
-        and issue.message == "Pickle parsing failed before full scan completion"
-        and issue.details.get("failure_reason") == "unknown_opcode_or_format_error"
-        for issue in result.issues
+    parse_issue = next(
+        issue for issue in result.issues if issue.message == "Pickle parsing failed before full scan completion"
     )
+    assert parse_issue.severity.value == "info"
+    assert parse_issue.details.get("category") == "parse_error"
+    assert parse_issue.details.get("failure_reason") == "unknown_opcode_or_format_error"
+    assert not any(issue.severity.value in {"warning", "critical"} for issue in result.issues)
 
 
 def test_joblib_scanner_preserves_legacy_pickle_rule_codes_on_embedded_pickle() -> None:

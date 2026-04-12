@@ -331,6 +331,32 @@ class TestPickleContextFiltering(unittest.TestCase):
             if test_file.exists():
                 test_file.unlink()
 
+    def test_plain_dunder_metadata_keys_are_not_suspicious_strings(self):
+        """Common dunder metadata keys should not produce string-literal warnings."""
+        test_file = Path(__file__).parent / "temp_dunder_metadata.pkl"
+        with test_file.open("wb") as f:
+            pickle.dump(
+                {
+                    "__version__": "1.0.0",
+                    "__metadata__": {"format": "safe"},
+                    "__schema__": "model-card-v1",
+                    "__name__": "example-model",
+                },
+                f,
+            )
+
+        try:
+            result = self.scanner.scan(str(test_file))
+
+            self.assertTrue(result.success)
+            self.assertEqual(
+                [issue for issue in result.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}],
+                [],
+            )
+        finally:
+            if test_file.exists():
+                test_file.unlink()
+
     def test_actual_malicious_pickle_still_detected(self):
         """Test that genuinely malicious pickles are still caught"""
 

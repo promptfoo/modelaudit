@@ -143,7 +143,10 @@ class TestSuspiciousStringPatterns:
                 r"subprocess\.(?:Popen|call|check_output)",
                 "subprocess.call(['rm', 'file'])",
             ),
-            (r"(?<!\w)__(?=[a-zA-Z])[a-zA-Z0-9_]*[a-zA-Z]__(?!\w)", "__reduce__"),
+            (
+                r"(?<!\w)__(?:reduce(?:_ex)?|setstate|getstate|getnewargs(?:_ex)?|getinitargs|new|class|subclasses|globals|builtins|mro)__(?!\w)",
+                "__reduce__",
+            ),
             (r"base64\.b64decode", "base64.b64decode(encoded_payload)"),
             (r"\bimport\s+[\w\.]+", "import os"),
             (r"\\x[0-9a-fA-F]{2}", "\\x41\\x42\\x43"),
@@ -172,6 +175,18 @@ class TestSuspiciousStringPatterns:
         # Document known false positives but don't fail
         # (These are trade-offs between security and usability)
         print(f"Known false positives: {false_positives}")
+
+    def test_magic_method_pattern_only_matches_dangerous_dunders(self) -> None:
+        """Common dunder metadata keys should not match the magic-method pattern."""
+        magic_method_pattern = next(pattern for pattern in SUSPICIOUS_STRING_PATTERNS if "reduce" in pattern)
+
+        dangerous_examples = ["__reduce__", "__reduce_ex__", "__setstate__", "__globals__", "__subclasses__"]
+        for example in dangerous_examples:
+            assert re.search(magic_method_pattern, example), f"Pattern failed to match dangerous key {example}"
+
+        benign_examples = ["__version__", "__metadata__", "__schema__", "__name__", "__doc__"]
+        for example in benign_examples:
+            assert not re.search(magic_method_pattern, example), f"Pattern should not match benign key {example}"
 
     def test_detects_getattr_system_evasion(self) -> None:
         """Test that getattr-based system call evasion is detected."""

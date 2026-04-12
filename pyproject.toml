@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "modelaudit"
-version = "0.2.36"
+version = "0.2.37"
 description = "Static scanning library for detecting malicious code, backdoors, and other security risks in ML model files"
 authors = [
     { name = "Ian Webster", email = "ian@promptfoo.dev" },
@@ -59,7 +59,7 @@ dependencies = [
 # - Checkpoint reading from SavedModel directories (variables/*.index files)
 # - Maximum compatibility with edge cases
 tensorflow = [
-    "tensorflow>=2.17.0,<3.0; python_version >= '3.11' and python_version < '3.13'",
+    "tensorflow>=2.21,<2.22; python_version >= '3.11' and python_version < '3.13'",
 ]
 h5 = ["h5py>=3.1,<4.0"]
 pytorch = ["torch>=2.6.0,<3.0"]

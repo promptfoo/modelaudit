@@ -47,7 +47,11 @@ class PickleScanner:
             position_offset = 0
 
         try:
-            payload = _read_stream_payload(stream, normalized_size)
+            payload = _read_stream_payload(
+                stream,
+                normalized_size,
+                max_unbounded_read_bytes=self.options.max_unbounded_stream_read_bytes,
+            )
         except (OSError, ValueError) as error:
             return _io_error_report(
                 source=source,
@@ -405,11 +409,17 @@ def _normalize_stream_size(size: int | None) -> int | None:
     return size
 
 
-def _read_stream_payload(stream: BinaryIO, size: int | None) -> bytes:
+def _read_stream_payload(
+    stream: BinaryIO,
+    size: int | None,
+    *,
+    max_unbounded_read_bytes: int,
+) -> bytes:
     chunks: list[bytes] = []
     if size is None:
+        read_chunk_size = min(_RUST_STREAM_READ_CHUNK_SIZE, max_unbounded_read_bytes)
         while True:
-            chunk = stream.read(_RUST_STREAM_READ_CHUNK_SIZE)
+            chunk = stream.read(read_chunk_size)
             if not chunk:
                 break
             chunks.append(chunk)

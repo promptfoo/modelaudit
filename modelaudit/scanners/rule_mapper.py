@@ -112,6 +112,8 @@ def get_pickle_opcode_rule_code(opcode_name: str) -> str | None:
         return _rule("S210")
     elif opcode_upper in ["EXT1", "EXT2", "EXT4"]:
         return _rule("S211")
+    elif opcode_upper in ["PERSID", "BINPERSID"]:
+        return _rule("S212")
 
     return None
 
@@ -323,7 +325,7 @@ def get_generic_rule_code(message: str) -> str | None:
 
     # Check for specific patterns
     if "protocol" in msg_lower and "version" in msg_lower:
-        return _rule("S212")
+        return None
     elif (
         ("stack" in msg_lower and "depth" in msg_lower)
         or "timeout" in msg_lower

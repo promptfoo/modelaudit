@@ -12,9 +12,10 @@ from typing import Any
 
 import pytest
 
+from modelaudit import core as core_module
 from modelaudit.core import scan_file
 from modelaudit.scanners.base import IssueSeverity, ScanResult
-from tests.helpers import create_mock_pytorch_zip
+from tests.helpers import create_mock_gguf, create_mock_pytorch_zip
 
 _SYSTEM_GLOBAL_NAMES = ("os.system", "posix.system", "nt.system")
 
@@ -570,6 +571,13 @@ def test_scan_file_routes_raw_bin_without_zip_structure_to_pytorch_binary(tmp_pa
     assert result.success is True
 
 
+def test_preferred_scanner_does_not_route_generic_zip_bin_to_pickle(tmp_path: Path) -> None:
+    model_path = tmp_path / "weights.bin"
+    _create_misnamed_zip(model_path, {"metadata.txt": b"not a pickle"})
+
+    assert core_module._select_preferred_scanner_id(str(model_path), "zip", ".bin") == "zip"
+
+
 def test_scan_file_routes_misnamed_executorch_archive_by_content(tmp_path: Path) -> None:
     disguised_exec = tmp_path / "model.jpg"
     _create_misnamed_zip(
@@ -670,6 +678,46 @@ def test_scan_file_routes_misnamed_keras_hdf5_by_header(tmp_path: Path) -> None:
 
     assert result.scanner_name == "keras_h5"
     assert any("CVE-2025-9905" in issue.message for issue in result.issues)
+
+
+def test_scan_file_routes_misnamed_gguf_by_header(tmp_path: Path) -> None:
+    disguised_gguf = create_mock_gguf(tmp_path / "model.payload")
+
+    result = scan_file(str(disguised_gguf))
+
+    assert result.scanner_name == "gguf"
+    assert result.metadata["format"] == "gguf"
+
+
+def test_scan_file_does_not_route_gguf_magic_near_match_to_gguf(tmp_path: Path) -> None:
+    near_match = tmp_path / "model.payload"
+    near_match.write_bytes(b"GGU?" + b"\x00" * 32)
+
+    result = scan_file(str(near_match))
+
+    assert result.scanner_name == "unknown"
+    assert result.issues == []
+
+
+def test_scan_file_routes_misnamed_onnx_by_header(tmp_path: Path) -> None:
+    disguised_onnx = tmp_path / "model.payload"
+    disguised_onnx.write_bytes(b"\x08\x01\x12\x00onnx.proto" + b"\x00" * 32)
+
+    result = scan_file(str(disguised_onnx))
+
+    assert result.scanner_name == "onnx"
+
+
+def test_scan_file_routes_misnamed_numpy_by_header(tmp_path: Path) -> None:
+    np = pytest.importorskip("numpy")
+
+    disguised_numpy = tmp_path / "weights.payload"
+    with disguised_numpy.open("wb") as handle:
+        np.save(handle, np.array([1, 2, 3], dtype=np.float32), allow_pickle=False)
+
+    result = scan_file(str(disguised_numpy))
+
+    assert result.scanner_name == "numpy"
 
 
 def test_scan_file_routes_misnamed_sevenzip_by_header(tmp_path: Path) -> None:

@@ -20,6 +20,7 @@ const DEFAULT_POST_BUDGET_SCAN_BYTES: usize = 100 * 1024 * 1024;
 const DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS: usize = 8 * 1024 * 1024;
 const DEFAULT_MAX_NESTED_PICKLE_BYTES: usize = 2 * 1024 * 1024;
 const DEFAULT_MAX_NESTED_DEPTH: usize = 1;
+const MAX_TRACKED_TUPLE_ITEMS: usize = 16;
 
 const STACK_GLOBAL_STRING_OPCODES: &[&str] = &[
     "BINSTRING",
@@ -56,6 +57,7 @@ enum StackValue {
     Text(String),
     Bytes(Vec<u8>),
     Global(GlobalRef),
+    Tuple(Vec<StackValue>),
     Primitive {
         type_name: &'static str,
         repr: String,
@@ -497,14 +499,21 @@ impl<'a> ScanState<'a> {
             "POP_MARK" => {
                 self.pop_to_mark();
             }
-            "EMPTY_TUPLE" | "EMPTY_LIST" | "EMPTY_DICT" | "EMPTY_SET" => {
+            "EMPTY_TUPLE" => {
+                self.stack.push(StackValue::Tuple(Vec::new()));
+            }
+            "EMPTY_LIST" | "EMPTY_DICT" | "EMPTY_SET" => {
                 self.stack.push(StackValue::Primitive {
                     type_name: "tuple",
                     repr: "()".to_string(),
                 });
             }
-            "TUPLE" | "LIST" | "DICT" | "SET" | "FROZENSET" => {
-                self.pop_to_mark();
+            "TUPLE" => {
+                let values = self.pop_to_mark();
+                self.stack.push(collapse_tuple_values(values));
+            }
+            "LIST" | "DICT" | "SET" | "FROZENSET" => {
+                let _ = self.pop_to_mark();
                 self.stack.push(StackValue::Other);
             }
             "TUPLE1" => self.collapse_top_n(1),
@@ -627,7 +636,10 @@ impl<'a> ScanState<'a> {
                     }
                 }
             }
-            "PERSID" | "BINPERSID" | "FRAME" | "STOP" => {}
+            "PERSID" | "BINPERSID" => {
+                self.record_persistent_id(opcode, position);
+            }
+            "FRAME" | "STOP" => {}
             _ => {}
         }
     }
@@ -649,10 +661,14 @@ impl<'a> ScanState<'a> {
             self.stack.push(StackValue::Other);
             return;
         }
+        let mut values = Vec::with_capacity(count);
         for _ in 0..count {
-            self.stack.pop();
+            if let Some(value) = self.stack.pop() {
+                values.push(value);
+            }
         }
-        self.stack.push(StackValue::Other);
+        values.reverse();
+        self.stack.push(collapse_tuple_values(values));
     }
 
     fn consume_callable_opcode(
@@ -1122,6 +1138,47 @@ impl<'a> ScanState<'a> {
         }
     }
 
+    fn record_persistent_id(&mut self, opcode: &ParsedOpcode, position: usize) {
+        let persistent_id = if opcode.name == "BINPERSID" {
+            self.stack.pop()
+        } else {
+            Some(StackValue::Text(opcode.arg.coerce_text()))
+        };
+
+        let mut details = vec![(
+            "opcode".to_string(),
+            DetailValue::String(opcode.name.to_string()),
+        )];
+        if let Some(value) = persistent_id.as_ref() {
+            details.push((
+                "persistent_id_preview".to_string(),
+                DetailValue::String(stack_value_preview(value, 0)),
+            ));
+            if let Some(storage_key) = pytorch_storage_key(value) {
+                details.push((
+                    "pytorch_storage_persistent_id".to_string(),
+                    DetailValue::Bool(true),
+                ));
+                details.push((
+                    "pytorch_storage_key".to_string(),
+                    DetailValue::String(storage_key),
+                ));
+            }
+        }
+
+        self.add_finding(Finding {
+            message: format!("Found pickle persistent ID opcode: {}", opcode.name),
+            severity: "warning",
+            location: Some(format!("{} (pos {})", self.source, position)),
+            rule_code: Some("PERSISTENT_ID"),
+            details,
+            why: Some(
+                "Persistent pickle IDs delegate object resolution to loader-defined callbacks, which can hide external object construction or storage lookups.",
+            ),
+        });
+        self.stack.push(StackValue::Other);
+    }
+
     fn add_finding(&mut self, finding: Finding) {
         let key = (
             finding.message.clone(),
@@ -1468,9 +1525,79 @@ fn operand_preview(value: Option<&StackValue>) -> String {
         Some(StackValue::Bytes(bytes)) => format!("bytes(len={})", bytes.len()),
         Some(StackValue::Mark) => "MARK".to_string(),
         Some(StackValue::Text(value)) => format!("str:{:?}", value),
+        Some(StackValue::Tuple(values)) => format!("tuple(len={})", values.len()),
         Some(StackValue::Primitive { type_name, repr }) => format!("{type_name}:{repr}"),
         Some(StackValue::Other) => "object".to_string(),
         None => "NoneType:None".to_string(),
+    }
+}
+
+fn collapse_tuple_values(values: Vec<StackValue>) -> StackValue {
+    if values.len() > MAX_TRACKED_TUPLE_ITEMS
+        || values
+            .iter()
+            .any(|value| matches!(value, StackValue::Tuple(_)))
+    {
+        StackValue::Other
+    } else {
+        StackValue::Tuple(values)
+    }
+}
+
+fn stack_value_preview(value: &StackValue, depth: usize) -> String {
+    if depth >= 3 {
+        return "...".to_string();
+    }
+
+    match value {
+        StackValue::Mark => "MARK".to_string(),
+        StackValue::Text(value) => format!("str:{:?}", value),
+        StackValue::Bytes(bytes) => format!("bytes(len={})", bytes.len()),
+        StackValue::Global(reference) => format!("global:{}", reference.symbol()),
+        StackValue::Tuple(values) => {
+            let mut parts: Vec<String> = values
+                .iter()
+                .take(6)
+                .map(|item| stack_value_preview(item, depth + 1))
+                .collect();
+            if values.len() > 6 {
+                parts.push("...".to_string());
+            }
+            format!("tuple({})", parts.join(", "))
+        }
+        StackValue::Primitive { type_name, repr } => format!("{type_name}:{repr}"),
+        StackValue::Other => "object".to_string(),
+    }
+}
+
+fn stack_value_text(value: &StackValue) -> Option<&str> {
+    match value {
+        StackValue::Text(text) => Some(text),
+        StackValue::Primitive { repr, .. } => Some(repr),
+        _ => None,
+    }
+}
+
+fn pytorch_storage_key(value: &StackValue) -> Option<String> {
+    let StackValue::Tuple(items) = value else {
+        return None;
+    };
+    if items.len() < 4 || stack_value_text(&items[0]) != Some("storage") {
+        return None;
+    }
+    if !is_pytorch_storage_descriptor(&items[1]) {
+        return None;
+    }
+    stack_value_text(&items[2]).map(str::to_string)
+}
+
+fn is_pytorch_storage_descriptor(value: &StackValue) -> bool {
+    match value {
+        StackValue::Global(reference) => {
+            reference.module == "torch" && reference.name.ends_with("Storage")
+        }
+        StackValue::Text(text) => text.starts_with("torch.") && text.ends_with("Storage"),
+        _ => false,
     }
 }
 
@@ -1520,7 +1647,10 @@ fn post_budget_opcode_prefix(opcode: &ParsedOpcode, stack: &[StackValue]) -> Vec
 fn suspicious_string_matches(value: &str) -> Vec<String> {
     let lower = value.to_ascii_lowercase();
     let mut matches = Vec::new();
-    if value.contains("__") && contains_magic_method(value) {
+    if value.contains("__")
+        && contains_magic_method(value)
+        && !is_common_dunder_metadata_literal(value)
+    {
         matches.push("magic method".to_string());
     }
     if lower.contains("base64.b64decode") {
@@ -1592,6 +1722,13 @@ fn suspicious_string_matches(value: &str) -> Vec<String> {
         }
     }
     matches
+}
+
+fn is_common_dunder_metadata_literal(value: &str) -> bool {
+    matches!(
+        value,
+        "__version__" | "__metadata__" | "__schema__" | "__name__" | "__author__" | "__license__"
+    )
 }
 
 fn contains_call_like(lower: &str, name: &str) -> bool {
@@ -1961,13 +2098,14 @@ fn validate_pickle_stack_effect(
             *stack_depth -= 2;
             true
         }
-        "APPEND" | "BINPERSID" => {
+        "APPEND" => {
             if *stack_depth < 2 {
                 return false;
             }
             *stack_depth -= 1;
             true
         }
+        "BINPERSID" => *stack_depth >= 1,
         "SETITEM" => {
             if *stack_depth < 3 {
                 return false;
@@ -2308,6 +2446,7 @@ mod tests {
         assert!(suspicious_string_matches("__reduce__").contains(&"magic method".to_string()));
         assert!(!suspicious_string_matches("__1__").contains(&"magic method".to_string()));
         assert!(!suspicious_string_matches("a__b__c").contains(&"magic method".to_string()));
+        assert!(suspicious_string_matches("__version__").is_empty());
     }
 
     #[test]
@@ -2376,6 +2515,41 @@ mod tests {
         assert_eq!(
             detail_string(&finding.details, "name_operand").as_deref(),
             Some("NoneType:None")
+        );
+    }
+
+    #[test]
+    fn persistent_id_opcodes_are_flagged() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let payload = b"Pexternal-storage-key\n.";
+        let mut scan = ScanState::new(
+            "persistent.pkl".to_string(),
+            payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+
+        scan.run();
+
+        assert_eq!(scan.verdict, "suspicious");
+        let finding = scan
+            .findings
+            .iter()
+            .find(|finding| finding.rule_code == Some("PERSISTENT_ID"))
+            .expect("persistent ID finding");
+        assert_eq!(
+            detail_string(&finding.details, "opcode").as_deref(),
+            Some("PERSID")
         );
     }
 }

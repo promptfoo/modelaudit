@@ -53,6 +53,20 @@ class NoBulkReadStream(io.BytesIO):
         return super().read(size)
 
 
+class NoUnboundedReadlineStream(io.BytesIO):
+    def __init__(self, payload: bytes) -> None:
+        super().__init__(payload)
+        self.max_seen_readline_size = 0
+        self.unbounded_readline_attempted = False
+
+    def readline(self, size: int | None = -1) -> bytes:
+        if size is None or size < 0:
+            self.unbounded_readline_attempted = True
+            raise AssertionError("scan_stream() attempted an unbounded line read")
+        self.max_seen_readline_size = max(self.max_seen_readline_size, size)
+        return super().readline(size)
+
+
 def test_scan_bytes_returns_clean_report_for_safe_pickle() -> None:
     report = scan_bytes(pickle.dumps({"weights": [1, 2, 3]}), source="safe.pkl")
 
@@ -80,6 +94,104 @@ def test_scan_bytes_detects_reduce_invoking_os_system() -> None:
         ref["import_reference"] in SYSTEM_GLOBALS and ref["is_dangerous"] is True
         for ref in report.metadata["import_references"]
     )
+
+
+@pytest.mark.parametrize(
+    ("payload", "opcode"),
+    [
+        (b"Pexternal-storage-key\n.", "PERSID"),
+        (b"\x80\x04\x8c\x14external-storage-key\x94Q.", "BINPERSID"),
+    ],
+)
+def test_scan_bytes_flags_untrusted_persistent_ids(payload: bytes, opcode: str) -> None:
+    report = scan_bytes(payload, source="persistent-id.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "PERSISTENT_ID" and finding.details.get("opcode") == opcode for finding in report.findings
+    )
+
+
+def test_scan_bytes_flags_canonical_pytorch_storage_persistent_ids() -> None:
+    payload = (
+        b"\x80\x04(\x8c\x07storage\x94\x8c\x05torch\x94\x8c\x0cFloatStorage\x94\x93\x8c\x01k\x94\x8c\x03cpu\x94K\x01tQ."
+    )
+
+    report = scan_bytes(payload, source="pytorch-storage.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "PERSISTENT_ID" and finding.details.get("opcode") == "BINPERSID"
+        for finding in report.findings
+    )
+    assert any(
+        finding.rule_code == "PERSISTENT_ID" and finding.details.get("pytorch_storage_key") == "k"
+        for finding in report.findings
+    )
+    assert report.notices == ()
+
+
+def test_scan_bytes_flags_noncanonical_pytorch_storage_persistent_ids() -> None:
+    payload = b"\x80\x04(\x8c\x07storage\x94\x8c\x12torch.FloatStorage\x94\x8c\x04evil\x94\x8c\x03cpu\x94K\x01tQ."
+
+    report = scan_bytes(payload, source="noncanonical-pytorch-storage.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "PERSISTENT_ID" and finding.details.get("opcode") == "BINPERSID"
+        for finding in report.findings
+    )
+    assert report.notices == ()
+
+
+def test_scan_bytes_flags_deeply_nested_persistent_id_preview() -> None:
+    payload = b"\x80\x04)" + (b"\x85" * 1500) + b"Q."
+
+    report = scan_bytes(payload, source="deep-persistent-id.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert report.errors == ()
+    assert any(
+        finding.rule_code == "PERSISTENT_ID" and finding.details.get("opcode") == "BINPERSID"
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_flags_pytorch_storage_persistent_ids_with_bool_size() -> None:
+    payload = (
+        b"\x80\x04(\x8c\x07storage\x94\x8c\x05torch\x94\x8c\x0cFloatStorage\x94\x93\x8c\x01k\x94\x8c\x03cpu\x94\x88tQ."
+    )
+
+    report = scan_bytes(payload, source="bool-sized-pytorch-storage.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "PERSISTENT_ID" and finding.details.get("opcode") == "BINPERSID"
+        for finding in report.findings
+    )
+    assert report.notices == ()
+
+
+def test_scan_bytes_flags_pytorch_storage_persistent_ids_with_extra_fields() -> None:
+    payload = (
+        b"\x80\x04(\x8c\x07storage\x94\x8c\x05torch\x94\x8c\x0cFloatStorage\x94\x93"
+        b"\x8c\x01k\x94\x8c\x03cpu\x94K\x01\x8c\x04evil\x94tQ."
+    )
+
+    report = scan_bytes(payload, source="extra-field-pytorch-storage.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "PERSISTENT_ID" and finding.details.get("opcode") == "BINPERSID"
+        for finding in report.findings
+    )
+    assert report.notices == ()
 
 
 def test_scan_bytes_attributes_reduce_calls_to_the_callable_operand_not_nested_args() -> None:
@@ -332,6 +444,39 @@ def test_scan_stream_incrementally_reads_bounded_streams_without_preloading_enti
     assert stream.max_seen_read_size <= 32
 
 
+def test_scan_stream_honors_explicit_reads_without_declared_size() -> None:
+    payload = pickle.dumps(b"a" * 64, protocol=4)
+
+    report = PickleScanner(ScanOptions(max_unbounded_stream_read_bytes=8)).scan_stream(
+        io.BytesIO(payload),
+        source="unknown-size-binbytes.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.errors == ()
+    assert report.coverage.bytes_scanned == len(payload)
+
+
+def test_scan_stream_bounds_protocol_zero_readline_without_declared_size() -> None:
+    stream = NoUnboundedReadlineStream(b"S'" + (b"a" * 64))
+
+    report = PickleScanner(ScanOptions(max_unbounded_stream_read_bytes=8)).scan_stream(
+        stream,
+        source="unterminated-protocol-zero.pkl",
+    )
+
+    assert report.status == ScanStatus.ERROR
+    assert report.errors[0].exception_type == "ValueError"
+    assert stream.unbounded_readline_attempted is False
+    assert stream.max_seen_readline_size <= 8
+
+
+def test_scan_options_rejects_invalid_unbounded_stream_read_limit() -> None:
+    with pytest.raises(ValueError, match="max_unbounded_stream_read_bytes"):
+        ScanOptions(max_unbounded_stream_read_bytes=0)
+
+
 def test_scan_bytes_flags_malformed_stack_global_operands() -> None:
     payload = b"\x80\x04K\x01K\x02\x93."
 
@@ -397,6 +542,24 @@ def test_scan_bytes_flags_suspicious_exec_string_literals() -> None:
     assert report.status == ScanStatus.COMPLETE
     assert report.verdict == SafetyVerdict.SUSPICIOUS
     assert any(finding.rule_code == "SUSPICIOUS_STRING" and "exec(" in finding.message for finding in report.findings)
+
+
+def test_scan_bytes_allows_common_dunder_metadata_literals() -> None:
+    report = scan_bytes(
+        pickle.dumps(
+            {
+                "__version__": "1.0.0",
+                "__metadata__": {"format": "safe"},
+                "__schema__": "model-card-v1",
+                "__name__": "example-model",
+            }
+        ),
+        source="dunder-metadata.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert not any(finding.rule_code == "SUSPICIOUS_STRING" for finding in report.findings)
 
 
 @pytest.mark.parametrize(

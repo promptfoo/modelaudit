@@ -185,18 +185,26 @@ def add_scan_result_to_model(
 def add_issue_to_model(
     results: ModelAuditResultModel,
     message: str,
-    severity: str = "warning",
+    severity: str | IssueSeverity | None = "info",
     location: str | None = None,
     details: dict | None = None,
     issue_type: str | None = None,
 ) -> None:
     """Add an issue directly to the aggregate results model."""
-    severity_enum = {
-        "debug": IssueSeverity.DEBUG,
-        "info": IssueSeverity.INFO,
-        "warning": IssueSeverity.WARNING,
-        "critical": IssueSeverity.CRITICAL,
-    }.get(severity.lower(), IssueSeverity.WARNING)
+    if isinstance(severity, IssueSeverity):
+        severity_enum = severity
+    else:
+        severity_str = str(severity).lower() if severity is not None else "info"
+        if severity_str == "warn":
+            severity_str = "warning"
+        if severity_str in {"error", "err"}:
+            severity_str = "critical"
+        severity_enum = {
+            "debug": IssueSeverity.DEBUG,
+            "info": IssueSeverity.INFO,
+            "warning": IssueSeverity.WARNING,
+            "critical": IssueSeverity.CRITICAL,
+        }.get(severity_str, IssueSeverity.INFO)
 
     issue = Issue(
         message=message,

@@ -232,6 +232,30 @@ def test_pickle_report_to_scan_result_maps_post_budget_rule_codes_to_legacy_name
     assert result.issues[0].details["pickle_rule_code"] == "POST_BUDGET_GLOBAL"
 
 
+def test_pickle_report_to_scan_result_falls_back_for_unmapped_persistent_id_opcode() -> None:
+    report = PickleReport(
+        source="persistent-id.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.SUSPICIOUS,
+        findings=(
+            Finding(
+                message="Found custom opcode using a persistent_load callback",
+                severity=Severity.WARNING,
+                location="persistent-id.pkl (pos 4)",
+                rule_code="PERSISTENT_ID",
+                details={"opcode": "CUSTOM_PERSISTENT_OPCODE"},
+            ),
+        ),
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert result.success is True
+    assert len(result.issues) == 1
+    assert result.issues[0].rule_code == "S212"
+    assert result.issues[0].details["pickle_rule_code"] == "PERSISTENT_ID"
+
+
 def test_pickle_report_to_scan_result_emits_passed_import_checks() -> None:
     report = PickleReport(
         source="safe.pkl",
@@ -525,7 +549,7 @@ def test_pickle_report_to_scan_result_fails_closed_for_nested_incomplete_notice(
     assert notice_check.message == "Nested pickle analysis did not complete"
 
 
-def test_pickle_report_to_scan_result_escalates_parse_incomplete_notices_to_parse_failures() -> None:
+def test_pickle_report_to_scan_result_keeps_parse_incomplete_notices_inconclusive() -> None:
     report = PickleReport(
         source="truncated.pkl",
         status=ScanStatus.INCONCLUSIVE,
@@ -550,17 +574,19 @@ def test_pickle_report_to_scan_result_escalates_parse_incomplete_notices_to_pars
     assert result.success is False
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert result.metadata["scan_outcome_reasons"] == ["pickle_analysis_incomplete"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL
-        and issue.message == "Pickle parsing failed before full scan completion"
-        and issue.location == "truncated.pkl (pos 4)"
-        and issue.details["parse_error"] == "pickle exhausted before seeing STOP"
-        and issue.details["failure_reason"] == "unknown_opcode_or_format_error"
-        for issue in result.issues
+    parse_issue = next(
+        issue for issue in result.issues if issue.message == "Pickle parsing failed before full scan completion"
     )
+    assert parse_issue.severity == IssueSeverity.INFO
+    assert parse_issue.location == "truncated.pkl (pos 4)"
+    assert parse_issue.details["category"] == "parse_error"
+    assert parse_issue.details["parse_error"] == "pickle exhausted before seeing STOP"
+    assert parse_issue.details["failure_reason"] == "unknown_opcode_or_format_error"
+    assert parse_issue.details["analysis_incomplete"] is True
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
-def test_pickle_report_to_scan_result_escalates_parse_failure_for_truncated_bin_sources() -> None:
+def test_pickle_report_to_scan_result_keeps_truncated_bin_parse_failure_inconclusive() -> None:
     report = PickleReport(
         source="truncated.bin",
         status=ScanStatus.INCONCLUSIVE,
@@ -584,14 +610,16 @@ def test_pickle_report_to_scan_result_escalates_parse_failure_for_truncated_bin_
 
     assert result.success is False
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL
-        and issue.message == "Pickle parsing failed before full scan completion"
-        and issue.location == "truncated.bin (pos 57)"
-        and issue.details["parse_error"] == "pickle exhausted before seeing STOP"
-        and issue.details["failure_reason"] == "unknown_opcode_or_format_error"
-        for issue in result.issues
+    parse_issue = next(
+        issue for issue in result.issues if issue.message == "Pickle parsing failed before full scan completion"
     )
+    assert parse_issue.severity == IssueSeverity.INFO
+    assert parse_issue.location == "truncated.bin (pos 57)"
+    assert parse_issue.details["category"] == "parse_error"
+    assert parse_issue.details["parse_error"] == "pickle exhausted before seeing STOP"
+    assert parse_issue.details["failure_reason"] == "unknown_opcode_or_format_error"
+    assert parse_issue.details["analysis_incomplete"] is True
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
 def test_pickle_report_to_scan_result_keeps_trusted_bin_padding_tails_as_inconclusive_notices() -> None:
@@ -694,6 +722,40 @@ def test_pickle_report_to_scan_result_keeps_zero_padding_tails_as_inconclusive_n
         and issue.message == "Pickle parsing stopped before the stream was fully consumed: ValueError"
         for issue in result.issues
     )
+
+
+def test_pickle_report_to_scan_result_fails_closed_for_raw_pickle_unknown_opcode_tail() -> None:
+    report = PickleReport(
+        source="unknown-tail.pkl",
+        status=ScanStatus.INCONCLUSIVE,
+        verdict=SafetyVerdict.UNKNOWN,
+        notices=(
+            Notice(
+                message="Pickle parsing stopped before the stream was fully consumed: ValueError",
+                severity=Severity.INFO,
+                location="unknown-tail.pkl (pos 20)",
+                code="parse_incomplete",
+                details={
+                    "exception": "at position 20, opcode b'A' unknown",
+                    "exception_type": "ValueError",
+                    "analysis_incomplete": True,
+                },
+            ),
+        ),
+        metadata={"first_pickle_end_pos": 19},
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert result.success is False
+    assert "trusted_incomplete_tail" not in result.metadata
+    parse_issue = next(
+        issue for issue in result.issues if issue.message == "Pickle parsing failed before full scan completion"
+    )
+    assert parse_issue.severity == IssueSeverity.INFO
+    assert parse_issue.details["category"] == "parse_error"
+    assert parse_issue.details["failure_reason"] == "unknown_opcode_or_format_error"
+    assert parse_issue.details["analysis_incomplete"] is True
 
 
 def test_pickle_report_to_scan_result_keeps_joblib_unknown_opcode_tails_as_inconclusive_notices() -> None:
@@ -840,14 +902,15 @@ def test_pickle_report_to_scan_result_requires_boundary_for_tail_suppression() -
     result = pickle_report_to_scan_result(report)
 
     assert "trusted_incomplete_tail" not in result.metadata
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL
-        and issue.message == "Pickle parsing failed before full scan completion"
-        for issue in result.issues
+    parse_issue = next(
+        issue for issue in result.issues if issue.message == "Pickle parsing failed before full scan completion"
     )
+    assert parse_issue.severity == IssueSeverity.INFO
+    assert parse_issue.details["category"] == "parse_error"
+    assert parse_issue.details["analysis_incomplete"] is True
 
 
-def test_pickle_report_to_scan_result_keeps_parse_errors_non_operational() -> None:
+def test_pickle_report_to_scan_result_keeps_parse_errors_inconclusive() -> None:
     report = PickleReport(
         source="bad.bin",
         status=ScanStatus.ERROR,
@@ -865,10 +928,15 @@ def test_pickle_report_to_scan_result_keeps_parse_errors_non_operational() -> No
     result = pickle_report_to_scan_result(report)
 
     assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == ["pickle_analysis_incomplete"]
+    assert result.metadata["analysis_incomplete"] is True
     assert "operational_error" not in result.metadata
     assert "operational_error_reason" not in result.metadata
     assert len(result.issues) == 1
-    assert result.issues[0].severity == IssueSeverity.CRITICAL
+    assert result.issues[0].severity == IssueSeverity.INFO
+    assert result.issues[0].details["category"] == "parse_error"
+    assert result.issues[0].details["analysis_incomplete"] is True
 
 
 def test_pickle_report_to_scan_result_maps_non_parse_errors_to_operational_errors() -> None:

@@ -49,6 +49,7 @@ _LEGACY_SCAN_OUTCOME_REASONS = {
     "parse_incomplete": "pickle_analysis_incomplete",
     "timeout": "scan_timeout",
 }
+_NESTED_PAYLOAD_RULE_CODES = frozenset({"S213", "S601", "S602"})
 _INT_TEXT_RE = re.compile(r"[+-]?\d+")
 _LEGACY_RULE_CODE_RE = re.compile(r"^S\d+$")
 _LOCATION_POSITION_RE = re.compile(r"\(pos\s+(?P<position>\d+)\)\s*$")
@@ -107,6 +108,14 @@ def scan_options_from_config(config: Mapping[str, Any]) -> ScanOptions:
             _DEFAULT_SCAN_OPTIONS.post_budget_scan_bytes,
             minimum=0,
         ),
+        max_unbounded_stream_read_bytes=_parse_min_int(
+            config.get(
+                "max_unbounded_stream_read_bytes",
+                _DEFAULT_SCAN_OPTIONS.max_unbounded_stream_read_bytes,
+            ),
+            _DEFAULT_SCAN_OPTIONS.max_unbounded_stream_read_bytes,
+            minimum=1,
+        ),
         max_string_literal_scan_chars=_parse_min_int(
             config.get(
                 "max_string_literal_scan_chars",
@@ -162,6 +171,12 @@ def pickle_report_to_scan_result(
             if notice.code in _INCONCLUSIVE_NOTICE_CODES
         ] or ["pickle_analysis_incomplete"]
         result.metadata["analysis_incomplete"] = True
+    elif report.status == ScanStatus.ERROR and any(error.category == "parse_error" for error in report.errors):
+        result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+        result.metadata["scan_outcome_reasons"] = ["pickle_analysis_incomplete"]
+        result.metadata["analysis_incomplete"] = True
+
+    dangerous_nested_encodings = _dangerous_nested_encodings(report.findings)
 
     for finding in report.findings:
         details = _add_legacy_detail_aliases(
@@ -172,11 +187,15 @@ def pickle_report_to_scan_result(
         )
         if finding.rule_code:
             details.setdefault("pickle_rule_code", finding.rule_code)
+        severity = _to_issue_severity(finding.severity)
+        if _is_benign_nested_payload_detection(finding, dangerous_nested_encodings):
+            severity = IssueSeverity.INFO
+            details.setdefault("evidence", "nested_payload_detected")
         result.add_check(
             name="Standalone Pickle Finding",
             passed=False,
             message=finding.message,
-            severity=_to_issue_severity(finding.severity),
+            severity=severity,
             location=finding.location,
             details=details,
             why=_legacy_why_for_finding(finding),
@@ -200,21 +219,30 @@ def pickle_report_to_scan_result(
             rule_code=_legacy_rule_code_for_notice(notice.code),
         )
         if notice.code == "parse_incomplete" and not suppress_parse_failure_escalation:
-            result.add_check(
-                name="Standalone Pickle Parse Failure",
-                passed=False,
-                message="Pickle parsing failed before full scan completion",
-                severity=IssueSeverity.CRITICAL,
-                location=notice.location,
-                details={
-                    "pickle_source": report.source,
+            parse_failure_details = {
+                "pickle_source": report.source,
+                "file_type": "pickle",
+                "category": "parse_error",
+                "parse_error": notice.details.get("exception"),
+                "exception_type": notice.details.get("exception_type"),
+                "parsing_failed": True,
+                "failure_reason": "unknown_opcode_or_format_error",
+                "analysis_incomplete": True,
+            }
+            result.metadata.update(
+                {
                     "file_type": "pickle",
-                    "parse_error": notice.details.get("exception"),
-                    "exception_type": notice.details.get("exception_type"),
                     "parsing_failed": True,
                     "failure_reason": "unknown_opcode_or_format_error",
-                    "analysis_incomplete": True,
-                },
+                }
+            )
+            result.add_check(
+                name="Pickle Format Check",
+                passed=False,
+                message="Pickle parsing failed before full scan completion",
+                severity=IssueSeverity.INFO,
+                location=notice.location,
+                details=parse_failure_details,
                 why=(
                     "The scanner could not fully parse this pickle payload due to an opcode or format error. "
                     "Because full opcode analysis did not complete, the payload is treated as unsafe."
@@ -258,12 +286,13 @@ def pickle_report_to_scan_result(
             name="Standalone Pickle Error",
             passed=False,
             message=error.message,
-            severity=IssueSeverity.CRITICAL,
+            severity=IssueSeverity.INFO if error.category == "parse_error" else IssueSeverity.CRITICAL,
             location=error.location,
             details={
                 "pickle_source": report.source,
                 "category": error.category,
                 "exception_type": error.exception_type,
+                "analysis_incomplete": error.category == "parse_error",
                 **error.to_dict()["details"],
             },
         )
@@ -302,6 +331,32 @@ def _to_issue_severity(severity: Severity) -> IssueSeverity:
     return IssueSeverity(severity.value)
 
 
+def _dangerous_nested_encodings(findings: Sequence[Finding]) -> frozenset[str]:
+    encodings: set[str] = set()
+    for finding in findings:
+        if finding.message.startswith("Nested pickle finding:") and finding.severity in {
+            Severity.WARNING,
+            Severity.CRITICAL,
+        }:
+            encoding = finding.details.get("nested_encoding")
+            if isinstance(encoding, str):
+                encodings.add(encoding)
+    return frozenset(encodings)
+
+
+def _is_benign_nested_payload_detection(finding: Finding, dangerous_nested_encodings: frozenset[str]) -> bool:
+    if finding.rule_code not in _NESTED_PAYLOAD_RULE_CODES:
+        return False
+    if finding.details.get("analysis_incomplete") is True:
+        return False
+    if finding.message not in {"Nested pickle payload detected", "Encoded pickle payload detected"}:
+        return False
+    encoding = finding.details.get("encoding")
+    if not isinstance(encoding, str):
+        encoding = "raw" if finding.rule_code == "S213" else None
+    return encoding not in dangerous_nested_encodings
+
+
 def _should_suppress_parse_failure_escalation(report: PickleReport) -> bool:
     """Keep known benign malformed tails as INFO notices while preserving fail-closed truncation."""
     source_ext = _pickle_source_extension(report.source)
@@ -317,22 +372,22 @@ def _should_suppress_parse_failure_escalation(report: PickleReport) -> bool:
         if notice.code != "parse_incomplete":
             continue
 
-        if source_ext in {".bin", ".pkl", ".pickle", ".joblib", ".dill", ".pt", ".pth", ".ckpt"} and notice.details.get(
-            "exception_type"
-        ) in {
-            "ParseError",
-            "UnicodeDecodeError",
-            "ValueError",
-        }:
+        exception_type = notice.details.get("exception_type")
+        exception_message = str(notice.details.get("exception", ""))
+        if exception_type == "UnicodeDecodeError":
             return True
 
-        if notice.details.get("exception_type") == "UnicodeDecodeError":
-            return _has_only_non_dangerous_import_references(report)
-
-        if notice.details.get("exception_type") not in {"ParseError", "ValueError"}:
+        if exception_type not in {"ParseError", "ValueError"}:
             continue
 
-        exception_message = str(notice.details.get("exception", ""))
+        if source_ext == ".bin":
+            return True
+
+        if source_ext in {".pkl", ".pickle", ".joblib", ".dill"} and _is_zero_padding_tail_parse_error(
+            exception_message
+        ):
+            return True
+
         if (
             source_ext in {".joblib", ".dill", ".bin"}
             and "opcode b'" in exception_message
@@ -342,6 +397,11 @@ def _should_suppress_parse_failure_escalation(report: PickleReport) -> bool:
             return True
 
     return False
+
+
+def _is_zero_padding_tail_parse_error(exception_message: str) -> bool:
+    """Return True when parsing only failed because the trusted tail is zero padding."""
+    return "opcode b'\\x00' unknown" in exception_message or 'opcode b"\\x00" unknown' in exception_message
 
 
 def _pickle_source_extension(source: str) -> str:
@@ -368,15 +428,6 @@ def _has_only_benign_serialization_tail_imports(report: PickleReport) -> bool:
             return False
 
     return True
-
-
-def _has_only_non_dangerous_import_references(report: PickleReport) -> bool:
-    import_references = report.metadata.get("import_references")
-    if not _is_reference_sequence(import_references) or not import_references:
-        return False
-    return all(
-        isinstance(reference, Mapping) and not bool(reference.get("is_dangerous")) for reference in import_references
-    )
 
 
 def _is_reference_sequence(value: object) -> bool:
@@ -424,6 +475,13 @@ def _legacy_rule_code_for_finding(finding: Finding) -> str | None:
         if isinstance(opcode, str):
             return get_pickle_opcode_rule_code(opcode)
         return "S211"
+    if finding.rule_code == "PERSISTENT_ID":
+        opcode = finding.details.get("opcode")
+        if isinstance(opcode, str):
+            mapped = get_pickle_opcode_rule_code(opcode)
+            if mapped:
+                return mapped
+        return "S212"
     if finding.rule_code in {"DANGEROUS_CALL", "DANGEROUS_GLOBAL"}:
         opcode = finding.details.get("opcode")
         if isinstance(opcode, str):

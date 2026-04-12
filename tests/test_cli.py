@@ -944,6 +944,26 @@ def test_scan_huggingface_url_download_failure(mock_download, mock_is_hf_url):
     assert "Download failed" in result.output
 
 
+@patch("modelaudit.cli.download_file_from_hf")
+def test_scan_huggingface_file_download_failure_redacts_url(mock_download_file):
+    """Redact direct-file URL secrets from CLI download failures."""
+    mock_download_file.side_effect = Exception(
+        "Failed request https://huggingface.co/test/model/resolve/main/file.bin?token=hf_secret"
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["scan", "https://huggingface.co/test/model/resolve/main/file.bin?token=hf_secret"],
+    )
+
+    output = strip_ansi(result.output)
+    assert result.exit_code == 2
+    assert "hf_secret" not in output
+    assert "token=" not in output
+    assert "https://huggingface.co/test/model/resolve/main/file.bin" in output
+
+
 @patch("modelaudit.cli.is_huggingface_url")
 @patch("modelaudit.cli.download_model")
 @patch("modelaudit.cli.scan_model_directory_or_file")
@@ -1589,6 +1609,22 @@ def test_scan_cloud_url_download_failure(mock_download: MagicMock, mock_is_cloud
 
 @patch("modelaudit.cli.is_cloud_url")
 @patch("modelaudit.cli.download_from_cloud")
+def test_scan_cloud_url_download_failure_redacts_signed_url(mock_download: MagicMock, mock_is_cloud: MagicMock) -> None:
+    """Signed cloud URL secrets should not leak through shared CLI output."""
+    url = "s3://bucket/model.bin?X-Amz-Signature=secret"
+    mock_is_cloud.return_value = True
+    mock_download.side_effect = Exception(f"Forbidden while opening {url}")
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", url])
+
+    assert result.exit_code == 2
+    assert "s3://bucket/model.bin" in result.output
+    assert "X-Amz-Signature" not in result.output
+    assert "secret" not in result.output
+
+
+@patch("modelaudit.cli.is_cloud_url")
+@patch("modelaudit.cli.download_from_cloud")
 @patch("modelaudit.cli.scan_model_directory_or_file")
 @patch("shutil.rmtree")
 def test_scan_cloud_url_with_issues(
@@ -1726,6 +1762,24 @@ def test_scan_jfrog_url_download_failure(mock_scan_jfrog, mock_is_jfrog):
 
     assert result.exit_code == 2
     assert "Error downloading/scanning model" in result.output
+
+
+@patch("modelaudit.cli.is_jfrog_url")
+@patch("modelaudit.cli.scan_jfrog_artifact")
+def test_scan_jfrog_url_download_failure_redacts_sensitive_url(mock_scan_jfrog, mock_is_jfrog):
+    """JFrog CLI errors should not print URL credentials or query tokens."""
+    raw_url = "https://user:leaky-pass@company.jfrog.io/artifactory/repo/model.bin?token=leaky-token"
+    mock_is_jfrog.return_value = True
+    mock_scan_jfrog.side_effect = Exception(f"failed to fetch {raw_url}")
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", raw_url])
+
+    assert result.exit_code == 2
+    assert "https://<credentials-redacted>@company.jfrog.io/artifactory/repo/model.bin" in result.output
+    assert "user:leaky-pass" not in result.output
+    assert "leaky-token" not in result.output
+    assert "?token=" not in result.output
 
 
 @patch("modelaudit.cli.is_jfrog_url")
@@ -2352,6 +2406,22 @@ class TestExpandPaths:
         pattern = str(tmp_path / "?.pt")
         expanded, missing = expand_paths((pattern,))
         assert len(expanded) == 1
+        assert missing == []
+
+    def test_expand_paths_signed_cloud_url_is_not_a_glob(self):
+        """Signed cloud URLs may contain query wildcards but are not local globs."""
+        url = "s3://bucket/model.bin?X-Amz-Signature=secret"
+
+        expanded, missing = expand_paths((url,))
+        assert expanded == [url]
+        assert missing == []
+
+    def test_expand_paths_url_query_is_not_glob(self):
+        """Remote URLs with query strings should stay literal."""
+        url = "https://company.jfrog.io/artifactory/repo/model.bin?token=secret"
+
+        expanded, missing = expand_paths((url,))
+        assert expanded == [url]
         assert missing == []
 
     def test_expand_paths_empty_input(self):

@@ -248,6 +248,64 @@ def test_manifest_scanner_url_shortener_flagged(tmp_path):
     assert "bit.ly" in failed_url_checks[0].details.get("url", "")
 
 
+def test_manifest_scanner_redacts_untrusted_url_credentials(tmp_path: Path) -> None:
+    """Untrusted URL findings should not store userinfo, query strings, or fragments."""
+    test_file = tmp_path / "config.json"
+    raw_url = "https://user:leaky-pass@totally-legit-models.com/model.bin?token=leaky-token#fragment"
+    test_file.write_text(json.dumps({"model_type": "bert", "download_url": raw_url}))
+
+    scanner = ManifestScanner()
+    result = scanner.scan(str(test_file))
+
+    failed_url_checks = [c for c in result.checks if c.name == "Untrusted URL Check" and c.status == CheckStatus.FAILED]
+    assert len(failed_url_checks) == 1
+
+    check = failed_url_checks[0]
+    assert check.details["url"] == "https://<credentials-redacted>@totally-legit-models.com/model.bin"
+    assert "leaky-pass" not in check.message
+    assert "leaky-token" not in check.message
+    assert "fragment" not in check.message
+    assert "leaky-pass" not in check.details["url"]
+    assert "leaky-token" not in check.details["url"]
+    assert "fragment" not in check.details["url"]
+
+
+def test_manifest_scanner_container_schemes_redact_userinfo(tmp_path: Path) -> None:
+    """Azure container URI findings should redact userinfo-looking values."""
+    test_file = tmp_path / "config.json"
+    raw_urls = {
+        "abfs": "abfs://container:secret@workspace.dfs.core.windows.net/models/path.bin?token=leak#frag",
+        "abfss": "abfss://container:secret@workspace.dfs.core.windows.net/models/path.bin?token=leak#frag",
+        "wasb": "wasb://container:secret@workspace.blob.core.windows.net/models/path.bin?token=leak#frag",
+        "wasbs": "wasbs://container:secret@workspace.blob.core.windows.net/models/path.bin?token=leak#frag",
+    }
+    test_file.write_text(json.dumps({"model_type": "bert", "download_urls": raw_urls}))
+
+    scanner = ManifestScanner()
+    result = scanner.scan(str(test_file))
+
+    cloud_storage_checks = [
+        check
+        for check in result.checks
+        if check.name == "Cloud Storage URL Detection" and check.status == CheckStatus.FAILED
+    ]
+    urls_by_scheme = {check.details["url"].split(":", 1)[0]: check for check in cloud_storage_checks}
+
+    assert set(raw_urls).issubset(urls_by_scheme)
+    for scheme, raw_url in raw_urls.items():
+        check = urls_by_scheme[scheme]
+        redacted_url = check.details["url"]
+        expected_url = raw_url.replace("container:secret", "<credentials-redacted>").split("?", 1)[0]
+        assert redacted_url == expected_url
+        assert "container:secret@" not in redacted_url
+        assert "<credentials-redacted>" in redacted_url
+        assert "token=leak" not in redacted_url
+        assert "frag" not in redacted_url
+        assert "container:secret@" not in check.message
+        assert "token=leak" not in check.message
+        assert "frag" not in check.message
+
+
 def test_manifest_scanner_tunnel_service_flagged(tmp_path):
     """Test that tunnel services (ngrok, localtunnel) are flagged (not in allowlist)."""
     test_file = tmp_path / "config.json"
@@ -325,6 +383,26 @@ def test_manifest_scanner_regional_s3_urls_not_flagged(tmp_path: Path) -> None:
         config_with_s3_urls["regional_virtual_hosted"],
         config_with_s3_urls["legacy_regional_virtual_hosted"],
     }
+
+
+def test_manifest_scanner_redacts_cloud_url_query_credentials(tmp_path: Path) -> None:
+    """Cloud URL findings should not store signed query strings."""
+    test_file = tmp_path / "config.json"
+    raw_url = "https://bucket.s3.amazonaws.com/model.bin?X-Amz-Credential=leaky-cred&X-Amz-Signature=leaky-sig"
+    test_file.write_text(json.dumps({"model_type": "bert", "weights": raw_url}))
+
+    scanner = ManifestScanner()
+    result = scanner.scan(str(test_file))
+
+    cloud_storage_checks = [c for c in result.checks if c.name == "Cloud Storage URL Detection"]
+    assert len(cloud_storage_checks) == 1
+
+    check = cloud_storage_checks[0]
+    assert check.details["url"] == "https://bucket.s3.amazonaws.com/model.bin"
+    assert "leaky-cred" not in check.message
+    assert "leaky-sig" not in check.message
+    assert "leaky-cred" not in check.details["url"]
+    assert "leaky-sig" not in check.details["url"]
 
 
 def test_manifest_scanner_non_s3_amazonaws_hosts_flagged(tmp_path: Path) -> None:
@@ -932,7 +1010,7 @@ def test_manifest_scanner_userinfo_url_flagged(tmp_path: Path) -> None:
     failed_url_checks = [c for c in result.checks if c.name == "Untrusted URL Check" and c.status == CheckStatus.FAILED]
     assert len(failed_url_checks) >= 1
     detected_urls = {c.details.get("url", "") for c in failed_url_checks}
-    assert any("evil.com@huggingface.co" in u for u in detected_urls)
+    assert "https://<credentials-redacted>@huggingface.co/model.bin" in detected_urls
 
 
 def test_manifest_scanner_expanded_exact_domains_flagged(tmp_path: Path) -> None:

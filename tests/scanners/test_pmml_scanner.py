@@ -208,6 +208,308 @@ def test_pmml_scanner_external_references(tmp_path: Path) -> None:
     assert all(i.severity == IssueSeverity.WARNING for i in external_issues)
 
 
+def test_pmml_scanner_documentation_urls_are_not_external_resources(tmp_path: Path) -> None:
+    """Documentation and reference metadata URLs should not be warning-level resource references."""
+    pmml = """<?xml version='1.0'?>
+<PMML version='4.4'>
+  <Header description="https://example.com/model-card">
+    <Annotation>See https://example.com/docs for training notes.</Annotation>
+    <Application name="Trainer" reference="https://example.com/reference"/>
+  </Header>
+  <DataDictionary numberOfFields='0'/>
+</PMML>"""
+    path = tmp_path / "documented.pmml"
+    path.write_text(pmml, encoding="utf-8")
+
+    result = PmmlScanner().scan(str(path))
+
+    assert result.success is True
+    assert not any(check.name == "External Resource Reference Check" for check in result.checks)
+    assert not any("external resource" in issue.message.lower() for issue in result.issues)
+
+
+def test_pmml_scanner_standard_namespaced_documentation_urls_are_not_external_resources(
+    tmp_path: Path,
+) -> None:
+    """Recognized PMML namespaces should preserve benign documentation URL handling."""
+    pmml = """<?xml version='1.0'?>
+<PMML xmlns="https://www.dmg.org/PMML-4_4" version='4.4'>
+  <Header description="https://example.com/model-card">
+    <Annotation>See https://example.com/docs for training notes.</Annotation>
+    <Application name="Trainer" reference="https://example.com/reference"/>
+  </Header>
+  <DataDictionary numberOfFields='0'/>
+</PMML>"""
+    path = tmp_path / "namespaced_documented.pmml"
+    path.write_text(pmml, encoding="utf-8")
+
+    result = PmmlScanner().scan(str(path))
+
+    assert result.success is True
+    assert not any(check.name == "External Resource Reference Check" for check in result.checks)
+    assert not any("external resource" in issue.message.lower() for issue in result.issues)
+
+
+def test_pmml_scanner_mixed_case_documentation_attrs_are_not_external_resources(tmp_path: Path) -> None:
+    """Unqualified PMML documentation attributes keep exemptions even when mixed case."""
+    pmml = """<?xml version='1.0'?>
+<PMML version='4.4'>
+  <Header Description="https://example.com/model-card"
+          Documentation="https://example.com/docs"
+          Label="https://example.com/label">
+    <Application name="Trainer" Reference="https://example.com/reference"/>
+  </Header>
+  <DataDictionary numberOfFields='0'/>
+</PMML>"""
+    path = tmp_path / "mixed_case_documentation_attrs.pmml"
+    path.write_text(pmml, encoding="utf-8")
+
+    result = PmmlScanner().scan(str(path))
+
+    assert result.success is True
+    assert not any(check.name == "External Resource Reference Check" for check in result.checks)
+    assert not any("external resource" in issue.message.lower() for issue in result.issues)
+
+
+def test_pmml_scanner_unrecognized_root_namespace_documentation_urls_warn(tmp_path: Path) -> None:
+    """Documentation-looking elements in an unrecognized root namespace should not get PMML exemptions."""
+    pmml = """<?xml version='1.0'?>
+<PMML xmlns="https://attacker.example/not-pmml" version='4.4'>
+  <Header description="https://evil.example/model-card">
+    <Annotation>See https://evil.example/docs for payload notes.</Annotation>
+  </Header>
+  <DataDictionary numberOfFields='0'/>
+</PMML>"""
+    path = tmp_path / "unrecognized_namespace_documented.pmml"
+    path.write_text(pmml, encoding="utf-8")
+
+    result = PmmlScanner().scan(str(path))
+
+    external_issues = [issue for issue in result.issues if "external resource" in issue.message.lower()]
+    assert external_issues
+    assert all(issue.severity == IssueSeverity.WARNING for issue in external_issues)
+
+
+def test_pmml_scanner_unrecognized_root_namespace_documentation_attributes_warn(tmp_path: Path) -> None:
+    """Documentation-looking attributes in an unrecognized root namespace should not get PMML exemptions."""
+    pmml = """<?xml version='1.0'?>
+<PMML xmlns="https://attacker.example/not-pmml" version='4.4'>
+  <Header description="https://evil.example/model-card"/>
+  <DataDictionary numberOfFields='0'/>
+</PMML>"""
+    path = tmp_path / "unrecognized_namespace_documentation_attribute.pmml"
+    path.write_text(pmml, encoding="utf-8")
+
+    result = PmmlScanner().scan(str(path))
+
+    external_issues = [issue for issue in result.issues if "external resource" in issue.message.lower()]
+    assert external_issues
+    assert all(issue.severity == IssueSeverity.WARNING for issue in external_issues)
+    assert any(str(issue.details.get("attribute", "")).endswith("description") for issue in external_issues)
+
+
+def test_pmml_scanner_non_pmml_root_documentation_urls_warn(tmp_path: Path) -> None:
+    """Documentation-looking fields require an actual PMML root to get PMML exemptions."""
+    pmml = """<?xml version='1.0'?>
+<ModelPackage>
+  <Header description="https://evil.example/model-card">
+    <Annotation>See https://evil.example/docs for payload notes.</Annotation>
+    <Application name="Trainer" reference="https://evil.example/reference"/>
+  </Header>
+</ModelPackage>"""
+    path = tmp_path / "non_pmml_root_documentation.pmml"
+    path.write_text(pmml, encoding="utf-8")
+
+    result = PmmlScanner().scan(str(path))
+
+    external_issues = [issue for issue in result.issues if "external resource" in issue.message.lower()]
+    assert external_issues
+    assert all(issue.severity == IssueSeverity.WARNING for issue in external_issues)
+    assert any(issue.details.get("context") == "text" for issue in external_issues)
+    assert any(str(issue.details.get("attribute", "")).endswith("description") for issue in external_issues)
+    assert any(str(issue.details.get("attribute", "")).endswith("reference") for issue in external_issues)
+
+
+def test_pmml_scanner_namespaced_application_reference_still_warns(tmp_path: Path) -> None:
+    """Only unqualified Header/Application reference URLs are treated as documentation."""
+    pmml = """<?xml version='1.0'?>
+<PMML xmlns:x="https://example.com/custom" version='4.4'>
+  <Header>
+    <Application name="Trainer" x:reference="https://evil.example/payload"/>
+  </Header>
+  <DataDictionary numberOfFields='0'/>
+</PMML>"""
+    path = tmp_path / "namespaced_application_reference.pmml"
+    path.write_text(pmml, encoding="utf-8")
+
+    result = PmmlScanner().scan(str(path))
+
+    external_issues = [issue for issue in result.issues if "external resource" in issue.message.lower()]
+    assert external_issues
+    assert all(issue.severity == IssueSeverity.WARNING for issue in external_issues)
+    assert any(str(issue.details.get("attribute", "")).endswith("}reference") for issue in external_issues)
+
+
+def test_pmml_scanner_documentation_file_urls_still_warn(tmp_path: Path) -> None:
+    """Documentation contexts should still warn on local or transfer URL schemes."""
+    pmml = """<?xml version='1.0'?>
+<PMML version='4.4'>
+  <Header description="file:///var/tmp/model-card">
+    <Annotation>Read ftp://example.com/archive before loading.</Annotation>
+    <Application name="Trainer" reference="file:///tmp/reference"/>
+  </Header>
+  <DataDictionary numberOfFields='0'/>
+</PMML>"""
+    path = tmp_path / "documented_file_refs.pmml"
+    path.write_text(pmml, encoding="utf-8")
+
+    result = PmmlScanner().scan(str(path))
+
+    external_issues = [issue for issue in result.issues if "external resource" in issue.message.lower()]
+    assert external_issues
+    assert {issue.details.get("url_pattern") for issue in external_issues} >= {"file://", "ftp://"}
+    assert all(issue.severity == IssueSeverity.WARNING for issue in external_issues)
+
+
+def test_pmml_scanner_resource_url_attributes_still_warn(tmp_path: Path) -> None:
+    """Explicit resource attributes should remain warning-level external references."""
+    pmml = """<?xml version='1.0'?>
+<PMML version='4.4'>
+  <Header/>
+  <DataDictionary>
+    <DataField name="payload" optype="categorical" dataType="string" source="https://evil.example/payload"/>
+  </DataDictionary>
+</PMML>"""
+    path = tmp_path / "resource_attr.pmml"
+    path.write_text(pmml, encoding="utf-8")
+
+    result = PmmlScanner().scan(str(path))
+
+    external_issues = [issue for issue in result.issues if "external resource" in issue.message.lower()]
+    assert external_issues
+    assert all(issue.severity == IssueSeverity.WARNING for issue in external_issues)
+    assert any(issue.details.get("attribute") == "source" for issue in external_issues)
+
+
+def test_pmml_scanner_non_documentation_reference_attribute_still_warns(tmp_path: Path) -> None:
+    """Non-documentation reference attributes should remain external resource references."""
+    pmml = """<?xml version='1.0'?>
+<PMML version='4.4'>
+  <Header/>
+  <DataDictionary>
+    <DataField name="payload" optype="categorical" dataType="string" reference="https://evil.example/payload"/>
+  </DataDictionary>
+</PMML>"""
+    path = tmp_path / "reference_attr.pmml"
+    path.write_text(pmml, encoding="utf-8")
+
+    result = PmmlScanner().scan(str(path))
+
+    external_issues = [issue for issue in result.issues if "external resource" in issue.message.lower()]
+    assert external_issues
+    assert all(issue.severity == IssueSeverity.WARNING for issue in external_issues)
+    assert any(issue.details.get("attribute") == "reference" for issue in external_issues)
+
+
+def test_pmml_scanner_application_reference_outside_header_still_warns(tmp_path: Path) -> None:
+    """Application reference URLs are documentation only when nested under Header."""
+    pmml = """<?xml version='1.0'?>
+<PMML version='4.4'>
+  <Header/>
+  <DataDictionary>
+    <DataField name="payload" optype="categorical" dataType="string">
+      <Application name="NestedTrainer" reference="https://evil.example/payload"/>
+    </DataField>
+  </DataDictionary>
+</PMML>"""
+    path = tmp_path / "application_reference_outside_header.pmml"
+    path.write_text(pmml, encoding="utf-8")
+
+    result = PmmlScanner().scan(str(path))
+
+    external_issues = [issue for issue in result.issues if "external resource" in issue.message.lower()]
+    assert external_issues
+    assert all(issue.severity == IssueSeverity.WARNING for issue in external_issues)
+    assert any(issue.details.get("attribute") == "reference" for issue in external_issues)
+
+
+def test_pmml_scanner_namespaced_resource_url_attributes_warn(tmp_path: Path) -> None:
+    """Namespaced resource attributes should still be treated as external references."""
+    pmml = """<?xml version='1.0'?>
+<PMML xmlns:xlink="http://www.w3.org/1999/xlink" version='4.4'>
+  <Header/>
+  <DataDictionary>
+    <DataField name="payload" optype="categorical" dataType="string" xlink:href="https://evil.example/payload"/>
+  </DataDictionary>
+</PMML>"""
+    path = tmp_path / "namespaced_resource_attr.pmml"
+    path.write_text(pmml, encoding="utf-8")
+
+    result = PmmlScanner().scan(str(path))
+
+    external_issues = [issue for issue in result.issues if "external resource" in issue.message.lower()]
+    assert external_issues
+    assert all(issue.severity == IssueSeverity.WARNING for issue in external_issues)
+    assert any(str(issue.details.get("attribute", "")).endswith("}href") for issue in external_issues)
+
+
+def test_pmml_scanner_schema_location_urls_warn(tmp_path: Path) -> None:
+    """XML schemaLocation attributes are external references."""
+    pmml = """<?xml version='1.0'?>
+<PMML xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      version='4.4'
+      xsi:schemaLocation="https://evil.example/schema.xsd">
+  <Header/>
+  <DataDictionary numberOfFields='0'/>
+</PMML>"""
+    path = tmp_path / "schema_location.pmml"
+    path.write_text(pmml, encoding="utf-8")
+
+    result = PmmlScanner().scan(str(path))
+
+    external_issues = [issue for issue in result.issues if "external resource" in issue.message.lower()]
+    assert external_issues
+    assert all(issue.severity == IssueSeverity.WARNING for issue in external_issues)
+    assert any(str(issue.details.get("attribute", "")).endswith("}schemaLocation") for issue in external_issues)
+
+
+def test_pmml_scanner_namespaced_documentation_element_urls_warn(tmp_path: Path) -> None:
+    """Custom namespaced documentation-looking elements should not receive PMML doc URL exemptions."""
+    pmml = """<?xml version='1.0'?>
+<PMML xmlns:x="https://example.com/custom" version='4.4'>
+  <Header/>
+  <x:annotation>https://evil.example/payload</x:annotation>
+  <DataDictionary numberOfFields='0'/>
+</PMML>"""
+    path = tmp_path / "namespaced_doc_element.pmml"
+    path.write_text(pmml, encoding="utf-8")
+
+    result = PmmlScanner().scan(str(path))
+
+    external_issues = [issue for issue in result.issues if "external resource" in issue.message.lower()]
+    assert external_issues
+    assert all(issue.severity == IssueSeverity.WARNING for issue in external_issues)
+    assert any(str(issue.details.get("tag", "")).endswith("}annotation") for issue in external_issues)
+
+
+def test_pmml_scanner_namespaced_documentation_attribute_urls_warn(tmp_path: Path) -> None:
+    """Custom namespaced documentation-looking attributes should not receive PMML doc URL exemptions."""
+    pmml = """<?xml version='1.0'?>
+<PMML xmlns:x="https://example.com/custom" version='4.4'>
+  <Header x:label="https://evil.example/payload"/>
+  <DataDictionary numberOfFields='0'/>
+</PMML>"""
+    path = tmp_path / "namespaced_doc_attribute.pmml"
+    path.write_text(pmml, encoding="utf-8")
+
+    result = PmmlScanner().scan(str(path))
+
+    external_issues = [issue for issue in result.issues if "external resource" in issue.message.lower()]
+    assert external_issues
+    assert all(issue.severity == IssueSeverity.WARNING for issue in external_issues)
+    assert any(str(issue.details.get("attribute", "")).endswith("}label") for issue in external_issues)
+
+
 def test_pmml_scanner_malformed_xml(tmp_path: Path) -> None:
     """Test handling of malformed XML."""
     malformed_xml = """<?xml version='1.0'?>
