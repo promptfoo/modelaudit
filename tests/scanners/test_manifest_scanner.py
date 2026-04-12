@@ -270,8 +270,8 @@ def test_manifest_scanner_redacts_untrusted_url_credentials(tmp_path: Path) -> N
     assert "fragment" not in check.details["url"]
 
 
-def test_manifest_scanner_container_schemes_preserve_at_symbol(tmp_path: Path) -> None:
-    """Azure container URI findings should preserve the container/account separator."""
+def test_manifest_scanner_container_schemes_redact_userinfo(tmp_path: Path) -> None:
+    """Azure container URI findings should redact userinfo-looking values."""
     test_file = tmp_path / "config.json"
     raw_urls = {
         "abfs": "abfs://container:secret@workspace.dfs.core.windows.net/models/path.bin?token=leak#frag",
@@ -295,11 +295,13 @@ def test_manifest_scanner_container_schemes_preserve_at_symbol(tmp_path: Path) -
     for scheme, raw_url in raw_urls.items():
         check = urls_by_scheme[scheme]
         redacted_url = check.details["url"]
-        assert redacted_url == raw_url.split("?", 1)[0]
-        assert "container:secret@" in redacted_url
-        assert "<credentials-redacted>" not in redacted_url
+        expected_url = raw_url.replace("container:secret", "<credentials-redacted>").split("?", 1)[0]
+        assert redacted_url == expected_url
+        assert "container:secret@" not in redacted_url
+        assert "<credentials-redacted>" in redacted_url
         assert "token=leak" not in redacted_url
         assert "frag" not in redacted_url
+        assert "container:secret@" not in check.message
         assert "token=leak" not in check.message
         assert "frag" not in check.message
 

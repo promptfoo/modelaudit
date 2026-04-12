@@ -416,7 +416,6 @@ _TRUSTED_S3_ENDPOINT_HOST_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 _PARSE_FAILED: Final = object()
 _INI_SECTION_HEADER_RE = re.compile(r"^\s*\[[A-Za-z0-9_. -]+\]\s*(?:[#;].*)?(?:\r?\n|$)")
-_AT_SIGN_CONTAINER_SCHEMES: Final[frozenset[str]] = frozenset({"abfs", "abfss", "wasb", "wasbs"})
 
 
 def _scan_result_has_security_findings(result: ScanResult) -> bool:
@@ -439,9 +438,8 @@ def _redact_url_for_display(url: str) -> str:
     if not parts.scheme:
         return url
 
-    scheme = parts.scheme.lower()
     netloc = parts.netloc
-    if "@" in parts.netloc and scheme not in _AT_SIGN_CONTAINER_SCHEMES:
+    if "@" in parts.netloc:
         netloc = parts.hostname or ""
         try:
             port = parts.port
