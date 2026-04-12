@@ -64,7 +64,7 @@ from .utils.sources.huggingface import (
     redact_huggingface_url_for_display,
     redact_huggingface_urls_in_text,
 )
-from .utils.sources.jfrog import is_jfrog_url
+from .utils.sources.jfrog import is_jfrog_url, redact_jfrog_error_for_display, redact_jfrog_url_for_display
 from .utils.sources.pytorch_hub import download_pytorch_hub_model, is_pytorch_hub_url
 
 logger = logging.getLogger("modelaudit")
@@ -240,6 +240,10 @@ def expand_paths(paths: tuple[str, ...]) -> tuple[list[str], list[str]]:
     expanded: list[str] = []
     missing_globs: list[str] = []
     for path_str in paths:
+        if "://" in path_str:
+            expanded.append(path_str)
+            continue
+
         # Handle glob patterns and resolve paths
         path = Path(path_str)
         is_remote_url = bool(re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", path_str))
@@ -310,6 +314,13 @@ def create_progress_callback_wrapper(progress_callback: Any | None, spinner: Any
 def is_mlflow_uri(path: str) -> bool:
     """Check if a path is an MLflow model URI."""
     return path.startswith("models:/")
+
+
+def _redact_scan_path_for_display(path: str) -> str:
+    """Redact credentials from remote paths before printing them."""
+    if is_jfrog_url(path):
+        return redact_jfrog_url_for_display(path)
+    return redact_huggingface_url_for_display(path)
 
 
 def _resolve_scan_paths(paths: tuple[str, ...], scan_start_time: float) -> list[str]:
@@ -536,7 +547,7 @@ def _show_scan_runtime_defaults(
             "─" * 80,
         ]
         click.echo("\n".join(header))
-        display_paths = [redact_huggingface_url_for_display(path) for path in expanded_paths]
+        display_paths = [_redact_scan_path_for_display(path) for path in expanded_paths]
         click.echo(f"Paths to scan: {style_text(', '.join(display_paths), fg='green')}")
         if blacklist:
             click.echo(
@@ -1463,15 +1474,16 @@ def _resolve_scan_source_for_path(
             return None
 
     if is_jfrog_url(path):
+        display_path = redact_jfrog_url_for_display(path)
         download_spinner = None
         if runtime.show_styled_output and should_show_spinner():
             download_spinner = yaspin(
                 Spinners.dots,
-                text=f"Downloading and scanning from {style_text(path, fg='cyan')}",
+                text=f"Downloading and scanning from {style_text(display_path, fg='cyan')}",
             )
             download_spinner.start()
         elif runtime.show_styled_output:
-            click.echo(f"Downloading and scanning from {path}...")
+            click.echo(f"Downloading and scanning from {display_path}...")
 
         try:
             record_download_started("jfrog", path)
@@ -1508,8 +1520,9 @@ def _resolve_scan_source_for_path(
             elif runtime.show_styled_output:
                 click.echo("Download/scan failed")
 
-            logger.error(f"Failed to download/scan model from {path}: {exc!s}", exc_info=verbose)
-            click.echo(f"Error downloading/scanning model from {path}: {exc!s}", err=True)
+            error_msg = redact_jfrog_error_for_display(exc, path)
+            logger.error(f"Failed to download/scan model from {display_path}: {error_msg}", exc_info=verbose)
+            click.echo(f"Error downloading/scanning model from {display_path}: {error_msg}", err=True)
             audit_result.has_errors = True
             return None
 
