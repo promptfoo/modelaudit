@@ -14,8 +14,8 @@ from pathlib import Path
 
 import pytest
 
+import modelaudit_picklescan.api as package_api
 from modelaudit_picklescan import (
-    PickleReport,
     PickleScanner,
     SafetyVerdict,
     ScanOptions,
@@ -24,8 +24,6 @@ from modelaudit_picklescan import (
     scan_bytes,
     scan_file,
 )
-from modelaudit_picklescan.engine import nested as engine_nested
-from modelaudit_picklescan.engine import scanner as engine_scanner
 
 SYSTEM_GLOBALS = frozenset({"nt.system", "os.system", "posix.system"})
 
@@ -173,6 +171,72 @@ def test_scan_file_scans_strict_pickle_path(tmp_path: Path) -> None:
     assert report.coverage.bytes_total == payload_path.stat().st_size
 
 
+def test_scan_file_scans_pytorch_zip_data_pickle(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+
+    report = scan_file(archive_path)
+
+    assert report.source == str(archive_path)
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.metadata["container_type"] == "pytorch_zip"
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl"]
+    assert report.coverage.bytes_total == archive_path.stat().st_size
+    assert report.coverage.bytes_scanned > 0
+
+
+def test_scan_file_detects_malicious_pytorch_zip_data_pickle(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.bin"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("data.pkl", pickle.dumps(MaliciousPayload(), protocol=4))
+        archive.writestr("version", "3\n")
+        archive.writestr("byteorder", "little")
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(finding.rule_code == "DANGEROUS_CALL" for finding in report.findings)
+    assert all(
+        finding.location is not None and f"{archive_path}:data.pkl" in finding.location for finding in report.findings
+    )
+
+
+def test_scan_file_leaves_generic_data_pickle_zip_as_raw_pickle_input(tmp_path: Path) -> None:
+    archive_path = tmp_path / "generic.jpg"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.ERROR
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert "container_type" not in report.metadata
+
+
+def test_scan_file_marks_oversized_pytorch_zip_member_inconclusive(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(package_api, "_MAX_PYTORCH_ZIP_PICKLE_MEMBER_BYTES", 4)
+    archive_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+        archive.writestr("version", "3\n")
+        archive.writestr("byteorder", "little")
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.findings == ()
+    assert any(notice.code == "pytorch_zip_member_size_limit" for notice in report.notices)
+
+
 def test_scan_file_returns_error_report_for_missing_file(tmp_path: Path) -> None:
     missing_path = tmp_path / "missing.pkl"
 
@@ -220,6 +284,18 @@ def test_scan_stream_returns_empty_input_error_for_empty_unknown_size_stream() -
     assert report.coverage.opcode_scan_complete is False
 
 
+def test_scan_stream_treats_negative_size_as_unknown_size() -> None:
+    payload = pickle.dumps({"safe": True}, protocol=4)
+
+    report = PickleScanner().scan_stream(io.BytesIO(payload), source="unknown-size.pkl", size=-1)
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.errors == ()
+    assert report.coverage.bytes_total is None
+    assert report.coverage.bytes_scanned == len(payload)
+
+
 def test_scan_stream_fails_closed_on_short_reads_for_expected_size() -> None:
     payload = pickle.dumps({"safe": True})
     expected_size = len(payload) + 8
@@ -241,9 +317,12 @@ def test_scan_stream_fails_closed_on_short_reads_for_expected_size() -> None:
     assert report.coverage.opcode_scan_complete is False
 
 
-def test_scan_stream_incrementally_reads_bounded_streams_without_preloading_entire_payload() -> None:
+def test_scan_stream_incrementally_reads_bounded_streams_without_preloading_entire_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     payload = pickle.dumps(list(range(512)), protocol=4)
     stream = NoBulkReadStream(payload, max_read_size=32)
+    monkeypatch.setattr(package_api, "_RUST_STREAM_READ_CHUNK_SIZE", 32)
 
     report = PickleScanner().scan_stream(stream, source="chunked.pkl", size=len(payload))
 
@@ -251,12 +330,6 @@ def test_scan_stream_incrementally_reads_bounded_streams_without_preloading_enti
     assert report.verdict == SafetyVerdict.CLEAN
     assert report.coverage.bytes_scanned == len(payload)
     assert stream.max_seen_read_size <= 32
-
-
-def test_bounded_pickle_stream_normalizes_negative_reads_without_a_byte_limit() -> None:
-    stream = engine_scanner._BoundedPickleStream(io.BytesIO(b"abc"), None)
-
-    assert stream._bounded_size(-1) is None
 
 
 def test_scan_bytes_flags_malformed_stack_global_operands() -> None:
@@ -663,46 +736,6 @@ def test_scan_bytes_surfaces_deep_nested_pickle_findings_without_parse_incomplet
     )
 
 
-def test_scan_bytes_reuses_outer_deadline_for_nested_scans(monkeypatch: pytest.MonkeyPatch) -> None:
-    nested_payload = pickle.dumps({"inner": "data"}, protocol=4)
-    captured_deadlines: list[float | None] = []
-    original_scan_pickle_payload = engine_scanner.scan_pickle_payload
-
-    def spy_scan_pickle_payload(
-        payload: bytes,
-        *,
-        source: str,
-        options: ScanOptions,
-        bytes_total: int | None = None,
-        position_offset: int = 0,
-        nested_depth: int = 0,
-        deadline: float | None = None,
-    ) -> PickleReport:
-        captured_deadlines.append(deadline)
-        return original_scan_pickle_payload(
-            payload,
-            source=source,
-            options=options,
-            bytes_total=bytes_total,
-            position_offset=position_offset,
-            nested_depth=nested_depth,
-            deadline=deadline,
-        )
-
-    monkeypatch.setattr(engine_scanner.time, "monotonic", lambda: 100.0)
-    monkeypatch.setattr(engine_scanner, "scan_pickle_payload", spy_scan_pickle_payload)
-
-    report = scan_bytes(
-        pickle.dumps({"outer": nested_payload}, protocol=4),
-        source="nested-deadline.pkl",
-        options=ScanOptions(timeout_s=3.0),
-    )
-
-    assert report.status == ScanStatus.COMPLETE
-    assert len(captured_deadlines) == 1
-    assert captured_deadlines[0] == pytest.approx(103.0)
-
-
 def test_scan_bytes_marks_parent_inconclusive_when_nested_analysis_is_incomplete() -> None:
     nested_payload = pickle.dumps({"code": "A" * 128}, protocol=4)
 
@@ -877,57 +910,6 @@ def test_scan_bytes_still_checks_bounded_encoded_nested_windows_for_truncated_li
 
 
 @pytest.mark.parametrize(
-    ("literal", "expected_max_chars"),
-    [
-        ("Z" * 128, 16),
-        ("a" * 128, 24),
-        ("not encoded!" * 16, 16),
-    ],
-)
-def test_scan_bytes_uses_encoding_sized_windows_for_truncated_encoded_literals(
-    literal: str,
-    expected_max_chars: int,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    seen_candidates: list[str] = []
-
-    def fake_decode_possible_encoded_pickle(
-        candidate: str,
-        *,
-        max_nested_pickle_bytes: int,
-    ) -> list[tuple[str, bytes]]:
-        assert max_nested_pickle_bytes == 12
-        seen_candidates.append(candidate)
-        return []
-
-    def fake_detect_oversized_encoded_pickle_prefixes(
-        candidate: str,
-        *,
-        max_nested_pickle_bytes: int,
-    ) -> list[tuple[str, int]]:
-        assert max_nested_pickle_bytes == 12
-        del candidate
-        return []
-
-    monkeypatch.setattr(engine_scanner, "_decode_possible_encoded_pickle", fake_decode_possible_encoded_pickle)
-    monkeypatch.setattr(
-        engine_scanner,
-        "_detect_oversized_encoded_pickle_prefixes",
-        fake_detect_oversized_encoded_pickle_prefixes,
-    )
-
-    report = scan_bytes(
-        pickle.dumps({"outer": literal}, protocol=4),
-        source="bounded-encoded-window.pkl",
-        options=ScanOptions(max_string_literal_scan_chars=8, max_nested_pickle_bytes=12),
-    )
-
-    assert report.status == ScanStatus.INCONCLUSIVE
-    assert seen_candidates
-    assert max(len(candidate) for candidate in seen_candidates) <= expected_max_chars
-
-
-@pytest.mark.parametrize(
     ("literal", "encoding", "rule_code"),
     [
         (base64.b64encode(pickle.dumps({"inner": "data"}, protocol=4)).decode("ascii"), "base64", "S601"),
@@ -960,54 +942,6 @@ def test_scan_bytes_fails_closed_for_encoded_nested_payload_over_byte_limit(
         and notice.details.get("analysis_incomplete") is True
         for notice in report.notices
     )
-
-
-def test_decode_possible_encoded_pickle_bounds_base64_decode_input(monkeypatch: pytest.MonkeyPatch) -> None:
-    decoded_payload = pickle.dumps({"inner": "data"}, protocol=4)
-    max_nested_pickle_bytes = len(decoded_payload)
-    max_base64_chars = ((max_nested_pickle_bytes + 2) // 3) * 4
-    oversized_literal = base64.b64encode(decoded_payload).decode("ascii") + ("A" * (max_base64_chars * 4))
-    seen_lengths: list[int] = []
-
-    def fake_b64decode(value: str, *, validate: bool = False) -> bytes:
-        assert validate is True
-        seen_lengths.append(len(value))
-        return decoded_payload
-
-    monkeypatch.setattr(engine_nested.base64, "b64decode", fake_b64decode)
-
-    decoded = engine_nested._decode_possible_encoded_pickle(
-        oversized_literal,
-        max_nested_pickle_bytes=max_nested_pickle_bytes,
-    )
-
-    assert decoded == [("base64", decoded_payload)]
-    assert seen_lengths
-    assert max(seen_lengths) <= max_base64_chars
-
-
-def test_decode_possible_encoded_pickle_bounds_hex_decode_input(monkeypatch: pytest.MonkeyPatch) -> None:
-    decoded_payload = pickle.dumps({"inner": "data"}, protocol=4)
-    max_nested_pickle_bytes = len(decoded_payload) * 2
-    max_hex_chars = max_nested_pickle_bytes * 2
-    escaped_hex_payload = "".join(f"\\x{byte:02x}" for byte in decoded_payload)
-    oversized_literal = escaped_hex_payload + ("\\x41" * max_hex_chars)
-    seen_lengths: list[int] = []
-
-    def fake_unhexlify(value: str) -> bytes:
-        seen_lengths.append(len(value))
-        return decoded_payload
-
-    monkeypatch.setattr(engine_nested.binascii, "unhexlify", fake_unhexlify)
-
-    decoded = engine_nested._decode_possible_encoded_pickle(
-        oversized_literal,
-        max_nested_pickle_bytes=max_nested_pickle_bytes,
-    )
-
-    assert decoded == [("hex", decoded_payload)]
-    assert seen_lengths
-    assert max(seen_lengths) <= max_hex_chars
 
 
 def test_scan_stream_preserves_absolute_offsets_from_current_stream_position() -> None:

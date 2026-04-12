@@ -258,12 +258,50 @@ def _pickle_record_identity(record: Any) -> tuple[Hashable, ...]:
         message = getattr(record, "message", None)
 
     if rule_code:
-        return (location, rule_code)
+        record_name = getattr(record, "name", None)
+        if record_name is None:
+            return (location, rule_code, message)
+        return (record_name, location, rule_code)
 
     return (
         location,
         rule_code,
         message,
+    )
+
+
+def _pickle_record_identity_map(records: list[Any]) -> dict[tuple[Hashable, ...], Any]:
+    """Return record identities, including folded supporting evidence identities."""
+    identities = {_pickle_record_identity(record): record for record in records}
+    for record in records:
+        details = getattr(record, "details", {})
+        if not isinstance(details, Mapping):
+            continue
+        supporting_evidence = details.get("supporting_evidence")
+        if not isinstance(supporting_evidence, list):
+            continue
+        for evidence in supporting_evidence:
+            if isinstance(evidence, Mapping):
+                identities.setdefault(_pickle_record_identity(evidence), record)
+    return identities
+
+
+def _pickle_record_promotion_identity(record: Any) -> tuple[Hashable, ...] | None:
+    """Return a key for lower-severity records superseded by stronger fallback evidence."""
+    details = getattr(record, "details", {})
+    if not isinstance(details, Mapping):
+        return None
+
+    associated_global = details.get("associated_global")
+    if not isinstance(associated_global, str):
+        associated_global = details.get("import_reference")
+    if not isinstance(associated_global, str):
+        return None
+
+    return (
+        associated_global,
+        getattr(record, "rule_code", None),
+        getattr(record, "message", None),
     )
 
 
@@ -301,9 +339,16 @@ def _should_skip_fallback_pickle_issue(
     """Suppress package parse errors already represented by a legacy scanner-limitation downgrade."""
     if target_confirms_trusted_incomplete_tail and _is_parse_incomplete_pickle_issue(issue):
         return True
-    if not target.metadata.get("scanner_limitation") or issue.rule_code is not None:
+    if not target.metadata.get("scanner_limitation"):
         return False
-    return issue.details.get("category") == "parse_error" and issue.details.get("exception_type") in {
+    details = issue.details if isinstance(issue.details, Mapping) else {}
+    if details.get("notice_code") == "parse_incomplete" or details.get("pickle_notice_code") == "parse_incomplete":
+        return True
+    if issue.rule_code is not None:
+        return False
+    if _is_parse_incomplete_pickle_issue(issue):
+        return True
+    return details.get("category") == "parse_error" and details.get("exception_type") in {
         "MemoryError",
         "RecursionError",
     }
@@ -347,22 +392,8 @@ def _merge_missing_pickle_checks(
     target_confirms_trusted_incomplete_tail = _target_confirms_trusted_incomplete_tail(target, fallback)
     existing_check_signatures = {_pickle_check_signature(check) for check in target.checks}
     existing_issue_signatures = {_pickle_check_signature(issue) for issue in target.issues}
-    existing_check_identities = {_pickle_record_identity(check): check for check in target.checks}
-    existing_issue_identities = {_pickle_record_identity(issue): issue for issue in target.issues}
-    for check in target.checks:
-        supporting_evidence = check.details.get("supporting_evidence")
-        if not isinstance(supporting_evidence, list):
-            continue
-        for evidence in supporting_evidence:
-            if isinstance(evidence, Mapping):
-                existing_check_identities.setdefault(_pickle_record_identity(evidence), check)
-    for issue in target.issues:
-        supporting_evidence = issue.details.get("supporting_evidence")
-        if not isinstance(supporting_evidence, list):
-            continue
-        for evidence in supporting_evidence:
-            if isinstance(evidence, Mapping):
-                existing_issue_identities.setdefault(_pickle_record_identity(evidence), issue)
+    existing_check_identities = _pickle_record_identity_map(target.checks)
+    existing_issue_identities = _pickle_record_identity_map(target.issues)
 
     for check in fallback.checks:
         if target_confirms_trusted_incomplete_tail and _is_parse_incomplete_pickle_issue(check):
@@ -393,6 +424,23 @@ def _merge_missing_pickle_checks(
         ):
             continue
 
+        promotion_identity = _pickle_record_promotion_identity(issue)
+        if promotion_identity is not None:
+            retained_issues = [
+                existing_issue
+                for existing_issue in target.issues
+                if not (
+                    _pickle_record_promotion_identity(existing_issue) == promotion_identity
+                    and _severity_priority(existing_issue.severity) < _severity_priority(issue.severity)
+                )
+            ]
+            if len(retained_issues) != len(target.issues):
+                target.issues = retained_issues
+                existing_issue_signatures = {
+                    _pickle_check_signature(existing_issue) for existing_issue in target.issues
+                }
+                existing_issue_identities = _pickle_record_identity_map(target.issues)
+
         identity = _pickle_record_identity(issue)
         if identity in existing_issue_identities:
             continue
@@ -406,7 +454,7 @@ def _merge_missing_pickle_checks(
 
     target.bytes_scanned = max(target.bytes_scanned, fallback.bytes_scanned)
     for key, value in fallback.metadata.items():
-        if key in _STANDALONE_PICKLE_SHADOW_METADATA_KEYS:
+        if key in _STANDALONE_PICKLE_SHADOW_METADATA_KEYS and not propagate_fallback_state:
             continue
         if key in target.metadata and isinstance(target.metadata[key], dict) and isinstance(value, dict):
             target.metadata[key].update(value)
@@ -4048,7 +4096,6 @@ class PickleScanner(BaseScanner):
         self._standalone_pickle_scanner = StandalonePickleScanner(
             options=scan_options_from_config(self.config),
         )
-        self.use_standalone_pickle_primary = self._get_bool_config("use_standalone_pickle_primary", False)
 
     def _prepare_scan_context(self, source: str) -> None:
         """Reset per-scan timeout/context/analyzer state for a new pickle scan."""
@@ -4211,7 +4258,7 @@ class PickleScanner(BaseScanner):
         source: str,
         reuse_seekable_stream_for_legacy: bool = False,
     ) -> ScanResult:
-        """Scan a pickle stream through the standalone package and preserve legacy result semantics."""
+        """Scan through the Rust standalone package and merge bounded root-only checks."""
         self.current_file_path = source
 
         try:
@@ -4238,48 +4285,88 @@ class PickleScanner(BaseScanner):
         try:
             file_obj.seek(stream_start)
         except (AttributeError, OSError, ValueError):
+            package_result.metadata["pickle_primary_engine"] = "standalone"
+            return package_result
+
+        if file_size <= 0:
+            package_result.metadata["pickle_primary_engine"] = "standalone"
             return package_result
 
         try:
             if reuse_seekable_stream_for_legacy:
-                legacy_result = self._scan_pickle_bytes(file_obj, file_size)
+                compatibility_result = self._scan_pickle_bytes(file_obj, file_size)
             else:
                 max_in_mem = int((self.config or {}).get("pickle_max_memory_read", 32 * 1024 * 1024))
                 with tempfile.SpooledTemporaryFile(max_size=max(max_in_mem, 0), mode="w+b") as spool:
                     self._copy_pickle_stream_to_spool(file_obj, file_size, cast(BinaryIO, spool))
                     spool.seek(0)
-                    legacy_result = self._scan_pickle_bytes(cast(BinaryIO, spool), file_size)
+                    compatibility_result = self._scan_pickle_bytes(cast(BinaryIO, spool), file_size)
         except Exception as error:
-            if isinstance(error, RecursionError) or self._is_pickle_parse_failure(error):
-                if self.use_standalone_pickle_primary:
-                    package_result.metadata["legacy_compatibility_failed"] = True
-                    package_result.metadata["legacy_compatibility_failure"] = {
-                        "exception_type": type(error).__name__,
-                        "message": str(error),
-                    }
-                    package_result.metadata["pickle_primary_engine"] = "standalone"
-                    return package_result
-                raise
-            self._record_pickle_runtime_error(package_result, error, location=source)
-            package_result.finish(success=False)
+            package_result.metadata["compatibility_analysis_failed"] = True
+            package_result.metadata["compatibility_analysis_failure"] = {
+                "exception_type": type(error).__name__,
+                "message": str(error),
+            }
+            package_result.metadata["pickle_primary_engine"] = "standalone"
             return package_result
 
         with contextlib.suppress(AttributeError, OSError, ValueError):
             file_obj.seek(stream_start)
-        if self.use_standalone_pickle_primary:
-            _merge_missing_pickle_checks(package_result, legacy_result, propagate_fallback_state=False)
-            first_pickle_end_pos = package_result.metadata.get("first_pickle_end_pos")
-            if isinstance(first_pickle_end_pos, int):
-                package_result.metadata["first_pickle_end_pos"] = first_pickle_end_pos
-            package_result.metadata["pickle_primary_engine"] = "standalone"
-            return package_result
-
-        _merge_missing_pickle_checks(legacy_result, package_result)
+        compatibility_operational_only = not _scan_result_has_security_findings(compatibility_result) and (
+            bool(compatibility_result.metadata.get("operational_error"))
+            or bool(compatibility_result.metadata.get("scanner_limitation"))
+            or bool(compatibility_result.metadata.get("parsing_failed"))
+        )
+        compatibility_has_resource_limit = any(
+            check.name == "Pickle Parse Resource Limit" for check in compatibility_result.checks
+        )
+        propagate_compatibility_state = not (
+            pickle_report.status.value == "complete"
+            and compatibility_operational_only
+            and not compatibility_has_resource_limit
+        )
+        _merge_missing_pickle_checks(
+            package_result,
+            compatibility_result,
+            propagate_fallback_state=propagate_compatibility_state,
+        )
+        if compatibility_operational_only and compatibility_result.metadata.get("scanner_limitation"):
+            package_result.checks = [
+                check
+                for check in package_result.checks
+                if check.name != "Standalone Pickle Parse Failure" and not _is_parse_incomplete_pickle_issue(check)
+            ]
+            package_result.issues = [
+                issue for issue in package_result.issues if not _is_parse_incomplete_pickle_issue(issue)
+            ]
+        if Path(source).suffix.lower() == ".bin" and _has_trusted_incomplete_tail_context(package_result):
+            package_result.metadata.setdefault("file_type", "binary")
+            package_result.metadata.setdefault("pickle_parsing_failed", True)
+            if not any(check.name == "Pickle Format Check" for check in package_result.checks):
+                package_result.add_check(
+                    name="Pickle Format Check",
+                    passed=True,
+                    message="File appears to be binary data rather than pickle format",
+                    severity=IssueSeverity.INFO,
+                    location=source,
+                    details={
+                        "file_type": "binary",
+                        "pickle_parse_error": "pickle parsing stopped before full stream consumption",
+                    },
+                )
+        if (
+            _has_trusted_incomplete_tail_context(package_result)
+            and _scan_result_has_security_findings(compatibility_result)
+            and Path(source).suffix.lower() in {".pkl", ".pickle", ".pt", ".pth", ".ckpt"}
+        ):
+            package_result.finish(success=False)
+        elif _has_trusted_incomplete_tail_context(package_result) and compatibility_result.success:
+            package_result.finish(success=True)
         first_pickle_end_pos = package_result.metadata.get("first_pickle_end_pos")
         if isinstance(first_pickle_end_pos, int):
-            legacy_result.metadata["first_pickle_end_pos"] = first_pickle_end_pos
-        legacy_result.metadata["pickle_primary_engine"] = "legacy"
-        return legacy_result
+            package_result.metadata["first_pickle_end_pos"] = first_pickle_end_pos
+        package_result.metadata["pickle_primary_engine"] = "standalone"
+        return package_result
 
     def _copy_pickle_stream_to_spool(self, file_obj: BinaryIO, file_size: int, spool: BinaryIO) -> None:
         """Copy at most file_size bytes into a seekable spool while honoring interruption and timeout."""
@@ -4304,7 +4391,7 @@ class PickleScanner(BaseScanner):
         *,
         source: str,
     ) -> ScanResult:
-        """Copy a non-seekable pickle stream to a bounded spool and scan with both engines."""
+        """Copy a non-seekable pickle stream once, then run Rust primary plus compatibility checks."""
         max_in_mem = int((self.config or {}).get("pickle_max_memory_read", 32 * 1024 * 1024))
         result = self._create_result()
 

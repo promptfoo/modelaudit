@@ -84,10 +84,20 @@ Add focused tests under `tests/`:
 ## 6. Validation before PR
 
 ```bash
-uv run ruff format modelaudit/ tests/
-uv run ruff check --fix modelaudit/ tests/
-uv run mypy modelaudit/
-uv run pytest -n auto -m "not slow and not integration" --maxfail=1
+uv run ruff format modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests tests/
+uv run ruff check --fix modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests tests/
+uv run mypy modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests tests/
+PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest -n auto -m "not slow and not integration" --maxfail=1
+```
+
+If the change touches `packages/modelaudit-picklescan`, also run:
+
+```bash
+cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml -- --check
+cargo check --manifest-path packages/modelaudit-picklescan/Cargo.toml
+cargo clippy --manifest-path packages/modelaudit-picklescan/Cargo.toml --all-targets -- -D warnings
+cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml
+PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests -q
 ```
 
 ## 7. PR checklist

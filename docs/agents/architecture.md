@@ -9,6 +9,7 @@
 - `scanner_results.py`: Leaf result/check/issue contracts re-exported by `scanners/base.py`
 - `scanner_registry_metadata.py`: Static scanner metadata consumed by registry loading and extension utilities
 - `scanners/`: Format-specific scanner implementations
+- `packages/modelaudit-picklescan/`: Standalone Rust-backed pickle byte scanner used by root pickle and wrapper scanners
 - `utils/file/detection.py`: File type and content detection utilities
 - `utils/sources/huggingface_paths.py`: Leaf HuggingFace URL/cache provenance parsing
 - `version.py`: Leaf package-version lookup used by package init and telemetry
@@ -104,6 +105,8 @@ result.add_check(
 
 - `modelaudit/scanners/base.py`: Scanner interface and base classes
 - `modelaudit/scanners/<scanner>_support/`: Extracted helper modules for large scanners while preserving public `<scanner>_scanner.py` entrypoints
+- `packages/modelaudit-picklescan/src/modelaudit_picklescan/`: Standalone pickle scanner Python API and Rust bridge
+- `packages/modelaudit-picklescan/rust/src/`: Native Rust pickle parser, policy, and report conversion code
 - `modelaudit/core.py`: Main scanning orchestration logic
 - `modelaudit/core_results.py`: Shared result aggregation/finalization logic used by core scan flows
 - `modelaudit/cli.py`: Command-line interface

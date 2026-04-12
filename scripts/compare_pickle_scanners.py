@@ -140,9 +140,9 @@ def _normalize_scan_result(result: ScanResult, *, engine: str) -> NormalizedResu
     )
 
 
-def _normalize_package_report(report: PickleReport) -> NormalizedResult:
+def _normalize_package_report(report: PickleReport, *, engine: str = "package") -> NormalizedResult:
     return NormalizedResult(
-        engine="package",
+        engine=engine,
         status=report.status.value,
         verdict=report.verdict.value,
         success=report.status == ScanStatus.COMPLETE
@@ -156,13 +156,17 @@ def _normalize_package_report(report: PickleReport) -> NormalizedResult:
     )
 
 
+def _scan_package_report(path: Path) -> PickleReport:
+    return package_scan_file(path)
+
+
 def _scan_fixture(
     path: Path,
     legacy_scanner: LegacyBaselinePickleScanner,
 ) -> tuple[NormalizedResult, NormalizedResult, NormalizedResult]:
     legacy_result = _normalize_scan_result(legacy_scanner.scan(str(path)), engine="legacy")
-    package_report = package_scan_file(path)
-    package_result = _normalize_package_report(package_report)
+    package_report = _scan_package_report(path)
+    package_result = _normalize_package_report(package_report, engine="package:rust")
     adapter_result = _normalize_scan_result(
         pickle_report_to_scan_result(package_report, scanner_name="pickle"),
         engine="adapter",
@@ -170,7 +174,11 @@ def _scan_fixture(
     return legacy_result, package_result, adapter_result
 
 
-def _scan_root_fixture(path: Path, *, config: dict[str, Any] | None = None) -> NormalizedResult:
+def _scan_root_fixture(
+    path: Path,
+    *,
+    config: dict[str, Any] | None = None,
+) -> NormalizedResult:
     return _normalize_scan_result(PickleScanner(config=config).scan(str(path)), engine="root")
 
 
@@ -249,6 +257,7 @@ def _build_report(
 
     return {
         "fixture_count": len(fixtures),
+        "package_engine": "rust",
         "summary": {
             engine_name: dict(sorted(engine_summary.items())) for engine_name, engine_summary in summary.items()
         },
@@ -262,6 +271,10 @@ def _build_report(
 
 def _print_text_report(report: dict[str, Any]) -> None:
     print(f"Compared {report['fixture_count']} pickle fixtures")
+    if "engine_a" in report and "engine_b" in report:
+        print(f"Package engine comparison: {report['engine_a']} -> {report['engine_b']}")
+    elif "package_engine" in report:
+        print(f"Package engine: {report['package_engine']}")
     print("Summary:")
     for engine_name, engine_summary in report["summary"].items():
         print(f"  {engine_name}:")
@@ -294,8 +307,14 @@ def _print_text_report(report: dict[str, Any]) -> None:
             f"{key.removesuffix('_delta')}={value}" for key, value in item.items() if key.endswith("_delta")
         )
         print(f"\n[{delta_summary}] {item['path']} ({item['label']})")
-        for engine_name in ("legacy", "package", "adapter", "root"):
-            engine_result = item.get(engine_name)
+        engine_items = [
+            (engine_name, engine_result)
+            for engine_name, engine_result in item.items()
+            if isinstance(engine_result, dict)
+            and isinstance(engine_result.get("status"), str)
+            and isinstance(engine_result.get("verdict"), str)
+        ]
+        for engine_name, engine_result in engine_items:
             if not isinstance(engine_result, dict):
                 continue
             print(
@@ -304,26 +323,27 @@ def _print_text_report(report: dict[str, Any]) -> None:
                 f"warnings={engine_result['warning_count']} criticals={engine_result['critical_count']} "
                 f"success={engine_result['success']}"
             )
-        legacy = item["legacy"]
-        package = item["package"]
-        adapter = item["adapter"]
-        legacy_rules = Counter(legacy["rule_codes"])
-        package_rules = Counter(package["rule_codes"])
-        adapter_rules = Counter(adapter["rule_codes"])
-        print(f"  legacy-only rules : {sorted((legacy_rules - package_rules).elements())}")
-        print(f"  package-only rules: {sorted((package_rules - legacy_rules).elements())}")
-        print(f"  adapter-only rules: {sorted((adapter_rules - legacy_rules).elements())}")
-        root = item.get("root")
-        if isinstance(root, dict):
-            root_rules = Counter(root["rule_codes"])
-            print(f"  root-only rules   : {sorted((root_rules - legacy_rules).elements())}")
-        for message in package["messages"][:5]:
-            print(f"  package finding: {message}")
-        for message in adapter["messages"][:5]:
-            print(f"  adapter finding: {message}")
-        if isinstance(root, dict):
-            for message in root["messages"][:5]:
-                print(f"  root finding: {message}")
+        if all(key in item for key in ("legacy", "package", "adapter")):
+            legacy = item["legacy"]
+            package = item["package"]
+            adapter = item["adapter"]
+            legacy_rules = Counter(legacy["rule_codes"])
+            package_rules = Counter(package["rule_codes"])
+            adapter_rules = Counter(adapter["rule_codes"])
+            print(f"  legacy-only rules : {sorted((legacy_rules - package_rules).elements())}")
+            print(f"  package-only rules: {sorted((package_rules - legacy_rules).elements())}")
+            print(f"  adapter-only rules: {sorted((adapter_rules - legacy_rules).elements())}")
+            root = item.get("root")
+            if isinstance(root, dict):
+                root_rules = Counter(root["rule_codes"])
+                print(f"  root-only rules   : {sorted((root_rules - legacy_rules).elements())}")
+            for message in package["messages"][:5]:
+                print(f"  package finding: {message}")
+            for message in adapter["messages"][:5]:
+                print(f"  adapter finding: {message}")
+            if isinstance(root, dict):
+                for message in root["messages"][:5]:
+                    print(f"  root finding: {message}")
 
 
 def _has_exit_failure_drift(report: dict[str, Any]) -> bool:
@@ -341,15 +361,12 @@ def main() -> int:
     )
     parser.add_argument("--json", action="store_true", help="Print the full diff report as JSON")
     parser.add_argument("--include-root", action="store_true", help="Also compare the actual root PickleScanner")
-    parser.add_argument(
-        "--root-standalone-primary",
-        action="store_true",
-        help="Compare the root scanner with use_standalone_pickle_primary=True",
-    )
     args = parser.parse_args()
 
-    root_config = {"use_standalone_pickle_primary": True} if args.root_standalone_primary else None
-    report = _build_report(include_root=args.include_root or args.root_standalone_primary, root_config=root_config)
+    report = _build_report(
+        include_root=args.include_root,
+        root_config=None,
+    )
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
     else:

@@ -10,6 +10,8 @@ from typing import Any
 
 from modelaudit_picklescan import Finding, PickleReport, ScanOptions, ScanStatus, Severity
 
+from modelaudit.config.explanations import get_import_explanation
+
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, Check, Issue, IssueSeverity, ScanResult
 from .rule_mapper import get_generic_rule_code, get_import_rule_code, get_pickle_opcode_rule_code
 
@@ -177,7 +179,7 @@ def pickle_report_to_scan_result(
             severity=_to_issue_severity(finding.severity),
             location=finding.location,
             details=details,
-            why=finding.why,
+            why=_legacy_why_for_finding(finding),
             rule_code=_legacy_rule_code_for_finding(finding),
         )
 
@@ -315,7 +317,10 @@ def _should_suppress_parse_failure_escalation(report: PickleReport) -> bool:
         if notice.code != "parse_incomplete":
             continue
 
-        if source_ext in {".bin", ".pkl", ".pickle"} and notice.details.get("exception_type") in {
+        if source_ext in {".bin", ".pkl", ".pickle", ".joblib", ".dill", ".pt", ".pth", ".ckpt"} and notice.details.get(
+            "exception_type"
+        ) in {
+            "ParseError",
             "UnicodeDecodeError",
             "ValueError",
         }:
@@ -324,7 +329,7 @@ def _should_suppress_parse_failure_escalation(report: PickleReport) -> bool:
         if notice.details.get("exception_type") == "UnicodeDecodeError":
             return _has_only_non_dangerous_import_references(report)
 
-        if notice.details.get("exception_type") != "ValueError":
+        if notice.details.get("exception_type") not in {"ParseError", "ValueError"}:
             continue
 
         exception_message = str(notice.details.get("exception", ""))
@@ -519,4 +524,29 @@ def _location_position(location: str | None) -> int | None:
 def _add_legacy_detail_aliases(details: dict[str, Any]) -> dict[str, Any]:
     if "function" not in details and isinstance(details.get("name"), str):
         details["function"] = details["name"]
+    if "associated_global" not in details and isinstance(details.get("import_reference"), str):
+        details["associated_global"] = details["import_reference"]
     return details
+
+
+def _legacy_why_for_finding(finding: Finding) -> str | None:
+    if finding.rule_code not in {"DANGEROUS_CALL", "DANGEROUS_GLOBAL"}:
+        return finding.why
+
+    import_reference = finding.details.get("import_reference")
+    if isinstance(import_reference, str):
+        why = get_import_explanation(import_reference)
+        if why is not None:
+            return why
+
+    module = finding.details.get("module")
+    name = finding.details.get("name")
+    if isinstance(module, str):
+        if isinstance(name, str):
+            why = get_import_explanation(f"{module}.{name}")
+            if why is not None:
+                return why
+        why = get_import_explanation(module)
+        if why is not None:
+            return why
+    return finding.why

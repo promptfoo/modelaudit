@@ -3,12 +3,17 @@
 Standalone pickle security scanner package used by ModelAudit's pickle scanners.
 
 This package is intentionally small: it exposes pickle byte/stream analysis,
-safety verdicts, and typed findings without importing the broader ModelAudit
-scanner framework.
+safety verdicts, typed findings, and direct scanning of pickle members inside
+common PyTorch ZIP checkpoints without importing the broader ModelAudit scanner
+framework.
 
 ## Installation
 
-The root `modelaudit` wheel bundles `modelaudit_picklescan` as an import package.
+The standalone `modelaudit-picklescan` wheel includes the Python API and the
+native Rust scanner extension. The root `modelaudit` wheel bundles
+`modelaudit_picklescan` as an import package and uses the same Rust scanner for
+pickle payload analysis.
+
 For local package work from a checkout, install the package directory directly:
 
 ```bash
@@ -20,7 +25,7 @@ python -m pip install packages/modelaudit-picklescan
 ```python
 from modelaudit_picklescan import ScanOptions, scan_bytes, scan_file
 
-report = scan_file("model.pkl")
+report = scan_file("model.pt")  # raw pickle files and PyTorch ZIP checkpoints
 if report.has_security_findings:
     for finding in report.findings:
         print(finding.rule_code, finding.severity.value, finding.message)
@@ -38,6 +43,12 @@ report = scan_bytes(
 )
 ```
 
+## Rust Scanner
+
+The package is Rust-only at runtime. If the native extension cannot be imported,
+scan calls return an explicit `rust_engine_error` report instead of falling back
+to a deleted Python implementation.
+
 ## Report Contract
 
 - `status`: scan completeness (`complete`, `inconclusive`, `error`)
@@ -52,12 +63,13 @@ plain-Python representation is needed.
 
 ## Package Boundary
 
-`modelaudit-picklescan` only analyzes pickle payloads. Archive/container
-routing, SARIF export, CLI behavior, and ModelAudit result adaptation stay in
-the root `modelaudit` package.
+`modelaudit-picklescan` analyzes raw pickle payloads and PyTorch ZIP checkpoint
+pickle members. General archive/container routing, SARIF export, CLI behavior,
+and ModelAudit result adaptation stay in the root `modelaudit` package.
 
-The root `modelaudit` pickle scanner currently runs this standalone engine first
-and then merges legacy-only compatibility checks while detector parity continues
-to improve. Standalone users should rely on this package for pickle payload
-analysis, but full ModelAudit scans may still report additional root-package
-context such as archive metadata, CVE checks, and legacy rule identifiers.
+The root `modelaudit` pickle scanner runs this standalone Rust engine first and
+then may merge root-only compatibility checks while remaining detector parity
+work is completed. Standalone users should rely on this package for pickle
+payload analysis, but full ModelAudit scans may still report additional
+root-package context such as archive metadata, CVE checks, and legacy rule
+identifiers.

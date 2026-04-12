@@ -114,6 +114,100 @@ def test_pickle_report_to_scan_result_preserves_security_findings() -> None:
     assert result.issues[0].details["pickle_source"] == "payload.pkl"
 
 
+def test_pickle_report_to_scan_result_preserves_reduce_associated_global_alias() -> None:
+    report = PickleReport(
+        source="runpy.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.MALICIOUS,
+        findings=(
+            Finding(
+                message="Found REDUCE opcode invoking dangerous global: runpy.run_module",
+                severity=Severity.CRITICAL,
+                location="runpy.pkl (pos 45)",
+                rule_code="DANGEROUS_CALL",
+                details={
+                    "opcode": "REDUCE",
+                    "module": "runpy",
+                    "name": "run_module",
+                    "import_reference": "runpy.run_module",
+                    "global_position": 2,
+                },
+            ),
+        ),
+        coverage=CoverageSummary(bytes_scanned=48, bytes_total=48, opcode_count=9),
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert len(result.issues) == 1
+    assert result.issues[0].rule_code == "S201"
+    assert result.issues[0].details["function"] == "run_module"
+    assert result.issues[0].details["associated_global"] == "runpy.run_module"
+    assert result.issues[0].details["import_reference"] == "runpy.run_module"
+
+
+def test_pickle_report_to_scan_result_preserves_warning_dangerous_calls() -> None:
+    report = PickleReport(
+        source="partial.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.SUSPICIOUS,
+        findings=(
+            Finding(
+                message="Found REDUCE opcode invoking dangerous global: functools.partial",
+                severity=Severity.WARNING,
+                location="partial.pkl (pos 34)",
+                rule_code="DANGEROUS_CALL",
+                details={
+                    "opcode": "REDUCE",
+                    "module": "functools",
+                    "name": "partial",
+                    "import_reference": "functools.partial",
+                    "global_position": 0,
+                },
+            ),
+        ),
+        coverage=CoverageSummary(bytes_scanned=37, bytes_total=37, opcode_count=5),
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert len(result.issues) == 1
+    assert result.issues[0].severity == IssueSeverity.WARNING
+    assert result.issues[0].rule_code == "S201"
+    assert result.issues[0].details["pickle_rule_code"] == "DANGEROUS_CALL"
+    assert result.issues[0].details["associated_global"] == "functools.partial"
+
+
+def test_pickle_report_to_scan_result_derives_legacy_import_explanation() -> None:
+    report = PickleReport(
+        source="system.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.MALICIOUS,
+        findings=(
+            Finding(
+                message="Found REDUCE opcode invoking dangerous global: posix.system",
+                severity=Severity.CRITICAL,
+                location="system.pkl (pos 45)",
+                rule_code="DANGEROUS_CALL",
+                details={
+                    "opcode": "REDUCE",
+                    "module": "posix",
+                    "name": "system",
+                    "import_reference": "posix.system",
+                    "global_position": 2,
+                },
+            ),
+        ),
+        coverage=CoverageSummary(bytes_scanned=48, bytes_total=48, opcode_count=9),
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert len(result.issues) == 1
+    assert result.issues[0].why is not None
+    assert "system" in result.issues[0].why.lower()
+
+
 def test_pickle_report_to_scan_result_maps_post_budget_rule_codes_to_legacy_namespace() -> None:
     report = PickleReport(
         source="budget.pkl",

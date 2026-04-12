@@ -84,6 +84,30 @@ def test_scan_fixture_surfaces_package_only_findings_as_drift(
     assert compare_pickle_scanners._classify_delta("safe", legacy_result, adapter_result) == "potential_fp"
 
 
+def test_scan_package_report_uses_rust_only_package(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "safe.pkl"
+    path.write_bytes(b"\x80\x04}q\x00.")
+    seen_paths: list[Path] = []
+
+    def fake_package_scan_file(_path: Path) -> PickleReport:
+        seen_paths.append(_path)
+        return PickleReport(
+            source=str(_path),
+            status=ScanStatus.COMPLETE,
+            verdict=SafetyVerdict.CLEAN,
+        )
+
+    monkeypatch.setattr(compare_pickle_scanners, "package_scan_file", fake_package_scan_file)
+
+    report = compare_pickle_scanners._scan_package_report(path)
+
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert seen_paths == [path]
+
+
 def test_classify_delta_does_not_treat_unknown_to_clean_as_false_positive() -> None:
     legacy_result = compare_pickle_scanners.NormalizedResult(
         engine="legacy",
@@ -144,11 +168,8 @@ def test_build_report_summarizes_drift_by_fixture_label_and_preserves_safe_fp_au
     assert "S310" in exploit4["legacy"]["rule_codes"]
 
 
-def test_build_report_can_include_root_standalone_primary_mode() -> None:
-    report = compare_pickle_scanners._build_report(
-        include_root=True,
-        root_config={"use_standalone_pickle_primary": True},
-    )
+def test_build_report_can_include_root_mode() -> None:
+    report = compare_pickle_scanners._build_report(include_root=True)
 
     assert "root" in report["summary"]
     assert report["summary_by_label"]["root"]["safe"] == {"match": 6}

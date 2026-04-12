@@ -18,6 +18,9 @@ packages/
       options.py
       report.py
       engine/
+      _rust.*.so        # generated only by local/native builds; not committed
+    rust/
+      src/lib.rs
     tests/
 modelaudit/
   scanners/
@@ -45,6 +48,8 @@ modelaudit/
 - The root `modelaudit` wheel bundles `modelaudit_picklescan` as a second import
   package, so the adapter and wrapper scanners use the same source tree without
   depending on a separately published artifact.
+- The standalone wheel is built with `maturin` and includes the Rust extension
+  module `modelaudit_picklescan._rust`.
 
 ## API Contract
 
@@ -63,6 +68,9 @@ report = scanner.scan_stream(stream, source="archive.pt:data.pkl", size=pickle_s
 Resource controls include opcode and wall-clock limits, post-budget tail bytes,
 string-literal scan characters, nested-pickle bytes, and nested scan depth.
 
+The standalone package now uses the native Rust extension directly. The deleted
+package-engine selector and compare runtime are no longer part of the API.
+
 Report semantics keep these concepts separate:
 
 - `status`: scan completeness (`complete`, `inconclusive`, `error`)
@@ -75,12 +83,9 @@ Report semantics keep these concepts separate:
 
 ## Current Integration
 
-- `modelaudit.scanners.pickle_scanner.PickleScanner` scans through both engines.
-  The default root result is still legacy-primary for compatibility while the
-  migration is in progress. Set `use_standalone_pickle_primary=True` in scanner
-  config to exercise the intended standalone-primary merge path, where the
-  adapted `PickleReport` owns the result and legacy-only checks are merged as
-  compatibility evidence.
+- `modelaudit.scanners.pickle_scanner.PickleScanner` treats the standalone Rust
+  package report as the primary pickle result and merges bounded root-only
+  compatibility checks as supplemental evidence.
 - Embedded-pickle wrapper scanners (`pytorch_zip`, `joblib`, `numpy`, and
   `executorch`) call the public `scan_stream(..., source=...)` API and preserve
   archive-member context in result locations/details.
@@ -89,6 +94,9 @@ Report semantics keep these concepts separate:
 - CI lints, type-checks, tests, builds, and smoke-installs both the root
   `modelaudit` distribution and the standalone `modelaudit-picklescan`
   distribution in separate workflow jobs.
+- For the scoped Rust rewrite plan, parity gates, packaging decisions, and
+  benchmark methodology, see
+  `docs/maintainers/picklescan-rust-rewrite-plan.md`.
 
 ## Validation
 
@@ -109,6 +117,11 @@ uv run --with ruff ruff check src tests
 uv run --with ruff ruff format --check src tests
 uv run --with mypy mypy src tests
 uv run --with pytest --with pytest-xdist pytest -n auto tests --tb=short
+uv run --with pytest pytest tests -q
+cargo fmt --manifest-path Cargo.toml -- --check
+cargo check --manifest-path Cargo.toml
+cargo clippy --manifest-path Cargo.toml --all-targets -- -D warnings
+cargo test --manifest-path Cargo.toml
 uv build --out-dir /tmp/modelaudit-picklescan-dist
 uvx twine check /tmp/modelaudit-picklescan-dist/*
 ```

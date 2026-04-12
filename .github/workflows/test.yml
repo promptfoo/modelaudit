@@ -805,6 +805,22 @@ jobs:
         run: |
           uv python pin 3.12
 
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            packages/modelaudit-picklescan/target
+          key: ${{ runner.os }}-cargo-picklescan-${{ hashFiles('packages/modelaudit-picklescan/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-picklescan-
+
       - name: Check standalone package lock is in sync
         run: |
           uv lock --check
@@ -828,6 +844,22 @@ jobs:
       - name: Run standalone package tests
         run: |
           uv run --with pytest --with pytest-xdist pytest -n auto tests --tb=short
+
+      - name: Check Rust scanner formatting
+        run: |
+          cargo fmt --manifest-path Cargo.toml -- --check
+
+      - name: Check Rust scanner crate
+        run: |
+          cargo check --manifest-path Cargo.toml
+
+      - name: Lint Rust scanner crate
+        run: |
+          cargo clippy --manifest-path Cargo.toml --all-targets -- -D warnings
+
+      - name: Test Rust scanner crate
+        run: |
+          cargo test --manifest-path Cargo.toml
 
       - name: Build standalone package
         run: |
@@ -861,9 +893,11 @@ jobs:
           import modelaudit_picklescan
 
           assert importlib.util.find_spec("modelaudit") is None
+          assert importlib.util.find_spec("modelaudit_picklescan._rust") is not None
           report = modelaudit_picklescan.scan_bytes(b"\x80\x04}q\x00.")
           assert report.status.value == "complete", report
           assert report.verdict.value == "clean", report
+          assert not any(notice.code == "engine_fallback" for notice in report.notices)
           print("standalone modelaudit_picklescan wheel loaded without modelaudit")
           PY
           )

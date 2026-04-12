@@ -1,5 +1,8 @@
 """Standalone pickle analysis engine."""
 
-from .scanner import scan_pickle_payload, scan_pickle_stream
+from .selection import RUST_EXTENSION_MODULE, rust_engine_available
 
-__all__ = ["scan_pickle_payload", "scan_pickle_stream"]
+__all__ = [
+    "RUST_EXTENSION_MODULE",
+    "rust_engine_available",
+]

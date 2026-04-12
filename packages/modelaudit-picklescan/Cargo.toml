@@ -1,0 +1,21 @@
+[package]
+name = "modelaudit-picklescan-rust"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Native pickle security scanner engine for modelaudit-picklescan"
+license = "MIT"
+repository = "https://github.com/promptfoo/modelaudit"
+publish = false
+
+[lib]
+name = "modelaudit_picklescan_rust"
+path = "rust/src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+extension-module = ["pyo3/extension-module"]
+
+[dependencies]
+pyo3 = { version = "0.27.1" }

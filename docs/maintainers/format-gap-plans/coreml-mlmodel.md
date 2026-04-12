@@ -112,10 +112,10 @@ uv run python -m modelaudit.cli tests/fixtures/coreml/malicious.mlmodel --format
 1. Full gate:
 
 ```bash
-uv run ruff format modelaudit/ tests/
-uv run ruff check --fix modelaudit/ tests/
-uv run mypy modelaudit/
-uv run pytest -n auto -m "not slow and not integration" --maxfail=1
+uv run ruff format modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests tests/
+uv run ruff check --fix modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests tests/
+uv run mypy modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests tests/
+PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest -n auto -m "not slow and not integration" --maxfail=1
 ```
 
 ## Documentation Tasks
