@@ -26,7 +26,7 @@ _GGML_TYPE_INFO = {
     14: (256, 210),  # Q6_K
     15: (256, 292),  # Q8_K
 }
-_UINT64_MAX = 2**64 - 1
+_UINT64_MAX: int = 2**64 - 1
 
 # Accepted GGML variant magic bytes
 GGML_VARIANT_MAGICS = {

@@ -681,7 +681,7 @@ def test_gguf_scanner_tensor_size_validation(tmp_path):
     assert len(size_warnings) == 0
 
 
-def test_gguf_scanner_tensor_bounds_detects_uint64_wrap(tmp_path):
+def test_gguf_scanner_tensor_bounds_detects_uint64_wrap(tmp_path: Path) -> None:
     """Tensor offsets must not wrap or point outside the file."""
     path = tmp_path / "tensor_bounds_wrap.gguf"
     with open(path, "wb") as f:
@@ -712,7 +712,7 @@ def test_gguf_scanner_tensor_bounds_detects_uint64_wrap(tmp_path):
     assert any(issue.severity == IssueSeverity.WARNING for issue in result.issues)
 
 
-def test_gguf_scanner_tensor_bounds_allows_exact_file_end(tmp_path):
+def test_gguf_scanner_tensor_bounds_allows_exact_file_end(tmp_path: Path) -> None:
     """A tensor may end exactly at EOF when its offset and expected size fit."""
     path = tmp_path / "tensor_bounds_exact_end.gguf"
     with open(path, "wb") as f:
