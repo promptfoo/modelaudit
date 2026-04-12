@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- route extensionless compressed archive members through the compressed scanner by header alias
 - honor trusted header/content routing for misnamed ONNX, GGUF, and NumPy artifacts.
 - route extensionless compressed archive members through registry-backed nested dispatch.
 
