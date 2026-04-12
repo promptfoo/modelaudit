@@ -109,13 +109,13 @@ def test_scan_jfrog_artifact_redacts_source_url(
     with caplog.at_level(logging.DEBUG, logger="modelaudit.integrations.jfrog"):
         results = scan_jfrog_artifact(raw_url, api_token="token")
 
-    assert results.metadata["jfrog_source"]["url"] == (
-        "https://<credentials-redacted>@company.jfrog.io/artifactory/repo/model.pt"
-    )
+    assert results.model_extra is not None
+    jfrog_source = results.model_extra["metadata"]["jfrog_source"]
+    assert jfrog_source["url"] == "https://<credentials-redacted>@company.jfrog.io/artifactory/repo/model.pt"
     assert "user:leaky-pass" not in caplog.text
     assert "leaky-token" not in caplog.text
-    assert "user:leaky-pass" not in results.metadata["jfrog_source"]["url"]
-    assert "leaky-token" not in results.metadata["jfrog_source"]["url"]
+    assert "user:leaky-pass" not in jfrog_source["url"]
+    assert "leaky-token" not in jfrog_source["url"]
     mock_detect.assert_called_once_with(raw_url, api_token="token", access_token=None, timeout=30)
     mock_download.assert_called_once_with(
         raw_url,
