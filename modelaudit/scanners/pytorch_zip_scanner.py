@@ -57,10 +57,23 @@ _TORCHSCRIPT_FORBIDDEN_AST_NAMES: frozenset[str] = frozenset(
         "globals",
         "input",
         "locals",
+        "load_library",
         "open",
         "setattr",
         "vars",
     }
+)
+_TORCHSCRIPT_UNSAFE_DEFINITION_EXPR_NODES: tuple[type[ast.AST], ...] = (
+    ast.Await,
+    ast.Call,
+    ast.DictComp,
+    ast.GeneratorExp,
+    ast.Lambda,
+    ast.ListComp,
+    ast.NamedExpr,
+    ast.SetComp,
+    ast.Yield,
+    ast.YieldFrom,
 )
 
 
@@ -365,14 +378,56 @@ class PyTorchZipScanner(BaseScanner):
                 return False
 
             if isinstance(node, ast.ClassDef):
+                if node.decorator_list:
+                    return False
                 if not any(isinstance(item, ast.FunctionDef) for item in node.body):
                     return False
-                if any(
-                    not isinstance(item, (ast.AnnAssign, ast.Assign, ast.FunctionDef, ast.Pass)) for item in node.body
-                ):
+                for item in node.body:
+                    if isinstance(item, ast.Pass):
+                        continue
+                    if isinstance(item, ast.Assign):
+                        if not PyTorchZipScanner._is_torchscript_definition_time_expression_safe(item.value):
+                            return False
+                        continue
+                    if isinstance(item, ast.AnnAssign):
+                        if not PyTorchZipScanner._is_torchscript_definition_time_expression_safe(item.annotation):
+                            return False
+                        if (
+                            item.value is not None
+                            and not PyTorchZipScanner._is_torchscript_definition_time_expression_safe(item.value)
+                        ):
+                            return False
+                        continue
+                    if isinstance(item, ast.FunctionDef):
+                        if not PyTorchZipScanner._is_torchscript_function_definition_safe(item):
+                            return False
+                        continue
                     return False
 
         return True
+
+    @staticmethod
+    def _is_torchscript_definition_time_expression_safe(expression: ast.expr) -> bool:
+        return not any(isinstance(node, _TORCHSCRIPT_UNSAFE_DEFINITION_EXPR_NODES) for node in ast.walk(expression))
+
+    @staticmethod
+    def _is_torchscript_function_definition_safe(node: ast.FunctionDef) -> bool:
+        if node.decorator_list:
+            return False
+        definition_expressions: list[ast.expr] = [
+            *node.args.defaults,
+            *(default for default in node.args.kw_defaults if default is not None),
+        ]
+        if node.returns is not None:
+            definition_expressions.append(node.returns)
+        for arg in [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]:
+            if arg.annotation is not None:
+                definition_expressions.append(arg.annotation)
+
+        return all(
+            PyTorchZipScanner._is_torchscript_definition_time_expression_safe(expression)
+            for expression in definition_expressions
+        )
 
     def _is_torchscript_generated_python(
         self,
