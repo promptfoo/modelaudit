@@ -1609,6 +1609,22 @@ def test_scan_cloud_url_download_failure(mock_download: MagicMock, mock_is_cloud
 
 @patch("modelaudit.cli.is_cloud_url")
 @patch("modelaudit.cli.download_from_cloud")
+def test_scan_cloud_url_download_failure_redacts_signed_url(mock_download: MagicMock, mock_is_cloud: MagicMock) -> None:
+    """Signed cloud URL secrets should not leak through shared CLI output."""
+    url = "s3://bucket/model.bin?X-Amz-Signature=secret"
+    mock_is_cloud.return_value = True
+    mock_download.side_effect = Exception(f"Forbidden while opening {url}")
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", url])
+
+    assert result.exit_code == 2
+    assert "s3://bucket/model.bin" in result.output
+    assert "X-Amz-Signature" not in result.output
+    assert "secret" not in result.output
+
+
+@patch("modelaudit.cli.is_cloud_url")
+@patch("modelaudit.cli.download_from_cloud")
 @patch("modelaudit.cli.scan_model_directory_or_file")
 @patch("shutil.rmtree")
 def test_scan_cloud_url_with_issues(
@@ -2392,9 +2408,18 @@ class TestExpandPaths:
         assert len(expanded) == 1
         assert missing == []
 
+    def test_expand_paths_signed_cloud_url_is_not_a_glob(self):
+        """Signed cloud URLs may contain query wildcards but are not local globs."""
+        url = "s3://bucket/model.bin?X-Amz-Signature=secret"
+
+        expanded, missing = expand_paths((url,))
+        assert expanded == [url]
+        assert missing == []
+
     def test_expand_paths_url_query_is_not_glob(self):
         """Remote URLs with query strings should stay literal."""
         url = "https://company.jfrog.io/artifactory/repo/model.bin?token=secret"
+
         expanded, missing = expand_paths((url,))
         assert expanded == [url]
         assert missing == []

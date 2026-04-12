@@ -31,6 +31,7 @@ def exponential_backoff(
     jitter: bool = True,
     retry_on: tuple[type[Exception], ...] | None = None,
     verbose: bool = False,
+    sanitize_error: Callable[[Exception], object] | None = None,
 ) -> Callable[..., T]:
     """
     Decorator for exponential backoff retry logic.
@@ -75,8 +76,9 @@ def exponential_backoff(
                     delay *= 0.5 + random.random()
 
                 # Log retry attempt
+                display_error = sanitize_error(e) if sanitize_error else e
                 logger.debug(
-                    f"Attempt {attempt + 1} failed for {getattr(func, '__name__', 'unknown')}: {e}. "
+                    f"Attempt {attempt + 1} failed for {getattr(func, '__name__', 'unknown')}: {display_error}. "
                     f"Retrying in {delay:.1f} seconds..."
                 )
 
@@ -105,6 +107,7 @@ def retry_with_backoff(
     jitter: bool = True,
     retry_on: tuple[type[Exception], ...] | None = None,
     verbose: bool = False,
+    sanitize_error: Callable[[Exception], object] | None = None,
 ) -> Callable[[Callable[..., T]], Callable[..., T]]:
     """
     Decorator factory for retry with exponential backoff.
@@ -126,6 +129,7 @@ def retry_with_backoff(
             jitter=jitter,
             retry_on=retry_on,
             verbose=verbose,
+            sanitize_error=sanitize_error,
         )
 
     return decorator
@@ -136,6 +140,7 @@ def retry_cloud_operation(
     *args: Any,
     max_retries: int = 3,
     verbose: bool = False,
+    sanitize_error: Callable[[Exception], object] | None = None,
     **kwargs: Any,
 ) -> T:
     """
@@ -192,6 +197,7 @@ def retry_cloud_operation(
         max_retries=max_retries,
         retry_on=retry_exceptions,
         verbose=verbose,
+        sanitize_error=sanitize_error,
     )(func)
 
     return wrapped_func(*args, **kwargs)
