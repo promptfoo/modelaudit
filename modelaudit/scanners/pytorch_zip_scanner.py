@@ -16,7 +16,7 @@ from ..detectors.suspicious_symbols import CVE_COMBINED_PATTERNS
 from ..utils import sanitize_archive_path
 from ..utils.file.detection import PROTO0_1_MAX_PROBE_BYTES, PROTO0_1_START_BYTES, _looks_like_proto0_or_1_pickle
 from .archive_member_security import is_executable_archive_member_name
-from .base import BaseScanner, IssueSeverity, ScanResult
+from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 from .pickle_scanner import PickleScanner
 from .picklescan_adapter import apply_pickle_member_context
 from .pytorch_zip_support import (
@@ -103,6 +103,7 @@ _PICKLE_BINARY_PROTOCOL_PREFIXES: tuple[bytes, ...] = (
     b"\x80\x05",
 )
 _PICKLE_DISCOVERY_SHORT_PROBE_BYTES = 16
+_PYTORCH_STORAGE_BLOB_MEMBER_PATTERN = re.compile(r"^(?:.+/)?data/[0-9]+$")
 
 
 @dataclass(frozen=True)
@@ -293,7 +294,14 @@ class PyTorchZipScanner(BaseScanner):
                 self._check_pytorch_vulnerabilities(zip_file, safe_entries, result, path)
 
                 # Scan all discovered pickle files
-                bytes_scanned = self._scan_pickle_files(zip_file, pickle_files, result, path)
+                trusted_pytorch_storage_data_pkl_members = self._trusted_pytorch_storage_data_pkl_members(safe_entries)
+                bytes_scanned = self._scan_pickle_files(
+                    zip_file,
+                    pickle_files,
+                    result,
+                    path,
+                    trusted_pytorch_storage_data_pkl_members=trusted_pytorch_storage_data_pkl_members,
+                )
                 self._check_timeout()  # Check timeout after pickle scanning
 
                 # Validate tensor metadata consistency (CVE-2026-24747)
@@ -937,6 +945,8 @@ class PyTorchZipScanner(BaseScanner):
         pickle_files: list[zipfile.ZipInfo],
         result: ScanResult,
         path: str,
+        *,
+        trusted_pytorch_storage_data_pkl_members: dict[str, set[str]],
     ) -> int:
         """Scan all discovered pickle files for malicious content"""
         bytes_scanned = 0
@@ -992,12 +1002,72 @@ class PyTorchZipScanner(BaseScanner):
                     )
             sub_result.metadata.setdefault("archive_file_size", original_file_size)
             apply_pickle_member_context(sub_result, archive_path=path, member_name=name)
+            normalized_name = name.replace("\\", "/").lstrip("/")
+            trusted_storage_keys = trusted_pytorch_storage_data_pkl_members.get(normalized_name)
+            if trusted_storage_keys is not None:
+                self._downgrade_trusted_storage_persistent_ids(sub_result, trusted_storage_keys)
 
             # Add CVE-2025-32434 specific warnings
             self._add_weights_only_safety_warnings(sub_result, result, path, name)
             result.merge(sub_result)
 
         return bytes_scanned
+
+    @classmethod
+    def _trusted_pytorch_storage_data_pkl_members(cls, safe_entries: list[zipfile.ZipInfo]) -> dict[str, set[str]]:
+        """Return data.pkl members with PyTorch ZIP storage keys under the same prefix."""
+        members = [(cls._get_zip_member_name(entry).replace("\\", "/").lstrip("/"), entry) for entry in safe_entries]
+        names = {name for name, _entry in members}
+        trusted_members: dict[str, set[str]] = {}
+        for name in names:
+            if name.rsplit("/", 1)[-1] != "data.pkl":
+                continue
+            prefix = name[: -len("data.pkl")]
+            if f"{prefix}version" not in names:
+                continue
+            data_prefix = f"{prefix}data/"
+            storage_keys = {
+                candidate[len(data_prefix) :]
+                for candidate, entry in members
+                if candidate.startswith(data_prefix)
+                and cls._is_ascii_decimal_digits(candidate[len(data_prefix) :])
+                and not entry.is_dir()
+            }
+            if storage_keys:
+                trusted_members[name] = storage_keys
+        return trusted_members
+
+    @staticmethod
+    def _is_ascii_decimal_digits(value: str) -> bool:
+        return value.isascii() and value.isdecimal()
+
+    @staticmethod
+    def _is_pytorch_storage_persistent_id_record(details: dict[str, Any], trusted_storage_keys: set[str]) -> bool:
+        storage_key = details.get("pytorch_storage_key")
+        return (
+            details.get("pickle_rule_code") == "PERSISTENT_ID"
+            and details.get("opcode") == "BINPERSID"
+            and details.get("pytorch_storage_persistent_id") is True
+            and isinstance(storage_key, str)
+            and storage_key in trusted_storage_keys
+        )
+
+    @classmethod
+    def _downgrade_trusted_storage_persistent_ids(cls, result: ScanResult, trusted_storage_keys: set[str]) -> None:
+        """Treat PyTorch storage persistent IDs as informational inside validated PyTorch ZIP data.pkl."""
+        for check in result.checks:
+            if not cls._is_pytorch_storage_persistent_id_record(check.details, trusted_storage_keys):
+                continue
+            check.status = CheckStatus.PASSED
+            check.severity = IssueSeverity.INFO
+            check.message = "PyTorch storage persistent ID found in validated PyTorch archive"
+            check.details["trusted_pytorch_archive_context"] = True
+
+        result.issues = [
+            issue
+            for issue in result.issues
+            if not cls._is_pytorch_storage_persistent_id_record(issue.details, trusted_storage_keys)
+        ]
 
     def _scan_for_jit_patterns(
         self,
@@ -1016,7 +1086,7 @@ class PyTorchZipScanner(BaseScanner):
             try:
                 # Skip numeric tensor data files to support different versions of PyTorch ZIP files
                 # These are binary weight files that cause performance issues when scanned
-                if re.match(r"^(?:.+/)?data/\d+$", name):
+                if _PYTORCH_STORAGE_BLOB_MEMBER_PATTERN.match(name):
                     continue
 
                 file_data = self._read_member_bytes(
@@ -1877,7 +1947,7 @@ class PyTorchZipScanner(BaseScanner):
         data_blob_sizes: dict[str, int] = {}
         for entry in safe_entries:
             name = self._get_zip_member_name(entry)
-            if re.match(r"^(?:.+/)?data/\d+$", name):
+            if _PYTORCH_STORAGE_BLOB_MEMBER_PATTERN.match(name):
                 data_blob_sizes[name] = entry.file_size
 
         if not data_blob_sizes:
@@ -1978,7 +2048,7 @@ class PyTorchZipScanner(BaseScanner):
                         # Storage keys are small integer strings (e.g., "0", "1", "123")
                         if next_op.name in ("SHORT_BINUNICODE", "BINUNICODE") and next_arg:
                             arg_str = str(next_arg)
-                            if arg_str.isdigit() and storage_key is None:
+                            if self._is_ascii_decimal_digits(arg_str) and storage_key is None:
                                 storage_key = arg_str
                         # The element count is the integer argument just before
                         # TUPLE/BINPERSID in the storage constructor call.

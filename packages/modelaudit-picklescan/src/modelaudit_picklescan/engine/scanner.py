@@ -37,6 +37,7 @@ _MEMO_READ_OPCODES = frozenset({"GET", "BINGET", "LONG_BINGET"})
 _BASE64_LITERAL_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=")
 _HEX_LITERAL_CHARS = frozenset("0123456789abcdefABCDEF")
 _ENCODED_LITERAL_PROBE_CHARS = 64
+_PERSISTENT_ID_PREVIEW_MAX_DEPTH = 8
 
 
 class _OpcodeBudgetExceeded(Exception):
@@ -375,6 +376,11 @@ class _ScanState:
             self._scan_raw_nested_pickle_bytes(bytes_value, position=position)
             return
 
+        if op_name == "PERSID":
+            self._record_persistent_id(op_name, arg, position)
+            self.stack.append(())
+            return
+
         if op_name == "MARK":
             self.stack.append(_MARK)
             return
@@ -451,6 +457,12 @@ class _ScanState:
             ref = self._resolve_stack_global(module_value, name_value, position)
             self.stack.append(ref)
             self._record_global_ref(ref, op_name=op_name)
+            return
+
+        if op_name == "BINPERSID":
+            persistent_id = self.stack.pop() if self.stack else None
+            self._record_persistent_id(op_name, persistent_id, position)
+            self.stack.append(())
             return
 
         if op_name in {"EXT1", "EXT2", "EXT4"}:
@@ -581,6 +593,36 @@ class _ScanState:
         if isinstance(value, str):
             return value
         return None
+
+    def _record_persistent_id(self, op_name: str, persistent_id: Any, position: int) -> None:
+        details: dict[str, Any] = {
+            "opcode": op_name,
+            "position": position,
+            "persistent_id_type": type(persistent_id).__name__,
+        }
+        preview = _persistent_id_preview(persistent_id)
+        if preview:
+            details["persistent_id_preview"] = preview
+        if op_name == "BINPERSID" and _is_likely_pytorch_storage_persistent_id(persistent_id):
+            details["pytorch_storage_persistent_id"] = True
+            storage_key = _pytorch_storage_persistent_id_key(persistent_id)
+            if storage_key is not None:
+                details["pytorch_storage_key"] = storage_key
+
+        self._add_finding(
+            Finding(
+                message=f"Found {op_name} opcode using a persistent_load callback",
+                severity=Severity.WARNING,
+                location=f"{self.source} (pos {position})",
+                rule_code="PERSISTENT_ID",
+                details=details,
+                why=(
+                    "Persistent ID opcodes delegate object resolution to the loader's persistent_load callback. "
+                    "In model frameworks this can resolve external storages or custom resources, so untrusted "
+                    "persistent IDs should be reviewed explicitly."
+                ),
+            )
+        )
 
     def _scan_string_literal(self, value: str, *, op_name: str, position: int) -> None:
         for window in self._bounded_string_windows(value, op_name=op_name, position=position):
@@ -1045,6 +1087,61 @@ class _ScanState:
 
 def global_severity_for_ref(ref: _GlobalRef) -> Severity | None:
     return global_severity(ref.module, ref.name)
+
+
+def _is_likely_pytorch_storage_persistent_id(value: Any) -> bool:
+    if not isinstance(value, tuple) or len(value) != 5:
+        return False
+    tag, storage_type, key, location, size = value
+    if tag != "storage":
+        return False
+    if not _is_pytorch_storage_marker(storage_type):
+        return False
+    if not isinstance(key, (str, bytes)):
+        return False
+    if not isinstance(location, str):
+        return False
+    return isinstance(size, int) and not isinstance(size, bool) and size >= 0
+
+
+def _pytorch_storage_persistent_id_key(value: Any) -> str | None:
+    if not _is_likely_pytorch_storage_persistent_id(value):
+        return None
+    key = value[2]
+    if isinstance(key, bytes):
+        try:
+            return key.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    if isinstance(key, str):
+        return key
+    return None
+
+
+def _is_pytorch_storage_marker(value: Any) -> bool:
+    if isinstance(value, _GlobalRef):
+        return (value.module == "torch" or value.module.startswith("torch.")) and _looks_like_storage_name(value.name)
+    return False
+
+
+def _looks_like_storage_name(value: str) -> bool:
+    return value in {"Storage", "TypedStorage", "UntypedStorage"} or value.endswith("Storage")
+
+
+def _persistent_id_preview(value: Any, *, depth: int = 0) -> str:
+    if isinstance(value, _GlobalRef):
+        return value.symbol
+    if isinstance(value, tuple):
+        if depth >= _PERSISTENT_ID_PREVIEW_MAX_DEPTH:
+            return "(...)"
+        items = ", ".join(_persistent_id_preview(item, depth=depth + 1) for item in value[:5])
+        suffix = ", ..." if len(value) > 5 else ""
+        return f"({items}{suffix})"
+    if isinstance(value, bytes):
+        return f"bytes(len={len(value)})"
+    if isinstance(value, str):
+        return value[:80] + ("..." if len(value) > 80 else "")
+    return f"{type(value).__name__}:{value!r}"[:80]
 
 
 def _encoded_nested_window_char_limit(value: str, max_nested_pickle_bytes: int) -> int:

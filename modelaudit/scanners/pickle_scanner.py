@@ -3956,7 +3956,7 @@ def check_opcode_sequence(
     # Memo and framing opcodes are structural (data storage/retrieval, not code
     # execution).  They appear in every non-trivial pickle stream and counting
     # them inflates the dangerous-opcode metric for legitimate ML models.
-    _STRUCTURAL_OPCODES = frozenset({"BINPUT", "LONG_BINPUT", "BINGET", "LONG_BINGET", "FRAME"})
+    _STRUCTURAL_OPCODES = frozenset({"BINPUT", "LONG_BINPUT", "BINGET", "LONG_BINGET", "FRAME", "PERSID", "BINPERSID"})
 
     # Count dangerous opcodes with ML context awareness
     dangerous_opcode_count = 0

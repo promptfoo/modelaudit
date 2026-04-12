@@ -138,6 +138,30 @@ def test_pickle_report_to_scan_result_maps_post_budget_rule_codes_to_legacy_name
     assert result.issues[0].details["pickle_rule_code"] == "POST_BUDGET_GLOBAL"
 
 
+def test_pickle_report_to_scan_result_falls_back_for_unmapped_persistent_id_opcode() -> None:
+    report = PickleReport(
+        source="persistent-id.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.SUSPICIOUS,
+        findings=(
+            Finding(
+                message="Found custom opcode using a persistent_load callback",
+                severity=Severity.WARNING,
+                location="persistent-id.pkl (pos 4)",
+                rule_code="PERSISTENT_ID",
+                details={"opcode": "CUSTOM_PERSISTENT_OPCODE"},
+            ),
+        ),
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert result.success is True
+    assert len(result.issues) == 1
+    assert result.issues[0].rule_code == "S212"
+    assert result.issues[0].details["pickle_rule_code"] == "PERSISTENT_ID"
+
+
 def test_pickle_report_to_scan_result_emits_passed_import_checks() -> None:
     report = PickleReport(
         source="safe.pkl",
