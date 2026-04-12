@@ -103,6 +103,7 @@ _PICKLE_BINARY_PROTOCOL_PREFIXES: tuple[bytes, ...] = (
     b"\x80\x05",
 )
 _PICKLE_DISCOVERY_SHORT_PROBE_BYTES = 16
+_PYTORCH_STORAGE_BLOB_MEMBER_PATTERN = re.compile(r"^(?:.+/)?data/[0-9]+$")
 
 
 @dataclass(frozen=True)
@@ -1025,11 +1026,17 @@ class PyTorchZipScanner(BaseScanner):
                 continue
             data_prefix = f"{prefix}data/"
             if any(
-                candidate.startswith(data_prefix) and candidate[len(data_prefix) :].isdigit() and not entry.is_dir()
+                candidate.startswith(data_prefix)
+                and cls._is_ascii_decimal_digits(candidate[len(data_prefix) :])
+                and not entry.is_dir()
                 for candidate, entry in members
             ):
                 trusted_members.add(name)
         return trusted_members
+
+    @staticmethod
+    def _is_ascii_decimal_digits(value: str) -> bool:
+        return value.isascii() and value.isdecimal()
 
     @staticmethod
     def _is_pytorch_storage_persistent_id_record(details: dict[str, Any]) -> bool:
@@ -1071,7 +1078,7 @@ class PyTorchZipScanner(BaseScanner):
             try:
                 # Skip numeric tensor data files to support different versions of PyTorch ZIP files
                 # These are binary weight files that cause performance issues when scanned
-                if re.match(r"^(?:.+/)?data/\d+$", name):
+                if _PYTORCH_STORAGE_BLOB_MEMBER_PATTERN.match(name):
                     continue
 
                 file_data = self._read_member_bytes(
@@ -1932,7 +1939,7 @@ class PyTorchZipScanner(BaseScanner):
         data_blob_sizes: dict[str, int] = {}
         for entry in safe_entries:
             name = self._get_zip_member_name(entry)
-            if re.match(r"^(?:.+/)?data/\d+$", name):
+            if _PYTORCH_STORAGE_BLOB_MEMBER_PATTERN.match(name):
                 data_blob_sizes[name] = entry.file_size
 
         if not data_blob_sizes:
@@ -2033,7 +2040,7 @@ class PyTorchZipScanner(BaseScanner):
                         # Storage keys are small integer strings (e.g., "0", "1", "123")
                         if next_op.name in ("SHORT_BINUNICODE", "BINUNICODE") and next_arg:
                             arg_str = str(next_arg)
-                            if arg_str.isdigit() and storage_key is None:
+                            if self._is_ascii_decimal_digits(arg_str) and storage_key is None:
                                 storage_key = arg_str
                         # The element count is the integer argument just before
                         # TUPLE/BINPERSID in the storage constructor call.
