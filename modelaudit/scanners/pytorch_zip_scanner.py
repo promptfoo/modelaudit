@@ -60,6 +60,7 @@ _TORCHSCRIPT_FORBIDDEN_AST_NAMES: frozenset[str] = frozenset(
         "locals",
         "load_library",
         "open",
+        "print",
         "setattr",
         "vars",
     }
@@ -73,6 +74,23 @@ _TORCHSCRIPT_UNSAFE_DEFINITION_EXPR_NODES: tuple[type[ast.AST], ...] = (
     ast.ListComp,
     ast.NamedExpr,
     ast.SetComp,
+    ast.Yield,
+    ast.YieldFrom,
+)
+_TORCHSCRIPT_UNSAFE_BODY_NODES: tuple[type[ast.AST], ...] = (
+    ast.AsyncFor,
+    ast.AsyncFunctionDef,
+    ast.AsyncWith,
+    ast.Await,
+    ast.Delete,
+    ast.Global,
+    ast.Import,
+    ast.ImportFrom,
+    ast.Lambda,
+    ast.Nonlocal,
+    ast.Raise,
+    ast.Try,
+    ast.With,
     ast.Yield,
     ast.YieldFrom,
 )
@@ -358,22 +376,14 @@ class PyTorchZipScanner(BaseScanner):
     def _has_torchscript_generated_ast_shape(text: str) -> bool:
         try:
             tree = ast.parse(text)
-        except SyntaxError:
+        except (SyntaxError, ValueError):
             return False
 
         if not tree.body or any(not isinstance(node, ast.ClassDef) for node in tree.body):
             return False
 
         for node in ast.walk(tree):
-            if isinstance(node, ast.Name) and node.id in _TORCHSCRIPT_FORBIDDEN_AST_NAMES:
-                return False
-            if isinstance(node, ast.Attribute) and node.attr in _TORCHSCRIPT_FORBIDDEN_AST_NAMES:
-                return False
-            if (
-                isinstance(node, ast.Constant)
-                and isinstance(node.value, str)
-                and node.value in _TORCHSCRIPT_FORBIDDEN_AST_NAMES
-            ):
+            if PyTorchZipScanner._is_torchscript_forbidden_ast_symbol(node):
                 return False
 
             if isinstance(node, ast.ClassDef):
@@ -425,6 +435,18 @@ class PyTorchZipScanner(BaseScanner):
         return not any(isinstance(node, _TORCHSCRIPT_UNSAFE_DEFINITION_EXPR_NODES) for node in ast.walk(expression))
 
     @staticmethod
+    def _is_torchscript_forbidden_ast_symbol(node: ast.AST) -> bool:
+        if isinstance(node, ast.Name):
+            return node.id in _TORCHSCRIPT_FORBIDDEN_AST_NAMES
+        if isinstance(node, ast.Attribute):
+            return node.attr in _TORCHSCRIPT_FORBIDDEN_AST_NAMES
+        return (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and node.value in _TORCHSCRIPT_FORBIDDEN_AST_NAMES
+        )
+
+    @staticmethod
     def _is_torchscript_class_header_safe(node: ast.ClassDef) -> bool:
         if node.keywords or len(node.bases) != 1:
             return False
@@ -448,7 +470,17 @@ class PyTorchZipScanner(BaseScanner):
         return all(
             PyTorchZipScanner._is_torchscript_definition_time_expression_safe(expression)
             for expression in definition_expressions
-        )
+        ) and PyTorchZipScanner._is_torchscript_function_body_safe(node.body)
+
+    @staticmethod
+    def _is_torchscript_function_body_safe(statements: list[ast.stmt]) -> bool:
+        for statement in statements:
+            for node in ast.walk(statement):
+                if isinstance(node, _TORCHSCRIPT_UNSAFE_BODY_NODES):
+                    return False
+                if PyTorchZipScanner._is_torchscript_forbidden_ast_symbol(node):
+                    return False
+        return True
 
     def _is_torchscript_generated_python(
         self,
