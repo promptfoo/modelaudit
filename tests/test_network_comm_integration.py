@@ -4,7 +4,7 @@ import pickle
 import zipfile
 from pathlib import Path
 
-from modelaudit.scanners.base import CheckStatus
+from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.pickle_scanner import PickleScanner
 from modelaudit.scanners.pytorch_zip_scanner import PyTorchZipScanner
 
@@ -279,3 +279,25 @@ class NetworkExfiltrator:
 
         assert len(network_pass) == 1
         assert "No network communication patterns detected" in network_pass[0].message
+
+    def test_huggingface_homepage_url_stays_informational(self, tmp_path: Path) -> None:
+        """Benign Hugging Face metadata URLs should not become security warnings."""
+        test_file = tmp_path / "model_metadata.pkl"
+        data = {"homepage": "https://huggingface.co/meta-llama/Llama-2-7b"}
+
+        with test_file.open("wb") as f:
+            pickle.dump(data, f)
+
+        scanner = PickleScanner()
+        result = scanner.scan(str(test_file))
+
+        network_checks = [
+            c for c in result.checks if "Network Communication" in c.name and c.status == CheckStatus.FAILED
+        ]
+        assert network_checks
+        assert all(c.severity == IssueSeverity.INFO for c in network_checks)
+
+        warning_or_critical_issues = [
+            issue for issue in result.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        ]
+        assert warning_or_critical_issues == []

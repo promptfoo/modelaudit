@@ -376,6 +376,15 @@ class NetworkCommDetector:
     # via config parameter if they have specific domains to block
     BLACKLISTED_DOMAINS: ClassVar[list[bytes]] = []
 
+    INFORMATIONAL_DOMAIN_SUFFIXES: ClassVar[tuple[str, ...]] = (
+        "huggingface.co",
+        "amazonaws.com",
+        "storage.googleapis.com",
+        "storage.cloud.google.com",
+        "blob.core.windows.net",
+        "dfs.core.windows.net",
+    )
+
     def __init__(self, config: dict[str, Any] | None = None):
         """Initialize the detector with optional configuration."""
         self.config = config or {}
@@ -443,17 +452,22 @@ class NetworkCommDetector:
 
             # Calculate confidence based on URL characteristics
             confidence = 0.5
+            severity = "MEDIUM"
             if any(pattern in url.lower() for pattern in ["eval", "exec", "cmd", "shell"]):
                 confidence = 0.9
+                severity = "HIGH"
             elif any(port in url for port in [":1337", ":4444", ":31337"]):
                 confidence = 0.8
+                severity = "HIGH"
             elif "://" in url and not url.startswith(("http://", "https://")):
                 confidence = 0.7
+            elif self._is_cloud_storage_url(url):
+                severity = "INFO"
 
             self.findings.append(
                 {
                     "type": "url_detected",
-                    "severity": "HIGH" if confidence > 0.7 else "MEDIUM",
+                    "severity": severity,
                     "confidence": confidence,
                     "message": f"URL detected in model: {safe_url[:100]}",
                     "url": safe_url,
@@ -615,11 +629,13 @@ class NetworkCommDetector:
 
                     if domain not in seen_domains:
                         seen_domains.add(domain)
+                        severity = "INFO" if self._is_informational_domain(domain) else "MEDIUM"
+                        confidence = 0.3 if severity == "INFO" else 0.8
                         self.findings.append(
                             {
                                 "type": "domain",
-                                "severity": "MEDIUM",
-                                "confidence": 0.8,
+                                "severity": severity,
+                                "confidence": confidence,
                                 "message": f"Domain name detected: {domain}",
                                 "domain": domain,
                                 "position": match.start(),
@@ -706,10 +722,13 @@ class NetworkCommDetector:
                 confidence = 0.9
 
             if confidence > 0.2:  # Only report domains with reasonable confidence
+                severity = "INFO" if self._is_informational_domain(domain) else "MEDIUM"
+                if confidence >= 0.7:
+                    severity = "HIGH"
                 self.findings.append(
                     {
                         "type": "domain_name",
-                        "severity": "MEDIUM" if confidence < 0.7 else "HIGH",
+                        "severity": severity,
                         "confidence": confidence,
                         "message": f"Domain name detected: {domain}",
                         "domain": domain,
@@ -718,6 +737,17 @@ class NetworkCommDetector:
                         "context": context,
                     }
                 )
+
+    @classmethod
+    def _is_cloud_storage_url(cls, url: str) -> bool:
+        """Return whether a URL is already covered by specific informational cloud URL detection."""
+        url_bytes = url.encode()
+        return any(pattern.fullmatch(url_bytes) for pattern, _, _ in cls.CLOUD_STORAGE_PATTERNS)
+
+    @classmethod
+    def _is_informational_domain(cls, domain: str) -> bool:
+        """Return whether a generic domain hit is covered by informational model/cloud URL handling."""
+        return any(domain == suffix or domain.endswith(f".{suffix}") for suffix in cls.INFORMATIONAL_DOMAIN_SUFFIXES)
 
     def _scan_network_libraries(self, data: bytes, context: str) -> None:
         """Scan for network library imports."""
