@@ -29,7 +29,7 @@ class TestNetworkCommDetector:
         assert any("example.com" in url for url in urls)
         assert any("malware.net" in url for url in urls)
 
-    def test_detect_urls_redacts_credentials_and_query(self):
+    def test_detect_urls_redacts_credentials_and_query(self) -> None:
         """URL findings should not preserve credentialed or signed URL secrets."""
         detector = NetworkCommDetector()
         data = (
@@ -48,7 +48,22 @@ class TestNetworkCommDetector:
         assert "SECRET_TOKEN" not in serialized
         assert "SECRET_FRAGMENT" not in serialized
 
-    def test_cloud_storage_urls_redact_signed_query(self):
+    def test_detect_urls_preserves_port_zero_and_rejects_hostless_netloc(self) -> None:
+        """URL redaction should preserve explicit port 0 and avoid hostless netloc output."""
+        detector = NetworkCommDetector()
+        data = b"https://example.com:0/model.bin?token=SECRET https://@/missing-host"
+
+        findings = detector.scan(data, "model.bin")
+        url_findings = [finding for finding in findings if finding["type"] == "url_detected"]
+        urls = [finding["url"] for finding in url_findings]
+
+        assert "https://example.com:0/model.bin" in urls
+        assert "[invalid-url]" in urls
+        serialized = " ".join(f"{finding['url']} {finding['message']}" for finding in url_findings)
+        assert "token=SECRET" not in serialized
+        assert "https:///missing-host" not in serialized
+
+    def test_cloud_storage_urls_redact_signed_query(self) -> None:
         """Cloud storage findings should redact signed URL query material."""
         detector = NetworkCommDetector()
         data = b"s3://model-bucket/path/model.bin?X-Amz-Credential=SECRET_CREDENTIAL&X-Amz-Signature=SECRET_SIGNATURE"

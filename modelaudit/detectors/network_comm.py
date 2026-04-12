@@ -19,7 +19,9 @@ def _redact_url_for_finding(url: str) -> str:
     if not parsed.scheme or not parsed.netloc:
         return "[invalid-url]"
 
-    hostname = parsed.hostname or ""
+    hostname = parsed.hostname
+    if not hostname:
+        return "[invalid-url]"
     if ":" in hostname and not hostname.startswith("["):
         hostname = f"[{hostname}]"
 
@@ -28,7 +30,7 @@ def _redact_url_for_finding(url: str) -> str:
     except ValueError:
         port = None
 
-    netloc = f"{hostname}:{port}" if port else hostname
+    netloc = f"{hostname}:{port}" if port is not None else hostname
     return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
 
 
