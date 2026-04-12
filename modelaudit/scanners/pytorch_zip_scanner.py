@@ -946,7 +946,7 @@ class PyTorchZipScanner(BaseScanner):
         result: ScanResult,
         path: str,
         *,
-        trusted_pytorch_storage_data_pkl_members: set[str],
+        trusted_pytorch_storage_data_pkl_members: dict[str, set[str]],
     ) -> int:
         """Scan all discovered pickle files for malicious content"""
         bytes_scanned = 0
@@ -1003,8 +1003,9 @@ class PyTorchZipScanner(BaseScanner):
             sub_result.metadata.setdefault("archive_file_size", original_file_size)
             apply_pickle_member_context(sub_result, archive_path=path, member_name=name)
             normalized_name = name.replace("\\", "/").lstrip("/")
-            if normalized_name in trusted_pytorch_storage_data_pkl_members:
-                self._downgrade_trusted_storage_persistent_ids(sub_result)
+            trusted_storage_keys = trusted_pytorch_storage_data_pkl_members.get(normalized_name)
+            if trusted_storage_keys is not None:
+                self._downgrade_trusted_storage_persistent_ids(sub_result, trusted_storage_keys)
 
             # Add CVE-2025-32434 specific warnings
             self._add_weights_only_safety_warnings(sub_result, result, path, name)
@@ -1013,11 +1014,11 @@ class PyTorchZipScanner(BaseScanner):
         return bytes_scanned
 
     @classmethod
-    def _trusted_pytorch_storage_data_pkl_members(cls, safe_entries: list[zipfile.ZipInfo]) -> set[str]:
-        """Return data.pkl members with PyTorch ZIP storage markers under the same prefix."""
+    def _trusted_pytorch_storage_data_pkl_members(cls, safe_entries: list[zipfile.ZipInfo]) -> dict[str, set[str]]:
+        """Return data.pkl members with PyTorch ZIP storage keys under the same prefix."""
         members = [(cls._get_zip_member_name(entry).replace("\\", "/").lstrip("/"), entry) for entry in safe_entries]
         names = {name for name, _entry in members}
-        trusted_members: set[str] = set()
+        trusted_members: dict[str, set[str]] = {}
         for name in names:
             if name.rsplit("/", 1)[-1] != "data.pkl":
                 continue
@@ -1025,13 +1026,15 @@ class PyTorchZipScanner(BaseScanner):
             if f"{prefix}version" not in names:
                 continue
             data_prefix = f"{prefix}data/"
-            if any(
-                candidate.startswith(data_prefix)
+            storage_keys = {
+                candidate[len(data_prefix) :]
+                for candidate, entry in members
+                if candidate.startswith(data_prefix)
                 and cls._is_ascii_decimal_digits(candidate[len(data_prefix) :])
                 and not entry.is_dir()
-                for candidate, entry in members
-            ):
-                trusted_members.add(name)
+            }
+            if storage_keys:
+                trusted_members[name] = storage_keys
         return trusted_members
 
     @staticmethod
@@ -1039,18 +1042,21 @@ class PyTorchZipScanner(BaseScanner):
         return value.isascii() and value.isdecimal()
 
     @staticmethod
-    def _is_pytorch_storage_persistent_id_record(details: dict[str, Any]) -> bool:
+    def _is_pytorch_storage_persistent_id_record(details: dict[str, Any], trusted_storage_keys: set[str]) -> bool:
+        storage_key = details.get("pytorch_storage_key")
         return (
             details.get("pickle_rule_code") == "PERSISTENT_ID"
             and details.get("opcode") == "BINPERSID"
             and details.get("pytorch_storage_persistent_id") is True
+            and isinstance(storage_key, str)
+            and storage_key in trusted_storage_keys
         )
 
     @classmethod
-    def _downgrade_trusted_storage_persistent_ids(cls, result: ScanResult) -> None:
+    def _downgrade_trusted_storage_persistent_ids(cls, result: ScanResult, trusted_storage_keys: set[str]) -> None:
         """Treat PyTorch storage persistent IDs as informational inside validated PyTorch ZIP data.pkl."""
         for check in result.checks:
-            if not cls._is_pytorch_storage_persistent_id_record(check.details):
+            if not cls._is_pytorch_storage_persistent_id_record(check.details, trusted_storage_keys):
                 continue
             check.status = CheckStatus.PASSED
             check.severity = IssueSeverity.INFO
@@ -1058,7 +1064,9 @@ class PyTorchZipScanner(BaseScanner):
             check.details["trusted_pytorch_archive_context"] = True
 
         result.issues = [
-            issue for issue in result.issues if not cls._is_pytorch_storage_persistent_id_record(issue.details)
+            issue
+            for issue in result.issues
+            if not cls._is_pytorch_storage_persistent_id_record(issue.details, trusted_storage_keys)
         ]
 
     def _scan_for_jit_patterns(

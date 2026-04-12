@@ -51,6 +51,18 @@ def _malicious_eval_pickle_payload() -> bytes:
     return pickle.dumps({"payload": MaliciousClass()})
 
 
+def _pytorch_storage_persistent_id_payload(key: str) -> bytes:
+    key_bytes = key.encode("utf-8")
+    assert len(key_bytes) < 256
+    return (
+        b"\x80\x04("
+        b"\x8c\x07storage\x94"
+        b"\x8c\x05torch\x94"
+        b"\x8c\x0cFloatStorage\x94\x93"
+        b"\x8c" + bytes([len(key_bytes)]) + key_bytes + b"\x94\x8c\x03cpu\x94K\x01tQ."
+    )
+
+
 def _write_zip_with_duplicate_data_pkl(zip_path: Path, first_payload: bytes, second_payload: bytes) -> None:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
@@ -1188,9 +1200,7 @@ def test_pytorch_zip_scanner_preserves_legacy_pickle_rule_codes_for_embedded_mem
 
 
 def test_pytorch_zip_scanner_trusts_storage_persistent_ids_in_data_pkl(tmp_path: Path) -> None:
-    payload = (
-        b"\x80\x04(\x8c\x07storage\x94\x8c\x05torch\x94\x8c\x0cFloatStorage\x94\x93\x8c\x01k\x94\x8c\x03cpu\x94K\x01tQ."
-    )
+    payload = _pytorch_storage_persistent_id_payload("0")
     model_path = create_mock_pytorch_zip(tmp_path / "storage_persistent_id.pt", with_pickle=False, prefix="archive")
     with zipfile.ZipFile(model_path, "a") as zipf:
         zipf.writestr("archive/data.pkl", payload)
@@ -1209,9 +1219,7 @@ def test_pytorch_zip_scanner_trusts_storage_persistent_ids_in_data_pkl(tmp_path:
 def test_pytorch_zip_scanner_does_not_trust_storage_persistent_ids_without_storage_layout(
     tmp_path: Path,
 ) -> None:
-    payload = (
-        b"\x80\x04(\x8c\x07storage\x94\x8c\x05torch\x94\x8c\x0cFloatStorage\x94\x93\x8c\x01k\x94\x8c\x03cpu\x94K\x01tQ."
-    )
+    payload = _pytorch_storage_persistent_id_payload("0")
     model_path = create_mock_pytorch_zip(tmp_path / "storage_persistent_id_untrusted.pt", with_pickle=False)
     with zipfile.ZipFile(model_path, "a") as zipf:
         zipf.writestr("data.pkl", payload)
@@ -1225,9 +1233,7 @@ def test_pytorch_zip_scanner_does_not_trust_storage_persistent_ids_without_stora
 def test_pytorch_zip_scanner_does_not_trust_storage_persistent_ids_with_only_data_directory(
     tmp_path: Path,
 ) -> None:
-    payload = (
-        b"\x80\x04(\x8c\x07storage\x94\x8c\x05torch\x94\x8c\x0cFloatStorage\x94\x93\x8c\x01k\x94\x8c\x03cpu\x94K\x01tQ."
-    )
+    payload = _pytorch_storage_persistent_id_payload("0")
     model_path = create_mock_pytorch_zip(tmp_path / "storage_persistent_id_directory.pt", with_pickle=False)
     with zipfile.ZipFile(model_path, "a") as zipf:
         zipf.writestr("version", "3")
@@ -1243,9 +1249,7 @@ def test_pytorch_zip_scanner_does_not_trust_storage_persistent_ids_with_only_dat
 def test_pytorch_zip_scanner_does_not_trust_storage_persistent_ids_with_non_ascii_digit_blob(
     tmp_path: Path,
 ) -> None:
-    payload = (
-        b"\x80\x04(\x8c\x07storage\x94\x8c\x05torch\x94\x8c\x0cFloatStorage\x94\x93\x8c\x01k\x94\x8c\x03cpu\x94K\x01tQ."
-    )
+    payload = _pytorch_storage_persistent_id_payload("0")
     model_path = create_mock_pytorch_zip(tmp_path / "storage_persistent_id_non_ascii_digit.pt", with_pickle=False)
     with zipfile.ZipFile(model_path, "a") as zipf:
         zipf.writestr("version", "3")
@@ -1258,10 +1262,24 @@ def test_pytorch_zip_scanner_does_not_trust_storage_persistent_ids_with_non_asci
     assert not any(check.details.get("trusted_pytorch_archive_context") is True for check in result.checks)
 
 
+def test_pytorch_zip_scanner_does_not_trust_storage_persistent_ids_with_unrelated_blob(
+    tmp_path: Path,
+) -> None:
+    payload = _pytorch_storage_persistent_id_payload("1")
+    model_path = create_mock_pytorch_zip(tmp_path / "storage_persistent_id_unrelated_blob.pt", with_pickle=False)
+    with zipfile.ZipFile(model_path, "a") as zipf:
+        zipf.writestr("version", "3")
+        zipf.writestr("data.pkl", payload)
+        zipf.writestr("data/0", b"\x00" * 8)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert any(issue.details.get("pickle_rule_code") == "PERSISTENT_ID" for issue in result.issues)
+    assert not any(check.details.get("trusted_pytorch_archive_context") is True for check in result.checks)
+
+
 def test_pytorch_zip_scanner_scopes_storage_persistent_id_trust_by_prefix(tmp_path: Path) -> None:
-    payload = (
-        b"\x80\x04(\x8c\x07storage\x94\x8c\x05torch\x94\x8c\x0cFloatStorage\x94\x93\x8c\x01k\x94\x8c\x03cpu\x94K\x01tQ."
-    )
+    payload = _pytorch_storage_persistent_id_payload("0")
     model_path = tmp_path / "mixed_storage_persistent_id.pt"
     with zipfile.ZipFile(model_path, "w") as zipf:
         zipf.writestr("good/version", "3")

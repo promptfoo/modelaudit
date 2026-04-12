@@ -605,6 +605,9 @@ class _ScanState:
             details["persistent_id_preview"] = preview
         if op_name == "BINPERSID" and _is_likely_pytorch_storage_persistent_id(persistent_id):
             details["pytorch_storage_persistent_id"] = True
+            storage_key = _pytorch_storage_persistent_id_key(persistent_id)
+            if storage_key is not None:
+                details["pytorch_storage_key"] = storage_key
 
         self._add_finding(
             Finding(
@@ -1099,6 +1102,20 @@ def _is_likely_pytorch_storage_persistent_id(value: Any) -> bool:
     if not isinstance(location, str):
         return False
     return isinstance(size, int) and not isinstance(size, bool) and size >= 0
+
+
+def _pytorch_storage_persistent_id_key(value: Any) -> str | None:
+    if not _is_likely_pytorch_storage_persistent_id(value):
+        return None
+    key = value[2]
+    if isinstance(key, bytes):
+        try:
+            return key.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    if isinstance(key, str):
+        return key
+    return None
 
 
 def _is_pytorch_storage_marker(value: Any) -> bool:

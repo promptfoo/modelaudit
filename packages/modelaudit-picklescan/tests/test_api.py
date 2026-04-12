@@ -128,6 +128,10 @@ def test_scan_bytes_flags_canonical_pytorch_storage_persistent_ids() -> None:
         finding.rule_code == "PERSISTENT_ID" and finding.details.get("opcode") == "BINPERSID"
         for finding in report.findings
     )
+    assert any(
+        finding.rule_code == "PERSISTENT_ID" and finding.details.get("pytorch_storage_key") == "k"
+        for finding in report.findings
+    )
     assert report.notices == ()
 
 
