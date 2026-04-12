@@ -215,13 +215,13 @@ class PyTorchZipScanner(BaseScanner):
                 self._check_pytorch_vulnerabilities(zip_file, safe_entries, result, path)
 
                 # Scan all discovered pickle files
-                trusted_pytorch_storage_context = self._has_trusted_pytorch_storage_context(safe_entries)
+                trusted_pytorch_storage_data_pkl_members = self._trusted_pytorch_storage_data_pkl_members(safe_entries)
                 bytes_scanned = self._scan_pickle_files(
                     zip_file,
                     pickle_files,
                     result,
                     path,
-                    trusted_pytorch_storage_context=trusted_pytorch_storage_context,
+                    trusted_pytorch_storage_data_pkl_members=trusted_pytorch_storage_data_pkl_members,
                 )
                 self._check_timeout()  # Check timeout after pickle scanning
 
@@ -661,7 +661,7 @@ class PyTorchZipScanner(BaseScanner):
         result: ScanResult,
         path: str,
         *,
-        trusted_pytorch_storage_context: bool,
+        trusted_pytorch_storage_data_pkl_members: set[str],
     ) -> int:
         """Scan all discovered pickle files for malicious content"""
         bytes_scanned = 0
@@ -717,8 +717,8 @@ class PyTorchZipScanner(BaseScanner):
                     )
             sub_result.metadata.setdefault("archive_file_size", original_file_size)
             apply_pickle_member_context(sub_result, archive_path=path, member_name=name)
-            normalized_name = name.replace("\\", "/")
-            if trusted_pytorch_storage_context and normalized_name.rsplit("/", 1)[-1] == "data.pkl":
+            normalized_name = name.replace("\\", "/").lstrip("/")
+            if normalized_name in trusted_pytorch_storage_data_pkl_members:
                 self._downgrade_trusted_storage_persistent_ids(sub_result)
 
             # Add CVE-2025-32434 specific warnings
@@ -728,9 +728,10 @@ class PyTorchZipScanner(BaseScanner):
         return bytes_scanned
 
     @classmethod
-    def _has_trusted_pytorch_storage_context(cls, safe_entries: list[zipfile.ZipInfo]) -> bool:
-        """Return whether the archive has PyTorch ZIP storage markers around data.pkl."""
+    def _trusted_pytorch_storage_data_pkl_members(cls, safe_entries: list[zipfile.ZipInfo]) -> set[str]:
+        """Return data.pkl members with PyTorch ZIP storage markers under the same prefix."""
         names = {cls._get_zip_member_name(entry).replace("\\", "/").lstrip("/") for entry in safe_entries}
+        trusted_members: set[str] = set()
         for name in names:
             if name.rsplit("/", 1)[-1] != "data.pkl":
                 continue
@@ -738,8 +739,8 @@ class PyTorchZipScanner(BaseScanner):
             if f"{prefix}version" not in names:
                 continue
             if any(candidate.startswith(f"{prefix}data/") for candidate in names):
-                return True
-        return False
+                trusted_members.add(name)
+        return trusted_members
 
     @staticmethod
     def _is_pytorch_storage_persistent_id_record(details: dict[str, Any]) -> bool:

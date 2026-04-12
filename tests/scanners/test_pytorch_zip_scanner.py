@@ -672,6 +672,29 @@ def test_pytorch_zip_scanner_does_not_trust_storage_persistent_ids_without_stora
     assert not any(check.details.get("trusted_pytorch_archive_context") is True for check in result.checks)
 
 
+def test_pytorch_zip_scanner_scopes_storage_persistent_id_trust_by_prefix(tmp_path: Path) -> None:
+    payload = (
+        b"\x80\x04(\x8c\x07storage\x94\x8c\x05torch\x94\x8c\x0cFloatStorage\x94\x93\x8c\x01k\x94\x8c\x03cpu\x94K\x01tQ."
+    )
+    model_path = tmp_path / "mixed_storage_persistent_id.pt"
+    with zipfile.ZipFile(model_path, "w") as zipf:
+        zipf.writestr("good/version", "3")
+        zipf.writestr("good/data.pkl", payload)
+        zipf.writestr("good/data/0", b"\x00" * 8)
+        zipf.writestr("evil/data.pkl", payload)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    persistent_id_issues = [
+        issue for issue in result.issues if issue.details.get("pickle_rule_code") == "PERSISTENT_ID"
+    ]
+    assert any(issue.details.get("pickle_filename") == "evil/data.pkl" for issue in persistent_id_issues)
+    assert not any(issue.details.get("pickle_filename") == "good/data.pkl" for issue in persistent_id_issues)
+
+    trusted_checks = [check for check in result.checks if check.details.get("trusted_pytorch_archive_context") is True]
+    assert any(check.details.get("pickle_filename") == "good/data.pkl" for check in trusted_checks)
+
+
 def test_pytorch_zip_scanner_entry_limit(tmp_path):
     """Test that scanner enforces archive entry count limits."""
     zip_path = tmp_path / "model.pt"
