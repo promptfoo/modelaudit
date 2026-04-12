@@ -41,6 +41,7 @@ XML_CDATA_PATTERN = re.compile(r"<!\[CDATA\[.*?\]\]>", re.DOTALL)
 SUSPICIOUS_ELEMENT_NAMES = frozenset({"script", "javascript", "python", "exec", "eval"})
 DOCUMENTATION_ELEMENT_NAMES = frozenset({"annotation", "copyright", "description", "documentation"})
 DOCUMENTATION_ATTRIBUTE_NAMES = frozenset({"description", "documentation", "label"})
+PMML_NAMESPACE_PATTERN = re.compile(r"^https?://(?:www\.)?dmg\.org/PMML-\d+(?:_\d+)*$")
 EXTERNAL_RESOURCE_ATTRIBUTE_NAMES = frozenset(
     {
         "file",
@@ -470,6 +471,10 @@ class PmmlScanner(BaseScanner):
     @classmethod
     def _is_pmml_element(cls, tag: Any, root_namespace: str | None) -> bool:
         """Return whether a tag belongs to the PMML document namespace."""
+        if root_namespace is None:
+            return cls._xml_namespace(tag) is None
+        if PMML_NAMESPACE_PATTERN.fullmatch(root_namespace) is None:
+            return False
         return cls._xml_namespace(tag) == root_namespace
 
     def _get_all_text_content(self, element: Any) -> tuple[str, bool]:

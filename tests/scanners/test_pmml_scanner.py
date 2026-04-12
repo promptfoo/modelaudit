@@ -228,6 +228,47 @@ def test_pmml_scanner_documentation_urls_are_not_external_resources(tmp_path: Pa
     assert not any("external resource" in issue.message.lower() for issue in result.issues)
 
 
+def test_pmml_scanner_standard_namespaced_documentation_urls_are_not_external_resources(
+    tmp_path: Path,
+) -> None:
+    """Recognized PMML namespaces should preserve benign documentation URL handling."""
+    pmml = """<?xml version='1.0'?>
+<PMML xmlns="https://www.dmg.org/PMML-4_4" version='4.4'>
+  <Header description="https://example.com/model-card">
+    <Annotation>See https://example.com/docs for training notes.</Annotation>
+    <Application name="Trainer" reference="https://example.com/reference"/>
+  </Header>
+  <DataDictionary numberOfFields='0'/>
+</PMML>"""
+    path = tmp_path / "namespaced_documented.pmml"
+    path.write_text(pmml, encoding="utf-8")
+
+    result = PmmlScanner().scan(str(path))
+
+    assert result.success is True
+    assert not any(check.name == "External Resource Reference Check" for check in result.checks)
+    assert not any("external resource" in issue.message.lower() for issue in result.issues)
+
+
+def test_pmml_scanner_unrecognized_root_namespace_documentation_urls_warn(tmp_path: Path) -> None:
+    """Documentation-looking elements in an unrecognized root namespace should not get PMML exemptions."""
+    pmml = """<?xml version='1.0'?>
+<PMML xmlns="https://attacker.example/not-pmml" version='4.4'>
+  <Header description="https://evil.example/model-card">
+    <Annotation>See https://evil.example/docs for payload notes.</Annotation>
+  </Header>
+  <DataDictionary numberOfFields='0'/>
+</PMML>"""
+    path = tmp_path / "unrecognized_namespace_documented.pmml"
+    path.write_text(pmml, encoding="utf-8")
+
+    result = PmmlScanner().scan(str(path))
+
+    external_issues = [issue for issue in result.issues if "external resource" in issue.message.lower()]
+    assert external_issues
+    assert all(issue.severity == IssueSeverity.WARNING for issue in external_issues)
+
+
 def test_pmml_scanner_namespaced_application_reference_still_warns(tmp_path: Path) -> None:
     """Only unqualified Header/Application reference URLs are treated as documentation."""
     pmml = """<?xml version='1.0'?>
