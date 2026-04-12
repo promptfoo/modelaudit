@@ -22,19 +22,17 @@ NestedScanCallback = Callable[[str, dict[str, Any] | None], ScanResult]
 def _build_header_format_to_scanner_id() -> dict[str, str]:
     metadata = get_scanner_registry_metadata()
     header_format_to_scanner_id = {scanner_id: scanner_id for scanner_id in metadata}
-
     for scanner_id, scanner_info in metadata.items():
         for header_format in scanner_info.get("header_formats", ()):
             header_format_to_scanner_id[str(header_format)] = scanner_id
-
     return header_format_to_scanner_id
 
 
-_HEADER_FORMAT_TO_SCANNER_ID = _build_header_format_to_scanner_id()
-_COMPRESSED_HEADER_FORMATS = frozenset(
+_HEADER_FORMAT_TO_SCANNER_ID: dict[str, str] = _build_header_format_to_scanner_id()
+_COMPRESSED_HEADER_FORMATS: frozenset[str] = frozenset(
     header_format for header_format, scanner_id in _HEADER_FORMAT_TO_SCANNER_ID.items() if scanner_id == "compressed"
 )
-_R_SERIALIZED_EXTENSIONS = frozenset({".rds", ".rda", ".rdata"})
+_R_SERIALIZED_EXTENSIONS: frozenset[str] = frozenset({".rds", ".rda", ".rdata"})
 
 
 def _select_nested_scanner_id(path: str) -> str | None:
@@ -57,8 +55,6 @@ def _select_nested_scanner_id(path: str) -> str | None:
             return "skops"
         if ext == ".joblib":
             return "joblib"
-        if ext == ".bin":
-            return "pickle"
         return "zip"
 
     if ext == ".joblib" and header_format in _COMPRESSED_HEADER_FORMATS | {"pickle"}:
@@ -73,6 +69,27 @@ def _select_nested_scanner_id(path: str) -> str | None:
     return _HEADER_FORMAT_TO_SCANNER_ID.get(header_format)
 
 
+def _is_direct_header_route(scanner_id: str, header_format: str) -> bool:
+    """Return whether the detected header directly maps to this scanner."""
+    return header_format != "unknown" and _HEADER_FORMAT_TO_SCANNER_ID.get(header_format) == scanner_id
+
+
+def _nested_scanner_can_handle(scanner_class: type[Any], scanner_id: str, path: str) -> bool:
+    """Honor trusted header routing even when temporary archive paths are suffix-gated."""
+    if scanner_class.can_handle(path):
+        return True
+
+    if not os.path.exists(path):
+        return False
+
+    try:
+        header_format = detect_file_format(path)
+    except Exception:
+        return False
+
+    return _is_direct_header_route(scanner_id, header_format)
+
+
 def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
     """Scan an extracted archive member without importing `modelaudit.core`."""
     from . import _registry
@@ -81,7 +98,7 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
     scanner_id = _select_nested_scanner_id(path)
     if scanner_id:
         scanner_class = _registry.load_scanner_by_id(scanner_id)
-        if scanner_class and not scanner_class.can_handle(path):
+        if scanner_class and not _nested_scanner_can_handle(scanner_class, scanner_id, path):
             scanner_class = None
 
     if scanner_class is None:

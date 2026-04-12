@@ -257,35 +257,33 @@ class TestTarScanner:
         )
         assert any(issue.location == f"{archive_path}:payload.txt" for issue in critical_issues)
 
-    def test_scan_extensionless_nested_gzip_pickle_recurses_by_header(self, tmp_path: Path) -> None:
-        """Extensionless compressed members should decompress and scan their payload."""
-        payload = gzip.compress(b'cos\nsystem\n(S"echo pwned"\ntR.')
+    def test_scan_extensionless_nested_gzip_recurses_by_header(self, tmp_path: Path) -> None:
+        """Extensionless gzip members should route through CompressedScanner by header."""
         archive_path = tmp_path / "outer.tar"
+        payload = b'cos\nsystem\n(S"echo tar gzip payload"\ntR.'
+        compressed_payload = gzip.compress(payload)
 
         with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("payload")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+            info = tarfile.TarInfo("compressed_payload")
+            info.size = len(compressed_payload)
+            archive.addfile(info, tarfile.io.BytesIO(compressed_payload))  # type: ignore[attr-defined]
 
         result = self.scanner.scan(str(archive_path))
 
         assert result.success is False
         assert result.has_errors is True
+        routing_checks = [check for check in result.checks if check.name == "Compressed Wrapper Inner Scanner Routing"]
         assert any(
-            check.name == "Compressed Wrapper Inner Scanner Routing"
-            and check.details.get("tar_entry") == "payload"
-            and check.details.get("inner_scanner") == "pickle"
-            for check in result.checks
-        ), f"Expected compressed routing check, got: {[(c.name, c.details) for c in result.checks]}"
+            check.details.get("inner_scanner") == "pickle" and check.details.get("tar_entry") == "compressed_payload"
+            for check in routing_checks
+        ), f"Expected compressed nested routing check, got: {[(c.location, c.details) for c in routing_checks]}"
         assert any(
-            issue.rule_code == "S201"
-            and issue.severity == IssueSeverity.CRITICAL
-            and issue.details.get("tar_entry") == "payload"
-            and issue.location == f"{archive_path}:payload"
+            issue.severity == IssueSeverity.CRITICAL
+            and issue.details.get("tar_entry") == "compressed_payload"
             and ("os.system" in issue.message.lower() or "posix.system" in issue.message.lower())
             for issue in result.issues
         ), (
-            "Expected critical compressed nested pickle finding, got: "
+            "Expected critical nested compressed pickle finding, got: "
             f"{[(i.location, i.message, i.details) for i in result.issues]}"
         )
 

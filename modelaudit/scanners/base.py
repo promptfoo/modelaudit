@@ -860,10 +860,14 @@ class BaseScanner(ABC):
             severity_map = {
                 "CRITICAL": IssueSeverity.CRITICAL,
                 "HIGH": IssueSeverity.CRITICAL,
+                "WARNING": IssueSeverity.WARNING,
                 "MEDIUM": IssueSeverity.WARNING,
                 "LOW": IssueSeverity.INFO,
+                "INFO": IssueSeverity.INFO,
+                "DEBUG": IssueSeverity.DEBUG,
             }
-            severity = severity_map.get(finding.get("severity", "WARNING"), IssueSeverity.WARNING)
+            finding_severity = str(finding.get("severity", "WARNING")).upper()
+            severity = severity_map.get(finding_severity, IssueSeverity.WARNING)
             network_indicator = " ".join(
                 str(part)
                 for part in [

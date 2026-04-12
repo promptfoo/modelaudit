@@ -1208,6 +1208,35 @@ def test_scan_handles_corrupt_mar_gracefully(tmp_path: Path) -> None:
     assert result.success is False
 
 
+def test_scan_redacts_url_like_manifest_references(tmp_path: Path) -> None:
+    manifest = {
+        "model": {
+            "handler": "https://user:pass@example.com/handler.py?X-Amz-Signature=secret-signature#frag",
+            "serializedFile": "s3://access:secret@bucket.s3.amazonaws.com/model.pt?token=secret-token",
+        },
+    }
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={},
+        filename="url_references.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+
+    url_failures = _failed_checks(result, "TorchServe Manifest URL Reference Check")
+    assert len(url_failures) == 1
+    references = url_failures[0].details["references"]
+    serialized_references = json.dumps(references)
+    assert "https://example.com/handler.py" in serialized_references
+    assert "s3://bucket.s3.amazonaws.com/model.pt" in serialized_references
+    assert "user:pass" not in serialized_references
+    assert "access:secret" not in serialized_references
+    assert "secret-signature" not in serialized_references
+    assert "secret-token" not in serialized_references
+    assert "X-Amz-Signature" not in serialized_references
+
+
 def test_scan_detects_nested_zip_payloads(tmp_path: Path) -> None:
     nested_zip = tmp_path / "nested.zip"
     with zipfile.ZipFile(nested_zip, "w") as nested:

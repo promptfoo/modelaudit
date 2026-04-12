@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .scanners import SCANNER_REGISTRY
+from .utils import is_within_directory
 
 logger = logging.getLogger("modelaudit.metadata_extractor")
 
@@ -71,11 +72,22 @@ class ModelMetadataExtractor:
     ) -> dict[str, Any]:
         """Extract metadata from all model files in a directory."""
         results: dict[str, Any] = {"directory": directory, "files": [], "summary": {"total_files": 0, "formats": {}}}
+        base_dir = str(Path(directory).resolve())
 
         for root, _, files in os.walk(directory):
             for file in files:
                 file_path = os.path.join(root, file)
                 try:
+                    if not is_within_directory(base_dir, file_path):
+                        results["files"].append(
+                            {
+                                "file": file,
+                                "path": file_path,
+                                "error": "Path traversal outside metadata directory",
+                            }
+                        )
+                        continue
+
                     file_metadata = self._extract_file_metadata(file_path, security_only, allow_deserialization)
                     if file_metadata.get("format") != "unknown":
                         results["files"].append(file_metadata)

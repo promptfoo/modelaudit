@@ -102,17 +102,33 @@ class FlaxMsgpackScanner(BaseScanner):
                 "__globals__",
                 "__builtins__",
                 "__import__",
-                # JAX/Flax specific suspicious keys
-                "__jax_array__",  # Potential fake JAX array
-                "__tree_flatten__",
-                "__tree_unflatten__",
+            },
+        )
+        self.function_metadata_keys = self.config.get(
+            "function_metadata_keys",
+            {
                 "jax_fn",
                 "compiled_fn",
                 "eval_fn",
                 "exec_fn",
-                # Orbax specific
                 "restore_fn",
                 "transform_fn",
+                "__tree_flatten__",
+                "__tree_unflatten__",
+            },
+        )
+        self.dangerous_callable_names = self.config.get(
+            "dangerous_callable_names",
+            {
+                "eval",
+                "exec",
+                "compile",
+                "__import__",
+                "os.system",
+                "os.popen",
+                "subprocess.run",
+                "subprocess.call",
+                "subprocess.popen",
             },
         )
 
@@ -426,6 +442,7 @@ class FlaxMsgpackScanner(BaseScanner):
     def _check_suspicious_keys(
         self,
         key: str,
+        value: Any,
         location: str,
         result: ScanResult,
     ) -> None:
@@ -443,6 +460,28 @@ class FlaxMsgpackScanner(BaseScanner):
                 details={"suspicious_key": key},
                 rule_code=rule_code,
             )
+            return
+
+        if key in self.function_metadata_keys and self._value_names_dangerous_callable(value):
+            result.add_check(
+                name="Object Attribute Security Check",
+                passed=False,
+                message=f"Suspicious object attribute value detected: {key}",
+                severity=IssueSeverity.CRITICAL,
+                location=location,
+                details={
+                    "suspicious_key": key,
+                    "value_sample": str(value)[:200],
+                },
+                rule_code="S999",
+            )
+
+    def _value_names_dangerous_callable(self, value: Any) -> bool:
+        """Return whether a metadata value directly names a dangerous callable."""
+        if not isinstance(value, str):
+            return False
+        normalized = value.strip().lower()
+        return normalized in self.dangerous_callable_names
 
     def _analyze_content(
         self,
@@ -522,7 +561,7 @@ class FlaxMsgpackScanner(BaseScanner):
 
             for k, v in value.items():
                 key_str = str(k)
-                self._check_suspicious_keys(key_str, f"{location}/{key_str}", result)
+                self._check_suspicious_keys(key_str, v, f"{location}/{key_str}", result)
 
                 # Check if key itself contains suspicious patterns
                 if isinstance(k, str):
@@ -866,11 +905,6 @@ class FlaxMsgpackScanner(BaseScanner):
             "__globals__",
             "__builtins__",
             "__import__",
-            "eval",
-            "exec",
-            "subprocess",
-            "os",
-            "system",
         }
 
         suspicious_top_level = found_keys & dangerous_keys

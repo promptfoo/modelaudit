@@ -89,11 +89,6 @@ def _select_preferred_scanner_id(path: str, header_format: str, ext: str) -> str
             return "skops"
         if ext == ".joblib":
             return "joblib"
-
-        if ext == ".bin":
-            # ZIP-backed torch.save() .bin files are routed through the pickle scanner,
-            # which already understands the ZIP serialization used by PyTorch.
-            return "pickle"
         return "zip"
 
     if ext == ".joblib" and header_format in _COMPRESSED_HEADER_FORMATS | {"pickle"}:
@@ -106,6 +101,33 @@ def _select_preferred_scanner_id(path: str, header_format: str, ext: str) -> str
         return "nemo"
 
     return _registry.get_scanner_id_for_header_format(header_format)
+
+
+def _is_direct_header_route(scanner_id: str, header_format: str) -> bool:
+    """Return whether the detected header directly maps to this scanner."""
+    return header_format != "unknown" and HEADER_FORMAT_TO_SCANNER_ID.get(header_format) == scanner_id
+
+
+def _preferred_scanner_can_handle(
+    scanner_class: type[BaseScanner],
+    scanner_id: str,
+    header_format: str,
+    path: str,
+) -> bool:
+    """Honor trusted header routing even when scanner can_handle is suffix-gated."""
+    if scanner_class.can_handle(path):
+        return True
+
+    if os.path.exists(path) and _is_direct_header_route(scanner_id, header_format):
+        logger.debug(
+            "Using %s scanner for %s based on detected %s header despite can_handle rejection",
+            scanner_class.name,
+            path,
+            header_format,
+        )
+        return True
+
+    return False
 
 
 def _calculate_file_hash(file_path: str) -> str:
@@ -757,11 +779,22 @@ def _is_huggingface_cache_file(path: str) -> bool:
     # We no longer skip all HuggingFace cache files since we handle symlinks properly now
 
     # Check for Git-related files that are commonly cached
-    if filename in [".gitignore", ".gitattributes", "main", "HEAD"]:
+    if filename in [".gitignore", ".gitattributes"]:
         return True
 
-    # Check if file is in refs directory (Git references, not actual model files)
-    return bool("/refs/" in path and filename in ["main", "HEAD"])
+    if filename in ["main", "HEAD"]:
+        hf_cache_root = _find_hf_cache_root(path_obj)
+        if hf_cache_root is None:
+            return False
+
+        try:
+            relative_parts = _resolve_hf_cache_path(path_obj).relative_to(hf_cache_root).parts
+        except ValueError:
+            return False
+
+        return bool(relative_parts and relative_parts[0] == "refs")
+
+    return False
 
 
 @cached_scan()
@@ -935,7 +968,11 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     progress_callback = config.get("progress_callback")
     timeout = config.get("timeout", 3600)
 
-    if preferred_scanner and preferred_scanner.can_handle(path):
+    if (
+        preferred_scanner
+        and scanner_id
+        and _preferred_scanner_can_handle(preferred_scanner, scanner_id, header_format, path)
+    ):
         logger.debug(
             f"Using {preferred_scanner.name} scanner for {path} based on header",
         )
@@ -1090,6 +1127,8 @@ def scan_model_streaming(
     results = create_initial_audit_result()
     file_hashes: list[str] = []
     files_processed = 0
+    skip_file_types: bool = bool(kwargs.get("skip_file_types", False))
+    metadata_scanner_available: bool = _registry.has_scanner_class("MetadataScanner")
 
     base_dir = Path(scan_root).resolve() if scan_root is not None else None
     hf_cache_root = _find_hf_cache_root(base_dir) if base_dir is not None else None
@@ -1111,6 +1150,10 @@ def scan_model_streaming(
                 break
 
             try:
+                if is_hf_cache and _is_huggingface_cache_file(str(source_path)):
+                    logger.debug(f"Skipping HuggingFace cache file: {source_path}")
+                    continue
+
                 if base_dir is not None:
                     resolved_path, _is_hf_cache_symlink = _resolve_directory_scan_target(
                         source_path,
@@ -1122,6 +1165,24 @@ def scan_model_streaming(
                     if resolved_path is None:
                         continue
                     scan_path = resolved_path
+
+                if skip_file_types and should_skip_file(
+                    str(source_path),
+                    metadata_scanner_available=metadata_scanner_available,
+                ):
+                    filename_lower = source_path.name.lower()
+                    if filename_lower in LICENSE_FILES:
+                        try:
+                            license_metadata = collect_license_metadata(str(scan_path))
+                            from .models import FileMetadataModel
+
+                            results.file_metadata[report_path] = FileMetadataModel(**license_metadata)
+                            logger.debug(f"Collected license metadata from skipped file: {source_path}")
+                        except Exception as e:
+                            logger.warning(f"Error collecting license metadata for {source_path}: {e}")
+                    else:
+                        logger.debug(f"Skipping non-model file: {source_path}")
+                    continue
 
                 # Compute file hash
                 if progress_callback:

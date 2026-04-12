@@ -56,29 +56,17 @@ def resolve_dvc_file(file_path: str) -> list[str]:
         try:
             target = (dvc_dir / out_path).resolve()
 
-            # Check if target is within the DVC directory (or a reasonable parent)
-            # Allow up to 2 levels up to handle common DVC patterns
-            max_parent_levels = 2
-            current_check = dvc_dir
-            is_safe = False
-
-            for _ in range(max_parent_levels + 1):
+            try:
+                is_safe = target.is_relative_to(dvc_dir)
+            except (AttributeError, ValueError):
+                # Python < 3.9 or different drives on Windows
                 try:
-                    if target.is_relative_to(current_check):
-                        is_safe = True
-                        break
-                except (AttributeError, ValueError):
-                    # Python < 3.9 or different drives on Windows
-                    try:
-                        import os
+                    import os
 
-                        common = os.path.commonpath([target, current_check])
-                        if Path(common) == current_check:
-                            is_safe = True
-                            break
-                    except (ValueError, OSError):
-                        pass
-                current_check = current_check.parent
+                    common = os.path.commonpath([target, dvc_dir])
+                    is_safe = Path(common) == dvc_dir
+                except (ValueError, OSError):
+                    is_safe = False
 
             if not is_safe:
                 logger.warning(f"DVC target path outside safe boundaries: {file_path} -> {target}")

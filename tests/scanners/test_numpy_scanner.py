@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import pytest
 
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, Check, IssueSeverity, ScanResult
@@ -34,6 +35,36 @@ def test_numpy_scanner_truncated(tmp_path):
     result = scanner.scan(str(path))
 
     assert any(i.severity == IssueSeverity.INFO for i in result.issues)
+
+
+def test_numpy_format_module_unavailable_is_operational_not_critical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    arr = np.arange(3)
+    path = tmp_path / "array.npy"
+    np.save(path, arr)
+
+    import modelaudit.scanners.numpy_scanner as numpy_scanner_module
+
+    monkeypatch.setattr(numpy_scanner_module, "NUMPY_FORMAT_AVAILABLE", False)
+
+    result = NumPyScanner().scan(str(path))
+
+    assert result.success is False
+    assert result.has_errors is False
+    assert result.has_warnings is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["analysis_incomplete"] is True
+    assert result.metadata["operational_error"] is True
+    assert result.metadata["operational_error_reason"] == "numpy_format_module_unavailable"
+    assert "numpy_format_module_unavailable" in result.metadata["scan_outcome_reasons"]
+
+    check = next(check for check in result.checks if check.name == "NumPy Format Module Check")
+    assert check.severity == IssueSeverity.INFO
+    assert check.details["analysis_incomplete"] is True
+    assert check.details["operational_error"] is True
+    assert all(issue.severity != IssueSeverity.CRITICAL for issue in result.issues)
 
 
 class TestCVE20196446ObjectDtype:

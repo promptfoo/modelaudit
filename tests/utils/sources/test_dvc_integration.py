@@ -1,4 +1,5 @@
 import pickle
+from pathlib import Path
 
 from modelaudit.core import scan_model_directory_or_file
 from modelaudit.utils.sources.dvc import resolve_dvc_file
@@ -125,6 +126,20 @@ class TestDvcSecurity:
 
         resolved = resolve_dvc_file(str(dvc_file))
         # Should be empty due to path traversal protection
+        assert resolved == []
+
+    def test_parent_directory_target_prevention(self, tmp_path: Path) -> None:
+        """Test that sibling-directory DVC targets are blocked."""
+        outside_file = tmp_path / "secret.pkl"
+        with outside_file.open("wb") as f:
+            pickle.dump({"secret": "data"}, f)
+
+        dvc_dir = tmp_path / "dvc_project"
+        dvc_dir.mkdir()
+        dvc_file = dvc_dir / "sibling.dvc"
+        dvc_file.write_text("outs:\n- path: ../secret.pkl\n")
+
+        resolved = resolve_dvc_file(str(dvc_file))
         assert resolved == []
 
     def test_absolute_path_prevention(self, tmp_path):

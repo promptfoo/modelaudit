@@ -2,8 +2,9 @@
 
 import pickle
 import zipfile
+from pathlib import Path
 
-from modelaudit.scanners.base import CheckStatus
+from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.pickle_scanner import PickleScanner
 from modelaudit.scanners.pytorch_zip_scanner import PyTorchZipScanner
 
@@ -60,6 +61,24 @@ def exfiltrate(data):
         assert any("socket" in msg for msg in messages)
         assert any("requests" in msg or "http" in msg for msg in messages)
 
+    def test_pickle_scanner_metadata_field_description_text_no_fp(self, tmp_path: Path) -> None:
+        """Description prose mentioning network APIs should not fail network checks."""
+        test_file = tmp_path / "model_with_network_docs.pkl"
+        data = {
+            "model_weights": [1.0, 2.0, 3.0],
+            "description": "Model documentation includes import socket and requests.get examples.",
+        }
+
+        with open(test_file, "wb") as f:
+            pickle.dump(data, f)
+
+        result = PickleScanner().scan(str(test_file))
+
+        network_checks = [check for check in result.checks if check.name == "Network Communication Detection"]
+        assert network_checks, "Expected Network Communication Detection check to be emitted"
+        assert all(check.status != CheckStatus.FAILED for check in network_checks)
+        assert any(check.status == CheckStatus.PASSED for check in network_checks)
+
     def test_pytorch_zip_scanner_integration(self, tmp_path):
         """Test network communication detection in PyTorch ZIP scanner."""
         # Create a PyTorch ZIP file with network patterns
@@ -109,6 +128,26 @@ class NetworkExfiltrator:
         all_messages = " ".join(c.message for c in network_checks)
         # Check for backdoor detection (the scanner detects port 1337 as a common backdoor)
         assert "backdoor" in all_messages.lower() or "1337" in all_messages
+
+    def test_pytorch_zip_scanner_metadata_readme_member_no_network_fp(self, tmp_path: Path) -> None:
+        """README-style archive members should not fail network checks for prose mentions."""
+        test_file = tmp_path / "model_with_network_readme.pt"
+
+        with zipfile.ZipFile(test_file, "w") as zf:
+            zf.writestr("version", "3\n")
+            zf.writestr("byteorder", "little")
+            zf.writestr("data.pkl", pickle.dumps({"state_dict": {"layer1.weight": [1.0, 2.0]}}))
+            zf.writestr(
+                "metadata/README.md",
+                b"This README says import socket and requests.get can be used in client examples.",
+            )
+
+        result = PyTorchZipScanner().scan(str(test_file))
+
+        network_checks = [check for check in result.checks if check.name == "Network Communication Detection"]
+        assert network_checks, "Expected Network Communication Detection check to be emitted"
+        assert all(check.status != CheckStatus.FAILED for check in network_checks)
+        assert any(check.status == CheckStatus.PASSED for check in network_checks)
 
     def test_network_detection_can_be_disabled(self, tmp_path):
         """Test that network detection can be disabled via config."""
@@ -240,3 +279,25 @@ class NetworkExfiltrator:
 
         assert len(network_pass) == 1
         assert "No network communication patterns detected" in network_pass[0].message
+
+    def test_huggingface_homepage_url_stays_informational(self, tmp_path: Path) -> None:
+        """Benign Hugging Face metadata URLs should not become security warnings."""
+        test_file = tmp_path / "model_metadata.pkl"
+        data = {"homepage": "https://huggingface.co/meta-llama/Llama-2-7b"}
+
+        with test_file.open("wb") as f:
+            pickle.dump(data, f)
+
+        scanner = PickleScanner()
+        result = scanner.scan(str(test_file))
+
+        network_checks = [
+            c for c in result.checks if "Network Communication" in c.name and c.status == CheckStatus.FAILED
+        ]
+        assert network_checks
+        assert all(c.severity == IssueSeverity.INFO for c in network_checks)
+
+        warning_or_critical_issues = [
+            issue for issue in result.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        ]
+        assert warning_or_critical_issues == []

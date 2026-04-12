@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - route extensionless compressed archive members through the compressed scanner by header alias
+- honor trusted header/content routing for misnamed ONNX, GGUF, and NumPy artifacts.
+- route extensionless compressed archive members through registry-backed nested dispatch.
 
 ## [0.2.36](https://github.com/promptfoo/modelaudit/compare/v0.2.35...v0.2.36) (2026-04-11)
 
@@ -113,6 +115,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - mark incomplete ZIP, TAR, and 7z archive traversals as inconclusive in scan metadata
 - route helper-level ZIP-backed `.ckpt`/`.pkl` checkpoints through archive scanners
 - harden standalone pickle scanner dangerous global coverage, nested payload bounds, incomplete-scan reporting, and standalone-primary migration behavior
+- cap standalone pickle stream line reads when callers do not provide a stream size
 
 ## [0.2.31](https://github.com/promptfoo/modelaudit/compare/v0.2.30...v0.2.31) (2026-04-04)
 
