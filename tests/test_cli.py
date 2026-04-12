@@ -944,6 +944,26 @@ def test_scan_huggingface_url_download_failure(mock_download, mock_is_hf_url):
     assert "Download failed" in result.output
 
 
+@patch("modelaudit.cli.download_file_from_hf")
+def test_scan_huggingface_file_download_failure_redacts_url(mock_download_file):
+    """Redact direct-file URL secrets from CLI download failures."""
+    mock_download_file.side_effect = Exception(
+        "Failed request https://huggingface.co/test/model/resolve/main/file.bin?token=hf_secret"
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["scan", "https://huggingface.co/test/model/resolve/main/file.bin?token=hf_secret"],
+    )
+
+    output = strip_ansi(result.output)
+    assert result.exit_code == 2
+    assert "hf_secret" not in output
+    assert "token=" not in output
+    assert "https://huggingface.co/test/model/resolve/main/file.bin" in output
+
+
 @patch("modelaudit.cli.is_huggingface_url")
 @patch("modelaudit.cli.download_model")
 @patch("modelaudit.cli.scan_model_directory_or_file")

@@ -13,7 +13,7 @@ from typing import Any, ClassVar
 
 from ..detectors.cve_patterns import analyze_cve_patterns, enhance_scan_result_with_cve
 from ..utils.file.detection import read_magic_bytes
-from .base import BaseScanner, IssueSeverity, ScanResult
+from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 from .pickle_scanner import PickleScanner, _looks_like_pickle
 
 
@@ -370,7 +370,18 @@ class JoblibScanner(BaseScanner):
             result.finish(success=False)
             return result
 
-        result.finish(success=not result.has_errors)
+        has_security_findings = any(
+            issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues
+        )
+        has_trusted_incomplete_tail = result.metadata.get("trusted_incomplete_tail") is True
+        if (
+            result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+            and not has_security_findings
+            and not has_trusted_incomplete_tail
+        ):
+            result.finish(success=False)
+        else:
+            result.finish(success=not result.has_errors)
         return result
 
     def extract_metadata(self, file_path: str) -> dict[str, Any]:

@@ -19,6 +19,7 @@ from modelaudit.utils.sources.huggingface import (
     is_huggingface_url,
     parse_huggingface_file_url,
     parse_huggingface_url,
+    redact_huggingface_url_for_display,
 )
 
 
@@ -33,6 +34,7 @@ class TestHuggingFaceURLDetection:
             "https://hf.co/facebook/bart-large",
             "hf://llama/llama-7b",
             "http://huggingface.co/test/model",
+            "https://user:pass@huggingface.co/test/model?token=hf_secret",
         ]
         for url in valid_urls:
             assert is_huggingface_url(url), f"Failed to detect valid URL: {url}"
@@ -633,6 +635,19 @@ class TestGetModelInfo:
 class TestHuggingFaceFileURLs:
     """Test HuggingFace direct file URL handling."""
 
+    def test_redact_file_url_for_display(self):
+        """Redact credentials from HuggingFace URLs while keeping useful location context."""
+        url = "https://user:pass@huggingface.co/org/repo/resolve/main/model.bin?token=hf_secret#frag"
+
+        redacted = redact_huggingface_url_for_display(url)
+
+        assert redacted == "https://huggingface.co/org/repo/resolve/main/model.bin"
+        assert "user" not in redacted
+        assert "pass" not in redacted
+        assert "token=" not in redacted
+        assert "hf_secret" not in redacted
+        assert "#frag" not in redacted
+
     def test_valid_file_urls(self):
         """Test that valid HuggingFace file URLs are detected."""
         valid_urls = [
@@ -640,6 +655,7 @@ class TestHuggingFaceFileURLs:
             "https://huggingface.co/facebook/bart-large/resolve/main/config.json",
             "https://hf.co/microsoft/DialoGPT/resolve/main/model.safetensors",
             "https://huggingface.co/user/repo/resolve/refs%2Fpr%2F1/file.bin",  # Percent-encoded revision
+            "https://user:pass@huggingface.co/private/repo/resolve/main/model.bin?token=hf_secret",
         ]
         for url in valid_urls:
             assert is_huggingface_file_url(url), f"Failed to detect valid file URL: {url}"
@@ -673,6 +689,10 @@ class TestHuggingFaceFileURLs:
             (
                 "https://huggingface.co/user/repo/resolve/refs%2Fpr%2F1/file.bin",
                 ("user/repo", "refs/pr/1", "file.bin"),  # Percent-decoded revision
+            ),
+            (
+                "https://user:pass@huggingface.co/private/repo/resolve/main/model.bin?token=hf_secret",
+                ("private/repo", "main", "model.bin"),
             ),
         ]
         for url, expected in test_cases:
@@ -729,11 +749,18 @@ class TestHuggingFaceFileURLs:
     @patch("huggingface_hub.hf_hub_download")
     def test_download_file_failure(self, mock_hf_hub_download):
         """Test that file download failures are handled properly."""
-        mock_hf_hub_download.side_effect = Exception("Download failed")
+        mock_hf_hub_download.side_effect = Exception(
+            "Download failed for https://huggingface.co/test/model/resolve/main/file.bin?token=hf_secret"
+        )
 
-        url = "https://huggingface.co/test/model/resolve/main/file.bin"
-        with pytest.raises(Exception, match="Failed to download file from"):
+        url = "https://huggingface.co/test/model/resolve/main/file.bin?token=hf_secret"
+        with pytest.raises(Exception, match="Failed to download file from") as exc_info:
             download_file_from_hf(url)
+
+        error = str(exc_info.value)
+        assert "hf_secret" not in error
+        assert "token=" not in error
+        assert "https://huggingface.co/test/model/resolve/main/file.bin" in error
 
     def test_download_file_invalid_url(self):
         """Test that invalid file URLs raise appropriate errors."""

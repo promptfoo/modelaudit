@@ -178,6 +178,147 @@ def test_scan_model_streaming_basic(temp_test_files: list[Path]) -> None:
         assert len(result.content_hash) == 64  # SHA256 hex string
 
 
+def test_scan_model_streaming_skips_non_model_files(tmp_path: Path) -> None:
+    """Streaming directory scans should honor the normal skip_file_types policy."""
+    ignored_file = tmp_path / "notes.log"
+    ignored_file.write_text("debug output")
+    model_file = tmp_path / "model.pkl"
+    with model_file.open("wb") as f:
+        pickle.dump({"data": "safe"}, f)
+
+    with patch("modelaudit.core.scan_file") as mock_scan:
+        mock_scan.return_value = create_mock_scan_result(bytes_scanned=100)
+
+        result = scan_model_streaming(
+            file_generator=iter([(ignored_file, False), (model_file, True)]),
+            timeout=30,
+            delete_after_scan=False,
+            skip_file_types=True,
+        )
+
+    mock_scan.assert_called_once()
+    assert mock_scan.call_args.args[0] == str(model_file)
+    assert mock_scan.call_args.kwargs["config"]["skip_file_types"] is True
+    assert result.files_scanned == 1
+
+
+def test_scan_model_streaming_preserves_license_metadata_when_skipped(tmp_path: Path) -> None:
+    """Skipped license files should still populate file metadata in streaming mode."""
+    license_file = tmp_path / "license.txt"
+    license_file.write_text("MIT License\nCopyright 2026 Example")
+
+    with patch("modelaudit.core.scan_file") as mock_scan:
+        result = scan_model_streaming(
+            file_generator=iter([(license_file, True)]),
+            timeout=30,
+            delete_after_scan=False,
+            skip_file_types=True,
+        )
+
+    mock_scan.assert_not_called()
+    assert result.files_scanned == 0
+    assert str(license_file) in result.file_metadata
+    metadata = result.file_metadata[str(license_file)].model_dump()
+    assert "license_info" in metadata
+    assert "copyright_notices" in metadata
+
+
+def test_scan_model_streaming_skip_file_types_preserves_malicious_findings(tmp_path: Path) -> None:
+    """Prefiltering should skip non-model files without dropping model security findings."""
+    ignored_file = tmp_path / "notes.log"
+    ignored_file.write_text("debug output")
+    model_file = tmp_path / "model.pkl"
+    with model_file.open("wb") as f:
+        pickle.dump({"data": "safe"}, f)
+
+    with patch("modelaudit.core.scan_file") as mock_scan:
+        mock_scan.return_value = create_mock_scan_result(bytes_scanned=100, with_critical_issue=True)
+
+        result = scan_model_streaming(
+            file_generator=iter([(ignored_file, False), (model_file, True)]),
+            timeout=30,
+            delete_after_scan=False,
+            skip_file_types=True,
+        )
+
+    mock_scan.assert_called_once()
+    assert mock_scan.call_args.args[0] == str(model_file)
+    assert result.files_scanned == 1
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+    assert determine_exit_code(result) == 1
+
+
+def test_scan_model_streaming_keeps_non_model_files_when_skip_disabled(tmp_path: Path) -> None:
+    """The skip_file_types flag should remain opt-out for streaming scans."""
+    ignored_file = tmp_path / "notes.log"
+    ignored_file.write_text("debug output")
+    model_file = tmp_path / "model.pkl"
+    with model_file.open("wb") as f:
+        pickle.dump({"data": "safe"}, f)
+
+    with patch("modelaudit.core.scan_file") as mock_scan:
+        mock_scan.return_value = create_mock_scan_result(bytes_scanned=100)
+
+        result = scan_model_streaming(
+            file_generator=iter([(ignored_file, False), (model_file, True)]),
+            timeout=30,
+            delete_after_scan=False,
+            skip_file_types=False,
+        )
+
+    assert [call.args[0] for call in mock_scan.call_args_list] == [str(ignored_file), str(model_file)]
+    assert result.files_scanned == 2
+
+
+def test_scan_model_streaming_skips_huggingface_cache_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Streaming scans should skip HF bookkeeping metadata like regular scans."""
+    hf_home = tmp_path / ".cache" / "huggingface"
+    monkeypatch.setenv("HF_HOME", str(hf_home))
+    snapshots_dir = hf_home / "hub" / "models--test-model" / "snapshots" / "abc123"
+    snapshots_dir.mkdir(parents=True)
+
+    metadata_file = snapshots_dir / "config.json.metadata"
+    metadata_file.write_text("{}")
+    model_file = snapshots_dir / "model.pkl"
+    with model_file.open("wb") as f:
+        pickle.dump({"data": "safe"}, f)
+
+    with patch("modelaudit.core.scan_file") as mock_scan:
+        mock_scan.return_value = create_mock_scan_result(bytes_scanned=100)
+
+        result = scan_model_streaming(
+            file_generator=iter([(metadata_file, False), (model_file, True)]),
+            timeout=30,
+            delete_after_scan=False,
+            scan_root=str(snapshots_dir),
+            cache_enabled=False,
+        )
+
+    mock_scan.assert_called_once()
+    assert mock_scan.call_args.args[0] == str(model_file)
+    assert result.files_scanned == 1
+
+
+def test_scan_model_streaming_scans_local_file_named_main(tmp_path: Path) -> None:
+    """A local payload named like an HF ref must still be scanned in streaming mode."""
+    payload = tmp_path / "main"
+    payload.write_bytes(b"\x80\x02cos\nsystem\n.")
+
+    result = scan_model_streaming(
+        file_generator=iter([(payload, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        cache_enabled=False,
+    )
+
+    assert result.files_scanned == 1
+    assert any(issue.severity == IssueSeverity.CRITICAL and "system" in issue.message for issue in result.issues)
+    assert determine_exit_code(result) == 1
+
+
 def test_scan_model_streaming_symlink_outside_directory_matches_normal_scan(
     tmp_path: Path,
     requires_symlinks: None,

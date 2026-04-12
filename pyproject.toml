@@ -59,7 +59,7 @@ dependencies = [
 # - Checkpoint reading from SavedModel directories (variables/*.index files)
 # - Maximum compatibility with edge cases
 tensorflow = [
-    "tensorflow>=2.17.0,<3.0; python_version >= '3.11' and python_version < '3.13'",
+    "tensorflow>=2.17.0,<2.21; python_version >= '3.11' and python_version < '3.13'",
 ]
 h5 = ["h5py>=3.1,<4.0"]
 pytorch = ["torch>=2.6.0,<3.0"]

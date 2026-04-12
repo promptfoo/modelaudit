@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 import time
@@ -65,6 +66,8 @@ from .utils.sources.huggingface import (
     extract_model_id_from_path,
     is_huggingface_file_url,
     is_huggingface_url,
+    redact_huggingface_url_for_display,
+    redact_huggingface_urls_in_text,
 )
 from .utils.sources.jfrog import is_jfrog_url
 from .utils.sources.pytorch_hub import download_pytorch_hub_model, is_pytorch_hub_url
@@ -74,7 +77,7 @@ logger = logging.getLogger("modelaudit")
 
 def _display_path(path: str) -> str:
     """Return a path safe for user-facing CLI output."""
-    return redact_url_for_display(path) if is_cloud_url(path) else path
+    return redact_url_for_display(path) if is_cloud_url(path) else redact_huggingface_url_for_display(path)
 
 
 def _display_error(error: object, path: str) -> str:
@@ -258,7 +261,8 @@ def expand_paths(paths: tuple[str, ...]) -> tuple[list[str], list[str]]:
 
         # Handle glob patterns and resolve paths
         path = Path(path_str)
-        if "*" in path_str or "?" in path_str:
+        is_remote_url = bool(re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", path_str))
+        if ("*" in path_str or "?" in path_str) and not is_remote_url:
             # Handle glob patterns
             import glob
 
@@ -1003,13 +1007,16 @@ def _resolve_scan_source_for_path(
 ) -> _SourceDispatchResult | None:
     """Resolve one source path and execute source-native scans when they should bypass local scanning."""
     if is_huggingface_file_url(path):
+        display_path = redact_huggingface_url_for_display(path)
         download_spinner = None
         temp_dir = None
         if runtime.show_styled_output and should_show_spinner():
-            download_spinner = yaspin(Spinners.dots, text=f"Downloading file from {style_text(path, fg='cyan')}")
+            download_spinner = yaspin(
+                Spinners.dots, text=f"Downloading file from {style_text(display_path, fg='cyan')}"
+            )
             download_spinner.start()
         elif runtime.show_styled_output:
-            click.echo(f"Downloading file from {path}...")
+            click.echo(f"Downloading file from {display_path}...")
 
         try:
             if runtime.cache_enabled and runtime.cache_dir:
@@ -1045,9 +1052,9 @@ def _resolve_scan_source_for_path(
             elif runtime.show_styled_output:
                 click.echo(style_text("❌ Download failed", fg="red", bold=True))
 
-            error_msg = str(exc)
-            logger.error(f"Failed to download file from {path}: {error_msg}", exc_info=verbose)
-            click.echo(f"Error downloading file from {path}: {error_msg}", err=True)
+            error_msg = redact_huggingface_urls_in_text(str(exc))
+            logger.error(f"Failed to download file from {display_path}: {error_msg}", exc_info=verbose)
+            click.echo(f"Error downloading file from {display_path}: {error_msg}", err=True)
             audit_result.has_errors = True
             path_state.defer_temp_cleanup(
                 temp_dir,
@@ -1057,8 +1064,9 @@ def _resolve_scan_source_for_path(
             return None
 
     if is_huggingface_url(path):
+        display_path = redact_huggingface_url_for_display(path)
         if runtime.show_styled_output:
-            click.echo(f"\n📥 Preparing to download from {style_text(path, fg='cyan')}")
+            click.echo(f"\n📥 Preparing to download from {style_text(display_path, fg='cyan')}")
 
             try:
                 from .utils.sources.huggingface import get_model_info
@@ -1095,7 +1103,7 @@ def _resolve_scan_source_for_path(
                 hf_cache_dir = Path(tempfile.mkdtemp(prefix="modelaudit_hf_"))
                 temp_dir = str(hf_cache_dir)
 
-            record_download_started("huggingface", path)
+            record_download_started("huggingface", display_path)
             record_feature_used("huggingface_download", cache_enabled=runtime.cache_enabled)
             download_start = time.time()
             trusted_source_provenance = None
@@ -1140,7 +1148,7 @@ def _resolve_scan_source_for_path(
                 path_state.track_streaming_paths_for_sbom(streaming_result, path)
 
                 download_duration = time.time() - download_start
-                record_download_completed("huggingface", download_duration, 0, path)
+                record_download_completed("huggingface", download_duration, 0, display_path)
 
                 if runtime.show_styled_output:
                     click.echo(style_text("✅ Streaming scan complete", fg="green", bold=True))
@@ -1165,9 +1173,9 @@ def _resolve_scan_source_for_path(
                 download_size = sum(
                     file_path.stat().st_size for file_path in Path(download_path).rglob("*") if file_path.is_file()
                 )
-                record_download_completed("huggingface", download_duration, download_size, path)
+                record_download_completed("huggingface", download_duration, download_size, display_path)
             except Exception:
-                record_download_completed("huggingface", download_duration, 0, path)
+                record_download_completed("huggingface", download_duration, 0, display_path)
 
             if download_spinner:
                 download_spinner.ok(style_text("✅ Downloaded", fg="green", bold=True))
@@ -1184,9 +1192,9 @@ def _resolve_scan_source_for_path(
             if runtime.show_styled_output:
                 click.echo(style_text("❌ Download/scan failed", fg="red", bold=True))
 
-            error_msg = str(exc)
+            error_msg = redact_huggingface_urls_in_text(str(exc))
             if "insufficient disk space" in error_msg.lower():
-                logger.error(f"Disk space error for {path}: {error_msg}")
+                logger.error(f"Disk space error for {display_path}: {error_msg}")
                 click.echo(style_text(f"\n⚠️  {error_msg}", fg="yellow"), err=True)
                 click.echo(
                     style_text(
@@ -1197,8 +1205,8 @@ def _resolve_scan_source_for_path(
                     err=True,
                 )
             else:
-                logger.error(f"Failed to process model from {path}: {error_msg}", exc_info=verbose)
-                click.echo(f"Error processing model from {path}: {error_msg}", err=True)
+                logger.error(f"Failed to process model from {display_path}: {error_msg}", exc_info=verbose)
+                click.echo(f"Error processing model from {display_path}: {error_msg}", err=True)
 
             audit_result.has_errors = True
             path_state.defer_temp_cleanup(

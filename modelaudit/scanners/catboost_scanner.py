@@ -8,7 +8,7 @@ import os
 import re
 import struct
 from typing import Any, ClassVar
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 
@@ -74,6 +74,28 @@ _BENIGN_METADATA_KEYS = {
 
 class _CatBoostParseError(ValueError):
     """Raised when CatBoost structure parsing fails."""
+
+
+def _redact_url_for_display(url: str) -> str:
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+    except ValueError:
+        return "[invalid-url]"
+
+    if not parsed.scheme or not parsed.hostname:
+        return "[invalid-url]"
+
+    hostname = parsed.hostname
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+
+    netloc = f"{hostname}:{port}" if port is not None else hostname
+    return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+
+
+def _redact_urls_for_display(text: str) -> str:
+    return _URL_PATTERN.sub(lambda match: _redact_url_for_display(match.group(0)), text)
 
 
 class CatBoostScanner(BaseScanner):
@@ -303,7 +325,7 @@ class CatBoostScanner(BaseScanner):
     def _summarize_matches(matches: list[dict[str, str]], limit: int = 5) -> list[dict[str, str]]:
         summarized: list[dict[str, str]] = []
         for item in matches[:limit]:
-            text = item.get("text", "")
+            text = _redact_urls_for_display(item.get("text", ""))
             excerpt = text if len(text) <= 160 else f"{text[:157]}..."
             summarized.append(
                 {

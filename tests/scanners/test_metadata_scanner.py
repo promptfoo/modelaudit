@@ -131,11 +131,28 @@ class TestMetadataScanner:
         }
         assert flagged == {("bit.ly", "userinfo"), ("localtunnel.me", "userinfo")}
         flagged_urls = {issue.details.get("url") for issue in result.issues}
-        assert "https://bit.ly@github.com/download" in flagged_urls
-        assert "https://user:bit.ly@github.com/download-two" in flagged_urls
-        assert "https://%62it.ly@github.com/download-three" in flagged_urls
-        assert "https://localtunnel.me:token@huggingface.co/proxy" in flagged_urls
+        assert "https://github.com/download" in flagged_urls
+        assert "https://github.com/download-two" in flagged_urls
+        assert "https://github.com/download-three" in flagged_urls
+        assert "https://huggingface.co/proxy" in flagged_urls
         assert "https://example.com/model-card" not in flagged_urls
+
+    def test_scan_suspicious_urls_redacts_credentials_and_query(self, tmp_path: Path) -> None:
+        """Suspicious URL findings should not preserve credentials or signed query strings."""
+        scanner = MetadataScanner()
+        readme_path = tmp_path / "README.md"
+        readme_path.write_text("Download: https://user:pass@tinyurl.com/model.bin?token=SECRET_TOKEN#SECRET_FRAGMENT\n")
+
+        result = scanner.scan(str(readme_path))
+
+        assert len(result.issues) == 1
+        issue = result.issues[0]
+        assert issue.details["url"] == "https://tinyurl.com/model.bin"
+        assert "tinyurl.com/model.bin" in issue.message
+        serialized = f"{issue.message} {issue.details['url']}"
+        assert "user:pass" not in serialized
+        assert "SECRET_TOKEN" not in serialized
+        assert "SECRET_FRAGMENT" not in serialized
 
     def test_scan_ignores_non_suspicious_authenticated_url(self, tmp_path: Path) -> None:
         """Authenticated URLs without suspicious domains should stay quiet."""

@@ -6,7 +6,9 @@ import os
 import re
 from collections.abc import Iterator
 from io import BytesIO
+from pathlib import Path
 from typing import Any, ClassVar
+from urllib.parse import urlsplit, urlunsplit
 
 from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_STRING_PATTERNS
 
@@ -34,11 +36,21 @@ _OPENVINO_SUSPICIOUS_PATTERN = (
     else None
 )
 _OPENVINO_NATIVE_LIBRARY_SUFFIX = re.compile(r"(?:\.so(?:\.\d+)*|\.dll|\.dylib|\.lib)$", re.IGNORECASE)
+_URL_REFERENCE_PATTERN = re.compile(r"\b[a-z][a-z0-9+.-]*://[^\s\"'<>]+", re.IGNORECASE)
 
 
 def _local_tag_name(tag: str) -> str:
     """Return an XML tag's namespace-stripped local name."""
     return tag.rsplit("}", 1)[-1].lower()
+
+
+def _is_contained_in(child: Path, parent: Path) -> bool:
+    """Return True when child resolves under parent directory."""
+    try:
+        child.relative_to(parent)
+        return True
+    except ValueError:
+        return False
 
 
 def _skip_doctype_declaration(xml_prefix: bytes, start_offset: int) -> int | None:
@@ -151,6 +163,28 @@ def _is_likely_external_library_reference(value: str) -> bool:
     return "/" in normalized_value or "\\" in normalized_value
 
 
+def _redact_url_reference(value: str) -> str:
+    """Redact URL credentials, query strings, and fragments from scanner evidence."""
+
+    def replace_url(match: re.Match[str]) -> str:
+        raw_url = match.group(0)
+        try:
+            parts = urlsplit(raw_url)
+        except ValueError:
+            return "<url redacted>"
+
+        if not parts.scheme:
+            return raw_url
+
+        netloc = parts.hostname or ""
+        if parts.port is not None:
+            netloc = f"{netloc}:{parts.port}"
+
+        return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+
+    return _URL_REFERENCE_PATTERN.sub(replace_url, value)
+
+
 class OpenVinoScanner(BaseScanner):
     """Scanner for OpenVINO IR (.xml/.bin) model files."""
 
@@ -186,17 +220,41 @@ class OpenVinoScanner(BaseScanner):
 
         result.metadata["xml_size"] = self.get_file_size(path)
 
-        bin_path = os.path.splitext(path)[0] + ".bin"
-        if os.path.isfile(bin_path):
-            result.metadata["bin_size"] = self.get_file_size(bin_path)
+        model_dir = Path(path).resolve().parent
+        bin_path = Path(os.path.splitext(path)[0] + ".bin")
+        if bin_path.is_symlink():
+            resolved_bin_path = bin_path.resolve(strict=False)
+            if not _is_contained_in(resolved_bin_path, model_dir):
+                result.add_check(
+                    name="OpenVINO Weights Symlink Boundary Check",
+                    passed=False,
+                    message="Associated .bin weights file resolves outside the model directory",
+                    severity=IssueSeverity.CRITICAL,
+                    location=str(bin_path),
+                    details={
+                        "expected_file": str(bin_path),
+                        "resolved_path": str(resolved_bin_path),
+                        "model_directory": str(model_dir),
+                        "cwe": "CWE-22",
+                    },
+                    rule_code="S701",
+                    why=(
+                        "OpenVINO sidecar weights are loaded from the .bin file adjacent to the XML. "
+                        "A symlinked sidecar can make model loading read data outside the model directory."
+                    ),
+                )
+            elif bin_path.is_file():
+                result.metadata["bin_size"] = self.get_file_size(str(bin_path))
+        elif bin_path.is_file():
+            result.metadata["bin_size"] = self.get_file_size(str(bin_path))
         else:
             result.add_check(
                 name="OpenVINO Weights File Check",
                 passed=False,
                 message="Associated .bin weights file not found",
                 severity=IssueSeverity.INFO,
-                location=bin_path,
-                details={"expected_file": bin_path},
+                location=str(bin_path),
+                details={"expected_file": str(bin_path)},
                 rule_code="S701",
             )
 
@@ -240,18 +298,19 @@ class OpenVinoScanner(BaseScanner):
                 )
 
             for element_tag, attr_name, attr_val in _iter_element_attributes(layer):
+                loggable_attr_val = _redact_url_reference(attr_val)
                 if attr_name in {"library", "implementation"} and _is_likely_external_library_reference(attr_val):
                     result.add_check(
                         name="External Library Reference Check",
                         passed=False,
-                        message=f"Layer '{layer_name}' references external library '{attr_val}'",
+                        message=f"Layer '{layer_name}' references external library '{loggable_attr_val}'",
                         severity=IssueSeverity.CRITICAL,
                         location=path,
                         details={
                             "layer_name": layer_name,
                             "attribute": attr_name,
                             "element": element_tag,
-                            "library": attr_val,
+                            "library": loggable_attr_val,
                         },
                         rule_code="S902",
                     )
@@ -267,7 +326,7 @@ class OpenVinoScanner(BaseScanner):
                             "layer_name": layer_name,
                             "attribute": attr_name,
                             "element": element_tag,
-                            "value": attr_val,
+                            "value": loggable_attr_val,
                         },
                         rule_code="S902",
                     )

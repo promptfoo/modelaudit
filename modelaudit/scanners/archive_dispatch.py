@@ -69,6 +69,27 @@ def _select_nested_scanner_id(path: str) -> str | None:
     return _HEADER_FORMAT_TO_SCANNER_ID.get(header_format)
 
 
+def _is_direct_header_route(scanner_id: str, header_format: str) -> bool:
+    """Return whether the detected header directly maps to this scanner."""
+    return header_format != "unknown" and _HEADER_FORMAT_TO_SCANNER_ID.get(header_format) == scanner_id
+
+
+def _nested_scanner_can_handle(scanner_class: type[Any], scanner_id: str, path: str) -> bool:
+    """Honor trusted header routing even when temporary archive paths are suffix-gated."""
+    if scanner_class.can_handle(path):
+        return True
+
+    if not os.path.exists(path):
+        return False
+
+    try:
+        header_format = detect_file_format(path)
+    except Exception:
+        return False
+
+    return _is_direct_header_route(scanner_id, header_format)
+
+
 def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
     """Scan an extracted archive member without importing `modelaudit.core`."""
     from . import _registry
@@ -77,7 +98,7 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
     scanner_id = _select_nested_scanner_id(path)
     if scanner_id:
         scanner_class = _registry.load_scanner_by_id(scanner_id)
-        if scanner_class and not scanner_class.can_handle(path):
+        if scanner_class and not _nested_scanner_can_handle(scanner_class, scanner_id, path):
             scanner_class = None
 
     if scanner_class is None:

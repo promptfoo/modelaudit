@@ -34,10 +34,29 @@ SUSPICIOUS_PATTERNS = [
     r"system\s*\(",
 ]
 URL_PATTERNS = ["http://", "https://", "file://", "ftp://"]
+BENIGN_DOCUMENTATION_URL_PATTERNS = frozenset({"http://", "https://"})
 DANGEROUS_ENTITIES = ["<!DOCTYPE", "<!ENTITY", "<!ELEMENT", "<!ATTLIST"]
 XML_COMMENT_PATTERN = re.compile(r"<!--.*?-->", re.DOTALL)
 XML_CDATA_PATTERN = re.compile(r"<!\[CDATA\[.*?\]\]>", re.DOTALL)
 SUSPICIOUS_ELEMENT_NAMES = frozenset({"script", "javascript", "python", "exec", "eval"})
+DOCUMENTATION_ELEMENT_NAMES = frozenset({"annotation", "copyright", "description", "documentation"})
+DOCUMENTATION_ATTRIBUTE_NAMES = frozenset({"description", "documentation", "label"})
+PMML_NAMESPACE_PATTERN = re.compile(r"^https?://(?:www\.)?dmg\.org/PMML-\d+(?:_\d+)*$")
+EXTERNAL_RESOURCE_ATTRIBUTE_NAMES = frozenset(
+    {
+        "file",
+        "filename",
+        "href",
+        "location",
+        "nonamespaceschemalocation",
+        "path",
+        "schemalocation",
+        "source",
+        "src",
+        "uri",
+        "url",
+    },
+)
 
 
 class PmmlScanner(BaseScanner):
@@ -214,7 +233,7 @@ class PmmlScanner(BaseScanner):
         """Validate basic PMML structure and extract metadata."""
         # Extract local tag name (without namespace)
         # Tags can be "{http://namespace}PMML" or just "PMML"
-        tag_name = self._local_tag_name(root.tag)
+        tag_name = self._local_xml_name(root.tag)
 
         if tag_name != "pmml":
             result.add_check(
@@ -242,8 +261,22 @@ class PmmlScanner(BaseScanner):
 
     def _check_suspicious_content(self, root: Any, result: ScanResult, path: str) -> None:
         """Check for suspicious patterns and external references in PMML content."""
+        parent_by_child = {child: parent for parent in root.iter() for child in parent}
+        root_namespace = self._xml_namespace(root.tag)
+        root_is_pmml = self._is_pmml_root(root.tag, root_namespace)
         for elem in root.iter():
-            tag_name = self._local_tag_name(elem.tag)
+            tag_name = self._local_xml_name(elem.tag)
+            is_pmml_element = self._is_pmml_element(elem.tag, root_namespace, root_is_pmml=root_is_pmml)
+            parent = parent_by_child.get(elem)
+            parent_tag_name = self._local_xml_name(parent.tag) if parent is not None else ""
+            parent_is_pmml_element = parent is not None and self._is_pmml_element(
+                parent.tag,
+                root_namespace,
+                root_is_pmml=root_is_pmml,
+            )
+            in_header_metadata = (is_pmml_element and tag_name == "header") or (
+                is_pmml_element and parent_is_pmml_element and tag_name == "application" and parent_tag_name == "header"
+            )
 
             # Combine element text content with attributes for comprehensive scanning
             elem_text = elem.text or ""
@@ -275,22 +308,48 @@ class PmmlScanner(BaseScanner):
                 combined = f"{elem_text} {attr_text}".lower()
 
             # Check for external resource references
-            for url_pattern in URL_PATTERNS:
-                if url_pattern in combined:
-                    result.add_check(
-                        name="External Resource Reference Check",
-                        passed=False,
-                        message=f"PMML references external resource: {url_pattern}",
-                        severity=IssueSeverity.WARNING,
-                        location=path,
-                        details={"tag": elem.tag, "url_pattern": url_pattern},
-                        why=(
-                            "External references in PMML files may be used to exfiltrate data or perform "
-                            "network requests."
-                        ),
-                        rule_code="S902",
+            if tag_name == "extension":
+                self._add_external_resource_check_if_url(result, path, elem.tag, combined, context="extension")
+            else:
+                is_pmml_documentation_element = is_pmml_element and tag_name in DOCUMENTATION_ELEMENT_NAMES
+                if not is_pmml_documentation_element:
+                    self._add_external_resource_check_if_url(result, path, elem.tag, elem_text, context="text")
+                else:
+                    url_pattern = self._find_url_pattern(
+                        elem_text,
+                        ignored_patterns=BENIGN_DOCUMENTATION_URL_PATTERNS,
                     )
-                    break
+                    if url_pattern is not None:
+                        self._add_external_resource_check_if_url(
+                            result,
+                            path,
+                            elem.tag,
+                            elem_text,
+                            context="text",
+                            url_pattern=url_pattern,
+                        )
+
+                for attr_name, attr_value in elem.attrib.items():
+                    normalized_attr_name = self._local_xml_name(attr_name)
+                    url_pattern = self._external_resource_attribute_url_pattern(
+                        tag_name,
+                        attr_name,
+                        normalized_attr_name,
+                        str(attr_value),
+                        elem.attrib,
+                        in_pmml_element=is_pmml_element,
+                        in_header_metadata=in_header_metadata,
+                    )
+                    if url_pattern is not None:
+                        self._add_external_resource_check_if_url(
+                            result,
+                            path,
+                            elem.tag,
+                            str(attr_value),
+                            context="attribute",
+                            attribute=attr_name,
+                            url_pattern=url_pattern,
+                        )
 
             # Check for suspicious element names (like <script>)
             if tag_name in SUSPICIOUS_ELEMENT_NAMES:
@@ -325,11 +384,111 @@ class PmmlScanner(BaseScanner):
                         break
 
     @staticmethod
-    def _local_tag_name(tag: Any) -> str:
-        """Extract a lowercase local tag name from namespaced ElementTree tags."""
-        if not isinstance(tag, str):
+    def _find_url_pattern(text: str, *, ignored_patterns: frozenset[str] | None = None) -> str | None:
+        """Return the first URL scheme pattern found in text."""
+        normalized_text = text.lower()
+        for url_pattern in URL_PATTERNS:
+            if ignored_patterns is not None and url_pattern in ignored_patterns:
+                continue
+            if url_pattern in normalized_text:
+                return url_pattern
+        return None
+
+    @staticmethod
+    def _external_resource_attribute_url_pattern(
+        tag_name: str,
+        attr_name: str,
+        normalized_attr_name: str,
+        attr_value: str,
+        attributes: dict[str, Any],
+        *,
+        in_pmml_element: bool,
+        in_header_metadata: bool,
+    ) -> str | None:
+        """Return the URL pattern when an attribute is an external resource reference."""
+        normalized_attr_name_lower = normalized_attr_name.lower()
+        is_unqualified_attr = PmmlScanner._xml_namespace(attr_name) is None and ":" not in attr_name
+        if normalized_attr_name_lower in DOCUMENTATION_ATTRIBUTE_NAMES:
+            ignored_patterns = BENIGN_DOCUMENTATION_URL_PATTERNS if in_pmml_element and is_unqualified_attr else None
+            return PmmlScanner._find_url_pattern(
+                attr_value,
+                ignored_patterns=ignored_patterns,
+            )
+        if normalized_attr_name_lower == "reference":
+            ignored_patterns = BENIGN_DOCUMENTATION_URL_PATTERNS if is_unqualified_attr and in_header_metadata else None
+            return PmmlScanner._find_url_pattern(attr_value, ignored_patterns=ignored_patterns)
+        if normalized_attr_name_lower in EXTERNAL_RESOURCE_ATTRIBUTE_NAMES:
+            return PmmlScanner._find_url_pattern(attr_value)
+
+        if (
+            tag_name == "value"
+            and normalized_attr_name_lower == "value"
+            and attributes.get("property", "").lower() == "external"
+        ):
+            return PmmlScanner._find_url_pattern(attr_value)
+        return None
+
+    def _add_external_resource_check_if_url(
+        self,
+        result: ScanResult,
+        path: str,
+        tag: Any,
+        text: str,
+        *,
+        context: str,
+        attribute: str | None = None,
+        url_pattern: str | None = None,
+    ) -> None:
+        """Add an external resource warning when text contains a resource URL."""
+        url_pattern = url_pattern or self._find_url_pattern(text)
+        if url_pattern is None:
+            return
+
+        details = {"tag": tag, "url_pattern": url_pattern, "context": context}
+        if attribute is not None:
+            details["attribute"] = attribute
+
+        result.add_check(
+            name="External Resource Reference Check",
+            passed=False,
+            message=f"PMML references external resource: {url_pattern}",
+            severity=IssueSeverity.WARNING,
+            location=path,
+            details=details,
+            why=("External references in PMML files may be used to exfiltrate data or perform network requests."),
+            rule_code="S902",
+        )
+
+    @staticmethod
+    def _local_xml_name(name: Any) -> str:
+        """Extract a lowercase local name from namespaced ElementTree names."""
+        if not isinstance(name, str):
             return ""
-        return tag.split("}")[-1].lower() if "}" in tag else tag.lower()
+        local_name = name.split("}")[-1] if "}" in name else name
+        return local_name.rsplit(":", 1)[-1].strip().lower()
+
+    @staticmethod
+    def _xml_namespace(name: Any) -> str | None:
+        """Extract an ElementTree expanded namespace URI from a tag or attribute name."""
+        if not isinstance(name, str) or not name.startswith("{") or "}" not in name:
+            return None
+        return name[1:].split("}", 1)[0]
+
+    @classmethod
+    def _is_pmml_root(cls, tag: Any, root_namespace: str | None) -> bool:
+        """Return whether the document root is a recognized PMML root."""
+        if cls._local_xml_name(tag) != "pmml":
+            return False
+        return root_namespace is None or PMML_NAMESPACE_PATTERN.fullmatch(root_namespace) is not None
+
+    @classmethod
+    def _is_pmml_element(cls, tag: Any, root_namespace: str | None, *, root_is_pmml: bool) -> bool:
+        """Return whether a tag belongs to the PMML document namespace."""
+        if not root_is_pmml:
+            return False
+        if root_namespace is None:
+            return cls._xml_namespace(tag) is None
+        return cls._xml_namespace(tag) == root_namespace
 
     def _get_all_text_content(self, element: Any) -> tuple[str, bool]:
         """Collect Extension text and report whether traversal hit the node budget."""
@@ -346,7 +505,7 @@ class PmmlScanner(BaseScanner):
             current = stack.pop()
             nodes_seen += 1
 
-            tag_name = self._local_tag_name(current.tag)
+            tag_name = self._local_xml_name(current.tag)
             if tag_name:
                 text_parts.append(tag_name)
 
