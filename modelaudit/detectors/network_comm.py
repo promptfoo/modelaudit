@@ -7,6 +7,29 @@ that could be used for data exfiltration or command & control operations.
 import ipaddress
 import re
 from typing import Any, ClassVar
+from urllib.parse import urlsplit, urlunsplit
+
+
+def _redact_url_for_finding(url: str) -> str:
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return "[invalid-url]"
+
+    if not parsed.scheme or not parsed.netloc:
+        return "[invalid-url]"
+
+    hostname = parsed.hostname or ""
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+
+    netloc = f"{hostname}:{port}" if port else hostname
+    return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
 
 
 class NetworkCommDetector:
@@ -283,6 +306,7 @@ class NetworkCommDetector:
         """Scan for URL patterns."""
         for match in self.URL_PATTERN.finditer(data):
             url = match.group().decode("utf-8", errors="ignore")
+            safe_url = _redact_url_for_finding(url)
 
             # Calculate confidence based on URL characteristics
             confidence = 0.5
@@ -298,8 +322,8 @@ class NetworkCommDetector:
                     "type": "url_detected",
                     "severity": "HIGH" if confidence > 0.7 else "MEDIUM",
                     "confidence": confidence,
-                    "message": f"URL detected in model: {url[:100]}",
-                    "url": url,
+                    "message": f"URL detected in model: {safe_url[:100]}",
+                    "url": safe_url,
                     "position": match.start(),
                     "context": context,
                 }
@@ -318,6 +342,7 @@ class NetworkCommDetector:
         for pattern, description, provider in self.CLOUD_STORAGE_PATTERNS:
             for match in pattern.finditer(data):
                 url = match.group().decode("utf-8", errors="ignore")
+                safe_url = _redact_url_for_finding(url)
 
                 # Skip duplicates
                 if url in seen_urls:
@@ -342,8 +367,8 @@ class NetworkCommDetector:
                         "type": "cloud_storage_url",
                         "severity": severity,
                         "confidence": confidence,
-                        "message": f"{description} detected: {url[:150]}",
-                        "url": url,
+                        "message": f"{description} detected: {safe_url[:150]}",
+                        "url": safe_url,
                         "provider": provider,
                         "description": description,
                         "position": match.start(),

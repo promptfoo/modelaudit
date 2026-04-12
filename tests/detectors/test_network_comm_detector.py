@@ -29,6 +29,40 @@ class TestNetworkCommDetector:
         assert any("example.com" in url for url in urls)
         assert any("malware.net" in url for url in urls)
 
+    def test_detect_urls_redacts_credentials_and_query(self):
+        """URL findings should not preserve credentialed or signed URL secrets."""
+        detector = NetworkCommDetector()
+        data = (
+            b"https://user:pass@example.com/model.bin?"
+            b"X-Amz-Signature=SECRET_SIGNATURE&token=SECRET_TOKEN#SECRET_FRAGMENT"
+        )
+
+        findings = detector.scan(data, "model.bin")
+        url_finding = next(f for f in findings if f["type"] == "url_detected")
+
+        assert url_finding["url"] == "https://example.com/model.bin"
+        assert "example.com/model.bin" in url_finding["message"]
+        serialized = f"{url_finding['url']} {url_finding['message']}"
+        assert "user:pass" not in serialized
+        assert "SECRET_SIGNATURE" not in serialized
+        assert "SECRET_TOKEN" not in serialized
+        assert "SECRET_FRAGMENT" not in serialized
+
+    def test_cloud_storage_urls_redact_signed_query(self):
+        """Cloud storage findings should redact signed URL query material."""
+        detector = NetworkCommDetector()
+        data = b"s3://model-bucket/path/model.bin?X-Amz-Credential=SECRET_CREDENTIAL&X-Amz-Signature=SECRET_SIGNATURE"
+
+        findings = detector.scan(data, "model.bin")
+        cloud_finding = next(f for f in findings if f["type"] == "cloud_storage_url")
+
+        assert cloud_finding["url"] == "s3://model-bucket/path/model.bin"
+        assert "model-bucket/path/model.bin" in cloud_finding["message"]
+        serialized = f"{cloud_finding['url']} {cloud_finding['message']}"
+        assert "SECRET_CREDENTIAL" not in serialized
+        assert "SECRET_SIGNATURE" not in serialized
+        assert cloud_finding["provider"] == "s3"
+
     def test_detect_ipv4_addresses(self):
         """Test detection of IPv4 addresses."""
         detector = NetworkCommDetector()
