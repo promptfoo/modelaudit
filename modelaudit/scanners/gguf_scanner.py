@@ -26,6 +26,7 @@ _GGML_TYPE_INFO = {
     14: (256, 210),  # Q6_K
     15: (256, 292),  # Q8_K
 }
+_UINT64_MAX = 2**64 - 1
 
 # Accepted GGML variant magic bytes
 GGML_VARIANT_MAGICS = {
@@ -441,6 +442,37 @@ class GgufScanner(BaseScanner):
                     )
 
                 expected = ((nelements + blck - 1) // blck) * ts
+                tensor_abs_start = tensor_data_start + tensor["offset"]
+                tensor_abs_end = tensor_abs_start + expected
+                offset_overflows_uint64 = tensor["offset"] > _UINT64_MAX - tensor_data_start
+                end_overflows_uint64 = tensor_abs_start > _UINT64_MAX - expected
+
+                if (
+                    offset_overflows_uint64
+                    or end_overflows_uint64
+                    or tensor_abs_start > file_size
+                    or tensor_abs_end > file_size
+                ):
+                    result.add_check(
+                        name="Tensor Data Bounds Check",
+                        passed=False,
+                        message=f"Tensor {tensor['name']} data extends outside file bounds",
+                        severity=IssueSeverity.WARNING,
+                        location=self.current_file_path,
+                        details={
+                            "tensor_name": tensor["name"],
+                            "offset": tensor["offset"],
+                            "expected": expected,
+                            "tensor_data_start": tensor_data_start,
+                            "tensor_abs_start": tensor_abs_start,
+                            "tensor_abs_end": tensor_abs_end,
+                            "file_size": file_size,
+                            "offset_overflows_uint64": offset_overflows_uint64,
+                            "end_overflows_uint64": end_overflows_uint64,
+                        },
+                        rule_code="S902",
+                    )
+                    continue
 
                 # Calculate actual size: use next tensor's offset, or file size for last tensor
                 if idx + 1 < len(tensors):
@@ -458,7 +490,6 @@ class GgufScanner(BaseScanner):
                     actual = next_offset - tensor["offset"]
                 else:
                     # Last tensor: calculate from absolute position to end of file
-                    tensor_abs_start = tensor_data_start + tensor["offset"]
                     actual = file_size - tensor_abs_start
 
                 # Allow for alignment padding (tensors may be aligned to 32 bytes)

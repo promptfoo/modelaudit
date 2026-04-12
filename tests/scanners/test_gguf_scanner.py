@@ -681,6 +681,67 @@ def test_gguf_scanner_tensor_size_validation(tmp_path):
     assert len(size_warnings) == 0
 
 
+def test_gguf_scanner_tensor_bounds_detects_uint64_wrap(tmp_path):
+    """Tensor offsets must not wrap or point outside the file."""
+    path = tmp_path / "tensor_bounds_wrap.gguf"
+    with open(path, "wb") as f:
+        f.write(b"GGUF")
+        f.write(struct.pack("<I", 3))
+        f.write(struct.pack("<Q", 1))
+        f.write(struct.pack("<Q", 0))
+
+        name = b"wrap_tensor"
+        f.write(struct.pack("<Q", len(name)))
+        f.write(name)
+        f.write(struct.pack("<I", 1))
+        f.write(struct.pack("<Q", 8))
+        f.write(struct.pack("<I", 0))
+        f.write(struct.pack("<Q", 2**64 - 16))
+
+        pad_to_tensor_data = (32 - (f.tell() % 32)) % 32
+        if pad_to_tensor_data:
+            f.write(b"\x00" * pad_to_tensor_data)
+        f.write(b"\x00" * 32)
+
+    result = GgufScanner().scan(str(path))
+
+    bounds_checks = [check for check in result.checks if check.name == "Tensor Data Bounds Check"]
+    assert len(bounds_checks) == 1
+    assert bounds_checks[0].status.value == "failed"
+    assert bounds_checks[0].details["offset_overflows_uint64"] is True
+    assert any(issue.severity == IssueSeverity.WARNING for issue in result.issues)
+
+
+def test_gguf_scanner_tensor_bounds_allows_exact_file_end(tmp_path):
+    """A tensor may end exactly at EOF when its offset and expected size fit."""
+    path = tmp_path / "tensor_bounds_exact_end.gguf"
+    with open(path, "wb") as f:
+        f.write(b"GGUF")
+        f.write(struct.pack("<I", 3))
+        f.write(struct.pack("<Q", 1))
+        f.write(struct.pack("<Q", 0))
+
+        name = b"offset_tensor"
+        f.write(struct.pack("<Q", len(name)))
+        f.write(name)
+        f.write(struct.pack("<I", 1))
+        f.write(struct.pack("<Q", 8))
+        f.write(struct.pack("<I", 0))
+        f.write(struct.pack("<Q", 32))
+
+        pad_to_tensor_data = (32 - (f.tell() % 32)) % 32
+        if pad_to_tensor_data:
+            f.write(b"\x00" * pad_to_tensor_data)
+        f.write(b"\x00" * 32)
+        f.write(b"\x00" * 32)
+
+    result = GgufScanner().scan(str(path))
+
+    assert result.success
+    assert not any(check.name == "Tensor Data Bounds Check" for check in result.checks)
+    assert not any("size mismatch" in issue.message.lower() for issue in result.issues)
+
+
 def test_gguf_scanner_last_tensor_size(tmp_path):
     """Test that the last tensor's size is calculated correctly using file size."""
     path = tmp_path / "last_tensor.gguf"
