@@ -276,13 +276,14 @@ class PyTorchZipScanner(BaseScanner):
     @staticmethod
     def _torchscript_debug_member_name(name: str, member_names: set[str]) -> str | None:
         """Return the sibling TorchScript debug member name for a generated-source path."""
-        normalized = name.replace("\\", "/").lstrip("/").lower()
+        normalized = name.replace("\\", "/").lstrip("/")
         parts = tuple(part for part in normalized.split("/") if part)
-        if not parts or not parts[-1].endswith(".py"):
+        lower_parts = tuple(part.lower() for part in parts)
+        if not parts or not lower_parts[-1].endswith(".py"):
             return None
 
         try:
-            code_index = parts.index("code")
+            code_index = lower_parts.index("code")
         except ValueError:
             return None
 
@@ -291,7 +292,7 @@ class PyTorchZipScanner(BaseScanner):
         if code_index > 1:
             return None
 
-        torchscript_parts = parts[code_index + 1 :]
+        torchscript_parts = lower_parts[code_index + 1 :]
         is_generated_path = torchscript_parts == ("__torch__.py",) or (
             len(torchscript_parts) > 1 and torchscript_parts[0] == "__torch__"
         )
@@ -881,18 +882,17 @@ class PyTorchZipScanner(BaseScanner):
         """Detect suspicious non-pickle files in the archive"""
         python_files_found = False
         executable_files_found = False
-        member_names = {
-            self._get_zip_member_name(entry).replace("\\", "/").lstrip("/").lower() for entry in safe_entries
-        }
+        member_names = {self._get_zip_member_name(entry).replace("\\", "/").lstrip("/") for entry in safe_entries}
         entries_by_normalized_name = {
-            self._get_zip_member_name(entry).replace("\\", "/").lstrip("/").lower(): entry for entry in safe_entries
+            self._get_zip_member_name(entry).replace("\\", "/").lstrip("/"): entry for entry in safe_entries
         }
 
         for entry in safe_entries:
             name = self._get_zip_member_name(entry)
-            normalized_name = name.lower()
+            normalized_name = name.replace("\\", "/").lstrip("/")
+            normalized_name_lower = normalized_name.lower()
             # Check for Python code files
-            if normalized_name.endswith(".py"):
+            if normalized_name_lower.endswith(".py"):
                 debug_member_name = self._torchscript_debug_member_name(name, member_names)
                 debug_entry = entries_by_normalized_name.get(debug_member_name or "")
                 if debug_entry is not None and self._is_torchscript_generated_python(
@@ -912,7 +912,7 @@ class PyTorchZipScanner(BaseScanner):
                 )
                 python_files_found = True
             # Check for shell scripts or other executable files
-            elif is_executable_archive_member_name(normalized_name):
+            elif is_executable_archive_member_name(normalized_name_lower):
                 result.add_check(
                     name="Executable File Detection",
                     passed=False,
