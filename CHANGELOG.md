@@ -5,6 +5,8 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
 ## [0.2.37](https://github.com/promptfoo/modelaudit/compare/v0.2.36...v0.2.37) (2026-04-12)
 
 ### Bug Fixes
@@ -61,34 +63,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - add scanner CVE gap analysis ([73d6e8e](https://github.com/promptfoo/modelaudit/commit/73d6e8e512f0d86c7307df69a5663e3223724196))
 - allow promptfoo telemetry approval ([1fbe64c](https://github.com/promptfoo/modelaudit/commit/1fbe64cbe071579ebbb8064980cd05cf27133f2c))
-
-## [Unreleased]
-
-### Bug Fixes
-
-- route extensionless compressed archive members through the compressed scanner by header alias
-- honor trusted header/content routing for misnamed ONNX, GGUF, and NumPy artifacts.
-- route extensionless compressed archive members through registry-backed nested dispatch.
-- add CVE-specific coverage for ONNX symlink traversal, Keras `get_file(extract=True)` archives, MXNet ReDoS operator names, NeMo archive/checkpoint exploits, and TorchServe MAR ZipSlip attribution
-- mark trailing bytes after NumPy object-array pickle payloads inconclusive without escalating to security findings
-- avoid CoreML nested parse failures on bounded-read truncation
-- mark incomplete sharded-model scans as inconclusive, ignore shard-name prefix matches, and skip caching explicit incomplete outcomes
-- flag TensorFlow `LoadLibrary` and `LoadLibraryV2` graph ops as dangerous native-library loading
-- detect split CNTK native-user-function and native-library references
-- detect Linux/macOS native-library members in Keras archives and uppercase native-library members in PyTorch ZIPs
-- detect embedded Windows DLL/PE, Linux ELF shared-object, and TensorRT plugin entry-point markers in TensorRT engines
-- detect punctuation-delimited TensorRT `/tmp` plugin paths
-- clean up temporary ZIP entry files when extraction fails on entry size limits
-- preserve HuggingFace cache provenance for symlinked custom cache roots
-- mark ONNX tensor dtype validation failures inconclusive instead of allowing clean scans
-- ignore remote OCI `layers[].urls` entries during local layer discovery
-- fail closed on unterminated OpenVINO DOCTYPE declarations
-- avoid PMML `<Extension>` false positives for benign `subprocess` prose while preserving `subprocess.getoutput()`, `subprocess.getstatusoutput()`, and `importlib.import_module("subprocess")` detections
-- mark incomplete ZIP, TAR, and 7z archive traversals as inconclusive in scan metadata
-- route helper-level ZIP-backed `.ckpt`/`.pkl` checkpoints through archive scanners
-- harden standalone pickle scanner dangerous global coverage, nested payload bounds, incomplete-scan reporting, and standalone-primary migration behavior
-- flag untrusted pickle persistent ID opcodes while keeping PyTorch storage persistent IDs non-failing
-- cap standalone pickle stream line reads when callers do not provide a stream size
 
 ## [0.2.36](https://github.com/promptfoo/modelaudit/compare/v0.2.35...v0.2.36) (2026-04-11)
 
