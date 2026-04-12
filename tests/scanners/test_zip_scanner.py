@@ -65,12 +65,13 @@ def test_rewrite_extracted_member_location_preserves_scanner_specific_suffix_pol
 @pytest.mark.parametrize(
     ("payload", "filename"),
     [
-        (gzip.compress(b"payload"), "gzip_member"),
+        (gzip.compress(b"payload", mtime=0), "gzip_member"),
         (bz2.compress(b"payload"), "bzip2_member"),
         (lzma.compress(b"payload"), "xz_member"),
         (b"\x04\x22\x4d\x18" + b"\x00" * 8, "lz4_member"),
         (zlib.compress(b"payload"), "zlib_member"),
     ],
+    ids=["gzip_member", "bzip2_member", "xz_member", "lz4_member", "zlib_member"],
 )
 def test_nested_dispatch_routes_compressed_header_aliases_to_compressed_scanner(
     tmp_path: Path,
