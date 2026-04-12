@@ -1,4 +1,6 @@
+import base64
 import json
+import marshal
 from pathlib import Path
 from typing import Any
 
@@ -800,6 +802,76 @@ def test_lambda_safe_prefix_with_comment_token_in_malicious_payload_is_flagged(t
         and check.details.get("pattern_type") == "safe_normalization"
         for check in result.checks
     )
+
+
+def test_lambda_dict_bytecode_without_dangerous_patterns_stays_warning(tmp_path: Path) -> None:
+    encoded_code = base64.b64encode(marshal.dumps((lambda x: x + 1).__code__)).decode()
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "safe_dict_lambda_model",
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {
+                            "name": "safe_dict_lambda",
+                            "function": {"class_name": "__lambda__", "config": {"code": encoded_code}},
+                        },
+                    }
+                ],
+            },
+        },
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    bytecode_issues = [
+        issue for issue in result.issues if "embedded bytecode" in issue.message and "safe_dict_lambda" in issue.message
+    ]
+    assert len(bytecode_issues) == 1
+    assert bytecode_issues[0].severity == IssueSeverity.WARNING
+    assert not [
+        issue
+        for issue in result.issues
+        if "safe_dict_lambda" in issue.message and issue.severity == IssueSeverity.CRITICAL
+    ]
+
+
+def test_lambda_dict_bytecode_with_dangerous_pattern_still_critical(tmp_path: Path) -> None:
+    encoded_code = base64.b64encode(b"import os\nos.system('id')\neval('__import__(\"os\")')").decode()
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "dangerous_dict_lambda_model",
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {
+                            "name": "dangerous_dict_lambda",
+                            "function": {"class_name": "__lambda__", "config": {"code": encoded_code}},
+                        },
+                    }
+                ],
+            },
+        },
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    dangerous_checks = [
+        check
+        for check in result.checks
+        if check.name == "Lambda Layer Code Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("layer_name") == "dangerous_dict_lambda"
+    ]
+    assert len(dangerous_checks) == 1
+    assert {"eval", "__import__", "os.system"}.issubset(set(dangerous_checks[0].details["dangerous_patterns"]))
 
 
 def test_keras_h5_scanner_empty_file(tmp_path):

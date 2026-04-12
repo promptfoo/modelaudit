@@ -1760,15 +1760,22 @@ class KerasZipScanner(BaseScanner):
                             result.add_check(
                                 name="Lambda Layer Detection",
                                 passed=False,
-                                message=f"Lambda layer '{layer_name}' contains encoded data (unable to validate)",
+                                message=(
+                                    f"Lambda layer '{layer_name}' contains opaque encoded bytecode with no dangerous "
+                                    "text patterns detected"
+                                ),
                                 severity=IssueSeverity.WARNING,
                                 location=f"{self.current_file_path} (layer: {layer_name})",
                                 details={
                                     "layer_name": layer_name,
                                     "layer_class": "Lambda",
                                     "validation_error": error,
+                                    "analysis_status": "opaque_bytecode",
                                 },
-                                why="Lambda layers with encoded data may contain arbitrary code.",
+                                why=(
+                                    "Keras Lambda layers can embed bytecode that executes during model loading or "
+                                    "inference; no high-risk text patterns were detected."
+                                ),
                             )
 
                 except Exception as e:
