@@ -1,5 +1,6 @@
 """Scanner for PyTorch zip-archived model files (.pt, .pth)."""
 
+import ast
 import io
 import logging
 import os
@@ -37,6 +38,29 @@ _TORCHSCRIPT_GENERATED_CLASS_PATTERN = re.compile(r"(?m)^class\s+[A-Za-z_][A-Za-
 _TORCHSCRIPT_GENERATED_METHOD_PATTERN = re.compile(r"(?m)^\s+def\s+\w+\(self:\s+__torch__\.")
 _TORCHSCRIPT_FORBIDDEN_SOURCE_PATTERN = re.compile(
     r"(?im)(?:^\s*(?:import|from)\s+|\b(?:__import__|eval|exec|compile|open)\s*\(|\b(?:os|subprocess|socket|requests)\s*\.)"
+)
+_TORCHSCRIPT_FORBIDDEN_AST_NAMES: frozenset[str] = frozenset(
+    {
+        "__builtins__",
+        "__class__",
+        "__dict__",
+        "__getattribute__",
+        "__globals__",
+        "__import__",
+        "__mro__",
+        "__subclasses__",
+        "compile",
+        "delattr",
+        "eval",
+        "exec",
+        "getattr",
+        "globals",
+        "input",
+        "locals",
+        "open",
+        "setattr",
+        "vars",
+    }
 )
 
 
@@ -316,7 +340,40 @@ class PyTorchZipScanner(BaseScanner):
             and "__buffers__ = [" in text
             and _TORCHSCRIPT_GENERATED_CLASS_PATTERN.search(text) is not None
             and _TORCHSCRIPT_GENERATED_METHOD_PATTERN.search(text) is not None
+            and PyTorchZipScanner._has_torchscript_generated_ast_shape(text)
         )
+
+    @staticmethod
+    def _has_torchscript_generated_ast_shape(text: str) -> bool:
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            return False
+
+        if not tree.body or any(not isinstance(node, ast.ClassDef) for node in tree.body):
+            return False
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and node.id in _TORCHSCRIPT_FORBIDDEN_AST_NAMES:
+                return False
+            if isinstance(node, ast.Attribute) and node.attr in _TORCHSCRIPT_FORBIDDEN_AST_NAMES:
+                return False
+            if (
+                isinstance(node, ast.Constant)
+                and isinstance(node.value, str)
+                and node.value in _TORCHSCRIPT_FORBIDDEN_AST_NAMES
+            ):
+                return False
+
+            if isinstance(node, ast.ClassDef):
+                if not any(isinstance(item, ast.FunctionDef) for item in node.body):
+                    return False
+                if any(
+                    not isinstance(item, (ast.AnnAssign, ast.Assign, ast.FunctionDef, ast.Pass)) for item in node.body
+                ):
+                    return False
+
+        return True
 
     def _is_torchscript_generated_python(
         self,
