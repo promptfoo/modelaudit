@@ -288,6 +288,37 @@ def test_openvino_scanner_detects_path_external_library_reference(tmp_path: Path
     assert any("external library '../plugins/custom_op'" in issue.message for issue in result.issues)
 
 
+def test_openvino_scanner_redacts_external_library_url_secrets(tmp_path: Path) -> None:
+    """External library URL evidence should not preserve credentials or signed query strings."""
+    xml_path = tmp_path / "model.xml"
+    raw_library_url = "https://user:secret-token@evil.example/plugin.so?access_token=abcd#fragment"
+    xml_path.write_text(
+        f"""
+        <net version='10'>
+          <layers>
+            <layer id='1' name='conv' type='Convolution'>
+              <data implementation='{raw_library_url}'/>
+            </layer>
+          </layers>
+        </net>
+        """,
+        encoding="utf-8",
+    )
+    (tmp_path / "model.bin").write_bytes(b"\x00")
+
+    result = OpenVinoScanner().scan(str(xml_path))
+
+    library_checks = [check for check in result.checks if check.name == "External Library Reference Check"]
+    assert library_checks
+    assert library_checks[0].details["library"] == "https://evil.example/plugin.so"
+    rendered_result = f"{[check.message for check in result.checks]} {result.metadata} {library_checks[0].details}"
+    assert "https://evil.example/plugin.so" in rendered_result
+    assert "secret-token" not in rendered_result
+    assert "access_token=" not in rendered_result
+    assert "user:secret-token" not in rendered_result
+    assert "#fragment" not in rendered_result
+
+
 def test_openvino_scanner_layer_attribute_importlib_false_positive_control(tmp_path: Path) -> None:
     """Benign names containing importlib as a substring should not be flagged."""
     xml_path = tmp_path / "model.xml"

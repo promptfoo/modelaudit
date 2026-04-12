@@ -7,6 +7,7 @@ import re
 from collections.abc import Iterator
 from io import BytesIO
 from typing import Any, ClassVar
+from urllib.parse import urlsplit, urlunsplit
 
 from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_STRING_PATTERNS
 
@@ -34,6 +35,7 @@ _OPENVINO_SUSPICIOUS_PATTERN = (
     else None
 )
 _OPENVINO_NATIVE_LIBRARY_SUFFIX = re.compile(r"(?:\.so(?:\.\d+)*|\.dll|\.dylib|\.lib)$", re.IGNORECASE)
+_URL_REFERENCE_PATTERN = re.compile(r"\b[a-z][a-z0-9+.-]*://[^\s\"'<>]+", re.IGNORECASE)
 
 
 def _local_tag_name(tag: str) -> str:
@@ -151,6 +153,28 @@ def _is_likely_external_library_reference(value: str) -> bool:
     return "/" in normalized_value or "\\" in normalized_value
 
 
+def _redact_url_reference(value: str) -> str:
+    """Redact URL credentials, query strings, and fragments from scanner evidence."""
+
+    def replace_url(match: re.Match[str]) -> str:
+        raw_url = match.group(0)
+        try:
+            parts = urlsplit(raw_url)
+        except ValueError:
+            return "<url redacted>"
+
+        if not parts.scheme:
+            return raw_url
+
+        netloc = parts.hostname or ""
+        if parts.port is not None:
+            netloc = f"{netloc}:{parts.port}"
+
+        return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+
+    return _URL_REFERENCE_PATTERN.sub(replace_url, value)
+
+
 class OpenVinoScanner(BaseScanner):
     """Scanner for OpenVINO IR (.xml/.bin) model files."""
 
@@ -240,18 +264,19 @@ class OpenVinoScanner(BaseScanner):
                 )
 
             for element_tag, attr_name, attr_val in _iter_element_attributes(layer):
+                loggable_attr_val = _redact_url_reference(attr_val)
                 if attr_name in {"library", "implementation"} and _is_likely_external_library_reference(attr_val):
                     result.add_check(
                         name="External Library Reference Check",
                         passed=False,
-                        message=f"Layer '{layer_name}' references external library '{attr_val}'",
+                        message=f"Layer '{layer_name}' references external library '{loggable_attr_val}'",
                         severity=IssueSeverity.CRITICAL,
                         location=path,
                         details={
                             "layer_name": layer_name,
                             "attribute": attr_name,
                             "element": element_tag,
-                            "library": attr_val,
+                            "library": loggable_attr_val,
                         },
                         rule_code="S902",
                     )
@@ -267,7 +292,7 @@ class OpenVinoScanner(BaseScanner):
                             "layer_name": layer_name,
                             "attribute": attr_name,
                             "element": element_tag,
-                            "value": attr_val,
+                            "value": loggable_attr_val,
                         },
                         rule_code="S902",
                     )
