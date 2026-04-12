@@ -103,6 +103,12 @@ def _cloud_url_basename(url: str) -> str:
     return Path(path).name
 
 
+def _cloud_url_without_query(url: str) -> str:
+    """Return a cloud URL without signed query or fragment material for path comparison."""
+    parsed = urlsplit(url)
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", ""))
+
+
 def get_fs_protocol(url: str) -> str:
     """Get the fsspec protocol for a given URL."""
     parsed = urlparse(url)
@@ -518,11 +524,12 @@ def filter_scannable_files(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _build_safe_local_path(base_url: str, file_url: str, download_path: Path) -> Path:
     """Build a local path for a cloud object and reject traversal attempts."""
-    normalized_base = base_url.rstrip("/")
+    normalized_base = _cloud_url_without_query(base_url)
+    normalized_file_url = _cloud_url_without_query(file_url)
 
-    if file_url.startswith(f"{normalized_base}/"):
-        relative_path = file_url[len(normalized_base) + 1 :]
-    elif file_url == normalized_base:
+    if normalized_file_url.startswith(f"{normalized_base}/"):
+        relative_path = normalized_file_url[len(normalized_base) + 1 :]
+    elif normalized_file_url == normalized_base:
         relative_path = _cloud_url_basename(file_url)
     else:
         # Fallback to basename for unexpected path shapes.

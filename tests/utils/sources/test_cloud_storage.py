@@ -8,6 +8,7 @@ import pytest
 from modelaudit.utils.helpers.retry import RetryError
 from modelaudit.utils.sources.cloud_storage import (
     GCSCache,
+    _build_safe_local_path,
     _run_coroutine_sync,
     analyze_cloud_target,
     download_from_cloud,
@@ -171,6 +172,21 @@ def test_download_from_cloud_strips_signed_url_from_local_filename(mock_fs, mock
     assert "secret" not in str(result)
     assert "X-Amz-Signature" not in fs.get.call_args.args[1]
     assert "secret" not in fs.get.call_args.args[1]
+
+
+def test_build_safe_local_path_preserves_signed_directory_relative_paths(tmp_path: Path) -> None:
+    """Signed directory URLs should keep object-relative paths without query secrets."""
+    base_url = "s3://bucket/models?X-Amz-Signature=base-secret"
+    first = "s3://bucket/models/a/model.pkl?X-Amz-Signature=first-secret"
+    second = "s3://bucket/models/b/model.pkl?X-Amz-Signature=second-secret"
+
+    first_path = _build_safe_local_path(base_url, first, tmp_path)
+    second_path = _build_safe_local_path(base_url, second, tmp_path)
+
+    assert first_path == tmp_path / "a" / "model.pkl"
+    assert second_path == tmp_path / "b" / "model.pkl"
+    assert "X-Amz-Signature" not in str(first_path)
+    assert "X-Amz-Signature" not in str(second_path)
 
 
 @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
