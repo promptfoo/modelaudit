@@ -1766,6 +1766,24 @@ def test_scan_jfrog_url_download_failure(mock_scan_jfrog, mock_is_jfrog):
 
 @patch("modelaudit.cli.is_jfrog_url")
 @patch("modelaudit.cli.scan_jfrog_artifact")
+def test_scan_jfrog_url_download_failure_redacts_sensitive_url(mock_scan_jfrog, mock_is_jfrog):
+    """JFrog CLI errors should not print URL credentials or query tokens."""
+    raw_url = "https://user:leaky-pass@company.jfrog.io/artifactory/repo/model.bin?token=leaky-token"
+    mock_is_jfrog.return_value = True
+    mock_scan_jfrog.side_effect = Exception(f"failed to fetch {raw_url}")
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", raw_url])
+
+    assert result.exit_code == 2
+    assert "https://<credentials-redacted>@company.jfrog.io/artifactory/repo/model.bin" in result.output
+    assert "user:leaky-pass" not in result.output
+    assert "leaky-token" not in result.output
+    assert "?token=" not in result.output
+
+
+@patch("modelaudit.cli.is_jfrog_url")
+@patch("modelaudit.cli.scan_jfrog_artifact")
 def test_scan_jfrog_url_with_auth(
     mock_scan_jfrog: MagicMock,
     mock_is_jfrog: MagicMock,
@@ -2393,6 +2411,15 @@ class TestExpandPaths:
     def test_expand_paths_signed_cloud_url_is_not_a_glob(self):
         """Signed cloud URLs may contain query wildcards but are not local globs."""
         url = "s3://bucket/model.bin?X-Amz-Signature=secret"
+
+        expanded, missing = expand_paths((url,))
+        assert expanded == [url]
+        assert missing == []
+
+    def test_expand_paths_url_query_is_not_glob(self):
+        """Remote URLs with query strings should stay literal."""
+        url = "https://company.jfrog.io/artifactory/repo/model.bin?token=secret"
+
         expanded, missing = expand_paths((url,))
         assert expanded == [url]
         assert missing == []
