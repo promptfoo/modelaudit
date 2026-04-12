@@ -54,7 +54,12 @@ from .utils.helpers.auto_defaults import (
     parse_size_string,
 )
 from .utils.helpers.interrupt_handler import interruptible_scan
-from .utils.sources.cloud_storage import download_from_cloud, is_cloud_url
+from .utils.sources.cloud_storage import (
+    download_from_cloud,
+    is_cloud_url,
+    redact_cloud_error_for_display,
+    redact_url_for_display,
+)
 from .utils.sources.huggingface import (
     download_file_from_hf,
     download_model,
@@ -68,6 +73,20 @@ from .utils.sources.jfrog import is_jfrog_url, redact_jfrog_error_for_display, r
 from .utils.sources.pytorch_hub import download_pytorch_hub_model, is_pytorch_hub_url
 
 logger = logging.getLogger("modelaudit")
+
+
+def _display_path(path: str) -> str:
+    """Return a path safe for user-facing CLI output."""
+    if is_cloud_url(path):
+        return redact_url_for_display(path)
+    if is_jfrog_url(path):
+        return redact_jfrog_url_for_display(path)
+    return redact_huggingface_url_for_display(path)
+
+
+def _display_error(error: object, path: str) -> str:
+    """Return an error safe for user-facing CLI output."""
+    return redact_cloud_error_for_display(error, path) if is_cloud_url(path) else str(error)
 
 
 @dataclass
@@ -316,13 +335,6 @@ def is_mlflow_uri(path: str) -> bool:
     return path.startswith("models:/")
 
 
-def _redact_scan_path_for_display(path: str) -> str:
-    """Redact credentials from remote paths before printing them."""
-    if is_jfrog_url(path):
-        return redact_jfrog_url_for_display(path)
-    return redact_huggingface_url_for_display(path)
-
-
 def _resolve_scan_paths(paths: tuple[str, ...], scan_start_time: float) -> list[str]:
     """Expand user paths, resolve DVC pointers, warn on unmatched globs, and fail fast if empty."""
     expanded_paths, missing_globs = expand_paths(paths)
@@ -547,7 +559,7 @@ def _show_scan_runtime_defaults(
             "─" * 80,
         ]
         click.echo("\n".join(header))
-        display_paths = [_redact_scan_path_for_display(path) for path in expanded_paths]
+        display_paths = [_display_path(path) for path in expanded_paths]
         click.echo(f"Paths to scan: {style_text(', '.join(display_paths), fg='green')}")
         if blacklist:
             click.echo(
@@ -848,16 +860,17 @@ def _scan_local_or_downloaded_path(
 ) -> None:
     """Scan a local artifact or a downloaded path resolved by source dispatch."""
     actual_path = source_result.actual_path
+    display_path = _display_path(path)
     if _should_skip_non_model_file(actual_path, runtime, verbose=verbose):
         return
 
     spinner = None
     if runtime.show_styled_output and should_show_spinner():
-        spinner_text = f"Scanning {style_text(path, fg='cyan')}"
+        spinner_text = f"Scanning {style_text(display_path, fg='cyan')}"
         spinner = yaspin(Spinners.dots, text=spinner_text)
         spinner.start()
     elif runtime.show_styled_output:
-        click.echo(f"Scanning {path}...")
+        click.echo(f"Scanning {display_path}...")
 
     try:
         progress_callback = _create_path_progress_callback(
@@ -941,7 +954,7 @@ def _scan_local_or_downloaded_path(
         has_critical = any(issue.severity == IssueSeverity.CRITICAL for issue in visible_issues)
 
         if spinner:
-            spinner.text = f"Scanned {style_text(path, fg='cyan')}"
+            spinner.text = f"Scanned {style_text(display_path, fg='cyan')}"
             if issue_count == 0:
                 spinner.ok(style_text("✅ Clean", fg="green", bold=True))
             elif has_critical:
@@ -962,22 +975,23 @@ def _scan_local_or_downloaded_path(
                 )
         elif runtime.show_styled_output:
             if issue_count == 0:
-                click.echo(f"Scanned {path}: Clean")
+                click.echo(f"Scanned {display_path}: Clean")
             else:
                 issues_str = "issue" if issue_count == 1 else "issues"
                 if has_critical:
-                    click.echo(f"Scanned {path}: Found {issue_count} {issues_str} (CRITICAL)")
+                    click.echo(f"Scanned {display_path}: Found {issue_count} {issues_str} (CRITICAL)")
                 else:
-                    click.echo(f"Scanned {path}: Found {issue_count} {issues_str}")
+                    click.echo(f"Scanned {display_path}: Found {issue_count} {issues_str}")
     except Exception as exc:
+        display_error = _display_error(exc, path)
         if spinner:
-            spinner.text = f"Error scanning {style_text(path, fg='cyan')}"
+            spinner.text = f"Error scanning {style_text(display_path, fg='cyan')}"
             spinner.fail(style_text("❌ Error", fg="red", bold=True))
         elif runtime.show_styled_output:
-            click.echo(f"Error scanning {path}")
+            click.echo(f"Error scanning {display_path}")
 
-        logger.error(f"Error during scan of {path}: {exc!s}", exc_info=verbose)
-        click.echo(f"Error scanning {path}: {exc!s}", err=True)
+        logger.error(f"Error during scan of {display_path}: {display_error}", exc_info=verbose)
+        click.echo(f"Error scanning {display_path}: {display_error}", err=True)
         audit_result.has_errors = True
         path_state.scanned_paths.append(actual_path)
 
@@ -1304,7 +1318,7 @@ def _resolve_scan_source_for_path(
 
             try:
                 metadata = asyncio.run(analyze_cloud_target(path))
-                click.echo(f"\n📊 Preview for {style_text(path, fg='cyan')}:")
+                click.echo(f"\n📊 Preview for {style_text(redact_url_for_display(path), fg='cyan')}:")
                 click.echo(f"   Type: {metadata['type']}")
 
                 if metadata["type"] == "file":
@@ -1323,7 +1337,7 @@ def _resolve_scan_source_for_path(
 
                 return _SourceDispatchResult(actual_path=path, local_scan_required=False)
             except Exception as exc:
-                click.echo(f"Error analyzing {path}: {exc!s}", err=True)
+                click.echo(f"Error analyzing {redact_url_for_display(path)}: {exc!s}", err=True)
                 audit_result.has_errors = True
                 return None
 
@@ -1370,11 +1384,11 @@ def _resolve_scan_source_for_path(
                 return _SourceDispatchResult(actual_path=path, local_scan_required=False)
 
             if runtime.show_styled_output and should_show_spinner():
-                spinner_text = f"Downloading from {style_text(path, fg='cyan')}"
+                spinner_text = f"Downloading from {style_text(redact_url_for_display(path), fg='cyan')}"
                 download_spinner = yaspin(Spinners.dots, text=spinner_text)
                 download_spinner.start()
             elif runtime.show_styled_output:
-                click.echo(f"Downloading from {path}...")
+                click.echo(f"Downloading from {redact_url_for_display(path)}...")
 
             download_path = download_from_cloud(  # type: ignore[assignment]
                 path,
@@ -1409,9 +1423,9 @@ def _resolve_scan_source_for_path(
             elif runtime.show_styled_output:
                 click.echo("Download failed")
 
-            error_msg = str(exc)
+            error_msg = _display_error(exc, path)
             if "insufficient disk space" in error_msg.lower():
-                logger.error(f"Disk space error for {path}: {error_msg}")
+                logger.error(f"Disk space error for {redact_url_for_display(path)}: {error_msg}")
                 click.echo(style_text(f"\n⚠️  {error_msg}", fg="yellow"), err=True)
                 click.echo(
                     style_text(
@@ -1421,8 +1435,8 @@ def _resolve_scan_source_for_path(
                     err=True,
                 )
             else:
-                logger.error(f"Failed to download from {path}: {error_msg}", exc_info=verbose)
-                click.echo(f"Error downloading from {path}: {error_msg}", err=True)
+                logger.error(f"Failed to download from {redact_url_for_display(path)}: {error_msg}", exc_info=verbose)
+                click.echo(f"Error downloading from {redact_url_for_display(path)}: {error_msg}", err=True)
 
             audit_result.has_errors = True
             return None
