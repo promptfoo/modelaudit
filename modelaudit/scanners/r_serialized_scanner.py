@@ -10,8 +10,28 @@ import os
 import re
 from dataclasses import dataclass
 from typing import Any, ClassVar
+from urllib.parse import urlsplit, urlunsplit
 
 from .base import BaseScanner, IssueSeverity, ScanResult
+
+
+def _redact_url_for_display(url: str) -> str:
+    """Return a URL safe for scan output while preserving routing context."""
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+    except ValueError:
+        return "[invalid-url]"
+
+    if not parsed.scheme or not parsed.hostname:
+        return "[invalid-url]"
+
+    hostname = parsed.hostname
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+
+    netloc = f"{hostname}:{port}" if port is not None else hostname
+    return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
 
 
 @dataclass(frozen=True)
@@ -408,7 +428,7 @@ class RSerializedScanner(BaseScanner):
                     warning_payload_hits.append(hit)
 
             for url in self._URL_RE.findall(text):
-                url_hits.add(url)
+                url_hits.add(_redact_url_for_display(url))
 
             for ip in self._IP_RE.findall(text):
                 if self._is_valid_public_ip(ip):
