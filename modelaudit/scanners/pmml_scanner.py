@@ -332,6 +332,7 @@ class PmmlScanner(BaseScanner):
                         normalized_attr_name,
                         str(attr_value),
                         elem.attrib,
+                        in_pmml_element=is_pmml_element,
                         in_header_metadata=in_header_metadata,
                     )
                     if url_pattern is not None:
@@ -396,12 +397,17 @@ class PmmlScanner(BaseScanner):
         attr_value: str,
         attributes: dict[str, Any],
         *,
+        in_pmml_element: bool,
         in_header_metadata: bool,
     ) -> str | None:
         """Return the URL pattern when an attribute is an external resource reference."""
         normalized_attr_name_lower = normalized_attr_name.lower()
         if normalized_attr_name_lower in DOCUMENTATION_ATTRIBUTE_NAMES:
-            ignored_patterns = BENIGN_DOCUMENTATION_URL_PATTERNS if attr_name == normalized_attr_name_lower else None
+            ignored_patterns = (
+                BENIGN_DOCUMENTATION_URL_PATTERNS
+                if in_pmml_element and attr_name == normalized_attr_name_lower
+                else None
+            )
             return PmmlScanner._find_url_pattern(
                 attr_value,
                 ignored_patterns=ignored_patterns,
