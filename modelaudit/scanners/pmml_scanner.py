@@ -263,12 +263,17 @@ class PmmlScanner(BaseScanner):
         """Check for suspicious patterns and external references in PMML content."""
         parent_by_child = {child: parent for parent in root.iter() for child in parent}
         root_namespace = self._xml_namespace(root.tag)
+        root_is_pmml = self._is_pmml_root(root.tag, root_namespace)
         for elem in root.iter():
             tag_name = self._local_xml_name(elem.tag)
-            is_pmml_element = self._is_pmml_element(elem.tag, root_namespace)
+            is_pmml_element = self._is_pmml_element(elem.tag, root_namespace, root_is_pmml=root_is_pmml)
             parent = parent_by_child.get(elem)
             parent_tag_name = self._local_xml_name(parent.tag) if parent is not None else ""
-            parent_is_pmml_element = parent is not None and self._is_pmml_element(parent.tag, root_namespace)
+            parent_is_pmml_element = parent is not None and self._is_pmml_element(
+                parent.tag,
+                root_namespace,
+                root_is_pmml=root_is_pmml,
+            )
             in_header_metadata = (is_pmml_element and tag_name == "header") or (
                 is_pmml_element and parent_is_pmml_element and tag_name == "application" and parent_tag_name == "header"
             )
@@ -475,12 +480,19 @@ class PmmlScanner(BaseScanner):
         return name[1:].split("}", 1)[0]
 
     @classmethod
-    def _is_pmml_element(cls, tag: Any, root_namespace: str | None) -> bool:
+    def _is_pmml_root(cls, tag: Any, root_namespace: str | None) -> bool:
+        """Return whether the document root is a recognized PMML root."""
+        if cls._local_xml_name(tag) != "pmml":
+            return False
+        return root_namespace is None or PMML_NAMESPACE_PATTERN.fullmatch(root_namespace) is not None
+
+    @classmethod
+    def _is_pmml_element(cls, tag: Any, root_namespace: str | None, *, root_is_pmml: bool) -> bool:
         """Return whether a tag belongs to the PMML document namespace."""
+        if not root_is_pmml:
+            return False
         if root_namespace is None:
             return cls._xml_namespace(tag) is None
-        if PMML_NAMESPACE_PATTERN.fullmatch(root_namespace) is None:
-            return False
         return cls._xml_namespace(tag) == root_namespace
 
     def _get_all_text_content(self, element: Any) -> tuple[str, bool]:
