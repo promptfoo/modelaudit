@@ -233,6 +233,49 @@ def _finish_with_inconclusive_contract(
     result.finish(success=default_success or (allow_security_findings_override and has_security_findings))
 
 
+def _add_pickle_parse_failure_check(
+    result: ScanResult,
+    *,
+    location: str,
+    error: Exception,
+    early_detection_successful: bool | None = None,
+) -> None:
+    """Record incomplete pickle parsing as an operationally inconclusive scan."""
+    details: dict[str, Any] = {
+        "file_type": "pickle",
+        "category": "parse_error",
+        "parse_error": str(error),
+        "exception_type": type(error).__name__,
+        "parsing_failed": True,
+        "failure_reason": "unknown_opcode_or_format_error",
+        "analysis_incomplete": True,
+    }
+    if early_detection_successful is not None:
+        details["early_detection_successful"] = early_detection_successful
+
+    result.add_check(
+        name="Pickle Format Check",
+        passed=False,
+        message="Pickle parsing failed before full scan completion",
+        severity=IssueSeverity.INFO,
+        location=location,
+        details=details,
+        why=(
+            "The scanner could not fully parse this pickle file due to an opcode/format error. "
+            "The scan is marked inconclusive rather than a security finding unless separate dangerous evidence exists."
+        ),
+    )
+    result.metadata.update(
+        {
+            "file_type": "pickle",
+            "parsing_failed": True,
+            "failure_reason": "unknown_opcode_or_format_error",
+            "analysis_incomplete": True,
+        }
+    )
+    _mark_inconclusive_scan_result(result, "pickle_analysis_incomplete")
+
+
 def _freeze_pickle_scan_value(value: Any) -> Hashable:
     """Convert nested check details into a hashable representation for dedupe."""
     if isinstance(value, Mapping):
@@ -3395,6 +3438,193 @@ def _build_opcode_check_finding(
     }
 
 
+def _parse_global_reference_arg(arg: str) -> tuple[str, str]:
+    parsed = _parse_module_function(arg)
+    return parsed if parsed is not None else (arg, "")
+
+
+def _classify_nested_pickle_payload(
+    payload: bytes | bytearray,
+    nested_match: Any,
+    ml_context: dict[str, Any],
+    *,
+    deadline: float | None = None,
+) -> tuple[IssueSeverity, str, dict[str, Any]]:
+    """Classify nested pickle evidence without treating structure alone as critical."""
+    nested_bytes = bytes(payload)[nested_match.offset :]
+    opcodes: list[tuple[Any, Any, int | None]] = []
+    try:
+        for opcode_info in _genops_with_fallback(
+            io.BytesIO(nested_bytes),
+            multi_stream=True,
+            max_items=_POST_BUDGET_OPCODE_SCAN_LIMIT_OPCODES,
+            deadline=deadline,
+        ):
+            opcodes.append(opcode_info)
+    except _GenopsBudgetExceeded as exc:
+        if opcodes:
+            severity, evidence, evidence_details = _classify_nested_pickle_opcodes(opcodes, ml_context)
+            if severity == IssueSeverity.CRITICAL:
+                evidence_details["analysis_incomplete"] = True
+                evidence_details["analysis_error"] = exc.reason
+                evidence_details["opcode_budget_exceeded"] = True
+                return severity, evidence, evidence_details
+            return (
+                _get_context_aware_severity(IssueSeverity.CRITICAL, ml_context),
+                "analysis_incomplete",
+                {
+                    "evidence": "analysis_incomplete",
+                    "partial_evidence": evidence,
+                    "partial_evidence_details": evidence_details,
+                    "analysis_incomplete": True,
+                    "analysis_error": exc.reason,
+                    "opcode_budget_exceeded": True,
+                },
+            )
+        return (
+            _get_context_aware_severity(IssueSeverity.CRITICAL, ml_context),
+            "analysis_incomplete",
+            {
+                "evidence": "analysis_incomplete",
+                "analysis_incomplete": True,
+                "analysis_error": exc.reason,
+                "opcode_budget_exceeded": True,
+            },
+        )
+    except Exception as exc:
+        if opcodes:
+            severity, evidence, evidence_details = _classify_nested_pickle_opcodes(opcodes, ml_context)
+            if severity == IssueSeverity.CRITICAL:
+                evidence_details["analysis_incomplete"] = True
+                evidence_details["analysis_error"] = str(exc)
+                evidence_details["analysis_error_type"] = type(exc).__name__
+                return severity, evidence, evidence_details
+            return (
+                _get_context_aware_severity(IssueSeverity.CRITICAL, ml_context),
+                "analysis_incomplete",
+                {
+                    "evidence": "analysis_incomplete",
+                    "partial_evidence": evidence,
+                    "partial_evidence_details": evidence_details,
+                    "analysis_incomplete": True,
+                    "analysis_error": str(exc),
+                    "analysis_error_type": type(exc).__name__,
+                },
+            )
+        return (
+            _get_context_aware_severity(IssueSeverity.CRITICAL, ml_context),
+            "analysis_incomplete",
+            {
+                "evidence": "analysis_incomplete",
+                "analysis_incomplete": True,
+                "analysis_error": str(exc),
+                "analysis_error_type": type(exc).__name__,
+            },
+        )
+
+    return _classify_nested_pickle_opcodes(opcodes, ml_context)
+
+
+def _classify_nested_pickle_opcodes(
+    opcodes: list[tuple[Any, Any, int | None]],
+    ml_context: dict[str, Any],
+) -> tuple[IssueSeverity, str, dict[str, Any]]:
+    """Classify already-collected nested pickle opcodes."""
+    (
+        stack_global_refs,
+        callable_refs,
+        _callable_origin_refs,
+        callable_origin_is_ext,
+        _malformed_stack_globals,
+        mutation_target_refs,
+    ) = _simulate_symbolic_reference_maps(opcodes)
+
+    dangerous_pattern = is_dangerous_reduce_pattern(
+        opcodes,
+        stack_global_refs=stack_global_refs,
+        callable_refs=callable_refs,
+        callable_origin_is_ext=callable_origin_is_ext,
+        mutation_target_refs=mutation_target_refs,
+    )
+    if dangerous_pattern is not None:
+        return (
+            _get_context_aware_severity(IssueSeverity.CRITICAL, ml_context),
+            "dangerous_execution",
+            {"evidence": "dangerous_execution", "dangerous_pattern": dangerous_pattern},
+        )
+
+    strongest_severity = IssueSeverity.INFO
+    evidence = "structure_only"
+    evidence_details: dict[str, Any] = {"evidence": evidence}
+
+    for index, (opcode, arg, _pos) in enumerate(opcodes):
+        if opcode.name == "GLOBAL" and isinstance(arg, str):
+            module, function = _parse_global_reference_arg(arg)
+            is_failure, severity, classification = _classify_import_reference(
+                module,
+                function,
+                ml_context,
+                is_import_only=True,
+            )
+            if is_failure and severity == IssueSeverity.CRITICAL:
+                return (
+                    _get_context_aware_severity(IssueSeverity.CRITICAL, ml_context),
+                    "dangerous_import",
+                    {
+                        "evidence": "dangerous_import",
+                        "import_reference": f"{module}.{function}" if function else module,
+                        "classification": classification,
+                    },
+                )
+            if is_failure and severity == IssueSeverity.WARNING and strongest_severity == IssueSeverity.INFO:
+                strongest_severity = IssueSeverity.WARNING
+                evidence = "unknown_import"
+                evidence_details = {
+                    "evidence": evidence,
+                    "import_reference": f"{module}.{function}" if function else module,
+                    "classification": classification,
+                }
+        elif opcode.name == "STACK_GLOBAL" and index in stack_global_refs:
+            module, function = stack_global_refs[index]
+            is_failure, severity, classification = _classify_import_reference(
+                module,
+                function,
+                ml_context,
+                is_import_only=True,
+            )
+            if is_failure and severity == IssueSeverity.CRITICAL:
+                return (
+                    _get_context_aware_severity(IssueSeverity.CRITICAL, ml_context),
+                    "dangerous_import",
+                    {
+                        "evidence": "dangerous_import",
+                        "import_reference": f"{module}.{function}" if function else module,
+                        "classification": classification,
+                    },
+                )
+            if is_failure and severity == IssueSeverity.WARNING and strongest_severity == IssueSeverity.INFO:
+                strongest_severity = IssueSeverity.WARNING
+                evidence = "unknown_import"
+                evidence_details = {
+                    "evidence": evidence,
+                    "import_reference": f"{module}.{function}" if function else module,
+                    "classification": classification,
+                }
+    if strongest_severity == IssueSeverity.INFO:
+        return strongest_severity, evidence, evidence_details
+    return _get_context_aware_severity(strongest_severity, ml_context), evidence, evidence_details
+
+
+def _nested_pickle_detection_message(base_message: str, evidence: str) -> str:
+    if evidence in {"dangerous_execution", "dangerous_import"}:
+        return f"{base_message} with dangerous execution evidence"
+    if evidence == "analysis_incomplete":
+        return f"{base_message} with incomplete nested-pickle analysis"
+    if evidence == "unknown_import":
+        return f"{base_message} with executable reconstruction evidence"
+    return f"{base_message} without dangerous execution evidence"
+
+
 def _serialize_opcode_check_finding(finding: dict[str, Any]) -> dict[str, Any]:
     """Convert opcode finding payloads into check-detail-friendly data."""
     severity = finding.get("severity")
@@ -3417,6 +3647,8 @@ def _collect_nested_pickle_opcode_findings(
     arg: Any,
     pos: int | None,
     ml_context: dict[str, Any],
+    *,
+    deadline: float | None = None,
 ) -> list[dict[str, Any]]:
     """Return nested/encoded pickle findings for a single opcode payload."""
     findings: list[dict[str, Any]] = []
@@ -3424,11 +3656,16 @@ def _collect_nested_pickle_opcode_findings(
     if opcode_name in {"BINBYTES", "SHORT_BINBYTES", "BINBYTES8", "BYTEARRAY8"} and isinstance(arg, bytes | bytearray):
         nested_match = _find_nested_pickle_match(arg)
         if nested_match is not None:
-            severity = _get_context_aware_severity(IssueSeverity.CRITICAL, ml_context)
+            severity, evidence, evidence_details = _classify_nested_pickle_payload(
+                arg,
+                nested_match,
+                ml_context,
+                deadline=deadline,
+            )
             findings.append(
                 _build_opcode_check_finding(
                     check_name="Nested Pickle Detection",
-                    message="Nested pickle payload detected",
+                    message=_nested_pickle_detection_message("Nested pickle payload detected", evidence),
                     severity=severity,
                     position=pos,
                     rule_code="S213",
@@ -3438,6 +3675,7 @@ def _collect_nested_pickle_opcode_findings(
                         "nested_offset": nested_match.offset,
                         "sample_size": nested_match.sample_size,
                         "searched_bytes": nested_match.searched_bytes,
+                        **evidence_details,
                     },
                     why=get_pattern_explanation("nested_pickle"),
                 )
@@ -3445,13 +3683,22 @@ def _collect_nested_pickle_opcode_findings(
 
     if opcode_name in {"BINSTRING", "SHORT_BINSTRING"} and isinstance(arg, str):
         try:
-            nested_match = _find_nested_pickle_match(arg.encode("latin-1"))
+            payload = arg.encode("latin-1")
+            nested_match = _find_nested_pickle_match(payload)
             if nested_match is not None:
-                severity = _get_context_aware_severity(IssueSeverity.CRITICAL, ml_context)
+                severity, evidence, evidence_details = _classify_nested_pickle_payload(
+                    payload,
+                    nested_match,
+                    ml_context,
+                    deadline=deadline,
+                )
                 findings.append(
                     _build_opcode_check_finding(
                         check_name="Nested Pickle Detection",
-                        message="Nested pickle payload detected in legacy string opcode",
+                        message=_nested_pickle_detection_message(
+                            "Nested pickle payload detected in legacy string opcode",
+                            evidence,
+                        ),
                         severity=severity,
                         position=pos,
                         rule_code="S213",
@@ -3461,6 +3708,7 @@ def _collect_nested_pickle_opcode_findings(
                             "nested_offset": nested_match.offset,
                             "sample_size": nested_match.sample_size,
                             "searched_bytes": nested_match.searched_bytes,
+                            **evidence_details,
                         },
                         why=get_pattern_explanation("nested_pickle"),
                     )
@@ -3472,11 +3720,16 @@ def _collect_nested_pickle_opcode_findings(
         for enc, decoded in _decode_string_to_bytes(arg):
             nested_match = _find_nested_pickle_match(decoded)
             if nested_match is not None:
-                severity = _get_context_aware_severity(IssueSeverity.CRITICAL, ml_context)
+                severity, evidence, evidence_details = _classify_nested_pickle_payload(
+                    decoded,
+                    nested_match,
+                    ml_context,
+                    deadline=deadline,
+                )
                 findings.append(
                     _build_opcode_check_finding(
                         check_name="Encoded Pickle Detection",
-                        message="Encoded pickle payload detected",
+                        message=_nested_pickle_detection_message("Encoded pickle payload detected", evidence),
                         severity=severity,
                         position=pos,
                         rule_code=get_encoding_rule_code(enc),
@@ -3488,6 +3741,7 @@ def _collect_nested_pickle_opcode_findings(
                             "nested_offset": nested_match.offset,
                             "sample_size": nested_match.sample_size,
                             "searched_bytes": nested_match.searched_bytes,
+                            **evidence_details,
                         },
                         why=get_pattern_explanation("nested_pickle"),
                     )
@@ -4640,37 +4894,19 @@ class PickleScanner(BaseScanner):
                     return result
 
                 elif file_ext in [".pkl", ".pickle", ".joblib", ".dill", ".pt", ".pth", ".ckpt"]:
-                    # Pickle-like files must fail closed when parsing aborts on unknown opcodes.
+                    # Pickle-like files fail closed operationally when parsing aborts on unknown opcodes.
                     logger.warning(f"Pickle parse failed for {path}: {e}")
-                    result.add_check(
-                        name="Pickle Format Check",
-                        passed=False,
-                        message="Pickle parsing failed before full scan completion",
-                        severity=IssueSeverity.CRITICAL,
+                    _add_pickle_parse_failure_check(
+                        result,
                         location=path,
-                        details={
-                            "file_type": "pickle",
-                            "parse_error": str(e),
-                            "early_detection_successful": early_pattern_scan_completed,
-                            "parsing_failed": True,
-                            "failure_reason": "unknown_opcode_or_format_error",
-                        },
-                        why=(
-                            "The scanner could not fully parse this pickle file due to an opcode/format error. "
-                            "Because full opcode analysis did not complete, the file is treated as unsafe."
-                        ),
+                        error=e,
+                        early_detection_successful=early_pattern_scan_completed,
                     )
-
-                    # Fail closed metadata for parse failures on pickle-like files.
-                    result.metadata.update(
-                        {
-                            "file_type": "pickle",
-                            "parsing_failed": True,
-                            "failure_reason": "unknown_opcode_or_format_error",
-                        }
+                    _finish_with_inconclusive_contract(
+                        result,
+                        default_success=False,
+                        allow_security_findings_override=True,
                     )
-
-                    result.finish(success=False)
                     return result
 
             if pickle_file_opened:
@@ -4828,27 +5064,16 @@ class PickleScanner(BaseScanner):
                     result.finish(success=True)
                     return result
                 if file_ext in {".pkl", ".pickle", ".joblib", ".dill", ".pt", ".pth", ".ckpt"}:
-                    result.add_check(
-                        name="Pickle Format Check",
-                        passed=False,
-                        message="Pickle parsing failed before full scan completion",
-                        severity=IssueSeverity.CRITICAL,
+                    _add_pickle_parse_failure_check(
+                        result,
                         location=source,
-                        details={
-                            "file_type": "pickle",
-                            "parse_error": str(error),
-                            "parsing_failed": True,
-                            "failure_reason": "unknown_opcode_or_format_error",
-                        },
+                        error=error,
                     )
-                    result.metadata.update(
-                        {
-                            "file_type": "pickle",
-                            "parsing_failed": True,
-                            "failure_reason": "unknown_opcode_or_format_error",
-                        }
+                    _finish_with_inconclusive_contract(
+                        result,
+                        default_success=False,
+                        allow_security_findings_override=True,
                     )
-                    result.finish(success=False)
                     return result
 
             self._record_pickle_runtime_error(result, error, location=source)
@@ -5971,7 +6196,15 @@ class PickleScanner(BaseScanner):
             if absolute_pos is None or absolute_pos < minimum_offset:
                 continue
 
-            findings.extend(_collect_nested_pickle_opcode_findings(opcode.name, arg, absolute_pos, ml_context))
+            findings.extend(
+                _collect_nested_pickle_opcode_findings(
+                    opcode.name,
+                    arg,
+                    absolute_pos,
+                    ml_context,
+                    deadline=deadline,
+                )
+            )
             findings.extend(_collect_encoded_python_opcode_findings(opcode.name, arg, absolute_pos, ml_context))
 
             if opcode.name == "STACK_GLOBAL":
@@ -7409,7 +7642,13 @@ class PickleScanner(BaseScanner):
                             ),
                         )
 
-                for nested_finding in _collect_nested_pickle_opcode_findings(opcode.name, arg, pos, ml_context):
+                for nested_finding in _collect_nested_pickle_opcode_findings(
+                    opcode.name,
+                    arg,
+                    pos,
+                    ml_context,
+                    deadline=deadline,
+                ):
                     result.add_check(
                         name=nested_finding["check_name"],
                         passed=False,
@@ -7996,31 +8235,16 @@ class PickleScanner(BaseScanner):
                     ".ckpt",
                 ]:
                     logger.warning(f"Pickle parse failed for {self.current_file_path}: {e}")
-                    result.add_check(
-                        name="Pickle Format Check",
-                        passed=False,
-                        message="Pickle parsing failed before full scan completion",
-                        severity=IssueSeverity.CRITICAL,
+                    _add_pickle_parse_failure_check(
+                        result,
                         location=self.current_file_path,
-                        details={
-                            "file_type": "pickle",
-                            "parse_error": str(e),
-                            "parsing_failed": True,
-                            "failure_reason": "unknown_opcode_or_format_error",
-                        },
-                        why=(
-                            "The scanner could not fully parse this pickle file due to an opcode/format error. "
-                            "Because full opcode analysis did not complete, the file is treated as unsafe."
-                        ),
+                        error=e,
                     )
-                    result.metadata.update(
-                        {
-                            "file_type": "pickle",
-                            "parsing_failed": True,
-                            "failure_reason": "unknown_opcode_or_format_error",
-                        }
+                    _finish_with_inconclusive_contract(
+                        result,
+                        default_success=False,
+                        allow_security_findings_override=True,
                     )
-                    result.finish(success=False)
                     return result
 
                 # Determine user-friendly error message and severity

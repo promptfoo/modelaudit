@@ -6,7 +6,7 @@ import ipaddress
 import os
 import re
 from typing import Any, ClassVar
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -87,6 +87,28 @@ _ABSOLUTE_PATH_PATTERN = re.compile(r"(?:\b[A-Za-z]:\\|^/|^~[/\\])")
 _TRAVERSAL_PATTERN = re.compile(r"(?:\.\./|\.\.\\)")
 _BASE64_PATTERN = re.compile(r"(?:[A-Za-z0-9+/]{100,}={0,2})")
 _HEX_ESCAPE_PATTERN = re.compile(r"(?:\\x[0-9a-fA-F]{2}){8,}")
+
+
+def _redact_url_for_display(url: str) -> str:
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+    except ValueError:
+        return "[invalid-url]"
+
+    if not parsed.scheme or not parsed.hostname:
+        return "[invalid-url]"
+
+    hostname = parsed.hostname
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+
+    netloc = f"{hostname}:{port}" if port is not None else hostname
+    return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+
+
+def _redact_urls_for_display(text: str) -> str:
+    return _URL_PATTERN.sub(lambda match: _redact_url_for_display(match.group(0)), text)
 
 
 class LightGBMScanner(BaseScanner):
@@ -196,7 +218,11 @@ class LightGBMScanner(BaseScanner):
 
             for pattern, reason in _COMMAND_PATTERNS:
                 if pattern.search(line):
-                    hit = {"line": str(line_number), "reason": reason, "excerpt": line[:200]}
+                    hit = {
+                        "line": str(line_number),
+                        "reason": reason,
+                        "excerpt": _redact_urls_for_display(line)[:200],
+                    }
                     if is_comment:
                         warning_command_hits.append(hit)
                     else:
@@ -205,19 +231,21 @@ class LightGBMScanner(BaseScanner):
 
             for url in _URL_PATTERN.findall(line):
                 if not self._is_trusted_url(url):
-                    network_hits.append({"line": str(line_number), "type": "url", "value": url})
+                    network_hits.append(
+                        {"line": str(line_number), "type": "url", "value": _redact_url_for_display(url)}
+                    )
 
             for candidate_ip in _IP_PATTERN.findall(line):
                 if self._is_public_ip(candidate_ip):
                     network_hits.append({"line": str(line_number), "type": "public_ip", "value": candidate_ip})
 
             if not safe_prefix and self._looks_like_external_reference(line):
-                path_hits.append({"line": str(line_number), "excerpt": line[:200]})
+                path_hits.append({"line": str(line_number), "excerpt": _redact_urls_for_display(line)[:200]})
 
             if (_BASE64_PATTERN.search(line) or _HEX_ESCAPE_PATTERN.search(line)) and _EXECUTION_CONTEXT_PATTERN.search(
                 line
             ):
-                encoded_hits.append({"line": str(line_number), "excerpt": line[:200]})
+                encoded_hits.append({"line": str(line_number), "excerpt": _redact_urls_for_display(line)[:200]})
 
         if critical_command_hits:
             result.add_check(

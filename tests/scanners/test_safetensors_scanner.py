@@ -411,6 +411,111 @@ def test_suspicious_metadata(tmp_path: Path) -> None:
     assert any("suspicious metadata" in issue.message.lower() for issue in result.issues)
 
 
+def test_unicode_metadata_is_not_code_injection(tmp_path: Path) -> None:
+    file_path = tmp_path / "unicode_metadata.safetensors"
+    data = {"t": np.arange(5, dtype=np.float32)}
+    metadata = {"description": "café model trained on multilingual text 日本語"}
+    save_file(data, str(file_path), metadata=metadata)
+
+    scanner = SafeTensorsScanner()
+    result = scanner.scan(str(file_path))
+
+    code_injection_checks = [check for check in result.checks if check.name == "SafeTensors Code Injection Detection"]
+    assert code_injection_checks == []
+    assert [issue for issue in result.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}] == []
+
+
+def test_literal_unicode_escape_metadata_still_flags_code_injection(tmp_path: Path) -> None:
+    file_path = tmp_path / "escaped_payload_metadata.safetensors"
+    data = {"t": np.arange(5, dtype=np.float32)}
+    metadata = {"payload": r"\u0065\u0076\u0061\u006c\u0028"}
+    save_file(data, str(file_path), metadata=metadata)
+
+    scanner = SafeTensorsScanner()
+    result = scanner.scan(str(file_path))
+
+    code_injection_checks = [check for check in result.checks if check.name == "SafeTensors Code Injection Detection"]
+    assert code_injection_checks
+    assert all(check.severity == IssueSeverity.CRITICAL for check in code_injection_checks)
+
+
+def test_single_comment_token_does_not_bypass_unicode_escape_detection(tmp_path: Path) -> None:
+    file_path = tmp_path / "commented_escape_payload_metadata.safetensors"
+    data = {"t": np.arange(5, dtype=np.float32)}
+    metadata = {"payload": r"\u0065#\u0076\u0061\u006c\u0028"}
+    save_file(data, str(file_path), metadata=metadata)
+
+    scanner = SafeTensorsScanner()
+    result = scanner.scan(str(file_path))
+
+    code_injection_checks = [check for check in result.checks if check.name == "SafeTensors Code Injection Detection"]
+    assert code_injection_checks
+    assert all(check.severity == IssueSeverity.CRITICAL for check in code_injection_checks)
+
+
+def test_safetensors_benign_path_like_metadata_not_flagged(tmp_path: Path) -> None:
+    """Benign path references in metadata should not be treated as traversal."""
+    file_path = tmp_path / "benign_metadata.safetensors"
+    data = {"t": np.arange(5, dtype=np.float32)}
+    metadata = {
+        "source_path": "/home/alice/model-cache/run-1",
+        "root_copy": "/root/.cache/model.bin",
+        "win_path": r"C:\Users\alice\models\weights.safetensors",
+        "encoded_path": "%2Fhome%2Falice%2Fworkspace%2Fmodel.bin",
+    }
+    save_file(data, str(file_path), metadata=metadata)
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert not [
+        check
+        for check in result.checks
+        if check.name == "SafeTensors Path Traversal Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert not [
+        check
+        for check in result.checks
+        if check.name == "Metadata Code Pattern Check" and check.status == CheckStatus.FAILED
+    ]
+
+
+def test_safetensors_traversal_metadata_still_detected(tmp_path: Path) -> None:
+    """Relative and URL-encoded traversal metadata should still be reported."""
+    file_path = tmp_path / "traversal_metadata.safetensors"
+    data = {"t": np.arange(5, dtype=np.float32)}
+    metadata = {
+        "payload_path": "../tmp/../../payload.bin",
+        "encoded_payload": "%2E%2e/%2e%2e/etc/shadow",
+    }
+    save_file(data, str(file_path), metadata=metadata)
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    traversal_checks = [
+        check
+        for check in result.checks
+        if check.name == "SafeTensors Path Traversal Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert traversal_checks
+    assert any((check.details or {}).get("attack_type") == "path_traversal" for check in traversal_checks)
+
+
+def test_metadata_windows_drive_path_no_code_pattern_false_positive(tmp_path: Path) -> None:
+    """Windows path separators alone should not trip the metadata code-pattern check."""
+    file_path = tmp_path / "windows_path_only.safetensors"
+    data = {"t": np.arange(5, dtype=np.float32)}
+    metadata = {"artifact": r"D:\models\artifact\run.bin"}
+    save_file(data, str(file_path), metadata=metadata)
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert not [
+        check
+        for check in result.checks
+        if check.name == "Metadata Code Pattern Check" and check.status == CheckStatus.FAILED
+    ]
+
+
 def test_mixed_suspicious_patterns(tmp_path: Path) -> None:
     """Test that both simple patterns and regex patterns are detected from the same metadata value."""
     file_path = tmp_path / "model.safetensors"

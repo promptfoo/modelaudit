@@ -1,18 +1,27 @@
+import bz2
+import gzip
 import io
+import lzma
 import os
 import tarfile
 import tempfile
 import zipfile
+import zlib
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
 from modelaudit import core
+from modelaudit.scanners import _registry, archive_dispatch
 from modelaudit.scanners._archive_locations import rewrite_extracted_member_location
-from modelaudit.scanners.archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY
-from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
+from modelaudit.scanners.archive_dispatch import (
+    NESTED_SCAN_CALLBACK_CONFIG_KEY,
+    _select_nested_scanner_id,
+    scan_nested_file,
+)
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.zip_scanner import ZipScanner
 
 
@@ -53,6 +62,150 @@ def test_rewrite_extracted_member_location_preserves_scanner_specific_suffix_pol
         )
         == "/archive.zip:model.pkl /tmp/extracted.pkl2"
     )
+
+
+@pytest.mark.parametrize(
+    ("payload", "filename"),
+    [
+        (gzip.compress(b"payload", mtime=0), "gzip_member"),
+        (bz2.compress(b"payload"), "bzip2_member"),
+        (lzma.compress(b"payload"), "xz_member"),
+        (b"\x04\x22\x4d\x18" + b"\x00" * 8, "lz4_member"),
+        (zlib.compress(b"payload"), "zlib_member"),
+    ],
+    ids=["gzip_member", "bzip2_member", "xz_member", "lz4_member", "zlib_member"],
+)
+def test_nested_dispatch_routes_compressed_header_aliases_to_compressed_scanner(
+    tmp_path: Path,
+    payload: bytes,
+    filename: str,
+) -> None:
+    """Extensionless archive members with compression magic should route to CompressedScanner."""
+    member_path = tmp_path / filename
+    member_path.write_bytes(payload)
+
+    assert _select_nested_scanner_id(str(member_path)) == "compressed"
+
+
+class _HeaderRoutedTempScanner(BaseScanner):
+    name: ClassVar[str] = "header_routed_temp"
+
+    @classmethod
+    def can_handle(cls, path: str) -> bool:
+        return False
+
+    def scan(self, path: str) -> ScanResult:
+        result = ScanResult(scanner_name=self.name, scanner=self)
+        result.add_check(
+            name="Header-routed temp scan",
+            passed=True,
+            message=f"Scanned {path}",
+            location=path,
+        )
+        result.finish(success=True)
+        return result
+
+
+class _HeaderRoutedFindingScanner(_HeaderRoutedTempScanner):
+    name: ClassVar[str] = "header_routed_finding"
+
+    def scan(self, path: str) -> ScanResult:
+        result = ScanResult(scanner_name=self.name, scanner=self)
+        result.add_check(
+            name="Header-routed temp scan",
+            passed=False,
+            message=f"Detected header-routed payload in {path}",
+            severity=IssueSeverity.WARNING,
+            location=path,
+        )
+        result.finish(success=False)
+        return result
+
+
+def test_scan_nested_file_honors_header_route_when_temp_suffix_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extracted_member = tmp_path / "member.dat"
+    extracted_member.write_bytes(b"header-routed model payload")
+
+    monkeypatch.setattr(archive_dispatch, "detect_file_format", lambda _path: "header_only_model")
+    monkeypatch.setitem(
+        archive_dispatch._HEADER_FORMAT_TO_SCANNER_ID,
+        "header_only_model",
+        "header_only_scanner",
+    )
+
+    def load_scanner_by_id(scanner_id: str) -> type[BaseScanner] | None:
+        if scanner_id == "header_only_scanner":
+            return _HeaderRoutedTempScanner
+        return None
+
+    def get_scanner_for_path(path: str) -> type[BaseScanner] | None:
+        raise AssertionError(f"header-routed nested member fell back to path routing: {path}")
+
+    monkeypatch.setattr(_registry, "load_scanner_by_id", load_scanner_by_id)
+    monkeypatch.setattr(_registry, "get_scanner_for_path", get_scanner_for_path)
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "header_routed_temp"
+    assert result.success is True
+
+
+def test_scan_nested_file_drops_header_route_when_rechecked_header_mismatches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extracted_member = tmp_path / "member.dat"
+    extracted_member.write_bytes(b"not actually a header-routed payload")
+    detected_formats = iter(["header_only_model", "unknown"])
+
+    monkeypatch.setattr(archive_dispatch, "detect_file_format", lambda _path: next(detected_formats))
+    monkeypatch.setitem(
+        archive_dispatch._HEADER_FORMAT_TO_SCANNER_ID,
+        "header_only_model",
+        "header_only_scanner",
+    )
+    monkeypatch.setattr(_registry, "load_scanner_by_id", lambda _scanner_id: _HeaderRoutedTempScanner)
+    monkeypatch.setattr(_registry, "get_scanner_for_path", lambda _path: None)
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.success is True
+
+
+def test_scan_nested_file_header_routed_generic_suffix_can_report_findings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extracted_member = tmp_path / "member.dat"
+    extracted_member.write_bytes(b"header-routed malicious payload")
+
+    monkeypatch.setattr(archive_dispatch, "detect_file_format", lambda _path: "header_only_model")
+    monkeypatch.setitem(
+        archive_dispatch._HEADER_FORMAT_TO_SCANNER_ID,
+        "header_only_model",
+        "header_only_scanner",
+    )
+    monkeypatch.setattr(_registry, "load_scanner_by_id", lambda _scanner_id: _HeaderRoutedFindingScanner)
+
+    def get_scanner_for_path(path: str) -> type[BaseScanner] | None:
+        raise AssertionError(f"header-routed nested member fell back to path routing: {path}")
+
+    monkeypatch.setattr(_registry, "get_scanner_for_path", get_scanner_for_path)
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "header_routed_finding"
+    assert result.success is False
+    failed_checks = [check for check in result.checks if check.status == CheckStatus.FAILED]
+    assert len(failed_checks) == 1
+    assert failed_checks[0].severity == IssueSeverity.WARNING
+    assert "detected header-routed payload" in failed_checks[0].message.lower()
+    assert result.has_warnings is True
+    assert result.has_errors is False
 
 
 class TestZipScanner:
@@ -391,6 +544,56 @@ class TestZipScanner:
             f"{[(i.location, i.message, i.details) for i in result.issues]}"
         )
 
+    def test_scan_extensionless_nested_gzip_recurses_by_header(self, tmp_path: Path) -> None:
+        """Extensionless gzip members should route through CompressedScanner by header."""
+        archive_path = tmp_path / "outer.zip"
+        payload = b'cos\nsystem\n(S"echo zipped gzip payload"\ntR.'
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("compressed_payload", gzip.compress(payload))
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert result.success is False
+        assert result.has_errors is True
+        routing_checks = [check for check in result.checks if check.name == "Compressed Wrapper Inner Scanner Routing"]
+        assert any(
+            check.details.get("inner_scanner") == "pickle" and check.details.get("zip_entry") == "compressed_payload"
+            for check in routing_checks
+        ), f"Expected compressed nested routing check, got: {[(c.location, c.details) for c in routing_checks]}"
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL
+            and issue.details.get("zip_entry") == "compressed_payload"
+            and ("os.system" in issue.message.lower() or "posix.system" in issue.message.lower())
+            for issue in result.issues
+        ), (
+            "Expected critical nested compressed pickle finding, got: "
+            f"{[(i.location, i.message, i.details) for i in result.issues]}"
+        )
+
+    def test_scan_extensionless_nested_gzip_benign_text_does_not_route_to_pickle(self, tmp_path: Path) -> None:
+        """Extensionless gzip text should not be treated as a nested pickle just because it is compressed."""
+        archive_path = tmp_path / "outer-benign.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("compressed_payload", gzip.compress(b"just some harmless text\n"))
+
+        result = self.scanner.scan(str(archive_path))
+
+        routing_checks = [
+            check
+            for check in result.checks
+            if check.name == "Compressed Wrapper Inner Scanner Routing"
+            and check.details.get("zip_entry") == "compressed_payload"
+        ]
+        assert not any(check.details.get("inner_scanner") == "pickle" for check in routing_checks), (
+            "Expected benign gzip text to avoid pickle routing, got: "
+            f"{[(check.location, check.details) for check in routing_checks]}"
+        )
+        assert not [
+            issue
+            for issue in result.issues
+            if issue.severity == IssueSeverity.CRITICAL and issue.details.get("zip_entry") == "compressed_payload"
+        ]
+
     def test_nested_keras_member_routes_through_nested_scan_callback(self, tmp_path: Path) -> None:
         """Nested ZIP-based members should preserve ZIP depth and use the injected callback."""
         nested_keras = io.BytesIO()
@@ -511,8 +714,7 @@ class TestZipScanner:
         """High compression-ratio entries should be reported without extracting them."""
         archive_path = tmp_path / "suspicious.zip"
         with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
-            # Keep highly compressible but smaller to speed CI.
-            z.writestr("suspicious.txt", "A" * 300000)
+            z.writestr("suspicious.txt", "A" * (2 * 1024 * 1024))
 
         nested_scan_paths: list[str] = []
 
@@ -532,11 +734,39 @@ class TestZipScanner:
         assert compression_issues[0].details["entry"] == "suspicious.txt"
         assert "skipping extraction" in compression_issues[0].message
 
+    def test_small_high_compression_ratio_entry_stays_clean(self, tmp_path: Path) -> None:
+        """Small repetitive metadata should not be treated as a ZIP bomb."""
+        archive_path = tmp_path / "metadata.zip"
+        with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+            z.writestr("metadata.txt", "A" * 16384)
+
+        nested_scan_paths: list[str] = []
+
+        def nested_scan(path: str, _config: dict[str, Any]) -> ScanResult:
+            nested_scan_paths.append(path)
+            return ScanResult(scanner_name="test")
+
+        scanner = ZipScanner(config={NESTED_SCAN_CALLBACK_CONFIG_KEY: nested_scan})
+        result = scanner.scan(str(archive_path))
+
+        assert result.success is True
+        assert any(path.endswith("_metadata.txt") for path in nested_scan_paths)
+        assert not [issue for issue in result.issues if issue.rule_code == "S410"]
+        compression_checks = [
+            check
+            for check in result.checks
+            if check.name == "Compression Ratio Check" and check.details.get("entry") == "metadata.txt"
+        ]
+        assert len(compression_checks) == 1
+        assert compression_checks[0].status == CheckStatus.PASSED
+        assert "size floor" in compression_checks[0].message
+        assert compression_checks[0].details["min_uncompressed_size"] == 1024 * 1024
+
     def test_zip_bomb_detection_skips_only_suspicious_entry(self, tmp_path: Path) -> None:
         """Suspicious entries should be skipped while safe entries still route to nested scanning."""
         archive_path = tmp_path / "mixed.zip"
         with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
-            z.writestr("suspicious.txt", "A" * 300000)
+            z.writestr("suspicious.txt", "A" * (2 * 1024 * 1024))
             z.writestr("safe.bin", os.urandom(4096))
 
         nested_scan_paths: list[str] = []
@@ -555,6 +785,27 @@ class TestZipScanner:
         compression_issues = [i for i in result.issues if i.rule_code == "S410"]
         assert len(compression_issues) == 1
         assert compression_issues[0].details["entry"] == "suspicious.txt"
+
+    def test_nested_zip_dispatch_does_not_route_generic_bin_zip_to_pickle(self, tmp_path: Path) -> None:
+        """A generic ZIP archive named .bin should not be forced through pickle routing."""
+        archive_path = tmp_path / "weights.bin"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("metadata.txt", "not a pickle")
+
+        assert _select_nested_scanner_id(str(archive_path)) == "zip"
+
+    def test_nested_member_routes_misnamed_onnx_by_header(self, tmp_path: Path) -> None:
+        """A model header should route nested members even when their suffix is generic."""
+        archive_path = tmp_path / "outer.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("model.payload", b"\x08\x01\x12\x00onnx.proto" + b"\x00" * 32)
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert any(
+            entry["path"] == f"{archive_path}:model.payload" and entry["type"] == "onnx"
+            for entry in result.metadata["contents"]
+        )
 
     def test_max_depth_limit(self):
         """Test that maximum nesting depth is enforced"""

@@ -7,7 +7,7 @@ import os
 import re
 from types import ModuleType
 from typing import Any, Final
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult, logger
 
@@ -426,6 +426,30 @@ def _scan_result_has_security_findings(result: ScanResult) -> bool:
 def _is_trusted_s3_endpoint_host(host: str) -> bool:
     """Return True for supported S3 endpoint host layouts only."""
     return any(pattern.match(host) for pattern in _TRUSTED_S3_ENDPOINT_HOST_PATTERNS)
+
+
+def _redact_url_for_display(url: str) -> str:
+    """Strip credential-bearing URL components before storing scan output."""
+    try:
+        parts = urlsplit(url)
+    except Exception:
+        return "<url redacted>"
+
+    if not parts.scheme:
+        return url
+
+    netloc = parts.netloc
+    if "@" in parts.netloc:
+        netloc = parts.hostname or ""
+        try:
+            port = parts.port
+        except ValueError:
+            port = None
+        if port is not None:
+            netloc = f"{netloc}:{port}"
+        netloc = f"<credentials-redacted>@{netloc}"
+
+    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
 
 
 def _is_trusted_url_domain(url: str) -> bool:
@@ -958,14 +982,15 @@ class ManifestScanner(BaseScanner):
                     if any(indicator in url_lower for indicator in suspicious_indicators):
                         severity = IssueSeverity.WARNING
 
+                    display_url = _redact_url_for_display(url)
                     result.add_check(
                         name="Cloud Storage URL Detection",
                         passed=False,  # Finding a cloud URL is informational, not a pass/fail
-                        message=f"{description} detected: {url[:150]}",
+                        message=f"{description} detected: {display_url[:150]}",
                         severity=severity,
                         location=self.current_file_path,
                         details={
-                            "url": url,
+                            "url": display_url,
                             "provider": provider,
                             "description": description,
                         },
@@ -1008,14 +1033,15 @@ class ManifestScanner(BaseScanner):
                     seen_urls.add(url)
                     # Flag any URL not from a trusted domain
                     if not is_trusted_domain(url):
+                        display_url = _redact_url_for_display(url)
                         result.add_check(
                             name="Untrusted URL Check",
                             passed=False,
-                            message=f"URL from untrusted domain: {url}",
+                            message=f"URL from untrusted domain: {display_url}",
                             severity=IssueSeverity.INFO,
                             location=self.current_file_path,
                             details={
-                                "url": url,
+                                "url": display_url,
                                 "key_path": key_path,
                             },
                             why=(
