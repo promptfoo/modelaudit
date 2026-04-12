@@ -380,6 +380,8 @@ class PyTorchZipScanner(BaseScanner):
             if isinstance(node, ast.ClassDef):
                 if node.decorator_list:
                     return False
+                if not PyTorchZipScanner._is_torchscript_class_header_safe(node):
+                    return False
                 if not any(isinstance(item, ast.FunctionDef) for item in node.body):
                     return False
                 for item in node.body:
@@ -409,6 +411,13 @@ class PyTorchZipScanner(BaseScanner):
     @staticmethod
     def _is_torchscript_definition_time_expression_safe(expression: ast.expr) -> bool:
         return not any(isinstance(node, _TORCHSCRIPT_UNSAFE_DEFINITION_EXPR_NODES) for node in ast.walk(expression))
+
+    @staticmethod
+    def _is_torchscript_class_header_safe(node: ast.ClassDef) -> bool:
+        if node.keywords or len(node.bases) != 1:
+            return False
+        base = node.bases[0]
+        return isinstance(base, ast.Name) and base.id == "Module"
 
     @staticmethod
     def _is_torchscript_function_definition_safe(node: ast.FunctionDef) -> bool:
