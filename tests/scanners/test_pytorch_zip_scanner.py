@@ -601,6 +601,41 @@ def test_pytorch_zip_requires_exact_case_torchscript_debug_pair(tmp_path: Path) 
     )
 
 
+def test_pytorch_zip_requires_exact_case_torchscript_tree(tmp_path: Path) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "scripted_tree_case_mismatch.pt", prefix="archive")
+    source_path = "archive/code/__TORCH__/payload.py"
+    debug_pkl = b"\x80\x02X\x18\x00\x00\x00FORMAT_WITH_STRING_TABLEq\x00."
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr(
+            source_path,
+            "\n".join(
+                [
+                    "class Payload(Module):",
+                    "  __parameters__ = []",
+                    "  __buffers__ = []",
+                    "  def forward(self: __torch__.Payload,",
+                    "    x: Tensor) -> Tensor:",
+                    "    return x",
+                    "",
+                ]
+            ),
+        )
+        zip_file.writestr("archive/code/__TORCH__/payload.py.debug_pkl", debug_pkl)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    python_failures = [
+        check
+        for check in result.checks
+        if check.name == "Python Code File Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert any(check.details.get("file") == source_path for check in python_failures)
+    assert any(
+        issue.location == f"{model_path}:{source_path}" and issue.severity == IssueSeverity.WARNING
+        for issue in result.issues
+    )
+
+
 def test_pytorch_zip_does_not_allow_nested_torchscript_generated_python_files(tmp_path: Path) -> None:
     model_path = create_mock_pytorch_zip(tmp_path / "nested_scripted.pt", prefix="archive")
     nested_path = "archive/data/code/__torch__/payload.py"

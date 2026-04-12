@@ -302,12 +302,11 @@ class PyTorchZipScanner(BaseScanner):
         """Return the sibling TorchScript debug member name for a generated-source path."""
         normalized = name.replace("\\", "/").lstrip("/")
         parts = tuple(part for part in normalized.split("/") if part)
-        lower_parts = tuple(part.lower() for part in parts)
-        if not parts or not lower_parts[-1].endswith(".py"):
+        if not parts or not parts[-1].endswith(".py"):
             return None
 
         try:
-            code_index = lower_parts.index("code")
+            code_index = parts.index("code")
         except ValueError:
             return None
 
@@ -316,7 +315,7 @@ class PyTorchZipScanner(BaseScanner):
         if code_index > 1:
             return None
 
-        torchscript_parts = lower_parts[code_index + 1 :]
+        torchscript_parts = parts[code_index + 1 :]
         is_generated_path = torchscript_parts == ("__torch__.py",) or (
             len(torchscript_parts) > 1 and torchscript_parts[0] == "__torch__"
         )
