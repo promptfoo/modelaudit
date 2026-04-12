@@ -352,7 +352,7 @@ class NemoScanner(BaseScanner):
                                 for config_path, referenced_member_name in self._collect_nemo_member_references(config):
                                     if referenced_member_name in scanned_member_entries:
                                         continue
-                                    self._scan_config_referenced_member(
+                                    referenced_member_scanned = self._scan_config_referenced_member(
                                         tar,
                                         referenced_member_name,
                                         path,
@@ -360,7 +360,8 @@ class NemoScanner(BaseScanner):
                                         config_file=member.name,
                                         config_path=config_path,
                                     )
-                                    scanned_member_entries.add(referenced_member_name)
+                                    if referenced_member_scanned:
+                                        scanned_member_entries.add(referenced_member_name)
                             else:
                                 self._mark_inconclusive_scan_result(
                                     result,
@@ -389,6 +390,8 @@ class NemoScanner(BaseScanner):
                             )
 
                 if name_lower.endswith(tuple(NEMO_CHECKPOINT_MEMBER_EXTENSIONS)):
+                    if member.name in scanned_member_entries:
+                        continue
                     self._scan_checkpoint_member(tar, member, path, result)
                     scanned_member_entries.add(member.name)
 
@@ -583,35 +586,63 @@ class NemoScanner(BaseScanner):
         *,
         config_file: str,
         config_path: str,
-    ) -> None:
+    ) -> bool:
         """Scan `nemo:`-referenced archive members through content-based nested dispatch."""
         try:
             member = tar.getmember(referenced_member_name)
         except KeyError:
-            return
+            return False
 
         if member.issym() or member.islnk():
             resolved_name = self._resolve_archive_link_member_name(member)
             if resolved_name is None:
-                return
+                return False
             try:
                 member = tar.getmember(resolved_name)
             except KeyError:
-                return
+                return False
 
         if not member.isfile():
-            return
+            return False
 
         max_scan_bytes = self._normalize_positive_int_config(
             self.config.get("max_nemo_checkpoint_scan_bytes"),
             NEMO_MAX_CHECKPOINT_SCAN_BYTES,
         )
         if member.size > max_scan_bytes:
-            return
+            self._mark_inconclusive_scan_result(
+                result,
+                reason="nemo_checkpoint_scan_skipped_size_limit",
+                check_name="NeMo Checkpoint Nested Scan",
+                message=f"Referenced member exceeds nested scan limit: {referenced_member_name}",
+                location=f"{archive_path}:{referenced_member_name}",
+                details={
+                    "entry": referenced_member_name,
+                    "source_entry": member.name,
+                    "config_file": config_file,
+                    "config_path": config_path,
+                    "size_bytes": member.size,
+                    "max_scan_bytes": max_scan_bytes,
+                },
+            )
+            return True
 
         extracted_path = self._extract_member_to_tempfile(tar, member, suffix_source=referenced_member_name)
         if extracted_path is None:
-            return
+            self._mark_inconclusive_scan_result(
+                result,
+                reason="nemo_checkpoint_extract_failed",
+                check_name="NeMo Checkpoint Nested Scan",
+                message=f"Could not extract referenced member for nested scan: {referenced_member_name}",
+                location=f"{archive_path}:{referenced_member_name}",
+                details={
+                    "entry": referenced_member_name,
+                    "source_entry": member.name,
+                    "config_file": config_file,
+                    "config_path": config_path,
+                },
+            )
+            return True
 
         try:
             from .archive_dispatch import scan_nested_file
@@ -635,6 +666,7 @@ class NemoScanner(BaseScanner):
                         "source_entry": member.name,
                     },
                 )
+            return True
         finally:
             try:
                 os.unlink(extracted_path)
