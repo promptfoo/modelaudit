@@ -1047,6 +1047,32 @@ def get_cve_2025_12058_explanation(issue_type: str) -> str:
     )
 
 
+def get_cve_2025_12060_explanation(issue_type: str) -> str:
+    """Get explanation for CVE-2025-12060: Keras get_file archive extraction traversal.
+
+    CVE-2025-12060 (CVSS 8.8 HIGH): A crafted .keras archive can configure
+    keras.utils.get_file(extract=True) with a remote tar archive. During model
+    loading, affected Keras versions may extract traversal or symlink entries
+    outside the intended cache directory. Fixed in Keras 3.12.0.
+    """
+    explanations = {
+        "get_file_extract_tar": (
+            "CVE-2025-12060: The config.json references keras.utils.get_file with "
+            "extract=True and a remote tar-like archive URL. In affected Keras versions, "
+            "loading the model may download and extract attacker-controlled archive entries "
+            "that traverse outside the intended destination. Upgrade to Keras >= 3.12.0 "
+            "and reject untrusted models that fetch and extract remote archives."
+        ),
+    }
+
+    return _get_explanation_with_default(
+        explanations,
+        issue_type,
+        "CVE-2025-12060: keras.utils.get_file(extract=True) can extract remote tar archives "
+        "with traversal entries. Upgrade to Keras >= 3.12.0.",
+    )
+
+
 def get_cve_2025_1550_explanation(issue_type: str) -> str:
     """Get explanation for CVE-2025-1550: Keras safe_mode bypass via config.json module references.
 

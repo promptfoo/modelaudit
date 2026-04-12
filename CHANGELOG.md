@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Bug Fixes
+
+- route extensionless compressed archive members through the compressed scanner by header alias
+- honor trusted header/content routing for misnamed ONNX, GGUF, and NumPy artifacts.
+- route extensionless compressed archive members through registry-backed nested dispatch.
+
 ## [0.2.36](https://github.com/promptfoo/modelaudit/compare/v0.2.35...v0.2.36) (2026-04-11)
 
 ### Documentation
@@ -89,6 +97,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- add CVE-specific coverage for ONNX symlink traversal, Keras `get_file(extract=True)` archives, MXNet ReDoS operator names, NeMo archive/checkpoint exploits, and TorchServe MAR ZipSlip attribution
 - mark trailing bytes after NumPy object-array pickle payloads inconclusive without escalating to security findings
 - avoid CoreML nested parse failures on bounded-read truncation
 - mark incomplete sharded-model scans as inconclusive, ignore shard-name prefix matches, and skip caching explicit incomplete outcomes
@@ -107,6 +116,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - route helper-level ZIP-backed `.ckpt`/`.pkl` checkpoints through archive scanners
 - harden standalone pickle scanner dangerous global coverage, nested payload bounds, incomplete-scan reporting, and standalone-primary migration behavior
 - flag untrusted pickle persistent ID opcodes while keeping PyTorch storage persistent IDs non-failing
+- cap standalone pickle stream line reads when callers do not provide a stream size
 
 ## [0.2.31](https://github.com/promptfoo/modelaudit/compare/v0.2.30...v0.2.31) (2026-04-04)
 

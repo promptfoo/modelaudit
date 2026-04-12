@@ -955,6 +955,11 @@ def detect_file_format(path: str) -> str:
     magic8 = header[:8]
     magic16 = header[:16]
 
+    if magic8.startswith(b"\x93NUMPY"):
+        return "numpy"
+    if magic4 == b"\x08\x01\x12\x00":
+        return "onnx"
+
     # Check first 8 bytes for HDF5 magic
     hdf5_magic = b"\x89HDF\r\n\x1a\n"
     if magic8 == hdf5_magic:

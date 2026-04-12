@@ -13,6 +13,7 @@ from collections import Counter
 from collections.abc import Callable, Iterator
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, BinaryIO, ClassVar, cast
 
 import pytest
@@ -34,6 +35,7 @@ from modelaudit.scanners.pickle_scanner import (
     _RAW_PATTERN_SCAN_LIMIT_BYTES,
     _RESYNC_FAST_FORWARD_PROBE_BYTES,
     PickleScanner,
+    _classify_nested_pickle_payload,
     _find_nested_pickle_match,
     _find_next_resync_stream_candidate_offset,
     _genops_with_fallback,
@@ -48,6 +50,7 @@ from modelaudit.scanners.pickle_scanner import (
     _simulate_symbolic_reference_maps,
     check_opcode_sequence,
 )
+from modelaudit.scanners.pickle_support import _NESTED_PICKLE_VALIDATION_WINDOW_BYTES
 from modelaudit.scanners.rule_mapper import get_pickle_opcode_rule_code
 from tests.assets.generators.generate_advanced_pickle_tests import (
     generate_memo_based_attack,
@@ -73,6 +76,16 @@ class _NonSeekableBytesIO(BytesIO):
 
     def seek(self, pos: int, whence: int = 0) -> int:
         raise OSError("seek disabled")
+
+
+def _assert_user_visible_parse_failure_issue(result: ScanResult) -> None:
+    parse_issue = next(
+        issue for issue in result.issues if issue.message == "Pickle parsing failed before full scan completion"
+    )
+    assert parse_issue.severity == IssueSeverity.INFO
+    assert parse_issue.details["category"] == "parse_error"
+    assert parse_issue.details["analysis_incomplete"] is True
+    assert "opcode" in parse_issue.details["parse_error"]
 
 
 def test_pickle_scanner_star_import_exports_scanner_class() -> None:
@@ -130,6 +143,19 @@ def _make_dup_heavy_pickle(iterations: int) -> bytes:
         payload += b"h\x002a0"
     payload += b"."
     return bytes(payload)
+
+
+def _make_os_system_pickle() -> bytes:
+    class Evil:
+        def __reduce__(self) -> tuple[object, tuple[str]]:
+            return (os.system, ("echo nested-pickle",))
+
+    return pickle.dumps(Evil(), protocol=4)
+
+
+def _make_delayed_os_system_pickle() -> bytes:
+    padding = b"K\x010" * ((_NESTED_PICKLE_VALIDATION_WINDOW_BYTES // 3) + 16)
+    return b"\x80\x04" + padding + b"cos\nsystem\n\x8c\x12echo nested-pickle\x85R."
 
 
 class _SliceCountingSearchWindow:
@@ -668,7 +694,7 @@ def test_scan_stream_preserves_package_findings_when_legacy_fallback_raises(
     )
 
 
-def test_scan_stream_parse_failure_fails_closed_for_pickle_stream(
+def test_scan_stream_parse_failure_is_inconclusive_for_pickle_stream(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     scanner = PickleScanner()
@@ -685,15 +711,16 @@ def test_scan_stream_parse_failure_fails_closed_for_pickle_stream(
     assert result.metadata["file_type"] == "pickle"
     assert result.metadata["parsing_failed"] is True
     assert result.metadata["failure_reason"] == "unknown_opcode_or_format_error"
-    assert any(
-        check.name == "Pickle Format Check"
-        and check.status == CheckStatus.FAILED
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    parse_check = next(check for check in result.checks if check.name == "Pickle Format Check")
+    assert parse_check.status == CheckStatus.FAILED
+    assert parse_check.severity == IssueSeverity.INFO
+    assert parse_check.details["category"] == "parse_error"
+    _assert_user_visible_parse_failure_issue(result)
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
-def test_scan_stream_non_seekable_parse_failure_fails_closed(
+def test_scan_stream_non_seekable_parse_failure_is_inconclusive(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     scanner = PickleScanner()
@@ -714,7 +741,13 @@ def test_scan_stream_non_seekable_parse_failure_fails_closed(
     assert result.metadata["file_type"] == "pickle"
     assert result.metadata["parsing_failed"] is True
     assert result.metadata["failure_reason"] == "unknown_opcode_or_format_error"
-    assert any(check.name == "Pickle Format Check" and check.status == CheckStatus.FAILED for check in result.checks)
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    parse_check = next(check for check in result.checks if check.name == "Pickle Format Check")
+    assert parse_check.status == CheckStatus.FAILED
+    assert parse_check.severity == IssueSeverity.INFO
+    assert parse_check.details["category"] == "parse_error"
+    _assert_user_visible_parse_failure_issue(result)
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
 def test_pickle_scanner_can_handle_rejects_non_pickle_content(tmp_path: Path) -> None:
@@ -952,14 +985,14 @@ def test_padding_stripped_base64_candidate_still_flags_potential_base64() -> Non
 
 
 @pytest.mark.parametrize("file_ext", [".pkl", ".pt", ".pth", ".ckpt"])
-def test_unknown_opcode_pickle_parse_failure_fails_closed(
+def test_unknown_opcode_pickle_parse_failure_is_inconclusive(
     file_ext: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Unknown opcode parse failures in raw pickle-backed checkpoint files must fail closed."""
+    """Unknown opcode parse failures in raw pickle-backed checkpoint files should be inconclusive."""
     pickle_path = tmp_path / f"unknown_opcode{file_ext}"
-    pickle_path.write_bytes(b"\x80\x04K\x01." + (b"A" * 9000) + b"os.system")
+    pickle_path.write_bytes(b"\x80\x04K\x01." + (b"A" * 9000))
 
     def _raise_unknown_opcode(self: PickleScanner, _file_obj: object, _file_size: int) -> ScanResult:
         raise ValueError("at position 2, opcode b'\\xff' unknown")
@@ -972,16 +1005,17 @@ def test_unknown_opcode_pickle_parse_failure_fails_closed(
     assert result.metadata["file_type"] == "pickle"
     assert result.metadata["parsing_failed"] is True
     assert result.metadata["failure_reason"] == "unknown_opcode_or_format_error"
-    assert any(
-        check.name == "Pickle Format Check"
-        and check.status == CheckStatus.FAILED
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    ), f"Expected fail-closed format check, got: {[(c.name, c.status, c.severity) for c in result.checks]}"
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    parse_check = next(check for check in result.checks if check.name == "Pickle Format Check")
+    assert parse_check.status == CheckStatus.FAILED
+    assert parse_check.severity == IssueSeverity.INFO
+    assert parse_check.details["category"] == "parse_error"
+    _assert_user_visible_parse_failure_issue(result)
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
-def test_merge_missing_pickle_checks_preserves_ruleless_parse_failures_and_fails_closed() -> None:
-    """Rule-less parse-failure fallback issues must survive merge and preserve fail-closed success."""
+def test_merge_missing_pickle_checks_preserves_ruleless_parse_failures_as_inconclusive() -> None:
+    """Rule-less parse-failure fallback issues must survive merge as inconclusive, not security."""
     scanner = PickleScanner()
     target = ScanResult(scanner_name="pickle", scanner=scanner)
     target.add_check(
@@ -997,9 +1031,10 @@ def test_merge_missing_pickle_checks_preserves_ruleless_parse_failures_and_fails
         name="Standalone Pickle Parse Failure",
         passed=False,
         message="Pickle parsing failed before full scan completion",
-        severity=IssueSeverity.CRITICAL,
+        severity=IssueSeverity.INFO,
         location="truncated.pkl (pos 4)",
         details={
+            "category": "parse_error",
             "parse_error": "pickle exhausted before seeing STOP",
             "failure_reason": "unknown_opcode_or_format_error",
             "analysis_incomplete": True,
@@ -1020,10 +1055,11 @@ def test_merge_missing_pickle_checks_preserves_ruleless_parse_failures_and_fails
     assert target.metadata["scan_outcome_reasons"] == ["pickle_analysis_incomplete"]
     assert any(
         issue.rule_code is None
-        and issue.severity == IssueSeverity.CRITICAL
+        and issue.severity == IssueSeverity.INFO
         and issue.message == "Pickle parsing failed before full scan completion"
         for issue in target.issues
     )
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in target.issues)
 
 
 def test_merge_missing_pickle_checks_propagates_fallback_operational_errors_and_fails_closed() -> None:
@@ -1169,7 +1205,7 @@ def test_merge_missing_pickle_checks_fails_closed_for_fallback_parse_errors_with
         name="Standalone Pickle Error",
         passed=False,
         message="Could not parse pickle stream: at position 0, opcode b'\\xff' unknown",
-        severity=IssueSeverity.CRITICAL,
+        severity=IssueSeverity.INFO,
         location="parse-error.bin (pos 0)",
         details={
             "pickle_source": "parse-error.bin",
@@ -1186,14 +1222,15 @@ def test_merge_missing_pickle_checks_fails_closed_for_fallback_parse_errors_with
     assert target.success is False
     assert any(
         issue.details.get("category") == "parse_error"
-        and issue.severity == IssueSeverity.CRITICAL
+        and issue.severity == IssueSeverity.INFO
         and issue.message.startswith("Could not parse pickle stream:")
         for issue in target.issues
     )
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in target.issues)
 
 
-def test_merge_missing_pickle_checks_preserves_bin_parse_failures_and_fails_closed() -> None:
-    """Truncated `.bin` pickle payloads should preserve fallback parse failures and fail closed."""
+def test_merge_missing_pickle_checks_preserves_bin_parse_failures_as_inconclusive() -> None:
+    """Truncated `.bin` pickle payloads should preserve fallback parse failures as inconclusive."""
     scanner = PickleScanner()
     target = ScanResult(scanner_name="pickle", scanner=scanner)
     target.add_check(
@@ -1209,10 +1246,11 @@ def test_merge_missing_pickle_checks_preserves_bin_parse_failures_and_fails_clos
         name="Standalone Pickle Parse Failure",
         passed=False,
         message="Pickle parsing failed before full scan completion",
-        severity=IssueSeverity.CRITICAL,
+        severity=IssueSeverity.INFO,
         location="truncated.bin (pos 0)",
         details={
             "pickle_source": "truncated.bin",
+            "category": "parse_error",
             "parse_error": "pickle exhausted before seeing STOP",
             "failure_reason": "unknown_opcode_or_format_error",
             "analysis_incomplete": True,
@@ -1233,8 +1271,10 @@ def test_merge_missing_pickle_checks_preserves_bin_parse_failures_and_fails_clos
     assert any(
         issue.message == "Pickle parsing failed before full scan completion"
         and issue.location == "truncated.bin (pos 0)"
+        and issue.severity == IssueSeverity.INFO
         for issue in target.issues
     )
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in target.issues)
 
 
 def test_merge_missing_pickle_checks_fails_closed_for_inconclusive_notice_only_fallback() -> None:
@@ -1313,10 +1353,11 @@ def test_merge_missing_pickle_checks_trusts_legacy_boundary_for_benign_joblib_ta
         name="Standalone Pickle Parse Failure",
         passed=False,
         message="Pickle parsing failed before full scan completion",
-        severity=IssueSeverity.CRITICAL,
+        severity=IssueSeverity.INFO,
         location="numpy_arrays.joblib (decompressed) (pos 227)",
         details={
             "pickle_source": "numpy_arrays.joblib (decompressed)",
+            "category": "parse_error",
             "parse_error": "at position 226, opcode b'\\r' unknown",
             "failure_reason": "unknown_opcode_or_format_error",
             "analysis_incomplete": True,
@@ -1376,10 +1417,11 @@ def test_merge_missing_pickle_checks_does_not_trust_boundary_for_dangerous_jobli
         name="Standalone Pickle Parse Failure",
         passed=False,
         message="Pickle parsing failed before full scan completion",
-        severity=IssueSeverity.CRITICAL,
+        severity=IssueSeverity.INFO,
         location="dangerous.joblib (decompressed) (pos 227)",
         details={
             "pickle_source": "dangerous.joblib (decompressed)",
+            "category": "parse_error",
             "parse_error": "at position 226, opcode b'\\r' unknown",
             "failure_reason": "unknown_opcode_or_format_error",
             "analysis_incomplete": True,
@@ -1406,7 +1448,10 @@ def test_merge_missing_pickle_checks_does_not_trust_boundary_for_dangerous_jobli
 
     assert target.success is False
     assert "trusted_incomplete_tail" not in target.metadata
-    assert any(issue.message == "Pickle parsing failed before full scan completion" for issue in target.issues)
+    assert any(
+        issue.message == "Pickle parsing failed before full scan completion" and issue.severity == IssueSeverity.INFO
+        for issue in target.issues
+    )
 
 
 @pytest.mark.parametrize(
@@ -1984,7 +2029,7 @@ def test_post_budget_global_scan_uses_consumed_opcode_boundary(tmp_path: Path) -
 def test_post_budget_opcode_scan_uses_consumed_opcode_boundary(tmp_path: Path) -> None:
     """Opcode tail scans should start at the consumed boundary, not inside the prior payload."""
     pickle_path = tmp_path / "post-budget-opcode-consumed-boundary.pkl"
-    inner_pickle = pickle.dumps({"ab": 1}, protocol=4)
+    inner_pickle = _make_os_system_pickle()
     poison_payload = b"\x8c\xff" + (b"A" * 4998)
     payload = (
         b"\x80\x04"
@@ -2221,7 +2266,7 @@ def test_scan_pickle_detects_post_budget_stack_global_with_binget(tmp_path: Path
 
 def test_post_budget_opcode_scan_detects_nested_pickle_payload(tmp_path: Path) -> None:
     """Nested inner pickle payloads beyond the opcode budget should still be surfaced."""
-    inner_pickle = pickle.dumps({"ab": 1}, protocol=4)
+    inner_pickle = _make_os_system_pickle()
     pickle_path = tmp_path / "post-budget-nested-pickle.pkl"
     benign_padding = _make_opcode_padding_stream(opcode_pairs=512)
     malicious_stream = b"\x80\x04B" + struct.pack("<I", len(inner_pickle)) + inner_pickle + b"."
@@ -2238,10 +2283,6 @@ def test_post_budget_opcode_scan_detects_nested_pickle_payload(tmp_path: Path) -
         finding["check_name"] == "Nested Pickle Detection" and finding["details"].get("opcode") == "BINBYTES"
         for finding in checks[0].details["findings"]
     ), checks[0].details
-    assert not any(
-        check.name == "Post-Budget Global Reference Scan" and check.status == CheckStatus.FAILED
-        for check in result.checks
-    ), f"Expected opcode-based detection, got: {result.checks}"
     assert result.success is False
 
 
@@ -2249,7 +2290,7 @@ def test_post_budget_opcode_scan_detects_encoded_pickle_payload(tmp_path: Path) 
     """Encoded inner pickle payloads beyond the opcode budget should still be surfaced."""
     import base64
 
-    inner_pickle = pickle.dumps({"ab": 1}, protocol=4)
+    inner_pickle = _make_os_system_pickle()
     encoded_pickle = base64.b64encode(inner_pickle)
     pickle_path = tmp_path / "post-budget-encoded-pickle.pkl"
     benign_padding = _make_opcode_padding_stream(opcode_pairs=512)
@@ -2444,7 +2485,7 @@ def test_post_budget_global_scan_runs_after_deadline_truncation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Deadline-triggered truncation should not continue scanning past the timeout boundary."""
-    import modelaudit.scanners.pickle_scanner as pickle_scanner_module
+    from modelaudit.scanners import pickle_scanner as pickle_scanner_module
 
     pickle_path = tmp_path / "post-budget-deadline.pkl"
     pickle_path.write_bytes(b"\x80\x04cmysterypkg\nloader\n.")
@@ -3481,40 +3522,293 @@ class TestDillLoadersRegression:
         ]
         assert len(ignored_pe_issues) == 0, "Validated PE signatures should not be suppressed"
 
-    def test_nested_pickle_detection(self):
-        """Scanner should detect nested pickle bytes and encoded payloads"""
+    def test_benign_nested_pickle_detection_is_info_only(self, tmp_path: Path) -> None:
+        """Benign nested pickle bytes and encoded payloads should not be critical."""
         scanner = PickleScanner()
 
         import base64
-        import os
-        import tempfile
 
-        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
-            try:
-                inner = {"a": 1}
-                inner_bytes = pickle.dumps(inner)
-                outer = {
-                    "raw": inner_bytes,
-                    "enc": base64.b64encode(inner_bytes).decode("ascii"),
-                }
-                pickle.dump(outer, f)
-                f.flush()
-                f.close()  # Close file before scanning (required on Windows to allow deletion)
+        inner = {"a": 1}
+        inner_bytes = pickle.dumps(inner)
+        outer = {
+            "raw": inner_bytes,
+            "enc": base64.b64encode(inner_bytes).decode("ascii"),
+        }
+        pickle_path = tmp_path / "benign-nested.pkl"
+        pickle_path.write_bytes(pickle.dumps(outer))
 
-                result = scanner.scan(f.name)
+        result = scanner.scan(str(pickle_path))
 
-                assert result.success
+        assert result.success
 
-                nested_issues = [
-                    i
-                    for i in result.issues
-                    if "nested pickle payload" in i.message.lower() or "encoded pickle payload" in i.message.lower()
-                ]
-                assert nested_issues
-                assert any(i.severity == IssueSeverity.CRITICAL for i in nested_issues)
+        nested_issues = [
+            i
+            for i in result.issues
+            if "nested pickle payload" in i.message.lower() or "encoded pickle payload" in i.message.lower()
+        ]
+        raw_issue = next((i for i in nested_issues if "nested pickle payload" in i.message.lower()), None)
+        encoded_issue = next((i for i in nested_issues if "encoded pickle payload" in i.message.lower()), None)
+        assert raw_issue is not None
+        assert encoded_issue is not None
+        assert raw_issue.severity == IssueSeverity.INFO
+        assert encoded_issue.severity == IssueSeverity.INFO
+        assert not any(
+            i.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for i in (raw_issue, encoded_issue)
+        )
 
-            finally:
-                os.unlink(f.name)
+    def test_malicious_nested_pickle_detection_stays_critical(self, tmp_path: Path) -> None:
+        """Nested pickle payloads with dangerous reducers should remain critical."""
+        scanner = PickleScanner()
+
+        import base64
+
+        inner_bytes = _make_os_system_pickle()
+        outer = {
+            "raw": inner_bytes,
+            "enc": base64.b64encode(inner_bytes).decode("ascii"),
+        }
+        pickle_path = tmp_path / "malicious-nested.pkl"
+        pickle_path.write_bytes(pickle.dumps(outer))
+
+        result = scanner.scan(str(pickle_path))
+
+        nested_issues = [
+            i
+            for i in result.issues
+            if "nested pickle payload" in i.message.lower() or "encoded pickle payload" in i.message.lower()
+        ]
+        assert nested_issues
+        assert any(i.severity == IssueSeverity.CRITICAL for i in nested_issues)
+
+    def test_nested_pickle_detection_scans_later_streams_after_benign_prefix(self) -> None:
+        """A benign first pickle stream should not mask a malicious follow-on stream."""
+        benign_stream = pickle.dumps({"safe": True})
+        malicious_stream = _make_os_system_pickle()
+
+        severity, evidence, details = _classify_nested_pickle_payload(
+            benign_stream + malicious_stream,
+            SimpleNamespace(offset=0),
+            {},
+        )
+
+        assert severity == IssueSeverity.CRITICAL
+        assert evidence == "dangerous_execution"
+        assert details["evidence"] == "dangerous_execution"
+
+    def test_nested_pickle_parse_error_preserves_collected_dangerous_opcodes(self) -> None:
+        """Trailing parse errors should not hide dangerous nested opcodes already seen."""
+        severity, evidence, details = _classify_nested_pickle_payload(
+            _make_os_system_pickle()[:-1],
+            SimpleNamespace(offset=0),
+            {},
+        )
+
+        assert severity == IssueSeverity.CRITICAL
+        assert evidence == "dangerous_execution"
+        assert details["evidence"] == "dangerous_execution"
+        assert details["analysis_incomplete"] is True
+        assert "analysis_error_type" in details
+
+    def test_nested_pickle_parse_error_without_dangerous_prefix_fails_closed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Parse aborts after benign prefix evidence should still be critical."""
+        from modelaudit.scanners import pickle_scanner as pickle_scanner_module
+
+        benign_opcodes = list(pickletools.genops(pickle.dumps({"padding": "benign"})))
+
+        def _benign_prefix_then_parse_error(
+            file_obj: BinaryIO,
+            *,
+            multi_stream: bool = False,
+            max_items: int | None = None,
+            deadline: float | None = None,
+        ) -> Iterator[tuple[Any, Any, int | None]]:
+            del file_obj, multi_stream, max_items, deadline
+            yield from benign_opcodes
+            raise ValueError("trailing nested parse error")
+
+        monkeypatch.setattr(pickle_scanner_module, "_genops_with_fallback", _benign_prefix_then_parse_error)
+
+        severity, evidence, details = _classify_nested_pickle_payload(
+            b"\x80\x04.",
+            SimpleNamespace(offset=0),
+            {},
+        )
+
+        assert severity == IssueSeverity.CRITICAL
+        assert evidence == "analysis_incomplete"
+        assert details["analysis_incomplete"] is True
+        assert details["analysis_error_type"] == "ValueError"
+        assert details["partial_evidence"] == "structure_only"
+
+    def test_nested_pickle_classification_passes_deadline_to_parser(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Nested re-parsing should preserve the active scan deadline."""
+        from modelaudit.scanners import pickle_scanner as pickle_scanner_module
+
+        observed_deadlines: list[float | None] = []
+
+        def _capture_deadline(
+            file_obj: BinaryIO,
+            *,
+            multi_stream: bool = False,
+            max_items: int | None = None,
+            deadline: float | None = None,
+        ) -> Iterator[tuple[Any, Any, int | None]]:
+            del file_obj, multi_stream, max_items
+            observed_deadlines.append(deadline)
+            yield from pickletools.genops(pickle.dumps({"safe": True}))
+
+        monkeypatch.setattr(pickle_scanner_module, "_genops_with_fallback", _capture_deadline)
+
+        _classify_nested_pickle_payload(
+            b"\x80\x04.",
+            SimpleNamespace(offset=0),
+            {},
+            deadline=123.0,
+        )
+
+        assert observed_deadlines == [123.0]
+
+    def test_nested_pickle_budget_error_preserves_collected_dangerous_opcodes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Budget exhaustion should not discard dangerous nested opcodes already yielded."""
+        from modelaudit.scanners import pickle_scanner as pickle_scanner_module
+
+        dangerous_opcodes = list(pickletools.genops(_make_os_system_pickle()))
+
+        def _dangerous_then_budget(
+            file_obj: BinaryIO,
+            *,
+            multi_stream: bool = False,
+            max_items: int | None = None,
+            deadline: float | None = None,
+        ) -> Iterator[tuple[Any, Any, int | None]]:
+            del file_obj, multi_stream, max_items, deadline
+            for opcode_info in dangerous_opcodes:
+                if opcode_info[0].name == "STOP":
+                    break
+                yield opcode_info
+            raise _GenopsBudgetExceeded("max_items")
+
+        monkeypatch.setattr(pickle_scanner_module, "_genops_with_fallback", _dangerous_then_budget)
+
+        severity, evidence, details = _classify_nested_pickle_payload(
+            b"\x80\x04.",
+            SimpleNamespace(offset=0),
+            {},
+        )
+
+        assert severity == IssueSeverity.CRITICAL
+        assert evidence == "dangerous_execution"
+        assert details["evidence"] == "dangerous_execution"
+        assert details["analysis_incomplete"] is True
+
+    def test_nested_pickle_budget_error_without_dangerous_prefix_fails_closed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Budget exhaustion before a dangerous opcode should still fail closed."""
+        from modelaudit.scanners import pickle_scanner as pickle_scanner_module
+
+        def _benign_prefix_then_budget(
+            file_obj: BinaryIO,
+            *,
+            multi_stream: bool = False,
+            max_items: int | None = None,
+            deadline: float | None = None,
+        ) -> Iterator[tuple[Any, Any, int | None]]:
+            del file_obj, multi_stream, max_items, deadline
+            yield from pickletools.genops(pickle.dumps({"padding": "benign"}))
+            raise _GenopsBudgetExceeded("max_items")
+
+        monkeypatch.setattr(pickle_scanner_module, "_genops_with_fallback", _benign_prefix_then_budget)
+
+        severity, evidence, details = _classify_nested_pickle_payload(
+            b"\x80\x04.",
+            SimpleNamespace(offset=0),
+            {},
+        )
+
+        assert severity == IssueSeverity.CRITICAL
+        assert evidence == "analysis_incomplete"
+        assert details["analysis_incomplete"] is True
+        assert details["opcode_budget_exceeded"] is True
+        assert details["analysis_error"] == "max_items"
+
+    def test_nested_pickle_budget_error_with_warning_prefix_fails_closed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Budget exhaustion after warning evidence should not leave the scan non-critical."""
+        from modelaudit.scanners import pickle_scanner as pickle_scanner_module
+
+        warning_opcodes = list(pickletools.genops(b"cthirdparty\nLoader\n."))
+
+        def _warning_prefix_then_budget(
+            file_obj: BinaryIO,
+            *,
+            multi_stream: bool = False,
+            max_items: int | None = None,
+            deadline: float | None = None,
+        ) -> Iterator[tuple[Any, Any, int | None]]:
+            del file_obj, multi_stream, max_items, deadline
+            yield from warning_opcodes
+            raise _GenopsBudgetExceeded("max_items")
+
+        monkeypatch.setattr(pickle_scanner_module, "_genops_with_fallback", _warning_prefix_then_budget)
+
+        severity, evidence, details = _classify_nested_pickle_payload(
+            b"\x80\x04.",
+            SimpleNamespace(offset=0),
+            {},
+        )
+
+        assert severity == IssueSeverity.CRITICAL
+        assert evidence == "analysis_incomplete"
+        assert details["analysis_incomplete"] is True
+        assert details["opcode_budget_exceeded"] is True
+        assert details["partial_evidence"] == "unknown_import"
+        assert details["partial_evidence_details"]["import_reference"] == "thirdparty.Loader"
+
+    def test_nested_pickle_classification_scans_follow_on_streams(self) -> None:
+        """A benign first nested stream should not hide a malicious follow-on stream."""
+        payload = pickle.dumps({"safe": True}, protocol=4) + _make_os_system_pickle()
+
+        severity, evidence, details = _classify_nested_pickle_payload(
+            payload,
+            SimpleNamespace(offset=0),
+            {},
+        )
+
+        assert severity == IssueSeverity.CRITICAL
+        assert evidence == "dangerous_execution"
+        assert details["evidence"] == "dangerous_execution"
+
+    def test_nested_pickle_detection_scans_beyond_validation_sample(self, tmp_path: Path) -> None:
+        """Dangerous nested evidence beyond the header-validation window should stay critical."""
+        scanner = PickleScanner()
+        pickle_path = tmp_path / "delayed-malicious-nested.pkl"
+        pickle_path.write_bytes(pickle.dumps({"raw": _make_delayed_os_system_pickle()}))
+
+        result = scanner.scan(str(pickle_path))
+
+        nested_issues = [i for i in result.issues if "nested pickle payload" in i.message.lower()]
+        assert nested_issues
+        assert any(
+            i.severity == IssueSeverity.CRITICAL and i.details.get("evidence") == "dangerous_execution"
+            for i in nested_issues
+        )
+
+    def test_safe_nested_reduce_detection_is_info_only(self, tmp_path: Path) -> None:
+        """Benign nested reconstruction opcodes should not warn without dangerous evidence."""
+        scanner = PickleScanner()
+        pickle_path = tmp_path / "safe-nested-reduce.pkl"
+        pickle_path.write_bytes(pickle.dumps({"raw": pickle.dumps(slice(1, 5, 2), protocol=4)}))
+
+        result = scanner.scan(str(pickle_path))
+
+        assert result.success
+        nested_issues = [i for i in result.issues if "nested pickle payload" in i.message.lower()]
+        assert nested_issues
+        assert all(i.severity == IssueSeverity.INFO for i in nested_issues)
 
 
 class TestPickleScannerBlocklistHardening(unittest.TestCase):
@@ -4814,18 +5108,20 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
             f"Expected CRITICAL __import__ detection, got: {critical_messages}"
         )
 
-    def test_malformed_unicode_tail_with_benign_prefix_fails_closed(self) -> None:
-        """Malformed tails without a trusted pickle boundary should fail closed."""
+    def test_malformed_unicode_tail_with_benign_prefix_is_inconclusive(self) -> None:
+        """Malformed tails without dangerous evidence should be operationally inconclusive."""
         payload = b"\x80\x02cbuiltins\nlen\nq\x00c\xff\n"
 
         result = self._scan_bytes(payload)
 
         assert not result.success
-        assert any(
-            issue.severity == IssueSeverity.CRITICAL
-            and issue.message == "Pickle parsing failed before full scan completion"
-            for issue in result.issues
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        parse_issue = next(
+            issue for issue in result.issues if issue.message == "Pickle parsing failed before full scan completion"
         )
+        assert parse_issue.severity == IssueSeverity.INFO
+        assert parse_issue.details["category"] == "parse_error"
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
     # ------------------------------------------------------------------
     # Fix 3: joblib.load loader trampoline bypass

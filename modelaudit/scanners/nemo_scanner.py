@@ -9,8 +9,10 @@ import logging
 import os
 import re
 import tarfile
+import tempfile
 from typing import Any, ClassVar
 
+from ..utils import is_absolute_archive_path, sanitize_archive_path
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 
 try:
@@ -104,6 +106,8 @@ CVE_2025_23304_DESCRIPTION = (
 CVE_2025_23304_REMEDIATION = (
     "Update to NeMo >= 2.3.2 which validates _target_ values. Do not load untrusted .nemo files."
 )
+NEMO_CHECKPOINT_MEMBER_EXTENSIONS = frozenset({".ckpt", ".pt", ".pth", ".pkl", ".pickle"})
+NEMO_MAX_CHECKPOINT_SCAN_BYTES = 50 * 1024 * 1024
 
 _INCONCLUSIVE_METADATA_KEY = "scan_outcome"
 _INCONCLUSIVE_REASONS_METADATA_KEY = "scan_outcome_reasons"
@@ -232,10 +236,73 @@ class NemoScanner(BaseScanner):
             for member in tar:
                 self.check_interrupted()
 
-                if not member.isfile():
+                temp_base = os.path.join(tempfile.gettempdir(), "extract_nemo")
+                resolved_member, member_path_safe = sanitize_archive_path(member.name, temp_base)
+                if not member_path_safe:
+                    self._add_archive_path_traversal_check(
+                        result,
+                        archive_path=path,
+                        entry=member.name,
+                        target=None,
+                    )
                     continue
 
                 name_lower = member.name.lower()
+                if member.issym() or member.islnk():
+                    target_base = os.path.dirname(resolved_member)
+                    _target_resolved, target_safe = sanitize_archive_path(member.linkname, target_base)
+                    if not target_safe:
+                        self._add_archive_path_traversal_check(
+                            result,
+                            archive_path=path,
+                            entry=member.name,
+                            target=member.linkname,
+                        )
+                    elif name_lower.endswith(tuple(NEMO_CHECKPOINT_MEMBER_EXTENSIONS)):
+                        link_target_name = self._resolve_archive_link_member_name(member)
+                        if link_target_name is None:
+                            self._mark_inconclusive_scan_result(
+                                result,
+                                reason="nemo_checkpoint_link_target_unresolved",
+                                check_name="NeMo Checkpoint Nested Scan",
+                                message=f"Could not resolve checkpoint link target: {member.name}",
+                                location=f"{path}:{member.name}",
+                                details={"entry": member.name, "target": member.linkname},
+                            )
+                        else:
+                            try:
+                                target_member = tar.getmember(link_target_name)
+                            except KeyError:
+                                self._mark_inconclusive_scan_result(
+                                    result,
+                                    reason="nemo_checkpoint_link_target_missing",
+                                    check_name="NeMo Checkpoint Nested Scan",
+                                    message=f"Checkpoint link target not found: {member.name} -> {member.linkname}",
+                                    location=f"{path}:{member.name}",
+                                    details={"entry": member.name, "target": member.linkname},
+                                )
+                            else:
+                                if target_member.isfile():
+                                    self._scan_checkpoint_member(
+                                        tar,
+                                        target_member,
+                                        path,
+                                        result,
+                                        entry_name=member.name,
+                                    )
+                                else:
+                                    self._mark_inconclusive_scan_result(
+                                        result,
+                                        reason="nemo_checkpoint_link_target_not_file",
+                                        check_name="NeMo Checkpoint Nested Scan",
+                                        message=f"Checkpoint link target is not a regular file: {member.name}",
+                                        location=f"{path}:{member.name}",
+                                        details={"entry": member.name, "target": member.linkname},
+                                    )
+                    continue
+
+                if not member.isfile():
+                    continue
 
                 # Check for suspicious files in the archive
                 if name_lower.endswith((".py", ".sh", ".bat", ".cmd", ".ps1")):
@@ -307,6 +374,9 @@ class NemoScanner(BaseScanner):
                                 details={"config_file": member.name},
                             )
 
+                if name_lower.endswith(tuple(NEMO_CHECKPOINT_MEMBER_EXTENSIONS)):
+                    self._scan_checkpoint_member(tar, member, path, result)
+
         if yaml_configs_found == 0:
             message = (
                 "No YAML configuration found in NeMo archive"
@@ -327,6 +397,261 @@ class NemoScanner(BaseScanner):
                 message=f"Found {yaml_configs_found} YAML config(s)",
                 location=path,
             )
+
+    @staticmethod
+    def _resolve_archive_link_member_name(member: tarfile.TarInfo) -> str | None:
+        """Resolve a tar link target to a normalized archive member name."""
+        linkname = member.linkname.replace("\\", "/")
+        if is_absolute_archive_path(linkname):
+            return None
+
+        member_dir = os.path.dirname(member.name.replace("\\", "/"))
+        candidate = os.path.normpath(os.path.join(member_dir, linkname)).replace("\\", "/")
+        if candidate in {"", "."} or candidate == ".." or candidate.startswith("../"):
+            return None
+        return candidate.lstrip("./")
+
+    def _add_archive_path_traversal_check(
+        self,
+        result: ScanResult,
+        *,
+        archive_path: str,
+        entry: str,
+        target: str | None,
+    ) -> None:
+        """Report NeMo archive member paths that can escape extraction roots."""
+        path_value = target or entry
+        if is_absolute_archive_path(path_value):
+            cve_id = "CVE-2025-23250"
+            cvss = 7.6
+            cwe = "CWE-22"
+            description = (
+                "NVIDIA NeMo Framework archive loading can improperly limit absolute or out-of-root paths, "
+                "allowing arbitrary file writes from crafted model archives."
+            )
+            remediation = "Update NVIDIA NeMo Framework to release 25.02 or later and reject unsafe archive paths."
+        else:
+            cve_id = "CVE-2025-23360"
+            cvss = 7.1
+            cwe = "CWE-23"
+            description = (
+                "NVIDIA NeMo Framework archive loading can process relative path traversal entries, allowing "
+                "crafted model archives to write files outside the intended extraction directory."
+            )
+            remediation = "Update NVIDIA NeMo Framework to release 24.12 or later and reject relative traversal paths."
+
+        result.add_check(
+            name=f"{cve_id}: NeMo Archive Path Traversal",
+            passed=False,
+            message=(
+                f"{cve_id}: NeMo archive member '{entry}'"
+                + (f" links to unsafe target '{target}'" if target is not None else " escapes extraction root")
+            ),
+            severity=IssueSeverity.CRITICAL,
+            location=f"{archive_path}:{entry}",
+            details={
+                "entry": entry,
+                "target": target,
+                "cve_id": cve_id,
+                "cvss": cvss,
+                "cwe": cwe,
+                "description": description,
+                "remediation": remediation,
+            },
+            why=(
+                "The .nemo file is a tar archive. This member path would escape the intended extraction "
+                "directory in vulnerable NeMo loaders, creating an arbitrary file-write risk."
+            ),
+        )
+
+    def _scan_checkpoint_member(
+        self,
+        tar: tarfile.TarFile,
+        member: tarfile.TarInfo,
+        archive_path: str,
+        result: ScanResult,
+        *,
+        entry_name: str | None = None,
+    ) -> None:
+        """Run existing nested scanners over small NeMo checkpoint members."""
+        report_entry = entry_name or member.name
+        max_scan_bytes = self._normalize_positive_int_config(
+            self.config.get("max_nemo_checkpoint_scan_bytes"),
+            NEMO_MAX_CHECKPOINT_SCAN_BYTES,
+        )
+        if member.size > max_scan_bytes:
+            self._mark_inconclusive_scan_result(
+                result,
+                reason="nemo_checkpoint_scan_skipped_size_limit",
+                check_name="NeMo Checkpoint Nested Scan",
+                message=f"Checkpoint member exceeds nested scan limit: {report_entry}",
+                location=f"{archive_path}:{report_entry}",
+                details={
+                    "entry": report_entry,
+                    "source_entry": member.name,
+                    "size_bytes": member.size,
+                    "max_scan_bytes": max_scan_bytes,
+                },
+            )
+            return
+
+        extracted_path = self._extract_member_to_tempfile(tar, member, suffix_source=report_entry)
+        if extracted_path is None:
+            self._mark_inconclusive_scan_result(
+                result,
+                reason="nemo_checkpoint_extract_failed",
+                check_name="NeMo Checkpoint Nested Scan",
+                message=f"Could not extract checkpoint member for nested scan: {report_entry}",
+                location=f"{archive_path}:{report_entry}",
+                details={"entry": report_entry, "source_entry": member.name},
+            )
+            return
+
+        try:
+            from modelaudit.scanners import get_scanner_for_file
+
+            scanner = get_scanner_for_file(extracted_path, config=dict(self.config))
+            if scanner is None:
+                self._mark_inconclusive_scan_result(
+                    result,
+                    reason="nemo_checkpoint_no_nested_scanner",
+                    check_name="NeMo Checkpoint Nested Scan",
+                    message=f"No nested scanner available for checkpoint member: {report_entry}",
+                    location=f"{archive_path}:{report_entry}",
+                    details={"entry": report_entry, "source_entry": member.name},
+                )
+                return
+
+            try:
+                nested_result = scanner.scan(extracted_path)
+            except Exception as exc:
+                self._mark_inconclusive_scan_result(
+                    result,
+                    reason="nemo_checkpoint_nested_scan_failed",
+                    check_name="NeMo Checkpoint Nested Scan",
+                    message=f"Nested scan failed for checkpoint member {report_entry}: {exc!s}",
+                    location=f"{archive_path}:{report_entry}",
+                    details={
+                        "entry": report_entry,
+                        "source_entry": member.name,
+                        "nested_scanner": scanner.name,
+                        "exception_type": type(exc).__name__,
+                    },
+                )
+                return
+
+            critical_issues = [
+                issue
+                for issue in nested_result.issues
+                if issue.severity == IssueSeverity.CRITICAL and self._is_nested_checkpoint_deserialization_issue(issue)
+            ]
+            if critical_issues:
+                self._add_checkpoint_deserialization_check(
+                    result,
+                    archive_path=archive_path,
+                    entry=report_entry,
+                    nested_scanner=nested_result.scanner_name,
+                    critical_issues=critical_issues,
+                )
+        finally:
+            try:
+                os.unlink(extracted_path)
+            except OSError:
+                logger.debug("Failed to remove temporary NeMo checkpoint scan file: %s", extracted_path)
+
+    @staticmethod
+    def _is_nested_checkpoint_deserialization_issue(issue: Any) -> bool:
+        details = issue.details if isinstance(issue.details, dict) else {}
+        text = " ".join(
+            str(part).lower()
+            for part in (
+                issue.message,
+                issue.type,
+                issue.rule_code,
+                details.get("cve_id", ""),
+                details.get("opcode", ""),
+                details.get("symbol", ""),
+                details.get("function", ""),
+            )
+        )
+        return any(
+            indicator in text
+            for indicator in (
+                "pickle",
+                "unpickle",
+                "deserial",
+                "opcode",
+                "global",
+                "reduce",
+                "torch.load",
+                "arbitrary code",
+                "cve-2020-13092",
+                "cve-2025-1716",
+                "cve-2025-32434",
+            )
+        )
+
+    @staticmethod
+    def _extract_member_to_tempfile(
+        tar: tarfile.TarFile,
+        member: tarfile.TarInfo,
+        *,
+        suffix_source: str | None = None,
+    ) -> str | None:
+        member_file = tar.extractfile(member)
+        if member_file is None:
+            return None
+
+        _root, suffix = os.path.splitext(suffix_source or member.name)
+        with member_file, tempfile.NamedTemporaryFile(suffix=suffix or ".bin", delete=False) as temp_file:
+            while True:
+                chunk = member_file.read(64 * 1024)
+                if not chunk:
+                    break
+                temp_file.write(chunk)
+            return temp_file.name
+
+    def _add_checkpoint_deserialization_check(
+        self,
+        result: ScanResult,
+        *,
+        archive_path: str,
+        entry: str,
+        nested_scanner: str,
+        critical_issues: list[Any],
+    ) -> None:
+        result.add_check(
+            name="CVE-2025-23249: NeMo Checkpoint Unsafe Deserialization",
+            passed=False,
+            message=(
+                "CVE-2025-23249: NeMo checkpoint member contains unsafe deserialization payloads "
+                f"detected by {nested_scanner}"
+            ),
+            severity=IssueSeverity.CRITICAL,
+            location=f"{archive_path}:{entry}",
+            details={
+                "entry": entry,
+                "nested_scanner": nested_scanner,
+                "critical_issue_count": len(critical_issues),
+                "sample_issue_messages": [issue.message for issue in critical_issues[:3]],
+                "cve_id": "CVE-2025-23249",
+                "cvss": 7.6,
+                "cwe": "CWE-502",
+                "description": (
+                    "NVIDIA NeMo Framework contains unsafe deserialization paths for untrusted model data. "
+                    "A crafted checkpoint inside a .nemo archive can trigger code execution when loaded."
+                ),
+                "related_cves": ["CVE-2025-33253", "CVE-2026-24157"],
+                "remediation": (
+                    "Update NVIDIA NeMo Framework to release 25.02 or later, keep current with subsequent "
+                    "checkpoint-loading fixes, and reject untrusted checkpoint payloads."
+                ),
+            },
+            why=(
+                "A nested scanner found critical unsafe-deserialization behavior inside a checkpoint bundled "
+                "in the .nemo archive. Vulnerable NeMo loaders may deserialize these checkpoints during model load."
+            ),
+        )
 
     def _check_hydra_targets(
         self,

@@ -809,6 +809,31 @@ def test_scan_detects_path_traversal_member_names(tmp_path: Path) -> None:
     traversal_failures = _failed_checks(result, "TorchServe MAR Path Traversal Protection")
     assert len(traversal_failures) >= 1
     assert traversal_failures[0].severity == IssueSeverity.CRITICAL
+    details = traversal_failures[0].details
+    assert details["cve_id"] == "CVE-2023-48299"
+    assert details["cvss"] == 7.5
+    assert details["cwe"] == "CWE-22"
+    assert "TorchServe MAR archives with traversal entries" in details["description"]
+    assert "remediation" in details
+
+
+def test_scan_allows_normalized_safe_member_names(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"def handle(data, context):\n    return data\n",
+            "subdir/../weights.bin": b"weights",
+        },
+        filename="normalized_safe.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+
+    traversal_failures = _failed_checks(result, "TorchServe MAR Path Traversal Protection")
+    assert traversal_failures == []
+    assert not [check for check in result.checks if check.details.get("cve_id") == "CVE-2023-48299"]
 
 
 def test_scan_detects_conflicting_duplicate_manifest_handler_entries(tmp_path: Path) -> None:
@@ -1181,6 +1206,35 @@ def test_scan_handles_corrupt_mar_gracefully(tmp_path: Path) -> None:
     archive_failures = _failed_checks(result, "TorchServe MAR Archive Validation")
     assert len(archive_failures) == 1
     assert result.success is False
+
+
+def test_scan_redacts_url_like_manifest_references(tmp_path: Path) -> None:
+    manifest = {
+        "model": {
+            "handler": "https://user:pass@example.com/handler.py?X-Amz-Signature=secret-signature#frag",
+            "serializedFile": "s3://access:secret@bucket.s3.amazonaws.com/model.pt?token=secret-token",
+        },
+    }
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={},
+        filename="url_references.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+
+    url_failures = _failed_checks(result, "TorchServe Manifest URL Reference Check")
+    assert len(url_failures) == 1
+    references = url_failures[0].details["references"]
+    serialized_references = json.dumps(references)
+    assert "https://example.com/handler.py" in serialized_references
+    assert "s3://bucket.s3.amazonaws.com/model.pt" in serialized_references
+    assert "user:pass" not in serialized_references
+    assert "access:secret" not in serialized_references
+    assert "secret-signature" not in serialized_references
+    assert "secret-token" not in serialized_references
+    assert "X-Amz-Signature" not in serialized_references
 
 
 def test_scan_detects_nested_zip_payloads(tmp_path: Path) -> None:

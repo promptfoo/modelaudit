@@ -27,6 +27,10 @@ BASE64_BLOB_RE = re.compile(r"^[A-Za-z0-9+/=\s]+$")
 SUSPICIOUS_DECODED_PAYLOAD_RE = re.compile(
     r"(?i)(?:os\.system|subprocess\.(?:popen|run|call|check_output)|eval\(|exec\(|__import__|ctypes\.(?:cdll|windll)|dlopen\(|loadlibrary)"
 )
+MXNET_CVE_2022_24294_ID = "CVE-2022-24294"
+MXNET_CVE_2022_24294_MIN_LENGTH = 1024
+MXNET_CVE_2022_24294_MIN_META_CHARS = 128
+MXNET_CVE_2022_24294_META_CHARS = frozenset("<>()[]{}*+?|\\")
 
 # Keep this list conservative to avoid flagging normal graph attributes.
 LOAD_AFFECTING_ATTR_KEYS = frozenset(
@@ -310,6 +314,7 @@ class MXNetScanner(BaseScanner):
             )
 
         self._scan_graph_references(path, payload, result)
+        self._scan_operator_names_for_cve_2022_24294(path, payload, result)
         self._scan_graph_metadata_payloads(path, payload, result)
         return True
 
@@ -446,6 +451,84 @@ class MXNetScanner(BaseScanner):
                         "reference_type": reference_type,
                     },
                 )
+
+    def _scan_operator_names_for_cve_2022_24294(
+        self,
+        path: str,
+        payload: dict[str, Any],
+        result: ScanResult,
+    ) -> None:
+        """Detect pathological MXNet operator names associated with CVE-2022-24294."""
+        nodes = payload.get("nodes")
+        if not isinstance(nodes, list):
+            return
+
+        findings: list[dict[str, Any]] = []
+        for index, raw_node in enumerate(nodes):
+            if not isinstance(raw_node, dict):
+                continue
+
+            op_name = str(raw_node.get("op", "")).strip()
+            if not self._is_cve_2022_24294_operator_name(op_name):
+                continue
+
+            findings.append(
+                {
+                    "node_name": str(raw_node.get("name", f"node_{index}")),
+                    "op_name_preview": op_name[:160],
+                    "op_name_length": len(op_name),
+                    "metacharacter_count": sum(1 for char in op_name if char in MXNET_CVE_2022_24294_META_CHARS),
+                }
+            )
+
+        if not findings:
+            return
+
+        result.add_check(
+            name="CVE-2022-24294: MXNet Operator Name ReDoS",
+            passed=False,
+            message=(
+                "Detected MXNet operator name shape associated with CVE-2022-24294 "
+                f"({len(findings)} node{'s' if len(findings) != 1 else ''} affected)"
+            ),
+            severity=IssueSeverity.WARNING,
+            location=path,
+            details={
+                "cve_id": MXNET_CVE_2022_24294_ID,
+                "cvss": 7.5,
+                "cwe": "CWE-400",
+                "description": (
+                    "Apache MXNet versions before 1.9.1 used a vulnerable regular expression when loading "
+                    "models with specially crafted operator names, causing excessive resource consumption."
+                ),
+                "remediation": (
+                    "Upgrade MXNet to >= 1.9.1 and reject model graphs containing pathological operator names."
+                ),
+                "findings": findings[:10],
+                "finding_count": len(findings),
+            },
+            why=(
+                "The operator name is not merely long; it combines extreme length with a dense, regex-active "
+                "delimiter pattern that matches the CVE-2022-24294 denial-of-service risk class."
+            ),
+        )
+
+    @staticmethod
+    def _is_cve_2022_24294_operator_name(op_name: str) -> bool:
+        """Return True for pathological operator names, avoiding long benign names."""
+        if len(op_name) < MXNET_CVE_2022_24294_MIN_LENGTH:
+            return False
+
+        metacharacter_count = sum(1 for char in op_name if char in MXNET_CVE_2022_24294_META_CHARS)
+        if metacharacter_count < MXNET_CVE_2022_24294_MIN_META_CHARS:
+            return False
+
+        # Require repeated regex-active bracket/quantifier runs so long namespace-like
+        # custom operator names do not become noisy findings.
+        repeated_angle_runs = len(re.findall(r"(?:<[^<>]{0,64}){16,}", op_name))
+        repeated_group_runs = len(re.findall(r"(?:\([^()]{0,64}){16,}", op_name))
+        repeated_quantifier_runs = len(re.findall(r"[+*?]{16,}", op_name))
+        return (repeated_angle_runs + repeated_group_runs + repeated_quantifier_runs) > 0
 
     def _scan_graph_metadata_payloads(self, path: str, payload: dict[str, Any], result: ScanResult) -> None:
         seen_payloads: set[str] = set()

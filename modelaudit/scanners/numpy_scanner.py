@@ -179,16 +179,29 @@ class NumPyScanner(BaseScanner):
 
         if not NUMPY_FORMAT_AVAILABLE:
             result = self._create_result()
+            result.metadata["numpy_version"] = NUMPY_VERSION
+            result.metadata["numpy_major_version"] = NUMPY_MAJOR_VERSION
+            result.metadata["operational_error"] = True
+            result.metadata["operational_error_reason"] = "numpy_format_module_unavailable"
+            _mark_inconclusive_scan_result(result, "numpy_format_module_unavailable")
             result.add_check(
                 name="NumPy Format Module Check",
                 passed=False,
                 message=f"NumPy format module not available (NumPy {NUMPY_VERSION}). May be a compatibility issue.",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
                 rule_code=None,  # Library availability, no rule
-                details={"numpy_version": NUMPY_VERSION, "numpy_major": NUMPY_MAJOR_VERSION},
+                details={
+                    "numpy_version": NUMPY_VERSION,
+                    "numpy_major": NUMPY_MAJOR_VERSION,
+                    "analysis_incomplete": True,
+                    "scan_outcome": result.metadata["scan_outcome"],
+                    "scan_outcome_reason": "numpy_format_module_unavailable",
+                    "operational_error": True,
+                    "operational_error_reason": "numpy_format_module_unavailable",
+                },
             )
-            result.finish(success=False)
+            _finish_with_inconclusive_contract(result, default_success=False)
             return result
 
         path_check_result = self._check_path(path)

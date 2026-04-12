@@ -105,6 +105,14 @@ def scan_options_from_config(config: Mapping[str, Any]) -> ScanOptions:
             _DEFAULT_SCAN_OPTIONS.post_budget_scan_bytes,
             minimum=0,
         ),
+        max_unbounded_stream_read_bytes=_parse_min_int(
+            config.get(
+                "max_unbounded_stream_read_bytes",
+                _DEFAULT_SCAN_OPTIONS.max_unbounded_stream_read_bytes,
+            ),
+            _DEFAULT_SCAN_OPTIONS.max_unbounded_stream_read_bytes,
+            minimum=1,
+        ),
         max_string_literal_scan_chars=_parse_min_int(
             config.get(
                 "max_string_literal_scan_chars",
@@ -160,6 +168,10 @@ def pickle_report_to_scan_result(
             if notice.code in _INCONCLUSIVE_NOTICE_CODES
         ] or ["pickle_analysis_incomplete"]
         result.metadata["analysis_incomplete"] = True
+    elif report.status == ScanStatus.ERROR and any(error.category == "parse_error" for error in report.errors):
+        result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+        result.metadata["scan_outcome_reasons"] = ["pickle_analysis_incomplete"]
+        result.metadata["analysis_incomplete"] = True
 
     for finding in report.findings:
         details = _add_legacy_detail_aliases(
@@ -202,11 +214,12 @@ def pickle_report_to_scan_result(
                 name="Standalone Pickle Parse Failure",
                 passed=False,
                 message="Pickle parsing failed before full scan completion",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=notice.location,
                 details={
                     "pickle_source": report.source,
                     "file_type": "pickle",
+                    "category": "parse_error",
                     "parse_error": notice.details.get("exception"),
                     "exception_type": notice.details.get("exception_type"),
                     "parsing_failed": True,
@@ -256,12 +269,13 @@ def pickle_report_to_scan_result(
             name="Standalone Pickle Error",
             passed=False,
             message=error.message,
-            severity=IssueSeverity.CRITICAL,
+            severity=IssueSeverity.INFO if error.category == "parse_error" else IssueSeverity.CRITICAL,
             location=error.location,
             details={
                 "pickle_source": report.source,
                 "category": error.category,
                 "exception_type": error.exception_type,
+                "analysis_incomplete": error.category == "parse_error",
                 **error.to_dict()["details"],
             },
         )

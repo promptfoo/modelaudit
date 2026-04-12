@@ -1,3 +1,4 @@
+import gzip
 import os
 import tarfile
 import tempfile
@@ -255,6 +256,36 @@ class TestTarScanner:
             "os.system" in issue.message.lower() or "posix.system" in issue.message.lower() for issue in critical_issues
         )
         assert any(issue.location == f"{archive_path}:payload.txt" for issue in critical_issues)
+
+    def test_scan_extensionless_nested_gzip_recurses_by_header(self, tmp_path: Path) -> None:
+        """Extensionless gzip members should route through CompressedScanner by header."""
+        archive_path = tmp_path / "outer.tar"
+        payload = b'cos\nsystem\n(S"echo tar gzip payload"\ntR.'
+        compressed_payload = gzip.compress(payload)
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("compressed_payload")
+            info.size = len(compressed_payload)
+            archive.addfile(info, tarfile.io.BytesIO(compressed_payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert result.success is False
+        assert result.has_errors is True
+        routing_checks = [check for check in result.checks if check.name == "Compressed Wrapper Inner Scanner Routing"]
+        assert any(
+            check.details.get("inner_scanner") == "pickle" and check.details.get("tar_entry") == "compressed_payload"
+            for check in routing_checks
+        ), f"Expected compressed nested routing check, got: {[(c.location, c.details) for c in routing_checks]}"
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL
+            and issue.details.get("tar_entry") == "compressed_payload"
+            and ("os.system" in issue.message.lower() or "posix.system" in issue.message.lower())
+            for issue in result.issues
+        ), (
+            "Expected critical nested compressed pickle finding, got: "
+            f"{[(i.location, i.message, i.details) for i in result.issues]}"
+        )
 
     def test_invalid_tar_file(self):
         """Test handling of invalid TAR files"""

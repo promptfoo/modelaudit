@@ -3,7 +3,7 @@
 import logging
 from pathlib import Path
 from typing import ClassVar
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urlparse, urlunparse
 
 from .base import BaseScanner, Issue, IssueSeverity, ScanResult
 
@@ -21,6 +21,28 @@ SUSPICIOUS_URL_DOMAINS = (
     "ngrok.io",
     "localtunnel.me",
 )
+
+
+def _redact_url_for_display(url: str) -> str:
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return "[invalid-url]"
+
+    if not parsed.scheme or not parsed.netloc:
+        return "[invalid-url]"
+
+    hostname = parsed.hostname or ""
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+
+    netloc = f"{hostname}:{port}" if port else hostname
+    return urlunparse((parsed.scheme, netloc, parsed.path, "", "", ""))
 
 
 class MetadataScanner(BaseScanner):
@@ -179,14 +201,15 @@ class MetadataScanner(BaseScanner):
                 continue
 
             seen.add(url)
+            safe_url = _redact_url_for_display(url)
             self._add_issue_check(
                 result,
                 Issue(
-                    message=f"Suspicious URL found in text metadata: {url}",
+                    message=f"Suspicious URL found in text metadata: {safe_url}",
                     severity=IssueSeverity.INFO,
                     location=file_path,
                     details={
-                        "url": url,
+                        "url": safe_url,
                         "suspicious_domain": matched_domain,
                         "url_component": matched_component,
                     },

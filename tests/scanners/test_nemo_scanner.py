@@ -1,7 +1,9 @@
 """Tests for CVE-2025-23304: NVIDIA NeMo Hydra _target_ injection."""
 
 import io
+import pickle
 import tarfile
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +51,22 @@ def _create_nemo_file(
 
     config_bytes = yaml.safe_dump(config_dict).encode() if HAS_YAML else b"{}"
     return _create_nemo_file_from_bytes(tmp_path, config_bytes, filename=filename, config_name=config_name)
+
+
+def _add_tar_bytes(tar: tarfile.TarFile, name: str, payload: bytes) -> None:
+    info = tarfile.TarInfo(name=name)
+    info.size = len(payload)
+    tar.addfile(info, io.BytesIO(payload))
+
+
+def _build_malicious_pickle() -> bytes:
+    import os as os_module
+
+    class DangerousPayload:
+        def __reduce__(self) -> tuple[Any, tuple[str]]:
+            return (os_module.system, ("echo nemo-checkpoint-test",))
+
+    return pickle.dumps(DangerousPayload())
 
 
 class TestNemoScannerBasic:
@@ -103,6 +121,215 @@ class TestNemoScannerBasic:
         assert len(checks) == 1
         assert checks[0].status != CheckStatus.PASSED
         assert checks[0].severity == IssueSeverity.WARNING
+
+
+@pytest.mark.skipif(not HAS_YAML, reason="PyYAML not installed")
+class TestNemoArchiveVulnerabilityCoverage:
+    """Tests for NeMo archive traversal and checkpoint deserialization coverage."""
+
+    def test_relative_member_path_traversal_detects_cve_2025_23360(self, tmp_path: Path) -> None:
+        nemo_path = tmp_path / "traversal.nemo"
+        with tarfile.open(nemo_path, "w") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+            _add_tar_bytes(tar, "../../evil.txt", b"overwrite")
+
+        result = NemoScanner().scan(str(nemo_path))
+
+        cve_checks = [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23360"]
+        assert len(cve_checks) == 1
+        assert cve_checks[0].severity == IssueSeverity.CRITICAL
+        details = cve_checks[0].details
+        assert details["cvss"] == 7.1
+        assert details["cwe"] == "CWE-23"
+        assert "remediation" in details
+
+    def test_absolute_member_path_traversal_detects_cve_2025_23250(self, tmp_path: Path) -> None:
+        nemo_path = tmp_path / "absolute.nemo"
+        with tarfile.open(nemo_path, "w") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+            _add_tar_bytes(tar, "/tmp/evil.txt", b"overwrite")
+
+        result = NemoScanner().scan(str(nemo_path))
+
+        cve_checks = [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23250"]
+        assert len(cve_checks) == 1
+        assert cve_checks[0].severity == IssueSeverity.CRITICAL
+        assert cve_checks[0].details["cvss"] == 7.6
+        assert cve_checks[0].details["cwe"] == "CWE-22"
+
+    def test_symlink_escape_detects_relative_path_traversal_cve(self, tmp_path: Path) -> None:
+        nemo_path = tmp_path / "symlink.nemo"
+        with tarfile.open(nemo_path, "w") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+            link_info = tarfile.TarInfo(name="weights_link")
+            link_info.type = tarfile.SYMTYPE
+            link_info.linkname = "../../outside_weights.ckpt"
+            tar.addfile(link_info)
+
+        result = NemoScanner().scan(str(nemo_path))
+
+        cve_checks = [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23360"]
+        assert len(cve_checks) == 1
+        assert cve_checks[0].details["entry"] == "weights_link"
+        assert cve_checks[0].details["target"] == "../../outside_weights.ckpt"
+
+    def test_normalized_safe_member_path_not_flagged_as_traversal(self, tmp_path: Path) -> None:
+        nemo_path = tmp_path / "normalized-safe.nemo"
+        with tarfile.open(nemo_path, "w") as tar:
+            _add_tar_bytes(tar, "configs/../model_config.yaml", b"model: safe\n")
+            _add_tar_bytes(tar, "weights/../model_weights.ckpt", b"not a pickle")
+
+        result = NemoScanner().scan(str(nemo_path))
+
+        assert not [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23360"]
+        assert not [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23250"]
+
+    def test_malicious_checkpoint_detects_ne_mo_deserialization_cve(self, tmp_path: Path) -> None:
+        nemo_path = tmp_path / "checkpoint-rce.nemo"
+        with tarfile.open(nemo_path, "w") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+            _add_tar_bytes(tar, "model_weights.ckpt", _build_malicious_pickle())
+
+        result = NemoScanner().scan(str(nemo_path))
+
+        cve_checks = [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23249"]
+        assert len(cve_checks) == 1
+        assert cve_checks[0].severity == IssueSeverity.CRITICAL
+        details = cve_checks[0].details
+        assert details["cvss"] == 7.6
+        assert details["cwe"] == "CWE-502"
+        assert "CVE-2026-24157" in details["related_cves"]
+        assert details["nested_scanner"] == "pickle"
+
+    def test_symlink_checkpoint_alias_detects_ne_mo_deserialization_cve(self, tmp_path: Path) -> None:
+        nemo_path = tmp_path / "checkpoint-symlink-alias.nemo"
+        with tarfile.open(nemo_path, "w") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+            link_info = tarfile.TarInfo(name="model_weights.ckpt")
+            link_info.type = tarfile.SYMTYPE
+            link_info.linkname = "payload.pkl"
+            tar.addfile(link_info)
+            _add_tar_bytes(tar, "payload.pkl", _build_malicious_pickle())
+
+        result = NemoScanner().scan(str(nemo_path))
+
+        cve_checks = [
+            check
+            for check in result.checks
+            if check.details.get("cve_id") == "CVE-2025-23249" and check.details.get("entry") == "model_weights.ckpt"
+        ]
+        assert len(cve_checks) == 1
+        assert cve_checks[0].severity == IssueSeverity.CRITICAL
+
+    def test_large_checkpoint_member_fails_closed(self, tmp_path: Path) -> None:
+        nemo_path = tmp_path / "checkpoint-large.nemo"
+        with tarfile.open(nemo_path, "w") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+            _add_tar_bytes(tar, "model_weights.ckpt", b"not scanned")
+
+        result = NemoScanner({"max_nemo_checkpoint_scan_bytes": 1}).scan(str(nemo_path))
+
+        skipped_checks = [
+            check
+            for check in result.checks
+            if check.details.get("scan_outcome_reason") == "nemo_checkpoint_scan_skipped_size_limit"
+        ]
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert len(skipped_checks) == 1
+        assert skipped_checks[0].status == CheckStatus.FAILED
+        assert skipped_checks[0].details["max_scan_bytes"] == 1
+
+    def test_nested_checkpoint_scanner_failure_fails_closed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        class RaisingScanner:
+            name = "raising_nested"
+
+            def scan(self, _path: str) -> None:
+                raise RuntimeError("nested boom")
+
+        import modelaudit.scanners as scanner_registry
+
+        monkeypatch.setattr(
+            scanner_registry,
+            "get_scanner_for_file",
+            lambda _path, config=None: RaisingScanner(),
+        )
+
+        nemo_path = tmp_path / "checkpoint-nested-fails.nemo"
+        with tarfile.open(nemo_path, "w") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+            _add_tar_bytes(tar, "model_weights.ckpt", b"checkpoint bytes")
+
+        result = NemoScanner().scan(str(nemo_path))
+
+        failed_checks = [
+            check
+            for check in result.checks
+            if check.details.get("scan_outcome_reason") == "nemo_checkpoint_nested_scan_failed"
+        ]
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert len(failed_checks) == 1
+        assert failed_checks[0].details["nested_scanner"] == "raising_nested"
+        assert failed_checks[0].details["exception_type"] == "RuntimeError"
+
+    def test_checkpoint_without_nested_scanner_fails_closed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import modelaudit.scanners as scanner_registry
+
+        monkeypatch.setattr(
+            scanner_registry,
+            "get_scanner_for_file",
+            lambda _path, config=None: None,
+        )
+
+        nemo_path = tmp_path / "checkpoint-no-scanner.nemo"
+        with tarfile.open(nemo_path, "w") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+            _add_tar_bytes(tar, "model_weights.ckpt", b"checkpoint bytes")
+
+        result = NemoScanner().scan(str(nemo_path))
+
+        unsupported_checks = [
+            check
+            for check in result.checks
+            if check.details.get("scan_outcome_reason") == "nemo_checkpoint_no_nested_scanner"
+        ]
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert len(unsupported_checks) == 1
+        assert unsupported_checks[0].details["entry"] == "model_weights.ckpt"
+
+    def test_benign_checkpoint_pickle_no_ne_mo_deserialization_cve(self, tmp_path: Path) -> None:
+        nemo_path = tmp_path / "checkpoint-safe.nemo"
+        with tarfile.open(nemo_path, "w") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+            _add_tar_bytes(tar, "model_weights.ckpt", pickle.dumps({"weights": [1, 2, 3]}))
+
+        result = NemoScanner().scan(str(nemo_path))
+
+        assert not [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23249"]
+
+    def test_nested_checkpoint_archive_traversal_not_labeled_deserialization_cve(self, tmp_path: Path) -> None:
+        nested_checkpoint = io.BytesIO()
+        with zipfile.ZipFile(nested_checkpoint, "w") as zipf:
+            zipf.writestr("../../evil.pkl", b"not a pickle")
+
+        nemo_path = tmp_path / "checkpoint-archive-traversal.nemo"
+        with tarfile.open(nemo_path, "w") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+            _add_tar_bytes(tar, "model_weights.pt", nested_checkpoint.getvalue())
+
+        result = NemoScanner().scan(str(nemo_path))
+
+        assert not [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23249"]
 
 
 @pytest.mark.skipif(not HAS_YAML, reason="PyYAML not installed")

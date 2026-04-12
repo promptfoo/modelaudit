@@ -8,6 +8,7 @@ import re
 from pathlib import Path
 from typing import Any, ClassVar
 
+from ._evidence_redaction import redact_evidence_string
 from ._string_extraction import extract_bounded_printable_strings
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -268,9 +269,7 @@ class RknnScanner(BaseScanner):
 
     @staticmethod
     def _snippet(text: str, max_chars: int = 180) -> str:
-        if len(text) <= max_chars:
-            return text
-        return text[: max_chars - 3] + "..."
+        return redact_evidence_string(text, max_chars=max_chars)
 
     def _check_path_references(self, path: str, extracted_strings: list[str], result: ScanResult) -> None:
         risky_references: list[dict[str, str]] = []
