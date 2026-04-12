@@ -7,31 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.37](https://github.com/promptfoo/modelaudit/compare/v0.2.36...v0.2.37) (2026-04-12)
+
 ### Bug Fixes
 
-- route extensionless compressed archive members through the compressed scanner by header alias
-- honor trusted header/content routing for misnamed ONNX, GGUF, and NumPy artifacts.
-- route extensionless compressed archive members through registry-backed nested dispatch.
-- add CVE-specific coverage for ONNX symlink traversal, Keras `get_file(extract=True)` archives, MXNet ReDoS operator names, NeMo archive/checkpoint exploits, and TorchServe MAR ZipSlip attribution
-- mark trailing bytes after NumPy object-array pickle payloads inconclusive without escalating to security findings
-- avoid CoreML nested parse failures on bounded-read truncation
-- mark incomplete sharded-model scans as inconclusive, ignore shard-name prefix matches, and skip caching explicit incomplete outcomes
-- flag TensorFlow `LoadLibrary` and `LoadLibraryV2` graph ops as dangerous native-library loading
-- detect split CNTK native-user-function and native-library references
-- detect Linux/macOS native-library members in Keras archives and uppercase native-library members in PyTorch ZIPs
-- detect embedded Windows DLL/PE, Linux ELF shared-object, and TensorRT plugin entry-point markers in TensorRT engines
-- detect punctuation-delimited TensorRT `/tmp` plugin paths
-- clean up temporary ZIP entry files when extraction fails on entry size limits
-- preserve HuggingFace cache provenance for symlinked custom cache roots
-- mark ONNX tensor dtype validation failures inconclusive instead of allowing clean scans
-- ignore remote OCI `layers[].urls` entries during local layer discovery
-- fail closed on unterminated OpenVINO DOCTYPE declarations
-- avoid PMML `<Extension>` false positives for benign `subprocess` prose while preserving `subprocess.getoutput()`, `subprocess.getstatusoutput()`, and `importlib.import_module("subprocess")` detections
-- mark incomplete ZIP, TAR, and 7z archive traversals as inconclusive in scan metadata
-- route helper-level ZIP-backed `.ckpt`/`.pkl` checkpoints through archive scanners
-- harden standalone pickle scanner dangerous global coverage, nested payload bounds, incomplete-scan reporting, and standalone-primary migration behavior
-- flag untrusted pickle persistent ID opcodes while keeping PyTorch storage persistent IDs non-failing
-- cap standalone pickle stream line reads when callers do not provide a stream size
+- add CVE scanner coverage ([01dec02](https://github.com/promptfoo/modelaudit/commit/01dec0270516738295651ce07e7804de82eaabdb))
+- add size floor for zip compression ratio ([#949](https://github.com/promptfoo/modelaudit/issues/949)) ([5e66eeb](https://github.com/promptfoo/modelaudit/commit/5e66eeb483048644da7c07bba6496a5c6c73a187))
+- align SARIF scan metadata with CLI results ([#934](https://github.com/promptfoo/modelaudit/issues/934)) ([1a90415](https://github.com/promptfoo/modelaudit/commit/1a90415d53d9ddc4dba01ff7ad804125a1d76c20))
+- allow generated TorchScript source files ([#948](https://github.com/promptfoo/modelaudit/issues/948)) ([53d0cdc](https://github.com/promptfoo/modelaudit/commit/53d0cdc48025628de0f56397d832dbac839721fd))
+- **archives:** honor nested header routing ([fccdb91](https://github.com/promptfoo/modelaudit/commit/fccdb914ccd87d0f178729f6becdfdddcfe72024))
+- avoid archive bin pickle routing ([#962](https://github.com/promptfoo/modelaudit/issues/962)) ([446df6b](https://github.com/promptfoo/modelaudit/commit/446df6b06a59cf6cc8e11485d6df8f5dc0d35ec8))
+- avoid safetensors unicode metadata false positive ([#945](https://github.com/promptfoo/modelaudit/issues/945)) ([d595fde](https://github.com/promptfoo/modelaudit/commit/d595fdee57150ea22d9bb38b92ec61cdc865da60))
+- bound standalone pickle stream reads ([4d0cb84](https://github.com/promptfoo/modelaudit/commit/4d0cb84af010b4ed332ebbf17fc8bd0769fa8b6e))
+- **catboost:** redact finding urls ([c65334c](https://github.com/promptfoo/modelaudit/commit/c65334ceb456556835d80bf17010d952c7437985))
+- **cli:** honor streaming file skips ([49291ac](https://github.com/promptfoo/modelaudit/commit/49291acbc9fb8c35f7944ee894fd81ac23fe3045))
+- **cli:** redact cloud urls in output ([#964](https://github.com/promptfoo/modelaudit/issues/964)) ([0ee82ca](https://github.com/promptfoo/modelaudit/commit/0ee82ca1e84f2dc06daa8d05a4ad9c3abdc85987))
+- default unknown severities to info ([#963](https://github.com/promptfoo/modelaudit/issues/963)) ([9b27b9a](https://github.com/promptfoo/modelaudit/commit/9b27b9ac672009a77a413aeea1fea350f6df145c))
+- **deps:** update dependency tensorflow to &gt;=2.21,&lt;2.22 ([#985](https://github.com/promptfoo/modelaudit/issues/985)) ([2e3ac65](https://github.com/promptfoo/modelaudit/commit/2e3ac651e2bb0b83d87d070c00894eeddcf0091d))
+- **detectors:** redact network urls in findings ([7e28a46](https://github.com/promptfoo/modelaudit/commit/7e28a46c6de3f5646d42b14fd76061fdfeaf114e))
+- **dvc:** restrict target paths ([3bd9b68](https://github.com/promptfoo/modelaudit/commit/3bd9b685a3e3bb5de87d3775a9704deb7f4a253b))
+- flag pickle persistent ids ([#938](https://github.com/promptfoo/modelaudit/issues/938)) ([2cfba40](https://github.com/promptfoo/modelaudit/commit/2cfba403e21d53f46ba7089b655cebc564dcddaf))
+- **gguf:** detect tensor bounds overflow ([a4358ff](https://github.com/promptfoo/modelaudit/commit/a4358ffe0e3b8a8d8729b8bcf23a8f00f205a5e1))
+- honor header-routed scanners ([#941](https://github.com/promptfoo/modelaudit/issues/941)) ([6740260](https://github.com/promptfoo/modelaudit/commit/6740260c36331156eb6f7fc491d58f5b570dbee4))
+- **huggingface:** redact source urls ([73b538e](https://github.com/promptfoo/modelaudit/commit/73b538e21ccf23c5ef452b16153c1e6e2b8e6663))
+- ignore pmml documentation urls ([506aa75](https://github.com/promptfoo/modelaudit/commit/506aa7510a820e4c01018231cb52be4f5964334f))
+- **jfrog:** redact url secrets ([4546eee](https://github.com/promptfoo/modelaudit/commit/4546eeeadad7a8fadd31e21cf550a44688f0d076))
+- **keras:** redact archive urls ([e532b0d](https://github.com/promptfoo/modelaudit/commit/e532b0dd67d2f7033c29644356efe8a220060441))
+- **lightgbm:** redact finding urls ([d4f1fe2](https://github.com/promptfoo/modelaudit/commit/d4f1fe2a61e51166bf48c74861ff7cb31f55a69c))
+- **manifest:** redact url secrets ([c831733](https://github.com/promptfoo/modelaudit/commit/c83173316cf98d9f19b0a8481a40b848077d0096))
+- mark missing numpy format as operational ([#958](https://github.com/promptfoo/modelaudit/issues/958)) ([6d271d6](https://github.com/promptfoo/modelaudit/commit/6d271d6eb4e3faf38bf03ae3db76ce9d369ce4af))
+- mark pickle parse failures inconclusive ([8a0e3fd](https://github.com/promptfoo/modelaudit/commit/8a0e3fd125ec6e4d49f72ab68d43d1c6544d3ae0))
+- **metadata:** redact suspicious urls ([7af0d4d](https://github.com/promptfoo/modelaudit/commit/7af0d4d1dbe8a6c6d87870f3a0b5989c91bb35d1))
+- **metadata:** reject symlink escapes ([3869cf0](https://github.com/promptfoo/modelaudit/commit/3869cf0492fa1db7418269c8263b42f65a130a07))
+- narrow flax suspicious key criticals ([#957](https://github.com/promptfoo/modelaudit/issues/957)) ([9276d24](https://github.com/promptfoo/modelaudit/commit/9276d2472c18cda02a559c1f451fa65c91bdbcf1))
+- narrow network c2 metadata patterns ([fd9cc41](https://github.com/promptfoo/modelaudit/commit/fd9cc410440568cbb1ef0c17fea03499c16441e9))
+- narrow openvino external library checks ([#959](https://github.com/promptfoo/modelaudit/issues/959)) ([e895872](https://github.com/promptfoo/modelaudit/commit/e895872612c15bfd016f9a9e1fb58262ff4ee1eb))
+- narrow safetensors path metadata checks ([#955](https://github.com/promptfoo/modelaudit/issues/955)) ([4241780](https://github.com/promptfoo/modelaudit/commit/42417800670c4fb49d8bf2ea9b46aec702550485))
+- narrow suspicious dunder string detection ([#947](https://github.com/promptfoo/modelaudit/issues/947)) ([e866760](https://github.com/promptfoo/modelaudit/commit/e8667609d293d4391205ce4e8884fa3559030604))
+- **nemo:** scan referenced non-checkpoint suffixes ([3ba4ff7](https://github.com/promptfoo/modelaudit/commit/3ba4ff76399987dbcaf7b56c1a23f0d0a3c0a205))
+- **openvino:** flag sidecar symlink escapes ([772e796](https://github.com/promptfoo/modelaudit/commit/772e796c73b1b05172225af27a6dabf6c5254aae))
+- **openvino:** redact library urls ([241a667](https://github.com/promptfoo/modelaudit/commit/241a667dd658f1e0a827a05d3ddef5d13717f357))
+- preserve informational network findings ([b39d312](https://github.com/promptfoo/modelaudit/commit/b39d3124bf0b8578ae79919c726a28d7731261a4))
+- reduce benign Keras Lambda bytecode noise ([8cb5c29](https://github.com/promptfoo/modelaudit/commit/8cb5c29308673f52e9a9f2b7186cdd37c9657214))
+- require nested pickle execution evidence ([d2ad631](https://github.com/promptfoo/modelaudit/commit/d2ad6314f4df70ae03064f78ef37ddd6c8de8f53))
+- route nested compressed archive members ([e217b29](https://github.com/promptfoo/modelaudit/commit/e217b2982609a1888450c3d4ae9bd29726e187d4))
+- route nested compressed members ([#944](https://github.com/promptfoo/modelaudit/issues/944)) ([d839fe7](https://github.com/promptfoo/modelaudit/commit/d839fe734ccdabb62401970f4b652048156707ec))
+- **r:** redact serialized urls ([013bcf0](https://github.com/promptfoo/modelaudit/commit/013bcf0056b63f850ff569062ca3f6c64cfdbd9a))
+- **scanners:** redact evidence secrets ([3ae1383](https://github.com/promptfoo/modelaudit/commit/3ae13834844cd1cffc3975379e3ab8550309dc83))
+- skip prose-only network references ([773eb88](https://github.com/promptfoo/modelaudit/commit/773eb881187ef3b6601c9650e5bd4c8c17ec939c))
+- skip protocol-only streaming pickle warning ([#961](https://github.com/promptfoo/modelaudit/issues/961)) ([dba3ebe](https://github.com/promptfoo/modelaudit/commit/dba3ebec5c19ea86b1e40012ff0ffce8d81af451))
+- tighten pytorch zip pickle discovery ([#953](https://github.com/promptfoo/modelaudit/issues/953)) ([bfd9663](https://github.com/promptfoo/modelaudit/commit/bfd9663f68e30213fa8bb76016815dfbfdbdd968))
+- **torchserve:** redact manifest urls ([4626a02](https://github.com/promptfoo/modelaudit/commit/4626a02450b5436cc994329662b5e1623d2d6b00))
+
+### Documentation
+
+- add scanner CVE gap analysis ([73d6e8e](https://github.com/promptfoo/modelaudit/commit/73d6e8e512f0d86c7307df69a5663e3223724196))
+- allow promptfoo telemetry approval ([1fbe64c](https://github.com/promptfoo/modelaudit/commit/1fbe64cbe071579ebbb8064980cd05cf27133f2c))
 
 ## [0.2.36](https://github.com/promptfoo/modelaudit/compare/v0.2.35...v0.2.36) (2026-04-11)
 
