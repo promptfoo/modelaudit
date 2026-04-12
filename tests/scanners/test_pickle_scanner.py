@@ -13,6 +13,7 @@ from collections import Counter
 from collections.abc import Callable, Iterator
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, BinaryIO, ClassVar, cast
 
 import pytest
@@ -34,6 +35,7 @@ from modelaudit.scanners.pickle_scanner import (
     _RAW_PATTERN_SCAN_LIMIT_BYTES,
     _RESYNC_FAST_FORWARD_PROBE_BYTES,
     PickleScanner,
+    _classify_nested_pickle_payload,
     _find_nested_pickle_match,
     _find_next_resync_stream_candidate_offset,
     _genops_with_fallback,
@@ -48,6 +50,7 @@ from modelaudit.scanners.pickle_scanner import (
     _simulate_symbolic_reference_maps,
     check_opcode_sequence,
 )
+from modelaudit.scanners.pickle_support import _NESTED_PICKLE_VALIDATION_WINDOW_BYTES
 from modelaudit.scanners.rule_mapper import get_pickle_opcode_rule_code
 from tests.assets.generators.generate_advanced_pickle_tests import (
     generate_memo_based_attack,
@@ -130,6 +133,19 @@ def _make_dup_heavy_pickle(iterations: int) -> bytes:
         payload += b"h\x002a0"
     payload += b"."
     return bytes(payload)
+
+
+def _make_os_system_pickle() -> bytes:
+    class Evil:
+        def __reduce__(self) -> tuple[object, tuple[str]]:
+            return (os.system, ("echo nested-pickle",))
+
+    return pickle.dumps(Evil(), protocol=4)
+
+
+def _make_delayed_os_system_pickle() -> bytes:
+    padding = b"K\x010" * ((_NESTED_PICKLE_VALIDATION_WINDOW_BYTES // 3) + 16)
+    return b"\x80\x04" + padding + b"cos\nsystem\n\x8c\x12echo nested-pickle\x85R."
 
 
 class _SliceCountingSearchWindow:
@@ -1939,7 +1955,7 @@ def test_post_budget_global_scan_uses_consumed_opcode_boundary(tmp_path: Path) -
 def test_post_budget_opcode_scan_uses_consumed_opcode_boundary(tmp_path: Path) -> None:
     """Opcode tail scans should start at the consumed boundary, not inside the prior payload."""
     pickle_path = tmp_path / "post-budget-opcode-consumed-boundary.pkl"
-    inner_pickle = pickle.dumps({"ab": 1}, protocol=4)
+    inner_pickle = _make_os_system_pickle()
     poison_payload = b"\x8c\xff" + (b"A" * 4998)
     payload = (
         b"\x80\x04"
@@ -2176,7 +2192,7 @@ def test_scan_pickle_detects_post_budget_stack_global_with_binget(tmp_path: Path
 
 def test_post_budget_opcode_scan_detects_nested_pickle_payload(tmp_path: Path) -> None:
     """Nested inner pickle payloads beyond the opcode budget should still be surfaced."""
-    inner_pickle = pickle.dumps({"ab": 1}, protocol=4)
+    inner_pickle = _make_os_system_pickle()
     pickle_path = tmp_path / "post-budget-nested-pickle.pkl"
     benign_padding = _make_opcode_padding_stream(opcode_pairs=512)
     malicious_stream = b"\x80\x04B" + struct.pack("<I", len(inner_pickle)) + inner_pickle + b"."
@@ -2193,10 +2209,6 @@ def test_post_budget_opcode_scan_detects_nested_pickle_payload(tmp_path: Path) -
         finding["check_name"] == "Nested Pickle Detection" and finding["details"].get("opcode") == "BINBYTES"
         for finding in checks[0].details["findings"]
     ), checks[0].details
-    assert not any(
-        check.name == "Post-Budget Global Reference Scan" and check.status == CheckStatus.FAILED
-        for check in result.checks
-    ), f"Expected opcode-based detection, got: {result.checks}"
     assert result.success is False
 
 
@@ -2204,7 +2216,7 @@ def test_post_budget_opcode_scan_detects_encoded_pickle_payload(tmp_path: Path) 
     """Encoded inner pickle payloads beyond the opcode budget should still be surfaced."""
     import base64
 
-    inner_pickle = pickle.dumps({"ab": 1}, protocol=4)
+    inner_pickle = _make_os_system_pickle()
     encoded_pickle = base64.b64encode(inner_pickle)
     pickle_path = tmp_path / "post-budget-encoded-pickle.pkl"
     benign_padding = _make_opcode_padding_stream(opcode_pairs=512)
@@ -2399,7 +2411,7 @@ def test_post_budget_global_scan_runs_after_deadline_truncation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Deadline-triggered truncation should not continue scanning past the timeout boundary."""
-    import modelaudit.scanners.pickle_scanner as pickle_scanner_module
+    from modelaudit.scanners import pickle_scanner as pickle_scanner_module
 
     pickle_path = tmp_path / "post-budget-deadline.pkl"
     pickle_path.write_bytes(b"\x80\x04cmysterypkg\nloader\n.")
@@ -3436,40 +3448,293 @@ class TestDillLoadersRegression:
         ]
         assert len(ignored_pe_issues) == 0, "Validated PE signatures should not be suppressed"
 
-    def test_nested_pickle_detection(self):
-        """Scanner should detect nested pickle bytes and encoded payloads"""
+    def test_benign_nested_pickle_detection_is_info_only(self, tmp_path: Path) -> None:
+        """Benign nested pickle bytes and encoded payloads should not be critical."""
         scanner = PickleScanner()
 
         import base64
-        import os
-        import tempfile
 
-        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
-            try:
-                inner = {"a": 1}
-                inner_bytes = pickle.dumps(inner)
-                outer = {
-                    "raw": inner_bytes,
-                    "enc": base64.b64encode(inner_bytes).decode("ascii"),
-                }
-                pickle.dump(outer, f)
-                f.flush()
-                f.close()  # Close file before scanning (required on Windows to allow deletion)
+        inner = {"a": 1}
+        inner_bytes = pickle.dumps(inner)
+        outer = {
+            "raw": inner_bytes,
+            "enc": base64.b64encode(inner_bytes).decode("ascii"),
+        }
+        pickle_path = tmp_path / "benign-nested.pkl"
+        pickle_path.write_bytes(pickle.dumps(outer))
 
-                result = scanner.scan(f.name)
+        result = scanner.scan(str(pickle_path))
 
-                assert result.success
+        assert result.success
 
-                nested_issues = [
-                    i
-                    for i in result.issues
-                    if "nested pickle payload" in i.message.lower() or "encoded pickle payload" in i.message.lower()
-                ]
-                assert nested_issues
-                assert any(i.severity == IssueSeverity.CRITICAL for i in nested_issues)
+        nested_issues = [
+            i
+            for i in result.issues
+            if "nested pickle payload" in i.message.lower() or "encoded pickle payload" in i.message.lower()
+        ]
+        raw_issue = next((i for i in nested_issues if "nested pickle payload" in i.message.lower()), None)
+        encoded_issue = next((i for i in nested_issues if "encoded pickle payload" in i.message.lower()), None)
+        assert raw_issue is not None
+        assert encoded_issue is not None
+        assert raw_issue.severity == IssueSeverity.INFO
+        assert encoded_issue.severity == IssueSeverity.INFO
+        assert not any(
+            i.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for i in (raw_issue, encoded_issue)
+        )
 
-            finally:
-                os.unlink(f.name)
+    def test_malicious_nested_pickle_detection_stays_critical(self, tmp_path: Path) -> None:
+        """Nested pickle payloads with dangerous reducers should remain critical."""
+        scanner = PickleScanner()
+
+        import base64
+
+        inner_bytes = _make_os_system_pickle()
+        outer = {
+            "raw": inner_bytes,
+            "enc": base64.b64encode(inner_bytes).decode("ascii"),
+        }
+        pickle_path = tmp_path / "malicious-nested.pkl"
+        pickle_path.write_bytes(pickle.dumps(outer))
+
+        result = scanner.scan(str(pickle_path))
+
+        nested_issues = [
+            i
+            for i in result.issues
+            if "nested pickle payload" in i.message.lower() or "encoded pickle payload" in i.message.lower()
+        ]
+        assert nested_issues
+        assert any(i.severity == IssueSeverity.CRITICAL for i in nested_issues)
+
+    def test_nested_pickle_detection_scans_later_streams_after_benign_prefix(self) -> None:
+        """A benign first pickle stream should not mask a malicious follow-on stream."""
+        benign_stream = pickle.dumps({"safe": True})
+        malicious_stream = _make_os_system_pickle()
+
+        severity, evidence, details = _classify_nested_pickle_payload(
+            benign_stream + malicious_stream,
+            SimpleNamespace(offset=0),
+            {},
+        )
+
+        assert severity == IssueSeverity.CRITICAL
+        assert evidence == "dangerous_execution"
+        assert details["evidence"] == "dangerous_execution"
+
+    def test_nested_pickle_parse_error_preserves_collected_dangerous_opcodes(self) -> None:
+        """Trailing parse errors should not hide dangerous nested opcodes already seen."""
+        severity, evidence, details = _classify_nested_pickle_payload(
+            _make_os_system_pickle()[:-1],
+            SimpleNamespace(offset=0),
+            {},
+        )
+
+        assert severity == IssueSeverity.CRITICAL
+        assert evidence == "dangerous_execution"
+        assert details["evidence"] == "dangerous_execution"
+        assert details["analysis_incomplete"] is True
+        assert "analysis_error_type" in details
+
+    def test_nested_pickle_parse_error_without_dangerous_prefix_fails_closed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Parse aborts after benign prefix evidence should still be critical."""
+        from modelaudit.scanners import pickle_scanner as pickle_scanner_module
+
+        benign_opcodes = list(pickletools.genops(pickle.dumps({"padding": "benign"})))
+
+        def _benign_prefix_then_parse_error(
+            file_obj: BinaryIO,
+            *,
+            multi_stream: bool = False,
+            max_items: int | None = None,
+            deadline: float | None = None,
+        ) -> Iterator[tuple[Any, Any, int | None]]:
+            del file_obj, multi_stream, max_items, deadline
+            yield from benign_opcodes
+            raise ValueError("trailing nested parse error")
+
+        monkeypatch.setattr(pickle_scanner_module, "_genops_with_fallback", _benign_prefix_then_parse_error)
+
+        severity, evidence, details = _classify_nested_pickle_payload(
+            b"\x80\x04.",
+            SimpleNamespace(offset=0),
+            {},
+        )
+
+        assert severity == IssueSeverity.CRITICAL
+        assert evidence == "analysis_incomplete"
+        assert details["analysis_incomplete"] is True
+        assert details["analysis_error_type"] == "ValueError"
+        assert details["partial_evidence"] == "structure_only"
+
+    def test_nested_pickle_classification_passes_deadline_to_parser(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Nested re-parsing should preserve the active scan deadline."""
+        from modelaudit.scanners import pickle_scanner as pickle_scanner_module
+
+        observed_deadlines: list[float | None] = []
+
+        def _capture_deadline(
+            file_obj: BinaryIO,
+            *,
+            multi_stream: bool = False,
+            max_items: int | None = None,
+            deadline: float | None = None,
+        ) -> Iterator[tuple[Any, Any, int | None]]:
+            del file_obj, multi_stream, max_items
+            observed_deadlines.append(deadline)
+            yield from pickletools.genops(pickle.dumps({"safe": True}))
+
+        monkeypatch.setattr(pickle_scanner_module, "_genops_with_fallback", _capture_deadline)
+
+        _classify_nested_pickle_payload(
+            b"\x80\x04.",
+            SimpleNamespace(offset=0),
+            {},
+            deadline=123.0,
+        )
+
+        assert observed_deadlines == [123.0]
+
+    def test_nested_pickle_budget_error_preserves_collected_dangerous_opcodes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Budget exhaustion should not discard dangerous nested opcodes already yielded."""
+        from modelaudit.scanners import pickle_scanner as pickle_scanner_module
+
+        dangerous_opcodes = list(pickletools.genops(_make_os_system_pickle()))
+
+        def _dangerous_then_budget(
+            file_obj: BinaryIO,
+            *,
+            multi_stream: bool = False,
+            max_items: int | None = None,
+            deadline: float | None = None,
+        ) -> Iterator[tuple[Any, Any, int | None]]:
+            del file_obj, multi_stream, max_items, deadline
+            for opcode_info in dangerous_opcodes:
+                if opcode_info[0].name == "STOP":
+                    break
+                yield opcode_info
+            raise _GenopsBudgetExceeded("max_items")
+
+        monkeypatch.setattr(pickle_scanner_module, "_genops_with_fallback", _dangerous_then_budget)
+
+        severity, evidence, details = _classify_nested_pickle_payload(
+            b"\x80\x04.",
+            SimpleNamespace(offset=0),
+            {},
+        )
+
+        assert severity == IssueSeverity.CRITICAL
+        assert evidence == "dangerous_execution"
+        assert details["evidence"] == "dangerous_execution"
+        assert details["analysis_incomplete"] is True
+
+    def test_nested_pickle_budget_error_without_dangerous_prefix_fails_closed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Budget exhaustion before a dangerous opcode should still fail closed."""
+        from modelaudit.scanners import pickle_scanner as pickle_scanner_module
+
+        def _benign_prefix_then_budget(
+            file_obj: BinaryIO,
+            *,
+            multi_stream: bool = False,
+            max_items: int | None = None,
+            deadline: float | None = None,
+        ) -> Iterator[tuple[Any, Any, int | None]]:
+            del file_obj, multi_stream, max_items, deadline
+            yield from pickletools.genops(pickle.dumps({"padding": "benign"}))
+            raise _GenopsBudgetExceeded("max_items")
+
+        monkeypatch.setattr(pickle_scanner_module, "_genops_with_fallback", _benign_prefix_then_budget)
+
+        severity, evidence, details = _classify_nested_pickle_payload(
+            b"\x80\x04.",
+            SimpleNamespace(offset=0),
+            {},
+        )
+
+        assert severity == IssueSeverity.CRITICAL
+        assert evidence == "analysis_incomplete"
+        assert details["analysis_incomplete"] is True
+        assert details["opcode_budget_exceeded"] is True
+        assert details["analysis_error"] == "max_items"
+
+    def test_nested_pickle_budget_error_with_warning_prefix_fails_closed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Budget exhaustion after warning evidence should not leave the scan non-critical."""
+        from modelaudit.scanners import pickle_scanner as pickle_scanner_module
+
+        warning_opcodes = list(pickletools.genops(b"cthirdparty\nLoader\n."))
+
+        def _warning_prefix_then_budget(
+            file_obj: BinaryIO,
+            *,
+            multi_stream: bool = False,
+            max_items: int | None = None,
+            deadline: float | None = None,
+        ) -> Iterator[tuple[Any, Any, int | None]]:
+            del file_obj, multi_stream, max_items, deadline
+            yield from warning_opcodes
+            raise _GenopsBudgetExceeded("max_items")
+
+        monkeypatch.setattr(pickle_scanner_module, "_genops_with_fallback", _warning_prefix_then_budget)
+
+        severity, evidence, details = _classify_nested_pickle_payload(
+            b"\x80\x04.",
+            SimpleNamespace(offset=0),
+            {},
+        )
+
+        assert severity == IssueSeverity.CRITICAL
+        assert evidence == "analysis_incomplete"
+        assert details["analysis_incomplete"] is True
+        assert details["opcode_budget_exceeded"] is True
+        assert details["partial_evidence"] == "unknown_import"
+        assert details["partial_evidence_details"]["import_reference"] == "thirdparty.Loader"
+
+    def test_nested_pickle_classification_scans_follow_on_streams(self) -> None:
+        """A benign first nested stream should not hide a malicious follow-on stream."""
+        payload = pickle.dumps({"safe": True}, protocol=4) + _make_os_system_pickle()
+
+        severity, evidence, details = _classify_nested_pickle_payload(
+            payload,
+            SimpleNamespace(offset=0),
+            {},
+        )
+
+        assert severity == IssueSeverity.CRITICAL
+        assert evidence == "dangerous_execution"
+        assert details["evidence"] == "dangerous_execution"
+
+    def test_nested_pickle_detection_scans_beyond_validation_sample(self, tmp_path: Path) -> None:
+        """Dangerous nested evidence beyond the header-validation window should stay critical."""
+        scanner = PickleScanner()
+        pickle_path = tmp_path / "delayed-malicious-nested.pkl"
+        pickle_path.write_bytes(pickle.dumps({"raw": _make_delayed_os_system_pickle()}))
+
+        result = scanner.scan(str(pickle_path))
+
+        nested_issues = [i for i in result.issues if "nested pickle payload" in i.message.lower()]
+        assert nested_issues
+        assert any(
+            i.severity == IssueSeverity.CRITICAL and i.details.get("evidence") == "dangerous_execution"
+            for i in nested_issues
+        )
+
+    def test_safe_nested_reduce_detection_is_info_only(self, tmp_path: Path) -> None:
+        """Benign nested reconstruction opcodes should not warn without dangerous evidence."""
+        scanner = PickleScanner()
+        pickle_path = tmp_path / "safe-nested-reduce.pkl"
+        pickle_path.write_bytes(pickle.dumps({"raw": pickle.dumps(slice(1, 5, 2), protocol=4)}))
+
+        result = scanner.scan(str(pickle_path))
+
+        assert result.success
+        nested_issues = [i for i in result.issues if "nested pickle payload" in i.message.lower()]
+        assert nested_issues
+        assert all(i.severity == IssueSeverity.INFO for i in nested_issues)
 
 
 class TestPickleScannerBlocklistHardening(unittest.TestCase):
