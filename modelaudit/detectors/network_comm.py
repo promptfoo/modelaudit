@@ -305,18 +305,14 @@ class NetworkCommDetector:
         b"dns.resolver",
     ]
 
-    # Known C&C patterns
+    # Known C&C patterns. Keep this list to high-signal indicators; ordinary
+    # metadata keys like download_url or heartbeat are common in model cards.
     CC_PATTERNS: ClassVar[list[bytes]] = [
         b"beacon_url",
         b"callback_url",
         b"c2_server",
         b"command_server",
         b"exfil_endpoint",
-        b"report_url",
-        b"telemetry_endpoint",
-        b"update_server",
-        b"download_url",
-        b"upload_endpoint",
         b"malware",
         b"backdoor",
         b"trojan",
@@ -324,8 +320,6 @@ class NetworkCommDetector:
         b"zombie",
         b"phone_home",
         b"check_in",
-        b"heartbeat",
-        b"keepalive",
     ]
 
     # Suspicious ports

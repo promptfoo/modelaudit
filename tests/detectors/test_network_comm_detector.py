@@ -311,6 +311,37 @@ class TestNetworkCommDetector:
         assert "backdoor" in patterns
         assert "botnet" in patterns
 
+    def test_benign_metadata_reference_keys_are_not_cc_patterns(self) -> None:
+        """Common model metadata URL keys are not C&C indicators by themselves."""
+        detector = NetworkCommDetector()
+
+        data = b"""
+        {
+            "download_url": "https://huggingface.co/example/model",
+            "report_url": "https://huggingface.co/example/model/blob/main/README.md",
+            "telemetry_endpoint": "disabled",
+            "heartbeat_interval": 30,
+            "keepalive": true,
+            "update_server": "none",
+            "upload_endpoint": "none"
+        }
+        """
+
+        findings = detector.scan(data)
+        cc_patterns = {f["pattern"] for f in findings if f["type"] == "cc_pattern"}
+
+        assert cc_patterns.isdisjoint(
+            {
+                "download_url",
+                "report_url",
+                "telemetry_endpoint",
+                "heartbeat",
+                "keepalive",
+                "update_server",
+                "upload_endpoint",
+            }
+        )
+
     def test_detect_suspicious_ports(self):
         """Test detection of suspicious port numbers."""
         detector = NetworkCommDetector()
