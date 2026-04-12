@@ -647,7 +647,26 @@ class NemoScanner(BaseScanner):
         try:
             from .archive_dispatch import scan_nested_file
 
-            nested_result = scan_nested_file(extracted_path, config=dict(self.config))
+            try:
+                nested_result = scan_nested_file(extracted_path, config=dict(self.config))
+            except Exception as exc:
+                self._mark_inconclusive_scan_result(
+                    result,
+                    reason="nemo_referenced_nested_scan_failed",
+                    check_name="NeMo Checkpoint Nested Scan",
+                    message=f"Nested scan failed for referenced member {referenced_member_name}: {exc!s}",
+                    location=f"{archive_path}:{referenced_member_name}",
+                    details={
+                        "entry": referenced_member_name,
+                        "source_entry": member.name,
+                        "config_file": config_file,
+                        "config_path": config_path,
+                        "exception_type": type(exc).__name__,
+                        "exception_message": str(exc),
+                    },
+                )
+                return True
+
             critical_issues = [
                 issue
                 for issue in nested_result.issues

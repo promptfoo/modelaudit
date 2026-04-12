@@ -423,6 +423,45 @@ class TestNemoArchiveVulnerabilityCoverage:
         assert failed_checks[0].details["config_file"] == "model_config.yaml"
         assert failed_checks[0].details["config_path"] == "tokenizer.model"
 
+    def test_config_referenced_nested_scan_failure_fails_closed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from modelaudit.scanners import archive_dispatch
+
+        def raise_nested_scan(_path: str, config: dict[str, Any] | None = None) -> Any:
+            _ = config
+            raise RuntimeError("referenced nested boom")
+
+        monkeypatch.setattr(archive_dispatch, "scan_nested_file", raise_nested_scan)
+
+        nemo_path = tmp_path / "referenced-nested-fails.nemo"
+        config = {
+            "model": {"_target_": "nemo.Model"},
+            "tokenizer": {"model": "nemo:artifacts/tokenizer.model"},
+        }
+        with tarfile.open(nemo_path, "w") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", yaml.safe_dump(config).encode())
+            _add_tar_bytes(tar, "artifacts/tokenizer.model", b"payload")
+
+        result = NemoScanner().scan(str(nemo_path))
+
+        failed_checks = [
+            check
+            for check in result.checks
+            if check.details.get("scan_outcome_reason") == "nemo_referenced_nested_scan_failed"
+        ]
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert len(failed_checks) == 1
+        assert failed_checks[0].details["entry"] == "artifacts/tokenizer.model"
+        assert failed_checks[0].details["source_entry"] == "artifacts/tokenizer.model"
+        assert failed_checks[0].details["config_file"] == "model_config.yaml"
+        assert failed_checks[0].details["config_path"] == "tokenizer.model"
+        assert failed_checks[0].details["exception_type"] == "RuntimeError"
+        assert failed_checks[0].details["exception_message"] == "referenced nested boom"
+
     def test_metadata_referenced_benign_non_checkpoint_suffix_stays_clean(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "referenced-benign-artifact.nemo"
         config = {
