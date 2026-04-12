@@ -8,6 +8,7 @@ import tempfile
 import zipfile
 from pathlib import Path
 from typing import Any, ClassVar
+from urllib.parse import urlsplit, urlunsplit
 
 from modelaudit.detectors.suspicious_symbols import (
     SUSPICIOUS_CONFIG_PROPERTIES,
@@ -96,6 +97,25 @@ _KERAS_CONFIG_MAX_BYTES = 10 * 1024 * 1024
 _KERAS_METADATA_ENTRY = "metadata.json"
 _KERAS_METADATA_MAX_BYTES = 10 * 1024 * 1024
 _KERAS_WEIGHTS_ENTRY = "model.weights.h5"
+
+
+def _redact_url_for_display(url: str) -> str:
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+    except ValueError:
+        return "[invalid-url]"
+
+    if not parsed.scheme or not parsed.hostname:
+        return "[invalid-url]"
+
+    hostname = parsed.hostname
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+
+    netloc = f"{hostname}:{port}" if port is not None else hostname
+    return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+
 
 try:
     import h5py
@@ -1114,7 +1134,7 @@ class KerasZipScanner(BaseScanner):
                 details={
                     "cve_id": "CVE-2025-12060",
                     "context": context,
-                    "urls": archive_urls[:5],
+                    "urls": [_redact_url_for_display(url) for url in archive_urls[:5]],
                     "cvss": 8.8,
                     "cwe": "CWE-22",
                     "description": (
