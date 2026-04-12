@@ -13,6 +13,8 @@ from .huggingface_paths import (
     is_huggingface_url,
     parse_huggingface_file_url,
     parse_huggingface_url,
+    redact_huggingface_url_for_display,
+    redact_huggingface_urls_in_text,
 )
 
 logger = logging.getLogger(__name__)
@@ -28,6 +30,8 @@ __all__ = [
     "is_huggingface_url",
     "parse_huggingface_file_url",
     "parse_huggingface_url",
+    "redact_huggingface_url_for_display",
+    "redact_huggingface_urls_in_text",
 ]
 
 
@@ -106,6 +110,7 @@ def get_model_info(url: str) -> dict:
 
     namespace, repo_name = parse_huggingface_url(url)
     repo_id = f"{namespace}/{repo_name}" if repo_name else namespace
+    display_url = redact_huggingface_url_for_display(url)
 
     api = HfApi()
     try:
@@ -146,7 +151,7 @@ def get_model_info(url: str) -> dict:
             "author": getattr(model_info, "author", ""),
         }
     except Exception as e:
-        raise Exception(f"Failed to get model info for {url}: {e!s}") from e
+        raise Exception(f"Failed to get model info for {display_url}: {redact_huggingface_urls_in_text(str(e))}") from e
 
 
 def get_model_size(repo_id: str) -> int | None:
@@ -202,6 +207,7 @@ def download_model(url: str, cache_dir: Path | None = None, show_progress: bool 
 
     namespace, repo_name = parse_huggingface_url(url)
     repo_id = f"{namespace}/{repo_name}" if repo_name else namespace
+    display_url = redact_huggingface_url_for_display(url)
 
     # Disk space check and path setup
     model_size = get_model_size(repo_id)
@@ -236,7 +242,7 @@ def download_model(url: str, cache_dir: Path | None = None, show_progress: bool 
     if model_size and disk_check_path is not None:
         has_space, message = check_disk_space(disk_check_path, model_size)
         if not has_space:
-            raise Exception(f"Cannot download model from {url}: {message}")
+            raise Exception(f"Cannot download model from {display_url}: {redact_huggingface_urls_in_text(message)}")
 
     try:
         # Configure progress display based on environment
@@ -323,7 +329,9 @@ def download_model(url: str, cache_dir: Path | None = None, show_progress: bool 
             import shutil
 
             shutil.rmtree(download_path)
-        raise Exception(f"Failed to download model from {url}: {e!s}") from e
+        raise Exception(
+            f"Failed to download model from {display_url}: {redact_huggingface_urls_in_text(str(e))}"
+        ) from e
 
 
 def download_model_streaming(
@@ -356,6 +364,7 @@ def download_model_streaming(
 
     namespace, repo_name = parse_huggingface_url(url)
     repo_id = f"{namespace}/{repo_name}" if repo_name else namespace
+    display_url = redact_huggingface_url_for_display(url)
 
     try:
         # List all files in the repository
@@ -418,7 +427,9 @@ def download_model_streaming(
             yield (Path(local_path), is_last)
 
     except Exception as e:
-        raise Exception(f"Failed to download model from {url}: {e!s}") from e
+        raise Exception(
+            f"Failed to download model from {display_url}: {redact_huggingface_urls_in_text(str(e))}"
+        ) from e
 
 
 def download_file_from_hf(url: str, cache_dir: Path | None = None) -> Path:
@@ -444,6 +455,7 @@ def download_file_from_hf(url: str, cache_dir: Path | None = None) -> Path:
         ) from e
 
     repo_id, branch, filename = parse_huggingface_file_url(url)
+    display_url = redact_huggingface_url_for_display(url)
 
     try:
         # Use hf_hub_download for single file downloads
@@ -455,4 +467,4 @@ def download_file_from_hf(url: str, cache_dir: Path | None = None) -> Path:
         )
         return Path(local_path)
     except Exception as e:
-        raise Exception(f"Failed to download file from {url}: {e!s}") from e
+        raise Exception(f"Failed to download file from {display_url}: {redact_huggingface_urls_in_text(str(e))}") from e
