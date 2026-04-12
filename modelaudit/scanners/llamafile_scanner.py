@@ -9,6 +9,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, ClassVar
 
+from ._evidence_redaction import redact_evidence_string
 from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 
 LLAMAFILE_MARKER = b"llamafile"
@@ -255,12 +256,16 @@ class LlamafileScanner(BaseScanner):
             if self._is_known_runtime_string(text):
                 continue
             lowered = text.lower()
-            for token in COMMAND_TOKENS:
-                if token in lowered:
-                    command_hits.add(text[:200])
-            for token in NETWORK_TOKENS:
-                if token in lowered:
-                    network_hits.add(text[:200])
+            has_command_token = any(token in lowered for token in COMMAND_TOKENS)
+            has_network_token = any(token in lowered for token in NETWORK_TOKENS)
+            if not has_command_token and not has_network_token:
+                continue
+
+            redacted_text = redact_evidence_string(text, max_chars=200)
+            if has_command_token:
+                command_hits.add(redacted_text)
+            if has_network_token:
+                network_hits.add(redacted_text)
 
         if not command_hits and not network_hits:
             return
