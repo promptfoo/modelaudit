@@ -9,6 +9,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, ClassVar
 
+from ._evidence_redaction import redact_evidence_string
 from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 
 LLAMAFILE_MARKER = b"llamafile"
@@ -257,10 +258,10 @@ class LlamafileScanner(BaseScanner):
             lowered = text.lower()
             for token in COMMAND_TOKENS:
                 if token in lowered:
-                    command_hits.add(text[:200])
+                    command_hits.add(redact_evidence_string(text, max_chars=200))
             for token in NETWORK_TOKENS:
                 if token in lowered:
-                    network_hits.add(text[:200])
+                    network_hits.add(redact_evidence_string(text, max_chars=200))
 
         if not command_hits and not network_hits:
             return
