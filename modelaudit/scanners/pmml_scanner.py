@@ -407,20 +407,15 @@ class PmmlScanner(BaseScanner):
     ) -> str | None:
         """Return the URL pattern when an attribute is an external resource reference."""
         normalized_attr_name_lower = normalized_attr_name.lower()
+        is_unqualified_attr = PmmlScanner._xml_namespace(attr_name) is None and ":" not in attr_name
         if normalized_attr_name_lower in DOCUMENTATION_ATTRIBUTE_NAMES:
-            ignored_patterns = (
-                BENIGN_DOCUMENTATION_URL_PATTERNS
-                if in_pmml_element and attr_name == normalized_attr_name_lower
-                else None
-            )
+            ignored_patterns = BENIGN_DOCUMENTATION_URL_PATTERNS if in_pmml_element and is_unqualified_attr else None
             return PmmlScanner._find_url_pattern(
                 attr_value,
                 ignored_patterns=ignored_patterns,
             )
         if normalized_attr_name_lower == "reference":
-            ignored_patterns = (
-                BENIGN_DOCUMENTATION_URL_PATTERNS if attr_name == "reference" and in_header_metadata else None
-            )
+            ignored_patterns = BENIGN_DOCUMENTATION_URL_PATTERNS if is_unqualified_attr and in_header_metadata else None
             return PmmlScanner._find_url_pattern(attr_value, ignored_patterns=ignored_patterns)
         if normalized_attr_name_lower in EXTERNAL_RESOURCE_ATTRIBUTE_NAMES:
             return PmmlScanner._find_url_pattern(attr_value)

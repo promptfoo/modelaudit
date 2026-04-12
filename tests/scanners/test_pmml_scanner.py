@@ -250,6 +250,27 @@ def test_pmml_scanner_standard_namespaced_documentation_urls_are_not_external_re
     assert not any("external resource" in issue.message.lower() for issue in result.issues)
 
 
+def test_pmml_scanner_mixed_case_documentation_attrs_are_not_external_resources(tmp_path: Path) -> None:
+    """Unqualified PMML documentation attributes keep exemptions even when mixed case."""
+    pmml = """<?xml version='1.0'?>
+<PMML version='4.4'>
+  <Header Description="https://example.com/model-card"
+          Documentation="https://example.com/docs"
+          Label="https://example.com/label">
+    <Application name="Trainer" Reference="https://example.com/reference"/>
+  </Header>
+  <DataDictionary numberOfFields='0'/>
+</PMML>"""
+    path = tmp_path / "mixed_case_documentation_attrs.pmml"
+    path.write_text(pmml, encoding="utf-8")
+
+    result = PmmlScanner().scan(str(path))
+
+    assert result.success is True
+    assert not any(check.name == "External Resource Reference Check" for check in result.checks)
+    assert not any("external resource" in issue.message.lower() for issue in result.issues)
+
+
 def test_pmml_scanner_unrecognized_root_namespace_documentation_urls_warn(tmp_path: Path) -> None:
     """Documentation-looking elements in an unrecognized root namespace should not get PMML exemptions."""
     pmml = """<?xml version='1.0'?>
