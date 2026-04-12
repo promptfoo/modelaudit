@@ -3,39 +3,44 @@
 from __future__ import annotations
 
 import re
+from typing import Final
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-REDACTED_EVIDENCE_VALUE = "<redacted>"
-REDACTED_URL_CREDENTIALS = "<credentials-redacted>"
+REDACTED_EVIDENCE_VALUE: Final[str] = "<redacted>"
+REDACTED_URL_CREDENTIALS: Final[str] = "<credentials-redacted>"
 
-URL_RE = re.compile(r"(?i)\b(?:https?|ftp|s3|gs|file)://[^\s\"'<>]+")
-SENSITIVE_QUERY_KEYS = {
-    "access_key",
-    "access-key",
-    "access_token",
-    "access-token",
-    "api_key",
-    "api-key",
-    "apikey",
-    "credential",
-    "password",
-    "passwd",
-    "sas",
-    "secret",
-    "sig",
-    "signature",
-    "token",
-    "x-amz-credential",
-    "x-amz-security-token",
-    "x-amz-signature",
-}
-AUTHORIZATION_VALUE_RE = re.compile(r"(?i)(\bauthorization\s*[:=]\s*(?:(?:bearer|basic)\s+)?)" r"[^\s\"';&|]+")
-BEARER_VALUE_RE = re.compile(r"(?i)(\bbearer\s+)[A-Za-z0-9._~+/=-]{8,}")
-SENSITIVE_ASSIGNMENT_RE = re.compile(
+URL_RE: Final[re.Pattern[str]] = re.compile(r"(?i)\b(?:https?|ftp|s3|gs|file)://[^\s\"'<>]+")
+SENSITIVE_QUERY_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "access_key",
+        "access-key",
+        "access_token",
+        "access-token",
+        "api_key",
+        "api-key",
+        "apikey",
+        "credential",
+        "password",
+        "passwd",
+        "sas",
+        "secret",
+        "sig",
+        "signature",
+        "token",
+        "x-amz-credential",
+        "x-amz-security-token",
+        "x-amz-signature",
+    }
+)
+AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?i)(\bauthorization\s*[:=]\s*(?:(?:bearer|basic)\s+)?)" r"[^\s\"';&|]+"
+)
+BEARER_VALUE_RE: Final[re.Pattern[str]] = re.compile(r"(?i)(\bbearer\s+)[A-Za-z0-9._~+/=-]{8,}")
+SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     r"(?i)\b((?:api[_-]?key|access[_-]?token|token|password|passwd|secret|credential|signature|sig|sas)"
     r"\s*[:=]\s*)[^\s\"';&|]+"
 )
-QUOTED_SENSITIVE_ASSIGNMENT_RE = re.compile(
+QUOTED_SENSITIVE_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     r"(?i)\b((?:api[_-]?key|access[_-]?token|token|password|passwd|secret|credential|signature|sig|sas)"
     r"\s*[:=]\s*)([\"']).*?\2"
 )
