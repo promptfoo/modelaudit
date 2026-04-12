@@ -49,6 +49,7 @@ _TORCHSCRIPT_FORBIDDEN_AST_NAMES: frozenset[str] = frozenset(
         "__import__",
         "__mro__",
         "__subclasses__",
+        "breakpoint",
         "compile",
         "delattr",
         "eval",
@@ -348,9 +349,7 @@ class PyTorchZipScanner(BaseScanner):
         if _TORCHSCRIPT_FORBIDDEN_SOURCE_PATTERN.search(text):
             return False
         return (
-            "__parameters__ = [" in text
-            and "__buffers__ = [" in text
-            and _TORCHSCRIPT_GENERATED_CLASS_PATTERN.search(text) is not None
+            _TORCHSCRIPT_GENERATED_CLASS_PATTERN.search(text) is not None
             and _TORCHSCRIPT_GENERATED_METHOD_PATTERN.search(text) is not None
             and PyTorchZipScanner._has_torchscript_generated_ast_shape(text)
         )
@@ -384,14 +383,21 @@ class PyTorchZipScanner(BaseScanner):
                     return False
                 if not any(isinstance(item, ast.FunctionDef) for item in node.body):
                     return False
+                generated_marker_assignments: set[str] = set()
                 for item in node.body:
                     if isinstance(item, ast.Pass):
                         continue
                     if isinstance(item, ast.Assign):
+                        generated_marker_assignments.update(
+                            PyTorchZipScanner._torchscript_assignment_target_names(item.targets)
+                        )
                         if not PyTorchZipScanner._is_torchscript_definition_time_expression_safe(item.value):
                             return False
                         continue
                     if isinstance(item, ast.AnnAssign):
+                        generated_marker_assignments.update(
+                            PyTorchZipScanner._torchscript_assignment_target_names([item.target])
+                        )
                         if not PyTorchZipScanner._is_torchscript_definition_time_expression_safe(item.annotation):
                             return False
                         if (
@@ -405,8 +411,14 @@ class PyTorchZipScanner(BaseScanner):
                             return False
                         continue
                     return False
+                if not {"__parameters__", "__buffers__"}.issubset(generated_marker_assignments):
+                    return False
 
         return True
+
+    @staticmethod
+    def _torchscript_assignment_target_names(targets: list[ast.expr]) -> set[str]:
+        return {target.id for target in targets if isinstance(target, ast.Name)}
 
     @staticmethod
     def _is_torchscript_definition_time_expression_safe(expression: ast.expr) -> bool:

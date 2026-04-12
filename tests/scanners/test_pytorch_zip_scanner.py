@@ -759,6 +759,74 @@ def test_pytorch_zip_warns_on_torchscript_stub_with_builtins_indirection(tmp_pat
     assert all(check.severity == IssueSeverity.WARNING for check in python_failures)
 
 
+def test_pytorch_zip_warns_on_torchscript_stub_with_markers_only_in_comments(tmp_path: Path) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "model.pt", prefix="archive")
+    source_path = "archive/code/__torch__/payload.py"
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr(
+            source_path,
+            "\n".join(
+                [
+                    "class Payload(Module):",
+                    "  # __parameters__ = []",
+                    "  # __buffers__ = []",
+                    "  def forward(self: __torch__.Payload,",
+                    "    x: Tensor) -> Tensor:",
+                    "    return x",
+                    "",
+                ]
+            ),
+        )
+        zip_file.writestr(
+            "archive/code/__torch__/payload.py.debug_pkl",
+            b"\x80\x02X\x18\x00\x00\x00FORMAT_WITH_STRING_TABLEq\x00.",
+        )
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    python_failures = [
+        check
+        for check in result.checks
+        if check.name == "Python Code File Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert any(check.details.get("file") == source_path for check in python_failures)
+    assert all(check.severity == IssueSeverity.WARNING for check in python_failures)
+
+
+def test_pytorch_zip_warns_on_torchscript_stub_with_breakpoint_body_call(tmp_path: Path) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "model.pt", prefix="archive")
+    source_path = "archive/code/__torch__/payload.py"
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr(
+            source_path,
+            "\n".join(
+                [
+                    "class Payload(Module):",
+                    "  __parameters__ = []",
+                    "  __buffers__ = []",
+                    "  def forward(self: __torch__.Payload,",
+                    "    x: Tensor) -> Tensor:",
+                    "    return breakpoint()",
+                    "",
+                ]
+            ),
+        )
+        zip_file.writestr(
+            "archive/code/__torch__/payload.py.debug_pkl",
+            b"\x80\x02X\x18\x00\x00\x00FORMAT_WITH_STRING_TABLEq\x00.",
+        )
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    python_failures = [
+        check
+        for check in result.checks
+        if check.name == "Python Code File Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert any(check.details.get("file") == source_path for check in python_failures)
+    assert all(check.severity == IssueSeverity.WARNING for check in python_failures)
+
+
 def test_pytorch_zip_warns_on_torchscript_stub_with_class_decorator_call(tmp_path: Path) -> None:
     model_path = create_mock_pytorch_zip(tmp_path / "model.pt", prefix="archive")
     source_path = "archive/code/__torch__/payload.py"
