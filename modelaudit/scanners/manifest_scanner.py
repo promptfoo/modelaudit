@@ -416,7 +416,7 @@ _TRUSTED_S3_ENDPOINT_HOST_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 _PARSE_FAILED: Final = object()
 _INI_SECTION_HEADER_RE = re.compile(r"^\s*\[[A-Za-z0-9_. -]+\]\s*(?:[#;].*)?(?:\r?\n|$)")
-_AT_SIGN_CONTAINER_SCHEMES = {"abfs", "abfss", "wasb", "wasbs"}
+_AT_SIGN_CONTAINER_SCHEMES: Final[frozenset[str]] = frozenset({"abfs", "abfss", "wasb", "wasbs"})
 
 
 def _scan_result_has_security_findings(result: ScanResult) -> bool:

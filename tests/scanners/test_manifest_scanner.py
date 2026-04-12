@@ -270,6 +270,40 @@ def test_manifest_scanner_redacts_untrusted_url_credentials(tmp_path: Path) -> N
     assert "fragment" not in check.details["url"]
 
 
+def test_manifest_scanner_container_schemes_preserve_at_symbol(tmp_path: Path) -> None:
+    """Azure container URI findings should preserve the container/account separator."""
+    test_file = tmp_path / "config.json"
+    raw_urls = {
+        "abfs": "abfs://container:secret@workspace.dfs.core.windows.net/models/path.bin?token=leak#frag",
+        "abfss": "abfss://container:secret@workspace.dfs.core.windows.net/models/path.bin?token=leak#frag",
+        "wasb": "wasb://container:secret@workspace.blob.core.windows.net/models/path.bin?token=leak#frag",
+        "wasbs": "wasbs://container:secret@workspace.blob.core.windows.net/models/path.bin?token=leak#frag",
+    }
+    test_file.write_text(json.dumps({"model_type": "bert", "download_urls": raw_urls}))
+
+    scanner = ManifestScanner()
+    result = scanner.scan(str(test_file))
+
+    cloud_storage_checks = [
+        check
+        for check in result.checks
+        if check.name == "Cloud Storage URL Detection" and check.status == CheckStatus.FAILED
+    ]
+    urls_by_scheme = {check.details["url"].split(":", 1)[0]: check for check in cloud_storage_checks}
+
+    assert set(raw_urls).issubset(urls_by_scheme)
+    for scheme, raw_url in raw_urls.items():
+        check = urls_by_scheme[scheme]
+        redacted_url = check.details["url"]
+        assert redacted_url == raw_url.split("?", 1)[0]
+        assert "container:secret@" in redacted_url
+        assert "<credentials-redacted>" not in redacted_url
+        assert "token=leak" not in redacted_url
+        assert "frag" not in redacted_url
+        assert "token=leak" not in check.message
+        assert "frag" not in check.message
+
+
 def test_manifest_scanner_tunnel_service_flagged(tmp_path):
     """Test that tunnel services (ngrok, localtunnel) are flagged (not in allowlist)."""
     test_file = tmp_path / "config.json"
