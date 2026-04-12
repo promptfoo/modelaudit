@@ -779,11 +779,22 @@ def _is_huggingface_cache_file(path: str) -> bool:
     # We no longer skip all HuggingFace cache files since we handle symlinks properly now
 
     # Check for Git-related files that are commonly cached
-    if filename in [".gitignore", ".gitattributes", "main", "HEAD"]:
+    if filename in [".gitignore", ".gitattributes"]:
         return True
 
-    # Check if file is in refs directory (Git references, not actual model files)
-    return bool("/refs/" in path and filename in ["main", "HEAD"])
+    if filename in ["main", "HEAD"]:
+        hf_cache_root = _find_hf_cache_root(path_obj)
+        if hf_cache_root is None:
+            return False
+
+        try:
+            relative_parts = _resolve_hf_cache_path(path_obj).relative_to(hf_cache_root).parts
+        except ValueError:
+            return False
+
+        return bool(relative_parts and relative_parts[0] == "refs")
+
+    return False
 
 
 @cached_scan()
@@ -1116,6 +1127,8 @@ def scan_model_streaming(
     results = create_initial_audit_result()
     file_hashes: list[str] = []
     files_processed = 0
+    skip_file_types: bool = bool(kwargs.get("skip_file_types", False))
+    metadata_scanner_available: bool = _registry.has_scanner_class("MetadataScanner")
 
     base_dir = Path(scan_root).resolve() if scan_root is not None else None
     hf_cache_root = _find_hf_cache_root(base_dir) if base_dir is not None else None
@@ -1137,6 +1150,10 @@ def scan_model_streaming(
                 break
 
             try:
+                if is_hf_cache and _is_huggingface_cache_file(str(source_path)):
+                    logger.debug(f"Skipping HuggingFace cache file: {source_path}")
+                    continue
+
                 if base_dir is not None:
                     resolved_path, _is_hf_cache_symlink = _resolve_directory_scan_target(
                         source_path,
@@ -1148,6 +1165,24 @@ def scan_model_streaming(
                     if resolved_path is None:
                         continue
                     scan_path = resolved_path
+
+                if skip_file_types and should_skip_file(
+                    str(source_path),
+                    metadata_scanner_available=metadata_scanner_available,
+                ):
+                    filename_lower = source_path.name.lower()
+                    if filename_lower in LICENSE_FILES:
+                        try:
+                            license_metadata = collect_license_metadata(str(scan_path))
+                            from .models import FileMetadataModel
+
+                            results.file_metadata[report_path] = FileMetadataModel(**license_metadata)
+                            logger.debug(f"Collected license metadata from skipped file: {source_path}")
+                        except Exception as e:
+                            logger.warning(f"Error collecting license metadata for {source_path}: {e}")
+                    else:
+                        logger.debug(f"Skipping non-model file: {source_path}")
+                    continue
 
                 # Compute file hash
                 if progress_callback:
