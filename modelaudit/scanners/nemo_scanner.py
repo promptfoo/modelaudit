@@ -699,8 +699,9 @@ class NemoScanner(BaseScanner):
         path_prefix: str = "",
     ) -> list[tuple[str, str]]:
         """Collect internal `nemo:` artifact references from a parsed config."""
+        collected: list[tuple[str, str]] = []
+
         if isinstance(config, list):
-            collected: list[tuple[str, str]] = []
             for index, item in enumerate(config):
                 collected.extend(
                     cls._collect_nemo_member_references(
@@ -711,7 +712,6 @@ class NemoScanner(BaseScanner):
             return collected
 
         if isinstance(config, dict):
-            collected = []
             for key, value in config.items():
                 current_path = f"{path_prefix}.{key}" if path_prefix else key
                 collected.extend(cls._collect_nemo_member_references(value, current_path))
