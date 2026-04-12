@@ -78,6 +78,16 @@ class _NonSeekableBytesIO(BytesIO):
         raise OSError("seek disabled")
 
 
+def _assert_user_visible_parse_failure_issue(result: ScanResult) -> None:
+    parse_issue = next(
+        issue for issue in result.issues if issue.message == "Pickle parsing failed before full scan completion"
+    )
+    assert parse_issue.severity == IssueSeverity.INFO
+    assert parse_issue.details["category"] == "parse_error"
+    assert parse_issue.details["analysis_incomplete"] is True
+    assert "opcode" in parse_issue.details["parse_error"]
+
+
 def test_pickle_scanner_star_import_exports_scanner_class() -> None:
     """Wildcard imports should still expose the scanner class after helper extraction."""
     namespace: dict[str, object] = {}
@@ -639,7 +649,7 @@ def test_scan_stream_preserves_package_findings_when_legacy_fallback_raises(
     )
 
 
-def test_scan_stream_parse_failure_fails_closed_for_pickle_stream(
+def test_scan_stream_parse_failure_is_inconclusive_for_pickle_stream(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     scanner = PickleScanner()
@@ -656,15 +666,16 @@ def test_scan_stream_parse_failure_fails_closed_for_pickle_stream(
     assert result.metadata["file_type"] == "pickle"
     assert result.metadata["parsing_failed"] is True
     assert result.metadata["failure_reason"] == "unknown_opcode_or_format_error"
-    assert any(
-        check.name == "Pickle Format Check"
-        and check.status == CheckStatus.FAILED
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    )
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    parse_check = next(check for check in result.checks if check.name == "Pickle Format Check")
+    assert parse_check.status == CheckStatus.FAILED
+    assert parse_check.severity == IssueSeverity.INFO
+    assert parse_check.details["category"] == "parse_error"
+    _assert_user_visible_parse_failure_issue(result)
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
-def test_scan_stream_non_seekable_parse_failure_fails_closed(
+def test_scan_stream_non_seekable_parse_failure_is_inconclusive(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     scanner = PickleScanner()
@@ -685,7 +696,13 @@ def test_scan_stream_non_seekable_parse_failure_fails_closed(
     assert result.metadata["file_type"] == "pickle"
     assert result.metadata["parsing_failed"] is True
     assert result.metadata["failure_reason"] == "unknown_opcode_or_format_error"
-    assert any(check.name == "Pickle Format Check" and check.status == CheckStatus.FAILED for check in result.checks)
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    parse_check = next(check for check in result.checks if check.name == "Pickle Format Check")
+    assert parse_check.status == CheckStatus.FAILED
+    assert parse_check.severity == IssueSeverity.INFO
+    assert parse_check.details["category"] == "parse_error"
+    _assert_user_visible_parse_failure_issue(result)
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
 def test_pickle_scanner_can_handle_rejects_non_pickle_content(tmp_path: Path) -> None:
@@ -923,14 +940,14 @@ def test_padding_stripped_base64_candidate_still_flags_potential_base64() -> Non
 
 
 @pytest.mark.parametrize("file_ext", [".pkl", ".pt", ".pth", ".ckpt"])
-def test_unknown_opcode_pickle_parse_failure_fails_closed(
+def test_unknown_opcode_pickle_parse_failure_is_inconclusive(
     file_ext: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Unknown opcode parse failures in raw pickle-backed checkpoint files must fail closed."""
+    """Unknown opcode parse failures in raw pickle-backed checkpoint files should be inconclusive."""
     pickle_path = tmp_path / f"unknown_opcode{file_ext}"
-    pickle_path.write_bytes(b"\x80\x04K\x01." + (b"A" * 9000) + b"os.system")
+    pickle_path.write_bytes(b"\x80\x04K\x01." + (b"A" * 9000))
 
     def _raise_unknown_opcode(self: PickleScanner, _file_obj: object, _file_size: int) -> ScanResult:
         raise ValueError("at position 2, opcode b'\\xff' unknown")
@@ -943,16 +960,17 @@ def test_unknown_opcode_pickle_parse_failure_fails_closed(
     assert result.metadata["file_type"] == "pickle"
     assert result.metadata["parsing_failed"] is True
     assert result.metadata["failure_reason"] == "unknown_opcode_or_format_error"
-    assert any(
-        check.name == "Pickle Format Check"
-        and check.status == CheckStatus.FAILED
-        and check.severity == IssueSeverity.CRITICAL
-        for check in result.checks
-    ), f"Expected fail-closed format check, got: {[(c.name, c.status, c.severity) for c in result.checks]}"
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    parse_check = next(check for check in result.checks if check.name == "Pickle Format Check")
+    assert parse_check.status == CheckStatus.FAILED
+    assert parse_check.severity == IssueSeverity.INFO
+    assert parse_check.details["category"] == "parse_error"
+    _assert_user_visible_parse_failure_issue(result)
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
-def test_merge_missing_pickle_checks_preserves_ruleless_parse_failures_and_fails_closed() -> None:
-    """Rule-less parse-failure fallback issues must survive merge and preserve fail-closed success."""
+def test_merge_missing_pickle_checks_preserves_ruleless_parse_failures_as_inconclusive() -> None:
+    """Rule-less parse-failure fallback issues must survive merge as inconclusive, not security."""
     scanner = PickleScanner()
     target = ScanResult(scanner_name="pickle", scanner=scanner)
     target.add_check(
@@ -968,9 +986,10 @@ def test_merge_missing_pickle_checks_preserves_ruleless_parse_failures_and_fails
         name="Standalone Pickle Parse Failure",
         passed=False,
         message="Pickle parsing failed before full scan completion",
-        severity=IssueSeverity.CRITICAL,
+        severity=IssueSeverity.INFO,
         location="truncated.pkl (pos 4)",
         details={
+            "category": "parse_error",
             "parse_error": "pickle exhausted before seeing STOP",
             "failure_reason": "unknown_opcode_or_format_error",
             "analysis_incomplete": True,
@@ -991,10 +1010,11 @@ def test_merge_missing_pickle_checks_preserves_ruleless_parse_failures_and_fails
     assert target.metadata["scan_outcome_reasons"] == ["pickle_analysis_incomplete"]
     assert any(
         issue.rule_code is None
-        and issue.severity == IssueSeverity.CRITICAL
+        and issue.severity == IssueSeverity.INFO
         and issue.message == "Pickle parsing failed before full scan completion"
         for issue in target.issues
     )
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in target.issues)
 
 
 def test_merge_missing_pickle_checks_propagates_fallback_operational_errors_and_fails_closed() -> None:
@@ -1140,7 +1160,7 @@ def test_merge_missing_pickle_checks_fails_closed_for_fallback_parse_errors_with
         name="Standalone Pickle Error",
         passed=False,
         message="Could not parse pickle stream: at position 0, opcode b'\\xff' unknown",
-        severity=IssueSeverity.CRITICAL,
+        severity=IssueSeverity.INFO,
         location="parse-error.bin (pos 0)",
         details={
             "pickle_source": "parse-error.bin",
@@ -1157,14 +1177,15 @@ def test_merge_missing_pickle_checks_fails_closed_for_fallback_parse_errors_with
     assert target.success is False
     assert any(
         issue.details.get("category") == "parse_error"
-        and issue.severity == IssueSeverity.CRITICAL
+        and issue.severity == IssueSeverity.INFO
         and issue.message.startswith("Could not parse pickle stream:")
         for issue in target.issues
     )
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in target.issues)
 
 
-def test_merge_missing_pickle_checks_preserves_bin_parse_failures_and_fails_closed() -> None:
-    """Truncated `.bin` pickle payloads should preserve fallback parse failures and fail closed."""
+def test_merge_missing_pickle_checks_preserves_bin_parse_failures_as_inconclusive() -> None:
+    """Truncated `.bin` pickle payloads should preserve fallback parse failures as inconclusive."""
     scanner = PickleScanner()
     target = ScanResult(scanner_name="pickle", scanner=scanner)
     target.add_check(
@@ -1180,10 +1201,11 @@ def test_merge_missing_pickle_checks_preserves_bin_parse_failures_and_fails_clos
         name="Standalone Pickle Parse Failure",
         passed=False,
         message="Pickle parsing failed before full scan completion",
-        severity=IssueSeverity.CRITICAL,
+        severity=IssueSeverity.INFO,
         location="truncated.bin (pos 0)",
         details={
             "pickle_source": "truncated.bin",
+            "category": "parse_error",
             "parse_error": "pickle exhausted before seeing STOP",
             "failure_reason": "unknown_opcode_or_format_error",
             "analysis_incomplete": True,
@@ -1204,8 +1226,10 @@ def test_merge_missing_pickle_checks_preserves_bin_parse_failures_and_fails_clos
     assert any(
         issue.message == "Pickle parsing failed before full scan completion"
         and issue.location == "truncated.bin (pos 0)"
+        and issue.severity == IssueSeverity.INFO
         for issue in target.issues
     )
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in target.issues)
 
 
 def test_merge_missing_pickle_checks_fails_closed_for_inconclusive_notice_only_fallback() -> None:
@@ -1284,10 +1308,11 @@ def test_merge_missing_pickle_checks_trusts_legacy_boundary_for_benign_joblib_ta
         name="Standalone Pickle Parse Failure",
         passed=False,
         message="Pickle parsing failed before full scan completion",
-        severity=IssueSeverity.CRITICAL,
+        severity=IssueSeverity.INFO,
         location="numpy_arrays.joblib (decompressed) (pos 227)",
         details={
             "pickle_source": "numpy_arrays.joblib (decompressed)",
+            "category": "parse_error",
             "parse_error": "at position 226, opcode b'\\r' unknown",
             "failure_reason": "unknown_opcode_or_format_error",
             "analysis_incomplete": True,
@@ -1347,10 +1372,11 @@ def test_merge_missing_pickle_checks_does_not_trust_boundary_for_dangerous_jobli
         name="Standalone Pickle Parse Failure",
         passed=False,
         message="Pickle parsing failed before full scan completion",
-        severity=IssueSeverity.CRITICAL,
+        severity=IssueSeverity.INFO,
         location="dangerous.joblib (decompressed) (pos 227)",
         details={
             "pickle_source": "dangerous.joblib (decompressed)",
+            "category": "parse_error",
             "parse_error": "at position 226, opcode b'\\r' unknown",
             "failure_reason": "unknown_opcode_or_format_error",
             "analysis_incomplete": True,
@@ -1377,7 +1403,10 @@ def test_merge_missing_pickle_checks_does_not_trust_boundary_for_dangerous_jobli
 
     assert target.success is False
     assert "trusted_incomplete_tail" not in target.metadata
-    assert any(issue.message == "Pickle parsing failed before full scan completion" for issue in target.issues)
+    assert any(
+        issue.message == "Pickle parsing failed before full scan completion" and issue.severity == IssueSeverity.INFO
+        for issue in target.issues
+    )
 
 
 @pytest.mark.parametrize(
@@ -5034,18 +5063,20 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
             f"Expected CRITICAL __import__ detection, got: {critical_messages}"
         )
 
-    def test_malformed_unicode_tail_with_benign_prefix_fails_closed(self) -> None:
-        """Malformed tails without a trusted pickle boundary should fail closed."""
+    def test_malformed_unicode_tail_with_benign_prefix_is_inconclusive(self) -> None:
+        """Malformed tails without dangerous evidence should be operationally inconclusive."""
         payload = b"\x80\x02cbuiltins\nlen\nq\x00c\xff\n"
 
         result = self._scan_bytes(payload)
 
         assert not result.success
-        assert any(
-            issue.severity == IssueSeverity.CRITICAL
-            and issue.message == "Pickle parsing failed before full scan completion"
-            for issue in result.issues
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        parse_issue = next(
+            issue for issue in result.issues if issue.message == "Pickle parsing failed before full scan completion"
         )
+        assert parse_issue.severity == IssueSeverity.INFO
+        assert parse_issue.details["category"] == "parse_error"
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
     # ------------------------------------------------------------------
     # Fix 3: joblib.load loader trampoline bypass

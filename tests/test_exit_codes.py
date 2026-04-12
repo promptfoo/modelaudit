@@ -223,6 +223,30 @@ def test_exit_code_inconclusive_pickle_without_security_findings() -> None:
     assert determine_exit_code(results) == 2
 
 
+def test_exit_code_inconclusive_pickle_with_info_parse_failure_without_security_findings() -> None:
+    """Operational parse failures should return exit code 2, not security exit code 1."""
+    results = _create_result_model(
+        success=False,
+        file_metadata={"model.pkl": {"scan_outcome": "inconclusive", "analysis_incomplete": True}},
+        issues=[
+            Issue(
+                message="Pickle parsing failed before full scan completion",
+                severity=IssueSeverity.INFO,
+                location="model.pkl",
+                details={
+                    "category": "parse_error",
+                    "failure_reason": "unknown_opcode_or_format_error",
+                    "analysis_incomplete": True,
+                },
+                timestamp=0.0,
+                why=None,
+                type=None,
+            ),
+        ],
+    )
+    assert determine_exit_code(results) == 2
+
+
 def test_exit_code_inconclusive_pickle_with_security_findings() -> None:
     """Security findings should still return exit code 1 even if analysis was inconclusive."""
     results = _create_result_model(
