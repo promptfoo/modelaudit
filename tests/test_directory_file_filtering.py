@@ -309,6 +309,27 @@ class TestDirectoryFileFiltering:
         # be treated as HuggingFace bookkeeping even though a sibling snapshots/ exists.
         assert _is_huggingface_cache_file(str(malicious_metadata)) is False
 
+    def test_huggingface_ref_names_only_skip_inside_hf_refs(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Files named main/HEAD are model payloads unless they are HF cache refs."""
+        hf_home = tmp_path / ".cache" / "huggingface"
+        monkeypatch.setenv("HF_HOME", str(hf_home))
+
+        local_main = tmp_path / "main"
+        local_head = tmp_path / "HEAD"
+        hf_ref_main = hf_home / "hub" / "models--org--repo" / "refs" / "main"
+        hf_ref_head = hf_home / "hub" / "models--org--repo" / "refs" / "HEAD"
+        hf_snapshot_main = hf_home / "hub" / "models--org--repo" / "snapshots" / "abc123" / "main"
+
+        assert _is_huggingface_cache_file(str(local_main)) is False
+        assert _is_huggingface_cache_file(str(local_head)) is False
+        assert _is_huggingface_cache_file(str(hf_ref_main)) is True
+        assert _is_huggingface_cache_file(str(hf_ref_head)) is True
+        assert _is_huggingface_cache_file(str(hf_snapshot_main)) is False
+
     def test_performance_with_many_files(self):
         """Test that file filtering improves performance with many non-model files."""
         with tempfile.TemporaryDirectory() as tmp_dir:

@@ -6,14 +6,19 @@ import tempfile
 import zipfile
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
 from modelaudit import core
+from modelaudit.scanners import _registry, archive_dispatch
 from modelaudit.scanners._archive_locations import rewrite_extracted_member_location
-from modelaudit.scanners.archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY, _select_nested_scanner_id
-from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
+from modelaudit.scanners.archive_dispatch import (
+    NESTED_SCAN_CALLBACK_CONFIG_KEY,
+    _select_nested_scanner_id,
+    scan_nested_file,
+)
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.zip_scanner import ZipScanner
 
 
@@ -54,6 +59,127 @@ def test_rewrite_extracted_member_location_preserves_scanner_specific_suffix_pol
         )
         == "/archive.zip:model.pkl /tmp/extracted.pkl2"
     )
+
+
+class _HeaderRoutedTempScanner(BaseScanner):
+    name: ClassVar[str] = "header_routed_temp"
+
+    @classmethod
+    def can_handle(cls, path: str) -> bool:
+        return False
+
+    def scan(self, path: str) -> ScanResult:
+        result = ScanResult(scanner_name=self.name, scanner=self)
+        result.add_check(
+            name="Header-routed temp scan",
+            passed=True,
+            message=f"Scanned {path}",
+            location=path,
+        )
+        result.finish(success=True)
+        return result
+
+
+class _HeaderRoutedFindingScanner(_HeaderRoutedTempScanner):
+    name: ClassVar[str] = "header_routed_finding"
+
+    def scan(self, path: str) -> ScanResult:
+        result = ScanResult(scanner_name=self.name, scanner=self)
+        result.add_check(
+            name="Header-routed temp scan",
+            passed=False,
+            message=f"Detected header-routed payload in {path}",
+            severity=IssueSeverity.WARNING,
+            location=path,
+        )
+        result.finish(success=False)
+        return result
+
+
+def test_scan_nested_file_honors_header_route_when_temp_suffix_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extracted_member = tmp_path / "member.dat"
+    extracted_member.write_bytes(b"header-routed model payload")
+
+    monkeypatch.setattr(archive_dispatch, "detect_file_format", lambda _path: "header_only_model")
+    monkeypatch.setitem(
+        archive_dispatch._HEADER_FORMAT_TO_SCANNER_ID,
+        "header_only_model",
+        "header_only_scanner",
+    )
+
+    def load_scanner_by_id(scanner_id: str) -> type[BaseScanner] | None:
+        if scanner_id == "header_only_scanner":
+            return _HeaderRoutedTempScanner
+        return None
+
+    def get_scanner_for_path(path: str) -> type[BaseScanner] | None:
+        raise AssertionError(f"header-routed nested member fell back to path routing: {path}")
+
+    monkeypatch.setattr(_registry, "load_scanner_by_id", load_scanner_by_id)
+    monkeypatch.setattr(_registry, "get_scanner_for_path", get_scanner_for_path)
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "header_routed_temp"
+    assert result.success is True
+
+
+def test_scan_nested_file_drops_header_route_when_rechecked_header_mismatches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extracted_member = tmp_path / "member.dat"
+    extracted_member.write_bytes(b"not actually a header-routed payload")
+    detected_formats = iter(["header_only_model", "unknown"])
+
+    monkeypatch.setattr(archive_dispatch, "detect_file_format", lambda _path: next(detected_formats))
+    monkeypatch.setitem(
+        archive_dispatch._HEADER_FORMAT_TO_SCANNER_ID,
+        "header_only_model",
+        "header_only_scanner",
+    )
+    monkeypatch.setattr(_registry, "load_scanner_by_id", lambda _scanner_id: _HeaderRoutedTempScanner)
+    monkeypatch.setattr(_registry, "get_scanner_for_path", lambda _path: None)
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.success is True
+
+
+def test_scan_nested_file_header_routed_generic_suffix_can_report_findings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extracted_member = tmp_path / "member.dat"
+    extracted_member.write_bytes(b"header-routed malicious payload")
+
+    monkeypatch.setattr(archive_dispatch, "detect_file_format", lambda _path: "header_only_model")
+    monkeypatch.setitem(
+        archive_dispatch._HEADER_FORMAT_TO_SCANNER_ID,
+        "header_only_model",
+        "header_only_scanner",
+    )
+    monkeypatch.setattr(_registry, "load_scanner_by_id", lambda _scanner_id: _HeaderRoutedFindingScanner)
+
+    def get_scanner_for_path(path: str) -> type[BaseScanner] | None:
+        raise AssertionError(f"header-routed nested member fell back to path routing: {path}")
+
+    monkeypatch.setattr(_registry, "get_scanner_for_path", get_scanner_for_path)
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "header_routed_finding"
+    assert result.success is False
+    failed_checks = [check for check in result.checks if check.status == CheckStatus.FAILED]
+    assert len(failed_checks) == 1
+    assert failed_checks[0].severity == IssueSeverity.WARNING
+    assert "detected header-routed payload" in failed_checks[0].message.lower()
+    assert result.has_warnings is True
+    assert result.has_errors is False
 
 
 class TestZipScanner:
@@ -641,6 +767,19 @@ class TestZipScanner:
             archive.writestr("metadata.txt", "not a pickle")
 
         assert _select_nested_scanner_id(str(archive_path)) == "zip"
+
+    def test_nested_member_routes_misnamed_onnx_by_header(self, tmp_path: Path) -> None:
+        """A model header should route nested members even when their suffix is generic."""
+        archive_path = tmp_path / "outer.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("model.payload", b"\x08\x01\x12\x00onnx.proto" + b"\x00" * 32)
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert any(
+            entry["path"] == f"{archive_path}:model.payload" and entry["type"] == "onnx"
+            for entry in result.metadata["contents"]
+        )
 
     def test_max_depth_limit(self):
         """Test that maximum nesting depth is enforced"""

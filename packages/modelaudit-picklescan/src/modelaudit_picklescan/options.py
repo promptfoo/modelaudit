@@ -9,6 +9,7 @@ from numbers import Real
 DEFAULT_TIMEOUT_S = 3600.0
 DEFAULT_MAX_OPCODES = 1_000_000
 DEFAULT_POST_BUDGET_SCAN_BYTES = 100 * 1024 * 1024
+DEFAULT_MAX_UNBOUNDED_STREAM_READ_BYTES = 8 * 1024 * 1024
 DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS = 8 * 1024 * 1024
 DEFAULT_MAX_NESTED_PICKLE_BYTES = 2 * 1024 * 1024
 DEFAULT_MAX_NESTED_DEPTH = 1
@@ -21,6 +22,7 @@ class ScanOptions:
     timeout_s: float = DEFAULT_TIMEOUT_S
     max_opcodes: int = DEFAULT_MAX_OPCODES
     post_budget_scan_bytes: int = DEFAULT_POST_BUDGET_SCAN_BYTES
+    max_unbounded_stream_read_bytes: int = DEFAULT_MAX_UNBOUNDED_STREAM_READ_BYTES
     max_string_literal_scan_chars: int = DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS
     max_nested_pickle_bytes: int = DEFAULT_MAX_NESTED_PICKLE_BYTES
     max_nested_depth: int = DEFAULT_MAX_NESTED_DEPTH
@@ -43,6 +45,17 @@ class ScanOptions:
             raise ValueError(
                 "post_budget_scan_bytes must be greater than or equal to 0 and an integer, "
                 f"got {post_budget_scan_bytes!r}",
+            )
+
+        max_unbounded_stream_read_bytes: object = self.max_unbounded_stream_read_bytes
+        if (
+            isinstance(max_unbounded_stream_read_bytes, bool)
+            or not isinstance(max_unbounded_stream_read_bytes, int)
+            or max_unbounded_stream_read_bytes <= 0
+        ):
+            raise ValueError(
+                "max_unbounded_stream_read_bytes must be greater than 0 and an integer, "
+                f"got {max_unbounded_stream_read_bytes!r}",
             )
 
         max_string_literal_scan_chars: object = self.max_string_literal_scan_chars

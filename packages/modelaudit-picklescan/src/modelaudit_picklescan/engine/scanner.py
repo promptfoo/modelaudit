@@ -91,7 +91,11 @@ def scan_pickle_stream(
     started_at = time.monotonic()
     scan = _ScanState(
         source=source,
-        stream=_BoundedPickleStream(stream, bytes_total),
+        stream=_BoundedPickleStream(
+            stream,
+            bytes_total,
+            unbounded_read_limit=options.max_unbounded_stream_read_bytes,
+        ),
         options=options,
         bytes_total=bytes_total,
         position_offset=position_offset,

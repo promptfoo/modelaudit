@@ -9,6 +9,7 @@ The new .keras format is a ZIP archive containing:
 
 import base64
 import json
+import marshal
 import os
 import tempfile
 import warnings
@@ -866,6 +867,38 @@ __import__('pickle').loads(data)
 
         finally:
             os.unlink(temp_path)
+
+    def test_opaque_lambda_bytecode_stays_warning(self, tmp_path: Path) -> None:
+        """Opaque compiled Lambda bytecode should remain a warning-level finding."""
+        scanner = KerasZipScanner()
+        encoded_code = base64.b64encode(marshal.dumps((lambda x: x + 1).__code__)).decode()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": "opaque_lambda",
+                        "config": {"function": [encoded_code, None, None]},
+                    }
+                ]
+            },
+        }
+
+        result = scanner.scan(str(create_configured_keras_zip(tmp_path, config)))
+
+        opaque_issues = [
+            issue
+            for issue in result.issues
+            if "opaque encoded bytecode" in issue.message and "opaque_lambda" in issue.message
+        ]
+        assert len(opaque_issues) == 1
+        assert opaque_issues[0].severity == IssueSeverity.WARNING
+        assert not [
+            issue
+            for issue in result.issues
+            if "opaque_lambda" in issue.message and issue.severity == IssueSeverity.CRITICAL
+        ]
 
     def test_stringlookup_external_vocabulary_path_triggers_cve_2025_12058(self, tmp_path: Path) -> None:
         """Absolute StringLookup vocabulary paths should be attributed to CVE-2025-12058 on vulnerable Keras."""
@@ -2246,7 +2279,7 @@ class TestCVE20258747GetFileGadget:
     def test_get_file_extract_tar_url_fragment_detects_cve_2025_12060(self, tmp_path: Path) -> None:
         """URL fragments must not hide tar extraction gadgets from CVE attribution."""
         scanner = KerasZipScanner()
-        archive_url = "https://evil.example/payload.tar.gz#comment-token"
+        archive_url = "https://user:pass@evil.example/payload.tar.gz?token=SECRET#comment-token"
         config = {
             "class_name": "Sequential",
             "config": {
@@ -2268,7 +2301,12 @@ class TestCVE20258747GetFileGadget:
         cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-12060"]
         assert len(cve_issues) == 1
         assert cve_issues[0].severity == IssueSeverity.CRITICAL
-        assert cve_issues[0].details["urls"] == [archive_url]
+        details = cve_issues[0].details
+        assert details["urls"] == ["https://evil.example/payload.tar.gz"]
+        assert "user" not in str(details)
+        assert "pass" not in str(details)
+        assert "SECRET" not in str(details)
+        assert "comment-token" not in str(details)
 
     def test_get_file_extract_tar_url_fragment_in_kwargs_detects_cve_2025_12060(self, tmp_path: Path) -> None:
         """kwargs.origin fragments should remain part of the detected archive URL."""
@@ -2297,7 +2335,7 @@ class TestCVE20258747GetFileGadget:
         cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-12060"]
         assert len(cve_issues) == 1
         assert cve_issues[0].severity == IssueSeverity.CRITICAL
-        assert cve_issues[0].details["urls"] == [archive_url]
+        assert cve_issues[0].details["urls"] == ["https://evil.example/payload.tgz"]
 
     def test_get_file_positional_extract_tar_url_detects_cve_2025_12060(self, tmp_path: Path) -> None:
         """Positional get_file args with extract=True should receive CVE attribution."""

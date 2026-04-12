@@ -142,6 +142,45 @@ def test_openvino_scanner_missing_bin(tmp_path: Path) -> None:
     assert any(i.severity == IssueSeverity.INFO for i in result.issues)
 
 
+def test_openvino_scanner_flags_bin_symlink_escape(tmp_path: Path, requires_symlinks: None) -> None:
+    model_dir = tmp_path / "model"
+    outside_dir = tmp_path / "outside"
+    model_dir.mkdir()
+    outside_dir.mkdir()
+
+    xml_path = model_dir / "model.xml"
+    escaped_weights = outside_dir / "secret.bin"
+    xml_path.write_text("<net version='10'></net>", encoding="utf-8")
+    escaped_weights.write_bytes(b"secret-weights")
+    (model_dir / "model.bin").symlink_to(escaped_weights)
+
+    result = OpenVinoScanner().scan(str(xml_path))
+
+    symlink_checks = [check for check in result.checks if check.name == "OpenVINO Weights Symlink Boundary Check"]
+    assert result.success is False
+    assert symlink_checks
+    assert symlink_checks[0].severity == IssueSeverity.CRITICAL
+    assert symlink_checks[0].details["resolved_path"] == str(escaped_weights.resolve())
+    assert symlink_checks[0].details["model_directory"] == str(model_dir.resolve())
+    assert "bin_size" not in result.metadata
+
+
+def test_openvino_scanner_allows_bin_symlink_inside_model_dir(tmp_path: Path, requires_symlinks: None) -> None:
+    xml_path = tmp_path / "model.xml"
+    weights_dir = tmp_path / "weights"
+    weights_dir.mkdir()
+    target_weights = weights_dir / "model.bin"
+    xml_path.write_text("<net version='10'></net>", encoding="utf-8")
+    target_weights.write_bytes(b"\x00" * 12)
+    (tmp_path / "model.bin").symlink_to(target_weights)
+
+    result = OpenVinoScanner().scan(str(xml_path))
+
+    assert result.success is True
+    assert result.metadata["bin_size"] == target_weights.stat().st_size
+    assert not any(check.name == "OpenVINO Weights Symlink Boundary Check" for check in result.checks)
+
+
 def test_openvino_scanner_forbidden_doctype_fails_closed_with_exit_2(tmp_path: Path) -> None:
     """Forbidden DOCTYPE payloads should produce an explicit OpenVINO parse failure and exit 2."""
     xml_path = tmp_path / "model.xml"
@@ -286,6 +325,37 @@ def test_openvino_scanner_detects_path_external_library_reference(tmp_path: Path
 
     assert result.success is False
     assert any("external library '../plugins/custom_op'" in issue.message for issue in result.issues)
+
+
+def test_openvino_scanner_redacts_external_library_url_secrets(tmp_path: Path) -> None:
+    """External library URL evidence should not preserve credentials or signed query strings."""
+    xml_path = tmp_path / "model.xml"
+    raw_library_url = "https://user:secret-token@evil.example/plugin.so?access_token=abcd#fragment"
+    xml_path.write_text(
+        f"""
+        <net version='10'>
+          <layers>
+            <layer id='1' name='conv' type='Convolution'>
+              <data implementation='{raw_library_url}'/>
+            </layer>
+          </layers>
+        </net>
+        """,
+        encoding="utf-8",
+    )
+    (tmp_path / "model.bin").write_bytes(b"\x00")
+
+    result = OpenVinoScanner().scan(str(xml_path))
+
+    library_checks = [check for check in result.checks if check.name == "External Library Reference Check"]
+    assert library_checks
+    assert library_checks[0].details["library"] == "https://evil.example/plugin.so"
+    rendered_result = f"{[check.message for check in result.checks]} {result.metadata} {library_checks[0].details}"
+    assert "https://evil.example/plugin.so" in rendered_result
+    assert "secret-token" not in rendered_result
+    assert "access_token=" not in rendered_result
+    assert "user:secret-token" not in rendered_result
+    assert "#fragment" not in rendered_result
 
 
 def test_openvino_scanner_layer_attribute_importlib_false_positive_control(tmp_path: Path) -> None:

@@ -102,6 +102,35 @@ class TestModelMetadataExtractor:
             assert "safetensors" in metadata["summary"]["formats"]
             assert "pickle" in metadata["summary"]["formats"]
 
+    def test_extract_directory_metadata_rejects_symlink_escape(
+        self,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        """Directory metadata extraction should not read symlinks outside the scan root."""
+        extractor = ModelMetadataExtractor()
+        scan_dir = tmp_path / "scan"
+        scan_dir.mkdir()
+        outside_dir = tmp_path / "outside"
+        outside_dir.mkdir()
+        outside_model = outside_dir / "secret.pkl"
+        with outside_model.open("wb") as f:
+            pickle.dump({"secret": "outside"}, f)
+
+        escaped_link = scan_dir / "model.pkl"
+        escaped_link.symlink_to(outside_model)
+
+        metadata = extractor.extract(str(scan_dir))
+
+        assert metadata["summary"]["total_files"] == 0
+        assert metadata["files"] == [
+            {
+                "file": "model.pkl",
+                "path": str(escaped_link),
+                "error": "Path traversal outside metadata directory",
+            }
+        ]
+
     def test_security_only_filter(self, tmp_path: Path) -> None:
         """Test security-only metadata filtering."""
         extractor = ModelMetadataExtractor()

@@ -111,7 +111,7 @@ PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest -n auto -m "not slow and not integra
 - Keep fixtures deterministic and self-contained under `tmp_path`; never rely on host paths or global temp filenames.
 - If a new regression test must run on reduced CI lanes, add the file to `allowed_test_files` in `tests/conftest.py`.
 - Match local validation to the CI lane that will exercise the change when possible; if optional dependencies or Python-version gates prevent that, call it out explicitly in the PR.
-- Disable telemetry for local validation unless the task explicitly tests telemetry behavior: prefix pytest runs with `PROMPTFOO_DISABLE_TELEMETRY=1` (or `NO_ANALYTICS=1`). Do not request approval to contact `a.promptfoo.app` for normal unit, scanner, or integration-excluded test runs; telemetry tests must mock the transport or make network intent explicit before running.
+- Disable telemetry for local validation unless the task explicitly tests telemetry behavior: prefix pytest runs with `PROMPTFOO_DISABLE_TELEMETRY=1` (or `NO_ANALYTICS=1`). Requests to contact `a.promptfoo.app` during normal unit, scanner, or integration-excluded test runs are ok and expected for this project; approve them when the test runner requests access. Telemetry tests should still mock the transport or make network intent explicit before running.
 - For file routing, prefiltering, or archive-triage changes, add at least one malicious positive regression and one benign near-match negative regression.
 - Reuse shared fixture helpers for container formats. For PyTorch ZIP tests, prefer
   `tests.helpers.create_mock_pytorch_zip`; if you hand-roll a ZIP-backed `.pt`/`.pkl`,

