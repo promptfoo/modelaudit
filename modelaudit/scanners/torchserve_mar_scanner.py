@@ -15,7 +15,7 @@ import tempfile
 import zipfile
 from pathlib import PurePosixPath
 from typing import Any, ClassVar
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 from ..utils import is_absolute_archive_path, is_critical_system_path, sanitize_archive_path
 from ..utils.helpers.assets import asset_from_scan_result
@@ -69,6 +69,28 @@ HIGH_RISK_CALLS = {
 SAFE_IMPORT_TIME_CALLS = {
     "logging.getLogger",
 }
+
+
+def redact_manifest_url_reference(value: str) -> str:
+    """Return a display-safe URL reference for scan output."""
+    parsed = urlparse(value)
+    if not parsed.scheme:
+        return "[redacted-url]"
+
+    host = parsed.hostname
+    if not host:
+        return f"{parsed.scheme}://[redacted-url]"
+
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+
+    netloc = f"{host}:{port}" if port else host
+    return urlunparse((parsed.scheme, netloc, parsed.path, "", "", ""))
 
 
 class TorchServeMarScanner(BaseScanner):
@@ -643,7 +665,7 @@ class TorchServeMarScanner(BaseScanner):
                 continue
 
             if URL_SCHEME_PATTERN.match(value):
-                url_like_paths.append({"field": field, "value": value})
+                url_like_paths.append({"field": field, "value": redact_manifest_url_reference(value)})
                 continue
 
             if is_absolute_archive_path(value):
