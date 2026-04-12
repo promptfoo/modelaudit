@@ -1,5 +1,6 @@
 """Scanner for PyTorch zip-archived model files (.pt, .pth)."""
 
+import ast
 import io
 import logging
 import os
@@ -31,6 +32,69 @@ from .pytorch_zip_support import (
 
 logger = logging.getLogger(__name__)
 _INSTALLED_PYTORCH_VERSION_UNSET = object()
+_TORCHSCRIPT_DEBUG_PAYLOAD_MARKER = b"FORMAT_WITH_STRING_TABLE"
+_TORCHSCRIPT_DEBUG_PREFIX_BYTES = 256
+_TORCHSCRIPT_SOURCE_MAX_BYTES = 1024 * 1024
+_TORCHSCRIPT_GENERATED_CLASS_PATTERN = re.compile(r"(?m)^class\s+[A-Za-z_][A-Za-z0-9_]*\(Module\):\s*$")
+_TORCHSCRIPT_GENERATED_METHOD_PATTERN = re.compile(r"(?m)^\s+def\s+\w+\(self:\s+__torch__\.")
+_TORCHSCRIPT_FORBIDDEN_SOURCE_PATTERN = re.compile(
+    r"(?im)(?:^\s*(?:import|from)\s+|\b(?:__import__|eval|exec|compile|open)\s*\(|\b(?:os|subprocess|socket|requests)\s*\.)"
+)
+_TORCHSCRIPT_FORBIDDEN_AST_NAMES: frozenset[str] = frozenset(
+    {
+        "__builtins__",
+        "__class__",
+        "__dict__",
+        "__getattribute__",
+        "__globals__",
+        "__import__",
+        "__mro__",
+        "__subclasses__",
+        "breakpoint",
+        "compile",
+        "delattr",
+        "eval",
+        "exec",
+        "getattr",
+        "globals",
+        "input",
+        "locals",
+        "load_library",
+        "open",
+        "print",
+        "setattr",
+        "vars",
+    }
+)
+_TORCHSCRIPT_UNSAFE_DEFINITION_EXPR_NODES: tuple[type[ast.AST], ...] = (
+    ast.Await,
+    ast.Call,
+    ast.DictComp,
+    ast.GeneratorExp,
+    ast.Lambda,
+    ast.ListComp,
+    ast.NamedExpr,
+    ast.SetComp,
+    ast.Yield,
+    ast.YieldFrom,
+)
+_TORCHSCRIPT_UNSAFE_BODY_NODES: tuple[type[ast.AST], ...] = (
+    ast.AsyncFor,
+    ast.AsyncFunctionDef,
+    ast.AsyncWith,
+    ast.Await,
+    ast.Delete,
+    ast.Global,
+    ast.Import,
+    ast.ImportFrom,
+    ast.Lambda,
+    ast.Nonlocal,
+    ast.Raise,
+    ast.Try,
+    ast.With,
+    ast.Yield,
+    ast.YieldFrom,
+)
 _PICKLE_BINARY_PROTOCOL_PREFIXES: tuple[bytes, ...] = (
     b"\x80\x01",
     b"\x80\x02",
@@ -239,7 +303,7 @@ class PyTorchZipScanner(BaseScanner):
                 bytes_scanned += self._scan_for_jit_patterns(zip_file, safe_entries, result, path)
 
                 # Detect suspicious non-pickle files
-                self._detect_suspicious_files(safe_entries, result, path)
+                self._detect_suspicious_files(zip_file, safe_entries, result, path)
 
                 # Validate PyTorch model structure
                 self._validate_pytorch_structure(pickle_files, result)
@@ -278,6 +342,191 @@ class PyTorchZipScanner(BaseScanner):
     def _get_zip_member_names(cls, entries: list[zipfile.ZipInfo]) -> list[str]:
         """Return archive member names while preserving duplicate entries."""
         return get_zip_member_names(entries)
+
+    @staticmethod
+    def _torchscript_debug_member_name(name: str, member_names: set[str]) -> str | None:
+        """Return the sibling TorchScript debug member name for a generated-source path."""
+        normalized = name.replace("\\", "/").lstrip("/")
+        parts = tuple(part for part in normalized.split("/") if part)
+        if not parts or not parts[-1].endswith(".py"):
+            return None
+
+        try:
+            code_index = parts.index("code")
+        except ValueError:
+            return None
+
+        # TorchScript writes generated Python directly under the archive root
+        # (optionally behind a single top-level archive prefix like "archive/").
+        if code_index > 1:
+            return None
+
+        torchscript_parts = parts[code_index + 1 :]
+        is_generated_path = torchscript_parts == ("__torch__.py",) or (
+            len(torchscript_parts) > 1 and torchscript_parts[0] == "__torch__"
+        )
+        debug_name = f"{normalized}.debug_pkl"
+        if not is_generated_path or debug_name not in member_names:
+            return None
+        return debug_name
+
+    @staticmethod
+    def _looks_like_torchscript_generated_source(source: bytes) -> bool:
+        """Return true when source text has TorchScript-generated structure and no Python escape hatches."""
+        try:
+            text = source.decode("utf-8")
+        except UnicodeDecodeError:
+            return False
+
+        if _TORCHSCRIPT_FORBIDDEN_SOURCE_PATTERN.search(text):
+            return False
+        return (
+            _TORCHSCRIPT_GENERATED_CLASS_PATTERN.search(text) is not None
+            and _TORCHSCRIPT_GENERATED_METHOD_PATTERN.search(text) is not None
+            and PyTorchZipScanner._has_torchscript_generated_ast_shape(text)
+        )
+
+    @staticmethod
+    def _has_torchscript_generated_ast_shape(text: str) -> bool:
+        try:
+            tree = ast.parse(text)
+        except (SyntaxError, ValueError):
+            return False
+
+        if not tree.body or any(not isinstance(node, ast.ClassDef) for node in tree.body):
+            return False
+
+        for node in ast.walk(tree):
+            if PyTorchZipScanner._is_torchscript_forbidden_ast_symbol(node):
+                return False
+
+            if isinstance(node, ast.ClassDef):
+                if node.decorator_list:
+                    return False
+                if not PyTorchZipScanner._is_torchscript_class_header_safe(node):
+                    return False
+                if not any(isinstance(item, ast.FunctionDef) for item in node.body):
+                    return False
+                generated_marker_assignments: set[str] = set()
+                for item in node.body:
+                    if isinstance(item, ast.Pass):
+                        continue
+                    if isinstance(item, ast.Assign):
+                        generated_marker_assignments.update(
+                            PyTorchZipScanner._torchscript_assignment_target_names(item.targets)
+                        )
+                        if not PyTorchZipScanner._is_torchscript_definition_time_expression_safe(item.value):
+                            return False
+                        continue
+                    if isinstance(item, ast.AnnAssign):
+                        generated_marker_assignments.update(
+                            PyTorchZipScanner._torchscript_assignment_target_names([item.target])
+                        )
+                        if not PyTorchZipScanner._is_torchscript_definition_time_expression_safe(item.annotation):
+                            return False
+                        if (
+                            item.value is not None
+                            and not PyTorchZipScanner._is_torchscript_definition_time_expression_safe(item.value)
+                        ):
+                            return False
+                        continue
+                    if isinstance(item, ast.FunctionDef):
+                        if not PyTorchZipScanner._is_torchscript_function_definition_safe(item):
+                            return False
+                        continue
+                    return False
+                if not {"__parameters__", "__buffers__"}.issubset(generated_marker_assignments):
+                    return False
+
+        return True
+
+    @staticmethod
+    def _torchscript_assignment_target_names(targets: list[ast.expr]) -> set[str]:
+        return {target.id for target in targets if isinstance(target, ast.Name)}
+
+    @staticmethod
+    def _is_torchscript_definition_time_expression_safe(expression: ast.expr) -> bool:
+        return not any(isinstance(node, _TORCHSCRIPT_UNSAFE_DEFINITION_EXPR_NODES) for node in ast.walk(expression))
+
+    @staticmethod
+    def _is_torchscript_forbidden_ast_symbol(node: ast.AST) -> bool:
+        if isinstance(node, ast.Name):
+            return node.id in _TORCHSCRIPT_FORBIDDEN_AST_NAMES
+        if isinstance(node, ast.Attribute):
+            return node.attr in _TORCHSCRIPT_FORBIDDEN_AST_NAMES
+        return (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and node.value in _TORCHSCRIPT_FORBIDDEN_AST_NAMES
+        )
+
+    @staticmethod
+    def _is_torchscript_class_header_safe(node: ast.ClassDef) -> bool:
+        if node.keywords or len(node.bases) != 1:
+            return False
+        base = node.bases[0]
+        return isinstance(base, ast.Name) and base.id == "Module"
+
+    @staticmethod
+    def _is_torchscript_function_definition_safe(node: ast.FunctionDef) -> bool:
+        if node.decorator_list:
+            return False
+        definition_expressions: list[ast.expr] = [
+            *node.args.defaults,
+            *(default for default in node.args.kw_defaults if default is not None),
+        ]
+        if node.returns is not None:
+            definition_expressions.append(node.returns)
+        for arg in [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]:
+            if arg.annotation is not None:
+                definition_expressions.append(arg.annotation)
+
+        return all(
+            PyTorchZipScanner._is_torchscript_definition_time_expression_safe(expression)
+            for expression in definition_expressions
+        ) and PyTorchZipScanner._is_torchscript_function_body_safe(node.body)
+
+    @staticmethod
+    def _is_torchscript_function_body_safe(statements: list[ast.stmt]) -> bool:
+        for statement in statements:
+            for node in ast.walk(statement):
+                if isinstance(node, _TORCHSCRIPT_UNSAFE_BODY_NODES):
+                    return False
+                if PyTorchZipScanner._is_torchscript_forbidden_ast_symbol(node):
+                    return False
+        return True
+
+    def _is_torchscript_generated_python(
+        self,
+        zip_file: zipfile.ZipFile,
+        entry: zipfile.ZipInfo,
+        debug_entry: zipfile.ZipInfo,
+        result: ScanResult,
+    ) -> bool:
+        """Return true for validated TorchScript-generated Python source members."""
+        try:
+            debug_prefix = self._read_member_prefix(
+                zip_file,
+                debug_entry,
+                _TORCHSCRIPT_DEBUG_PREFIX_BYTES,
+                phase="torchscript generated source validation",
+                result=result,
+            )
+            if _TORCHSCRIPT_DEBUG_PAYLOAD_MARKER not in debug_prefix:
+                return False
+
+            source = self._read_member_bytes(
+                zip_file,
+                entry,
+                phase="torchscript generated source validation",
+                result=result,
+                max_bytes=_TORCHSCRIPT_SOURCE_MAX_BYTES,
+            )
+        except Exception as exc:
+            logger.debug("Unable to validate TorchScript generated source member %s: %s", entry.filename, exc)
+            return False
+
+        return self._looks_like_torchscript_generated_source(source)
 
     @staticmethod
     def _find_zip_entry(entries: list[zipfile.ZipInfo], member_name: str) -> zipfile.ZipInfo | None:
@@ -824,6 +1073,7 @@ class PyTorchZipScanner(BaseScanner):
 
     def _detect_suspicious_files(
         self,
+        zip_file: zipfile.ZipFile,
         safe_entries: list[zipfile.ZipInfo],
         result: ScanResult,
         path: str,
@@ -831,12 +1081,26 @@ class PyTorchZipScanner(BaseScanner):
         """Detect suspicious non-pickle files in the archive"""
         python_files_found = False
         executable_files_found = False
+        member_names = {self._get_zip_member_name(entry).replace("\\", "/").lstrip("/") for entry in safe_entries}
+        entries_by_normalized_name = {
+            self._get_zip_member_name(entry).replace("\\", "/").lstrip("/"): entry for entry in safe_entries
+        }
 
         for entry in safe_entries:
             name = self._get_zip_member_name(entry)
-            normalized_name = name.lower()
+            normalized_name = name.replace("\\", "/").lstrip("/")
+            normalized_name_lower = normalized_name.lower()
             # Check for Python code files
-            if normalized_name.endswith(".py"):
+            if normalized_name_lower.endswith(".py"):
+                debug_member_name = self._torchscript_debug_member_name(name, member_names)
+                debug_entry = entries_by_normalized_name.get(debug_member_name or "")
+                if debug_entry is not None and self._is_torchscript_generated_python(
+                    zip_file,
+                    entry,
+                    debug_entry,
+                    result,
+                ):
+                    continue
                 result.add_check(
                     name="Python Code File Detection",
                     passed=False,
@@ -847,7 +1111,7 @@ class PyTorchZipScanner(BaseScanner):
                 )
                 python_files_found = True
             # Check for shell scripts or other executable files
-            elif is_executable_archive_member_name(normalized_name):
+            elif is_executable_archive_member_name(normalized_name_lower):
                 result.add_check(
                     name="Executable File Detection",
                     passed=False,
@@ -863,7 +1127,7 @@ class PyTorchZipScanner(BaseScanner):
             result.add_check(
                 name="Python Code File Detection",
                 passed=True,
-                message="No Python code files found in model",
+                message="No unexpected Python code files found in model",
                 location=path,
             )
 
