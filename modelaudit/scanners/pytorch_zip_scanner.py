@@ -730,7 +730,8 @@ class PyTorchZipScanner(BaseScanner):
     @classmethod
     def _trusted_pytorch_storage_data_pkl_members(cls, safe_entries: list[zipfile.ZipInfo]) -> set[str]:
         """Return data.pkl members with PyTorch ZIP storage markers under the same prefix."""
-        names = {cls._get_zip_member_name(entry).replace("\\", "/").lstrip("/") for entry in safe_entries}
+        members = [(cls._get_zip_member_name(entry).replace("\\", "/").lstrip("/"), entry) for entry in safe_entries]
+        names = {name for name, _entry in members}
         trusted_members: set[str] = set()
         for name in names:
             if name.rsplit("/", 1)[-1] != "data.pkl":
@@ -738,7 +739,11 @@ class PyTorchZipScanner(BaseScanner):
             prefix = name[: -len("data.pkl")]
             if f"{prefix}version" not in names:
                 continue
-            if any(candidate.startswith(f"{prefix}data/") for candidate in names):
+            data_prefix = f"{prefix}data/"
+            if any(
+                candidate.startswith(data_prefix) and candidate[len(data_prefix) :].isdigit() and not entry.is_dir()
+                for candidate, entry in members
+            ):
                 trusted_members.add(name)
         return trusted_members
 
