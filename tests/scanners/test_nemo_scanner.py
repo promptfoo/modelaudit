@@ -317,6 +317,45 @@ class TestNemoArchiveVulnerabilityCoverage:
 
         assert not [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23249"]
 
+    def test_metadata_referenced_misnamed_payload_detects_ne_mo_deserialization_cve(self, tmp_path: Path) -> None:
+        nemo_path = tmp_path / "referenced-misnamed-payload.nemo"
+        config = {
+            "model": {"_target_": "nemo.Model"},
+            "tokenizer": {"model": "nemo:artifacts/payload.jpg"},
+        }
+        with tarfile.open(nemo_path, "w") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", yaml.safe_dump(config).encode())
+            _add_tar_bytes(tar, "artifacts/payload.jpg", _build_malicious_pickle())
+
+        result = NemoScanner().scan(str(nemo_path))
+
+        cve_checks = [
+            check
+            for check in result.checks
+            if check.details.get("cve_id") == "CVE-2025-23249" and check.details.get("entry") == "artifacts/payload.jpg"
+        ]
+        assert len(cve_checks) == 1
+        assert cve_checks[0].severity == IssueSeverity.CRITICAL
+        assert cve_checks[0].details["config_file"] == "model_config.yaml"
+        assert cve_checks[0].details["config_path"] == "tokenizer.model"
+        assert cve_checks[0].details["source_entry"] == "artifacts/payload.jpg"
+
+    def test_metadata_referenced_benign_non_checkpoint_suffix_stays_clean(self, tmp_path: Path) -> None:
+        nemo_path = tmp_path / "referenced-benign-artifact.nemo"
+        config = {
+            "model": {"_target_": "nemo.Model"},
+            "tokenizer": {"model": "nemo:artifacts/tokenizer.model"},
+        }
+        with tarfile.open(nemo_path, "w") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", yaml.safe_dump(config).encode())
+            _add_tar_bytes(tar, "artifacts/tokenizer.model", b"plain tokenizer bytes")
+
+        result = NemoScanner().scan(str(nemo_path))
+
+        assert result.success is True
+        assert not [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23249"]
+        assert "scan_outcome" not in result.metadata
+
     def test_nested_checkpoint_archive_traversal_not_labeled_deserialization_cve(self, tmp_path: Path) -> None:
         nested_checkpoint = io.BytesIO()
         with zipfile.ZipFile(nested_checkpoint, "w") as zipf:

@@ -231,6 +231,7 @@ class NemoScanner(BaseScanner):
         """Extract and scan YAML configs from a NeMo tar archive."""
         yaml_configs_found = 0
         yaml_config_files_found = 0
+        scanned_member_entries: set[str] = set()
 
         with tarfile.open(path, "r:*") as tar:
             for member in tar:
@@ -290,6 +291,7 @@ class NemoScanner(BaseScanner):
                                         result,
                                         entry_name=member.name,
                                     )
+                                    scanned_member_entries.add(member.name)
                                 else:
                                     self._mark_inconclusive_scan_result(
                                         result,
@@ -347,6 +349,18 @@ class NemoScanner(BaseScanner):
                             if isinstance(config, dict | list):
                                 yaml_configs_found += 1
                                 self._check_hydra_targets(config, member.name, path, result)
+                                for config_path, referenced_member_name in self._collect_nemo_member_references(config):
+                                    if referenced_member_name in scanned_member_entries:
+                                        continue
+                                    self._scan_config_referenced_member(
+                                        tar,
+                                        referenced_member_name,
+                                        path,
+                                        result,
+                                        config_file=member.name,
+                                        config_path=config_path,
+                                    )
+                                    scanned_member_entries.add(referenced_member_name)
                             else:
                                 self._mark_inconclusive_scan_result(
                                     result,
@@ -376,6 +390,7 @@ class NemoScanner(BaseScanner):
 
                 if name_lower.endswith(tuple(NEMO_CHECKPOINT_MEMBER_EXTENSIONS)):
                     self._scan_checkpoint_member(tar, member, path, result)
+                    scanned_member_entries.add(member.name)
 
         if yaml_configs_found == 0:
             message = (
@@ -559,6 +574,129 @@ class NemoScanner(BaseScanner):
             except OSError:
                 logger.debug("Failed to remove temporary NeMo checkpoint scan file: %s", extracted_path)
 
+    def _scan_config_referenced_member(
+        self,
+        tar: tarfile.TarFile,
+        referenced_member_name: str,
+        archive_path: str,
+        result: ScanResult,
+        *,
+        config_file: str,
+        config_path: str,
+    ) -> None:
+        """Scan `nemo:`-referenced archive members through content-based nested dispatch."""
+        try:
+            member = tar.getmember(referenced_member_name)
+        except KeyError:
+            return
+
+        if member.issym() or member.islnk():
+            resolved_name = self._resolve_archive_link_member_name(member)
+            if resolved_name is None:
+                return
+            try:
+                member = tar.getmember(resolved_name)
+            except KeyError:
+                return
+
+        if not member.isfile():
+            return
+
+        max_scan_bytes = self._normalize_positive_int_config(
+            self.config.get("max_nemo_checkpoint_scan_bytes"),
+            NEMO_MAX_CHECKPOINT_SCAN_BYTES,
+        )
+        if member.size > max_scan_bytes:
+            return
+
+        extracted_path = self._extract_member_to_tempfile(tar, member, suffix_source=referenced_member_name)
+        if extracted_path is None:
+            return
+
+        try:
+            from .archive_dispatch import scan_nested_file
+
+            nested_result = scan_nested_file(extracted_path, config=dict(self.config))
+            critical_issues = [
+                issue
+                for issue in nested_result.issues
+                if issue.severity == IssueSeverity.CRITICAL and self._is_nested_checkpoint_deserialization_issue(issue)
+            ]
+            if critical_issues:
+                self._add_checkpoint_deserialization_check(
+                    result,
+                    archive_path=archive_path,
+                    entry=referenced_member_name,
+                    nested_scanner=nested_result.scanner_name,
+                    critical_issues=critical_issues,
+                    extra_details={
+                        "config_file": config_file,
+                        "config_path": config_path,
+                        "source_entry": member.name,
+                    },
+                )
+        finally:
+            try:
+                os.unlink(extracted_path)
+            except OSError:
+                logger.debug("Failed to remove temporary NeMo referenced scan file: %s", extracted_path)
+
+    @classmethod
+    def _collect_nemo_member_references(
+        cls,
+        config: Any,
+        path_prefix: str = "",
+    ) -> list[tuple[str, str]]:
+        """Collect internal `nemo:` artifact references from a parsed config."""
+        if isinstance(config, list):
+            collected: list[tuple[str, str]] = []
+            for index, item in enumerate(config):
+                collected.extend(
+                    cls._collect_nemo_member_references(
+                        item,
+                        f"{path_prefix}[{index}]" if path_prefix else f"[{index}]",
+                    )
+                )
+            return collected
+
+        if isinstance(config, dict):
+            collected = []
+            for key, value in config.items():
+                current_path = f"{path_prefix}.{key}" if path_prefix else key
+                collected.extend(cls._collect_nemo_member_references(value, current_path))
+            return collected
+
+        if isinstance(config, str):
+            member_name = cls._extract_nemo_member_reference(config)
+            if member_name is not None:
+                return [(path_prefix or "$", member_name)]
+
+        return []
+
+    @staticmethod
+    def _extract_nemo_member_reference(value: str) -> str | None:
+        normalized = value.strip()
+        if not normalized or ":" not in normalized:
+            return None
+
+        scheme, member_name = normalized.split(":", 1)
+        if scheme.lower() != "nemo":
+            return None
+
+        member_name = member_name.strip().replace("\\", "/")
+        if not member_name:
+            return None
+
+        normalized_member = os.path.normpath(member_name).replace("\\", "/")
+        if (
+            normalized_member in {"", ".", ".."}
+            or normalized_member.startswith("../")
+            or is_absolute_archive_path(normalized_member)
+        ):
+            return None
+
+        return normalized_member.lstrip("./")
+
     @staticmethod
     def _is_nested_checkpoint_deserialization_issue(issue: Any) -> bool:
         details = issue.details if isinstance(issue.details, dict) else {}
@@ -619,6 +757,7 @@ class NemoScanner(BaseScanner):
         entry: str,
         nested_scanner: str,
         critical_issues: list[Any],
+        extra_details: dict[str, Any] | None = None,
     ) -> None:
         result.add_check(
             name="CVE-2025-23249: NeMo Checkpoint Unsafe Deserialization",
@@ -646,6 +785,7 @@ class NemoScanner(BaseScanner):
                     "Update NVIDIA NeMo Framework to release 25.02 or later, keep current with subsequent "
                     "checkpoint-loading fixes, and reject untrusted checkpoint payloads."
                 ),
+                **(extra_details or {}),
             },
             why=(
                 "A nested scanner found critical unsafe-deserialization behavior inside a checkpoint bundled "
