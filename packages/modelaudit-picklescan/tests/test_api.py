@@ -995,6 +995,9 @@ def test_scan_bytes_allows_user_defined_dunder_metadata_literals(literal: str) -
         ("subprocess.run(['id'])", "subprocess call"),
         ("getattr(os, 'system')('id')", "getattr system"),
         ("base64.b64decode(blob)", "base64.b64decode"),
+        ("joblib.load(path)", "pickle loader call"),
+        ("cloudpickle.loads(blob)", "pickle loader call"),
+        ("copyreg.add_extension(module, name, code)", "copyreg extension"),
     ],
 )
 def test_scan_bytes_flags_expanded_suspicious_string_patterns(literal: str, expected_pattern: str) -> None:

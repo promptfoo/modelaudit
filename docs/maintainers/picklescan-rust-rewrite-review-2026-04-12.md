@@ -504,7 +504,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] N-P2-22 — Collapse encoded-text S604/S104 twin emissions.
 - [x] N-P2-24 — Clean redundant lowercase seed spelling.
 - [x] N-P2-26 — Replace remaining `_contains_non_comment_token` guards with scoped documentation analysis.
-- [ ] N-P2-27 — Add Rust string seeds for joblib/cloudpickle/copyreg.
+- [x] N-P2-27 — Add Rust string seeds for joblib/cloudpickle/copyreg.
 - [ ] N-P2-28 — Add tests for encoded protocol 2-5 prefixes.
 - [ ] N-P2-29 — Complete escaped-hex protocol-0 prefix table.
 - [ ] N-P2-30 — Bound `encoded_nested_literal_probe_windows` linear scan cost.
@@ -728,6 +728,16 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run mypy modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py -q` — passed, 70 tests.
   - `rg -n "_contains_non_comment_token" modelaudit/scanners/pickle_scanner.py` — passed, no remaining references.
+- N-P2-27 — Same-item commit adds Rust fast-reject seeds and suspicious-string patterns for `joblib.load`, `joblib._pickle_load`, `cloudpickle.load(s)`, and `copyreg.add/remove_extension`, so string-literal scanning no longer skips these loader/extension hints. Targeted QA:
+  - `cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml -- --check` — passed.
+  - `cargo check --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed.
+  - `cargo clippy --manifest-path packages/modelaudit-picklescan/Cargo.toml --all-targets -- -D warnings` — passed.
+  - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, 19 tests.
+  - `uv run --with 'maturin>=1.9,<2' maturin develop --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, rebuilt the editable native extension.
+  - `uv run ruff format --check packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `uv run ruff check packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `uv run mypy packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests/test_api.py::test_scan_bytes_flags_expanded_suspicious_string_patterns packages/modelaudit-picklescan/tests/test_api.py -q` — passed, 155 tests.
 
 ### Newly discovered gaps while remediating
 

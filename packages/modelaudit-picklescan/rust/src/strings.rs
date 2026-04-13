@@ -66,6 +66,20 @@ pub(crate) fn suspicious_string_matches(value: &str) -> Vec<String> {
     if lower.contains("commands.getoutput") || lower.contains("commands.getstatusoutput") {
         matches.push("commands call".to_string());
     }
+    for needle in [
+        "joblib.load",
+        "joblib._pickle_load",
+        "cloudpickle.load",
+        "cloudpickle.loads",
+    ] {
+        if lower.contains(needle) {
+            matches.push("pickle loader call".to_string());
+            break;
+        }
+    }
+    if lower.contains("copyreg.add_extension") || lower.contains("copyreg.remove_extension") {
+        matches.push("copyreg extension".to_string());
+    }
     if lower.contains("import") && contains_import_statement(&lower) {
         matches.push("import statement".to_string());
     }
@@ -251,7 +265,9 @@ fn has_suspicious_ascii_seed(bytes: &[u8]) -> bool {
             }
             b'c' => {
                 if starts_with_ascii_case_insensitive(bytes, index, b"commands")
+                    || starts_with_ascii_case_insensitive(bytes, index, b"cloudpickle")
                     || starts_with_ascii_case_insensitive(bytes, index, b"compile")
+                    || starts_with_ascii_case_insensitive(bytes, index, b"copyreg")
                     || starts_with_ascii_case_insensitive(bytes, index, b"ctypes")
                     || starts_with_ascii_case_insensitive(bytes, index, b"codecs")
                 {
@@ -272,6 +288,11 @@ fn has_suspicious_ascii_seed(bytes: &[u8]) -> bool {
             }
             b'i' => {
                 if starts_with_ascii_case_insensitive(bytes, index, b"import") {
+                    return true;
+                }
+            }
+            b'j' => {
+                if starts_with_ascii_case_insensitive(bytes, index, b"joblib") {
                     return true;
                 }
             }
@@ -713,6 +734,18 @@ mod tests {
         assert!(suspicious_string_matches("OS.System('id')").contains(&"os.system".to_string()));
         assert!(suspicious_string_matches("OS . system('id')").contains(&"os.system".to_string()));
         assert!(suspicious_string_matches("Import OS").contains(&"import statement".to_string()));
+    }
+
+    #[test]
+    fn suspicious_string_matching_detects_pickle_loader_literals() {
+        assert!(suspicious_string_matches("joblib.load(path)")
+            .contains(&"pickle loader call".to_string()));
+        assert!(suspicious_string_matches("cloudpickle.loads(blob)")
+            .contains(&"pickle loader call".to_string()));
+        assert!(
+            suspicious_string_matches("copyreg.add_extension(module, name, code)")
+                .contains(&"copyreg extension".to_string())
+        );
     }
 
     #[test]
