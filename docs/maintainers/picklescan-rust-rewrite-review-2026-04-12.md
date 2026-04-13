@@ -526,7 +526,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] R-P1-39 — Add more Rust unit coverage for dispatch, policy, report, and bridge behavior.
 - [ ] R-P2-40 — Decide whether to support embedded-Python cargo tests for `pybridge`; bridge coverage currently runs through Python package tests.
 - [x] T-P1-51 / T-P1-52 — Strengthen parity/fuzz tests with expected verdicts.
-- [ ] T-P1-53 / T-P1-66 — Restore multi-stream regression coverage.
+- [x] T-P1-53 / T-P1-66 — Restore multi-stream regression coverage.
 - [ ] T-P1-54 — Replace Rust policy source-text tests with functional tests.
 - [ ] T-P1-55 / T-P1-56 — Strengthen weak negative/overbroad assertions.
 - [ ] T-P1-57 — Document BINBYTES text-scan design decision.
@@ -613,6 +613,13 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run ruff check packages/modelaudit-picklescan/tests/test_rust_engine.py` — passed.
   - `uv run mypy packages/modelaudit-picklescan/tests/test_rust_engine.py` — passed.
   - `uv run pytest packages/modelaudit-picklescan/tests/test_rust_engine.py -q` — passed, 7 tests.
+- T-P1-53 / T-P1-66 — Same-item commit expands standalone multi-stream coverage for 4 KiB null padding, text padding, mark-like padding, malformed-first-stream recovery, high-risk `httplib.HTTPConnection` in a second stream, and benign follow-on streams that must stay finding-free. Targeted QA:
+  - `uv run ruff format packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `uv run ruff format --check packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `uv run ruff check packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `uv run mypy packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `uv run pytest packages/modelaudit-picklescan/tests/test_api.py -q -k "follow_on"` — passed, 8 tests.
+  - `uv run pytest tests/benchmarks/test_picklescan_benchmarks.py::test_picklescan_multi_stream_padded_payload -q` — skipped because `pytest_benchmark` is not installed in this environment.
 - N-P0-3 — Same-item commit removes the global raw-window documentation short-circuit, records documentation-like pickle literal spans, and filters only matches that fall inside documentation spans or comment-like lines. Targeted QA:
   - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.

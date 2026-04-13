@@ -224,6 +224,7 @@ def test_scan_bytes_detects_junk_prefixed_small_raw_nested_pickle() -> None:
     "separator",
     [
         b"\x00" * 64,
+        b"\x00" * 4096,
         b"# padding that looks like text\n",
         b"MARK" * 16,
     ],
@@ -237,6 +238,38 @@ def test_scan_bytes_detects_follow_on_malicious_pickle_streams(separator: bytes)
     assert report.verdict == SafetyVerdict.MALICIOUS
     assert any(notice.code == "follow_on_stream_detected" for notice in report.notices)
     assert any(finding.details.get("import_reference") in SYSTEM_GLOBALS for finding in report.findings)
+
+
+@pytest.mark.parametrize(
+    ("second_stream", "expected_reference"),
+    [
+        (b"cos\nsystem\n)R.", SYSTEM_GLOBALS),
+        (b"chttplib\nHTTPConnection\n)R.", frozenset({"httplib.HTTPConnection"})),
+    ],
+)
+def test_scan_bytes_detects_large_padding_follow_on_high_risk_streams(
+    second_stream: bytes,
+    expected_reference: frozenset[str],
+) -> None:
+    payload = pickle.dumps({"safe": True}, protocol=4) + (b"\x00" * 4096) + second_stream
+
+    report = scan_bytes(payload, source="large-padding-follow-on.pkl")
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(notice.code == "follow_on_stream_detected" for notice in report.notices)
+    assert any(finding.details.get("import_reference") in expected_reference for finding in report.findings)
+
+
+def test_scan_bytes_does_not_promote_benign_follow_on_stream() -> None:
+    payload = pickle.dumps({"safe": True}, protocol=4) + (b"\x00" * 4096) + pickle.dumps({"benign": True}, protocol=4)
+
+    report = scan_bytes(payload, source="benign-follow-on.pkl")
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert not report.findings
+    assert not any(notice.code == "follow_on_stream_detected" for notice in report.notices)
 
 
 def test_scan_bytes_detects_malicious_stream_after_malformed_prefix() -> None:
