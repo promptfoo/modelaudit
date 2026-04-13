@@ -24,7 +24,11 @@ from modelaudit.utils.sources.cloud_storage import (
 def make_fs_mock() -> MagicMock:
     fs = MagicMock()
     fs.__enter__.return_value = fs
-    fs.__exit__.side_effect = lambda exc_type, exc, tb: fs.close()
+
+    def close_context(_exc_type: object, _exc: object, _tb: object) -> None:
+        fs.close()
+
+    fs.__exit__.side_effect = close_context
     return fs
 
 
@@ -113,6 +117,33 @@ def test_analyze_cloud_target_redacts_signed_url_retry_logs(mock_fs, mock_sleep,
     mock_sleep.assert_called()
 
 
+@patch("fsspec.filesystem")
+def test_analyze_cloud_target_directory_success(mock_fs: MagicMock) -> None:
+    url = "s3://bucket/path/"
+    model_url = "s3://bucket/path/model.bin"
+    fs = make_fs_mock()
+
+    def info_side_effect(path: str) -> dict[str, object]:
+        if path == url:
+            return {"type": "directory", "name": "bucket/path/"}
+        if path == model_url:
+            return {"type": "file", "size": 2048}
+        raise FileNotFoundError(path)
+
+    fs.info.side_effect = info_side_effect
+    fs.glob.return_value = [model_url]
+    mock_fs.return_value = fs
+
+    result = asyncio.run(analyze_cloud_target(url))
+
+    assert result["type"] == "directory"
+    assert result["file_count"] == 1
+    assert result["total_size"] == 2048
+    assert result["human_size"] == "2.0 KB"
+    assert result["files"] == [{"path": model_url, "name": "model.bin", "size": 2048, "human_size": "2.0 KB"}]
+    fs.glob.assert_called_once_with("s3://bucket/path/**")
+
+
 def test_filter_scannable_files_handles_signed_cloud_urls() -> None:
     files = [{"path": "s3://bucket/model.pkl?X-Amz-Signature=secret"}]
 
@@ -120,7 +151,7 @@ def test_filter_scannable_files_handles_signed_cloud_urls() -> None:
 
 
 @patch("fsspec.filesystem")
-def test_download_from_cloud(mock_fs, tmp_path):
+def test_download_from_cloud(mock_fs: MagicMock, tmp_path: Path) -> None:
     fs_meta = make_fs_mock()
     fs_meta.info.return_value = {"type": "file", "size": 1024}
 
@@ -141,7 +172,6 @@ def test_download_from_cloud(mock_fs, tmp_path):
     # Result should be a path containing the filename
     assert isinstance(result, Path)
     assert result.name == "model.pt"
-    assert result.exists() or True  # Mock doesn't create actual files
 
     # Note: fsspec filesystems don't need explicit cleanup according to implementation
 
@@ -149,7 +179,9 @@ def test_download_from_cloud(mock_fs, tmp_path):
 @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
 @patch("modelaudit.utils.sources.cloud_storage.check_disk_space")
 @patch("fsspec.filesystem")
-def test_download_from_cloud_strips_signed_url_from_local_filename(mock_fs, mock_disk_space, mock_analyze, tmp_path):
+def test_download_from_cloud_strips_query_params_from_local_path(
+    mock_fs: MagicMock, mock_disk_space: MagicMock, mock_analyze: AsyncMock, tmp_path: Path
+) -> None:
     url = "s3://bucket/model.bin?X-Amz-Signature=secret"
     fs = make_fs_mock()
     fs.info.return_value = {"type": "file", "size": 1024}
@@ -267,6 +299,12 @@ async def test_download_from_cloud_async_context(tmp_path: Path) -> None:
     """download_from_cloud should work from an active event loop context."""
     fs = make_fs_mock()
     fs.info.return_value = {"type": "file", "size": 1024}
+    downloaded_content = b"async test payload"
+
+    def mock_get(remote_path: str, local_path: str, **_kwargs: object) -> None:
+        Path(local_path).write_bytes(downloaded_content)
+
+    fs.get.side_effect = mock_get
 
     async def mock_analyze(_url: str) -> dict[str, object]:
         return {
@@ -290,6 +328,12 @@ async def test_download_from_cloud_async_context(tmp_path: Path) -> None:
 
     assert isinstance(result, Path)
     assert result.name == "model.pt"
+    fs.get.assert_called_once()
+    get_args = fs.get.call_args.args
+    assert get_args[0] == "s3://bucket/model.pt"
+    assert Path(get_args[1]) == result
+    assert result.exists()
+    assert result.read_bytes() == downloaded_content
 
 
 @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
@@ -311,11 +355,12 @@ def test_download_from_cloud_streaming_returns_stream_url(mock_preview, mock_ana
 
 
 @pytest.mark.asyncio
-async def test_download_from_cloud_streaming_async_context() -> None:
+async def test_download_from_cloud_streaming_async_context(tmp_path: Path) -> None:
     """download_from_cloud_streaming should work from an active event loop context."""
     fs = make_fs_mock()
     fs.info.return_value = {"type": "file", "size": 1024}
     fs.get.side_effect = lambda _src, dst: Path(dst).write_bytes(b"data")
+    temp_dir = tmp_path / "streaming-tempdir"
 
     async def mock_analyze(_url: str) -> dict[str, object]:
         return {
@@ -334,6 +379,7 @@ async def test_download_from_cloud_streaming_async_context() -> None:
             "modelaudit.utils.sources.cloud_storage.asyncio.run_coroutine_threadsafe",
             side_effect=AssertionError("run_coroutine_threadsafe should not be used"),
         ),
+        patch("modelaudit.utils.sources.cloud_storage.tempfile.mkdtemp", return_value=str(temp_dir)) as mock_mkdtemp,
     ):
         streamed = list(download_from_cloud_streaming("s3://bucket/model.pt", show_progress=False))
 
@@ -341,6 +387,9 @@ async def test_download_from_cloud_streaming_async_context() -> None:
     streamed_path, is_last = streamed[0]
     assert streamed_path.name == "model.pt"
     assert is_last is True
+    fs.get.assert_called_once()
+    mock_mkdtemp.assert_called_once_with(prefix="modelaudit_stream_")
+    assert not temp_dir.exists()
 
 
 @patch("builtins.__import__")
@@ -685,7 +734,7 @@ class TestCloudCacheSafety:
         cached_path = cache.get_cached_path("s3://bucket/model.bin")
         assert cached_path is not None
         assert cached_path.resolve() != source_file.resolve()
-        cached_path.resolve().relative_to(cache.cache_dir.resolve())
+        assert cached_path.resolve().is_relative_to(cache.cache_dir.resolve())
         assert source_file.exists()
 
     def test_clean_old_cache_does_not_delete_outside_cache(
@@ -756,9 +805,10 @@ class TestCloudDownloadCleanup:
         assert not temp_download_dir.exists()
 
 
-def test_filter_scannable_files_recognizes_pdiparams():
-    files = [{"path": "model.pdiparams"}]
-    assert filter_scannable_files(files) == files
+def test_filter_scannable_files_recognizes_pdiparams() -> None:
+    files = [{"path": "model.pdiparams"}, {"path": "notes.csv"}, {"path": "preview.png"}]
+
+    assert filter_scannable_files(files) == [{"path": "model.pdiparams"}]
 
 
 def test_filter_scannable_files_uses_registry_extensions():

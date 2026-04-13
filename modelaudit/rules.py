@@ -62,6 +62,13 @@ class RuleRegistry:
         cls._initialized = True
 
     @classmethod
+    def reset_for_testing(cls) -> None:
+        """Reset registry state for tests that need deterministic initialization."""
+        cls._rules.clear()
+        cls._message_match_cache.clear()
+        cls._initialized = False
+
+    @classmethod
     def _add_rule(cls, code: str, name: str, severity: Severity, description: str, patterns: list[str]) -> None:
         """Add a rule to the registry."""
         compiled_patterns = [re.compile(p, re.IGNORECASE) for p in patterns]
@@ -75,8 +82,11 @@ class RuleRegistry:
         return cls._rules.get(code)
 
     @classmethod
-    def find_matching_rule(cls, message: str) -> tuple[str, Rule] | None:
+    def find_matching_rule(cls, message: str | None) -> tuple[str, Rule] | None:
         """Find the first rule that matches a message."""
+        if not message or not message.strip():
+            return None
+
         cls.initialize()
         if message in cls._message_match_cache:
             return cls._message_match_cache[message]

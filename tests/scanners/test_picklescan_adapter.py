@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from modelaudit_picklescan import (
     CoverageSummary,
     Finding,
@@ -25,20 +26,22 @@ from modelaudit.scanners.pytorch_zip_scanner import PyTorchZipScanner
 from tests.helpers import create_mock_pytorch_zip
 
 
-def test_scan_options_from_config_parses_string_values_and_falls_back_for_bad_values() -> None:
-    defaults = ScanOptions()
-
+def test_scan_options_from_config_parses_string_values() -> None:
     parsed = scan_options_from_config(
         {
             "timeout": "2.5",
             "max_opcodes": "4096",
-            "post_budget_global_scan_limit_bytes": "not-an-int",
+            "post_budget_global_scan_limit_bytes": "8192",
         }
     )
 
     assert parsed.timeout_s == 2.5
     assert parsed.max_opcodes == 4096
-    assert parsed.post_budget_scan_bytes == defaults.post_budget_scan_bytes
+    assert parsed.post_budget_scan_bytes == 8192
+
+
+def test_scan_options_from_config_falls_back_for_bad_values() -> None:
+    defaults = ScanOptions()
 
     fallback = scan_options_from_config(
         {
@@ -254,6 +257,62 @@ def test_pickle_report_to_scan_result_falls_back_for_unmapped_persistent_id_opco
     assert len(result.issues) == 1
     assert result.issues[0].rule_code == "S212"
     assert result.issues[0].details["pickle_rule_code"] == "PERSISTENT_ID"
+
+
+@pytest.mark.parametrize(
+    ("pickle_rule_code", "details", "expected_legacy_rule_code"),
+    [
+        ("S203", {}, "S203"),
+        ("MALFORMED_STACK_GLOBAL", {}, "S205"),
+        ("EXTENSION_REF", {"opcode": "EXT1"}, "S211"),
+        ("EXTENSION_REF", {}, "S211"),
+        ("PERSISTENT_ID", {"opcode": "BINPERSID"}, "S212"),
+        ("PERSISTENT_ID", {"opcode": "CUSTOM_PERSISTENT_OPCODE"}, "S212"),
+        ("DANGEROUS_CALL", {"opcode": "REDUCE"}, "S201"),
+        ("DANGEROUS_CALL", {"module": "sys", "name": "exit"}, "S102"),
+        ("DANGEROUS_CALL", {"module": "custom", "name": "loader"}, "S201"),
+        ("DANGEROUS_GLOBAL", {"opcode": "GLOBAL"}, "S206"),
+        ("DANGEROUS_GLOBAL", {"module": "posix", "name": "system"}, "S101"),
+        ("DANGEROUS_GLOBAL", {"module": "custom", "name": "loader"}, None),
+        ("SUSPICIOUS_STRING", {"pattern": "eval(user_input)"}, "S104"),
+        ("SUSPICIOUS_STRING", {"pattern": "os.system(payload)"}, "S101"),
+        ("SUSPICIOUS_STRING", {"pattern": "subprocess.Popen(payload)"}, "S103"),
+        ("SUSPICIOUS_STRING", {"pattern": "__import__('os')"}, "S106"),
+        ("SUSPICIOUS_STRING", {"pattern": "compile(source, path, mode)"}, "S105"),
+        ("SUSPICIOUS_STRING", {"pattern": "base64 encoded string literal"}, "S601"),
+        ("SUSPICIOUS_STRING", {"pattern": "ordinary string literal"}, None),
+        ("POST_BUDGET_GLOBAL", {"pattern": "posix\nsystem"}, "S101"),
+        ("POST_BUDGET_GLOBAL", {"pattern": "custom\nloader"}, "S206"),
+        ("UNKNOWN_PICKLE_RULE", {}, "UNKNOWN_PICKLE_RULE"),
+    ],
+)
+def test_pickle_report_to_scan_result_maps_pickle_rule_codes_to_legacy_namespace(
+    pickle_rule_code: str,
+    details: dict[str, str],
+    expected_legacy_rule_code: str | None,
+) -> None:
+    """Verify standalone pickle findings preserve legacy rule-code mappings."""
+    report = PickleReport(
+        source="mapped.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.SUSPICIOUS,
+        findings=(
+            Finding(
+                message="Mapped pickle finding",
+                severity=Severity.WARNING,
+                location="mapped.pkl (pos 1)",
+                rule_code=pickle_rule_code,
+                details=details,
+            ),
+        ),
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert result.success is True
+    assert len(result.issues) == 1
+    assert result.issues[0].rule_code == expected_legacy_rule_code
+    assert result.issues[0].details["pickle_rule_code"] == pickle_rule_code
 
 
 def test_pickle_report_to_scan_result_emits_passed_import_checks() -> None:
