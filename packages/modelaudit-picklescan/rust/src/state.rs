@@ -31,6 +31,7 @@ const MAX_STACK_BYTES_PREVIEW: usize = 4096;
 const MIN_SUSPICIOUS_LITERAL_SCAN_WINDOW_CHARS: usize = 8192;
 const SUSPICIOUS_LITERAL_SCAN_OVERLAP_CHARS: usize = 4096;
 const TIME_CHECK_INTERVAL_OPCODES: usize = 4096;
+const MAX_IMPORT_REFERENCES: usize = 10_000;
 
 const STACK_GLOBAL_STRING_OPCODES: &[&str] = &[
     "BINSTRING",
@@ -338,6 +339,7 @@ pub(crate) struct ScanState<'a> {
     seen_finding_keys: HashSet<(String, Option<String>, Option<&'static str>)>,
     seen_notice_keys: HashSet<NoticeDedupeKey>,
     seen_global_reference_keys: HashSet<GlobalReferenceDedupeKey>,
+    import_references_truncated: bool,
 }
 
 impl<'a> ScanState<'a> {
@@ -388,6 +390,7 @@ impl<'a> ScanState<'a> {
             seen_finding_keys: HashSet::new(),
             seen_notice_keys: HashSet::new(),
             seen_global_reference_keys: HashSet::new(),
+            import_references_truncated: false,
         }
     }
 
@@ -1501,7 +1504,7 @@ impl<'a> ScanState<'a> {
             let mut import_reference_details = details.clone();
             import_reference_details
                 .push(("is_dangerous".to_string(), DetailValue::Bool(is_dangerous)));
-            self.import_references.push(import_reference_details);
+            self.push_import_reference(import_reference_details);
         }
 
         if let Some(global_severity) = severity {
@@ -1592,6 +1595,30 @@ impl<'a> ScanState<'a> {
         if self.seen_notice_keys.insert(key) {
             self.notices.push(notice);
         }
+    }
+
+    fn push_import_reference(&mut self, details: Vec<(String, DetailValue)>) {
+        if self.import_references.len() < MAX_IMPORT_REFERENCES {
+            self.import_references.push(details);
+            return;
+        }
+        if self.import_references_truncated {
+            return;
+        }
+        self.import_references_truncated = true;
+        self.add_notice(Notice {
+            message: "Import reference metadata exceeded the scanner reporting limit".to_string(),
+            severity: "info",
+            location: Some(self.source.clone()),
+            code: Some("import_references_truncated"),
+            details: vec![
+                (
+                    "max_import_references".to_string(),
+                    DetailValue::UInt(MAX_IMPORT_REFERENCES as u64),
+                ),
+                ("analysis_incomplete".to_string(), DetailValue::Bool(true)),
+            ],
+        });
     }
 
     fn rebuild_seen_notice_keys(&mut self) {
@@ -2098,7 +2125,7 @@ impl<'a> ScanState<'a> {
                 self.add_finding(finding);
             }
             for reference in follow_on_scan.import_references {
-                self.import_references.push(reference);
+                self.push_import_reference(reference);
             }
             if had_findings {
                 self.add_notice(Notice {
@@ -3595,6 +3622,43 @@ mod tests {
             .notices
             .iter()
             .any(|notice| notice.code == Some("follow_on_stream_detected")));
+    }
+
+    #[test]
+    fn import_reference_metadata_is_capped_with_notice() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let mut scan = ScanState::new(
+            "import-cap.pkl".to_string(),
+            b"",
+            &options,
+            Some(0),
+            0,
+            0,
+            None,
+        );
+
+        for index in 0..=MAX_IMPORT_REFERENCES {
+            scan.push_import_reference(vec![(
+                "position".to_string(),
+                DetailValue::UInt(index as u64),
+            )]);
+        }
+
+        assert_eq!(scan.import_references.len(), MAX_IMPORT_REFERENCES);
+        assert_eq!(
+            scan.notices
+                .iter()
+                .filter(|notice| notice.code == Some("import_references_truncated"))
+                .count(),
+            1
+        );
     }
 
     #[test]
