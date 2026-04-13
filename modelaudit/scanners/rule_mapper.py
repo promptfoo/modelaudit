@@ -4,6 +4,7 @@ Centralizes the logic for assigning rule codes to specific security issues.
 """
 
 import logging
+from collections.abc import Callable
 
 from modelaudit.rules import RuleRegistry
 
@@ -303,6 +304,16 @@ def get_model_rule_code(issue_type: str) -> str | None:
     return None
 
 
+_GENERIC_RULE_MAPPERS: tuple[Callable[[str], str | None], ...] = (
+    get_file_issue_rule_code,
+    get_network_rule_code,
+    get_encoding_rule_code,
+    get_secret_rule_code,
+    get_embedded_code_rule_code,
+    get_model_rule_code,
+)
+
+
 def get_generic_rule_code(message: str) -> str | None:
     """
     Try to determine rule code from a generic message.
@@ -311,15 +322,8 @@ def get_generic_rule_code(message: str) -> str | None:
     msg_lower = message.lower()
 
     # Try each specialized mapper
-    for mapper in [
-        lambda: get_file_issue_rule_code(msg_lower),
-        lambda: get_network_rule_code(msg_lower),
-        lambda: get_encoding_rule_code(msg_lower),
-        lambda: get_secret_rule_code(msg_lower),
-        lambda: get_embedded_code_rule_code(msg_lower),
-        lambda: get_model_rule_code(msg_lower),
-    ]:
-        code = mapper()
+    for mapper in _GENERIC_RULE_MAPPERS:
+        code = mapper(msg_lower)
         if code:
             return code
 
