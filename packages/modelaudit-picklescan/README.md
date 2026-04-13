@@ -10,8 +10,8 @@ framework.
 ## Installation
 
 The standalone `modelaudit-picklescan` wheel includes the Python API and the
-native Rust scanner extension. The root `modelaudit` wheel bundles
-`modelaudit_picklescan` as an import package and uses the same Rust scanner for
+native Rust scanner extension. The root `modelaudit` wheel depends on this
+distribution so installed ModelAudit scans use the same native Rust scanner for
 pickle payload analysis.
 
 For local package work from a checkout, install the package directory directly:

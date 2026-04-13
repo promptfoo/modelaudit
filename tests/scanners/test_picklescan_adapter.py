@@ -867,7 +867,7 @@ def test_pickle_report_to_scan_result_ignores_decompressed_wrapper_suffix_for_jo
     )
 
 
-def test_pickle_report_to_scan_result_requires_boundary_for_tail_suppression() -> None:
+def test_pickle_report_to_scan_result_allows_joblib_serialization_tail_without_boundary() -> None:
     report = PickleReport(
         source="numpy_arrays.joblib",
         status=ScanStatus.INCONCLUSIVE,
@@ -877,6 +877,44 @@ def test_pickle_report_to_scan_result_requires_boundary_for_tail_suppression() -
                 message="Pickle parsing stopped before the stream was fully consumed: ValueError",
                 severity=Severity.INFO,
                 location="numpy_arrays.joblib (pos 231)",
+                code="parse_incomplete",
+                details={
+                    "exception": "at position 230, opcode b'\\t' unknown",
+                    "exception_type": "ValueError",
+                    "analysis_incomplete": True,
+                },
+            ),
+        ),
+        metadata={
+            "import_references": [
+                {
+                    "import_reference": "joblib.numpy_pickle.NumpyArrayWrapper",
+                    "module": "joblib.numpy_pickle",
+                    "name": "NumpyArrayWrapper",
+                    "opcode": "STACK_GLOBAL",
+                    "position": 66,
+                    "is_dangerous": False,
+                },
+            ],
+        },
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert result.metadata["trusted_incomplete_tail"] is True
+    assert not any(issue.message == "Pickle parsing failed before full scan completion" for issue in result.issues)
+
+
+def test_pickle_report_to_scan_result_requires_boundary_for_non_joblib_tail_suppression() -> None:
+    report = PickleReport(
+        source="numpy_arrays.dill",
+        status=ScanStatus.INCONCLUSIVE,
+        verdict=SafetyVerdict.UNKNOWN,
+        notices=(
+            Notice(
+                message="Pickle parsing stopped before the stream was fully consumed: ValueError",
+                severity=Severity.INFO,
+                location="numpy_arrays.dill (pos 231)",
                 code="parse_incomplete",
                 details={
                     "exception": "at position 230, opcode b'\\t' unknown",

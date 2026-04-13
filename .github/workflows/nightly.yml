@@ -31,6 +31,11 @@ jobs:
         run: |
           uv python pin ${{ matrix.python-version }}
 
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
       - name: Sync dependencies
         run: |
           uv sync --extra all-ci
@@ -53,6 +58,11 @@ jobs:
       - name: Pin Python version
         run: |
           uv python pin 3.11
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
 
       - name: Sync dependencies
         run: |

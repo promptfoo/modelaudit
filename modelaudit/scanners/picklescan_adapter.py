@@ -365,8 +365,6 @@ def _should_suppress_parse_failure_escalation(report: PickleReport) -> bool:
 
     first_pickle_end_pos = report.metadata.get("first_pickle_end_pos")
     has_trusted_pickle_boundary = isinstance(first_pickle_end_pos, int) and first_pickle_end_pos >= 0
-    if not has_trusted_pickle_boundary:
-        return False
 
     for notice in report.notices:
         if notice.code != "parse_incomplete":
@@ -374,22 +372,33 @@ def _should_suppress_parse_failure_escalation(report: PickleReport) -> bool:
 
         exception_type = notice.details.get("exception_type")
         exception_message = str(notice.details.get("exception", ""))
-        if exception_type == "UnicodeDecodeError":
+        if exception_type == "UnicodeDecodeError" and has_trusted_pickle_boundary:
             return True
 
         if exception_type not in {"ParseError", "ValueError"}:
             continue
 
-        if source_ext == ".bin":
+        if source_ext == ".bin" and has_trusted_pickle_boundary:
             return True
 
-        if source_ext in {".pkl", ".pickle", ".joblib", ".dill"} and _is_zero_padding_tail_parse_error(
-            exception_message
+        if (
+            has_trusted_pickle_boundary
+            and source_ext in {".pkl", ".pickle", ".joblib", ".dill"}
+            and _is_zero_padding_tail_parse_error(exception_message)
         ):
             return True
 
         if (
-            source_ext in {".joblib", ".dill", ".bin"}
+            source_ext == ".joblib"
+            and "opcode b'" in exception_message
+            and exception_message.endswith(" unknown")
+            and _has_only_benign_serialization_tail_imports(report)
+        ):
+            return True
+
+        if (
+            has_trusted_pickle_boundary
+            and source_ext in {".dill", ".bin"}
             and "opcode b'" in exception_message
             and exception_message.endswith(" unknown")
             and _has_only_benign_serialization_tail_imports(report)

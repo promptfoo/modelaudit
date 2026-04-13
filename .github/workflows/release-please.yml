@@ -129,6 +129,11 @@ jobs:
         with:
           enable-cache: true
 
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
       - name: Sync dependencies
         run: uv sync --extra all-ci
 
@@ -147,6 +152,9 @@ jobs:
 
       - name: Build package
         run: uv build
+
+      - name: Build standalone pickle package for smoke installs
+        run: uv build packages/modelaudit-picklescan --out-dir /tmp/modelaudit-picklescan-dist
 
       - name: Verify distribution artifacts and version consistency
         run: |
@@ -250,7 +258,10 @@ jobs:
 
           uv venv /tmp/modelaudit-wheel-smoke
 
-          uv pip install --python /tmp/modelaudit-wheel-smoke/bin/python "${WHEEL_ARTIFACT}"
+          uv pip install \
+            --python /tmp/modelaudit-wheel-smoke/bin/python \
+            --find-links /tmp/modelaudit-picklescan-dist \
+            "${WHEEL_ARTIFACT}"
 
           INSTALLED_VERSION="$(
             /tmp/modelaudit-wheel-smoke/bin/python -c "import importlib.metadata as m; print(m.version('modelaudit'))"
@@ -336,7 +347,10 @@ jobs:
 
           uv venv /tmp/modelaudit-sdist-smoke
 
-          uv pip install --python /tmp/modelaudit-sdist-smoke/bin/python "${SDIST_ARTIFACT}"
+          uv pip install \
+            --python /tmp/modelaudit-sdist-smoke/bin/python \
+            --find-links /tmp/modelaudit-picklescan-dist \
+            "${SDIST_ARTIFACT}"
 
           INSTALLED_VERSION="$(
             /tmp/modelaudit-sdist-smoke/bin/python -c "import importlib.metadata as m; print(m.version('modelaudit'))"
@@ -492,6 +506,12 @@ jobs:
           PY
           )
 
+      - name: Upload standalone package artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: modelaudit-picklescan-dist
+          path: /tmp/modelaudit-picklescan-dist/
+
   publish-pypi:
     if: needs.release-please.outputs.release_created == 'true'
     needs: [build, build-picklescan-package, release-please]
@@ -507,6 +527,12 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           name: dist
+          path: dist/
+
+      - name: Download standalone pickle package artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: modelaudit-picklescan-dist
           path: dist/
 
       - name: Publish to PyPI
@@ -539,6 +565,12 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           name: dist
+          path: dist/
+
+      - name: Download standalone pickle package artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: modelaudit-picklescan-dist
           path: dist/
 
       - name: Generate artifact attestations

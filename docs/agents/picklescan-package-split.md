@@ -45,9 +45,9 @@ modelaudit/
   rule coverage are sufficient for the root scanner to depend on it alone.
 - Wrapper scanners in `modelaudit` pass embedded pickle streams into
   `modelaudit-picklescan`; archive parsing stays in `modelaudit`.
-- The root `modelaudit` wheel bundles `modelaudit_picklescan` as a second import
-  package, so the adapter and wrapper scanners use the same source tree without
-  depending on a separately published artifact.
+- The root `modelaudit` wheel depends on the `modelaudit-picklescan`
+  distribution instead of bundling its pure Python package files. This keeps
+  wheel installs aligned with the native extension that the scanner requires.
 - The standalone wheel is built with `maturin` and includes the Rust extension
   module `modelaudit_picklescan._rust`.
 
@@ -93,7 +93,9 @@ Report semantics keep these concepts separate:
   verdict/status drift and rule-code differences across fixture corpora.
 - CI lints, type-checks, tests, builds, and smoke-installs both the root
   `modelaudit` distribution and the standalone `modelaudit-picklescan`
-  distribution in separate workflow jobs.
+  distribution. Root wheel smoke tests install the local standalone wheel via
+  `--find-links` so the unpublished dependency is exercised exactly as an
+  installed package.
 - For the scoped Rust rewrite plan, parity gates, packaging decisions, and
   benchmark methodology, see
   `docs/maintainers/picklescan-rust-rewrite-plan.md`.

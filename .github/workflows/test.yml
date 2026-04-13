@@ -73,6 +73,11 @@ jobs:
         run: |
           uv python pin 3.12
 
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
       - name: Cache Python dependencies
         uses: actions/cache@v5
         with:
@@ -120,6 +125,11 @@ jobs:
         run: |
           uv python pin 3.12
 
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
       - name: Sync dependencies
         run: |
           uv sync --extra all-ci
@@ -127,7 +137,12 @@ jobs:
       - name: Audit dependencies for vulnerabilities
         run: |
           # CVE-2026-4539 currently has no upstream Pygments fix release.
-          uvx pip-audit --strict --desc --ignore-vuln CVE-2026-4539 -r <(uv export --no-hashes --no-emit-project)
+          # The local Rust-backed pickle package has no third-party Python dependencies,
+          # and pip-audit cannot audit unpublished editable path requirements.
+          uv export --no-hashes --no-emit-project \
+            | sed '/^-e \.\/packages\/modelaudit-picklescan$/d' \
+            > /tmp/modelaudit-audit-requirements.txt
+          uvx pip-audit --strict --desc --ignore-vuln CVE-2026-4539 -r /tmp/modelaudit-audit-requirements.txt
 
   license-check:
     name: License Compliance
@@ -147,6 +162,11 @@ jobs:
       - name: Pin Python version
         run: |
           uv python pin 3.12
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
 
       - name: Sync dependencies
         run: |
@@ -309,6 +329,11 @@ jobs:
         run: |
           uv python pin 3.12
 
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
       - name: Cache Python dependencies
         uses: actions/cache@v5
         with:
@@ -355,6 +380,11 @@ jobs:
         run: |
           uv python pin 3.12
 
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
       - name: Cache Python dependencies
         uses: actions/cache@v5
         with:
@@ -392,6 +422,11 @@ jobs:
         run: |
           uv python pin 3.11
 
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
       - name: Sync dependencies
         run: |
           uv sync --extra all-ci-windows
@@ -426,6 +461,11 @@ jobs:
       - name: Pin Python version
         run: |
           uv python pin ${{ matrix.python-version }}
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
 
       - name: Cache Python dependencies
         uses: actions/cache@v5
@@ -517,6 +557,11 @@ jobs:
         run: |
           uv python pin ${{ matrix.python-version }}
 
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
       - name: Cache Python dependencies
         uses: actions/cache@v5
         with:
@@ -577,6 +622,11 @@ jobs:
       - name: Pin Python version
         run: |
           uv python pin 3.12
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
 
       - name: Install WITHOUT TensorFlow
         run: |
@@ -697,6 +747,11 @@ jobs:
         run: |
           uv python pin 3.12
 
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
       - name: Install with ${{ matrix.extra }} extra
         run: |
           uv sync --extra ${{ matrix.extra }}
@@ -719,7 +774,7 @@ jobs:
     # Always build on main, otherwise only if Python/dependency/workflow files changed
     if: github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - name: Checkout repo
         uses: actions/checkout@v6
@@ -732,6 +787,11 @@ jobs:
       - name: Pin Python version
         run: |
           uv python pin 3.12
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
 
       - name: Cache Python dependencies
         uses: actions/cache@v5
@@ -749,6 +809,10 @@ jobs:
         run: |
           uv sync --extra all-ci
 
+      - name: Build standalone pickle package
+        run: |
+          uv build packages/modelaudit-picklescan --out-dir /tmp/modelaudit-picklescan-dist
+
       - name: Build package
         run: |
           uv build
@@ -762,15 +826,21 @@ jobs:
           set -euo pipefail
           uv venv /tmp/modelaudit-wheel-smoke
 
-          uv pip install --python /tmp/modelaudit-wheel-smoke/bin/python dist/modelaudit-*.whl
+          uv pip install \
+            --python /tmp/modelaudit-wheel-smoke/bin/python \
+            --find-links /tmp/modelaudit-picklescan-dist \
+            dist/modelaudit-*.whl
 
           smoke_dir="$(mktemp -d)"
           (
             cd "$smoke_dir"
             PYTHONPATH= /tmp/modelaudit-wheel-smoke/bin/python -I - <<'PY'
+          import importlib.util
+
           import modelaudit
           import modelaudit_picklescan
 
+          assert importlib.util.find_spec("modelaudit_picklescan._rust") is not None
           report = modelaudit_picklescan.scan_bytes(b"\x80\x04}q\x00.")
           assert report.status.value == "complete", report
           print(f"modelaudit {modelaudit.__version__} and modelaudit_picklescan loaded")

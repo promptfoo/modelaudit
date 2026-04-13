@@ -190,12 +190,13 @@ Recommended profiling checkpoints:
 
 - The standalone package now uses `maturin` as its build backend and builds
   `modelaudit_picklescan._rust`.
-- The root `modelaudit` wheel bundles the package sources and uses the Rust
-  extension for standalone pickle payload analysis.
+- The root `modelaudit` wheel depends on the `modelaudit-picklescan`
+  distribution rather than bundling pure Python package sources without the
+  native extension.
 - Release work still needs the full wheel matrix: macOS x86_64/arm64,
   manylinux x86_64/aarch64, Windows x86_64, and Python 3.10-3.13.
-- Source distribution behavior is safe because missing native extensions fail
-  closed with an explicit Rust engine error report.
+- Source distribution behavior depends on the standalone package build; missing
+  native extensions fail closed with an explicit Rust engine error report.
 - CI should validate native standalone wheels, missing-extension error handling,
   and root adapter behavior.
 

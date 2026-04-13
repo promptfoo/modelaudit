@@ -57,6 +57,11 @@ jobs:
         run: |
           uv python pin 3.11
 
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
       - name: Prepare benchmark temp directories
         id: paths
         run: |
