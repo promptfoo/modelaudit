@@ -1097,6 +1097,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] V5-P2-37 — Close N5-P2-PICKLESCAN-PACKAGE-CARGO-TEST-ORDERING by running cargo checks before Python package tests in CI.
 - [x] V5-QA-38 — Final pytest gate found stale trusted-tail fixtures without the benign import evidence required by V5-P1-24; update fixtures so the trusted path and fail-closed empty-evidence path are both tested.
 - [x] V5-QA-39 — Final pytest gate found padded long suspicious literals missed by the Rust module-attribute boundary heuristic; treat long homogeneous literal padding as a boundary without regressing normal word-boundary false-positive guards.
+- [x] V5-QA-40 — Final pytest gate found corrupted raw byte blobs could fail closed on structural protocol-0 near matches inside the blob; require binary pickle headers, protocol-0 global/inst line shape, or execution opcodes before treating truncated raw nested prefixes as security-relevant.
 
 ### Completed item QA log
 
@@ -1283,6 +1284,10 @@ This section is the active implementation log for follow-up commits after revisi
   - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml suspicious_string_matching` — passed, 8 tests.
   - `uv run --with 'maturin>=1.9,<2' maturin develop --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests/test_api.py::test_scan_bytes_flags_suspicious_literal_content_across_truncated_literal_windows packages/modelaudit-picklescan/tests/test_api.py::test_scan_bytes_flags_suspicious_literal_content_across_default_long_literal_windows packages/modelaudit-picklescan/tests/test_api.py::test_scan_bytes_flags_suspicious_literal_content_beyond_default_prefix_suffix_windows -q` — passed.
+- V5-QA-40 — Final full-suite QA surfaced that a corrupted raw nested-pickle near match could be promoted to `S213` solely because an interior text byte resembled protocol-0 `INST`. Same-item commit keeps fail-closed behavior for binary pickle headers, protocol-0 `GLOBAL`/`INST` prefixes with module/name line shape, and probes with execution opcodes, while ignoring structural/text near matches. Targeted QA:
+  - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml truncated_prefix_fail_closed_ignores_structural_protocol0_near_matches` — passed.
+  - `uv run --with 'maturin>=1.9,<2' maturin develop --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests/test_api.py::test_scan_bytes_ignores_invalid_raw_nested_pickle_near_match_hidden_inside_large_literal packages/modelaudit-picklescan/tests/test_api.py::test_scan_bytes_flags_oversized_nested_pickle_prefix_without_deep_parse -q` — passed.
 - N-P0-1 — Same-item commit adds a bounded `_RootStreamPayloadRead` result for non-seekable root stream buffering, records truncation metadata, and emits an `S902` warning instead of raising when the stream exceeds the root raw-scan cap. Targeted QA:
   - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.

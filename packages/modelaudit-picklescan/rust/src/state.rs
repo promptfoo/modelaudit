@@ -9,7 +9,7 @@ use crate::nested::{
     decode_possible_encoded_pickle, detect_oversized_encoded_pickle_prefixes,
     encoded_nested_literal_probe_windows, encoded_nested_window_char_limit, has_execution_opcode,
     has_pickle_prefix, looks_like_pickle_payload, nested_pickle_probe_offsets,
-    pickle_payload_extent,
+    pickle_payload_extent, truncated_pickle_prefix_requires_fail_closed,
 };
 use crate::opcode::{parse_opcode, ArgValue, ParseError, ParsedOpcode};
 use crate::policy::global_severity;
@@ -1265,7 +1265,10 @@ impl<'a> ScanState<'a> {
                 return;
             }
             let candidate_truncated = remaining_len > self.options.max_nested_pickle_bytes;
-            if candidate_truncated && has_pickle_prefix(probe) {
+            if candidate_truncated
+                && has_pickle_prefix(probe)
+                && truncated_pickle_prefix_requires_fail_closed(probe)
+            {
                 self.add_nested_payload_finding(raw_nested_payload_finding(
                     remaining_len,
                     position + offset,

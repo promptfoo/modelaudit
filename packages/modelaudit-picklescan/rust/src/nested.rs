@@ -297,11 +297,37 @@ pub(crate) fn has_pickle_prefix(value: &[u8]) -> bool {
     if value.len() < 2 {
         return false;
     }
-    (value[0] == 0x80 && matches!(value[1], 2..=5))
+    has_binary_pickle_prefix(value)
         || matches!(
             value[0],
             b'(' | b'c' | b'd' | b'l' | b'i' | b'I' | b'S' | b'V'
         )
+}
+
+pub(crate) fn has_binary_pickle_prefix(value: &[u8]) -> bool {
+    value.len() >= 2 && value[0] == 0x80 && matches!(value[1], 2..=5)
+}
+
+pub(crate) fn truncated_pickle_prefix_requires_fail_closed(value: &[u8]) -> bool {
+    has_binary_pickle_prefix(value)
+        || protocol0_global_or_inst_prefix_has_lines(value)
+        || has_execution_opcode(value)
+}
+
+fn protocol0_global_or_inst_prefix_has_lines(value: &[u8]) -> bool {
+    if !matches!(value.first().copied(), Some(b'c' | b'i')) {
+        return false;
+    }
+    let mut newline_count = 0usize;
+    for byte in &value[1..] {
+        if *byte == b'\n' {
+            newline_count += 1;
+            if newline_count >= 2 {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 pub(crate) fn nested_pickle_probe_offsets(value: &[u8]) -> Vec<usize> {
@@ -828,6 +854,31 @@ mod tests {
         assert!(looks_like_pickle_payload(
             b"\x80\x04cos\nsystem\nPfake_id\n.",
             TEST_MAX_NESTED_PICKLE_BYTES
+        ));
+    }
+
+    #[test]
+    fn truncated_prefix_fail_closed_ignores_structural_protocol0_near_matches() {
+        assert!(truncated_pickle_prefix_requires_fail_closed(
+            b"\x80\x04AAAAAAAA"
+        ));
+        assert!(truncated_pickle_prefix_requires_fail_closed(
+            b"cos\nsystem\nAAAAAAAA"
+        ));
+        assert!(truncated_pickle_prefix_requires_fail_closed(
+            b"ios\nsystem\nAAAAAAAA"
+        ));
+        assert!(!truncated_pickle_prefix_requires_fail_closed(
+            b"inner\x94\x8c\x04data\x94s.BBBBB"
+        ));
+        assert!(!truncated_pickle_prefix_requires_fail_closed(
+            b"S'not-a-full-pickle'\nAAAA"
+        ));
+        assert!(!truncated_pickle_prefix_requires_fail_closed(
+            b"Vnot-a-full-pickle\nAAAA"
+        ));
+        assert!(!truncated_pickle_prefix_requires_fail_closed(
+            b"}q\x00BBBBBBBB"
         ));
     }
 }
