@@ -1026,11 +1026,14 @@ class PickleScanner(BaseScanner):
         return b"".join(chunks)
 
     def _read_stream_payload_for_root(self, file_obj: BinaryIO, file_size: int | None) -> _RootStreamPayloadRead:
-        limit = (
-            self.max_file_read_size
-            if self.max_file_read_size and self.max_file_read_size > 0
-            else self._root_raw_scan_limit()
-        )
+        if file_size is not None:
+            limit = self.max_file_read_size if self.max_file_read_size and self.max_file_read_size > 0 else file_size
+        else:
+            limit = (
+                self.max_file_read_size
+                if self.max_file_read_size and self.max_file_read_size > 0
+                else self._root_raw_scan_limit()
+            )
         if limit <= 0:
             return _RootStreamPayloadRead(payload=b"", truncated=False, read_limit=0)
 
@@ -1223,6 +1226,42 @@ class PickleScanner(BaseScanner):
 
         tail = self._read_file_binary_tail_window(path, tail_start, file_size)
         self._scan_binary_tail_window(tail, result, path, tail_start)
+
+    def _scan_seekable_stream_binary_tail_if_needed(
+        self,
+        file_obj: BinaryIO,
+        start_position: int,
+        file_size: int | None,
+        result: ScanResult,
+        source: str,
+    ) -> None:
+        if Path(source).suffix.lower() not in _PYTORCH_CONTAINER_EXTENSIONS:
+            return
+        tail_start = self._binary_tail_start(result)
+        if tail_start is None:
+            return
+        if file_size is not None and tail_start >= file_size:
+            return
+        remaining = (
+            _BINARY_TAIL_SCAN_BYTES if file_size is None else min(_BINARY_TAIL_SCAN_BYTES, file_size - tail_start)
+        )
+        if remaining <= 0:
+            return
+        chunks: list[bytes] = []
+        try:
+            file_obj.seek(start_position + tail_start)
+            while remaining > 0:
+                self.check_interrupted()
+                if self._check_timeout(allow_partial=True):
+                    break
+                chunk = file_obj.read(min(_RAW_READ_CHUNK_BYTES, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+        finally:
+            file_obj.seek(start_position)
+        self._scan_binary_tail_window(b"".join(chunks), result, source, tail_start)
 
     @staticmethod
     def _binary_tail_start(result: ScanResult) -> int | None:
@@ -1699,26 +1738,36 @@ class PickleScanner(BaseScanner):
         if size_check:
             return size_check
         standalone_size = file_size if file_size is not None and file_size >= 0 else None
-        if _stream_is_seekable(file_obj):
+        stream_is_seekable = _stream_is_seekable(file_obj)
+        start_position: int | None = None
+        if stream_is_seekable:
             start_position = file_obj.tell()
             result = self._scan_standalone_stream(file_obj, standalone_size, source=source)
             file_obj.seek(start_position)
             raw_data = self._read_root_raw_scan_window_from_stream(file_obj, standalone_size)
             self._add_seekable_stream_integrity_check(file_obj, result, source, start_position, standalone_size)
+            binary_tail_payload: bytes | None = None
         else:
             stream_read = self._read_stream_payload_for_root(file_obj, standalone_size)
             payload = stream_read.payload
             rust_stream_size = len(payload) if stream_read.truncated else standalone_size
             result = self._scan_standalone_stream(io.BytesIO(payload), rust_stream_size, source=source)
+            result.metadata["pickle_stream_bytes_buffered"] = len(payload)
             self._add_stream_integrity_check(payload, result, source)
             self._add_stream_truncation_check(stream_read, result, source, standalone_size)
             raw_data = self._raw_window_from_payload(payload, self._root_raw_scan_limit())
+            binary_tail_payload = payload
         self._run_root_raw_detectors(
             raw_data,
             result,
             source,
             skip_expensive_detectors=self._should_skip_expensive_raw_detectors(result, raw_data),
+            scan_binary_tail=False,
         )
+        if stream_is_seekable and start_position is not None:
+            self._scan_seekable_stream_binary_tail_if_needed(file_obj, start_position, standalone_size, result, source)
+        elif binary_tail_payload is not None:
+            self._scan_binary_tail_if_needed(binary_tail_payload, result, source)
         self._add_root_legacy_metadata_detectors(result, source)
         return result
 

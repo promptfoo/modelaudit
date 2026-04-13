@@ -751,12 +751,12 @@ def test_scan_stream_accepts_unknown_size_stream() -> None:
     assert result.metadata["pickle_primary_engine"] == "rust"
 
 
-def test_scan_stream_non_seekable_payload_above_root_cap_returns_truncated_result() -> None:
+def test_scan_stream_unknown_size_non_seekable_payload_above_root_cap_returns_truncated_result() -> None:
     payload = pickle.dumps({"pad": b"A" * 4096}, protocol=4)
 
     result = PickleScanner(config={"pickle_root_raw_scan_limit_bytes": 64}).scan_stream(
         NonSeekableBytesIO(payload),
-        len(payload),
+        None,
         source="large-nonseek.pkl",
     )
 
@@ -769,20 +769,33 @@ def test_scan_stream_non_seekable_payload_above_root_cap_returns_truncated_resul
     assert any(check.name == "Pickle Stream Read Limit" for check in result.checks)
 
 
-def test_scan_stream_unknown_size_non_seekable_payload_above_root_cap_reports_truncation() -> None:
+def test_scan_stream_non_seekable_known_size_buffers_full_payload_past_raw_cap() -> None:
     payload = pickle.dumps({"pad": b"A" * 4096}, protocol=4)
 
     result = PickleScanner(config={"pickle_root_raw_scan_limit_bytes": 64}).scan_stream(
         NonSeekableBytesIO(payload),
-        None,
-        source="unknown-large-nonseek.pkl",
+        len(payload),
+        source="known-large-nonseek.pkl",
     )
 
-    assert result.metadata["pickle_stream_truncated_for_root_scan"] is True
-    assert result.metadata["pickle_stream_bytes_buffered"] == 64
-    assert result.metadata["scan_outcome"] == "inconclusive"
-    assert result.success is False
-    assert any(check.name == "Pickle Stream Read Limit" for check in result.checks)
+    assert result.success is True
+    assert result.metadata["pickle_stream_bytes_buffered"] == len(payload)
+    assert "pickle_stream_truncated_for_root_scan" not in result.metadata
+
+
+def test_scan_stream_detects_binary_tail_past_raw_window() -> None:
+    pickle_payload = pickle.dumps({"pad": b"A" * 256}, protocol=4)
+    payload = pickle_payload + b"\x7fELF/bin/sh\x00"
+
+    result = PickleScanner(config={"pickle_root_raw_scan_limit_bytes": 64}).scan_stream(
+        NonSeekableBytesIO(payload),
+        len(payload),
+        source="stream-tail.bin",
+    )
+
+    assert any(
+        issue.rule_code == "S502" and issue.details.get("offset") == len(pickle_payload) for issue in result.issues
+    )
 
 
 def test_extract_metadata_uses_pickle_opcodes_not_raw_bytes(tmp_path: Path) -> None:
