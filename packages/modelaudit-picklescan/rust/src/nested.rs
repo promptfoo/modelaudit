@@ -5,6 +5,7 @@ const BASE64_LITERAL_CHARS: &[u8] =
 const HEX_LITERAL_CHARS: &[u8] = b"0123456789abcdefABCDEF";
 const ENCODED_LITERAL_PROBE_CHARS: usize = 64;
 const MAX_NESTED_PAYLOAD_PROBES: usize = 64;
+const MAX_ENCODED_LITERAL_MID_SCAN_BYTES: usize = 1024 * 1024;
 
 pub(crate) fn decode_possible_encoded_pickle(
     value: &str,
@@ -303,7 +304,8 @@ pub(crate) fn encoded_nested_literal_probe_windows(
     }
 
     let bytes = value.as_bytes();
-    for index in 0..bytes.len() {
+    let mid_scan_len = bytes.len().min(MAX_ENCODED_LITERAL_MID_SCAN_BYTES);
+    for index in 0..mid_scan_len {
         if windows.len() >= MAX_NESTED_PAYLOAD_PROBES {
             break;
         }
@@ -655,6 +657,29 @@ mod tests {
         let windows = encoded_nested_literal_probe_windows(&value, 64);
 
         assert!(windows.iter().any(|window| window.starts_with("gAR9Lg==")));
+    }
+
+    #[test]
+    fn encoded_probe_windows_bound_mid_literal_scan_cost() {
+        let within_bound = format!(
+            "{}gAR9Lg=={}",
+            "A".repeat(MAX_ENCODED_LITERAL_MID_SCAN_BYTES.saturating_sub(16)),
+            "B".repeat(128)
+        );
+        let within_windows = encoded_nested_literal_probe_windows(&within_bound, 64);
+        assert!(within_windows
+            .iter()
+            .any(|window| window.starts_with("gAR9Lg==")));
+
+        let beyond_bound = format!(
+            "{}gAR9Lg=={}",
+            "A".repeat(MAX_ENCODED_LITERAL_MID_SCAN_BYTES + 16),
+            "B".repeat(ENCODED_LITERAL_PROBE_CHARS + 1)
+        );
+        let beyond_windows = encoded_nested_literal_probe_windows(&beyond_bound, 64);
+        assert!(!beyond_windows
+            .iter()
+            .any(|window| window.starts_with("gAR9Lg==")));
     }
 
     #[test]

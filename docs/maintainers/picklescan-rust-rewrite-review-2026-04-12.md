@@ -507,7 +507,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] N-P2-27 — Add Rust string seeds for joblib/cloudpickle/copyreg.
 - [x] N-P2-28 — Add tests for encoded protocol 2-5 prefixes.
 - [x] N-P2-29 — Complete escaped-hex protocol-0 prefix table.
-- [ ] N-P2-30 — Bound `encoded_nested_literal_probe_windows` linear scan cost.
+- [x] N-P2-30 — Bound `encoded_nested_literal_probe_windows` linear scan cost.
 - [ ] N-P2-31 — Optimize Rust dangerous-global policy lookup.
 - [x] N-P2-32 — Clean stale moved parity-corpus pycache.
 - [ ] N-P2-33 — Refactor duplicate stream-read helpers.
@@ -753,6 +753,11 @@ This section is the active implementation log for follow-up commits after revisi
   - `cargo check --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed.
   - `cargo clippy --manifest-path packages/modelaudit-picklescan/Cargo.toml --all-targets -- -D warnings` — passed.
   - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, 21 tests.
+- N-P2-30 — Same-item commit bounds the byte-by-byte middle scan in `encoded_nested_literal_probe_windows` to 1 MiB while retaining the existing prefix and suffix probes. This prevents huge benign encoded-looking literals from forcing an unbounded linear scan. Targeted QA:
+  - `cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml -- --check` — passed.
+  - `cargo check --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed.
+  - `cargo clippy --manifest-path packages/modelaudit-picklescan/Cargo.toml --all-targets -- -D warnings` — passed.
+  - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, 22 tests, including an in-bound candidate positive and out-of-bound middle candidate negative for the new cap.
 
 ### Newly discovered gaps while remediating
 
