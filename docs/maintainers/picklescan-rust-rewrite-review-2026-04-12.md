@@ -93,6 +93,62 @@ On the repo's own 21 exploit fixtures and 2 safe samples the scanner is **0 FN /
 
 After re-pulling at `22b2d0df` and re-running validation gates, **`pytest packages/modelaudit-picklescan/tests/test_api.py` produces 10 failures** and the broader pickle suite produces 4 additional regressions. These landed *with* the `fix: close picklescan follow-up review items` commit — the author added the test files and the documentation but several Rust/Python wirings are incomplete or out of sync.
 
+### **N5-CRITICAL-RCE-BYPASS** — post-budget tail produces UNKNOWN for non-needle dangerous globals (validated end-to-end)
+
+This is the most important finding in any revision of this review. **A 9 MB pickle that calls `subprocess.run(['echo', 'PWNED'])` produces `verdict=unknown, status=inconclusive, findings=0, criticals=0, warnings=0` from both the standalone `modelaudit_picklescan.scan_bytes()` and the full `modelaudit.scanners.pickle_scanner.PickleScanner().scan()` paths.** I executed the payload with `pickle.loads()` and confirmed it actually runs the subprocess and prints `PWNED` to stdout. Scanner reports only an INFO `opcode_budget` notice. CI policies that fail only on CRITICAL or WARNING let this through.
+
+**Reproduction (validated by running `pickle.loads(mal)` in a sandbox):**
+```python
+import pickle, subprocess
+class Evil:
+    def __reduce__(self):
+        return (subprocess.run, (['echo', 'PWNED'],))
+header = b'\x80\x04'
+filler = b'\x880' * 4_500_000          # 9 MB of NEWTRUE/POP — exhausts 1 M opcode budget
+evil_bytes = pickle.dumps(Evil(), protocol=4)
+mal = header + filler + evil_bytes[2:]  # skip duplicate proto
+
+# Validation:
+from modelaudit_picklescan import scan_bytes
+r = scan_bytes(mal)
+assert r.verdict.value == 'unknown'    # NOT MALICIOUS
+assert len(r.findings) == 0            # ZERO findings
+
+result = pickle.loads(mal)
+# → CompletedProcess(args=['echo', 'PWNED'], returncode=0)
+# → 'PWNED' printed to stdout
+```
+
+**Root cause:** `scan_post_budget_tail` (`packages/modelaudit-picklescan/rust/src/state.rs:1968`) reads up to 100 MB of tail bytes after the opcode budget is exhausted, but only matches the **24 hardcoded needles** in `POST_BUDGET_DANGEROUS_GLOBAL_PATTERNS` at `state.rs:57-83`. Confirmed missing from the needle table by hand-testing each:
+
+| Tail global | Detected? |
+|---|---|
+| `csubprocess\nrun` | ❌ verdict=unknown |
+| `csubprocess\ncheck_call` | ❌ verdict=unknown |
+| `cimportlib\nreload` | ❌ verdict=unknown |
+| `c__main__\n<symbol>` | ❌ verdict=unknown |
+| `cos\npopen` | ⚠️ verdict=suspicious (warning, not critical) |
+| `cctypes\nCDLL` | ⚠️ verdict=suspicious (warning, not critical) |
+
+The Python belt-and-suspenders raw detector `_scan_raw_text_indicators` (`pickle_scanner.py:1341`) only runs on `data` capped at `_ROOT_RAW_SCAN_LIMIT_BYTES = 8 MB` (`pickle_scanner.py:24,1769`), so the tail at offset 9 000 003 is past that window — never seen. The full ModelAudit `PickleScanner().scan()` path on this payload returns:
+```
+success=False
+total issues: 1
+crits: 0  warns: 0
+sev=info rule=S902 msg=Opcode analysis stopped after reaching max_opcodes=1000000
+```
+
+**Severity escalation gap (F2 from security agent):** Even when the needle table DOES match (e.g., `cos\nsystem\n...R.` past budget), the finding is hardcoded `severity: "warning"` at `state.rs:1997-2020` — never CRITICAL, even when followed immediately by a REDUCE-class byte. CI policies of "fail only on CRITICAL" let `os.system('id')` past budget through.
+
+**Timeout exhaustion bypass (F3):** `LimitError::Timeout` at `state.rs:480-501` only emits a timeout notice and does NOT call `scan_post_budget_tail`. An attacker can craft any pickle that takes longer than `options.timeout_s` to parse (deep MARK nesting, large LONG4 buffers) and the post-budget tail scan is **completely skipped**. Default timeout is 3600 s but ModelAudit CI/CD configs often set lower.
+
+**Required fix (one commit, three changes in `state.rs`):**
+1. Generate `POST_BUDGET_DANGEROUS_GLOBAL_PATTERNS` from `policy.rs:DANGEROUS_WILDCARD_MODULES` + `DANGEROUS_GLOBALS` instead of hardcoding 24 needles.
+2. Promote `POST_BUDGET_GLOBAL` to `severity: "critical"` when the matched needle is followed by a REDUCE-class byte (`R`/`o`/`b`/`\x81`/`\x92`) within ~64 bytes.
+3. Call `scan_post_budget_tail` from the timeout branch too.
+
+**This is a P0 RCE-bypass merge blocker. The PR cannot be merged until N5-CRITICAL-RCE-BYPASS is resolved.**
+
 ### Test failures landed at `22b2d0df` (CI would block the merge today)
 
 **N5-FAIL-1.** `test_scan_bytes_records_oversized_frame_notice` (`packages/modelaudit-picklescan/tests/test_api.py:1897`). The Rust `record_oversized_frame_notice` exists at `state.rs:1674-1716` and a cargo-test `oversized_frame_lengths_emit_structural_notice` at `state.rs:3370` confirms it works inside Rust. But via the PyO3 boundary, `scan_bytes(b"\x80\x04\x95\xfe\xff\xff\xff\xff\xff\xff\xff}.")` returns `len(notices) == 0` and the test errors with `StopIteration`. Either the FRAME branch in `record_structural_opcode` (`state.rs:1596-1599`) is being skipped for some reason in the production build but not in the cargo test, or `add_notice` is deduping it against an unrelated key. Reproduction is one-line; my hands-on QA confirmed `notices == 0` for `frame_len=16`, `frame_len=255`, and `frame_len=u64::MAX-1`. **Real implementation gap, not just a test bug.**
@@ -167,6 +223,56 @@ PERSID specifically as the LAST executable opcode before STOP is uniquely bypass
 
 **N5-R19.** Mid-string proto-0 hex prefix table accepts lowercase `\x` only (`nested.rs:351-362`). A payload using uppercase `\X80` slips past mid-string detection. Low-impact (CPython and most encoders use lowercase) but still a parity gap.
 
+### Security/fuzzing audit — additional findings (a0776fb9c2a2c45d7)
+
+The security agent's primary finding is N5-CRITICAL-RCE-BYPASS above. Additional items:
+
+**N5-SEC-F4.** `STRUCTURAL_TAMPER` unconditional INFO downgrade (`picklescan_adapter.py:189-190`). Same as N5-PY1-3 from the integration audit — Rust emits at WARNING, adapter rewrites to INFO. Two independent agents flagged this. Fix: remove the unconditional downgrade.
+
+**N5-SEC-F5.** Multi-line wrapping bypasses `encoded_nested_literal_probe_windows` (`nested.rs:308-341, 443-461`). A base64-encoded pickle wrapped in `# this is doc\n# <b64>\n# more` is reported `verdict=clean`. Same `b64` on a single line is correctly detected as MALICIOUS. Defense-in-depth gap for downstream code that base64-decodes string fields after stripping comment prefixes (HF metadata loaders, config preprocessors). Fix: strip ASCII whitespace and `#` line-leaders before re-attempting `is_base64_candidate`, or run `base64_tokens` over the literal.
+
+**N5-SEC-F6.** `_pickle_opcode_summary` memo PUT/MEMOIZE collision with CPython (`pickle_scanner.py:705-715`). After `PUT 5` followed by `MEMOIZE`, CPython stores at slot 1 (`len(memo) == 1`), but the Python summary stores at slot 6 (`max(0, 5+1)`). Subsequent BINGET 1 then resolves wrong in the summary. Affects metadata-only paths (CVE attribution at line 1453, dangerous-globals listing); Rust verdict is unaffected. Fix: track memo as a dict and use `len(memo)` as the next implicit index.
+
+**N5-SEC-F7.** `find_module_attr` lacks left word boundary (`strings.rs:523-559`). `find_module_attr("foos.system(...)")` matches `os.system`. False positive (suspicious-string verdict downgrade), not exploit. Verified: `pickle.dumps('foos.system("id")') → SUSPICIOUS`. Fix: left-boundary check at line 532.
+
+**N5-SEC-F8.** `EMPTY_LIST/EMPTY_DICT/EMPTY_SET` push wrong `type_name="tuple"` (`state.rs:733-738`). Cosmetic — only affects `operand_preview` output in MALFORMED_STACK_GLOBAL details. Same as N5-R1 from the Rust audit. Two agents flagged this independently.
+
+**N5-SEC-F9.** `record_persistent_id` always emits WARNING with per-position dedupe (`state.rs:1559-1568`). A pickle with 10 000 PERSID opcodes emits 10 000 deduped WARNINGs. The buffer-opcode notice was collapsed in N-P1-20; PERSID was not. Fix: track first PERSID position + counter, emit a single notice with `persistent_id_count`.
+
+### Verified-already-mitigated by the security agent (good news)
+
+The security agent confirmed these defenses are working at rev 5:
+- PyTorch ZIP multi-`data.pkl` → all members enumerated and scanned.
+- `SHORT_BINSTRING`/`BINSTRING` as STACK_GLOBAL operand → caught.
+- Memo PUT/GET reuse for STACK_GLOBAL → correctly tracked.
+- Multi-stream pickle → outer scan re-enters after STOP.
+- `getattr(o, 'system')`/`getattr(o, 'spawn')`/`getattr(o, 'run')` → all caught.
+- NEXT_BUFFER stack desync attack → forces MALFORMED_STACK_GLOBAL critical.
+- 1-deep encoded nested via `pickle.dumps({'x': base64(pickle(Evil()))})` → CRITICAL.
+- 2-deep nested → inner REDUCE still surfaced (`DEFAULT_MAX_NESTED_DEPTH = 2`).
+- Symlink to `/etc/passwd` → graceful parse error.
+- Truncated pickle without STOP → REDUCE detected before parse error.
+- FRAME announcing wrong length → parser ignores length, walks opcodes.
+- `__main__.<symbol>` REDUCE → CRITICAL.
+
+### Hands-on QA for security agent's claims
+
+Probed independently of the security agent:
+- **URL-encoded payload** (`%63%6f%73...` decodes to `cos\nsystem\n)R.`): wrapped → clean. Scanner doesn't decode URL escapes. Defense-in-depth gap.
+- **zlib-compressed inner pickle**: wrapped → clean. Scanner doesn't decompress zlib content. Known limitation.
+- **Module name with leading dot** `.evil`: clean. Not a real Python module name.
+- **Module name with NUL byte**: clean. CPython rejects at import time.
+- **Empty module name**: clean. CPython rejects.
+- **Dotted name in single string** `os.system`: malicious ✓ (correctly caught).
+- **REDUCE on tuple** (callable is a tuple): clean. CPython would TypeError.
+- **PyTorch ZIP with `custom.pkl` member**: malicious ✓.
+- **PyTorch ZIP with double `data.pkl`**: malicious ✓.
+- **`.txt` file with `\x80\x04` prefix**: malicious ✓ (magic-byte sniffing routes correctly).
+- **Symlink to /etc/passwd**: verdict=unknown (parses as text).
+- **Recursive symlink (self-loop)**: verdict=unknown (no crash).
+- **Long filename (255 chars)**: clean (handled).
+- **NEXT_BUFFER spam (100 buffer ops)**: collapsed to 1 notice ✓.
+
 ### High-impact P1 from Python integration audit (ad112afbd9e15d72b)
 
 **N5-PY1-1.** **Non-seekable scan_stream silently truncates known-size streams past 8 MB.** `pickle_scanner.py:1031-1049`. When `scan_stream(file_obj, file_size=N)` is called on a non-seekable stream with `N > 8 MB` (default `_ROOT_RAW_SCAN_LIMIT_BYTES`), `_read_stream_payload_for_root` caps the read at 8 MB and passes the prefix to standalone with `rust_stream_size=8MB`. Rust then emits `verdict=clean status=complete` for the truncated prefix because from its perspective it saw a complete 8 MB stream. A WARNING S902 truncation check IS emitted, so the outcome is WARNING + "clean" — not CRITICAL. **Detection asymmetry**: identical pickle content scanned via seekable stream returns full findings, via non-seekable stream returns only 8 MB worth. `ZipExtFile`, HTTP bodies, pipes routinely hit the non-seekable path. Fix: buffer the declared size to a `SpooledTemporaryFile` matching standalone's own semantics, or raise the cap when `file_size` is known.
@@ -232,22 +338,44 @@ Rust emits these findings with `severity: "warning"` (`state.rs:1622,1659`). The
 
 ### Rev 5 release-readiness checklist
 
-| Status | Item |
-|---|---|
-| ❌ | 10 `test_api.py` failures (N5-FAIL-1..10) |
-| ❌ | 2 numpy/joblib regressions (N5-FAIL-11..12) — tests not updated for rev-4 collapse |
-| ❌ | 2 unenumerated `tests/scanners/test_*.py` failures (N5-FAIL-13/14) |
-| ❌ | PERSID nested-pickle bypass (N5-EXPLOIT-PERSID-NESTED) |
-| ❌ | No manylinux wheel build (N5-P0-WHEEL-MANYLINUX) |
-| ❌ | release-please can't bump standalone package (N5-P0-RELEASE-PLEASE-EXTRA-FILES-MARKERS) |
-| ❌ | Hot-path skip defeated on real PyTorch checkpoints (N5-P1-HOT-PATH-DEFEATED-BY-TORCH-SEED) |
-| ❌ | SARIF emits duplicate findings + no rule-code regression coverage (N5-P1-SARIF-*) |
-| ❌ | Adapter dead code for benign-nested downgrade (N5-P1-DEAD-ADAPTER-NESTED-DOWNGRADE) |
-| ❌ | PICKLE_EXPANSION mis-classified as S902 corruption (N5-P1-RULE-CODE-CONFLATION-S902) |
-| ❌ | 21 P1 Rust correctness/parity gaps (N5-R1..R20) |
-| ✅ | All five rev-4 residuals confirmed FIXED (empty.pkl, proto 6, directory severity, wheel matrix, oversized FRAME notice — though the FRAME notice has a regression at the PyO3 boundary, see N5-FAIL-1) |
+| Status | Severity | Item |
+|---|---|---|
+| ❌ | **P0 RCE BYPASS** | **N5-CRITICAL-RCE-BYPASS** — `subprocess.run` past 1M opcode budget = clean verdict, validated end-to-end with `pickle.loads()` printing PWNED |
+| ❌ | P0 RCE BYPASS | N5-EXPLOIT-PERSID-NESTED — 24-byte PERSID nested pickle bypasses recursion |
+| ❌ | P0 release | N5-P0-WHEEL-MANYLINUX — no manylinux build; PyPI rejects upload |
+| ❌ | P0 release | N5-P0-RELEASE-PLEASE-EXTRA-FILES-MARKERS — standalone package never auto-bumps |
+| ❌ | P0 test | 10 `test_api.py` failures (N5-FAIL-1..10) |
+| ❌ | P0 test | 2 numpy/joblib regressions (N5-FAIL-11..12) — tests not updated for rev-4 collapse |
+| ❌ | P0 test | 2 unenumerated `tests/scanners/test_*.py` failures (N5-FAIL-13/14) |
+| ❌ | P1 | N5-SEC-F2 — POST_BUDGET_GLOBAL severity hardcoded WARNING even with REDUCE proximity |
+| ❌ | P1 | N5-SEC-F3 — timeout exhaustion skips post-budget tail entirely |
+| ❌ | P1 | N5-PY1-3 / N5-SEC-F4 — STRUCTURAL_TAMPER unconditionally downgraded WARNING→INFO (flagged by 2 agents independently) |
+| ❌ | P1 | N5-PY1-1/2/4 — non-seekable scan_stream silently truncates / loses binary tail / unbounded streams cap silently |
+| ❌ | P1 | N5-PY1-7/8 — `_StreamShortReadError` discards already-read bytes; ZIP member streaming discards on Exception |
+| ❌ | P1 | N5-PY1-10 — `_pickle_opcode_summary` walker ignores SETITEM/TUPLE/REDUCE stack effects |
+| ❌ | P1 | N5-P1-HOT-PATH-DEFEATED-BY-TORCH-SEED — `b"torch"` defeats hot-path skip on every PyTorch checkpoint (verified empirically) |
+| ❌ | P1 | N5-P1-SARIF-DUPLICATE-FINDINGS — SARIF emits duplicate primary+supporting rows |
+| ❌ | P1 | N5-P1-SARIF-NO-PICKLESCAN-RULE-COVERAGE — zero SARIF tests for new rule codes |
+| ❌ | P1 | N5-P1-DEAD-ADAPTER-NESTED-DOWNGRADE — dead adapter code |
+| ❌ | P1 | N5-P1-RULE-CODE-CONFLATION-S902 — PICKLE_EXPANSION mis-classified as corruption |
+| ❌ | P1 | 21 P1 Rust correctness/parity gaps (N5-R1..R20) |
+| ❌ | P1 | N5-SEC-F5 — multi-line wrapped base64 nested pickles bypass |
+| ✅ | — | All five rev-4 residuals confirmed FIXED (empty.pkl INFO, proto 6 recognized, directory severity INFO, wheel matrix expanded, oversized FRAME notice path added — though the path is broken at the PyO3 boundary, see N5-FAIL-1) |
 
-**Recommendation: do not merge until N5-FAIL-1..12, N5-EXPLOIT-PERSID-NESTED, N5-P0-WHEEL-MANYLINUX, and N5-P0-RELEASE-PLEASE-EXTRA-FILES-MARKERS are addressed.** The remaining N5-R/N5-P1 items can be follow-up PRs.
+**Verdict: PR is NOT MERGE READY.** N5-CRITICAL-RCE-BYPASS is a confirmed end-to-end RCE bypass that the scanner reports as `verdict=unknown, findings=0`. An attacker who pads a pickle with cheap opcodes past the 1 M-opcode budget can hide ANY dangerous global not in the hardcoded `POST_BUDGET_DANGEROUS_GLOBAL_PATTERNS` table — including `subprocess.run`, `subprocess.check_call`, `importlib.reload`, `__main__.*`, `os.execv*`, and most of the `DANGEROUS_WILDCARD_MODULES` policy table.
+
+**Required before merge:**
+1. **N5-CRITICAL-RCE-BYPASS** + N5-SEC-F2 + N5-SEC-F3 — generate the post-budget needle list from `policy.rs`, promote to CRITICAL on REDUCE proximity, scan tail on timeout.
+2. **N5-EXPLOIT-PERSID-NESTED** — model PERSID stack semantics correctly in `validate_pickle_stack_effect` OR add PERSID to `has_execution_opcode`.
+3. **N5-FAIL-1..14** — fix the 14 test failures (10 wiring gaps + 4 consumer test updates).
+4. **N5-P0-WHEEL-MANYLINUX** + **N5-P0-RELEASE-PLEASE-EXTRA-FILES-MARKERS** — release-mechanics.
+
+**Strongly recommended before merge:**
+5. N5-PY1-1..10 (scan_stream truncation/binary-tail/walker gaps).
+6. N5-P1-HOT-PATH-DEFEATED-BY-TORCH-SEED (perf claim doesn't generalize).
+7. N5-P1-SARIF-* (duplicate findings + zero rule-code regression coverage).
+
+The remaining N5-R* / N5-SEC-F4..F9 / N5-P2-* items can be follow-up PRs.
 
 ---
 
