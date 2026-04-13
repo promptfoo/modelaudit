@@ -487,7 +487,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] P1-SEED-SHAPE / N-P1-14 / N-P1-15 / N-P1-17 / N-P2-23 / N-P2-25 — Tighten and de-duplicate expensive raw-detector seed/shape helpers.
 - [x] P1-DUNDER-WALKER — Reduce benign user-dunder false positives.
 - [x] P1-NESTED-DEPTH — Raise nested depth or fail closed when nested analysis depth is exhausted.
-- [ ] T-P1-WHEEL — Add missing macOS x86_64 and Linux aarch64 wheel coverage or document the gap.
+- [x] T-P1-WHEEL — Add missing macOS x86_64 and Linux aarch64 wheel coverage or document the gap.
 - [ ] T-P2-COMMENT — Restore missing comment-token bypass regression coverage.
 - [ ] T-P2-EXPANSION — Restore expansion/memo-growth regression coverage.
 - [ ] T-P2-STRUCTURAL — Restore structural tamper / duplicate-PROTO regression coverage.
@@ -614,6 +614,8 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run mypy packages/modelaudit-picklescan/src/modelaudit_picklescan/options.py packages/modelaudit-picklescan/tests/test_api.py` — passed.
   - `uv run --with 'maturin>=1.9,<2' maturin develop --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, rebuilt the editable native extension.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests/test_api.py -q` — passed, 143 tests, including default two-layer base64 nested malicious-payload coverage.
+- T-P1-WHEEL — Same-item commit documents the remaining macOS x86_64 and Linux aarch64 wheel gap in the standalone package README, including the sdist/local-Rust fallback. Targeted QA:
+  - `git diff --check` — passed.
 
 ### Newly discovered gaps while remediating
 

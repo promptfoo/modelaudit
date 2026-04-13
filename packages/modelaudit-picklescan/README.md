@@ -47,6 +47,9 @@ report = scan_bytes(
 
 The wheel includes a native Rust scanner for pickle payload analysis. Maintainer
 migration notes and failure-mode details live in the repository maintainer docs.
+Release wheels are published for the primary Linux x86_64, macOS arm64, and
+Windows targets. macOS x86_64 and Linux aarch64 users may install from the
+source distribution and need a local Rust toolchain available during install.
 
 ## Report Contract
 
