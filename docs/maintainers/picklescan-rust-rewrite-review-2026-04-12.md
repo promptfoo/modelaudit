@@ -528,7 +528,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] T-P1-51 / T-P1-52 — Strengthen parity/fuzz tests with expected verdicts.
 - [x] T-P1-53 / T-P1-66 — Restore multi-stream regression coverage.
 - [x] T-P1-54 — Replace Rust policy source-text tests with functional tests.
-- [ ] T-P1-55 / T-P1-56 — Strengthen weak negative/overbroad assertions.
+- [x] T-P1-55 / T-P1-56 — Strengthen weak negative/overbroad assertions.
 - [ ] T-P1-57 — Document BINBYTES text-scan design decision.
 - [ ] T-P1-63 — Expand high-risk callable module coverage.
 - [ ] T-P1-64 — Add real NEWOBJ_EX end-to-end test coverage.
@@ -626,6 +626,12 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run ruff check packages/modelaudit-picklescan/tests/test_rust_engine.py` — passed.
   - `uv run mypy packages/modelaudit-picklescan/tests/test_rust_engine.py` — passed.
   - `uv run pytest packages/modelaudit-picklescan/tests/test_rust_engine.py -q` — passed, 20 tests.
+- T-P1-55 / T-P1-56 — Same-item commit tightens system-global assertions to exact expected import references: platform-specific `os.system` reduce payloads must report the platform-specific callable, and a literal `cos\nsystem` global-only stream must still report `os.system` while avoiding CVE-2026-24747 SETITEM attribution. Targeted QA:
+  - `uv run ruff format tests/scanners/test_pickle_scanner.py` — passed.
+  - `uv run ruff format --check tests/scanners/test_pickle_scanner.py packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `uv run ruff check tests/scanners/test_pickle_scanner.py packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `uv run mypy tests/scanners/test_pickle_scanner.py packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py::test_scan_malicious_pickle_reports_rust_finding tests/scanners/test_pickle_scanner.py::test_scan_stream_does_not_treat_system_name_as_setitem_cve packages/modelaudit-picklescan/tests/test_api.py::test_scan_bytes_detects_reduce_invoking_os_system -q` — passed, 3 tests.
 - N-P0-3 — Same-item commit removes the global raw-window documentation short-circuit, records documentation-like pickle literal spans, and filters only matches that fall inside documentation spans or comment-like lines. Targeted QA:
   - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.

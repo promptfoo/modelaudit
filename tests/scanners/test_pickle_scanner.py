@@ -21,6 +21,8 @@ from modelaudit.scanners.pickle_scanner import (
 )
 from tests.helpers import create_mock_pytorch_zip
 
+EXPECTED_SYSTEM_GLOBAL = "nt.system" if os.name == "nt" else "posix.system"
+
 
 class MaliciousPayload:
     def __reduce__(self) -> tuple[Any, tuple[str]]:
@@ -163,9 +165,7 @@ def test_scan_malicious_pickle_reports_rust_finding(tmp_path: Path) -> None:
     assert result.success is True
     assert result.metadata["pickle_primary_engine"] == "rust"
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
-    assert any(
-        issue.details.get("import_reference") in {"posix.system", "os.system", "nt.system"} for issue in result.issues
-    )
+    assert any(issue.details.get("import_reference") == EXPECTED_SYSTEM_GLOBAL for issue in result.issues)
 
 
 def test_scan_stream_treats_negative_size_as_unknown_size() -> None:
@@ -634,9 +634,7 @@ def test_scan_stream_does_not_treat_system_name_as_setitem_cve() -> None:
 
     result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="global-only.pkl")
 
-    assert any(
-        issue.details.get("associated_global") in {"os.system", "posix.system", "nt.system"} for issue in result.issues
-    )
+    assert any(issue.details.get("associated_global") == "os.system" for issue in result.issues)
     assert all(issue.rule_code != "S310" for issue in result.issues)
     assert all(issue.rule_code != "S209" for issue in result.issues)
 
