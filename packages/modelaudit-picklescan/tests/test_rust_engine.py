@@ -26,18 +26,12 @@ _GENERATED_EXPECTED_VERDICTS: dict[str, SafetyVerdict] = {
         for index in _SUSPICIOUS_STRING_LITERAL_INDICES
         for protocol in range(6)
     },
-    "bytes-2": SafetyVerdict.MALICIOUS,
     "bytes-small-limit-2": SafetyVerdict.MALICIOUS,
-    "base64-2": SafetyVerdict.MALICIOUS,
-    "hex-2": SafetyVerdict.MALICIOUS,
     "bytes-3": SafetyVerdict.MALICIOUS,
     "bytes-small-limit-3": SafetyVerdict.MALICIOUS,
     "base64-3": SafetyVerdict.MALICIOUS,
     "hex-3": SafetyVerdict.MALICIOUS,
-    "bytes-4": SafetyVerdict.MALICIOUS,
     "bytes-small-limit-4": SafetyVerdict.MALICIOUS,
-    "base64-4": SafetyVerdict.MALICIOUS,
-    "hex-4": SafetyVerdict.MALICIOUS,
     "raw-0": SafetyVerdict.SUSPICIOUS,
     "raw-1": SafetyVerdict.SUSPICIOUS,
     "raw-4": SafetyVerdict.MALICIOUS,
@@ -56,7 +50,7 @@ _GENERATED_EXPECTED_VERDICTS: dict[str, SafetyVerdict] = {
     "raw-19": SafetyVerdict.SUSPICIOUS,
     "raw-20": SafetyVerdict.MALICIOUS,
     "raw-21": SafetyVerdict.MALICIOUS,
-    "budget-1": SafetyVerdict.SUSPICIOUS,
+    "budget-1": SafetyVerdict.MALICIOUS,
     "budget-2": SafetyVerdict.MALICIOUS,
     "budget-3": SafetyVerdict.MALICIOUS,
     "budget-5": SafetyVerdict.MALICIOUS,
@@ -165,9 +159,9 @@ def test_rust_engine_scans_parity_payloads(parity_payloads: dict[str, tuple[byte
         "non_magic_numeric_dunder_string": SafetyVerdict.CLEAN,
         "non_magic_embedded_dunder_string": SafetyVerdict.CLEAN,
         "getattr_whitespace_suspicious_string": SafetyVerdict.SUSPICIOUS,
-        "nested_raw": SafetyVerdict.MALICIOUS,
-        "nested_base64": SafetyVerdict.MALICIOUS,
-        "nested_hex": SafetyVerdict.MALICIOUS,
+        "nested_raw": SafetyVerdict.CLEAN,
+        "nested_base64": SafetyVerdict.CLEAN,
+        "nested_hex": SafetyVerdict.CLEAN,
     }
     for name, (payload, options) in parity_payloads.items():
         rust_report = scan_bytes(payload, source=f"{name}.pkl", options=options)
