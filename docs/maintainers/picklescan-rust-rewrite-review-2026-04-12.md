@@ -520,7 +520,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] R-P1-30 — Confirm timeout checks are amortized.
 - [x] R-P1-31 — Replace location-string parsing with structured positions where possible.
 - [x] R-P1-32 — Expand post-budget dangerous needle table.
-- [ ] R-P1-33 — Decide/fuzz STACK_GLOBAL byte operand behavior.
+- [x] R-P1-33 — Decide/fuzz STACK_GLOBAL byte operand behavior.
 - [ ] R-P1-34 — Rebuild notice dedupe state if notices are ever coalesced.
 - [ ] R-P1-38 — Document or raise `DEFAULT_MAX_NESTED_DEPTH`.
 - [ ] R-P1-39 — Add more Rust unit coverage for dispatch, policy, report, and bridge behavior.
@@ -585,6 +585,12 @@ This section is the active implementation log for follow-up commits after revisi
   - `cargo clippy --manifest-path packages/modelaudit-picklescan/Cargo.toml --all-targets -- -D warnings` — passed.
   - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml post_budget_tail_detects_every_dangerous_pattern` — passed.
   - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, 30 tests.
+- R-P1-33 — Same-item commit keeps the fail-closed decision for `STACK_GLOBAL` byte operands: CPython rejects bytes module/name operands, so Rust reports `MALFORMED_STACK_GLOBAL` instead of reinterpreting bytes as text globals. Targeted QA:
+  - `cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml -- --check` — passed.
+  - `cargo check --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed.
+  - `cargo clippy --manifest-path packages/modelaudit-picklescan/Cargo.toml --all-targets -- -D warnings` — passed.
+  - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml stack_global_rejects_byte_operands_fail_closed` — passed.
+  - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, 31 tests.
 - N-P0-3 — Same-item commit removes the global raw-window documentation short-circuit, records documentation-like pickle literal spans, and filters only matches that fall inside documentation spans or comment-like lines. Targeted QA:
   - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.

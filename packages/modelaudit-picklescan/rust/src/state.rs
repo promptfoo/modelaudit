@@ -2862,6 +2862,59 @@ mod tests {
     }
 
     #[test]
+    fn stack_global_rejects_byte_operands_fail_closed() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+
+        for (name, payload) in [
+            (
+                "bytes-module-and-name",
+                b"\x80\x04C\x02osC\x06system\x93.".as_slice(),
+            ),
+            (
+                "bytes-module",
+                b"\x80\x04C\x02os\x8c\x06system\x93.".as_slice(),
+            ),
+            (
+                "bytes-name",
+                b"\x80\x04\x8c\x02osC\x06system\x93.".as_slice(),
+            ),
+        ] {
+            let mut scan = ScanState::new(
+                format!("stack-global-{name}.pkl"),
+                payload,
+                &options,
+                Some(payload.len()),
+                0,
+                0,
+                None,
+            );
+
+            scan.run();
+
+            assert_eq!(scan.verdict, "malicious", "{name}");
+            assert!(
+                scan.findings
+                    .iter()
+                    .any(|finding| finding.rule_code == Some("MALFORMED_STACK_GLOBAL")),
+                "{name} should fail closed"
+            );
+            assert!(
+                scan.findings
+                    .iter()
+                    .all(|finding| finding.rule_code != Some("DANGEROUS_CALL")),
+                "{name} should not reinterpret bytes as text globals"
+            );
+        }
+    }
+
+    #[test]
     fn protocol5_buffer_opcodes_create_opaque_stack_context() {
         let options = ScanOptions {
             timeout_s: DEFAULT_TIMEOUT_S,
