@@ -44,6 +44,7 @@ _ENCODED_CODE_EXECUTION_PATTERNS: tuple[tuple[bytes, str], ...] = (
     (b"__import__", "__import__"),
 )
 _RAW_READ_CHUNK_BYTES = 1024 * 1024
+_BINARY_TAIL_SCAN_BYTES = 1024 * 1024
 _BINARY_TAIL_SIGNATURES: tuple[tuple[bytes, str, str], ...] = (
     (b"MZ", "Windows executable (PE)", "S501"),
     (b"\x7fELF", "Linux executable (ELF)", "S502"),
@@ -54,6 +55,9 @@ _BINARY_TAIL_SIGNATURES: tuple[tuple[bytes, str, str], ...] = (
     (b"#!/bin/bash", "Shell script", "S504"),
     (b"powershell", "PowerShell script", "S506"),
     (b"invoke-expression", "PowerShell script", "S506"),
+)
+_BINARY_TAIL_SIGNATURE_BACKTRACK_BYTES = (
+    max(len(signature) for signature, _label, _rule_code in _BINARY_TAIL_SIGNATURES) - 1
 )
 _RAW_PICKLE_GLOBAL_REFERENCES: tuple[tuple[bytes, bytes, str], ...] = (
     (b"os", b"system", "os.system"),
@@ -1055,6 +1059,7 @@ class PickleScanner(BaseScanner):
         source: str,
         *,
         skip_expensive_detectors: bool = False,
+        scan_binary_tail: bool = True,
     ) -> None:
         """Run non-pickle-specific ModelAudit detectors over a bounded raw window."""
         if not data:
@@ -1063,7 +1068,8 @@ class PickleScanner(BaseScanner):
         self._scan_raw_text_indicators(data, result, source)
         self._scan_encoded_text_indicators(data, result, source)
         self._analyze_cve_patterns(data, result, source)
-        self._scan_binary_tail_if_needed(data, result, source)
+        if scan_binary_tail:
+            self._scan_binary_tail_if_needed(data, result, source)
         if skip_expensive_detectors:
             result.metadata["pickle_expensive_raw_detectors_skipped"] = True
             result.metadata["pickle_expensive_raw_detector_skip_reason"] = (
@@ -1100,10 +1106,54 @@ class PickleScanner(BaseScanner):
     def _scan_binary_tail_if_needed(self, data: bytes, result: ScanResult, source: str) -> None:
         if Path(source).suffix.lower() not in _PYTORCH_CONTAINER_EXTENSIONS:
             return
-        first_pickle_end_pos = result.metadata.get("first_pickle_end_pos")
-        if not isinstance(first_pickle_end_pos, int) or first_pickle_end_pos <= 0 or first_pickle_end_pos >= len(data):
+        tail_start = self._binary_tail_start(result)
+        if tail_start is None:
             return
-        tail = data[first_pickle_end_pos:]
+        tail = data[tail_start : tail_start + _BINARY_TAIL_SCAN_BYTES]
+        self._scan_binary_tail_window(tail, result, source, tail_start)
+
+    def _scan_file_binary_tail_if_needed(self, path: str, file_size: int, result: ScanResult) -> None:
+        if Path(path).suffix.lower() not in _PYTORCH_CONTAINER_EXTENSIONS:
+            return
+        tail_start = self._binary_tail_start(result)
+        if tail_start is None or tail_start >= file_size:
+            return
+
+        tail = self._read_file_binary_tail_window(path, tail_start, file_size)
+        self._scan_binary_tail_window(tail, result, path, tail_start)
+
+    @staticmethod
+    def _binary_tail_start(result: ScanResult) -> int | None:
+        first_pickle_end_pos = result.metadata.get("first_pickle_end_pos")
+        if isinstance(first_pickle_end_pos, int) and first_pickle_end_pos > 0:
+            return first_pickle_end_pos
+
+        coverage = result.metadata.get("pickle_coverage")
+        if isinstance(coverage, dict):
+            bytes_scanned = coverage.get("bytes_scanned")
+            if isinstance(bytes_scanned, int) and bytes_scanned > 0:
+                return max(bytes_scanned - _BINARY_TAIL_SIGNATURE_BACKTRACK_BYTES, 0)
+        return None
+
+    def _read_file_binary_tail_window(self, path: str, tail_start: int, file_size: int) -> bytes:
+        remaining = min(_BINARY_TAIL_SCAN_BYTES, max(file_size - tail_start, 0))
+        chunks: list[bytes] = []
+        with open(path, "rb") as handle:
+            handle.seek(tail_start)
+            while remaining > 0:
+                self.check_interrupted()
+                if self._check_timeout(allow_partial=True):
+                    break
+                chunk = handle.read(min(_RAW_READ_CHUNK_BYTES, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+        return b"".join(chunks)
+
+    def _scan_binary_tail_window(self, tail: bytes, result: ScanResult, source: str, tail_start: int) -> None:
+        if not tail:
+            return
         lower_tail = tail.lower()
         for signature, label, rule_code in _BINARY_TAIL_SIGNATURES:
             haystack = lower_tail if signature.isascii() else tail
@@ -1113,7 +1163,7 @@ class PickleScanner(BaseScanner):
                 continue
             if signature == b"MZ" and not _looks_like_portable_executable(tail[offset : offset + 1024]):
                 continue
-            absolute_offset = first_pickle_end_pos + offset
+            absolute_offset = tail_start + offset
             result.add_check(
                 name="Pickle Binary Tail Detection",
                 passed=False,
@@ -1124,7 +1174,7 @@ class PickleScanner(BaseScanner):
                     "source": "pickle_binary_tail",
                     "pattern": label,
                     "offset": absolute_offset,
-                    "first_pickle_end_pos": first_pickle_end_pos,
+                    "tail_scan_start": tail_start,
                 },
                 rule_code=rule_code,
             )
@@ -1631,7 +1681,9 @@ class PickleScanner(BaseScanner):
                 result,
                 path,
                 skip_expensive_detectors=self._should_skip_expensive_raw_detectors(result, raw_data),
+                scan_binary_tail=False,
             )
+            self._scan_file_binary_tail_if_needed(path, file_size, result)
         except OSError as error:
             result.add_check(
                 name="Pickle File Open",

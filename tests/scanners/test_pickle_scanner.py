@@ -664,6 +664,27 @@ def test_scan_pytorch_extension_detects_executable_tail_after_pickle_stream(tmp_
     assert any(issue.rule_code == "S502" for issue in result.issues)
 
 
+def test_scan_file_detects_executable_tail_past_raw_scan_window(tmp_path: Path) -> None:
+    pickle_payload = pickle.dumps({"pad": b"A" * 256}, protocol=4)
+    path = tmp_path / "large-tail.bin"
+    path.write_bytes(pickle_payload + b"\x7fELF/bin/sh\x00")
+
+    result = PickleScanner(config={"pickle_root_raw_scan_limit_bytes": 64}).scan(str(path))
+
+    assert any(
+        issue.rule_code == "S502" and issue.details.get("offset") == len(pickle_payload) for issue in result.issues
+    )
+
+
+def test_scan_file_detects_executable_tail_after_malformed_pickle_prefix(tmp_path: Path) -> None:
+    path = tmp_path / "malformed-tail.bin"
+    path.write_bytes(b"\x80\x04}JUNK\x7fELF/bin/sh\x00")
+
+    result = PickleScanner().scan(str(path))
+
+    assert any(issue.rule_code == "S502" and issue.details.get("offset") == 7 for issue in result.issues)
+
+
 def test_scan_bin_file_pe_tail_requires_pe_evidence(tmp_path: Path) -> None:
     path = tmp_path / "model.bin"
     path.write_bytes(pickle.dumps({"safe": True}, protocol=4) + b"MZ benign initials")

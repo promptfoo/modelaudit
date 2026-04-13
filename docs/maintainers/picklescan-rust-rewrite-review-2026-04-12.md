@@ -496,7 +496,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] N-P1-7 — Make `_pickle_opcode_summary` memo-aware instead of clearing the string stack too aggressively.
 - [x] N-P1-8 — Widen `_contains_call_token` separator handling.
 - [x] N-P1-9 — Add raw-layer pickle GLOBAL newline-form module attribute coverage.
-- [ ] N-P1-10 / N-P1-12 — Scan binary tails past the 8 MB raw window and after malformed/truncated pickle prefixes.
+- [x] N-P1-10 / N-P1-12 — Scan binary tails past the 8 MB raw window and after malformed/truncated pickle prefixes.
 - [ ] N-P1-13 — Preserve stream integrity hashes for streams larger than the raw scan window.
 - [ ] N-P1-18 — Pin or adjust primary DANGEROUS_CALL rule-code mapping for builtins.
 - [ ] N-P1-20 — Collapse protocol-5 buffer opcode notices into bounded/count-based notices.
@@ -677,6 +677,11 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run mypy modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py -q` — passed, 66 tests, including raw-window assertions for `cos\npopen\n`, `cos\nspawnv\n`, `cposix\npopen\n`, `csubprocess\nPopen\n`, and `ccommands\ngetoutput\n`.
+- N-P1-10 / N-P1-12 — Same-item commit decouples file-backed binary-tail scanning from the bounded raw detector window. `scan(path)` now seeks from Rust's first pickle end position, or from a parse-progress fallback with signature-length backtracking when no `STOP` was found, and scans a bounded 1 MiB tail window from the actual file. Stream scans retain the raw-window-only behavior because no full file handle is available. Targeted QA:
+  - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `uv run mypy modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py -q` — passed, 68 tests, including an executable tail beyond a 64-byte raw window and an executable tail after a malformed pickle prefix with no `first_pickle_end_pos`.
 
 ### Newly discovered gaps while remediating
 
