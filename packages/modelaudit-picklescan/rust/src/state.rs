@@ -334,6 +334,8 @@ pub(crate) struct ScanState<'a> {
     readonly_buffer_count: usize,
     readonly_buffer_empty_stack_count: usize,
     first_buffer_opcode_position: Option<usize>,
+    persistent_id_count: usize,
+    first_persistent_id_position: Option<usize>,
     status: &'static str,
     verdict: &'static str,
     seen_finding_keys: HashSet<(String, Option<String>, Option<&'static str>)>,
@@ -385,6 +387,8 @@ impl<'a> ScanState<'a> {
             readonly_buffer_count: 0,
             readonly_buffer_empty_stack_count: 0,
             first_buffer_opcode_position: None,
+            persistent_id_count: 0,
+            first_persistent_id_position: None,
             status: "complete",
             verdict: "clean",
             seen_finding_keys: HashSet::new(),
@@ -1539,11 +1543,19 @@ impl<'a> ScanState<'a> {
     }
 
     fn record_persistent_id(&mut self, opcode: &ParsedOpcode, position: usize) {
+        self.persistent_id_count += 1;
+        if self.first_persistent_id_position.is_none() {
+            self.first_persistent_id_position = Some(position);
+        }
         let persistent_id = if opcode.name == "BINPERSID" {
             self.stack.pop()
         } else {
             Some(StackValue::Text(opcode.arg.coerce_text(self.payload)))
         };
+        self.stack.push(StackValue::Other);
+        if self.persistent_id_count > 1 {
+            return;
+        }
 
         let mut details = vec![(
             "opcode".to_string(),
@@ -1576,7 +1588,30 @@ impl<'a> ScanState<'a> {
                 "Persistent pickle IDs delegate object resolution to loader-defined callbacks, which can hide external object construction or storage lookups.",
             ),
         });
-        self.stack.push(StackValue::Other);
+    }
+
+    fn emit_persistent_id_notice(&mut self) {
+        if self.persistent_id_count <= 1 {
+            return;
+        }
+        self.add_notice(Notice {
+            message: "Additional pickle persistent ID opcodes were summarized".to_string(),
+            severity: "info",
+            location: self
+                .first_persistent_id_position
+                .map(|position| format!("{} (pos {})", self.source, position)),
+            code: Some("persistent_id_summary"),
+            details: vec![
+                (
+                    "persistent_id_count".to_string(),
+                    DetailValue::UInt(self.persistent_id_count as u64),
+                ),
+                (
+                    "first_persistent_id_position".to_string(),
+                    DetailValue::UInt(self.first_persistent_id_position.unwrap_or_default() as u64),
+                ),
+            ],
+        });
     }
 
     fn add_finding(&mut self, finding: Finding) {
@@ -1750,6 +1785,7 @@ impl<'a> ScanState<'a> {
         flush_expansion_state(&mut self.expansion_state, &mut self.expansion_findings);
         self.emit_collected_expansion_finding();
         self.emit_buffer_opcode_notice();
+        self.emit_persistent_id_notice();
         self.rebuild_seen_notice_keys();
         self.coalesce_redundant_global_findings();
         self.finalize_verdict();
@@ -3693,6 +3729,47 @@ mod tests {
         assert_eq!(
             detail_string(&finding.details, "opcode").as_deref(),
             Some("PERSID")
+        );
+    }
+
+    #[test]
+    fn repeated_persistent_id_opcodes_are_summarized() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let payload = b"Pa\nPb\nPc\n.";
+        let mut scan = ScanState::new(
+            "persistent-many.pkl".to_string(),
+            payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+
+        scan.run();
+
+        assert_eq!(
+            scan.findings
+                .iter()
+                .filter(|finding| finding.rule_code == Some("PERSISTENT_ID"))
+                .count(),
+            1
+        );
+        let notice = scan
+            .notices
+            .iter()
+            .find(|notice| notice.code == Some("persistent_id_summary"))
+            .expect("persistent ID summary notice");
+        assert_eq!(
+            detail_usize(&notice.details, "persistent_id_count"),
+            Some(3)
         );
     }
 
