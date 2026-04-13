@@ -486,7 +486,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] P1-BINTAIL-SCOPE / N-P1-11 — Broaden binary-tail scan beyond `.bin`.
 - [x] P1-SEED-SHAPE / N-P1-14 / N-P1-15 / N-P1-17 / N-P2-23 / N-P2-25 — Tighten and de-duplicate expensive raw-detector seed/shape helpers.
 - [x] P1-DUNDER-WALKER — Reduce benign user-dunder false positives.
-- [ ] P1-NESTED-DEPTH — Raise nested depth or fail closed when nested analysis depth is exhausted.
+- [x] P1-NESTED-DEPTH — Raise nested depth or fail closed when nested analysis depth is exhausted.
 - [ ] T-P1-WHEEL — Add missing macOS x86_64 and Linux aarch64 wheel coverage or document the gap.
 - [ ] T-P2-COMMENT — Restore missing comment-token bypass regression coverage.
 - [ ] T-P2-EXPANSION — Restore expansion/memo-growth regression coverage.
@@ -606,6 +606,14 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run ruff check packages/modelaudit-picklescan/tests/test_api.py` — passed.
   - `uv run mypy packages/modelaudit-picklescan/tests/test_api.py` — passed.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests/test_api.py -q` — passed, 142 tests, including common/user-defined dunder clean regressions.
+- P1-NESTED-DEPTH — Same-item commit raises the standalone default nested-pickle depth from 1 to 2 in both Python and Rust options, so two-layer encoded nested payloads are analyzed by default. Targeted QA:
+  - `cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed.
+  - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, 16 tests.
+  - `cargo clippy --manifest-path packages/modelaudit-picklescan/Cargo.toml --all-targets -- -D warnings` — passed.
+  - `uv run ruff check packages/modelaudit-picklescan/src/modelaudit_picklescan/options.py packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `uv run mypy packages/modelaudit-picklescan/src/modelaudit_picklescan/options.py packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `uv run --with 'maturin>=1.9,<2' maturin develop --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, rebuilt the editable native extension.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests/test_api.py -q` — passed, 143 tests, including default two-layer base64 nested malicious-payload coverage.
 
 ### Newly discovered gaps while remediating
 
