@@ -510,7 +510,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] N-P2-30 — Bound `encoded_nested_literal_probe_windows` linear scan cost.
 - [x] N-P2-31 — Optimize Rust dangerous-global policy lookup.
 - [x] N-P2-32 — Clean stale moved parity-corpus pycache.
-- [ ] N-P2-33 — Refactor duplicate stream-read helpers.
+- [x] N-P2-33 — Refactor duplicate stream-read helpers.
 - [x] N-P0-34 — Bound recursive follow-on pickle probing for pickle-like binary tails.
 - [ ] R-P0-2 — Preserve integer stack values for `INT`/`LONG` variants.
 - [ ] R-P1-BUF / R-P1-20 / R-P1-21 — Protocol-5 buffer stack and notice parity follow-up.
@@ -763,6 +763,11 @@ This section is the active implementation log for follow-up commits after revisi
   - `cargo check --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed.
   - `cargo clippy --manifest-path packages/modelaudit-picklescan/Cargo.toml --all-targets -- -D warnings` — passed.
   - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, 24 tests.
+- N-P2-33 — Same-item commit extracts the shared bounded chunked stream reader used by seekable raw-window reads and non-seekable root buffering, removing duplicated timeout/interruption/chunk logic while preserving existing stream semantics. Targeted QA:
+  - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `uv run mypy modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py -q` — passed, 70 tests.
 
 ### Newly discovered gaps while remediating
 

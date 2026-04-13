@@ -941,11 +941,25 @@ class PickleScanner(BaseScanner):
             if not _stream_is_seekable(file_obj):
                 return b""
             start_position = file_obj.tell()
-            data = file_obj.read(read_size)
+            data = self._read_stream_bytes(file_obj, read_size)
             file_obj.seek(start_position)
         except (AttributeError, OSError, ValueError):
             return b""
-        return bytes(data)
+        return data
+
+    def _read_stream_bytes(self, file_obj: BinaryIO, read_size: int) -> bytes:
+        remaining = max(read_size, 0)
+        chunks: list[bytes] = []
+        while remaining > 0:
+            self.check_interrupted()
+            if self._check_timeout(allow_partial=True):
+                break
+            chunk = file_obj.read(min(_RAW_READ_CHUNK_BYTES, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
 
     def _read_stream_payload_for_root(self, file_obj: BinaryIO, file_size: int | None) -> _RootStreamPayloadRead:
         limit = (
@@ -960,23 +974,10 @@ class PickleScanner(BaseScanner):
         if read_target <= 0:
             return _RootStreamPayloadRead(payload=b"", truncated=False, read_limit=limit)
 
-        remaining = read_target
-        chunks: list[bytes] = []
-        bytes_read = 0
-        while remaining > 0:
-            self.check_interrupted()
-            if self._check_timeout(allow_partial=True):
-                break
-            read_size = min(_RAW_READ_CHUNK_BYTES, remaining)
-            chunk = file_obj.read(read_size)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            bytes_read += len(chunk)
-            remaining -= len(chunk)
+        payload = self._read_stream_bytes(file_obj, read_target)
         return _RootStreamPayloadRead(
-            payload=b"".join(chunks),
-            truncated=file_size is not None and file_size > read_target and bytes_read >= read_target,
+            payload=payload,
+            truncated=file_size is not None and file_size > read_target and len(payload) >= read_target,
             read_limit=limit,
         )
 
