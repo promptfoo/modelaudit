@@ -9,7 +9,7 @@ import tempfile
 import unittest
 import uuid
 import zipfile
-from collections import Counter
+from collections import Counter, OrderedDict
 from collections.abc import Callable, Iterator
 from io import BytesIO
 from pathlib import Path
@@ -3296,12 +3296,9 @@ class TestDillLoadersRegression:
 
         # Create a complex ML-like data structure that might trigger some ML detection
         # Focus on collections.OrderedDict which is a common PyTorch pattern
-        import collections
-        import os
-        import tempfile
 
         # Create nested OrderedDict structures that mimic PyTorch state_dict patterns
-        complex_ml_data = collections.OrderedDict(
+        complex_ml_data = OrderedDict(
             [
                 ("features.0.weight", "tensor_data_placeholder"),
                 ("features.0.bias", "tensor_data_placeholder"),
@@ -3309,9 +3306,9 @@ class TestDillLoadersRegression:
                 ("features.3.bias", "tensor_data_placeholder"),
                 ("classifier.weight", "tensor_data_placeholder"),
                 ("classifier.bias", "tensor_data_placeholder"),
-                ("_metadata", collections.OrderedDict([("version", 1)])),
-                ("_modules", collections.OrderedDict()),
-                ("_parameters", collections.OrderedDict()),
+                ("_metadata", OrderedDict([("version", 1)])),
+                ("_modules", OrderedDict()),
+                ("_parameters", OrderedDict()),
             ],
         )
 
@@ -7963,9 +7960,7 @@ def test_safe_ml_reconstruction_globals_remain_non_failing(tmp_path: Path, paylo
 
 def test_safe_pytorch_state_dict_pickle_remains_non_failing(tmp_path: Path) -> None:
     """State-dict-style payloads should not start failing under the risky-ML policy."""
-    import collections
-
-    safe_state_dict = collections.OrderedDict(
+    safe_state_dict = OrderedDict(
         [
             ("layer1.weight", [1.0, 2.0, 3.0]),
             ("layer1.bias", [0.1, 0.2, 0.3]),
@@ -7974,7 +7969,7 @@ def test_safe_pytorch_state_dict_pickle_remains_non_failing(tmp_path: Path) -> N
     )
     payload = {
         "state_dict": safe_state_dict,
-        "_metadata": collections.OrderedDict([("", {"version": 1})]),
+        "_metadata": OrderedDict([("", {"version": 1})]),
     }
     path = tmp_path / "safe_state_dict.pth"
     with path.open("wb") as handle:
