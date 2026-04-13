@@ -263,21 +263,20 @@ class TestFileTypeValidationIntegration:
             # Should complete successfully
             assert results["success"], "Mixed licenses directory scan should succeed"
 
-    def test_security_threat_scenarios(self, temp_test_dir):
+    def test_security_threat_scenarios(self, temp_test_dir: Path) -> None:
         """Test various security threat scenarios involving file type mismatches."""
         security_threats = []
 
         # Scenario 1: Executable disguised as model file
         malicious_model = temp_test_dir / "backdoor_model.pkl"
-        # Simulate a file with executable signatures
-        malicious_content = b"\x80\x03"  # Pickle header
-        malicious_content += b"MZ"  # Windows PE signature
-        malicious_content += b"\x00" * 100
+        # Simulate a PE executable signature with DOS-stub evidence.
+        malicious_content = b"MZ" + (b"\x00" * 64) + b"This program cannot be run in DOS mode" + (b"\x00" * 100)
         malicious_model.write_bytes(malicious_content)
 
-        result = scan_file(str(malicious_model))
-        # Should detect executable patterns (this would be caught by pickle scanner)
-        # Check if any issues were detected (executable patterns would be caught by pickle scanner)
+        malicious_result = scan_file(str(malicious_model))
+        executable_issues = [i for i in malicious_result.issues if "executable" in i.message.lower()]
+        if len(executable_issues) == 0:
+            security_threats.append("Executable disguised as pickle not detected")
 
         # Scenario 2: Model with suspicious file size vs content mismatch
         tiny_model = temp_test_dir / "suspicious_model.h5"
@@ -310,10 +309,8 @@ class TestFileTypeValidationIntegration:
                 "Mixed legitimate/malicious directory not fully detected",
             )
 
-        # Some security threats should be detected
-        total_detections = len([t for t in security_threats if "not detected" not in t])
-        print(f"Security threat detections: {total_detections}")
-        print(f"Undetected threats: {security_threats}")
+        # At least two of the three scenarios should be caught by validation/scanner routing.
+        assert len(security_threats) <= 1, f"Too many security threat scenarios were missed: {security_threats}"
 
     def test_format_compatibility_matrix(self, tmp_path: Path) -> None:
         """Test the file format compatibility matrix systematically."""

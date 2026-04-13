@@ -213,7 +213,6 @@ class IntegratedAnalyzer:
 
     def _analyze_semantics(self, code: str, context: UnifiedMLContext) -> dict[str, Any]:
         """Perform semantic analysis."""
-        confidence_safe = 0.5
         reasoning = []
         mitigations = []
 
@@ -329,7 +328,6 @@ class IntegratedAnalyzer:
 
     def _validate_code(self, code: str) -> dict[str, Any]:
         """Validate code syntax and safety."""
-        confidence_safe = 0.5
         reasoning = []
 
         # Check syntax

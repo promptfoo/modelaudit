@@ -29,7 +29,7 @@ class TestNetworkCommDetector:
 
         # Check specific URLs are detected
         urls = [f["url"] for f in url_findings]
-        assert any("example.com" in url for url in urls)
+        assert any(urlparse(url).hostname == "example.com" for url in urls)
         assert any(urlparse(url).hostname == "malware.net" for url in urls)
 
     def test_detect_urls_redacts_credentials_and_query(self) -> None:
@@ -434,8 +434,8 @@ class TestNetworkCommDetector:
         # Check custom blacklist
         blacklist_findings = [f for f in findings if f["type"] == "blacklisted_domain"]
         domains = [f["domain"] for f in blacklist_findings]
-        assert "custom-evil.com" in domains
-        assert "my-c2.net" in domains
+        assert any(domain == "custom-evil.com" for domain in domains)
+        assert any(domain == "my-c2.net" for domain in domains)
 
     def test_custom_patterns_isolated_between_instances(self) -> None:
         """Ensure custom patterns and blacklists do not leak between instances."""
@@ -542,7 +542,7 @@ class TestDetectNetworkCommunication:
 
         findings = detect_network_communication(str(test_file))
         assert len(findings) > 0
-        assert any("malicious.com" in f.get("url", "") for f in findings)
+        assert any(urlparse(f.get("url", "")).hostname == "malicious.com" for f in findings)
 
     def test_file_not_found(self) -> None:
         """Test handling of non-existent files."""
