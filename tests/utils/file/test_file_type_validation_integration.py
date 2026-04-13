@@ -36,7 +36,7 @@ except ImportError:
 class TestFileTypeValidationIntegration:
     """Integration tests for file type validation feature."""
 
-    LICENSE_SCENARIOS_PATH = Path("assets/scenarios/license_scenarios")
+    LICENSE_SCENARIOS_PATH = "assets/scenarios/license_scenarios"
 
     @pytest.fixture
     def test_data_dir(self):
