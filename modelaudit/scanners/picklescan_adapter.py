@@ -8,7 +8,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from modelaudit_picklescan import Finding, PickleReport, ScanOptions, ScanStatus, Severity
+from modelaudit_picklescan import Finding, PickleReport, ScanError, ScanOptions, ScanStatus, Severity
 
 from modelaudit.config.explanations import get_import_explanation
 
@@ -295,7 +295,7 @@ def pickle_report_to_scan_result(
             name="Standalone Pickle Error",
             passed=False,
             message=error.message,
-            severity=IssueSeverity.WARNING if is_parse_error else IssueSeverity.CRITICAL,
+            severity=_issue_severity_for_error(error),
             location=error.location,
             details={
                 "pickle_source": report.source,
@@ -337,6 +337,14 @@ def pickle_report_to_scan_result(
     )
     result.finish(success=scan_success)
     return result
+
+
+def _issue_severity_for_error(error: ScanError) -> IssueSeverity:
+    if error.category == "parse_error":
+        return IssueSeverity.WARNING
+    if error.category == "empty_input":
+        return IssueSeverity.INFO
+    return IssueSeverity.CRITICAL
 
 
 def apply_pickle_member_context(result: ScanResult, *, archive_path: str, member_name: str) -> None:

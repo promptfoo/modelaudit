@@ -1163,6 +1163,29 @@ def test_pickle_report_to_scan_result_requires_boundary_for_non_joblib_tail_supp
     assert parse_issue.details["analysis_incomplete"] is True
 
 
+def test_pickle_report_to_scan_result_maps_empty_input_to_info_issue() -> None:
+    report = PickleReport(
+        source="empty.pkl",
+        status=ScanStatus.ERROR,
+        verdict=SafetyVerdict.UNKNOWN,
+        errors=(
+            ScanError(
+                message="Input is empty and does not contain a pickle stream",
+                category="empty_input",
+                location="empty.pkl",
+            ),
+        ),
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "empty_input"
+    assert result.has_errors is False
+    issue = next(issue for issue in result.issues if issue.details.get("category") == "empty_input")
+    assert issue.severity == IssueSeverity.INFO
+
+
 def test_pickle_report_to_scan_result_keeps_parse_errors_inconclusive() -> None:
     report = PickleReport(
         source="bad.bin",
