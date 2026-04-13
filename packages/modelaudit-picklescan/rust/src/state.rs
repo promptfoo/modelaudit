@@ -169,6 +169,7 @@ impl ExpansionHeuristicState {
 }
 
 type GlobalReferenceDedupeKey = (String, String, usize, &'static str, bool);
+type NoticeDedupeKey = (Option<&'static str>, Option<String>, String);
 
 pub(crate) struct ScanOptions {
     timeout_s: f64,
@@ -268,7 +269,7 @@ pub(crate) struct ScanState<'a> {
     status: &'static str,
     verdict: &'static str,
     seen_finding_keys: HashSet<(String, Option<String>, Option<&'static str>)>,
-    seen_notice_keys: HashSet<(Option<&'static str>, Option<String>, String)>,
+    seen_notice_keys: HashSet<NoticeDedupeKey>,
     seen_global_reference_keys: HashSet<GlobalReferenceDedupeKey>,
 }
 
@@ -1536,10 +1537,14 @@ impl<'a> ScanState<'a> {
     }
 
     fn add_notice(&mut self, notice: Notice) {
-        let key = (notice.code, notice.location.clone(), notice.message.clone());
+        let key = notice_dedupe_key(&notice);
         if self.seen_notice_keys.insert(key) {
             self.notices.push(notice);
         }
+    }
+
+    fn rebuild_seen_notice_keys(&mut self) {
+        self.seen_notice_keys = self.notices.iter().map(notice_dedupe_key).collect();
     }
 
     fn record_structural_opcode(&mut self, opcode: &ParsedOpcode, position: usize) {
@@ -1630,6 +1635,7 @@ impl<'a> ScanState<'a> {
         flush_expansion_state(&mut self.expansion_state, &mut self.expansion_findings);
         self.emit_collected_expansion_finding();
         self.emit_buffer_opcode_notice();
+        self.rebuild_seen_notice_keys();
         self.coalesce_redundant_global_findings();
         self.finalize_verdict();
     }
@@ -2631,6 +2637,10 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
+fn notice_dedupe_key(notice: &Notice) -> NoticeDedupeKey {
+    (notice.code, notice.location.clone(), notice.message.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2912,6 +2922,53 @@ mod tests {
                 "{name} should not reinterpret bytes as text globals"
             );
         }
+    }
+
+    #[test]
+    fn notice_dedupe_state_can_be_rebuilt_after_notice_rewrites() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let payload = b".";
+        let mut scan = ScanState::new(
+            "notice-dedupe.pkl".to_string(),
+            payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+        let old_notice = Notice {
+            message: "old notice".to_string(),
+            severity: "info",
+            location: Some("notice-dedupe.pkl (pos 1)".to_string()),
+            code: Some("rewritten_notice"),
+            details: Vec::new(),
+        };
+        let coalesced_notice = Notice {
+            message: "coalesced notice".to_string(),
+            severity: "info",
+            location: Some("notice-dedupe.pkl".to_string()),
+            code: Some("rewritten_notice"),
+            details: Vec::new(),
+        };
+
+        scan.add_notice(old_notice.clone());
+        scan.notices.clear();
+        scan.notices.push(coalesced_notice.clone());
+        scan.rebuild_seen_notice_keys();
+
+        scan.add_notice(old_notice);
+        scan.add_notice(coalesced_notice);
+
+        assert_eq!(scan.notices.len(), 2);
+        assert_eq!(scan.seen_notice_keys.len(), 2);
     }
 
     #[test]
