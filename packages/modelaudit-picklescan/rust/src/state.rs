@@ -1248,7 +1248,7 @@ impl<'a> ScanState<'a> {
                 return;
             }
             let candidate_truncated = remaining_len > self.options.max_nested_pickle_bytes;
-            if candidate_truncated && probe.first() == Some(&0x80) && has_pickle_prefix(probe) {
+            if candidate_truncated && has_pickle_prefix(probe) {
                 self.add_nested_payload_finding(raw_nested_payload_finding(
                     remaining_len,
                     position + offset,
@@ -3459,6 +3459,49 @@ mod tests {
                 Some(expected_preview)
             );
         }
+    }
+
+    #[test]
+    fn truncated_proto0_nested_payloads_are_not_silently_dropped() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: 4,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let inner = b"cos\nsystem\n.";
+        let payload = [
+            b"\x80\x04C".as_slice(),
+            &[inner.len() as u8],
+            inner.as_slice(),
+            b".".as_slice(),
+        ]
+        .concat();
+        let mut scan = ScanState::new(
+            "truncated-proto0-nested.pkl".to_string(),
+            &payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+
+        scan.run();
+
+        assert_eq!(scan.status, "inconclusive");
+        assert!(scan.findings.iter().any(|finding| {
+            finding.rule_code == Some("S213")
+                && finding.details.iter().any(|(key, value)| {
+                    key == "analysis_incomplete" && matches!(value, DetailValue::Bool(true))
+                })
+        }));
+        assert!(scan
+            .notices
+            .iter()
+            .any(|notice| notice.code == Some("nested_payload_truncated")));
     }
 
     #[test]
