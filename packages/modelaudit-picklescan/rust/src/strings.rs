@@ -1,10 +1,11 @@
 const MAX_BASE64_TEXT_TOKENS: usize = 32;
+const MIN_BASE64_TEXT_TOKEN_CHARS: usize = 12;
 const MAX_BASE64_TEXT_TOKEN_CHARS: usize = 16 * 1024;
 const BASE64_DANGEROUS_SEEDS: &[&str] = &[
     "b3Muc3lzdGVt",   // os.system
-    "ZXZhbCg",        // eval(
-    "ZXhlYyg",        // exec(
-    "X19pbXBvcnRfXw", // __import__
+    "ZXZh",           // eval prefix; the following base64 chars depend on the next bytes
+    "ZXhl",           // exec prefix; the following base64 chars depend on the next bytes
+    "X19p",           // __import__ prefix
     "c3VicHJvY2Vzcw", // subprocess
 ];
 
@@ -247,7 +248,7 @@ fn base64_tokens(value: &str) -> impl Iterator<Item = &str> {
         while index < bytes.len() && bytes[index] == b'=' {
             index += 1;
         }
-        if index.saturating_sub(start) >= 16 {
+        if index.saturating_sub(start) >= MIN_BASE64_TEXT_TOKEN_CHARS {
             return value.get(start..index);
         }
         if index >= bytes.len() {
@@ -832,5 +833,6 @@ mod tests {
         let matches = suspicious_string_matches("b3Muc3lzdGVtKCdpZCcp");
 
         assert!(matches.contains(&"base64 os.system".to_string()));
+        assert!(suspicious_string_matches("ZXZhbCh4KQ==").contains(&"base64 eval(".to_string()));
     }
 }

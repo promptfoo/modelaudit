@@ -26,7 +26,7 @@ _ROOT_EXPENSIVE_RAW_SCAN_LIMIT_BYTES = 1 * 1024 * 1024
 _MAX_METADATA_PICKLE_READ_BYTES = 10 * 1024 * 1024
 _KNOWN_PICKLE_EXTENSIONS = frozenset({".pkl", ".pickle", ".dill", ".joblib"})
 _PYTORCH_CONTAINER_EXTENSIONS = frozenset({".bin", ".pt", ".pth", ".ckpt", ".pkl"})
-_BASE64_TOKEN_RE = re.compile(rb"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{12,}={0,2}(?![A-Za-z0-9+/=])")
+_BASE64_TOKEN_RE = re.compile(rb"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{10,}={0,2}(?![A-Za-z0-9+/=])")
 _MAX_RAW_ENCODED_TOKENS = 64
 _MAX_RAW_ENCODED_BYTES = 1024 * 1024
 _MAX_RAW_ENCODED_TOKEN_WITHOUT_SEED_BYTES = 4096

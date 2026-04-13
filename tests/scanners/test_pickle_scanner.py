@@ -187,8 +187,15 @@ def test_scan_stream_runs_root_raw_detectors_for_seekable_stream() -> None:
     assert any(issue.details.get("source") == "bounded_raw_pickle_window" for issue in result.issues)
 
 
-def test_scan_stream_detects_base64_encoded_execution_text() -> None:
-    payload = pickle.dumps({"encoded": "b3Muc3lzdGVtKCdpZCcp"}, protocol=4)
+@pytest.mark.parametrize(
+    ("encoded", "pattern"),
+    [
+        ("b3Muc3lzdGVtKCdpZCcp", "os.system"),
+        ("ZXZhbCh4KQ==", "eval"),
+    ],
+)
+def test_scan_stream_detects_base64_encoded_execution_text(encoded: str, pattern: str) -> None:
+    payload = pickle.dumps({"encoded": encoded}, protocol=4)
 
     result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="encoded-raw.pkl")
 
@@ -198,6 +205,7 @@ def test_scan_stream_detects_base64_encoded_execution_text() -> None:
         if issue.message.startswith("Encoded pickle content decodes to dangerous code pattern")
     ]
     assert [issue.rule_code for issue in encoded_issues] == ["S604"]
+    assert encoded_issues[0].details["pattern"] == pattern
     assert encoded_issues[0].details["legacy_rule_aliases"] == ["S104"]
     assert not any(issue.message.startswith("Legacy encoded dangerous pattern detected") for issue in result.issues)
 

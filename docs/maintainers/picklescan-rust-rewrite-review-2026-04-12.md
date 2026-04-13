@@ -553,6 +553,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] S-D2-39 — Move non-Rust report conversion test out of Rust-gated file.
 - [x] S-D2-40 — Use canonical PyTorch suffix in package API test.
 - [x] A-P1-68 — Close missed P-P1-42a raw eval/exec/__import__ duplicate emissions found during closure audit.
+- [x] A-P1-69 — Close missed P-P1-41 short base64 execution literal detection found during adversarial probes.
 
 ### Completed item QA log
 
@@ -783,6 +784,20 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run mypy modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py::test_scan_stream_deduplicates_legacy_raw_eval_exec_import_patterns tests/scanners/test_pickle_scanner.py::test_scan_stream_preserves_legacy_raw_eval_exec_importlib_detection tests/scanners/test_pickle_scanner.py::test_scan_stream_detects_legacy_raw_eval_with_obscured_separator -q` — passed, 6 tests.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py -q` — passed, 76 tests.
+- A-P1-69 — Adversarial probes reproduced P-P1-41: a pickle string containing `ZXZhbCh4KQ==` (`base64("eval(x)")`) scanned clean because the root raw detector and Rust string detector both skipped short base64 tokens. Same-item commit lowers the bounded token thresholds enough to decode this minimal execution pattern while keeping token/decode budgets. Targeted QA:
+  - `cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml -- --check` — passed.
+  - `cargo check --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed.
+  - `cargo clippy --manifest-path packages/modelaudit-picklescan/Cargo.toml --all-targets -- -D warnings` — passed.
+  - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml strings::tests::suspicious_string_matching_detects_base64_encoded_code` — passed, 1 test.
+  - `uv run --with 'maturin>=1.9,<2' maturin develop --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed.
+  - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `uv run mypy modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py::test_scan_stream_detects_base64_encoded_execution_text packages/modelaudit-picklescan/tests/test_api.py::test_scan_bytes_flags_base64_encoded_code_string_literals -q` — passed, 4 tests.
+  - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, 42 tests.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py -q` — passed, 77 tests.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests/test_api.py -q` — passed, 169 tests.
+  - Manual `uv run python` probe for `pickle.dumps({"encoded": base64("eval(x)")})` — passed; root scanner emitted `S604` with pattern `eval`, standalone scanner returned `suspicious` with `SUSPICIOUS_STRING` / `base64 eval(`.
 - N-P0-3 — Same-item commit removes the global raw-window documentation short-circuit, records documentation-like pickle literal spans, and filters only matches that fall inside documentation spans or comment-like lines. Targeted QA:
   - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
@@ -1015,6 +1030,7 @@ This section is the active implementation log for follow-up commits after revisi
 - N-P0-34 — Follow-on stream probing could recurse through pickle-like binary tails; fixed and tracked in the remediation checklist above.
 - R-P2-40 — Resolved decision: direct PyO3 `pybridge` cargo tests require an embedded-Python initialization strategy; a naive `Python::initialize()` unit test failed with `ModuleNotFoundError: No module named 'encodings'` from the cargo test binary. Keep bridge behavior covered through Python package tests unless/until the Rust test harness sets a reliable Python home/path.
 - A-P1-68 — Closure audit found P-P1-42a was not listed in the active tracker and was still reproducible; fixed by keeping one legacy raw builtins issue per `eval`/`exec`/`__import__` evidence item instead of emitting a duplicate generic `S201`.
+- A-P1-69 — Adversarial probes found P-P1-41 was still reproducible for `base64("eval(x)")`; fixed by lowering bounded base64 token thresholds in both root raw and Rust string scanning and adding root/standalone regressions.
 
 ---
 

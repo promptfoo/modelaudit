@@ -1079,15 +1079,22 @@ def test_scan_bytes_flags_expanded_suspicious_string_patterns(literal: str, expe
     )
 
 
-def test_scan_bytes_flags_base64_encoded_code_string_literals() -> None:
-    encoded = base64.b64encode(b"os.system('id')").decode("ascii")
+@pytest.mark.parametrize(
+    ("literal", "pattern"),
+    [
+        (b"os.system('id')", "base64 os.system"),
+        (b"eval(x)", "base64 eval("),
+    ],
+)
+def test_scan_bytes_flags_base64_encoded_code_string_literals(literal: bytes, pattern: str) -> None:
+    encoded = base64.b64encode(literal).decode("ascii")
 
     report = scan_bytes(pickle.dumps({"code": encoded}), source="encoded-code-string.pkl")
 
     assert report.status == ScanStatus.COMPLETE
     assert report.verdict == SafetyVerdict.SUSPICIOUS
     assert any(
-        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "base64 os.system"
+        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == pattern
         for finding in report.findings
     )
 
