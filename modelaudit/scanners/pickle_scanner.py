@@ -81,6 +81,24 @@ _RAW_PICKLE_GLOBAL_REFERENCES: tuple[tuple[bytes, bytes, str], ...] = (
     (b"subprocess", b"run", "subprocess.run"),
     (b"subprocess", b"popen", "subprocess.Popen"),
 )
+_RAW_TEXT_MODULE_ATTR_INDICATORS: tuple[tuple[bytes, bytes, str], ...] = (
+    (b"os", b"system", "os.system"),
+    (b"posix", b"system", "posix.system"),
+    (b"nt", b"system", "nt.system"),
+    (b"os", b"popen", "os.popen"),
+)
+_RAW_TEXT_REGEX_INDICATORS: tuple[tuple[bytes, str, str], ...] = (
+    (rb"(?<![A-Za-z0-9_])os\s*\.\s*spawn", "os.spawn", "os.spawn"),
+)
+_RAW_TEXT_TOKEN_INDICATORS: tuple[tuple[bytes, str, str], ...] = (
+    (b"commands.getoutput", "commands.getoutput", "commands.getoutput"),
+    (b"commands.getstatusoutput", "commands.getstatusoutput", "commands.getstatusoutput"),
+    (b"subprocess.call", "subprocess.call", "subprocess.call"),
+    (b"subprocess.run", "subprocess.run", "subprocess.run"),
+    (b"subprocess.popen", "subprocess.popen", "subprocess.popen"),
+)
+_RAW_IMPORTLIB_METHODS: tuple[bytes, ...] = (b"import_module", b"reload", b"find_loader", b"load_module")
+_RAW_WEBBROWSER_METHODS: tuple[bytes, ...] = (b"open", b"open_new", b"open_new_tab")
 _SECRET_SCAN_SEEDS: tuple[bytes, ...] = (
     b"://",
     b"-----begin dsa private key-----",
@@ -514,6 +532,14 @@ def _has_issue_for_import_reference(result: ScanResult, import_reference: str) -
         issue.details.get("associated_global", issue.details.get("import_reference")) == import_reference
         for issue in result.issues
     )
+
+
+def _append_raw_indicator(
+    indicators: list[tuple[str, dict[str, Any]]],
+    label: str,
+    associated_global: str | None = None,
+) -> None:
+    indicators.append((label, {"associated_global": associated_global or label}))
 
 
 def _is_dangerous_module(module: str) -> bool:
@@ -1274,27 +1300,25 @@ class PickleScanner(BaseScanner):
     def _scan_raw_text_indicators(self, data: bytes, result: ScanResult, source: str) -> None:
         lower = data.lower()
         documentation_spans = _documentation_literal_spans(data)
-        indicators: list[tuple[str, bytes, dict[str, Any]]] = []
-        warning_indicators: list[tuple[str, bytes, dict[str, Any]]] = []
+        indicators: list[tuple[str, dict[str, Any]]] = []
+        warning_indicators: list[tuple[str, dict[str, Any]]] = []
         if _contains_non_documentation_token(lower, b"import os", documentation_spans):
-            warning_indicators.append(("import os", b"import os", {"associated_global": "os"}))
+            _append_raw_indicator(warning_indicators, "import os", "os")
         if _contains_non_documentation_token(lower, b"importlib.import_module", documentation_spans) or (
             _contains_non_documentation_token(lower, b"import importlib", documentation_spans)
             and _contains_non_documentation_token(lower, b"import_module", documentation_spans)
         ):
-            indicators.append(
-                ("importlib.import_module", b"importlib", {"associated_global": "importlib.import_module"})
-            )
+            _append_raw_indicator(indicators, "importlib.import_module")
         elif _contains_non_documentation_token(lower, b"importlib", documentation_spans):
             importlib_method_added = False
-            for method in (b"import_module", b"reload", b"find_loader", b"load_module"):
+            for method in _RAW_IMPORTLIB_METHODS:
                 if _contains_non_documentation_token(
                     lower,
                     method,
                     documentation_spans,
                 ) and _contains_non_documentation_token(lower, b"importlib", documentation_spans):
                     label = f"importlib.{method.decode('ascii')}"
-                    indicators.append((label, b"importlib", {"associated_global": label}))
+                    _append_raw_indicator(indicators, label)
                     importlib_method_added = True
                     break
             if (
@@ -1302,22 +1326,22 @@ class PickleScanner(BaseScanner):
                 and _contains_non_documentation_token(lower, b"importlib", documentation_spans)
                 and _contains_non_documentation_token(lower, b"import ", documentation_spans)
             ):
-                indicators.append(("importlib", b"importlib", {"associated_global": "importlib"}))
+                _append_raw_indicator(indicators, "importlib")
         if _contains_call_token(lower, b"eval", documentation_spans):
-            indicators.append(("eval", b"eval", {"associated_global": "builtins.eval"}))
+            _append_raw_indicator(indicators, "eval", "builtins.eval")
         if _contains_call_token(lower, b"exec", documentation_spans):
-            indicators.append(("exec", b"exec", {"associated_global": "builtins.exec"}))
+            _append_raw_indicator(indicators, "exec", "builtins.exec")
         if _contains_module_attr(lower, b"webbrowser", b"open", documentation_spans):
-            indicators.append(("webbrowser.open", b"webbrowser", {"associated_global": "webbrowser.open"}))
+            _append_raw_indicator(indicators, "webbrowser.open")
         elif _contains_non_documentation_token(lower, b"webbrowser", documentation_spans):
-            for method in (b"open", b"open_new", b"open_new_tab"):
+            for method in _RAW_WEBBROWSER_METHODS:
                 if _contains_non_documentation_token(
                     lower,
                     method,
                     documentation_spans,
                 ) and _contains_non_documentation_token(lower, b"webbrowser", documentation_spans):
                     label = f"webbrowser.{method.decode('ascii')}"
-                    indicators.append((label, b"webbrowser", {"associated_global": label}))
+                    _append_raw_indicator(indicators, label)
                     break
         if _contains_non_documentation_token(lower, b"runpy", documentation_spans):
             runpy_global = (
@@ -1325,36 +1349,23 @@ class PickleScanner(BaseScanner):
                 if _contains_non_documentation_token(lower, b"run_module", documentation_spans)
                 else "runpy"
             )
-            indicators.append((runpy_global, b"runpy", {"associated_global": runpy_global}))
+            _append_raw_indicator(indicators, runpy_global)
         if _contains_non_documentation_token(lower, b"__import__", documentation_spans):
-            indicators.append(("__import__", b"__import__", {"associated_global": "builtins.__import__"}))
+            _append_raw_indicator(indicators, "__import__", "builtins.__import__")
         for module_token, attr_token, associated_global in _RAW_PICKLE_GLOBAL_REFERENCES:
             if _contains_pickle_global_reference(lower, module_token, attr_token, documentation_spans):
-                indicators.append((associated_global, attr_token, {"associated_global": associated_global}))
-        if _contains_module_attr(lower, b"os", b"system", documentation_spans):
-            indicators.append(("os.system", b"os.system", {"associated_global": "os.system"}))
-        if _contains_module_attr(lower, b"posix", b"system", documentation_spans):
-            indicators.append(("posix.system", b"posix.system", {"associated_global": "posix.system"}))
-        if _contains_module_attr(lower, b"nt", b"system", documentation_spans):
-            indicators.append(("nt.system", b"nt.system", {"associated_global": "nt.system"}))
-        if _contains_module_attr(lower, b"os", b"popen", documentation_spans):
-            indicators.append(("os.popen", b"os.popen", {"associated_global": "os.popen"}))
-        if _contains_non_documentation_pattern(
-            lower,
-            rb"(?<![A-Za-z0-9_])os\s*\.\s*spawn",
-            documentation_spans,
-        ):
-            indicators.append(("os.spawn", b"os.spawn", {"associated_global": "os.spawn"}))
-        for commands_api in (b"commands.getoutput", b"commands.getstatusoutput"):
-            if _contains_non_documentation_token(lower, commands_api, documentation_spans):
-                label = commands_api.decode("ascii")
-                indicators.append((label, commands_api, {"associated_global": label}))
-        for subprocess_api in (b"subprocess.call", b"subprocess.run", b"subprocess.popen"):
-            if _contains_non_documentation_token(lower, subprocess_api, documentation_spans):
-                label = subprocess_api.decode("ascii")
-                indicators.append((label, subprocess_api, {"associated_global": label}))
+                _append_raw_indicator(indicators, associated_global)
+        for module_token, attr_token, associated_global in _RAW_TEXT_MODULE_ATTR_INDICATORS:
+            if _contains_module_attr(lower, module_token, attr_token, documentation_spans):
+                _append_raw_indicator(indicators, associated_global)
+        for pattern, label, associated_global in _RAW_TEXT_REGEX_INDICATORS:
+            if _contains_non_documentation_pattern(lower, pattern, documentation_spans):
+                _append_raw_indicator(indicators, label, associated_global)
+        for token, label, associated_global in _RAW_TEXT_TOKEN_INDICATORS:
+            if _contains_non_documentation_token(lower, token, documentation_spans):
+                _append_raw_indicator(indicators, label, associated_global)
 
-        for label, _token, details in indicators:
+        for label, details in indicators:
             result.add_check(
                 name="Pickle Raw Content Detection",
                 passed=False,
@@ -1390,9 +1401,7 @@ class PickleScanner(BaseScanner):
                 rule_code="S104",
             )
 
-        for label, token, details in warning_indicators:
-            if not _contains_non_documentation_token(lower, token, documentation_spans):
-                continue
+        for label, details in warning_indicators:
             result.add_check(
                 name="Pickle Raw Content Detection",
                 passed=False,

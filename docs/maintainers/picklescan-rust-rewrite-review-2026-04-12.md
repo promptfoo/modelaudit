@@ -539,7 +539,10 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] S-R2-8 — Table-drive suspicious string matches.
 - [x] S-R2-9 — Merge `getattr` parsers.
 - [x] S-R2-10 — Replace warning-global slice sentinel with an explicit enum.
-- [ ] S-P2-15 / S-P2-17 / S-P2-18 / S-P2-19 — Python readability/drift refactors.
+- [x] S-P2-15 — Table-drive `_scan_raw_text_indicators`.
+- [ ] S-P2-17 — Avoid duplicate CVE-2026-24747 attribution.
+- [ ] S-P2-18 — Consolidate `extract_metadata` read-limit validation.
+- [ ] S-P2-19 — Reduce Python/Rust dangerous-policy drift.
 - [ ] S-D2-29 / S-D2-30 / S-D2-33 / S-D2-34 / S-D2-35 / S-D2-37 / S-D2-38 / S-D2-39 / S-D2-40 — Documentation and CI hygiene follow-ups.
 
 ### Completed item QA log
@@ -700,6 +703,12 @@ This section is the active implementation log for follow-up commits after revisi
   - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, 42 tests.
   - `uv run --with 'maturin>=1.9,<2' maturin develop --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, rebuilt the editable native extension.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests/test_api.py::test_scan_bytes_warns_on_functools_partial_without_marking_benign_partial_malicious -q` — passed, 1 test.
+- S-P2-15 — Same-item commit table-drives the repeated raw text module-attribute, regex, direct-token, importlib-method, and webbrowser-method indicators and uses a shared raw-indicator append helper. Targeted QA:
+  - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `uv run ruff format --check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `uv run mypy modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py -q` — passed, 70 tests.
 - N-P0-3 — Same-item commit removes the global raw-window documentation short-circuit, records documentation-like pickle literal spans, and filters only matches that fall inside documentation spans or comment-like lines. Targeted QA:
   - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
