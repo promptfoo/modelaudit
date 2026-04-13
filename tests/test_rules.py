@@ -34,7 +34,7 @@ class TestRuleRegistry:
         rule = RuleRegistry.get_rule("S9999")
         assert rule is None
 
-    def test_find_matching_rule(self):
+    def test_find_matching_rule(self) -> None:
         """Test finding rules by message patterns."""
         # Test exact pattern match
         match = RuleRegistry.find_matching_rule("import os")
@@ -51,6 +51,21 @@ class TestRuleRegistry:
         # Test no match
         match = RuleRegistry.find_matching_rule("this should not match anything")
         assert match is None
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "",
+            "   ",
+            None,
+            "import osx",
+            "from osx import path",
+            "import osx; import sysx",
+        ],
+    )
+    def test_find_matching_rule_edge_case_non_matches(self, message: str | None) -> None:
+        """Empty, missing, and partial messages should not match rule patterns."""
+        assert RuleRegistry.find_matching_rule(message) is None
 
     def test_get_all_rules(self):
         """Test getting all rules."""
@@ -74,18 +89,18 @@ class TestRuleRegistry:
         assert "S201" in rules
         assert "S101" not in rules
 
-    def test_initialize_loads_catalog_order_and_clears_cache(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Catalog order and cache reset behavior should be preserved."""
-        monkeypatch.setattr(RuleRegistry, "_rules", {})
-        monkeypatch.setattr(RuleRegistry, "_message_match_cache", {"import os": None})
-        monkeypatch.setattr(RuleRegistry, "_initialized", False)
+    def test_initialize_loads_catalog_order_after_reset(self) -> None:
+        """Catalog order should be preserved after a full registry reset."""
+        RuleRegistry.find_matching_rule("import os")
+        assert "import os" in RuleRegistry._message_match_cache
+        RuleRegistry.reset_for_testing()
+        assert RuleRegistry._message_match_cache == {}
 
         RuleRegistry.initialize()
         loaded_rules = RuleRegistry.get_all_rules()
 
         assert list(loaded_rules) == [entry.code for entry in RULE_CATALOG]
         assert len(loaded_rules) == len(RULE_CATALOG)
-        assert RuleRegistry._message_match_cache == {}
 
         RuleRegistry.initialize()
 
@@ -242,7 +257,10 @@ S301 = "HIGH"
             }
         )
 
+        # S700-S702 expands the whole numeric span, then filters out unknown S700.
+        assert "S700" not in RuleRegistry.get_all_rules()
         assert config.suppress == {"S701", "S702", "S710"}
+        assert "S700" not in config.suppress
         assert config.severity == {"S301": Severity.HIGH}
         assert set(config.ignore["tests/**"]) == {"S201", "S202", "ALL"}
 
