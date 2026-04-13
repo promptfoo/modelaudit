@@ -1,6 +1,9 @@
 ARG PYTHON_IMAGE=python:3.13-slim@sha256:d168b8d9eb761f4d3fe305ebd04aeb7e7f2de0297cec5fb2f8f6403244621664
+# Keep the major/minor version in sync with packages/modelaudit-picklescan/Cargo.toml rust-version.
+ARG PICKLESCAN_RUST_TOOLCHAIN=1.74.1
 
 FROM ${PYTHON_IMAGE} AS builder
+ARG PICKLESCAN_RUST_TOOLCHAIN
 
 WORKDIR /build
 
@@ -12,7 +15,7 @@ RUN apt-get update \
     && apt-get install --yes --no-install-recommends --only-upgrade libc-bin libc6 \
     && apt-get install --yes --no-install-recommends build-essential ca-certificates curl \
     && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --profile minimal --default-toolchain 1.74.1 \
+        | sh -s -- -y --profile minimal --default-toolchain "${PICKLESCAN_RUST_TOOLCHAIN}" \
     && PATH="/root/.cargo/bin:${PATH}" pip wheel --no-cache-dir --wheel-dir /wheels \
         ./packages/modelaudit-picklescan \
         .
