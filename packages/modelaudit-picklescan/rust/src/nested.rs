@@ -25,13 +25,14 @@ pub(crate) fn decode_possible_encoded_pickle(
         let bounded = take_bytes_str(stripped, max_base64_nested_pickle_chars);
         let padded = pad_base64(&bounded);
         if let Some(decoded) = decode_base64(&padded) {
-            if looks_like_pickle_payload(&decoded, max_nested_pickle_bytes) {
-                decoded_values.push(("base64", decoded));
+            if let Some(payload_len) = pickle_payload_extent(&decoded, max_nested_pickle_bytes) {
+                decoded_values.push(("base64", decoded[..payload_len].to_vec()));
             }
         }
     }
 
     if hex_prefix_has_pickle_prefix(stripped) {
+        let encoding = hex_encoding_label(stripped);
         let hex_candidate =
             take_bytes_str(stripped, max_escaped_hex_nested_pickle_chars).replace("\\x", "");
         if hex_candidate.len() >= 16
@@ -41,8 +42,9 @@ pub(crate) fn decode_possible_encoded_pickle(
         {
             let bounded_hex_candidate = take_bytes_str(&hex_candidate, max_hex_nested_pickle_chars);
             if let Some(decoded) = decode_hex(&bounded_hex_candidate) {
-                if looks_like_pickle_payload(&decoded, max_nested_pickle_bytes) {
-                    decoded_values.push(("hex", decoded));
+                if let Some(payload_len) = pickle_payload_extent(&decoded, max_nested_pickle_bytes)
+                {
+                    decoded_values.push((encoding, decoded[..payload_len].to_vec()));
                 }
             }
         }
@@ -75,6 +77,7 @@ pub(crate) fn detect_oversized_encoded_pickle_prefixes(
     }
 
     if hex_prefix_has_pickle_prefix(stripped) {
+        let encoding = hex_encoding_label(stripped);
         let max_hex_probe_chars = (probe_decoded_bytes * 4).max(16);
         let mut hex_candidate = take_bytes_str(stripped, max_hex_probe_chars).replace("\\x", "");
         if hex_candidate.len() % 2 == 1 {
@@ -86,7 +89,7 @@ pub(crate) fn detect_oversized_encoded_pickle_prefixes(
         {
             if let Some(decoded) = decode_hex(&hex_candidate) {
                 if decoded.len() > max_nested_pickle_bytes && has_pickle_prefix(&decoded) {
-                    detected.push(("hex", estimate_hex_decoded_size(stripped)));
+                    detected.push((encoding, estimate_hex_decoded_size(stripped)));
                 }
             }
         }
@@ -96,8 +99,12 @@ pub(crate) fn detect_oversized_encoded_pickle_prefixes(
 }
 
 pub(crate) fn looks_like_pickle_payload(value: &[u8], max_bytes: usize) -> bool {
+    pickle_payload_extent(value, max_bytes).is_some()
+}
+
+pub(crate) fn pickle_payload_extent(value: &[u8], max_bytes: usize) -> Option<usize> {
     if value.len() < 2 || value.len() > max_bytes || !has_pickle_prefix(value) {
-        return false;
+        return None;
     }
     let mut index = 0usize;
     let mut stack_depth = 0usize;
@@ -105,17 +112,17 @@ pub(crate) fn looks_like_pickle_payload(value: &[u8], max_bytes: usize) -> bool 
     while index < value.len() {
         let parsed = match parse_opcode(value, index, value.len()) {
             Ok(parsed) => parsed,
-            Err(_) => return false,
+            Err(_) => return None,
         };
         index = parsed.next;
         if !validate_pickle_stack_effect(&parsed, &mut stack_depth, &mut mark_depths) {
-            return false;
+            return None;
         }
         if parsed.name == "STOP" {
-            return stack_depth > 0;
+            return (stack_depth > 0).then_some(index);
         }
     }
-    false
+    None
 }
 
 pub(crate) fn has_execution_opcode(value: &[u8]) -> bool {
@@ -263,6 +270,14 @@ fn validate_pickle_stack_effect(
             *stack_depth += 1;
             true
         }
+    }
+}
+
+fn hex_encoding_label(value: &str) -> &'static str {
+    if value.contains("\\x") {
+        "escaped_hex"
+    } else {
+        "hex"
     }
 }
 

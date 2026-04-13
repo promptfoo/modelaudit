@@ -9,6 +9,7 @@ use crate::nested::{
     decode_possible_encoded_pickle, detect_oversized_encoded_pickle_prefixes,
     encoded_nested_literal_probe_windows, encoded_nested_window_char_limit, has_execution_opcode,
     has_pickle_prefix, looks_like_pickle_payload, nested_pickle_probe_offsets,
+    pickle_payload_extent,
 };
 use crate::opcode::{parse_opcode, ArgValue, ParseError, ParsedOpcode};
 use crate::policy::global_severity;
@@ -209,6 +210,14 @@ fn encoded_nested_payload_finding(
         incomplete_message: "Encoded pickle payload exceeds deep-scan byte limit",
         why: "Encoded nested pickle payloads can hide deserialization gadgets inside apparently inert metadata strings.",
         include_limit_when_complete: false,
+    }
+}
+
+fn nested_rule_code_for_encoding(encoding: &'static str) -> &'static str {
+    match encoding {
+        "raw" => "S213",
+        "base64" => "S601",
+        _ => "S602",
     }
 }
 
@@ -667,7 +676,8 @@ impl<'a> ScanState<'a> {
             }
             name if STACK_GLOBAL_STRING_OPCODES.contains(&name) => {
                 let value = opcode.arg.text(self.payload);
-                self.scan_string_literal(&value, opcode.name, position);
+                let suppress_hex_escape = self.is_data_only_encoded_nested_pickle_literal(&value);
+                self.scan_string_literal(&value, opcode.name, position, suppress_hex_escape);
                 self.scan_encoded_nested_pickle_literal(&value, position);
                 self.stack
                     .push(stack_value_from_text_arg(&opcode.arg, self.payload));
@@ -1131,7 +1141,13 @@ impl<'a> ScanState<'a> {
         }
     }
 
-    fn scan_string_literal(&mut self, value: &str, op_name: &'static str, position: usize) {
+    fn scan_string_literal(
+        &mut self,
+        value: &str,
+        op_name: &'static str,
+        position: usize,
+        suppress_hex_escape: bool,
+    ) {
         let max_chars = self.options.max_string_literal_scan_chars;
         if max_chars == 0 {
             if !value.is_empty() {
@@ -1145,13 +1161,13 @@ impl<'a> ScanState<'a> {
             return;
         }
         if value.len() <= max_chars {
-            self.scan_string_literal_candidate(value, op_name, position);
+            self.scan_string_literal_candidate(value, op_name, position, suppress_hex_escape);
             return;
         }
 
         let value_len = string_char_len(value);
         if value_len <= max_chars {
-            self.scan_string_literal_candidate(value, op_name, position);
+            self.scan_string_literal_candidate(value, op_name, position, suppress_hex_escape);
             return;
         }
 
@@ -1164,7 +1180,12 @@ impl<'a> ScanState<'a> {
         let mut window_start = 0usize;
         loop {
             let window_end = advance_chars_from(value, window_start, suspicious_window_chars);
-            self.scan_string_literal_candidate(&value[window_start..window_end], op_name, position);
+            self.scan_string_literal_candidate(
+                &value[window_start..window_end],
+                op_name,
+                position,
+                suppress_hex_escape,
+            );
             if window_end >= value.len() {
                 break;
             }
@@ -1181,8 +1202,12 @@ impl<'a> ScanState<'a> {
         value: &str,
         op_name: &'static str,
         position: usize,
+        suppress_hex_escape: bool,
     ) {
         for matched_pattern in suspicious_string_matches(value) {
+            if suppress_hex_escape && matched_pattern == "hex escape" {
+                continue;
+            }
             self.add_finding(Finding {
                 message: format!(
                     "Suspicious string literal contains code execution pattern: {}",
@@ -1205,28 +1230,25 @@ impl<'a> ScanState<'a> {
     fn scan_raw_nested_pickle_bytes(&mut self, value: &[u8], position: usize) {
         for offset in nested_pickle_probe_offsets(value) {
             let remaining_len = value.len().saturating_sub(offset);
-            let candidate_truncated = remaining_len > self.options.max_nested_pickle_bytes;
             let end = value
                 .len()
                 .min(offset.saturating_add(self.options.max_nested_pickle_bytes));
-            let candidate = &value[offset..end];
-            if looks_like_pickle_payload(candidate, self.options.max_nested_pickle_bytes) {
+            let probe = &value[offset..end];
+            if let Some(payload_len) =
+                pickle_payload_extent(probe, self.options.max_nested_pickle_bytes)
+            {
+                let candidate = &probe[..payload_len];
                 self.add_nested_payload_finding(raw_nested_payload_finding(
-                    remaining_len,
+                    candidate.len(),
                     position + offset,
-                    candidate_truncated,
+                    false,
                     has_execution_opcode(candidate),
                 ));
-                if candidate_truncated {
-                    self.record_raw_nested_payload_truncated(remaining_len, position + offset);
-                }
                 self.surface_nested_pickle_findings(candidate, "raw", position + offset);
                 return;
             }
-            if candidate_truncated
-                && candidate.first() == Some(&0x80)
-                && has_pickle_prefix(candidate)
-            {
+            let candidate_truncated = remaining_len > self.options.max_nested_pickle_bytes;
+            if candidate_truncated && probe.first() == Some(&0x80) && has_pickle_prefix(probe) {
                 self.add_nested_payload_finding(raw_nested_payload_finding(
                     remaining_len,
                     position + offset,
@@ -1237,6 +1259,12 @@ impl<'a> ScanState<'a> {
                 return;
             }
         }
+    }
+
+    fn is_data_only_encoded_nested_pickle_literal(&self, value: &str) -> bool {
+        decode_possible_encoded_pickle(value, self.options.max_nested_pickle_bytes)
+            .into_iter()
+            .any(|(_, decoded)| !has_execution_opcode(&decoded))
     }
 
     fn scan_encoded_nested_pickle_literal(&mut self, value: &str, position: usize) {
@@ -1374,6 +1402,22 @@ impl<'a> ScanState<'a> {
             DetailValue::Bool(finding.nested_has_execution_opcode),
         ));
 
+        let location = Some(format!("{} (pos {})", self.source, finding.position));
+        if !finding.analysis_incomplete && !finding.nested_has_execution_opcode {
+            self.add_notice(Notice {
+                message: finding.complete_message.to_string(),
+                severity: "info",
+                location,
+                code: Some(if finding.encoding == "raw" {
+                    "nested_payload_detected"
+                } else {
+                    "encoded_nested_payload_detected"
+                }),
+                details,
+            });
+            return;
+        }
+
         self.add_finding(Finding {
             message: if finding.analysis_incomplete {
                 finding.incomplete_message.to_string()
@@ -1381,7 +1425,7 @@ impl<'a> ScanState<'a> {
                 finding.complete_message.to_string()
             },
             severity: "critical",
-            location: Some(format!("{} (pos {})", self.source, finding.position)),
+            location,
             rule_code: Some(finding.rule_code),
             details,
             why: Some(finding.why),
@@ -1549,6 +1593,10 @@ impl<'a> ScanState<'a> {
 
     fn record_structural_opcode(&mut self, opcode: &ParsedOpcode, position: usize) {
         self.stream_opcode_count += 1;
+        if opcode.name == "FRAME" {
+            self.record_oversized_frame_notice(opcode, position);
+            return;
+        }
         if opcode.name != "PROTO" {
             return;
         }
@@ -1621,6 +1669,39 @@ impl<'a> ScanState<'a> {
         if let Some(protocol) = protocol {
             self.stream_proto_version = Some(protocol);
         }
+    }
+
+    fn record_oversized_frame_notice(&mut self, opcode: &ParsedOpcode, position: usize) {
+        let ArgValue::UInt(frame_len) = &opcode.arg else {
+            return;
+        };
+        let remaining_bytes = self.payload.len().saturating_sub(opcode.next);
+        let oversized_threshold = remaining_bytes.saturating_add(remaining_bytes / 2);
+        if *frame_len <= oversized_threshold {
+            return;
+        }
+
+        self.add_notice(Notice {
+            message: "Pickle FRAME declares more bytes than remain in the stream".to_string(),
+            severity: "info",
+            location: Some(format!("{} (pos {})", self.source, position)),
+            code: Some("oversized_frame"),
+            details: vec![
+                ("position".to_string(), DetailValue::UInt(position as u64)),
+                (
+                    "stream_offset".to_string(),
+                    DetailValue::UInt(self.stream_start_offset as u64),
+                ),
+                (
+                    "frame_length".to_string(),
+                    DetailValue::UInt(*frame_len as u64),
+                ),
+                (
+                    "remaining_bytes".to_string(),
+                    DetailValue::UInt(remaining_bytes as u64),
+                ),
+            ],
+        });
     }
 
     fn record_expansion_opcode(&mut self, opcode: &ParsedOpcode, position: usize) {
@@ -1826,6 +1907,26 @@ impl<'a> ScanState<'a> {
             if self.status == "complete" {
                 self.status = "inconclusive";
             }
+            self.add_finding(Finding {
+                message: "Nested pickle analysis did not complete".to_string(),
+                severity: "critical",
+                location: Some(nested_source.clone()),
+                rule_code: Some(nested_rule_code_for_encoding(encoding)),
+                details: vec![
+                    (
+                        "nested_encoding".to_string(),
+                        DetailValue::String(encoding.to_string()),
+                    ),
+                    (
+                        "nested_status".to_string(),
+                        DetailValue::String(nested_scan.status.to_string()),
+                    ),
+                    ("analysis_incomplete".to_string(), DetailValue::Bool(true)),
+                ],
+                why: Some(
+                    "Incomplete nested pickle analysis is treated as unsafe because truncated or budget-limited nested payloads can hide deserialization gadgets.",
+                ),
+            });
             let nested_errors = nested_scan
                 .errors
                 .iter()
@@ -3228,6 +3329,75 @@ mod tests {
             detail_string(&finding.details, "opcode").as_deref(),
             Some("PERSID")
         );
+    }
+
+    #[test]
+    fn data_only_nested_payloads_emit_notice_not_finding() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let payload = b"\x80\x04C\x04\x80\x04}.\x94.";
+        let mut scan = ScanState::new(
+            "data-only-nested.pkl".to_string(),
+            payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+
+        scan.run();
+
+        assert_eq!(scan.verdict, "clean");
+        assert!(scan.findings.is_empty());
+        let notice = scan
+            .notices
+            .iter()
+            .find(|notice| notice.code == Some("nested_payload_detected"))
+            .expect("data-only nested payload notice");
+        assert_eq!(
+            detail_string(&notice.details, "encoding").as_deref(),
+            Some("raw")
+        );
+    }
+
+    #[test]
+    fn oversized_frame_lengths_emit_structural_notice() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let payload = b"\x80\x04\x95\xfe\xff\xff\xff\xff\xff\xff\xff}.";
+        let mut scan = ScanState::new(
+            "oversized-frame.pkl".to_string(),
+            payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+
+        scan.run();
+
+        let notice = scan
+            .notices
+            .iter()
+            .find(|notice| notice.code == Some("oversized_frame"))
+            .expect("oversized FRAME notice");
+        assert_eq!(detail_usize(&notice.details, "position"), Some(2));
+        assert_eq!(detail_usize(&notice.details, "remaining_bytes"), Some(2));
+        assert_eq!(scan.verdict, "clean");
     }
 
     #[test]

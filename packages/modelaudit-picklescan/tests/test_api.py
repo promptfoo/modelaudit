@@ -1423,7 +1423,7 @@ def test_scan_bytes_does_not_scan_raw_binbytes_payloads_as_text_strings() -> Non
     assert report.findings == ()
 
 
-def test_scan_bytes_flags_raw_nested_pickle_payloads() -> None:
+def test_scan_bytes_records_data_only_raw_nested_pickle_payloads_as_notices() -> None:
     nested_payload = pickle.dumps({"inner": "data"}, protocol=4)
     report = scan_bytes(
         pickle.dumps({"outer": nested_payload}, protocol=4),
@@ -1431,11 +1431,17 @@ def test_scan_bytes_flags_raw_nested_pickle_payloads() -> None:
     )
 
     assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert any(finding.rule_code == "S213" for finding in report.findings)
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+    assert any(
+        notice.code == "nested_payload_detected"
+        and notice.details.get("encoding") == "raw"
+        and notice.details.get("nested_has_execution_opcode") is False
+        for notice in report.notices
+    )
 
 
-def test_scan_bytes_flags_raw_nested_pickle_payload_hidden_inside_large_literal() -> None:
+def test_scan_bytes_records_data_only_raw_nested_pickle_hidden_inside_large_literal_as_notice() -> None:
     nested_payload = pickle.dumps({"inner": "data"}, protocol=4)
     hidden_payload = b"A" * 64 + nested_payload + b"B" * 64
 
@@ -1445,8 +1451,9 @@ def test_scan_bytes_flags_raw_nested_pickle_payload_hidden_inside_large_literal(
         options=ScanOptions(max_nested_pickle_bytes=len(nested_payload) + 16),
     )
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert any(finding.rule_code == "S213" for finding in report.findings)
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+    assert any(notice.code == "nested_payload_detected" for notice in report.notices)
 
 
 def test_scan_bytes_ignores_invalid_raw_nested_pickle_near_match_hidden_inside_large_literal() -> None:
@@ -1599,7 +1606,7 @@ def test_scan_bytes_does_not_flag_stack_invalid_encoded_pickle_fragments(fragmen
     assert all(finding.rule_code != "S601" for finding in report.findings)
 
 
-def test_scan_bytes_flags_base64_encoded_nested_pickle_payloads() -> None:
+def test_scan_bytes_records_data_only_base64_nested_pickle_payloads_as_notices() -> None:
     nested_payload = pickle.dumps({"inner": "data"}, protocol=4)
     report = scan_bytes(
         pickle.dumps({"outer": base64.b64encode(nested_payload).decode("ascii")}, protocol=4),
@@ -1607,11 +1614,17 @@ def test_scan_bytes_flags_base64_encoded_nested_pickle_payloads() -> None:
     )
 
     assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert any(finding.rule_code == "S601" for finding in report.findings)
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+    assert any(
+        notice.code == "encoded_nested_payload_detected"
+        and notice.details.get("encoding") == "base64"
+        and notice.details.get("nested_has_execution_opcode") is False
+        for notice in report.notices
+    )
 
 
-def test_scan_bytes_flags_base64_nested_pickle_payload_hidden_inside_large_literal() -> None:
+def test_scan_bytes_records_data_only_base64_nested_pickle_hidden_inside_large_literal_as_notice() -> None:
     nested_payload = pickle.dumps({"inner": "data"}, protocol=4)
     hidden_payload = "A" * 64 + base64.b64encode(nested_payload).decode("ascii") + "A" * 64
 
@@ -1621,8 +1634,10 @@ def test_scan_bytes_flags_base64_nested_pickle_payload_hidden_inside_large_liter
         options=ScanOptions(max_string_literal_scan_chars=8),
     )
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert any(finding.rule_code == "S601" for finding in report.findings)
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.findings == ()
+    assert any(notice.code == "encoded_nested_payload_detected" for notice in report.notices)
+    assert any(notice.code == "literal_scan_truncated" for notice in report.notices)
 
 
 def test_scan_bytes_ignores_invalid_base64_nested_pickle_near_match_hidden_inside_large_literal() -> None:
@@ -1641,7 +1656,7 @@ def test_scan_bytes_ignores_invalid_base64_nested_pickle_near_match_hidden_insid
     assert any(notice.code == "literal_scan_truncated" for notice in report.notices)
 
 
-def test_scan_bytes_flags_hex_encoded_nested_pickle_payloads() -> None:
+def test_scan_bytes_records_data_only_hex_nested_pickle_payloads_as_notices() -> None:
     nested_payload = pickle.dumps({"inner": "data"}, protocol=4)
     report = scan_bytes(
         pickle.dumps({"outer": binascii.hexlify(nested_payload).decode("ascii")}, protocol=4),
@@ -1649,11 +1664,17 @@ def test_scan_bytes_flags_hex_encoded_nested_pickle_payloads() -> None:
     )
 
     assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert any(finding.rule_code == "S602" for finding in report.findings)
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+    assert any(
+        notice.code == "encoded_nested_payload_detected"
+        and notice.details.get("encoding") == "hex"
+        and notice.details.get("nested_has_execution_opcode") is False
+        for notice in report.notices
+    )
 
 
-def test_scan_bytes_flags_hex_nested_pickle_payload_hidden_inside_large_literal() -> None:
+def test_scan_bytes_records_data_only_hex_nested_pickle_hidden_inside_large_literal_as_notice() -> None:
     nested_payload = pickle.dumps({"inner": "data"}, protocol=4)
     hidden_payload = "A" * 64 + binascii.hexlify(nested_payload).decode("ascii") + "A" * 64
 
@@ -1663,8 +1684,10 @@ def test_scan_bytes_flags_hex_nested_pickle_payload_hidden_inside_large_literal(
         options=ScanOptions(max_string_literal_scan_chars=8),
     )
 
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert any(finding.rule_code == "S602" for finding in report.findings)
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.findings == ()
+    assert any(notice.code == "encoded_nested_payload_detected" for notice in report.notices)
+    assert any(notice.code == "literal_scan_truncated" for notice in report.notices)
 
 
 def test_scan_bytes_ignores_invalid_hex_nested_pickle_near_match_hidden_inside_large_literal() -> None:
@@ -1683,7 +1706,7 @@ def test_scan_bytes_ignores_invalid_hex_nested_pickle_near_match_hidden_inside_l
     assert any(notice.code == "literal_scan_truncated" for notice in report.notices)
 
 
-def test_scan_bytes_flags_escaped_hex_encoded_nested_pickle_payloads() -> None:
+def test_scan_bytes_records_data_only_escaped_hex_nested_pickle_payloads_as_notices() -> None:
     nested_payload = pickle.dumps({"inner": "data"}, protocol=4)
     escaped_hex_payload = "".join(f"\\x{byte:02x}" for byte in nested_payload)
 
@@ -1693,8 +1716,14 @@ def test_scan_bytes_flags_escaped_hex_encoded_nested_pickle_payloads() -> None:
     )
 
     assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert any(finding.rule_code == "S602" for finding in report.findings)
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+    assert any(
+        notice.code == "encoded_nested_payload_detected"
+        and notice.details.get("encoding") == "escaped_hex"
+        and notice.details.get("nested_has_execution_opcode") is False
+        for notice in report.notices
+    )
 
 
 def test_scan_bytes_applies_nested_byte_budget_after_unescaping_hex_literals() -> None:
@@ -1708,10 +1737,13 @@ def test_scan_bytes_applies_nested_byte_budget_after_unescaping_hex_literals() -
     )
 
     assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
     assert any(
-        finding.rule_code == "S602" and finding.details.get("analysis_incomplete") is not True
-        for finding in report.findings
+        notice.code == "encoded_nested_payload_detected"
+        and notice.details.get("encoding") == "escaped_hex"
+        and notice.details.get("analysis_incomplete") is not True
+        for notice in report.notices
     )
 
 
@@ -1800,8 +1832,9 @@ def test_scan_bytes_still_checks_bounded_encoded_nested_windows_for_truncated_li
     )
 
     assert report.status == ScanStatus.INCONCLUSIVE
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert any(finding.rule_code == "S601" for finding in report.findings)
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.findings == ()
+    assert any(notice.code == "encoded_nested_payload_detected" for notice in report.notices)
     assert any(notice.code == "literal_scan_truncated" for notice in report.notices)
 
 
@@ -1859,6 +1892,16 @@ def test_scan_bytes_preserves_readonly_buffer_empty_stack_parity() -> None:
     assert finding.details["name_operand"] == "NoneType:None"
     buffer_notice = next(notice for notice in report.notices if notice.code == "buffer_opcode")
     assert buffer_notice.details["readonly_buffer_empty_stack_count"] == 1
+
+
+def test_scan_bytes_records_oversized_frame_notice() -> None:
+    report = scan_bytes(b"\x80\x04\x95\xfe\xff\xff\xff\xff\xff\xff\xff}.", source="oversized-frame.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    notice = next(notice for notice in report.notices if notice.code == "oversized_frame")
+    assert notice.details["frame_length"] == 0xFFFFFFFFFFFFFFFE
+    assert notice.details["remaining_bytes"] == 2
 
 
 def test_scan_stream_preserves_absolute_offsets_from_current_stream_position() -> None:

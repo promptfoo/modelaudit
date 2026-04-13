@@ -762,6 +762,34 @@ mod tests {
     }
 
     #[test]
+    fn parse_long_integer_operands_as_payload_spans() {
+        let long1_payload = b"\x8a\x02\x01\x00.";
+        let long1 = parse_opcode(long1_payload, 0, long1_payload.len()).expect("LONG1 opcode");
+        assert_eq!(long1.name, "LONG1");
+        assert_eq!(long1.arg.byte_span(long1_payload.len()), Some((2, 4)));
+        assert_eq!(long1.next, 4);
+
+        let long4_payload = b"\x8b\x02\x00\x00\x00\xff\x00.";
+        let long4 = parse_opcode(long4_payload, 0, long4_payload.len()).expect("LONG4 opcode");
+        assert_eq!(long4.name, "LONG4");
+        assert_eq!(long4.arg.byte_span(long4_payload.len()), Some((5, 7)));
+        assert_eq!(long4.next, 7);
+    }
+
+    #[test]
+    fn parse_oversized_long4_reports_bounded_value_error() {
+        let payload = b"\x8b\xff\xff\xff\xff.";
+        let error = match parse_opcode(payload, 0, payload.len()) {
+            Ok(_) => panic!("oversized LONG4 should fail"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.exception_type, "ValueError");
+        assert!(error.message.contains("long4"));
+        assert_eq!(error.report_index, Some(payload.len()));
+    }
+
+    #[test]
     fn parse_protocol0_string_escapes() {
         let payload = b"S'\\x6f\\163\\n'\n.";
         let opcode = parse_opcode(payload, 0, payload.len()).expect("STRING opcode");

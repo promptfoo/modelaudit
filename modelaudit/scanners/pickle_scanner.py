@@ -108,15 +108,20 @@ _SECRET_SCAN_SEEDS: tuple[bytes, ...] = (
     b"-----begin pgp private key block-----",
     b"-----begin rsa private key-----",
     b"akia",
-    b"api",
-    b"auth",
+    b"api_key:",
+    b"api_key=",
+    b"auth_token:",
+    b"auth_token=",
     b"aws_",
-    b"az",
+    b"azure_client_secret:",
+    b"azure_client_secret=",
     b"bearer",
-    b"client_secret",
+    b"client_secret:",
+    b"client_secret=",
     b"credential",
     b"eyj",
-    b"gcp_api_key",
+    b"gcp_api_key:",
+    b"gcp_api_key=",
     b"github_pat_",
     b"ghp_",
     b"ghs_",
@@ -125,15 +130,20 @@ _SECRET_SCAN_SEEDS: tuple[bytes, ...] = (
     b"mailgun",
     b"mongodb+srv://",
     b"npm_",
-    b"openai_api_key",
-    b"passwd",
-    b"password",
-    b"api_key",
+    b"openai_api_key:",
+    b"openai_api_key=",
+    b"passwd:",
+    b"passwd=",
+    b"password:",
+    b"password=",
     b"private_key",
-    b"pwd",
+    b"pwd:",
+    b"pwd=",
     b"rg_",
-    b"secret",
-    b"secret_key",
+    b"secret:",
+    b"secret=",
+    b"secret_key:",
+    b"secret_key=",
     b"seed phrase",
     b"sendgrid",
     b"sk-",
@@ -141,7 +151,8 @@ _SECRET_SCAN_SEEDS: tuple[bytes, ...] = (
     b"slack://",
     b"sq0",
     b"stripe_live_",
-    b"token",
+    b"token:",
+    b"token=",
     b"twilio",
     b"xox",
 )
@@ -505,7 +516,9 @@ def _has_domain_like_dot(data: bytes) -> bool:
 
 
 def _has_domain_or_ip_shape(data: bytes) -> bool:
-    return _has_text_shape(data, require_dot=True)
+    if not _has_text_shape(data, require_dot=True):
+        return False
+    return any(marker in data for marker in (b"://", b"/", b"?", b"=", b":", b"@"))
 
 
 def _looks_like_portable_executable(data: bytes) -> bool:
@@ -950,11 +963,15 @@ class PickleScanner(BaseScanner):
         if not self._rust_scan_completed_cleanly(result):
             return False
 
+        # This fast path is valid only for the current expensive raw detectors
+        # (secrets, JIT code, and network indicators), whose evidence is covered
+        # by the seed/shape gates below. Any future expensive raw detector with
+        # non-seeded structural evidence must update this predicate and tests.
         expensive_limit = self._root_expensive_raw_scan_limit()
         if expensive_limit <= 0:
             return True
         expensive_data = raw_data[:expensive_limit]
-        return not _has_domain_like_dot(expensive_data) and not _contains_any_seed_lowered(
+        return not _has_domain_or_ip_shape(expensive_data) and not _contains_any_seed_lowered(
             expensive_data.lower(),
             _EXPENSIVE_RAW_SCAN_SEEDS,
         )
@@ -1709,6 +1726,27 @@ class PickleScanner(BaseScanner):
         path_check = self._check_path(path)
         if path_check:
             return path_check
+
+        if Path(path).is_dir():
+            result = self._create_result()
+            if self._path_validation_result is not None:
+                result.merge(self._path_validation_result)
+            result.add_check(
+                name="Pickle File Open",
+                passed=False,
+                message="Path is a directory, not a pickle file",
+                severity=IssueSeverity.INFO,
+                location=path,
+                details={
+                    "category": "pickle_file_open_failed",
+                    "exception_type": "IsADirectoryError",
+                    "operational_error": True,
+                },
+            )
+            result.metadata["operational_error"] = True
+            result.metadata["operational_error_reason"] = "path_is_directory"
+            result.finish(success=False)
+            return result
 
         size_check = self._check_size_limit(path)
         if size_check:

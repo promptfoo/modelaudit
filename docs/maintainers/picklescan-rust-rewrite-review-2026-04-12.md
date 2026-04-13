@@ -166,6 +166,8 @@ Rev 3 residuals that were also addressed:
 
 ### Remaining open items at rev 4
 
+> Follow-up note (2026-04-13): items in this rev-4 list were re-checked and closed in the active follow-up tracker below as A-P1-70 through A-P2-79. The historical text is retained for auditability; current QA evidence is in the completed-item log.
+
 **P1-NESTED-DIVERGENCE.** Standalone `modelaudit_picklescan.scan_bytes` reports a benign nested pickle (`{'outer_data': 'legitimate', 'inner_pickle': <bytes of pickle({'malicious': 'data'})>}`) as `verdict=malicious` / S213 CRITICAL, but the ModelAudit adapter downgrades it to INFO via `_is_benign_nested_payload_detection` (`picklescan_adapter.py:378-393`). The adapter checks `nested_has_execution_opcode is not False` → if the Rust finding reports the inner has NO execution opcodes, the adapter demotes severity. This is documented as intentional: a nested data-only pickle is not exploitable.
 
 However the **standalone API and the adapter disagree** on the verdict for the same bytes. Downstream users integrating `modelaudit-picklescan` directly see MALICIOUS; users going through ModelAudit see INFO. This divergence should either (a) move the benign-downgrade heuristic into the Rust layer so both APIs agree, or (b) be explicitly documented in `packages/modelaudit-picklescan/README.md` as "the standalone API is conservative — integrators should pair with their own downgrade policy". File: `packages/modelaudit-picklescan/src/modelaudit_picklescan/api.py` vs `modelaudit/scanners/picklescan_adapter.py:378`.
@@ -209,6 +211,8 @@ However the **standalone API and the adapter disagree** on the verdict for the s
 - Huge FRAME (`0xFFFFFFFFFFFFFFFE`) + valid REDUCE inside: STILL CRITICAL S201 (parse cleanly past the bogus FRAME length) ✓
 
 ### Honest residual list at rev 4
+
+> Follow-up note (2026-04-13): this residual list reflects the rev-4 audit snapshot. The current branch closes these items in the active follow-up tracker below and did not surface additional unresolved gaps during the final targeted QA pass.
 
 After all the verification above, the items I am **certain** still need attention before merge are:
 
@@ -741,6 +745,16 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] S-D2-40 — Use canonical PyTorch suffix in package API test.
 - [x] A-P1-68 — Close missed P-P1-42a raw eval/exec/__import__ duplicate emissions found during closure audit.
 - [x] A-P1-69 — Close missed P-P1-41 short base64 execution literal detection found during adversarial probes.
+- [x] A-P1-70 — Resolve rev-4 P1-NESTED-DIVERGENCE so standalone and ModelAudit agree on benign nested data-only payloads.
+- [x] A-P2-71 — Tighten remaining generic expensive raw-detector secret seeds and preserve true-positive coverage, including confirmed HuggingFace-style `use_auth_token` / `api_key=None` perf inflation.
+- [x] A-P2-72 — Resolve rev-4 P2-REMAINING-NESTED-FINDING-DUP by pinning the intentional S104+S201 compatibility policy and documenting the counting contract.
+- [x] A-P2-73 — Expand direct Rust coverage for opcode/report edge cases called out by P2-CARGO-TEST-SURFACE.
+- [x] A-P2-74 — Pin the expensive raw-detector skip invariant so future non-seeded detectors are not accidentally skipped.
+- [x] A-P2-75 — Document INFO notice volume and recommended dashboard filtering for aggregate scans.
+- [x] A-P2-76 — Fix or document P2-PROTO6-FORWARD-COMPAT so file-type pickle magic is ready for future protocol bumps.
+- [x] A-P2-77 — Add oversized FRAME structural-tamper coverage for impossible frame lengths.
+- [x] A-P2-78 — Downgrade directory-open failures from security CRITICAL to operational/non-security severity.
+- [x] A-P2-79 — Close P2-WHEEL-MATRIX-INCOMPLETE by adding macOS x86_64 and Linux aarch64 wheels or explicitly documenting the fallback.
 
 ### Completed item QA log
 
@@ -985,6 +999,39 @@ This section is the active implementation log for follow-up commits after revisi
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py -q` — passed, 77 tests.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests/test_api.py -q` — passed, 169 tests.
   - Manual `uv run python` probe for `pickle.dumps({"encoded": base64("eval(x)")})` — passed; root scanner emitted `S604` with pattern `eval`, standalone scanner returned `suspicious` with `SUSPICIOUS_STRING` / `base64 eval(`.
+- A-P1-70 — Same-item commit moves the benign nested-payload downgrade into the Rust scanner itself. Complete data-only raw/encoded nested payloads now emit INFO notices instead of security findings, while dangerous nested payloads and incomplete nested analysis still fail closed. The raw nested scanner also crops a complete hidden nested pickle at its `STOP` opcode so benign bytes after the nested stream do not inflate the nested size or create false malicious verdicts. Targeted QA:
+  - `cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml -- --check` — passed.
+  - `cargo check --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed.
+  - `cargo clippy --manifest-path packages/modelaudit-picklescan/Cargo.toml --all-targets -- -D warnings` — passed.
+  - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, 46 tests.
+  - `uv run --with 'maturin>=1.9,<2' maturin develop --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, rebuilt the editable native extension.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests/test_api.py::test_scan_bytes_records_data_only_raw_nested_pickle_payloads_as_notices packages/modelaudit-picklescan/tests/test_api.py::test_scan_bytes_records_data_only_base64_nested_pickle_payloads_as_notices packages/modelaudit-picklescan/tests/test_api.py::test_scan_bytes_records_data_only_raw_nested_pickle_hidden_inside_large_literal_as_notice packages/modelaudit-picklescan/tests/test_api.py::test_scan_bytes_marks_parent_inconclusive_when_nested_analysis_is_incomplete -q` — passed, 4 tests.
+- A-P2-71 — Same-item commit narrows the expensive raw-detector seeds away from bare generic words (`api`, `auth`, `az`, `pwd`, `secret`, `password`, `token`) and requires structural assignment forms for secret-like keys. The domain/IP prefilter now requires a domain-like dot plus URL/value/network punctuation, so class names like `LlamaForCausalLM` no longer defeat the hot-path skip. Targeted QA:
+  - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `uv run mypy modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py::test_expensive_raw_prefilters_skip_generic_secret_words_without_values tests/scanners/test_pickle_scanner.py::test_expensive_raw_prefilters_skip_huggingface_style_metadata_without_values tests/scanners/test_pickle_scanner.py::test_expensive_raw_prefilters_preserve_structured_secret_assignments -q` — passed, 3 tests.
+- A-P2-72 — Same-item commit keeps the intentional builtin compatibility duplicate (`primary legacy rule` + supporting `S201`) but marks the supporting issue with `details.supporting_rule_code=True` and `details.primary_rule_code`, so dashboards can count only primary security issues without losing backward-compatible rule codes. Targeted QA:
+  - `uv run ruff check modelaudit/scanners/picklescan_adapter.py tests/scanners/test_picklescan_adapter.py` — passed.
+  - `uv run mypy modelaudit/scanners/picklescan_adapter.py tests/scanners/test_picklescan_adapter.py` — passed.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_picklescan_adapter.py::test_pickle_report_to_scan_result_preserves_legacy_builtin_call_rule_alias -q` — passed, 1 test.
+- A-P2-73 — Same-item commit expands direct Rust opcode coverage for borrowed operand spans and malformed large integer operands. This pins `LONG1`/`LONG4` byte-span behavior and verifies an oversized `LONG4` reports a bounded `ValueError` rather than panicking or allocating. Targeted QA:
+  - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, 46 tests.
+- A-P2-74 — Same-item commit documents the expensive raw-detector skip invariant at the predicate and adds a regression proving the skip only applies after a clean, complete Rust scan. Future raw detectors that do not rely on the current seed/shape contract must update this predicate and tests. Targeted QA:
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py::test_expensive_raw_skip_requires_clean_complete_rust_result -q` — passed, 1 test.
+- A-P2-75 — Same-item commit documents INFO notice semantics for aggregate scans in the standalone README and the user security model. Recommended dashboards should alert on WARNING/CRITICAL findings by default, group INFO notices into counts, and exclude `supporting_rule_code=true` rows from primary counts. Targeted QA:
+  - Documentation-only change; covered by `git diff --check` in final QA.
+- A-P2-76 — Same-item commit replaces protocol-specific pickle magic duplication with a forward-compatible binary pickle helper accepting protocols 2 through 6. Protocol 6 is treated as pickle-shaped for routing while the Rust scanner can still apply normal parser policy to the actual stream. Targeted QA:
+  - `uv run ruff check modelaudit/utils/file/detection.py tests/utils/file/test_filetype.py` — passed.
+  - `uv run mypy modelaudit/utils/file/detection.py tests/utils/file/test_filetype.py` — passed.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/utils/file/test_filetype.py::test_detect_file_format_accepts_forward_compatible_binary_pickle_protocol -q` — passed, 1 test.
+- A-P2-77 — Same-item commit records an INFO `oversized_frame` notice when a `FRAME` declares a size far larger than the bytes remaining in the stream. FRAME remains informational for parsing, but impossible sizes are now visible as structural tamper evidence. Targeted QA:
+  - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, 46 tests.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests/test_api.py::test_scan_bytes_records_oversized_frame_notice -q` — passed, 1 test.
+- A-P2-78 — Same-item commit treats directory paths as operational input errors rather than security-critical findings. `PickleScanner.scan(path_to_dir)` now returns `success=False`, `operational_error=True`, and an INFO failed check with `operational_error_reason=path_is_directory`. Targeted QA:
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py::test_scan_directory_reports_operational_error_without_critical_issue -q` — passed, 1 test.
+- A-P2-79 — Same-item commit expands the standalone release matrix with macOS x86_64 and Linux aarch64 wheel jobs and updates the standalone README wheel/fallback text. Targeted QA:
+  - YAML/docs-only change; covered by `git diff --check` in final QA.
+  - Final combined QA after all A-P1/A-P2 follow-ups: `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests/test_api.py tests/scanners/test_pickle_scanner.py tests/scanners/test_picklescan_adapter.py tests/utils/file/test_filetype.py -q` — passed, 395 tests.
 - N-P0-3 — Same-item commit removes the global raw-window documentation short-circuit, records documentation-like pickle literal spans, and filters only matches that fall inside documentation spans or comment-like lines. Targeted QA:
   - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
@@ -1218,6 +1265,7 @@ This section is the active implementation log for follow-up commits after revisi
 - R-P2-40 — Resolved decision: direct PyO3 `pybridge` cargo tests require an embedded-Python initialization strategy; a naive `Python::initialize()` unit test failed with `ModuleNotFoundError: No module named 'encodings'` from the cargo test binary. Keep bridge behavior covered through Python package tests unless/until the Rust test harness sets a reliable Python home/path.
 - A-P1-68 — Closure audit found P-P1-42a was not listed in the active tracker and was still reproducible; fixed by keeping one legacy raw builtins issue per `eval`/`exec`/`__import__` evidence item instead of emitting a duplicate generic `S201`.
 - A-P1-69 — Adversarial probes found P-P1-41 was still reproducible for `base64("eval(x)")`; fixed by lowering bounded base64 token thresholds in both root raw and Rust string scanning and adding root/standalone regressions.
+- 2026-04-13 A-P1/A-P2 pass — No unresolved new gaps found. The pass did uncover two sub-issues while validating A-P1-70 (raw nested candidates with benign bytes after `STOP`, and escaped-hex data-only nested payloads tripping the generic `hex escape` warning); both were fixed under A-P1-70 and covered by standalone API regressions.
 
 ---
 

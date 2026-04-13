@@ -209,6 +209,9 @@ def test_pickle_report_to_scan_result_preserves_legacy_builtin_call_rule_alias(
     assert [issue.rule_code for issue in result.issues] == [expected_primary_rule, "S201"]
     assert all(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
     assert all(issue.details["legacy_rule_aliases"] == ["S115"] for issue in result.issues)
+    assert result.issues[0].details.get("supporting_rule_code") is None
+    assert result.issues[1].details["supporting_rule_code"] is True
+    assert result.issues[1].details["primary_rule_code"] == expected_primary_rule
 
 
 def test_pickle_report_to_scan_result_preserves_warning_dangerous_calls() -> None:

@@ -86,6 +86,9 @@ _COMPRESSED_EXTENSION_CODECS = {
     ".zlib": "zlib",
 }
 
+_MIN_BINARY_PICKLE_PROTOCOL = 2
+_MAX_FORWARD_COMPAT_BINARY_PICKLE_PROTOCOL = 6
+
 # Pickle protocol 0/1 GLOBAL opcode signatures used for .bin fallback detection.
 # Format: c<module>\n<name>\n
 PROTOCOL0_GLOBAL_RE = re.compile(rb"^c[^\n\r]{1,64}\n[^\n\r]{1,64}\n")
@@ -135,6 +138,16 @@ PROTO0_1_TRIVIAL_LEADING_OPCODES: frozenset[str] = frozenset(
         "SHORT_BINUNICODE",
     },
 )
+
+
+def _looks_like_binary_pickle_protocol(header: bytes) -> bool:
+    return (
+        len(header) >= 2
+        and header[0] == 0x80
+        and _MIN_BINARY_PICKLE_PROTOCOL <= header[1] <= _MAX_FORWARD_COMPAT_BINARY_PICKLE_PROTOCOL
+    )
+
+
 SAFETENSORS_MAX_HEADER_BYTES: int = 100 * 1024 * 1024
 
 
@@ -803,12 +816,8 @@ def detect_format_from_magic_bytes(
     if any(magic16.startswith(marker) for marker in R_SERIALIZATION_MARKERS):
         return "r_serialized"
 
-    # Check pickle magic bytes using pattern matching
-    match magic4[:2]:
-        case b"\x80\x02" | b"\x80\x03" | b"\x80\x04" | b"\x80\x05":
-            return "pickle"
-        case _:
-            pass
+    if _looks_like_binary_pickle_protocol(magic4):
+        return "pickle"
     if _looks_like_safetensors_structure(file_path, magic8, file_size):
         return "safetensors"
 
@@ -1000,14 +1009,7 @@ def detect_file_format(path: str) -> str:
             return "torchserve_mar"
         return "zip"
 
-    # Check pickle magic patterns
-    pickle_magics = [
-        b"\x80\x02",  # Protocol 2
-        b"\x80\x03",  # Protocol 3
-        b"\x80\x04",  # Protocol 4
-        b"\x80\x05",  # Protocol 5
-    ]
-    if any(magic4.startswith(m) for m in pickle_magics):
+    if _looks_like_binary_pickle_protocol(magic4):
         return "pickle"
     pickle_probe_sample = _read_pickle_probe_sample(file_path, size, magic16)
     if _looks_like_proto0_or_1_pickle(
@@ -1024,8 +1026,7 @@ def detect_file_format(path: str) -> str:
         # IMPORTANT: Check ZIP format first (PyTorch models saved with torch.save())
         if magic4.startswith(b"PK"):
             return "zip"
-        # Check if it's a pickle file (protocol 2-5)
-        if any(magic4.startswith(m) for m in pickle_magics):
+        if _looks_like_binary_pickle_protocol(magic4):
             return "pickle"
         # CVE-2025-10155: Detect protocol 0/1 pickles that lack magic bytes.
         # Protocol 0 GLOBAL opcode: c<module>\n<name>\n

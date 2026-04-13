@@ -111,6 +111,18 @@ def test_scan_safe_pickle_uses_rust_engine_and_preserves_integrity_metadata(tmp_
     assert not [issue for issue in result.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}]
 
 
+def test_scan_directory_reports_operational_error_without_critical_issue(tmp_path: Path) -> None:
+    result = PickleScanner().scan(str(tmp_path))
+
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "path_is_directory"
+    assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+    assert any(
+        issue.message == "Path is a directory, not a pickle file" and issue.severity == IssueSeverity.INFO
+        for issue in result.issues
+    )
+
+
 def test_scan_large_low_information_pickle_skips_expensive_raw_detectors(tmp_path: Path) -> None:
     path = tmp_path / "large-safe.pkl"
     path.write_bytes(pickle.dumps({"blob": "A" * (2 * 1024 * 1024)}, protocol=4))
@@ -120,6 +132,17 @@ def test_scan_large_low_information_pickle_skips_expensive_raw_detectors(tmp_pat
     assert result.metadata["pickle_primary_engine"] == "rust"
     assert result.metadata["pickle_expensive_raw_detectors_skipped"] is True
     assert result.metadata["pickle_expensive_raw_detector_skip_reason"] == "rust_complete_clean_no_expensive_raw_seeds"
+
+
+def test_expensive_raw_skip_requires_clean_complete_rust_result() -> None:
+    scanner = PickleScanner()
+    clean_result = ScanResult(scanner_name="pickle")
+    clean_result.metadata.update({"pickle_report_status": "complete", "pickle_verdict": "clean"})
+    suspicious_result = ScanResult(scanner_name="pickle")
+    suspicious_result.metadata.update({"pickle_report_status": "complete", "pickle_verdict": "suspicious"})
+
+    assert scanner._should_skip_expensive_raw_detectors(clean_result, b"A" * 128) is True
+    assert scanner._should_skip_expensive_raw_detectors(suspicious_result, b"A" * 128) is False
 
 
 def test_expensive_raw_prefilters_preserve_secret_and_network_findings(tmp_path: Path) -> None:
@@ -155,6 +178,56 @@ def test_expensive_raw_prefilters_skip_plain_key_substrings(tmp_path: Path) -> N
     result = PickleScanner().scan(str(path))
 
     assert result.metadata["pickle_expensive_raw_detectors_skipped"] is True
+
+
+def test_expensive_raw_prefilters_skip_generic_secret_words_without_values(tmp_path: Path) -> None:
+    path = tmp_path / "generic-secret-words.pkl"
+    path.write_bytes(
+        pickle.dumps(
+            {
+                "apigateway": "metadata",
+                "use_auth_token": False,
+                "secret_key": "not a secret value",
+                "password_policy": "disabled in fixture metadata",
+            },
+            protocol=4,
+        )
+    )
+
+    result = PickleScanner().scan(str(path))
+
+    assert result.metadata["pickle_expensive_raw_detectors_skipped"] is True
+
+
+def test_expensive_raw_prefilters_skip_huggingface_style_metadata_without_values(tmp_path: Path) -> None:
+    path = tmp_path / "hf-style-metadata.pkl"
+    path.write_bytes(
+        pickle.dumps(
+            {
+                "__version__": "4.37.0",
+                "auto_map": {"AutoModelForCausalLM": "modeling_llama.LlamaForCausalLM"},
+                "use_auth_token": None,
+                "api_key": None,
+                "state_dict": "A" * (2 * 1024 * 1024),
+            },
+            protocol=4,
+        )
+    )
+
+    result = PickleScanner().scan(str(path))
+
+    assert result.metadata["pickle_expensive_raw_detectors_skipped"] is True
+    assert not result.issues
+
+
+def test_expensive_raw_prefilters_preserve_structured_secret_assignments(tmp_path: Path) -> None:
+    path = tmp_path / "structured-secret.pkl"
+    path.write_bytes(pickle.dumps({"env": "password=CorrectHorseBattery42"}, protocol=4))
+
+    result = PickleScanner().scan(str(path))
+
+    assert any(check.name == "Embedded Secrets Detection" for check in result.checks)
+    assert not result.metadata.get("pickle_secrets_raw_detector_skipped")
 
 
 def test_scan_malicious_pickle_reports_rust_finding(tmp_path: Path) -> None:

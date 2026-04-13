@@ -424,6 +424,12 @@ jobs:
           - os: macos-14
             artifact-suffix: macos-arm64
             build-sdist: "false"
+          - os: macos-15-intel
+            artifact-suffix: macos-x86_64
+            build-sdist: "false"
+          - os: ubuntu-24.04-arm
+            artifact-suffix: linux-aarch64
+            build-sdist: "false"
           - os: windows-latest
             artifact-suffix: windows
             build-sdist: "false"

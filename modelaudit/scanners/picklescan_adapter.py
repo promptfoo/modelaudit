@@ -665,13 +665,18 @@ def _add_legacy_supporting_finding_checks(
                 "__import__",
             }
         ):
+            supporting_details = {
+                **details,
+                "supporting_rule_code": True,
+                "primary_rule_code": primary_rule_code,
+            }
             result.add_check(
                 name="REDUCE Opcode Safety Check",
                 passed=False,
                 message=finding.message,
                 severity=severity,
                 location=finding.location,
-                details=details,
+                details=supporting_details,
                 why=_legacy_why_for_finding(finding),
                 rule_code="S201",
             )
