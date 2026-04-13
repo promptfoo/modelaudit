@@ -524,7 +524,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] R-P1-34 — Rebuild notice dedupe state if notices are ever coalesced.
 - [x] R-P1-38 — Document or raise `DEFAULT_MAX_NESTED_DEPTH`.
 - [x] R-P1-39 — Add more Rust unit coverage for dispatch, policy, report, and bridge behavior.
-- [ ] R-P2-40 — Decide whether to support embedded-Python cargo tests for `pybridge`; bridge coverage currently runs through Python package tests.
+- [x] R-P2-40 — Decide whether to support embedded-Python cargo tests for `pybridge`; bridge coverage currently runs through Python package tests.
 - [x] T-P1-51 / T-P1-52 — Strengthen parity/fuzz tests with expected verdicts.
 - [x] T-P1-53 / T-P1-66 — Restore multi-stream regression coverage.
 - [x] T-P1-54 — Replace Rust policy source-text tests with functional tests.
@@ -773,6 +773,9 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run ruff check packages/modelaudit-picklescan/tests/test_api.py` — passed.
   - `uv run mypy packages/modelaudit-picklescan/tests/test_api.py` — passed.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests/test_api.py::test_scan_file_detects_malicious_pytorch_zip_data_pickle -q` — passed, 1 test.
+- R-P2-40 — Same-item commit records the decision not to add direct embedded-Python cargo tests for `pybridge` in this PR. The PyO3 bridge remains covered through Python package tests after native extension build, while pure Rust parser/state/policy/report behavior remains covered by `cargo test`; direct embedded cargo tests can be reconsidered only with a stable Python-home/path harness. Targeted QA:
+  - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, 42 tests.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests/test_native_interface.py packages/modelaudit-picklescan/tests/test_report.py -q` — passed, 10 tests.
 - N-P0-3 — Same-item commit removes the global raw-window documentation short-circuit, records documentation-like pickle literal spans, and filters only matches that fall inside documentation spans or comment-like lines. Targeted QA:
   - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
@@ -1003,7 +1006,7 @@ This section is the active implementation log for follow-up commits after revisi
 ### Newly discovered gaps while remediating
 
 - N-P0-34 — Follow-on stream probing could recurse through pickle-like binary tails; fixed and tracked in the remediation checklist above.
-- R-P2-40 — Direct PyO3 `pybridge` cargo tests currently require an embedded-Python initialization strategy; a naive `Python::initialize()` unit test failed with `ModuleNotFoundError: No module named 'encodings'` from the cargo test binary. Keep bridge behavior covered through Python package tests unless/until the Rust test harness sets a reliable Python home/path.
+- R-P2-40 — Resolved decision: direct PyO3 `pybridge` cargo tests require an embedded-Python initialization strategy; a naive `Python::initialize()` unit test failed with `ModuleNotFoundError: No module named 'encodings'` from the cargo test binary. Keep bridge behavior covered through Python package tests unless/until the Rust test harness sets a reliable Python home/path.
 
 ---
 
