@@ -545,7 +545,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] S-P2-19 — Reduce Python/Rust dangerous-policy drift.
 - [x] S-D2-29 — Document Rust toolchain requirement in contributor setup.
 - [x] S-D2-30 — Add standalone package project URLs.
-- [ ] S-D2-33 — Validate standalone `uv.lock` in CI.
+- [x] S-D2-33 — Validate standalone `uv.lock` in CI.
 - [ ] S-D2-34 — Run standalone `cargo test` in nightly/perf workflows.
 - [ ] S-D2-35 — Install Rust before release-please standalone lock refresh.
 - [ ] S-D2-37 — Add future annotations to large-corpus QA test.
@@ -742,6 +742,10 @@ This section is the active implementation log for follow-up commits after revisi
   - `npx prettier --check CONTRIBUTING.md` — passed.
 - S-D2-30 — Same-item commit expands the standalone package `[project.urls]` metadata with Documentation and Security links in addition to homepage/repository/issues/changelog. Targeted QA:
   - `uv run python - <<'PY' ... tomllib.loads(...)[\"project\"][\"urls\"] ... PY` — passed, parsed the package TOML and confirmed Homepage, Documentation, Repository, Issues, Changelog, and Security are present.
+- S-D2-33 — Same-item commit adds standalone package `pyproject.toml` and `uv.lock` paths to the dependency path filter so the existing `uv-lock-check` job runs when standalone lock inputs change. Targeted QA:
+  - `npx prettier --check .github/workflows/test.yml` — passed.
+  - `uv lock --check` — passed at repo root.
+  - `(cd packages/modelaudit-picklescan && uv lock --check)` — passed.
 - N-P0-3 — Same-item commit removes the global raw-window documentation short-circuit, records documentation-like pickle literal spans, and filters only matches that fall inside documentation spans or comment-like lines. Targeted QA:
   - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.

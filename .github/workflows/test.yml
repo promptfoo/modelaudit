@@ -52,6 +52,8 @@ jobs:
             dependencies:
               - 'pyproject.toml'
               - 'uv.lock'
+              - 'packages/modelaudit-picklescan/pyproject.toml'
+              - 'packages/modelaudit-picklescan/uv.lock'
 
   lint:
     name: Lint and Format
