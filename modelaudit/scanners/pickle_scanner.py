@@ -674,7 +674,6 @@ def _pickle_opcode_summary(data: bytes) -> dict[str, Any]:
     opcode_counts: dict[str, int] = {}
     stack: list[str | None] = []
     memo: dict[int, str | None] = {}
-    next_memo_index = 0
     dangerous_globals: list[str] = []
     protocol: int | None = None
     total_opcodes = 0
@@ -704,14 +703,12 @@ def _pickle_opcode_summary(data: bytes) -> dict[str, Any]:
                 continue
             if name == "MEMOIZE":
                 if stack:
-                    memo[next_memo_index] = stack[-1]
-                next_memo_index += 1
+                    memo[len(memo)] = stack[-1]
                 continue
             if name in {"PUT", "BINPUT", "LONG_BINPUT"}:
                 index = _memo_index(arg)
                 if index is not None and stack:
                     memo[index] = stack[-1]
-                    next_memo_index = max(next_memo_index, index + 1)
                 continue
             if name in {"GET", "BINGET", "LONG_BINGET"}:
                 index = _memo_index(arg)

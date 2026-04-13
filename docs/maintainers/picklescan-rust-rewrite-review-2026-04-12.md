@@ -1073,7 +1073,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] V5-P1-13 — Close N5-R18 by capping import-reference metadata and surfacing truncation as a notice.
 - [x] V5-P1-14 — Close N5-R19 by accepting uppercase escaped-hex pickle prefixes.
 - [x] V5-P1-15 — Close N5-SEC-F5 by detecting wrapped/multiline encoded nested pickles.
-- [ ] V5-P1-16 — Close N5-SEC-F6 by aligning `_pickle_opcode_summary` implicit MEMOIZE indexing with CPython.
+- [x] V5-P1-16 — Close N5-SEC-F6 by aligning `_pickle_opcode_summary` implicit MEMOIZE indexing with CPython.
 - [ ] V5-P1-17 — Close N5-SEC-F9 by collapsing persistent-id warning spam into a counted notice.
 - [ ] V5-P1-18 — Close N5-PY1-1 / N5-PY1-4 by making non-seekable stream truncation explicit for known and unknown sizes.
 - [ ] V5-P1-19 — Close N5-PY1-2 by scanning binary tails for stream-backed pickle content beyond the raw window.
@@ -1177,6 +1177,11 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run ruff check packages/modelaudit-picklescan/tests/test_api.py` — passed.
   - `uv run pip install -e packages/modelaudit-picklescan` — passed, rebuilt the editable native extension for Python API QA.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests/test_api.py -q -k "comment_wrapped_base64"` — passed, 1 test.
+- V5-P1-16 — Same-item commit aligns the Python metadata-only opcode summary with CPython MEMOIZE semantics by storing implicit memo entries at `len(memo)` rather than `max(explicit_put)+1`. Targeted QA:
+  - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `uv run mypy modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py -q -k "memoize_indexing or memoized_stack_global"` — passed, 2 tests.
 - N-P0-1 — Same-item commit adds a bounded `_RootStreamPayloadRead` result for non-seekable root stream buffering, records truncation metadata, and emits an `S902` warning instead of raising when the stream exceeds the root raw-scan cap. Targeted QA:
   - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.

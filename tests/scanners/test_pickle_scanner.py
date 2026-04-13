@@ -968,6 +968,14 @@ def test_opcode_summary_tracks_memoized_stack_global_through_structure(tmp_path:
     )
 
 
+def test_opcode_summary_uses_cpython_memoize_indexing_after_explicit_put() -> None:
+    payload = b"\x80\x04\x8c\x02osq\x05\x8c\x06system\x94h\x05h\x01\x93."
+
+    summary = _pickle_opcode_summary(payload)
+
+    assert summary["dangerous_globals"] == ["os.system"]
+
+
 def test_scan_stream_enforces_size_limit() -> None:
     payload = pickle.dumps({"safe": True}, protocol=4)
 
