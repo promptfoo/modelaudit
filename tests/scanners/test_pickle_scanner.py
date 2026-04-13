@@ -6,6 +6,8 @@ import pickle
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from modelaudit.scanners.base import IssueSeverity, ScanResult
 from modelaudit.scanners.pickle_scanner import (
     ALWAYS_DANGEROUS_FUNCTIONS,
@@ -26,6 +28,12 @@ class MaliciousPayload:
 class NonSeekableBytesIO(io.BytesIO):
     def seekable(self) -> bool:
         return False
+
+
+def _short_binunicode(data: bytes) -> bytes:
+    if len(data) > 0xFF:
+        raise ValueError("SHORT_BINUNICODE helper accepts at most 255 bytes")
+    return b"\x8c" + bytes([len(data)]) + data
 
 
 def test_pickle_scanner_star_import_exports_scanner_class() -> None:
@@ -200,6 +208,59 @@ def test_scan_stream_documentation_padding_does_not_suppress_raw_structural_evid
         issue.details.get("source") == "bounded_raw_pickle_window"
         and issue.details.get("associated_global") in {"os.system", "posix.system", "nt.system"}
         for issue in result.issues
+    )
+
+
+@pytest.mark.parametrize(
+    ("payload_tail", "expected_reference"),
+    [
+        (b"cpip\nmain\n)R.", "pip.main"),
+        (b"c__main__\nEvil\n)R.", "__main__.Evil"),
+        (b"ctorch\nload\n)R.", "torch.load"),
+        (b"cbuiltins\neval\n)R.", "builtins.eval"),
+        (b"cbuiltins\nexec\n)R.", "builtins.exec"),
+        (b"cdill\nloads\n)R.", "dill.loads"),
+    ],
+)
+def test_comment_token_does_not_bypass_dangerous_reduce_detection(
+    tmp_path: Path,
+    payload_tail: bytes,
+    expected_reference: str,
+) -> None:
+    comment_prefix = _short_binunicode(b"# benign comment token") + b"0"
+    path = tmp_path / f"{expected_reference.replace('.', '_')}_comment_reduce.pkl"
+    path.write_bytes(b"\x80\x02" + comment_prefix + payload_tail)
+
+    result = PickleScanner().scan(str(path))
+
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("associated_global") == expected_reference
+        and issue.details.get("opcode") == "REDUCE"
+        for issue in result.issues
+    ), (
+        f"Expected {expected_reference} detection despite comment token, "
+        f"got: {[issue.message for issue in result.issues]}"
+    )
+
+
+def test_comment_token_does_not_bypass_main_stack_global_detection(tmp_path: Path) -> None:
+    comment_prefix = _short_binunicode(b"# benign comment token") + b"0"
+    path = tmp_path / "main_stack_global_comment.pkl"
+    path.write_bytes(
+        b"\x80\x04" + comment_prefix + _short_binunicode(b"__main__") + _short_binunicode(b"CustomType") + b"\x93."
+    )
+
+    result = PickleScanner().scan(str(path))
+
+    assert any(
+        issue.severity == IssueSeverity.WARNING
+        and issue.details.get("associated_global") == "__main__.CustomType"
+        and issue.details.get("opcode") == "STACK_GLOBAL"
+        for issue in result.issues
+    ), (
+        "Expected __main__ STACK_GLOBAL warning despite comment token, "
+        f"got: {[issue.message for issue in result.issues]}"
     )
 
 

@@ -488,7 +488,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] P1-DUNDER-WALKER — Reduce benign user-dunder false positives.
 - [x] P1-NESTED-DEPTH — Raise nested depth or fail closed when nested analysis depth is exhausted.
 - [x] T-P1-WHEEL — Add missing macOS x86_64 and Linux aarch64 wheel coverage or document the gap.
-- [ ] T-P2-COMMENT — Restore missing comment-token bypass regression coverage.
+- [x] T-P2-COMMENT — Restore missing comment-token bypass regression coverage.
 - [ ] T-P2-EXPANSION — Restore expansion/memo-growth regression coverage.
 - [ ] T-P2-STRUCTURAL — Restore structural tamper / duplicate-PROTO regression coverage.
 - [ ] P2-STALE-PYCACHE — Remove stale `_parity_corpus` pycache artifact or ignore it explicitly.
@@ -616,6 +616,12 @@ This section is the active implementation log for follow-up commits after revisi
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests/test_api.py -q` — passed, 143 tests, including default two-layer base64 nested malicious-payload coverage.
 - T-P1-WHEEL — Same-item commit documents the remaining macOS x86_64 and Linux aarch64 wheel gap in the standalone package README, including the sdist/local-Rust fallback. Targeted QA:
   - `git diff --check` — passed.
+- T-P2-COMMENT — Same-item commit restores comment-token bypass regressions for `pip.main`, `__main__.*`, `torch.load`, `builtins.eval`, `builtins.exec`, and `dill.loads`, plus a `__main__` `STACK_GLOBAL` warning case. Targeted QA:
+  - `uv run ruff format tests/scanners/test_pickle_scanner.py` — passed.
+  - `uv run ruff format --check tests/scanners/test_pickle_scanner.py` — passed.
+  - `uv run ruff check tests/scanners/test_pickle_scanner.py` — passed.
+  - `uv run mypy tests/scanners/test_pickle_scanner.py` — passed.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py -q` — passed, 42 tests.
 
 ### Newly discovered gaps while remediating
 
