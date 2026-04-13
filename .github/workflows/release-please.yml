@@ -469,18 +469,6 @@ jobs:
         run: |
           uv lock --check
 
-      - name: Lint standalone package with Ruff
-        run: uv run --with ruff ruff check src tests
-
-      - name: Check standalone package formatting with Ruff
-        run: uv run --with ruff ruff format --check src tests
-
-      - name: Type check standalone package with mypy
-        run: uv run --with mypy mypy src tests
-
-      - name: Run standalone package tests
-        run: uv run --with pytest --with pytest-xdist pytest -n auto tests --tb=short
-
       - name: Check Rust scanner formatting
         run: cargo fmt --manifest-path Cargo.toml -- --check
 
@@ -493,6 +481,18 @@ jobs:
       - name: Test Rust scanner crate
         run: |
           cargo test --manifest-path Cargo.toml
+
+      - name: Lint standalone package with Ruff
+        run: uv run --with ruff ruff check src tests
+
+      - name: Check standalone package formatting with Ruff
+        run: uv run --with ruff ruff format --check src tests
+
+      - name: Type check standalone package with mypy
+        run: uv run --with mypy mypy src tests
+
+      - name: Run standalone package tests
+        run: uv run --with pytest --with pytest-xdist pytest -n auto tests --tb=short
 
       - name: Build standalone package sdist
         if: matrix.build-sdist == 'true'
