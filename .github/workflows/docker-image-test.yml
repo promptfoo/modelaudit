@@ -42,6 +42,7 @@ jobs:
               - 'uv.lock'
             full-image:
               - 'Dockerfile.full'
+              - 'packages/modelaudit-picklescan/**'
 
   build-test-lightweight:
     name: Build and Test Lightweight Docker Image

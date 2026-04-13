@@ -18,6 +18,13 @@ _MAX_PYTORCH_ZIP_ENTRIES = 10_000
 _MAX_PYTORCH_ZIP_PICKLE_MEMBER_BYTES = 512 * 1024 * 1024
 
 
+class _StreamShortReadError(ValueError):
+    def __init__(self, *, expected_size: int, bytes_read: int) -> None:
+        super().__init__("Stream ended before the declared size was read")
+        self.expected_size = expected_size
+        self.bytes_read = bytes_read
+
+
 class PickleScanner:
     """State-light scanner facade configured only by scan options.
 
@@ -52,6 +59,15 @@ class PickleScanner:
                 stream,
                 normalized_size,
                 max_unbounded_read_bytes=self.options.max_unbounded_stream_read_bytes,
+            )
+        except _StreamShortReadError as error:
+            return _io_error_report(
+                source=source,
+                message=f"Could not read pickle stream: {error!s}",
+                category="short_read",
+                exception=error,
+                bytes_scanned=error.bytes_read,
+                bytes_total=error.expected_size,
             )
         except Exception as error:
             return _io_error_report(
@@ -443,15 +459,17 @@ def _read_stream_payload(
                     break
                 spool.write(chunk)
                 remaining -= len(chunk)
-            else:
+            if remaining == 0 and stream.read(1):
                 raise ValueError("Unbounded stream exceeded max_unbounded_stream_read_bytes")
         else:
             remaining = size
+            bytes_read = 0
             while remaining > 0:
                 chunk = stream.read(min(_RUST_STREAM_READ_CHUNK_SIZE, remaining))
                 if not chunk:
-                    break
+                    raise _StreamShortReadError(expected_size=size, bytes_read=bytes_read)
                 spool.write(chunk)
+                bytes_read += len(chunk)
                 remaining -= len(chunk)
 
         spool.seek(0)

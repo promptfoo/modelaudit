@@ -487,7 +487,7 @@ def test_scan_stream_standalone_primary_does_not_inherit_legacy_operational_fail
     )
 
 
-def test_scan_stream_does_not_run_legacy_parse_fallback(
+def test_scan_stream_fails_closed_when_compatibility_parse_fallback_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     payload = pickle.dumps({"safe": True}, protocol=4)
@@ -517,11 +517,13 @@ def test_scan_stream_does_not_run_legacy_parse_fallback(
 
     result = scanner.scan_stream(BytesIO(payload), len(payload), source="standalone-clean.pkl")
 
-    assert result.success is True
+    assert result.success is False
     assert result.has_warnings is False
     assert result.has_errors is False
     assert result.metadata["pickle_primary_engine"] == "standalone"
-    assert "legacy_compatibility_failed" not in result.metadata
+    assert result.metadata["compatibility_analysis_failed"] is True
+    assert result.metadata["compatibility_analysis_failure"]["exception_type"] == "AssertionError"
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
 
 
 def test_scan_stream_resets_post_budget_global_state_before_reused_scanner_scan() -> None:
@@ -6299,7 +6301,9 @@ def test_recursion_limited_pickle_marks_inconclusive(tmp_path: Path, monkeypatch
     assert limitation_checks == []
     assert result.metadata["compatibility_analysis_failed"] is True
     assert result.metadata["compatibility_analysis_failure"]["exception_type"] == "RecursionError"
-    assert result.success is True
+    assert result.success is False
+    assert result.metadata["analysis_incomplete"] is True
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
@@ -6320,9 +6324,11 @@ def test_recursion_limited_pickle_directory_scan_returns_inconclusive_exit_code(
     metadata = results.file_metadata[str(model_path)]
     assert metadata["compatibility_analysis_failed"] is True
     assert metadata["compatibility_analysis_failure"]["exception_type"] == "RecursionError"
+    assert metadata["analysis_incomplete"] is True
+    assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert results.has_errors is False
-    assert results.success is True
-    assert determine_exit_code(results) == 0
+    assert results.success is False
+    assert determine_exit_code(results) == 2
 
 
 def test_non_recursion_exception_with_security_findings_avoids_limitation_note(

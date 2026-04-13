@@ -488,10 +488,6 @@ def _merge_missing_pickle_checks(
             ]
             if len(retained_checks) != len(target.checks):
                 target.checks = retained_checks
-                existing_check_signatures = {
-                    _pickle_check_signature(existing_check) for existing_check in target.checks
-                }
-                existing_check_identities = _pickle_record_identity_map(target.checks)
             if len(retained_issues) != len(target.issues):
                 target.issues = retained_issues
                 existing_issue_signatures = {
@@ -4576,7 +4572,14 @@ class PickleScanner(BaseScanner):
                 "exception_type": type(error).__name__,
                 "message": str(error),
             }
+            package_result.metadata["analysis_incomplete"] = True
+            _mark_inconclusive_scan_result(package_result, "compatibility_analysis_failed")
             package_result.metadata["pickle_primary_engine"] = "standalone"
+            _finish_with_inconclusive_contract(
+                package_result,
+                default_success=False,
+                allow_security_findings_override=True,
+            )
             return package_result
 
         with contextlib.suppress(AttributeError, OSError, ValueError):

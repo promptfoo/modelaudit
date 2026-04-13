@@ -11,7 +11,7 @@ impl ArgValue {
     pub(crate) fn as_i64(&self) -> Option<i64> {
         match self {
             ArgValue::Int(value) => Some(*value),
-            ArgValue::UInt(value) => Some(*value as i64),
+            ArgValue::UInt(value) => i64::try_from(*value).ok(),
             ArgValue::Text(value) => value.parse::<i64>().ok(),
             _ => None,
         }

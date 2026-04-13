@@ -88,6 +88,10 @@ def test_rust_policy_tables_keep_required_security_coverage() -> None:
     wildcard_modules = _rust_string_array(source, "DANGEROUS_WILDCARD_MODULES")
     dangerous_globals = _rust_tuple_array(source, "DANGEROUS_GLOBALS")
 
+    assert builtin_names, "Failed to extract BUILTIN_DANGEROUS_NAMES from Rust source"
+    assert wildcard_modules, "Failed to extract DANGEROUS_WILDCARD_MODULES from Rust source"
+    assert dangerous_globals, "Failed to extract DANGEROUS_GLOBALS from Rust source"
+
     assert {"eval", "exec", "getattr", "open", "__import__"} <= builtin_names
     assert {"os", "posix", "subprocess", "socket", "ctypes", "pickle"} <= wildcard_modules
     assert {

@@ -28,6 +28,12 @@ from modelaudit_picklescan import (
 SYSTEM_GLOBALS = frozenset({"nt.system", "os.system", "posix.system"})
 
 
+def _corrupt_first_byte(payload: bytes) -> bytes:
+    corrupted = bytearray(payload)
+    corrupted[0] ^= 0xFF
+    return bytes(corrupted)
+
+
 class MaliciousPayload:
     def __reduce__(self) -> tuple[object, tuple[str]]:
         return (os.system, ("echo pwned",))
@@ -527,6 +533,20 @@ def test_scan_stream_honors_explicit_reads_without_declared_size() -> None:
     assert report.coverage.bytes_scanned == len(payload)
 
 
+def test_scan_stream_allows_unknown_size_stream_at_exact_total_cap() -> None:
+    payload = pickle.dumps(b"a" * 64, protocol=4)
+
+    report = PickleScanner(ScanOptions(max_unbounded_stream_read_bytes=len(payload))).scan_stream(
+        io.BytesIO(payload),
+        source="unknown-size-exact-cap.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.errors == ()
+    assert report.coverage.bytes_scanned == len(payload)
+
+
 def test_scan_stream_enforces_total_unbounded_stream_read_limit() -> None:
     payload = pickle.dumps(b"a" * 64, protocol=4)
 
@@ -954,6 +974,21 @@ def test_scan_bytes_flags_raw_nested_pickle_payload_hidden_inside_large_literal(
     assert any(finding.rule_code == "S213" for finding in report.findings)
 
 
+def test_scan_bytes_ignores_invalid_raw_nested_pickle_near_match_hidden_inside_large_literal() -> None:
+    nested_payload = _corrupt_first_byte(pickle.dumps({"inner": "data"}, protocol=4))
+    hidden_payload = b"A" * 64 + nested_payload + b"B" * 64
+
+    report = scan_bytes(
+        pickle.dumps({"outer": hidden_payload}, protocol=4),
+        source="hidden-raw-nested-near-match.pkl",
+        options=ScanOptions(max_nested_pickle_bytes=len(nested_payload) + 16),
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert all(finding.rule_code != "S213" for finding in report.findings)
+
+
 def test_scan_bytes_surfaces_nested_pickle_inner_findings() -> None:
     nested_payload = pickle.dumps(MaliciousPayload(), protocol=4)
 
@@ -1091,6 +1126,22 @@ def test_scan_bytes_flags_base64_nested_pickle_payload_hidden_inside_large_liter
     assert any(finding.rule_code == "S601" for finding in report.findings)
 
 
+def test_scan_bytes_ignores_invalid_base64_nested_pickle_near_match_hidden_inside_large_literal() -> None:
+    nested_payload = _corrupt_first_byte(pickle.dumps({"inner": "data"}, protocol=4))
+    hidden_payload = "A" * 64 + base64.b64encode(nested_payload).decode("ascii") + "A" * 64
+
+    report = scan_bytes(
+        pickle.dumps({"outer": hidden_payload}, protocol=4),
+        source="hidden-base64-nested-near-match.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=8),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.findings == ()
+    assert any(notice.code == "literal_scan_truncated" for notice in report.notices)
+
+
 def test_scan_bytes_flags_hex_encoded_nested_pickle_payloads() -> None:
     nested_payload = pickle.dumps({"inner": "data"}, protocol=4)
     report = scan_bytes(
@@ -1115,6 +1166,22 @@ def test_scan_bytes_flags_hex_nested_pickle_payload_hidden_inside_large_literal(
 
     assert report.verdict == SafetyVerdict.MALICIOUS
     assert any(finding.rule_code == "S602" for finding in report.findings)
+
+
+def test_scan_bytes_ignores_invalid_hex_nested_pickle_near_match_hidden_inside_large_literal() -> None:
+    nested_payload = _corrupt_first_byte(pickle.dumps({"inner": "data"}, protocol=4))
+    hidden_payload = "A" * 64 + binascii.hexlify(nested_payload).decode("ascii") + "A" * 64
+
+    report = scan_bytes(
+        pickle.dumps({"outer": hidden_payload}, protocol=4),
+        source="hidden-hex-nested-near-match.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=8),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.findings == ()
+    assert any(notice.code == "literal_scan_truncated" for notice in report.notices)
 
 
 def test_scan_bytes_flags_escaped_hex_encoded_nested_pickle_payloads() -> None:
