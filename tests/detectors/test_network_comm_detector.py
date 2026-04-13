@@ -1,12 +1,14 @@
 """Tests for network communication detection."""
 
+from urllib.parse import urlparse
+
 from modelaudit.detectors.network_comm import NetworkCommDetector, detect_network_communication
 
 
 class TestNetworkCommDetector:
     """Test the NetworkCommDetector class."""
 
-    def test_detect_urls(self):
+    def test_detect_urls(self) -> None:
         """Test detection of URLs in binary data."""
         detector = NetworkCommDetector()
 
@@ -27,7 +29,7 @@ class TestNetworkCommDetector:
         # Check specific URLs are detected
         urls = [f["url"] for f in url_findings]
         assert any("example.com" in url for url in urls)
-        assert any("malware.net" in url for url in urls)
+        assert any(urlparse(url).hostname == "malware.net" for url in urls)
 
     def test_detect_urls_redacts_credentials_and_query(self) -> None:
         """URL findings should not preserve credentialed or signed URL secrets."""
