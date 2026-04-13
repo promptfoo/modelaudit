@@ -284,6 +284,16 @@ def test_scan_bin_file_detects_executable_tail_after_pickle_stream(tmp_path: Pat
     assert any(issue.rule_code == "S502" for issue in result.issues)
 
 
+def test_scan_pytorch_extension_detects_executable_tail_after_pickle_stream(tmp_path: Path) -> None:
+    path = tmp_path / "model.pt"
+    path.write_bytes(pickle.dumps({"safe": True}, protocol=4) + b"\x7fELF/bin/sh\x00")
+
+    result = PickleScanner().scan(str(path))
+
+    assert result.success is False
+    assert any(issue.rule_code == "S502" for issue in result.issues)
+
+
 def test_scan_bin_file_pe_tail_requires_pe_evidence(tmp_path: Path) -> None:
     path = tmp_path / "model.bin"
     path.write_bytes(pickle.dumps({"safe": True}, protocol=4) + b"MZ benign initials")

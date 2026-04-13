@@ -945,7 +945,7 @@ class PickleScanner(BaseScanner):
             result.metadata["pickle_network_raw_detector_skipped"] = True
 
     def _scan_binary_tail_if_needed(self, data: bytes, result: ScanResult, source: str) -> None:
-        if Path(source).suffix.lower() != ".bin":
+        if Path(source).suffix.lower() not in _PYTORCH_CONTAINER_EXTENSIONS:
             return
         first_pickle_end_pos = result.metadata.get("first_pickle_end_pos")
         if not isinstance(first_pickle_end_pos, int) or first_pickle_end_pos <= 0 or first_pickle_end_pos >= len(data):
