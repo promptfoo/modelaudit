@@ -190,6 +190,7 @@ def pickle_report_to_scan_result(
             severity = IssueSeverity.INFO
             details.setdefault("evidence", "nested_payload_detected")
         legacy_rule_code = _legacy_rule_code_for_finding(finding)
+        _add_legacy_rule_alias_metadata(finding, details, legacy_rule_code)
         result.add_check(
             name=_legacy_check_name_for_finding(finding),
             passed=False,
@@ -575,6 +576,23 @@ def _legacy_rule_code_for_finding(finding: Finding) -> str | None:
     return finding.rule_code
 
 
+def _add_legacy_rule_alias_metadata(
+    finding: Finding,
+    details: dict[str, Any],
+    primary_rule_code: str | None,
+) -> None:
+    if primary_rule_code == "S115" or finding.rule_code != "DANGEROUS_CALL":
+        return
+    module = finding.details.get("module")
+    name = finding.details.get("name")
+    if (
+        isinstance(module, str)
+        and module.lower() in {"__builtin__", "__builtins__", "builtins"}
+        and name in {"eval", "exec", "compile", "__import__"}
+    ):
+        details["legacy_rule_aliases"] = ["S115"]
+
+
 def _legacy_check_name_for_finding(finding: Finding) -> str:
     opcode = finding.details.get("opcode")
     if finding.rule_code in {"DANGEROUS_CALL", "DANGEROUS_GLOBAL"} and isinstance(opcode, str):
@@ -638,16 +656,7 @@ def _add_legacy_supporting_finding_checks(
                 rule_code="S201",
             )
             if primary_rule_code != "S115":
-                result.add_check(
-                    name="REDUCE Opcode Safety Check",
-                    passed=False,
-                    message=finding.message,
-                    severity=severity,
-                    location=finding.location,
-                    details={**details, "legacy_rule_alias": True},
-                    why=_legacy_why_for_finding(finding),
-                    rule_code="S115",
-                )
+                details.setdefault("legacy_rule_aliases", ["S115"])
         return
 
     if finding.rule_code == "DANGEROUS_GLOBAL":

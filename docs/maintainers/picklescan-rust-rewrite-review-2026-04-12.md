@@ -480,7 +480,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] N-P0-4 — Prevent documentation-like `_rebuild_tensor` literals from suppressing real CVE-2026-24747 GLOBAL evidence.
 - [x] N-P0-5 — Clamp user-controlled Rust timeout values before `Duration::from_secs_f64`.
 - [x] N-P0-6 — Add a clean-Rust hot path that skips expensive raw detectors when full Rust analysis completed cleanly.
-- [ ] P1-TRIPLE / N-P1-19 — Reduce or explicitly downgrade triple CRITICAL emissions for builtins eval/exec/compile/import aliases.
+- [x] P1-TRIPLE / N-P1-19 — Reduce or explicitly downgrade triple CRITICAL emissions for builtins eval/exec/compile/import aliases.
 - [ ] P1-PARSE — Decide and document parse-failure suppression semantics, or tighten them.
 - [ ] P1-EMPTY — Map empty pickle input to a non-CRITICAL operational outcome.
 - [ ] P1-BINTAIL-SCOPE / N-P1-11 — Broaden binary-tail scan beyond `.bin`.
@@ -573,6 +573,11 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run mypy modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py -q` — passed, 32 tests, including low-information clean-pickle skip coverage and seeded secret/network preservation coverage.
+- P1-TRIPLE / N-P1-19 — Same-item commit stops emitting the generic `S115` alias as a third failed issue for builtins `eval`/`exec`/`compile`/`__import__` REDUCE findings. The primary legacy rule and `S201` opcode support remain failed checks, while `S115` is preserved in `legacy_rule_aliases` metadata. Targeted QA:
+  - `uv run ruff format modelaudit/scanners/picklescan_adapter.py tests/scanners/test_picklescan_adapter.py` — passed.
+  - `uv run ruff check modelaudit/scanners/picklescan_adapter.py tests/scanners/test_picklescan_adapter.py` — passed.
+  - `uv run mypy modelaudit/scanners/picklescan_adapter.py tests/scanners/test_picklescan_adapter.py` — passed.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_picklescan_adapter.py -q` — passed, 59 tests, including exact `["S104", "S201"]` issue emission and `legacy_rule_aliases=["S115"]` coverage.
 
 ### Newly discovered gaps while remediating
 

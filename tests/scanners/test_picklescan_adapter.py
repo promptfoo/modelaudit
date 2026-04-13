@@ -188,7 +188,9 @@ def test_pickle_report_to_scan_result_preserves_legacy_builtin_call_rule_alias()
 
     result = pickle_report_to_scan_result(report)
 
-    assert {issue.rule_code for issue in result.issues} >= {"S104", "S201"}
+    assert [issue.rule_code for issue in result.issues] == ["S104", "S201"]
+    assert all(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+    assert all(issue.details["legacy_rule_aliases"] == ["S115"] for issue in result.issues)
 
 
 def test_pickle_report_to_scan_result_preserves_warning_dangerous_calls() -> None:
