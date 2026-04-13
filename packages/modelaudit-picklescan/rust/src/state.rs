@@ -1057,7 +1057,6 @@ impl<'a> ScanState<'a> {
 
     fn consume_top_operands(&mut self, operand_count: usize) -> Option<StackValue> {
         if self.stack.len() < operand_count {
-            self.stack.clear();
             self.stack.push(StackValue::Other);
             return None;
         }
@@ -3502,6 +3501,34 @@ mod tests {
             .notices
             .iter()
             .any(|notice| notice.code == Some("nested_payload_truncated")));
+    }
+
+    #[test]
+    fn callable_operand_underflow_does_not_clear_stack_state() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let mut scan = ScanState::new(
+            "operand-underflow.pkl".to_string(),
+            b"",
+            &options,
+            Some(0),
+            0,
+            0,
+            None,
+        );
+        scan.stack.push(StackValue::Text("survivor".to_string()));
+
+        assert!(scan.consume_top_operands(2).is_none());
+
+        assert_eq!(scan.stack.len(), 2);
+        assert_eq!(stack_value_preview(&scan.stack[0], 0), "str:\"survivor\"");
+        assert!(matches!(scan.stack[1], StackValue::Other));
     }
 
     #[test]

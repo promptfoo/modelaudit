@@ -1066,7 +1066,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] V5-P1-06 — Close N5-R1 / N5-SEC-F8 by fixing empty list/dict/set stack operand previews.
 - [x] V5-P1-07 — Close N5-R2 by emitting truncated nested-pickle notices/findings for proto-0 as well as binary-protocol payloads.
 - [x] V5-P1-08 — Close N5-R3 / N5-SEC-F7 by enforcing left word boundaries for suspicious call and module-attribute string matching.
-- [ ] V5-P1-09 — Close N5-R11 by preventing stack-state wipes on operand underflow.
+- [x] V5-P1-09 — Close N5-R11 by preventing stack-state wipes on operand underflow.
 - [ ] V5-P1-10 — Close N5-R13 by preventing MARK from being wrapped into tuple values.
 - [ ] V5-P1-11 — Close N5-R15 by preserving INST module/name operands without space-splitting ambiguity.
 - [ ] V5-P1-12 — Close N5-R17 by keeping follow-on sibling pickle streams at the current nested depth.
@@ -1138,6 +1138,11 @@ This section is the active implementation log for follow-up commits after revisi
   - `cargo check --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed.
   - `cargo clippy --manifest-path packages/modelaudit-picklescan/Cargo.toml --all-targets -- -D warnings` — passed.
   - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml suspicious_string_matching_keeps_word_boundaries -- --nocapture` — passed, 1 test.
+- V5-P1-09 — Same-item commit stops `consume_top_operands` from clearing the entire VM stack when a REDUCE-class opcode underflows. The scanner now preserves existing stack state and pushes an opaque result for the malformed operation. Targeted QA:
+  - `cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed.
+  - `cargo check --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed.
+  - `cargo clippy --manifest-path packages/modelaudit-picklescan/Cargo.toml --all-targets -- -D warnings` — passed.
+  - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml callable_operand_underflow_does_not_clear_stack_state -- --nocapture` — passed, 1 test.
 - N-P0-1 — Same-item commit adds a bounded `_RootStreamPayloadRead` result for non-seekable root stream buffering, records truncation metadata, and emits an `S902` warning instead of raising when the stream exceeds the root raw-scan cap. Targeted QA:
   - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
