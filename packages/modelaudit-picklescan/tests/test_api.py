@@ -1664,6 +1664,26 @@ def test_scan_bytes_records_data_only_base64_nested_pickle_payloads_as_notices()
     )
 
 
+def test_scan_bytes_detects_comment_wrapped_base64_nested_pickle_payloads() -> None:
+    nested_payload = pickle.dumps(MaliciousPayload(), protocol=4)
+    encoded = base64.b64encode(nested_payload).decode("ascii")
+    wrapped = f"# this is doc\n# {encoded[:12]}\n# {encoded[12:]}\n# more"
+
+    report = scan_bytes(
+        pickle.dumps({"outer": wrapped}, protocol=4),
+        source="wrapped-base64-nested.pkl",
+    )
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(finding.rule_code == "S601" for finding in report.findings)
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.details.get("nested_encoding") == "base64"
+        and finding.details.get("nested_details", {}).get("import_reference") in SYSTEM_GLOBALS
+        for finding in report.findings
+    )
+
+
 def test_scan_bytes_records_data_only_base64_nested_pickle_hidden_inside_large_literal_as_notice() -> None:
     nested_payload = pickle.dumps({"inner": "data"}, protocol=4)
     hidden_payload = "A" * 64 + base64.b64encode(nested_payload).decode("ascii") + "A" * 64
