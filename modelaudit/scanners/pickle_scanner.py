@@ -6457,7 +6457,6 @@ class PickleScanner(BaseScanner):
             # Process the pickle
             start_pos = file_obj.tell()
             base_stack_depth_limit = 3000
-            warning_stack_depth_limit = 5000
             scan_start_time = self.scan_start_time if self.scan_start_time is not None else result.start_time
             deadline = scan_start_time + self.timeout
             analysis = self._build_pickle_opcode_analysis(
