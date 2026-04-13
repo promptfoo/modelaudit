@@ -180,6 +180,61 @@ However the **standalone API and the adapter disagree** on the verdict for the s
 
 **P2-INFO-NOISY-NOTICES.** Rev 4 adds many new INFO-level notices (buffer opcodes, structural tamper, expansion heuristics, stream truncation). Aggregate scans of large corpora will see a lot more INFO-level rows. Dashboards should filter `severity >= WARNING` by default or group INFO into a count field. Documentation callout worth adding.
 
+### Rev 4 follow-up audit — additional issues surfaced after the 80-commit re-audit
+
+**P2-CONFIRMED-SEEDS-INFLATE-EXPENSIVE.** Verified empirically with a realistic HuggingFace-style pickle: a 10 MB `state_dict`-shaped pickle with `__version__`, `auto_map`, `use_auth_token`, `api_key=None` keys → 0 issues (clean) but **`pickle_expensive_raw_detectors_skipped` is `None` and scan takes 1.25 s** (vs 0.53 s for a 16 MB `b"A"*N` literal). The benign keys trip seed checks (`api_key` is in `_SECRET_SCAN_SEEDS`, `auth` is in there, `LlamaForCausalLM` shape passes `_has_domain_like_dot`). Net effect: **realistic ML pickles consistently miss the hot-path skip**, defeating most of the `111d0ae7` perf gain on the actual corpus the scanner is meant to handle. Recommendation: tighten seeds further (require `b"_key"` not `b"api_key"`, drop `b"auth"`, add structural validation), or move the seed gate to a "Rust verdict clean AND ML-format heuristic" check.
+
+**P2-PROTO6-FORWARD-COMPAT.** A pickle starting with `\x80\x06` (hypothetical protocol 6) is currently flagged as `S901 file type validation failed: extension indicates pickle but magic bytes indicate unknown`. Not a bug today (proto 6 doesn't exist), but the moment Python introduces it, the scanner will misclassify every modern pickle. The file-type detector's pickle-magic table needs to track proto bumps. File: `modelaudit/utils/file/filetype.py` (or wherever pickle magic is enumerated).
+
+**P2-OVERSIZED-FRAME-NOT-FLAGGED.** A pickle declaring `FRAME 0xFFFFFFFFFFFFFFFE` followed by a small body parses cleanly because the FRAME length is informational, not enforced. Test: `b'\x80\x04\x95\xff\xff\xff\xff\xff\xff\xff\xfe}.'` → 0 issues, success=True. An obviously-impossible FRAME size (≫ file size) is a useful structural-tamper signal but is currently silent. Add a notice when `FRAME.length > remaining_bytes * 1.5` or similar.
+
+**P2-DIRECTORY-ERROR-SEVERITY.** `PickleScanner.scan('/tmp')` (a directory) emits `CRITICAL` "Error opening pickle file: [Errno 21] Is a directory". User error → CRITICAL severity is excessive and pollutes downstream metrics for users scanning mixed file trees. Should be `IssueSeverity.ERROR` (operational), not `CRITICAL` (security). File: `modelaudit/scanners/pickle_scanner.py:1739-1751` (the `OSError` branch).
+
+**P2-WHEEL-MATRIX-INCOMPLETE.** `release-please.yml:411-423` matrix covers `ubuntu-latest`, `macos-14` (arm64), `windows-latest`. Still missing: `macos-13` (Intel Mac) and `linux-aarch64`. With abi3 a single wheel-per-OS covers Python 3.10+, but Intel Mac users and Linux ARM users (e.g., AWS Graviton, Raspberry Pi, M1 ARM Linux containers) still hit sdist + Rust. Not a P0 today because abi3 mitigated the Python-version explosion, but a real coverage gap.
+
+**Concurrency stress (passing).** Verified `PickleScanner.scan()` is safe under 16 concurrent threads (8 malicious + 8 benign in parallel) — 0 errors, 8/8 correct on each path. The Rust scanner uses `py.detach()` to release the GIL during the actual scan, so true parallelism is achievable.
+
+**Rust panic-safety audit (passing).** All `unwrap()` / `expect()` / `panic!()` occurrences in `packages/modelaudit-picklescan/rust/src/` are inside `#[cfg(test)]` blocks (lines 700+ in `opcode.rs`, 200+ in `report.rs`, 2600+ in `state.rs`). No hot-path panics in production code. PyO3 boundary in `pybridge.rs` is minimal (33 lines), uses `py.detach()` correctly, and copies `payload` into Rust-owned `Vec<u8>` before releasing the GIL — Python GC during scan is safe.
+
+**Edge-case stress (all passing).**
+- Circular reference (memo loop): 0.003 s, 0 issues, success=True.
+- Multi-stream proto 4 + proto 0: 0 issues, success=True.
+- Negative `file_size=-1` via `scan_stream`: handled via `standalone_size = None` normalization.
+- 50,000-deep MARK/FRAME nesting: 0.1 s, 0 issues, success=True.
+- INST opcode with `__main__` reference: CRITICAL S202 ✓
+- OBJ opcode with `dill.loads`: CRITICAL S203 ✓
+- NEWOBJ_EX with `__main__` class: CRITICAL S204 ✓
+- Tail garbage after STOP: WARNING S901 + INFO S902, success=False ✓
+- Invalid opcode 0xFF mid-stream: WARNING S901, success=False ✓
+- Huge FRAME (`0xFFFFFFFFFFFFFFFE`) + valid REDUCE inside: STILL CRITICAL S201 (parse cleanly past the bogus FRAME length) ✓
+
+### Honest residual list at rev 4
+
+After all the verification above, the items I am **certain** still need attention before merge are:
+
+1. **P1-NESTED-DIVERGENCE** — the standalone vs adapter verdict mismatch for benign nested payloads. This will surprise integrators of `modelaudit-picklescan`.
+2. **P2-CONFIRMED-SEEDS-INFLATE-EXPENSIVE** — realistic HF/PyTorch pickles consistently miss the hot-path skip due to overly broad `_SECRET_SCAN_SEEDS`. Perf claim is confirmed for synthetic literal payloads but degrades on real-world workloads.
+3. **P2-WHEEL-MATRIX-INCOMPLETE** — Intel Mac + Linux ARM users still need local Rust.
+4. **P2-DIRECTORY-ERROR-SEVERITY** — CRITICAL severity for "Is a directory" is operational, not security.
+
+Items I am **fairly sure** are open but lower priority:
+- P2-REMAINING-NESTED-FINDING-DUP (intentional dual emission for `builtins.eval` REDUCE).
+- P2-CARGO-TEST-SURFACE (`opcode.rs` LONG1/LONG4 edge cases, `report.rs` detail serialization).
+- P2-INFO-NOISY-NOTICES (new INFO categories need dashboard guidance).
+- P2-PROTO6-FORWARD-COMPAT (cosmetic until Python releases proto 6).
+- P2-OVERSIZED-FRAME-NOT-FLAGGED (a useful tamper signal, currently silent).
+
+Items I am **not sure about** but couldn't find in the time budget:
+- I have not fuzzed the Rust opcode parser with random/crafted inputs at scale — there could be additional panics or stack-shape bugs.
+- I have not exercised the scanner against a real HuggingFace model directory (`config.json`, `tokenizer.json`, `pytorch_model.bin`, `model.safetensors`) end-to-end via the CLI.
+- I have not validated SARIF output for the new INFO/WARNING notices, or checked downstream JSON schema compatibility.
+- I have not exercised the PyO3 bridge with concurrent scans + memory pressure (`malloc_failed`, OOM).
+- I have not audited `tests/scripts/test_large_pickle_corpus_qa.py` (301 lines new, the corpus QA harness) for assertion strength.
+- I have not checked whether `scan_stream` correctly handles a `BufferedReader` wrapping a socket or pipe (real-world archive-member streaming).
+- I have not verified that the new `_documentation_literal_spans` walker correctly handles nested-pickle literals (does the doc-gating apply to the nested pickle's text content too?).
+
+**Bottom line**: the PR is in dramatically better shape than at rev 1. Every concrete, reproducible bug I have surfaced has been verified or addressed. But "no more issues" is not a claim I can make about a 12k-line PR with a 3,300-line Rust state machine after a few hours of focused review. There are almost certainly more issues — probably P1/P2 in the categories above, possibly a P0 lurking in opcode-parser fuzzing or in a code path I haven't exercised.
+
 ### New observation — `84bb76f3 fix: detect short base64 pickle code strings`
 
 The latest commit tightens detection of short base64-encoded exec strings in string literals. This specifically addresses the R-P0-4 residual where `base64(b"eval(x)") = 12 chars` was below the 16-char minimum. Verified test at `test_api.py` confirms the 12-char case now surfaces. Good close.
