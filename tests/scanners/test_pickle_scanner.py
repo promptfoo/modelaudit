@@ -403,6 +403,119 @@ def test_scan_bounds_follow_on_probe_recursion_for_pickle_like_binary_tail(tmp_p
     assert result.metadata["pickle_report_status"] == "inconclusive"
     assert not any(issue.details.get("pickle_notice_code") == "follow_on_stream_detected" for issue in result.issues)
     assert not any(check.name == "Pickle Expansion Heuristic Check" for check in result.checks)
+    assert not any(check.name == "Pickle Structural Tamper Check" for check in result.checks)
+
+
+def test_duplicate_proto_same_version_reports_structural_tamper(tmp_path: Path) -> None:
+    path = tmp_path / "duplicate-proto.pkl"
+    path.write_bytes(b"\x80\x02\x80\x02K\x01.")
+
+    result = PickleScanner().scan(str(path))
+    structural_checks = [
+        check
+        for check in result.checks
+        if check.name == "Pickle Structural Tamper Check" and check.status.value == "failed"
+    ]
+
+    assert any(check.details.get("tamper_type") == "duplicate_proto" for check in structural_checks), (
+        f"Expected duplicate_proto finding, got: {[check.details for check in structural_checks]}"
+    )
+    assert any(check.details.get("tamper_type") == "misplaced_proto" for check in structural_checks), (
+        f"Expected misplaced_proto finding, got: {[check.details for check in structural_checks]}"
+    )
+    assert any(check.details.get("position") == 2 for check in structural_checks), (
+        f"Expected duplicate/misplaced PROTO position, got: {[check.details for check in structural_checks]}"
+    )
+
+
+def test_duplicate_proto_mixed_versions_reports_structural_tamper(tmp_path: Path) -> None:
+    path = tmp_path / "duplicate-proto-mixed.pkl"
+    path.write_bytes(b"\x80\x02\x80\x04K\x01.")
+
+    result = PickleScanner().scan(str(path))
+    structural_checks = [check for check in result.checks if check.name == "Pickle Structural Tamper Check"]
+    duplicate = [check for check in structural_checks if check.details.get("tamper_type") == "duplicate_proto"]
+
+    assert duplicate, f"Expected duplicate_proto finding, got: {[check.details for check in structural_checks]}"
+    assert any(
+        check.details.get("previous_protocol") == 2 and check.details.get("protocol") == 4 for check in duplicate
+    ), f"Expected previous/current protocol details, got: {[check.details for check in duplicate]}"
+
+
+def test_misplaced_proto_reports_structural_tamper(tmp_path: Path) -> None:
+    path = tmp_path / "misplaced-proto.pkl"
+    path.write_bytes(b"K\x01\x80\x02.")
+
+    result = PickleScanner().scan(str(path))
+
+    assert any(
+        check.name == "Pickle Structural Tamper Check" and check.details.get("tamper_type") == "misplaced_proto"
+        for check in result.checks
+    ), f"Expected misplaced_proto finding, got: {[check.details for check in result.checks]}"
+
+
+def test_valid_single_and_multi_stream_proto_stays_without_structural_tamper(tmp_path: Path) -> None:
+    single_path = tmp_path / "single.pkl"
+    single_path.write_bytes(pickle.dumps({"safe": True}, protocol=4))
+
+    single_result = PickleScanner().scan(str(single_path))
+
+    assert not any(check.name == "Pickle Structural Tamper Check" for check in single_result.checks)
+
+    multi_stream = io.BytesIO()
+    pickle.dump({"a": 1}, multi_stream, protocol=2)
+    multi_stream.write(b"\x00")
+    pickle.dump({"b": 2}, multi_stream, protocol=4)
+    multi_path = tmp_path / "multi.pkl"
+    multi_path.write_bytes(multi_stream.getvalue())
+
+    multi_result = PickleScanner().scan(str(multi_path))
+
+    assert not any(check.name == "Pickle Structural Tamper Check" for check in multi_result.checks)
+
+
+def test_structural_tamper_in_second_stream_is_detected(tmp_path: Path) -> None:
+    stream = io.BytesIO()
+    pickle.dump({"safe": True}, stream, protocol=2)
+    stream.write(b"\x00")
+    stream.write(b"\x80\x02\x80\x02K\x01.")
+    path = tmp_path / "second-stream-duplicate-proto.pkl"
+    path.write_bytes(stream.getvalue())
+
+    result = PickleScanner().scan(str(path))
+    structural_checks = [check for check in result.checks if check.name == "Pickle Structural Tamper Check"]
+
+    assert any(check.details.get("tamper_type") == "duplicate_proto" for check in structural_checks), (
+        f"Expected duplicate_proto finding in later stream, got: {[check.details for check in structural_checks]}"
+    )
+    assert any(check.details.get("stream_offset", 0) > 0 for check in structural_checks), (
+        f"Expected later-stream offset, got: {[check.details for check in structural_checks]}"
+    )
+
+
+def test_structural_tamper_and_malicious_import_both_reported(tmp_path: Path) -> None:
+    path = tmp_path / "duplicate-proto-os-system.pkl"
+    path.write_bytes(b"\x80\x02\x80\x02cos\nsystem\n)R.")
+
+    result = PickleScanner().scan(str(path))
+
+    assert any(check.name == "Pickle Structural Tamper Check" for check in result.checks)
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("associated_global") == "os.system"
+        for issue in result.issues
+    ), f"Expected CRITICAL os.system finding, got: {[issue.message for issue in result.issues]}"
+
+
+def test_structural_tamper_with_safe_ml_payload_only_info_severity(tmp_path: Path) -> None:
+    safe_payload = pickle.dumps({"layer": "linear", "shape": [4, 8]}, protocol=2)
+    path = tmp_path / "safe-ml-duplicate-proto.pkl"
+    path.write_bytes(b"\x80\x02" + safe_payload)
+
+    result = PickleScanner().scan(str(path))
+    structural_checks = [check for check in result.checks if check.name == "Pickle Structural Tamper Check"]
+
+    assert structural_checks, "Expected structural tamper finding for duplicate/misplaced PROTO"
+    assert all(check.severity == IssueSeverity.INFO for check in structural_checks)
 
 
 def test_root_legacy_metadata_detectors_preserve_import_only_and_main_build_rules() -> None:

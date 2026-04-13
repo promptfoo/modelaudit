@@ -227,6 +227,9 @@ pub(crate) struct ScanState<'a> {
     global_count: usize,
     bytes_scanned: usize,
     first_pickle_end_pos: Option<usize>,
+    stream_start_offset: usize,
+    stream_opcode_count: usize,
+    stream_proto_version: Option<i64>,
     expansion_state: ExpansionHeuristicState,
     expansion_findings: Vec<ExpansionHeuristicFinding>,
     status: &'static str,
@@ -270,6 +273,9 @@ impl<'a> ScanState<'a> {
             global_count: 0,
             bytes_scanned: 0,
             first_pickle_end_pos: None,
+            stream_start_offset: position_offset,
+            stream_opcode_count: 0,
+            stream_proto_version: None,
             expansion_state: ExpansionHeuristicState::new(0),
             expansion_findings: Vec::new(),
             status: "complete",
@@ -297,6 +303,9 @@ impl<'a> ScanState<'a> {
             let stream_start = index;
             let mut parsed_opcode = false;
             let mut saw_stop = false;
+            self.stream_start_offset = self.position_offset + stream_start;
+            self.stream_opcode_count = 0;
+            self.stream_proto_version = None;
 
             loop {
                 if index >= scan_limit {
@@ -370,6 +379,7 @@ impl<'a> ScanState<'a> {
                 self.bytes_scanned = self.bytes_scanned.max(parsed.next);
                 self.opcode_count += 1;
                 index = parsed.next;
+                self.record_structural_opcode(&parsed, position);
                 self.record_expansion_opcode(&parsed, position);
                 self.handle_opcode(&parsed, position);
 
@@ -1457,6 +1467,82 @@ impl<'a> ScanState<'a> {
         }
     }
 
+    fn record_structural_opcode(&mut self, opcode: &ParsedOpcode, position: usize) {
+        self.stream_opcode_count += 1;
+        if opcode.name != "PROTO" {
+            return;
+        }
+
+        let protocol = opcode.arg.as_i64();
+        if self.stream_opcode_count > 1 {
+            let mut details = vec![
+                (
+                    "tamper_type".to_string(),
+                    DetailValue::String("misplaced_proto".to_string()),
+                ),
+                ("position".to_string(), DetailValue::UInt(position as u64)),
+                (
+                    "stream_offset".to_string(),
+                    DetailValue::UInt(self.stream_start_offset as u64),
+                ),
+            ];
+            if let Some(protocol) = protocol {
+                details.push(("protocol".to_string(), DetailValue::Int(protocol)));
+            }
+            self.add_finding(Finding {
+                message: format!("Misplaced PROTO opcode in pickle stream at byte position {position}"),
+                severity: "warning",
+                location: Some(format!("{} (pos {})", self.source, position)),
+                rule_code: Some("STRUCTURAL_TAMPER"),
+                details,
+                why: Some(
+                    "Binary protocol declarations are expected at the beginning of a stream. A later PROTO opcode indicates structural tampering or malformed serialization.",
+                ),
+            });
+        }
+
+        if let Some(previous_protocol) = self.stream_proto_version {
+            let mut details = vec![
+                (
+                    "tamper_type".to_string(),
+                    DetailValue::String("duplicate_proto".to_string()),
+                ),
+                ("position".to_string(), DetailValue::UInt(position as u64)),
+                (
+                    "stream_offset".to_string(),
+                    DetailValue::UInt(self.stream_start_offset as u64),
+                ),
+                (
+                    "previous_protocol".to_string(),
+                    DetailValue::Int(previous_protocol),
+                ),
+            ];
+            if let Some(protocol) = protocol {
+                details.push(("protocol".to_string(), DetailValue::Int(protocol)));
+            }
+            self.add_finding(Finding {
+                message: format!(
+                    "Duplicate PROTO opcode in pickle stream at byte position {position} (previous={}, current={})",
+                    previous_protocol,
+                    protocol
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "unknown".to_string())
+                ),
+                severity: "warning",
+                location: Some(format!("{} (pos {})", self.source, position)),
+                rule_code: Some("STRUCTURAL_TAMPER"),
+                details,
+                why: Some(
+                    "Multiple protocol declarations inside one pickle stream are structurally unusual and can be used to probe parser differences between tools.",
+                ),
+            });
+        }
+
+        if let Some(protocol) = protocol {
+            self.stream_proto_version = Some(protocol);
+        }
+    }
+
     fn record_expansion_opcode(&mut self, opcode: &ParsedOpcode, position: usize) {
         let should_finish_stream =
             record_expansion_state_opcode(&mut self.expansion_state, opcode, position);
@@ -1801,6 +1887,16 @@ impl<'a> ScanState<'a> {
                 continue;
             }
             let candidate = &self.payload[absolute_offset..scan_end];
+            if self.options.max_nested_pickle_bytes == 0 {
+                return;
+            }
+            let candidate_probe_len = candidate.len().min(self.options.max_nested_pickle_bytes);
+            if !looks_like_pickle_payload(
+                &candidate[..candidate_probe_len],
+                self.options.max_nested_pickle_bytes,
+            ) {
+                continue;
+            }
             let nested_source = format!(
                 "{} (follow-on pickle stream at pos {})",
                 self.source,

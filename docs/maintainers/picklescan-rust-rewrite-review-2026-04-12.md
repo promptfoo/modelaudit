@@ -490,7 +490,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] T-P1-WHEEL — Add missing macOS x86_64 and Linux aarch64 wheel coverage or document the gap.
 - [x] T-P2-COMMENT — Restore missing comment-token bypass regression coverage.
 - [x] T-P2-EXPANSION — Restore expansion/memo-growth regression coverage.
-- [ ] T-P2-STRUCTURAL — Restore structural tamper / duplicate-PROTO regression coverage.
+- [x] T-P2-STRUCTURAL — Restore structural tamper / duplicate-PROTO regression coverage.
 - [ ] P2-STALE-PYCACHE — Remove stale `_parity_corpus` pycache artifact or ignore it explicitly.
 - [ ] P2-NEW-HELPER-DUP — Refactor duplicated text-shape helper loops.
 - [ ] N-P1-7 — Make `_pickle_opcode_summary` memo-aware instead of clearing the string stack too aggressively.
@@ -644,6 +644,16 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run ruff check tests/scanners/test_pickle_scanner.py packages/modelaudit-picklescan/tests/test_api.py` — passed.
   - `uv run mypy tests/scanners/test_pickle_scanner.py packages/modelaudit-picklescan/tests/test_api.py` — passed.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests/test_api.py::test_scan_bytes_bounds_follow_on_probe_recursion_for_pickle_like_binary_tail tests/scanners/test_pickle_scanner.py::test_scan_bounds_follow_on_probe_recursion_for_pickle_like_binary_tail -q` — passed, 2 tests.
+- T-P2-STRUCTURAL — Same-item commit restores native structural tamper detection for duplicate and misplaced `PROTO` opcodes, maps it back to the legacy `Pickle Structural Tamper Check` / `S902` contract at info severity in ModelAudit, and restores the deleted same-stream, mixed-version, misplaced, second-stream, malicious-plus-tamper, safe-ML, and binary-tail regressions. QA also found that broad follow-on candidates could misclassify ZIP local-header bytes before a real embedded pickle; the implementation now validates follow-on candidates as plausible pickle payloads before recursive scanning. Targeted QA:
+  - `cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml -- --check` — passed.
+  - `cargo check --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed.
+  - `cargo clippy --manifest-path packages/modelaudit-picklescan/Cargo.toml --all-targets -- -D warnings` — passed.
+  - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, 16 tests.
+  - `uv run --with 'maturin>=1.9,<2' maturin develop --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, rebuilt the editable native extension.
+  - `uv run ruff format --check modelaudit/scanners/picklescan_adapter.py tests/scanners/test_pickle_scanner.py packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `uv run ruff check modelaudit/scanners/picklescan_adapter.py tests/scanners/test_pickle_scanner.py packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `uv run mypy modelaudit/scanners/picklescan_adapter.py tests/scanners/test_pickle_scanner.py packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests/test_api.py tests/scanners/test_pickle_scanner.py -q` — passed, 206 tests.
 
 ### Newly discovered gaps while remediating
 

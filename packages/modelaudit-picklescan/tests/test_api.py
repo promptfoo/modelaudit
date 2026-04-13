@@ -282,6 +282,33 @@ def test_scan_bytes_bounds_follow_on_probe_recursion_for_pickle_like_binary_tail
     assert report.findings == ()
 
 
+def test_scan_bytes_reports_duplicate_and_misplaced_proto_tamper() -> None:
+    report = scan_bytes(b"\x80\x02\x80\x04K\x01.", source="duplicate-proto.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "STRUCTURAL_TAMPER"
+        and finding.severity == Severity.WARNING
+        and finding.details.get("tamper_type") == "duplicate_proto"
+        and finding.details.get("previous_protocol") == 2
+        and finding.details.get("protocol") == 4
+        for finding in report.findings
+    )
+    assert any(
+        finding.rule_code == "STRUCTURAL_TAMPER" and finding.details.get("tamper_type") == "misplaced_proto"
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_does_not_report_structural_tamper_for_binary_tail() -> None:
+    payload = pickle.dumps({"safe": True}, protocol=2) + (b"XYZNmore-binary-data" * 20)
+
+    report = scan_bytes(payload, source="binary-tail.pkl")
+
+    assert all(finding.rule_code != "STRUCTURAL_TAMPER" for finding in report.findings)
+
+
 def test_scan_bytes_warns_on_post_budget_memo_growth_tail() -> None:
     payload = _make_opcode_padding_stream(64) + _make_memo_expansion_pickle(iterations=80)
 

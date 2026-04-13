@@ -186,6 +186,8 @@ def pickle_report_to_scan_result(
         if finding.rule_code:
             details.setdefault("pickle_rule_code", finding.rule_code)
         severity = _to_issue_severity(finding.severity)
+        if finding.rule_code == "STRUCTURAL_TAMPER":
+            severity = IssueSeverity.INFO
         if _is_benign_nested_payload_detection(finding, dangerous_nested_encodings):
             severity = IssueSeverity.INFO
             details.setdefault("evidence", "nested_payload_detected")
@@ -583,6 +585,8 @@ def _legacy_rule_code_for_finding(finding: Finding) -> str | None:
         return "S206"
     if finding.rule_code == "PICKLE_EXPANSION":
         return "S902"
+    if finding.rule_code == "STRUCTURAL_TAMPER":
+        return "S902"
     return finding.rule_code
 
 
@@ -608,6 +612,8 @@ def _legacy_check_name_for_finding(finding: Finding) -> str:
         if finding.details.get("post_budget") is True:
             return "Post-Budget Pickle Expansion Heuristic Check"
         return "Pickle Expansion Heuristic Check"
+    if finding.rule_code == "STRUCTURAL_TAMPER":
+        return "Pickle Structural Tamper Check"
     opcode = finding.details.get("opcode")
     if finding.rule_code in {"DANGEROUS_CALL", "DANGEROUS_GLOBAL"} and isinstance(opcode, str):
         return f"{opcode.upper()} Opcode Safety Check"
