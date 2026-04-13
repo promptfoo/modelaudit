@@ -354,6 +354,20 @@ def test_detect_file_format_accepts_forward_compatible_binary_pickle_protocol(tm
     assert validate_file_type(str(payload)) is True
 
 
+@pytest.mark.parametrize("filename", ["protocol1-binary-header", "protocol1-binary-header.bin"])
+def test_detect_file_format_accepts_protocol1_binary_pickle_header(
+    tmp_path: Path,
+    filename: str,
+) -> None:
+    """Crafted protocol-1 PROTO headers should route to pickle scanning without suffix help."""
+    payload = tmp_path / filename
+    payload.write_bytes(b"\x80\x01}.")
+
+    assert detect_file_format(str(payload)) == "pickle"
+    assert detect_file_format_from_magic(str(payload)) == "pickle"
+    assert validate_file_type(str(payload)) is True
+
+
 def test_detect_file_format_proto0_pickle_with_single_comment_token_prefix(tmp_path: Path) -> None:
     """A single leading comment token should not suppress proto0 detection."""
     payload = tmp_path / "comment-prefixed-payload.txt"

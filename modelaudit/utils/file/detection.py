@@ -86,7 +86,7 @@ _COMPRESSED_EXTENSION_CODECS = {
     ".zlib": "zlib",
 }
 
-_MIN_BINARY_PICKLE_PROTOCOL = 2
+_MIN_BINARY_PICKLE_PROTOCOL = 1
 _MAX_FORWARD_COMPAT_BINARY_PICKLE_PROTOCOL = 6
 
 # Pickle protocol 0/1 GLOBAL opcode signatures used for .bin fallback detection.
