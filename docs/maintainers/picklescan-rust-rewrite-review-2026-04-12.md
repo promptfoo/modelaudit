@@ -1056,6 +1056,46 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] A-P2-78 — Downgrade directory-open failures from security CRITICAL to operational/non-security severity.
 - [x] A-P2-79 — Close P2-WHEEL-MATRIX-INCOMPLETE by adding macOS x86_64 and Linux aarch64 wheels or explicitly documenting the fallback.
 
+### Rev 5 active remediation tracker
+
+- [ ] V5-P0-01 — Close N5-CRITICAL-RCE-BYPASS / N5-SEC-F2 / N5-SEC-F3 by deriving post-budget dangerous-global coverage from policy, promoting REDUCE-proximate matches to CRITICAL, and running the tail scan on timeout exhaustion.
+- [ ] V5-P0-02 — Close N5-EXPLOIT-PERSID-NESTED / N5-R10 by recognizing PERSID/BINPERSID nested execution semantics and preserving recursive detection.
+- [ ] V5-P0-03 — Re-run and resolve N5-FAIL-1..14, including current scanner-suite legacy rule-code regressions.
+- [ ] V5-P0-04 — Close N5-P0-WHEEL-MANYLINUX by producing manylinux-compatible standalone wheels in release automation.
+- [ ] V5-P0-05 — Close N5-P0-RELEASE-PLEASE-EXTRA-FILES-MARKERS so standalone package versions are bumped by release-please.
+- [ ] V5-P1-06 — Close N5-R1 / N5-SEC-F8 by fixing empty list/dict/set stack operand previews.
+- [ ] V5-P1-07 — Close N5-R2 by emitting truncated nested-pickle notices/findings for proto-0 as well as binary-protocol payloads.
+- [ ] V5-P1-08 — Close N5-R3 / N5-SEC-F7 by enforcing left word boundaries for suspicious call and module-attribute string matching.
+- [ ] V5-P1-09 — Close N5-R11 by preventing stack-state wipes on operand underflow.
+- [ ] V5-P1-10 — Close N5-R13 by preventing MARK from being wrapped into tuple values.
+- [ ] V5-P1-11 — Close N5-R15 by preserving INST module/name operands without space-splitting ambiguity.
+- [ ] V5-P1-12 — Close N5-R17 by keeping follow-on sibling pickle streams at the current nested depth.
+- [ ] V5-P1-13 — Close N5-R18 by capping import-reference metadata and surfacing truncation as a notice.
+- [ ] V5-P1-14 — Close N5-R19 by accepting uppercase escaped-hex pickle prefixes.
+- [ ] V5-P1-15 — Close N5-SEC-F5 by detecting wrapped/multiline encoded nested pickles.
+- [ ] V5-P1-16 — Close N5-SEC-F6 by aligning `_pickle_opcode_summary` implicit MEMOIZE indexing with CPython.
+- [ ] V5-P1-17 — Close N5-SEC-F9 by collapsing persistent-id warning spam into a counted notice.
+- [ ] V5-P1-18 — Close N5-PY1-1 / N5-PY1-4 by making non-seekable stream truncation explicit for known and unknown sizes.
+- [ ] V5-P1-19 — Close N5-PY1-2 by scanning binary tails for stream-backed pickle content beyond the raw window.
+- [ ] V5-P1-20 — Close N5-PY1-3 / N5-SEC-F4 by preserving Rust STRUCTURAL_TAMPER warning severity through the adapter.
+- [ ] V5-P1-21 — Close N5-PY1-5 by assigning a deterministic fallback rule code to unknown dangerous globals.
+- [ ] V5-P1-22 — Close N5-PY1-6 by adding a standalone known-size stream read ceiling.
+- [ ] V5-P1-23 — Close N5-PY1-7 / N5-PY1-8 by scanning partial bytes on short reads, including ZIP member scans.
+- [ ] V5-P1-24 — Close N5-PY1-9 by failing closed when parse failure suppression has no import-reference evidence.
+- [ ] V5-P1-25 — Close N5-PY1-10 by avoiding or retiring the incomplete parallel Python opcode walker where Rust metadata is authoritative.
+- [ ] V5-P1-26 — Close N5-PY1-11 by making rebuild-tensor documentation checks memo-aware or delegating to Rust metadata.
+- [ ] V5-P1-27 — Close N5-P1-HOT-PATH-DEFEATED-BY-TORCH-SEED with realistic PyTorch/HF hot-path skip coverage.
+- [ ] V5-P1-28 — Close N5-P1-SARIF-DUPLICATE-FINDINGS by filtering supporting-rule-code rows from SARIF primary results.
+- [ ] V5-P1-29 — Close N5-P1-SARIF-NO-PICKLESCAN-RULE-COVERAGE with SARIF regression coverage for new picklescan rule codes.
+- [ ] V5-P1-30 — Close N5-P1-DEAD-ADAPTER-NESTED-DOWNGRADE by deleting the obsolete adapter downgrade path.
+- [ ] V5-P1-31 — Close N5-P1-RULE-CODE-CONFLATION-S902 by assigning PICKLE_EXPANSION a distinct DoS-oriented rule code.
+- [ ] V5-P1-32 — Close N5-P1-DOCKER-SINGLE-STAGE by moving Docker builds to a builder/runtime split.
+- [ ] V5-P2-33 — Close N5-P2-PACKAGE-CHANGELOG-THIN with a fuller standalone package changelog.
+- [ ] V5-P2-34 — Close N5-P2-CHANGELOG-RULE-CODES by documenting new rule codes in the root changelog.
+- [ ] V5-P2-35 — Close N5-P2-PYPROJECT-URLS-CHANGELOG by pointing standalone package metadata at its own changelog.
+- [ ] V5-P2-36 — Close N5-P2-DOCKERFILE-RUST-VERSION-DRIFT by documenting or deriving the Rust version sync point.
+- [ ] V5-P2-37 — Close N5-P2-PICKLESCAN-PACKAGE-CARGO-TEST-ORDERING by running cargo checks before Python package tests in CI.
+
 ### Completed item QA log
 
 - N-P0-1 — Same-item commit adds a bounded `_RootStreamPayloadRead` result for non-seekable root stream buffering, records truncation metadata, and emits an `S902` warning instead of raising when the stream exceeds the root raw-scan cap. Targeted QA:
