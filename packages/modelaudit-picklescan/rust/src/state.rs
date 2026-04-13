@@ -232,6 +232,9 @@ pub(crate) struct ScanState<'a> {
     stream_proto_version: Option<i64>,
     expansion_state: ExpansionHeuristicState,
     expansion_findings: Vec<ExpansionHeuristicFinding>,
+    next_buffer_count: usize,
+    readonly_buffer_count: usize,
+    first_buffer_opcode_position: Option<usize>,
     status: &'static str,
     verdict: &'static str,
     seen_finding_keys: HashSet<(String, Option<String>, Option<&'static str>)>,
@@ -278,6 +281,9 @@ impl<'a> ScanState<'a> {
             stream_proto_version: None,
             expansion_state: ExpansionHeuristicState::new(0),
             expansion_findings: Vec::new(),
+            next_buffer_count: 0,
+            readonly_buffer_count: 0,
+            first_buffer_opcode_position: None,
             status: "complete",
             verdict: "clean",
             seen_finding_keys: HashSet::new(),
@@ -801,15 +807,41 @@ impl<'a> ScanState<'a> {
     }
 
     fn record_buffer_opcode(&mut self, op_name: &'static str, position: usize) {
+        if self.first_buffer_opcode_position.is_none() {
+            self.first_buffer_opcode_position = Some(position);
+        }
+        match op_name {
+            "NEXT_BUFFER" => self.next_buffer_count += 1,
+            "READONLY_BUFFER" => self.readonly_buffer_count += 1,
+            _ => {}
+        }
+    }
+
+    fn emit_buffer_opcode_notice(&mut self) {
+        let buffer_opcode_count = self.next_buffer_count + self.readonly_buffer_count;
+        if buffer_opcode_count == 0 {
+            return;
+        }
+        let position = self.first_buffer_opcode_position.unwrap_or(0);
         self.add_notice(Notice {
-            message: format!("Encountered protocol 5 buffer opcode: {op_name}"),
+            message: format!(
+                "Encountered {buffer_opcode_count} protocol 5 buffer opcode(s); external buffer context is opaque"
+            ),
             severity: "info",
             location: Some(format!("{} (pos {})", self.source, position)),
             code: Some("buffer_opcode"),
             details: vec![
                 (
-                    "opcode".to_string(),
-                    DetailValue::String(op_name.to_string()),
+                    "buffer_opcode_count".to_string(),
+                    DetailValue::UInt(buffer_opcode_count as u64),
+                ),
+                (
+                    "next_buffer_count".to_string(),
+                    DetailValue::UInt(self.next_buffer_count as u64),
+                ),
+                (
+                    "readonly_buffer_count".to_string(),
+                    DetailValue::UInt(self.readonly_buffer_count as u64),
                 ),
                 (
                     "requires_external_buffer_context".to_string(),
@@ -1554,6 +1586,7 @@ impl<'a> ScanState<'a> {
     fn finish_analysis(&mut self) {
         flush_expansion_state(&mut self.expansion_state, &mut self.expansion_findings);
         self.emit_collected_expansion_finding();
+        self.emit_buffer_opcode_notice();
         self.coalesce_redundant_global_findings();
         self.finalize_verdict();
     }
@@ -2586,7 +2619,7 @@ fn location_position(location: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::report::detail_string;
+    use crate::report::{detail_string, detail_usize};
 
     #[test]
     fn timeout_duration_clamps_excessive_values() {
@@ -2636,6 +2669,47 @@ mod tests {
             .notices
             .iter()
             .any(|notice| notice.code == Some("buffer_opcode")));
+    }
+
+    #[test]
+    fn protocol5_buffer_opcode_notices_are_collapsed() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let payload = b"\x80\x05\x97\x97\x98\x97\x98.";
+        let mut scan = ScanState::new(
+            "many-buffer-opcodes.pkl".to_string(),
+            payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+
+        scan.run();
+
+        let buffer_notices = scan
+            .notices
+            .iter()
+            .filter(|notice| notice.code == Some("buffer_opcode"))
+            .collect::<Vec<_>>();
+        assert_eq!(buffer_notices.len(), 1);
+        let notice = buffer_notices[0];
+        assert_eq!(
+            detail_usize(&notice.details, "buffer_opcode_count"),
+            Some(5)
+        );
+        assert_eq!(detail_usize(&notice.details, "next_buffer_count"), Some(3));
+        assert_eq!(
+            detail_usize(&notice.details, "readonly_buffer_count"),
+            Some(2)
+        );
     }
 
     #[test]
