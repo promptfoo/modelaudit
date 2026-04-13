@@ -1090,7 +1090,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] V5-P1-30 — Close N5-P1-DEAD-ADAPTER-NESTED-DOWNGRADE by deleting the obsolete adapter downgrade path.
 - [x] V5-P1-31 — Close N5-P1-RULE-CODE-CONFLATION-S902 by assigning PICKLE_EXPANSION a distinct DoS-oriented rule code.
 - [x] V5-P1-32 — Close N5-P1-DOCKER-SINGLE-STAGE by moving Docker builds to a builder/runtime split.
-- [ ] V5-P2-33 — Close N5-P2-PACKAGE-CHANGELOG-THIN with a fuller standalone package changelog.
+- [x] V5-P2-33 — Close N5-P2-PACKAGE-CHANGELOG-THIN with a fuller standalone package changelog.
 - [ ] V5-P2-34 — Close N5-P2-CHANGELOG-RULE-CODES by documenting new rule codes in the root changelog.
 - [ ] V5-P2-35 — Close N5-P2-PYPROJECT-URLS-CHANGELOG by pointing standalone package metadata at its own changelog.
 - [ ] V5-P2-36 — Close N5-P2-DOCKERFILE-RUST-VERSION-DRIFT by documenting or deriving the Rust version sync point.
@@ -1265,6 +1265,8 @@ This section is the active implementation log for follow-up commits after revisi
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_picklescan_adapter.py tests/scanners/test_pickle_scanner.py tests/scanners/test_rule_code_registry_consistency.py -q -k "PICKLE_EXPANSION or expansion_heuristics or rule_codes_are_registered"` — passed, 6 tests.
 - V5-P1-32 — Same-item commit converts `Dockerfile` and `Dockerfile.full` to builder/runtime multi-stage builds. Rust, rustup, curl, and build-essential stay in the builder stage; runtime installs only built wheels plus runtime dependencies and keeps `ca-certificates` for HTTPS package installs. Targeted QA:
   - `uv run python - <<'PY' ... dockerfile multistage assertions ... PY` — passed for `Dockerfile` and `Dockerfile.full`.
+- V5-P2-33 — Same-item commit expands the standalone `modelaudit-picklescan` changelog with first-release details for API surface, PyTorch ZIP scanning, Rust detection coverage, resource controls, parity/CI gates, runtime-engine removal, GIL/operand-copy performance work, stream short-read behavior, and major security fixes. Targeted QA:
+  - Manual Markdown review of `packages/modelaudit-picklescan/CHANGELOG.md` — passed.
 - N-P0-1 — Same-item commit adds a bounded `_RootStreamPayloadRead` result for non-seekable root stream buffering, records truncation metadata, and emits an `S902` warning instead of raising when the stream exceeds the root raw-scan cap. Targeted QA:
   - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
