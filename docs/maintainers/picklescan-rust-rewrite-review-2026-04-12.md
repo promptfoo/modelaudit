@@ -531,7 +531,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] T-P1-55 / T-P1-56 — Strengthen weak negative/overbroad assertions.
 - [x] T-P1-57 — Document BINBYTES text-scan design decision.
 - [x] T-P1-63 — Expand high-risk callable module coverage.
-- [ ] T-P1-64 — Add real NEWOBJ_EX end-to-end test coverage.
+- [x] T-P1-64 — Add real NEWOBJ_EX end-to-end test coverage.
 - [ ] T-P1-65 — Expand EXT1/EXT2/EXT4 extension-registry tests.
 - [ ] T-P1-67 — Restore dill load and benign dill-string tests.
 - [ ] S-R2-5 / S-R2-6 / S-R2-8 / S-R2-9 / S-R2-10 — Rust readability refactors.
@@ -639,6 +639,8 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run ruff check packages/modelaudit-picklescan/tests/test_api.py` — passed.
   - `uv run mypy packages/modelaudit-picklescan/tests/test_api.py` — passed.
   - `uv run pytest packages/modelaudit-picklescan/tests/test_api.py::test_scan_bytes_flags_expanded_high_risk_callables -q` — passed, 19 tests.
+- T-P1-64 — Existing standalone API regression `test_scan_bytes_flags_newobj_ex_dangerous_class` drives a concrete `NEWOBJ_EX` pickle through the Rust engine and asserts the `DANGEROUS_CALL` opcode/import reference. Targeted QA:
+  - `uv run pytest packages/modelaudit-picklescan/tests/test_api.py::test_scan_bytes_flags_newobj_ex_dangerous_class -q` — passed, 1 test.
 - N-P0-3 — Same-item commit removes the global raw-window documentation short-circuit, records documentation-like pickle literal spans, and filters only matches that fall inside documentation spans or comment-like lines. Targeted QA:
   - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
