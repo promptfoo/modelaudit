@@ -543,7 +543,15 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] S-P2-17 — Avoid duplicate CVE-2026-24747 attribution.
 - [x] S-P2-18 — Consolidate `extract_metadata` read-limit validation.
 - [x] S-P2-19 — Reduce Python/Rust dangerous-policy drift.
-- [ ] S-D2-29 / S-D2-30 / S-D2-33 / S-D2-34 / S-D2-35 / S-D2-37 / S-D2-38 / S-D2-39 / S-D2-40 — Documentation and CI hygiene follow-ups.
+- [x] S-D2-29 — Document Rust toolchain requirement in contributor setup.
+- [ ] S-D2-30 — Add standalone package project URLs.
+- [ ] S-D2-33 — Validate standalone `uv.lock` in CI.
+- [ ] S-D2-34 — Run standalone `cargo test` in nightly/perf workflows.
+- [ ] S-D2-35 — Install Rust before release-please standalone lock refresh.
+- [ ] S-D2-37 — Add future annotations to large-corpus QA test.
+- [ ] S-D2-38 — Add new tests to `allowed_test_files`.
+- [ ] S-D2-39 — Move non-Rust report conversion test out of Rust-gated file.
+- [ ] S-D2-40 — Use canonical PyTorch suffix in package API test.
 
 ### Completed item QA log
 
@@ -730,6 +738,8 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run mypy modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py tests/detectors/test_builtin_detection.py` — passed.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py::test_policy_compatibility_exports_cover_required_dangerous_symbols tests/detectors/test_builtin_detection.py -q` — passed, 10 tests.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py -q` — passed, 75 tests.
+- S-D2-29 — Same-item commit clarifies that editable installs build the native pickle scanner extension and therefore require a Rust stable toolchain, including the pip setup snippets that reviewers flagged. Targeted QA:
+  - `npx prettier --check CONTRIBUTING.md` — passed.
 - N-P0-3 — Same-item commit removes the global raw-window documentation short-circuit, records documentation-like pickle literal spans, and filters only matches that fall inside documentation spans or comment-like lines. Targeted QA:
   - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.

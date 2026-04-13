@@ -9,7 +9,7 @@ Thank you for your interest in contributing to ModelAudit! This guide will help 
 - Python 3.10 or higher
 - uv (recommended) or pip
 - Git
-- Rust toolchain with `rustfmt` and `clippy` for the standalone pickle scanner
+- Rust stable toolchain with `cargo`, `rustfmt`, and `clippy`; editable installs build the native pickle scanner extension
 
 ### Setup
 
@@ -24,7 +24,7 @@ uv sync --extra all
 # Windows (lighter optional set)
 uv sync --extra all-ci-windows
 
-# Or with pip
+# Or with pip (also requires the Rust toolchain above)
 pip install -e .[all]
 ```
 
@@ -33,7 +33,7 @@ pip install -e .[all]
 **Install and test your local development version:**
 
 ```bash
-# Option 1: Install in development mode with pip
+# Option 1: Install in development mode with pip (also requires the Rust toolchain above)
 pip install -e .[all]
 
 # Then test the CLI directly (both forms work: "modelaudit <path>" or "modelaudit scan <path>")
