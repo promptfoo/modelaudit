@@ -469,14 +469,29 @@ def _merge_missing_pickle_checks(
 
         promotion_identity = _pickle_record_promotion_identity(issue)
         if promotion_identity is not None:
+            promoted_severity = _severity_priority(issue.severity)
+            retained_checks = [
+                existing_check
+                for existing_check in target.checks
+                if not (
+                    _pickle_record_promotion_identity(existing_check) == promotion_identity
+                    and _severity_priority(existing_check.severity) < promoted_severity
+                )
+            ]
             retained_issues = [
                 existing_issue
                 for existing_issue in target.issues
                 if not (
                     _pickle_record_promotion_identity(existing_issue) == promotion_identity
-                    and _severity_priority(existing_issue.severity) < _severity_priority(issue.severity)
+                    and _severity_priority(existing_issue.severity) < promoted_severity
                 )
             ]
+            if len(retained_checks) != len(target.checks):
+                target.checks = retained_checks
+                existing_check_signatures = {
+                    _pickle_check_signature(existing_check) for existing_check in target.checks
+                }
+                existing_check_identities = _pickle_record_identity_map(target.checks)
             if len(retained_issues) != len(target.issues):
                 target.issues = retained_issues
                 existing_issue_signatures = {
@@ -4579,6 +4594,14 @@ class PickleScanner(BaseScanner):
             and compatibility_operational_only
             and not compatibility_has_resource_limit
         )
+        compatibility_parse_incomplete_check_ids = {
+            id(check)
+            for check in compatibility_result.checks
+            if check.name == "Standalone Pickle Parse Failure" or _is_parse_incomplete_pickle_issue(check)
+        }
+        compatibility_parse_incomplete_issue_ids = {
+            id(issue) for issue in compatibility_result.issues if _is_parse_incomplete_pickle_issue(issue)
+        }
         _merge_missing_pickle_checks(
             package_result,
             compatibility_result,
@@ -4586,12 +4609,10 @@ class PickleScanner(BaseScanner):
         )
         if compatibility_operational_only and compatibility_result.metadata.get("scanner_limitation"):
             package_result.checks = [
-                check
-                for check in package_result.checks
-                if check.name != "Standalone Pickle Parse Failure" and not _is_parse_incomplete_pickle_issue(check)
+                check for check in package_result.checks if id(check) not in compatibility_parse_incomplete_check_ids
             ]
             package_result.issues = [
-                issue for issue in package_result.issues if not _is_parse_incomplete_pickle_issue(issue)
+                issue for issue in package_result.issues if id(issue) not in compatibility_parse_incomplete_issue_ids
             ]
         if Path(source).suffix.lower() == ".bin" and _has_trusted_incomplete_tail_context(package_result):
             package_result.metadata.setdefault("file_type", "binary")

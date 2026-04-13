@@ -5,29 +5,6 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
-### Features
-
-- replace the standalone pickle scanner's package-engine selector with the Rust-only runtime and explicit native-extension errors
-- scan PyTorch ZIP checkpoint pickle members directly in the standalone pickle scanner
-
-### Performance
-
-- increase Rust stream read chunks to reduce scan overhead on large file and archive-member inputs
-
-### Documentation
-
-- add the scoped Rust rewrite plan and parity gates for the standalone pickle scanner
-- add large-corpus QA plan and execution notes for the Rust pickle scanner rewrite
-
-### Bug Fixes
-
-- align Rust pickle suspicious-string matching, protocol-0 text decoding, EOF-before-`STOP` handling, malformed argument diagnostics, and parse-incomplete reports with Python parity for magic-method, escaped-string, raw-unicode, malformed-tail, length-prefixed truncation, and whitespace-tolerant `getattr(...)` cases
-- preserve warning-level dangerous-call findings when adapting standalone pickle reports into ModelAudit results
-- normalize negative standalone pickle stream sizes before crossing the Rust native-extension boundary
-- keep stronger compatibility findings when fallback analysis promotes a weaker standalone pickle finding
-
 ## [0.2.37](https://github.com/promptfoo/modelaudit/compare/v0.2.36...v0.2.37) (2026-04-12)
 
 ### Bug Fixes
@@ -295,7 +272,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **pickle:** replace the standalone pickle scanner's package-engine selector with the Rust-only runtime and explicit native-extension errors
+- **pickle:** scan PyTorch ZIP checkpoint pickle members directly in the standalone pickle scanner
 - **pickle:** bundle the standalone `modelaudit_picklescan` API in the root `modelaudit` wheel and add source-tree coverage for the package boundary
+- **pickle:** add the scoped Rust rewrite plan, parity gates, large-corpus QA plan, and execution notes for the standalone pickle scanner
 - **tests:** enable existing PaddlePaddle scanner tests in CI by adding `test_paddle_scanner.py` to the allowed test files list (Python 3.10/3.12/3.13)
 - **security:** detect CVE-2026-1669 Keras HDF5 external weight references in standalone `.h5` and embedded `.keras` weights
 - **security:** detect CVE-2026-24747 PyTorch weights_only=True bypass via SETITEM/SETITEMS abuse and tensor metadata mismatch detection
@@ -304,6 +284,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **pickle:** increase Rust stream read chunks to reduce scan overhead on large file and archive-member inputs
 - **security:** temporarily bump the optional ONNX dependency to `1.21.0rc3`, which removes the vulnerable `onnx.hub` module flagged by CVE-2026-28500.
 
 ### Fixed
@@ -323,6 +304,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **security:** detect protocol 0/1 pickle streams with trivial opcode prefixes even when `STOP` is followed by trailing junk, while preserving plain-text near-match rejection
 - **security:** detect protocol 0/1 pickle streams whose dangerous opcode appears after large trivial padding or after a non-trivial probe-boundary prelude, reject all-trivial no-`STOP` probe prefixes, and preserve rule codes across cached scan-result round trips
 - **pickle:** propagate standalone fallback parse and stream-read failures into merged scan success, preserve truncated `.bin` fail-closed behavior, reuse non-seekable stream spools for the legacy parity pass, clamp negative stream sizes, and reset post-budget scan state between reused scanner runs
+- **pickle:** align Rust pickle suspicious-string matching, protocol-0 text decoding, EOF-before-`STOP` handling, malformed argument diagnostics, parse-incomplete reports, warning dangerous-call adaptation, negative stream sizes, and compatibility finding promotion with Python parity
 - **license:** bound binary header scans and reuse compiled patterns to avoid full-file regex passes on large model archives
 - **security:** stop iterating malformed TFLite models after excessive subgraph counts are detected
 - **openvino:** route forbidden-DOCTYPE IR XML into the OpenVINO scanner, fail closed on XML parse errors, and suppress warning-level format-validation noise for benign `.xml` models with no distinctive magic bytes

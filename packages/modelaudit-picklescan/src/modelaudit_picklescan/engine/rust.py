@@ -134,4 +134,6 @@ def _optional_int(value: object) -> int | None:
 def _optional_bool(value: object) -> bool | None:
     if value is None:
         return None
-    return bool(value)
+    if isinstance(value, bool):
+        return value
+    raise TypeError(f"expected bool or None, got {type(value).__name__}")

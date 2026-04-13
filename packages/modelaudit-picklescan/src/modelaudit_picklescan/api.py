@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import tempfile
 import zipfile
 from pathlib import Path
 from typing import Any, BinaryIO, cast
@@ -52,7 +53,7 @@ class PickleScanner:
                 normalized_size,
                 max_unbounded_read_bytes=self.options.max_unbounded_stream_read_bytes,
             )
-        except (OSError, ValueError) as error:
+        except Exception as error:
             return _io_error_report(
                 source=source,
                 message=f"Could not read pickle stream: {error!s}",
@@ -154,9 +155,25 @@ class PickleScanner:
                         )
                     )
                     continue
-                with archive.open(entry, "r") as member_stream:
+                try:
+                    with archive.open(entry, "r") as member_stream:
+                        reports.append(
+                            self.scan_stream(
+                                cast(BinaryIO, member_stream),
+                                source=member_source,
+                                size=entry.file_size,
+                            )
+                        )
+                except Exception as error:
                     reports.append(
-                        self.scan_stream(cast(BinaryIO, member_stream), source=member_source, size=entry.file_size)
+                        _io_error_report(
+                            source=member_source,
+                            message=f"Could not read PyTorch ZIP pickle member: {error!s}",
+                            category="zip_error",
+                            exception=error,
+                            bytes_scanned=0,
+                            bytes_total=entry.file_size,
+                        )
                     )
 
             return _combine_pytorch_zip_reports(
@@ -309,6 +326,8 @@ def _combine_pytorch_zip_reports(
 def _combine_status(member_reports: list[PickleReport], notices: tuple[Notice, ...]) -> ScanStatus:
     if not member_reports:
         return ScanStatus.INCONCLUSIVE
+    if any(report.status == ScanStatus.ERROR for report in member_reports):
+        return ScanStatus.ERROR
     if notices or any(report.status != ScanStatus.COMPLETE for report in member_reports):
         return ScanStatus.INCONCLUSIVE
     return ScanStatus.COMPLETE
@@ -415,24 +434,28 @@ def _read_stream_payload(
     *,
     max_unbounded_read_bytes: int,
 ) -> bytes:
-    chunks: list[bytes] = []
-    if size is None:
-        read_chunk_size = min(_RUST_STREAM_READ_CHUNK_SIZE, max_unbounded_read_bytes)
-        while True:
-            chunk = stream.read(read_chunk_size)
-            if not chunk:
-                break
-            chunks.append(chunk)
-        return b"".join(chunks)
+    with tempfile.SpooledTemporaryFile(max_size=max_unbounded_read_bytes, mode="w+b") as spool:
+        if size is None:
+            remaining = max_unbounded_read_bytes
+            while remaining > 0:
+                chunk = stream.read(min(_RUST_STREAM_READ_CHUNK_SIZE, remaining))
+                if not chunk:
+                    break
+                spool.write(chunk)
+                remaining -= len(chunk)
+            else:
+                raise ValueError("Unbounded stream exceeded max_unbounded_stream_read_bytes")
+        else:
+            remaining = size
+            while remaining > 0:
+                chunk = stream.read(min(_RUST_STREAM_READ_CHUNK_SIZE, remaining))
+                if not chunk:
+                    break
+                spool.write(chunk)
+                remaining -= len(chunk)
 
-    remaining = size
-    while remaining > 0:
-        chunk = stream.read(min(_RUST_STREAM_READ_CHUNK_SIZE, remaining))
-        if not chunk:
-            break
-        chunks.append(chunk)
-        remaining -= len(chunk)
-    return b"".join(chunks)
+        spool.seek(0)
+        return spool.read()
 
 
 def _engine_error_report(

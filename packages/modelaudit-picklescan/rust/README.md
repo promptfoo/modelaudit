@@ -26,8 +26,8 @@ cargo check --manifest-path packages/modelaudit-picklescan/Cargo.toml
 cargo clippy --manifest-path packages/modelaudit-picklescan/Cargo.toml --all-targets -- -D warnings
 cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml
 uv run --with maturin maturin develop --manifest-path packages/modelaudit-picklescan/Cargo.toml
-.venv/bin/pytest packages/modelaudit-picklescan/tests/test_rust_engine.py -q
-.venv/bin/pytest packages/modelaudit-picklescan/tests -q
+uv run pytest packages/modelaudit-picklescan/tests/test_rust_engine.py -q
+uv run pytest packages/modelaudit-picklescan/tests -q
 ```
 
 For performance-sensitive changes, also run:

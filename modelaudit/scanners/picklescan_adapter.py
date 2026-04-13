@@ -349,11 +349,14 @@ def _is_benign_nested_payload_detection(finding: Finding, dangerous_nested_encod
         return False
     if finding.details.get("analysis_incomplete") is True:
         return False
-    if finding.message not in {"Nested pickle payload detected", "Encoded pickle payload detected"}:
+    if not finding.message.startswith(("Nested pickle payload detected", "Encoded pickle payload detected")):
         return False
     encoding = finding.details.get("encoding")
     if not isinstance(encoding, str):
-        encoding = "raw" if finding.rule_code == "S213" else None
+        if finding.rule_code == "S213":
+            encoding = "raw"
+        else:
+            return False
     return encoding not in dangerous_nested_encodings
 
 

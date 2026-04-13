@@ -18,7 +18,7 @@ packages/
       options.py
       report.py
       engine/
-      _rust.*.so        # generated only by local/native builds; not committed
+      _rust.*           # generated only by local/native builds; not committed
     rust/
       src/lib.rs
     tests/
@@ -39,10 +39,9 @@ modelaudit/
 - `modelaudit` owns file routing, archive/container orchestration, CLI, cache,
   telemetry, SARIF/export integrations, and `PickleReport -> ScanResult`
   adaptation.
-- During the migration period, `modelaudit.scanners.pickle_scanner.PickleScanner`
-  still merges legacy-only checks after the standalone pass. Keep this fallback
-  until the parity harness shows that standalone verdict, status, and required
-  rule coverage are sufficient for the root scanner to depend on it alone.
+- `modelaudit.scanners.pickle_scanner.PickleScanner` runs the Rust-backed
+  standalone pass first and may merge root-only compatibility checks until the
+  remaining root-specific detections are moved or intentionally retained.
 - Wrapper scanners in `modelaudit` pass embedded pickle streams into
   `modelaudit-picklescan`; archive parsing stays in `modelaudit`.
 - The root `modelaudit` wheel depends on the `modelaudit-picklescan`

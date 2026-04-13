@@ -1,3 +1,4 @@
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use std::collections::{HashMap, HashSet};
@@ -36,6 +37,7 @@ const BASE64_LITERAL_CHARS: &[u8] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
 const HEX_LITERAL_CHARS: &[u8] = b"0123456789abcdefABCDEF";
 const ENCODED_LITERAL_PROBE_CHARS: usize = 64;
+const MAX_NESTED_PAYLOAD_PROBES: usize = 64;
 
 #[derive(Clone)]
 struct GlobalRef {
@@ -57,6 +59,7 @@ enum StackValue {
     Text(String),
     Bytes(Vec<u8>),
     Global(GlobalRef),
+    Constructed(GlobalRef),
     Tuple(Vec<StackValue>),
     Primitive {
         type_name: &'static str,
@@ -112,9 +115,16 @@ fn option_usize(options: &Bound<'_, PyDict>, key: &str, default: usize) -> PyRes
 }
 
 fn option_f64(options: &Bound<'_, PyDict>, key: &str, default: f64) -> PyResult<f64> {
-    match options.get_item(key)? {
+    let value = match options.get_item(key)? {
         Some(value) => value.extract::<f64>(),
         None => Ok(default),
+    }?;
+    if value.is_finite() && value > 0.0 {
+        Ok(value)
+    } else {
+        Err(PyValueError::new_err(format!(
+            "{key} must be greater than 0 and finite, got {value:?}"
+        )))
     }
 }
 
@@ -681,8 +691,9 @@ impl<'a> ScanState<'a> {
             "NEWOBJ_EX" => self.consume_top_operands(3),
             "OBJ" => {
                 let values = self.pop_to_mark();
-                self.stack.push(StackValue::Other);
-                values.into_iter().next()
+                let callable_value = values.into_iter().next();
+                self.push_constructed_result(callable_value.as_ref());
+                callable_value
             }
             "INST" => {
                 let _ = self.pop_to_mark();
@@ -694,7 +705,7 @@ impl<'a> ScanState<'a> {
                     malformed: false,
                 };
                 self.record_global_ref(&reference, opcode.name);
-                self.stack.push(StackValue::Other);
+                self.stack.push(StackValue::Constructed(reference.clone()));
                 Some(StackValue::Global(reference))
             }
             "BUILD" => self.consume_top_operands(2),
@@ -702,7 +713,11 @@ impl<'a> ScanState<'a> {
         };
 
         match callable_value {
-            Some(StackValue::Global(reference)) if !reference.malformed => Some(reference),
+            Some(StackValue::Global(reference) | StackValue::Constructed(reference))
+                if !reference.malformed =>
+            {
+                Some(reference)
+            }
             _ => None,
         }
     }
@@ -720,8 +735,20 @@ impl<'a> ScanState<'a> {
             }
         }
         values.reverse();
-        self.stack.push(StackValue::Other);
-        values.into_iter().next()
+        let callable_value = values.into_iter().next();
+        self.push_constructed_result(callable_value.as_ref());
+        callable_value
+    }
+
+    fn push_constructed_result(&mut self, callable_value: Option<&StackValue>) {
+        match callable_value {
+            Some(StackValue::Global(reference) | StackValue::Constructed(reference))
+                if !reference.malformed =>
+            {
+                self.stack.push(StackValue::Constructed(reference.clone()));
+            }
+            _ => self.stack.push(StackValue::Other),
+        }
     }
 
     fn resolve_stack_global(
@@ -834,6 +861,17 @@ impl<'a> ScanState<'a> {
 
     fn scan_raw_nested_pickle_bytes(&mut self, value: &[u8], position: usize) {
         if value.len() > self.options.max_nested_pickle_bytes {
+            for offset in nested_pickle_probe_offsets(value) {
+                let end = value
+                    .len()
+                    .min(offset.saturating_add(self.options.max_nested_pickle_bytes));
+                let candidate = &value[offset..end];
+                if looks_like_pickle_payload(candidate, self.options.max_nested_pickle_bytes) {
+                    self.add_nested_payload_finding("raw", value.len(), position + offset, false);
+                    self.surface_nested_pickle_findings(candidate, "raw", position + offset);
+                    return;
+                }
+            }
             if has_pickle_prefix(value) {
                 self.add_nested_payload_finding("raw", value.len(), position, true);
                 self.record_raw_nested_payload_truncated(value.len(), position);
@@ -906,22 +944,12 @@ impl<'a> ScanState<'a> {
 
         let max_window_chars =
             encoded_nested_window_char_limit(value, self.options.max_nested_pickle_bytes);
-        if value.len() <= max_window_chars {
+        if value.len() <= max_window_chars || value.chars().count() <= max_window_chars {
             self.scan_encoded_nested_pickle_candidate(value, position);
-            return;
         }
 
-        let value_len = value.chars().count();
-        if value_len <= max_window_chars {
-            self.scan_encoded_nested_pickle_candidate(value, position);
-            return;
-        }
-
-        let prefix = take_chars(value, max_window_chars);
-        let suffix = take_last_chars(value, max_window_chars);
-        self.scan_encoded_nested_pickle_candidate(&prefix, position);
-        if prefix != suffix {
-            self.scan_encoded_nested_pickle_candidate(&suffix, position);
+        for candidate in encoded_nested_literal_probe_windows(value, max_window_chars) {
+            self.scan_encoded_nested_pickle_candidate(&candidate, position);
         }
     }
 
@@ -1522,6 +1550,7 @@ fn resolve_global_operand(value: Option<&StackValue>) -> Option<String> {
 fn operand_preview(value: Option<&StackValue>) -> String {
     match value {
         Some(StackValue::Global(reference)) => format!("_GlobalRef({})", reference.symbol()),
+        Some(StackValue::Constructed(reference)) => format!("constructed:{}", reference.symbol()),
         Some(StackValue::Bytes(bytes)) => format!("bytes(len={})", bytes.len()),
         Some(StackValue::Mark) => "MARK".to_string(),
         Some(StackValue::Text(value)) => format!("str:{:?}", value),
@@ -1554,6 +1583,7 @@ fn stack_value_preview(value: &StackValue, depth: usize) -> String {
         StackValue::Text(value) => format!("str:{:?}", value),
         StackValue::Bytes(bytes) => format!("bytes(len={})", bytes.len()),
         StackValue::Global(reference) => format!("global:{}", reference.symbol()),
+        StackValue::Constructed(reference) => format!("constructed:{}", reference.symbol()),
         StackValue::Tuple(values) => {
             let mut parts: Vec<String> = values
                 .iter()
@@ -2113,7 +2143,13 @@ fn validate_pickle_stack_effect(
             *stack_depth -= 2;
             true
         }
-        "REDUCE" | "NEWOBJ" | "BUILD" => *stack_depth >= 2,
+        "REDUCE" | "NEWOBJ" | "BUILD" => {
+            if *stack_depth < 2 {
+                return false;
+            }
+            *stack_depth -= 1;
+            true
+        }
         "NEWOBJ_EX" => {
             if *stack_depth < 3 {
                 return false;
@@ -2154,10 +2190,7 @@ fn validate_pickle_stack_effect(
             true
         }
         "PUT" | "BINPUT" | "LONG_BINPUT" | "MEMOIZE" | "PROTO" | "FRAME" | "STOP" => true,
-        "NEXT_BUFFER" | "READONLY_BUFFER" => {
-            *stack_depth += 1;
-            true
-        }
+        "NEXT_BUFFER" | "READONLY_BUFFER" => true,
         _ => {
             *stack_depth += 1;
             true
@@ -2174,6 +2207,55 @@ fn has_pickle_prefix(value: &[u8]) -> bool {
             value[0],
             b'(' | b'c' | b'd' | b'l' | b'i' | b'I' | b'S' | b'V'
         )
+}
+
+fn nested_pickle_probe_offsets(value: &[u8]) -> Vec<usize> {
+    let mut offsets = Vec::new();
+    for index in 0..value.len().saturating_sub(1) {
+        if has_pickle_prefix(&value[index..]) {
+            offsets.push(index);
+            if offsets.len() >= MAX_NESTED_PAYLOAD_PROBES {
+                break;
+            }
+        }
+    }
+    offsets
+}
+
+fn encoded_nested_literal_probe_windows(value: &str, max_window_chars: usize) -> Vec<String> {
+    let mut windows = Vec::new();
+    push_unique_window(&mut windows, take_chars(value, max_window_chars));
+    push_unique_window(&mut windows, take_last_chars(value, max_window_chars));
+
+    let bytes = value.as_bytes();
+    let patterns: [&[u8]; 3] = [b"gA", b"800", b"\\x80"];
+    for index in 0..bytes.len() {
+        if windows.len() >= MAX_NESTED_PAYLOAD_PROBES {
+            break;
+        }
+        if !patterns
+            .iter()
+            .any(|pattern| bytes[index..].starts_with(pattern))
+        {
+            continue;
+        }
+        if !value.is_char_boundary(index) {
+            continue;
+        }
+        push_unique_window(
+            &mut windows,
+            take_bytes_str(&value[index..], max_window_chars),
+        );
+    }
+
+    windows
+}
+
+fn push_unique_window(windows: &mut Vec<String>, candidate: String) {
+    if candidate.is_empty() || windows.iter().any(|window| window == &candidate) {
+        return;
+    }
+    windows.push(candidate);
 }
 
 fn encoded_nested_window_char_limit(value: &str, max_nested_pickle_bytes: usize) -> usize {

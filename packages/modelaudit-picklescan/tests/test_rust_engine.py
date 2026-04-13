@@ -16,6 +16,7 @@ from modelaudit_picklescan._parity_corpus import (
     malicious_reduce_payload,
     prefix_truncation_payloads,
 )
+from modelaudit_picklescan.engine.rust import _report_from_native_dict
 from modelaudit_picklescan.engine.selection import rust_engine_available
 
 pytestmark = pytest.mark.skipif(not rust_engine_available(), reason="Rust picklescan extension is not built")
@@ -115,6 +116,27 @@ def test_generated_payloads_scan_without_runtime_errors() -> None:
             failures.append(name)
 
     assert failures == []
+
+
+def test_rust_report_conversion_rejects_non_bool_coverage_flags() -> None:
+    raw_report = {
+        "source": "native.pkl",
+        "status": "complete",
+        "verdict": "clean",
+        "findings": [],
+        "notices": [],
+        "errors": [],
+        "coverage": {
+            "bytes_scanned": 0,
+            "raw_scan_complete": "false",
+            "opcode_scan_complete": True,
+        },
+        "metadata": {},
+        "duration_s": 0.0,
+    }
+
+    with pytest.raises(TypeError, match="expected bool or None"):
+        _report_from_native_dict(raw_report)
 
 
 def test_prefix_truncations_scan_without_runtime_errors() -> None:

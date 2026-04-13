@@ -210,7 +210,7 @@ pub(crate) fn parse_opcode(
             }
         }
         0x8e => {
-            let len = read_u64_le(payload, &mut cursor, limit)? as usize;
+            let len = read_u64_len(payload, &mut cursor, limit, index, "bytes8")?;
             ParsedOpcode {
                 name: "BINBYTES8",
                 arg: ArgValue::Bytes(read_variable_bytes(
@@ -225,7 +225,7 @@ pub(crate) fn parse_opcode(
             }
         }
         0x96 => {
-            let len = read_u64_le(payload, &mut cursor, limit)? as usize;
+            let len = read_u64_len(payload, &mut cursor, limit, index, "bytearray8")?;
             ParsedOpcode {
                 name: "BYTEARRAY8",
                 arg: ArgValue::Bytes(read_variable_bytes(
@@ -287,7 +287,7 @@ pub(crate) fn parse_opcode(
             }
         }
         0x8d => {
-            let len = read_u64_le(payload, &mut cursor, limit)? as usize;
+            let len = read_u64_len(payload, &mut cursor, limit, index, "unicodestring8")?;
             ParsedOpcode {
                 name: "BINUNICODE8",
                 arg: ArgValue::Text(
@@ -431,7 +431,7 @@ pub(crate) fn parse_opcode(
         },
         b'.' => simple_opcode("STOP", index, cursor),
         0x95 => {
-            let frame_len = read_u64_le(payload, &mut cursor, limit)? as usize;
+            let frame_len = read_u64_len(payload, &mut cursor, limit, index, "frame")?;
             ParsedOpcode {
                 name: "FRAME",
                 arg: ArgValue::UInt(frame_len),
@@ -500,6 +500,18 @@ fn read_u64_le(payload: &[u8], cursor: &mut usize, limit: usize) -> Result<u64, 
     Ok(u64::from_le_bytes([
         bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
     ]))
+}
+
+fn read_u64_len(
+    payload: &[u8],
+    cursor: &mut usize,
+    limit: usize,
+    index: usize,
+    read_kind: &'static str,
+) -> Result<usize, ParseError> {
+    usize::try_from(read_u64_le(payload, cursor, limit)?).map_err(|_| {
+        ParseError::new(format!("pickle opcode {read_kind} length overflow")).at(index)
+    })
 }
 
 fn read_fixed_width_bytes(

@@ -1,4 +1,5 @@
 import json
+import zipfile
 from argparse import Namespace
 from pathlib import Path
 
@@ -48,6 +49,30 @@ def test_package_scannable_path_includes_pytorch_zip_suffixes(tmp_path: Path) ->
         tmp_path / "archive.zip",
         {"kind": "zip"},
     )
+
+
+def test_iter_pickle_zip_members_extracts_data_pickle_and_skips_near_matches(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.zip"
+    malicious_payload = large_pickle_corpus_qa.raw_os_system_reduce_payload()
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("data.pkl", malicious_payload)
+        archive.writestr("data.pkl.txt", b"benign near match")
+        archive.writestr("notes.txt", b"not a pickle")
+
+    members = list(
+        large_pickle_corpus_qa._iter_pickle_zip_members(
+            archive_path,
+            run_dir=tmp_path,
+            artifact_id="A01",
+        )
+    )
+
+    assert [member_name for member_name, _member_path in members] == ["data.pkl"]
+    member_path = members[0][1]
+    assert member_path.read_bytes() == malicious_payload
+
+    scan_row = large_pickle_corpus_qa._scan_package(member_path, engine="rust", artifact_id="A01:data.pkl")
+    assert scan_row["result"]["critical_count"] >= 1
 
 
 def test_preflight_offline_writes_lockfile(tmp_path: Path) -> None:

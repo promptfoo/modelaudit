@@ -43,11 +43,10 @@ report = scan_bytes(
 )
 ```
 
-## Rust Scanner
+## Native Scanner
 
-The package is Rust-only at runtime. If the native extension cannot be imported,
-scan calls return an explicit `rust_engine_error` report instead of falling back
-to a deleted Python implementation.
+The wheel includes a native Rust scanner for pickle payload analysis. Maintainer
+migration notes and failure-mode details live in the repository maintainer docs.
 
 ## Report Contract
 
@@ -64,12 +63,6 @@ plain-Python representation is needed.
 ## Package Boundary
 
 `modelaudit-picklescan` analyzes raw pickle payloads and PyTorch ZIP checkpoint
-pickle members. General archive/container routing, SARIF export, CLI behavior,
-and ModelAudit result adaptation stay in the root `modelaudit` package.
-
-The root `modelaudit` pickle scanner runs this standalone Rust engine first and
-then may merge root-only compatibility checks while remaining detector parity
-work is completed. Standalone users should rely on this package for pickle
-payload analysis, but full ModelAudit scans may still report additional
-root-package context such as archive metadata, CVE checks, and legacy rule
-identifiers.
+pickle members. For full model-file routing, archive context, CLI output,
+SARIF/export integrations, and broader scanner coverage, use the root
+`modelaudit` package.

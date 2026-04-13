@@ -472,6 +472,30 @@ def test_pickle_report_to_scan_result_fails_closed_for_encoded_nested_truncation
     assert notice_check.message == "Encoded pickle payload exceeds configured deep-scan byte limit"
 
 
+def test_pickle_report_to_scan_result_fails_closed_for_encoded_nested_payload_missing_encoding() -> None:
+    report = PickleReport(
+        source="encoded.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.MALICIOUS,
+        findings=(
+            Finding(
+                message="Encoded pickle payload detected in string literal",
+                severity=Severity.CRITICAL,
+                location="encoded.pkl (pos 16)",
+                rule_code="S601",
+                details={},
+            ),
+        ),
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert result.success is True
+    assert len(result.issues) == 1
+    assert result.issues[0].severity == IssueSeverity.CRITICAL
+    assert result.issues[0].rule_code == "S601"
+
+
 def test_pickle_report_to_scan_result_fails_closed_for_raw_nested_truncation_notice() -> None:
     report = PickleReport(
         source="oversized-raw.pkl",
@@ -901,6 +925,9 @@ def test_pickle_report_to_scan_result_allows_joblib_serialization_tail_without_b
 
     result = pickle_report_to_scan_result(report)
 
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["analysis_incomplete"] is True
     assert result.metadata["trusted_incomplete_tail"] is True
     assert not any(issue.message == "Pickle parsing failed before full scan completion" for issue in result.issues)
 
@@ -939,6 +966,9 @@ def test_pickle_report_to_scan_result_requires_boundary_for_non_joblib_tail_supp
 
     result = pickle_report_to_scan_result(report)
 
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["analysis_incomplete"] is True
     assert "trusted_incomplete_tail" not in result.metadata
     parse_issue = next(
         issue for issue in result.issues if issue.message == "Pickle parsing failed before full scan completion"

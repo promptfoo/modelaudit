@@ -40,10 +40,10 @@ The standalone implementation is now Rust-only:
 - Do not change scanner routing, archive parsing, CLI behavior, telemetry,
   cache semantics, SARIF output, or root `ScanResult` models as part of the
   Rust engine.
-- Do not remove the Python implementation or legacy root fallback until the
-  parity gates in this document pass.
-- Do not make Rust the default or remove the Python implementation until the
-  release-wheel matrix and long-running parity gates are complete.
+- Do not reintroduce a package-engine selector or Python package fallback.
+- Do not remove root-only compatibility checks until the parity gates in this
+  document show that each check is either implemented in Rust or intentionally
+  retained in the root scanner.
 
 ## Current Boundary
 
@@ -66,11 +66,9 @@ The Rust engine sits behind the existing Python API:
   remain source-compatible.
 - The Rust module returns a plain Python mapping that the Python wrapper
   converts into the existing dataclasses.
-- Engine selection is internal and explicit during migration:
-  - `python`: current implementation.
-  - `rust`: Rust-backed implementation.
-  - `compare`: run both, return Python output, and expose diagnostics for tests.
-- Default stays `python` until all parity and packaging gates pass.
+- Engine selection in the standalone package is no longer user- or
+  test-selectable.
+- The standalone runtime is Rust-only.
 - On import/build failure for the Rust extension, the package reports a Rust
   engine error. The Python package engine and compare selector have been
   removed.

@@ -38,6 +38,11 @@ class UnreadableStream(io.BytesIO):
         raise OSError("simulated stream read failure")
 
 
+class RuntimeFailingStream(io.BytesIO):
+    def read(self, size: int | None = -1) -> bytes:
+        raise RuntimeError("simulated runtime stream read failure")
+
+
 class NoBulkReadStream(io.BytesIO):
     def __init__(self, payload: bytes, *, max_read_size: int) -> None:
         super().__init__(payload)
@@ -93,6 +98,20 @@ def test_scan_bytes_detects_reduce_invoking_os_system() -> None:
     assert any(
         ref["import_reference"] in SYSTEM_GLOBALS and ref["is_dangerous"] is True
         for ref in report.metadata["import_references"]
+    )
+
+
+def test_scan_bytes_detects_build_on_constructed_dangerous_global() -> None:
+    payload = b"cos\nsystem\n)R}b."
+
+    report = scan_bytes(payload, source="build-dangerous.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.details.get("opcode") == "BUILD"
+        and finding.details.get("import_reference") in SYSTEM_GLOBALS
+        for finding in report.findings
     )
 
 
@@ -318,6 +337,43 @@ def test_scan_file_detects_malicious_pytorch_zip_data_pickle(tmp_path: Path) -> 
     )
 
 
+def test_scan_file_returns_error_report_for_pytorch_zip_member_access_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    archive_path = tmp_path / "encrypted.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+        archive.writestr("version", "3\n")
+        archive.writestr("byteorder", "little")
+
+    original_open = zipfile.ZipFile.open
+
+    def fail_member_open(
+        archive: zipfile.ZipFile,
+        name: str | zipfile.ZipInfo,
+        mode: str = "r",
+        pwd: bytes | None = None,
+        *,
+        force_zip64: bool = False,
+    ) -> object:
+        member_name = name.filename if isinstance(name, zipfile.ZipInfo) else name
+        if member_name == "data.pkl":
+            raise RuntimeError("unsupported encrypted member")
+        return original_open(archive, name, mode=mode, pwd=pwd, force_zip64=force_zip64)
+
+    monkeypatch.setattr(zipfile.ZipFile, "open", fail_member_open)
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.ERROR
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert len(report.errors) == 1
+    assert report.errors[0].category == "zip_error"
+    assert report.errors[0].exception_type == "RuntimeError"
+    assert report.errors[0].location == f"{archive_path}:data.pkl"
+
+
 def test_scan_file_leaves_generic_data_pickle_zip_as_raw_pickle_input(tmp_path: Path) -> None:
     archive_path = tmp_path / "generic.jpg"
     with zipfile.ZipFile(archive_path, "w") as archive:
@@ -380,6 +436,19 @@ def test_scan_stream_returns_error_report_for_read_failures() -> None:
     assert report.coverage.bytes_total == 16
     assert report.coverage.raw_scan_complete is False
     assert report.coverage.opcode_scan_complete is False
+
+
+def test_scan_stream_returns_error_report_for_runtime_read_failures() -> None:
+    report = PickleScanner().scan_stream(RuntimeFailingStream(), source="broken-stream.pkl", size=16)
+
+    assert report.status == ScanStatus.ERROR
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.findings == ()
+    assert len(report.errors) == 1
+    assert report.errors[0].category == "io_error"
+    assert report.errors[0].exception_type == "RuntimeError"
+    assert report.coverage.bytes_scanned == 0
+    assert report.coverage.bytes_total == 16
 
 
 def test_scan_stream_returns_empty_input_error_for_empty_unknown_size_stream() -> None:
@@ -447,7 +516,7 @@ def test_scan_stream_incrementally_reads_bounded_streams_without_preloading_enti
 def test_scan_stream_honors_explicit_reads_without_declared_size() -> None:
     payload = pickle.dumps(b"a" * 64, protocol=4)
 
-    report = PickleScanner(ScanOptions(max_unbounded_stream_read_bytes=8)).scan_stream(
+    report = PickleScanner(ScanOptions(max_unbounded_stream_read_bytes=len(payload) + 1)).scan_stream(
         io.BytesIO(payload),
         source="unknown-size-binbytes.pkl",
     )
@@ -456,6 +525,23 @@ def test_scan_stream_honors_explicit_reads_without_declared_size() -> None:
     assert report.verdict == SafetyVerdict.CLEAN
     assert report.errors == ()
     assert report.coverage.bytes_scanned == len(payload)
+
+
+def test_scan_stream_enforces_total_unbounded_stream_read_limit() -> None:
+    payload = pickle.dumps(b"a" * 64, protocol=4)
+
+    report = PickleScanner(ScanOptions(max_unbounded_stream_read_bytes=8)).scan_stream(
+        io.BytesIO(payload),
+        source="unknown-size-over-limit.pkl",
+    )
+
+    assert report.status == ScanStatus.ERROR
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.findings == ()
+    assert len(report.errors) == 1
+    assert report.errors[0].category == "io_error"
+    assert report.errors[0].exception_type == "ValueError"
+    assert "max_unbounded_stream_read_bytes" in report.errors[0].message
 
 
 def test_scan_stream_bounds_protocol_zero_readline_without_declared_size() -> None:
@@ -854,6 +940,20 @@ def test_scan_bytes_flags_raw_nested_pickle_payloads() -> None:
     assert any(finding.rule_code == "S213" for finding in report.findings)
 
 
+def test_scan_bytes_flags_raw_nested_pickle_payload_hidden_inside_large_literal() -> None:
+    nested_payload = pickle.dumps({"inner": "data"}, protocol=4)
+    hidden_payload = b"A" * 64 + nested_payload + b"B" * 64
+
+    report = scan_bytes(
+        pickle.dumps({"outer": hidden_payload}, protocol=4),
+        source="hidden-raw-nested.pkl",
+        options=ScanOptions(max_nested_pickle_bytes=len(nested_payload) + 16),
+    )
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(finding.rule_code == "S213" for finding in report.findings)
+
+
 def test_scan_bytes_surfaces_nested_pickle_inner_findings() -> None:
     nested_payload = pickle.dumps(MaliciousPayload(), protocol=4)
 
@@ -977,6 +1077,20 @@ def test_scan_bytes_flags_base64_encoded_nested_pickle_payloads() -> None:
     assert any(finding.rule_code == "S601" for finding in report.findings)
 
 
+def test_scan_bytes_flags_base64_nested_pickle_payload_hidden_inside_large_literal() -> None:
+    nested_payload = pickle.dumps({"inner": "data"}, protocol=4)
+    hidden_payload = "A" * 64 + base64.b64encode(nested_payload).decode("ascii") + "A" * 64
+
+    report = scan_bytes(
+        pickle.dumps({"outer": hidden_payload}, protocol=4),
+        source="hidden-base64-nested.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=8),
+    )
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(finding.rule_code == "S601" for finding in report.findings)
+
+
 def test_scan_bytes_flags_hex_encoded_nested_pickle_payloads() -> None:
     nested_payload = pickle.dumps({"inner": "data"}, protocol=4)
     report = scan_bytes(
@@ -985,6 +1099,20 @@ def test_scan_bytes_flags_hex_encoded_nested_pickle_payloads() -> None:
     )
 
     assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(finding.rule_code == "S602" for finding in report.findings)
+
+
+def test_scan_bytes_flags_hex_nested_pickle_payload_hidden_inside_large_literal() -> None:
+    nested_payload = pickle.dumps({"inner": "data"}, protocol=4)
+    hidden_payload = "A" * 64 + binascii.hexlify(nested_payload).decode("ascii") + "A" * 64
+
+    report = scan_bytes(
+        pickle.dumps({"outer": hidden_payload}, protocol=4),
+        source="hidden-hex-nested.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=8),
+    )
+
     assert report.verdict == SafetyVerdict.MALICIOUS
     assert any(finding.rule_code == "S602" for finding in report.findings)
 

@@ -18,6 +18,7 @@ import os
 import pickle
 import platform
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -39,6 +40,7 @@ from modelaudit_picklescan._parity_corpus import raw_os_system_reduce_payload, r
 
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity, ScanResult
 from modelaudit.scanners.pickle_scanner import PickleScanner
+from modelaudit.scanners.picklescan_adapter import pickle_report_to_scan_result
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CORPUS_ROOT = Path("/tmp/modelaudit-large-pickle-corpus")
@@ -389,7 +391,7 @@ TOOL_SPECS: dict[str, ToolSpec] = {
     "fickling": ToolSpec(
         "fickling",
         "https://github.com/trailofbits/fickling.git",
-        "~/code/fickling",
+        "fickling",
         (
             "uv",
             "run",
@@ -405,7 +407,7 @@ TOOL_SPECS: dict[str, ToolSpec] = {
     "modelscan": ToolSpec(
         "modelscan",
         "https://github.com/protectai/modelscan.git",
-        "~/code/modelscan",
+        "modelscan",
         (
             "uv",
             "run",
@@ -424,7 +426,7 @@ TOOL_SPECS: dict[str, ToolSpec] = {
     "picklescan": ToolSpec(
         "picklescan",
         "https://github.com/mmaitre314/picklescan.git",
-        "~/code/picklescan",
+        "picklescan",
         (
             "uv",
             "run",
@@ -810,9 +812,11 @@ def _download_entry(
 def _classify_file(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {"exists": False, "kind": "missing", "size_bytes": None}
-    header = path.read_bytes()[:16]
+    with path.open("rb") as handle:
+        header = handle.read(16)
     kind = "unknown"
-    if zipfile.is_zipfile(path):
+    is_zip = zipfile.is_zipfile(path)
+    if is_zip:
         kind = "zip"
     elif header.startswith(b"\x80") or header[:1] in {b"(", b"c", b"d", b"l", b"i", b"I", b"S", b"V"}:
         kind = "pickle-like"
@@ -825,7 +829,7 @@ def _classify_file(path: Path) -> dict[str, Any]:
         "kind": kind,
         "size_bytes": path.stat().st_size,
         "header_hex": header.hex(),
-        "is_zip": zipfile.is_zipfile(path),
+        "is_zip": is_zip,
     }
 
 
@@ -903,7 +907,15 @@ def _scan_root(path: Path, *, engine: str, root_mode: str, artifact_id: str) -> 
     if engine != "rust":
         raise ValueError(f"unsupported root picklescan engine after Rust migration: {engine}")
     started = time.monotonic()
-    result = PickleScanner().scan(str(path))
+    scanner = PickleScanner()
+    if root_mode == "default":
+        result = scanner.scan(str(path))
+    elif root_mode == "standalone-primary":
+        report = package_scan_file(path)
+        result = pickle_report_to_scan_result(report, scanner_name=scanner.name, scanner=scanner)
+        result.metadata["pickle_primary_engine"] = "standalone"
+    else:
+        raise ValueError(f"unsupported root mode: {root_mode}")
     duration = time.monotonic() - started
     normalized = _normalize_scan_result(result, engine=f"root:{root_mode}:{engine}")
     return {
@@ -1028,7 +1040,7 @@ def _is_package_scannable_path(path: Path, classification: Mapping[str, Any]) ->
     return path.suffix.lower() in {".pkl", ".pickle", ".dill", ".joblib", ".pt", ".pth", ".ckpt", ".bin"}
 
 
-def _iter_pickle_zip_members(path: Path) -> Iterator[tuple[str, bytes]]:
+def _iter_pickle_zip_members(path: Path, *, run_dir: Path, artifact_id: str) -> Iterator[tuple[str, Path]]:
     try:
         with zipfile.ZipFile(path) as archive:
             for member in archive.infolist():
@@ -1040,7 +1052,15 @@ def _iter_pickle_zip_members(path: Path) -> Iterator[tuple[str, bytes]]:
                     lowered.endswith((".pkl", ".pickle")) or lowered.endswith("/data.pkl") or lowered == "data.pkl"
                 ):
                     continue
-                yield member_name, archive.read(member)
+                member_path = _member_file_path(run_dir, artifact_id, member_name)
+                member_path.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    with archive.open(member) as source, member_path.open("wb") as target:
+                        shutil.copyfileobj(source, target, length=1024 * 1024)
+                except Exception as error:
+                    logging.warning("failed to extract %s from %s: %s", member_name, path, error)
+                    continue
+                yield member_name, member_path
     except zipfile.BadZipFile:
         return
 
@@ -1347,10 +1367,7 @@ def _scan_records_for_entry(
     if _is_package_scannable_path(path, classification_map):
         package_targets.append((artifact_id, path))
     elif classification_map.get("kind") == "zip":
-        for member_name, member_bytes in _iter_pickle_zip_members(path):
-            member_path = _member_file_path(run_dir, artifact_id, member_name)
-            member_path.parent.mkdir(parents=True, exist_ok=True)
-            member_path.write_bytes(member_bytes)
+        for member_name, member_path in _iter_pickle_zip_members(path, run_dir=run_dir, artifact_id=artifact_id):
             package_targets.append((f"{artifact_id}:{member_name}", member_path))
 
     for target_artifact_id, target_path in package_targets:
