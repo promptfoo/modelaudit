@@ -382,8 +382,9 @@ def test_scan_file_returns_error_report_for_pytorch_zip_member_access_failure(
 
 def test_scan_file_leaves_generic_data_pickle_zip_as_raw_pickle_input(tmp_path: Path) -> None:
     archive_path = tmp_path / "generic.jpg"
+    entry = zipfile.ZipInfo("data.pkl", (1980, 1, 1, 0, 0, 0))
     with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+        archive.writestr(entry, pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
 
     report = scan_file(archive_path)
 
