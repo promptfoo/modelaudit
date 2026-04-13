@@ -176,25 +176,37 @@ def test_pickle_report_to_scan_result_preserves_reduce_associated_global_alias()
     assert result.issues[0].details["import_reference"] == "runpy.run_module"
 
 
-def test_pickle_report_to_scan_result_preserves_legacy_builtin_call_rule_alias() -> None:
+@pytest.mark.parametrize(
+    ("name", "expected_primary_rule"),
+    [
+        ("eval", "S104"),
+        ("exec", "S104"),
+        ("compile", "S105"),
+        ("__import__", "S106"),
+    ],
+)
+def test_pickle_report_to_scan_result_preserves_legacy_builtin_call_rule_alias(
+    name: str,
+    expected_primary_rule: str,
+) -> None:
     report = PickleReport(
-        source="eval.pkl",
+        source=f"{name}.pkl",
         status=ScanStatus.COMPLETE,
         verdict=SafetyVerdict.MALICIOUS,
         findings=(
             Finding(
-                message="Found REDUCE opcode invoking dangerous global: builtins.eval",
+                message=f"Found REDUCE opcode invoking dangerous global: builtins.{name}",
                 severity=Severity.CRITICAL,
                 location="eval.pkl (pos 12)",
                 rule_code="DANGEROUS_CALL",
-                details={"opcode": "REDUCE", "module": "builtins", "name": "eval"},
+                details={"opcode": "REDUCE", "module": "builtins", "name": name},
             ),
         ),
     )
 
     result = pickle_report_to_scan_result(report)
 
-    assert [issue.rule_code for issue in result.issues] == ["S104", "S201"]
+    assert [issue.rule_code for issue in result.issues] == [expected_primary_rule, "S201"]
     assert all(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
     assert all(issue.details["legacy_rule_aliases"] == ["S115"] for issue in result.issues)
 

@@ -498,7 +498,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] N-P1-9 — Add raw-layer pickle GLOBAL newline-form module attribute coverage.
 - [x] N-P1-10 / N-P1-12 — Scan binary tails past the 8 MB raw window and after malformed/truncated pickle prefixes.
 - [x] N-P1-13 — Preserve stream integrity hashes for streams larger than the raw scan window.
-- [ ] N-P1-18 — Pin or adjust primary DANGEROUS_CALL rule-code mapping for builtins.
+- [x] N-P1-18 — Pin or adjust primary DANGEROUS_CALL rule-code mapping for builtins.
 - [ ] N-P1-20 — Collapse protocol-5 buffer opcode notices into bounded/count-based notices.
 - [ ] N-P1-21 — Review `READONLY_BUFFER` empty-stack parity behavior.
 - [ ] N-P2-22 — Collapse encoded-text S604/S104 twin emissions.
@@ -687,6 +687,11 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run mypy modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py -q` — passed, 69 tests, including a seekable stream whose full payload is larger than a 64-byte root raw scan window.
+- N-P1-18 — Same-item commit pins the intentional adapter contract for builtin `DANGEROUS_CALL` findings: builtin-specific legacy rules remain primary (`eval`/`exec`→`S104`, `compile`→`S105`, `__import__`→`S106`) and `S201` remains a supporting REDUCE opcode issue with `S115` recorded as a metadata alias. Targeted QA:
+  - `uv run ruff format tests/scanners/test_picklescan_adapter.py` — passed.
+  - `uv run ruff check tests/scanners/test_picklescan_adapter.py` — passed.
+  - `uv run mypy tests/scanners/test_picklescan_adapter.py` — passed.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_picklescan_adapter.py -q` — passed, 66 tests, including all four builtin primary-rule mappings.
 
 ### Newly discovered gaps while remediating
 
