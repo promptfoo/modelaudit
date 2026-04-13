@@ -550,7 +550,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] S-D2-35 — Install Rust before release-please standalone lock refresh.
 - [x] S-D2-37 — Add future annotations to large-corpus QA test.
 - [x] S-D2-38 — Add new tests to `allowed_test_files`.
-- [ ] S-D2-39 — Move non-Rust report conversion test out of Rust-gated file.
+- [x] S-D2-39 — Move non-Rust report conversion test out of Rust-gated file.
 - [ ] S-D2-40 — Use canonical PyTorch suffix in package API test.
 
 ### Completed item QA log
@@ -763,6 +763,11 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run ruff check tests/conftest.py tests/test_dill_joblib_enhanced.py tests/test_pickle_context_filtering.py` — passed.
   - `uv run mypy tests/conftest.py tests/test_dill_joblib_enhanced.py tests/test_pickle_context_filtering.py` — passed.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/test_dill_joblib_enhanced.py tests/test_pickle_context_filtering.py -q` — passed, 7 tests.
+- S-D2-39 — Same-item commit records that `test_rust_report_conversion_rejects_non_bool_coverage_flags` already lives in `packages/modelaudit-picklescan/tests/test_report.py`, outside the Rust-extension-gated `test_rust_engine.py`. Targeted QA:
+  - `uv run ruff format --check packages/modelaudit-picklescan/tests/test_report.py packages/modelaudit-picklescan/tests/test_rust_engine.py` — passed.
+  - `uv run ruff check packages/modelaudit-picklescan/tests/test_report.py packages/modelaudit-picklescan/tests/test_rust_engine.py` — passed.
+  - `uv run mypy packages/modelaudit-picklescan/tests/test_report.py packages/modelaudit-picklescan/tests/test_rust_engine.py` — passed.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests/test_report.py -q` — passed, 8 tests.
 - N-P0-3 — Same-item commit removes the global raw-window documentation short-circuit, records documentation-like pickle literal spans, and filters only matches that fall inside documentation spans or comment-like lines. Targeted QA:
   - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
