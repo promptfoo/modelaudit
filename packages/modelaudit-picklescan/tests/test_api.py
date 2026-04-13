@@ -92,6 +92,17 @@ def test_scan_bytes_returns_clean_report_for_safe_pickle() -> None:
     assert report.coverage.opcode_count > 0
 
 
+def test_scan_bytes_clamps_excessive_timeout_without_engine_error() -> None:
+    report = scan_bytes(
+        pickle.dumps({"weights": [1, 2, 3]}, protocol=4),
+        source="huge-timeout.pkl",
+        options=ScanOptions(timeout_s=1.0e18),
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.errors == ()
+
+
 def test_scan_bytes_detects_reduce_invoking_os_system() -> None:
     report = scan_bytes(pickle.dumps(MaliciousPayload()), source="payload.pkl")
 

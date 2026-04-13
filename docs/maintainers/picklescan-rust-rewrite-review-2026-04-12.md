@@ -478,7 +478,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] N-P0-2 / N-P1-16 — Pass buffered payload size to Rust for non-seekable streams to avoid spurious `short_read`.
 - [x] N-P0-3 — Scope documentation/comment gating to the relevant literal or evidence window, not the entire raw detector pass.
 - [x] N-P0-4 — Prevent documentation-like `_rebuild_tensor` literals from suppressing real CVE-2026-24747 GLOBAL evidence.
-- [ ] N-P0-5 — Clamp user-controlled Rust timeout values before `Duration::from_secs_f64`.
+- [x] N-P0-5 — Clamp user-controlled Rust timeout values before `Duration::from_secs_f64`.
 - [ ] N-P0-6 — Add a clean-Rust hot path that skips expensive raw detectors when full Rust analysis completed cleanly.
 - [ ] P1-TRIPLE / N-P1-19 — Reduce or explicitly downgrade triple CRITICAL emissions for builtins eval/exec/compile/import aliases.
 - [ ] P1-PARSE — Decide and document parse-failure suppression semantics, or tighten them.
@@ -560,6 +560,14 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run mypy modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py -q` — passed, 32 tests, including a doc-literal plus real `torch._rebuild_tensor_v2` GLOBAL regression that preserves `primary_cve=CVE-2026-24747`.
+- N-P0-5 — Same-item commit clamps `timeout_s` to 24 hours in Python options and Rust `ScanOptions::from_py`, with a defensive Rust `timeout_duration` helper before `Duration::from_secs_f64`. Targeted QA:
+  - `cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed.
+  - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, 16 tests.
+  - `cargo clippy --manifest-path packages/modelaudit-picklescan/Cargo.toml --all-targets -- -D warnings` — passed.
+  - `uv run ruff format packages/modelaudit-picklescan/src/modelaudit_picklescan/options.py packages/modelaudit-picklescan/tests/test_options.py packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `uv run ruff check packages/modelaudit-picklescan/src/modelaudit_picklescan/options.py packages/modelaudit-picklescan/tests/test_options.py packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `uv run mypy packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests/test_options.py packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests/test_options.py packages/modelaudit-picklescan/tests/test_api.py -q` — passed, 159 tests, including `ScanOptions(timeout_s=1.0e18)` and native `scan_bytes` no-engine-error coverage.
 
 ### Newly discovered gaps while remediating
 

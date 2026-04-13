@@ -5,6 +5,7 @@ from typing import Any
 import pytest
 
 from modelaudit_picklescan import ScanOptions
+from modelaudit_picklescan.options import MAX_TIMEOUT_S
 
 
 def test_scan_options_defaults_are_safe_and_finite() -> None:
@@ -13,6 +14,12 @@ def test_scan_options_defaults_are_safe_and_finite() -> None:
     assert options.timeout_s > 0
     assert options.max_opcodes > 0
     assert options.post_budget_scan_bytes >= 0
+
+
+def test_scan_options_clamps_excessive_timeout() -> None:
+    options = ScanOptions(timeout_s=1.0e18)
+
+    assert options.timeout_s == MAX_TIMEOUT_S
 
 
 @pytest.mark.parametrize(

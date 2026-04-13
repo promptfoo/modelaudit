@@ -19,6 +19,7 @@ use crate::report::{
 use crate::strings::suspicious_string_matches;
 
 const DEFAULT_TIMEOUT_S: f64 = 3600.0;
+const MAX_TIMEOUT_S: f64 = 86_400.0;
 const DEFAULT_MAX_OPCODES: usize = 1_000_000;
 const DEFAULT_POST_BUDGET_SCAN_BYTES: usize = 100 * 1024 * 1024;
 const DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS: usize = 8 * 1024 * 1024;
@@ -94,7 +95,7 @@ pub(crate) struct ScanOptions {
 impl ScanOptions {
     pub(crate) fn from_py(options: &Bound<'_, PyDict>) -> PyResult<Self> {
         Ok(Self {
-            timeout_s: option_f64(options, "timeout_s", DEFAULT_TIMEOUT_S)?,
+            timeout_s: clamp_timeout_s(option_f64(options, "timeout_s", DEFAULT_TIMEOUT_S)?),
             max_opcodes: option_usize(options, "max_opcodes", DEFAULT_MAX_OPCODES)?,
             post_budget_scan_bytes: option_usize(
                 options,
@@ -113,6 +114,18 @@ impl ScanOptions {
             )?,
             max_nested_depth: option_usize(options, "max_nested_depth", DEFAULT_MAX_NESTED_DEPTH)?,
         })
+    }
+}
+
+fn clamp_timeout_s(timeout_s: f64) -> f64 {
+    timeout_s.min(MAX_TIMEOUT_S)
+}
+
+fn timeout_duration(timeout_s: f64) -> Duration {
+    if timeout_s.is_finite() && timeout_s > 0.0 {
+        Duration::from_secs_f64(clamp_timeout_s(timeout_s))
+    } else {
+        Duration::from_secs_f64(DEFAULT_TIMEOUT_S)
     }
 }
 
@@ -175,7 +188,7 @@ impl<'a> ScanState<'a> {
     ) -> Self {
         let deadline = deadline.unwrap_or_else(|| {
             Instant::now()
-                .checked_add(Duration::from_secs_f64(options.timeout_s))
+                .checked_add(timeout_duration(options.timeout_s))
                 .unwrap_or_else(Instant::now)
         });
         Self {
@@ -2069,6 +2082,13 @@ fn location_position(location: &str) -> Option<usize> {
 mod tests {
     use super::*;
     use crate::report::detail_string;
+
+    #[test]
+    fn timeout_duration_clamps_excessive_values() {
+        assert_eq!(clamp_timeout_s(1.0e18), MAX_TIMEOUT_S);
+        assert_eq!(timeout_duration(1.0e18), Duration::from_secs(86_400));
+        assert_eq!(timeout_duration(f64::NAN), Duration::from_secs(3600));
+    }
 
     #[test]
     fn protocol5_buffer_opcodes_create_opaque_stack_context() {
