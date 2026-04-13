@@ -16,7 +16,7 @@ Run a controlled, repeatable QA campaign across:
 
 - the standalone `modelaudit-picklescan` package in `python`, `rust`, and
   `compare` engine modes;
-- root ModelAudit pickle scanning in default and standalone-primary migration
+- root ModelAudit pickle scanning in default and adapter-only migration
   modes;
 - third-party scanner cross-checks with Fickling, ModelScan, and upstream
   PickleScan;
@@ -177,7 +177,7 @@ The harness should support:
 - `--tier smoke|medium|full`.
 - `--ids B01,P01,...`.
 - `--engines rust`.
-- `--root-modes default,standalone-primary`.
+- `--root-modes default,adapter-only`.
 - `--third-party-tools fickling,modelscan,picklescan`.
 - `--tools-root ~/code`.
 - `--include-replacements` on preflight.
@@ -353,7 +353,7 @@ Any Rust engine import/build failure is a release-candidate failure.
 For the full artifact path:
 
 - default root scan with the Rust standalone package;
-- standalone-primary compatibility mode with the Rust standalone package.
+- adapter-only mode with the Rust standalone package.
 
 For root comparison, normalize:
 
@@ -496,7 +496,7 @@ For every real artifact member and synthetic variant:
 
 For every whole artifact and applicable archive member:
 
-- Default root scan and standalone-primary compatibility scan match on success,
+- Default root scan and adapter-only scan match on success,
   issue severity floor, rule codes, scan outcome, and exit code unless the
   difference is explicitly triaged.
 - Root scan never downgrades a historical baseline security issue under the
@@ -721,7 +721,7 @@ Hard requirements:
 - Use only allowlisted corpus entries and resolved revision pins.
 - Store downloaded artifacts and generated variants outside the repo.
 - Run standalone PickleScan in Rust-only mode.
-- Run root ModelAudit in default and standalone-primary modes.
+- Run root ModelAudit in default and adapter-only modes.
 - Sync and run Fickling, ModelScan, and upstream PickleScan from local clones
   under ~/code, using the most recent fast-forwarded revisions.
 - Generate deterministic synthetic large malicious variants from benign seeds.

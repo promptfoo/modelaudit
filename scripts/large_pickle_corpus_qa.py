@@ -53,7 +53,7 @@ TELEMETRY_ENV = {
 TIER_ORDER = {"smoke": 0, "medium": 1, "full": 2}
 MODELAUDIT_THIRD_PARTY_BASELINE_PRIORITY = (
     ("modelaudit-picklescan", "rust"),
-    ("modelaudit-root", "standalone-primary:rust"),
+    ("modelaudit-root", "adapter-only:rust"),
     ("modelaudit-root", "default:rust"),
 )
 
@@ -910,10 +910,10 @@ def _scan_root(path: Path, *, engine: str, root_mode: str, artifact_id: str) -> 
     scanner = PickleScanner()
     if root_mode == "default":
         result = scanner.scan(str(path))
-    elif root_mode == "standalone-primary":
+    elif root_mode == "adapter-only":
         report = package_scan_file(path)
         result = pickle_report_to_scan_result(report, scanner_name=scanner.name, scanner=scanner)
-        result.metadata["pickle_primary_engine"] = "standalone"
+        result.metadata["pickle_primary_engine"] = "rust"
     else:
         raise ValueError(f"unsupported root mode: {root_mode}")
     duration = time.monotonic() - started
@@ -1535,7 +1535,7 @@ def _build_parity_drift(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     drifts = []
     for artifact_id, artifact_rows in sorted(by_artifact.items()):
         package_rust = _find_result(artifact_rows, "modelaudit-picklescan", "rust")
-        for root_mode in ("default", "standalone-primary"):
+        for root_mode in ("default", "adapter-only"):
             root_rust = _find_result(artifact_rows, "modelaudit-root", f"{root_mode}:rust")
             if package_rust and root_rust:
                 drift = _compare_results(package_rust, root_rust)
@@ -1921,7 +1921,7 @@ def build_parser() -> argparse.ArgumentParser:
     scan_parser.add_argument("--out", required=True)
     scan_parser.add_argument("--ids", nargs="*")
     scan_parser.add_argument("--engines", default="rust", help="Comma-separated engine list; only 'rust' is supported.")
-    scan_parser.add_argument("--root-modes", default="default,standalone-primary")
+    scan_parser.add_argument("--root-modes", default="default,adapter-only")
     scan_parser.add_argument("--third-party-tools", default="")
     scan_parser.add_argument("--tools-root", default=str(DEFAULT_TOOLS_ROOT))
     scan_parser.add_argument("--third-party-timeout-s", type=float, default=300.0)

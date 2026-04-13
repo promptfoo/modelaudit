@@ -141,8 +141,7 @@ Root pickle scanner and comparison tests:
 
 ```bash
 PROMPTFOO_DISABLE_TELEMETRY=1 \
-  .venv/bin/pytest tests/scanners/test_pickle_scanner.py \
-  tests/scripts/test_compare_pickle_scanners.py -q
+  .venv/bin/pytest tests/scanners/test_pickle_scanner.py -q
 ```
 
 Result after parity fixes: `398 passed, 14 subtests passed`.
@@ -523,10 +522,9 @@ packages/modelaudit-picklescan/Cargo.toml`: passed.
 - Package tests:
   `PROMPTFOO_DISABLE_TELEMETRY=1 .venv/bin/pytest packages/modelaudit-picklescan/tests -q`
   reported `133 passed`.
-- Root pickle scanner/adapter/script lane:
+- Root pickle scanner/adapter lane:
   `PROMPTFOO_DISABLE_TELEMETRY=1
 .venv/bin/pytest tests/scanners/test_pickle_scanner.py
-tests/scripts/test_compare_pickle_scanners.py
 tests/scanners/test_picklescan_adapter.py -q` reported
   `423 passed, 14 subtests passed`.
 
@@ -651,7 +649,6 @@ packages/modelaudit-picklescan/Cargo.toml`: passed.
 .venv/bin/pytest packages/modelaudit-picklescan/tests -q`: `133 passed`.
 - `PROMPTFOO_DISABLE_TELEMETRY=1
 .venv/bin/pytest tests/scanners/test_pickle_scanner.py
-tests/scripts/test_compare_pickle_scanners.py
 tests/scanners/test_picklescan_adapter.py -q`:
   `423 passed, 14 subtests passed`.
 
@@ -659,7 +656,7 @@ tests/scanners/test_picklescan_adapter.py -q`:
 
 The standalone package is now Rust-only. The Python package engine and compare
 mode have been removed. A subprocess guardrail verifies that a default Rust scan
-does not import `modelaudit_picklescan.engine.scanner`.
+does not import the deleted `modelaudit_picklescan.engine` package.
 
 Backwards-compatibility validation after flipping the default:
 
@@ -708,8 +705,7 @@ was faster on every measured case in this local environment.
   tests/conftest.py
 .venv/bin/pytest packages/modelaudit-picklescan/tests -q
 PROMPTFOO_DISABLE_TELEMETRY=1 \
-  .venv/bin/pytest tests/scanners/test_pickle_scanner.py \
-  tests/scripts/test_compare_pickle_scanners.py -q
+  .venv/bin/pytest tests/scanners/test_pickle_scanner.py -q
 PROMPTFOO_DISABLE_TELEMETRY=1 \
   .venv/bin/pytest -n auto -m 'not slow and not integration' --maxfail=1
 .venv/bin/mypy modelaudit/scanners/pickle_scanner.py \

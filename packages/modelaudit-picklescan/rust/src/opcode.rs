@@ -1,9 +1,12 @@
+use std::borrow::Cow;
+
 #[derive(Clone)]
 pub(crate) enum ArgValue {
     None,
     Int(i64),
     UInt(usize),
     Text(String),
+    TextSpan { start: usize, end: usize },
     Bytes { start: usize, end: usize },
 }
 
@@ -17,15 +20,6 @@ impl ArgValue {
         }
     }
 
-    pub(crate) fn bytes<'payload>(&self, payload: &'payload [u8]) -> Option<&'payload [u8]> {
-        match self {
-            ArgValue::Bytes { start, end } if start <= end && *end <= payload.len() => {
-                Some(&payload[*start..*end])
-            }
-            _ => None,
-        }
-    }
-
     pub(crate) fn byte_span(&self, payload_len: usize) -> Option<(usize, usize)> {
         match self {
             ArgValue::Bytes { start, end } if start <= end && *end <= payload_len => {
@@ -35,9 +29,25 @@ impl ArgValue {
         }
     }
 
-    pub(crate) fn global_parts(&self) -> (String, String) {
+    pub(crate) fn text<'payload>(&self, payload: &'payload [u8]) -> Cow<'payload, str> {
         match self {
-            ArgValue::Text(value) => {
+            ArgValue::Text(value) => Cow::Owned(value.clone()),
+            ArgValue::TextSpan { start, end } | ArgValue::Bytes { start, end }
+                if start <= end && *end <= payload.len() =>
+            {
+                String::from_utf8_lossy(&payload[*start..*end])
+            }
+            ArgValue::Int(value) => Cow::Owned(value.to_string()),
+            ArgValue::UInt(value) => Cow::Owned(value.to_string()),
+            ArgValue::None => Cow::Borrowed(""),
+            _ => Cow::Borrowed(""),
+        }
+    }
+
+    pub(crate) fn global_parts(&self, payload: &[u8]) -> (String, String) {
+        match self {
+            ArgValue::Text(_) | ArgValue::TextSpan { .. } | ArgValue::Bytes { .. } => {
+                let value = self.text(payload);
                 let mut parts = value.splitn(2, ' ');
                 let module = parts.next().unwrap_or_default().to_string();
                 let name = parts.next().unwrap_or_default().to_string();
@@ -48,16 +58,7 @@ impl ArgValue {
     }
 
     pub(crate) fn coerce_text(&self, payload: &[u8]) -> String {
-        match self {
-            ArgValue::Text(value) => value.clone(),
-            ArgValue::Bytes { .. } => self
-                .bytes(payload)
-                .map(|value| String::from_utf8_lossy(value).to_string())
-                .unwrap_or_default(),
-            ArgValue::Int(value) => value.to_string(),
-            ArgValue::UInt(value) => value.to_string(),
-            ArgValue::None => "".to_string(),
-        }
+        self.text(payload).into_owned()
     }
 }
 
@@ -247,7 +248,7 @@ pub(crate) fn parse_opcode(
                 read_variable_span(payload, &mut cursor, limit, len, "unicodestring1")?;
             ParsedOpcode {
                 name: "SHORT_BINUNICODE",
-                arg: ArgValue::Text(String::from_utf8_lossy(&payload[start..end]).to_string()),
+                arg: ArgValue::TextSpan { start, end },
                 pos: index,
                 next: cursor,
             }
@@ -258,7 +259,7 @@ pub(crate) fn parse_opcode(
                 read_variable_span(payload, &mut cursor, limit, len, "unicodestring4")?;
             ParsedOpcode {
                 name: "BINUNICODE",
-                arg: ArgValue::Text(String::from_utf8_lossy(&payload[start..end]).to_string()),
+                arg: ArgValue::TextSpan { start, end },
                 pos: index,
                 next: cursor,
             }
@@ -269,7 +270,7 @@ pub(crate) fn parse_opcode(
                 read_variable_span(payload, &mut cursor, limit, len, "unicodestring8")?;
             ParsedOpcode {
                 name: "BINUNICODE8",
-                arg: ArgValue::Text(String::from_utf8_lossy(&payload[start..end]).to_string()),
+                arg: ArgValue::TextSpan { start, end },
                 pos: index,
                 next: cursor,
             }

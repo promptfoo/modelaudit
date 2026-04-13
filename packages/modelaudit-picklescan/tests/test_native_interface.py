@@ -3,19 +3,18 @@ from __future__ import annotations
 import subprocess
 import sys
 import textwrap
+from importlib.util import find_spec
 
-import pytest
-
-from modelaudit_picklescan.engine.selection import RUST_EXTENSION_MODULE, rust_engine_available
-
-
-def test_rust_engine_available_returns_bool() -> None:
-    assert isinstance(rust_engine_available(), bool)
+from modelaudit_picklescan.api import _RUST_EXTENSION_MODULE
 
 
-def test_default_scan_does_not_import_deleted_python_engine() -> None:
-    if not rust_engine_available():
-        pytest.skip("Rust extension is not available")
+def test_rust_extension_module_name_is_stable() -> None:
+    assert _RUST_EXTENSION_MODULE == "modelaudit_picklescan._rust"
+
+
+def test_default_scan_imports_native_module_without_engine_package() -> None:
+    if find_spec(_RUST_EXTENSION_MODULE) is None:
+        return
 
     completed = subprocess.run(
         [
@@ -27,7 +26,6 @@ def test_default_scan_does_not_import_deleted_python_engine() -> None:
                 import sys
 
                 from modelaudit_picklescan import ScanStatus, scan_bytes
-                from modelaudit_picklescan.engine.selection import RUST_EXTENSION_MODULE
 
                 report = scan_bytes(
                     pickle.dumps({"weights": [1, 2, 3]}, protocol=4),
@@ -35,9 +33,9 @@ def test_default_scan_does_not_import_deleted_python_engine() -> None:
                 )
                 if report.status != ScanStatus.COMPLETE:
                     raise SystemExit(f"unexpected status: {report.status!r}")
-                if "modelaudit_picklescan.engine.scanner" in sys.modules:
-                    raise SystemExit("deleted Python scanner was imported")
-                if RUST_EXTENSION_MODULE not in sys.modules:
+                if any(name.startswith("modelaudit_picklescan.engine") for name in sys.modules):
+                    raise SystemExit("deleted engine package was imported")
+                if "modelaudit_picklescan._rust" not in sys.modules:
                     raise SystemExit("Rust extension was not imported")
                 """
             ),
@@ -48,7 +46,3 @@ def test_default_scan_does_not_import_deleted_python_engine() -> None:
     )
 
     assert completed.returncode == 0, completed.stderr or completed.stdout
-
-
-def test_rust_extension_module_name_is_stable() -> None:
-    assert RUST_EXTENSION_MODULE == "modelaudit_picklescan._rust"

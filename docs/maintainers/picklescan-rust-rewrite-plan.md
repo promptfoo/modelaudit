@@ -14,8 +14,8 @@ The standalone implementation is now Rust-only:
 - `packages/modelaudit-picklescan/rust/src/lib.rs` implements the native opcode
   parser, policy checks, nested-pickle handling, resource-budget notices,
   report serialization, and parity-oriented fail-closed semantics.
-- `modelaudit_picklescan.engine.rust` converts the native report mapping back
-  into the existing Python dataclasses.
+- `modelaudit_picklescan.api` calls the native extension directly and converts
+  native report mappings back into the existing Python dataclasses.
 - If the compatible native extension is not importable, scan calls return an
   explicit `rust_engine_error`; the deleted Python package scanner is not used
   as a fallback.
@@ -28,8 +28,7 @@ The standalone implementation is now Rust-only:
   `SafetyVerdict`, `ScanStatus`, and `Severity`.
 - Preserve historical scanner coverage for verdicts, statuses, coverage,
   metadata, findings, notices, errors, locations, and rule codes.
-- Preserve root `modelaudit` behavior while the legacy pickle scanner remains
-  the compatibility fallback.
+- Preserve root `modelaudit` behavior through the Rust-backed wrapper scanner.
 - Improve large-payload throughput and memory behavior with measurable
   benchmark artifacts.
 - Keep the standalone wheel independent from the root `modelaudit` package.
@@ -41,9 +40,8 @@ The standalone implementation is now Rust-only:
   cache semantics, SARIF output, or root `ScanResult` models as part of the
   Rust engine.
 - Do not reintroduce a package-engine selector or Python package fallback.
-- Do not remove root-only compatibility checks until the parity gates in this
-  document show that each check is either implemented in Rust or intentionally
-  retained in the root scanner.
+- Keep root-only concerns limited to file routing, path checks, file integrity
+  metadata, and `PickleReport` to `ScanResult` adaptation.
 
 ## Current Boundary
 
@@ -53,9 +51,9 @@ root `modelaudit` package owns file routing, archive orchestration, CLI, cache,
 telemetry, SARIF/export integrations, and `PickleReport` to `ScanResult`
 adaptation.
 
-The root `PickleScanner` still merges legacy-only checks while the standalone
-engine continues toward full parity. A Rust rewrite must target the standalone
-engine first and keep this migration boundary intact.
+The root `PickleScanner` is now a thin wrapper over the standalone Rust package.
+Any additional pickle detection work should be implemented in Rust first, then
+adapted into root `ScanResult` objects through `picklescan_adapter.py`.
 
 ## Architecture
 
@@ -102,7 +100,7 @@ the native extension directly.
 | Post-budget tail scan                                   | Standalone engine           | Preserve `POST_BUDGET_GLOBAL` findings and tail-prefix behavior at budget boundaries.                |
 | Deduplication                                           | Standalone engine           | Preserve finding, notice, and import-reference dedupe keys.                                          |
 | Adapter mapping                                         | Root adapter                | No change except optional engine metadata in experimental mode.                                      |
-| Root legacy merge                                       | Root scanner                | No removal until standalone/rust parity gates pass.                                                  |
+| Root wrapper enrichment                                 | Root scanner                | Keep non-opcode ModelAudit checks outside the standalone package unless deliberately moved to Rust.  |
 | Binary tail/JIT/network/secrets scans                   | Root scanner                | Stay outside standalone Rust scope.                                                                  |
 | CVE attribution and ML context                          | Root scanner plus detectors | Stay outside initial Rust scope unless explicitly moved later.                                       |
 | Archive-member context                                  | Root wrapper scanners       | Preserve `scan_stream(..., source=...)` contract.                                                    |
@@ -113,16 +111,13 @@ Run these gates before enabling Rust by default:
 
 1. Existing standalone tests pass with the Rust-only package engine.
 2. Rust golden comparisons match for all committed pickle fixtures:
-   status, verdict, success-equivalent, finding severities, rule codes,
-   messages, locations, details, notices, errors, coverage, and metadata.
-   `duration_s` is excluded.
-3. `scripts/compare_pickle_scanners.py --include-root` has no new
-   verdict or status drift relative to the pre-Rust baseline.
-4. Safe fixtures in `scripts/compare_pickle_scanners_fixture_labels.json`
-   remain `match`; no new false positives are allowed.
-5. Root pickle tests, adapter tests, nested-pickle integration tests, and
+   status, verdict, success-equivalent, finding severities, messages,
+   locations, details, notices, errors, coverage, and metadata. `duration_s` is
+   excluded. Native rule names may differ from ModelAudit `S###` adapter rule
+   codes, which are validated by adapter tests.
+3. Root pickle tests, adapter tests, nested-pickle integration tests, and
    regression corpus tests pass.
-6. Root and standalone wheel smoke tests pass, including the standalone check
+4. Root and standalone wheel smoke tests pass, including the standalone check
    that `importlib.util.find_spec("modelaudit") is None`.
 
 ## Benchmark Plan
@@ -176,9 +171,6 @@ Recommended profiling checkpoints:
 
 ## Test Additions
 
-- Add a package-engine comparison mode to `scripts/compare_pickle_scanners.py`
-  so future Rust work can compare `python` vs `rust` without changing the root
-  scanner.
 - Add standalone pickle microbenchmarks under `tests/benchmarks/`.
 - Add golden report fixtures only after the normalization rules are settled.
 - Add malformed opcode and resource-budget cases for Rust-specific parser edge
@@ -241,14 +233,13 @@ uvx twine check /tmp/modelaudit-picklescan-dist/*
 Parity and performance:
 
 ```bash
-PYTHONPATH=packages/modelaudit-picklescan/src uv run python scripts/compare_pickle_scanners.py --include-root
 uv run --with pytest-benchmark pytest tests/benchmarks/test_picklescan_benchmarks.py --benchmark-json=/tmp/modelaudit-picklescan-benchmark.json -q
 ```
 
 ## Definition Of Done
 
 The rewrite is complete only when the Rust-only standalone package passes all
-current tests, generated historical-parity regressions stay green, root
-default/standalone-primary comparison has no untriaged drift, wheel smoke tests
-pass for root and standalone packages, and benchmark artifacts show enough value
-to justify removing the remaining root-only compatibility analyzer.
+current tests, generated historical-parity regressions stay green, package,
+adapter, and root-wrapper fixture comparisons have no untriaged drift, wheel
+smoke tests pass for root and standalone packages, and benchmark artifacts show
+the Rust scanner is the correct production path.

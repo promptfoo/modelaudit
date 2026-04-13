@@ -1,10 +1,29 @@
+const MAX_BASE64_TEXT_TOKENS: usize = 32;
+const MAX_BASE64_TEXT_TOKEN_CHARS: usize = 16 * 1024;
+const BASE64_DANGEROUS_SEEDS: &[&str] = &[
+    "b3Muc3lzdGVt",   // os.system
+    "ZXZhbCg",        // eval(
+    "ZXhlYyg",        // exec(
+    "X19pbXBvcnRfXw", // __import__
+    "c3VicHJvY2Vzcw", // subprocess
+];
+
 pub(crate) fn suspicious_string_matches(value: &str) -> Vec<String> {
-    if !has_suspicious_ascii_seed(value.as_bytes()) {
+    let has_plain_seed = has_suspicious_ascii_seed(value.as_bytes());
+    let has_encoded_seed = has_base64_dangerous_seed(value);
+    if !has_plain_seed && !has_encoded_seed {
         return Vec::new();
     }
 
-    let lower = value.to_ascii_lowercase();
     let mut matches = Vec::new();
+    if has_encoded_seed {
+        matches.extend(encoded_dangerous_string_matches(value));
+    }
+    if !has_plain_seed {
+        return matches;
+    }
+
+    let lower = value.to_ascii_lowercase();
     if value.contains("__")
         && contains_magic_method(value)
         && !is_common_dunder_metadata_literal(value)
@@ -80,6 +99,125 @@ pub(crate) fn suspicious_string_matches(value: &str) -> Vec<String> {
         }
     }
     matches
+}
+
+fn has_base64_dangerous_seed(value: &str) -> bool {
+    BASE64_DANGEROUS_SEEDS
+        .iter()
+        .any(|seed| value.contains(seed))
+}
+
+fn encoded_dangerous_string_matches(value: &str) -> Vec<String> {
+    let mut matches = Vec::new();
+    for (token_count, token) in base64_tokens(value).enumerate() {
+        if token_count >= MAX_BASE64_TEXT_TOKENS {
+            break;
+        }
+        let bounded = if token.len() > MAX_BASE64_TEXT_TOKEN_CHARS {
+            &token[..MAX_BASE64_TEXT_TOKEN_CHARS]
+        } else {
+            token
+        };
+        let Some(decoded) = decode_base64(bounded) else {
+            continue;
+        };
+        let lower = ascii_lowercase_bytes(&decoded);
+        for (needle, label) in [
+            (b"os.system".as_slice(), "base64 os.system"),
+            (b"eval(".as_slice(), "base64 eval("),
+            (b"exec(".as_slice(), "base64 exec("),
+            (b"__import__".as_slice(), "base64 __import__"),
+            (b"subprocess".as_slice(), "base64 subprocess"),
+        ] {
+            if contains_bytes(&lower, needle) {
+                matches.push(label.to_string());
+            }
+        }
+    }
+    matches
+}
+
+fn base64_tokens(value: &str) -> impl Iterator<Item = &str> {
+    let bytes = value.as_bytes();
+    let mut index = 0usize;
+    std::iter::from_fn(move || loop {
+        while index < bytes.len() && !is_base64_body_byte(bytes[index]) {
+            index += 1;
+        }
+        let start = index;
+        while index < bytes.len() && is_base64_body_byte(bytes[index]) {
+            index += 1;
+        }
+        while index < bytes.len() && bytes[index] == b'=' {
+            index += 1;
+        }
+        if index.saturating_sub(start) >= 16 {
+            return value.get(start..index);
+        }
+        if index >= bytes.len() {
+            return None;
+        }
+    })
+}
+
+fn is_base64_body_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'+' || byte == b'/'
+}
+
+fn decode_base64(value: &str) -> Option<Vec<u8>> {
+    let bytes = value.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut values = [0u8; 4];
+    let mut decoded = Vec::with_capacity(bytes.len() / 4 * 3);
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let remaining = bytes.len() - index;
+        if remaining == 1 {
+            return None;
+        }
+        let chunk_len = remaining.min(4);
+        values.fill(64);
+        for offset in 0..chunk_len {
+            let byte = bytes[index + offset];
+            values[offset] = if byte == b'=' {
+                64
+            } else {
+                base64_value(byte)?
+            };
+        }
+        decoded.push((values[0] << 2) | (values[1] >> 4));
+        if values[2] != 64 {
+            decoded.push((values[1] << 4) | (values[2] >> 2));
+        }
+        if values[3] != 64 {
+            decoded.push((values[2] << 6) | values[3]);
+        }
+        index += chunk_len;
+    }
+    Some(decoded)
+}
+
+fn base64_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
+}
+
+fn ascii_lowercase_bytes(value: &[u8]) -> Vec<u8> {
+    value.iter().map(u8::to_ascii_lowercase).collect()
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 fn has_suspicious_ascii_seed(bytes: &[u8]) -> bool {
@@ -403,5 +541,12 @@ mod tests {
     fn suspicious_string_matching_keeps_case_insensitive_patterns() {
         assert!(suspicious_string_matches("OS.System('id')").contains(&"os.system".to_string()));
         assert!(suspicious_string_matches("Import OS").contains(&"import statement".to_string()));
+    }
+
+    #[test]
+    fn suspicious_string_matching_detects_base64_encoded_code() {
+        let matches = suspicious_string_matches("b3Muc3lzdGVtKCdpZCcp");
+
+        assert!(matches.contains(&"base64 os.system".to_string()));
     }
 }

@@ -17,7 +17,6 @@ packages/
       api.py
       options.py
       report.py
-      engine/
       _rust.*           # generated only by local/native builds; not committed
     rust/
       src/lib.rs
@@ -39,9 +38,8 @@ modelaudit/
 - `modelaudit` owns file routing, archive/container orchestration, CLI, cache,
   telemetry, SARIF/export integrations, and `PickleReport -> ScanResult`
   adaptation.
-- `modelaudit.scanners.pickle_scanner.PickleScanner` runs the Rust-backed
-  standalone pass first and may merge root-only compatibility checks until the
-  remaining root-specific detections are moved or intentionally retained.
+- `modelaudit.scanners.pickle_scanner.PickleScanner` is a thin ModelAudit
+  adapter around the Rust-backed standalone package.
 - Wrapper scanners in `modelaudit` pass embedded pickle streams into
   `modelaudit-picklescan`; archive parsing stays in `modelaudit`.
 - The root `modelaudit` wheel depends on the `modelaudit-picklescan`
@@ -83,13 +81,11 @@ Report semantics keep these concepts separate:
 ## Current Integration
 
 - `modelaudit.scanners.pickle_scanner.PickleScanner` treats the standalone Rust
-  package report as the primary pickle result and merges bounded root-only
-  compatibility checks as supplemental evidence.
+  package report as the pickle result and only adds ModelAudit wrapper concerns
+  such as path validation, file integrity metadata, and `ScanResult` adaptation.
 - Embedded-pickle wrapper scanners (`pytorch_zip`, `joblib`, `numpy`, and
   `executorch`) call the public `scan_stream(..., source=...)` API and preserve
   archive-member context in result locations/details.
-- `scripts/compare_pickle_scanners.py` is the parity harness for checking
-  verdict/status drift and rule-code differences across fixture corpora.
 - CI lints, type-checks, tests, builds, and smoke-installs both the root
   `modelaudit` distribution and the standalone `modelaudit-picklescan`
   distribution. Root wheel smoke tests install the local standalone wheel via
@@ -132,9 +128,8 @@ uvx twine check /tmp/modelaudit-picklescan-dist/*
 - Detection logic must not weaken at the package boundary.
 - Each moved detector or routing rule has malicious-positive and benign-negative
   regression coverage.
-- Verdict/status drift is a blocker in the differential harness. Legacy and
-  standalone rule identifiers may differ, but the safety decision and
-  scan-completeness contract must stay aligned.
+- Legacy and standalone rule identifiers may differ, but the safety decision
+  and scan-completeness contract must stay aligned.
 - Inconclusive analysis is represented as first-class status/metadata, not as a
   hidden success boolean.
 - Per-scan state stays isolated so one scan cannot leak source/location context

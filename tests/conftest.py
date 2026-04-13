@@ -170,7 +170,6 @@ def pytest_runtest_setup(item):
             "test_large_file_handler.py",  # Large file handler regression tests
             "test_file_iterator.py",  # Streaming file iterator memory regression tests
             "test_benchmark_report.py",  # benchmark CI summary and regression gate tests
-            "test_compare_pickle_scanners.py",  # standalone pickle differential harness regression tests
             "test_large_pickle_corpus_qa.py",  # large PickleScan Rust corpus QA harness tests
             "test_xdist_status.py",  # xdist worker progress reporting tests
         ]

@@ -484,6 +484,23 @@ def test_scan_stream_treats_negative_size_as_unknown_size() -> None:
     assert report.coverage.bytes_scanned == len(payload)
 
 
+def test_native_payload_scan_normalizes_negative_private_size_guard() -> None:
+    payload = pickle.dumps({"safe": True}, protocol=4)
+
+    report = package_api._scan_pickle_payload_native(
+        payload,
+        source="private-negative-size.pkl",
+        options=ScanOptions(),
+        bytes_total=-1,
+        position_offset=-5,
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.errors == ()
+    assert report.coverage.bytes_total is None
+    assert report.coverage.bytes_scanned == len(payload)
+
+
 def test_scan_stream_fails_closed_on_short_reads_for_expected_size() -> None:
     payload = pickle.dumps({"safe": True})
     expected_size = len(payload) + 8
@@ -685,6 +702,19 @@ def test_scan_bytes_flags_expanded_suspicious_string_patterns(literal: str, expe
     assert report.verdict == SafetyVerdict.SUSPICIOUS
     assert any(
         finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == expected_pattern
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_flags_base64_encoded_code_string_literals() -> None:
+    encoded = base64.b64encode(b"os.system('id')").decode("ascii")
+
+    report = scan_bytes(pickle.dumps({"code": encoded}), source="encoded-code-string.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "base64 os.system"
         for finding in report.findings
     )
 

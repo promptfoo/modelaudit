@@ -117,6 +117,27 @@ def test_pickle_report_to_scan_result_preserves_security_findings() -> None:
     assert result.issues[0].details["pickle_source"] == "payload.pkl"
 
 
+def test_pickle_report_to_scan_result_preserves_legacy_import_rule_for_global_opcode() -> None:
+    report = PickleReport(
+        source="payload.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.MALICIOUS,
+        findings=(
+            Finding(
+                message="Found dangerous global reference: posix.system",
+                severity=Severity.CRITICAL,
+                location="payload.pkl (pos 12)",
+                rule_code="DANGEROUS_GLOBAL",
+                details={"opcode": "GLOBAL", "module": "posix", "name": "system"},
+            ),
+        ),
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert {issue.rule_code for issue in result.issues} >= {"S101", "S206"}
+
+
 def test_pickle_report_to_scan_result_preserves_reduce_associated_global_alias() -> None:
     report = PickleReport(
         source="runpy.pkl",
@@ -147,6 +168,27 @@ def test_pickle_report_to_scan_result_preserves_reduce_associated_global_alias()
     assert result.issues[0].details["function"] == "run_module"
     assert result.issues[0].details["associated_global"] == "runpy.run_module"
     assert result.issues[0].details["import_reference"] == "runpy.run_module"
+
+
+def test_pickle_report_to_scan_result_preserves_legacy_builtin_call_rule_alias() -> None:
+    report = PickleReport(
+        source="eval.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.MALICIOUS,
+        findings=(
+            Finding(
+                message="Found REDUCE opcode invoking dangerous global: builtins.eval",
+                severity=Severity.CRITICAL,
+                location="eval.pkl (pos 12)",
+                rule_code="DANGEROUS_CALL",
+                details={"opcode": "REDUCE", "module": "builtins", "name": "eval"},
+            ),
+        ),
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert {issue.rule_code for issue in result.issues} >= {"S115", "S201"}
 
 
 def test_pickle_report_to_scan_result_preserves_warning_dangerous_calls() -> None:
@@ -270,6 +312,7 @@ def test_pickle_report_to_scan_result_falls_back_for_unmapped_persistent_id_opco
         ("PERSISTENT_ID", {"opcode": "CUSTOM_PERSISTENT_OPCODE"}, "S212"),
         ("DANGEROUS_CALL", {"opcode": "REDUCE"}, "S201"),
         ("DANGEROUS_CALL", {"module": "sys", "name": "exit"}, "S102"),
+        ("DANGEROUS_CALL", {"module": "builtins", "name": "exec"}, "S115"),
         ("DANGEROUS_CALL", {"module": "custom", "name": "loader"}, "S201"),
         ("DANGEROUS_GLOBAL", {"opcode": "GLOBAL"}, "S206"),
         ("DANGEROUS_GLOBAL", {"module": "posix", "name": "system"}, "S101"),
@@ -555,6 +598,29 @@ def test_pickle_report_to_scan_result_fails_closed_for_encoded_nested_payload_mi
     assert result.issues[0].rule_code == "S601"
 
 
+def test_pickle_report_to_scan_result_downgrades_nested_payload_without_dangerous_inner_evidence() -> None:
+    report = PickleReport(
+        source="nested-benign.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.MALICIOUS,
+        findings=(
+            Finding(
+                message="Nested pickle payload detected",
+                severity=Severity.CRITICAL,
+                location="nested-benign.pkl (pos 16)",
+                rule_code="S213",
+                details={"encoding": "raw", "nested_has_execution_opcode": False},
+            ),
+        ),
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert result.success is True
+    assert result.issues[0].severity == IssueSeverity.INFO
+    assert result.issues[0].details["evidence"] == "nested_payload_detected"
+
+
 def test_pickle_report_to_scan_result_fails_closed_for_raw_nested_truncation_notice() -> None:
     report = PickleReport(
         source="oversized-raw.pkl",
@@ -660,13 +726,13 @@ def test_pickle_report_to_scan_result_keeps_parse_incomplete_notices_inconclusiv
     parse_issue = next(
         issue for issue in result.issues if issue.message == "Pickle parsing failed before full scan completion"
     )
-    assert parse_issue.severity == IssueSeverity.INFO
+    assert parse_issue.severity == IssueSeverity.WARNING
+    assert parse_issue.rule_code == "S901"
     assert parse_issue.location == "truncated.pkl (pos 4)"
     assert parse_issue.details["category"] == "parse_error"
     assert parse_issue.details["parse_error"] == "pickle exhausted before seeing STOP"
     assert parse_issue.details["failure_reason"] == "unknown_opcode_or_format_error"
     assert parse_issue.details["analysis_incomplete"] is True
-    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
 def test_pickle_report_to_scan_result_keeps_truncated_bin_parse_failure_inconclusive() -> None:
@@ -696,13 +762,13 @@ def test_pickle_report_to_scan_result_keeps_truncated_bin_parse_failure_inconclu
     parse_issue = next(
         issue for issue in result.issues if issue.message == "Pickle parsing failed before full scan completion"
     )
-    assert parse_issue.severity == IssueSeverity.INFO
+    assert parse_issue.severity == IssueSeverity.WARNING
+    assert parse_issue.rule_code == "S901"
     assert parse_issue.location == "truncated.bin (pos 57)"
     assert parse_issue.details["category"] == "parse_error"
     assert parse_issue.details["parse_error"] == "pickle exhausted before seeing STOP"
     assert parse_issue.details["failure_reason"] == "unknown_opcode_or_format_error"
     assert parse_issue.details["analysis_incomplete"] is True
-    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
 def test_pickle_report_to_scan_result_keeps_trusted_bin_padding_tails_as_inconclusive_notices() -> None:
@@ -835,7 +901,8 @@ def test_pickle_report_to_scan_result_fails_closed_for_raw_pickle_unknown_opcode
     parse_issue = next(
         issue for issue in result.issues if issue.message == "Pickle parsing failed before full scan completion"
     )
-    assert parse_issue.severity == IssueSeverity.INFO
+    assert parse_issue.severity == IssueSeverity.WARNING
+    assert parse_issue.rule_code == "S901"
     assert parse_issue.details["category"] == "parse_error"
     assert parse_issue.details["failure_reason"] == "unknown_opcode_or_format_error"
     assert parse_issue.details["analysis_incomplete"] is True
@@ -1032,7 +1099,8 @@ def test_pickle_report_to_scan_result_requires_boundary_for_non_joblib_tail_supp
     parse_issue = next(
         issue for issue in result.issues if issue.message == "Pickle parsing failed before full scan completion"
     )
-    assert parse_issue.severity == IssueSeverity.INFO
+    assert parse_issue.severity == IssueSeverity.WARNING
+    assert parse_issue.rule_code == "S901"
     assert parse_issue.details["category"] == "parse_error"
     assert parse_issue.details["analysis_incomplete"] is True
 
@@ -1054,16 +1122,20 @@ def test_pickle_report_to_scan_result_keeps_parse_errors_inconclusive() -> None:
 
     result = pickle_report_to_scan_result(report)
 
-    assert result.success is False
+    assert result.success is True
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert result.metadata["scan_outcome_reasons"] == ["pickle_analysis_incomplete"]
     assert result.metadata["analysis_incomplete"] is True
+    assert result.metadata["parsing_failed"] is True
+    assert result.metadata["failure_reason"] == "unknown_opcode_or_format_error"
     assert "operational_error" not in result.metadata
     assert "operational_error_reason" not in result.metadata
     assert len(result.issues) == 1
-    assert result.issues[0].severity == IssueSeverity.INFO
+    assert result.issues[0].severity == IssueSeverity.WARNING
+    assert result.issues[0].rule_code == "S901"
     assert result.issues[0].details["category"] == "parse_error"
     assert result.issues[0].details["analysis_incomplete"] is True
+    assert result.issues[0].details["parsing_failed"] is True
 
 
 def test_pickle_report_to_scan_result_maps_non_parse_errors_to_operational_errors() -> None:

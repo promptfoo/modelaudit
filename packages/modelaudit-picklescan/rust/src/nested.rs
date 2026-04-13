@@ -117,6 +117,27 @@ pub(crate) fn looks_like_pickle_payload(value: &[u8], max_bytes: usize) -> bool 
     false
 }
 
+pub(crate) fn has_execution_opcode(value: &[u8]) -> bool {
+    let mut index = 0usize;
+    while index < value.len() {
+        let parsed = match parse_opcode(value, index, value.len()) {
+            Ok(parsed) => parsed,
+            Err(_) => return false,
+        };
+        if matches!(
+            parsed.name,
+            "REDUCE" | "NEWOBJ" | "NEWOBJ_EX" | "OBJ" | "INST" | "BUILD"
+        ) {
+            return true;
+        }
+        index = parsed.next;
+        if parsed.name == "STOP" {
+            return false;
+        }
+    }
+    false
+}
+
 fn validate_pickle_stack_effect(
     opcode: &ParsedOpcode,
     stack_depth: &mut usize,
@@ -576,5 +597,13 @@ mod tests {
         let windows = encoded_nested_literal_probe_windows(&value, 64);
 
         assert!(windows.iter().any(|window| window.starts_with("gAR9Lg==")));
+    }
+
+    #[test]
+    fn execution_opcode_detection_distinguishes_structural_nested_payloads() {
+        assert!(!has_execution_opcode(b"\x80\x04}q\x00."));
+        assert!(has_execution_opcode(
+            b"\x80\x04\x8c\x08builtins\x94\x8c\x05print\x94\x93\x8c\x02hi\x85R."
+        ));
     }
 }

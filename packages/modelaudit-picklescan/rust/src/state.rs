@@ -1,13 +1,14 @@
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use crate::nested::{
     decode_possible_encoded_pickle, detect_oversized_encoded_pickle_prefixes,
-    encoded_nested_literal_probe_windows, encoded_nested_window_char_limit, has_pickle_prefix,
-    looks_like_pickle_payload, nested_pickle_probe_offsets,
+    encoded_nested_literal_probe_windows, encoded_nested_window_char_limit, has_execution_opcode,
+    has_pickle_prefix, looks_like_pickle_payload, nested_pickle_probe_offsets,
 };
 use crate::opcode::{parse_opcode, ArgValue, ParseError, ParsedOpcode};
 use crate::policy::global_severity;
@@ -57,6 +58,10 @@ impl GlobalRef {
 enum StackValue {
     Mark,
     Text(String),
+    TextSpan {
+        start: usize,
+        end: usize,
+    },
     Bytes {
         start: usize,
         end: usize,
@@ -355,6 +360,7 @@ impl<'a> ScanState<'a> {
             return Err(LimitError::OpcodeBudgetExceeded(post_budget_opcode_prefix(
                 opcode,
                 &self.stack,
+                self.payload,
             )));
         }
         if Instant::now() > self.deadline {
@@ -469,10 +475,11 @@ impl<'a> ScanState<'a> {
                 }
             }
             name if STACK_GLOBAL_STRING_OPCODES.contains(&name) => {
-                let value = opcode.arg.coerce_text(self.payload);
+                let value = opcode.arg.text(self.payload);
                 self.scan_string_literal(&value, opcode.name, position);
                 self.scan_encoded_nested_pickle_literal(&value, position);
-                self.stack.push(StackValue::Text(value));
+                self.stack
+                    .push(stack_value_from_text_arg(&opcode.arg, self.payload));
             }
             "NONE" => self.stack.push(StackValue::Primitive {
                 type_name: "NoneType",
@@ -568,7 +575,7 @@ impl<'a> ScanState<'a> {
                 }
             }
             "GLOBAL" => {
-                let (module, name) = opcode.arg.global_parts();
+                let (module, name) = opcode.arg.global_parts(self.payload);
                 let reference = GlobalRef {
                     module,
                     name,
@@ -700,7 +707,7 @@ impl<'a> ScanState<'a> {
             }
             "INST" => {
                 let _ = self.pop_to_mark();
-                let (module, name) = opcode.arg.global_parts();
+                let (module, name) = opcode.arg.global_parts(self.payload);
                 let reference = GlobalRef {
                     module,
                     name,
@@ -760,8 +767,8 @@ impl<'a> ScanState<'a> {
         name_value: Option<StackValue>,
         position: usize,
     ) -> GlobalRef {
-        let module = resolve_global_operand(module_value.as_ref());
-        let name = resolve_global_operand(name_value.as_ref());
+        let module = resolve_global_operand(module_value.as_ref(), self.payload);
+        let name = resolve_global_operand(name_value.as_ref(), self.payload);
 
         match (module, name) {
             (Some(module), Some(name)) => GlobalRef {
@@ -880,13 +887,19 @@ impl<'a> ScanState<'a> {
                     .min(offset.saturating_add(self.options.max_nested_pickle_bytes));
                 let candidate = &value[offset..end];
                 if looks_like_pickle_payload(candidate, self.options.max_nested_pickle_bytes) {
-                    self.add_nested_payload_finding("raw", value.len(), position + offset, false);
+                    self.add_nested_payload_finding(
+                        "raw",
+                        value.len(),
+                        position + offset,
+                        false,
+                        has_execution_opcode(candidate),
+                    );
                     self.surface_nested_pickle_findings(candidate, "raw", position + offset);
                     return;
                 }
             }
             if has_pickle_prefix(value) {
-                self.add_nested_payload_finding("raw", value.len(), position, true);
+                self.add_nested_payload_finding("raw", value.len(), position, true, false);
                 self.record_raw_nested_payload_truncated(value.len(), position);
             }
             return;
@@ -896,7 +909,13 @@ impl<'a> ScanState<'a> {
             return;
         }
 
-        self.add_nested_payload_finding("raw", value.len(), position, false);
+        self.add_nested_payload_finding(
+            "raw",
+            value.len(),
+            position,
+            false,
+            has_execution_opcode(value),
+        );
         self.surface_nested_pickle_findings(value, "raw", position);
     }
 
@@ -906,6 +925,7 @@ impl<'a> ScanState<'a> {
         payload_size: usize,
         position: usize,
         analysis_incomplete: bool,
+        nested_has_execution_opcode: bool,
     ) {
         self.add_finding(Finding {
             message: if analysis_incomplete {
@@ -926,6 +946,10 @@ impl<'a> ScanState<'a> {
                 (
                     "analysis_incomplete".to_string(),
                     DetailValue::Bool(analysis_incomplete),
+                ),
+                (
+                    "nested_has_execution_opcode".to_string(),
+                    DetailValue::Bool(nested_has_execution_opcode),
                 ),
             ],
             why: Some(
@@ -972,7 +996,13 @@ impl<'a> ScanState<'a> {
             decode_possible_encoded_pickle(value, self.options.max_nested_pickle_bytes)
         {
             decoded_payload_found = true;
-            self.add_encoded_nested_payload_finding(encoding, decoded.len(), position, false);
+            self.add_encoded_nested_payload_finding(
+                encoding,
+                decoded.len(),
+                position,
+                false,
+                has_execution_opcode(&decoded),
+            );
             self.surface_nested_pickle_findings(&decoded, encoding, position);
         }
         if decoded_payload_found {
@@ -982,7 +1012,7 @@ impl<'a> ScanState<'a> {
         for (encoding, payload_size) in
             detect_oversized_encoded_pickle_prefixes(value, self.options.max_nested_pickle_bytes)
         {
-            self.add_encoded_nested_payload_finding(encoding, payload_size, position, true);
+            self.add_encoded_nested_payload_finding(encoding, payload_size, position, true, false);
             self.record_encoded_nested_payload_truncated(encoding, payload_size, position);
         }
     }
@@ -1020,6 +1050,7 @@ impl<'a> ScanState<'a> {
         payload_size: usize,
         position: usize,
         analysis_incomplete: bool,
+        nested_has_execution_opcode: bool,
     ) {
         let mut details = vec![
             (
@@ -1038,6 +1069,10 @@ impl<'a> ScanState<'a> {
             ));
             details.push(("analysis_incomplete".to_string(), DetailValue::Bool(true)));
         }
+        details.push((
+            "nested_has_execution_opcode".to_string(),
+            DetailValue::Bool(nested_has_execution_opcode),
+        ));
 
         self.add_finding(Finding {
             message: if analysis_incomplete {
@@ -1553,9 +1588,12 @@ impl<'a> ScanState<'a> {
     }
 }
 
-fn resolve_global_operand(value: Option<&StackValue>) -> Option<String> {
+fn resolve_global_operand(value: Option<&StackValue>, payload: &[u8]) -> Option<String> {
     match value {
         Some(StackValue::Text(value)) => Some(value.clone()),
+        Some(StackValue::TextSpan { start, end }) if start <= end && *end <= payload.len() => {
+            Some(String::from_utf8_lossy(&payload[*start..*end]).to_string())
+        }
         _ => None,
     }
 }
@@ -1564,6 +1602,9 @@ fn operand_preview(value: Option<&StackValue>) -> String {
     match value {
         Some(StackValue::Global(reference)) => format!("_GlobalRef({})", reference.symbol()),
         Some(StackValue::Constructed(reference)) => format!("constructed:{}", reference.symbol()),
+        Some(StackValue::TextSpan { start, end }) => {
+            format!("str_span(len={})", end.saturating_sub(*start))
+        }
         Some(StackValue::Bytes { start, end }) => {
             format!("bytes(len={})", end.saturating_sub(*start))
         }
@@ -1596,6 +1637,9 @@ fn stack_value_preview(value: &StackValue, depth: usize) -> String {
     match value {
         StackValue::Mark => "MARK".to_string(),
         StackValue::Text(value) => format!("str:{:?}", value),
+        StackValue::TextSpan { start, end } => {
+            format!("str_span(len={})", end.saturating_sub(*start))
+        }
         StackValue::Bytes { start, end } => format!("bytes(len={})", end.saturating_sub(*start)),
         StackValue::Global(reference) => format!("global:{}", reference.symbol()),
         StackValue::Constructed(reference) => format!("constructed:{}", reference.symbol()),
@@ -1615,10 +1659,16 @@ fn stack_value_preview(value: &StackValue, depth: usize) -> String {
     }
 }
 
-fn stack_value_text(value: &StackValue) -> Option<&str> {
+fn stack_value_text<'payload>(
+    value: &'payload StackValue,
+    payload: &'payload [u8],
+) -> Option<Cow<'payload, str>> {
     match value {
-        StackValue::Text(text) => Some(text),
-        StackValue::Primitive { repr, .. } => Some(repr),
+        StackValue::Text(text) => Some(Cow::Borrowed(text)),
+        StackValue::TextSpan { start, end } if start <= end && *end <= payload.len() => {
+            Some(String::from_utf8_lossy(&payload[*start..*end]))
+        }
+        StackValue::Primitive { repr, .. } => Some(Cow::Borrowed(repr)),
         _ => None,
     }
 }
@@ -1626,6 +1676,9 @@ fn stack_value_text(value: &StackValue) -> Option<&str> {
 fn stack_value_string(value: &StackValue, payload: &[u8]) -> Option<String> {
     match value {
         StackValue::Text(text) => Some(text.clone()),
+        StackValue::TextSpan { start, end } if start <= end && *end <= payload.len() => {
+            Some(String::from_utf8_lossy(&payload[*start..*end]).to_string())
+        }
         StackValue::Primitive { repr, .. } => Some(repr.clone()),
         StackValue::Bytes { start, end }
             if start <= end
@@ -1645,21 +1698,25 @@ fn pytorch_storage_key(value: &StackValue, payload: &[u8]) -> Option<String> {
     let StackValue::Tuple(items) = value else {
         return None;
     };
-    if items.len() < 4 || stack_value_text(&items[0]) != Some("storage") {
+    if items.len() < 4 || stack_value_text(&items[0], payload).as_deref() != Some("storage") {
         return None;
     }
-    if !is_pytorch_storage_descriptor(&items[1]) {
+    if !is_pytorch_storage_descriptor(&items[1], payload) {
         return None;
     }
     stack_value_string(&items[2], payload)
 }
 
-fn is_pytorch_storage_descriptor(value: &StackValue) -> bool {
+fn is_pytorch_storage_descriptor(value: &StackValue, payload: &[u8]) -> bool {
     match value {
         StackValue::Global(reference) => {
             reference.module == "torch" && reference.name.ends_with("Storage")
         }
         StackValue::Text(text) => text.starts_with("torch.") && text.ends_with("Storage"),
+        StackValue::TextSpan { start, end } if start <= end && *end <= payload.len() => {
+            let text = String::from_utf8_lossy(&payload[*start..*end]);
+            text.starts_with("torch.") && text.ends_with("Storage")
+        }
         _ => false,
     }
 }
@@ -1678,11 +1735,31 @@ fn stack_value_from_integer_arg(arg: &ArgValue) -> StackValue {
     }
 }
 
-fn post_budget_opcode_prefix(opcode: &ParsedOpcode, stack: &[StackValue]) -> Vec<u8> {
-    if opcode.name == "STACK_GLOBAL" && stack.len() >= 2 {
-        if let (StackValue::Text(module), StackValue::Text(name)) =
-            (&stack[stack.len() - 2], &stack[stack.len() - 1])
+fn stack_value_from_text_arg(arg: &ArgValue, payload: &[u8]) -> StackValue {
+    match arg {
+        ArgValue::Text(value) => StackValue::Text(value.clone()),
+        ArgValue::TextSpan { start, end } | ArgValue::Bytes { start, end }
+            if start <= end && *end <= payload.len() =>
         {
+            StackValue::TextSpan {
+                start: *start,
+                end: *end,
+            }
+        }
+        _ => StackValue::Text(arg.coerce_text(payload)),
+    }
+}
+
+fn post_budget_opcode_prefix(
+    opcode: &ParsedOpcode,
+    stack: &[StackValue],
+    payload: &[u8],
+) -> Vec<u8> {
+    if opcode.name == "STACK_GLOBAL" && stack.len() >= 2 {
+        if let (Some(module), Some(name)) = (
+            stack_value_string(&stack[stack.len() - 2], payload),
+            stack_value_string(&stack[stack.len() - 1], payload),
+        ) {
             let mut prefix = module.as_bytes().to_vec();
             prefix.push(b'\n');
             prefix.extend_from_slice(name.as_bytes());
@@ -1694,7 +1771,7 @@ fn post_budget_opcode_prefix(opcode: &ParsedOpcode, stack: &[StackValue]) -> Vec
         return Vec::new();
     }
 
-    let (module, name) = opcode.arg.global_parts();
+    let (module, name) = opcode.arg.global_parts(payload);
     if module.is_empty() || name.is_empty() {
         return Vec::new();
     }

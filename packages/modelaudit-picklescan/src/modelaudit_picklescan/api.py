@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import tempfile
 import zipfile
+from collections.abc import Mapping
+from importlib import import_module
 from pathlib import Path
 from typing import Any, BinaryIO, cast
 
@@ -16,6 +18,7 @@ _PYTORCH_ZIP_METADATA_BASENAMES = frozenset({"version", "byteorder"})
 _PICKLE_MEMBER_SUFFIXES = (".pkl", ".pickle")
 _MAX_PYTORCH_ZIP_ENTRIES = 10_000
 _MAX_PYTORCH_ZIP_PICKLE_MEMBER_BYTES = 512 * 1024 * 1024
+_RUST_EXTENSION_MODULE = "modelaudit_picklescan._rust"
 
 
 class _StreamShortReadError(ValueError):
@@ -38,7 +41,7 @@ class PickleScanner:
     def scan_bytes(self, data: bytes | bytearray | memoryview, *, source: str = "<bytes>") -> PickleReport:
         """Scan a raw pickle byte payload."""
         payload = bytes(data)
-        return _scan_pickle_payload_selected(payload, source=source, options=self.options, bytes_total=len(payload))
+        return _scan_pickle_payload_native(payload, source=source, options=self.options, bytes_total=len(payload))
 
     def scan_stream(
         self,
@@ -78,7 +81,7 @@ class PickleScanner:
                 bytes_scanned=0,
                 bytes_total=normalized_size,
             )
-        return _scan_pickle_payload_selected(
+        return _scan_pickle_payload_native(
             payload,
             source=source,
             options=self.options,
@@ -395,7 +398,7 @@ def _io_error_report(
     )
 
 
-def _scan_pickle_payload_selected(
+def _scan_pickle_payload_native(
     payload: bytes,
     *,
     source: str,
@@ -403,39 +406,130 @@ def _scan_pickle_payload_selected(
     bytes_total: int | None = None,
     position_offset: int = 0,
 ) -> PickleReport:
+    native_bytes_total = _normalize_stream_size(bytes_total)
+    native_position_offset = max(position_offset, 0)
     try:
-        return _scan_pickle_payload_rust(
+        native_module = import_module(_RUST_EXTENSION_MODULE)
+        raw_report = native_module.scan_bytes(
             payload,
-            source=source,
-            options=options,
-            bytes_total=bytes_total,
-            position_offset=position_offset,
+            source,
+            _options_to_native_dict(options),
+            native_bytes_total,
+            native_position_offset,
+            0,
         )
+        if not isinstance(raw_report, Mapping):
+            raise TypeError(f"Rust scanner returned {type(raw_report).__name__}, expected mapping")
+        return _report_from_native_dict(raw_report)
     except Exception as error:
         return _engine_error_report(
             source=source,
             error=error,
-            bytes_total=bytes_total,
+            bytes_total=native_bytes_total,
         )
 
 
-def _scan_pickle_payload_rust(
-    payload: bytes,
-    *,
-    source: str,
-    options: ScanOptions,
-    bytes_total: int | None = None,
-    position_offset: int = 0,
-) -> PickleReport:
-    from .engine.rust import scan_pickle_payload as scan_pickle_payload_rust
+def _options_to_native_dict(options: ScanOptions) -> dict[str, int | float]:
+    return {
+        "timeout_s": options.timeout_s,
+        "max_opcodes": options.max_opcodes,
+        "post_budget_scan_bytes": options.post_budget_scan_bytes,
+        "max_string_literal_scan_chars": options.max_string_literal_scan_chars,
+        "max_nested_pickle_bytes": options.max_nested_pickle_bytes,
+        "max_nested_depth": options.max_nested_depth,
+    }
 
-    return scan_pickle_payload_rust(
-        payload,
-        source=source,
-        options=options,
-        bytes_total=bytes_total,
-        position_offset=position_offset,
+
+def _report_from_native_dict(raw_report: Mapping[str, Any]) -> PickleReport:
+    coverage = _mapping(raw_report.get("coverage", {}))
+    return PickleReport(
+        source=str(raw_report["source"]),
+        status=ScanStatus(str(raw_report["status"])),
+        verdict=SafetyVerdict(str(raw_report["verdict"])),
+        findings=tuple(_finding_from_native_dict(_mapping(item)) for item in _sequence(raw_report.get("findings"))),
+        notices=tuple(_notice_from_native_dict(_mapping(item)) for item in _sequence(raw_report.get("notices"))),
+        errors=tuple(_error_from_native_dict(_mapping(item)) for item in _sequence(raw_report.get("errors"))),
+        coverage=CoverageSummary(
+            bytes_scanned=int(coverage.get("bytes_scanned", 0)),
+            bytes_total=_optional_int(coverage.get("bytes_total")),
+            opcode_count=_optional_int(coverage.get("opcode_count")),
+            raw_scan_complete=_optional_bool(coverage.get("raw_scan_complete")),
+            opcode_scan_complete=_optional_bool(coverage.get("opcode_scan_complete")),
+        ),
+        metadata=dict(_mapping(raw_report.get("metadata", {}))),
+        duration_s=float(raw_report.get("duration_s", 0.0)),
     )
+
+
+def _finding_from_native_dict(raw_finding: Mapping[str, Any]) -> Finding:
+    return Finding(
+        message=str(raw_finding["message"]),
+        severity=Severity(str(raw_finding["severity"])),
+        location=_optional_str(raw_finding.get("location")),
+        rule_code=_optional_str(raw_finding.get("rule_code")),
+        details=dict(_mapping(raw_finding.get("details", {}))),
+        why=_optional_str(raw_finding.get("why")),
+    )
+
+
+def _notice_from_native_dict(raw_notice: Mapping[str, Any]) -> Notice:
+    return Notice(
+        message=str(raw_notice["message"]),
+        severity=Severity(str(raw_notice.get("severity", Severity.INFO.value))),
+        location=_optional_str(raw_notice.get("location")),
+        code=_optional_str(raw_notice.get("code")),
+        details=dict(_mapping(raw_notice.get("details", {}))),
+    )
+
+
+def _error_from_native_dict(raw_error: Mapping[str, Any]) -> ScanError:
+    return ScanError(
+        message=str(raw_error["message"]),
+        category=str(raw_error["category"]),
+        location=_optional_str(raw_error.get("location")),
+        exception_type=_optional_str(raw_error.get("exception_type")),
+        details=dict(_mapping(raw_error.get("details", {}))),
+    )
+
+
+def _mapping(value: object) -> Mapping[str, Any]:
+    if isinstance(value, Mapping):
+        return value
+    raise TypeError(f"expected mapping, got {type(value).__name__}")
+
+
+def _sequence(value: object) -> tuple[object, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, tuple):
+        return value
+    if isinstance(value, list):
+        return tuple(value)
+    raise TypeError(f"expected sequence, got {type(value).__name__}")
+
+
+def _optional_str(value: object) -> str | None:
+    if value is None:
+        return None
+    return str(value)
+
+
+def _optional_int(value: object) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str | bytes | bytearray):
+        return int(value)
+    raise TypeError(f"expected int-compatible value, got {type(value).__name__}")
+
+
+def _optional_bool(value: object) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    raise TypeError(f"expected bool or None, got {type(value).__name__}")
 
 
 def _normalize_stream_size(size: int | None) -> int | None:

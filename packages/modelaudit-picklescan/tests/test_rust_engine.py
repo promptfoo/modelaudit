@@ -6,6 +6,7 @@ import pickle
 import pickletools
 import re
 import zipfile
+from importlib.util import find_spec
 from pathlib import Path
 
 import pytest
@@ -16,10 +17,11 @@ from modelaudit_picklescan._parity_corpus import (
     malicious_reduce_payload,
     prefix_truncation_payloads,
 )
-from modelaudit_picklescan.engine.rust import _report_from_native_dict
-from modelaudit_picklescan.engine.selection import rust_engine_available
+from modelaudit_picklescan.api import _RUST_EXTENSION_MODULE, _report_from_native_dict
 
-pytestmark = pytest.mark.skipif(not rust_engine_available(), reason="Rust picklescan extension is not built")
+pytestmark = pytest.mark.skipif(
+    find_spec(_RUST_EXTENSION_MODULE) is None, reason="Rust picklescan extension is not built"
+)
 
 
 def _rust_source_text() -> str:
