@@ -216,7 +216,7 @@ _JIT_SCAN_SEEDS: tuple[bytes, ...] = (
     b"socket.",
     b"subprocess.",
     b"tf.",
-    b"torch",
+    b"torch.jit",
     b"torchscript",
     b"urllib.",
 )

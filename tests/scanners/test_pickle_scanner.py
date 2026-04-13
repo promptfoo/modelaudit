@@ -220,6 +220,37 @@ def test_expensive_raw_prefilters_skip_huggingface_style_metadata_without_values
     assert not result.issues
 
 
+def test_expensive_raw_prefilters_skip_common_torch_metadata_without_jit_markers(tmp_path: Path) -> None:
+    path = tmp_path / "torch-metadata.pkl"
+    path.write_bytes(
+        pickle.dumps(
+            {
+                "__version__": "2.3.0",
+                "framework": "torch",
+                "torch_dtype": "float16",
+                "architectures": ["LlamaForCausalLM"],
+                "state_dict": "A" * (2 * 1024 * 1024),
+            },
+            protocol=4,
+        )
+    )
+
+    result = PickleScanner().scan(str(path))
+
+    assert result.metadata["pickle_expensive_raw_detectors_skipped"] is True
+    assert not result.issues
+
+
+def test_expensive_raw_prefilters_preserve_torch_jit_markers(tmp_path: Path) -> None:
+    path = tmp_path / "torch-jit-metadata.pkl"
+    path.write_bytes(pickle.dumps({"loader": "torch.jit.load('model.pt')"}, protocol=4))
+
+    result = PickleScanner().scan(str(path))
+
+    assert result.metadata.get("pickle_expensive_raw_detectors_skipped") is not True
+    assert result.metadata.get("pickle_jit_raw_detector_skipped") is not True
+
+
 def test_expensive_raw_prefilters_preserve_structured_secret_assignments(tmp_path: Path) -> None:
     path = tmp_path / "structured-secret.pkl"
     path.write_bytes(pickle.dumps({"env": "password=CorrectHorseBattery42"}, protocol=4))
