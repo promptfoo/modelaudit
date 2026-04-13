@@ -83,7 +83,11 @@ _RAW_PICKLE_GLOBAL_REFERENCES: tuple[tuple[bytes, bytes, str], ...] = (
 )
 _SECRET_SCAN_SEEDS: tuple[bytes, ...] = (
     b"://",
-    b"-----begin ",
+    b"-----begin dsa private key-----",
+    b"-----begin ec private key-----",
+    b"-----begin openssh private key-----",
+    b"-----begin pgp private key block-----",
+    b"-----begin rsa private key-----",
     b"akia",
     b"api",
     b"auth",

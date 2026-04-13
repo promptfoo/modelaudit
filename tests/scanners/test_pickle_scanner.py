@@ -201,6 +201,17 @@ def test_scan_stream_detects_base64_encoded_execution_text() -> None:
     assert not any(issue.message.startswith("Legacy encoded dangerous pattern detected") for issue in result.issues)
 
 
+def test_scan_stream_detects_pem_private_key_after_seed_tightening() -> None:
+    payload = pickle.dumps(
+        {"pem": "-----BEGIN RSA PRIVATE KEY-----\nabc123\n-----END RSA PRIVATE KEY-----"},
+        protocol=4,
+    )
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="pem-secret.pkl")
+
+    assert any(issue.rule_code == "S703" and "Private Key" in str(issue.details) for issue in result.issues)
+
+
 def test_scan_stream_hashes_seekable_stream_past_raw_scan_window() -> None:
     payload = pickle.dumps({"pad": b"A" * 256}, protocol=4)
 

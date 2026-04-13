@@ -502,7 +502,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] N-P1-20 — Collapse protocol-5 buffer opcode notices into bounded/count-based notices.
 - [x] N-P1-21 — Review `READONLY_BUFFER` empty-stack parity behavior.
 - [x] N-P2-22 — Collapse encoded-text S604/S104 twin emissions.
-- [ ] N-P2-24 — Clean redundant lowercase seed spelling.
+- [x] N-P2-24 — Clean redundant lowercase seed spelling.
 - [ ] N-P2-26 — Replace remaining `_contains_non_comment_token` guards with scoped documentation analysis.
 - [ ] N-P2-27 — Add Rust string seeds for joblib/cloudpickle/copyreg.
 - [ ] N-P2-28 — Add tests for encoded protocol 2-5 prefixes.
@@ -717,6 +717,11 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run mypy modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py -q` — passed, 69 tests, including an encoded `os.system` payload with exactly one encoded-code issue and no legacy duplicate issue.
+- N-P2-24 — Same-item commit replaces the broad lowercased `-----begin ` expensive-detector seed with specific lowercased private-key PEM header seeds, keeping private-key coverage while avoiding a generic certificate/PEM trigger. Targeted QA:
+  - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `uv run mypy modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py -q` — passed, 70 tests, including an RSA private-key PEM fixture that still emits `S703`.
 
 ### Newly discovered gaps while remediating
 
