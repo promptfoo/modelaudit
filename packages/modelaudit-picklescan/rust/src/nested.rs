@@ -309,7 +309,7 @@ pub(crate) fn has_pickle_prefix(value: &[u8]) -> bool {
 }
 
 pub(crate) fn has_binary_pickle_prefix(value: &[u8]) -> bool {
-    value.len() >= 2 && value[0] == 0x80 && matches!(value[1], 2..=5)
+    value.len() >= 2 && value[0] == 0x80 && matches!(value[1], 1..=5)
 }
 
 pub(crate) fn truncated_pickle_prefix_requires_fail_closed(value: &[u8]) -> bool {
@@ -733,21 +733,36 @@ mod tests {
     }
 
     #[test]
-    fn encoded_prefix_gates_recognize_binary_protocols_2_to_5() {
-        for encoded in ["gAJ9Lg==", "gAN9Lg==", "gAR9Lg==", "gAV9Lg=="] {
+    fn encoded_prefix_gates_recognize_binary_protocols_1_to_5() {
+        for encoded in ["gAF9Lg==", "gAJ9Lg==", "gAN9Lg==", "gAR9Lg==", "gAV9Lg=="] {
             assert!(base64_prefix_has_pickle_prefix(encoded));
             let wrapped = format!("prefix-{encoded}-suffix");
             let windows = encoded_nested_literal_probe_windows(&wrapped, 64);
             assert!(windows.iter().any(|window| window.starts_with(encoded)));
         }
 
-        for protocol in 2..=5 {
+        for protocol in 1..=5 {
             let encoded = format!("800{protocol}7d2e");
             assert!(hex_prefix_has_pickle_prefix(&encoded));
             let wrapped = format!("prefix-{encoded}-suffix");
             let windows = encoded_nested_literal_probe_windows(&wrapped, 64);
             assert!(windows.iter().any(|window| window.starts_with(&encoded)));
         }
+    }
+
+    #[test]
+    fn pickle_prefix_recognizes_protocol1_binary_header() {
+        let payload = b"\x80\x01}.";
+
+        assert!(has_binary_pickle_prefix(payload));
+        assert!(looks_like_pickle_payload(
+            payload,
+            TEST_MAX_NESTED_PICKLE_BYTES
+        ));
+        assert_eq!(
+            pickle_payload_extent(payload, TEST_MAX_NESTED_PICKLE_BYTES),
+            Some(payload.len())
+        );
     }
 
     #[test]

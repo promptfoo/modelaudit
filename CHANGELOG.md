@@ -52,6 +52,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **pickle:** harden Rust opcode parity for protocol 5 buffers, copyreg extensions, follow-on streams, protocol-0 encoded nested payloads, and `__main__` call escalation while bounding Python raw-detector hot paths
 - **pickle:** preserve root raw-detector coverage for Slack tokens, `mongodb+srv://` secrets, bare IPs, domains, and network-library/function indicators behind large-file compatibility prefilters
 - **pickle:** detect modern `STACK_GLOBAL`, `INST`, and copyreg extension references in post-budget pickle tails, avoid a second Rust-boundary copy of Python byte payloads, and skip expensive raw detectors for realistic benign PyTorch state-dict key streams
+- **pickle:** route crafted protocol-1 binary pickle headers and nested protocol-1 payload prefixes through the same scanner paths as newer binary protocols
 - **numpy:** propagate incomplete embedded-pickle scan status from object-dtype `.npy` payloads so partial recursive pickle coverage fails closed
 - **license:** bound binary header scans and reuse compiled patterns to avoid full-file regex passes on large model archives
 - **security:** stop iterating malformed TFLite models after excessive subgraph counts are detected
