@@ -393,6 +393,18 @@ def test_post_budget_expansion_scan_ignores_benign_follow_on_stream(tmp_path: Pa
     ), result.checks
 
 
+def test_scan_bounds_follow_on_probe_recursion_for_pickle_like_binary_tail(tmp_path: Path) -> None:
+    path = tmp_path / "binary-tail.pkl"
+    path.write_bytes(pickle.dumps({"safe": True}, protocol=2) + (b"XYZNmore-binary-data" * 20))
+
+    result = PickleScanner().scan(str(path))
+
+    assert result.metadata["pickle_primary_engine"] == "rust"
+    assert result.metadata["pickle_report_status"] == "inconclusive"
+    assert not any(issue.details.get("pickle_notice_code") == "follow_on_stream_detected" for issue in result.issues)
+    assert not any(check.name == "Pickle Expansion Heuristic Check" for check in result.checks)
+
+
 def test_root_legacy_metadata_detectors_preserve_import_only_and_main_build_rules() -> None:
     scanner = PickleScanner()
     result = ScanResult(scanner_name="pickle", scanner=scanner)

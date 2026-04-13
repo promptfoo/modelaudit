@@ -272,6 +272,16 @@ def test_scan_bytes_does_not_warn_on_benign_shared_references() -> None:
     assert all(finding.rule_code != "PICKLE_EXPANSION" for finding in report.findings)
 
 
+def test_scan_bytes_bounds_follow_on_probe_recursion_for_pickle_like_binary_tail() -> None:
+    payload = pickle.dumps({"safe": True}, protocol=2) + (b"XYZNmore-binary-data" * 20)
+
+    report = scan_bytes(payload, source="binary-tail.pkl")
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.findings == ()
+
+
 def test_scan_bytes_warns_on_post_budget_memo_growth_tail() -> None:
     payload = _make_opcode_padding_stream(64) + _make_memo_expansion_pickle(iterations=80)
 

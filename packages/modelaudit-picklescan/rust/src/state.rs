@@ -1784,7 +1784,10 @@ impl<'a> ScanState<'a> {
     }
 
     fn scan_follow_on_pickle_streams(&mut self, start_index: usize) {
-        if self.options.post_budget_scan_bytes == 0 || start_index >= self.payload.len() {
+        if self.options.post_budget_scan_bytes == 0
+            || self.nested_depth >= self.options.max_nested_depth
+            || start_index >= self.payload.len()
+        {
             return;
         }
         let scan_end = self
@@ -1809,7 +1812,7 @@ impl<'a> ScanState<'a> {
                 self.options,
                 Some(candidate.len()),
                 self.position_offset + absolute_offset,
-                self.nested_depth,
+                self.nested_depth + 1,
                 Some(self.deadline),
             );
             follow_on_scan.run();

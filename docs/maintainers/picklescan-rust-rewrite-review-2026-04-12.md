@@ -511,6 +511,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [ ] N-P2-31 — Optimize Rust dangerous-global policy lookup.
 - [ ] N-P2-32 — Clean stale moved parity-corpus pycache.
 - [ ] N-P2-33 — Refactor duplicate stream-read helpers.
+- [x] N-P0-34 — Bound recursive follow-on pickle probing for pickle-like binary tails.
 - [ ] R-P0-2 — Preserve integer stack values for `INT`/`LONG` variants.
 - [ ] R-P1-BUF / R-P1-20 / R-P1-21 — Protocol-5 buffer stack and notice parity follow-up.
 - [ ] R-P1-27 — Include malformed state in global-reference dedupe.
@@ -633,10 +634,20 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run ruff check modelaudit/scanners/picklescan_adapter.py tests/scanners/test_picklescan_adapter.py tests/scanners/test_pickle_scanner.py packages/modelaudit-picklescan/tests/test_api.py` — passed.
   - `uv run mypy modelaudit/scanners/picklescan_adapter.py tests/scanners/test_picklescan_adapter.py tests/scanners/test_pickle_scanner.py packages/modelaudit-picklescan/tests/test_api.py` — passed.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_picklescan_adapter.py tests/scanners/test_pickle_scanner.py packages/modelaudit-picklescan/tests/test_api.py -q` — passed, 258 tests.
+- N-P0-34 — While starting T-P2-STRUCTURAL QA, a valid pickle followed by `XYZNmore-binary-data` repetitions caused unbounded recursive follow-on probing because each synthetic follow-on scan could recursively probe later pickle-like text bytes at the same depth. Same-item commit increments follow-on scan depth, respects `max_nested_depth`, and adds standalone plus root scanner regressions for pickle-like binary tails. Targeted QA:
+  - `cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml -- --check` — passed.
+  - `cargo check --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed.
+  - `cargo clippy --manifest-path packages/modelaudit-picklescan/Cargo.toml --all-targets -- -D warnings` — passed.
+  - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, 16 tests.
+  - `uv run --with 'maturin>=1.9,<2' maturin develop --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, rebuilt the editable native extension.
+  - `uv run ruff format --check tests/scanners/test_pickle_scanner.py packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `uv run ruff check tests/scanners/test_pickle_scanner.py packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `uv run mypy tests/scanners/test_pickle_scanner.py packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests/test_api.py::test_scan_bytes_bounds_follow_on_probe_recursion_for_pickle_like_binary_tail tests/scanners/test_pickle_scanner.py::test_scan_bounds_follow_on_probe_recursion_for_pickle_like_binary_tail -q` — passed, 2 tests.
 
 ### Newly discovered gaps while remediating
 
-- None yet.
+- N-P0-34 — Follow-on stream probing could recurse through pickle-like binary tails; fixed and tracked in the remediation checklist above.
 
 ---
 
