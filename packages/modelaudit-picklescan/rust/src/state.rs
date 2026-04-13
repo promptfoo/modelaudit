@@ -53,6 +53,33 @@ const EXPANSION_MEMO_GROWTH_MIN_WRITES: usize = 64;
 const EXPANSION_MEMO_GROWTH_STEPS_THRESHOLD: usize = 32;
 const EXPANSION_RATIO_SUPPORTING_DUP_THRESHOLD: usize = 64;
 const EXPANSION_RATIO_SUPPORTING_GROWTH_THRESHOLD: usize = 16;
+const POST_BUDGET_DANGEROUS_GLOBAL_PATTERNS: &[&[u8]] = &[
+    b"nt\nsystem",
+    b"nt\npopen",
+    b"nt\nspawn",
+    b"os\nsystem",
+    b"os\npopen",
+    b"os\nspawn",
+    b"posix\nsystem",
+    b"posix\npopen",
+    b"posix\nspawn",
+    b"commands\ngetoutput",
+    b"commands\ngetstatusoutput",
+    b"subprocess\nPopen",
+    b"builtins\neval",
+    b"builtins\nexec",
+    b"builtins\ncompile",
+    b"builtins\n__import__",
+    b"__builtin__\neval",
+    b"__builtin__\nexec",
+    b"__builtin__\ncompile",
+    b"__builtin__\n__import__",
+    b"importlib\nimport_module",
+    b"marshal\nloads",
+    b"ctypes\nCDLL",
+    b"runpy\nrun_module",
+    b"runpy\nrun_path",
+];
 
 #[derive(Clone)]
 struct GlobalRef {
@@ -1853,33 +1880,7 @@ impl<'a> ScanState<'a> {
             .bytes_scanned
             .max(stream_offset.saturating_add(tail.len()));
 
-        for needle in [
-            b"nt\nsystem".as_slice(),
-            b"nt\npopen".as_slice(),
-            b"nt\nspawn".as_slice(),
-            b"os\nsystem".as_slice(),
-            b"os\npopen".as_slice(),
-            b"os\nspawn".as_slice(),
-            b"posix\nsystem".as_slice(),
-            b"posix\npopen".as_slice(),
-            b"posix\nspawn".as_slice(),
-            b"commands\ngetoutput".as_slice(),
-            b"commands\ngetstatusoutput".as_slice(),
-            b"subprocess\nPopen".as_slice(),
-            b"builtins\neval".as_slice(),
-            b"builtins\nexec".as_slice(),
-            b"builtins\ncompile".as_slice(),
-            b"builtins\n__import__".as_slice(),
-            b"__builtin__\neval".as_slice(),
-            b"__builtin__\nexec".as_slice(),
-            b"__builtin__\ncompile".as_slice(),
-            b"__builtin__\n__import__".as_slice(),
-            b"importlib\nimport_module".as_slice(),
-            b"marshal\nloads".as_slice(),
-            b"ctypes\nCDLL".as_slice(),
-            b"runpy\nrun_module".as_slice(),
-            b"runpy\nrun_path".as_slice(),
-        ] {
+        for needle in POST_BUDGET_DANGEROUS_GLOBAL_PATTERNS {
             if let Some(offset) = find_bytes(&tail, needle) {
                 let absolute_position = if offset < tail_prefix_len {
                     stream_offset.saturating_add(offset)
@@ -3060,5 +3061,44 @@ mod tests {
         );
         assert_eq!(detail_usize(&finding.details, "position"), Some(3));
         assert_eq!(finding.location.as_deref(), Some("post-budget.pkl (pos 3)"));
+    }
+
+    #[test]
+    fn post_budget_tail_detects_every_dangerous_pattern() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: 1,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+
+        for needle in POST_BUDGET_DANGEROUS_GLOBAL_PATTERNS {
+            let mut payload = b"\x80\x04c".to_vec();
+            payload.extend_from_slice(needle);
+            payload.extend_from_slice(b"\n.");
+            let expected_pattern = String::from_utf8_lossy(needle);
+            let mut scan = ScanState::new(
+                format!("post-budget-{expected_pattern}.pkl"),
+                &payload,
+                &options,
+                Some(payload.len()),
+                0,
+                0,
+                None,
+            );
+
+            scan.run();
+
+            assert!(
+                scan.findings.iter().any(|finding| {
+                    finding.rule_code == Some("POST_BUDGET_GLOBAL")
+                        && detail_string(&finding.details, "pattern").as_deref()
+                            == Some(expected_pattern.as_ref())
+                }),
+                "missing post-budget pattern {expected_pattern:?}"
+            );
+        }
     }
 }
