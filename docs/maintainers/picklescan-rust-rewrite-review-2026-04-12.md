@@ -485,7 +485,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] P1-EMPTY — Map empty pickle input to a non-CRITICAL operational outcome.
 - [x] P1-BINTAIL-SCOPE / N-P1-11 — Broaden binary-tail scan beyond `.bin`.
 - [x] P1-SEED-SHAPE / N-P1-14 / N-P1-15 / N-P1-17 / N-P2-23 / N-P2-25 — Tighten and de-duplicate expensive raw-detector seed/shape helpers.
-- [ ] P1-DUNDER-WALKER — Reduce benign user-dunder false positives.
+- [x] P1-DUNDER-WALKER — Reduce benign user-dunder false positives.
 - [ ] P1-NESTED-DEPTH — Raise nested depth or fail closed when nested analysis depth is exhausted.
 - [ ] T-P1-WHEEL — Add missing macOS x86_64 and Linux aarch64 wheel coverage or document the gap.
 - [ ] T-P2-COMMENT — Restore missing comment-token bypass regression coverage.
@@ -598,6 +598,14 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run mypy modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py -q` — passed, 35 tests, including seeded secret/network preservation, bare alpha-only domain detection, and a plain `key` substring skip regression.
+- P1-DUNDER-WALKER — Same-item commit narrows Rust `magic method` string findings to dangerous dunder hooks/introspection names and expands the metadata allowlist for common benign dunders. User-defined metadata dunders like `__a__` and `__x_y__` now scan clean, while `__reduce__`/`__getnewargs_ex__` still warn. Targeted QA:
+  - `cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed.
+  - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, 16 tests.
+  - `cargo clippy --manifest-path packages/modelaudit-picklescan/Cargo.toml --all-targets -- -D warnings` — passed.
+  - `uv run --with 'maturin>=1.9,<2' maturin develop --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, rebuilt the editable native extension.
+  - `uv run ruff check packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `uv run mypy packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests/test_api.py -q` — passed, 142 tests, including common/user-defined dunder clean regressions.
 
 ### Newly discovered gaps while remediating
 

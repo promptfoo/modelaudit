@@ -338,7 +338,44 @@ fn starts_with_ascii_case_insensitive(haystack: &[u8], start: usize, needle: &[u
 fn is_common_dunder_metadata_literal(value: &str) -> bool {
     matches!(
         value.trim(),
-        "__version__" | "__metadata__" | "__schema__" | "__name__" | "__author__" | "__license__"
+        "__version__"
+            | "__metadata__"
+            | "__schema__"
+            | "__name__"
+            | "__author__"
+            | "__license__"
+            | "__dict__"
+            | "__slots__"
+            | "__module__"
+            | "__qualname__"
+            | "__doc__"
+            | "__all__"
+            | "__annotations__"
+    )
+}
+
+fn is_suspicious_magic_method(value: &str) -> bool {
+    matches!(
+        value,
+        "__reduce__"
+            | "__reduce_ex__"
+            | "__setstate__"
+            | "__getstate__"
+            | "__getnewargs__"
+            | "__getnewargs_ex__"
+            | "__subclasses__"
+            | "__globals__"
+            | "__code__"
+            | "__builtins__"
+            | "__import__"
+            | "__mro__"
+            | "__base__"
+            | "__bases__"
+            | "__call__"
+            | "__getattribute__"
+            | "__getattr__"
+            | "__setattr__"
+            | "__delattr__"
     )
 }
 
@@ -460,7 +497,14 @@ fn contains_magic_method(value: &str) -> bool {
                 let next_is_word = chars
                     .get(end + 2)
                     .is_some_and(|next| is_python_word_char(*next));
-                if previous.is_ascii_alphabetic() && !next_is_word {
+                let token = chars[start..=end + 1]
+                    .iter()
+                    .collect::<String>()
+                    .to_ascii_lowercase();
+                if previous.is_ascii_alphabetic()
+                    && !next_is_word
+                    && is_suspicious_magic_method(&token)
+                {
                     return true;
                 }
             }
@@ -638,9 +682,16 @@ mod tests {
     #[test]
     fn suspicious_string_matching_keeps_magic_method_boundaries() {
         assert!(suspicious_string_matches("__reduce__").contains(&"magic method".to_string()));
+        assert!(
+            suspicious_string_matches("__getnewargs_ex__").contains(&"magic method".to_string())
+        );
         assert!(!suspicious_string_matches("__1__").contains(&"magic method".to_string()));
+        assert!(!suspicious_string_matches("__a__").contains(&"magic method".to_string()));
+        assert!(!suspicious_string_matches("__x_y__").contains(&"magic method".to_string()));
         assert!(!suspicious_string_matches("a__b__c").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__version__").is_empty());
+        assert!(suspicious_string_matches("__dict__").is_empty());
+        assert!(suspicious_string_matches("['__slots__', '__module__']").is_empty());
         assert!(suspicious_string_matches("['__version__']").is_empty());
     }
 

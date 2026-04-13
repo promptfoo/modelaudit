@@ -840,6 +840,11 @@ def test_scan_bytes_allows_common_dunder_metadata_literals() -> None:
                 "__metadata__": {"format": "safe"},
                 "__schema__": "model-card-v1",
                 "__name__": "example-model",
+                "__dict__": {"shape": "metadata"},
+                "__slots__": ("weight", "bias"),
+                "__module__": "example",
+                "__qualname__": "Example",
+                "__annotations__": {"weight": "Tensor"},
             }
         ),
         source="dunder-metadata.pkl",
@@ -848,6 +853,15 @@ def test_scan_bytes_allows_common_dunder_metadata_literals() -> None:
     assert report.status == ScanStatus.COMPLETE
     assert report.verdict == SafetyVerdict.CLEAN
     assert not any(finding.rule_code == "SUSPICIOUS_STRING" for finding in report.findings)
+
+
+@pytest.mark.parametrize("literal", ["__a__", "__x_y__"])
+def test_scan_bytes_allows_user_defined_dunder_metadata_literals(literal: str) -> None:
+    report = scan_bytes(pickle.dumps({"metadata": literal}, protocol=4), source="user-dunder.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
 
 
 @pytest.mark.parametrize(
