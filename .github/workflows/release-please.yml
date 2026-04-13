@@ -52,6 +52,12 @@ jobs:
         if: steps.check-pr.outputs.has_pr == 'true'
         uses: astral-sh/setup-uv@v7
 
+      - name: Install Rust toolchain for standalone lock refresh
+        if: steps.check-pr.outputs.has_pr == 'true'
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
       - name: Sync uv.lock with pyproject.toml
         if: steps.check-pr.outputs.has_pr == 'true'
         run: |
