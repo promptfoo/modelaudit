@@ -513,7 +513,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] N-P2-33 — Refactor duplicate stream-read helpers.
 - [x] N-P0-34 — Bound recursive follow-on pickle probing for pickle-like binary tails.
 - [x] R-P0-2 — Preserve integer stack values for `INT`/`LONG` variants.
-- [ ] R-P1-BUF / R-P1-20 / R-P1-21 — Protocol-5 buffer stack and notice parity follow-up.
+- [x] R-P1-BUF / R-P1-20 / R-P1-21 — Protocol-5 buffer stack and notice parity follow-up.
 - [ ] R-P1-27 — Include malformed state in global-reference dedupe.
 - [ ] R-P1-28 — Push `Other` for missing memo GET/BINGET/LONG_BINGET.
 - [ ] R-P1-29 — Correct post-budget tail position reporting.
@@ -773,6 +773,10 @@ This section is the active implementation log for follow-up commits after revisi
   - `cargo check --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed.
   - `cargo clippy --manifest-path packages/modelaudit-picklescan/Cargo.toml --all-targets -- -D warnings` — passed.
   - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, 25 tests.
+- R-P1-BUF / R-P1-20 / R-P1-21 — Closed by the dedicated protocol-5 buffer commits above:
+  - `fix: collapse protocol5 buffer notices` coalesces repeated buffer notices and records total/`NEXT_BUFFER`/`READONLY_BUFFER` counts.
+  - `fix: preserve readonly buffer stack parity` keeps normal `NEXT_BUFFER` stack behavior while preventing empty-stack `READONLY_BUFFER` from fabricating an operand.
+  - Targeted QA is recorded under N-P1-20 and N-P1-21, including Rust unit tests, native rebuilds, and Python API regressions.
 
 ### Newly discovered gaps while remediating
 
