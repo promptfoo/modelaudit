@@ -952,6 +952,50 @@ def test_pickle_report_to_scan_result_requires_no_dangerous_imports_for_tail_sup
     assert parse_issue.details["analysis_incomplete"] is True
 
 
+@pytest.mark.parametrize(
+    ("source", "exception_type", "exception_message"),
+    [
+        ("empty-evidence-unicode-tail.pkl", "UnicodeDecodeError", "'utf-8' codec can't decode byte 0xff in position 0"),
+        ("empty-evidence-padding-tail.pkl", "ValueError", "at position 4096, opcode b'\\x00' unknown"),
+    ],
+)
+def test_pickle_report_to_scan_result_requires_import_evidence_for_tail_suppression(
+    source: str,
+    exception_type: str,
+    exception_message: str,
+) -> None:
+    report = PickleReport(
+        source=source,
+        status=ScanStatus.INCONCLUSIVE,
+        verdict=SafetyVerdict.UNKNOWN,
+        notices=(
+            Notice(
+                message=f"Pickle parsing stopped before the stream was fully consumed: {exception_type}",
+                severity=Severity.INFO,
+                location=f"{source} (pos 20)",
+                code="parse_incomplete",
+                details={
+                    "exception": exception_message,
+                    "exception_type": exception_type,
+                    "analysis_incomplete": True,
+                },
+            ),
+        ),
+        metadata={"first_pickle_end_pos": 19},
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert result.success is False
+    assert "trusted_incomplete_tail" not in result.metadata
+    parse_issue = next(
+        issue for issue in result.issues if issue.message == "Pickle parsing failed before full scan completion"
+    )
+    assert parse_issue.severity == IssueSeverity.WARNING
+    assert parse_issue.rule_code == "S901"
+    assert parse_issue.details["analysis_incomplete"] is True
+
+
 def test_pickle_report_to_scan_result_fails_closed_for_raw_pickle_unknown_opcode_tail() -> None:
     report = PickleReport(
         source="unknown-tail.pkl",

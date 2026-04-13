@@ -488,7 +488,7 @@ def _has_only_benign_serialization_tail_imports(report: PickleReport) -> bool:
 def _has_no_or_only_benign_serialization_tail_imports(report: PickleReport) -> bool:
     import_references = report.metadata.get("import_references")
     if not _is_reference_sequence(import_references) or not import_references:
-        return True
+        return False
     return _has_only_benign_serialization_tail_imports(report)
 
 
