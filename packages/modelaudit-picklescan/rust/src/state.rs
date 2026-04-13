@@ -999,6 +999,14 @@ impl<'a> ScanState<'a> {
             self.stack.push(StackValue::Other);
             return;
         }
+        let start = self.stack.len().saturating_sub(count);
+        if self.stack[start..]
+            .iter()
+            .any(|value| matches!(value, StackValue::Mark))
+        {
+            self.stack.push(StackValue::Other);
+            return;
+        }
         let mut values = Vec::with_capacity(count);
         for _ in 0..count {
             if let Some(value) = self.stack.pop() {
@@ -3528,6 +3536,34 @@ mod tests {
 
         assert_eq!(scan.stack.len(), 2);
         assert_eq!(stack_value_preview(&scan.stack[0], 0), "str:\"survivor\"");
+        assert!(matches!(scan.stack[1], StackValue::Other));
+    }
+
+    #[test]
+    fn tuple_shortcuts_do_not_wrap_mark_sentinels() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let mut scan = ScanState::new(
+            "tuple-mark.pkl".to_string(),
+            b"",
+            &options,
+            Some(0),
+            0,
+            0,
+            None,
+        );
+        scan.stack.push(StackValue::Mark);
+
+        scan.collapse_top_n(1);
+
+        assert_eq!(scan.stack.len(), 2);
+        assert!(matches!(scan.stack[0], StackValue::Mark));
         assert!(matches!(scan.stack[1], StackValue::Other));
     }
 
