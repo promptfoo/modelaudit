@@ -92,7 +92,9 @@ class TestRuleRegistry:
     def test_initialize_loads_catalog_order_after_reset(self) -> None:
         """Catalog order should be preserved after a full registry reset."""
         RuleRegistry.find_matching_rule("import os")
+        assert "import os" in RuleRegistry._message_match_cache
         RuleRegistry.reset_for_testing()
+        assert RuleRegistry._message_match_cache == {}
 
         RuleRegistry.initialize()
         loaded_rules = RuleRegistry.get_all_rules()
