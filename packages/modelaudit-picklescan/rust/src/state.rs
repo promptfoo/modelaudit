@@ -1895,10 +1895,16 @@ impl<'a> ScanState<'a> {
                         self.position_offset + absolute_position
                     )),
                     rule_code: Some("POST_BUDGET_GLOBAL"),
-                    details: vec![(
-                        "pattern".to_string(),
-                        DetailValue::String(String::from_utf8_lossy(needle).to_string()),
-                    )],
+                    details: vec![
+                        (
+                            "pattern".to_string(),
+                            DetailValue::String(String::from_utf8_lossy(needle).to_string()),
+                        ),
+                        (
+                            "position".to_string(),
+                            DetailValue::UInt((self.position_offset + absolute_position) as u64),
+                        ),
+                    ],
                     why: Some(
                         "Opcode analysis stopped early, but a byte-level tail scan still found suspicious global references.",
                     ),
@@ -2945,6 +2951,7 @@ mod tests {
             detail_string(&finding.details, "pattern").as_deref(),
             Some("os\npopen")
         );
+        assert_eq!(detail_usize(&finding.details, "position"), Some(3));
         assert_eq!(finding.location.as_deref(), Some("post-budget.pkl (pos 3)"));
     }
 }
