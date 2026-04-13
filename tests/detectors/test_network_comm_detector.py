@@ -1,9 +1,15 @@
 """Tests for network communication detection."""
 
+import os
 from pathlib import Path
 from urllib.parse import urlparse
 
 from modelaudit.detectors.network_comm import NetworkCommDetector, detect_network_communication
+
+
+def _is_ci_environment() -> bool:
+    """Return True when running in a CI environment."""
+    return bool(os.getenv("CI") or os.getenv("GITHUB_ACTIONS"))
 
 
 class TestNetworkCommDetector:
@@ -374,12 +380,11 @@ class TestNetworkCommDetector:
         data = b"connect to server:1337" * 100
         context = "model.bin"
 
-        import os
         import time
 
         start = time.perf_counter()
         # Fewer iterations in CI environments
-        iterations = 20 if (os.getenv("CI") or os.getenv("GITHUB_ACTIONS")) else 50
+        iterations = 20 if _is_ci_environment() else 50
         for _ in range(iterations):
             detector.findings = []
             detector._scan_suspicious_ports(data, context)
