@@ -503,7 +503,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] N-P1-21 — Review `READONLY_BUFFER` empty-stack parity behavior.
 - [x] N-P2-22 — Collapse encoded-text S604/S104 twin emissions.
 - [x] N-P2-24 — Clean redundant lowercase seed spelling.
-- [ ] N-P2-26 — Replace remaining `_contains_non_comment_token` guards with scoped documentation analysis.
+- [x] N-P2-26 — Replace remaining `_contains_non_comment_token` guards with scoped documentation analysis.
 - [ ] N-P2-27 — Add Rust string seeds for joblib/cloudpickle/copyreg.
 - [ ] N-P2-28 — Add tests for encoded protocol 2-5 prefixes.
 - [ ] N-P2-29 — Complete escaped-hex protocol-0 prefix table.
@@ -722,6 +722,12 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run mypy modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py -q` — passed, 70 tests, including an RSA private-key PEM fixture that still emits `S703`.
+- N-P2-26 — Same-item commit removes `_contains_non_comment_token` and routes the remaining importlib/webbrowser raw-text guards through `_contains_non_documentation_token`, so raw matching consistently uses literal-aware documentation spans. Targeted QA:
+  - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `uv run mypy modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py -q` — passed, 70 tests.
+  - `rg -n "_contains_non_comment_token" modelaudit/scanners/pickle_scanner.py` — passed, no remaining references.
 
 ### Newly discovered gaps while remediating
 

@@ -280,29 +280,6 @@ def _looks_like_pickle(data: bytes) -> bool:
     return first in {ord("("), ord("]"), ord("}"), ord("c"), ord("i"), ord("l"), ord("d"), ord("t")}
 
 
-def _contains_non_comment_token(
-    data: bytes,
-    token: bytes,
-    documentation_spans: tuple[tuple[int, int], ...] = (),
-) -> bool:
-    start = 0
-    while True:
-        index = data.find(token, start)
-        if index < 0:
-            return False
-        if _is_documentation_match(data, index, documentation_spans):
-            start = index + len(token)
-            continue
-
-        after = index + len(token)
-        while after < len(data) and data[after] in b" \t":
-            after += 1
-        if after >= len(data) or data[after] != ord("#"):
-            return True
-
-        start = index + len(token)
-
-
 def _is_primarily_documentation(data: bytes) -> bool:
     lines = [line.strip() for line in data.splitlines() if line.strip()]
     if not lines:
@@ -1314,14 +1291,14 @@ class PickleScanner(BaseScanner):
                     lower,
                     method,
                     documentation_spans,
-                ) and _contains_non_comment_token(lower, b"importlib", documentation_spans):
+                ) and _contains_non_documentation_token(lower, b"importlib", documentation_spans):
                     label = f"importlib.{method.decode('ascii')}"
                     indicators.append((label, b"importlib", {"associated_global": label}))
                     importlib_method_added = True
                     break
             if (
                 not importlib_method_added
-                and _contains_non_comment_token(lower, b"importlib", documentation_spans)
+                and _contains_non_documentation_token(lower, b"importlib", documentation_spans)
                 and _contains_non_documentation_token(lower, b"import ", documentation_spans)
             ):
                 indicators.append(("importlib", b"importlib", {"associated_global": "importlib"}))
@@ -1337,7 +1314,7 @@ class PickleScanner(BaseScanner):
                     lower,
                     method,
                     documentation_spans,
-                ) and _contains_non_comment_token(lower, b"webbrowser", documentation_spans):
+                ) and _contains_non_documentation_token(lower, b"webbrowser", documentation_spans):
                     label = f"webbrowser.{method.decode('ascii')}"
                     indicators.append((label, b"webbrowser", {"associated_global": label}))
                     break
