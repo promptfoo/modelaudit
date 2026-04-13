@@ -506,7 +506,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] N-P2-26 — Replace remaining `_contains_non_comment_token` guards with scoped documentation analysis.
 - [x] N-P2-27 — Add Rust string seeds for joblib/cloudpickle/copyreg.
 - [x] N-P2-28 — Add tests for encoded protocol 2-5 prefixes.
-- [ ] N-P2-29 — Complete escaped-hex protocol-0 prefix table.
+- [x] N-P2-29 — Complete escaped-hex protocol-0 prefix table.
 - [ ] N-P2-30 — Bound `encoded_nested_literal_probe_windows` linear scan cost.
 - [ ] N-P2-31 — Optimize Rust dangerous-global policy lookup.
 - [x] N-P2-32 — Clean stale moved parity-corpus pycache.
@@ -748,6 +748,11 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run ruff check packages/modelaudit-picklescan/tests/test_api.py` — passed.
   - `uv run mypy packages/modelaudit-picklescan/tests/test_api.py` — passed.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests/test_api.py::test_scan_bytes_detects_binary_protocol_encoded_nested_pickle_mid_literal packages/modelaudit-picklescan/tests/test_api.py -q` — passed, 159 tests.
+- N-P2-29 — Same-item commit expands the escaped-hex mid-literal prefix table for protocol-0 pickle starters (`I`, `S`, `V`, `d`, `l`, `i`) in addition to the existing protocol/bare global/list starters. Targeted QA:
+  - `cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml -- --check` — passed.
+  - `cargo check --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed.
+  - `cargo clippy --manifest-path packages/modelaudit-picklescan/Cargo.toml --all-targets -- -D warnings` — passed.
+  - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, 21 tests.
 
 ### Newly discovered gaps while remediating
 

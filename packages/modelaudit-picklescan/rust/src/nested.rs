@@ -350,6 +350,13 @@ fn starts_encoded_pickle_at(bytes: &[u8], index: usize) -> bool {
             suffix.starts_with(b"\\x80")
                 || suffix.starts_with(b"\\x28")
                 || suffix.starts_with(b"\\x63")
+                || suffix.starts_with(b"\\x64")
+                || suffix.starts_with(b"\\x6c")
+                || suffix.starts_with(b"\\x6C")
+                || suffix.starts_with(b"\\x69")
+                || suffix.starts_with(b"\\x49")
+                || suffix.starts_with(b"\\x53")
+                || suffix.starts_with(b"\\x56")
         }
         _ => false,
     }
@@ -658,6 +665,28 @@ mod tests {
         assert!(windows
             .iter()
             .any(|window| window.starts_with("Y29zCnN5c3RlbQopUi4=")));
+    }
+
+    #[test]
+    fn encoded_probe_windows_keep_protocol0_escaped_hex_pickle_candidates() {
+        for encoded in [
+            r"\x28\x64\x2e",
+            r"\x49\x31\x0a\x2e",
+            r"\x53\x27\x78\x27\x0a\x2e",
+            r"\x56\x78\x0a\x2e",
+            r"\x63\x6f\x73\x0a\x73\x79\x73\x74\x65\x6d\x0a\x2e",
+            r"\x64\x2e",
+            r"\x6c\x2e",
+            r"\x69\x6f\x73\x0a\x73\x79\x73\x74\x65\x6d\x0a\x2e",
+        ] {
+            let value = format!("prefix-{encoded}-suffix");
+            let windows = encoded_nested_literal_probe_windows(&value, 64);
+
+            assert!(
+                windows.iter().any(|window| window.starts_with(encoded)),
+                "missing escaped-hex candidate window for {encoded}"
+            );
+        }
     }
 
     #[test]
