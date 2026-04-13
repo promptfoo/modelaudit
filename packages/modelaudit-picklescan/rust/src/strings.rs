@@ -1,6 +1,7 @@
 const MAX_BASE64_TEXT_TOKENS: usize = 32;
 const MIN_BASE64_TEXT_TOKEN_CHARS: usize = 12;
 const MAX_BASE64_TEXT_TOKEN_CHARS: usize = 16 * 1024;
+const MIN_LITERAL_PADDING_BOUNDARY_CHARS: usize = 16;
 const BASE64_DANGEROUS_SEEDS: &[&str] = &[
     "b3Muc3lzdGVt",   // os.system
     "ZXZh",           // eval prefix; the following base64 chars depend on the next bytes
@@ -534,7 +535,10 @@ fn find_module_attr(lower: &str, module: &str, attr: &str, prefix: bool) -> bool
 
     let max_start = chars.len().saturating_sub(module_chars.len());
     for start in 0..=max_start {
-        if start > 0 && is_python_word_char(chars[start - 1]) {
+        if start > 0
+            && is_python_word_char(chars[start - 1])
+            && !has_literal_padding_boundary_before(&chars, start)
+        {
             continue;
         }
         if chars[start..start + module_chars.len()] != module_chars[..] {
@@ -564,6 +568,19 @@ fn find_module_attr(lower: &str, module: &str, attr: &str, prefix: bool) -> bool
         }
     }
     false
+}
+
+fn has_literal_padding_boundary_before(chars: &[char], start: usize) -> bool {
+    if start < MIN_LITERAL_PADDING_BOUNDARY_CHARS {
+        return false;
+    }
+    let padding = chars[start - 1];
+    if !padding.is_ascii_alphanumeric() {
+        return false;
+    }
+    chars[start - MIN_LITERAL_PADDING_BOUNDARY_CHARS..start]
+        .iter()
+        .all(|ch| *ch == padding)
 }
 
 fn contains_magic_method(value: &str) -> bool {
@@ -815,6 +832,10 @@ mod tests {
     fn suspicious_string_matching_keeps_case_insensitive_patterns() {
         assert!(suspicious_string_matches("OS.System('id')").contains(&"os.system".to_string()));
         assert!(suspicious_string_matches("OS . system('id')").contains(&"os.system".to_string()));
+        assert!(
+            suspicious_string_matches(&format!("{}os.system('id')", "A".repeat(32)))
+                .contains(&"os.system".to_string())
+        );
         assert!(suspicious_string_matches("Import OS").contains(&"import statement".to_string()));
     }
 

@@ -1096,6 +1096,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] V5-P2-36 — Close N5-P2-DOCKERFILE-RUST-VERSION-DRIFT by documenting or deriving the Rust version sync point.
 - [x] V5-P2-37 — Close N5-P2-PICKLESCAN-PACKAGE-CARGO-TEST-ORDERING by running cargo checks before Python package tests in CI.
 - [x] V5-QA-38 — Final pytest gate found stale trusted-tail fixtures without the benign import evidence required by V5-P1-24; update fixtures so the trusted path and fail-closed empty-evidence path are both tested.
+- [x] V5-QA-39 — Final pytest gate found padded long suspicious literals missed by the Rust module-attribute boundary heuristic; treat long homogeneous literal padding as a boundary without regressing normal word-boundary false-positive guards.
 
 ### Completed item QA log
 
@@ -1278,6 +1279,10 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run python - <<'PY' ... picklescan CI cargo-before-pytest assertions ... PY` — passed for `.github/workflows/test.yml` and `.github/workflows/release-please.yml`.
 - V5-QA-38 — Final full-suite QA surfaced that legacy trusted-tail adapter tests still expected suppression without import evidence, conflicting with the hardened V5-P1-24 contract. Same-item commit adds explicit benign `numpy.core.multiarray.scalar` import references to the trusted padding/Unicode tail fixtures while leaving the empty-evidence fail-closed tests intact. Targeted QA:
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_picklescan_adapter.py -k "tail" -q` — passed.
+- V5-QA-39 — Final full-suite QA surfaced that the Rust suspicious-string matcher missed `os.system(...)` after long homogeneous padding because the module-attribute matcher treated the padding as an identifier prefix. Same-item commit makes long repeated literal padding a boundary for module-attribute detection and pins the false-positive guard for ordinary identifiers. Targeted QA:
+  - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml suspicious_string_matching` — passed, 8 tests.
+  - `uv run --with 'maturin>=1.9,<2' maturin develop --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests/test_api.py::test_scan_bytes_flags_suspicious_literal_content_across_truncated_literal_windows packages/modelaudit-picklescan/tests/test_api.py::test_scan_bytes_flags_suspicious_literal_content_across_default_long_literal_windows packages/modelaudit-picklescan/tests/test_api.py::test_scan_bytes_flags_suspicious_literal_content_beyond_default_prefix_suffix_windows -q` — passed.
 - N-P0-1 — Same-item commit adds a bounded `_RootStreamPayloadRead` result for non-seekable root stream buffering, records truncation metadata, and emits an `S902` warning instead of raising when the stream exceeds the root raw-scan cap. Targeted QA:
   - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
