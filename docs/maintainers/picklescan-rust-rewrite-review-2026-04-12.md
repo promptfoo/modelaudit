@@ -522,7 +522,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] R-P1-32 — Expand post-budget dangerous needle table.
 - [x] R-P1-33 — Decide/fuzz STACK_GLOBAL byte operand behavior.
 - [x] R-P1-34 — Rebuild notice dedupe state if notices are ever coalesced.
-- [ ] R-P1-38 — Document or raise `DEFAULT_MAX_NESTED_DEPTH`.
+- [x] R-P1-38 — Document or raise `DEFAULT_MAX_NESTED_DEPTH`.
 - [ ] R-P1-39 — Add more Rust unit coverage for dispatch, policy, report, and bridge behavior.
 - [ ] T-P1-51 / T-P1-52 — Strengthen parity/fuzz tests with expected verdicts.
 - [ ] T-P1-53 / T-P1-66 — Restore multi-stream regression coverage.
@@ -597,6 +597,8 @@ This section is the active implementation log for follow-up commits after revisi
   - `cargo clippy --manifest-path packages/modelaudit-picklescan/Cargo.toml --all-targets -- -D warnings` — passed.
   - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml notice_dedupe_state_can_be_rebuilt_after_notice_rewrites` — passed.
   - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, 32 tests.
+- R-P1-38 — Same-item commit documents the default `max_nested_depth=2` in the standalone package README and notes the depth/byte budget tradeoff. Targeted QA:
+  - `uv run pytest packages/modelaudit-picklescan/tests/test_api.py -q -k default_depth_surfaces_two_layer` — passed, 1 test.
 - N-P0-3 — Same-item commit removes the global raw-window documentation short-circuit, records documentation-like pickle literal spans, and filters only matches that fall inside documentation spans or comment-like lines. Targeted QA:
   - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
