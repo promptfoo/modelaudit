@@ -157,6 +157,7 @@ _JIT_SCAN_SEEDS: tuple[bytes, ...] = (
     b"torchscript",
     b"urllib.",
 )
+_EXPENSIVE_RAW_SCAN_SEEDS = tuple(dict.fromkeys(_SECRET_SCAN_SEEDS + _NETWORK_SCAN_SEEDS + _JIT_SCAN_SEEDS))
 
 
 @dataclass(frozen=True)
@@ -748,6 +749,28 @@ class PickleScanner(BaseScanner):
             return _ROOT_EXPENSIVE_RAW_SCAN_LIMIT_BYTES
         return max(parsed_limit, 0)
 
+    @staticmethod
+    def _rust_scan_completed_cleanly(result: ScanResult) -> bool:
+        return (
+            result.metadata.get("pickle_report_status") == "complete"
+            and result.metadata.get("pickle_verdict") == "clean"
+            and not result.metadata.get("analysis_incomplete")
+            and not result.metadata.get("operational_error")
+            and not result.has_errors
+            and not result.has_warnings
+        )
+
+    def _should_skip_expensive_raw_detectors(self, result: ScanResult, raw_data: bytes) -> bool:
+        if result.has_errors:
+            return True
+        if not self._rust_scan_completed_cleanly(result):
+            return False
+
+        expensive_limit = self._root_expensive_raw_scan_limit()
+        if expensive_limit <= 0:
+            return True
+        return not _contains_any_seed(raw_data[:expensive_limit], _EXPENSIVE_RAW_SCAN_SEEDS)
+
     def _read_root_raw_scan_window(self, path: str, file_size: int) -> bytes:
         parsed_limit = self._root_raw_scan_limit()
         if parsed_limit <= 0:
@@ -891,6 +914,9 @@ class PickleScanner(BaseScanner):
         self._scan_binary_tail_if_needed(data, result, source)
         if skip_expensive_detectors:
             result.metadata["pickle_expensive_raw_detectors_skipped"] = True
+            result.metadata["pickle_expensive_raw_detector_skip_reason"] = (
+                "prior_critical_findings" if result.has_errors else "rust_complete_clean_no_expensive_raw_seeds"
+            )
             return
 
         expensive_limit = self._root_expensive_raw_scan_limit()
@@ -1420,7 +1446,7 @@ class PickleScanner(BaseScanner):
             raw_data,
             result,
             source,
-            skip_expensive_detectors=result.has_errors,
+            skip_expensive_detectors=self._should_skip_expensive_raw_detectors(result, raw_data),
         )
         self._add_root_legacy_metadata_detectors(result, source)
         return result
@@ -1455,7 +1481,7 @@ class PickleScanner(BaseScanner):
                 raw_data,
                 result,
                 path,
-                skip_expensive_detectors=result.has_errors,
+                skip_expensive_detectors=self._should_skip_expensive_raw_detectors(result, raw_data),
             )
         except OSError as error:
             result.add_check(

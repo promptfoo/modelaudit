@@ -72,9 +72,8 @@ def test_scan_large_low_information_pickle_skips_expensive_raw_detectors(tmp_pat
     result = PickleScanner().scan(str(path))
 
     assert result.metadata["pickle_primary_engine"] == "rust"
-    assert result.metadata["pickle_secrets_raw_detector_skipped"] is True
-    assert result.metadata["pickle_jit_raw_detector_skipped"] is True
-    assert result.metadata["pickle_network_raw_detector_skipped"] is True
+    assert result.metadata["pickle_expensive_raw_detectors_skipped"] is True
+    assert result.metadata["pickle_expensive_raw_detector_skip_reason"] == "rust_complete_clean_no_expensive_raw_seeds"
 
 
 def test_expensive_raw_prefilters_preserve_secret_and_network_findings(tmp_path: Path) -> None:

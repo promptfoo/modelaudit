@@ -479,7 +479,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] N-P0-3 — Scope documentation/comment gating to the relevant literal or evidence window, not the entire raw detector pass.
 - [x] N-P0-4 — Prevent documentation-like `_rebuild_tensor` literals from suppressing real CVE-2026-24747 GLOBAL evidence.
 - [x] N-P0-5 — Clamp user-controlled Rust timeout values before `Duration::from_secs_f64`.
-- [ ] N-P0-6 — Add a clean-Rust hot path that skips expensive raw detectors when full Rust analysis completed cleanly.
+- [x] N-P0-6 — Add a clean-Rust hot path that skips expensive raw detectors when full Rust analysis completed cleanly.
 - [ ] P1-TRIPLE / N-P1-19 — Reduce or explicitly downgrade triple CRITICAL emissions for builtins eval/exec/compile/import aliases.
 - [ ] P1-PARSE — Decide and document parse-failure suppression semantics, or tighten them.
 - [ ] P1-EMPTY — Map empty pickle input to a non-CRITICAL operational outcome.
@@ -568,6 +568,11 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run ruff check packages/modelaudit-picklescan/src/modelaudit_picklescan/options.py packages/modelaudit-picklescan/tests/test_options.py packages/modelaudit-picklescan/tests/test_api.py` — passed.
   - `uv run mypy packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests/test_options.py packages/modelaudit-picklescan/tests/test_api.py` — passed.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests/test_options.py packages/modelaudit-picklescan/tests/test_api.py -q` — passed, 159 tests, including `ScanOptions(timeout_s=1.0e18)` and native `scan_bytes` no-engine-error coverage.
+- N-P0-6 — Same-item commit adds `_rust_scan_completed_cleanly` and skips expensive secrets/JIT/network raw detectors only when Rust completed cleanly and the expensive-detector seed set is absent from the bounded raw window. Initial QA showed that skipping on clean Rust alone would regress seeded secret/network findings; the implementation was narrowed before commit. Targeted QA:
+  - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `uv run mypy modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py -q` — passed, 32 tests, including low-information clean-pickle skip coverage and seeded secret/network preservation coverage.
 
 ### Newly discovered gaps while remediating
 
