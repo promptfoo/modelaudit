@@ -26,6 +26,19 @@ from modelaudit.scanners.pytorch_zip_scanner import PyTorchZipScanner
 from tests.helpers import create_mock_pytorch_zip
 
 
+def _benign_tail_import_references() -> list[dict[str, object]]:
+    return [
+        {
+            "import_reference": "numpy.core.multiarray.scalar",
+            "module": "numpy.core.multiarray",
+            "name": "scalar",
+            "opcode": "GLOBAL",
+            "position": 3,
+            "is_dangerous": False,
+        },
+    ]
+
+
 def test_scan_options_from_config_parses_string_values() -> None:
     parsed = scan_options_from_config(
         {
@@ -814,7 +827,7 @@ def test_pickle_report_to_scan_result_keeps_trusted_bin_padding_tails_as_inconcl
                 },
             ),
         ),
-        metadata={"first_pickle_end_pos": 56},
+        metadata={"first_pickle_end_pos": 56, "import_references": _benign_tail_import_references()},
     )
 
     result = pickle_report_to_scan_result(report)
@@ -848,7 +861,7 @@ def test_pickle_report_to_scan_result_keeps_unicode_decode_tails_as_inconclusive
                 },
             ),
         ),
-        metadata={"first_pickle_end_pos": 20},
+        metadata={"first_pickle_end_pos": 20, "import_references": _benign_tail_import_references()},
     )
 
     result = pickle_report_to_scan_result(report)
@@ -882,7 +895,7 @@ def test_pickle_report_to_scan_result_keeps_zero_padding_tails_as_inconclusive_n
                 },
             ),
         ),
-        metadata={"first_pickle_end_pos": 19},
+        metadata={"first_pickle_end_pos": 19, "import_references": _benign_tail_import_references()},
     )
 
     result = pickle_report_to_scan_result(report)

@@ -1095,6 +1095,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] V5-P2-35 — Close N5-P2-PYPROJECT-URLS-CHANGELOG by pointing standalone package metadata at its own changelog.
 - [x] V5-P2-36 — Close N5-P2-DOCKERFILE-RUST-VERSION-DRIFT by documenting or deriving the Rust version sync point.
 - [x] V5-P2-37 — Close N5-P2-PICKLESCAN-PACKAGE-CARGO-TEST-ORDERING by running cargo checks before Python package tests in CI.
+- [x] V5-QA-38 — Final pytest gate found stale trusted-tail fixtures without the benign import evidence required by V5-P1-24; update fixtures so the trusted path and fail-closed empty-evidence path are both tested.
 
 ### Completed item QA log
 
@@ -1275,6 +1276,8 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run python - <<'PY' ... Docker Rust toolchain sync assertions ... PY` — passed.
 - V5-P2-37 — Same-item commit reorders standalone picklescan package CI so Rust formatting, check, MSRV check where present, clippy, and cargo tests run before the Python wrapper lint/type/test steps. While checking the normal test workflow, the same masking pattern was found in `release-please.yml` and fixed in the same CI-ordering commit. Targeted QA:
   - `uv run python - <<'PY' ... picklescan CI cargo-before-pytest assertions ... PY` — passed for `.github/workflows/test.yml` and `.github/workflows/release-please.yml`.
+- V5-QA-38 — Final full-suite QA surfaced that legacy trusted-tail adapter tests still expected suppression without import evidence, conflicting with the hardened V5-P1-24 contract. Same-item commit adds explicit benign `numpy.core.multiarray.scalar` import references to the trusted padding/Unicode tail fixtures while leaving the empty-evidence fail-closed tests intact. Targeted QA:
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_picklescan_adapter.py -k "tail" -q` — passed.
 - N-P0-1 — Same-item commit adds a bounded `_RootStreamPayloadRead` result for non-seekable root stream buffering, records truncation metadata, and emits an `S902` warning instead of raising when the stream exceeds the root raw-scan cap. Targeted QA:
   - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
