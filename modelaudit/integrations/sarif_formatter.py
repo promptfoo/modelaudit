@@ -55,6 +55,7 @@ def _create_run(
     issues = audit_result.issues
     if not verbose:
         issues = [i for i in issues if i.severity != IssueSeverity.DEBUG]
+    issues = _primary_sarif_issues(issues)
 
     # Create rules from unique issue types
     rules = _create_rules(issues)
@@ -149,6 +150,7 @@ def _exit_code_description(audit_result: ModelAuditResultModel, exit_code: int) 
 
 def _create_rules(issues: list) -> list[dict[str, Any]]:
     """Create SARIF rules from unique issue types."""
+    issues = _primary_sarif_issues(issues)
     rules = []
     seen_rules = set()
 
@@ -191,6 +193,7 @@ def _create_rules(issues: list) -> list[dict[str, Any]]:
 
 def _create_results(issues: list, rule_indices: dict[str, int] | None = None) -> list[dict[str, Any]]:
     """Create SARIF results from issues."""
+    issues = _primary_sarif_issues(issues)
     results = []
     if rule_indices is None:
         rule_indices = {rule["id"]: idx for idx, rule in enumerate(_create_rules(issues))}
@@ -288,6 +291,16 @@ def _create_artifacts(audit_result: ModelAuditResultModel) -> list[dict[str, Any
         artifacts.append(artifact)
 
     return artifacts
+
+
+def _primary_sarif_issues(issues: list) -> list:
+    """Return issues that should be emitted as primary SARIF results."""
+    return [issue for issue in issues if not _is_supporting_rule_code_issue(issue)]
+
+
+def _is_supporting_rule_code_issue(issue: Any) -> bool:
+    details = getattr(issue, "details", None)
+    return isinstance(details, dict) and details.get("supporting_rule_code") is True
 
 
 def _get_rule_id(issue: Any) -> str:

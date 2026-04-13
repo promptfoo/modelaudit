@@ -77,6 +77,35 @@ class TestFormatSarifOutput:
         parsed = json.loads(output)
         assert len(parsed["runs"][0]["results"]) == 2
 
+    def test_supporting_rule_code_issues_are_not_emitted_as_primary_results(self) -> None:
+        """Compatibility-only supporting rows should not duplicate SARIF findings."""
+        result = create_initial_audit_result()
+        result.issues = [
+            Issue(
+                message="Primary dangerous call",
+                severity=IssueSeverity.CRITICAL,
+                location="/test/file.pkl",
+                details={"pickle_rule_code": "DANGEROUS_CALL"},
+                rule_code="S104",
+                timestamp=time.time(),
+            ),
+            Issue(
+                message="Supporting REDUCE opcode row",
+                severity=IssueSeverity.CRITICAL,
+                location="/test/file.pkl",
+                details={"supporting_rule_code": True, "primary_rule_code": "S104"},
+                rule_code="S201",
+                timestamp=time.time(),
+            ),
+        ]
+        result.finalize_statistics()
+
+        output = format_sarif_output(result, ["/test"], verbose=True)
+        run = json.loads(output)["runs"][0]
+
+        assert [item["ruleId"] for item in run["results"]] == ["S104"]
+        assert [rule["id"] for rule in run["tool"]["driver"]["rules"]] == ["S104"]
+
 
 class TestCreateRun:
     """Tests for _create_run function."""
@@ -276,6 +305,22 @@ class TestCreateResults:
 
         assert critical_results[0]["kind"] == "fail"
         assert info_results[0]["kind"] == "informational"
+
+    def test_supporting_rule_code_issue_is_filtered(self) -> None:
+        issues = [
+            Issue(message="Primary", severity=IssueSeverity.CRITICAL, rule_code="S104", timestamp=time.time()),
+            Issue(
+                message="Supporting",
+                severity=IssueSeverity.CRITICAL,
+                details={"supporting_rule_code": True, "primary_rule_code": "S104"},
+                rule_code="S201",
+                timestamp=time.time(),
+            ),
+        ]
+
+        results = _create_results(issues)
+
+        assert [result["ruleId"] for result in results] == ["S104"]
 
 
 class TestCreateArtifacts:
