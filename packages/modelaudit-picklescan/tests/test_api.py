@@ -807,6 +807,63 @@ def test_scan_file_marks_oversized_pytorch_zip_member_inconclusive(
     assert any(notice.code == "pytorch_zip_member_size_limit" for notice in report.notices)
 
 
+def test_scan_file_scans_pytorch_zip_member_partial_bytes_on_short_read(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    archive_path = tmp_path / "short-read.pt"
+    archive_path.write_bytes(b"fake zip placeholder")
+    payload = pickle.dumps(MaliciousPayload(), protocol=4)
+
+    data_entry = zipfile.ZipInfo("data.pkl")
+    data_entry.file_size = len(payload) + 8
+    version_entry = zipfile.ZipInfo("version")
+    version_entry.file_size = 2
+
+    class ShortReadArchive:
+        def __init__(self, path: Path, mode: str) -> None:
+            self.path = path
+            self.mode = mode
+
+        def __enter__(self) -> ShortReadArchive:
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+            return None
+
+        def infolist(self) -> list[zipfile.ZipInfo]:
+            return [data_entry, version_entry]
+
+        def open(
+            self,
+            name: str | zipfile.ZipInfo,
+            mode: str = "r",
+            pwd: bytes | None = None,
+            *,
+            force_zip64: bool = False,
+        ) -> io.BytesIO:
+            del mode, pwd, force_zip64
+            member_name = name.filename if isinstance(name, zipfile.ZipInfo) else name
+            if member_name == "data.pkl":
+                return io.BytesIO(payload)
+            return io.BytesIO(b"3\n")
+
+    monkeypatch.setattr(package_api.zipfile, "ZipFile", ShortReadArchive)
+
+    report = PickleScanner()._scan_pytorch_zip_file(
+        archive_path,
+        source=str(archive_path),
+        size=archive_path.stat().st_size,
+    )
+
+    assert report is not None
+    assert report.status == ScanStatus.ERROR
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(finding.rule_code == "DANGEROUS_CALL" for finding in report.findings)
+    assert any(error.category == "short_read" for error in report.errors)
+    assert report.metadata["container_type"] == "pytorch_zip"
+
+
 def test_scan_file_returns_error_report_for_missing_file(tmp_path: Path) -> None:
     missing_path = tmp_path / "missing.pkl"
 
@@ -915,6 +972,25 @@ def test_scan_stream_fails_closed_on_short_reads_for_expected_size() -> None:
     assert report.coverage.bytes_total == expected_size
     assert report.coverage.raw_scan_complete is False
     assert report.coverage.opcode_scan_complete is False
+
+
+def test_scan_stream_scans_partial_bytes_on_short_read() -> None:
+    payload = pickle.dumps(MaliciousPayload(), protocol=4)
+    expected_size = len(payload) + 8
+
+    report = PickleScanner().scan_stream(
+        io.BytesIO(payload),
+        source="malicious-short-read.pkl",
+        size=expected_size,
+    )
+
+    assert report.status == ScanStatus.ERROR
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(finding.rule_code == "DANGEROUS_CALL" for finding in report.findings)
+    assert any(error.category == "short_read" for error in report.errors)
+    assert report.metadata["stream_short_read"] is True
+    assert report.coverage.bytes_scanned == len(payload)
+    assert report.coverage.bytes_total == expected_size
 
 
 def test_scan_stream_incrementally_reads_bounded_streams_without_preloading_entire_payload(

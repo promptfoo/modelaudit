@@ -1080,7 +1080,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] V5-P1-20 — Close N5-PY1-3 / N5-SEC-F4 by preserving Rust STRUCTURAL_TAMPER warning severity through the adapter.
 - [x] V5-P1-21 — Close N5-PY1-5 by assigning a deterministic fallback rule code to unknown dangerous globals.
 - [x] V5-P1-22 — Close N5-PY1-6 by adding a standalone known-size stream read ceiling.
-- [ ] V5-P1-23 — Close N5-PY1-7 / N5-PY1-8 by scanning partial bytes on short reads, including ZIP member scans.
+- [x] V5-P1-23 — Close N5-PY1-7 / N5-PY1-8 by scanning partial bytes on short reads, including ZIP member scans.
 - [ ] V5-P1-24 — Close N5-PY1-9 by failing closed when parse failure suppression has no import-reference evidence.
 - [ ] V5-P1-25 — Close N5-PY1-10 by avoiding or retiring the incomplete parallel Python opcode walker where Rust metadata is authoritative.
 - [ ] V5-P1-26 — Close N5-PY1-11 by making rebuild-tensor documentation checks memo-aware or delegating to Rust metadata.
@@ -1212,6 +1212,11 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run ruff check packages/modelaudit-picklescan/src/modelaudit_picklescan/options.py packages/modelaudit-picklescan/src/modelaudit_picklescan/api.py packages/modelaudit-picklescan/tests/test_api.py packages/modelaudit-picklescan/tests/test_options.py modelaudit/scanners/picklescan_adapter.py` — passed.
   - `uv run mypy packages/modelaudit-picklescan/src/modelaudit_picklescan/options.py packages/modelaudit-picklescan/src/modelaudit_picklescan/api.py packages/modelaudit-picklescan/tests/test_api.py packages/modelaudit-picklescan/tests/test_options.py modelaudit/scanners/picklescan_adapter.py` — passed.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests/test_api.py packages/modelaudit-picklescan/tests/test_options.py tests/scanners/test_picklescan_adapter.py -q -k "known_stream or unbounded_stream or options"` — passed, 28 tests.
+- V5-P1-23 — Same-item commit preserves bytes read before a declared-size short read, scans those partial bytes with Rust, then appends a deterministic `short_read` error and incomplete coverage metadata. This preserves malicious findings from truncated root streams and truncated PyTorch ZIP pickle members while still reporting the operational read failure. Targeted QA:
+  - `uv run ruff format packages/modelaudit-picklescan/src/modelaudit_picklescan/api.py packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `uv run ruff check packages/modelaudit-picklescan/src/modelaudit_picklescan/api.py packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `uv run mypy packages/modelaudit-picklescan/src/modelaudit_picklescan/api.py packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests/test_api.py -q -k "short_read"` — passed, 3 tests.
 - N-P0-1 — Same-item commit adds a bounded `_RootStreamPayloadRead` result for non-seekable root stream buffering, records truncation metadata, and emits an `S902` warning instead of raising when the stream exceeds the root raw-scan cap. Targeted QA:
   - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.

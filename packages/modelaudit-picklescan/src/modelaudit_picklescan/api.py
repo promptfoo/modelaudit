@@ -22,10 +22,11 @@ _RUST_EXTENSION_MODULE = "modelaudit_picklescan._rust"
 
 
 class _StreamShortReadError(ValueError):
-    def __init__(self, *, expected_size: int, bytes_read: int) -> None:
+    def __init__(self, *, expected_size: int, bytes_read: int, partial_payload: bytes) -> None:
         super().__init__("Stream ended before the declared size was read")
         self.expected_size = expected_size
         self.bytes_read = bytes_read
+        self.partial_payload = partial_payload
 
 
 class PickleScanner:
@@ -65,12 +66,25 @@ class PickleScanner:
                 max_unbounded_read_bytes=self.options.max_unbounded_stream_read_bytes,
             )
         except _StreamShortReadError as error:
+            if error.partial_payload:
+                partial_report = _scan_pickle_payload_native(
+                    error.partial_payload,
+                    source=source,
+                    options=self.options,
+                    bytes_total=error.bytes_read,
+                    position_offset=position_offset,
+                )
+                return _with_short_read_error(
+                    partial_report,
+                    source=source,
+                    error=error,
+                )
             return _io_error_report(
                 source=source,
                 message=f"Could not read pickle stream: {error!s}",
                 category="short_read",
                 exception=error,
-                bytes_scanned=error.bytes_read,
+                bytes_scanned=0,
                 bytes_total=error.expected_size,
             )
         except Exception as error:
@@ -475,6 +489,53 @@ def _with_known_stream_notice(
     )
 
 
+def _with_short_read_error(
+    report: PickleReport,
+    *,
+    source: str,
+    error: _StreamShortReadError,
+) -> PickleReport:
+    errors = (
+        *report.errors,
+        ScanError(
+            message=f"Could not read pickle stream: {error!s}",
+            category="short_read",
+            location=source,
+            exception_type=type(error).__name__,
+            details={
+                "bytes_read": error.bytes_read,
+                "expected_size": error.expected_size,
+                "analysis_incomplete": True,
+            },
+        ),
+    )
+    verdict = SafetyVerdict.UNKNOWN if report.verdict == SafetyVerdict.CLEAN else report.verdict
+    metadata = {
+        **report.to_dict()["metadata"],
+        "analysis_incomplete": True,
+        "stream_short_read": True,
+        "stream_bytes_read": error.bytes_read,
+        "stream_expected_size": error.expected_size,
+    }
+    return PickleReport(
+        source=report.source,
+        status=ScanStatus.ERROR,
+        verdict=verdict,
+        findings=report.findings,
+        notices=report.notices,
+        errors=errors,
+        coverage=CoverageSummary(
+            bytes_scanned=max(report.coverage.bytes_scanned, error.bytes_read),
+            bytes_total=error.expected_size,
+            opcode_count=report.coverage.opcode_count,
+            raw_scan_complete=False,
+            opcode_scan_complete=False,
+        ),
+        metadata=metadata,
+        duration_s=report.duration_s,
+    )
+
+
 def _io_error_report(
     *,
     source: str,
@@ -669,7 +730,12 @@ def _read_stream_payload(
             while remaining > 0:
                 chunk = stream.read(min(_RUST_STREAM_READ_CHUNK_SIZE, remaining))
                 if not chunk:
-                    raise _StreamShortReadError(expected_size=size, bytes_read=bytes_read)
+                    spool.seek(0)
+                    raise _StreamShortReadError(
+                        expected_size=size,
+                        bytes_read=bytes_read,
+                        partial_payload=spool.read(),
+                    )
                 spool.write(chunk)
                 bytes_read += len(chunk)
                 remaining -= len(chunk)
