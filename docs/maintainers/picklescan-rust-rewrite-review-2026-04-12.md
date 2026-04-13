@@ -1092,7 +1092,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] V5-P1-32 — Close N5-P1-DOCKER-SINGLE-STAGE by moving Docker builds to a builder/runtime split.
 - [x] V5-P2-33 — Close N5-P2-PACKAGE-CHANGELOG-THIN with a fuller standalone package changelog.
 - [x] V5-P2-34 — Close N5-P2-CHANGELOG-RULE-CODES by documenting new rule codes in the root changelog.
-- [ ] V5-P2-35 — Close N5-P2-PYPROJECT-URLS-CHANGELOG by pointing standalone package metadata at its own changelog.
+- [x] V5-P2-35 — Close N5-P2-PYPROJECT-URLS-CHANGELOG by pointing standalone package metadata at its own changelog.
 - [ ] V5-P2-36 — Close N5-P2-DOCKERFILE-RUST-VERSION-DRIFT by documenting or deriving the Rust version sync point.
 - [ ] V5-P2-37 — Close N5-P2-PICKLESCAN-PACKAGE-CARGO-TEST-ORDERING by running cargo checks before Python package tests in CI.
 
@@ -1269,6 +1269,8 @@ This section is the active implementation log for follow-up commits after revisi
   - Manual Markdown review of `packages/modelaudit-picklescan/CHANGELOG.md` — passed.
 - V5-P2-34 — Same-item commit adds a root `CHANGELOG.md` "Rule Codes" subsection for the Rust pickle scanner mappings, including `S209`, `S211`, `S212`, `S213`, `S214`, `S601`, `S602`, `S604`, `S902`, and the internal `STRUCTURAL_TAMPER` / `PICKLE_EXPANSION` detail-code contract. Targeted QA:
   - Manual Markdown review of `CHANGELOG.md` — passed.
+- V5-P2-35 — Same-item commit points the standalone package `Changelog` project URL at `packages/modelaudit-picklescan/CHANGELOG.md` so package-index users land on the package-specific release notes. Targeted QA:
+  - `uv run python - <<'PY' ... package changelog URL assertion ... PY` — passed.
 - N-P0-1 — Same-item commit adds a bounded `_RootStreamPayloadRead` result for non-seekable root stream buffering, records truncation metadata, and emits an `S902` warning instead of raising when the stream exceeds the root raw-scan cap. Targeted QA:
   - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.

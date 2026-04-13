@@ -34,7 +34,7 @@ Homepage = "https://github.com/promptfoo/modelaudit"
 Documentation = "https://github.com/promptfoo/modelaudit/tree/main/packages/modelaudit-picklescan"
 Repository = "https://github.com/promptfoo/modelaudit"
 Issues = "https://github.com/promptfoo/modelaudit/issues"
-Changelog = "https://github.com/promptfoo/modelaudit/blob/main/CHANGELOG.md"
+Changelog = "https://github.com/promptfoo/modelaudit/blob/main/packages/modelaudit-picklescan/CHANGELOG.md"
 Security = "https://github.com/promptfoo/modelaudit/security/policy"
 
 [tool.maturin]
