@@ -1091,7 +1091,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] V5-P1-31 — Close N5-P1-RULE-CODE-CONFLATION-S902 by assigning PICKLE_EXPANSION a distinct DoS-oriented rule code.
 - [x] V5-P1-32 — Close N5-P1-DOCKER-SINGLE-STAGE by moving Docker builds to a builder/runtime split.
 - [x] V5-P2-33 — Close N5-P2-PACKAGE-CHANGELOG-THIN with a fuller standalone package changelog.
-- [ ] V5-P2-34 — Close N5-P2-CHANGELOG-RULE-CODES by documenting new rule codes in the root changelog.
+- [x] V5-P2-34 — Close N5-P2-CHANGELOG-RULE-CODES by documenting new rule codes in the root changelog.
 - [ ] V5-P2-35 — Close N5-P2-PYPROJECT-URLS-CHANGELOG by pointing standalone package metadata at its own changelog.
 - [ ] V5-P2-36 — Close N5-P2-DOCKERFILE-RUST-VERSION-DRIFT by documenting or deriving the Rust version sync point.
 - [ ] V5-P2-37 — Close N5-P2-PICKLESCAN-PACKAGE-CARGO-TEST-ORDERING by running cargo checks before Python package tests in CI.
@@ -1267,6 +1267,8 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run python - <<'PY' ... dockerfile multistage assertions ... PY` — passed for `Dockerfile` and `Dockerfile.full`.
 - V5-P2-33 — Same-item commit expands the standalone `modelaudit-picklescan` changelog with first-release details for API surface, PyTorch ZIP scanning, Rust detection coverage, resource controls, parity/CI gates, runtime-engine removal, GIL/operand-copy performance work, stream short-read behavior, and major security fixes. Targeted QA:
   - Manual Markdown review of `packages/modelaudit-picklescan/CHANGELOG.md` — passed.
+- V5-P2-34 — Same-item commit adds a root `CHANGELOG.md` "Rule Codes" subsection for the Rust pickle scanner mappings, including `S209`, `S211`, `S212`, `S213`, `S214`, `S601`, `S602`, `S604`, `S902`, and the internal `STRUCTURAL_TAMPER` / `PICKLE_EXPANSION` detail-code contract. Targeted QA:
+  - Manual Markdown review of `CHANGELOG.md` — passed.
 - N-P0-1 — Same-item commit adds a bounded `_RootStreamPayloadRead` result for non-seekable root stream buffering, records truncation metadata, and emits an `S902` warning instead of raising when the stream exceeds the root raw-scan cap. Targeted QA:
   - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.

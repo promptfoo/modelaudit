@@ -26,6 +26,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **pickle:** document and pin parse-incomplete tail suppression to trusted pickle boundaries without dangerous import references; parse failures with security findings or dangerous imports still fail closed
 - **security:** temporarily bump the optional ONNX dependency to `1.21.0rc3`, which removes the vulnerable `onnx.hub` module flagged by CVE-2026-28500.
 
+### Rule Codes
+
+- **pickle:** preserve and document Rust pickle scanner mappings for SETITEM abuse (`S209`), copyreg extensions (`S211`), persistent IDs (`S212`), nested or encoded pickle payloads (`S213`), base64/hex/obfuscated encoded payloads (`S601`/`S602`/`S604`), structural tamper and incomplete analysis (`S902`), and the new pickle expansion denial-of-service rule (`S214`).
+- **pickle:** keep internal Rust finding codes such as `STRUCTURAL_TAMPER` and `PICKLE_EXPANSION` in `pickle_rule_code` details while exposing stable ModelAudit rule codes for dashboards, SARIF, suppression, and severity configuration.
+
 ### Fixed
 
 - **security:** route renamed TFLite FlatBuffers by magic bytes, enforce scanner file-size limits before model reads, and fail closed instead of propagating malformed structure traversal exceptions
