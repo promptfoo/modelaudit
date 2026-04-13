@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **pickle:** increase Rust stream read chunks to reduce scan overhead on large file and archive-member inputs
 - **pickle:** store Rust byte stack operands as source spans instead of copied previews to reduce large-pickle scan overhead
+- **pickle:** document and pin parse-incomplete tail suppression to trusted pickle boundaries without dangerous import references; parse failures with security findings or dangerous imports still fail closed
 - **security:** temporarily bump the optional ONNX dependency to `1.21.0rc3`, which removes the vulnerable `onnx.hub` module flagged by CVE-2026-28500.
 
 ### Fixed

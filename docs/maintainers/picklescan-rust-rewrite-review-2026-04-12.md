@@ -481,7 +481,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] N-P0-5 — Clamp user-controlled Rust timeout values before `Duration::from_secs_f64`.
 - [x] N-P0-6 — Add a clean-Rust hot path that skips expensive raw detectors when full Rust analysis completed cleanly.
 - [x] P1-TRIPLE / N-P1-19 — Reduce or explicitly downgrade triple CRITICAL emissions for builtins eval/exec/compile/import aliases.
-- [ ] P1-PARSE — Decide and document parse-failure suppression semantics, or tighten them.
+- [x] P1-PARSE — Decide and document parse-failure suppression semantics, or tighten them.
 - [ ] P1-EMPTY — Map empty pickle input to a non-CRITICAL operational outcome.
 - [ ] P1-BINTAIL-SCOPE / N-P1-11 — Broaden binary-tail scan beyond `.bin`.
 - [ ] P1-SEED-SHAPE / N-P1-14 / N-P1-15 / N-P1-17 / N-P2-23 / N-P2-25 — Tighten and de-duplicate expensive raw-detector seed/shape helpers.
@@ -578,6 +578,11 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run ruff check modelaudit/scanners/picklescan_adapter.py tests/scanners/test_picklescan_adapter.py` — passed.
   - `uv run mypy modelaudit/scanners/picklescan_adapter.py tests/scanners/test_picklescan_adapter.py` — passed.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_picklescan_adapter.py -q` — passed, 59 tests, including exact `["S104", "S201"]` issue emission and `legacy_rule_aliases=["S115"]` coverage.
+- P1-PARSE — Same-item commit documents the intended parse-incomplete tail policy in `CHANGELOG.md` and pins the security boundary with tests: trusted-tail suppression requires a trusted pickle boundary and no dangerous import references; dangerous refs still fail closed with `S901`. Targeted QA:
+  - `uv run ruff format tests/scanners/test_picklescan_adapter.py` — passed.
+  - `uv run ruff check tests/scanners/test_picklescan_adapter.py` — passed.
+  - `uv run mypy tests/scanners/test_picklescan_adapter.py` — passed.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_picklescan_adapter.py -q` — passed, 61 tests, including UnicodeDecodeError and zero-padding tails with dangerous import references.
 
 ### Newly discovered gaps while remediating
 
