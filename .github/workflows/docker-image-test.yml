@@ -6,6 +6,7 @@ on:
       - "Dockerfile*"
       - ".dockerignore"
       - "modelaudit/**"
+      - "packages/modelaudit-picklescan/**"
       - "pyproject.toml"
       - "uv.lock"
       - ".github/workflows/docker-image-test.yml"
@@ -36,6 +37,7 @@ jobs:
               - 'Dockerfile*'
               - '.dockerignore'
               - 'modelaudit/**'
+              - 'packages/modelaudit-picklescan/**'
               - 'pyproject.toml'
               - 'uv.lock'
             full-image:
