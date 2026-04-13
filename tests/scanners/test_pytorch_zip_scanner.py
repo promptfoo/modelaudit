@@ -51,15 +51,20 @@ def _malicious_eval_pickle_payload() -> bytes:
     return pickle.dumps({"payload": MaliciousClass()})
 
 
-def _pytorch_storage_persistent_id_payload(key: str) -> bytes:
-    key_bytes = key.encode("utf-8")
+def _pytorch_storage_persistent_id_payload(key: str | bytes) -> bytes:
+    if isinstance(key, str):
+        key_bytes = key.encode("utf-8")
+        key_opcode = b"\x8c" + bytes([len(key_bytes)]) + key_bytes + b"\x94"
+    else:
+        key_bytes = key
+        key_opcode = b"C" + bytes([len(key_bytes)]) + key_bytes + b"\x94"
+
     assert len(key_bytes) < 256
     return (
         b"\x80\x04("
         b"\x8c\x07storage\x94"
         b"\x8c\x05torch\x94"
-        b"\x8c\x0cFloatStorage\x94\x93"
-        b"\x8c" + bytes([len(key_bytes)]) + key_bytes + b"\x94\x8c\x03cpu\x94K\x01tQ."
+        b"\x8c\x0cFloatStorage\x94\x93" + key_opcode + b"\x8c\x03cpu\x94K\x01tQ."
     )
 
 
@@ -1214,6 +1219,37 @@ def test_pytorch_zip_scanner_trusts_storage_persistent_ids_in_data_pkl(tmp_path:
     assert trusted_checks
     assert all(check.status == CheckStatus.PASSED for check in trusted_checks)
     assert all(check.severity == IssueSeverity.INFO for check in trusted_checks)
+
+
+def test_pytorch_zip_scanner_trusts_storage_persistent_ids_with_utf8_byte_key(tmp_path: Path) -> None:
+    payload = _pytorch_storage_persistent_id_payload(b"0")
+    model_path = create_mock_pytorch_zip(tmp_path / "storage_persistent_id_bytes.pt", with_pickle=False)
+    with zipfile.ZipFile(model_path, "a") as zipf:
+        zipf.writestr("version", "3")
+        zipf.writestr("data.pkl", payload)
+        zipf.writestr("data/0", b"\x00" * 8)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert not any(issue.details.get("pickle_rule_code") == "PERSISTENT_ID" for issue in result.issues)
+    assert any(check.details.get("trusted_pytorch_archive_context") is True for check in result.checks)
+
+
+def test_pytorch_zip_scanner_does_not_trust_storage_persistent_ids_with_non_utf8_byte_key(
+    tmp_path: Path,
+) -> None:
+    payload = _pytorch_storage_persistent_id_payload(b"\xff")
+    model_path = create_mock_pytorch_zip(tmp_path / "storage_persistent_id_non_utf8_bytes.pt", with_pickle=False)
+    with zipfile.ZipFile(model_path, "a") as zipf:
+        zipf.writestr("version", "3")
+        zipf.writestr("data.pkl", payload)
+        zipf.writestr("data/0", b"\x00" * 8)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert any(issue.details.get("pickle_rule_code") == "PERSISTENT_ID" for issue in result.issues)
+    assert not any(check.details.get("trusted_pytorch_archive_context") is True for check in result.checks)
 
 
 def test_pytorch_zip_scanner_does_not_trust_storage_persistent_ids_without_storage_layout(
