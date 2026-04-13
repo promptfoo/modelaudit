@@ -8,6 +8,62 @@ const BASE64_DANGEROUS_SEEDS: &[&str] = &[
     "c3VicHJvY2Vzcw", // subprocess
 ];
 
+struct ModuleAttrPattern {
+    module: &'static str,
+    attr: &'static str,
+    label: &'static str,
+    prefix: bool,
+}
+
+const SIMPLE_SUBSTRING_PATTERNS: &[(&str, &str)] = &[("base64.b64decode", "base64.b64decode")];
+const CALL_LIKE_PATTERNS: &[(&str, &str)] = &[
+    ("compile", "compile("),
+    ("eval", "eval("),
+    ("exec", "exec("),
+];
+const MODULE_ATTR_PATTERNS: &[ModuleAttrPattern] = &[
+    ModuleAttrPattern {
+        module: "os",
+        attr: "system",
+        label: "os.system",
+        prefix: false,
+    },
+    ModuleAttrPattern {
+        module: "os",
+        attr: "popen",
+        label: "os.popen",
+        prefix: false,
+    },
+    ModuleAttrPattern {
+        module: "os",
+        attr: "spawn",
+        label: "os.spawn*",
+        prefix: true,
+    },
+];
+const SUBPROCESS_CALL_NEEDLES: &[&str] = &[
+    "subprocess.popen",
+    "subprocess.call",
+    "subprocess.check_output",
+    "subprocess.run",
+    "subprocess.check_call",
+];
+const COMMANDS_CALL_NEEDLES: &[&str] = &["commands.getoutput", "commands.getstatusoutput"];
+const PICKLE_LOADER_NEEDLES: &[&str] = &[
+    "joblib.load",
+    "joblib._pickle_load",
+    "cloudpickle.load",
+    "cloudpickle.loads",
+];
+const COPYREG_EXTENSION_NEEDLES: &[&str] = &["copyreg.add_extension", "copyreg.remove_extension"];
+const GETATTR_TARGET_PATTERNS: &[(&str, &str)] = &[
+    ("system", "getattr system"),
+    ("exec", "getattr exec"),
+    ("eval", "getattr eval"),
+    ("popen", "getattr popen"),
+];
+const GETATTR_PROCESS_TARGETS: &[&str] = &["spawn", "call", "run", "popen"];
+
 pub(crate) fn suspicious_string_matches(value: &str) -> Vec<String> {
     let has_plain_seed = has_suspicious_ascii_seed(value.as_bytes());
     let has_encoded_seed = has_base64_dangerous_seed(value);
@@ -30,54 +86,32 @@ pub(crate) fn suspicious_string_matches(value: &str) -> Vec<String> {
     {
         matches.push("magic method".to_string());
     }
-    if lower.contains("base64.b64decode") {
-        matches.push("base64.b64decode".to_string());
-    }
-    if contains_call_like(&lower, "compile") {
-        matches.push("compile(".to_string());
-    }
-    if contains_call_like(&lower, "eval") {
-        matches.push("eval(".to_string());
-    }
-    if contains_call_like(&lower, "exec") {
-        matches.push("exec(".to_string());
-    }
-    if contains_module_attr(&lower, "os", "system") {
-        matches.push("os.system".to_string());
-    }
-    if contains_module_attr(&lower, "os", "popen") {
-        matches.push("os.popen".to_string());
-    }
-    if contains_module_attr_prefix(&lower, "os", "spawn") {
-        matches.push("os.spawn*".to_string());
-    }
-    for needle in [
-        "subprocess.popen",
-        "subprocess.call",
-        "subprocess.check_output",
-        "subprocess.run",
-        "subprocess.check_call",
-    ] {
+
+    for (needle, label) in SIMPLE_SUBSTRING_PATTERNS {
         if lower.contains(needle) {
-            matches.push("subprocess call".to_string());
-            break;
+            matches.push((*label).to_string());
         }
     }
-    if lower.contains("commands.getoutput") || lower.contains("commands.getstatusoutput") {
+    for (name, label) in CALL_LIKE_PATTERNS {
+        if contains_call_like(&lower, name) {
+            matches.push((*label).to_string());
+        }
+    }
+    for pattern in MODULE_ATTR_PATTERNS {
+        if find_module_attr(&lower, pattern.module, pattern.attr, pattern.prefix) {
+            matches.push(pattern.label.to_string());
+        }
+    }
+    if any_lower_contains(&lower, SUBPROCESS_CALL_NEEDLES) {
+        matches.push("subprocess call".to_string());
+    }
+    if any_lower_contains(&lower, COMMANDS_CALL_NEEDLES) {
         matches.push("commands call".to_string());
     }
-    for needle in [
-        "joblib.load",
-        "joblib._pickle_load",
-        "cloudpickle.load",
-        "cloudpickle.loads",
-    ] {
-        if lower.contains(needle) {
-            matches.push("pickle loader call".to_string());
-            break;
-        }
+    if any_lower_contains(&lower, PICKLE_LOADER_NEEDLES) {
+        matches.push("pickle loader call".to_string());
     }
-    if lower.contains("copyreg.add_extension") || lower.contains("copyreg.remove_extension") {
+    if any_lower_contains(&lower, COPYREG_EXTENSION_NEEDLES) {
         matches.push("copyreg extension".to_string());
     }
     if lower.contains("import") && contains_import_statement(&lower) {
@@ -97,29 +131,26 @@ pub(crate) fn suspicious_string_matches(value: &str) -> Vec<String> {
         matches.push("hex escape".to_string());
     }
     if lower.contains("getattr") {
-        if contains_getattr_target(value, "system") {
-            matches.push("getattr system".to_string());
-        }
-        if contains_getattr_target(value, "exec") {
-            matches.push("getattr exec".to_string());
-        }
-        if contains_getattr_target(value, "eval") {
-            matches.push("getattr eval".to_string());
-        }
-        if contains_getattr_target(value, "popen") {
-            matches.push("getattr popen".to_string());
-        }
-        for method in ["spawn", "call", "run", "popen"] {
-            if contains_getattr_target(value, method) {
-                matches.push("getattr process call".to_string());
-                break;
+        for (target, label) in GETATTR_TARGET_PATTERNS {
+            if contains_getattr_target(value, target) {
+                matches.push((*label).to_string());
             }
+        }
+        if GETATTR_PROCESS_TARGETS
+            .iter()
+            .any(|target| contains_getattr_target(value, target))
+        {
+            matches.push("getattr process call".to_string());
         }
         if contains_nested_getattr(value) {
             matches.push("nested getattr".to_string());
         }
     }
     matches
+}
+
+fn any_lower_contains(lower: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| lower.contains(needle))
 }
 
 fn has_base64_dangerous_seed(value: &str) -> bool {
@@ -442,14 +473,6 @@ fn contains_call_like(lower: &str, name: &str) -> bool {
         offset = after;
     }
     false
-}
-
-fn contains_module_attr(lower: &str, module: &str, attr: &str) -> bool {
-    find_module_attr(lower, module, attr, false)
-}
-
-fn contains_module_attr_prefix(lower: &str, module: &str, attr_prefix: &str) -> bool {
-    find_module_attr(lower, module, attr_prefix, true)
 }
 
 fn find_module_attr(lower: &str, module: &str, attr: &str, prefix: bool) -> bool {
