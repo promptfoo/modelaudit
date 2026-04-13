@@ -4,7 +4,7 @@ pub(crate) enum ArgValue {
     Int(i64),
     UInt(usize),
     Text(String),
-    Bytes(Vec<u8>),
+    Bytes { start: usize, end: usize },
 }
 
 impl ArgValue {
@@ -13,6 +13,15 @@ impl ArgValue {
             ArgValue::Int(value) => Some(*value),
             ArgValue::UInt(value) => i64::try_from(*value).ok(),
             ArgValue::Text(value) => value.parse::<i64>().ok(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn bytes<'payload>(&self, payload: &'payload [u8]) -> Option<&'payload [u8]> {
+        match self {
+            ArgValue::Bytes { start, end } if start <= end && *end <= payload.len() => {
+                Some(&payload[*start..*end])
+            }
             _ => None,
         }
     }
@@ -29,10 +38,13 @@ impl ArgValue {
         }
     }
 
-    pub(crate) fn coerce_text(&self) -> String {
+    pub(crate) fn coerce_text(&self, payload: &[u8]) -> String {
         match self {
             ArgValue::Text(value) => value.clone(),
-            ArgValue::Bytes(value) => String::from_utf8_lossy(value).to_string(),
+            ArgValue::Bytes { .. } => self
+                .bytes(payload)
+                .map(|value| String::from_utf8_lossy(value).to_string())
+                .unwrap_or_default(),
             ArgValue::Int(value) => value.to_string(),
             ArgValue::UInt(value) => value.to_string(),
             ArgValue::None => "".to_string(),
@@ -121,20 +133,20 @@ pub(crate) fn parse_opcode(
         },
         0x8a => {
             let len = read_u8(payload, &mut cursor, limit)? as usize;
-            let value = read_fixed_width_bytes(payload, &mut cursor, limit, len, "long1")?;
+            let (start, end) = read_fixed_width_span(payload, &mut cursor, limit, len, "long1")?;
             ParsedOpcode {
                 name: "LONG1",
-                arg: ArgValue::Bytes(value),
+                arg: ArgValue::Bytes { start, end },
                 pos: index,
                 next: cursor,
             }
         }
         0x8b => {
             let len = read_u32_le(payload, &mut cursor, limit)? as usize;
-            let value = read_fixed_width_bytes(payload, &mut cursor, limit, len, "long4")?;
+            let (start, end) = read_fixed_width_span(payload, &mut cursor, limit, len, "long4")?;
             ParsedOpcode {
                 name: "LONG4",
-                arg: ArgValue::Bytes(value),
+                arg: ArgValue::Bytes { start, end },
                 pos: index,
                 next: cursor,
             }
@@ -151,90 +163,60 @@ pub(crate) fn parse_opcode(
         },
         b'T' => {
             let len = read_u32_le(payload, &mut cursor, limit)? as usize;
+            let (start, end) = read_variable_span(payload, &mut cursor, limit, len, "string4")?;
             ParsedOpcode {
                 name: "BINSTRING",
-                arg: ArgValue::Bytes(read_variable_bytes(
-                    payload,
-                    &mut cursor,
-                    limit,
-                    len,
-                    "string4",
-                )?),
+                arg: ArgValue::Bytes { start, end },
                 pos: index,
                 next: cursor,
             }
         }
         b'U' => {
             let len = read_u8(payload, &mut cursor, limit)? as usize;
+            let (start, end) = read_variable_span(payload, &mut cursor, limit, len, "string1")?;
             ParsedOpcode {
                 name: "SHORT_BINSTRING",
-                arg: ArgValue::Bytes(read_variable_bytes(
-                    payload,
-                    &mut cursor,
-                    limit,
-                    len,
-                    "string1",
-                )?),
+                arg: ArgValue::Bytes { start, end },
                 pos: index,
                 next: cursor,
             }
         }
         b'B' => {
             let len = read_u32_le(payload, &mut cursor, limit)? as usize;
+            let (start, end) = read_variable_span(payload, &mut cursor, limit, len, "bytes4")?;
             ParsedOpcode {
                 name: "BINBYTES",
-                arg: ArgValue::Bytes(read_variable_bytes(
-                    payload,
-                    &mut cursor,
-                    limit,
-                    len,
-                    "bytes4",
-                )?),
+                arg: ArgValue::Bytes { start, end },
                 pos: index,
                 next: cursor,
             }
         }
         b'C' => {
             let len = read_u8(payload, &mut cursor, limit)? as usize;
+            let (start, end) = read_variable_span(payload, &mut cursor, limit, len, "bytes1")?;
             ParsedOpcode {
                 name: "SHORT_BINBYTES",
-                arg: ArgValue::Bytes(read_variable_bytes(
-                    payload,
-                    &mut cursor,
-                    limit,
-                    len,
-                    "bytes1",
-                )?),
+                arg: ArgValue::Bytes { start, end },
                 pos: index,
                 next: cursor,
             }
         }
         0x8e => {
             let len = read_u64_len(payload, &mut cursor, limit, index, "bytes8")?;
+            let (start, end) = read_variable_span(payload, &mut cursor, limit, len, "bytes8")?;
             ParsedOpcode {
                 name: "BINBYTES8",
-                arg: ArgValue::Bytes(read_variable_bytes(
-                    payload,
-                    &mut cursor,
-                    limit,
-                    len,
-                    "bytes8",
-                )?),
+                arg: ArgValue::Bytes { start, end },
                 pos: index,
                 next: cursor,
             }
         }
         0x96 => {
             let len = read_u64_len(payload, &mut cursor, limit, index, "bytearray8")?;
+            let (start, end) = read_variable_span(payload, &mut cursor, limit, len, "bytearray8")?;
             ParsedOpcode {
                 name: "BYTEARRAY8",
-                arg: ArgValue::Bytes(read_variable_bytes(
-                    payload,
-                    &mut cursor,
-                    limit,
-                    len,
-                    "bytearray8",
-                )?),
+                arg: ArgValue::Bytes { start, end },
                 pos: index,
                 next: cursor,
             }
@@ -252,54 +234,33 @@ pub(crate) fn parse_opcode(
         },
         0x8c => {
             let len = read_u8(payload, &mut cursor, limit)? as usize;
+            let (start, end) =
+                read_variable_span(payload, &mut cursor, limit, len, "unicodestring1")?;
             ParsedOpcode {
                 name: "SHORT_BINUNICODE",
-                arg: ArgValue::Text(
-                    String::from_utf8_lossy(&read_variable_bytes(
-                        payload,
-                        &mut cursor,
-                        limit,
-                        len,
-                        "unicodestring1",
-                    )?)
-                    .to_string(),
-                ),
+                arg: ArgValue::Text(String::from_utf8_lossy(&payload[start..end]).to_string()),
                 pos: index,
                 next: cursor,
             }
         }
         b'X' => {
             let len = read_u32_le(payload, &mut cursor, limit)? as usize;
+            let (start, end) =
+                read_variable_span(payload, &mut cursor, limit, len, "unicodestring4")?;
             ParsedOpcode {
                 name: "BINUNICODE",
-                arg: ArgValue::Text(
-                    String::from_utf8_lossy(&read_variable_bytes(
-                        payload,
-                        &mut cursor,
-                        limit,
-                        len,
-                        "unicodestring4",
-                    )?)
-                    .to_string(),
-                ),
+                arg: ArgValue::Text(String::from_utf8_lossy(&payload[start..end]).to_string()),
                 pos: index,
                 next: cursor,
             }
         }
         0x8d => {
             let len = read_u64_len(payload, &mut cursor, limit, index, "unicodestring8")?;
+            let (start, end) =
+                read_variable_span(payload, &mut cursor, limit, len, "unicodestring8")?;
             ParsedOpcode {
                 name: "BINUNICODE8",
-                arg: ArgValue::Text(
-                    String::from_utf8_lossy(&read_variable_bytes(
-                        payload,
-                        &mut cursor,
-                        limit,
-                        len,
-                        "unicodestring8",
-                    )?)
-                    .to_string(),
-                ),
+                arg: ArgValue::Text(String::from_utf8_lossy(&payload[start..end]).to_string()),
                 pos: index,
                 next: cursor,
             }
@@ -312,13 +273,10 @@ pub(crate) fn parse_opcode(
         },
         b'G' => ParsedOpcode {
             name: "BINFLOAT",
-            arg: ArgValue::Bytes(read_fixed_width_bytes(
-                payload,
-                &mut cursor,
-                limit,
-                8,
-                "float8",
-            )?),
+            arg: {
+                let (start, end) = read_fixed_width_span(payload, &mut cursor, limit, 8, "float8")?;
+                ArgValue::Bytes { start, end }
+            },
             pos: index,
             next: cursor,
         },
@@ -476,27 +434,31 @@ fn python_byte_literal(byte: u8) -> String {
 }
 
 fn read_u8(payload: &[u8], cursor: &mut usize, limit: usize) -> Result<u8, ParseError> {
-    let bytes = read_fixed_width_bytes(payload, cursor, limit, 1, "uint1")?;
-    Ok(bytes[0])
+    let (start, end) = read_fixed_width_span(payload, cursor, limit, 1, "uint1")?;
+    Ok(payload[start..end][0])
 }
 
 fn read_u16_le(payload: &[u8], cursor: &mut usize, limit: usize) -> Result<u16, ParseError> {
-    let bytes = read_fixed_width_bytes(payload, cursor, limit, 2, "uint2")?;
+    let (start, end) = read_fixed_width_span(payload, cursor, limit, 2, "uint2")?;
+    let bytes = &payload[start..end];
     Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
 }
 
 fn read_i32_le(payload: &[u8], cursor: &mut usize, limit: usize) -> Result<i32, ParseError> {
-    let bytes = read_fixed_width_bytes(payload, cursor, limit, 4, "int4")?;
+    let (start, end) = read_fixed_width_span(payload, cursor, limit, 4, "int4")?;
+    let bytes = &payload[start..end];
     Ok(i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
 fn read_u32_le(payload: &[u8], cursor: &mut usize, limit: usize) -> Result<u32, ParseError> {
-    let bytes = read_fixed_width_bytes(payload, cursor, limit, 4, "uint4")?;
+    let (start, end) = read_fixed_width_span(payload, cursor, limit, 4, "uint4")?;
+    let bytes = &payload[start..end];
     Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
 fn read_u64_le(payload: &[u8], cursor: &mut usize, limit: usize) -> Result<u64, ParseError> {
-    let bytes = read_fixed_width_bytes(payload, cursor, limit, 8, "uint8")?;
+    let (start, end) = read_fixed_width_span(payload, cursor, limit, 8, "uint8")?;
+    let bytes = &payload[start..end];
     Ok(u64::from_le_bytes([
         bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
     ]))
@@ -514,13 +476,13 @@ fn read_u64_len(
     })
 }
 
-fn read_fixed_width_bytes(
+fn read_fixed_width_span(
     payload: &[u8],
     cursor: &mut usize,
     limit: usize,
     len: usize,
     read_kind: &'static str,
-) -> Result<Vec<u8>, ParseError> {
+) -> Result<(usize, usize), ParseError> {
     let end = cursor
         .checked_add(len)
         .ok_or_else(|| ParseError::new("pickle opcode length overflow").at(*cursor))?;
@@ -530,18 +492,18 @@ fn read_fixed_width_bytes(
             limit.min(payload.len()),
         ));
     }
-    let value = payload[*cursor..end].to_vec();
+    let start = *cursor;
     *cursor = end;
-    Ok(value)
+    Ok((start, end))
 }
 
-fn read_variable_bytes(
+fn read_variable_span(
     payload: &[u8],
     cursor: &mut usize,
     limit: usize,
     len: usize,
     read_kind: &'static str,
-) -> Result<Vec<u8>, ParseError> {
+) -> Result<(usize, usize), ParseError> {
     let end = cursor
         .checked_add(len)
         .ok_or_else(|| ParseError::new("pickle opcode length overflow").at(*cursor))?;
@@ -552,9 +514,9 @@ fn read_variable_bytes(
         ))
         .at(limit.min(payload.len())));
     }
-    let value = payload[*cursor..end].to_vec();
+    let start = *cursor;
     *cursor = end;
-    Ok(value)
+    Ok((start, end))
 }
 
 fn read_line_bytes(

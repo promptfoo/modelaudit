@@ -1236,7 +1236,7 @@ def test_scan_bytes_records_truncated_literal_scan_notice() -> None:
     )
 
 
-def test_scan_bytes_fails_closed_when_suspicious_literal_content_is_outside_scan_windows() -> None:
+def test_scan_bytes_flags_suspicious_literal_content_across_truncated_literal_windows() -> None:
     hidden_payload = "A" * 32 + "os.system('id')" + "B" * 32
 
     report = scan_bytes(
@@ -1246,9 +1246,30 @@ def test_scan_bytes_fails_closed_when_suspicious_literal_content_is_outside_scan
     )
 
     assert report.status == ScanStatus.INCONCLUSIVE
-    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
     assert report.is_clean is False
-    assert not any(finding.rule_code == "SUSPICIOUS_STRING" for finding in report.findings)
+    assert any(
+        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "os.system"
+        for finding in report.findings
+    )
+    assert any(notice.code == "literal_scan_truncated" for notice in report.notices)
+
+
+def test_scan_bytes_flags_suspicious_literal_content_across_default_long_literal_windows() -> None:
+    gap_padding = "A" * (4 * 1024 * 1024 + 2048)
+    hidden_payload = gap_padding + "os.system('id')" + gap_padding
+
+    report = scan_bytes(
+        pickle.dumps({"code": hidden_payload}, protocol=4),
+        source="default-hidden-large-string.pkl",
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "os.system"
+        for finding in report.findings
+    )
     assert any(notice.code == "literal_scan_truncated" for notice in report.notices)
 
 

@@ -923,6 +923,11 @@ jobs:
         run: |
           cargo check --manifest-path Cargo.toml
 
+      - name: Check Rust scanner MSRV
+        run: |
+          rustup toolchain install 1.74.0 --profile minimal
+          cargo +1.74.0 check --manifest-path Cargo.toml --locked
+
       - name: Lint Rust scanner crate
         run: |
           cargo clippy --manifest-path Cargo.toml --all-targets -- -D warnings

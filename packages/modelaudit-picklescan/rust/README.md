@@ -40,20 +40,20 @@ uv run --with pytest-benchmark pytest \
 
 ## Current Structure
 
-The native crate keeps scan state, suspicious-string matching, nested payload
-detection, PyO3 entrypoints, and unit tests in `rust/src/lib.rs`. Pickle opcode
-decoding, argument parsing, escape handling, and malformed-read errors live in
-`rust/src/opcode.rs`. Dangerous global policy tables live in
-`rust/src/policy.rs`. Python report conversion/value types live in
-`rust/src/report.rs`. This is already easier to audit than a single-file port,
-but it should not be the final shape.
+The native crate is split by responsibility:
 
-Good future split points:
+- `rust/src/lib.rs`: small crate root and `_rust` module registration.
+- `rust/src/pybridge.rs`: PyO3 entrypoints and scan invocation boundary.
+- `rust/src/state.rs`: stack/memo scan state, opcode handling, finding/report
+  assembly, and state-level unit tests.
+- `rust/src/strings.rs`: suspicious string literal matching and parser helpers.
+- `rust/src/nested.rs`: raw/base64/hex nested-pickle detection and nested
+  payload validation helpers.
+- `rust/src/opcode.rs`: pickle opcode decoding, argument parsing, escape
+  handling, and malformed-read errors.
+- `rust/src/policy.rs`: dangerous global policy tables.
+- `rust/src/report.rs`: Python report conversion/value types.
 
-- `state`: stack/memo scan state and report assembly.
-- `strings`: suspicious-string matching.
-- `nested`: raw/base64/hex nested-pickle detection.
-- `pybridge`: PyO3 entrypoints.
-
-Keep module splits behavior-preserving and guarded by the generated regression
-corpus. Prefer one module extraction per change so review stays sharp.
+Keep future module splits behavior-preserving and guarded by the generated
+regression corpus. Prefer one module extraction per change so review stays
+sharp.
