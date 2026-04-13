@@ -34,10 +34,12 @@ class TestPyCompileImprovements:
         scanner = PickleScanner()
         result = scanner.scan(str(pickle_path))
 
-        # Should only flag the actual dangerous code, not the false positives
-        dangerous_issues = [i for i in result.issues if "executable code" in i.message]
-        assert len(dangerous_issues) == 1
-        assert "validated as executable code" in dangerous_issues[0].message
+        # Should only flag the actual dangerous helper, not explanatory eval() text.
+        assert any(
+            issue.rule_code == "S201" and issue.details.get("associated_global") == "os.system"
+            for issue in result.issues
+        )
+        assert not any(issue.rule_code == "S104" and issue.details.get("pattern") == "eval(" for issue in result.issues)
 
     def test_pickle_base64_validation(self, tmp_path):
         """Test that base64 strings are checked for Python code."""

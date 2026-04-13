@@ -285,6 +285,15 @@ fn timeout_duration(timeout_s: f64) -> Duration {
     }
 }
 
+fn deadline_from_timeout(timeout_s: f64) -> Instant {
+    let now = Instant::now();
+    let duration = timeout_duration(timeout_s);
+    now.checked_add(duration).unwrap_or_else(|| {
+        now.checked_add(Duration::from_secs_f64(DEFAULT_TIMEOUT_S))
+            .unwrap_or(now)
+    })
+}
+
 fn option_usize(options: &Bound<'_, PyDict>, key: &str, default: usize) -> PyResult<usize> {
     match options.get_item(key)? {
         Some(value) => value.extract::<usize>(),
@@ -355,11 +364,7 @@ impl<'a> ScanState<'a> {
         nested_depth: usize,
         deadline: Option<Instant>,
     ) -> Self {
-        let deadline = deadline.unwrap_or_else(|| {
-            Instant::now()
-                .checked_add(timeout_duration(options.timeout_s))
-                .unwrap_or_else(Instant::now)
-        });
+        let deadline = deadline.unwrap_or_else(|| deadline_from_timeout(options.timeout_s));
         Self {
             source,
             payload,

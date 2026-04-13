@@ -35,6 +35,14 @@ class NonSeekableBytesIO(io.BytesIO):
         return False
 
 
+class BrokenTellStream(io.BytesIO):
+    def seekable(self) -> bool:
+        return True
+
+    def tell(self) -> int:
+        raise OSError("tell failed")
+
+
 def _short_binunicode(data: bytes) -> bytes:
     if len(data) > 0xFF:
         raise ValueError("SHORT_BINUNICODE helper accepts at most 255 bytes")
@@ -371,7 +379,11 @@ def test_scan_stream_deduplicates_legacy_raw_eval_exec_import_patterns() -> None
         "builtins.exec",
         "builtins.__import__",
     }
-    assert {issue.rule_code for issue in raw_builtin_issues} == {"S104"}
+    assert {issue.details["associated_global"]: issue.rule_code for issue in raw_builtin_issues} == {
+        "builtins.eval": "S104",
+        "builtins.exec": "S104",
+        "builtins.__import__": "S106",
+    }
 
 
 @pytest.mark.parametrize("separator", ["\x00", "\\\n", ";", "/* comment */"])
@@ -782,6 +794,16 @@ def test_scan_stream_accepts_unknown_size_stream() -> None:
 
     assert result.success is True
     assert result.metadata["pickle_primary_engine"] == "rust"
+
+
+def test_scan_stream_handles_seekable_stream_position_failures() -> None:
+    payload = pickle.dumps({"safe": True}, protocol=4)
+
+    result = PickleScanner().scan_stream(BrokenTellStream(payload), len(payload), source="broken-tell.pkl")
+
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "stream_position_failed"
+    assert any(issue.details.get("category") == "stream_position_failed" for issue in result.issues)
 
 
 def test_scan_stream_unknown_size_non_seekable_payload_above_root_cap_returns_truncated_result() -> None:

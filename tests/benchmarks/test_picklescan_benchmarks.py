@@ -59,10 +59,10 @@ def _build_large_safe_model() -> dict[str, Any]:
 
 @pytest.fixture(scope="session")
 def standalone_pickle_payloads() -> dict[str, bytes]:
-    nested_payload = pickle.dumps({"inner": "data"}, protocol=4)
     safe_small = pickle.dumps({"weights": [1, 2, 3], "metadata": {"format": "pickle"}}, protocol=4)
     safe_large = pickle.dumps(_build_large_safe_model(), protocol=4)
     malicious_reduce = pickle.dumps(MaliciousReduce(), protocol=4)
+    nested_payload = malicious_reduce
     stack_global = b"\x80\x04\x8c\x05posix\x94\x8c\x06system\x94\x93."
     multi_stream_padded = safe_small + (b"\x00" * 4096) + malicious_reduce
     opcode_budget_tail = b"\x80\x04cos\nsystem\n."
@@ -195,7 +195,7 @@ def test_picklescan_opcode_budget_tail_payload(
     )
 
     assert report.status == ScanStatus.INCONCLUSIVE
-    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert report.verdict == SafetyVerdict.MALICIOUS
     assert report.findings
 
 

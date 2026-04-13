@@ -142,7 +142,36 @@ class JoblibScanner(BaseScanner):
                 source=context,
             )
         result.merge(sub_result)
+        self._downgrade_embedded_pickle_parse_errors(result)
+        self._mark_trusted_numpy_wrapper_tail(result)
         result.bytes_scanned = len(payload)
+
+    @staticmethod
+    def _downgrade_embedded_pickle_parse_errors(result: ScanResult) -> None:
+        for issue in result.issues:
+            if issue.rule_code == "S901" and issue.details.get("category") == "parse_error":
+                issue.severity = IssueSeverity.INFO
+        for check in result.checks:
+            if check.rule_code == "S901" and check.details.get("category") == "parse_error":
+                check.severity = IssueSeverity.INFO
+
+    @staticmethod
+    def _mark_trusted_numpy_wrapper_tail(result: ScanResult) -> None:
+        if result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME:
+            return
+        if result.metadata.get("failure_reason") != "unknown_opcode_or_format_error":
+            return
+
+        references = result.metadata.get("import_references")
+        if not isinstance(references, list):
+            return
+        has_numpy_wrapper = any(
+            isinstance(reference, dict) and reference.get("import_reference") == "joblib.numpy_pickle.NumpyArrayWrapper"
+            for reference in references
+        )
+        if has_numpy_wrapper:
+            result.metadata["trusted_incomplete_tail"] = True
+            result.metadata["trusted_incomplete_tail_reason"] = "joblib_numpy_array_payload"
 
     def _looks_like_raw_pickle_payload(self, data: bytes) -> bool:
         """Return True when `.joblib` bytes should be scanned directly as pickle."""

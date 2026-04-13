@@ -191,7 +191,7 @@ fn validate_pickle_stack_effect(
         },
         "APPENDS" | "SETITEMS" | "ADDITEMS" => match mark_depths.pop() {
             Some(mark_depth) => {
-                *stack_depth = mark_depth + 1;
+                *stack_depth = mark_depth;
                 true
             }
             None => false,
@@ -277,7 +277,11 @@ fn validate_pickle_stack_effect(
             true
         }
         "PUT" | "BINPUT" | "LONG_BINPUT" | "MEMOIZE" | "PROTO" | "FRAME" | "STOP" => true,
-        "NEXT_BUFFER" | "READONLY_BUFFER" => true,
+        "NEXT_BUFFER" => {
+            *stack_depth += 1;
+            true
+        }
+        "READONLY_BUFFER" => true,
         _ => {
             *stack_depth += 1;
             true
@@ -705,7 +709,14 @@ fn take_last_chars(value: &str, count: usize) -> String {
 }
 
 fn take_bytes_str(value: &str, count: usize) -> String {
-    value.bytes().take(count).map(char::from).collect()
+    if count >= value.len() {
+        return value.to_string();
+    }
+    let mut end = count;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
 }
 
 #[cfg(test)]
@@ -871,5 +882,24 @@ mod tests {
         assert!(!truncated_pickle_prefix_requires_fail_closed(
             b"}q\x00BBBBBBBB"
         ));
+    }
+
+    #[test]
+    fn stack_validation_models_batch_container_mutation_and_protocol5_buffers() {
+        assert!(!looks_like_pickle_payload(
+            b"\x80\x04](ea.",
+            TEST_MAX_NESTED_PICKLE_BYTES
+        ));
+        assert!(looks_like_pickle_payload(
+            b"\x80\x05\x97.",
+            TEST_MAX_NESTED_PICKLE_BYTES
+        ));
+    }
+
+    #[test]
+    fn byte_bounded_string_windows_preserve_utf8_boundaries() {
+        assert_eq!(take_bytes_str("abc", 2), "ab");
+        assert_eq!(take_bytes_str("a\u{2603}b", 2), "a");
+        assert_eq!(take_bytes_str("a\u{2603}b", 4), "a\u{2603}");
     }
 }

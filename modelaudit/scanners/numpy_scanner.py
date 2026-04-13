@@ -51,7 +51,7 @@ def _mark_inconclusive_scan_result(result: ScanResult, reason: str) -> None:
 
 
 def _finish_with_inconclusive_contract(result: ScanResult, *, default_success: bool) -> None:
-    result.finish(success=True if result.has_errors else default_success)
+    result.finish(success=default_success and not result.has_errors)
 
 
 class NumPyScanner(BaseScanner):

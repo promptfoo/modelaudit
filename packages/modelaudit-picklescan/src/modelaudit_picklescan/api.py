@@ -704,6 +704,13 @@ def _normalize_stream_size(size: int | None) -> int | None:
     return size
 
 
+def _stream_is_seekable(stream: BinaryIO) -> bool:
+    try:
+        return bool(stream.seekable())
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
 def _read_stream_payload(
     stream: BinaryIO,
     size: int | None,
@@ -721,8 +728,8 @@ def _read_stream_payload(
                     break
                 spool.write(chunk)
                 remaining -= len(chunk)
-            if remaining == 0 and stream.read(1):
-                stream_truncated = True
+            if remaining == 0:
+                stream_truncated = bool(stream.read(1)) if _stream_is_seekable(stream) else True
         else:
             remaining = min(size, max_known_read_bytes)
             stream_truncated = size > max_known_read_bytes

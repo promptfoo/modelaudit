@@ -112,6 +112,23 @@ class NoUnboundedReadlineStream(io.BytesIO):
         return super().readline(size)
 
 
+class NonSeekableExactLimitStream(io.BytesIO):
+    def __init__(self, payload: bytes, *, limit: int) -> None:
+        super().__init__(payload)
+        self.limit = limit
+        self.bytes_returned = 0
+
+    def seekable(self) -> bool:
+        return False
+
+    def read(self, size: int | None = -1) -> bytes:
+        if self.bytes_returned >= self.limit:
+            raise AssertionError("scan_stream() attempted an overflow probe on a non-seekable stream")
+        chunk = super().read(size)
+        self.bytes_returned += len(chunk)
+        return chunk
+
+
 def test_scan_bytes_returns_clean_report_for_safe_pickle() -> None:
     report = scan_bytes(pickle.dumps({"weights": [1, 2, 3]}), source="safe.pkl")
 
@@ -1056,6 +1073,21 @@ def test_scan_stream_enforces_total_unbounded_stream_read_limit() -> None:
     assert report.status == ScanStatus.INCONCLUSIVE
     assert report.verdict == SafetyVerdict.UNKNOWN
     assert report.findings == ()
+    assert not any(error.category == "io_error" for error in report.errors)
+    assert any(notice.code == "unbounded_stream_truncated" for notice in report.notices)
+
+
+def test_scan_stream_does_not_overflow_probe_non_seekable_unknown_size_streams() -> None:
+    payload = pickle.dumps(b"a" * 64, protocol=4)
+    stream = NonSeekableExactLimitStream(payload, limit=8)
+
+    report = PickleScanner(ScanOptions(max_unbounded_stream_read_bytes=8)).scan_stream(
+        stream,
+        source="unknown-size-nonseek-exact-cap.pkl",
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
     assert not any(error.category == "io_error" for error in report.errors)
     assert any(notice.code == "unbounded_stream_truncated" for notice in report.notices)
 

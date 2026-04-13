@@ -45,3 +45,4 @@ def test_rust_pickle_scanner_does_not_let_ml_context_hide_dangerous_reduce(tmp_p
     assert any(
         issue.details.get("import_reference") in {"posix.system", "os.system", "nt.system"} for issue in result.issues
     )
+    assert not any(issue.details.get("pattern_type") == "setitem_near_dangerous_global" for issue in result.issues)

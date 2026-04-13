@@ -518,9 +518,39 @@ fn contains_call_like(lower: &str, name: &str) -> bool {
         }
         let rest = &lower[after..];
         if rest.trim_start().starts_with('(') || lower[start..].starts_with(&needle) {
+            if call_like_has_prose_suffix(rest) {
+                offset = after;
+                continue;
+            }
             return true;
         }
         offset = after;
+    }
+    false
+}
+
+fn call_like_has_prose_suffix(rest_after_name: &str) -> bool {
+    let trimmed = rest_after_name.trim_start();
+    if !trimmed.starts_with('(') {
+        return false;
+    }
+
+    let mut depth = 0usize;
+    for (index, ch) in trimmed.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    let suffix = trimmed[index + ch.len_utf8()..].trim_start();
+                    return suffix
+                        .chars()
+                        .next()
+                        .is_some_and(|next| next.is_ascii_alphabetic());
+                }
+            }
+            _ => {}
+        }
     }
     false
 }
@@ -706,11 +736,21 @@ fn find_ascii_word(chars: &[char], word: &str, start: usize) -> Option<usize> {
     }
     let max_start = chars.len().saturating_sub(word_chars.len());
     for index in start..=max_start {
-        if chars[index..index + word_chars.len()] == word_chars[..] {
+        let end = index + word_chars.len();
+        let has_word_boundary_before = index == 0 || !is_ascii_word_char(chars[index - 1]);
+        let has_word_boundary_after = end == chars.len() || !is_ascii_word_char(chars[end]);
+        if has_word_boundary_before
+            && has_word_boundary_after
+            && chars[index..end] == word_chars[..]
+        {
             return Some(index);
         }
     }
     None
+}
+
+fn is_ascii_word_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
 }
 
 fn skip_whitespace(chars: &[char], cursor: &mut usize) {
@@ -821,6 +861,7 @@ mod tests {
             suspicious_string_matches(r#"getattr(getattr(obj, "runner"), "system")"#);
 
         assert!(nested_matches.contains(&"nested getattr".to_string()));
+        assert!(suspicious_string_matches(r#"mygetattr(target, "system")"#).is_empty());
     }
 
     #[test]
@@ -846,6 +887,13 @@ mod tests {
         assert!(suspicious_string_matches("recompile(x)").is_empty());
         assert!(suspicious_string_matches("foos.system('id')").is_empty());
         assert!(suspicious_string_matches("subprocess_eval_guard").is_empty());
+    }
+
+    #[test]
+    fn suspicious_string_matching_ignores_prose_call_mentions() {
+        assert!(suspicious_string_matches("Use eval() function to compute results").is_empty());
+        assert!(suspicious_string_matches("eval(x + 2) where x is input").is_empty());
+        assert!(suspicious_string_matches("eval(x); exec(y)").contains(&"eval(".to_string()));
     }
 
     #[test]
